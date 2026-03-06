@@ -918,6 +918,10 @@ impl Application {
                     self.render().await;
                 }
             }
+            EditorEvent::AcpMessage((id, call)) => {
+                self.handle_acp_message(call, id).await;
+                helix_event::request_redraw();
+            }
             EditorEvent::Redraw => {
                 self.render().await;
             }
@@ -1539,6 +1543,291 @@ impl Application {
             };
         };
         lsp::ShowDocumentResult { success: true }
+    }
+
+    pub async fn handle_acp_message(
+        &mut self,
+        call: helix_acp::jsonrpc::Call,
+        agent_id: helix_acp::AgentId,
+    ) {
+        use helix_acp::jsonrpc::Call;
+        use helix_acp::types::{AgentMethodCall, AgentNotification};
+
+        let agent = match self.editor.acp_agents.get(agent_id) {
+            Some(agent) => agent.clone(),
+            None => {
+                log::warn!("ACP message from unknown agent {:?}", agent_id);
+                return;
+            }
+        };
+
+        match call {
+            Call::Notification(helix_acp::jsonrpc::Notification { method, params, .. }) => {
+                match AgentNotification::parse(&method, params) {
+                    Ok(AgentNotification::SessionUpdate(notif)) => {
+                        self.handle_acp_session_update(agent_id, notif);
+                    }
+                    Err(helix_acp::Error::Unhandled(method)) => {
+                        log::debug!("Ignoring unhandled ACP notification: {method}");
+                    }
+                    Err(err) => {
+                        log::error!("Error parsing ACP notification: {err}");
+                    }
+                }
+            }
+            Call::MethodCall(helix_acp::jsonrpc::MethodCall {
+                method,
+                params,
+                id,
+                ..
+            }) => {
+                match AgentMethodCall::parse(&method, params) {
+                    Ok(AgentMethodCall::ReadTextFile(req)) => {
+                        let result = self.handle_acp_read_file(&req);
+                        match result {
+                            Ok(resp) => agent.reply(id, serde_json::to_value(resp).unwrap()),
+                            Err(e) => agent.reply_error(
+                                id,
+                                helix_acp::jsonrpc::Error::internal_error(e.to_string()),
+                            ),
+                        }
+                    }
+                    Ok(AgentMethodCall::WriteTextFile(req)) => {
+                        let result = self.handle_acp_write_file(&req);
+                        match result {
+                            Ok(resp) => agent.reply(id, serde_json::to_value(resp).unwrap()),
+                            Err(e) => agent.reply_error(
+                                id,
+                                helix_acp::jsonrpc::Error::internal_error(e.to_string()),
+                            ),
+                        }
+                    }
+                    Ok(AgentMethodCall::CreateTerminal(req)) => {
+                        match self.handle_acp_create_terminal(&req).await {
+                            Ok(resp) => agent.reply(id, serde_json::to_value(resp).unwrap()),
+                            Err(e) => agent.reply_error(
+                                id,
+                                helix_acp::jsonrpc::Error::internal_error(e.to_string()),
+                            ),
+                        }
+                    }
+                    Ok(AgentMethodCall::TerminalOutput(req)) => {
+                        match self.handle_acp_terminal_output(&req) {
+                            Ok(resp) => agent.reply(id, serde_json::to_value(resp).unwrap()),
+                            Err(e) => agent.reply_error(
+                                id,
+                                helix_acp::jsonrpc::Error::internal_error(e.to_string()),
+                            ),
+                        }
+                    }
+                    Ok(AgentMethodCall::WaitForTerminalExit(req)) => {
+                        match self.handle_acp_wait_terminal(&req).await {
+                            Ok(resp) => agent.reply(id, serde_json::to_value(resp).unwrap()),
+                            Err(e) => agent.reply_error(
+                                id,
+                                helix_acp::jsonrpc::Error::internal_error(e.to_string()),
+                            ),
+                        }
+                    }
+                    Ok(AgentMethodCall::KillTerminal(req)) => {
+                        self.handle_acp_kill_terminal(&req);
+                        agent.reply(id, serde_json::Value::Null);
+                    }
+                    Ok(AgentMethodCall::ReleaseTerminal(req)) => {
+                        self.handle_acp_release_terminal(&req);
+                        agent.reply(id, serde_json::Value::Null);
+                    }
+                    Ok(AgentMethodCall::RequestPermission(req)) => {
+                        // For now, auto-approve all permissions
+                        // TODO: show a permission dialog in the UI
+                        let resp = helix_acp::types::RequestPermissionResponse {
+                            outcome: if let Some(first) = req.permissions.first() {
+                                helix_acp::types::RequestPermissionOutcome::Selected {
+                                    id: first.id.clone(),
+                                }
+                            } else {
+                                helix_acp::types::RequestPermissionOutcome::Dismissed
+                            },
+                        };
+                        agent.reply(id, serde_json::to_value(resp).unwrap());
+                    }
+                    Err(helix_acp::Error::Unhandled(method)) => {
+                        log::warn!("Unhandled ACP method call: {method}");
+                        agent.reply_error(
+                            id,
+                            helix_acp::jsonrpc::Error::method_not_found(method),
+                        );
+                    }
+                    Err(err) => {
+                        log::error!("Error parsing ACP method call: {err}");
+                        agent.reply_error(
+                            id,
+                            helix_acp::jsonrpc::Error::internal_error(err.to_string()),
+                        );
+                    }
+                }
+            }
+            Call::Invalid { id } => {
+                log::error!("Invalid ACP message (id={id})");
+            }
+        }
+    }
+
+    fn handle_acp_session_update(
+        &mut self,
+        _agent_id: helix_acp::AgentId,
+        notif: helix_acp::types::SessionNotification,
+    ) {
+        use helix_acp::types::SessionUpdate;
+
+        match notif.update {
+            SessionUpdate::AgentMessageChunk(chunk) => {
+                if let helix_acp::ContentBlock::Text(text) = chunk.content {
+                    // Display agent text as a status message for now.
+                    // TODO: route to a dedicated ACP chat/output buffer
+                    self.editor.set_status(text.text);
+                }
+            }
+            SessionUpdate::ToolCall(tool_call) => {
+                let status = format!(
+                    "[ACP] Tool: {} ({})",
+                    tool_call.title.as_deref().unwrap_or("unknown"),
+                    match tool_call.status {
+                        helix_acp::types::ToolCallStatus::Running => "running",
+                        helix_acp::types::ToolCallStatus::Completed => "completed",
+                        helix_acp::types::ToolCallStatus::Failed => "failed",
+                        helix_acp::types::ToolCallStatus::Cancelled => "cancelled",
+                    }
+                );
+                self.editor.set_status(status);
+            }
+            SessionUpdate::ToolCallUpdate(update) => {
+                if let Some(status) = update.status {
+                    let msg = format!(
+                        "[ACP] Tool update: {} ({})",
+                        update.tool_call_id,
+                        match status {
+                            helix_acp::types::ToolCallStatus::Running => "running",
+                            helix_acp::types::ToolCallStatus::Completed => "done",
+                            helix_acp::types::ToolCallStatus::Failed => "failed",
+                            helix_acp::types::ToolCallStatus::Cancelled => "cancelled",
+                        }
+                    );
+                    self.editor.set_status(msg);
+                }
+            }
+            SessionUpdate::Plan(plan) => {
+                let summary = plan
+                    .entries
+                    .iter()
+                    .map(|e| e.content.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                self.editor.set_status(format!("[ACP] Plan: {summary}"));
+            }
+            _ => {
+                log::debug!("Unhandled ACP session update type");
+            }
+        }
+    }
+
+    fn handle_acp_read_file(
+        &self,
+        req: &helix_acp::types::ReadTextFileRequest,
+    ) -> anyhow::Result<helix_acp::types::ReadTextFileResponse> {
+        let path = std::path::Path::new(&req.path);
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("Failed to read {}: {}", req.path, e))?;
+
+        let content = match (req.line, req.limit) {
+            (Some(start_line), Some(limit)) => {
+                let start = (start_line.saturating_sub(1)) as usize;
+                content
+                    .lines()
+                    .skip(start)
+                    .take(limit as usize)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }
+            (Some(start_line), None) => {
+                let start = (start_line.saturating_sub(1)) as usize;
+                content
+                    .lines()
+                    .skip(start)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }
+            (None, Some(limit)) => content
+                .lines()
+                .take(limit as usize)
+                .collect::<Vec<_>>()
+                .join("\n"),
+            (None, None) => content,
+        };
+
+        Ok(helix_acp::types::ReadTextFileResponse { content })
+    }
+
+    fn handle_acp_write_file(
+        &mut self,
+        req: &helix_acp::types::WriteTextFileRequest,
+    ) -> anyhow::Result<helix_acp::types::WriteTextFileResponse> {
+        let path = std::path::Path::new(&req.path);
+
+        // If the document is open in the editor, update it in-place
+        let doc_id = self
+            .editor
+            .documents()
+            .find(|doc| doc.path().map_or(false, |p| p == path))
+            .map(|doc| doc.id());
+
+        if let Some(doc_id) = doc_id {
+            let doc = doc_mut!(self.editor, &doc_id);
+            let view_id = self.editor.tree.focus;
+            let transaction = helix_core::Transaction::change(
+                doc.text(),
+                [(0, doc.text().len_chars(), Some(helix_core::Tendril::from(req.content.as_str())))].into_iter(),
+            );
+            doc.apply(&transaction, view_id);
+        } else {
+            // Write directly to disk
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(path, &req.content)
+                .map_err(|e| anyhow::anyhow!("Failed to write {}: {}", req.path, e))?;
+        }
+
+        Ok(helix_acp::types::WriteTextFileResponse {})
+    }
+
+    async fn handle_acp_create_terminal(
+        &mut self,
+        _req: &helix_acp::types::CreateTerminalRequest,
+    ) -> anyhow::Result<helix_acp::types::CreateTerminalResponse> {
+        anyhow::bail!("Terminal support not yet implemented")
+    }
+
+    fn handle_acp_terminal_output(
+        &self,
+        _req: &helix_acp::types::TerminalOutputRequest,
+    ) -> anyhow::Result<helix_acp::types::TerminalOutputResponse> {
+        anyhow::bail!("Terminal support not yet implemented")
+    }
+
+    async fn handle_acp_wait_terminal(
+        &self,
+        _req: &helix_acp::types::WaitForTerminalExitRequest,
+    ) -> anyhow::Result<helix_acp::types::WaitForTerminalExitResponse> {
+        anyhow::bail!("Terminal support not yet implemented")
+    }
+
+    fn handle_acp_kill_terminal(&mut self, _req: &helix_acp::types::KillTerminalRequest) {
+        log::warn!("Terminal kill not yet implemented");
+    }
+
+    fn handle_acp_release_terminal(&mut self, _req: &helix_acp::types::ReleaseTerminalRequest) {
+        log::warn!("Terminal release not yet implemented");
     }
 
     fn restore_term(&mut self) -> std::io::Result<()> {

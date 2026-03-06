@@ -1260,7 +1260,7 @@ fn change_current_directory(
 
     cx.editor.set_status(format!(
         "Current working directory is now {}",
-        helix_stdx::env::current_working_dir().display()
+        std::env::current_dir().unwrap_or_default().display()
     ));
 
     Ok(())
@@ -1275,7 +1275,7 @@ fn show_current_directory(
         return Ok(());
     }
 
-    let cwd = helix_stdx::env::current_working_dir();
+    let cwd = std::env::current_dir().unwrap_or_default();
     let message = format!("Current working directory is {}", cwd.display());
 
     if cwd.exists() {
@@ -3524,6 +3524,141 @@ fn reload_all_plugins(
     Ok(())
 }
 
+fn acp_connect(
+    cx: &mut compositor::Context,
+    args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+
+    let command = args
+        .first()
+        .context("Usage: acp-connect <command> [args...]")?
+        .to_string();
+
+    let cmd_args: Vec<String> = args.iter().skip(1).map(|a| a.to_string()).collect();
+
+    let cwd = std::env::current_dir().unwrap_or_default();
+
+    let config = helix_acp::client::AgentConfig {
+        command: command.clone(),
+        args: cmd_args,
+        env: Vec::new(),
+        cwd: cwd.clone(),
+        timeout_secs: 120,
+    };
+
+    let (_id, agent) = cx.editor.acp_agents.launch(&config)?;
+
+    // Initialize the agent in the background
+    let client_info = helix_acp::types::Implementation {
+        name: "helix".to_string(),
+        title: Some("Helix Editor".to_string()),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+    };
+
+    let client_caps = helix_acp::types::ClientCapabilities {
+        fs: Some(helix_acp::types::FileSystemCapabilities {
+            read_text_file: Some(true),
+            write_text_file: Some(true),
+        }),
+        terminal: Some(false),
+    };
+
+    let agent_clone = agent.clone();
+    let cwd_clone = cwd.clone();
+    let callback = async move {
+        let init_resp = agent_clone.initialize(client_info, client_caps).await?;
+        let agent_name = init_resp
+            .agent_info
+            .as_ref()
+            .map(|i| i.title.as_deref().unwrap_or(&i.name))
+            .unwrap_or("agent")
+            .to_string();
+
+        let session_resp = agent_clone.new_session(cwd_clone).await?;
+
+        let msg = format!(
+            "Connected to {} (session: {})",
+            agent_name, session_resp.session_id
+        );
+
+        let callback: crate::job::Callback = crate::job::Callback::EditorCompositor(
+            Box::new(move |editor: &mut helix_view::Editor, _compositor| {
+                editor.set_status(msg);
+            }),
+        );
+        Ok(callback)
+    };
+
+    cx.jobs.callback(callback);
+
+    cx.editor
+        .set_status(format!("Connecting to ACP agent: {command}..."));
+
+    Ok(())
+}
+
+fn acp_prompt(
+    cx: &mut compositor::Context,
+    args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+
+    let prompt_text: String = args.iter().map(|a| a.as_ref().to_string()).collect::<Vec<_>>().join(" ");
+    if prompt_text.is_empty() {
+        bail!("Usage: acp-prompt <message>");
+    }
+
+    // Find the first connected agent
+    let (_agent_id, agent) = cx
+        .editor
+        .acp_agents
+        .iter()
+        .next()
+        .map(|(id, a)| (id, a.clone()))
+        .context("No ACP agents connected. Use :acp-connect first.")?;
+
+    // We need the session ID. For now, store it on the agent or use a simple approach.
+    // TODO: proper session tracking. For now, create a new session per prompt.
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let prompt = vec![helix_acp::ContentBlock::from(prompt_text.clone())];
+
+    let callback = async move {
+        let session = agent.new_session(cwd).await?;
+        let response = agent
+            .prompt(session.session_id, prompt)
+            .await?;
+
+        let msg = format!("[ACP] Done ({})", match response.stop_reason {
+            helix_acp::types::StopReason::EndTurn => "completed",
+            helix_acp::types::StopReason::Cancelled => "cancelled",
+            helix_acp::types::StopReason::MaxTokens => "max tokens",
+            helix_acp::types::StopReason::MaxTurnRequests => "max turns",
+            helix_acp::types::StopReason::Refusal => "refused",
+        });
+
+        let callback: crate::job::Callback = crate::job::Callback::EditorCompositor(
+            Box::new(move |editor: &mut helix_view::Editor, _compositor| {
+                editor.set_status(msg);
+            }),
+        );
+        Ok(callback)
+    };
+
+    cx.jobs.callback(callback);
+
+    cx.editor
+        .set_status(format!("Sending prompt to agent..."));
+
+    Ok(())
+}
+
 pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     TypableCommand {
         name: "exit",
@@ -4707,6 +4842,28 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         completer: CommandCompleter::none(),
         signature: Signature {
             positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "acp-connect",
+        aliases: &["agent"],
+        doc: "Connect to an ACP agent. Usage: :acp-connect <command> [args...]",
+        fun: acp_connect,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (1, None),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "acp-prompt",
+        aliases: &["ask"],
+        doc: "Send a prompt to a connected ACP agent. Usage: :acp-prompt <message>",
+        fun: acp_prompt,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (1, None),
             ..Signature::DEFAULT
         },
     },

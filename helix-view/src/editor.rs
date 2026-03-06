@@ -1824,6 +1824,7 @@ pub struct Editor {
     pub diff_providers: DiffProviderRegistry,
 
     pub debug_adapters: dap::registry::Registry,
+    pub acp_agents: helix_acp::Registry,
     pub breakpoints: HashMap<PathBuf, Vec<Breakpoint>>,
 
     pub syn_loader: Arc<ArcSwap<syntax::Loader>>,
@@ -1883,6 +1884,7 @@ pub enum EditorEvent {
     ConfigEvent(ConfigEvent),
     LanguageServerMessage((LanguageServerId, Call)),
     DebuggerEvent((DebugAdapterId, dap::Payload)),
+    AcpMessage((helix_acp::AgentId, helix_acp::jsonrpc::Call)),
     IdleTimer,
     Redraw,
 }
@@ -1970,6 +1972,7 @@ impl Editor {
             diagnostics: Diagnostics::new(),
             diff_providers: DiffProviderRegistry::default(),
             debug_adapters: dap::registry::Registry::new(),
+            acp_agents: helix_acp::Registry::new(),
             breakpoints: HashMap::new(),
             syn_loader,
             theme_loader,
@@ -3084,6 +3087,9 @@ impl Editor {
                 }
                 Some(event) = self.debug_adapters.incoming.next() => {
                     return EditorEvent::DebuggerEvent(event)
+                }
+                Some(message) = self.acp_agents.incoming().next() => {
+                    return EditorEvent::AcpMessage(message)
                 }
 
                 _ = helix_event::redraw_requested() => {

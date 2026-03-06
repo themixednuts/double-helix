@@ -15,6 +15,7 @@ members = [
   "helix-parsec",
   "helix-stdx",
   "helix-plugin",
+  "helix-acp",
   "xtask",
 ]
 

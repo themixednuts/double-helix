@@ -1,0 +1,19 @@
+[package]
+name = "helix-acp"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Agent Client Protocol support for Helix"
+
+[dependencies]
+tokio = { version = "1", features = ["rt", "sync", "process", "io-util", "time", "macros"] }
+tokio-stream = { workspace = true }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1"
+futures-util = { workspace = true }
+slotmap = { workspace = true }
+thiserror = { workspace = true }
+log = "0.4"
+anyhow = "1"

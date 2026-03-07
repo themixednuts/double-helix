@@ -487,6 +487,7 @@ impl MappableCommand {
         grow_buffer_height, "Grow focused container height",
         shrink_buffer_height, "Shrink focused container height",
         toggle_focus_window, "Toggle focus mode on buffer",
+        toggle_agent_panel, "Toggle ACP agent panel",
         goto_line_start, "Goto line start",
         goto_line_end, "Goto line end",
         goto_column, "Goto column",
@@ -1032,6 +1033,37 @@ fn shrink_buffer_height(cx: &mut Context) {
 
 fn toggle_focus_window(cx: &mut Context) {
     cx.editor.toggle_focus_window();
+}
+
+fn toggle_agent_panel(cx: &mut Context) {
+    use crate::ui::acp::{AcpPanel, ID as ACP_PANEL_ID};
+    // Get agent name while we still have cx.editor
+    let agent_name = cx
+        .editor
+        .acp_agents
+        .iter()
+        .next()
+        .and_then(|(_, agent)| {
+            agent
+                .agent_info()
+                .map(|info| info.title.as_deref().unwrap_or(&info.name).to_string())
+        });
+
+    cx.callback.push(Box::new(
+        move |compositor: &mut Compositor, _cx: &mut crate::compositor::Context| {
+            if let Some(panel) = compositor.find_id::<AcpPanel>(ACP_PANEL_ID) {
+                // Panel exists: toggle focus
+                panel.toggle_focus();
+            } else {
+                // No panel: create focused
+                let mut panel = AcpPanel::new();
+                if let Some(name) = agent_name {
+                    panel.set_agent_name(name);
+                }
+                compositor.push(Box::new(panel));
+            }
+        },
+    ));
 }
 
 fn goto_next_buffer(cx: &mut Context) {

@@ -188,18 +188,56 @@ impl Compositor {
         // Check if there are prompt layers active and update EditorView
         let has_prompt = self.has_component("helix_term::ui::prompt::Prompt");
 
+        // Check if ACP panel is present and compute split
+        let acp_panel_id = "acp-panel";
+        let has_acp_panel = self.layers.iter().any(|l| l.id() == Some(acp_panel_id));
+        let (editor_area, acp_area) = if has_acp_panel && area.width > 60 {
+            let panel_width = (area.width * 35 / 100).max(30).min(area.width.saturating_sub(40));
+            let editor_width = area.width.saturating_sub(panel_width);
+            (
+                Rect { x: area.x, y: area.y, width: editor_width, height: area.height },
+                Some(Rect { x: area.x + editor_width, y: area.y, width: panel_width, height: area.height }),
+            )
+        } else {
+            (area, None)
+        };
+
         for layer in &mut self.layers {
             // Update prompt state for EditorView
             if let Some(editor_view) = layer.as_any_mut().downcast_mut::<crate::ui::EditorView>() {
                 editor_view.prompt_active = has_prompt;
             }
-            layer.render(area, surface, cx);
+            if layer.id() == Some(acp_panel_id) {
+                if let Some(acp_rect) = acp_area {
+                    layer.render(acp_rect, surface, cx);
+                }
+            } else {
+                layer.render(editor_area, surface, cx);
+            }
         }
     }
 
     pub fn cursor(&self, area: Rect, editor: &Editor) -> (Option<Position>, CursorKind) {
+        let acp_panel_id = "acp-panel";
+        let has_acp_panel = self.layers.iter().any(|l| l.id() == Some(acp_panel_id));
+        let (editor_area, acp_area) = if has_acp_panel && area.width > 60 {
+            let panel_width = (area.width * 35 / 100).max(30).min(area.width.saturating_sub(40));
+            let editor_width = area.width.saturating_sub(panel_width);
+            (
+                Rect { x: area.x, y: area.y, width: editor_width, height: area.height },
+                Some(Rect { x: area.x + editor_width, y: area.y, width: panel_width, height: area.height }),
+            )
+        } else {
+            (area, None)
+        };
+
         for layer in self.layers.iter().rev() {
-            if let (Some(pos), kind) = layer.cursor(area, editor) {
+            let layer_area = if layer.id() == Some(acp_panel_id) {
+                acp_area.unwrap_or(area)
+            } else {
+                editor_area
+            };
+            if let (Some(pos), kind) = layer.cursor(layer_area, editor) {
                 return (Some(pos), kind);
             }
         }

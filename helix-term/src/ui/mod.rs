@@ -1,3 +1,4 @@
+pub mod acp;
 mod cmdline_popup;
 mod completion;
 mod document;

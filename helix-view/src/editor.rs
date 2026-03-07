@@ -506,6 +506,46 @@ pub struct Config {
     /// Defines which text objects will be folded when a document is opened.
     #[serde(default)]
     pub fold_textobjects: Vec<String>,
+    /// Preconfigured ACP agents.
+    #[serde(default = "default_agents")]
+    pub agents: Vec<AgentConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct AgentConfig {
+    /// Display name for the agent.
+    pub name: String,
+    /// Command to spawn the agent process.
+    pub command: String,
+    /// Arguments to pass to the agent command.
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
+fn default_agents() -> Vec<AgentConfig> {
+    vec![
+        AgentConfig {
+            name: "Claude Code".into(),
+            command: "claude-code-acp".into(),
+            args: vec![],
+        },
+        AgentConfig {
+            name: "Cursor".into(),
+            command: "cursor".into(),
+            args: vec!["agent".into(), "acp".into()],
+        },
+        AgentConfig {
+            name: "Gemini CLI".into(),
+            command: "gemini".into(),
+            args: vec!["--experimental-acp".into()],
+        },
+        AgentConfig {
+            name: "Goose".into(),
+            command: "goose".into(),
+            args: vec!["acp".into()],
+        },
+    ]
 }
 
 #[derive(Debug, Default, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize, Clone, Copy)]
@@ -1653,6 +1693,33 @@ impl Default for Config {
             completion_highlight: CompletionHighlight::default(),
             buffer_picker: BufferPickerConfig::default(),
             fold_textobjects: Vec::new(),
+            agents: vec![
+                AgentConfig {
+                    name: "Claude Code".into(),
+                    command: "claude-agent-acp".into(),
+                    args: vec![],
+                },
+                AgentConfig {
+                    name: "Gemini CLI".into(),
+                    command: "gemini".into(),
+                    args: vec!["--experimental-acp".into()],
+                },
+                AgentConfig {
+                    name: "Cursor".into(),
+                    command: "cursor".into(),
+                    args: vec!["agent".into(), "acp".into()],
+                },
+                AgentConfig {
+                    name: "Goose".into(),
+                    command: "goose".into(),
+                    args: vec!["acp".into()],
+                },
+                AgentConfig {
+                    name: "Codex (bridge)".into(),
+                    command: "codex-acp".into(),
+                    args: vec![],
+                },
+            ],
         }
     }
 }
@@ -1825,6 +1892,11 @@ pub struct Editor {
 
     pub debug_adapters: dap::registry::Registry,
     pub acp_agents: helix_acp::Registry,
+    pub acp_terminals: helix_acp::TerminalManager,
+    /// Lines of ACP agent output for the chat buffer.
+    pub acp_output: Vec<String>,
+    /// History of past ACP sessions.
+    pub acp_session_history: Vec<(String, String, std::time::Instant)>, // (session_id, agent_name, started)
     pub breakpoints: HashMap<PathBuf, Vec<Breakpoint>>,
 
     pub syn_loader: Arc<ArcSwap<syntax::Loader>>,
@@ -1973,6 +2045,9 @@ impl Editor {
             diff_providers: DiffProviderRegistry::default(),
             debug_adapters: dap::registry::Registry::new(),
             acp_agents: helix_acp::Registry::new(),
+            acp_terminals: helix_acp::TerminalManager::new(),
+            acp_output: Vec::new(),
+            acp_session_history: Vec::new(),
             breakpoints: HashMap::new(),
             syn_loader,
             theme_loader,

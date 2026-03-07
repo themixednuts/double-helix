@@ -3524,22 +3524,13 @@ fn reload_all_plugins(
     Ok(())
 }
 
-fn acp_connect(
-    cx: &mut compositor::Context,
-    args: Args,
-    event: PromptEvent,
+/// Launch and initialize an ACP agent, then open the panel.
+fn do_acp_connect(
+    editor: &mut helix_view::Editor,
+    jobs: &mut crate::job::Jobs,
+    command: String,
+    cmd_args: Vec<String>,
 ) -> anyhow::Result<()> {
-    if event != PromptEvent::Validate {
-        return Ok(());
-    }
-
-    let command = args
-        .first()
-        .context("Usage: acp-connect <command> [args...]")?
-        .to_string();
-
-    let cmd_args: Vec<String> = args.iter().skip(1).map(|a| a.to_string()).collect();
-
     let cwd = std::env::current_dir().unwrap_or_default();
 
     let config = helix_acp::client::AgentConfig {
@@ -3550,9 +3541,8 @@ fn acp_connect(
         timeout_secs: 120,
     };
 
-    let (_id, agent) = cx.editor.acp_agents.launch(&config)?;
+    let (_id, agent) = editor.acp_agents.launch(&config)?;
 
-    // Initialize the agent in the background
     let client_info = helix_acp::types::Implementation {
         name: "helix".to_string(),
         title: Some("Helix Editor".to_string()),
@@ -3564,19 +3554,21 @@ fn acp_connect(
             read_text_file: Some(true),
             write_text_file: Some(true),
         }),
-        terminal: Some(false),
+        terminal: Some(true),
     };
 
     let agent_clone = agent.clone();
     let cwd_clone = cwd.clone();
     let callback = async move {
         let init_resp = agent_clone.initialize(client_info, client_caps).await?;
-        let agent_name = init_resp
-            .agent_info
-            .as_ref()
+        let agent_info = init_resp.agent_info.as_ref();
+        let agent_name = agent_info
             .map(|i| i.title.as_deref().unwrap_or(&i.name))
             .unwrap_or("agent")
             .to_string();
+        let agent_version = agent_info
+            .map(|i| i.version.clone())
+            .unwrap_or_default();
 
         let session_resp = agent_clone.new_session(cwd_clone).await?;
 
@@ -3585,18 +3577,113 @@ fn acp_connect(
             agent_name, session_resp.session_id
         );
 
+        let agent_name_for_panel = agent_name.clone();
+        let agent_version_for_panel = agent_version.clone();
+        let config_options = session_resp.config_options.unwrap_or_default();
+        let session_modes = session_resp.session_modes.unwrap_or_default();
+        let session_id_for_history = session_resp.session_id.clone();
+        let agent_name_for_history = agent_name.clone();
         let callback: crate::job::Callback = crate::job::Callback::EditorCompositor(
-            Box::new(move |editor: &mut helix_view::Editor, _compositor| {
+            Box::new(move |editor: &mut helix_view::Editor, compositor| {
                 editor.set_status(msg);
+
+                editor.acp_session_history.push((
+                    session_id_for_history,
+                    agent_name_for_history,
+                    std::time::Instant::now(),
+                ));
+
+                use crate::ui::acp::{AcpPanel, ID as ACP_PANEL_ID};
+                let mut panel = AcpPanel::new();
+                panel.set_agent_name(agent_name_for_panel);
+                panel.set_agent_version(agent_version_for_panel);
+                panel.set_config_options(config_options);
+                panel.set_session_modes(session_modes);
+                compositor.replace_or_push(ACP_PANEL_ID, panel);
             }),
         );
         Ok(callback)
     };
 
-    cx.jobs.callback(callback);
+    jobs.callback(callback);
 
-    cx.editor
+    editor
         .set_status(format!("Connecting to ACP agent: {command}..."));
+
+    Ok(())
+}
+
+fn acp_connect(
+    cx: &mut compositor::Context,
+    args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+
+    // If args provided, connect directly
+    if let Some(first) = args.first() {
+        let command = first.to_string();
+        let cmd_args: Vec<String> = args.iter().skip(1).map(|a| a.to_string()).collect();
+        return do_acp_connect(cx.editor, cx.jobs, command, cmd_args);
+    }
+
+    // No args — show picker from configured agents
+    let agents = cx.editor.config().agents.clone();
+    if agents.is_empty() {
+        bail!("No agents configured. Add [[editor.agents]] to config.toml or use :acp-connect <command> [args...]");
+    }
+
+    let callback = async move {
+        let call: crate::job::Callback = crate::job::Callback::EditorCompositor(Box::new(
+            move |_editor: &mut helix_view::Editor, compositor: &mut compositor::Compositor| {
+                let columns = [
+                    crate::ui::PickerColumn::new(
+                        "name",
+                        |item: &helix_view::editor::AgentConfig, _: &()| {
+                            item.name.as_str().into()
+                        },
+                    ),
+                    crate::ui::PickerColumn::new(
+                        "command",
+                        |item: &helix_view::editor::AgentConfig, _: &()| {
+                            let mut cmd = item.command.clone();
+                            if !item.args.is_empty() {
+                                cmd.push(' ');
+                                cmd.push_str(&item.args.join(" "));
+                            }
+                            cmd.into()
+                        },
+                    ),
+                ];
+
+                let picker = crate::ui::Picker::new(
+                    columns,
+                    0,
+                    agents,
+                    (),
+                    move |cx, item: &helix_view::editor::AgentConfig, _action| {
+                        match do_acp_connect(
+                            cx.editor,
+                            cx.jobs,
+                            item.command.clone(),
+                            item.args.clone(),
+                        ) {
+                            Ok(()) => {}
+                            Err(e) => {
+                                cx.editor.set_error(format!("Agent failed: {e}"));
+                            }
+                        }
+                    },
+                );
+
+                compositor.push(Box::new(crate::ui::overlay::overlaid(picker)));
+            },
+        ));
+        Ok(call)
+    };
+    cx.jobs.callback(callback);
 
     Ok(())
 }
@@ -3624,15 +3711,20 @@ fn acp_prompt(
         .map(|(id, a)| (id, a.clone()))
         .context("No ACP agents connected. Use :acp-connect first.")?;
 
-    // We need the session ID. For now, store it on the agent or use a simple approach.
-    // TODO: proper session tracking. For now, create a new session per prompt.
     let cwd = std::env::current_dir().unwrap_or_default();
     let prompt = vec![helix_acp::ContentBlock::from(prompt_text.clone())];
 
     let callback = async move {
-        let session = agent.new_session(cwd).await?;
+        // Reuse existing session or create one if none exists
+        let session_id = match agent.session_id().await {
+            Some(id) => id,
+            None => {
+                let session = agent.new_session(cwd).await?;
+                session.session_id
+            }
+        };
         let response = agent
-            .prompt(session.session_id, prompt)
+            .prompt(session_id, prompt)
             .await?;
 
         let msg = format!("[ACP] Done ({})", match response.stop_reason {
@@ -3644,8 +3736,20 @@ fn acp_prompt(
         });
 
         let callback: crate::job::Callback = crate::job::Callback::EditorCompositor(
-            Box::new(move |editor: &mut helix_view::Editor, _compositor| {
+            Box::new(move |editor: &mut helix_view::Editor, compositor| {
                 editor.set_status(msg);
+                if let Some(panel) = compositor.find_id::<crate::ui::acp::AcpPanel>(crate::ui::acp::ID) {
+                    panel.set_busy(false);
+                    // Auto-send next queued message
+                    if let Some(next_msg) = panel.dequeue_message() {
+                        let agent = editor.acp_agents.iter().next().map(|(_, a)| a.clone());
+                        if let Some(agent) = agent {
+                            panel.push_entry(crate::ui::acp::ChatEntry::UserMessage(next_msg.clone()));
+                            panel.set_busy(true);
+                            crate::ui::acp::dispatch_queued_prompt(agent, next_msg);
+                        }
+                    }
+                }
             }),
         );
         Ok(callback)
@@ -3653,8 +3757,186 @@ fn acp_prompt(
 
     cx.jobs.callback(callback);
 
+    // Add user message to panel and mark busy
+    let callback2 = crate::job::Callback::EditorCompositor(Box::new(
+        move |_editor: &mut helix_view::Editor, compositor| {
+            if let Some(panel) = compositor.find_id::<crate::ui::acp::AcpPanel>(crate::ui::acp::ID) {
+                panel.push_entry(crate::ui::acp::ChatEntry::UserMessage(prompt_text));
+                panel.set_busy(true);
+            }
+        },
+    ));
+    cx.jobs.callback(async { Ok(callback2) });
+
     cx.editor
         .set_status(format!("Sending prompt to agent..."));
+
+    Ok(())
+}
+
+fn acp_open(
+    cx: &mut compositor::Context,
+    _args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+
+    use crate::ui::acp::{AcpPanel, ChatEntry, ID as ACP_PANEL_ID};
+
+    // Capture config to create panel in callback (AcpPanel contains Prompt with non-Send closures)
+    let agent_name = cx
+        .editor
+        .acp_agents
+        .iter()
+        .next()
+        .map(|(_id, agent)| {
+            agent
+                .agent_info()
+                .and_then(|info| info.title.clone())
+                .unwrap_or_else(|| agent.name().to_string())
+        })
+        .unwrap_or_else(|| "No agent".to_string());
+    let accumulated_text = if cx.editor.acp_output.is_empty() {
+        None
+    } else {
+        Some(cx.editor.acp_output.join("\n"))
+    };
+
+    let callback = crate::job::Callback::EditorCompositor(Box::new(
+        move |_editor, compositor: &mut crate::compositor::Compositor| {
+            let mut panel = AcpPanel::new();
+            panel.set_agent_name(agent_name);
+            if let Some(text) = accumulated_text {
+                panel.push_entry(ChatEntry::AgentText(text));
+            }
+            compositor.replace_or_push(ACP_PANEL_ID, panel);
+        },
+    ));
+    cx.jobs.callback(async { Ok(callback) });
+
+    Ok(())
+}
+
+fn acp_cancel(
+    cx: &mut compositor::Context,
+    _args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+
+    // Cancel the active prompt on all agents
+    for (_id, agent) in cx.editor.acp_agents.iter() {
+        let agent = agent.clone();
+        tokio::spawn(async move {
+            if let Some(session_id) = agent.session_id().await {
+                agent.cancel(session_id);
+            }
+        });
+    }
+
+    cx.editor.set_status("Cancelling ACP agent...");
+    Ok(())
+}
+
+fn acp_history(
+    cx: &mut compositor::Context,
+    _args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+
+    if cx.editor.acp_session_history.is_empty() {
+        cx.editor.set_status("No ACP session history.");
+        return Ok(());
+    }
+
+    let callback = async move {
+        let call: crate::job::Callback = crate::job::Callback::EditorCompositor(Box::new(
+            move |editor: &mut helix_view::Editor, compositor: &mut compositor::Compositor| {
+                let columns = [
+                    crate::ui::PickerColumn::new(
+                        "agent",
+                        |item: &(String, String, String), _: &()| {
+                            item.1.as_str().into()
+                        },
+                    ),
+                    crate::ui::PickerColumn::new(
+                        "session",
+                        |item: &(String, String, String), _: &()| {
+                            item.0.chars().take(12).collect::<String>().into()
+                        },
+                    ),
+                    crate::ui::PickerColumn::new(
+                        "when",
+                        |item: &(String, String, String), _: &()| {
+                            item.2.as_str().into()
+                        },
+                    ),
+                ];
+
+                let history: Vec<(String, String, String)> = editor
+                    .acp_session_history
+                    .iter()
+                    .rev()
+                    .map(|(session_id, agent_name, started)| {
+                        let elapsed = started.elapsed();
+                        let time_ago = if elapsed.as_secs() < 60 {
+                            format!("{}s ago", elapsed.as_secs())
+                        } else if elapsed.as_secs() < 3600 {
+                            format!("{}m ago", elapsed.as_secs() / 60)
+                        } else {
+                            format!("{}h ago", elapsed.as_secs() / 3600)
+                        };
+                        (session_id.clone(), agent_name.clone(), time_ago)
+                    })
+                    .collect();
+
+                let picker = crate::ui::Picker::new(
+                    columns,
+                    0,
+                    history,
+                    (),
+                    move |cx, item: &(String, String, String), _action| {
+                        let session_id = item.0.clone();
+                        let agent_name = item.1.clone();
+
+                        let agent = cx.editor.acp_agents.iter().next().map(|(_, a)| a.clone());
+                        if let Some(agent) = agent {
+                            let callback = async move {
+                                agent.load_session(session_id.clone()).await?;
+
+                                let callback: crate::job::Callback =
+                                    crate::job::Callback::EditorCompositor(Box::new(
+                                        move |editor: &mut helix_view::Editor, compositor: &mut compositor::Compositor| {
+                                            editor.set_status(format!("Loaded session from {agent_name}"));
+                                            use crate::ui::acp::{AcpPanel, ID as ACP_PANEL_ID};
+                                            let mut panel = AcpPanel::new();
+                                            panel.set_agent_name(agent_name);
+                                            compositor.replace_or_push(ACP_PANEL_ID, panel);
+                                        },
+                                    ));
+                                Ok(callback)
+                            };
+                            cx.jobs.callback(callback);
+                        } else {
+                            cx.editor
+                                .set_error("No ACP agents connected. Use :acp-connect first.");
+                        }
+                    },
+                );
+
+                compositor.push(Box::new(crate::ui::overlay::overlaid(picker)));
+            },
+        ));
+        Ok(call)
+    };
+    cx.jobs.callback(callback);
 
     Ok(())
 }
@@ -4848,11 +5130,11 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     TypableCommand {
         name: "acp-connect",
         aliases: &["agent"],
-        doc: "Connect to an ACP agent. Usage: :acp-connect <command> [args...]",
+        doc: "Connect to an ACP agent. Shows picker if no args, or use: :acp-connect <command> [args...]",
         fun: acp_connect,
         completer: CommandCompleter::none(),
         signature: Signature {
-            positionals: (1, None),
+            positionals: (0, None),
             ..Signature::DEFAULT
         },
     },
@@ -4864,6 +5146,39 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         completer: CommandCompleter::none(),
         signature: Signature {
             positionals: (1, None),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "acp-open",
+        aliases: &["acp"],
+        doc: "Open the ACP agent output buffer.",
+        fun: acp_open,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "acp-cancel",
+        aliases: &["stop"],
+        doc: "Cancel the current ACP agent prompt.",
+        fun: acp_cancel,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "acp-history",
+        aliases: &["sessions"],
+        doc: "Browse and load previous ACP sessions.",
+        fun: acp_history,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
             ..Signature::DEFAULT
         },
     },

@@ -21,7 +21,7 @@ use tokio::{
     process::{Child, Command},
     sync::{
         mpsc::UnboundedSender,
-        Notify, OnceCell,
+        Mutex, Notify, OnceCell,
     },
     time::timeout,
 };
@@ -66,6 +66,8 @@ pub struct AcpAgent {
     agent_info: OnceCell<Implementation>,
     initialize_notify: Arc<Notify>,
     timeout_secs: u64,
+    /// The current session ID, set after `new_session` or `load_session`.
+    session_id: Mutex<Option<SessionId>>,
 }
 
 impl AcpAgent {
@@ -125,6 +127,7 @@ impl AcpAgent {
             agent_info: OnceCell::new(),
             initialize_notify,
             timeout_secs: config.timeout_secs,
+            session_id: Mutex::new(None),
         });
 
         Ok((agent, incoming_rx))
@@ -144,6 +147,11 @@ impl AcpAgent {
 
     pub fn agent_info(&self) -> Option<&Implementation> {
         self.agent_info.get()
+    }
+
+    /// Get the current session ID, if any.
+    pub async fn session_id(&self) -> Option<SessionId> {
+        self.session_id.lock().await.clone()
     }
 
     fn next_request_id(&self) -> u64 {
@@ -281,25 +289,27 @@ impl AcpAgent {
         Ok(response)
     }
 
-    /// Create a new session.
-    pub fn new_session(
-        &self,
-        cwd: PathBuf,
-    ) -> impl Future<Output = Result<NewSessionResponse>> {
+    /// Create a new session and store the session ID.
+    pub async fn new_session(&self, cwd: PathBuf) -> Result<NewSessionResponse> {
         let params = NewSessionRequest {
             mcp_servers: Vec::new(),
             cwd,
         };
-        self.call(methods::SESSION_NEW, params, self.timeout_secs)
+        let resp: NewSessionResponse =
+            self.call(methods::SESSION_NEW, params, self.timeout_secs).await?;
+        *self.session_id.lock().await = Some(resp.session_id.clone());
+        Ok(resp)
     }
 
-    /// Load an existing session.
-    pub fn load_session(
-        &self,
-        session_id: SessionId,
-    ) -> impl Future<Output = Result<LoadSessionResponse>> {
-        let params = LoadSessionRequest { session_id };
-        self.call(methods::SESSION_LOAD, params, self.timeout_secs)
+    /// Load an existing session and store the session ID.
+    pub async fn load_session(&self, session_id: SessionId) -> Result<LoadSessionResponse> {
+        let params = LoadSessionRequest {
+            session_id: session_id.clone(),
+        };
+        let resp: LoadSessionResponse =
+            self.call(methods::SESSION_LOAD, params, self.timeout_secs).await?;
+        *self.session_id.lock().await = Some(resp.session_id.clone());
+        Ok(resp)
     }
 
     /// Send a prompt to the agent within a session.

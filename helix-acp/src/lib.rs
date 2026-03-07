@@ -1,11 +1,13 @@
 pub mod client;
 pub mod jsonrpc;
 pub mod registry;
+pub mod terminal;
 pub mod transport;
 pub mod types;
 
 pub use client::AcpAgent;
 pub use registry::Registry;
+pub use terminal::TerminalManager;
 pub use types::*;
 
 use slotmap::new_key_type;

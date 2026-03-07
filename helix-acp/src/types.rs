@@ -126,7 +126,7 @@ pub struct NewSessionResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_modes: Option<Vec<SessionMode>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub config_options: Option<Vec<Value>>,
+    pub config_options: Option<Vec<ConfigOption>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub available_commands: Option<Vec<Value>>,
 }
@@ -144,7 +144,7 @@ pub struct LoadSessionResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_modes: Option<Vec<SessionMode>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub config_options: Option<Vec<Value>>,
+    pub config_options: Option<Vec<ConfigOption>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -154,6 +154,44 @@ pub struct SessionMode {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfigOption {
+    pub id: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+    #[serde(rename = "type", default)]
+    pub option_type: String,
+    #[serde(default)]
+    pub current_value: String,
+    #[serde(default)]
+    pub options: Vec<ConfigOptionValue>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfigOptionValue {
+    pub value: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfigOptionUpdateData {
+    pub config_options: Vec<ConfigOption>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CurrentModeUpdateData {
+    pub mode_id: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -288,9 +326,9 @@ pub enum SessionUpdate {
     #[serde(rename = "tool_call_update")]
     ToolCallUpdate(ToolCallUpdate),
     #[serde(rename = "config_option_update")]
-    ConfigOptionUpdate(Value),
+    ConfigOptionUpdate(ConfigOptionUpdateData),
     #[serde(rename = "current_mode_update")]
-    CurrentModeUpdate(Value),
+    CurrentModeUpdate(CurrentModeUpdateData),
     #[serde(rename = "available_commands_update")]
     AvailableCommandsUpdate(Value),
 }

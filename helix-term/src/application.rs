@@ -1612,7 +1612,7 @@ impl Application {
                         }
                     }
                     Ok(AgentMethodCall::TerminalOutput(req)) => {
-                        match self.handle_acp_terminal_output(&req) {
+                        match self.handle_acp_terminal_output(&req).await {
                             Ok(resp) => agent.reply(id, serde_json::to_value(resp).unwrap()),
                             Err(e) => agent.reply_error(
                                 id,
@@ -1630,26 +1630,72 @@ impl Application {
                         }
                     }
                     Ok(AgentMethodCall::KillTerminal(req)) => {
-                        self.handle_acp_kill_terminal(&req);
-                        agent.reply(id, serde_json::Value::Null);
+                        match self.handle_acp_kill_terminal(&req).await {
+                            Ok(resp) => agent.reply(id, serde_json::to_value(resp).unwrap()),
+                            Err(e) => agent.reply_error(
+                                id,
+                                helix_acp::jsonrpc::Error::internal_error(e.to_string()),
+                            ),
+                        }
                     }
                     Ok(AgentMethodCall::ReleaseTerminal(req)) => {
-                        self.handle_acp_release_terminal(&req);
-                        agent.reply(id, serde_json::Value::Null);
+                        match self.handle_acp_release_terminal(&req).await {
+                            Ok(resp) => agent.reply(id, serde_json::to_value(resp).unwrap()),
+                            Err(e) => agent.reply_error(
+                                id,
+                                helix_acp::jsonrpc::Error::internal_error(e.to_string()),
+                            ),
+                        }
                     }
                     Ok(AgentMethodCall::RequestPermission(req)) => {
-                        // For now, auto-approve all permissions
-                        // TODO: show a permission dialog in the UI
-                        let resp = helix_acp::types::RequestPermissionResponse {
-                            outcome: if let Some(first) = req.permissions.first() {
-                                helix_acp::types::RequestPermissionOutcome::Selected {
-                                    id: first.id.clone(),
-                                }
-                            } else {
-                                helix_acp::types::RequestPermissionOutcome::Dismissed
-                            },
+                        use crate::ui::acp::{
+                            PermissionChoice, PermissionPopup, PermissionResponse,
+                            PERMISSION_ID,
                         };
-                        agent.reply(id, serde_json::to_value(resp).unwrap());
+
+                        if req.permissions.is_empty() {
+                            let resp = helix_acp::types::RequestPermissionResponse {
+                                outcome: helix_acp::types::RequestPermissionOutcome::Dismissed,
+                            };
+                            agent.reply(id, serde_json::to_value(resp).unwrap());
+                        } else {
+                            let (tx, rx) = tokio::sync::oneshot::channel::<PermissionResponse>();
+
+                            let choices: Vec<PermissionChoice> = req
+                                .permissions
+                                .iter()
+                                .map(|p| PermissionChoice {
+                                    id: p.id.clone(),
+                                    title: p.title.clone(),
+                                    description: p.description.clone(),
+                                })
+                                .collect();
+
+                            let popup = PermissionPopup::new(
+                                req.title.clone(),
+                                req.description.clone(),
+                                choices,
+                                tx,
+                            );
+                            self.compositor.replace_or_push(PERMISSION_ID, popup);
+
+                            // Spawn a task to wait for the user's response
+                            let agent_for_reply = agent.clone();
+                            let reply_id = id;
+                            tokio::spawn(async move {
+                                let outcome = match rx.await {
+                                    Ok(PermissionResponse::Selected(selected_id)) => {
+                                        helix_acp::types::RequestPermissionOutcome::Selected {
+                                            id: selected_id,
+                                        }
+                                    }
+                                    _ => helix_acp::types::RequestPermissionOutcome::Dismissed,
+                                };
+                                let resp = helix_acp::types::RequestPermissionResponse { outcome };
+                                agent_for_reply
+                                    .reply(reply_id, serde_json::to_value(resp).unwrap());
+                            });
+                        }
                     }
                     Err(helix_acp::Error::Unhandled(method)) => {
                         log::warn!("Unhandled ACP method call: {method}");
@@ -1678,55 +1724,98 @@ impl Application {
         _agent_id: helix_acp::AgentId,
         notif: helix_acp::types::SessionNotification,
     ) {
+        use crate::ui::acp::{AcpPanel, PlanItem, PlanStatus, ID as ACP_PANEL_ID};
         use helix_acp::types::SessionUpdate;
 
         match notif.update {
             SessionUpdate::AgentMessageChunk(chunk) => {
                 if let helix_acp::ContentBlock::Text(text) = chunk.content {
-                    // Display agent text as a status message for now.
-                    // TODO: route to a dedicated ACP chat/output buffer
-                    self.editor.set_status(text.text);
+                    // Accumulate for fallback
+                    self.acp_append_output(&text.text);
+                    // Route to panel
+                    if let Some(panel) = self.compositor.find_id::<AcpPanel>(ACP_PANEL_ID) {
+                        panel.append_agent_text(&text.text);
+                    }
+                    // Status bar shows latest
+                    let truncated: String = text.text.chars().take(80).collect();
+                    self.editor.set_status(truncated);
                 }
             }
             SessionUpdate::ToolCall(tool_call) => {
-                let status = format!(
-                    "[ACP] Tool: {} ({})",
-                    tool_call.title.as_deref().unwrap_or("unknown"),
-                    match tool_call.status {
-                        helix_acp::types::ToolCallStatus::Running => "running",
-                        helix_acp::types::ToolCallStatus::Completed => "completed",
-                        helix_acp::types::ToolCallStatus::Failed => "failed",
-                        helix_acp::types::ToolCallStatus::Cancelled => "cancelled",
-                    }
-                );
-                self.editor.set_status(status);
+                let status_str = match tool_call.status {
+                    helix_acp::types::ToolCallStatus::Running => "running",
+                    helix_acp::types::ToolCallStatus::Completed => "completed",
+                    helix_acp::types::ToolCallStatus::Failed => "failed",
+                    helix_acp::types::ToolCallStatus::Cancelled => "cancelled",
+                };
+                let name = tool_call.title.as_deref().unwrap_or("unknown").to_string();
+                if let Some(panel) = self.compositor.find_id::<AcpPanel>(ACP_PANEL_ID) {
+                    panel.update_tool_call(&name, status_str, None);
+                }
+                self.editor
+                    .set_status(format!("[ACP] Tool: {name} ({status_str})"));
             }
             SessionUpdate::ToolCallUpdate(update) => {
                 if let Some(status) = update.status {
-                    let msg = format!(
-                        "[ACP] Tool update: {} ({})",
-                        update.tool_call_id,
-                        match status {
-                            helix_acp::types::ToolCallStatus::Running => "running",
-                            helix_acp::types::ToolCallStatus::Completed => "done",
-                            helix_acp::types::ToolCallStatus::Failed => "failed",
-                            helix_acp::types::ToolCallStatus::Cancelled => "cancelled",
-                        }
-                    );
-                    self.editor.set_status(msg);
+                    let status_str = match status {
+                        helix_acp::types::ToolCallStatus::Running => "running",
+                        helix_acp::types::ToolCallStatus::Completed => "done",
+                        helix_acp::types::ToolCallStatus::Failed => "failed",
+                        helix_acp::types::ToolCallStatus::Cancelled => "cancelled",
+                    };
+                    if let Some(panel) = self.compositor.find_id::<AcpPanel>(ACP_PANEL_ID) {
+                        panel.update_tool_call(&update.tool_call_id, status_str, None);
+                    }
                 }
             }
             SessionUpdate::Plan(plan) => {
-                let summary = plan
+                let items: Vec<PlanItem> = plan
                     .entries
                     .iter()
-                    .map(|e| e.content.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                self.editor.set_status(format!("[ACP] Plan: {summary}"));
+                    .map(|e| PlanItem {
+                        content: e.content.clone(),
+                        status: match e.status {
+                            Some(helix_acp::types::PlanEntryStatus::Completed) => {
+                                PlanStatus::Completed
+                            }
+                            Some(helix_acp::types::PlanEntryStatus::InProgress) => {
+                                PlanStatus::InProgress
+                            }
+                            Some(helix_acp::types::PlanEntryStatus::Failed) => PlanStatus::Failed,
+                            _ => PlanStatus::Pending,
+                        },
+                    })
+                    .collect();
+                if let Some(panel) = self.compositor.find_id::<AcpPanel>(ACP_PANEL_ID) {
+                    panel.update_plan(items);
+                }
+            }
+            SessionUpdate::ConfigOptionUpdate(data) => {
+                if let Some(panel) = self.compositor.find_id::<AcpPanel>(ACP_PANEL_ID) {
+                    panel.set_config_options(data.config_options);
+                }
+            }
+            SessionUpdate::CurrentModeUpdate(data) => {
+                if let Some(panel) = self.compositor.find_id::<AcpPanel>(ACP_PANEL_ID) {
+                    panel.set_current_mode_id(data.mode_id);
+                }
             }
             _ => {
                 log::debug!("Unhandled ACP session update type");
+            }
+        }
+    }
+
+    /// Append text to the ACP output log (fallback for when panel is not open).
+    fn acp_append_output(&mut self, text: &str) {
+        for ch in text.chars() {
+            if ch == '\n' {
+                self.editor.acp_output.push(String::new());
+            } else {
+                if self.editor.acp_output.is_empty() {
+                    self.editor.acp_output.push(String::new());
+                }
+                self.editor.acp_output.last_mut().unwrap().push(ch);
             }
         }
     }
@@ -1803,31 +1892,37 @@ impl Application {
 
     async fn handle_acp_create_terminal(
         &mut self,
-        _req: &helix_acp::types::CreateTerminalRequest,
+        req: &helix_acp::types::CreateTerminalRequest,
     ) -> anyhow::Result<helix_acp::types::CreateTerminalResponse> {
-        anyhow::bail!("Terminal support not yet implemented")
+        self.editor.acp_terminals.create(req).await
     }
 
-    fn handle_acp_terminal_output(
+    async fn handle_acp_terminal_output(
         &self,
-        _req: &helix_acp::types::TerminalOutputRequest,
+        req: &helix_acp::types::TerminalOutputRequest,
     ) -> anyhow::Result<helix_acp::types::TerminalOutputResponse> {
-        anyhow::bail!("Terminal support not yet implemented")
+        self.editor.acp_terminals.output(req).await
     }
 
     async fn handle_acp_wait_terminal(
         &self,
-        _req: &helix_acp::types::WaitForTerminalExitRequest,
+        req: &helix_acp::types::WaitForTerminalExitRequest,
     ) -> anyhow::Result<helix_acp::types::WaitForTerminalExitResponse> {
-        anyhow::bail!("Terminal support not yet implemented")
+        self.editor.acp_terminals.wait_for_exit(req).await
     }
 
-    fn handle_acp_kill_terminal(&mut self, _req: &helix_acp::types::KillTerminalRequest) {
-        log::warn!("Terminal kill not yet implemented");
+    async fn handle_acp_kill_terminal(
+        &mut self,
+        req: &helix_acp::types::KillTerminalRequest,
+    ) -> anyhow::Result<helix_acp::types::KillTerminalResponse> {
+        self.editor.acp_terminals.kill(req).await
     }
 
-    fn handle_acp_release_terminal(&mut self, _req: &helix_acp::types::ReleaseTerminalRequest) {
-        log::warn!("Terminal release not yet implemented");
+    async fn handle_acp_release_terminal(
+        &mut self,
+        req: &helix_acp::types::ReleaseTerminalRequest,
+    ) -> anyhow::Result<helix_acp::types::ReleaseTerminalResponse> {
+        self.editor.acp_terminals.release(req).await
     }
 
     fn restore_term(&mut self) -> std::io::Result<()> {

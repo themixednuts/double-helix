@@ -315,7 +315,7 @@ pub struct SessionNotification {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type")]
+#[serde(tag = "sessionUpdate")]
 pub enum SessionUpdate {
     #[serde(rename = "plan")]
     Plan(Plan),
@@ -591,6 +591,7 @@ pub struct SetSessionModeResponse {}
 pub struct SetSessionConfigOptionRequest {
     pub session_id: SessionId,
     pub config_id: String,
+    #[serde(rename = "value")]
     pub value_id: String,
 }
 
@@ -613,7 +614,8 @@ impl AgentNotification {
     ) -> std::result::Result<Self, crate::Error> {
         match method {
             crate::methods::SESSION_UPDATE => {
-                let notif: SessionNotification = params.parse().map_err(crate::Error::AgentError)?;
+                let notif: SessionNotification =
+                    params.parse().map_err(crate::Error::AgentError)?;
                 Ok(AgentNotification::SessionUpdate(notif))
             }
             _ => Err(crate::Error::Unhandled(method.to_string())),
@@ -639,30 +641,30 @@ impl AgentMethodCall {
         params: crate::jsonrpc::Params,
     ) -> std::result::Result<Self, crate::Error> {
         match method {
-            crate::methods::FS_READ_TEXT_FILE => {
-                Ok(AgentMethodCall::ReadTextFile(params.parse().map_err(crate::Error::AgentError)?))
-            }
-            crate::methods::FS_WRITE_TEXT_FILE => {
-                Ok(AgentMethodCall::WriteTextFile(params.parse().map_err(crate::Error::AgentError)?))
-            }
-            crate::methods::TERMINAL_CREATE => {
-                Ok(AgentMethodCall::CreateTerminal(params.parse().map_err(crate::Error::AgentError)?))
-            }
-            crate::methods::TERMINAL_OUTPUT => {
-                Ok(AgentMethodCall::TerminalOutput(params.parse().map_err(crate::Error::AgentError)?))
-            }
-            crate::methods::TERMINAL_WAIT_FOR_EXIT => {
-                Ok(AgentMethodCall::WaitForTerminalExit(params.parse().map_err(crate::Error::AgentError)?))
-            }
-            crate::methods::TERMINAL_KILL => {
-                Ok(AgentMethodCall::KillTerminal(params.parse().map_err(crate::Error::AgentError)?))
-            }
-            crate::methods::TERMINAL_RELEASE => {
-                Ok(AgentMethodCall::ReleaseTerminal(params.parse().map_err(crate::Error::AgentError)?))
-            }
-            crate::methods::REQUEST_PERMISSION => {
-                Ok(AgentMethodCall::RequestPermission(params.parse().map_err(crate::Error::AgentError)?))
-            }
+            crate::methods::FS_READ_TEXT_FILE => Ok(AgentMethodCall::ReadTextFile(
+                params.parse().map_err(crate::Error::AgentError)?,
+            )),
+            crate::methods::FS_WRITE_TEXT_FILE => Ok(AgentMethodCall::WriteTextFile(
+                params.parse().map_err(crate::Error::AgentError)?,
+            )),
+            crate::methods::TERMINAL_CREATE => Ok(AgentMethodCall::CreateTerminal(
+                params.parse().map_err(crate::Error::AgentError)?,
+            )),
+            crate::methods::TERMINAL_OUTPUT => Ok(AgentMethodCall::TerminalOutput(
+                params.parse().map_err(crate::Error::AgentError)?,
+            )),
+            crate::methods::TERMINAL_WAIT_FOR_EXIT => Ok(AgentMethodCall::WaitForTerminalExit(
+                params.parse().map_err(crate::Error::AgentError)?,
+            )),
+            crate::methods::TERMINAL_KILL => Ok(AgentMethodCall::KillTerminal(
+                params.parse().map_err(crate::Error::AgentError)?,
+            )),
+            crate::methods::TERMINAL_RELEASE => Ok(AgentMethodCall::ReleaseTerminal(
+                params.parse().map_err(crate::Error::AgentError)?,
+            )),
+            crate::methods::REQUEST_PERMISSION => Ok(AgentMethodCall::RequestPermission(
+                params.parse().map_err(crate::Error::AgentError)?,
+            )),
             _ => Err(crate::Error::Unhandled(method.to_string())),
         }
     }

@@ -313,8 +313,7 @@ where
     }
 
     fn size(&self) -> io::Result<Rect> {
-        let (width, height) =
-            terminal::size().map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        let (width, height) = terminal::size().map_err(|e| io::Error::other(e.to_string()))?;
 
         Ok(Rect::new(0, 0, width, height))
     }
@@ -448,8 +447,7 @@ impl Command for SetUnderlineColor {
 
     #[cfg(windows)]
     fn execute_winapi(&self) -> io::Result<()> {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
+        Err(std::io::Error::other(
             "SetUnderlineColor not supported by winapi.",
         ))
     }

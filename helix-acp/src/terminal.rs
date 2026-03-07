@@ -64,9 +64,9 @@ impl TerminalManager {
             .stdin(std::process::Stdio::null())
             .kill_on_drop(true);
 
-        let mut child = cmd.spawn().map_err(|e| {
-            anyhow::anyhow!("Failed to spawn terminal '{}': {}", req.command, e)
-        })?;
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| anyhow::anyhow!("Failed to spawn terminal '{}': {}", req.command, e))?;
 
         let id = self.counter.fetch_add(1, Ordering::Relaxed);
         let terminal_id = format!("term-{id}");
@@ -146,7 +146,10 @@ impl TerminalManager {
             exit_notify,
         };
 
-        self.terminals.lock().await.insert(terminal_id.clone(), managed);
+        self.terminals
+            .lock()
+            .await
+            .insert(terminal_id.clone(), managed);
 
         Ok(CreateTerminalResponse { terminal_id })
     }
@@ -221,10 +224,7 @@ impl TerminalManager {
     }
 
     /// Kill a terminal process.
-    pub async fn kill(
-        &self,
-        req: &KillTerminalRequest,
-    ) -> anyhow::Result<KillTerminalResponse> {
+    pub async fn kill(&self, req: &KillTerminalRequest) -> anyhow::Result<KillTerminalResponse> {
         // The child is owned by the exit-watcher task, which calls child.wait().
         // We can't kill it from here directly. Instead, we just note it.
         // The kill_on_drop will handle it when the terminal is released.

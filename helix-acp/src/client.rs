@@ -4,13 +4,11 @@
 //! Follows the same patterns as `helix-lsp::Client`.
 
 use crate::{
-    jsonrpc, methods,
-    transport::Payload,
-    types::*,
-    AgentId, Error, Result, PROTOCOL_VERSION,
+    jsonrpc, methods, transport::Payload, types::*, AgentId, Error, Result, PROTOCOL_VERSION,
 };
 use serde::Serialize;
 use serde_json::Value;
+use slotmap::SlotMap;
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -19,14 +17,14 @@ use std::time::Duration;
 use tokio::{
     io::{BufReader, BufWriter},
     process::{Child, Command},
-    sync::{
-        mpsc::UnboundedSender,
-        Mutex, Notify, OnceCell,
-    },
+    sync::{mpsc::UnboundedSender, Mutex, Notify, OnceCell},
     time::timeout,
 };
 
 use crate::transport::Transport;
+
+/// Receiver for incoming agent requests/notifications from the transport.
+pub type IncomingReceiver = tokio::sync::mpsc::UnboundedReceiver<(AgentId, jsonrpc::Call)>;
 
 /// Configuration for launching an ACP agent.
 #[derive(Debug, Clone)]
@@ -75,13 +73,7 @@ impl AcpAgent {
     ///
     /// Returns `(agent, incoming_receiver, initialize_notify)`.
     /// The caller should poll `incoming_receiver` for agent requests/notifications.
-    pub fn start(
-        id: AgentId,
-        config: &AgentConfig,
-    ) -> Result<(
-        Arc<Self>,
-        tokio::sync::mpsc::UnboundedReceiver<(AgentId, jsonrpc::Call)>,
-    )> {
+    pub fn start(id: AgentId, config: &AgentConfig) -> Result<(Arc<Self>, IncomingReceiver)> {
         let mut cmd = Command::new(&config.command);
         cmd.args(&config.args)
             .stdin(std::process::Stdio::piped())
@@ -131,6 +123,13 @@ impl AcpAgent {
         });
 
         Ok((agent, incoming_rx))
+    }
+
+    /// Like `start` but allocates a new agent id internally. Use for one-off clients (e.g. examples).
+    pub fn start_standalone(config: &AgentConfig) -> Result<(Arc<Self>, IncomingReceiver)> {
+        let mut map = SlotMap::<AgentId, ()>::default();
+        let id = map.insert(());
+        Self::start(id, config)
     }
 
     pub fn id(&self) -> AgentId {
@@ -190,10 +189,12 @@ impl AcpAgent {
                     chan: tx,
                     value: request,
                 })
-                .map_err(|e| serde_json::Error::io(std::io::Error::new(
-                    std::io::ErrorKind::BrokenPipe,
-                    e.to_string(),
-                )))?;
+                .map_err(|e| {
+                    serde_json::Error::io(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        e.to_string(),
+                    ))
+                })?;
             Ok(rx)
         });
 
@@ -274,8 +275,9 @@ impl AcpAgent {
             client_info: Some(client_info),
         };
 
-        let response: InitializeResponse =
-            self.call(methods::INITIALIZE, params, self.timeout_secs).await?;
+        let response: InitializeResponse = self
+            .call(methods::INITIALIZE, params, self.timeout_secs)
+            .await?;
 
         // Store capabilities
         let _ = self.capabilities.set(response.agent_capabilities.clone());
@@ -295,8 +297,9 @@ impl AcpAgent {
             mcp_servers: Vec::new(),
             cwd,
         };
-        let resp: NewSessionResponse =
-            self.call(methods::SESSION_NEW, params, self.timeout_secs).await?;
+        let resp: NewSessionResponse = self
+            .call(methods::SESSION_NEW, params, self.timeout_secs)
+            .await?;
         *self.session_id.lock().await = Some(resp.session_id.clone());
         Ok(resp)
     }
@@ -306,8 +309,9 @@ impl AcpAgent {
         let params = LoadSessionRequest {
             session_id: session_id.clone(),
         };
-        let resp: LoadSessionResponse =
-            self.call(methods::SESSION_LOAD, params, self.timeout_secs).await?;
+        let resp: LoadSessionResponse = self
+            .call(methods::SESSION_LOAD, params, self.timeout_secs)
+            .await?;
         *self.session_id.lock().await = Some(resp.session_id.clone());
         Ok(resp)
     }

@@ -11,6 +11,7 @@ pub mod health;
 pub mod job;
 pub mod keymap;
 pub mod plugin_registry;
+pub mod shutdown;
 pub mod ui;
 
 #[cfg(not(windows))]

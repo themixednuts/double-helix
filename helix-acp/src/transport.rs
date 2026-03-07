@@ -179,9 +179,7 @@ impl Transport {
 
         if let Some(tx) = self.pending_requests.lock().await.remove(&id) {
             if tx.send(result).await.is_err() {
-                error!(
-                    "Response channel closed (id={id}), original request likely timed out"
-                );
+                error!("Response channel closed (id={id}), original request likely timed out");
             }
         } else {
             error!("Received response without matching request (id={id})");
@@ -235,12 +233,10 @@ impl Transport {
     /// Stderr loop: logs agent stderr output.
     async fn err(transport: Arc<Self>, mut agent_stderr: BufReader<ChildStderr>) {
         let mut buffer = String::new();
-        loop {
-            match Self::recv_agent_error(&mut agent_stderr, &mut buffer, &transport.name).await {
-                Ok(_) => {}
-                Err(_) => break,
-            }
-        }
+        while Self::recv_agent_error(&mut agent_stderr, &mut buffer, &transport.name)
+            .await
+            .is_ok()
+        {}
     }
 
     /// Send loop: writes queued payloads to agent stdin.
@@ -288,10 +284,10 @@ impl Transport {
                                 continue; // drop notifications before init
                             }
                             pending_messages.push(msg);
-                        } else {
-                            if let Err(err) = transport.send_payload_to_agent(&mut agent_stdin, msg).await {
-                                error!("{} send error: {err:?}", transport.name);
-                            }
+                        } else if let Err(err) =
+                            transport.send_payload_to_agent(&mut agent_stdin, msg).await
+                        {
+                            error!("{} send error: {err:?}", transport.name);
                         }
                     } else {
                         // Channel closed

@@ -83,6 +83,15 @@ tabstop = { modifiers = ["italic"], bg = "bossanova" }
 "ui.menu.selected" = { fg = "revolver", bg = "white" }
 "ui.menu.scroll" = { fg = "lavender", bg = "comet" }
 
+# ACP panel status bar (agent, model, thinking, mode). Themes can override.
+"ui.acp.agent" = { fg = "revolver", bg = "white" }
+"ui.acp.model" = { fg = "revolver", bg = "white" }
+"ui.acp.thinking" = { fg = "revolver", bg = "mint" }
+"ui.acp.mode" = { fg = "revolver", bg = "lilac" }
+# Message block backgrounds (iOS-style bubbles)
+"ui.acp.user_bubble" = { bg = "comet" }
+"ui.acp.agent_bubble" = { bg = "bossanova" }
+
 "diagnostic.hint" = { underline = { color = "silver", style = "curl" } }
 "diagnostic.info" = { underline = { color = "delta", style = "curl" } }
 "diagnostic.warning" = { underline = { color = "lightning", style = "curl" } }

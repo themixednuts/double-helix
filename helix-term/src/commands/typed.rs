@@ -3525,11 +3525,15 @@ fn reload_all_plugins(
 }
 
 /// Launch and initialize an ACP agent, then open the panel.
-fn do_acp_connect(
+/// `agent_index` is the index in config.agents (for cycling); None when connecting with explicit command.
+/// `activate_input` when true, focuses the chat input line when the panel is created.
+pub(crate) fn do_acp_connect(
     editor: &mut helix_view::Editor,
     jobs: &mut crate::job::Jobs,
     command: String,
     cmd_args: Vec<String>,
+    agent_index: Option<usize>,
+    activate_input: bool,
 ) -> anyhow::Result<()> {
     let cwd = std::env::current_dir().unwrap_or_default();
 
@@ -3566,9 +3570,7 @@ fn do_acp_connect(
             .map(|i| i.title.as_deref().unwrap_or(&i.name))
             .unwrap_or("agent")
             .to_string();
-        let agent_version = agent_info
-            .map(|i| i.version.clone())
-            .unwrap_or_default();
+        let agent_version = agent_info.map(|i| i.version.clone()).unwrap_or_default();
 
         let session_resp = agent_clone.new_session(cwd_clone).await?;
 
@@ -3583,8 +3585,8 @@ fn do_acp_connect(
         let session_modes = session_resp.session_modes.unwrap_or_default();
         let session_id_for_history = session_resp.session_id.clone();
         let agent_name_for_history = agent_name.clone();
-        let callback: crate::job::Callback = crate::job::Callback::EditorCompositor(
-            Box::new(move |editor: &mut helix_view::Editor, compositor| {
+        let callback: crate::job::Callback = crate::job::Callback::EditorCompositor(Box::new(
+            move |editor: &mut helix_view::Editor, compositor| {
                 editor.set_status(msg);
 
                 editor.acp_session_history.push((
@@ -3597,27 +3599,29 @@ fn do_acp_connect(
                 let mut panel = AcpPanel::new();
                 panel.set_agent_name(agent_name_for_panel);
                 panel.set_agent_version(agent_version_for_panel);
-                panel.set_config_options(config_options);
-                panel.set_session_modes(session_modes);
+                panel.set_config_options(config_options.clone());
+                panel.set_session_modes(session_modes.clone());
+                editor.acp_config_options = config_options;
+                editor.acp_session_modes = session_modes;
+                editor.current_acp_agent_index = agent_index;
+                editor.apply_acp_agent_theme(agent_index);
+                if activate_input {
+                    panel.activate_input();
+                }
                 compositor.replace_or_push(ACP_PANEL_ID, panel);
-            }),
-        );
+            },
+        ));
         Ok(callback)
     };
 
     jobs.callback(callback);
 
-    editor
-        .set_status(format!("Connecting to ACP agent: {command}..."));
+    editor.set_status(format!("Connecting to ACP agent: {command}..."));
 
     Ok(())
 }
 
-fn acp_connect(
-    cx: &mut compositor::Context,
-    args: Args,
-    event: PromptEvent,
-) -> anyhow::Result<()> {
+fn acp_connect(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow::Result<()> {
     if event != PromptEvent::Validate {
         return Ok(());
     }
@@ -3626,7 +3630,7 @@ fn acp_connect(
     if let Some(first) = args.first() {
         let command = first.to_string();
         let cmd_args: Vec<String> = args.iter().skip(1).map(|a| a.to_string()).collect();
-        return do_acp_connect(cx.editor, cx.jobs, command, cmd_args);
+        return do_acp_connect(cx.editor, cx.jobs, command, cmd_args, None, false);
     }
 
     // No args — show picker from configured agents
@@ -3641,9 +3645,7 @@ fn acp_connect(
                 let columns = [
                     crate::ui::PickerColumn::new(
                         "name",
-                        |item: &helix_view::editor::AgentConfig, _: &()| {
-                            item.name.as_str().into()
-                        },
+                        |item: &helix_view::editor::AgentConfig, _: &()| item.name.as_str().into(),
                     ),
                     crate::ui::PickerColumn::new(
                         "command",
@@ -3658,17 +3660,28 @@ fn acp_connect(
                     ),
                 ];
 
+                let agents_for_callback = agents.clone();
                 let picker = crate::ui::Picker::new(
                     columns,
                     0,
                     agents,
                     (),
                     move |cx, item: &helix_view::editor::AgentConfig, _action| {
+                        let idx = agents_for_callback
+                            .iter()
+                            .position(|a| a.name == item.name && a.command == item.command)
+                            .or_else(|| {
+                                agents_for_callback
+                                    .iter()
+                                    .position(|a| a.command == item.command)
+                            });
                         match do_acp_connect(
                             cx.editor,
                             cx.jobs,
                             item.command.clone(),
                             item.args.clone(),
+                            idx,
+                            false,
                         ) {
                             Ok(()) => {}
                             Err(e) => {
@@ -3688,16 +3701,16 @@ fn acp_connect(
     Ok(())
 }
 
-fn acp_prompt(
-    cx: &mut compositor::Context,
-    args: Args,
-    event: PromptEvent,
-) -> anyhow::Result<()> {
+fn acp_prompt(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow::Result<()> {
     if event != PromptEvent::Validate {
         return Ok(());
     }
 
-    let prompt_text: String = args.iter().map(|a| a.as_ref().to_string()).collect::<Vec<_>>().join(" ");
+    let prompt_text: String = args
+        .iter()
+        .map(|a| a.as_ref().to_string())
+        .collect::<Vec<_>>()
+        .join(" ");
     if prompt_text.is_empty() {
         bail!("Usage: acp-prompt <message>");
     }
@@ -3715,44 +3728,67 @@ fn acp_prompt(
     let prompt = vec![helix_acp::ContentBlock::from(prompt_text.clone())];
 
     let callback = async move {
-        // Reuse existing session or create one if none exists
-        let session_id = match agent.session_id().await {
-            Some(id) => id,
-            None => {
-                let session = agent.new_session(cwd).await?;
-                session.session_id
+        let result = async {
+            let session_id = match agent.session_id().await {
+                Some(id) => id,
+                None => {
+                    let session = agent.new_session(cwd).await?;
+                    session.session_id
+                }
+            };
+            agent.prompt(session_id, prompt).await
+        }
+        .await;
+
+        let cb: crate::job::Callback = match result {
+            Ok(response) => {
+                let msg = format!(
+                    "[ACP] Done ({})",
+                    match response.stop_reason {
+                        helix_acp::types::StopReason::EndTurn => "completed",
+                        helix_acp::types::StopReason::Cancelled => "cancelled",
+                        helix_acp::types::StopReason::MaxTokens => "max tokens",
+                        helix_acp::types::StopReason::MaxTurnRequests => "max turns",
+                        helix_acp::types::StopReason::Refusal => "refused",
+                    }
+                );
+                crate::job::Callback::EditorCompositor(Box::new(
+                    move |editor: &mut helix_view::Editor, compositor| {
+                        editor.set_status(msg);
+                        if let Some(panel) =
+                            compositor.find_id::<crate::ui::acp::AcpPanel>(crate::ui::acp::ID)
+                        {
+                            panel.set_busy(false);
+                            panel.set_panel_error(None);
+                            if let Some(next_msg) = panel.dequeue_message() {
+                                let agent = editor.acp_agents.iter().next().map(|(_, a)| a.clone());
+                                if let Some(agent) = agent {
+                                    panel.push_entry(crate::ui::acp::ChatEntry::UserMessage(
+                                        next_msg.clone(),
+                                    ));
+                                    panel.set_busy(true);
+                                    crate::ui::acp::dispatch_queued_prompt(agent, next_msg);
+                                }
+                            }
+                        }
+                    },
+                ))
+            }
+            Err(e) => {
+                let err_msg = format!("{e}");
+                crate::job::Callback::EditorCompositor(Box::new(
+                    move |_editor: &mut helix_view::Editor, compositor| {
+                        if let Some(panel) =
+                            compositor.find_id::<crate::ui::acp::AcpPanel>(crate::ui::acp::ID)
+                        {
+                            panel.set_panel_error(Some(err_msg));
+                            panel.set_busy(false);
+                        }
+                    },
+                ))
             }
         };
-        let response = agent
-            .prompt(session_id, prompt)
-            .await?;
-
-        let msg = format!("[ACP] Done ({})", match response.stop_reason {
-            helix_acp::types::StopReason::EndTurn => "completed",
-            helix_acp::types::StopReason::Cancelled => "cancelled",
-            helix_acp::types::StopReason::MaxTokens => "max tokens",
-            helix_acp::types::StopReason::MaxTurnRequests => "max turns",
-            helix_acp::types::StopReason::Refusal => "refused",
-        });
-
-        let callback: crate::job::Callback = crate::job::Callback::EditorCompositor(
-            Box::new(move |editor: &mut helix_view::Editor, compositor| {
-                editor.set_status(msg);
-                if let Some(panel) = compositor.find_id::<crate::ui::acp::AcpPanel>(crate::ui::acp::ID) {
-                    panel.set_busy(false);
-                    // Auto-send next queued message
-                    if let Some(next_msg) = panel.dequeue_message() {
-                        let agent = editor.acp_agents.iter().next().map(|(_, a)| a.clone());
-                        if let Some(agent) = agent {
-                            panel.push_entry(crate::ui::acp::ChatEntry::UserMessage(next_msg.clone()));
-                            panel.set_busy(true);
-                            crate::ui::acp::dispatch_queued_prompt(agent, next_msg);
-                        }
-                    }
-                }
-            }),
-        );
-        Ok(callback)
+        Ok(cb)
     };
 
     cx.jobs.callback(callback);
@@ -3760,7 +3796,8 @@ fn acp_prompt(
     // Add user message to panel and mark busy
     let callback2 = crate::job::Callback::EditorCompositor(Box::new(
         move |_editor: &mut helix_view::Editor, compositor| {
-            if let Some(panel) = compositor.find_id::<crate::ui::acp::AcpPanel>(crate::ui::acp::ID) {
+            if let Some(panel) = compositor.find_id::<crate::ui::acp::AcpPanel>(crate::ui::acp::ID)
+            {
                 panel.push_entry(crate::ui::acp::ChatEntry::UserMessage(prompt_text));
                 panel.set_busy(true);
             }
@@ -3769,23 +3806,35 @@ fn acp_prompt(
     cx.jobs.callback(async { Ok(callback2) });
 
     cx.editor
-        .set_status(format!("Sending prompt to agent..."));
+        .set_status("Sending prompt to agent...".to_string());
 
     Ok(())
 }
 
-fn acp_open(
-    cx: &mut compositor::Context,
-    _args: Args,
-    event: PromptEvent,
-) -> anyhow::Result<()> {
+fn acp_open(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> anyhow::Result<()> {
     if event != PromptEvent::Validate {
         return Ok(());
     }
 
     use crate::ui::acp::{AcpPanel, ChatEntry, ID as ACP_PANEL_ID};
 
-    // Capture config to create panel in callback (AcpPanel contains Prompt with non-Send closures)
+    let has_agent = cx.editor.acp_agents.iter().next().is_some();
+    let agents = cx.editor.config().agents.clone();
+    let last_index = cx.editor.current_acp_agent_index;
+
+    if !has_agent && !agents.is_empty() {
+        let idx = last_index.unwrap_or(0).min(agents.len().saturating_sub(1));
+        let agent = agents[idx].clone();
+        return do_acp_connect(
+            cx.editor,
+            cx.jobs,
+            agent.command,
+            agent.args,
+            Some(idx),
+            false,
+        );
+    }
+
     let agent_name = cx
         .editor
         .acp_agents
@@ -3803,11 +3852,15 @@ fn acp_open(
     } else {
         Some(cx.editor.acp_output.join("\n"))
     };
+    let config_options = cx.editor.acp_config_options.clone();
+    let session_modes = cx.editor.acp_session_modes.clone();
 
     let callback = crate::job::Callback::EditorCompositor(Box::new(
         move |_editor, compositor: &mut crate::compositor::Compositor| {
             let mut panel = AcpPanel::new();
             panel.set_agent_name(agent_name);
+            panel.set_config_options(config_options);
+            panel.set_session_modes(session_modes);
             if let Some(text) = accumulated_text {
                 panel.push_entry(ChatEntry::AgentText(text));
             }
@@ -3819,11 +3872,7 @@ fn acp_open(
     Ok(())
 }
 
-fn acp_cancel(
-    cx: &mut compositor::Context,
-    _args: Args,
-    event: PromptEvent,
-) -> anyhow::Result<()> {
+fn acp_cancel(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> anyhow::Result<()> {
     if event != PromptEvent::Validate {
         return Ok(());
     }
@@ -3862,9 +3911,7 @@ fn acp_history(
                 let columns = [
                     crate::ui::PickerColumn::new(
                         "agent",
-                        |item: &(String, String, String), _: &()| {
-                            item.1.as_str().into()
-                        },
+                        |item: &(String, String, String), _: &()| item.1.as_str().into(),
                     ),
                     crate::ui::PickerColumn::new(
                         "session",
@@ -3874,9 +3921,7 @@ fn acp_history(
                     ),
                     crate::ui::PickerColumn::new(
                         "when",
-                        |item: &(String, String, String), _: &()| {
-                            item.2.as_str().into()
-                        },
+                        |item: &(String, String, String), _: &()| item.2.as_str().into(),
                     ),
                 ];
 

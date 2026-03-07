@@ -1,0 +1,57 @@
+theme = "catppuccin_macchiato"
+
+[editor]
+line-number = "relative"
+color-modes = true
+completion-trigger-len = 1
+true-color = true
+preview-completion-insert = false
+default-line-ending = "lf"
+shell = ["pwsh", "--no-config", "-c"]
+# end-of-line-diagnostics = "hint"
+# gutters = ["diagnostics","spacer","diff"]
+# rulers = [80]
+
+[editor.bufferline]
+render-mode = "multiple"
+
+[editor.lsp]
+# display-inlay-hints = true
+
+[editor.cursor-shape]
+insert = "bar"
+
+[editor.statusline]
+mode.normal = "NORMAL"
+mode.insert = "INSERT"
+mode.select = "SELECT"
+
+[keys.normal]
+esc = ["collapse_selection", "keep_primary_selection"]
+H = "goto_previous_buffer"
+L = "goto_next_buffer"
+"{" = "goto_prev_paragraph"
+"}" = "goto_next_paragraph"
+# C-s = ":w"
+
+[keys.normal.backspace]
+f = ":format"
+c = ":config-open"
+q = ":bc"
+s = ":w"
+# d = ":sh cargo build"
+# r = ":sh cargo build --release"
+
+[keys.insert]
+# C-space = ":completion"
+
+# [editor.file-picker]
+# hidden=false
+
+[editor.inline-diagnostics]
+cursor-line = "hint"
+
+[[editor.agents]]
+name = "Mock Echo"
+command = "node"
+args = ["E:/helix/helix-fork/scripts/mock-acp-agent.js"]

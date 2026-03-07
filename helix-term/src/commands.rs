@@ -488,6 +488,11 @@ impl MappableCommand {
         shrink_buffer_height, "Shrink focused container height",
         toggle_focus_window, "Toggle focus mode on buffer",
         toggle_agent_panel, "Toggle ACP agent panel",
+        acp_close, "Close ACP panel",
+        acp_chat, "Focus ACP panel and activate chat input",
+        acp_cycle_thinking, "Cycle thinking options",
+        acp_cycle_model, "Cycle model options",
+        acp_cycle_mode, "Cycle mode options",
         goto_line_start, "Goto line start",
         goto_line_end, "Goto line end",
         goto_column, "Goto column",
@@ -1036,31 +1041,292 @@ fn toggle_focus_window(cx: &mut Context) {
 }
 
 fn toggle_agent_panel(cx: &mut Context) {
+    use crate::commands::typed::do_acp_connect;
     use crate::ui::acp::{AcpPanel, ID as ACP_PANEL_ID};
-    // Get agent name while we still have cx.editor
-    let agent_name = cx
-        .editor
-        .acp_agents
-        .iter()
-        .next()
-        .and_then(|(_, agent)| {
-            agent
-                .agent_info()
-                .map(|info| info.title.as_deref().unwrap_or(&info.name).to_string())
-        });
+    let first_agent = cx.editor.acp_agents.iter().next();
+    let has_agent = first_agent.is_some();
+    let agent_name = first_agent.and_then(|(_, agent)| {
+        agent
+            .agent_info()
+            .map(|info| info.title.as_deref().unwrap_or(&info.name).to_string())
+    });
+    let agents = cx.editor.config().agents.clone();
+    let last_index = cx.editor.current_acp_agent_index;
 
     cx.callback.push(Box::new(
-        move |compositor: &mut Compositor, _cx: &mut crate::compositor::Context| {
+        move |compositor: &mut Compositor, cx: &mut crate::compositor::Context| {
             if let Some(panel) = compositor.find_id::<AcpPanel>(ACP_PANEL_ID) {
-                // Panel exists: toggle focus
                 panel.toggle_focus();
-            } else {
-                // No panel: create focused
+            } else if has_agent {
                 let mut panel = AcpPanel::new();
                 if let Some(name) = agent_name {
                     panel.set_agent_name(name);
+                } else {
+                    panel.set_agent_name("Agent".to_string());
                 }
                 compositor.push(Box::new(panel));
+            } else if !agents.is_empty() {
+                let idx = last_index.unwrap_or(0).min(agents.len().saturating_sub(1));
+                let agent = agents[idx].clone();
+                if let Err(e) = do_acp_connect(
+                    cx.editor,
+                    cx.jobs,
+                    agent.command,
+                    agent.args,
+                    Some(idx),
+                    false,
+                ) {
+                    cx.editor.set_error(format!("Agent failed: {e}"));
+                }
+            } else {
+                let mut panel = AcpPanel::new();
+                panel.set_agent_name("No agent".to_string());
+                compositor.push(Box::new(panel));
+            }
+        },
+    ));
+}
+
+fn acp_close(cx: &mut Context) {
+    use crate::ui::acp::ID as ACP_PANEL_ID;
+    cx.callback.push(Box::new(
+        move |compositor: &mut Compositor, _cx: &mut crate::compositor::Context| {
+            compositor.remove(ACP_PANEL_ID);
+        },
+    ));
+}
+
+fn acp_chat(cx: &mut Context) {
+    use crate::commands::typed::do_acp_connect;
+    use crate::ui::acp::{AcpPanel, ID as ACP_PANEL_ID};
+    let first_agent = cx.editor.acp_agents.iter().next();
+    let has_agent = first_agent.is_some();
+    let agent_name = first_agent.and_then(|(_, agent)| {
+        agent
+            .agent_info()
+            .map(|info| info.title.as_deref().unwrap_or(&info.name).to_string())
+    });
+    let agents = cx.editor.config().agents.clone();
+    let last_index = cx.editor.current_acp_agent_index;
+
+    cx.callback.push(Box::new(
+        move |compositor: &mut Compositor, cx: &mut crate::compositor::Context| {
+            if let Some(panel) = compositor.find_id::<AcpPanel>(ACP_PANEL_ID) {
+                panel.activate_input();
+            } else if has_agent {
+                let mut panel = AcpPanel::new();
+                if let Some(name) = agent_name {
+                    panel.set_agent_name(name);
+                } else {
+                    panel.set_agent_name("Agent".to_string());
+                }
+                panel.activate_input();
+                compositor.push(Box::new(panel));
+            } else if !agents.is_empty() {
+                let idx = last_index.unwrap_or(0).min(agents.len().saturating_sub(1));
+                let agent = agents[idx].clone();
+                if let Err(e) = do_acp_connect(
+                    cx.editor,
+                    cx.jobs,
+                    agent.command,
+                    agent.args,
+                    Some(idx),
+                    true,
+                ) {
+                    cx.editor.set_error(format!("Agent failed: {e}"));
+                }
+            } else {
+                let mut panel = AcpPanel::new();
+                panel.set_agent_name("No agent".to_string());
+                panel.activate_input();
+                compositor.push(Box::new(panel));
+            }
+        },
+    ));
+}
+
+fn acp_cycle_thinking(cx: &mut Context) {
+    use crate::ui::acp::{AcpPanel, ID as ACP_PANEL_ID};
+    cx.callback.push(Box::new(
+        move |compositor: &mut Compositor, cx: &mut crate::compositor::Context| {
+            let Some(panel) = compositor.find_id::<AcpPanel>(ACP_PANEL_ID) else {
+                cx.editor.set_status("ACP panel not open");
+                return;
+            };
+            if let Some((config_id, next_value, prev_value)) = panel.cycle_config_option("thinking")
+            {
+                panel.apply_config_option_cycle("thinking", next_value.clone());
+                let agent = cx.editor.acp_agents.iter().next().map(|(_, a)| a.clone());
+                if let Some(agent) = agent {
+                    let category = "thinking".to_string();
+                    cx.jobs.callback(async move {
+                        let session_id = match agent.session_id().await {
+                            Some(id) => id,
+                            None => {
+                                let prev = prev_value.clone();
+                                return Ok(crate::job::Callback::EditorCompositor(Box::new(
+                                    move |editor, compositor| {
+                                        if let Some(panel) =
+                                            compositor.find_id::<AcpPanel>(ACP_PANEL_ID)
+                                        {
+                                            panel.apply_config_option_cycle(&category, prev);
+                                        }
+                                        editor.set_error("No session to update thinking");
+                                    },
+                                )));
+                            }
+                        };
+                        match agent
+                            .set_session_config_option(
+                                session_id,
+                                config_id.clone(),
+                                next_value.clone(),
+                            )
+                            .await
+                        {
+                            Ok(_) => {
+                                Ok(crate::job::Callback::EditorCompositor(Box::new(|_, _| {})))
+                            }
+                            Err(e) => Ok(crate::job::Callback::EditorCompositor(Box::new(
+                                move |editor, compositor| {
+                                    if let Some(panel) =
+                                        compositor.find_id::<AcpPanel>(ACP_PANEL_ID)
+                                    {
+                                        panel.apply_config_option_cycle(&category, prev_value);
+                                    }
+                                    editor.set_error(format!("Failed to set thinking: {e}"));
+                                },
+                            ))),
+                        }
+                    });
+                }
+                cx.editor.set_status("Cycled thinking");
+            } else {
+                cx.editor.set_status("No thinking options from agent");
+            }
+        },
+    ));
+}
+
+fn acp_cycle_model(cx: &mut Context) {
+    use crate::ui::acp::{AcpPanel, ID as ACP_PANEL_ID};
+    cx.callback.push(Box::new(
+        move |compositor: &mut Compositor, cx: &mut crate::compositor::Context| {
+            let Some(panel) = compositor.find_id::<AcpPanel>(ACP_PANEL_ID) else {
+                cx.editor.set_status("ACP panel not open");
+                return;
+            };
+            if let Some((config_id, next_value, prev_value)) = panel.cycle_config_option("model") {
+                panel.apply_config_option_cycle("model", next_value.clone());
+                let agent = cx.editor.acp_agents.iter().next().map(|(_, a)| a.clone());
+                if let Some(agent) = agent {
+                    let category = "model".to_string();
+                    cx.jobs.callback(async move {
+                        let session_id = match agent.session_id().await {
+                            Some(id) => id,
+                            None => {
+                                let prev = prev_value.clone();
+                                return Ok(crate::job::Callback::EditorCompositor(Box::new(
+                                    move |editor, compositor| {
+                                        if let Some(panel) =
+                                            compositor.find_id::<AcpPanel>(ACP_PANEL_ID)
+                                        {
+                                            panel.apply_config_option_cycle(&category, prev);
+                                        }
+                                        editor.set_error("No session to update model");
+                                    },
+                                )));
+                            }
+                        };
+                        match agent
+                            .set_session_config_option(
+                                session_id,
+                                config_id.clone(),
+                                next_value.clone(),
+                            )
+                            .await
+                        {
+                            Ok(_) => {
+                                Ok(crate::job::Callback::EditorCompositor(Box::new(|_, _| {})))
+                            }
+                            Err(e) => Ok(crate::job::Callback::EditorCompositor(Box::new(
+                                move |editor, compositor| {
+                                    if let Some(panel) =
+                                        compositor.find_id::<AcpPanel>(ACP_PANEL_ID)
+                                    {
+                                        panel.apply_config_option_cycle(&category, prev_value);
+                                    }
+                                    editor.set_error(format!("Failed to set model: {e}"));
+                                },
+                            ))),
+                        }
+                    });
+                }
+                cx.editor.set_status("Cycled model");
+            } else {
+                cx.editor.set_status("No model options from agent");
+            }
+        },
+    ));
+}
+
+fn acp_cycle_mode(cx: &mut Context) {
+    use crate::ui::acp::{AcpPanel, ID as ACP_PANEL_ID};
+    cx.callback.push(Box::new(
+        move |compositor: &mut Compositor, cx: &mut crate::compositor::Context| {
+            let Some(panel) = compositor.find_id::<AcpPanel>(ACP_PANEL_ID) else {
+                cx.editor.set_status("ACP panel not open");
+                return;
+            };
+            if let Some((config_id, next_value, prev_value)) = panel.cycle_config_option("mode") {
+                panel.apply_config_option_cycle("mode", next_value.clone());
+                let agent = cx.editor.acp_agents.iter().next().map(|(_, a)| a.clone());
+                if let Some(agent) = agent {
+                    let category = "mode".to_string();
+                    cx.jobs.callback(async move {
+                        let session_id = match agent.session_id().await {
+                            Some(id) => id,
+                            None => {
+                                let prev = prev_value.clone();
+                                return Ok(crate::job::Callback::EditorCompositor(Box::new(
+                                    move |editor, compositor| {
+                                        if let Some(panel) =
+                                            compositor.find_id::<AcpPanel>(ACP_PANEL_ID)
+                                        {
+                                            panel.apply_config_option_cycle(&category, prev);
+                                        }
+                                        editor.set_error("No session to update mode");
+                                    },
+                                )));
+                            }
+                        };
+                        match agent
+                            .set_session_config_option(
+                                session_id,
+                                config_id.clone(),
+                                next_value.clone(),
+                            )
+                            .await
+                        {
+                            Ok(_) => {
+                                Ok(crate::job::Callback::EditorCompositor(Box::new(|_, _| {})))
+                            }
+                            Err(e) => Ok(crate::job::Callback::EditorCompositor(Box::new(
+                                move |editor, compositor| {
+                                    if let Some(panel) =
+                                        compositor.find_id::<AcpPanel>(ACP_PANEL_ID)
+                                    {
+                                        panel.apply_config_option_cycle(&category, prev_value);
+                                    }
+                                    editor.set_error(format!("Failed to set mode: {e}"));
+                                },
+                            ))),
+                        }
+                    });
+                }
+                cx.editor.set_status("Cycled mode");
+            } else {
+                cx.editor.set_status("No mode options from agent");
             }
         },
     ));

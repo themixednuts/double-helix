@@ -8,6 +8,7 @@ pub mod gradient_border;
 mod info;
 pub mod lsp;
 mod markdown;
+pub mod marquee;
 pub mod menu;
 mod notification_popup;
 pub mod overlay;

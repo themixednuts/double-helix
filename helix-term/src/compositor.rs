@@ -192,11 +192,23 @@ impl Compositor {
         let acp_panel_id = "acp-panel";
         let has_acp_panel = self.layers.iter().any(|l| l.id() == Some(acp_panel_id));
         let (editor_area, acp_area) = if has_acp_panel && area.width > 60 {
-            let panel_width = (area.width * 35 / 100).max(30).min(area.width.saturating_sub(40));
+            let panel_width = (area.width * 35 / 100)
+                .max(30)
+                .min(area.width.saturating_sub(40));
             let editor_width = area.width.saturating_sub(panel_width);
             (
-                Rect { x: area.x, y: area.y, width: editor_width, height: area.height },
-                Some(Rect { x: area.x + editor_width, y: area.y, width: panel_width, height: area.height }),
+                Rect {
+                    x: area.x,
+                    y: area.y,
+                    width: editor_width,
+                    height: area.height,
+                },
+                Some(Rect {
+                    x: area.x + editor_width,
+                    y: area.y,
+                    width: panel_width,
+                    height: area.height,
+                }),
             )
         } else {
             (area, None)
@@ -207,13 +219,15 @@ impl Compositor {
             if let Some(editor_view) = layer.as_any_mut().downcast_mut::<crate::ui::EditorView>() {
                 editor_view.prompt_active = has_prompt;
             }
-            if layer.id() == Some(acp_panel_id) {
-                if let Some(acp_rect) = acp_area {
-                    layer.render(acp_rect, surface, cx);
-                }
+            let layer_area = if layer.id() == Some(acp_panel_id) {
+                acp_area.unwrap_or(area)
+            } else if layer.type_name() == std::any::type_name::<crate::ui::EditorView>() {
+                editor_area
             } else {
-                layer.render(editor_area, surface, cx);
-            }
+                // Overlay layers (picker, popup, etc.) get full area so they can center when ACP panel is open
+                area
+            };
+            layer.render(layer_area, surface, cx);
         }
     }
 
@@ -221,11 +235,23 @@ impl Compositor {
         let acp_panel_id = "acp-panel";
         let has_acp_panel = self.layers.iter().any(|l| l.id() == Some(acp_panel_id));
         let (editor_area, acp_area) = if has_acp_panel && area.width > 60 {
-            let panel_width = (area.width * 35 / 100).max(30).min(area.width.saturating_sub(40));
+            let panel_width = (area.width * 35 / 100)
+                .max(30)
+                .min(area.width.saturating_sub(40));
             let editor_width = area.width.saturating_sub(panel_width);
             (
-                Rect { x: area.x, y: area.y, width: editor_width, height: area.height },
-                Some(Rect { x: area.x + editor_width, y: area.y, width: panel_width, height: area.height }),
+                Rect {
+                    x: area.x,
+                    y: area.y,
+                    width: editor_width,
+                    height: area.height,
+                },
+                Some(Rect {
+                    x: area.x + editor_width,
+                    y: area.y,
+                    width: panel_width,
+                    height: area.height,
+                }),
             )
         } else {
             (area, None)
@@ -234,8 +260,10 @@ impl Compositor {
         for layer in self.layers.iter().rev() {
             let layer_area = if layer.id() == Some(acp_panel_id) {
                 acp_area.unwrap_or(area)
-            } else {
+            } else if layer.type_name() == std::any::type_name::<crate::ui::EditorView>() {
                 editor_area
+            } else {
+                area
             };
             if let (Some(pos), kind) = layer.cursor(layer_area, editor) {
                 return (Some(pos), kind);

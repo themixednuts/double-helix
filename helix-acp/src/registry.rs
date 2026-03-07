@@ -53,6 +53,12 @@ impl Registry {
         self.inner.remove(id)
     }
 
+    /// Close all agents. Drops each agent, which kills the child process via `kill_on_drop`.
+    /// Call this during application shutdown to ensure clean process termination.
+    pub fn close_all(&mut self) {
+        self.inner.clear();
+    }
+
     /// Iterate over all agents.
     pub fn iter(&self) -> impl Iterator<Item = (AgentId, &Arc<AcpAgent>)> {
         self.inner.iter()
@@ -71,7 +77,9 @@ impl Registry {
     ///
     /// This stream yields `(AgentId, Call)` pairs from all connected agents.
     /// The caller should poll this in a select loop (like `Application::handle_acp_message`).
-    pub fn incoming(&mut self) -> &mut SelectAll<UnboundedReceiverStream<(AgentId, jsonrpc::Call)>> {
+    pub fn incoming(
+        &mut self,
+    ) -> &mut SelectAll<UnboundedReceiverStream<(AgentId, jsonrpc::Call)>> {
         &mut self.incoming
     }
 }

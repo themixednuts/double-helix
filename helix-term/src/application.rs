@@ -91,6 +91,9 @@ pub struct Application {
     plugin_manager: Arc<PluginManager>,
     ui_receiver: tokio::sync::mpsc::UnboundedReceiver<crate::plugin_registry::UiRequest>,
 
+    /// Native shutdown channel (Windows: console ctrl; Unix: None, uses signal stream).
+    shutdown_rx: Option<tokio::sync::mpsc::UnboundedReceiver<()>>,
+
     theme_mode: Option<theme::Mode>,
 }
 
@@ -269,6 +272,7 @@ impl Application {
             signal::SIGUSR1,
             signal::SIGTERM,
             signal::SIGINT,
+            signal::SIGHUP, // terminal closed (macOS Terminal.app, Linux, SSH disconnect)
         ])
         .context("build signal handler")?;
 
@@ -294,6 +298,11 @@ impl Application {
             }
         }
         let plugin_manager = Arc::new(plugin_manager);
+
+        #[cfg(windows)]
+        let shutdown_rx = crate::shutdown::setup();
+        #[cfg(not(windows))]
+        let shutdown_rx = None;
 
         register_hook!(move |event: &mut DocumentDidOpen<'_>| {
             if let Ok(mut events) = PENDING_PLUGIN_EVENTS.lock() {
@@ -382,6 +391,7 @@ impl Application {
             lsp_progress: LspProgressMap::new(),
             plugin_manager,
             ui_receiver,
+            shutdown_rx,
             theme_mode,
         };
 
@@ -462,6 +472,7 @@ impl Application {
                 return false;
             }
 
+            use futures_util::future::{pending, Either};
             use futures_util::StreamExt;
 
             tokio::select! {
@@ -472,6 +483,10 @@ impl Application {
                         return false;
                     };
                 }
+                _ = match &mut self.shutdown_rx {
+                    Some(rx) => Either::Left(rx.recv()),
+                    None => Either::Right(pending()),
+                } => return false,
                 Some(event) = input_stream.next() => {
                     self.handle_terminal_events(event).await;
                 }
@@ -699,7 +714,7 @@ impl Application {
                 self.refresh_config();
                 self.render().await;
             }
-            signal::SIGTERM | signal::SIGINT => {
+            signal::SIGTERM | signal::SIGINT | signal::SIGHUP => {
                 self.restore_term().unwrap();
                 return false;
             }
@@ -1576,10 +1591,7 @@ impl Application {
                 }
             }
             Call::MethodCall(helix_acp::jsonrpc::MethodCall {
-                method,
-                params,
-                id,
-                ..
+                method, params, id, ..
             }) => {
                 match AgentMethodCall::parse(&method, params) {
                     Ok(AgentMethodCall::ReadTextFile(req)) => {
@@ -1649,8 +1661,7 @@ impl Application {
                     }
                     Ok(AgentMethodCall::RequestPermission(req)) => {
                         use crate::ui::acp::{
-                            PermissionChoice, PermissionPopup, PermissionResponse,
-                            PERMISSION_ID,
+                            PermissionChoice, PermissionPopup, PermissionResponse, PERMISSION_ID,
                         };
 
                         if req.permissions.is_empty() {
@@ -1699,10 +1710,7 @@ impl Application {
                     }
                     Err(helix_acp::Error::Unhandled(method)) => {
                         log::warn!("Unhandled ACP method call: {method}");
-                        agent.reply_error(
-                            id,
-                            helix_acp::jsonrpc::Error::method_not_found(method),
-                        );
+                        agent.reply_error(id, helix_acp::jsonrpc::Error::method_not_found(method));
                     }
                     Err(err) => {
                         log::error!("Error parsing ACP method call: {err}");
@@ -1748,56 +1756,78 @@ impl Application {
                     helix_acp::types::ToolCallStatus::Failed => "failed",
                     helix_acp::types::ToolCallStatus::Cancelled => "cancelled",
                 };
-                let name = tool_call.title.as_deref().unwrap_or("unknown").to_string();
+                let name = tool_call.title.as_deref().unwrap_or("unknown");
                 if let Some(panel) = self.compositor.find_id::<AcpPanel>(ACP_PANEL_ID) {
-                    panel.update_tool_call(&name, status_str, None);
+                    panel.update_tool_call(&tool_call.tool_call_id, Some(name), None, status_str);
                 }
                 self.editor
                     .set_status(format!("[ACP] Tool: {name} ({status_str})"));
             }
             SessionUpdate::ToolCallUpdate(update) => {
+                let path = update.content.as_ref().and_then(|blocks| {
+                    blocks.iter().find_map(|b| {
+                        if let helix_acp::ContentBlock::Text(t) = b {
+                            Some(t.text.lines().next().unwrap_or(&t.text).to_string())
+                        } else {
+                            None
+                        }
+                    })
+                });
                 if let Some(status) = update.status {
                     let status_str = match status {
                         helix_acp::types::ToolCallStatus::Running => "running",
-                        helix_acp::types::ToolCallStatus::Completed => "done",
+                        helix_acp::types::ToolCallStatus::Completed => "completed",
                         helix_acp::types::ToolCallStatus::Failed => "failed",
                         helix_acp::types::ToolCallStatus::Cancelled => "cancelled",
                     };
                     if let Some(panel) = self.compositor.find_id::<AcpPanel>(ACP_PANEL_ID) {
-                        panel.update_tool_call(&update.tool_call_id, status_str, None);
+                        panel.update_tool_call(
+                            &update.tool_call_id,
+                            None,
+                            path.as_deref(),
+                            status_str,
+                        );
                     }
                 }
             }
             SessionUpdate::Plan(plan) => {
-                let items: Vec<PlanItem> = plan
-                    .entries
-                    .iter()
-                    .map(|e| PlanItem {
-                        content: e.content.clone(),
-                        status: match e.status {
-                            Some(helix_acp::types::PlanEntryStatus::Completed) => {
-                                PlanStatus::Completed
-                            }
-                            Some(helix_acp::types::PlanEntryStatus::InProgress) => {
-                                PlanStatus::InProgress
-                            }
-                            Some(helix_acp::types::PlanEntryStatus::Failed) => PlanStatus::Failed,
-                            _ => PlanStatus::Pending,
-                        },
-                    })
-                    .collect();
-                if let Some(panel) = self.compositor.find_id::<AcpPanel>(ACP_PANEL_ID) {
-                    panel.update_plan(items);
+                if plan.entries.is_empty() {
+                    if let Some(panel) = self.compositor.find_id::<AcpPanel>(ACP_PANEL_ID) {
+                        panel.clear_plan();
+                    }
+                } else {
+                    let items: Vec<PlanItem> = plan
+                        .entries
+                        .iter()
+                        .map(|e| PlanItem {
+                            content: e.content.clone(),
+                            status: match e.status {
+                                Some(helix_acp::types::PlanEntryStatus::Completed) => {
+                                    PlanStatus::Completed
+                                }
+                                Some(helix_acp::types::PlanEntryStatus::InProgress) => {
+                                    PlanStatus::InProgress
+                                }
+                                Some(helix_acp::types::PlanEntryStatus::Failed) => PlanStatus::Failed,
+                                _ => PlanStatus::Pending,
+                            },
+                        })
+                        .collect();
+                    if let Some(panel) = self.compositor.find_id::<AcpPanel>(ACP_PANEL_ID) {
+                        panel.update_plan(items);
+                    }
                 }
             }
             SessionUpdate::ConfigOptionUpdate(data) => {
+                self.editor.acp_config_options = data.config_options.clone();
                 if let Some(panel) = self.compositor.find_id::<AcpPanel>(ACP_PANEL_ID) {
                     panel.set_config_options(data.config_options);
                 }
             }
             SessionUpdate::CurrentModeUpdate(data) => {
                 if let Some(panel) = self.compositor.find_id::<AcpPanel>(ACP_PANEL_ID) {
-                    panel.set_current_mode_id(data.mode_id);
+                    panel.set_current_mode_id(data.mode_id.clone());
+                    panel.apply_config_option_cycle("mode", data.mode_id);
                 }
             }
             _ => {
@@ -1840,11 +1870,7 @@ impl Application {
             }
             (Some(start_line), None) => {
                 let start = (start_line.saturating_sub(1)) as usize;
-                content
-                    .lines()
-                    .skip(start)
-                    .collect::<Vec<_>>()
-                    .join("\n")
+                content.lines().skip(start).collect::<Vec<_>>().join("\n")
             }
             (None, Some(limit)) => content
                 .lines()
@@ -1867,7 +1893,7 @@ impl Application {
         let doc_id = self
             .editor
             .documents()
-            .find(|doc| doc.path().map_or(false, |p| p == path))
+            .find(|doc| doc.path().is_some_and(|p| p == path))
             .map(|doc| doc.id());
 
         if let Some(doc_id) = doc_id {
@@ -1875,7 +1901,12 @@ impl Application {
             let view_id = self.editor.tree.focus;
             let transaction = helix_core::Transaction::change(
                 doc.text(),
-                [(0, doc.text().len_chars(), Some(helix_core::Tendril::from(req.content.as_str())))].into_iter(),
+                [(
+                    0,
+                    doc.text().len_chars(),
+                    Some(helix_core::Tendril::from(req.content.as_str())),
+                )]
+                .into_iter(),
             );
             doc.apply(&transaction, view_id);
         } else {
@@ -2020,6 +2051,8 @@ impl Application {
                 "Timed out waiting for language servers to shutdown"
             ));
         }
+
+        self.editor.close_acp_agents();
 
         errs
     }

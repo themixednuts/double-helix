@@ -8,7 +8,7 @@ use crate::{
     graphics::{CursorKind, Rect},
     handlers::Handlers,
     info::Info,
-    input::KeyEvent,
+    input::{KeyCode, KeyEvent, KeyModifiers},
     register::Registers,
     theme::{self, Theme},
     tree::{self, Dimension, Resize, Tree},
@@ -509,6 +509,53 @@ pub struct Config {
     /// Preconfigured ACP agents.
     #[serde(default = "default_agents")]
     pub agents: Vec<AgentConfig>,
+    /// ACP panel configuration (keybindings for cycle agent, thinking, model).
+    #[serde(default)]
+    pub acp: AcpConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case", default)]
+pub struct AcpConfig {
+    /// Cycle through thinking options (if available). Default: C-t
+    pub cycle_thinking: Option<String>,
+    /// Cycle through model options. Default: C-m
+    pub cycle_model: Option<String>,
+    /// Cycle through mode options (e.g. Default, Accept Edits, Plan Mode). Default: S-tab
+    pub cycle_mode: Option<String>,
+}
+
+impl AcpConfig {
+    pub fn cycle_thinking(&self) -> KeyEvent {
+        self.cycle_thinking
+            .as_deref()
+            .unwrap_or("C-t")
+            .parse()
+            .unwrap_or(KeyEvent {
+                code: KeyCode::Char('t'),
+                modifiers: KeyModifiers::CONTROL,
+            })
+    }
+    pub fn cycle_model(&self) -> KeyEvent {
+        self.cycle_model
+            .as_deref()
+            .unwrap_or("C-m")
+            .parse()
+            .unwrap_or(KeyEvent {
+                code: KeyCode::Char('m'),
+                modifiers: KeyModifiers::CONTROL,
+            })
+    }
+    pub fn cycle_mode(&self) -> KeyEvent {
+        self.cycle_mode
+            .as_deref()
+            .unwrap_or("S-tab")
+            .parse()
+            .unwrap_or(KeyEvent {
+                code: KeyCode::Tab,
+                modifiers: KeyModifiers::SHIFT,
+            })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -521,29 +568,48 @@ pub struct AgentConfig {
     /// Arguments to pass to the agent command.
     #[serde(default)]
     pub args: Vec<String>,
+    /// Optional theme to apply when this agent is connected (e.g. "claude", "gemini").
+    #[serde(default)]
+    pub theme: Option<String>,
 }
 
 fn default_agents() -> Vec<AgentConfig> {
+    let claude_cmd = if cfg!(windows) {
+        (
+            "npm.cmd".into(),
+            vec![
+                "exec".into(),
+                "--yes".into(),
+                "@zed-industries/claude-agent-acp@0.20.2".into(),
+            ],
+        )
+    } else {
+        ("claude-agent-acp".into(), vec![])
+    };
     vec![
         AgentConfig {
-            name: "Claude Code".into(),
-            command: "claude-code-acp".into(),
-            args: vec![],
+            name: "Claude Agent".into(),
+            command: claude_cmd.0,
+            args: claude_cmd.1,
+            theme: None,
         },
         AgentConfig {
             name: "Cursor".into(),
             command: "cursor".into(),
             args: vec!["agent".into(), "acp".into()],
+            theme: None,
         },
         AgentConfig {
             name: "Gemini CLI".into(),
             command: "gemini".into(),
             args: vec!["--experimental-acp".into()],
+            theme: None,
         },
         AgentConfig {
             name: "Goose".into(),
             command: "goose".into(),
             args: vec!["acp".into()],
+            theme: None,
         },
     ]
 }
@@ -1695,31 +1761,49 @@ impl Default for Config {
             fold_textobjects: Vec::new(),
             agents: vec![
                 AgentConfig {
-                    name: "Claude Code".into(),
-                    command: "claude-agent-acp".into(),
-                    args: vec![],
+                    name: "Claude Agent".into(),
+                    command: if cfg!(windows) {
+                        "npm.cmd".into()
+                    } else {
+                        "claude-agent-acp".into()
+                    },
+                    args: if cfg!(windows) {
+                        vec![
+                            "exec".into(),
+                            "--yes".into(),
+                            "@zed-industries/claude-agent-acp@0.20.2".into(),
+                        ]
+                    } else {
+                        vec![]
+                    },
+                    theme: None,
                 },
                 AgentConfig {
                     name: "Gemini CLI".into(),
                     command: "gemini".into(),
                     args: vec!["--experimental-acp".into()],
+                    theme: None,
                 },
                 AgentConfig {
                     name: "Cursor".into(),
                     command: "cursor".into(),
                     args: vec!["agent".into(), "acp".into()],
+                    theme: None,
                 },
                 AgentConfig {
                     name: "Goose".into(),
                     command: "goose".into(),
                     args: vec!["acp".into()],
+                    theme: None,
                 },
                 AgentConfig {
                     name: "Codex (bridge)".into(),
                     command: "codex-acp".into(),
                     args: vec![],
+                    theme: None,
                 },
             ],
+            acp: AcpConfig::default(),
         }
     }
 }
@@ -1897,6 +1981,14 @@ pub struct Editor {
     pub acp_output: Vec<String>,
     /// History of past ACP sessions.
     pub acp_session_history: Vec<(String, String, std::time::Instant)>, // (session_id, agent_name, started)
+    /// Latest ACP config options (model, etc.) from session; used when opening panel via :acp-open.
+    pub acp_config_options: Vec<helix_acp::types::ConfigOption>,
+    /// Latest ACP session modes from session; used when opening panel via :acp-open.
+    pub acp_session_modes: Vec<helix_acp::types::SessionMode>,
+    /// Index in config.agents of the currently connected agent (for cycling).
+    pub current_acp_agent_index: Option<usize>,
+    /// Theme for the ACP panel only (when agent has theme configured). None = use global theme.
+    pub acp_panel_theme: Option<Theme>,
     pub breakpoints: HashMap<PathBuf, Vec<Breakpoint>>,
 
     pub syn_loader: Arc<ArcSwap<syntax::Loader>>,
@@ -2048,6 +2140,10 @@ impl Editor {
             acp_terminals: helix_acp::TerminalManager::new(),
             acp_output: Vec::new(),
             acp_session_history: Vec::new(),
+            acp_config_options: Vec::new(),
+            acp_session_modes: Vec::new(),
+            current_acp_agent_index: None,
+            acp_panel_theme: None,
             breakpoints: HashMap::new(),
             syn_loader,
             theme_loader,
@@ -2351,6 +2447,25 @@ impl Editor {
 
     pub fn set_theme(&mut self, theme: Theme) {
         self.set_theme_impl(theme, ThemeAction::Set);
+    }
+
+    /// Set the ACP panel theme based on the connected agent. Only affects the ACP panel, not the rest of Helix.
+    pub fn apply_acp_agent_theme(&mut self, agent_index: Option<usize>) {
+        let theme_name = agent_index.and_then(|i| {
+            self.config
+                .load()
+                .agents
+                .get(i)
+                .and_then(|a| a.theme.as_ref())
+                .cloned()
+        });
+
+        self.acp_panel_theme = theme_name.and_then(|name| self.theme_loader.load(&name).ok());
+    }
+
+    /// Theme to use when rendering the ACP panel. Returns panel-specific theme if set, else global.
+    pub fn acp_theme(&self) -> &Theme {
+        self.acp_panel_theme.as_ref().unwrap_or(&self.theme)
     }
 
     fn set_theme_impl(&mut self, theme: Theme, preview: ThemeAction) {
@@ -3141,6 +3256,12 @@ impl Editor {
         )
         .await
         .map(|_| ())
+    }
+
+    /// Closes all ACP agents. Drops each agent, which kills the child process via `kill_on_drop`.
+    /// Call this during application shutdown to ensure clean process termination.
+    pub fn close_acp_agents(&mut self) {
+        self.acp_agents.close_all();
     }
 
     pub async fn wait_event(&mut self) -> EditorEvent {

@@ -114,6 +114,18 @@ impl Overlay {
 /// caches is preferable as otherwise a lot of lifetimes become invariant
 /// which complicates APIs a lot.
 pub trait LineAnnotation {
+    fn plain_viewport_debug_name(&self) -> &'static str {
+        std::any::type_name::<Self>()
+    }
+
+    fn plain_viewport_support(
+        &self,
+        _top_line: usize,
+        _cursor_line: usize,
+    ) -> PlainViewportSupport {
+        PlainViewportSupport::LineAnnotations
+    }
+
     /// Resets the internal position to `char_idx`. This function is called
     /// when a new traversal of a document starts.
     ///
@@ -179,6 +191,74 @@ struct Layer<'a, A, M> {
     annotations: &'a [A],
     current_index: Cell<usize>,
     metadata: M,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlainLineSeekSupport {
+    Supported,
+    InlineAnnotations,
+    Overlays,
+    FoldContainsLineStart,
+    FoldStartsBeforeTarget,
+}
+
+impl PlainLineSeekSupport {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Supported => "supported",
+            Self::InlineAnnotations => "inline_annotations",
+            Self::Overlays => "overlays",
+            Self::FoldContainsLineStart => "fold_contains_line_start",
+            Self::FoldStartsBeforeTarget => "fold_starts_before_target",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlainViewportSupport {
+    Supported,
+    LineAnnotations,
+    InlineDiagnostics,
+    PluginAnnotations,
+    FoldContainsTopLine,
+    FoldContainsCursorLine,
+    FoldStartsBetween,
+}
+
+impl PlainViewportSupport {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Supported => "supported",
+            Self::LineAnnotations => "line_annotations",
+            Self::InlineDiagnostics => "inline_diagnostics",
+            Self::PluginAnnotations => "plugin_annotations",
+            Self::FoldContainsTopLine => "fold_contains_top_line",
+            Self::FoldContainsCursorLine => "fold_contains_cursor_line",
+            Self::FoldStartsBetween => "fold_starts_between",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlainViewportSupportReport {
+    pub support: PlainViewportSupport,
+    pub blocker: Option<&'static str>,
+}
+
+impl PlainViewportSupportReport {
+    pub const fn supported() -> Self {
+        Self {
+            support: PlainViewportSupport::Supported,
+            blocker: None,
+        }
+    }
+
+    pub const fn new(
+        support: PlainViewportSupport,
+        blocker: Option<&'static str>,
+    ) -> Self {
+        Self { support, blocker }
+    }
 }
 
 impl<A, M: Clone> Clone for Layer<'_, A, M> {
@@ -294,6 +374,147 @@ impl Debug for TextAnnotations<'_> {
 }
 
 impl<'a> TextAnnotations<'a> {
+    pub fn is_empty(&self) -> bool {
+        self.inline_annotations.is_empty()
+            && self.overlays.is_empty()
+            && self.line_annotations.is_empty()
+            && self.folds.container.is_none()
+    }
+
+    pub fn has_vertical_layout_annotations(&self) -> bool {
+        !self.line_annotations.is_empty() || self.folds.container.is_some()
+    }
+
+    pub fn plain_viewport_support_report(
+        &self,
+        top_line: usize,
+        cursor_line: usize,
+    ) -> PlainViewportSupportReport {
+        for (_, layer) in &self.line_annotations {
+            let support = unsafe { layer.get().plain_viewport_support(top_line, cursor_line) };
+            if support != PlainViewportSupport::Supported {
+                return PlainViewportSupportReport::new(
+                    support,
+                    Some(unsafe { layer.get().plain_viewport_debug_name() }),
+                );
+            }
+        }
+
+        let Some(container) = self.folds.container() else {
+            return PlainViewportSupportReport::supported();
+        };
+
+        if container
+            .superest_fold_containing(top_line, |fold| fold.start.line..=fold.end.line)
+            .is_some()
+        {
+            return PlainViewportSupportReport::new(
+                PlainViewportSupport::FoldContainsTopLine,
+                None,
+            );
+        }
+
+        if container
+            .superest_fold_containing(cursor_line, |fold| fold.start.line..=fold.end.line)
+            .is_some()
+        {
+            return PlainViewportSupportReport::new(
+                PlainViewportSupport::FoldContainsCursorLine,
+                None,
+            );
+        }
+
+        let (start, end) = if top_line <= cursor_line {
+            (top_line, cursor_line)
+        } else {
+            (cursor_line, top_line)
+        };
+
+        if container
+            .start_points_in_range(&(start..=end), |sfp| sfp.line)
+            .iter()
+            .any(|sfp| sfp.is_superest())
+        {
+            PlainViewportSupportReport::new(PlainViewportSupport::FoldStartsBetween, None)
+        } else {
+            PlainViewportSupportReport::supported()
+        }
+    }
+
+    pub fn plain_viewport_support(
+        &self,
+        top_line: usize,
+        cursor_line: usize,
+    ) -> PlainViewportSupport {
+        self.plain_viewport_support_report(top_line, cursor_line)
+            .support
+    }
+
+    pub fn plain_line_seek_support(
+        &self,
+        line_start: usize,
+        line_end: usize,
+        target_char: usize,
+    ) -> PlainLineSeekSupport {
+        fn layer_overlaps<A>(
+            layers: &[Layer<'_, A, Option<Highlight>>],
+            line_start: usize,
+            seek_end: usize,
+            get_char_idx: impl Fn(&A) -> usize,
+        ) -> bool {
+            layers.iter().any(|layer| {
+                let annotations = layer.annotations;
+                let start = annotations.partition_point(|annot| get_char_idx(annot) < line_start);
+                annotations
+                    .get(start)
+                    .is_some_and(|annot| get_char_idx(annot) <= seek_end)
+            })
+        }
+
+        let seek_end = target_char.min(line_end);
+        let seek_range = line_start..=seek_end;
+
+        if layer_overlaps(&self.inline_annotations, line_start, seek_end, |annot| annot.char_idx) {
+            return PlainLineSeekSupport::InlineAnnotations;
+        }
+
+        if layer_overlaps(&self.overlays, line_start, seek_end, |annot| annot.char_idx) {
+            return PlainLineSeekSupport::Overlays;
+        }
+
+        let Some(container) = self.folds.container() else {
+            return PlainLineSeekSupport::Supported;
+        };
+
+        if container
+            .superest_fold_containing(line_start, |fold| fold.start.char..=fold.end.char)
+            .is_some()
+        {
+            return PlainLineSeekSupport::FoldContainsLineStart;
+        }
+
+        if container
+            .start_points_in_range(&seek_range, |sfp| sfp.char)
+            .is_empty()
+        {
+            PlainLineSeekSupport::Supported
+        } else {
+            PlainLineSeekSupport::FoldStartsBeforeTarget
+        }
+    }
+
+    pub fn supports_plain_line_seek(
+        &self,
+        line_start: usize,
+        line_end: usize,
+        target_char: usize,
+    ) -> bool {
+        matches!(
+            self.plain_line_seek_support(line_start, line_end, target_char),
+            PlainLineSeekSupport::Supported
+        )
+    }
+
     /// Prepare the TextAnnotations for iteration starting at char_idx
     pub fn reset_pos(&self, char_idx: usize) {
         reset_pos(&self.inline_annotations, char_idx, |annot| annot.char_idx);
@@ -432,5 +653,101 @@ impl<'a> TextAnnotations<'a> {
             };
         }
         virt_off.row
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LineAnnotation, PlainViewportSupport, PlainViewportSupportReport, TextAnnotations};
+    use crate::Rope;
+    use crate::text_folding::{FoldContainer, test_utils::{TEXT_SAMPLE, fold_points, new_fold_points}};
+    use crate::Position;
+
+    #[test]
+    fn plain_viewport_support_ignores_folds_outside_line_span() {
+        let text = Rope::from("head\nbody\nkeep\nskip-a\nskip-b\ntail\n");
+        let slice = text.slice(..);
+        let fold = new_fold_points(slice, "function", 3, 4..=4);
+        let container = FoldContainer::from(slice, vec![fold]);
+
+        let mut annotations = TextAnnotations::default();
+        annotations.add_folds(&container);
+
+        assert_eq!(
+            annotations.plain_viewport_support(0, 2),
+            PlainViewportSupport::Supported
+        );
+    }
+
+    #[test]
+    fn plain_viewport_support_rejects_fold_on_cursor_line() {
+        let container = FoldContainer::from(*TEXT_SAMPLE, fold_points());
+        let mut annotations = TextAnnotations::default();
+        annotations.add_folds(&container);
+
+        assert_eq!(
+            annotations.plain_viewport_support(0, 11),
+            PlainViewportSupport::FoldContainsCursorLine
+        );
+    }
+
+    #[test]
+    fn plain_viewport_support_allows_line_annotation_opt_in() {
+        struct NoopLineAnnotation;
+
+        impl LineAnnotation for NoopLineAnnotation {
+            fn plain_viewport_support(
+                &self,
+                _top_line: usize,
+                _cursor_line: usize,
+            ) -> PlainViewportSupport {
+                PlainViewportSupport::Supported
+            }
+
+            fn insert_virtual_lines(
+                &mut self,
+                _line_end_char_idx: usize,
+                _line_end_visual_pos: Position,
+                _doc_line: usize,
+            ) -> Position {
+                Position::new(0, 0)
+            }
+        }
+
+        let mut annotations = TextAnnotations::default();
+        annotations.add_line_annotation(Box::new(NoopLineAnnotation));
+
+        assert_eq!(
+            annotations.plain_viewport_support(0, 10),
+            PlainViewportSupport::Supported
+        );
+    }
+
+    #[test]
+    fn plain_viewport_support_report_includes_blocker_type() {
+        struct BlockingLineAnnotation;
+
+        impl LineAnnotation for BlockingLineAnnotation {
+            fn insert_virtual_lines(
+                &mut self,
+                _line_end_char_idx: usize,
+                _line_end_visual_pos: Position,
+                _doc_line: usize,
+            ) -> Position {
+                Position::new(0, 0)
+            }
+        }
+
+        let mut annotations = TextAnnotations::default();
+        annotations.add_line_annotation(Box::new(BlockingLineAnnotation));
+
+        let report = annotations.plain_viewport_support_report(0, 10);
+        assert_eq!(
+            report,
+            PlainViewportSupportReport::new(
+                PlainViewportSupport::LineAnnotations,
+                Some(std::any::type_name::<BlockingLineAnnotation>())
+            )
+        );
     }
 }

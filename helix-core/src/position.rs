@@ -5,21 +5,37 @@ use std::{
 };
 
 use helix_stdx::rope::RopeSliceExt;
+use memchr::memchr;
 
 use crate::{
     chars::char_is_line_ending,
     doc_formatter::{DocumentFormatter, TextFormat},
     graphemes::{ensure_grapheme_boundary_prev, grapheme_width},
     line_ending::line_end_char_index,
-    text_annotations::TextAnnotations,
+    text_annotations::{PlainLineSeekSupport, TextAnnotations},
     RopeSlice,
 };
 
 /// Represents a single point in a text buffer. Zero indexed.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Position {
     pub row: usize,
     pub col: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VisualBlockOffsetSeekKind {
+    PlainFastPath,
+    FormatterFallback,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VisualBlockOffsetResult {
+    pub char_idx: usize,
+    pub visual_pos: Position,
+    pub virtual_lines: usize,
+    pub kind: VisualBlockOffsetSeekKind,
+    pub plain_seek_support: PlainLineSeekSupport,
 }
 
 impl AddAssign for Position {
@@ -98,7 +114,12 @@ pub fn coords_at_pos(text: RopeSlice, pos: usize) -> Position {
 
     let line_start = text.line_to_char(line);
     let pos = ensure_grapheme_boundary_prev(text, pos);
-    let col = text.slice(line_start..pos).graphemes().count();
+    let line_slice = text.slice(line_start..pos);
+    let col = if line_slice.chunks().all(|chunk| chunk.is_ascii()) {
+        pos - line_start
+    } else {
+        line_slice.graphemes().count()
+    };
 
     Position::new(line, col)
 }
@@ -153,19 +174,72 @@ pub fn visual_offset_from_block(
     text_fmt: &TextFormat,
     annotations: &TextAnnotations,
 ) -> (Position, usize) {
+    visual_offset_from_block_with_metrics(text, anchor, pos, text_fmt, annotations).result
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct VisualOffsetFromBlockMetrics {
+    pub next_calls: usize,
+    pub formatter_next_calls: usize,
+    pub formatter_advance_grapheme_calls: usize,
+    pub formatter_word_refills: usize,
+    pub formatter_fold_skip_count: usize,
+    pub formatter_inline_annotation_hits: usize,
+    pub formatter_overlay_hits: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct VisualOffsetFromBlockResult {
+    pub result: (Position, usize),
+    pub metrics: VisualOffsetFromBlockMetrics,
+}
+
+pub fn visual_offset_from_block_with_metrics(
+    text: RopeSlice,
+    anchor: usize,
+    pos: usize,
+    text_fmt: &TextFormat,
+    annotations: &TextAnnotations,
+) -> VisualOffsetFromBlockResult {
     let mut last_pos = Position::default();
     let mut formatter =
         DocumentFormatter::new_at_prev_checkpoint(text, text_fmt, annotations, anchor);
     let block_start = formatter.next_char_pos();
+    let mut next_calls = 0usize;
 
     while let Some(grapheme) = formatter.next() {
+        next_calls += 1;
         last_pos = grapheme.visual_pos;
         if formatter.next_char_pos() > pos {
-            return (grapheme.visual_pos, block_start);
+            let stats = formatter.stats();
+            return VisualOffsetFromBlockResult {
+                result: (grapheme.visual_pos, block_start),
+                metrics: VisualOffsetFromBlockMetrics {
+                    next_calls,
+                    formatter_next_calls: stats.next_calls,
+                    formatter_advance_grapheme_calls: stats.advance_grapheme_calls,
+                    formatter_word_refills: stats.word_refills,
+                    formatter_fold_skip_count: stats.fold_skip_count,
+                    formatter_inline_annotation_hits: stats.inline_annotation_hits,
+                    formatter_overlay_hits: stats.overlay_hits,
+                },
+            };
         }
     }
 
-    (last_pos, block_start)
+    let stats = formatter.stats();
+    VisualOffsetFromBlockResult {
+        result: (last_pos, block_start),
+        metrics: VisualOffsetFromBlockMetrics {
+            next_calls,
+            formatter_next_calls: stats.next_calls,
+            formatter_advance_grapheme_calls: stats.advance_grapheme_calls,
+            formatter_word_refills: stats.word_refills,
+            formatter_fold_skip_count: stats.fold_skip_count,
+            formatter_inline_annotation_hits: stats.inline_annotation_hits,
+            formatter_overlay_hits: stats.overlay_hits,
+        },
+    }
 }
 
 /// Returns the height of the given text when softwrapping
@@ -177,6 +251,356 @@ pub fn softwrapped_dimensions(text: RopeSlice, text_fmt: &TextFormat) -> (usize,
     } else {
         (last_pos.row + 1, text_fmt.viewport_width)
     }
+}
+
+fn plain_char_idx_and_visual_col_at_visual_column(
+    text: RopeSlice,
+    anchor: usize,
+    column: usize,
+    tab_width: usize,
+) -> (usize, usize) {
+    let line = text.char_to_line(anchor.min(text.len_chars()));
+    let line_start = text.line_to_char(line);
+    let line_end = line_end_char_index(&text, line);
+    let line_slice = text.slice(line_start..line_end);
+
+    let mut char_idx = line_start;
+    let mut visual_col = 0usize;
+    let mut slice_byte_offset = 0usize;
+
+    for chunk in line_slice.chunks() {
+        let bytes = chunk.as_bytes();
+        if bytes.is_ascii() {
+            let mut chunk_offset = 0usize;
+
+            while chunk_offset < bytes.len() {
+                let remaining = column.saturating_sub(visual_col);
+                if remaining == 0 {
+                    return (char_idx, visual_col);
+                }
+
+                let haystack = &bytes[chunk_offset..];
+                let next_tab = memchr(b'\t', haystack).unwrap_or(haystack.len());
+                let ascii_run = next_tab.min(remaining);
+
+                if ascii_run != 0 {
+                    char_idx += ascii_run;
+                    visual_col += ascii_run;
+                    chunk_offset += ascii_run;
+                    slice_byte_offset += ascii_run;
+                }
+
+                if visual_col == column {
+                    return (char_idx, visual_col);
+                }
+
+                if chunk_offset == bytes.len() {
+                    break;
+                }
+
+                debug_assert_eq!(bytes[chunk_offset], b'\t');
+                let width = tab_width - (visual_col % tab_width);
+                if visual_col + width > column {
+                    return (char_idx, visual_col);
+                }
+                char_idx += 1;
+                visual_col += width;
+                chunk_offset += 1;
+                slice_byte_offset += 1;
+            }
+
+            continue;
+        }
+
+        let mut i = 0usize;
+
+        while i < bytes.len() {
+            let ascii_start = i;
+            while i < bytes.len() && bytes[i].is_ascii() && bytes[i] != b'\t' {
+                i += 1;
+            }
+
+            // Check if the byte after the ASCII run is a combining character
+            // (leading byte 0xCC or 0xCD for U+0300..U+036F). If so, the last
+            // ASCII byte is the base of a multi-char grapheme — exclude it from
+            // the fast-path count so the grapheme iterator handles the full cluster.
+            let next_is_combining = i < bytes.len()
+                && i > ascii_start
+                && (bytes[i] == 0xCC || bytes[i] == 0xCD);
+            let ascii_len = if next_is_combining {
+                i - ascii_start - 1
+            } else {
+                i - ascii_start
+            };
+
+            if ascii_len != 0 {
+                if visual_col + ascii_len > column {
+                    let delta = column - visual_col;
+                    return (char_idx + delta, visual_col + delta);
+                }
+                char_idx += ascii_len;
+                visual_col += ascii_len;
+                slice_byte_offset += ascii_len;
+                if visual_col == column {
+                    return (char_idx, visual_col);
+                }
+            }
+
+            if !next_is_combining && i == bytes.len() {
+                break;
+            }
+
+            if !next_is_combining && bytes[i] == b'\t' {
+                let width = tab_width - (visual_col % tab_width);
+                if visual_col + width > column {
+                    return (char_idx, visual_col);
+                }
+                char_idx += 1;
+                visual_col += width;
+                i += 1;
+                slice_byte_offset += 1;
+                if visual_col == column {
+                    return (char_idx, visual_col);
+                }
+                continue;
+            }
+
+            for (byte_idx, grapheme) in line_slice.grapheme_indices_at(slice_byte_offset) {
+                let grapheme_char_idx = line_start + line_slice.byte_to_char(byte_idx);
+                let width = grapheme
+                    .as_str()
+                    .map_or_else(|| grapheme_width(&grapheme.to_string()), grapheme_width);
+                if visual_col + width > column {
+                    return (grapheme_char_idx, visual_col);
+                }
+                visual_col += width;
+                char_idx = grapheme_char_idx + grapheme.chars().count();
+                if visual_col == column {
+                    return (char_idx, visual_col);
+                }
+            }
+
+            return (line_end, visual_col);
+        }
+    }
+
+    (line_end, visual_col)
+}
+
+pub fn plain_visual_col_at_char_idx(text: RopeSlice, pos: usize, tab_width: usize) -> usize {
+    let line = text.char_to_line(pos.min(text.len_chars()));
+    let line_start = text.line_to_char(line);
+    let target = pos.min(line_end_char_index(&text, line));
+    let line_slice = text.slice(line_start..target);
+
+    let mut visual_col = 0usize;
+    let mut slice_byte_offset = 0usize;
+
+    for chunk in line_slice.chunks() {
+        let bytes = chunk.as_bytes();
+        if bytes.is_ascii() {
+            let mut chunk_offset = 0usize;
+            while chunk_offset < bytes.len() {
+                let haystack = &bytes[chunk_offset..];
+                let next_tab = memchr(b'\t', haystack).unwrap_or(haystack.len());
+
+                if next_tab != 0 {
+                    visual_col += next_tab;
+                    chunk_offset += next_tab;
+                    slice_byte_offset += next_tab;
+                }
+
+                if chunk_offset == bytes.len() {
+                    break;
+                }
+
+                debug_assert_eq!(bytes[chunk_offset], b'\t');
+                let width = tab_width - (visual_col % tab_width);
+                visual_col += width;
+                chunk_offset += 1;
+                slice_byte_offset += 1;
+            }
+
+            continue;
+        }
+
+        let mut i = 0usize;
+        while i < bytes.len() {
+            let ascii_start = i;
+            while i < bytes.len() && bytes[i].is_ascii() && bytes[i] != b'\t' {
+                i += 1;
+            }
+
+            // Exclude last ASCII byte if followed by a combining character
+            // (0xCC/0xCD lead byte for U+0300..U+036F) so the grapheme
+            // iterator can see the full cluster.
+            let next_is_combining = i < bytes.len()
+                && i > ascii_start
+                && (bytes[i] == 0xCC || bytes[i] == 0xCD);
+            let ascii_len = if next_is_combining {
+                i - ascii_start - 1
+            } else {
+                i - ascii_start
+            };
+            if next_is_combining {
+                i -= 1;
+            }
+
+            if ascii_len != 0 {
+                visual_col += ascii_len;
+                slice_byte_offset += ascii_len;
+            }
+
+            if i == bytes.len() {
+                break;
+            }
+
+            if bytes[i] == b'\t' {
+                let width = tab_width - (visual_col % tab_width);
+                visual_col += width;
+                i += 1;
+                slice_byte_offset += 1;
+                continue;
+            }
+
+            let chunk_end = slice_byte_offset + bytes.len() - i;
+            for (byte_idx, grapheme) in line_slice.grapheme_indices_at(slice_byte_offset) {
+                if byte_idx >= chunk_end {
+                    break;
+                }
+                let width = grapheme
+                    .as_str()
+                    .map_or_else(|| grapheme_width(&grapheme.to_string()), grapheme_width);
+                visual_col += width;
+                let next_byte = byte_idx + grapheme.len_bytes();
+                i += next_byte - slice_byte_offset;
+                slice_byte_offset = next_byte;
+            }
+        }
+    }
+
+    visual_col
+}
+
+pub fn char_idx_and_visual_offset_at_visual_block_offset_with_kind(
+    text: RopeSlice,
+    anchor: usize,
+    row: usize,
+    column: usize,
+    text_fmt: &TextFormat,
+    annotations: &TextAnnotations,
+) -> VisualBlockOffsetResult {
+    let line = text.char_to_line(anchor.min(text.len_chars()));
+    let line_start = text.line_to_char(line);
+    let line_end = line_end_char_index(&text, line);
+    let mut plain_seek_support = PlainLineSeekSupport::Supported;
+
+    if !text_fmt.soft_wrap && row == 0 {
+        let (char_idx, visual_col) = plain_char_idx_and_visual_col_at_visual_column(
+            text,
+            anchor,
+            column,
+            text_fmt.tab_width as usize,
+        );
+        plain_seek_support = annotations.plain_line_seek_support(line_start, line_end, char_idx);
+        if matches!(plain_seek_support, PlainLineSeekSupport::Supported) {
+            return VisualBlockOffsetResult {
+                char_idx,
+                visual_pos: Position::new(0, visual_col),
+                virtual_lines: 0,
+                kind: VisualBlockOffsetSeekKind::PlainFastPath,
+                plain_seek_support,
+            };
+        }
+    }
+
+    let mut formatter =
+        DocumentFormatter::new_at_prev_checkpoint(text, text_fmt, annotations, anchor);
+    let mut last_char_idx = formatter.next_char_pos();
+    let mut last_pos = Position::default();
+    let mut found_non_virtual_on_row = false;
+    let mut last_row = 0;
+    for grapheme in &mut formatter {
+        match grapheme.visual_pos.row.cmp(&row) {
+            Ordering::Equal => {
+                if grapheme.visual_pos.col + grapheme.width() > column {
+                    if !grapheme.is_virtual() {
+                        return VisualBlockOffsetResult {
+                            char_idx: grapheme.char_idx,
+                            visual_pos: grapheme.visual_pos,
+                            virtual_lines: 0,
+                            kind: VisualBlockOffsetSeekKind::FormatterFallback,
+                            plain_seek_support,
+                        };
+                    } else if found_non_virtual_on_row {
+                        return VisualBlockOffsetResult {
+                            char_idx: last_char_idx,
+                            visual_pos: last_pos,
+                            virtual_lines: 0,
+                            kind: VisualBlockOffsetSeekKind::FormatterFallback,
+                            plain_seek_support,
+                        };
+                    }
+                } else if !grapheme.is_virtual() {
+                    found_non_virtual_on_row = true;
+                    last_char_idx = grapheme.char_idx;
+                    last_pos = grapheme.visual_pos;
+                }
+            }
+            Ordering::Greater if found_non_virtual_on_row => {
+                return VisualBlockOffsetResult {
+                    char_idx: last_char_idx,
+                    visual_pos: last_pos,
+                    virtual_lines: 0,
+                    kind: VisualBlockOffsetSeekKind::FormatterFallback,
+                    plain_seek_support,
+                };
+            }
+            Ordering::Greater => {
+                return VisualBlockOffsetResult {
+                    char_idx: last_char_idx,
+                    visual_pos: last_pos,
+                    virtual_lines: row - last_row,
+                    kind: VisualBlockOffsetSeekKind::FormatterFallback,
+                    plain_seek_support,
+                };
+            }
+            Ordering::Less => {
+                if !grapheme.is_virtual() {
+                    last_row = grapheme.visual_pos.row;
+                    last_char_idx = grapheme.char_idx;
+                    last_pos = grapheme.visual_pos;
+                }
+            }
+        }
+    }
+
+    VisualBlockOffsetResult {
+        char_idx: formatter.next_char_pos(),
+        visual_pos: formatter.next_visual_pos(),
+        virtual_lines: 0,
+        kind: VisualBlockOffsetSeekKind::FormatterFallback,
+        plain_seek_support,
+    }
+}
+
+pub fn char_idx_and_visual_offset_at_visual_block_offset(
+    text: RopeSlice,
+    anchor: usize,
+    row: usize,
+    column: usize,
+    text_fmt: &TextFormat,
+    annotations: &TextAnnotations,
+) -> (usize, Position, usize) {
+    let result = char_idx_and_visual_offset_at_visual_block_offset_with_kind(
+        text,
+        anchor,
+        row,
+        column,
+        text_fmt,
+        annotations,
+    );
+    (result.char_idx, result.visual_pos, result.virtual_lines)
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -416,37 +840,15 @@ pub fn char_idx_at_visual_block_offset(
     text_fmt: &TextFormat,
     annotations: &TextAnnotations,
 ) -> (usize, usize) {
-    let mut formatter =
-        DocumentFormatter::new_at_prev_checkpoint(text, text_fmt, annotations, anchor);
-    let mut last_char_idx = formatter.next_char_pos();
-    let mut found_non_virtual_on_row = false;
-    let mut last_row = 0;
-    for grapheme in &mut formatter {
-        match grapheme.visual_pos.row.cmp(&row) {
-            Ordering::Equal => {
-                if grapheme.visual_pos.col + grapheme.width() > column {
-                    if !grapheme.is_virtual() {
-                        return (grapheme.char_idx, 0);
-                    } else if found_non_virtual_on_row {
-                        return (last_char_idx, 0);
-                    }
-                } else if !grapheme.is_virtual() {
-                    found_non_virtual_on_row = true;
-                    last_char_idx = grapheme.char_idx;
-                }
-            }
-            Ordering::Greater if found_non_virtual_on_row => return (last_char_idx, 0),
-            Ordering::Greater => return (last_char_idx, row - last_row),
-            Ordering::Less => {
-                if !grapheme.is_virtual() {
-                    last_row = grapheme.visual_pos.row;
-                    last_char_idx = grapheme.char_idx;
-                }
-            }
-        }
-    }
-
-    (formatter.next_char_pos(), 0)
+    let (char_idx, _, virtual_lines) = char_idx_and_visual_offset_at_visual_block_offset(
+        text,
+        anchor,
+        row,
+        column,
+        text_fmt,
+        annotations,
+    );
+    (char_idx, virtual_lines)
 }
 
 #[cfg(test)]
@@ -506,6 +908,11 @@ mod test {
         assert_eq!(coords_at_pos(slice, 0), (0, 0).into());
         assert_eq!(coords_at_pos(slice, 1), (0, 1).into());
         assert_eq!(coords_at_pos(slice, 2), (0, 2).into());
+
+        // Test ASCII fast path on long single lines.
+        let text = Rope::from("a".repeat(16_384));
+        let slice = text.slice(..);
+        assert_eq!(coords_at_pos(slice, 16_384), (0, 16_384).into());
     }
 
     #[test]
@@ -680,6 +1087,189 @@ mod test {
             visual_offset_from_block(slice, 0, 2, &text_fmt, &annot).0,
             (0, 5).into()
         );
+    }
+
+    #[test]
+    fn char_idx_and_visual_offset_fast_path_plain_ascii_line() {
+        let text = Rope::from("abcdef\n");
+        let slice = text.slice(..);
+        let annotations = TextAnnotations::default();
+        let fmt = TextFormat::default();
+
+        let (char_idx, visual_pos, virtual_lines) =
+            char_idx_and_visual_offset_at_visual_block_offset(
+                slice,
+                0,
+                0,
+                4,
+                &fmt,
+                &annotations,
+            );
+
+        assert_eq!(char_idx, 4);
+        assert_eq!(visual_pos, Position::new(0, 4));
+        assert_eq!(virtual_lines, 0);
+    }
+
+    #[test]
+    fn char_idx_and_visual_offset_fast_path_handles_tabs() {
+        let text = Rope::from("\tabc\n");
+        let slice = text.slice(..);
+        let annotations = TextAnnotations::default();
+        let fmt = TextFormat::default();
+
+        let (char_idx, visual_pos, virtual_lines) =
+            char_idx_and_visual_offset_at_visual_block_offset(
+                slice,
+                0,
+                0,
+                2,
+                &fmt,
+                &annotations,
+            );
+
+        assert_eq!(char_idx, 0);
+        assert_eq!(visual_pos, Position::new(0, 0));
+        assert_eq!(virtual_lines, 0);
+
+        let (char_idx, visual_pos, virtual_lines) =
+            char_idx_and_visual_offset_at_visual_block_offset(
+                slice,
+                0,
+                0,
+                4,
+                &fmt,
+                &annotations,
+            );
+
+        assert_eq!(char_idx, 1);
+        assert_eq!(visual_pos, Position::new(0, 4));
+        assert_eq!(virtual_lines, 0);
+    }
+
+    #[test]
+    fn char_idx_and_visual_offset_fast_path_skips_large_ascii_prefix() {
+        let text = Rope::from(format!("{}{}\n", "a".repeat(200_000), "\txyz"));
+        let slice = text.slice(..);
+        let annotations = TextAnnotations::default();
+        let fmt = TextFormat::default();
+
+        let (char_idx, visual_pos, virtual_lines) =
+            char_idx_and_visual_offset_at_visual_block_offset(
+                slice,
+                0,
+                0,
+                150_000,
+                &fmt,
+                &annotations,
+            );
+
+        assert_eq!(char_idx, 150_000);
+        assert_eq!(visual_pos, Position::new(0, 150_000));
+        assert_eq!(virtual_lines, 0);
+    }
+
+    #[test]
+    fn plain_visual_col_at_char_idx_fast_path_plain_ascii_line() {
+        let text = Rope::from("abcdef\n");
+        let slice = text.slice(..);
+
+        assert_eq!(plain_visual_col_at_char_idx(slice, 0, 4), 0);
+        assert_eq!(plain_visual_col_at_char_idx(slice, 4, 4), 4);
+        assert_eq!(plain_visual_col_at_char_idx(slice, 6, 4), 6);
+    }
+
+    #[test]
+    fn plain_visual_col_at_char_idx_fast_path_handles_tabs() {
+        let text = Rope::from("\tabc\tz\n");
+        let slice = text.slice(..);
+
+        assert_eq!(plain_visual_col_at_char_idx(slice, 0, 4), 0);
+        assert_eq!(plain_visual_col_at_char_idx(slice, 1, 4), 4);
+        assert_eq!(plain_visual_col_at_char_idx(slice, 4, 4), 7);
+        assert_eq!(plain_visual_col_at_char_idx(slice, 5, 4), 8);
+    }
+
+    #[test]
+    fn char_idx_and_visual_offset_fast_path_ignores_irrelevant_line_annotations() {
+        struct EmptyLineAnnotation;
+
+        impl crate::text_annotations::LineAnnotation for EmptyLineAnnotation {
+            fn insert_virtual_lines(
+                &mut self,
+                _line_end_char_idx: usize,
+                _line_end_visual_pos: Position,
+                _doc_line: usize,
+            ) -> Position {
+                Position::default()
+            }
+        }
+
+        let text = Rope::from("abcdef\n");
+        let slice = text.slice(..);
+        let mut annotations = TextAnnotations::default();
+        annotations.add_line_annotation(Box::new(EmptyLineAnnotation));
+        let fmt = TextFormat::default();
+
+        let result = char_idx_and_visual_offset_at_visual_block_offset_with_kind(
+            slice,
+            0,
+            0,
+            4,
+            &fmt,
+            &annotations,
+        );
+
+        assert_eq!(result.kind, VisualBlockOffsetSeekKind::PlainFastPath);
+        assert_eq!(result.char_idx, 4);
+        assert_eq!(result.visual_pos, Position::new(0, 4));
+        assert_eq!(result.virtual_lines, 0);
+    }
+
+    #[test]
+    fn char_idx_and_visual_offset_fast_path_ignores_inline_annotations_after_target() {
+        let text = Rope::from("abcdefghijklmnopqrstuvwxyz\n");
+        let slice = text.slice(..);
+        let inline = [crate::text_annotations::InlineAnnotation::new(20, "hint")];
+        let mut annotations = TextAnnotations::default();
+        annotations.add_inline_annotations(&inline, None);
+        let fmt = TextFormat::default();
+
+        let result = char_idx_and_visual_offset_at_visual_block_offset_with_kind(
+            slice,
+            0,
+            0,
+            8,
+            &fmt,
+            &annotations,
+        );
+
+        assert_eq!(result.kind, VisualBlockOffsetSeekKind::PlainFastPath);
+        assert_eq!(result.char_idx, 8);
+        assert_eq!(result.visual_pos, Position::new(0, 8));
+    }
+
+    #[test]
+    fn char_idx_and_visual_offset_fast_path_ignores_overlays_after_target() {
+        let text = Rope::from("abcdefghijklmnopqrstuvwxyz\n");
+        let slice = text.slice(..);
+        let overlays = [crate::text_annotations::Overlay::new(18, "X")];
+        let mut annotations = TextAnnotations::default();
+        annotations.add_overlay(&overlays, None);
+        let fmt = TextFormat::default();
+
+        let result = char_idx_and_visual_offset_at_visual_block_offset_with_kind(
+            slice,
+            0,
+            0,
+            6,
+            &fmt,
+            &annotations,
+        );
+
+        assert_eq!(result.kind, VisualBlockOffsetSeekKind::PlainFastPath);
+        assert_eq!(result.char_idx, 6);
+        assert_eq!(result.visual_pos, Position::new(0, 6));
     }
     #[test]
     fn test_pos_at_coords() {

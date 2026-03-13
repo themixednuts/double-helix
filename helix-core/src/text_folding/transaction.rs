@@ -32,14 +32,14 @@ impl FoldContainer {
         let disturbed = self.disturbed_folds(old_text, transaction);
         let mut sort = !disturbed.is_empty();
 
-        self.delete(disturbed);
+        self.delete(&disturbed);
 
         self.update(new_text, transaction.changes());
 
         let removables = self.normalize(new_text);
         sort |= !removables.is_empty();
 
-        self.delete(removables);
+        self.delete(&removables);
 
         if sort {
             self.sort_end_points();

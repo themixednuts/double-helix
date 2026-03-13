@@ -144,9 +144,17 @@ fn find_pair(
     if node.child_count() != 0 {
         return None;
     }
-    let node_start = doc.byte_to_char(node.start_byte() as usize);
-    let node_text = doc.byte_slice(node.start_byte() as usize..node.end_byte() as usize);
-    find_matching_bracket_plaintext(node_text, pos_ - node_start).map(|pos| pos + node_start)
+    let start_byte = node.start_byte() as usize;
+    let end_byte = node.end_byte() as usize;
+    if start_byte > end_byte || end_byte > doc.len_bytes() {
+        return find_matching_bracket_plaintext(doc, pos_);
+    }
+    let Ok(node_start) = doc.try_byte_to_char(start_byte) else {
+        return find_matching_bracket_plaintext(doc, pos_);
+    };
+    let node_text = doc.byte_slice(start_byte..end_byte);
+    find_matching_bracket_plaintext(node_text, pos_.saturating_sub(node_start))
+        .map(|pos| pos + node_start)
 }
 
 /// Returns the position of the matching bracket under cursor.

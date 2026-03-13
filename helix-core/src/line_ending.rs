@@ -6,7 +6,7 @@ pub const NATIVE_LINE_ENDING: LineEnding = LineEnding::Crlf;
 pub const NATIVE_LINE_ENDING: LineEnding = LineEnding::LF;
 
 /// Represents one of the valid Unicode line endings.
-#[derive(PartialEq, Eq, Copy, Clone, Debug)]
+#[derive(PartialEq, Eq, Copy, Clone, Debug, Hash)]
 pub enum LineEnding {
     Crlf, // CarriageReturn followed by LineFeed
     LF,   // U+000A -- LineFeed

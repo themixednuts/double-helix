@@ -223,18 +223,12 @@ impl EndFoldPoint {
     }
 
     /// Returns the last line of the block.
+    ///
+    /// Always excludes the target's line so closing context
+    /// (e.g. `}`, `} satisfies Config;`) remains visible after folding.
     fn block_line(&self, text: RopeSlice) -> usize {
-        let truncate = text
-            .graphemes_at(text.char_to_byte(self.target))
-            .skip({
-                let end_char = line_end_char_index(&text, text.char_to_line(self.target));
-                (self.target != end_char) as usize
-            })
-            .take_while(|&g| !rope_is_line_ending(g))
-            .flat_map(|g| g.chars())
-            .any(|c| !c.is_whitespace());
-
-        text.char_to_line(self.target) - truncate as usize
+        let target_line = text.char_to_line(self.target);
+        target_line.saturating_sub(1)
     }
 
     /// Sets `byte`, `char`, `line` fields.
@@ -354,7 +348,7 @@ impl FoldContainer {
         self.sort_start_points();
 
         let deletables = self.normalize(text);
-        self.delete(deletables);
+        self.delete(&deletables);
 
         self.sort_end_points();
         self.set_super_links();
@@ -398,7 +392,7 @@ impl FoldContainer {
                 efp.target = max(efp.target, fold.end.target);
             }
 
-            self.remove(text, overlappables);
+            self.remove(text, &overlappables);
         }
 
         self.add(text, points);
@@ -407,11 +401,11 @@ impl FoldContainer {
     /// Removes folds from the container for the passed `start_indices`.
     /// # Invariant
     /// Start indices must be sorted and unique.
-    pub fn remove(&mut self, text: RopeSlice, start_indices: Vec<usize>) {
+    pub fn remove(&mut self, text: RopeSlice, start_indices: &[usize]) {
         self.delete(start_indices);
 
         let removables = self.normalize(text);
-        self.delete(removables);
+        self.delete(&removables);
 
         self.sort_end_points();
         self.set_super_links();
@@ -457,7 +451,7 @@ impl FoldContainer {
         removables.sort();
         removables.dedup();
 
-        self.remove(text, removables);
+        self.remove(text, &removables);
     }
 
     /// Moves the left side of `range` to the start of the header if it is contained in the fold.
@@ -713,8 +707,8 @@ impl FoldContainer {
     /// # Attention
     /// It is service method.
     /// It is probably not the method you want to use; see `remove` method.
-    fn delete(&mut self, start_indices: Vec<usize>) {
-        for start_idx in start_indices.into_iter().rev() {
+    fn delete(&mut self, start_indices: &[usize]) {
+        for &start_idx in start_indices.iter().rev() {
             let end_idx = self.start_points[start_idx].link;
 
             // remove start point

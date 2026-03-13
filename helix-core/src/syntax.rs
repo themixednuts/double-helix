@@ -34,7 +34,8 @@ use crate::{indent::IndentQuery, tree_sitter, ChangeSet, Language};
 pub use tree_house::{
     highlighter::{Highlight, HighlightEvent},
     query_iter::QueryIterEvent,
-    Error as HighlighterError, LanguageLoader, TreeCursor, TREE_SITTER_MATCH_LIMIT,
+    Error as HighlighterError, LanguageLoader, TraceContext as SyntaxTraceContext,
+    TraceGuard as SyntaxTraceGuard, TreeCursor, TREE_SITTER_MATCH_LIMIT,
 };
 
 #[derive(Debug)]
@@ -516,11 +517,22 @@ pub struct Syntax {
     inner: tree_house::Syntax,
 }
 
-const PARSE_TIMEOUT: Duration = Duration::from_millis(500); // half a second is pretty generous
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SyntaxComplexity {
+    pub total_layers: usize,
+    pub root_injections: usize,
+}
+
+pub const INTERACTIVE_PARSE_TIMEOUT: Duration = Duration::from_millis(12);
+pub const IDLE_PARSE_TIMEOUT: Duration = Duration::from_millis(500);
 
 impl Syntax {
+    pub fn enter_trace(ctx: SyntaxTraceContext) -> SyntaxTraceGuard {
+        tree_house::enter_trace(ctx)
+    }
+
     pub fn new(source: RopeSlice, language: Language, loader: &Loader) -> Result<Self, Error> {
-        let inner = tree_house::Syntax::new(source, language, PARSE_TIMEOUT, loader)?;
+        let inner = tree_house::Syntax::new(source, language, IDLE_PARSE_TIMEOUT, loader)?;
         Ok(Self { inner })
     }
 
@@ -531,12 +543,32 @@ impl Syntax {
         changeset: &ChangeSet,
         loader: &Loader,
     ) -> Result<(), Error> {
+        self.update_with_timeout(old_source, source, changeset, loader, IDLE_PARSE_TIMEOUT)
+    }
+
+    pub fn update_with_timeout(
+        &mut self,
+        old_source: RopeSlice,
+        source: RopeSlice,
+        changeset: &ChangeSet,
+        loader: &Loader,
+        timeout: Duration,
+    ) -> Result<(), Error> {
         let edits = generate_edits(old_source, changeset);
         if edits.is_empty() {
             Ok(())
         } else {
-            self.inner.update(source, PARSE_TIMEOUT, &edits, loader)
+            self.inner.update(source, timeout, &edits, loader)
         }
+    }
+
+    pub fn refresh_with_timeout(
+        &mut self,
+        source: RopeSlice,
+        loader: &Loader,
+        timeout: Duration,
+    ) -> Result<(), Error> {
+        self.inner.update(source, timeout, &[], loader)
     }
 
     pub fn layer(&self, layer: Layer) -> &tree_house::LayerData {
@@ -569,6 +601,13 @@ impl Syntax {
 
     pub fn root_language(&self) -> Language {
         self.layer(self.root_layer()).language
+    }
+
+    pub fn complexity(&self) -> SyntaxComplexity {
+        SyntaxComplexity {
+            total_layers: self.inner.layer_count(),
+            root_injections: self.inner.root_injection_count(),
+        }
     }
 
     pub fn tree(&self) -> &Tree {

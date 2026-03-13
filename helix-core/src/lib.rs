@@ -33,6 +33,7 @@ pub mod text_folding;
 pub mod textobject;
 mod transaction;
 pub mod uri;
+pub mod versioned;
 pub mod wrap;
 
 pub mod unicode {
@@ -57,8 +58,12 @@ pub type Tendril = SmartString<smartstring::LazyCompact>;
 pub use {regex, tree_house::tree_sitter};
 
 pub use position::{
-    char_idx_at_visual_offset, coords_at_pos, pos_at_coords, softwrapped_dimensions,
-    visual_offset_from_anchor, visual_offset_from_block, Position, VisualOffsetError,
+    char_idx_and_visual_offset_at_visual_block_offset,
+    char_idx_and_visual_offset_at_visual_block_offset_with_kind, char_idx_at_visual_offset,
+    coords_at_pos, plain_visual_col_at_char_idx, pos_at_coords, softwrapped_dimensions,
+    visual_offset_from_anchor, visual_offset_from_block, visual_offset_from_block_with_metrics,
+    Position, VisualBlockOffsetResult, VisualBlockOffsetSeekKind, VisualOffsetError,
+    VisualOffsetFromBlockMetrics, VisualOffsetFromBlockResult,
 };
 #[allow(deprecated)]
 pub use position::{pos_at_visual_coords, visual_coords_at_pos};
@@ -74,5 +79,6 @@ pub use line_ending::{LineEnding, NATIVE_LINE_ENDING};
 pub use transaction::{Assoc, Change, ChangeSet, Deletion, Operation, Transaction};
 
 pub use uri::Uri;
+pub use versioned::Versioned;
 
 pub use tree_house::Language;

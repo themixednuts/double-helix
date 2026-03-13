@@ -181,6 +181,8 @@ pub struct DocumentFormatter<'t> {
     char_pos: usize,
     /// The line pos of the `graphemes` iter used for inserting annotations
     line_pos: usize,
+    /// The char index at the start of the current document line.
+    line_start_char: usize,
     exhausted: bool,
 
     inline_annotation_graphemes: Option<(Graphemes<'t>, Option<Highlight>)>,
@@ -197,9 +199,84 @@ pub struct DocumentFormatter<'t> {
     word_buf: Vec<GraphemeWithSource<'t>>,
     /// The index of the next grapheme that will be yielded from the `word_buf`
     word_i: usize,
+    stats: DocumentFormatterStats,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DocumentFormatterStats {
+    pub next_calls: usize,
+    pub advance_grapheme_calls: usize,
+    pub inline_annotation_hits: usize,
+    pub overlay_hits: usize,
+    pub fold_skip_count: usize,
+    pub folded_chars_skipped: usize,
+    pub word_refills: usize,
+    pub skip_to_next_line_calls: usize,
+    pub yielded_document: usize,
+    pub yielded_virtual: usize,
+    pub yielded_newlines: usize,
+    pub yielded_eof: usize,
+}
+
+pub enum HorizontalLineSeekResult<'t> {
+    Visible(FormattedGrapheme<'t>),
+    LineEnded {
+        next_grapheme: Option<FormattedGrapheme<'t>>,
+        next_char_idx: usize,
+        line_end_col: usize,
+    },
 }
 
 impl<'t> DocumentFormatter<'t> {
+    pub fn reset_to_checkpoint(
+        &mut self,
+        char_idx: usize,
+        visual_pos: Position,
+    ) {
+        let char_idx = char_idx.min(self.text.len_chars());
+        let line_idx = self.text.char_to_line(char_idx);
+        self.annotations.reset_pos(char_idx);
+        self.visual_pos = visual_pos;
+        self.graphemes = self.text.slice(char_idx..).graphemes();
+        self.char_pos = char_idx;
+        self.line_pos = line_idx;
+        self.line_start_char = self.text.line_to_char(line_idx);
+        self.exhausted = false;
+        self.inline_annotation_graphemes = None;
+        self.indent_level = None;
+        self.peeked_grapheme = None;
+        self.word_buf.clear();
+        self.word_i = 0;
+    }
+
+    pub fn new_at_checkpoint(
+        text: RopeSlice<'t>,
+        text_fmt: &'t TextFormat,
+        annotations: &'t TextAnnotations,
+        char_idx: usize,
+        visual_pos: Position,
+    ) -> Self {
+        let mut formatter = DocumentFormatter {
+            text,
+            text_fmt,
+            annotations,
+            visual_pos: Position::default(),
+            graphemes: text.slice(char_idx..).graphemes(),
+            char_pos: 0,
+            exhausted: false,
+            indent_level: None,
+            peeked_grapheme: None,
+            word_buf: Vec::with_capacity(64),
+            word_i: 0,
+            stats: DocumentFormatterStats::default(),
+            line_pos: 0,
+            line_start_char: 0,
+            inline_annotation_graphemes: None,
+        };
+        formatter.reset_to_checkpoint(char_idx, visual_pos);
+        formatter
+    }
+
     /// Creates a new formatter at the last block before `char_idx`.
     /// A block is a chunk which always ends with a linebreak.
     /// This is usually just a normal line break.
@@ -224,21 +301,13 @@ impl<'t> DocumentFormatter<'t> {
         let block_char_idx = text.line_to_char(block_line_idx);
         annotations.reset_pos(block_char_idx);
 
-        DocumentFormatter {
+        Self::new_at_checkpoint(
             text,
             text_fmt,
             annotations,
-            visual_pos: Position { row: 0, col: 0 },
-            graphemes: text.slice(block_char_idx..).graphemes(),
-            char_pos: block_char_idx,
-            exhausted: false,
-            indent_level: None,
-            peeked_grapheme: None,
-            word_buf: Vec::with_capacity(64),
-            word_i: 0,
-            line_pos: block_line_idx,
-            inline_annotation_graphemes: None,
-        }
+            block_char_idx,
+            Position { row: 0, col: 0 },
+        )
     }
 
     fn next_inline_annotation_grapheme(
@@ -272,19 +341,24 @@ impl<'t> DocumentFormatter<'t> {
         col: usize,
         mut char_pos: usize,
     ) -> Option<GraphemeWithSource<'t>> {
+        self.stats.advance_grapheme_calls += 1;
         if let Some(folded_chars) = self.skip_folded_chars(char_pos) {
             char_pos += folded_chars;
         }
 
         let (grapheme, source) =
             if let Some((grapheme, highlight)) = self.next_inline_annotation_grapheme(char_pos) {
+                self.stats.inline_annotation_hits += 1;
                 (grapheme.into(), GraphemeSource::VirtualText { highlight })
             } else if let Some(grapheme) = self.graphemes.next() {
                 let codepoints = grapheme.len_chars() as u32;
 
                 let overlay = self.annotations.overlay_at(char_pos);
                 let grapheme = match overlay {
-                    Some((overlay, _)) => overlay.grapheme.as_str().into(),
+                    Some((overlay, _)) => {
+                        self.stats.overlay_hits += 1;
+                        overlay.grapheme.as_str().into()
+                    }
                     None => Cow::from(grapheme).into(),
                 };
 
@@ -318,6 +392,8 @@ impl<'t> DocumentFormatter<'t> {
                     fold.end.line - fold.start.line + 1,
                 )
             })?;
+        self.stats.fold_skip_count += 1;
+        self.stats.folded_chars_skipped += folded_chars;
 
         if char_pos + folded_chars < self.text.len_chars() {
             self.graphemes = self.text.slice(char_pos + folded_chars..).graphemes();
@@ -328,6 +404,7 @@ impl<'t> DocumentFormatter<'t> {
 
         self.char_pos += folded_chars;
         self.line_pos += folded_lines;
+        self.line_start_char = self.text.line_to_char(self.line_pos);
 
         Some(folded_chars)
     }
@@ -382,6 +459,7 @@ impl<'t> DocumentFormatter<'t> {
     }
 
     fn advance_to_next_word(&mut self) {
+        self.stats.word_refills += 1;
         self.word_buf.clear();
         let mut word_width = 0;
         let mut word_chars = 0;
@@ -444,6 +522,53 @@ impl<'t> DocumentFormatter<'t> {
         }
     }
 
+    /// Skip to the start of the next document line without yielding graphemes.
+    /// Only valid in no-softwrap mode. Returns the char index of the next line,
+    /// or `None` if at the end of the document.
+    ///
+    /// This is an optimization for long lines: instead of iterating every grapheme
+    /// past the viewport right edge, we jump directly to the next line boundary.
+    pub fn skip_to_next_line(&mut self) -> Option<usize> {
+        self.stats.skip_to_next_line_calls += 1;
+        debug_assert!(
+            !self.text_fmt.soft_wrap,
+            "skip_to_next_line is only valid without soft-wrap"
+        );
+        let next_line = self.line_pos + 1;
+        if next_line >= self.text.len_lines() {
+            self.exhausted = true;
+            self.char_pos = self.text.len_chars();
+            self.graphemes = RopeSlice::from("").graphemes();
+            self.inline_annotation_graphemes = None;
+            return None;
+        }
+        let next_line_char = self.text.line_to_char(next_line);
+        let virtual_lines = if self.annotations.is_empty() {
+            0
+        } else {
+            // Account for virtual lines after the newline (e.g. diagnostics, inlay hints).
+            self.annotations.virtual_lines_at(
+                next_line_char,
+                Position {
+                    row: self.visual_pos.row,
+                    col: 1,
+                },
+                self.line_pos,
+            )
+        };
+        self.char_pos = next_line_char;
+        self.line_pos = next_line;
+        self.line_start_char = next_line_char;
+        self.visual_pos.row += 1 + virtual_lines;
+        self.visual_pos.col = 0;
+        self.graphemes = self.text.slice(next_line_char..).graphemes();
+        self.inline_annotation_graphemes = None;
+        if !self.annotations.is_empty() {
+            self.annotations.reset_pos(next_line_char);
+        }
+        Some(next_line_char)
+    }
+
     /// returns the char index at the end of the last yielded grapheme
     pub fn next_char_pos(&self) -> usize {
         self.char_pos
@@ -452,12 +577,55 @@ impl<'t> DocumentFormatter<'t> {
     pub fn next_visual_pos(&self) -> Position {
         self.visual_pos
     }
+
+    pub fn stats(&self) -> DocumentFormatterStats {
+        self.stats
+    }
+
+    pub fn seek_to_visual_col_in_current_line(
+        &mut self,
+        mut grapheme: FormattedGrapheme<'t>,
+        target_col: usize,
+    ) -> HorizontalLineSeekResult<'t> {
+        debug_assert!(
+            !self.text_fmt.soft_wrap,
+            "seek_to_visual_col_in_current_line is only valid without soft-wrap"
+        );
+        let visual_row = grapheme.visual_pos.row;
+        let mut line_end_col = grapheme.visual_pos.col + grapheme.width();
+
+        loop {
+            if grapheme.visual_pos.col + grapheme.width() > target_col {
+                return HorizontalLineSeekResult::Visible(grapheme);
+            }
+
+            let Some(next_grapheme) = self.next() else {
+                return HorizontalLineSeekResult::LineEnded {
+                    next_grapheme: None,
+                    next_char_idx: self.next_char_pos(),
+                    line_end_col,
+                };
+            };
+
+            if next_grapheme.visual_pos.row != visual_row {
+                return HorizontalLineSeekResult::LineEnded {
+                    next_grapheme: Some(next_grapheme),
+                    next_char_idx: self.next_char_pos(),
+                    line_end_col,
+                };
+            }
+
+            line_end_col = next_grapheme.visual_pos.col + next_grapheme.width();
+            grapheme = next_grapheme;
+        }
+    }
 }
 
 impl<'t> Iterator for DocumentFormatter<'t> {
     type Item = FormattedGrapheme<'t>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        self.stats.next_calls += 1;
         let grapheme = if self.text_fmt.soft_wrap {
             if self.word_i >= self.word_buf.len() {
                 self.advance_to_next_word();
@@ -481,6 +649,18 @@ impl<'t> Iterator for DocumentFormatter<'t> {
             char_idx: self.char_pos,
         };
 
+        if grapheme.is_virtual() {
+            self.stats.yielded_virtual += 1;
+        } else {
+            self.stats.yielded_document += 1;
+            if grapheme.source.is_eof() {
+                self.stats.yielded_eof += 1;
+            }
+        }
+        if grapheme.raw == Grapheme::Newline {
+            self.stats.yielded_newlines += 1;
+        }
+
         self.char_pos += grapheme.doc_chars();
         if !grapheme.is_virtual() {
             self.annotations.process_virtual_text_anchors(&grapheme);
@@ -495,6 +675,7 @@ impl<'t> Iterator for DocumentFormatter<'t> {
             self.visual_pos.col = 0;
             if !grapheme.is_virtual() {
                 self.line_pos += 1;
+                self.line_start_char = self.char_pos;
             }
         } else {
             self.visual_pos.col += grapheme.width();

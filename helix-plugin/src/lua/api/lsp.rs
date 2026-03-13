@@ -7,7 +7,7 @@ pub fn register_lsp_api(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
     // helix.lsp.get_clients() - Get active LSP clients for current buffer
     let get_clients = lua.create_function(|lua, ()| {
         let editor = crate::lua::get_editor_mut()?;
-        let (_, _doc) = helix_view::current_ref!(editor);
+        let (_, _doc) = helix_view::focused_ref!(editor);
 
         let clients = lua.create_table()?;
         // This is a bit complex as we need to find which clients are attached to the doc

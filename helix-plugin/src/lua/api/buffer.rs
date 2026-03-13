@@ -103,7 +103,7 @@ impl LuaUserData for LuaBuffer {
             "insert",
             |_lua, this, (line, col, text): (usize, usize, String)| {
                 let editor = crate::lua::get_editor_mut()?;
-                let (view, doc) = helix_view::current!(editor);
+                let (view_id, doc) = helix_view::focused!(editor);
 
                 // For now, only support current doc
                 if doc.id() != this.document_id {
@@ -122,7 +122,7 @@ impl LuaUserData for LuaBuffer {
                     text_rope,
                     std::iter::once((offset, offset, Some(text.into()))),
                 );
-                doc.apply(&transaction, view.id);
+                doc.apply(&transaction, view_id);
 
                 Ok(())
             },
@@ -135,7 +135,7 @@ impl LuaUserData for LuaBuffer {
              this,
              (start_line, start_col, end_line, end_col): (usize, usize, usize, usize)| {
                 let editor = crate::lua::get_editor_mut()?;
-                let (view, doc) = helix_view::current!(editor);
+                let (view_id, doc) = helix_view::focused!(editor);
 
                 // For now, only support current doc
                 if doc.id() != this.document_id {
@@ -160,7 +160,7 @@ impl LuaUserData for LuaBuffer {
                     text_rope,
                     std::iter::once((start_offset, end_offset, None)),
                 );
-                doc.apply(&transaction, view.id);
+                doc.apply(&transaction, view_id);
 
                 Ok(())
             },
@@ -173,13 +173,12 @@ impl LuaUserData for LuaBuffer {
                 LuaError::RuntimeError(format!("Buffer {:?} no longer exists", this.document_id))
             })?;
 
-            let (view, current_doc): (&helix_view::View, &helix_view::Document) =
-                helix_view::current_ref!(editor);
+            let (view_id, current_doc) = helix_view::focused_ref!(editor);
             if current_doc.id() != this.document_id {
                 return lua.create_table();
             }
 
-            let selection = doc.selection(view.id);
+            let selection = doc.selection(view_id);
             let selections = lua.create_table()?;
             for (i, range) in selection.iter().enumerate() {
                 let s = lua.create_table()?;
@@ -209,7 +208,7 @@ impl LuaUserData for LuaBuffer {
             "set_annotations",
             |_lua, this, annotations: Vec<LuaPluginAnnotation>| {
                 let editor = crate::lua::get_editor_mut()?;
-                let (view, doc) = helix_view::current!(editor);
+                let (view_id, doc) = helix_view::focused!(editor);
 
                 // For now, only support current doc
                 if doc.id() != this.document_id {
@@ -233,7 +232,7 @@ impl LuaUserData for LuaBuffer {
                     })
                     .collect();
 
-                doc.plugin_annotations.insert(view.id, plugin_annots);
+                doc.set_plugin_annotations(view_id, plugin_annots);
                 Ok(())
             },
         );
@@ -241,14 +240,14 @@ impl LuaUserData for LuaBuffer {
         // Get cursor position (char index)
         methods.add_method("get_cursor", |_lua, this, ()| {
             let editor = crate::lua::get_editor_mut()?;
-            let (view, doc) = helix_view::current!(editor);
+            let (view_id, doc) = helix_view::focused!(editor);
             if doc.id() != this.document_id {
                 return Err(LuaError::RuntimeError(
                     "Current view is not showing this buffer".into(),
                 ));
             }
             let cursor = doc
-                .selection(view.id)
+                .selection(view_id)
                 .primary()
                 .cursor(doc.text().slice(..));
             Ok(cursor)
@@ -468,8 +467,7 @@ pub fn register_buffer_api(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
     // helix.buffer.get_current() - Get current buffer
     let get_current = lua.create_function(|_lua, ()| {
         let editor = crate::lua::get_editor_mut()?;
-        let (_view, doc): (&helix_view::View, &helix_view::Document) =
-            helix_view::current_ref!(editor);
+        let (_view_id, doc) = helix_view::focused_ref!(editor);
         Ok(LuaBuffer::new(doc.id()))
     })?;
     buffer_module.set("get_current", get_current)?;

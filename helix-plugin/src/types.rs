@@ -216,7 +216,8 @@ pub trait EditorCommandRegistry: Send + Sync {
 /// Wrapper for EditorCommandRegistry to store in Lua app data
 pub struct CommandRegistryWrapper(pub std::sync::Arc<dyn EditorCommandRegistry>);
 
-/// Interface for handling UI elements (prompts, pickers) that require compositor access
+/// Interface for handling UI elements (prompts, pickers, panels) that require compositor access.
+#[allow(clippy::too_many_arguments)]
 pub trait UiHandler: Send + Sync {
     fn prompt(
         &self,
@@ -241,6 +242,18 @@ pub trait UiHandler: Send + Sync {
         plugin_name: String,
         callback_id: u64,
     );
+    fn register_panel(
+        &self,
+        editor: &mut helix_view::Editor,
+        plugin_name: String,
+        panel_id: String,
+        title: String,
+        side: String,
+        width: u16,
+        render_callback_id: u64,
+        event_callback_id: Option<u64>,
+    );
+    fn remove_panel(&self, editor: &mut helix_view::Editor, plugin_name: String, panel_id: String);
 }
 
 /// Wrapper for UiHandler to store in Lua app data
@@ -255,3 +268,58 @@ pub struct UiCallbackRegistry(
 
 /// Wrapper for UI callback counter to store in Lua app data
 pub struct UiCallbackCounter(pub std::sync::Arc<std::sync::atomic::AtomicU64>);
+
+#[allow(clippy::too_many_arguments)]
+/// Abstraction over a drawing surface for plugin rendering.
+///
+/// helix-plugin defines this trait; helix-term provides the implementation
+/// wrapping `tui::buffer::Buffer`. This avoids helix-plugin depending on helix-tui.
+pub trait DrawSurface {
+    fn set_string(&mut self, x: u16, y: u16, text: &str, style: helix_view::graphics::Style);
+    fn set_stringn(
+        &mut self,
+        x: u16,
+        y: u16,
+        text: &str,
+        max_width: usize,
+        style: helix_view::graphics::Style,
+    );
+    fn clear_with(&mut self, area: helix_view::graphics::Rect, style: helix_view::graphics::Style);
+    fn set_style(&mut self, area: helix_view::graphics::Rect, style: helix_view::graphics::Style);
+
+    // Widget-level operations — delegate to the real widget functions.
+    fn header(
+        &mut self,
+        area: helix_view::graphics::Rect,
+        title: &str,
+        style: helix_view::graphics::Style,
+    );
+    fn header_with_counts(
+        &mut self,
+        area: helix_view::graphics::Rect,
+        title: &str,
+        current: usize,
+        total: usize,
+        style: helix_view::graphics::Style,
+    );
+    fn hdivider(&mut self, area: helix_view::graphics::Rect, style: helix_view::graphics::Style);
+    fn vdivider(&mut self, area: helix_view::graphics::Rect, style: helix_view::graphics::Style);
+    fn text_input(
+        &mut self,
+        area: helix_view::graphics::Rect,
+        text: &str,
+        cursor: usize,
+        style: helix_view::graphics::Style,
+        cursor_style: helix_view::graphics::Style,
+    ) -> (u16, u16);
+    fn scrollbar(
+        &mut self,
+        area: helix_view::graphics::Rect,
+        total: usize,
+        offset: usize,
+        visible: usize,
+        thumb_style: helix_view::graphics::Style,
+        track_symbol: Option<&str>,
+        track_style: helix_view::graphics::Style,
+    );
+}

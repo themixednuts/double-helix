@@ -26,6 +26,7 @@ pub mod types;
 // Re-exports
 pub use error::{PluginError, Result};
 pub use lua::LuaEngine;
+pub use mlua;
 pub use types::{
     EventData, EventType, IndividualPluginConfig, Plugin, PluginConfig, PluginEvent, PluginMetadata,
 };

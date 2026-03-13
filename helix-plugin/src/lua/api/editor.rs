@@ -83,10 +83,9 @@ pub fn register_editor_api(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
     // helix.editor.get_cursor() - Get cursor position
     let get_cursor = lua.create_function(|_lua, ()| {
         let editor = crate::lua::get_editor_mut()?;
-        let (view, doc): (&helix_view::View, &helix_view::Document) =
-            helix_view::current_ref!(editor);
+        let (view_id, doc) = helix_view::focused_ref!(editor);
         let cursor = doc
-            .selection(view.id)
+            .selection(view_id)
             .primary()
             .cursor(doc.text().slice(..));
         let row = doc.text().char_to_line(cursor);
@@ -99,14 +98,14 @@ pub fn register_editor_api(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
     // helix.editor.set_cursor(row, col) - Set cursor position
     let set_cursor = lua.create_function(|_lua, (row, col): (usize, usize)| {
         let editor = crate::lua::get_editor_mut()?;
-        let (view, doc) = helix_view::current!(editor);
+        let (view_id, doc) = helix_view::focused!(editor);
 
         let text = doc.text();
         let row = row.min(text.len_lines().saturating_sub(1));
         let offset = text.line_to_char(row) + col.min(text.line(row).len_chars());
 
         let selection = helix_core::Selection::point(offset);
-        doc.set_selection(view.id, selection);
+        doc.set_selection(view_id, selection);
 
         Ok(())
     })?;
@@ -140,9 +139,8 @@ pub fn register_editor_api(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
     // helix.editor.get_selections() - Get current selections
     let get_selections = lua.create_function(|lua, ()| {
         let editor = crate::lua::get_editor_mut()?;
-        let (view, doc): (&helix_view::View, &helix_view::Document) =
-            helix_view::current_ref!(editor);
-        let selection = doc.selection(view.id);
+        let (view_id, doc) = helix_view::focused_ref!(editor);
+        let selection = doc.selection(view_id);
         let selections = lua.create_table()?;
         for (i, range) in selection.iter().enumerate() {
             let s = lua.create_table()?;
@@ -157,8 +155,7 @@ pub fn register_editor_api(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
     // helix.editor.set_selections(selections) - Set current selections
     let set_selections = lua.create_function(|_lua, selections: Vec<LuaTable>| {
         let editor = crate::lua::get_editor_mut()?;
-        let (view, doc): (&mut helix_view::View, &mut helix_view::Document) =
-            helix_view::current!(editor);
+        let (view_id, doc) = helix_view::focused!(editor);
         let mut ranges = Vec::new();
         for s in selections {
             let anchor: usize = s.get("anchor")?;
@@ -167,7 +164,7 @@ pub fn register_editor_api(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
         }
         if !ranges.is_empty() {
             let selection = helix_core::Selection::new(ranges.into(), 0);
-            doc.set_selection(view.id, selection);
+            doc.set_selection(view_id, selection);
         }
         Ok(())
     })?;
@@ -250,7 +247,8 @@ pub fn register_editor_api(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
     // helix.editor.undo() - Undo last change
     let undo = lua.create_function(|_lua, ()| {
         let editor = crate::lua::get_editor_mut()?;
-        let (view, doc) = helix_view::current!(editor);
+        let (view_id, doc) = helix_view::focused!(editor);
+        let view = editor.tree.get_mut(view_id);
         Ok(doc.undo(view))
     })?;
     editor_module.set("undo", undo)?;
@@ -258,7 +256,8 @@ pub fn register_editor_api(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
     // helix.editor.redo() - Redo last undone change
     let redo = lua.create_function(|_lua, ()| {
         let editor = crate::lua::get_editor_mut()?;
-        let (view, doc) = helix_view::current!(editor);
+        let (view_id, doc) = helix_view::focused!(editor);
+        let view = editor.tree.get_mut(view_id);
         Ok(doc.redo(view))
     })?;
     editor_module.set("redo", redo)?;
@@ -266,10 +265,10 @@ pub fn register_editor_api(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
     // helix.editor.select_all() - Select all text
     let select_all = lua.create_function(|_lua, ()| {
         let editor = crate::lua::get_editor_mut()?;
-        let (view, doc) = helix_view::current!(editor);
+        let (view_id, doc) = helix_view::focused!(editor);
         let end = doc.text().len_chars();
         let selection = helix_core::Selection::single(0, end);
-        doc.set_selection(view.id, selection);
+        doc.set_selection(view_id, selection);
         Ok(())
     })?;
     editor_module.set("select_all", select_all)?;

@@ -9,12 +9,20 @@ use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 
+// Raw fat pointer for dyn DrawSurface stored as two usizes (data + vtable).
+struct RawSurfacePtr {
+    data: *mut (),
+    vtable: *const (),
+}
+
 thread_local! {
     static CURRENT_EDITOR: RefCell<Option<*mut Editor>> = const { RefCell::new(None) };
+    static CURRENT_SURFACE: RefCell<Option<RawSurfacePtr>> = const { RefCell::new(None) };
+    static CURRENT_THEME: RefCell<Option<*const helix_view::Theme>> = const { RefCell::new(None) };
 }
 
 /// Helper to set the current editor context during a function execution
-pub(crate) fn with_editor_context<F, R>(editor: &mut Editor, f: F) -> R
+pub fn with_editor_context<F, R>(editor: &mut Editor, f: F) -> R
 where
     F: FnOnce() -> R,
 {
@@ -39,6 +47,103 @@ pub(crate) fn get_editor_mut() -> std::result::Result<&'static mut Editor, mlua:
             )),
         }
     })
+}
+
+/// Read-only variant of [`with_editor_context`] for immutable render phases.
+///
+/// The editor pointer is stored as `*mut` in the thread-local (for compatibility
+/// with the existing Lua API), but the caller only provides `&Editor`, so Lua
+/// callbacks that attempt mutation through `get_editor_mut` invoke UB.
+///
+/// In practice, render callbacks should only read editor state (theme, config).
+/// This is a pragmatic bridge until the plugin system gains a proper read-only
+/// editor API.
+pub fn with_editor_context_ref<F, R>(editor: &Editor, f: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    // SAFETY: we store a *mut but the pointer is only valid for the duration
+    // of `f`. Lua render callbacks should only call read-only editor APIs.
+    let ptr = editor as *const Editor as *mut Editor;
+    CURRENT_EDITOR.with(|e| {
+        *e.borrow_mut() = Some(ptr);
+    });
+    let result = f();
+    CURRENT_EDITOR.with(|e| {
+        *e.borrow_mut() = None;
+    });
+    result
+}
+
+/// Set up surface + theme context for a Lua render callback.
+pub fn with_render_context<F, R>(
+    surface: &mut dyn crate::types::DrawSurface,
+    theme: &helix_view::Theme,
+    f: F,
+) -> R
+where
+    F: FnOnce() -> R,
+{
+    // Store the fat pointer as two raw pointers (data + vtable).
+    let fat: *mut dyn crate::types::DrawSurface = surface;
+    let raw = unsafe {
+        let parts: [*const (); 2] = std::mem::transmute(fat);
+        RawSurfacePtr {
+            data: parts[0] as *mut (),
+            vtable: parts[1],
+        }
+    };
+    CURRENT_SURFACE.with(|s| {
+        *s.borrow_mut() = Some(raw);
+    });
+    CURRENT_THEME.with(|t| {
+        *t.borrow_mut() = Some(theme as *const _);
+    });
+    let result = f();
+    CURRENT_SURFACE.with(|s| {
+        *s.borrow_mut() = None;
+    });
+    CURRENT_THEME.with(|t| {
+        *t.borrow_mut() = None;
+    });
+    result
+}
+
+pub(crate) fn get_surface_mut(
+) -> std::result::Result<&'static mut dyn crate::types::DrawSurface, mlua::Error> {
+    CURRENT_SURFACE.with(|s| {
+        let raw = s.borrow();
+        match &*raw {
+            Some(ptr) => {
+                let fat: *mut dyn crate::types::DrawSurface = unsafe {
+                    std::mem::transmute([ptr.data as *const (), ptr.vtable])
+                };
+                Ok(unsafe { &mut *fat })
+            }
+            None => Err(mlua::Error::RuntimeError(
+                "No active render context. Drawing functions can only be called from a panel render callback.".to_string(),
+            )),
+        }
+    })
+}
+
+pub(crate) fn get_theme() -> std::result::Result<&'static helix_view::Theme, mlua::Error> {
+    CURRENT_THEME.with(|t| {
+        let ptr = *t.borrow();
+        match ptr {
+            Some(p) => Ok(unsafe { &*p }),
+            None => Err(mlua::Error::RuntimeError(
+                "No active theme context.".to_string(),
+            )),
+        }
+    })
+}
+
+pub(crate) fn resolve_style(
+    scope: &str,
+) -> std::result::Result<helix_view::graphics::Style, mlua::Error> {
+    let theme = get_theme()?;
+    Ok(theme.get(scope))
 }
 
 pub mod api;
@@ -186,6 +291,7 @@ impl LuaEngine {
         api::register_window_api(&self.lua, &helix)?;
         api::register_lsp_api(&self.lua, &helix)?;
         api::register_log_api(&self.lua, &helix)?;
+        api::register_layout_api(&self.lua, &helix)?;
 
         // Register version info
         helix.set("version", env!("CARGO_PKG_VERSION"))?;
@@ -468,6 +574,11 @@ impl LuaEngine {
     /// Get the Lua runtime (for advanced operations)
     pub fn lua(&self) -> &Lua {
         &self.lua
+    }
+
+    /// Get the UI callback registry (for looking up render/event callbacks).
+    pub fn ui_callbacks(&self) -> &Arc<RwLock<HashMap<(String, u64), RegistryKey>>> {
+        &self.ui_callbacks
     }
 
     /// Get loaded plugins

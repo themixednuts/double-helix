@@ -4,14 +4,17 @@
 /// Helix functionality to Lua plugins.
 pub mod buffer;
 pub mod editor;
+pub mod layout;
 pub mod log;
 pub mod lsp;
+pub mod surface;
 pub mod ui;
 pub mod window;
 
 // Re-exports for convenience
 pub use buffer::*;
 pub use editor::*;
+pub use layout::*;
 pub use log::*;
 pub use lsp::*;
 pub use ui::*;

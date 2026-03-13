@@ -178,6 +178,90 @@ pub fn register_ui_api(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
     })?;
     ui_module.set("picker", picker)?;
 
+    // helix.ui.panel(opts) - Register a custom panel
+    //
+    // opts: { title, side?, width?, render, on_event? }
+    // render(area, surface) is called each frame
+    // on_event(event) is called for key events when panel is focused
+    let panel_fn = lua.create_function(|lua, opts: LuaTable| {
+        let title: String = opts.get("title")?;
+        let side: String = opts
+            .get::<Option<String>>("side")?
+            .unwrap_or_else(|| "right".into());
+        let width: u16 = opts.get::<Option<u16>>("width")?.unwrap_or(30);
+        let render_fn: LuaFunction = opts.get("render")?;
+        let event_fn: Option<LuaFunction> = opts.get("on_event").ok();
+
+        let plugin_name = lua
+            .globals()
+            .get::<String>("_current_plugin_name")
+            .unwrap_or_else(|_| "unknown".to_string());
+        let panel_id = format!("{}:{}", plugin_name, title);
+
+        let handler = match lua.app_data_ref::<crate::types::UiHandlerWrapper>() {
+            Some(h) => h,
+            None => return Ok(LuaNil),
+        };
+        let callback_reg = match lua.app_data_ref::<crate::types::UiCallbackRegistry>() {
+            Some(r) => r,
+            None => return Ok(LuaNil),
+        };
+        let counter = match lua.app_data_ref::<crate::types::UiCallbackCounter>() {
+            Some(c) => c,
+            None => return Ok(LuaNil),
+        };
+
+        // Store render callback
+        let render_id = counter.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let render_ref = lua.create_registry_value(render_fn)?;
+        callback_reg
+            .0
+            .write()
+            .insert((plugin_name.clone(), render_id), render_ref);
+
+        // Store event callback (optional)
+        let event_id = if let Some(ef) = event_fn {
+            let eid = counter.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let event_ref = lua.create_registry_value(ef)?;
+            callback_reg
+                .0
+                .write()
+                .insert((plugin_name.clone(), eid), event_ref);
+            Some(eid)
+        } else {
+            None
+        };
+
+        let editor = crate::lua::get_editor_mut()?;
+        handler.0.register_panel(
+            editor,
+            plugin_name.clone(),
+            panel_id.clone(),
+            title,
+            side,
+            width,
+            render_id,
+            event_id,
+        );
+
+        // Return a handle table so the plugin can close the panel later
+        let pn = plugin_name.clone();
+        let pid = panel_id.clone();
+        let handle = lua.create_table()?;
+        let close_fn = lua.create_function(move |_lua, ()| {
+            if let Ok(editor) = crate::lua::get_editor_mut() {
+                if let Some(handler) = _lua.app_data_ref::<crate::types::UiHandlerWrapper>() {
+                    handler.0.remove_panel(editor, pn.clone(), pid.clone());
+                }
+            }
+            Ok(())
+        })?;
+        handle.set("close", close_fn)?;
+        handle.set("id", panel_id)?;
+        Ok(LuaValue::Table(handle))
+    })?;
+    ui_module.set("panel", panel_fn)?;
+
     // helix.ui.menu(items, callback) - Show menu
     let menu = lua.create_function(
         |_lua, (items, _callback): (Vec<String>, Option<LuaFunction>)| {

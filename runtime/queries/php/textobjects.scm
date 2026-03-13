@@ -50,3 +50,22 @@
 [
   (enum_case)
 ] @entry.around @entry.movement
+
+; Conditionals
+
+(if_statement
+  body: (_) @conditional.inside) @conditional.around
+
+(switch_statement
+  body: (_) @conditional.inside) @conditional.around
+
+; Loops
+
+(foreach_statement
+  body: (_) @loop.inside) @loop.around
+
+(while_statement
+  body: (_) @loop.inside) @loop.around
+
+(do_statement
+  body: (_) @loop.inside) @loop.around

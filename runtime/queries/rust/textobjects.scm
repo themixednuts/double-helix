@@ -83,3 +83,22 @@
   (_) @entry.inside) @entry.around
 
 (shorthand_field_initializer) @entry.around
+
+; Conditionals
+
+(if_expression
+  consequence: (_) @conditional.inside) @conditional.around
+
+(match_expression
+  body: (_) @conditional.inside) @conditional.around
+
+; Loops
+
+(for_expression
+  body: (_) @loop.inside) @loop.around
+
+(while_expression
+  body: (_) @loop.inside) @loop.around
+
+(loop_expression
+  body: (_) @loop.inside) @loop.around

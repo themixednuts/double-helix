@@ -61,5 +61,23 @@
 [(comment) (block_comment)] @comment.around ; Does not match consecutive block comments
 
 
+; Conditional queries
+
+(if_expression
+  consequence: (_) @conditional.inside) @conditional.around
+
+(match_expression
+  body: (_) @conditional.inside) @conditional.around
+
+
+; Loop queries
+
+(for_expression
+  body: (_) @loop.inside) @loop.around
+
+(while_expression
+  body: (_) @loop.inside) @loop.around
+
+
 ; Test queries
 ; Not supported

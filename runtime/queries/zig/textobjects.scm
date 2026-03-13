@@ -23,3 +23,18 @@
 
 (comment) @comment.inside
 (comment)+ @comment.around
+
+; Conditionals
+
+(if_statement
+  body: (_) @conditional.inside) @conditional.around
+
+(switch_expression) @conditional.around
+
+; Loops
+
+(for_statement
+  body: (_) @loop.inside) @loop.around
+
+(while_statement
+  body: (_) @loop.inside) @loop.around

@@ -20,3 +20,15 @@
 (union_declaration (identifier) "::") @class.around
 (bit_field_declaration (identifier) "::") @class.around
 (const_declaration (identifier) "::" [(array_type) (distinct_type) (bit_set_type) (pointer_type)]) @class.around
+
+; Conditionals
+
+(if_statement
+  consequence: (_) @conditional.inside) @conditional.around
+
+(switch_statement) @conditional.around
+
+; Loops
+
+(for_statement
+  consequence: (_) @loop.inside) @loop.around

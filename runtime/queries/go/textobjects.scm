@@ -31,3 +31,17 @@
    name: (identifier) @_name
    body: (block)? @test.inside) @test.around
  (#match? @_name "^Test"))
+
+; Conditionals
+
+(if_statement
+  consequence: (block) @conditional.inside) @conditional.around
+
+(expression_switch_statement) @conditional.around
+
+(type_switch_statement) @conditional.around
+
+; Loops
+
+(for_statement
+  body: (block) @loop.inside) @loop.around

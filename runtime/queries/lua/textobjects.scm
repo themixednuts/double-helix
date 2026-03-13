@@ -16,3 +16,19 @@
 
 (table_constructor
   (field (_) @entry.inside) @entry.around)
+
+; Conditionals
+
+(if_statement
+  consequence: (_) @conditional.inside) @conditional.around
+
+; Loops
+
+(for_statement
+  body: (_) @loop.inside) @loop.around
+
+(while_statement
+  body: (_) @loop.inside) @loop.around
+
+(repeat_statement
+  body: (_) @loop.inside) @loop.around

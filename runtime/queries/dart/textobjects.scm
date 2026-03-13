@@ -91,3 +91,22 @@
   (selector (argument_part (arguments . (_) . (argument) @test.inside)))
 ) @test.around
 
+; Conditionals
+
+(if_statement
+  consequence: (_) @conditional.inside) @conditional.around
+
+(switch_statement
+  body: (_) @conditional.inside) @conditional.around
+
+; Loops
+
+(for_statement
+  body: (_) @loop.inside) @loop.around
+
+(while_statement
+  body: (_) @loop.inside) @loop.around
+
+(do_statement
+  body: (_) @loop.inside) @loop.around
+

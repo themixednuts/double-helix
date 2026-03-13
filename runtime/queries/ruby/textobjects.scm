@@ -54,3 +54,24 @@
 
 (symbol_array
   (_) @entry.around)
+
+; Conditionals
+
+(if
+  consequence: (_) @conditional.inside) @conditional.around
+
+(unless
+  consequence: (_) @conditional.inside) @conditional.around
+
+(case) @conditional.around
+
+; Loops
+
+(for
+  body: (_) @loop.inside) @loop.around
+
+(while
+  body: (_) @loop.inside) @loop.around
+
+(until
+  body: (_) @loop.inside) @loop.around

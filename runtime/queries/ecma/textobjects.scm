@@ -43,3 +43,28 @@
 
 (pair_pattern
   (_) @entry.inside) @entry.around
+
+; Conditionals
+
+(if_statement
+  consequence: (_) @conditional.inside) @conditional.around
+
+(switch_statement
+  body: (_) @conditional.inside) @conditional.around
+
+(ternary_expression
+  consequence: (_) @conditional.inside) @conditional.around
+
+; Loops
+
+(for_statement
+  body: (_) @loop.inside) @loop.around
+
+(for_in_statement
+  body: (_) @loop.inside) @loop.around
+
+(while_statement
+  body: (_) @loop.inside) @loop.around
+
+(do_statement
+  body: (_) @loop.inside) @loop.around

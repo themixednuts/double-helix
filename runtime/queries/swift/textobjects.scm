@@ -21,3 +21,24 @@
 (comment)+ @comment.around
 
 (multiline_comment) @comment.around
+
+; Conditionals
+
+(if_statement
+  (statements) @conditional.inside) @conditional.around
+
+(guard_statement
+  (statements) @conditional.inside) @conditional.around
+
+(switch_statement) @conditional.around
+
+; Loops
+
+(for_statement
+  (statements) @loop.inside) @loop.around
+
+(while_statement
+  (statements) @loop.inside) @loop.around
+
+(repeat_while_statement
+  (statements) @loop.inside) @loop.around

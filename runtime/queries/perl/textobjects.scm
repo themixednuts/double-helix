@@ -12,3 +12,16 @@
 
 (comment) @comment.around
 (pod) @comment.around
+
+; Conditionals
+
+(conditional_statement
+  block: (_) @conditional.inside) @conditional.around
+
+; Loops
+
+(loop_statement
+  block: (_) @loop.inside) @loop.around
+
+(for_statement
+  block: (_) @loop.inside) @loop.around

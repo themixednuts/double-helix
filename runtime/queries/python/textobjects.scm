@@ -33,3 +33,19 @@
 
 (pair
   (_) @entry.inside) @entry.around
+
+; Conditionals
+
+(if_statement
+  consequence: (block) @conditional.inside) @conditional.around
+
+(match_statement
+  body: (block) @conditional.inside) @conditional.around
+
+; Loops
+
+(for_statement
+  body: (block) @loop.inside) @loop.around
+
+(while_statement
+  body: (block) @loop.inside) @loop.around

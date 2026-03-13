@@ -42,3 +42,25 @@
 
 (enum_body
   (enum_constant) @entry.around)
+
+; Conditionals
+
+(if_statement
+  consequence: (_) @conditional.inside) @conditional.around
+
+(switch_expression
+  body: (_) @conditional.inside) @conditional.around
+
+; Loops
+
+(for_statement
+  body: (_) @loop.inside) @loop.around
+
+(enhanced_for_statement
+  body: (_) @loop.inside) @loop.around
+
+(while_statement
+  body: (_) @loop.inside) @loop.around
+
+(do_statement
+  body: (_) @loop.inside) @loop.around

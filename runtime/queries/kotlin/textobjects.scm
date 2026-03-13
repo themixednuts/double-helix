@@ -43,3 +43,21 @@
 
 (lambda_parameters
   ((_) @parameter.inside . ","? @parameter.around) @parameter.around)
+
+; Conditionals
+
+(if_expression
+  consequence: (_) @conditional.inside) @conditional.around
+
+(when_expression) @conditional.around
+
+; Loops
+
+(for_statement
+  (control_structure_body) @loop.inside) @loop.around
+
+(while_statement
+  (control_structure_body) @loop.inside) @loop.around
+
+(do_while_statement
+  (control_structure_body) @loop.inside) @loop.around

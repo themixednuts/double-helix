@@ -10,3 +10,8 @@
 (binding
   (_) @entry.inside) @entry.around
 
+; Conditionals
+
+(if_expression
+  consequence: (_) @conditional.inside) @conditional.around
+

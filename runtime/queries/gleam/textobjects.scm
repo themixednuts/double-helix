@@ -9,3 +9,8 @@
    name: (identifier) @_name
    body: (block) @test.inside) @test.around
  (#match? @_name "_test$"))
+
+; Conditionals
+
+(case
+  clauses: (_) @conditional.inside) @conditional.around

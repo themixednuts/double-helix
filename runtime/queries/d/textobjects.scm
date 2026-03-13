@@ -7,3 +7,25 @@
 (unittest_declaration (block_statement) @test.inside) @test.around
 (parameter) @parameter.inside
 (template_parameter) @parameter.inside
+
+; Conditionals
+
+(if_statement
+  consequence: (_) @conditional.inside) @conditional.around
+
+(switch_statement
+  body: (_) @conditional.inside) @conditional.around
+
+; Loops
+
+(for_statement
+  body: (_) @loop.inside) @loop.around
+
+(foreach_statement
+  body: (_) @loop.inside) @loop.around
+
+(while_statement
+  body: (_) @loop.inside) @loop.around
+
+(do_statement
+  body: (_) @loop.inside) @loop.around

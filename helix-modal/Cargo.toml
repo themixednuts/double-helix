@@ -1,0 +1,24 @@
+[package]
+name = "helix-modal"
+description = "Modal editing engines for Helix"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+categories.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+bench-profile = ["helix-core/bench-profile", "helix-view/bench-profile"]
+
+[dependencies]
+helix-core = { path = "../helix-core" }
+helix-view = { path = "../helix-view" }
+log = "0.4"
+
+[dev-dependencies]
+arc-swap.workspace = true
+helix-loader = { path = "../helix-loader" }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }

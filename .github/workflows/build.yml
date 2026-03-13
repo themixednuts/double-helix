@@ -9,7 +9,7 @@ on:
     - cron: "00 01 * * *"
 
 env:
-  MSRV: "1.87"
+  MSRV: "1.94"
   # This key can be changed to bust the cache of tree-sitter grammars.
   GRAMMAR_CACHE_VERSION: ""
 
@@ -109,4 +109,24 @@ jobs:
 
       - name: Run cargo clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+
+  arch-check:
+    name: Architectural checks
+    runs-on: ubuntu-latest
+    if: github.repository == 'helix-editor/helix' || github.event_name != 'schedule'
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v6
+
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.MSRV }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "build"
+
+      - name: Run architectural checks
+        run: cargo xtask arch-check
 

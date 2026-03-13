@@ -14,6 +14,7 @@ homepage.workspace = true
 default = []
 term = ["termina", "crossterm"]
 unicode-lines = []
+bench-profile = ["helix-core/bench-profile"]
 
 [dependencies]
 helix-stdx = { path = "../helix-stdx" }
@@ -52,6 +53,7 @@ log = "~0.4"
 
 parking_lot.workspace = true
 thiserror.workspace = true
+notify.workspace = true
 
 kstring = "2.0"
 [target.'cfg(windows)'.dependencies]

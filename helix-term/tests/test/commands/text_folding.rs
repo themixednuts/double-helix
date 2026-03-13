@@ -19,7 +19,8 @@ fn fold_text(app: &Application) -> Rope {
     use helix_core::graphemes::Grapheme;
     use std::fmt::Write;
 
-    let (view, doc) = current_ref!(&app.editor);
+    let (view_id, doc) = focused_ref!(&app.editor);
+    let view = helix_view::view!(&app.editor, view_id);
     let text = doc.text().slice(..);
     let text_format = &TextFormat::default();
     let annotations = &view.text_annotations(doc, None);
@@ -150,17 +151,17 @@ async fn fold_class() -> anyhow::Result<()> {
 
     let prev_folds_number = Cell::new(0);
     let result = |app: &Application| -> TestResult {
-        let (view, doc) = current_ref!(&app.editor);
+        let (view_id, doc) = focused_ref!(&app.editor);
         let text = doc.text().slice(..);
 
         let (from, to) = {
-            let range = doc.selection(view.id).primary();
+            let range = doc.selection(view_id).primary();
             positions_from_range(text, range)
         };
 
         let additional_folds_number = {
             let folds_number = doc
-                .fold_container(view.id)
+                .fold_container(view_id)
                 .map_or(0, |container| container.len());
             folds_number as isize - prev_folds_number.replace(folds_number) as isize
         };
@@ -257,17 +258,17 @@ async fn fold_function() -> anyhow::Result<()> {
 
     let prev_folds_number = Cell::new(0);
     let result = |app: &Application| -> TestResult {
-        let (view, doc) = current_ref!(&app.editor);
+        let (view_id, doc) = focused_ref!(&app.editor);
         let text = doc.text().slice(..);
 
         let (from, to) = {
-            let range = doc.selection(view.id).primary();
+            let range = doc.selection(view_id).primary();
             positions_from_range(text, range)
         };
 
         let additional_folds_number = {
             let folds_number = doc
-                .fold_container(view.id)
+                .fold_container(view_id)
                 .map_or(0, |container| container.len());
             folds_number as isize - prev_folds_number.replace(folds_number) as isize
         };
@@ -354,17 +355,17 @@ async fn fold_comment() -> anyhow::Result<()> {
 
     let prev_folds_number = Cell::new(0);
     let result = |app: &Application| -> TestResult {
-        let (view, doc) = current_ref!(&app.editor);
+        let (view_id, doc) = focused_ref!(&app.editor);
         let text = doc.text().slice(..);
 
         let (from, to) = {
-            let range = doc.selection(view.id).primary();
+            let range = doc.selection(view_id).primary();
             positions_from_range(text, range)
         };
 
         let additional_folds_number = {
             let folds_number = doc
-                .fold_container(view.id)
+                .fold_container(view_id)
                 .map_or(0, |container| container.len());
             folds_number as isize - prev_folds_number.replace(folds_number) as isize
         };
@@ -486,17 +487,17 @@ async fn fold_selection() -> anyhow::Result<()> {
 
     let prev_folds_number = Cell::new(0);
     let result = |app: &Application| -> TestResult {
-        let (view, doc) = current_ref!(&app.editor);
+        let (view_id, doc) = focused_ref!(&app.editor);
         let text = doc.text().slice(..);
 
         let (from, to) = {
-            let range = doc.selection(view.id).primary();
+            let range = doc.selection(view_id).primary();
             positions_from_range(text, range)
         };
 
         let additional_folds_number = {
             let folds_number = doc
-                .fold_container(view.id)
+                .fold_container(view_id)
                 .map_or(0, |container| container.len());
             folds_number as isize - prev_folds_number.replace(folds_number) as isize
         };
@@ -550,10 +551,10 @@ async fn fold_selection() -> anyhow::Result<()> {
                     2j<esc>",
                 ),
                 Some(&|app| {
-                    let (view, doc) = current_ref!(&app.editor);
+                    let (view_id, doc) = focused_ref!(&app.editor);
                     let text = doc.text().slice(..);
 
-                    let range = doc.selection(view.id).primary();
+                    let range = doc.selection(view_id).primary();
                     let (start, end) = range.line_range(text);
 
                     let expected = (1, 14);
@@ -573,10 +574,10 @@ async fn fold_selection() -> anyhow::Result<()> {
                     j<esc>",
                 ),
                 Some(&|app| {
-                    let (view, doc) = current_ref!(&app.editor);
+                    let (view_id, doc) = focused_ref!(&app.editor);
                     let text = doc.text().slice(..);
 
-                    let range = doc.selection(view.id).primary();
+                    let range = doc.selection(view_id).primary();
                     let (start, end) = range.line_range(text);
 
                     let expected = (1, 25);
@@ -603,17 +604,17 @@ async fn fold() -> anyhow::Result<()> {
 
     let prev_folds_number = Cell::new(0);
     let result = |app: &Application| -> TestResult {
-        let (view, doc) = current_ref!(&app.editor);
+        let (view_id, doc) = focused_ref!(&app.editor);
         let text = doc.text().slice(..);
 
         let (from, to) = {
-            let range = doc.selection(view.id).primary();
+            let range = doc.selection(view_id).primary();
             positions_from_range(text, range)
         };
 
         let additional_folds_number = {
             let folds_number = doc
-                .fold_container(view.id)
+                .fold_container(view_id)
                 .map_or(0, |container| container.len());
             folds_number as isize - prev_folds_number.replace(folds_number) as isize
         };
@@ -714,9 +715,9 @@ async fn format() -> anyhow::Result<()> {
             (
                 Some(":fold -a -d<ret>"),
                 Some(&|app| {
-                    let (view, doc) = current_ref!(&app.editor);
+                    let (view_id, doc) = focused_ref!(&app.editor);
                     let container = doc
-                        .fold_container(view.id)
+                        .fold_container(view_id)
                         .expect("Container must be initialized.");
 
                     prev_folds_number.set(container.len());
@@ -725,9 +726,9 @@ async fn format() -> anyhow::Result<()> {
             (
                 Some(":format<ret>"),
                 Some(&|app| {
-                    let (view, doc) = current_ref!(&app.editor);
+                    let (view_id, doc) = focused_ref!(&app.editor);
                     let container = doc
-                        .fold_container(view.id)
+                        .fold_container(view_id)
                         .expect("Container must be initialized.");
 
                     assert_eq!(
@@ -758,11 +759,11 @@ async fn unfold_class() -> anyhow::Result<()> {
     let prev_folds_number = Cell::new(0);
     // NOTE: header is one-based indexing (row, col)
     let result = |app: &Application, headers: &[(usize, usize)]| -> TestResult {
-        let (view, doc) = current_ref!(&app.editor);
+        let (view_id, doc) = focused_ref!(&app.editor);
 
         let text = doc.text().slice(..);
         let container = doc
-            .fold_container(view.id)
+            .fold_container(view_id)
             .expect("Container must be initialized.");
 
         let additional_folds_number = {
@@ -789,9 +790,9 @@ async fn unfold_class() -> anyhow::Result<()> {
             (
                 Some(":fold -a -d<ret>"),
                 Some(&|app| {
-                    let (view, doc) = current_ref!(&app.editor);
+                    let (view_id, doc) = focused_ref!(&app.editor);
                     let container = doc
-                        .fold_container(view.id)
+                        .fold_container(view_id)
                         .expect("Container must be initialized.");
 
                     prev_folds_number.set(container.len());
@@ -922,11 +923,11 @@ async fn unfold_function() -> anyhow::Result<()> {
     let prev_folds_number = Cell::new(0);
     // NOTE: header is one-based indexing (row, col)
     let result = |app: &Application, headers: &[(usize, usize)]| -> TestResult {
-        let (view, doc) = current_ref!(&app.editor);
+        let (view_id, doc) = focused_ref!(&app.editor);
 
         let text = doc.text().slice(..);
         let container = doc
-            .fold_container(view.id)
+            .fold_container(view_id)
             .expect("Container must be initialized.");
 
         let additional_folds_number = {
@@ -953,9 +954,9 @@ async fn unfold_function() -> anyhow::Result<()> {
             (
                 Some(":fold -a -d class<ret>"),
                 Some(&|app| {
-                    let (view, doc) = current_ref!(&app.editor);
+                    let (view_id, doc) = focused_ref!(&app.editor);
                     let container = doc
-                        .fold_container(view.id)
+                        .fold_container(view_id)
                         .expect("Container must be initialized.");
 
                     prev_folds_number.set(container.len());
@@ -1032,11 +1033,11 @@ async fn unfold_comment() -> anyhow::Result<()> {
     let prev_folds_number = Cell::new(0);
     // NOTE: header is one-based indexing (row, col)
     let result = |app: &Application, headers: &[(usize, usize)]| -> TestResult {
-        let (view, doc) = current_ref!(&app.editor);
+        let (view_id, doc) = focused_ref!(&app.editor);
 
         let text = doc.text().slice(..);
         let container = doc
-            .fold_container(view.id)
+            .fold_container(view_id)
             .expect("Container must be initialized.");
 
         let additional_folds_number = {
@@ -1069,9 +1070,9 @@ async fn unfold_comment() -> anyhow::Result<()> {
                     gg",
                 ),
                 Some(&|app| {
-                    let (view, doc) = current_ref!(&app.editor);
+                    let (view_id, doc) = focused_ref!(&app.editor);
                     let container = doc
-                        .fold_container(view.id)
+                        .fold_container(view_id)
                         .expect("Container must be initialized.");
 
                     prev_folds_number.set(container.len());
@@ -1216,11 +1217,11 @@ async fn unfold_selection() -> anyhow::Result<()> {
     let prev_folds_number = Cell::new(0);
     // NOTE: header is one-based indexing (row, col)
     let result = |app: &Application, headers: &[(usize, usize)]| -> TestResult {
-        let (view, doc) = current_ref!(&app.editor);
+        let (view_id, doc) = focused_ref!(&app.editor);
 
         let text = doc.text().slice(..);
         let container = doc
-            .fold_container(view.id)
+            .fold_container(view_id)
             .expect("Container must be initialized.");
 
         let additional_folds_number = {
@@ -1261,9 +1262,9 @@ async fn unfold_selection() -> anyhow::Result<()> {
                     gg",
                 ),
                 Some(&|app| {
-                    let (view, doc) = current_ref!(&app.editor);
+                    let (view_id, doc) = focused_ref!(&app.editor);
                     let container = doc
-                        .fold_container(view.id)
+                        .fold_container(view_id)
                         .expect("Container must be initialized.");
 
                     prev_folds_number.set(container.len());
@@ -1323,11 +1324,11 @@ async fn unfold() -> anyhow::Result<()> {
     let prev_folds_number = Cell::new(0);
     // NOTE: header is one-based indexing (row, col)
     let result = |app: &Application, headers: &[(usize, usize)]| -> TestResult {
-        let (view, doc) = current_ref!(&app.editor);
+        let (view_id, doc) = focused_ref!(&app.editor);
 
         let text = doc.text().slice(..);
         let container = doc
-            .fold_container(view.id)
+            .fold_container(view_id)
             .expect("Container must be initialized.");
 
         let additional_folds_number = {
@@ -1354,9 +1355,9 @@ async fn unfold() -> anyhow::Result<()> {
             (
                 Some(":fold -a -d<ret>"),
                 Some(&|app| {
-                    let (view, doc) = current_ref!(&app.editor);
+                    let (view_id, doc) = focused_ref!(&app.editor);
                     let container = doc
-                        .fold_container(view.id)
+                        .fold_container(view_id)
                         .expect("Container must be initialized.");
 
                     prev_folds_number.set(container.len());
@@ -1461,10 +1462,10 @@ async fn open() -> anyhow::Result<()> {
     let prev_folds_number = Cell::new(0);
     // NOTE: new_line is one-based indexing
     let result = |app: &Application, new_line: usize| -> TestResult {
-        let (view, doc) = current_ref!(&app.editor);
+        let (view_id, doc) = focused_ref!(&app.editor);
         let text = doc.text().slice(..);
         let container = doc
-            .fold_container(view.id)
+            .fold_container(view_id)
             .expect("Container must be initialized.");
 
         let additional_folds_number = {
@@ -1483,9 +1484,9 @@ async fn open() -> anyhow::Result<()> {
             (
                 Some(":fold -a -d class<ret>"),
                 Some(&|app| {
-                    let (view, doc) = current_ref!(&app.editor);
+                    let (view_id, doc) = focused_ref!(&app.editor);
                     let container = doc
-                        .fold_container(view.id)
+                        .fold_container(view_id)
                         .expect("Container must be initialized.");
 
                     prev_folds_number.set(container.len());
@@ -1532,9 +1533,9 @@ async fn open() -> anyhow::Result<()> {
             (
                 Some("xdzf"),
                 Some(&|app| {
-                    let (view, doc) = current_ref!(&app.editor);
+                    let (view_id, doc) = focused_ref!(&app.editor);
                     let container = doc
-                        .fold_container(view.id)
+                        .fold_container(view_id)
                         .expect("Container must be initialized.");
 
                     prev_folds_number.set(container.len());
@@ -1571,9 +1572,9 @@ async fn open() -> anyhow::Result<()> {
                     zF",
                 ),
                 Some(&|app| {
-                    let (view, doc) = current_ref!(&app.editor);
+                    let (view_id, doc) = focused_ref!(&app.editor);
                     let container = doc
-                        .fold_container(view.id)
+                        .fold_container(view_id)
                         .expect("Container must be initialized.");
 
                     prev_folds_number.set(container.len());
@@ -1625,9 +1626,9 @@ async fn default_folding() -> anyhow::Result<()> {
         app,
         None,
         Some(&|app| {
-            let (view, doc) = current_ref!(&app.editor);
+            let (view_id, doc) = focused_ref!(&app.editor);
             let container = doc
-                .fold_container(view.id)
+                .fold_container(view_id)
                 .expect("Container must be initialized.");
 
             let folds_number = container.len();
@@ -1647,8 +1648,8 @@ async fn toggle_fold() -> anyhow::Result<()> {
         .unwrap();
 
     let folds_number = |app: &Application| {
-        let (view, doc) = current_ref!(&app.editor);
-        doc.fold_container(view.id)
+        let (view_id, doc) = focused_ref!(&app.editor);
+        doc.fold_container(view_id)
             .map_or(0, |container| container.len())
     };
 

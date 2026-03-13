@@ -2,6 +2,7 @@ use helix_term::application::Application;
 
 use super::*;
 
+mod golden;
 mod insert;
 mod movement;
 mod reverse_selection_contents;

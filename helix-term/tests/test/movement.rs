@@ -419,8 +419,8 @@ async fn cursor_position_newly_opened_file() -> anyhow::Result<()> {
             .with_file(file.path(), None)
             .build()?;
 
-        let (view, doc) = helix_view::current!(app.editor);
-        let sel = doc.selection(view.id).clone();
+        let (view_id, doc) = helix_view::focused!(app.editor);
+        let sel = doc.selection(view_id).clone();
         assert_eq!(expected_sel, sel);
 
         Ok(())

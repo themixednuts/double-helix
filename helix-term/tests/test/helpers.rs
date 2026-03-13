@@ -118,8 +118,8 @@ pub async fn test_key_sequences(
     let num_inputs = inputs.len();
 
     for (i, (in_keys, test_fn)) in inputs.into_iter().enumerate() {
-        let (view, doc) = current_ref!(app.editor);
-        let state = test::plain(doc.text().slice(..), doc.selection(view.id));
+        let (view_id, doc) = focused_ref!(app.editor);
+        let state = test::plain(doc.text().slice(..), doc.selection(view_id));
 
         log::debug!("executing test with document state:\n\n-----\n\n{}", state);
 
@@ -134,8 +134,8 @@ pub async fn test_key_sequences(
         let app_exited = !app.event_loop_until_idle(&mut rx_stream).await;
 
         if !app_exited {
-            let (view, doc) = current_ref!(app.editor);
-            let state = test::plain(doc.text().slice(..), doc.selection(view.id));
+            let (view_id, doc) = focused_ref!(app.editor);
+            let state = test::plain(doc.text().slice(..), doc.selection(view_id));
 
             log::debug!(
                 "finished running test with document state:\n\n-----\n\n{}",
@@ -183,6 +183,25 @@ pub async fn test_key_sequences(
     Ok(())
 }
 
+/// Asserts selection equality ignoring `old_visual_position`, which is set by
+/// movement commands and can differ from parsed expectations.
+fn assert_selection_eq_ignoring_visual(expected: &Selection, actual: &Selection) {
+    assert_eq!(expected.len(), actual.len(), "selection length mismatch");
+    assert_eq!(
+        expected.primary_index(),
+        actual.primary_index(),
+        "primary index mismatch"
+    );
+    for (i, (e, a)) in expected.iter().zip(actual.iter()).enumerate() {
+        assert_eq!(
+            (e.anchor, e.head),
+            (a.anchor, a.head),
+            "range {} anchor/head mismatch",
+            i
+        );
+    }
+}
+
 pub async fn test_key_sequence_with_input_text<T: Into<TestCase>>(
     app: Option<Application>,
     test_case: T,
@@ -196,8 +215,8 @@ pub async fn test_key_sequence_with_input_text<T: Into<TestCase>>(
         None => Application::new(Args::default(), test_config(), test_syntax_loader(None))?,
     };
 
-    let (view, doc) = helix_view::current!(app.editor);
-    let sel = doc.selection(view.id).clone();
+    let (view_id, doc) = helix_view::focused!(app.editor);
+    let sel = doc.selection(view_id).clone();
 
     // replace the initial text with the input text
     let transaction = Transaction::change_by_selection(doc.text(), &sel, |_| {
@@ -205,7 +224,7 @@ pub async fn test_key_sequence_with_input_text<T: Into<TestCase>>(
     })
     .with_selection(test_case.in_selection.clone());
 
-    doc.apply(&transaction, view.id);
+    doc.apply(&transaction, view_id);
 
     test_key_sequence(
         &mut app,
@@ -250,7 +269,7 @@ pub async fn test_with_config<T: Into<TestCase>>(
             assert_eq!(1, selections.len());
 
             let sel = selections.pop().unwrap();
-            assert_eq!(test_case.out_selection, sel);
+            assert_selection_eq_ignoring_visual(&test_case.out_selection, &sel);
         },
         false,
     )
@@ -384,15 +403,15 @@ impl AppBuilder {
         let mut app = Application::new(self.args, self.config, self.syn_loader)?;
 
         if let Some((text, selection)) = self.input {
-            let (view, doc) = helix_view::current!(app.editor);
-            let sel = doc.selection(view.id).clone();
+            let (view_id, doc) = helix_view::focused!(app.editor);
+            let sel = doc.selection(view_id).clone();
             let trans = Transaction::change_by_selection(doc.text(), &sel, |_| {
                 (0, doc.text().len_chars(), Some((text.clone()).into()))
             })
             .with_selection(selection);
 
             // replace the initial text with the input text
-            doc.apply(&trans, view.id);
+            doc.apply(&trans, view_id);
         }
 
         Ok(app)

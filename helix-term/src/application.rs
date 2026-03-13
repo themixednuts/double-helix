@@ -9,6 +9,7 @@ use helix_lsp::{
 use helix_stdx::path::get_relative_path;
 use helix_view::{
     align_view,
+    bench::{enter_bench_run, log_run_event, log_run_phase, BenchRunContext},
     document::{DocumentOpenError, DocumentSavedEventResult},
     editor::{ConfigEvent, EditorEvent},
     events::EditorConfigDidChange,
@@ -78,6 +79,26 @@ type TerminalEvent = crossterm::event::Event;
 
 type Terminal = tui::terminal::Terminal<TerminalBackend>;
 
+struct ModalEngineFactory {
+    registry: Arc<helix_modal::registry::CommandRegistry>,
+}
+
+impl helix_view::engine::EditingEngineFactory for ModalEngineFactory {
+    fn create(
+        &self,
+        config: helix_view::editor::EditingEngineConfig,
+    ) -> Box<dyn helix_view::engine::EditingEngine> {
+        match config {
+            helix_view::editor::EditingEngineConfig::Helix => {
+                Box::new(helix_modal::helix::HelixEngine::new(self.registry.clone()))
+            }
+            helix_view::editor::EditingEngineConfig::Vim => {
+                Box::new(helix_modal::vim::VimEngine::new(self.registry.clone()))
+            }
+        }
+    }
+}
+
 pub struct Application {
     compositor: Compositor,
     terminal: Terminal,
@@ -119,6 +140,12 @@ fn setup_integration_logging() {
         .apply();
 }
 
+// ---------------------------------------------------------------------------
+use helix_view::bench::{
+    bench_pick_action, enter_bench_command, log_command_phase, BenchCommandContext,
+    BenchResetStats, BenchTickTrace, BENCH_INSERT_SNIPPETS,
+};
+
 impl Application {
     pub fn new(args: Args, config: Config, lang_loader: syntax::Loader) -> Result<Self, Error> {
         #[cfg(feature = "integration")]
@@ -154,6 +181,9 @@ impl Application {
             })),
             handlers,
         );
+        // Initialize OS-native file watcher for auto-reload
+        crate::handlers::auto_reload::setup_file_watcher(&mut editor);
+
         Self::load_configured_theme(
             &mut editor,
             &config.load(),
@@ -164,7 +194,23 @@ impl Application {
         let keys = Box::new(Map::new(Arc::clone(&config), |config: &Config| {
             &config.keys
         }));
-        let editor_view = Box::new(ui::EditorView::new(Keymaps::new(keys)));
+        editor.modal_keymaps = Some(Arc::new(arc_swap::ArcSwap::from_pointee(
+            crate::keymap::to_component_modal_keymaps(&config.load().keys),
+        )));
+
+        // Build the editing engine based on config
+        let registry = std::sync::Arc::new(helix_modal::populate::build_registry());
+        editor.engine_factory = Some(Arc::new(ModalEngineFactory {
+            registry: registry.clone(),
+        }));
+        let engine = editor
+            .engine_factory
+            .as_ref()
+            .expect("engine_factory not set")
+            .create(config.load().editor.editing_engine);
+        log::info!("Editing engine: {}", engine.name());
+
+        let editor_view = Box::new(ui::EditorView::new(Keymaps::new(keys), engine, registry));
         compositor.push(editor_view);
 
         let jobs = Jobs::new();
@@ -173,7 +219,7 @@ impl Application {
             let path = helix_loader::runtime_file(Path::new("tutor"));
             editor.open(&path, Action::VerticalSplit)?;
             // Unset path to prevent accidentally saving to the original tutor file.
-            doc_mut!(editor).set_path(None);
+            focused!(editor).1.set_path(None);
         } else if !args.files.is_empty() {
             let mut files_it = args.files.into_iter().peekable();
 
@@ -249,7 +295,8 @@ impl Application {
                     ));
                     // align the view to center after all files are loaded,
                     // does not affect views without pos since it is at the top
-                    let (view, doc) = current!(editor);
+                    let (view_id, doc) = focused!(editor);
+                    let view = view!(editor, view_id);
                     align_view(doc, view, Align::Center);
                 }
             } else {
@@ -415,13 +462,27 @@ impl Application {
     }
 
     async fn render(&mut self) {
-        self.handle_plugin_events();
+        let t0 = std::time::Instant::now();
 
+        let plugin_start = std::time::Instant::now();
+        self.handle_plugin_events();
+        let plugin_elapsed = plugin_start.elapsed();
+        log_run_phase("render_setup", "plugin_events", plugin_elapsed, || {
+            "handled plugin event queue".to_string()
+        });
+
+        let clear_start = std::time::Instant::now();
+        let did_full_redraw_clear = self.compositor.full_redraw;
         if self.compositor.full_redraw {
             self.terminal.clear().expect("Cannot clear the terminal");
             self.compositor.full_redraw = false;
         }
+        let clear_elapsed = clear_start.elapsed();
+        log_run_phase("render_setup", "full_redraw_clear", clear_elapsed, || {
+            format!("did_clear={did_full_redraw_clear}")
+        });
 
+        let frame_setup_start = std::time::Instant::now();
         let mut cx = crate::compositor::Context {
             editor: &mut self.editor,
             jobs: &mut self.jobs,
@@ -431,23 +492,408 @@ impl Application {
 
         helix_event::start_frame();
         cx.editor.needs_redraw = false;
+        let frame_setup_elapsed = frame_setup_start.elapsed();
+        log_run_phase("render_setup", "frame_state", frame_setup_elapsed, || {
+            format!("needs_redraw_reset={}", !cx.editor.needs_redraw)
+        });
 
+        let autoresize_start = std::time::Instant::now();
+        let previous_area = self.terminal.viewport_area();
         let area = self
             .terminal
             .autoresize()
             .expect("Unable to determine terminal size");
+        let autoresize_elapsed = autoresize_start.elapsed();
+        log_run_phase("render_setup", "terminal_autoresize", autoresize_elapsed, || {
+            format!(
+                "prev={}x{} next={}x{} changed={}",
+                previous_area.width,
+                previous_area.height,
+                area.width,
+                area.height,
+                previous_area != area
+            )
+        });
 
-        // TODO: need to recalculate view tree if necessary
+        let t1 = std::time::Instant::now(); // setup done
 
+        let surface_start = std::time::Instant::now();
         let surface = self.terminal.current_buffer_mut();
+        let surface_elapsed = surface_start.elapsed();
+        log_run_phase("render_setup", "surface_prepare", surface_elapsed, || {
+            format!("width={} height={}", area.width, area.height)
+        });
 
         self.compositor.render(area, surface, &mut cx);
+        let render_done = std::time::Instant::now();
+        log_run_phase("render", "compositor_render_only", render_done - t1, || {
+            format!("area={}x{}", area.width, area.height)
+        });
+        let cursor_start = std::time::Instant::now();
         let (pos, kind) = self.compositor.cursor(area, &self.editor);
-        // reset cursor cache
+        let cursor_elapsed = cursor_start.elapsed();
+        log_run_phase("render", "cursor_total", cursor_elapsed, || {
+            format!("cursor_visible={}", pos.is_some())
+        });
         self.editor.cursor_cache.reset();
+
+        let t2 = std::time::Instant::now(); // compositor done
+        log_run_phase("render", "compositor_total", t2 - t1, || {
+            format!("area={}x{}", area.width, area.height)
+        });
 
         let pos = pos.map(|pos| (pos.col as u16, pos.row as u16));
         self.terminal.draw(pos, kind).unwrap();
+
+        let t3 = std::time::Instant::now(); // terminal flush done
+        log_run_phase("render", "flush_total", t3 - t2, || {
+            format!("cursor_visible={}", pos.is_some())
+        });
+
+        // Record render sub-phases when bench is active
+        if let Some(bench) = self.editor.bench.as_mut() {
+            bench.render_setup.push(t1 - t0);
+            bench.render_compositor.push(t2 - t1);
+            bench.render_flush.push(t3 - t2);
+        }
+    }
+
+    /// Render and return the frame duration. Used by benchmarks.
+    #[cfg(feature = "integration")]
+    pub async fn render_timed(&mut self) -> std::time::Duration {
+        let start = std::time::Instant::now();
+        self.render().await;
+        start.elapsed()
+    }
+
+    /// Drive one benchmark action: pick a random action, feed its keys, render, record timing.
+    /// Returns `true` if the bench is still running, `false` if it finished.
+    fn bench_tick(&mut self) -> bool {
+        use helix_view::input::Event as ViewEvent;
+
+        // Check if bench exists and is not expired
+        match self.editor.bench.as_mut() {
+            None => return false,
+            Some(b) if b.is_expired() => {
+                let report = b.report();
+                self.editor.bench = None;
+                eprintln!("{report}");
+                self.editor
+                    .set_status("Bench complete. Report printed to stderr.");
+                return false;
+            }
+            _ => {}
+        }
+
+        // Ensure clean state before each action
+        let reset_start = std::time::Instant::now();
+        let reset_stats = self.bench_reset_state();
+        let reset_dur = reset_start.elapsed();
+
+        // If buffer is too small, force an insert to replenish it
+        let force_insert = reset_stats.after_lines < 100;
+
+        // Pick action (re-borrow bench after reset_state released it)
+        let bench = self.editor.bench.as_mut().unwrap();
+        let (category, macro_str) = if force_insert {
+            ("insert", "")
+        } else {
+            bench_pick_action(bench)
+        };
+
+        let action_start = std::time::Instant::now();
+        let bench_context = {
+            let bench = self.editor.bench.as_ref().unwrap();
+            BenchCommandContext {
+                seed: bench.seed,
+                event_log_path: bench.event_log_path.clone(),
+                action_index: bench.actions_executed + 1,
+                elapsed_secs: bench.elapsed().as_secs_f64(),
+                category,
+                macro_str,
+                force_insert,
+            }
+        };
+        let _bench_command_guard = enter_bench_command(bench_context);
+
+        if category == "insert" {
+            // Direct Transaction insertion — bypasses compositor entirely.
+            // This is safe: no mode changes, no overlays, just text insertion.
+            self.bench_insert_text();
+        } else {
+            let keys = match helix_view::input::parse_macro(macro_str) {
+                Ok(k) => k,
+                Err(_) => return true,
+            };
+
+            // Feed keys through compositor
+            let mut cx = crate::compositor::Context {
+                editor: &mut self.editor,
+                jobs: &mut self.jobs,
+                scroll: None,
+                plugin_manager: Some(self.plugin_manager.clone()),
+            };
+
+            for key in &keys {
+                self.compositor.handle_event(&ViewEvent::Key(*key), &mut cx);
+            }
+        }
+
+        let action_dur = action_start.elapsed();
+        let (post_action_lines, post_action_bytes) = self.bench_buffer_stats();
+
+        // Store reset duration for the event loop to read (avoids double-timing)
+        if let Some(bench) = self.editor.bench.as_mut() {
+            bench.last_reset_dur = reset_dur;
+            bench.record_action(category, action_dur);
+            bench.log_slow_tick(&BenchTickTrace {
+                action_index: bench.actions_executed,
+                elapsed_secs: bench.elapsed().as_secs_f64(),
+                category,
+                macro_str,
+                force_insert,
+                reset: reset_stats,
+                post_action_lines,
+                post_action_bytes,
+                reset_us: reset_dur.as_micros() as u64,
+                action_us: action_dur.as_micros() as u64,
+            });
+        }
+
+        self.editor.needs_redraw = true;
+        true
+    }
+
+    /// Insert a random code snippet at the cursor via direct Transaction.
+    /// This bypasses the compositor entirely — no mode changes, no overlays.
+    fn bench_insert_text(&mut self) {
+        use helix_core::{Tendril, Transaction};
+
+        let snippet_idx = self
+            .editor
+            .bench
+            .as_mut()
+            .map(|b| b.rand_range(BENCH_INSERT_SNIPPETS.len() as u32) as usize)
+            .unwrap_or(0);
+        let snippet = BENCH_INSERT_SNIPPETS[snippet_idx];
+
+        let view_id = self.editor.tree.focus;
+        let view = self.editor.tree.get(view_id);
+        let doc_id = view.doc;
+
+        if let Some(doc) = self.editor.documents.get_mut(&doc_id) {
+            let text = doc.text();
+            let selection = doc.selection(view_id).clone();
+            let before_lines = text.len_lines();
+            let before_bytes = text.len_bytes();
+            let selection_count = selection.len();
+            let build_start = std::time::Instant::now();
+            let transaction = Transaction::insert(text, &selection, Tendril::from(snippet));
+            let build_dur = build_start.elapsed();
+            log_command_phase("bench_insert", "build_transaction", build_dur, || {
+                format!(
+                    "snippet_idx={} snippet_bytes={} selections={} lines={} bytes={}",
+                    snippet_idx,
+                    snippet.len(),
+                    selection_count,
+                    before_lines,
+                    before_bytes
+                )
+            });
+            let apply_start = std::time::Instant::now();
+            doc.apply(&transaction, view_id);
+            let apply_dur = apply_start.elapsed();
+            log_command_phase("bench_insert", "apply", apply_dur, || {
+                format!(
+                    "snippet_idx={} snippet_bytes={} selections={} before_lines={} after_lines={} before_bytes={} after_bytes={}",
+                    snippet_idx,
+                    snippet.len(),
+                    selection_count,
+                    before_lines,
+                    doc.text().len_lines(),
+                    before_bytes,
+                    doc.text().len_bytes()
+                )
+            });
+        }
+    }
+
+    /// Force the editor into a clean normal-mode state by dismissing all
+    /// compositor layers except the base EditorView and sending escapes.
+    fn bench_reset_state(&mut self) -> BenchResetStats {
+        use helix_view::input::{Event as ViewEvent, KeyCode, KeyEvent as VKeyEvent, KeyModifiers};
+
+        let (before_lines, before_bytes) = self.bench_buffer_stats();
+        let mut stats = BenchResetStats {
+            before_lines,
+            before_bytes,
+            ..BenchResetStats::default()
+        };
+
+        let esc = VKeyEvent {
+            code: KeyCode::Esc,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        // Pop all compositor layers except the bottom one (EditorView).
+        // This clears prompts, pickers, menus, completion popups, etc.
+        while self.compositor.layer_count() > 1 {
+            self.compositor.pop();
+            stats.layers_popped += 1;
+        }
+
+        // Send escapes to exit any non-normal mode (visual, insert, etc.)
+        for _ in 0..5 {
+            if self.editor.mode == helix_view::document::Mode::Normal {
+                break;
+            }
+            stats.escapes_sent += 1;
+            let mut cx = crate::compositor::Context {
+                editor: &mut self.editor,
+                jobs: &mut self.jobs,
+                scroll: None,
+                plugin_manager: Some(self.plugin_manager.clone()),
+            };
+            self.compositor.handle_event(&ViewEvent::Key(esc), &mut cx);
+        }
+
+        // If editor wants to close (e.g., last buffer was closed), reopen scratch
+        if self.editor.should_close() {
+            let _ = self.editor.new_file(helix_view::editor::Action::Replace);
+            stats.reopened_scratch = true;
+        }
+
+        // Prevent runaway buffer growth (e.g. paste loops creating millions of lines).
+        // Only cap at extreme sizes — the bench should stress real code paths.
+        {
+            let view_id = self.editor.tree.focus;
+            let view = self.editor.tree.get_mut(view_id);
+            let doc_id = view.doc;
+            if let Some(doc) = self.editor.documents.get_mut(&doc_id) {
+                if doc.text().len_lines() > 10_000 {
+                    let view = self.editor.tree.get_mut(view_id);
+                    for _ in 0..50 {
+                        if doc.text().len_lines() <= 5_000 {
+                            break;
+                        }
+                        if !doc.undo(view) {
+                            break;
+                        }
+                        stats.undo_steps += 1;
+                    }
+                }
+            }
+        }
+
+        let (after_lines, after_bytes) = self.bench_buffer_stats();
+        stats.after_lines = after_lines;
+        stats.after_bytes = after_bytes;
+        stats
+    }
+
+    fn bench_buffer_stats(&self) -> (usize, usize) {
+        let view = self.editor.tree.get(self.editor.tree.focus);
+        self.editor
+            .documents
+            .get(&view.doc)
+            .map(|d| (d.text().len_lines(), d.text().len_bytes()))
+            .unwrap_or((0, 0))
+    }
+
+    /// Tight bench loop: batch actions within budget, render once per batch,
+    /// poll for Ctrl+C periodically. Used by both `:bench` and `hx-bench`.
+    pub async fn bench_run_loop<S>(&mut self, input_stream: &mut S)
+    where
+        S: Stream<Item = std::io::Result<TerminalEvent>> + Unpin,
+    {
+        use futures_util::StreamExt;
+
+        let _bench_run_guard = self.editor.bench.as_ref().and_then(|bench| {
+            bench.event_log_path.clone().map(|event_log_path| {
+                enter_bench_run(BenchRunContext {
+                    seed: bench.seed,
+                    event_log_path,
+                })
+            })
+        });
+
+        let mut last_poll = std::time::Instant::now();
+
+        while self.editor.bench.is_some() {
+            const ACTION_BUDGET: std::time::Duration = std::time::Duration::from_millis(4);
+
+            // Poll for terminal events (Ctrl+C) every ~200ms, not every frame
+            let poll_dur = if last_poll.elapsed() >= std::time::Duration::from_millis(200) {
+                let poll_start = std::time::Instant::now();
+                if let Ok(Some(event)) =
+                    tokio::time::timeout(std::time::Duration::ZERO, input_stream.next()).await
+                {
+                    self.handle_terminal_events(event).await;
+                    if self.editor.bench.is_none() {
+                        break;
+                    }
+                }
+                last_poll = std::time::Instant::now();
+                poll_start.elapsed()
+            } else {
+                std::time::Duration::ZERO
+            };
+
+            let batch_start = std::time::Instant::now();
+            let mut total_reset = std::time::Duration::ZERO;
+            let mut bench_running = true;
+
+            // Run actions until budget exhausted or bench ends
+            while batch_start.elapsed() < ACTION_BUDGET {
+                if !self.bench_tick() {
+                    bench_running = false;
+                    break;
+                }
+                if let Some(bench) = self.editor.bench.as_ref() {
+                    total_reset += bench.last_reset_dur;
+                }
+            }
+
+            let action_dur = batch_start.elapsed();
+
+            if tokio::time::Instant::now() >= self.editor.idle_timer.deadline() {
+                self.service_idle_timeout(false).await;
+            }
+
+            // Single render for the whole batch
+            let render_start = std::time::Instant::now();
+            self.render().await;
+            let render_dur = render_start.elapsed();
+
+            let tick_dur = action_dur + render_dur + poll_dur;
+
+            // Record frame + per-phase timing + periodic diagnostic snapshot
+            if let Some(bench) = self.editor.bench.as_mut() {
+                bench.record_frame(render_dur);
+                bench.record_phases(
+                    poll_dur,
+                    total_reset,
+                    action_dur.saturating_sub(total_reset),
+                    render_dur,
+                    tick_dur,
+                );
+                bench.last_tick_end = std::time::Instant::now();
+
+                let (buf_lines, buf_bytes) = {
+                    let view = self.editor.tree.get(self.editor.tree.focus);
+                    self.editor
+                        .documents
+                        .get(&view.doc)
+                        .map(|d| (d.text().len_lines(), d.text().len_bytes()))
+                        .unwrap_or((0, 0))
+                };
+                bench.maybe_snapshot(buf_lines, buf_bytes);
+            }
+
+            if !bench_running {
+                break;
+            }
+        }
     }
 
     pub async fn event_loop<S>(&mut self, input_stream: &mut S)
@@ -531,10 +977,15 @@ impl Application {
             {
                 self.editor.reset_idle_timer();
             }
+
+            if self.editor.bench.is_some() {
+                self.bench_run_loop(input_stream).await;
+            }
         }
     }
 
     pub fn handle_config_events(&mut self, config_event: ConfigEvent) {
+        self.editor.config_gen = self.editor.config_gen.wrapping_add(1);
         let old_editor_config = self.editor.config();
 
         match config_event {
@@ -554,6 +1005,11 @@ impl Application {
                     self.editor.set_error(err.to_string());
                 };
                 self.config.store(Arc::new(app_config));
+                if let Some(modal_keymaps) = &self.editor.modal_keymaps {
+                    modal_keymaps.store(Arc::new(crate::keymap::to_component_modal_keymaps(
+                        &self.config.load().keys,
+                    )));
+                }
             }
         }
 
@@ -603,6 +1059,11 @@ impl Application {
             self.terminal.reconfigure((&default_config.editor).into())?;
             // Store new config
             self.config.store(Arc::new(default_config));
+            if let Some(modal_keymaps) = &self.editor.modal_keymaps {
+                modal_keymaps.store(Arc::new(crate::keymap::to_component_modal_keymaps(
+                    &self.config.load().keys,
+                )));
+            }
             Ok(())
         };
 
@@ -724,7 +1185,7 @@ impl Application {
         true
     }
 
-    pub async fn handle_idle_timeout(&mut self) {
+    async fn service_idle_timeout(&mut self, render_immediately: bool) {
         let mut cx = crate::compositor::Context {
             editor: &mut self.editor,
             jobs: &mut self.jobs,
@@ -732,9 +1193,28 @@ impl Application {
             plugin_manager: Some(self.plugin_manager.clone()),
         };
         let should_render = self.compositor.handle_event(&Event::IdleTimeout, &mut cx);
-        if should_render || self.editor.needs_redraw {
+        let syntax_refreshed = self.editor.refresh_one_stale_syntax();
+        if self.editor.has_stale_syntax() {
+            self.editor.reset_idle_timer();
+        }
+        if syntax_refreshed || self.editor.has_stale_syntax() {
+            log_run_event("bench_idle_service", || {
+                format!(
+                    "syntax_refreshed={} stale_remaining={} render_immediately={} needs_redraw={}",
+                    syntax_refreshed,
+                    self.editor.has_stale_syntax(),
+                    render_immediately,
+                    self.editor.needs_redraw
+                )
+            });
+        }
+        if render_immediately && (should_render || syntax_refreshed || self.editor.needs_redraw) {
             self.render().await;
         }
+    }
+
+    pub async fn handle_idle_timeout(&mut self) {
+        self.service_idle_timeout(true).await;
     }
 
     pub fn handle_document_write(&mut self, doc_save_event: DocumentSavedEventResult) {
@@ -906,6 +1386,60 @@ impl Application {
                     });
                 self.compositor.push(Box::new(overlaid(picker)));
             }
+            UiRequest::RegisterPanel {
+                plugin_name,
+                panel_id,
+                title,
+                side,
+                width,
+                render_callback_id,
+                event_callback_id,
+            } => {
+                use helix_view::model::{PanelSide, PanelSize, PluginPanelModel};
+
+                let panel_side = match side.as_str() {
+                    "left" => PanelSide::Left,
+                    "bottom" => PanelSide::Bottom,
+                    _ => PanelSide::Right,
+                };
+                let model = PluginPanelModel {
+                    plugin_name: plugin_name.clone(),
+                    panel_id: panel_id.clone(),
+                    render_callback_id,
+                    event_callback_id,
+                };
+                self.editor.model.insert_panel(
+                    title,
+                    Box::new(model),
+                    panel_side,
+                    PanelSize::fixed(width),
+                );
+
+                let panel = crate::ui::plugin_panel::PluginPanel::new(
+                    plugin_name,
+                    panel_id,
+                    render_callback_id,
+                    event_callback_id,
+                );
+                self.compositor.push(Box::new(panel));
+            }
+            UiRequest::RemovePanel {
+                plugin_name: _,
+                panel_id,
+            } => {
+                // Remove the component from the compositor by ID.
+                let target_id = format!("plugin_panel:{panel_id}");
+                self.compositor.remove_by_id(&target_id);
+                // Remove from model.
+                self.editor.model.panels.retain(|_, entry| {
+                    entry.tag() != "plugin_panel"
+                        || entry
+                            .content
+                            .as_any()
+                            .downcast_ref::<helix_view::model::PluginPanelModel>()
+                            .is_none_or(|m| m.panel_id != panel_id)
+                });
+            }
         }
     }
 
@@ -938,7 +1472,11 @@ impl Application {
                 helix_event::request_redraw();
             }
             EditorEvent::Redraw => {
-                self.render().await;
+                // Skip render here when bench is active — the bench tick
+                // does its own render, avoiding double-render per iteration.
+                if self.editor.bench.is_none() {
+                    self.render().await;
+                }
             }
             EditorEvent::IdleTimer => {
                 self.editor.clear_idle_timer();
@@ -957,6 +1495,35 @@ impl Application {
     pub async fn handle_terminal_events(&mut self, event: std::io::Result<TerminalEvent>) {
         #[cfg(not(windows))]
         use termina::escape::csi;
+
+        // Cancel bench on Ctrl+C
+        if self.editor.bench.is_some() {
+            let is_cancel = match &event {
+                #[cfg(windows)]
+                Ok(crossterm::event::Event::Key(crossterm::event::KeyEvent {
+                    code: crossterm::event::KeyCode::Char('c'),
+                    modifiers,
+                    ..
+                })) => modifiers.contains(crossterm::event::KeyModifiers::CONTROL),
+                #[cfg(not(windows))]
+                Ok(termina::Event::Key(termina::event::KeyEvent {
+                    code: termina::event::KeyCode::Char('c'),
+                    modifiers,
+                    ..
+                })) => modifiers.contains(termina::event::KeyModifiers::CONTROL),
+                _ => false,
+            };
+            if is_cancel {
+                if let Some(mut bench) = self.editor.bench.take() {
+                    let report = bench.report();
+                    eprintln!("{report}");
+                    self.editor
+                        .set_status("Bench cancelled (Ctrl+C). Report printed to stderr.");
+                    self.render().await;
+                }
+                return;
+            }
+        }
 
         let mut cx = crate::compositor::Context {
             editor: &mut self.editor,
@@ -1249,6 +1816,7 @@ impl Application {
                         }
 
                         self.editor.diagnostics.retain(|_, diags| !diags.is_empty());
+                        self.editor.refresh_workspace_diagnostic_counts();
 
                         // Clear any diagnostics for documents with this server open.
                         for doc in self.editor.documents_mut() {
@@ -1808,7 +2376,9 @@ impl Application {
                                 Some(helix_acp::types::PlanEntryStatus::InProgress) => {
                                     PlanStatus::InProgress
                                 }
-                                Some(helix_acp::types::PlanEntryStatus::Failed) => PlanStatus::Failed,
+                                Some(helix_acp::types::PlanEntryStatus::Failed) => {
+                                    PlanStatus::Failed
+                                }
                                 _ => PlanStatus::Pending,
                             },
                         })

@@ -8,11 +8,14 @@ pub mod compositor;
 pub mod config;
 pub mod events;
 pub mod health;
+pub mod host;
 pub mod job;
 pub mod keymap;
 pub mod plugin_registry;
+pub mod render;
 pub mod shutdown;
 pub mod ui;
+pub mod widgets;
 
 #[cfg(not(windows))]
 use std::env::var_os;

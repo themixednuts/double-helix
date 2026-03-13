@@ -25,6 +25,19 @@ pub enum UiRequest {
         plugin_name: String,
         callback_id: u64,
     },
+    RegisterPanel {
+        plugin_name: String,
+        panel_id: String,
+        title: String,
+        side: String,
+        width: u16,
+        render_callback_id: u64,
+        event_callback_id: Option<u64>,
+    },
+    RemovePanel {
+        plugin_name: String,
+        panel_id: String,
+    },
 }
 
 pub struct TermUiHandler {
@@ -75,6 +88,35 @@ impl UiHandler for TermUiHandler {
             prompt,
             plugin_name,
             callback_id,
+        });
+    }
+
+    fn register_panel(
+        &self,
+        _editor: &mut Editor,
+        plugin_name: String,
+        panel_id: String,
+        title: String,
+        side: String,
+        width: u16,
+        render_callback_id: u64,
+        event_callback_id: Option<u64>,
+    ) {
+        let _ = self.sender.send(UiRequest::RegisterPanel {
+            plugin_name,
+            panel_id,
+            title,
+            side,
+            width,
+            render_callback_id,
+            event_callback_id,
+        });
+    }
+
+    fn remove_panel(&self, _editor: &mut Editor, plugin_name: String, panel_id: String) {
+        let _ = self.sender.send(UiRequest::RemovePanel {
+            plugin_name,
+            panel_id,
         });
     }
 }

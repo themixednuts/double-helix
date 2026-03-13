@@ -1,11 +1,15 @@
-use std::{collections::HashSet, time::Duration};
+use std::{
+    collections::HashSet,
+    time::Duration,
+};
 
 use futures_util::{stream::FuturesOrdered, StreamExt};
 use helix_core::{syntax::config::LanguageServerFeature, text_annotations::InlineAnnotation};
 use helix_event::{cancelable_future, register_hook};
 use helix_lsp::lsp;
+use helix_view::bench::log_command_phase;
 use helix_view::{
-    document::DocumentColorSwatches,
+    document_lsp::DocumentColorSwatches,
     events::{DocumentDidChange, DocumentDidOpen, LanguageServerExited, LanguageServerInitialized},
     handlers::{lsp::DocumentColorsEvent, Handlers},
     DocumentId, Editor, Theme,
@@ -50,7 +54,7 @@ fn request_document_colors(editor: &mut Editor, doc_id: DocumentId) {
         return;
     };
 
-    let cancel = doc.color_swatch_controller.restart();
+    let cancel = doc.restart_color_swatches();
 
     let mut seen_language_servers = HashSet::new();
     let mut futures: FuturesOrdered<_> = doc
@@ -118,7 +122,7 @@ fn attach_document_colors(
     };
 
     if doc_colors.is_empty() {
-        doc.color_swatches.take();
+        doc.clear_color_swatches();
         return;
     }
 
@@ -138,7 +142,7 @@ fn attach_document_colors(
         ));
     }
 
-    doc.color_swatches = Some(DocumentColorSwatches {
+    doc.set_color_swatches(DocumentColorSwatches {
         color_swatches,
         colors,
         color_swatches_padding,
@@ -155,35 +159,30 @@ pub(super) fn register_hooks(handlers: &Handlers) {
 
     let tx = handlers.document_colors.clone();
     register_hook!(move |event: &mut DocumentDidChange<'_>| {
-        // Update the color swatch' positions, helping ensure they are displayed in the
-        // proper place.
-        let apply_color_swatch_changes = |annotations: &mut Vec<InlineAnnotation>| {
-            event.changes.update_positions(
-                annotations
-                    .iter_mut()
-                    .map(|annotation| (&mut annotation.char_idx, helix_core::Assoc::After)),
-            );
-        };
-
-        if let Some(DocumentColorSwatches {
-            color_swatches,
-            colors: _colors,
-            color_swatches_padding,
-        }) = &mut event.doc.color_swatches
-        {
-            apply_color_swatch_changes(color_swatches);
-            apply_color_swatch_changes(color_swatches_padding);
-        }
+        let hook_start = std::time::Instant::now();
+        // Update the color swatch positions so they stay aligned with edits.
+        event.doc.update_color_swatches(event.changes);
 
         // Avoid re-requesting document colors if the change is a ghost transaction (completion)
         // because the language server will not know about the updates to the document and will
         // give out-of-date locations.
         if !event.ghost_transaction {
             // Cancel the ongoing request, if present.
-            event.doc.color_swatch_controller.cancel();
+            event.doc.cancel_color_swatches();
             helix_event::send_blocking(&tx, DocumentColorsEvent(event.doc.id()));
         }
 
+        let hook_dur = hook_start.elapsed();
+        log_command_phase("document_did_change_hook", "document_colors", hook_dur, || {
+            format!(
+                "doc_id={:?} ghost={} lines={} bytes={} has_swatches={}",
+                event.doc.id(),
+                event.ghost_transaction,
+                event.doc.text().len_lines(),
+                event.doc.text().len_bytes(),
+                event.doc.color_swatches().is_some()
+            )
+        });
         Ok(())
     });
 
@@ -201,7 +200,7 @@ pub(super) fn register_hooks(handlers: &Handlers) {
         // Clear and re-request all color swatches when a server exits.
         for doc in event.editor.documents_mut() {
             if doc.supports_language_server(event.server_id) {
-                doc.color_swatches.take();
+                doc.clear_color_swatches();
             }
         }
 

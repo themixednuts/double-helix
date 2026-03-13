@@ -87,13 +87,13 @@ fn show_completion(
     context: HashMap<CompletionProvider, ResponseContext>,
     trigger: Trigger,
 ) {
-    let (view, doc) = current_ref!(editor);
+    let (view_id, doc) = focused_ref!(editor);
     // check if the completion request is stale.
     //
     // Completions are completed asynchronously and therefore the user could
     //switch document/view or leave insert mode. In all of thoise cases the
     // completion should be discarded
-    if editor.mode != Mode::Insert || view.id != trigger.view || doc.id() != trigger.doc {
+    if editor.mode != Mode::Insert || view_id != trigger.view || doc.id() != trigger.doc {
         return;
     }
 
@@ -102,7 +102,7 @@ fn show_completion(
     if ui.completion.is_some() {
         return;
     }
-    word::retain_valid_completions(trigger, doc, view.id, &mut items);
+    word::retain_valid_completions(trigger, doc, view_id, &mut items);
     editor.handlers.completions.active_completions = context;
 
     let completion_area = ui.set_completion(editor, items, trigger.pos, size);
@@ -120,9 +120,9 @@ pub fn trigger_auto_completion(editor: &Editor, trigger_char_only: bool) {
     if !config.auto_completion {
         return;
     }
-    let (view, doc): (&helix_view::View, &helix_view::Document) = current_ref!(editor);
+    let (view_id, doc) = focused_ref!(editor);
     let mut text = doc.text().slice(..);
-    let cursor = doc.selection(view.id).primary().cursor(text);
+    let cursor = doc.selection(view_id).primary().cursor(text);
     text = doc.text().slice(..cursor);
 
     let is_trigger_char = doc
@@ -148,7 +148,7 @@ pub fn trigger_auto_completion(editor: &Editor, trigger_char_only: bool) {
         handler.event(CompletionEvent::TriggerChar {
             cursor,
             doc: doc.id(),
-            view: view.id,
+            view: view_id,
         });
         return;
     }
@@ -165,7 +165,7 @@ pub fn trigger_auto_completion(editor: &Editor, trigger_char_only: bool) {
         handler.event(CompletionEvent::AutoTrigger {
             cursor,
             doc: doc.id(),
-            view: view.id,
+            view: view_id,
         });
     }
 }
@@ -203,25 +203,28 @@ fn completion_post_command_hook(
     if cx.editor.mode == Mode::Insert {
         if cx.editor.last_completion.is_some() {
             match command {
-                MappableCommand::Static {
-                    name: "delete_word_forward" | "delete_char_forward" | "completion",
-                    ..
-                } => (),
-                MappableCommand::Static {
-                    name: "delete_char_backward",
-                    ..
-                } => update_completion_filter(cx, None),
+                MappableCommand::Engine { .. }
+                    if matches!(
+                        command.name(),
+                        "delete_word_forward" | "delete_char_forward"
+                    ) => {}
+                MappableCommand::Frontend { .. } if command.name() == "completion" => (),
+                MappableCommand::Engine { .. } if command.name() == "delete_char_backward" => {
+                    update_completion_filter(cx, None)
+                }
                 _ => clear_completions(cx),
             }
         } else {
             let event = match command {
-                MappableCommand::Static {
-                    name: "delete_char_backward" | "delete_word_forward" | "delete_char_forward",
-                    ..
-                } => {
-                    let (view, doc) = current!(cx.editor);
+                MappableCommand::Engine { .. }
+                    if matches!(
+                        command.name(),
+                        "delete_char_backward" | "delete_word_forward" | "delete_char_forward"
+                    ) =>
+                {
+                    let (view_id, doc) = focused!(cx.editor);
                     let primary_cursor = doc
-                        .selection(view.id)
+                        .selection(view_id)
                         .primary()
                         .cursor(doc.text().slice(..));
                     CompletionEvent::DeleteText {
@@ -230,10 +233,11 @@ fn completion_post_command_hook(
                 }
                 // hacks: some commands are handeled elsewhere and we don't want to
                 // cancel in that case
-                MappableCommand::Static {
-                    name: "completion" | "insert_mode" | "append_mode",
-                    ..
-                } => return Ok(()),
+                MappableCommand::Frontend { .. }
+                    if matches!(command.name(), "completion" | "insert_mode" | "append_mode") =>
+                {
+                    return Ok(());
+                }
                 _ => CompletionEvent::Cancel,
             };
             cx.editor.handlers.completions.event(event);

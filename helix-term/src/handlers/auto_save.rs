@@ -10,6 +10,7 @@ use anyhow::Ok;
 use arc_swap::access::Access;
 
 use helix_event::{register_hook, send_blocking};
+use helix_view::bench::log_command_phase;
 use helix_view::{
     document::Mode,
     events::DocumentDidChange,
@@ -102,6 +103,7 @@ fn request_auto_save(editor: &mut Editor) {
 pub(super) fn register_hooks(handlers: &Handlers) {
     let tx = handlers.auto_save.clone();
     register_hook!(move |event: &mut DocumentDidChange<'_>| {
+        let hook_start = std::time::Instant::now();
         let config = event.doc.config.load();
         if config.auto_save.after_delay.enable {
             send_blocking(
@@ -111,6 +113,17 @@ pub(super) fn register_hooks(handlers: &Handlers) {
                 },
             );
         }
+        let hook_dur = hook_start.elapsed();
+        log_command_phase("document_did_change_hook", "auto_save", hook_dur, || {
+            format!(
+                "doc_id={:?} enabled={} timeout_ms={} lines={} bytes={}",
+                event.doc.id(),
+                config.auto_save.after_delay.enable,
+                config.auto_save.after_delay.timeout,
+                event.doc.text().len_lines(),
+                event.doc.text().len_bytes()
+            )
+        });
         Ok(())
     });
 

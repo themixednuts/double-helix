@@ -11,6 +11,7 @@ use helix_core::Uri;
 use helix_event::{cancelable_future, register_hook, send_blocking};
 use helix_lsp::{lsp, LanguageServerId};
 use helix_view::document::Mode;
+use helix_view::bench::log_command_phase;
 use helix_view::events::{
     DiagnosticsDidChange, DocumentDidChange, DocumentDidOpen, LanguageServerInitialized,
 };
@@ -41,13 +42,14 @@ pub(super) fn register_hooks(handlers: &Handlers) {
     let tx = handlers.pull_diagnostics.clone();
     let tx_all_documents = handlers.pull_all_documents_diagnostics.clone();
     register_hook!(move |event: &mut DocumentDidChange<'_>| {
+        let hook_start = std::time::Instant::now();
         if event
             .doc
             .has_language_server_with_feature(LanguageServerFeature::PullDiagnostics)
             && !event.ghost_transaction
         {
             // Cancel the ongoing request, if present.
-            event.doc.pull_diagnostic_controller.cancel();
+            event.doc.cancel_pull_diagnostics();
             let document_id = event.doc.id();
             send_blocking(&tx, PullDiagnosticsEvent { document_id });
 
@@ -79,6 +81,16 @@ pub(super) fn register_hooks(handlers: &Handlers) {
                 },
             );
         }
+        let hook_dur = hook_start.elapsed();
+        log_command_phase("document_did_change_hook", "diagnostics_pull", hook_dur, || {
+            format!(
+                "doc_id={:?} ghost={} lines={} bytes={}",
+                event.doc.id(),
+                event.ghost_transaction,
+                event.doc.text().len_lines(),
+                event.doc.text().len_bytes()
+            )
+        });
         Ok(())
     });
 
@@ -168,14 +180,16 @@ fn request_document_diagnostics_for_language_severs(
         return;
     };
 
-    let cancel = doc.pull_diagnostic_controller.restart();
+    let cancel = doc.restart_pull_diagnostics();
 
     let mut futures: FuturesUnordered<_> = language_servers
         .iter()
         .filter_map(|x| doc.language_servers().find(|y| &y.id() == x))
         .filter_map(|language_server| {
-            let future = language_server
-                .text_document_diagnostic(doc.identifier(), doc.previous_diagnostic_id.clone())?;
+            let future = language_server.text_document_diagnostic(
+                doc.identifier(),
+                doc.previous_diagnostic_id().map(ToOwned::to_owned),
+            )?;
 
             let identifier = language_server
                 .capabilities()
@@ -293,7 +307,7 @@ fn handle_pull_diagnostics_response(
             };
 
             if let Some(doc) = editor.document_mut(document_id) {
-                doc.previous_diagnostic_id = result_id;
+                doc.set_previous_diagnostic_id(result_id);
             };
         }
         lsp::DocumentDiagnosticReportResult::Partial(_) => {}

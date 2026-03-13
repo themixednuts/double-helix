@@ -20,11 +20,12 @@ pub(super) fn completion(
     handle: TaskHandle,
     savepoint: Arc<SavePoint>,
 ) -> Option<impl FnOnce() -> CompletionResponse> {
-    if !doc!(editor).word_completion_enabled() {
+    if !focused_ref!(editor).1.word_completion_enabled() {
         return None;
     }
     let config = editor.config().word_completion;
-    let doc_config = doc!(editor)
+    let doc_config = focused_ref!(editor)
+        .1
         .language_config()
         .and_then(|config| config.word_completion);
     let trigger_length = doc_config
@@ -32,11 +33,11 @@ pub(super) fn completion(
         .unwrap_or(config.trigger_length)
         .get() as usize;
 
-    let (view, doc) = current_ref!(editor);
+    let (view_id, doc) = focused_ref!(editor);
     let rope = doc.text().clone();
     let word_index = editor.handlers.word_index().clone();
     let text = doc.text().slice(..);
-    let selection = doc.selection(view.id).clone();
+    let selection = doc.selection(view_id).clone();
     let pos = selection.primary().cursor(text);
 
     let cursor = movement::move_prev_word_start(

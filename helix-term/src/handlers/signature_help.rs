@@ -5,6 +5,7 @@ use helix_core::syntax::config::LanguageServerFeature;
 use helix_event::{cancelable_future, register_hook, send_blocking, TaskController, TaskHandle};
 use helix_lsp::lsp::{self, SignatureInformation};
 use helix_stdx::rope::RopeSliceExt;
+use helix_view::bench::log_command_phase;
 use helix_view::document::Mode;
 use helix_view::events::{DocumentDidChange, SelectionDidChange};
 use helix_view::handlers::lsp::{SignatureHelpEvent, SignatureHelpInvoked};
@@ -104,13 +105,13 @@ pub fn request_signature_help(
     invoked: SignatureHelpInvoked,
     cancel: TaskHandle,
 ) {
-    let (view, doc) = current!(editor);
+    let (view_id, doc) = focused!(editor);
 
     // TODO merge multiple language server signature help into one instead of just taking the first language server that supports it
     let future = doc
         .language_servers_with_feature(LanguageServerFeature::SignatureHelp)
         .find_map(|language_server| {
-            let pos = doc.position(view.id, language_server.offset_encoding());
+            let pos = doc.position(view_id, language_server.offset_encoding());
             language_server.text_document_signature_help(doc.identifier(), pos, None)
         });
 
@@ -205,7 +206,7 @@ pub fn show_signature_help(
         SignatureHelpEvent::RequestComplete { open: true },
     );
 
-    let doc = doc!(editor);
+    let (_, doc) = focused_ref!(editor);
     let language = doc.language_name().unwrap_or("");
 
     if response.signatures.is_empty() {
@@ -298,7 +299,7 @@ fn signature_help_post_insert_char_hook(
     if !cx.editor.config().lsp.auto_signature_help {
         return Ok(());
     }
-    let (view, doc) = current!(cx.editor);
+    let (view_id, doc) = focused!(cx.editor);
     // TODO support multiple language servers (not just the first that is found), likely by merging UI somehow
     let Some(language_server) = doc
         .language_servers_with_feature(LanguageServerFeature::SignatureHelp)
@@ -320,7 +321,7 @@ fn signature_help_post_insert_char_hook(
     } = capabilities
     {
         let mut text = doc.text().slice(..);
-        let cursor = doc.selection(view.id).primary().cursor(text);
+        let cursor = doc.selection(view_id).primary().cursor(text);
         text = text.slice(..cursor);
         if triggers.iter().any(|trigger| text.ends_with(trigger)) {
             send_blocking(tx, SignatureHelpEvent::Trigger)
@@ -354,9 +355,21 @@ pub(super) fn register_hooks(handlers: &Handlers) {
 
     let tx = handlers.signature_hints.clone();
     register_hook!(move |event: &mut DocumentDidChange<'_>| {
+        let hook_start = std::time::Instant::now();
         if event.doc.config.load().lsp.auto_signature_help && !event.ghost_transaction {
             send_blocking(&tx, SignatureHelpEvent::ReTrigger);
         }
+        let hook_dur = hook_start.elapsed();
+        log_command_phase("document_did_change_hook", "signature_help", hook_dur, || {
+            format!(
+                "doc_id={:?} ghost={} auto_signature_help={} lines={} bytes={}",
+                event.doc.id(),
+                event.ghost_transaction,
+                event.doc.config.load().lsp.auto_signature_help,
+                event.doc.text().len_lines(),
+                event.doc.text().len_bytes()
+            )
+        });
         Ok(())
     });
 

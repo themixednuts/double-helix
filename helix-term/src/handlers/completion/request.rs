@@ -17,6 +17,7 @@ use helix_view::{Document, DocumentId, Editor, ViewId};
 use tokio::task::JoinSet;
 use tokio::time::{timeout_at, Instant};
 
+use super::word;
 use crate::compositor::Compositor;
 use crate::config::Config;
 use crate::handlers::completion::item::CompletionResponse;
@@ -26,9 +27,6 @@ use crate::handlers::completion::{
 };
 use crate::job::{dispatch, dispatch_blocking};
 use crate::ui;
-use crate::ui::editor::InsertEvent;
-
-use super::word;
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub(super) enum TriggerKind {
@@ -164,7 +162,7 @@ fn request_completions(
     editor: &mut Editor,
     compositor: &mut Compositor,
 ) {
-    let (view, doc) = current_ref!(editor);
+    let (view_id, doc) = focused_ref!(editor);
 
     if compositor
         .find::<ui::EditorView>()
@@ -177,8 +175,8 @@ fn request_completions(
     }
 
     let text = doc.text();
-    let cursor = doc.selection(view.id).primary().cursor(text.slice(..));
-    if trigger.view != view.id || trigger.doc != doc.id() || cursor < trigger.pos {
+    let cursor = doc.selection(view_id).primary().cursor(text.slice(..));
+    if trigger.view != view_id || trigger.doc != doc.id() || cursor < trigger.pos {
         return;
     }
     // This looks odd... Why are we not using the trigger position from the `trigger` here? Won't
@@ -189,6 +187,7 @@ fn request_completions(
     // rely on the trigger offset and primary cursor matching for multi-cursor completions so this
     // is definitely necessary from our side too.
     trigger.pos = cursor;
+    let view = view!(editor, view_id);
     let doc = doc_mut!(editor, &doc.id());
     let savepoint = doc.savepoint(view);
     let text = doc.text();
@@ -234,14 +233,14 @@ fn request_completions(
         requests.spawn(request_completions_from_language_server(
             ls,
             doc,
-            view.id,
+            view_id,
             context,
             -(priority as i8),
             savepoint.clone(),
         ));
     }
     if let Some(path_completion_request) = path_completion(
-        doc.selection(view.id).clone(),
+        doc.selection(view_id).clone(),
         doc,
         handle.clone(),
         savepoint.clone(),
@@ -254,8 +253,6 @@ fn request_completions(
         requests.spawn_blocking(word_completion_request);
     }
 
-    let ui = compositor.find::<ui::EditorView>().unwrap();
-    ui.last_insert.1.push(InsertEvent::RequestCompletion);
     let handle_ = handle.clone();
     let request_completions = async move {
         let mut context = HashMap::new();
@@ -353,12 +350,13 @@ pub fn request_incomplete_completion_list(editor: &mut Editor, handle: TaskHandl
         let Some(ls) = editor.language_servers.get_by_id(ls_id) else {
             continue;
         };
-        let (view, doc) = current!(editor);
+        let (view_id, doc) = focused!(editor);
+        let view = view!(editor, view_id);
         let savepoint = savepoint.get_or_insert_with(|| doc.savepoint(view)).clone();
         let request = request_completions_from_language_server(
             ls,
             doc,
-            view.id,
+            view_id,
             CompletionContext {
                 trigger_kind: CompletionTriggerKind::TRIGGER_FOR_INCOMPLETE_COMPLETIONS,
                 trigger_character: None,

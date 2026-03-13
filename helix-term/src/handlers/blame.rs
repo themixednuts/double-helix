@@ -42,7 +42,7 @@ impl helix_event::AsyncHook for BlameHandler {
                     return;
                 };
                 let result = FileBlame::try_new(path);
-                doc.file_blame = Some(result);
+                doc.set_file_blame(result);
                 if !editor.config().inline_blame.auto_fetch {
                     if let Some(line) = line_blame {
                         crate::commands::blame_line_impl(editor, doc_id, line);

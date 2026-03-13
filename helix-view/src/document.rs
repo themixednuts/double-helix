@@ -9,35 +9,31 @@ use helix_core::command_line::Token;
 use helix_core::diagnostic::DiagnosticProvider;
 use helix_core::doc_formatter::TextFormat;
 use helix_core::encoding::Encoding;
-use helix_core::snippets::{ActiveSnippet, SnippetRenderCtx};
+use helix_core::snippets::{ActiveSnippet, RenderedSnippet, SnippetRenderCtx};
 use helix_core::syntax::config::LanguageServerFeature;
 use helix_core::text_annotations::{InlineAnnotation, Overlay};
 use helix_core::text_folding::{EndFoldPoint, FoldContainer, StartFoldPoint};
-use helix_event::TaskController;
 use helix_lsp::util::lsp_pos_to_pos;
 use helix_stdx::faccess::{copy_metadata, readonly};
 use helix_vcs::{DiffHandle, DiffProviderRegistry};
-use once_cell::sync::OnceCell;
-use thiserror;
 
 use ::parking_lot::Mutex;
 use serde::de::{self, Deserialize, Deserializer};
 use serde::Serialize;
 use std::borrow::Cow;
-use std::cell::Cell;
 use std::collections::HashMap;
 use std::fmt::Display;
 use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::{Arc, Weak};
-use std::time::SystemTime;
+use std::sync::Arc;
+use std::time::{Instant, SystemTime};
 
 use helix_core::{
     editor_config::EditorConfig,
     encoding,
-    history::{History, State, UndoKind},
+    history::{State, UndoKind},
     indent::{auto_detect_indent_style, IndentStyle},
     line_ending::auto_detect_line_ending,
     syntax::{self, config::LanguageConfiguration},
@@ -45,9 +41,19 @@ use helix_core::{
 };
 
 use crate::{
+    bench::{current_bench_command_context, log_command_phase},
+    document_lsp::{DocumentColorSwatches, DocumentLspState},
     editor::Config,
     events::{DocumentDidChange, SelectionDidChange},
     expansion,
+    file_bound::FileBoundState,
+    presentation_state::DocumentPresentationState,
+    selection_store::SelectionStore,
+    session_state::DocumentSessionState,
+    snippet_state::DocumentSnippetState,
+    syntax_aware::SyntaxAwareState,
+    text_buffer::TextBuffer,
+    vcs_state::{LineBlameError, VcsState},
     view::ViewPosition,
     DocumentId, Editor, Theme, View, ViewId,
 };
@@ -128,7 +134,7 @@ pub type DocumentSavedEventFuture = BoxFuture<'static, DocumentSavedEventResult>
 pub struct SavePoint {
     /// The view this savepoint is associated with
     pub view: ViewId,
-    revert: Mutex<Transaction>,
+    pub(crate) revert: Mutex<Transaction>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -158,100 +164,24 @@ pub struct PluginAnnotation {
 
 pub struct Document {
     pub(crate) id: DocumentId,
-    text: Rope,
-    selections: HashMap<ViewId, Selection>,
-    view_data: HashMap<ViewId, ViewData>,
-    pub active_snippet: Option<ActiveSnippet>,
+    buffer: TextBuffer,
+    selection_store: SelectionStore,
+    presentation: DocumentPresentationState,
+    session: DocumentSessionState,
+    snippet: DocumentSnippetState,
 
-    /// Inlay hints annotations for the document, by view.
-    ///
-    /// To know if they're up-to-date, check the `id` field in `DocumentInlayHints`.
-    pub(crate) inlay_hints: HashMap<ViewId, DocumentInlayHints>,
-    pub(crate) jump_labels: HashMap<ViewId, Vec<Overlay>>,
-    pub plugin_annotations: HashMap<ViewId, Vec<PluginAnnotation>>,
-    fold_container: HashMap<ViewId, FoldContainer>,
-    /// Set to `true` when the document is updated, reset to `false` on the next inlay hints
-    /// update from the LSP
-    pub inlay_hints_oudated: bool,
+    file: FileBoundState,
 
-    path: Option<PathBuf>,
-    relative_path: OnceCell<Option<PathBuf>>,
-    encoding: &'static encoding::Encoding,
-    has_bom: bool,
+    syntax_aware: SyntaxAwareState,
+    pub config: Arc<dyn DynAccess<Config> + Send + Sync>,
 
-    pub restore_cursor: bool,
+    vcs: VcsState,
 
-    /// Current indent style.
-    pub indent_style: IndentStyle,
-    editor_config: EditorConfig,
-
-    /// The document's default line ending.
-    pub line_ending: LineEnding,
-
-    pub syntax: Option<Syntax>,
-    /// Corresponding language scope name. Usually `source.<lang>`.
-    pub language: Option<Arc<LanguageConfiguration>>,
-
-    /// Pending changes since last history commit.
-    changes: ChangeSet,
-    /// State at last commit. Used for calculating reverts.
-    old_state: Option<State>,
-    /// Undo tree.
-    // It can be used as a cell where we will take it out to get some parts of the history and put
-    // it back as it separated from the edits. We could split out the parts manually but that will
-    // be more troublesome.
-    pub history: Cell<History>,
-    pub config: Arc<dyn DynAccess<Config>>,
-
-    savepoints: Vec<Weak<SavePoint>>,
-
-    // Last time we wrote to the file. This will carry the time the file was last opened if there
-    // were no saves.
-    last_saved_time: SystemTime,
-
-    last_saved_revision: usize,
-    version: i32, // should be usize?
-    pub(crate) modified_since_accessed: bool,
-
-    pub(crate) diagnostics: Vec<Diagnostic>,
-    pub(crate) language_servers: HashMap<LanguageServerName, Arc<Client>>,
-
-    diff_handle: Option<DiffHandle>,
-    version_control_head: Option<Arc<ArcSwap<Box<str>>>>,
-    /// Contains blame information for each line in the file
-    /// We store the Result because when we access the blame manually we want to log the error
-    /// But if it is in the background we are just going to ignore the error
-    pub file_blame: Option<anyhow::Result<helix_vcs::FileBlame>>,
-
-    // when document was used for most-recent-used buffer picker
-    pub focused_at: std::time::Instant,
-
-    pub readonly: bool,
-
-    pub previous_diagnostic_id: Option<String>,
-
-    /// Annotations for LSP document color swatches
-    pub color_swatches: Option<DocumentColorSwatches>,
-    // NOTE: ideally this would live on the handler for color swatches. This is blocked on a
-    // large refactor that would make `&mut Editor` available on the `DocumentDidChange` event.
-    pub color_swatch_controller: TaskController,
-    pub pull_diagnostic_controller: TaskController,
-
-    /// Whether to render the welcome screen when opening the document
-    pub is_welcome: bool,
-    /// When fetching blame on-demand, if this field is `true` we request the blame for this document again
-    pub is_blame_potentially_out_of_date: bool,
+    lsp: DocumentLspState,
     // NOTE: this field should eventually go away - we should use the Editor's syn_loader instead
     // of storing a copy on every doc. Then we can remove the surrounding `Arc` and use the
     // `ArcSwap` directly.
     syn_loader: Arc<ArcSwap<syntax::Loader>>,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct DocumentColorSwatches {
-    pub color_swatches: Vec<InlineAnnotation>,
-    pub colors: Vec<syntax::Highlight>,
-    pub color_swatches_padding: Vec<InlineAnnotation>,
 }
 
 /// Inlay hints for a single `(Document, View)` combo.
@@ -321,41 +251,20 @@ pub struct DocumentInlayHintsId {
     pub last_line: usize,
 }
 
-#[derive(Debug, thiserror::Error)]
-pub enum LineBlameError<'a> {
-    #[error("Not committed yet")]
-    NotCommittedYet,
-    #[error("Unable to get blame for line {0}: {1}")]
-    NoFileBlame(u32, &'a anyhow::Error),
-    #[error("The blame for this file is not ready yet. Try again in a few seconds")]
-    NotReadyYet,
-}
-
 use std::{fmt, mem};
 impl fmt::Debug for Document {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Document")
             .field("id", &self.id)
-            .field("text", &self.text)
-            .field("selections", &self.selections)
-            .field("inlay_hints_oudated", &self.inlay_hints_oudated)
-            .field("text_annotations", &self.inlay_hints)
-            .field("view_data", &self.view_data)
-            .field("path", &self.path)
-            .field("encoding", &self.encoding)
-            .field("restore_cursor", &self.restore_cursor)
-            .field("syntax", &self.syntax)
-            .field("language", &self.language)
-            .field("changes", &self.changes)
-            .field("old_state", &self.old_state)
-            // .field("history", &self.history)
-            .field("last_saved_time", &self.last_saved_time)
-            .field("last_saved_revision", &self.last_saved_revision)
-            .field("version", &self.version)
-            .field("modified_since_accessed", &self.modified_since_accessed)
-            .field("diagnostics", &self.diagnostics)
+            .field("buffer", &self.buffer)
+            .field("selection_store", &self.selection_store)
+            .field("presentation", &self.presentation)
+            .field("session", &self.session)
+            .field("file", &self.file)
+            .field("syntax_aware", &self.syntax_aware)
+            .field("vcs", &self.vcs)
+            .field("lsp", &self.lsp)
             // .field("language_server", &self.language_server)
-            .field("fold_container", &self.fold_container)
             .finish()
     }
 }
@@ -372,7 +281,7 @@ impl fmt::Debug for DocumentInlayHintsId {
 impl Editor {
     pub(crate) fn clear_doc_relative_paths(&mut self) {
         for doc in self.documents_mut() {
-            doc.relative_path.take();
+            doc.clear_relative_path();
         }
     }
 }
@@ -725,71 +634,34 @@ impl Document {
     pub fn from(
         text: Rope,
         encoding_with_bom_info: Option<(&'static Encoding, bool)>,
-        config: Arc<dyn DynAccess<Config>>,
+        config: Arc<dyn DynAccess<Config> + Send + Sync>,
         syn_loader: Arc<ArcSwap<syntax::Loader>>,
     ) -> Self {
         let (encoding, has_bom) = encoding_with_bom_info.unwrap_or((encoding::UTF_8, false));
         let line_ending = config.load().default_line_ending.into();
-        let changes = ChangeSet::new(text.slice(..));
-        let old_state = None;
 
         Self {
             id: DocumentId::default(),
-            active_snippet: None,
-            path: None,
-            relative_path: OnceCell::new(),
-            encoding,
-            has_bom,
-            text,
-            selections: HashMap::default(),
-            inlay_hints: HashMap::default(),
-            fold_container: HashMap::default(),
-            inlay_hints_oudated: false,
-            view_data: Default::default(),
-            indent_style: DEFAULT_INDENT,
-            editor_config: EditorConfig::default(),
-            line_ending,
-            restore_cursor: false,
-            syntax: None,
-            language: None,
-            changes,
-            old_state,
-            diagnostics: Vec::new(),
-            version: 0,
-            history: Cell::new(History::default()),
-            savepoints: Vec::new(),
-            last_saved_time: SystemTime::now(),
-            last_saved_revision: 0,
-            modified_since_accessed: false,
-            language_servers: HashMap::new(),
-            diff_handle: None,
+            file: FileBoundState::new(encoding, has_bom),
+            buffer: TextBuffer::new(text, line_ending),
+            selection_store: SelectionStore::default(),
+            presentation: DocumentPresentationState::default(),
+            session: DocumentSessionState::default(),
+            snippet: DocumentSnippetState::default(),
+            syntax_aware: SyntaxAwareState::default(),
+            vcs: VcsState::default(),
             config,
-            version_control_head: None,
-            focused_at: std::time::Instant::now(),
-            readonly: false,
-            jump_labels: HashMap::new(),
-            plugin_annotations: HashMap::new(),
-            color_swatches: None,
-            color_swatch_controller: TaskController::new(),
-            is_welcome: false,
-            file_blame: None,
-            is_blame_potentially_out_of_date: false,
+            lsp: DocumentLspState::default(),
             syn_loader,
-            previous_diagnostic_id: None,
-            pull_diagnostic_controller: TaskController::new(),
         }
     }
 
-    pub fn should_request_full_file_blame(&mut self, auto_fetch: bool) -> bool {
-        if auto_fetch {
-            true
-        } else {
-            self.is_blame_potentially_out_of_date
-        }
+    pub fn should_request_full_file_blame(&self, auto_fetch: bool) -> bool {
+        self.vcs.should_request_full_file_blame(auto_fetch)
     }
 
     pub fn default(
-        config: Arc<dyn DynAccess<Config>>,
+        config: Arc<dyn DynAccess<Config> + Send + Sync>,
         syn_loader: Arc<ArcSwap<syntax::Loader>>,
     ) -> Self {
         let line_ending: LineEnding = config.load().default_line_ending.into();
@@ -798,7 +670,7 @@ impl Document {
     }
 
     pub fn with_welcome(mut self) -> Self {
-        self.is_welcome = true;
+        self.presentation.set_welcome(true);
         self
     }
 
@@ -809,7 +681,7 @@ impl Document {
         path: &Path,
         mut encoding: Option<&'static Encoding>,
         detect_language: bool,
-        config: Arc<dyn DynAccess<Config>>,
+        config: Arc<dyn DynAccess<Config> + Send + Sync>,
         syn_loader: Arc<ArcSwap<syntax::Loader>>,
     ) -> Result<Self, DocumentOpenError> {
         // If the path is not a regular file (e.g.: /dev/random) it should not be opened.
@@ -845,7 +717,7 @@ impl Document {
             doc.detect_language(&loader);
         }
 
-        doc.editor_config = editor_config;
+        doc.presentation.set_editor_config(editor_config);
         doc.detect_indent_and_line_ending();
 
         Ok(doc)
@@ -892,7 +764,7 @@ impl Document {
 
             let mut process = tokio::process::Command::new(&fmt_cmd);
 
-            if let Some(doc_dir) = self.path.as_ref().and_then(|path| path.parent()) {
+            if let Some(doc_dir) = self.path().and_then(|path| path.parent()) {
                 process.current_dir(doc_dir);
             }
 
@@ -960,7 +832,7 @@ impl Document {
             return Some(formatting_future.boxed());
         };
 
-        let text = self.text.clone();
+        let text = self.text().clone();
         // finds first language server that supports formatting and then formats
         let language_server = self
             .language_servers_with_feature(LanguageServerFeature::Format)
@@ -970,7 +842,7 @@ impl Document {
             self.identifier(),
             lsp::FormattingOptions {
                 tab_size: self.tab_width() as u32,
-                insert_spaces: matches!(self.indent_style, IndentStyle::Spaces(_)),
+                insert_spaces: matches!(self.indent_style(), IndentStyle::Spaces(_)),
                 ..Default::default()
             },
             None,
@@ -1029,23 +901,23 @@ impl Document {
         let path = match path {
             Some(path) => helix_stdx::path::canonicalize(path),
             None => {
-                if self.path.is_none() {
+                if self.path().is_none() {
                     bail!("Can't save with no path set!");
                 }
-                self.path.as_ref().unwrap().clone()
+                self.path().cloned().unwrap()
             }
         };
 
         let identifier = self.path().map(|_| self.identifier());
-        let language_servers: Vec<_> = self.language_servers.values().cloned().collect();
+        let language_servers: Vec<_> = self.syntax_aware.all_language_servers().cloned().collect();
 
         // mark changes up to now as saved
         let current_rev = self.get_current_revision();
         let doc_id = self.id();
         let atomic_save = self.config.load().atomic_save;
 
-        let encoding_with_bom_info = (self.encoding, self.has_bom);
-        let last_saved_time = self.last_saved_time;
+        let encoding_with_bom_info = self.file.encoding_with_bom_info();
+        let last_saved_time = self.file.last_saved_time();
 
         // We encode the file according to the `Document`'s encoding.
         let future = async move {
@@ -1213,7 +1085,7 @@ impl Document {
         loader: &syntax::Loader,
     ) -> Option<Arc<syntax::config::LanguageConfiguration>> {
         let language = loader
-            .language_for_filename(self.path.as_ref()?)
+            .language_for_filename(self.path()?)
             .or_else(|| loader.language_for_shebang(self.text().slice(..)))?;
 
         Some(loader.language(language).config().clone())
@@ -1223,63 +1095,48 @@ impl Document {
     /// configured in `languages.toml`, with a fallback to tabs if it isn't specified. Line ending
     /// is likewise auto-detected, and will remain unchanged if no line endings were detected.
     pub fn detect_indent_and_line_ending(&mut self) {
-        self.indent_style = if let Some(indent_style) = self.editor_config.indent_style {
-            indent_style
-        } else {
-            auto_detect_indent_style(&self.text).unwrap_or_else(|| {
-                self.language_config()
-                    .and_then(|config| config.indent.as_ref())
-                    .map_or(DEFAULT_INDENT, |config| IndentStyle::from_str(&config.unit))
-            })
-        };
+        self.presentation.set_indent_style(
+            if let Some(indent_style) = self.presentation.editor_config().indent_style {
+                indent_style
+            } else {
+                auto_detect_indent_style(self.text()).unwrap_or_else(|| {
+                    self.language_config()
+                        .and_then(|config| config.indent.as_ref())
+                        .map_or(DEFAULT_INDENT, |config| IndentStyle::from_str(&config.unit))
+                })
+            },
+        );
         if let Some(line_ending) = self
-            .editor_config
+            .presentation
+            .editor_config()
             .line_ending
-            .or_else(|| auto_detect_line_ending(&self.text))
+            .or_else(|| auto_detect_line_ending(self.text()))
         {
-            self.line_ending = line_ending;
+            self.set_line_ending(line_ending);
         }
     }
 
     pub fn detect_editor_config(&mut self) {
         if self.config.load().editor_config {
-            if let Some(path) = self.path.as_ref() {
-                self.editor_config = EditorConfig::find(path);
+            if let Some(path) = self.path() {
+                self.presentation
+                    .set_editor_config(EditorConfig::find(path));
             }
         }
     }
 
     pub fn pickup_last_saved_time(&mut self) {
-        self.last_saved_time = match self.path() {
-            Some(path) => match path.metadata() {
-                Ok(metadata) => match metadata.modified() {
-                    Ok(mtime) => mtime,
-                    Err(err) => {
-                        log::debug!("Could not fetch file system's mtime, falling back to current system time: {}", err);
-                        SystemTime::now()
-                    }
-                },
-                Err(err) => {
-                    log::debug!("Could not fetch file system's mtime, falling back to current system time: {}", err);
-                    SystemTime::now()
-                }
-            },
-            None => SystemTime::now(),
-        };
+        self.file.pickup_last_saved_time();
     }
 
     /// Return the last saved time of the document.
     pub fn get_last_saved_time(&self) -> SystemTime {
-        self.last_saved_time
+        self.file.last_saved_time()
     }
 
     // Detect if the file is readonly and change the readonly field if necessary (unix only)
     pub fn detect_readonly(&mut self) {
-        // Allows setting the flag for files the user cannot modify, like root files
-        self.readonly = match &self.path {
-            None => false,
-            Some(p) => readonly(p),
-        };
+        self.file.detect_readonly();
     }
 
     /// Reload the document from its path.
@@ -1288,7 +1145,7 @@ impl Document {
         view: &mut View,
         provider_registry: &DiffProviderRegistry,
     ) -> Result<(), Error> {
-        let encoding = self.encoding;
+        let encoding = self.encoding();
         let path = match self.path() {
             None => return Ok(()),
             Some(path) => match path.exists() {
@@ -1315,45 +1172,29 @@ impl Document {
 
         match provider_registry.get_diff_base(&path) {
             Some(diff_base) => self.set_diff_base(diff_base),
-            None => self.diff_handle = None,
+            None => self.vcs.clear_diff_base(),
         }
 
-        self.version_control_head = provider_registry.get_current_head_name(&path);
+        self.set_version_control_head(provider_registry.get_current_head_name(&path));
 
         Ok(())
     }
 
     /// Sets the [`Document`]'s encoding with the encoding correspondent to `label`.
     pub fn set_encoding(&mut self, label: &str) -> Result<(), Error> {
-        let encoding =
-            Encoding::for_label(label.as_bytes()).ok_or_else(|| anyhow!("unknown encoding"))?;
-
-        self.encoding = encoding;
-
-        Ok(())
+        self.file.set_encoding(label)
     }
 
     /// Returns the [`Document`]'s current encoding.
     pub fn encoding(&self) -> &'static Encoding {
-        self.encoding
+        self.file.encoding()
     }
 
     /// sets the document path without sending events to various
     /// observers (like LSP), in most cases `Editor::set_doc_path`
     /// should be used instead
     pub fn set_path(&mut self, path: Option<&Path>) {
-        let path = path.map(helix_stdx::path::canonicalize);
-
-        // `take` to remove any prior relative path that may have existed.
-        // This will get set in `relative_path()`.
-        self.relative_path.take();
-
-        // if parent doesn't exist we still want to open the document
-        // and error out when document is saved
-        self.path = path;
-
-        self.detect_readonly();
-        self.pickup_last_saved_time();
+        self.file.set_path(path);
     }
 
     /// Set the programming language for the file and load associated data (e.g. highlighting)
@@ -1363,19 +1204,10 @@ impl Document {
         language_config: Option<Arc<syntax::config::LanguageConfiguration>>,
         loader: &syntax::Loader,
     ) {
-        self.language = language_config;
-        self.syntax = self.language.as_ref().and_then(|config| {
-            Syntax::new(self.text.slice(..), config.language(), loader)
-                .map_err(|err| {
-                    // `NoRootConfig` means that there was an issue loading the language/syntax
-                    // config for the root language of the document. An error must have already
-                    // been logged by `LanguageData::syntax_config`.
-                    if err != syntax::HighlighterError::NoRootConfig {
-                        log::warn!("Error building syntax for '{}': {err}", self.display_name());
-                    }
-                })
-                .ok()
-        });
+        let display_name = self.display_name().into_owned();
+        let text = self.text().clone();
+        self.syntax_aware
+            .set_language(language_config, text.slice(..), loader, &display_name);
     }
 
     /// Set the programming language for the file if you know the language but don't have the
@@ -1393,18 +1225,27 @@ impl Document {
         Ok(())
     }
 
+    pub fn set_language_configuration(
+        &mut self,
+        language_config: Option<Arc<LanguageConfiguration>>,
+    ) {
+        self.syntax_aware
+            .set_language_configuration(language_config);
+    }
+
     /// Select text within the [`Document`].
     pub fn set_selection(&mut self, view_id: ViewId, selection: Selection) {
         // TODO: use a transaction?
-        self.selections
-            .insert(view_id, selection.ensure_invariants(self.text().slice(..)));
+        self.selection_store
+            .insert_selection(view_id, selection.ensure_invariants(self.text().slice(..)));
 
         if let Some((container, selection)) = self
-            .fold_container
-            .get_mut(&view_id)
-            .zip(self.selections.get(&view_id))
+            .presentation
+            .fold_container_get_mut(&view_id)
+            .zip(self.selection_store.get_selection(view_id))
         {
-            container.remove_by_selection(self.text.slice(..), selection)
+            let text = self.buffer.text().slice(..);
+            container.remove_by_selection(text, selection)
         }
 
         helix_event::dispatch(SelectionDidChange {
@@ -1441,23 +1282,58 @@ impl Document {
     /// Initializes a new selection and view_data for the given view
     /// if it does not already have them.
     pub fn ensure_view_init(&mut self, view_id: ViewId) {
-        if !self.selections.contains_key(&view_id) {
+        if !self.selection_store.contains_selection(view_id) {
             self.reset_selection(view_id);
         }
 
-        self.view_data_mut(view_id);
+        self.selection_store.ensure_view_data(view_id);
     }
 
     /// Mark document as recent used for MRU sorting
     pub fn mark_as_focused(&mut self) {
-        self.focused_at = std::time::Instant::now();
+        self.session.mark_as_focused();
     }
 
-    /// Remove a view's selection and inlay hints from this document.
+    pub fn focused_at(&self) -> std::time::Instant {
+        self.session.focused_at()
+    }
+
+    pub fn take_modified_since_accessed(&mut self) -> bool {
+        self.session.take_modified_since_accessed()
+    }
+
+    pub fn active_snippet(&self) -> Option<&ActiveSnippet> {
+        self.snippet.active_snippet()
+    }
+
+    pub fn active_snippet_mut(&mut self) -> Option<&mut ActiveSnippet> {
+        self.snippet.active_snippet_mut()
+    }
+
+    pub fn has_active_snippet(&self) -> bool {
+        self.snippet.has_active_snippet()
+    }
+
+    pub fn take_active_snippet(&mut self) -> Option<ActiveSnippet> {
+        self.snippet.take_active_snippet()
+    }
+
+    pub fn set_active_snippet(&mut self, snippet: ActiveSnippet) {
+        self.snippet.set_active_snippet(snippet);
+    }
+
+    pub fn clear_active_snippet(&mut self) {
+        self.snippet.clear_active_snippet();
+    }
+
+    pub fn apply_rendered_snippet(&mut self, snippet: RenderedSnippet) {
+        self.snippet.apply_rendered_snippet(snippet);
+    }
+
+    /// Remove a view's selection and annotations from this document.
     pub fn remove_view(&mut self, view_id: ViewId) {
-        self.selections.remove(&view_id);
-        self.inlay_hints.remove(&view_id);
-        self.jump_labels.remove(&view_id);
+        self.selection_store.remove_view(view_id);
+        self.presentation.remove_view(view_id);
     }
 
     /// Apply a [`Transaction`] to the [`Document`] to change its text.
@@ -1470,8 +1346,25 @@ impl Document {
         use helix_core::Assoc;
 
         let old_doc = self.text().clone();
+        let before_lines = old_doc.len_lines();
+        let before_bytes = old_doc.len_bytes();
         let changes = transaction.changes();
-        if !changes.apply(&mut self.text) {
+        let apply_changes_start = Instant::now();
+        let applied = changes.apply(self.buffer.text_mut());
+        let apply_changes_dur = apply_changes_start.elapsed();
+        log_command_phase("document_apply", "apply_changes", apply_changes_dur, || {
+            format!(
+                "view_id={:?} change_ops={} before_len={} after_len={} before_lines={} before_bytes={} emit_lsp={}",
+                view_id,
+                changes.changes().len(),
+                changes.len(),
+                changes.len_after(),
+                before_lines,
+                before_bytes,
+                emit_lsp_notification
+            )
+        });
+        if !applied {
             return false;
         }
 
@@ -1479,117 +1372,161 @@ impl Document {
             if let Some(selection) = transaction.selection() {
                 self.set_selection(
                     view_id,
-                    selection.clone().ensure_invariants(self.text.slice(..)),
+                    selection.clone().ensure_invariants(self.text().slice(..)),
                 );
             }
             return true;
         }
 
-        self.modified_since_accessed = true;
-        self.version += 1;
+        self.session.mark_text_changed();
 
-        for container in self.fold_container.values_mut() {
-            container.update_by_transaction(self.text.slice(..), old_doc.slice(..), transaction);
+        let current_doc = self.buffer.text().clone();
+        let fold_start = Instant::now();
+        for container in self.presentation.fold_containers_mut() {
+            container.update_by_transaction(current_doc.slice(..), old_doc.slice(..), transaction);
         }
+        let fold_dur = fold_start.elapsed();
+        log_command_phase("document_apply", "update_folds", fold_dur, || {
+            format!(
+                "before_lines={} after_lines={} before_bytes={} after_bytes={}",
+                before_lines,
+                current_doc.len_lines(),
+                before_bytes,
+                current_doc.len_bytes()
+            )
+        });
 
-        for (id, selection) in &mut self.selections {
+        let current_doc = self.buffer.text().clone();
+        let selection_start = Instant::now();
+        for (id, selection) in self.selection_store.selections_mut() {
             let ensured_selection = selection
                 .clone()
                 // Map through changes
                 .map(transaction.changes())
                 // Ensure all selections across all views still adhere to invariants.
-                .ensure_invariants(self.text.slice(..));
+                .ensure_invariants(current_doc.slice(..));
 
-            if let Some(container) = self.fold_container.get_mut(id) {
-                container.remove_by_selection(self.text.slice(..), &ensured_selection);
+            if let Some(container) = self.presentation.fold_container_get_mut(id) {
+                container.remove_by_selection(current_doc.slice(..), &ensured_selection);
             }
 
             *selection = ensured_selection;
         }
+        let selection_dur = selection_start.elapsed();
+        log_command_phase("document_apply", "remap_selections", selection_dur, || {
+            format!(
+                "selection_views={} before_lines={} after_lines={} before_bytes={} after_bytes={}",
+                self.selection_store.selections().len(),
+                before_lines,
+                current_doc.len_lines(),
+                before_bytes,
+                current_doc.len_bytes()
+            )
+        });
 
-        for view_data in self.view_data.values_mut() {
+        let viewport_start = Instant::now();
+        for view_data in self.selection_store.view_data_values_mut() {
             view_data.view_position.anchor = transaction
                 .changes()
                 .map_pos(view_data.view_position.anchor, Assoc::Before);
         }
+        let viewport_dur = viewport_start.elapsed();
+        log_command_phase("document_apply", "remap_viewports", viewport_dur, || {
+            format!(
+                "view_data_count={} before_lines={} after_lines={} before_bytes={} after_bytes={}",
+                self.selection_store.selections().len(),
+                before_lines,
+                current_doc.len_lines(),
+                before_bytes,
+                current_doc.len_bytes()
+            )
+        });
 
         // generate revert to savepoint
-        if !self.savepoints.is_empty() {
+        if self.session.has_savepoints() {
+            let savepoint_start = Instant::now();
             let revert = transaction.invert(&old_doc);
-            self.savepoints
-                .retain_mut(|save_point| match save_point.upgrade() {
-                    Some(savepoint) => {
-                        let mut revert_to_savepoint = savepoint.revert.lock();
-                        if revert.changes().len_after() != revert_to_savepoint.changes().len() {
-                            return true;
-                        }
-                        *revert_to_savepoint =
-                            revert.clone().compose(mem::take(&mut revert_to_savepoint));
-                        true
-                    }
-                    None => false,
-                })
+            self.session.update_savepoints(&revert);
+            let savepoint_dur = savepoint_start.elapsed();
+            log_command_phase("document_apply", "update_savepoints", savepoint_dur, || {
+                format!(
+                    "before_lines={} after_lines={} before_bytes={} after_bytes={}",
+                    before_lines,
+                    current_doc.len_lines(),
+                    before_bytes,
+                    current_doc.len_bytes()
+                )
+            });
         }
 
         // update tree-sitter syntax tree
-        if let Some(syntax) = &mut self.syntax {
-            let loader = self.syn_loader.load();
-            if let Err(err) = syntax.update(
-                old_doc.slice(..),
-                self.text.slice(..),
-                transaction.changes(),
-                &loader,
-            ) {
-                log::error!("TS parser failed, disabling TS for the current buffer: {err}");
-                self.syntax = None;
-            }
-        }
+        let loader = self.syn_loader.load();
+        let current_doc = self.buffer.text().clone();
+        let syntax_start = Instant::now();
+        let _syntax_trace = current_bench_command_context().and_then(|ctx| {
+            ctx.event_log_path.map(|log_path| {
+                syntax::Syntax::enter_trace(syntax::SyntaxTraceContext {
+                    log_path,
+                    seed: ctx.seed,
+                    elapsed_secs: ctx.elapsed_secs,
+                    action_index: ctx.action_index,
+                    category: ctx.category,
+                    macro_str: ctx.macro_str,
+                    force_insert: ctx.force_insert,
+                })
+            })
+        });
+        self.syntax_aware.update_syntax(
+            old_doc.slice(..),
+            current_doc.slice(..),
+            transaction.changes(),
+            &loader,
+        );
+        let syntax_dur = syntax_start.elapsed();
+        log_command_phase("document_apply", "update_syntax", syntax_dur, || {
+            format!(
+                "before_lines={} after_lines={} before_bytes={} after_bytes={}",
+                before_lines,
+                current_doc.len_lines(),
+                before_bytes,
+                current_doc.len_bytes()
+            )
+        });
 
         // TODO: all of that should likely just be hooks
         // start computing the diff in parallel
-        if let Some(diff_handle) = &self.diff_handle {
-            diff_handle.update_document(self.text.clone(), false);
-        }
-
-        // map diagnostics over changes too
-        changes.update_positions(self.diagnostics.iter_mut().map(|diagnostic| {
-            let assoc = if diagnostic.starts_at_word {
-                Assoc::BeforeWord
-            } else {
-                Assoc::After
-            };
-            (&mut diagnostic.range.start, assoc)
-        }));
-        changes.update_positions(self.diagnostics.iter_mut().filter_map(|diagnostic| {
-            if diagnostic.zero_width {
-                // for zero width diagnostics treat the diagnostic as a point
-                // rather than a range
-                return None;
-            }
-            let assoc = if diagnostic.ends_at_word {
-                Assoc::AfterWord
-            } else {
-                Assoc::Before
-            };
-            Some((&mut diagnostic.range.end, assoc))
-        }));
-        self.diagnostics.retain_mut(|diagnostic| {
-            if diagnostic.zero_width {
-                diagnostic.range.end = diagnostic.range.start
-            } else if diagnostic.range.start >= diagnostic.range.end {
-                return false;
-            }
-            diagnostic.line = self.text.char_to_line(diagnostic.range.start);
-            true
-        });
-
-        self.diagnostics.sort_by_key(|diagnostic| {
-            (
-                diagnostic.range,
-                diagnostic.severity,
-                diagnostic.provider.clone(),
+        let diff_start = Instant::now();
+        self.vcs.refresh_diff_document(self.text().clone());
+        let diff_dur = diff_start.elapsed();
+        log_command_phase("document_apply", "refresh_diff_document", diff_dur, || {
+            format!(
+                "before_lines={} after_lines={} before_bytes={} after_bytes={}",
+                before_lines,
+                self.text().len_lines(),
+                before_bytes,
+                self.text().len_bytes()
             )
         });
+
+        // map diagnostics over changes too
+        let diagnostics_start = Instant::now();
+        self.syntax_aware
+            .remap_diagnostics(changes, self.buffer.text().slice(..));
+        let diagnostics_dur = diagnostics_start.elapsed();
+        log_command_phase(
+            "document_apply",
+            "remap_diagnostics",
+            diagnostics_dur,
+            || {
+                format!(
+                    "before_lines={} after_lines={} before_bytes={} after_bytes={}",
+                    before_lines,
+                    self.text().len_lines(),
+                    before_bytes,
+                    self.text().len_bytes()
+                )
+            },
+        );
 
         // Update the inlay hint annotations' positions, helping ensure they are displayed in the proper place
         let apply_inlay_hint_changes = |annotations: &mut Vec<InlineAnnotation>| {
@@ -1600,8 +1537,9 @@ impl Document {
             );
         };
 
-        self.inlay_hints_oudated = true;
-        for text_annotation in self.inlay_hints.values_mut() {
+        self.presentation.mark_inlay_hints_outdated();
+        let inlay_start = Instant::now();
+        for text_annotation in self.presentation.inlay_hints_mut() {
             let DocumentInlayHints {
                 id: _,
                 type_inlay_hints,
@@ -1617,7 +1555,19 @@ impl Document {
             apply_inlay_hint_changes(other_inlay_hints);
             apply_inlay_hint_changes(padding_after_inlay_hints);
         }
+        let inlay_dur = inlay_start.elapsed();
+        log_command_phase("document_apply", "remap_inlay_hints", inlay_dur, || {
+            format!(
+                "has_inlay_hints={} before_lines={} after_lines={} before_bytes={} after_bytes={}",
+                self.presentation.inlay_hints(view_id).is_some(),
+                before_lines,
+                self.text().len_lines(),
+                before_bytes,
+                self.text().len_bytes()
+            )
+        });
 
+        let dispatch_start = Instant::now();
         helix_event::dispatch(DocumentDidChange {
             doc: self,
             view: view_id,
@@ -1625,12 +1575,42 @@ impl Document {
             changes,
             ghost_transaction: !emit_lsp_notification,
         });
+        let dispatch_dur = dispatch_start.elapsed();
+        log_command_phase(
+            "document_apply",
+            "dispatch_document_did_change",
+            dispatch_dur,
+            || {
+                format!(
+                    "before_lines={} after_lines={} before_bytes={} after_bytes={}",
+                    before_lines,
+                    self.text().len_lines(),
+                    before_bytes,
+                    self.text().len_bytes()
+                )
+            },
+        );
 
         // if specified, the current selection should instead be replaced by transaction.selection
         if let Some(selection) = transaction.selection() {
+            let selection_apply_start = Instant::now();
             self.set_selection(
                 view_id,
-                selection.clone().ensure_invariants(self.text.slice(..)),
+                selection.clone().ensure_invariants(self.text().slice(..)),
+            );
+            let selection_apply_dur = selection_apply_start.elapsed();
+            log_command_phase(
+                "document_apply",
+                "set_transaction_selection",
+                selection_apply_dur,
+                || {
+                    format!(
+                        "selection_len={} after_lines={} after_bytes={}",
+                        selection.len(),
+                        self.text().len_lines(),
+                        self.text().len_bytes()
+                    )
+                },
             );
         }
 
@@ -1645,11 +1625,11 @@ impl Document {
     ) -> bool {
         // store the state just before any changes are made. This allows us to undo to the
         // state just before a transaction was applied.
-        if self.changes.is_empty() && !transaction.changes().is_empty() {
-            self.old_state = Some(State {
-                doc: self.text.clone(),
+        if self.changes().is_empty() && !transaction.changes().is_empty() {
+            self.buffer.set_old_state(Some(State {
+                doc: self.text().clone(),
                 selection: self.selection(view_id).clone(),
-            });
+            }));
         }
 
         let success = self.apply_impl(transaction, view_id, emit_lsp_notification);
@@ -1658,7 +1638,8 @@ impl Document {
             // Compose this transaction with the previous one.
             // We handle recursion by checking if the existing changes happened
             // BEFORE or AFTER this one.
-            take_with(&mut self.changes, |changes| {
+            let compose_start = Instant::now();
+            take_with(self.buffer.changes_mut(), |changes| {
                 if changes.is_empty() {
                     return transaction.changes().clone();
                 }
@@ -1679,6 +1660,16 @@ impl Document {
                 log::warn!("Composition skipped due to unexpected length mismatch: prev_after={}, txn_before={}, txn_after={}, curr_len={}", changes.len_after(), transaction.changes().len(), transaction.changes().len_after(), changes.len());
                 changes
             });
+            let compose_dur = compose_start.elapsed();
+            log_command_phase("document_apply", "compose_changes", compose_dur, || {
+                format!(
+                    "success={} txn_ops={} lines={} bytes={}",
+                    success,
+                    transaction.changes().changes().len(),
+                    self.text().len_lines(),
+                    self.text().len_bytes()
+                )
+            });
         }
         success
     }
@@ -1689,56 +1680,7 @@ impl Document {
 
     /// Get the line blame for this view
     pub fn line_blame(&self, cursor_line: u32, format: &str) -> Result<String, LineBlameError<'_>> {
-        // how many lines were inserted and deleted before the cursor line
-        let (inserted_lines, deleted_lines) = self
-            .diff_handle()
-            .map_or(
-                // in theory there can be situations where we don't have the diff for a file
-                // but we have the blame. In this case, we can just act like there is no diff
-                Some((0, 0)),
-                |diff_handle| {
-                    // Compute the amount of lines inserted and deleted before the `line`
-                    // This information is needed to accurately transform the state of the
-                    // file in the file system into what gix::blame knows about (gix::blame only
-                    // knows about commit history, it does not know about uncommitted changes)
-                    diff_handle
-                        .try_load()?
-                        .hunks_intersecting_line_ranges(std::iter::once((0, cursor_line as usize)))
-                        .try_fold(
-                            (0, 0),
-                            |(total_inserted_lines, total_deleted_lines), hunk| {
-                                // check if the line intersects the hunk's `after` (which represents
-                                // inserted lines)
-                                (hunk.after.start > cursor_line || hunk.after.end <= cursor_line)
-                                    .then_some((
-                                        total_inserted_lines + (hunk.after.end - hunk.after.start),
-                                        total_deleted_lines + (hunk.before.end - hunk.before.start),
-                                    ))
-                            },
-                        )
-                },
-            )
-            .ok_or(LineBlameError::NotCommittedYet)?;
-
-        let file_blame = match &self.file_blame {
-            None => return Err(LineBlameError::NotReadyYet),
-            Some(result) => match result {
-                Err(err) => {
-                    return Err(LineBlameError::NoFileBlame(
-                        // convert 0-based line into 1-based line
-                        cursor_line.saturating_add(1),
-                        err,
-                    ));
-                }
-                Ok(file_blame) => file_blame,
-            },
-        };
-
-        let line_blame = file_blame
-            .blame_for_line(cursor_line, inserted_lines, deleted_lines)
-            .parse_format(format);
-
-        Ok(line_blame)
+        self.vcs.line_blame(cursor_line, format)
     }
 
     /// Apply a [`Transaction`] to the [`Document`] to change its text
@@ -1748,37 +1690,101 @@ impl Document {
         self.apply_inner(transaction, view_id, false)
     }
 
-    fn undo_redo_impl(&mut self, view: &mut View, undo: bool) -> bool {
+    fn undo_redo_impl<V>(&mut self, view: &mut V, undo: bool) -> bool
+    where
+        V: crate::traits::HistoryViewport<Document>,
+    {
+        let command = if undo { "undo" } else { "redo" };
+
         if undo {
+            let append_start = Instant::now();
             self.append_changes_to_history(view);
-        } else if !self.changes.is_empty() {
+            let append_dur = append_start.elapsed();
+            log_command_phase(command, "append_changes_to_history", append_dur, || {
+                format!(
+                    "lines={} bytes={} pending_changes={}",
+                    self.text().len_lines(),
+                    self.text().len_bytes(),
+                    self.changes().len()
+                )
+            });
+        } else if !self.changes().is_empty() {
             return false;
         }
-        let mut history = self.history.take();
-        let txn = if undo { history.undo() } else { history.redo() };
+        let history_start = Instant::now();
+        let txn = self.buffer.with_history_mut(|history| {
+            if undo {
+                history.undo().cloned()
+            } else {
+                history.redo().cloned()
+            }
+        });
+        let history_dur = history_start.elapsed();
+        log_command_phase(command, "history_lookup", history_dur, || {
+            format!(
+                "has_txn={} lines={} bytes={}",
+                txn.is_some(),
+                self.text().len_lines(),
+                self.text().len_bytes()
+            )
+        });
+        let apply_start = Instant::now();
         let success = if let Some(txn) = txn {
-            self.apply_impl(txn, view.id, true)
+            self.apply_impl(&txn, view.id(), true)
         } else {
             false
         };
-        self.history.set(history);
+        let apply_dur = apply_start.elapsed();
+        log_command_phase(command, "apply_transaction", apply_dur, || {
+            format!(
+                "success={} lines={} bytes={}",
+                success,
+                self.text().len_lines(),
+                self.text().len_bytes()
+            )
+        });
 
         if success {
             // reset changeset to fix len
-            self.changes = ChangeSet::new(self.text().slice(..));
+            let reset_start = Instant::now();
+            self.buffer
+                .set_changes(ChangeSet::new(self.text().slice(..)));
+            let reset_dur = reset_start.elapsed();
+            log_command_phase(command, "reset_changeset", reset_dur, || {
+                format!(
+                    "lines={} bytes={}",
+                    self.text().len_lines(),
+                    self.text().len_bytes()
+                )
+            });
             // Sync with changes with the jumplist selections.
+            let sync_start = Instant::now();
             view.sync_changes(self);
+            let sync_dur = sync_start.elapsed();
+            log_command_phase(command, "sync_changes", sync_dur, || {
+                format!(
+                    "lines={} bytes={}",
+                    self.text().len_lines(),
+                    self.text().len_bytes()
+                )
+            });
         }
         success
     }
 
     /// Undo the last modification to the [`Document`]. Returns whether the undo was successful.
-    pub fn undo(&mut self, view: &mut View) -> bool {
+    pub fn undo<V>(&mut self, view: &mut V) -> bool
+    where
+        V: crate::traits::HistoryViewport<Document>,
+    {
         self.undo_redo_impl(view, true)
     }
 
     /// Redo the last modification to the [`Document`]. Returns whether the redo was successful.
-    pub fn redo(&mut self, view: &mut View) -> bool {
+    pub fn redo<V>(&mut self, view: &mut V) -> bool
+    where
+        V: crate::traits::HistoryViewport<Document>,
+    {
         self.undo_redo_impl(view, false)
     }
 
@@ -1790,26 +1796,14 @@ impl Document {
     pub fn savepoint(&mut self, view: &View) -> Arc<SavePoint> {
         let revert = Transaction::new(self.text()).with_selection(self.selection(view.id).clone());
         // check if there is already an existing (identical) savepoint around
-        if let Some(savepoint) = self
-            .savepoints
-            .iter()
-            .rev()
-            .find_map(|savepoint| savepoint.upgrade())
-        {
-            let transaction = savepoint.revert.lock();
-            if savepoint.view == view.id
-                && transaction.changes().is_empty()
-                && transaction.selection() == revert.selection()
-            {
-                drop(transaction);
-                return savepoint;
-            }
+        if let Some(savepoint) = self.session.matching_savepoint(view.id, &revert) {
+            return savepoint;
         }
         let savepoint = Arc::new(SavePoint {
             view: view.id,
             revert: Mutex::new(revert),
         });
-        self.savepoints.push(Arc::downgrade(&savepoint));
+        self.session.track_savepoint(&savepoint);
         savepoint
     }
 
@@ -1820,39 +1814,39 @@ impl Document {
         );
         // search and remove savepoint using a ptr comparison
         // this avoids a deadlock as we need to lock the mutex
-        let savepoint_idx = self
-            .savepoints
-            .iter()
-            .position(|savepoint_ref| std::ptr::eq(savepoint_ref.as_ptr(), savepoint))
-            .expect("Savepoint must belong to this document");
-
-        let savepoint_ref = self.savepoints.remove(savepoint_idx);
+        let savepoint_ref = self.session.remove_savepoint(savepoint);
         let mut revert = savepoint.revert.lock();
         self.apply_inner(&revert, view.id, emit_lsp_notification);
         *revert = Transaction::new(self.text()).with_selection(self.selection(view.id).clone());
-        self.savepoints.push(savepoint_ref)
+        self.session.restore_savepoint_tracking(savepoint_ref)
     }
 
-    fn earlier_later_impl(&mut self, view: &mut View, uk: UndoKind, earlier: bool) -> bool {
+    fn earlier_later_impl<V>(&mut self, view: &mut V, uk: UndoKind, earlier: bool) -> bool
+    where
+        V: crate::traits::HistoryViewport<Document>,
+    {
         if earlier {
             self.append_changes_to_history(view);
-        } else if !self.changes.is_empty() {
+        } else if !self.changes().is_empty() {
             return false;
         }
-        let txns = if earlier {
-            self.history.get_mut().earlier(uk)
-        } else {
-            self.history.get_mut().later(uk)
-        };
+        let txns = self.buffer.with_history_mut(|history| {
+            if earlier {
+                history.earlier(uk)
+            } else {
+                history.later(uk)
+            }
+        });
         let mut success = false;
         for txn in txns {
-            if self.apply_impl(&txn, view.id, true) {
+            if self.apply_impl(&txn, view.id(), true) {
                 success = true;
             }
         }
         if success {
             // reset changeset to fix len
-            self.changes = ChangeSet::new(self.text().slice(..));
+            self.buffer
+                .set_changes(ChangeSet::new(self.text().slice(..)));
             // Sync with changes with the jumplist selections.
             view.sync_changes(self);
         }
@@ -1860,37 +1854,48 @@ impl Document {
     }
 
     /// Undo modifications to the [`Document`] according to `uk`.
-    pub fn earlier(&mut self, view: &mut View, uk: UndoKind) -> bool {
+    pub fn earlier<V>(&mut self, view: &mut V, uk: UndoKind) -> bool
+    where
+        V: crate::traits::HistoryViewport<Document>,
+    {
         self.earlier_later_impl(view, uk, true)
     }
 
     /// Redo modifications to the [`Document`] according to `uk`.
-    pub fn later(&mut self, view: &mut View, uk: UndoKind) -> bool {
+    pub fn later<V>(&mut self, view: &mut V, uk: UndoKind) -> bool
+    where
+        V: crate::traits::HistoryViewport<Document>,
+    {
         self.earlier_later_impl(view, uk, false)
     }
 
     /// Commit pending changes to history
-    pub fn append_changes_to_history(&mut self, view: &mut View) {
-        if self.changes.is_empty() {
+    pub fn append_changes_to_history<V>(&mut self, view: &mut V)
+    where
+        V: crate::traits::HistoryViewport<Document>,
+    {
+        if self.changes().is_empty() {
             return;
         }
 
         let new_changeset = ChangeSet::new(self.text().slice(..));
-        let changes = std::mem::replace(&mut self.changes, new_changeset);
+        let changes = std::mem::replace(self.buffer.changes_mut(), new_changeset);
         // Instead of doing this messy merge we could always commit, and based on transaction
         // annotations either add a new layer or compose into the previous one.
         let transaction =
-            Transaction::from(changes).with_selection(self.selection(view.id).clone());
+            Transaction::from(changes).with_selection(self.selection(view.id()).clone());
 
         // HAXX: we need to reconstruct the state as it was before the changes..
-        let old_state = self.old_state.take().expect("no old_state available");
+        let old_state = self
+            .buffer
+            .take_old_state()
+            .expect("no old_state available");
 
-        let mut history = self.history.take();
-        history.commit_revision(&transaction, &old_state);
-        self.history.set(history);
+        self.buffer
+            .with_history_mut(|history| history.commit_revision(&transaction, &old_state));
 
         // Update jumplist entries in the view.
-        view.apply(&transaction, self);
+        view.apply_history_transaction(&transaction, self);
     }
 
     pub fn id(&self) -> DocumentId {
@@ -1899,24 +1904,25 @@ impl Document {
 
     /// If there are unsaved modifications.
     pub fn is_modified(&self) -> bool {
-        let history = self.history.take();
-        let current_revision = history.current_revision();
-        self.history.set(history);
+        let current_revision = self
+            .buffer
+            .with_history(|history| history.current_revision());
         log::debug!(
             "id {} modified - last saved: {}, current: {}",
             self.id,
-            self.last_saved_revision,
+            self.file.last_saved_revision(),
             current_revision
         );
-        current_revision != self.last_saved_revision || !self.changes.is_empty()
+        self.file
+            .is_modified(current_revision, !self.changes().is_empty())
     }
 
     /// Save modifications to history, and so [`Self::is_modified`] will return false.
     pub fn reset_modified(&mut self) {
-        let history = self.history.take();
-        let current_revision = history.current_revision();
-        self.history.set(history);
-        self.last_saved_revision = current_revision;
+        let current_revision = self
+            .buffer
+            .with_history(|history| history.current_revision());
+        self.file.reset_modified(current_revision);
     }
 
     /// Set the document's latest saved revision to the given one.
@@ -1924,58 +1930,57 @@ impl Document {
         log::debug!(
             "doc {} revision updated {} -> {}",
             self.id,
-            self.last_saved_revision,
+            self.file.last_saved_revision(),
             rev
         );
-        self.last_saved_revision = rev;
-        self.last_saved_time = save_time;
+        self.file.set_last_saved_revision(rev, save_time);
     }
 
     /// Get the document's latest saved revision.
     pub fn get_last_saved_revision(&mut self) -> usize {
-        self.last_saved_revision
+        self.file.last_saved_revision()
     }
 
     /// Get the current revision number
     pub fn get_current_revision(&mut self) -> usize {
-        let history = self.history.take();
-        let current_revision = history.current_revision();
-        self.history.set(history);
-        current_revision
+        self.buffer
+            .with_history(|history| history.current_revision())
     }
 
     /// Corresponding language scope name. Usually `source.<lang>`.
     pub fn language_scope(&self) -> Option<&str> {
-        self.language
-            .as_ref()
-            .map(|language| language.scope.as_str())
+        self.syntax_aware.language_scope()
     }
 
     /// Language name for the document. Corresponds to the `name` key in
     /// `languages.toml` configuration.
     pub fn language_name(&self) -> Option<&str> {
-        self.language
-            .as_ref()
-            .map(|language| language.language_id.as_str())
+        self.syntax_aware.language_name()
     }
 
     /// Language ID for the document. Either the `language-id`,
     /// or the document language name if no `language-id` has been specified.
     pub fn language_id(&self) -> Option<&str> {
-        self.language_config()?
-            .language_server_language_id
-            .as_deref()
-            .or_else(|| self.language_name())
+        self.syntax_aware.language_id()
     }
 
     /// Corresponding [`LanguageConfiguration`].
     pub fn language_config(&self) -> Option<&LanguageConfiguration> {
-        self.language.as_deref()
+        self.syntax_aware.language_config()
+    }
+
+    pub fn language_configuration(&self) -> Option<&Arc<LanguageConfiguration>> {
+        self.syntax_aware.language_configuration()
     }
 
     /// Current document version, incremented at each change.
     pub fn version(&self) -> i32 {
-        self.version
+        self.session.version()
+    }
+
+    /// Generation counter for diagnostics, incremented on any diagnostic change.
+    pub fn diagnostics_gen(&self) -> u64 {
+        self.syntax_aware.diagnostics_gen()
     }
 
     pub fn word_completion_enabled(&self) -> bool {
@@ -1992,82 +1997,187 @@ impl Document {
 
     /// maintains the order as configured in the language_servers TOML array
     pub fn language_servers(&self) -> impl Iterator<Item = &helix_lsp::Client> {
-        self.language_config().into_iter().flat_map(move |config| {
-            config.language_servers.iter().filter_map(move |features| {
-                let ls = &**self.language_servers.get(&features.name)?;
-                if ls.is_initialized() {
-                    Some(ls)
-                } else {
-                    None
-                }
-            })
-        })
+        self.syntax_aware.language_servers()
+    }
+
+    pub fn all_language_servers(&self) -> impl Iterator<Item = &Arc<Client>> {
+        self.syntax_aware.all_language_servers()
+    }
+
+    pub fn clear_language_servers(&mut self) {
+        self.syntax_aware.clear_language_servers();
+    }
+
+    pub fn has_language_servers(&self) -> bool {
+        self.syntax_aware.has_language_servers()
+    }
+
+    pub fn language_server_by_name(&self, name: &LanguageServerName) -> Option<&Arc<Client>> {
+        self.syntax_aware.language_server_by_name(name)
+    }
+
+    pub fn set_language_servers(
+        &mut self,
+        language_servers: HashMap<LanguageServerName, Arc<Client>>,
+    ) {
+        self.syntax_aware.set_language_servers(language_servers);
     }
 
     pub fn remove_language_server_by_name(&mut self, name: &str) -> Option<Arc<Client>> {
-        self.language_servers.remove(name)
+        self.syntax_aware.remove_language_server_by_name(name)
     }
 
     pub fn language_servers_with_feature(
         &self,
         feature: LanguageServerFeature,
     ) -> impl Iterator<Item = &helix_lsp::Client> {
-        self.language_config().into_iter().flat_map(move |config| {
-            config.language_servers.iter().filter_map(move |features| {
-                let ls = &**self.language_servers.get(&features.name)?;
-                if ls.is_initialized()
-                    && ls.supports_feature(feature)
-                    && features.has_feature(feature)
-                {
-                    Some(ls)
-                } else {
-                    None
-                }
-            })
-        })
+        self.syntax_aware.language_servers_with_feature(feature)
     }
 
     pub fn supports_language_server(&self, id: LanguageServerId) -> bool {
-        self.language_servers().any(|l| l.id() == id)
+        self.syntax_aware.supports_language_server(id)
+    }
+
+    pub fn is_blame_outdated(&self) -> bool {
+        self.vcs.is_blame_outdated()
+    }
+
+    pub fn mark_blame_outdated(&mut self) {
+        self.vcs.mark_blame_outdated();
+    }
+
+    pub fn clear_blame_outdated(&mut self) {
+        self.vcs.clear_blame_outdated();
+    }
+
+    pub fn set_file_blame(&mut self, result: anyhow::Result<helix_vcs::FileBlame>) {
+        self.vcs.set_file_blame(result);
+    }
+
+    pub fn restore_cursor(&self) -> bool {
+        self.presentation.restore_cursor()
+    }
+
+    pub fn mark_restore_cursor(&mut self) {
+        self.presentation.mark_restore_cursor();
+    }
+
+    pub fn clear_restore_cursor(&mut self) {
+        self.presentation.clear_restore_cursor();
+    }
+
+    pub fn is_welcome(&self) -> bool {
+        self.presentation.is_welcome()
+    }
+
+    pub fn indent_style(&self) -> IndentStyle {
+        self.presentation.indent_style()
+    }
+
+    pub fn set_indent_style(&mut self, indent_style: IndentStyle) {
+        self.presentation.set_indent_style(indent_style);
+    }
+
+    pub fn inlay_hints_outdated(&self) -> bool {
+        self.presentation.inlay_hints_outdated()
+    }
+
+    pub fn mark_inlay_hints_outdated(&mut self) {
+        self.presentation.mark_inlay_hints_outdated();
+    }
+
+    pub fn clear_inlay_hints_outdated(&mut self) {
+        self.presentation.clear_inlay_hints_outdated();
+    }
+
+    pub fn restart_pull_diagnostics(&mut self) -> helix_event::TaskHandle {
+        self.lsp.restart_pull_diagnostics()
+    }
+
+    pub fn cancel_pull_diagnostics(&mut self) -> bool {
+        self.lsp.cancel_pull_diagnostics()
+    }
+
+    pub fn previous_diagnostic_id(&self) -> Option<&str> {
+        self.lsp.previous_diagnostic_id()
+    }
+
+    pub fn set_previous_diagnostic_id(&mut self, previous_diagnostic_id: Option<String>) {
+        self.lsp.set_previous_diagnostic_id(previous_diagnostic_id);
+    }
+
+    pub fn restart_color_swatches(&mut self) -> helix_event::TaskHandle {
+        self.lsp.restart_color_swatches()
+    }
+
+    pub fn cancel_color_swatches(&mut self) -> bool {
+        self.lsp.cancel_color_swatches()
+    }
+
+    pub fn color_swatches(&self) -> Option<&DocumentColorSwatches> {
+        self.lsp.color_swatches()
+    }
+
+    pub fn clear_color_swatches(&mut self) {
+        self.lsp.clear_color_swatches();
+    }
+
+    pub fn set_color_swatches(&mut self, color_swatches: DocumentColorSwatches) {
+        self.lsp.set_color_swatches(color_swatches);
+    }
+
+    pub fn update_color_swatches(&mut self, changes: &ChangeSet) {
+        self.lsp.update_color_swatches(changes);
     }
 
     pub fn diff_handle(&self) -> Option<&DiffHandle> {
-        self.diff_handle.as_ref()
+        self.vcs.diff_handle()
     }
 
     /// Intialize/updates the differ for this document with a new base.
     pub fn set_diff_base(&mut self, diff_base: Vec<u8>) {
-        if let Ok((diff_base, ..)) = from_reader(&mut diff_base.as_slice(), Some(self.encoding)) {
-            if let Some(differ) = &self.diff_handle {
-                differ.update_diff_base(diff_base);
-                return;
-            }
-            self.diff_handle = Some(DiffHandle::new(diff_base, self.text.clone()))
+        if let Ok((diff_base, ..)) = from_reader(&mut diff_base.as_slice(), Some(self.encoding())) {
+            self.vcs.set_diff_base(diff_base, self.text().clone())
         } else {
-            self.diff_handle = None;
+            self.vcs.clear_diff_base();
         }
     }
 
     pub fn version_control_head(&self) -> Option<Arc<Box<str>>> {
-        self.version_control_head.as_ref().map(|a| a.load_full())
+        self.vcs.version_control_head()
     }
 
     pub fn set_version_control_head(
         &mut self,
         version_control_head: Option<Arc<ArcSwap<Box<str>>>>,
     ) {
-        self.version_control_head = version_control_head;
+        self.vcs.set_version_control_head(version_control_head);
     }
 
     #[inline]
     /// Tree-sitter AST tree
     pub fn syntax(&self) -> Option<&Syntax> {
-        self.syntax.as_ref()
+        self.syntax_aware.syntax()
+    }
+
+    pub fn set_syntax(&mut self, syntax: Option<Syntax>) {
+        self.syntax_aware.set_syntax(syntax);
+    }
+
+    pub fn syntax_is_stale(&self) -> bool {
+        self.syntax_aware.syntax_is_stale()
+    }
+
+    pub fn refresh_stale_syntax(&mut self, loader: &syntax::Loader) -> bool {
+        let text = self.text().clone();
+        self.syntax_aware
+            .refresh_stale_syntax(text.slice(..), loader)
     }
 
     /// The width that the tab character is rendered at
     pub fn tab_width(&self) -> usize {
-        self.editor_config
+        self.presentation
+            .editor_config()
             .tab_width
             .map(|n| n.get() as usize)
             .unwrap_or_else(|| {
@@ -2079,92 +2189,109 @@ impl Document {
 
     // The width (in spaces) of a level of indentation.
     pub fn indent_width(&self) -> usize {
-        self.indent_style.indent_width(self.tab_width())
+        self.indent_style().indent_width(self.tab_width())
     }
 
     /// Whether the document should have a trailing line ending appended on save.
     pub fn insert_final_newline(&self) -> bool {
-        self.editor_config
+        self.presentation
+            .editor_config()
             .insert_final_newline
             .unwrap_or_else(|| self.config.load().insert_final_newline)
     }
 
     /// Whether the document should trim whitespace preceding line endings on save.
     pub fn trim_trailing_whitespace(&self) -> bool {
-        self.editor_config
+        self.presentation
+            .editor_config()
             .trim_trailing_whitespace
             .unwrap_or_else(|| self.config.load().trim_trailing_whitespace)
     }
 
     pub fn changes(&self) -> &ChangeSet {
-        &self.changes
+        self.buffer.changes()
     }
 
     #[inline]
     /// File path on disk.
     pub fn path(&self) -> Option<&PathBuf> {
-        self.path.as_ref()
+        self.file.path()
     }
 
     /// File path as a URL.
     pub fn url(&self) -> Option<Url> {
-        Url::from_file_path(self.path()?).ok()
+        self.file.url()
     }
 
     pub fn uri(&self) -> Option<helix_core::Uri> {
-        Some(self.path()?.clone().into())
+        self.file.uri()
+    }
+
+    #[inline]
+    pub fn clear_relative_path(&mut self) {
+        self.file.clear_relative_path();
     }
 
     #[inline]
     pub fn text(&self) -> &Rope {
-        &self.text
+        self.buffer.text()
+    }
+
+    #[inline]
+    pub fn line_ending(&self) -> LineEnding {
+        self.buffer.line_ending()
+    }
+
+    #[inline]
+    pub fn set_line_ending(&mut self, line_ending: LineEnding) {
+        self.buffer.set_line_ending(line_ending);
+    }
+
+    #[inline]
+    pub fn with_history<R>(&self, f: impl FnOnce(&helix_core::history::History) -> R) -> R {
+        self.buffer.with_history(f)
+    }
+
+    #[inline]
+    pub fn with_history_mut<R>(
+        &mut self,
+        f: impl FnOnce(&mut helix_core::history::History) -> R,
+    ) -> R {
+        self.buffer.with_history_mut(f)
     }
 
     #[inline]
     pub fn selection(&self, view_id: ViewId) -> &Selection {
-        &self.selections[&view_id]
+        self.selection_store.selection(view_id)
     }
 
     #[inline]
     pub fn selections(&self) -> &HashMap<ViewId, Selection> {
-        &self.selections
-    }
-
-    fn view_data(&self, view_id: ViewId) -> &ViewData {
-        self.view_data
-            .get(&view_id)
-            .expect("This should only be called after ensure_view_init")
-    }
-
-    fn view_data_mut(&mut self, view_id: ViewId) -> &mut ViewData {
-        self.view_data.entry(view_id).or_default()
+        self.selection_store.selections()
     }
 
     pub(crate) fn get_view_offset(&self, view_id: ViewId) -> Option<ViewPosition> {
-        Some(self.view_data.get(&view_id)?.view_position)
+        self.selection_store.get_view_offset(view_id)
     }
 
     pub fn view_offset(&self, view_id: ViewId) -> ViewPosition {
-        self.view_data(view_id).view_position
+        self.selection_store.view_offset(view_id)
     }
 
     pub fn set_view_offset(&mut self, view_id: ViewId, new_offset: ViewPosition) {
-        self.view_data_mut(view_id).view_position = new_offset;
+        self.selection_store.set_view_offset(view_id, new_offset);
     }
 
     pub fn relative_path(&self) -> Option<&Path> {
-        self.relative_path
-            .get_or_init(|| {
-                self.path
-                    .as_ref()
-                    .map(|path| helix_stdx::path::get_relative_path(path).to_path_buf())
-            })
-            .as_deref()
+        self.file.relative_path()
     }
 
     pub fn display_name(&self) -> Cow<'_, str> {
-        self.relative_path()
-            .map_or_else(|| SCRATCH_BUFFER_NAME.into(), |path| path.to_string_lossy())
+        self.file.display_name(SCRATCH_BUFFER_NAME)
+    }
+
+    pub fn readonly(&self) -> bool {
+        self.file.readonly()
     }
 
     // transact(Fn) ?
@@ -2177,7 +2304,7 @@ impl Document {
     }
 
     pub fn versioned_identifier(&self) -> lsp::VersionedTextDocumentIdentifier {
-        lsp::VersionedTextDocumentIdentifier::new(self.url().unwrap(), self.version)
+        lsp::VersionedTextDocumentIdentifier::new(self.url().unwrap(), self.version())
     }
 
     pub fn position(
@@ -2284,7 +2411,7 @@ impl Document {
 
     #[inline]
     pub fn diagnostics(&self) -> &[Diagnostic] {
-        &self.diagnostics
+        self.syntax_aware.diagnostics()
     }
 
     pub fn replace_diagnostics(
@@ -2293,40 +2420,13 @@ impl Document {
         unchanged_sources: &[String],
         provider: Option<&DiagnosticProvider>,
     ) {
-        if unchanged_sources.is_empty() {
-            if let Some(provider) = provider {
-                self.diagnostics
-                    .retain(|diagnostic| &diagnostic.provider != provider);
-            } else {
-                self.diagnostics.clear();
-            }
-        } else {
-            self.diagnostics.retain(|d| {
-                if provider.is_some_and(|provider| provider != &d.provider) {
-                    return true;
-                }
-
-                if let Some(source) = &d.source {
-                    unchanged_sources.contains(source)
-                } else {
-                    false
-                }
-            });
-        }
-        self.diagnostics.extend(diagnostics);
-        self.diagnostics.sort_by_key(|diagnostic| {
-            (
-                diagnostic.range,
-                diagnostic.severity,
-                diagnostic.provider.clone(),
-            )
-        });
+        self.syntax_aware
+            .replace_diagnostics(diagnostics, unchanged_sources, provider);
     }
 
     /// clears diagnostics for a given language server id if set, otherwise all diagnostics are cleared
     pub fn clear_diagnostics_for_language_server(&mut self, id: LanguageServerId) {
-        self.diagnostics
-            .retain(|d| d.provider.language_server_id() != Some(id));
+        self.syntax_aware.clear_diagnostics_for_language_server(id);
     }
 
     /// Get the document's auto pairs. If the document has a recognized
@@ -2337,7 +2437,7 @@ impl Document {
         &'a self,
         editor: &'a Editor,
         loader: &'a syntax::Loader,
-        view: &View,
+        target: &impl crate::traits::Identified,
     ) -> Option<&'a AutoPairs> {
         let global_config = (editor.auto_pairs).as_ref();
 
@@ -2350,10 +2450,9 @@ impl Document {
             }
         }
 
-        self.syntax
-            .as_ref()
+        self.syntax()
             .and_then(|syntax| {
-                let selection = self.selection(view.id).primary();
+                let selection = self.selection(target.id()).primary();
                 let (start, end) = selection.into_byte_range(self.text().slice(..));
                 let layer = syntax.layer_for_byte_range(start as u32, end as u32);
 
@@ -2368,13 +2467,14 @@ impl Document {
             // TODO snippet variable resolution
             resolve_var: Box::new(|_| None),
             tab_width: self.tab_width(),
-            indent_style: self.indent_style,
-            line_ending: self.line_ending.as_str(),
+            indent_style: self.indent_style(),
+            line_ending: self.line_ending().as_str(),
         }
     }
 
     pub fn text_width(&self) -> usize {
-        self.editor_config
+        self.presentation
+            .editor_config()
             .max_line_length
             .map(|n| n.get() as usize)
             .or_else(|| self.language_config().and_then(|config| config.text_width))
@@ -2406,8 +2506,7 @@ impl Document {
         let config = self.config.load();
         let editor_soft_wrap = &config.soft_wrap;
         let language_soft_wrap = self
-            .language
-            .as_ref()
+            .language_configuration()
             .and_then(|config| config.soft_wrap.as_ref());
         let enable_soft_wrap = language_soft_wrap
             .and_then(|soft_wrap| soft_wrap.enable)
@@ -2438,26 +2537,37 @@ impl Document {
 
     /// Set the inlay hints for this document and `view_id`.
     pub fn set_inlay_hints(&mut self, view_id: ViewId, inlay_hints: DocumentInlayHints) {
-        self.inlay_hints.insert(view_id, inlay_hints);
+        self.presentation.set_inlay_hints(view_id, inlay_hints);
+    }
+
+    /// Generation counter for text annotations. Bumped whenever annotation
+    /// state changes (jump labels, inlay hints, etc.), enabling the render
+    /// cache to detect changes without tracking each annotation type.
+    pub fn annotation_gen(&self) -> u64 {
+        self.presentation.annotation_gen()
     }
 
     pub fn set_jump_labels(&mut self, view_id: ViewId, labels: Vec<Overlay>) {
-        self.jump_labels.insert(view_id, labels);
+        self.presentation.set_jump_labels(view_id, labels);
     }
 
     pub fn remove_jump_labels(&mut self, view_id: ViewId) {
-        self.jump_labels.remove(&view_id);
+        self.presentation.remove_jump_labels(view_id);
+    }
+
+    pub fn jump_labels(&self, view_id: ViewId) -> Option<&[Overlay]> {
+        self.presentation.jump_labels(view_id)
     }
 
     /// Get the inlay hints for this document and `view_id`.
     pub fn inlay_hints(&self, view_id: ViewId) -> Option<&DocumentInlayHints> {
-        self.inlay_hints.get(&view_id)
+        self.presentation.inlay_hints(view_id)
     }
 
     /// Completely removes all the inlay hints saved for the document, dropping them to free memory
     /// (since it often means inlay hints have been fully deactivated).
     pub fn reset_all_inlay_hints(&mut self) {
-        self.inlay_hints = Default::default();
+        self.presentation.reset_all_inlay_hints();
     }
 
     pub fn has_language_server_with_feature(&self, feature: LanguageServerFeature) -> bool {
@@ -2465,12 +2575,21 @@ impl Document {
     }
 
     pub fn insert_fold_container(&mut self, view_id: ViewId, container: FoldContainer) {
-        self.fold_container.insert(view_id, container);
+        self.presentation.insert_fold_container(view_id, container);
     }
 
     /// `None` when container is empty.
     pub fn fold_container(&self, view_id: ViewId) -> Option<&FoldContainer> {
-        self.fold_container.get(&view_id)
+        self.presentation.fold_container(view_id)
+    }
+
+    pub fn plugin_annotations(&self, view_id: ViewId) -> Option<&Vec<PluginAnnotation>> {
+        self.presentation.plugin_annotations(view_id)
+    }
+
+    pub fn set_plugin_annotations(&mut self, view_id: ViewId, annotations: Vec<PluginAnnotation>) {
+        self.presentation
+            .set_plugin_annotations(view_id, annotations);
     }
 
     fn add_folds_impl(
@@ -2479,9 +2598,9 @@ impl Document {
         fold_points: Vec<(StartFoldPoint, EndFoldPoint)>,
         replace: bool,
     ) {
-        let text = self.text.slice(..);
+        let text = self.buffer.text().slice(..);
         let range = self.selection(view.id).primary();
-        let container = self.fold_container.entry(view.id).or_default();
+        let container = self.presentation.fold_container_mut(view.id);
 
         if replace {
             container.replace(text, fold_points);
@@ -2504,11 +2623,11 @@ impl Document {
         self.add_folds_impl(view, fold_points, true);
     }
 
-    pub fn remove_folds(&mut self, view: &View, start_indices: Vec<usize>) {
-        let text = self.text.slice(..);
+    pub fn remove_folds(&mut self, view: &View, start_indices: &[usize]) {
+        let text = self.buffer.text().slice(..);
         let container = self
-            .fold_container
-            .get_mut(&view.id)
+            .presentation
+            .fold_container_get_mut(&view.id)
             .expect("Container must be initialized");
 
         container.remove(text, start_indices);
@@ -2516,11 +2635,6 @@ impl Document {
         let scrolloff = self.config.load().scrolloff;
         view.ensure_cursor_in_view(self, scrolloff);
     }
-}
-
-#[derive(Debug, Default)]
-pub struct ViewData {
-    view_position: ViewPosition,
 }
 
 #[derive(Clone, Debug)]
@@ -2551,6 +2665,91 @@ impl Display for FormatterError {
                 write!(f, "Formatter exited with non zero exit status")
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Trait impls (helix-view::traits)
+// ---------------------------------------------------------------------------
+
+impl crate::traits::TextContent for Document {
+    fn text(&self) -> &Rope {
+        self.text()
+    }
+}
+
+impl crate::traits::MutableText for Document {
+    fn apply(&mut self, transaction: &Transaction, view_id: ViewId) -> bool {
+        Document::apply(self, transaction, view_id)
+    }
+}
+
+impl crate::traits::FormattableText for Document {
+    fn text_format(&self, viewport_width: u16) -> helix_core::doc_formatter::TextFormat {
+        Document::text_format(self, viewport_width, None)
+    }
+}
+
+impl crate::traits::TextMetrics for Document {
+    fn tab_width(&self) -> usize {
+        Document::tab_width(self)
+    }
+}
+
+impl crate::traits::Indentation for Document {
+    fn indent_style(&self) -> helix_core::indent::IndentStyle {
+        Document::indent_style(self)
+    }
+
+    fn indent_width(&self) -> usize {
+        Document::indent_width(self)
+    }
+}
+
+impl crate::traits::LineEndingAware for Document {
+    fn line_ending(&self) -> helix_core::line_ending::LineEnding {
+        Document::line_ending(self)
+    }
+}
+
+impl<V> crate::traits::Undoable<V> for Document
+where
+    V: crate::traits::HistoryViewport<Document>,
+{
+    fn undo(&mut self, viewport: &mut V) -> bool {
+        Document::undo(self, viewport)
+    }
+
+    fn redo(&mut self, viewport: &mut V) -> bool {
+        Document::redo(self, viewport)
+    }
+
+    fn earlier(&mut self, viewport: &mut V, kind: helix_core::history::UndoKind) -> bool {
+        Document::earlier(self, viewport, kind)
+    }
+
+    fn later(&mut self, viewport: &mut V, kind: helix_core::history::UndoKind) -> bool {
+        Document::later(self, viewport, kind)
+    }
+
+    fn commit_undo_checkpoint(&mut self, viewport: &mut V) {
+        Document::append_changes_to_history(self, viewport);
+    }
+}
+
+impl crate::traits::SyntaxAware for Document {
+    fn syntax(&self) -> Option<&helix_core::Syntax> {
+        Document::syntax(self)
+    }
+}
+
+impl crate::traits::Selectable for Document {
+    fn selection(&self, view_id: ViewId) -> &Selection {
+        Document::selection(self, view_id)
+    }
+
+    fn set_selection(&mut self, view_id: ViewId, selection: Selection) {
+        Document::set_selection(self, view_id, selection);
     }
 }
 

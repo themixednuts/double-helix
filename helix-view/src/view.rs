@@ -1,17 +1,21 @@
 use crate::{
-    align_view,
+    align_view_in,
     annotations::{diagnostics::InlineDiagnostics, plugins::PluginLineAnnotations},
-    document::{DocumentColorSwatches, DocumentInlayHints},
+    bench::log_run_event,
+    document::{DocumentInlayHints, Mode},
+    document_lsp::DocumentColorSwatches,
     editor::{GutterConfig, GutterType},
     graphics::Rect,
     handlers::diagnostics::DiagnosticsHandler,
+    history_state::ViewHistoryState,
     Align, Document, DocumentId, Theme, ViewId,
 };
 
 use helix_core::{
     char_idx_at_visual_offset,
     doc_formatter::TextFormat,
-    text_annotations::TextAnnotations,
+    plain_visual_col_at_char_idx,
+    text_annotations::{PlainViewportSupport, TextAnnotations},
     text_folding::{FoldAnnotations, RopeSliceFoldExt},
     visual_offset_from_anchor, visual_offset_from_block, Position, RopeSlice, Selection,
     Transaction,
@@ -19,107 +23,10 @@ use helix_core::{
 };
 
 use std::{
-    collections::{HashMap, VecDeque},
     fmt,
+    hash::{Hash, Hasher},
+    sync::Arc,
 };
-
-const JUMP_LIST_CAPACITY: usize = 30;
-
-type Jump = (DocumentId, Selection);
-
-#[derive(Debug, Clone)]
-pub struct JumpList {
-    jumps: VecDeque<Jump>,
-    current: usize,
-}
-
-impl JumpList {
-    pub fn new(initial: Jump) -> Self {
-        let mut jumps = VecDeque::with_capacity(JUMP_LIST_CAPACITY);
-        jumps.push_back(initial);
-        Self { jumps, current: 0 }
-    }
-
-    fn push_impl(&mut self, jump: Jump) -> usize {
-        let mut num_removed_from_front = 0;
-        self.jumps.truncate(self.current);
-        // don't push duplicates
-        if self.jumps.back() != Some(&jump) {
-            // If the jumplist is full, drop the oldest item.
-            while self.jumps.len() >= JUMP_LIST_CAPACITY {
-                self.jumps.pop_front();
-                num_removed_from_front += 1;
-            }
-
-            self.jumps.push_back(jump);
-            self.current = self.jumps.len();
-        }
-        num_removed_from_front
-    }
-
-    pub fn push(&mut self, jump: Jump) {
-        self.push_impl(jump);
-    }
-
-    pub(crate) fn forward(&mut self, count: usize) -> Option<&Jump> {
-        if self.current + count < self.jumps.len() {
-            self.current += count;
-            self.jumps.get(self.current)
-        } else {
-            None
-        }
-    }
-
-    // Taking view and doc to prevent unnecessary cloning when jump is not required.
-    pub(crate) fn backward(
-        &mut self,
-        view_id: ViewId,
-        doc: &mut Document,
-        count: usize,
-    ) -> Option<&Jump> {
-        if let Some(mut current) = self.current.checked_sub(count) {
-            if self.current == self.jumps.len() {
-                let jump = (doc.id(), doc.selection(view_id).clone());
-                let num_removed = self.push_impl(jump);
-                current = current.saturating_sub(num_removed);
-            }
-            self.current = current;
-
-            // Avoid jumping to the current location.
-            let (doc_id, selection) = self.jumps.get(self.current)?;
-            if doc.id() == *doc_id && doc.selection(view_id) == selection {
-                self.current = self.current.checked_sub(1)?;
-            }
-            self.jumps.get(self.current)
-        } else {
-            None
-        }
-    }
-
-    pub fn remove(&mut self, doc_id: &DocumentId) {
-        self.jumps.retain(|(other_id, _)| other_id != doc_id);
-    }
-
-    pub fn iter(&self) -> impl DoubleEndedIterator<Item = &Jump> {
-        self.jumps.iter()
-    }
-
-    /// Applies a [`Transaction`] of changes to the jumplist.
-    /// This is necessary to ensure that changes to documents do not leave jump-list
-    /// selections pointing to parts of the text which no longer exist.
-    fn apply(&mut self, transaction: &Transaction, doc: &Document) {
-        let text = doc.text().slice(..);
-
-        for (doc_id, selection) in &mut self.jumps {
-            if doc.id() == *doc_id {
-                *selection = selection
-                    .clone()
-                    .map(transaction.changes())
-                    .ensure_invariants(text);
-            }
-        }
-    }
-}
 
 #[derive(Clone, Debug, PartialEq, Eq, Copy, Default)]
 pub struct ViewPosition {
@@ -128,12 +35,253 @@ pub struct ViewPosition {
     pub vertical_offset: usize,
 }
 
+#[derive(Clone, Debug)]
+pub struct ComponentViewState {
+    pub id: ViewId,
+    pub area: Rect,
+    pub doc: DocumentId,
+    pub history: ViewHistoryState,
+    pub object_selections: Vec<Selection>,
+}
+
+impl ComponentViewState {
+    pub fn new(id: ViewId, doc: DocumentId) -> Self {
+        Self {
+            id,
+            area: Rect::default(),
+            doc,
+            history: ViewHistoryState::new(doc),
+            object_selections: Vec::new(),
+        }
+    }
+}
+
+pub enum AnyViewMut<'a> {
+    Tree(&'a mut View),
+    Component(&'a mut ComponentViewState),
+}
+
+impl AnyViewMut<'_> {
+    pub fn doc_id(&self) -> DocumentId {
+        match self {
+            Self::Tree(view) => view.doc,
+            Self::Component(view) => view.doc,
+        }
+    }
+
+    pub fn object_selections_mut(&mut self) -> &mut Vec<Selection> {
+        match self {
+            Self::Tree(view) => &mut view.object_selections,
+            Self::Component(view) => &mut view.object_selections,
+        }
+    }
+}
+
+/// Content-level fingerprint — inputs that affect text layout and syntax highlighting.
+/// When this changes, the syntax highlighter must re-run (tree-sitter queries).
+/// When this is unchanged but overlays change, cached syntax styles can be reused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ViewContentState {
+    pub doc_id: crate::DocumentId,
+    pub doc_version: i32,
+    pub view_position: ViewPosition,
+    pub area: Rect,
+    pub theme_name: Arc<str>,
+    pub config_gen: u64,
+    /// Annotation generation counter — changes when any text annotation
+    /// (jump labels, inlay hints, etc.) is added or removed.
+    pub annotation_gen: u64,
+    /// Primary cursor line — invalidates cache when cursor moves (affects
+    /// relative line numbers and gutter selection highlights).
+    pub cursor_line: usize,
+}
+
+/// A cached syntax style entry: the char position where the style takes effect,
+/// and the accumulated `Style` at that position.
+#[derive(Debug, Clone)]
+pub struct SyntaxStyleEntry {
+    pub char_idx: usize,
+    pub style: crate::graphics::Style,
+}
+
+/// Cached syntax styles for a viewport. Replaces the tree-sitter `Highlighter`
+/// when the content hasn't changed but overlays (cursor, selection) have.
+/// Uses `Arc<[T]>` so clones are O(1) refcount bumps.
+#[derive(Debug, Clone)]
+pub struct SyntaxStyleCache {
+    pub entries: Arc<[SyntaxStyleEntry]>,
+}
+
+impl Default for SyntaxStyleCache {
+    fn default() -> Self {
+        Self {
+            entries: Arc::from([]),
+        }
+    }
+}
+
+/// Metadata for one visual line (one row on screen), built during rendering.
+/// Used to map visual rows back to document positions for dirty-line detection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HorizontalCheckpoint {
+    pub char_idx: usize,
+    pub visual_col: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct VisualLineInfo {
+    /// The visual row index (relative to viewport top).
+    pub visual_row: u16,
+    /// The document line this visual row belongs to.
+    pub doc_line: usize,
+    /// First char index on this visual row.
+    pub char_range_start: usize,
+    /// Last char index on this visual row (exclusive).
+    pub char_range_end: usize,
+    /// First visible document char rendered on this visual row.
+    pub visible_char_start: usize,
+    /// Visual column for `visible_char_start`.
+    pub visible_col_start: usize,
+    /// Last visible document char rendered on this visual row.
+    pub visible_char_last: usize,
+    /// Visual column for `visible_char_last`.
+    pub visible_col_last: usize,
+    /// Sampled horizontal checkpoints on this row for fast re-entry at large horizontal offsets.
+    pub horizontal_checkpoints: Vec<HorizontalCheckpoint>,
+}
+
+/// Per-visual-line map built during rendering. Enables dirty-line detection
+/// by mapping visual rows to document positions.
+/// Uses `Arc<[T]>` so clones are O(1) refcount bumps.
+#[derive(Debug, Clone)]
+pub struct LineMap {
+    pub lines: Arc<[VisualLineInfo]>,
+}
+
+impl Default for LineMap {
+    fn default() -> Self {
+        Self {
+            lines: Arc::from([]),
+        }
+    }
+}
+
+impl LineMap {
+    pub fn best_horizontal_checkpoint(
+        &self,
+        doc_line: usize,
+        horizontal_offset: usize,
+    ) -> Option<HorizontalCheckpoint> {
+        self.best_horizontal_checkpoint_within_gap(doc_line, horizontal_offset, usize::MAX)
+    }
+
+    pub fn best_horizontal_checkpoint_within_gap(
+        &self,
+        doc_line: usize,
+        horizontal_offset: usize,
+        max_gap: usize,
+    ) -> Option<HorizontalCheckpoint> {
+        let mut best = None;
+        let mut best_gap = usize::MAX;
+
+        let mut consider = |checkpoint: HorizontalCheckpoint| {
+            if checkpoint.visual_col > horizontal_offset {
+                return;
+            }
+            let gap = horizontal_offset.saturating_sub(checkpoint.visual_col);
+            if gap > max_gap {
+                return;
+            }
+            if gap < best_gap {
+                best_gap = gap;
+                best = Some(checkpoint);
+            }
+        };
+
+        for line in self.lines.iter().filter(|line| line.doc_line == doc_line) {
+            for checkpoint in &line.horizontal_checkpoints {
+                consider(*checkpoint);
+            }
+            if line.visible_char_start != usize::MAX {
+                consider(HorizontalCheckpoint {
+                    char_idx: line.visible_char_start,
+                    visual_col: line.visible_col_start,
+                });
+            }
+            if line.visible_char_last != usize::MAX {
+                consider(HorizontalCheckpoint {
+                    char_idx: line.visible_char_last,
+                    visual_col: line.visible_col_last,
+                });
+            }
+        }
+
+        best
+    }
+
+    /// Compute per-line overlay fingerprints. A fingerprint changes when the
+    /// overlay state (selection, cursor, focus, mode) affecting that line changes.
+    pub fn overlay_fingerprints(
+        &self,
+        selection: &Selection,
+        mode: Mode,
+        is_focused: bool,
+        terminal_focused: bool,
+    ) -> Arc<[u64]> {
+        let mut fingerprints = Vec::with_capacity(self.lines.len());
+        for line in self.lines.iter() {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            // Hash focus/mode state
+            is_focused.hash(&mut h);
+            terminal_focused.hash(&mut h);
+            std::mem::discriminant(&mode).hash(&mut h);
+
+            // Hash which selection ranges intersect this line's char range
+            for (i, range) in selection.ranges().iter().enumerate() {
+                let (start, end) = if range.anchor <= range.head {
+                    (range.anchor, range.head)
+                } else {
+                    (range.head, range.anchor)
+                };
+                // Check intersection with this line's char range
+                if start < line.char_range_end && end >= line.char_range_start {
+                    i.hash(&mut h);
+                    range.anchor.hash(&mut h);
+                    range.head.hash(&mut h);
+                }
+            }
+            // Hash whether primary cursor head is on this line
+            let primary_head = selection.primary().head;
+            if primary_head >= line.char_range_start && primary_head < line.char_range_end {
+                true.hash(&mut h);
+            }
+
+            fingerprints.push(h.finish());
+        }
+        Arc::from(fingerprints)
+    }
+
+    /// Compare two fingerprint vecs and return the set of dirty visual rows.
+    pub fn dirty_rows(old: &[u64], new: &[u64]) -> std::collections::HashSet<u16> {
+        let mut dirty = std::collections::HashSet::new();
+        let max_len = old.len().max(new.len());
+        for i in 0..max_len {
+            let old_fp = old.get(i).copied().unwrap_or(0);
+            let new_fp = new.get(i).copied().unwrap_or(0);
+            if old_fp != new_fp {
+                dirty.insert(i as u16);
+            }
+        }
+        dirty
+    }
+}
+
 #[derive(Clone)]
 pub struct View {
     pub id: ViewId,
     pub area: Rect,
     pub doc: DocumentId,
-    pub jumps: JumpList,
+    pub history: ViewHistoryState,
     // documents accessed from this view from the oldest one to last viewed one
     pub docs_access_history: Vec<DocumentId>,
     /// the last modified files before the current one
@@ -145,11 +293,6 @@ pub struct View {
     pub object_selections: Vec<Selection>,
     /// all gutter-related configuration settings, used primarily for gutter rendering
     pub gutters: GutterConfig,
-    /// A mapping between documents and the last history revision the view was updated at.
-    /// Changes between documents and views are synced lazily when switching windows. This
-    /// mapping keeps track of the last applied history revision so that only new changes
-    /// are applied.
-    doc_revisions: HashMap<DocumentId, usize>,
     // HACKS: there should really only be a global diagnostics handler (the
     // non-focused views should just not have different handling for the cursor
     // line). For that we would need accces to editor everywhere (we want to use
@@ -176,12 +319,11 @@ impl View {
             id: ViewId::default(),
             doc,
             area: Rect::default(), // will get calculated upon inserting into tree
-            jumps: JumpList::new((doc, Selection::point(0))), // TODO: use actual sel
+            history: ViewHistoryState::new(doc),
             docs_access_history: Vec::new(),
             last_modified_docs: [None, None],
             object_selections: Vec::new(),
             gutters,
-            doc_revisions: HashMap::new(),
             diagnostics_handler: DiagnosticsHandler::new(),
         }
     }
@@ -241,7 +383,7 @@ impl View {
         doc: &Document,
         scrolloff: usize,
     ) -> Option<ViewPosition> {
-        self.offset_coords_to_in_view_center::<false>(doc, scrolloff)
+        offset_coords_to_in_view_center_in::<_, false>(self, doc, scrolloff)
     }
 
     pub fn offset_coords_to_in_view_center<const CENTERING: bool>(
@@ -249,117 +391,15 @@ impl View {
         doc: &Document,
         scrolloff: usize,
     ) -> Option<ViewPosition> {
-        let view_offset = doc.get_view_offset(self.id)?;
-        let doc_text = doc.text().slice(..);
-        let viewport = self.inner_area(doc);
-        let vertical_viewport_end = view_offset.vertical_offset + viewport.height as usize;
-        let text_fmt = doc.text_format(viewport.width, None);
-        let annotations = self.text_annotations(doc, None);
-
-        let (scrolloff_top, scrolloff_bottom) = if CENTERING {
-            (0, 0)
-        } else {
-            (
-                // - 1 from the top so we have at least one gap in the middle.
-                scrolloff.min(viewport.height.saturating_sub(1) as usize / 2),
-                scrolloff.min(viewport.height as usize / 2),
-            )
-        };
-        let (scrolloff_left, scrolloff_right) = if CENTERING {
-            (0, 0)
-        } else {
-            (
-                // - 1 from the left so we have at least one gap in the middle.
-                scrolloff.min(viewport.width.saturating_sub(1) as usize / 2),
-                scrolloff.min(viewport.width as usize / 2),
-            )
-        };
-
-        let cursor = doc.selection(self.id).primary().cursor(doc_text);
-        let mut offset = view_offset;
-        let off = visual_offset_from_anchor(
-            doc_text,
-            offset.anchor,
-            cursor,
-            &text_fmt,
-            &annotations,
-            vertical_viewport_end,
-        );
-
-        let (new_anchor, at_top) = match off {
-            Ok((visual_pos, _)) if visual_pos.row < scrolloff_top + offset.vertical_offset => {
-                if CENTERING {
-                    // cursor out of view
-                    return None;
-                }
-                (true, true)
-            }
-            Ok((visual_pos, _)) if visual_pos.row + scrolloff_bottom >= vertical_viewport_end => {
-                (true, false)
-            }
-            Ok((_, _)) => (false, false),
-            Err(_) if CENTERING => return None,
-            Err(PosBeforeAnchorRow) => (true, true),
-            Err(PosAfterMaxRow) => (true, false),
-        };
-
-        if new_anchor {
-            let v_off = if at_top {
-                scrolloff_top as isize
-            } else {
-                viewport.height as isize - scrolloff_bottom as isize - 1
-            };
-            (offset.anchor, offset.vertical_offset) =
-                char_idx_at_visual_offset(doc_text, cursor, -v_off, 0, &text_fmt, &annotations);
-        }
-
-        if text_fmt.soft_wrap {
-            offset.horizontal_offset = 0;
-        } else {
-            // determine the current visual column of the text
-            let col = off
-                .unwrap_or_else(|_| {
-                    visual_offset_from_block(
-                        doc_text,
-                        offset.anchor,
-                        cursor,
-                        &text_fmt,
-                        &annotations,
-                    )
-                })
-                .0
-                .col;
-
-            let last_col = offset.horizontal_offset + viewport.width.saturating_sub(1) as usize;
-            if col > last_col.saturating_sub(scrolloff_right) {
-                // scroll right
-                offset.horizontal_offset += col - (last_col.saturating_sub(scrolloff_right))
-            } else if col < offset.horizontal_offset + scrolloff_left {
-                // scroll left
-                offset.horizontal_offset = col.saturating_sub(scrolloff_left)
-            };
-        }
-
-        // if we are not centering return None if view position is unchanged
-        if !CENTERING && offset == view_offset {
-            return None;
-        }
-
-        Some(offset)
+        offset_coords_to_in_view_center_in::<_, CENTERING>(self, doc, scrolloff)
     }
 
     pub fn ensure_cursor_in_view(&self, doc: &mut Document, scrolloff: usize) {
-        if let Some(offset) = self.offset_coords_to_in_view_center::<false>(doc, scrolloff) {
-            doc.set_view_offset(self.id, offset);
-        }
+        ensure_cursor_in_view_in(self, doc, scrolloff);
     }
 
     pub fn ensure_cursor_in_view_center(&self, doc: &mut Document, scrolloff: usize) {
-        if let Some(offset) = self.offset_coords_to_in_view_center::<true>(doc, scrolloff) {
-            doc.set_view_offset(self.id, offset);
-        } else {
-            align_view(doc, self, Align::Center);
-        }
+        ensure_cursor_in_view_center_in(self, doc, scrolloff);
     }
 
     pub fn is_cursor_in_view(&mut self, doc: &Document, scrolloff: usize) -> bool {
@@ -461,7 +501,7 @@ impl View {
     ) -> TextAnnotations<'a> {
         let mut text_annotations = TextAnnotations::default();
 
-        if let Some(labels) = doc.jump_labels.get(&self.id) {
+        if let Some(labels) = doc.jump_labels(self.id) {
             let style = theme.and_then(|t| t.find_highlight("ui.virtual.jump-label"));
             text_annotations.add_overlay(labels, style);
         }
@@ -473,7 +513,7 @@ impl View {
             other_inlay_hints,
             padding_before_inlay_hints,
             padding_after_inlay_hints,
-        }) = doc.inlay_hints.get(&self.id)
+        }) = doc.inlay_hints(self.id)
         {
             let type_style = theme.and_then(|t| t.find_highlight("ui.virtual.inlay-hint.type"));
             let parameter_style =
@@ -497,7 +537,7 @@ impl View {
                 color_swatches,
                 colors,
                 color_swatches_padding,
-            }) = &doc.color_swatches
+            }) = doc.color_swatches()
             {
                 for (color_swatch, color) in color_swatches.iter().zip(colors) {
                     text_annotations
@@ -518,6 +558,17 @@ impl View {
                 .selection(self.id)
                 .primary()
                 .cursor(doc.text().slice(..));
+            if doc.text().len_bytes() >= 100_000 {
+                log_run_event("view_line_annotation_attach", || {
+                    format!(
+                        "kind=inline_diagnostics view_id={:?} doc_id={:?} cursor={} width={}",
+                        self.id,
+                        doc.id(),
+                        cursor,
+                        width,
+                    )
+                });
+            }
             text_annotations.add_line_annotation(InlineDiagnostics::new(
                 doc,
                 cursor,
@@ -527,8 +578,20 @@ impl View {
             ));
         }
 
-        text_annotations
-            .add_line_annotation(Box::new(PluginLineAnnotations::new(doc, self.id, width)));
+        if doc.text().len_bytes() >= 100_000 {
+            log_run_event("view_line_annotation_attach", || {
+                format!(
+                    "kind=plugin_annotations view_id={:?} doc_id={:?} width={}",
+                    self.id,
+                    doc.id(),
+                    width,
+                )
+            });
+        }
+
+        text_annotations.add_line_annotation(Box::new(PluginLineAnnotations::new(
+            doc, self.id, width,
+        )));
 
         if let Some(fold_container) = doc.fold_container(self.id) {
             text_annotations.add_folds(fold_container);
@@ -657,7 +720,7 @@ impl View {
     }
 
     pub fn remove_document(&mut self, doc_id: &DocumentId) {
-        self.jumps.remove(doc_id);
+        self.history.remove_document(doc_id);
         self.docs_access_history.retain(|doc| doc != doc_id);
     }
 
@@ -684,37 +747,634 @@ impl View {
 
     /// Applies a [`Transaction`] to the view.
     pub fn apply(&mut self, transaction: &Transaction, doc: &mut Document) {
-        self.jumps.apply(transaction, doc);
-        self.doc_revisions
-            .insert(doc.id(), doc.get_current_revision());
+        self.history.apply(transaction, doc);
     }
 
     pub fn sync_changes(&mut self, doc: &mut Document) {
-        if let Some(transaction) = self.changes_to_sync(doc) {
-            self.apply(&transaction, doc);
-        }
+        self.history.sync_changes(doc);
     }
 
     pub(crate) fn changes_to_sync(&mut self, doc: &mut Document) -> Option<Transaction> {
-        let latest_revision = doc.get_current_revision();
-        let current_revision = *self
-            .doc_revisions
-            .entry(doc.id())
-            .or_insert(latest_revision);
+        self.history.changes_to_sync(doc)
+    }
+}
 
-        if current_revision == latest_revision {
-            return None;
+pub fn offset_coords_to_in_view_center_in<V, const CENTERING: bool>(
+    view: &V,
+    doc: &Document,
+    scrolloff: usize,
+) -> Option<ViewPosition>
+where
+    V: crate::traits::TextViewport<Document> + crate::traits::NavigableViewport<Document>,
+{
+    let view_offset = doc.get_view_offset(view.id())?;
+    let doc_text = doc.text().slice(..);
+    let viewport = view.text_area(doc);
+    let vertical_viewport_end = view_offset.vertical_offset + viewport.height as usize;
+    let text_fmt = doc.text_format(viewport.width, None);
+    let annotations = view.text_annotations(doc);
+
+    let (scrolloff_top, scrolloff_bottom) = if CENTERING {
+        (0, 0)
+    } else {
+        (
+            scrolloff.min(viewport.height.saturating_sub(1) as usize / 2),
+            scrolloff.min(viewport.height as usize / 2),
+        )
+    };
+    let (scrolloff_left, scrolloff_right) = if CENTERING {
+        (0, 0)
+    } else {
+        (
+            scrolloff.min(viewport.width.saturating_sub(1) as usize / 2),
+            scrolloff.min(viewport.width as usize / 2),
+        )
+    };
+
+    let cursor = doc.selection(view.id()).primary().cursor(doc_text);
+    let mut offset = view_offset;
+
+    if !text_fmt.soft_wrap {
+        let anchor = offset.anchor.min(doc_text.len_chars());
+        let anchor_line = doc_text.char_to_line(anchor);
+        let top_line = anchor_line.saturating_add(offset.vertical_offset);
+        let cursor_line = doc_text.char_to_line(cursor);
+        let viewport_height = viewport.height as usize;
+
+        let vertical_support =
+            annotations.plain_viewport_support_report(top_line, cursor_line);
+
+        let cursor_line_start = doc_text.line_to_char(cursor_line);
+        let cursor_line_end = helix_core::line_ending::line_end_char_index(&doc_text, cursor_line);
+        let horizontal_support =
+            annotations.plain_line_seek_support(cursor_line_start, cursor_line_end, cursor);
+
+        if matches!(vertical_support.support, PlainViewportSupport::Supported)
+            && matches!(
+                horizontal_support,
+                helix_core::text_annotations::PlainLineSeekSupport::Supported
+            )
+        {
+            let new_top_line = if CENTERING {
+                let center_row = viewport_height.saturating_sub(1) / 2;
+                cursor_line.saturating_sub(center_row)
+            } else if cursor_line < top_line.saturating_add(scrolloff_top) {
+                cursor_line.saturating_sub(scrolloff_top)
+            } else if cursor_line.saturating_add(scrolloff_bottom) >= top_line + viewport_height {
+                cursor_line
+                    .saturating_add(scrolloff_bottom)
+                    .saturating_add(1)
+                    .saturating_sub(viewport_height)
+            } else {
+                top_line
+            };
+
+            if new_top_line != top_line {
+                offset.anchor = doc_text.line_to_char(new_top_line);
+                offset.vertical_offset = 0;
+            }
+
+            let col = plain_visual_col_at_char_idx(doc_text, cursor, text_fmt.tab_width as usize);
+            let last_col = offset.horizontal_offset + viewport.width.saturating_sub(1) as usize;
+            if col > last_col.saturating_sub(scrolloff_right) {
+                offset.horizontal_offset += col - (last_col.saturating_sub(scrolloff_right));
+            } else if col < offset.horizontal_offset + scrolloff_left {
+                offset.horizontal_offset = col.saturating_sub(scrolloff_left);
+            }
+
+            if !CENTERING && offset == view_offset {
+                return None;
+            }
+
+            return Some(offset);
         }
 
-        doc.history.get_mut().changes_since(current_revision)
+        if doc_text.len_bytes() >= 100_000 {
+            log_run_event("ensure_cursor_fast_path_v2", || {
+                format!(
+                    "result=fallback view_id={:?} doc_id={:?} top_line={} cursor_line={} cursor={} vertical_support={} blocker={} horizontal_support={}",
+                    view.id(),
+                    doc.id(),
+                    top_line,
+                    cursor_line,
+                    cursor,
+                    vertical_support.support.as_str(),
+                    vertical_support.blocker.unwrap_or("none"),
+                    horizontal_support.as_str(),
+                )
+            });
+        }
+    }
+
+    let off = visual_offset_from_anchor(
+        doc_text,
+        offset.anchor,
+        cursor,
+        &text_fmt,
+        &annotations,
+        vertical_viewport_end,
+    );
+
+    let (new_anchor, at_top) = match off {
+        Ok((visual_pos, _)) if visual_pos.row < scrolloff_top + offset.vertical_offset => {
+            if CENTERING {
+                return None;
+            }
+            (true, true)
+        }
+        Ok((visual_pos, _)) if visual_pos.row + scrolloff_bottom >= vertical_viewport_end => {
+            (true, false)
+        }
+        Ok((_, _)) => (false, false),
+        Err(_) if CENTERING => return None,
+        Err(PosBeforeAnchorRow) => (true, true),
+        Err(PosAfterMaxRow) => (true, false),
+    };
+
+    if new_anchor {
+        let v_off = if at_top {
+            scrolloff_top as isize
+        } else {
+            viewport.height as isize - scrolloff_bottom as isize - 1
+        };
+        (offset.anchor, offset.vertical_offset) =
+            char_idx_at_visual_offset(doc_text, cursor, -v_off, 0, &text_fmt, &annotations);
+    }
+
+    if text_fmt.soft_wrap {
+        offset.horizontal_offset = 0;
+    } else {
+        let col = off
+            .unwrap_or_else(|_| {
+                visual_offset_from_block(doc_text, offset.anchor, cursor, &text_fmt, &annotations)
+            })
+            .0
+            .col;
+
+        let last_col = offset.horizontal_offset + viewport.width.saturating_sub(1) as usize;
+        if col > last_col.saturating_sub(scrolloff_right) {
+            offset.horizontal_offset += col - (last_col.saturating_sub(scrolloff_right))
+        } else if col < offset.horizontal_offset + scrolloff_left {
+            offset.horizontal_offset = col.saturating_sub(scrolloff_left)
+        };
+    }
+
+    if !CENTERING && offset == view_offset {
+        return None;
+    }
+
+    Some(offset)
+}
+
+pub fn ensure_cursor_in_view_in<V>(view: &V, doc: &mut Document, scrolloff: usize)
+where
+    V: crate::traits::TextViewport<Document> + crate::traits::NavigableViewport<Document>,
+{
+    if let Some(offset) = offset_coords_to_in_view_center_in::<V, false>(view, doc, scrolloff) {
+        view.set_view_offset(doc, offset);
+    }
+}
+
+pub fn ensure_cursor_in_view_center_in<V>(view: &V, doc: &mut Document, scrolloff: usize)
+where
+    V: crate::traits::TextViewport<Document> + crate::traits::NavigableViewport<Document>,
+{
+    if let Some(offset) = offset_coords_to_in_view_center_in::<V, true>(view, doc, scrolloff) {
+        view.set_view_offset(doc, offset);
+    } else {
+        align_view_in(doc, view, Align::Center);
+    }
+}
+
+/// Store a jump on the jumplist. Call before changing selection for motions that should be
+/// reversible via the jumplist (e.g. goto file start/end, goto line).
+pub fn push_jump<V, D>(view: &mut V, doc: &mut D)
+where
+    V: crate::traits::Jumpable<D>,
+{
+    view.push_jump(doc);
+}
+
+// ---------------------------------------------------------------------------
+// Trait impls (helix-view::traits)
+// ---------------------------------------------------------------------------
+
+impl crate::traits::Identified for View {
+    fn id(&self) -> ViewId {
+        self.id
+    }
+}
+
+impl crate::traits::Identified for ComponentViewState {
+    fn id(&self) -> ViewId {
+        self.id
+    }
+}
+
+impl crate::traits::Identified for AnyViewMut<'_> {
+    fn id(&self) -> ViewId {
+        match self {
+            Self::Tree(view) => view.id,
+            Self::Component(view) => view.id,
+        }
+    }
+}
+
+impl crate::traits::Bounded for View {
+    fn area(&self) -> Rect {
+        self.area
+    }
+
+    fn set_area(&mut self, area: Rect) {
+        self.area = area;
+    }
+}
+
+impl crate::traits::Bounded for ComponentViewState {
+    fn area(&self) -> Rect {
+        self.area
+    }
+
+    fn set_area(&mut self, area: Rect) {
+        self.area = area;
+    }
+}
+
+impl crate::traits::Bounded for AnyViewMut<'_> {
+    fn area(&self) -> Rect {
+        match self {
+            Self::Tree(view) => view.area(),
+            Self::Component(view) => view.area(),
+        }
+    }
+
+    fn set_area(&mut self, area: Rect) {
+        match self {
+            Self::Tree(view) => view.set_area(area),
+            Self::Component(view) => view.set_area(area),
+        }
+    }
+}
+
+impl crate::traits::NavigableViewport<crate::Document> for View {
+    fn text_area_width(&self, doc: &crate::Document) -> u16 {
+        self.inner_width(doc)
+    }
+
+    fn text_annotations<'a>(
+        &self,
+        doc: &'a crate::Document,
+    ) -> helix_core::text_annotations::TextAnnotations<'a> {
+        View::text_annotations(self, doc, None)
+    }
+}
+
+impl crate::traits::NavigableViewport<crate::Document> for ComponentViewState {
+    fn text_area_width(&self, _doc: &crate::Document) -> u16 {
+        self.area.width
+    }
+
+    fn text_annotations<'a>(
+        &self,
+        _doc: &'a crate::Document,
+    ) -> helix_core::text_annotations::TextAnnotations<'a> {
+        helix_core::text_annotations::TextAnnotations::default()
+    }
+}
+
+impl crate::traits::NavigableViewport<crate::Document> for AnyViewMut<'_> {
+    fn text_area_width(&self, doc: &crate::Document) -> u16 {
+        match self {
+            Self::Tree(view) => view.text_area_width(doc),
+            Self::Component(view) => view.text_area_width(doc),
+        }
+    }
+
+    fn text_annotations<'a>(
+        &self,
+        doc: &'a crate::Document,
+    ) -> helix_core::text_annotations::TextAnnotations<'a> {
+        match self {
+            Self::Tree(view) => view.text_annotations(doc, None),
+            Self::Component(view) => view.text_annotations(doc),
+        }
+    }
+}
+
+impl crate::traits::TextViewport<crate::Document> for View {
+    fn text_area(&self, doc: &crate::Document) -> Rect {
+        self.inner_area(doc)
+    }
+
+    fn view_offset(&self, doc: &crate::Document) -> ViewPosition {
+        doc.view_offset(self.id)
+    }
+
+    fn set_view_offset(&self, doc: &mut crate::Document, pos: ViewPosition) {
+        doc.set_view_offset(self.id, pos);
+    }
+}
+
+impl crate::traits::TextViewport<crate::Document> for ComponentViewState {
+    fn text_area(&self, _doc: &crate::Document) -> Rect {
+        self.area
+    }
+
+    fn view_offset(&self, doc: &crate::Document) -> ViewPosition {
+        doc.view_offset(self.id)
+    }
+
+    fn set_view_offset(&self, doc: &mut crate::Document, pos: ViewPosition) {
+        doc.set_view_offset(self.id, pos);
+    }
+}
+
+impl crate::traits::TextViewport<crate::Document> for AnyViewMut<'_> {
+    fn text_area(&self, doc: &crate::Document) -> Rect {
+        match self {
+            Self::Tree(view) => view.text_area(doc),
+            Self::Component(view) => view.text_area(doc),
+        }
+    }
+
+    fn view_offset(&self, doc: &crate::Document) -> ViewPosition {
+        match self {
+            Self::Tree(view) => view.view_offset(doc),
+            Self::Component(view) => view.view_offset(doc),
+        }
+    }
+
+    fn set_view_offset(&self, doc: &mut crate::Document, pos: ViewPosition) {
+        match self {
+            Self::Tree(view) => view.set_view_offset(doc, pos),
+            Self::Component(view) => view.set_view_offset(doc, pos),
+        }
+    }
+}
+
+impl crate::traits::HistoryViewport<crate::Document> for View {
+    fn apply_history_transaction(&mut self, transaction: &Transaction, doc: &mut crate::Document) {
+        self.history.apply(transaction, doc);
+    }
+
+    fn sync_changes(&mut self, doc: &mut crate::Document) {
+        self.history.sync_changes(doc);
+    }
+}
+
+impl crate::traits::HistoryViewport<crate::Document> for ComponentViewState {
+    fn apply_history_transaction(&mut self, transaction: &Transaction, doc: &mut crate::Document) {
+        self.history.apply(transaction, doc);
+    }
+
+    fn sync_changes(&mut self, doc: &mut crate::Document) {
+        self.history.sync_changes(doc);
+    }
+}
+
+impl crate::traits::HistoryViewport<crate::Document> for AnyViewMut<'_> {
+    fn apply_history_transaction(&mut self, transaction: &Transaction, doc: &mut crate::Document) {
+        match self {
+            Self::Tree(view) => view.apply_history_transaction(transaction, doc),
+            Self::Component(view) => view.apply_history_transaction(transaction, doc),
+        }
+    }
+
+    fn sync_changes(&mut self, doc: &mut crate::Document) {
+        match self {
+            Self::Tree(view) => view.sync_changes(doc),
+            Self::Component(view) => view.sync_changes(doc),
+        }
+    }
+}
+
+impl crate::traits::Jumpable<crate::Document> for View {
+    fn push_jump(&mut self, doc: &mut crate::Document) {
+        doc.append_changes_to_history(self);
+        self.history
+            .jumps
+            .push((doc.id(), doc.selection(self.id).clone()));
+    }
+}
+
+impl crate::traits::Jumpable<crate::Document> for ComponentViewState {
+    fn push_jump(&mut self, doc: &mut crate::Document) {
+        doc.append_changes_to_history(self);
+        self.history
+            .jumps
+            .push((doc.id(), doc.selection(self.id).clone()));
+    }
+}
+
+impl crate::traits::Jumpable<crate::Document> for AnyViewMut<'_> {
+    fn push_jump(&mut self, doc: &mut crate::Document) {
+        match self {
+            Self::Tree(view) => view.push_jump(doc),
+            Self::Component(view) => view.push_jump(doc),
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use std::sync::Arc;
 
-    use super::*;
+    fn make_content_state() -> ViewContentState {
+        ViewContentState {
+            doc_id: crate::DocumentId::default(),
+            doc_version: 1,
+            view_position: ViewPosition {
+                anchor: 0,
+                horizontal_offset: 0,
+                vertical_offset: 0,
+            },
+            area: Rect::new(0, 0, 80, 24),
+            theme_name: "default".into(),
+            config_gen: 0,
+            annotation_gen: 0,
+            cursor_line: 0,
+        }
+    }
+
+    #[test]
+    fn content_state_equality() {
+        let a = make_content_state();
+        let b = make_content_state();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn content_state_differs_on_doc_version() {
+        let a = make_content_state();
+        let mut b = make_content_state();
+        b.doc_version = 2;
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn content_state_differs_on_scroll() {
+        let a = make_content_state();
+        let mut b = make_content_state();
+        b.view_position.anchor = 100;
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn content_state_differs_on_theme() {
+        let a = make_content_state();
+        let mut b = make_content_state();
+        b.theme_name = "gruvbox".into();
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn content_state_differs_on_config() {
+        let a = make_content_state();
+        let mut b = make_content_state();
+        b.config_gen = 1;
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn content_state_differs_on_area() {
+        let a = make_content_state();
+        let mut b = make_content_state();
+        b.area = Rect::new(0, 0, 120, 40);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn line_map_dirty_rows_detects_changes() {
+        let old = vec![100, 200, 300, 400, 500];
+        let new = vec![100, 200, 999, 400, 500];
+        let dirty = LineMap::dirty_rows(&old, &new);
+        assert_eq!(dirty.len(), 1);
+        assert!(dirty.contains(&2));
+    }
+
+    #[test]
+    fn line_map_dirty_rows_all_same() {
+        let fps = vec![10, 20, 30];
+        let dirty = LineMap::dirty_rows(&fps, &fps);
+        assert!(dirty.is_empty());
+    }
+
+    #[test]
+    fn line_map_dirty_rows_different_lengths() {
+        let old = vec![1, 2, 3];
+        let new = vec![1, 2, 3, 4];
+        let dirty = LineMap::dirty_rows(&old, &new);
+        assert_eq!(dirty.len(), 1);
+        assert!(dirty.contains(&3));
+    }
+
+    #[test]
+    fn overlay_fingerprints_change_on_cursor_move() {
+        let line_map = LineMap {
+            lines: Arc::from(vec![
+                VisualLineInfo {
+                    visual_row: 0,
+                    doc_line: 0,
+                    char_range_start: 0,
+                    char_range_end: 20,
+                    visible_char_start: 0,
+                    visible_col_start: 0,
+                    visible_char_last: 19,
+                    visible_col_last: 19,
+                    horizontal_checkpoints: Vec::new(),
+                },
+                VisualLineInfo {
+                    visual_row: 1,
+                    doc_line: 1,
+                    char_range_start: 20,
+                    char_range_end: 40,
+                    visible_char_start: 20,
+                    visible_col_start: 0,
+                    visible_char_last: 39,
+                    visible_col_last: 19,
+                    horizontal_checkpoints: Vec::new(),
+                },
+                VisualLineInfo {
+                    visual_row: 2,
+                    doc_line: 2,
+                    char_range_start: 40,
+                    char_range_end: 60,
+                    visible_char_start: 40,
+                    visible_col_start: 0,
+                    visible_char_last: 59,
+                    visible_col_last: 19,
+                    horizontal_checkpoints: Vec::new(),
+                },
+            ]),
+        };
+
+        let sel_a = Selection::point(5); // cursor on line 0
+        let sel_b = Selection::point(25); // cursor on line 1
+
+        let fp_a = line_map.overlay_fingerprints(&sel_a, Mode::Normal, true, true);
+        let fp_b = line_map.overlay_fingerprints(&sel_b, Mode::Normal, true, true);
+
+        // Line 0 and 1 should differ (cursor moved between them)
+        assert_ne!(fp_a[0], fp_b[0]);
+        assert_ne!(fp_a[1], fp_b[1]);
+        // Line 2 should be the same (cursor not on either)
+        assert_eq!(fp_a[2], fp_b[2]);
+    }
+
+    #[test]
+    fn overlay_fingerprints_change_on_mode() {
+        let line_map = LineMap {
+            lines: Arc::from(vec![VisualLineInfo {
+                visual_row: 0,
+                doc_line: 0,
+                char_range_start: 0,
+                char_range_end: 20,
+                visible_char_start: 0,
+                visible_col_start: 0,
+                visible_char_last: 19,
+                visible_col_last: 19,
+                horizontal_checkpoints: Vec::new(),
+            }]),
+        };
+        let sel = Selection::point(5);
+        let fp_normal = line_map.overlay_fingerprints(&sel, Mode::Normal, true, true);
+        let fp_insert = line_map.overlay_fingerprints(&sel, Mode::Insert, true, true);
+        assert_ne!(fp_normal[0], fp_insert[0]);
+    }
+
+    #[test]
+    fn best_horizontal_checkpoint_respects_gap_limit() {
+        let line_map = LineMap {
+            lines: Arc::from(vec![VisualLineInfo {
+                visual_row: 0,
+                doc_line: 7,
+                char_range_start: 0,
+                char_range_end: 300_000,
+                visible_char_start: 143_200,
+                visible_col_start: 143_200,
+                visible_char_last: 143_237,
+                visible_col_last: 143_237,
+                horizontal_checkpoints: vec![HorizontalCheckpoint {
+                    char_idx: 139_264,
+                    visual_col: 139_264,
+                }],
+            }]),
+        };
+
+        assert_eq!(
+            line_map.best_horizontal_checkpoint_within_gap(7, 143_296, 4_096),
+            Some(HorizontalCheckpoint {
+                char_idx: 143_237,
+                visual_col: 143_237,
+            })
+        );
+        assert_eq!(
+            line_map.best_horizontal_checkpoint_within_gap(7, 290_989, 4_096),
+            None
+        );
+    }
+
     use arc_swap::ArcSwap;
     use helix_core::{syntax, Rope};
 

@@ -2,7 +2,7 @@ use crate::register::Registers;
 use helix_core::unicode::width::UnicodeWidthStr;
 use std::{borrow::Cow, fmt::Write};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 /// Info box used in editor. Rendering logic will be in other crate.
 pub struct Info {
     /// Title shown at top.
@@ -55,6 +55,18 @@ impl Info {
             height: body.len() as u16,
             text,
         }
+    }
+
+    /// Compute the screen area this info box would occupy in the given viewport.
+    pub fn screen_area(&self, viewport: crate::graphics::Rect) -> crate::graphics::Rect {
+        let width = self.width + 2 + 2; // +2 border, +2 margin
+        let height = self.height + 2; // +2 border
+        viewport.intersection(crate::graphics::Rect::new(
+            viewport.width.saturating_sub(width),
+            viewport.height.saturating_sub(height + 2), // +2 statusline
+            width,
+            height,
+        ))
     }
 
     pub fn from_registers(title: impl Into<Cow<'static, str>>, registers: &Registers) -> Self {

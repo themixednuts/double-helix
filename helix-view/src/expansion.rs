@@ -228,16 +228,16 @@ fn expand_inner<'a>(editor: &Editor, content: Cow<'a, str>) -> Result<Cow<'a, st
 // known strings like the scratch buffer name or line ending strings though, so this function
 // returns a `Cow<'static, str>` instead.
 fn expand_variable(editor: &Editor, variable: Variable) -> Result<Cow<'static, str>> {
-    let (view, doc) = current_ref!(editor);
+    let (view_id, doc) = focused_ref!(editor);
     let text = doc.text().slice(..);
 
     match variable {
         Variable::CursorLine => {
-            let cursor_line = doc.selection(view.id).primary().cursor_line(text);
+            let cursor_line = doc.selection(view_id).primary().cursor_line(text);
             Ok(Cow::Owned((cursor_line + 1).to_string()))
         }
         Variable::CursorColumn => {
-            let cursor = doc.selection(view.id).primary().cursor(text);
+            let cursor = doc.selection(view_id).primary().cursor(text);
             let position = helix_core::coords_at_pos(text, cursor);
             Ok(Cow::Owned((position.col + 1).to_string()))
         }
@@ -259,7 +259,7 @@ fn expand_variable(editor: &Editor, variable: Variable) -> Result<Cow<'static, s
             .to_string();
             Ok(Cow::Owned(path))
         }
-        Variable::LineEnding => Ok(Cow::Borrowed(doc.line_ending.as_str())),
+        Variable::LineEnding => Ok(Cow::Borrowed(doc.line_ending().as_str())),
         Variable::CurrentWorkingDirectory => Ok(std::borrow::Cow::Owned(
             helix_stdx::env::current_working_dir()
                 .to_string_lossy()
@@ -276,14 +276,14 @@ fn expand_variable(editor: &Editor, variable: Variable) -> Result<Cow<'static, s
             None => Cow::Borrowed("text"),
         }),
         Variable::Selection => Ok(Cow::Owned(
-            doc.selection(view.id).primary().fragment(text).to_string(),
+            doc.selection(view_id).primary().fragment(text).to_string(),
         )),
         Variable::SelectionLineStart => {
-            let start_line = doc.selection(view.id).primary().line_range(text).0;
+            let start_line = doc.selection(view_id).primary().line_range(text).0;
             Ok(Cow::Owned((start_line + 1).to_string()))
         }
         Variable::SelectionLineEnd => {
-            let end_line = doc.selection(view.id).primary().line_range(text).1;
+            let end_line = doc.selection(view_id).primary().line_range(text).1;
             Ok(Cow::Owned((end_line + 1).to_string()))
         }
     }

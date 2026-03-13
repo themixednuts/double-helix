@@ -1,5 +1,6 @@
 use crate::{
     annotations::diagnostics::{DiagnosticFilter, InlineDiagnosticsConfig},
+    bench::log_run_event,
     clipboard::ClipboardProvider,
     document::{
         DocumentOpenError, DocumentSavedEventFuture, DocumentSavedEventResult, Mode, SavePoint,
@@ -12,6 +13,7 @@ use crate::{
     register::Registers,
     theme::{self, Theme},
     tree::{self, Dimension, Resize, Tree},
+    view::{ensure_cursor_in_view_center_in, AnyViewMut, ComponentViewState},
     Document, DocumentId, View, ViewId,
 };
 use helix_event::dispatch;
@@ -24,7 +26,6 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use std::{
     borrow::Cow,
-    cell::Cell,
     collections::{BTreeMap, HashMap, HashSet},
     fs,
     io::{self, stdin},
@@ -63,7 +64,6 @@ use arc_swap::{
 };
 
 pub const DEFAULT_AUTO_SAVE_DELAY: u64 = 3000;
-pub const DEFAULT_AUTO_RELOAD_INTERVAL: u64 = 3000;
 
 fn deserialize_duration_millis<'de, D>(deserializer: D) -> Result<Duration, D::Error>
 where
@@ -375,10 +375,10 @@ pub struct Config {
     /// Time delay defaults to false with 3000ms delay. Focus lost defaults to false.
     #[serde(deserialize_with = "deserialize_auto_save")]
     pub auto_save: AutoSave,
-    /// Automatic reload of the modified documents on a periodic time interval and/or when the editor gains focus.
-    /// Time interval defaults to false with 3000ms delay. Focus gained defaults to false.
-    #[serde(deserialize_with = "deserialize_auto_reload")]
-    pub auto_reload: AutoReload,
+    /// Automatically reload buffers when files change on disk (via OS file watcher).
+    /// Only reloads unmodified buffers. Defaults to true.
+    #[serde(default = "default_true")]
+    pub auto_reload: bool,
     /// Set a global text_width
     pub text_width: usize,
     /// Time in milliseconds since last keypress before idle timers trigger.
@@ -512,6 +512,10 @@ pub struct Config {
     /// ACP panel configuration (keybindings for cycle agent, thinking, model).
     #[serde(default)]
     pub acp: AcpConfig,
+    /// Which editing engine to use. Defaults to `"helix"`.
+    /// Set to `"vim"` for Vim-style operator-pending composition.
+    #[serde(default)]
+    pub editing_engine: EditingEngineConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -1125,7 +1129,7 @@ impl Default for BufferLineConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", default, deny_unknown_fields)]
 pub struct StatusLineConfig {
     pub left: Vec<StatusLineElement>,
@@ -1165,7 +1169,7 @@ impl Default for StatusLineConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", default, deny_unknown_fields)]
 pub struct ModeConfig {
     pub normal: String,
@@ -1183,7 +1187,7 @@ impl Default for ModeConfig {
     }
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum StatusLineElement {
     /// The editor mode (Normal, Insert, Visual/Selection)
@@ -1322,6 +1326,17 @@ pub enum LineNumber {
     /// If focused and in normal/select mode, show relative line number to the primary cursor.
     /// If unfocused or in insert mode, show absolute line number.
     Relative,
+}
+
+/// Which editing engine to use.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum EditingEngineConfig {
+    /// Helix select→act paradigm (default).
+    #[default]
+    Helix,
+    /// Vim verb→object paradigm with operator-pending mode.
+    Vim,
 }
 
 impl std::str::FromStr for LineNumber {
@@ -1482,6 +1497,10 @@ fn default_auto_save_delay() -> u64 {
     DEFAULT_AUTO_SAVE_DELAY
 }
 
+const fn default_true() -> bool {
+    true
+}
+
 fn deserialize_auto_save<'de, D>(deserializer: D) -> Result<AutoSave, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -1499,52 +1518,6 @@ where
             ..Default::default()
         }),
         AutoSaveToml::AutoSave(auto_save) => Ok(auto_save),
-    }
-}
-
-#[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub struct AutoReload {
-    /// Whether to check for file changes when the editor is focused. Defaults to false.
-    #[serde(default)]
-    pub focus_gained: bool,
-    /// Autosave periodically at some interval. Defaults to disabled.
-    #[serde(default)]
-    pub periodic: AutoReloadPeriodic,
-}
-
-#[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct AutoReloadPeriodic {
-    #[serde(default)]
-    /// Enable auto reload periodically. Defaults to false.
-    pub enable: bool,
-    #[serde(default = "default_auto_reload_interval")]
-    /// Time interval in milliseconds. Defaults to [DEFAULT_AUTO_RELOAD_INTERVAL].
-    pub interval: u64,
-}
-
-pub fn default_auto_reload_interval() -> u64 {
-    DEFAULT_AUTO_RELOAD_INTERVAL
-}
-
-fn deserialize_auto_reload<'de, D>(deserializer: D) -> Result<AutoReload, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    #[derive(Deserialize, Serialize)]
-    #[serde(untagged, deny_unknown_fields, rename_all = "kebab-case")]
-    enum AutoReloadToml {
-        FocusGained(bool),
-        AutoReload(AutoReload),
-    }
-
-    match AutoReloadToml::deserialize(deserializer)? {
-        AutoReloadToml::FocusGained(focus_gained) => Ok(AutoReload {
-            focus_gained,
-            ..Default::default()
-        }),
-        AutoReloadToml::AutoReload(auto_reload) => Ok(auto_reload),
     }
 }
 
@@ -1703,7 +1676,7 @@ impl Default for Config {
             auto_format: true,
             default_yank_register: '"',
             auto_save: AutoSave::default(),
-            auto_reload: AutoReload::default(),
+            auto_reload: true,
             idle_timeout: Duration::from_millis(250),
             completion_timeout: Duration::from_millis(250),
             preview_completion_insert: true,
@@ -1804,6 +1777,7 @@ impl Default for Config {
                 },
             ],
             acp: AcpConfig::default(),
+            editing_engine: EditingEngineConfig::default(),
         }
     }
 }
@@ -1833,6 +1807,14 @@ pub struct Breakpoint {
 use futures_util::stream::{Flatten, Once};
 
 type Diagnostics = BTreeMap<Uri, Vec<(lsp::Diagnostic, DiagnosticProvider)>>;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct WorkspaceDiagnosticCounts {
+    pub hints: u32,
+    pub info: u32,
+    pub warnings: u32,
+    pub errors: u32,
+}
 
 #[derive(Debug, Clone)]
 pub struct Notification {
@@ -1952,12 +1934,27 @@ impl NotificationManager {
     }
 }
 
+/// Identifies the active editing context for a component's editing region.
+/// Set by the compositor on `Editor` before key dispatch so that `focused!()`
+/// routes to the component's viewport and document instead of the tree's.
+#[derive(Clone, Copy, Debug)]
+pub struct EditTarget {
+    pub view_id: ViewId,
+    pub doc_id: DocumentId,
+}
+
 pub struct Editor {
     /// Current editing mode.
     pub mode: Mode,
     pub tree: Tree,
     pub next_document_id: DocumentId,
     pub documents: BTreeMap<DocumentId, Document>,
+    /// Documents owned by UI components (not shown in bufferline/pickers).
+    pub component_docs: BTreeMap<DocumentId, Document>,
+    /// Counter for allocating unique `ViewId`s for component-owned viewports.
+    next_virtual_view_idx: u32,
+    /// Per-viewport state for component-owned viewports that are not in the tree.
+    pub component_views: BTreeMap<ViewId, ComponentViewState>,
 
     // We Flatten<> to resolve the inner DocumentSavedEventFuture. For that we need a stream of streams, hence the Once<>.
     // https://stackoverflow.com/a/66875668
@@ -1965,13 +1962,16 @@ pub struct Editor {
     pub save_queue: SelectAll<Flatten<UnboundedReceiverStream<Once<DocumentSavedEventFuture>>>>,
     pub write_count: usize,
 
-    pub count: Option<std::num::NonZeroUsize>,
-    pub selected_register: Option<char>,
+    /// Snapshot of the currently focused editing surface's transient modal input state.
+    /// Engines own the authoritative state; this is published for UI consumers
+    /// that only have access to `Editor`.
+    pub focused_modal_input: crate::engine::ModalInputState,
     pub registers: Registers,
     pub macro_recording: Option<(char, Vec<KeyEvent>)>,
     pub macro_replaying: Vec<char>,
     pub language_servers: helix_lsp::Registry,
     pub diagnostics: Diagnostics,
+    pub workspace_diagnostic_counts: WorkspaceDiagnosticCounts,
     pub diff_providers: DiffProviderRegistry,
 
     pub debug_adapters: dap::registry::Registry,
@@ -1989,6 +1989,14 @@ pub struct Editor {
     pub current_acp_agent_index: Option<usize>,
     /// Theme for the ACP panel only (when agent has theme configured). None = use global theme.
     pub acp_panel_theme: Option<Theme>,
+    /// Shared engine factory for component-owned edit regions.
+    pub engine_factory: Option<std::sync::Arc<dyn crate::engine::EditingEngineFactory>>,
+    /// Shared modal keymap source for component-owned edit regions.
+    pub modal_keymaps: Option<
+        std::sync::Arc<
+            arc_swap::ArcSwap<std::collections::HashMap<Mode, crate::keymap::ModalKeyTrie>>,
+        >,
+    >,
     pub breakpoints: HashMap<PathBuf, Vec<Breakpoint>>,
 
     pub syn_loader: Arc<ArcSwap<syntax::Loader>>,
@@ -2009,11 +2017,11 @@ pub struct Editor {
     pub notifications: NotificationManager,
     pub autoinfo: Option<Info>,
 
-    pub config: Arc<dyn DynAccess<Config>>,
+    pub config: Arc<dyn DynAccess<Config> + Send + Sync>,
     pub auto_pairs: Option<AutoPairs>,
 
     pub idle_timer: Pin<Box<Sleep>>,
-    redraw_timer: Pin<Box<Sleep>>,
+    pub redraw_timer: Pin<Box<Sleep>>,
     last_motion: Option<Motion>,
     pub last_completion: Option<CompleteAction>,
     last_cwd: Option<PathBuf>,
@@ -2022,6 +2030,8 @@ pub struct Editor {
 
     pub config_events: (UnboundedSender<ConfigEvent>, UnboundedReceiver<ConfigEvent>),
     pub needs_redraw: bool,
+    /// Generation counter incremented on config changes. Used for render cache invalidation.
+    pub config_gen: u64,
     /// Cached position of the cursor calculated during rendering.
     /// The content of `cursor_cache` is returned by `Editor::cursor` if
     /// set to `Some(_)`. The value will be cleared after it's used.
@@ -2036,11 +2046,19 @@ pub struct Editor {
     /// times during rendering and should not be set by other functions.
     pub handlers: Handlers,
 
+    pub file_watcher: Option<crate::file_watcher::FileWatcher>,
+
     pub mouse_down_range: Option<Range>,
     pub cursor_cache: CursorCache,
+
+    /// Shared UI state (layers, panels, focus). Commands mutate this; frontends render it.
+    pub model: crate::model::Model,
+
+    /// Active benchmark state, set by `:bench` command.
+    pub bench: Option<BenchState>,
 }
 
-pub type Motion = Box<dyn Fn(&mut Editor)>;
+pub type Motion = Box<dyn Fn(&mut Editor) + Send + Sync>;
 
 #[derive(Debug)]
 pub enum EditorEvent {
@@ -2104,12 +2122,14 @@ pub enum CloseError {
     SaveError(anyhow::Error),
 }
 
+pub use crate::bench::{BenchSnapshot, BenchState};
+
 impl Editor {
     pub fn new(
         mut area: Rect,
         theme_loader: Arc<theme::Loader>,
         syn_loader: Arc<ArcSwap<syntax::Loader>>,
-        config: Arc<dyn DynAccess<Config>>,
+        config: Arc<dyn DynAccess<Config> + Send + Sync>,
         handlers: Handlers,
     ) -> Self {
         let language_servers = helix_lsp::Registry::new(syn_loader.clone());
@@ -2124,16 +2144,19 @@ impl Editor {
             tree: Tree::new(area),
             next_document_id: DocumentId::default(),
             documents: BTreeMap::new(),
+            component_docs: BTreeMap::new(),
+            next_virtual_view_idx: 0,
+            component_views: BTreeMap::new(),
             saves: HashMap::new(),
             save_queue: SelectAll::new(),
             write_count: 0,
-            count: None,
-            selected_register: None,
+            focused_modal_input: crate::engine::ModalInputState::default(),
             macro_recording: None,
             macro_replaying: Vec::new(),
             theme: theme_loader.default(),
             language_servers,
             diagnostics: Diagnostics::new(),
+            workspace_diagnostic_counts: WorkspaceDiagnosticCounts::default(),
             diff_providers: DiffProviderRegistry::default(),
             debug_adapters: dap::registry::Registry::new(),
             acp_agents: helix_acp::Registry::new(),
@@ -2144,6 +2167,8 @@ impl Editor {
             acp_session_modes: Vec::new(),
             current_acp_agent_index: None,
             acp_panel_theme: None,
+            engine_factory: None,
+            modal_keymaps: None,
             breakpoints: HashMap::new(),
             syn_loader,
             theme_loader,
@@ -2166,9 +2191,13 @@ impl Editor {
             exit_code: 0,
             config_events: unbounded_channel(),
             needs_redraw: false,
+            config_gen: 0,
             handlers,
+            file_watcher: None,
             mouse_down_range: None,
             cursor_cache: CursorCache::default(),
+            model: crate::model::Model::default(),
+            bench: None,
         }
     }
 
@@ -2182,7 +2211,25 @@ impl Editor {
             || self.config().popup_border == PopupBorderConfig::Menu
     }
 
-    pub fn apply_motion<F: Fn(&mut Self) + 'static>(&mut self, motion: F) {
+    pub fn workspace_diagnostic_counts(&self) -> WorkspaceDiagnosticCounts {
+        self.workspace_diagnostic_counts
+    }
+
+    pub fn refresh_workspace_diagnostic_counts(&mut self) {
+        let mut counts = WorkspaceDiagnosticCounts::default();
+        for (diagnostic, _) in self.diagnostics.values().flatten() {
+            match diagnostic.severity {
+                Some(lsp::DiagnosticSeverity::WARNING) => counts.warnings += 1,
+                Some(lsp::DiagnosticSeverity::ERROR) => counts.errors += 1,
+                Some(lsp::DiagnosticSeverity::HINT) => counts.hints += 1,
+                Some(lsp::DiagnosticSeverity::INFORMATION) => counts.info += 1,
+                _ => counts.hints += 1,
+            }
+        }
+        self.workspace_diagnostic_counts = counts;
+    }
+
+    pub fn apply_motion<F: Fn(&mut Self) + Send + Sync + 'static>(&mut self, motion: F) {
         motion(self);
         self.last_motion = Some(Box::new(motion));
     }
@@ -2583,7 +2630,7 @@ impl Editor {
         // refresh_doc_language/refresh_language_servers doesn't resend
         // text_document_did_close. Since we called `text_document_did_close`
         // we have fully unregistered this document from its LS
-        doc.language_servers.clear();
+        doc.clear_language_servers();
         doc.set_path(Some(path));
         doc.detect_editor_config();
         self.refresh_doc_language(doc_id)
@@ -2614,7 +2661,7 @@ impl Editor {
         let Some(doc_url) = doc.url() else {
             return;
         };
-        let (lang, path) = (doc.language.clone(), doc.path().cloned());
+        let (lang, path) = (doc.language_configuration().cloned(), doc.path().cloned());
         let config = doc.config.load();
         let root_dirs = &config.workspace_lsp_roots;
 
@@ -2644,29 +2691,28 @@ impl Editor {
                 .collect::<HashMap<_, _>>()
         });
 
-        if language_servers.is_empty() && doc.language_servers.is_empty() {
+        if language_servers.is_empty() && !doc.has_language_servers() {
             return;
         }
 
         let language_id = doc.language_id().map(ToOwned::to_owned).unwrap_or_default();
 
         // only spawn new language servers if the servers aren't the same
-        let doc_language_servers_not_in_registry =
-            doc.language_servers.iter().filter(|(name, doc_ls)| {
-                language_servers
-                    .get(*name)
-                    .is_none_or(|ls| ls.id() != doc_ls.id())
-            });
+        let doc_language_servers_not_in_registry = doc.all_language_servers().filter(|doc_ls| {
+            language_servers
+                .get(doc_ls.name())
+                .is_none_or(|language_server| language_server.id() != doc_ls.id())
+        });
 
-        for (_, language_server) in doc_language_servers_not_in_registry {
+        for language_server in doc_language_servers_not_in_registry {
             language_server.text_document_did_close(doc.identifier());
         }
 
-        let language_servers_not_in_doc = language_servers.iter().filter(|(name, ls)| {
-            doc.language_servers
-                .get(*name)
-                .is_none_or(|doc_ls| ls.id() != doc_ls.id())
-        });
+        let language_servers_not_in_doc =
+            language_servers.iter().filter(|(name, language_server)| {
+                doc.language_server_by_name(name)
+                    .is_none_or(|doc_ls| language_server.id() != doc_ls.id())
+            });
 
         for (_, language_server) in language_servers_not_in_doc {
             // TODO: this now races with on_init code if the init happens too quickly
@@ -2678,7 +2724,7 @@ impl Editor {
             );
         }
 
-        doc.language_servers = language_servers;
+        doc.set_language_servers(language_servers);
     }
 
     fn _refresh(&mut self) {
@@ -2732,7 +2778,7 @@ impl Editor {
 
         let focust_lost = match action {
             Action::Replace => {
-                let (view, doc) = current_ref!(self);
+                let (view_id, doc) = focused_ref!(self);
                 // If the current view is an empty scratch buffer and is not displayed in any other views, delete it.
                 // Boolean value is determined before the call to `view_mut` because the operation requires a borrow
                 // of `self.tree`, which is mutably borrowed when `view_mut` is called.
@@ -2745,12 +2791,12 @@ impl Editor {
                     && !self
                         .tree
                         .traverse()
-                        .any(|(_, v)| v.doc == doc.id && v.id != view.id);
+                        .any(|(_, v)| v.doc == doc.id && v.id != view_id);
 
-                let (view, doc) = current!(self);
-                let view_id = view.id;
+                let (view_id, doc) = focused!(self);
 
                 // Append any outstanding changes to history in the old document.
+                let view = self.tree.get_mut(view_id);
                 doc.append_changes_to_history(view);
 
                 if remove_empty_scratch {
@@ -2764,13 +2810,14 @@ impl Editor {
                         view.remove_document(&id);
                     }
                 } else {
-                    let jump = (view.doc, doc.selection(view.id).clone());
-                    view.jumps.push(jump);
+                    let view = self.tree.get_mut(view_id);
+                    let jump = (view.doc, doc.selection(view_id).clone());
+                    view.history.jumps.push(jump);
                     // Set last accessed doc if it is a different document
                     if doc.id != id {
                         view.add_to_history(view.doc);
                         // Set last modified doc if modified and last modified doc is different
-                        if std::mem::take(&mut doc.modified_since_accessed)
+                        if doc.take_modified_since_accessed()
                             && view.last_modified_docs[0] != Some(view.doc)
                         {
                             view.last_modified_docs = [Some(view.doc), view.last_modified_docs[0]];
@@ -2831,8 +2878,10 @@ impl Editor {
     fn new_document(&mut self, mut doc: Document) -> DocumentId {
         let id = self.next_document_id;
         // Safety: adding 1 from 1 is fine, practically impossible to reach usize max
-        self.next_document_id =
-            DocumentId(unsafe { NonZeroUsize::new_unchecked(self.next_document_id.0.get() + 1) });
+        // Safety: adding 1 to a NonZeroUsize that started at 1 won't reach 0.
+        self.next_document_id = DocumentId::new(unsafe {
+            NonZeroUsize::new_unchecked(self.next_document_id.value().get() + 1)
+        });
         doc.id = id;
         self.documents.insert(id, doc);
 
@@ -2843,6 +2892,100 @@ impl Editor {
         self.save_queue.push(stream);
 
         id
+    }
+
+    /// Create a component-owned document (not shown in bufferline/pickers).
+    /// The document lives in `component_docs` and is accessed explicitly by ID.
+    /// The caller is responsible for cleanup.
+    pub fn new_component_doc(&mut self, mut doc: Document) -> DocumentId {
+        let id = self.next_document_id;
+        self.next_document_id = DocumentId::new(unsafe {
+            std::num::NonZeroUsize::new_unchecked(self.next_document_id.value().get() + 1)
+        });
+        doc.id = id;
+        self.component_docs.insert(id, doc);
+        id
+    }
+
+    /// Allocate a unique `ViewId` for a component-owned viewport.
+    /// Uses a high version to avoid collisions with tree-allocated ViewIds.
+    pub fn allocate_view_id(&mut self) -> ViewId {
+        let idx = self.next_virtual_view_idx;
+        self.next_virtual_view_idx += 1;
+        // Tree-allocated keys use low versions (starting at 1).
+        // We use version = u32::MAX so the key spaces never overlap.
+        let raw = ((u32::MAX as u64) << 32) | (idx as u64);
+        ViewId::from(slotmap::KeyData::from_ffi(raw))
+    }
+
+    pub fn component_view(&self, id: ViewId) -> Option<&ComponentViewState> {
+        self.component_views.get(&id)
+    }
+
+    pub fn component_view_mut(&mut self, id: ViewId) -> Option<&mut ComponentViewState> {
+        self.component_views.get_mut(&id)
+    }
+
+    pub fn ensure_component_view(
+        &mut self,
+        id: ViewId,
+        doc: DocumentId,
+    ) -> &mut ComponentViewState {
+        self.component_views
+            .entry(id)
+            .or_insert_with(|| ComponentViewState::new(id, doc))
+    }
+
+    pub fn with_view_doc_mut<R>(
+        &mut self,
+        view_id: ViewId,
+        doc_id: DocumentId,
+        f: impl FnOnce(&mut AnyViewMut<'_>, &mut Document) -> R,
+    ) -> R {
+        let Self {
+            tree,
+            documents,
+            component_docs,
+            component_views,
+            ..
+        } = self;
+
+        let doc = documents
+            .get_mut(&doc_id)
+            .or_else(|| component_docs.get_mut(&doc_id))
+            .expect("document not found in documents or component_docs");
+        let mut view = if tree.contains(view_id) {
+            AnyViewMut::Tree(tree.get_mut(view_id))
+        } else {
+            AnyViewMut::Component(
+                component_views
+                    .get_mut(&view_id)
+                    .expect("component view not found"),
+            )
+        };
+        f(&mut view, doc)
+    }
+
+    pub fn with_view_mut<R>(
+        &mut self,
+        view_id: ViewId,
+        f: impl FnOnce(&mut AnyViewMut<'_>) -> R,
+    ) -> R {
+        let Self {
+            tree,
+            component_views,
+            ..
+        } = self;
+        let mut view = if tree.contains(view_id) {
+            AnyViewMut::Tree(tree.get_mut(view_id))
+        } else {
+            AnyViewMut::Component(
+                component_views
+                    .get_mut(&view_id)
+                    .expect("component view not found"),
+            )
+        };
+        f(&mut view)
     }
 
     pub fn new_file_from_document(&mut self, action: Action, doc: Document) -> DocumentId {
@@ -3071,7 +3214,8 @@ impl Editor {
 
         // Reset mode to normal and ensure any pending changes are committed in the old document.
         self.enter_normal_mode();
-        let (view, doc) = current!(self);
+        let (cur_view_id, doc) = focused!(self);
+        let view = self.tree.get_mut(cur_view_id);
         doc.append_changes_to_history(view);
         self.ensure_cursor_in_view(view_id);
         // Update jumplist selections with new document changes.
@@ -3081,7 +3225,7 @@ impl Editor {
         }
 
         let prev_id = std::mem::replace(&mut self.tree.focus, view_id);
-        doc_mut!(self).mark_as_focused();
+        focused!(self).1.mark_as_focused();
 
         let focus_lost = self.tree.get(prev_id).doc;
         dispatch(DocumentFocusLost {
@@ -3135,12 +3279,16 @@ impl Editor {
 
     #[inline]
     pub fn document(&self, id: DocumentId) -> Option<&Document> {
-        self.documents.get(&id)
+        self.documents
+            .get(&id)
+            .or_else(|| self.component_docs.get(&id))
     }
 
     #[inline]
     pub fn document_mut(&mut self, id: DocumentId) -> Option<&mut Document> {
-        self.documents.get_mut(&id)
+        self.documents
+            .get_mut(&id)
+            .or_else(|| self.component_docs.get_mut(&id))
     }
 
     #[inline]
@@ -3151,6 +3299,65 @@ impl Editor {
     #[inline]
     pub fn documents_mut(&mut self) -> impl Iterator<Item = &mut Document> {
         self.documents.values_mut()
+    }
+
+    pub fn has_stale_syntax(&self) -> bool {
+        self.documents.values().any(Document::syntax_is_stale)
+            || self.component_docs.values().any(Document::syntax_is_stale)
+    }
+
+    pub fn refresh_one_stale_syntax(&mut self) -> bool {
+        let focused_doc_id = self.tree.get(self.tree.focus).doc;
+        let loader = self.syn_loader.load();
+
+        if let Some(doc) = self.documents.get_mut(&focused_doc_id) {
+            if doc.syntax_is_stale() {
+                let refreshed = doc.refresh_stale_syntax(&loader);
+                log_run_event("syntax_refresh_attempt", || {
+                    format!(
+                        "target=focused doc_id={} refreshed={}",
+                        focused_doc_id, refreshed
+                    )
+                });
+                if refreshed {
+                    self.needs_redraw = true;
+                }
+                return refreshed;
+            }
+        }
+
+        for (doc_id, doc) in &mut self.documents {
+            if *doc_id == focused_doc_id || !doc.syntax_is_stale() {
+                continue;
+            }
+            let refreshed = doc.refresh_stale_syntax(&loader);
+            log_run_event("syntax_refresh_attempt", || {
+                format!(
+                    "target=background doc_id={} refreshed={}",
+                    doc_id, refreshed
+                )
+            });
+            if refreshed {
+                self.needs_redraw = true;
+            }
+            return refreshed;
+        }
+
+        for doc in self.component_docs.values_mut() {
+            if !doc.syntax_is_stale() {
+                continue;
+            }
+            let refreshed = doc.refresh_stale_syntax(&loader);
+            log_run_event("syntax_refresh_attempt", || {
+                format!("target=component refreshed={}", refreshed)
+            });
+            if refreshed {
+                self.needs_redraw = true;
+            }
+            return refreshed;
+        }
+
+        false
     }
 
     pub fn document_by_path<P: AsRef<Path>>(&self, path: P) -> Option<&Document> {
@@ -3181,7 +3388,7 @@ impl Editor {
         filter: impl Fn(&lsp::Diagnostic, &DiagnosticProvider) -> bool + 'a,
     ) -> impl Iterator<Item = helix_core::Diagnostic> + 'a {
         let text = document.text().clone();
-        let language_config = document.language.clone();
+        let language_config = document.language_configuration().cloned();
         document
             .uri()
             .and_then(|uri| diagnostics.get(&uri))
@@ -3220,7 +3427,8 @@ impl Editor {
     /// or `None` if the primary cursor is not visible on screen.
     pub fn cursor(&self) -> (Option<Position>, CursorKind) {
         let config = self.config();
-        let (view, doc) = current_ref!(self);
+        let (view_id, doc) = focused_ref!(self);
+        let view = self.tree.get(view_id);
         if let Some(mut pos) = self.cursor_cache.get(view, doc) {
             let inner = view.inner_area(doc);
             pos.col += inner.x as usize;
@@ -3339,14 +3547,15 @@ impl Editor {
         }
 
         self.mode = Mode::Normal;
-        let (view, doc) = current!(self);
+        let (view_id, doc) = focused!(self);
+        let view = self.tree.get_mut(view_id);
 
         try_restore_indent(doc, view);
 
         // if leaving append mode, move cursor back by 1
-        if doc.restore_cursor {
+        if doc.restore_cursor() {
             let text = doc.text().slice(..);
-            let selection = doc.selection(view.id).clone().transform(|range| {
+            let selection = doc.selection(view_id).clone().transform(|range| {
                 let mut head = range.to();
                 if range.head > range.anchor {
                     head = graphemes::prev_grapheme_boundary(text, head);
@@ -3355,8 +3564,8 @@ impl Editor {
                 Range::new(range.from(), head)
             });
 
-            doc.set_selection(view.id, selection);
-            doc.restore_cursor = false;
+            doc.set_selection(view_id, selection);
+            doc.clear_restore_cursor();
         }
     }
 
@@ -3399,40 +3608,69 @@ impl Editor {
     }
 
     pub fn jump_forward(&mut self, view_id: ViewId, count: usize) {
-        if let Some((doc_id, selection)) = view_mut!(self, view_id).jumps.forward(count).cloned() {
+        let jump = self.with_view_mut(view_id, |view| match view {
+            AnyViewMut::Tree(view) => view.history.jumps.forward(count).cloned(),
+            AnyViewMut::Component(view) => view.history.jumps.forward(count).cloned(),
+        });
+        if let Some((doc_id, selection)) = jump {
             self.jump_to(view_id, doc_id, selection);
         }
     }
 
     pub fn jump_backward(&mut self, view_id: ViewId, count: usize) {
-        let view = view_mut!(self, view_id);
-        if let Some((doc_id, selection)) = view
-            .jumps
-            .backward(view_id, doc_mut!(self, &view.doc), count)
-            .cloned()
-        {
+        let current_doc_id = self.with_view_mut(view_id, |view| view.doc_id());
+        let jump = self.with_view_doc_mut(view_id, current_doc_id, |view, doc| match view {
+            AnyViewMut::Tree(view) => view.history.jumps.backward(view_id, doc, count).cloned(),
+            AnyViewMut::Component(view) => {
+                view.history.jumps.backward(view_id, doc, count).cloned()
+            }
+        });
+        if let Some((doc_id, selection)) = jump {
             self.jump_to(view_id, doc_id, selection);
         }
     }
 
     fn jump_to(&mut self, view_id: ViewId, dest_doc_id: DocumentId, mut selection: Selection) {
-        let view = view_mut!(self, view_id);
-        let old_doc_id = view.doc;
-        if old_doc_id != dest_doc_id {
-            let new_doc = doc_mut!(self, &dest_doc_id);
-            if let Some(transaction) = view.changes_to_sync(new_doc) {
-                let text = new_doc.text().slice(..);
-                selection = selection.map(transaction.changes()).ensure_invariants(text);
+        if self.tree.contains(view_id) {
+            let view = view_mut!(self, view_id);
+            let old_doc_id = view.doc;
+            if old_doc_id != dest_doc_id {
+                let new_doc = doc_mut!(self, &dest_doc_id);
+                if let Some(transaction) = view.changes_to_sync(new_doc) {
+                    let text = new_doc.text().slice(..);
+                    selection = selection.map(transaction.changes()).ensure_invariants(text);
+                }
+                self.replace_document_in_view(view_id, dest_doc_id);
+                dispatch(DocumentFocusLost {
+                    editor: self,
+                    doc: old_doc_id,
+                });
             }
-            self.replace_document_in_view(view_id, dest_doc_id);
-            dispatch(DocumentFocusLost {
-                editor: self,
-                doc: old_doc_id,
-            });
+            let (cur_view_id, doc) = focused!(self);
+            doc.set_selection(cur_view_id, selection);
+            let view = self.tree.get(cur_view_id);
+            view.ensure_cursor_in_view_center(doc, self.config.load().scrolloff);
+            return;
         }
-        let (view, doc) = current!(self);
-        doc.set_selection(view_id, selection);
-        view.ensure_cursor_in_view_center(doc, self.config.load().scrolloff);
+
+        let scrolloff = self.config.load().scrolloff;
+        self.with_view_doc_mut(view_id, dest_doc_id, |view, doc| {
+            if view.doc_id() != dest_doc_id {
+                return;
+            }
+            doc.set_selection(view_id, selection);
+            ensure_cursor_in_view_center_in(view, doc, scrolloff);
+        });
+    }
+}
+
+impl crate::traits::Modal for Editor {
+    fn mode(&self) -> Mode {
+        Editor::mode(self)
+    }
+
+    fn set_mode(&mut self, mode: Mode) {
+        self.mode = mode;
     }
 }
 
@@ -3473,27 +3711,62 @@ fn try_restore_indent(doc: &mut Document, view: &mut View) {
     }
 }
 
-#[derive(Default)]
-pub struct CursorCache(Cell<Option<Option<Position>>>);
+/// Lock-free cursor position cache. Packs `Option<Option<Position>>` into
+/// a single `AtomicU64` so the cache is `Sync` without any locking.
+///
+/// Encoding: row (upper 32 bits) | col (lower 32 bits).
+/// Sentinel `u64::MAX` = not yet computed, `u64::MAX - 1` = offscreen.
+pub struct CursorCache(std::sync::atomic::AtomicU64);
+
+const CURSOR_UNSET: u64 = u64::MAX;
+const CURSOR_OFFSCREEN: u64 = u64::MAX - 1;
+
+impl Default for CursorCache {
+    fn default() -> Self {
+        Self(std::sync::atomic::AtomicU64::new(CURSOR_UNSET))
+    }
+}
 
 impl CursorCache {
     pub fn get(&self, view: &View, doc: &Document) -> Option<Position> {
-        if let Some(pos) = self.0.get() {
-            return pos;
+        let v = self.0.load(std::sync::atomic::Ordering::Relaxed);
+        if v != CURSOR_UNSET {
+            return Self::decode(v);
         }
 
         let text = doc.text().slice(..);
         let cursor = doc.selection(view.id).primary().cursor(text);
-        let res = view.screen_coords_at_pos(doc, text, cursor);
-        self.set(res);
-        res
+        let pos = view.screen_coords_at_pos(doc, text, cursor);
+        self.set(pos);
+        pos
     }
 
     pub fn set(&self, cursor_pos: Option<Position>) {
-        self.0.set(Some(cursor_pos))
+        self.0.store(
+            Self::encode(cursor_pos),
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 
     pub fn reset(&self) {
-        self.0.set(None)
+        self.0
+            .store(CURSOR_UNSET, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn encode(pos: Option<Position>) -> u64 {
+        match pos {
+            None => CURSOR_OFFSCREEN,
+            Some(p) => ((p.row as u64) << 32) | (p.col as u64 & 0xFFFF_FFFF),
+        }
+    }
+
+    fn decode(v: u64) -> Option<Position> {
+        if v == CURSOR_OFFSCREEN {
+            return None;
+        }
+        Some(Position {
+            row: (v >> 32) as usize,
+            col: (v & 0xFFFF_FFFF) as usize,
+        })
     }
 }

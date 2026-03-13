@@ -1,6 +1,6 @@
 use helix_core::diagnostic::Severity;
 use helix_core::doc_formatter::{FormattedGrapheme, TextFormat};
-use helix_core::text_annotations::LineAnnotation;
+use helix_core::text_annotations::{LineAnnotation, PlainViewportSupport};
 use helix_core::{softwrapped_dimensions, Diagnostic, Position};
 use serde::{Deserialize, Serialize};
 
@@ -146,7 +146,7 @@ impl<'a> InlineDiagnosticAccumulator<'a> {
     }
 
     pub fn skip_concealed(&mut self, conceal_end_char_idx: usize) -> usize {
-        let diagnostics = &self.doc.diagnostics[self.idx..];
+        let diagnostics = &self.doc.diagnostics()[self.idx..];
         let idx = diagnostics.partition_point(|diag| diag.range.start < conceal_end_char_idx);
         self.idx += idx;
         self.next_anchor(conceal_end_char_idx)
@@ -155,7 +155,7 @@ impl<'a> InlineDiagnosticAccumulator<'a> {
     pub fn next_anchor(&self, current_char_idx: usize) -> usize {
         let next_diag_start = self
             .doc
-            .diagnostics
+            .diagnostics()
             .get(self.idx)
             .map_or(usize::MAX, |diag| diag.range.start);
         if (current_char_idx..next_diag_start).contains(&self.cursor) {
@@ -183,7 +183,7 @@ impl<'a> InlineDiagnosticAccumulator<'a> {
             self.cursor_line = true;
             if self
                 .doc
-                .diagnostics
+                .diagnostics()
                 .get(self.idx)
                 .is_none_or(|diag| diag.range.start != grapheme.char_idx)
             {
@@ -198,7 +198,7 @@ impl<'a> InlineDiagnosticAccumulator<'a> {
             return true;
         }
 
-        for diag in &self.doc.diagnostics[self.idx..] {
+        for diag in &self.doc.diagnostics()[self.idx..] {
             if diag.range.start != grapheme.char_idx {
                 break;
             }
@@ -215,12 +215,24 @@ impl<'a> InlineDiagnosticAccumulator<'a> {
         horizontal_off: usize,
     ) -> usize {
         if self.process_anchor_impl(grapheme, width, horizontal_off) {
-            self.idx += self.doc.diagnostics[self.idx..]
+            self.idx += self.doc.diagnostics()[self.idx..]
                 .iter()
                 .take_while(|diag| diag.range.start == grapheme.char_idx)
                 .count();
         }
         self.next_anchor(grapheme.char_idx + 1)
+    }
+
+    pub fn fast_forward_to_char(&mut self, char_idx: usize, doc_line: usize) -> usize {
+        let cursor = self.cursor.min(self.doc.text().len_chars());
+        if self.doc.text().char_to_line(cursor) == doc_line && cursor < char_idx {
+            self.cursor_line = true;
+        }
+
+        let diagnostics = &self.doc.diagnostics()[self.idx..];
+        let idx = diagnostics.partition_point(|diag| diag.range.start < char_idx);
+        self.idx += idx;
+        self.next_anchor(char_idx)
     }
 
     pub fn filter(&self) -> DiagnosticFilter {
@@ -274,9 +286,68 @@ impl<'a> InlineDiagnostics<'a> {
             horizontal_off,
         })
     }
+
+    fn plain_viewport_support(&self, top_line: usize, cursor_line: usize) -> PlainViewportSupport {
+        if self.state.config.disabled() {
+            return PlainViewportSupport::Supported;
+        }
+
+        let text = self.state.doc.text();
+        let cursor_char = self.state.cursor.min(text.len_chars());
+        inline_diagnostics_plain_viewport_support(
+            text,
+            self.state.doc.diagnostics(),
+            self.state.config.clone(),
+            top_line,
+            cursor_line,
+            cursor_char,
+        )
+    }
+}
+
+fn inline_diagnostics_plain_viewport_support(
+    text: &helix_core::Rope,
+    diagnostics: &[helix_core::Diagnostic],
+    config: InlineDiagnosticsConfig,
+    top_line: usize,
+    cursor_line: usize,
+    cursor_char: usize,
+) -> PlainViewportSupport {
+    let start_line = top_line.min(cursor_line);
+    let end_line = top_line.max(cursor_line);
+    let cursor_doc_line = text.char_to_line(cursor_char.min(text.len_chars()));
+
+    for diagnostic in diagnostics {
+        let line = text.char_to_line(diagnostic.range.start.min(text.len_chars()));
+        // Diagnostics rendered after the cursor's own line do not affect the cursor's
+        // vertical position in the viewport fast path.
+        if line < start_line || line > end_line || line == cursor_line {
+            continue;
+        }
+
+        let filter = if line == cursor_doc_line {
+            config.cursor_line
+        } else {
+            config.other_lines
+        };
+
+        let DiagnosticFilter::Enable(min_severity) = filter else {
+            continue;
+        };
+
+        if diagnostic.severity() >= min_severity {
+            return PlainViewportSupport::InlineDiagnostics;
+        }
+    }
+
+    PlainViewportSupport::Supported
 }
 
 impl LineAnnotation for InlineDiagnostics<'_> {
+    fn plain_viewport_support(&self, top_line: usize, cursor_line: usize) -> PlainViewportSupport {
+        self.plain_viewport_support(top_line, cursor_line)
+    }
+
     fn reset_pos(&mut self, char_idx: usize) -> usize {
         self.state.reset_pos(char_idx)
     }
@@ -308,5 +379,85 @@ impl LineAnnotation for InlineDiagnostics<'_> {
             })
             .sum();
         Position::new(multi as usize + diagostic_height, 0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{inline_diagnostics_plain_viewport_support, DiagnosticFilter, InlineDiagnosticsConfig};
+    use helix_core::{
+        diagnostic::{Diagnostic, DiagnosticProvider, Range, Severity},
+        Rope,
+    };
+    use std::sync::Arc;
+
+    fn diagnostic_at_line(text: &Rope, line: usize) -> Diagnostic {
+        let start = text.line_to_char(line);
+        Diagnostic {
+            range: Range {
+                start,
+                end: start,
+            },
+            ends_at_word: false,
+            starts_at_word: false,
+            zero_width: true,
+            line,
+            message: "diagnostic".into(),
+            severity: Some(Severity::Warning),
+            code: None,
+            provider: DiagnosticProvider::Lsp {
+                server_id: helix_core::diagnostic::LanguageServerId::default(),
+                identifier: Some(Arc::<str>::from("test")),
+            },
+            tags: Vec::new(),
+            source: None,
+            data: None,
+        }
+    }
+
+    fn enabled_config() -> InlineDiagnosticsConfig {
+        InlineDiagnosticsConfig {
+            cursor_line: DiagnosticFilter::Enable(Severity::Hint),
+            other_lines: DiagnosticFilter::Enable(Severity::Hint),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn inline_diagnostics_on_cursor_line_keep_plain_viewport_support() {
+        let text = Rope::from("zero\none\ntwo\n");
+        let diagnostics = vec![diagnostic_at_line(&text, 2)];
+        let cursor_char = text.line_to_char(2);
+
+        assert_eq!(
+            inline_diagnostics_plain_viewport_support(
+                &text,
+                &diagnostics,
+                enabled_config(),
+                0,
+                2,
+                cursor_char,
+            ),
+            helix_core::text_annotations::PlainViewportSupport::Supported
+        );
+    }
+
+    #[test]
+    fn inline_diagnostics_before_cursor_line_block_plain_viewport_support() {
+        let text = Rope::from("zero\none\ntwo\n");
+        let diagnostics = vec![diagnostic_at_line(&text, 1)];
+        let cursor_char = text.line_to_char(2);
+
+        assert_eq!(
+            inline_diagnostics_plain_viewport_support(
+                &text,
+                &diagnostics,
+                enabled_config(),
+                0,
+                2,
+                cursor_char,
+            ),
+            helix_core::text_annotations::PlainViewportSupport::InlineDiagnostics
+        );
     }
 }

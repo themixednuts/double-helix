@@ -1,7 +1,7 @@
 use crate::Document;
 use crate::ViewId;
 use helix_core::doc_formatter::{FormattedGrapheme, TextFormat};
-use helix_core::text_annotations::LineAnnotation;
+use helix_core::text_annotations::{LineAnnotation, PlainViewportSupport};
 use helix_core::{softwrapped_dimensions, Position};
 use std::collections::BTreeMap;
 
@@ -19,9 +19,45 @@ impl<'a> PluginLineAnnotations<'a> {
             width,
         }
     }
+
+    fn plain_viewport_support(&self, top_line: usize, cursor_line: usize) -> PlainViewportSupport {
+        let Some(annotations) = self.doc.plugin_annotations(self.view_id) else {
+            return PlainViewportSupport::Supported;
+        };
+
+        plugin_plain_viewport_support(annotations, self.doc.text(), top_line, cursor_line)
+    }
+}
+
+fn plugin_plain_viewport_support(
+    annotations: &[crate::document::PluginAnnotation],
+    text: &helix_core::Rope,
+    top_line: usize,
+    cursor_line: usize,
+) -> PlainViewportSupport {
+    let start_line = top_line.min(cursor_line);
+    let end_line = top_line.max(cursor_line);
+    let text_len = text.len_chars();
+
+    if annotations.iter().any(|annotation| {
+        annotation.is_line && {
+            let line = text.char_to_line(annotation.char_idx.min(text_len));
+            // Virtual rows appended to the cursor's own line do not change the cursor's
+            // vertical position; only earlier lines in the traversed span matter.
+            line >= start_line && line <= end_line && line != cursor_line
+        }
+    }) {
+        PlainViewportSupport::PluginAnnotations
+    } else {
+        PlainViewportSupport::Supported
+    }
 }
 
 impl LineAnnotation for PluginLineAnnotations<'_> {
+    fn plain_viewport_support(&self, top_line: usize, cursor_line: usize) -> PlainViewportSupport {
+        self.plain_viewport_support(top_line, cursor_line)
+    }
+
     fn reset_pos(&mut self, _char_idx: usize) -> usize {
         usize::MAX
     }
@@ -44,7 +80,7 @@ impl LineAnnotation for PluginLineAnnotations<'_> {
         let mut max_virt_idx: i32 = -1;
         let mut next_auto_idx: u16 = 0;
 
-        if let Some(annots) = self.doc.plugin_annotations.get(&self.view_id) {
+        if let Some(annots) = self.doc.plugin_annotations(self.view_id) {
             let line_start = self.doc.text().line_to_char(doc_line);
             let line_end = self.doc.text().line_to_char(doc_line + 1);
 
@@ -181,5 +217,60 @@ impl LineAnnotation for PluginLineAnnotations<'_> {
         }
 
         Position::new(0, 0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::plugin_plain_viewport_support;
+    use crate::{document::PluginAnnotation, Document};
+    use arc_swap::ArcSwap;
+    use helix_core::{syntax, Rope};
+    use helix_core::text_annotations::PlainViewportSupport;
+    use std::sync::Arc;
+
+    fn test_doc(text: &str) -> Document {
+        Document::from(
+            Rope::from(text),
+            None,
+            Arc::new(ArcSwap::new(Arc::new(crate::editor::Config::default()))),
+            Arc::new(ArcSwap::from_pointee(syntax::Loader::default())),
+        )
+    }
+
+    fn line_annotation(doc: &Document, line: usize) -> PluginAnnotation {
+        PluginAnnotation {
+            char_idx: doc.text().line_to_char(line),
+            text: "virt".into(),
+            style: None,
+            fg: None,
+            bg: None,
+            offset: 0,
+            is_line: true,
+            virt_line_idx: Some(0),
+            dropped_text: None,
+        }
+    }
+
+    #[test]
+    fn plugin_annotations_on_cursor_line_keep_plain_viewport_support() {
+        let doc = test_doc("zero\none\ntwo\n");
+        let annotations = vec![line_annotation(&doc, 2)];
+
+        assert_eq!(
+            plugin_plain_viewport_support(&annotations, doc.text(), 0, 2),
+            PlainViewportSupport::Supported
+        );
+    }
+
+    #[test]
+    fn plugin_annotations_before_cursor_line_block_plain_viewport_support() {
+        let doc = test_doc("zero\none\ntwo\n");
+        let annotations = vec![line_annotation(&doc, 1)];
+
+        assert_eq!(
+            plugin_plain_viewport_support(&annotations, doc.text(), 0, 2),
+            PlainViewportSupport::PluginAnnotations
+        );
     }
 }

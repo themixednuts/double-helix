@@ -5,16 +5,17 @@
 
 use std::{borrow::Cow, collections::HashMap, iter, mem, sync::Arc, time::Duration};
 
+use arc_swap::ArcSwap;
 use helix_core::{
     chars::char_is_word, fuzzy::fuzzy_match, movement, text_annotations::TextAnnotations,
     ChangeSet, Range, Rope, RopeSlice,
 };
 use helix_event::{register_hook, AsyncHook};
 use helix_stdx::rope::RopeSliceExt as _;
-use parking_lot::RwLock;
 use tokio::{sync::mpsc, time::Instant};
 
 use crate::{
+    bench::log_command_phase,
     events::{ConfigDidChange, DocumentDidChange, DocumentDidClose, DocumentDidOpen},
     DocumentId,
 };
@@ -52,6 +53,17 @@ pub struct Handler {
 }
 
 impl Handler {
+    /// Create a dummy handler for headless testing (no async tasks spawned).
+    pub fn dummy() -> Self {
+        let (hook_tx, _) = mpsc::channel(1);
+        let (coord_tx, _) = mpsc::unbounded_channel();
+        Self {
+            index: WordIndex::default(),
+            hook: hook_tx,
+            coordinator: coord_tx,
+        }
+    }
+
     pub fn spawn() -> Self {
         let index = WordIndex::default();
         let (tx, rx) = mpsc::unbounded_channel();
@@ -134,7 +146,7 @@ const MAX_WORD_LEN: usize = 50;
 
 type Word = kstring::KString;
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct WordIndexInner {
     /// Reference counted storage for words.
     ///
@@ -178,14 +190,23 @@ impl WordIndexInner {
     }
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct WordIndex {
-    inner: Arc<RwLock<WordIndexInner>>,
+    inner: Arc<ArcSwap<WordIndexInner>>,
+}
+
+impl Default for WordIndex {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(ArcSwap::from_pointee(WordIndexInner::default())),
+        }
+    }
 }
 
 impl WordIndex {
+    /// Lock-free read — never blocks.
     pub fn matches(&self, pattern: &str) -> Vec<String> {
-        let inner = self.inner.read();
+        let inner = self.inner.load();
         let mut matches = fuzzy_match(pattern, inner.words(), false);
         matches.sort_unstable_by_key(|(_, score)| *score);
         matches
@@ -194,67 +215,53 @@ impl WordIndex {
             .collect()
     }
 
-    fn add_document(&self, text: &Rope) {
-        let mut inner = self.inner.write();
-        for word in words(text.slice(..)) {
-            inner.insert(word);
-        }
-    }
-
-    fn update_document(&self, old_text: &Rope, text: &Rope, changes: &ChangeSet) {
-        let mut inner = self.inner.write();
-        for (old_window, new_window) in changed_windows(old_text.slice(..), text.slice(..), changes)
-        {
-            for word in words(new_window) {
-                inner.insert(word);
-            }
-            for word in words(old_window) {
-                inner.remove(word);
-            }
-        }
-    }
-
-    fn remove_document(&self, text: &Rope) {
-        let mut inner = self.inner.write();
-        for word in words(text.slice(..)) {
-            inner.remove(word);
-        }
-    }
-
-    fn clear(&self) {
-        let mut inner = self.inner.write();
-        inner.clear();
-    }
-
     /// Coordinate the indexing of documents.
     ///
-    /// This task wraps a MPSC queue and spawns blocking tasks which update the index. Updates
-    /// are applied one-by-one to ensure that changes to the index are **serialized**:
-    /// updates to each document must be applied in-order.
+    /// The worker owns a local mutable copy of the index and publishes immutable
+    /// snapshots via ArcSwap after each batch — readers never block.
     async fn run(self, mut events: mpsc::UnboundedReceiver<Event>) {
+        let shared = self.inner;
+        let mut local = WordIndexInner::default();
         while let Some(event) = events.recv().await {
-            let this = self.clone();
-            tokio::task::spawn_blocking(move || match event {
-                Event::Insert(text) => {
-                    this.add_document(&text);
+            let shared = shared.clone();
+            local = tokio::task::spawn_blocking(move || {
+                match event {
+                    Event::Insert(text) => {
+                        for word in words(text.slice(..)) {
+                            local.insert(word);
+                        }
+                    }
+                    Event::Update(
+                        _doc,
+                        Change {
+                            old_text,
+                            text,
+                            changes,
+                            ..
+                        },
+                    ) => {
+                        for (old_window, new_window) in
+                            changed_windows(old_text.slice(..), text.slice(..), &changes)
+                        {
+                            for word in words(new_window) {
+                                local.insert(word);
+                            }
+                            for word in words(old_window) {
+                                local.remove(word);
+                            }
+                        }
+                    }
+                    Event::Delete(_doc, text) => {
+                        for word in words(text.slice(..)) {
+                            local.remove(word);
+                        }
+                    }
+                    Event::Clear => {
+                        local.clear();
+                    }
                 }
-                Event::Update(
-                    _doc,
-                    Change {
-                        old_text,
-                        text,
-                        changes,
-                        ..
-                    },
-                ) => {
-                    this.update_document(&old_text, &text, &changes);
-                }
-                Event::Delete(_doc, text) => {
-                    this.remove_document(&text);
-                }
-                Event::Clear => {
-                    this.clear();
-                }
+                shared.store(Arc::new(local.clone()));
+                local
             })
             .await
             .unwrap();
@@ -392,6 +399,7 @@ pub(crate) fn register_hooks(handlers: &Handlers) {
 
     let tx = handlers.word_index.hook.clone();
     register_hook!(move |event: &mut DocumentDidChange<'_>| {
+        let hook_start = std::time::Instant::now();
         if !event.ghost_transaction && event.doc.word_completion_enabled() {
             helix_event::send_blocking(
                 &tx,
@@ -405,6 +413,18 @@ pub(crate) fn register_hooks(handlers: &Handlers) {
                 ),
             );
         }
+        let hook_dur = hook_start.elapsed();
+        log_command_phase("document_did_change_hook", "word_index", hook_dur, || {
+            format!(
+                "doc_id={:?} ghost={} enabled={} lines={} bytes={} change_ops={}",
+                event.doc.id(),
+                event.ghost_transaction,
+                event.doc.word_completion_enabled(),
+                event.doc.text().len_lines(),
+                event.doc.text().len_bytes(),
+                event.changes.len()
+            )
+        });
         Ok(())
     });
 
@@ -446,19 +466,39 @@ mod tests {
     use super::*;
     use helix_core::diff::compare_ropes;
 
-    impl WordIndex {
-        fn words(&self) -> HashSet<String> {
-            let inner = self.inner.read();
-            inner.words().map(|w| w.to_string()).collect()
+    fn add_document(inner: &mut WordIndexInner, text: &Rope) {
+        for word in words(text.slice(..)) {
+            inner.insert(word);
         }
+    }
+
+    fn update_document(
+        inner: &mut WordIndexInner,
+        old_text: &Rope,
+        text: &Rope,
+        changes: &ChangeSet,
+    ) {
+        for (old_window, new_window) in changed_windows(old_text.slice(..), text.slice(..), changes)
+        {
+            for word in words(new_window) {
+                inner.insert(word);
+            }
+            for word in words(old_window) {
+                inner.remove(word);
+            }
+        }
+    }
+
+    fn collect_words(inner: &WordIndexInner) -> HashSet<String> {
+        inner.words().map(|w| w.to_string()).collect()
     }
 
     #[track_caller]
     fn assert_words<I: ToString, T: IntoIterator<Item = I>>(text: &str, expected: T) {
         let text = Rope::from_str(text);
-        let index = WordIndex::default();
-        index.add_document(&text);
-        let actual = index.words();
+        let mut inner = WordIndexInner::default();
+        add_document(&mut inner, &text);
+        let actual = collect_words(&inner);
         let expected: HashSet<_> = expected.into_iter().map(|i| i.to_string()).collect();
         assert_eq!(expected, actual);
     }
@@ -484,11 +524,11 @@ mod tests {
         let expect_inserted: HashSet<_> =
             expect_inserted.into_iter().map(|i| i.to_string()).collect();
 
-        let index = WordIndex::default();
-        index.add_document(&before);
-        let words_before = index.words();
-        index.update_document(&before, &after, diff.changes());
-        let words_after = index.words();
+        let mut inner = WordIndexInner::default();
+        add_document(&mut inner, &before);
+        let words_before = collect_words(&inner);
+        update_document(&mut inner, &before, &after, diff.changes());
+        let words_after = collect_words(&inner);
 
         let actual_removed = words_before.difference(&words_after).cloned().collect();
         let actual_inserted = words_after.difference(&words_before).cloned().collect();

@@ -2,38 +2,61 @@
 pub mod macros;
 
 pub mod annotations;
+pub mod bench;
 pub mod clipboard;
+pub mod commands;
+pub mod content_region;
 pub mod document;
+pub mod document_lsp;
+pub mod edit_region;
 pub mod editor;
+pub mod engine;
 pub mod events;
 pub mod expansion;
+pub mod file_bound;
+pub mod file_watcher;
 pub mod graphics;
 pub mod gutter;
 pub mod handlers;
+pub mod history_state;
 pub mod icons;
+pub mod id;
 pub mod info;
 pub mod input;
 pub mod keyboard;
+pub mod keymap;
+pub mod layout;
+pub mod model;
+pub mod presentation_state;
 pub mod register;
+pub mod selection_store;
+pub mod session_state;
+pub mod snippet_state;
+pub mod statusline;
+pub mod syntax_aware;
+pub mod text_buffer;
 pub mod theme;
+pub mod traits;
 pub mod tree;
+pub mod vcs_state;
 pub mod view;
+pub mod viewport;
 
 use std::num::NonZeroUsize;
 
-// uses NonZeroUsize so Option<DocumentId> use a byte rather than two
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
-pub struct DocumentId(NonZeroUsize);
+/// Marker type for document IDs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DocumentKind {}
+
+/// Uses `NonZeroUsize` so `Option<DocumentId>` gets niche optimization.
+pub type DocumentId = id::Id<DocumentKind, NonZeroUsize>;
+
+/// The default document ID (1).
+const DEFAULT_DOCUMENT_ID: DocumentId = DocumentId::new(NonZeroUsize::new(1).unwrap());
 
 impl Default for DocumentId {
     fn default() -> DocumentId {
-        DocumentId(NonZeroUsize::new(1).unwrap())
-    }
-}
-
-impl std::fmt::Display for DocumentId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_fmt(format_args!("{}", self.0))
+        DEFAULT_DOCUMENT_ID
     }
 }
 
@@ -47,12 +70,16 @@ pub enum Align {
     Bottom,
 }
 
-pub fn align_view(doc: &mut Document, view: &View, align: Align) {
+pub fn align_view_in<V, D>(doc: &mut D, view: &V, align: Align)
+where
+    V: traits::TextViewport<D>,
+    D: traits::FormattableText + traits::Selectable,
+{
     let doc_text = doc.text().slice(..);
-    let cursor = doc.selection(view.id).primary().cursor(doc_text);
-    let viewport = view.inner_area(doc);
+    let cursor = doc.selection(view.id()).primary().cursor(doc_text);
+    let viewport = view.text_area(doc);
     let last_line_height = viewport.height.saturating_sub(1);
-    let mut view_offset = doc.view_offset(view.id);
+    let mut view_offset = view.view_offset(doc);
 
     let relative = match align {
         Align::Center => last_line_height / 2,
@@ -60,16 +87,20 @@ pub fn align_view(doc: &mut Document, view: &View, align: Align) {
         Align::Bottom => last_line_height,
     };
 
-    let text_fmt = doc.text_format(viewport.width, None);
+    let text_fmt = doc.text_format(viewport.width);
     (view_offset.anchor, view_offset.vertical_offset) = char_idx_at_visual_offset(
         doc_text,
         cursor,
         -(relative as isize),
         0,
         &text_fmt,
-        &view.text_annotations(doc, None),
+        &view.text_annotations(doc),
     );
-    doc.set_view_offset(view.id, view_offset);
+    view.set_view_offset(doc, view_offset);
+}
+
+pub fn align_view(doc: &mut Document, view: &View, align: Align) {
+    align_view_in(doc, view, align);
 }
 
 pub use document::Document;

@@ -30,8 +30,11 @@ pub struct BlameEvent {
 
 #[derive(Debug)]
 pub enum AutoReloadEvent {
-    CheckForChanges { after: u64 },
-    EditorFocused,
+    /// A watched file changed on disk (from notify watcher).
+    FileChanged {
+        path: std::path::PathBuf,
+        doc_ids: Vec<crate::DocumentId>,
+    },
     LeftInsertMode,
 }
 
@@ -49,6 +52,33 @@ pub struct Handlers {
 }
 
 impl Handlers {
+    /// Create a dummy `Handlers` for headless testing.
+    ///
+    /// All senders point to immediately-dropped receivers, so any send will
+    /// fail silently.  This is fine for tests that don't exercise async
+    /// handler behaviour.
+    pub fn dummy() -> Self {
+        let (comp_tx, _) = tokio::sync::mpsc::channel(1);
+        let (sig_tx, _) = tokio::sync::mpsc::channel(1);
+        let (auto_save_tx, _) = tokio::sync::mpsc::channel(1);
+        let (auto_reload_tx, _) = tokio::sync::mpsc::channel(1);
+        let (doc_colors_tx, _) = tokio::sync::mpsc::channel(1);
+        let (blame_tx, _) = tokio::sync::mpsc::channel(1);
+        let (pull_diag_tx, _) = tokio::sync::mpsc::channel(1);
+        let (pull_all_diag_tx, _) = tokio::sync::mpsc::channel(1);
+        Self {
+            completions: CompletionHandler::new(comp_tx),
+            signature_hints: sig_tx,
+            auto_save: auto_save_tx,
+            auto_reload: auto_reload_tx,
+            document_colors: doc_colors_tx,
+            blame: blame_tx,
+            word_index: word_index::Handler::dummy(),
+            pull_diagnostics: pull_diag_tx,
+            pull_all_documents_diagnostics: pull_all_diag_tx,
+        }
+    }
+
     /// Manually trigger completion (c-x)
     pub fn trigger_completions(&self, trigger_pos: usize, doc: DocumentId, view: ViewId) {
         self.completions.event(CompletionEvent::ManualTrigger {

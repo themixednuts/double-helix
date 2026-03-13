@@ -72,7 +72,7 @@ pub fn jump_to_stack_frame(editor: &mut Editor, frame: &helix_dap::StackFrame) {
         return;
     }
 
-    let (view, doc) = current!(editor);
+    let (view_id, doc) = focused!(editor);
 
     let text_end = doc.text().len_chars().saturating_sub(1);
     let start = dap_pos_to_pos(doc.text(), frame.line, frame.column).unwrap_or(0);
@@ -82,7 +82,8 @@ pub fn jump_to_stack_frame(editor: &mut Editor, frame: &helix_dap::StackFrame) {
         .unwrap_or(start);
 
     let selection = Selection::single(start.min(text_end), end.min(text_end));
-    doc.set_selection(view.id, selection);
+    doc.set_selection(view_id, selection);
+    let view = editor.tree.get(view_id);
     align_view(doc, view, Align::Center);
 }
 

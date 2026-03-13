@@ -27,12 +27,12 @@ pub struct Registers {
     /// The order is reversed again in `Registers::read`. This allows us to
     /// efficiently prepend new values in `Registers::push`.
     inner: HashMap<char, Vec<String>>,
-    clipboard_provider: Box<dyn DynAccess<ClipboardProvider>>,
+    clipboard_provider: Box<dyn DynAccess<ClipboardProvider> + Send + Sync>,
     pub last_search_register: char,
 }
 
 impl Registers {
-    pub fn new(clipboard_provider: Box<dyn DynAccess<ClipboardProvider>>) -> Self {
+    pub fn new(clipboard_provider: Box<dyn DynAccess<ClipboardProvider> + Send + Sync>) -> Self {
         Self {
             inner: Default::default(),
             clipboard_provider,
@@ -44,8 +44,8 @@ impl Registers {
         match name {
             '_' => Some(RegisterValues::new(iter::empty())),
             '#' => {
-                let (view, doc) = current_ref!(editor);
-                let selections = doc.selection(view.id).len();
+                let (view_id, doc) = focused_ref!(editor);
+                let selections = doc.selection(view_id).len();
                 // ExactSizeIterator is implemented for Range<usize> but
                 // not RangeInclusive<usize>.
                 Some(RegisterValues::new(
@@ -53,12 +53,12 @@ impl Registers {
                 ))
             }
             '.' => {
-                let (view, doc) = current_ref!(editor);
+                let (view_id, doc) = focused_ref!(editor);
                 let text = doc.text().slice(..);
-                Some(RegisterValues::new(doc.selection(view.id).fragments(text)))
+                Some(RegisterValues::new(doc.selection(view_id).fragments(text)))
             }
             '%' => {
-                let path = doc!(editor).display_name();
+                let path = focused_ref!(editor).1.display_name();
                 Some(RegisterValues::new(iter::once(path)))
             }
             '*' | '+' => Some(read_from_clipboard(

@@ -1,7 +1,9 @@
 use std::collections::btree_map::Entry;
 use std::collections::HashSet;
 use std::fmt::Display;
+use std::time::Instant;
 
+use crate::bench::log_command_phase;
 use crate::editor::Action;
 use crate::events::{
     DiagnosticsDidChange, DocumentDidChange, DocumentDidClose, LanguageServerInitialized,
@@ -377,6 +379,7 @@ impl Editor {
             let doc = doc.id();
             helix_event::dispatch(DiagnosticsDidChange { editor: self, doc });
         }
+        self.refresh_workspace_diagnostic_counts();
     }
 
     pub fn execute_lsp_command(&mut self, command: lsp::Command, server_id: LanguageServerId) {
@@ -420,6 +423,7 @@ pub fn register_hooks(_handlers: &Handlers) {
     });
 
     register_hook!(move |event: &mut DocumentDidChange<'_>| {
+        let hook_start = Instant::now();
         // Send textDocument/didChange notifications.
         if !event.ghost_transaction {
             for language_server in event.doc.language_servers() {
@@ -431,7 +435,17 @@ pub fn register_hooks(_handlers: &Handlers) {
                 );
             }
         }
-
+        let hook_dur = hook_start.elapsed();
+        log_command_phase("document_did_change_hook", "lsp_did_change", hook_dur, || {
+            format!(
+                "doc_id={:?} ghost={} language_servers={} lines={} bytes={}",
+                event.doc.id(),
+                event.ghost_transaction,
+                event.doc.language_servers().count(),
+                event.doc.text().len_lines(),
+                event.doc.text().len_bytes()
+            )
+        });
         Ok(())
     });
 

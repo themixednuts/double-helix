@@ -1,6 +1,5 @@
-use std::cell::Cell;
 use std::num::NonZeroUsize;
-use std::sync::atomic::{self, AtomicUsize};
+use std::sync::atomic::{self, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -56,9 +55,9 @@ impl AsyncHook for DiagnosticTimeout {
 
 pub struct DiagnosticsHandler {
     active_generation: Arc<AtomicUsize>,
-    generation: Cell<usize>,
-    last_doc: Cell<DocumentId>,
-    last_cursor_line: Cell<usize>,
+    generation: AtomicUsize,
+    last_doc: AtomicUsize,
+    last_cursor_line: AtomicUsize,
     pub active: bool,
     pub events: Sender<DiagnosticEvent>,
 }
@@ -84,25 +83,37 @@ impl DiagnosticsHandler {
         .spawn();
         Self {
             active_generation,
-            generation: Cell::new(0),
+            generation: AtomicUsize::new(0),
             events,
-            last_doc: Cell::new(DocumentId(NonZeroUsize::new(usize::MAX).unwrap())),
-            last_cursor_line: Cell::new(usize::MAX),
+            // usize::MAX encodes a "no document" sentinel.
+            last_doc: AtomicUsize::new(usize::MAX),
+            last_cursor_line: AtomicUsize::new(usize::MAX),
             active: true,
         }
+    }
+
+    fn load_last_doc(&self) -> DocumentId {
+        let raw = self.last_doc.load(Ordering::Relaxed);
+        // Safety: we only store values from DocumentId::value() which are NonZeroUsize,
+        // or usize::MAX which is also non-zero.
+        DocumentId::new(unsafe { NonZeroUsize::new_unchecked(raw) })
+    }
+
+    fn store_last_doc(&self, id: DocumentId) {
+        self.last_doc.store(id.value().get(), Ordering::Relaxed);
     }
 }
 
 impl DiagnosticsHandler {
     pub fn immediately_show_diagnostic(&self, doc: &Document, view: ViewId) {
-        self.last_doc.set(doc.id());
+        self.store_last_doc(doc.id());
         let cursor_line = doc
             .selection(view)
             .primary()
             .cursor_line(doc.text().slice(..));
-        self.last_cursor_line.set(cursor_line);
+        self.last_cursor_line.store(cursor_line, Ordering::Relaxed);
         self.active_generation
-            .store(self.generation.get(), atomic::Ordering::Relaxed);
+            .store(self.generation.load(Ordering::Relaxed), Ordering::Relaxed);
     }
     pub fn show_cursorline_diagnostics(&self, doc: &Document, view: ViewId) -> bool {
         if !self.active {
@@ -112,17 +123,20 @@ impl DiagnosticsHandler {
             .selection(view)
             .primary()
             .cursor_line(doc.text().slice(..));
-        if self.last_cursor_line.get() == cursor_line && self.last_doc.get() == doc.id() {
-            let active_generation = self.active_generation.load(atomic::Ordering::Relaxed);
-            self.generation.get() == active_generation
+        if self.last_cursor_line.load(Ordering::Relaxed) == cursor_line
+            && self.load_last_doc() == doc.id()
+        {
+            let active_generation = self.active_generation.load(Ordering::Relaxed);
+            self.generation.load(Ordering::Relaxed) == active_generation
         } else {
-            self.last_doc.set(doc.id());
-            self.last_cursor_line.set(cursor_line);
-            self.generation.set(self.generation.get() + 1);
+            self.store_last_doc(doc.id());
+            self.last_cursor_line.store(cursor_line, Ordering::Relaxed);
+            let new_gen = self.generation.load(Ordering::Relaxed) + 1;
+            self.generation.store(new_gen, Ordering::Relaxed);
             send_blocking(
                 &self.events,
                 DiagnosticEvent::CursorLineChanged {
-                    generation: self.generation.get(),
+                    generation: new_gen,
                 },
             );
             false

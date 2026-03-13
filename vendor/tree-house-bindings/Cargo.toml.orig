@@ -1,0 +1,24 @@
+[package]
+name = "tree-house-bindings"
+description = "Homey Rust bindings for the tree-sitter C library"
+authors = ["Pascal Kuthe <pascalkuthe@pm.me>"]
+version = "0.2.3"
+edition = "2021"
+license = "MPL-2.0"
+repository = "https://github.com/helix-editor/tree-house"
+readme = "../README.md"
+rust-version = "1.76.0"
+
+[features]
+ropey = ["dep:ropey"]
+tree-sitter-language = ["dep:tree-sitter-language"]
+
+[dependencies]
+ropey = { version = "1.6", default-features = false, optional=true }
+regex-cursor = "0.1.5"
+libloading = "0.8"
+thiserror = "2.0"
+tree-sitter-language = { version = "0.1.5", optional = true }
+
+[build-dependencies]
+cc = "1.0"

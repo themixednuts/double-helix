@@ -78,7 +78,7 @@ fn exit(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow:
         return Ok(());
     }
 
-    if doc!(cx.editor).is_modified() {
+    if focused_ref!(cx.editor).1.is_modified() {
         write_impl(
             cx,
             args.first(),
@@ -97,7 +97,7 @@ fn force_exit(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> a
         return Ok(());
     }
 
-    if doc!(cx.editor).is_modified() {
+    if focused_ref!(cx.editor).1.is_modified() {
         write_impl(
             cx,
             args.first(),
@@ -168,10 +168,11 @@ fn open_impl(cx: &mut compositor::Context, args: Args, action: Action) -> anyhow
         } else {
             // Otherwise, just open the file
             let _ = cx.editor.open(&path, action)?;
-            let (view, doc) = current!(cx.editor);
+            let (view_id, doc) = focused!(cx.editor);
             let pos = Selection::point(pos_at_coords(doc.text().slice(..), pos, true));
-            doc.set_selection(view.id, pos);
+            doc.set_selection(view_id, pos);
             // does not affect opening a buffer without pos
+            let view = view!(cx.editor, view_id);
             align_view(doc, view, Align::Center);
         }
     }
@@ -197,7 +198,7 @@ fn buffer_close_by_ids_impl(
         .unzip();
 
     if let Some(first) = modified_ids.first() {
-        let current = doc!(cx.editor);
+        let (_, current) = focused_ref!(cx.editor);
         // If the current document is unmodified, and there are modified
         // documents, switch focus to the first modified doc.
         if !modified_ids.contains(&current.id()) {
@@ -288,7 +289,7 @@ fn buffer_gather_others_impl(editor: &mut Editor, skip_visible: bool) -> Vec<Doc
             .filter(|doc_id| !visible_document_ids.contains(doc_id))
             .collect()
     } else {
-        let current_document = &doc!(editor).id();
+        let current_document = &focused_ref!(editor).1.id();
         editor
             .documents()
             .map(|doc| doc.id())
@@ -386,28 +387,29 @@ fn write_impl(
 ) -> anyhow::Result<()> {
     let config = cx.editor.config();
     let jobs = &mut cx.jobs;
-    let (view, doc) = current!(cx.editor);
+    let (view_id, doc) = focused!(cx.editor);
 
     if doc.trim_trailing_whitespace() {
-        trim_trailing_whitespace(doc, view.id);
+        trim_trailing_whitespace(doc, view_id);
     }
     if config.trim_final_newlines {
-        trim_final_newlines(doc, view.id);
+        trim_final_newlines(doc, view_id);
     }
     if doc.insert_final_newline() {
-        insert_final_newline(doc, view.id);
+        insert_final_newline(doc, view_id);
     }
 
     // Save an undo checkpoint for any outstanding changes.
+    let view = view_mut!(cx.editor, view_id);
     doc.append_changes_to_history(view);
 
-    let (view, doc) = current_ref!(cx.editor);
+    let (view_id, doc) = focused_ref!(cx.editor);
     let fmt = if config.auto_format && options.auto_format {
         doc.auto_format(cx.editor).map(|fmt| {
             let callback = make_format_callback(
                 doc.id(),
                 doc.version(),
-                view.id,
+                view_id,
                 fmt,
                 Some((path.map(Into::into), options.force)),
             );
@@ -480,7 +482,7 @@ fn insert_final_newline(doc: &mut Document, view_id: ViewId) {
     let text = doc.text();
     if text.len_chars() > 0 && line_ending::get_line_ending(&text.slice(..)).is_none() {
         let eof = Selection::point(text.len_chars());
-        let insert = Transaction::insert(text, &eof, doc.line_ending.as_str().into());
+        let insert = Transaction::insert(text, &eof, doc.line_ending().as_str().into());
         doc.apply(&insert, view_id);
     }
 }
@@ -580,11 +582,11 @@ fn format(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> anyh
         return Ok(());
     }
 
-    let (view, doc) = current_ref!(cx.editor);
+    let (view_id, doc) = focused_ref!(cx.editor);
     let format = doc.format(cx.editor).context(
         "A formatter isn't available, and no language server provides formatting capabilities",
     )?;
-    let callback = make_format_callback(doc.id(), doc.version(), view.id, format, None);
+    let callback = make_format_callback(doc.id(), doc.version(), view_id, format, None);
     cx.jobs.callback(callback);
 
     Ok(())
@@ -603,7 +605,7 @@ fn set_indent_style(
 
     // If no argument, report current indent style.
     if args.is_empty() {
-        let style = doc!(cx.editor).indent_style;
+        let style = focused_ref!(cx.editor).1.indent_style();
         cx.editor.set_status(match style {
             Tabs => "tabs".to_owned(),
             Spaces(1) => "1 space".to_owned(),
@@ -625,8 +627,8 @@ fn set_indent_style(
     };
 
     let style = style.context("invalid indent style")?;
-    let doc = doc_mut!(cx.editor);
-    doc.indent_style = style;
+    let (_, doc) = focused!(cx.editor);
+    doc.set_indent_style(style);
 
     Ok(())
 }
@@ -645,7 +647,7 @@ fn set_line_ending(
 
     // If no argument, report current line ending setting.
     if args.is_empty() {
-        let line_ending = doc!(cx.editor).line_ending;
+        let line_ending = focused_ref!(cx.editor).1.line_ending();
         cx.editor.set_status(match line_ending {
             Crlf => "crlf",
             LF => "line feed",
@@ -681,8 +683,8 @@ fn set_line_ending(
         arg if arg.starts_with("nel") => Nel,
         _ => bail!("invalid line ending"),
     };
-    let (view, doc) = current!(cx.editor);
-    doc.line_ending = line_ending;
+    let (view_id, doc) = focused!(cx.editor);
+    doc.set_line_ending(line_ending);
 
     let mut pos = 0;
     let transaction = Transaction::change(
@@ -699,7 +701,8 @@ fn set_line_ending(
             }
         }),
     );
-    doc.apply(&transaction, view.id);
+    doc.apply(&transaction, view_id);
+    let view = view_mut!(cx.editor, view_id);
     doc.append_changes_to_history(view);
 
     Ok(())
@@ -711,7 +714,8 @@ fn earlier(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyh
 
     let uk = args.join(" ").parse::<UndoKind>().map_err(|s| anyhow!(s))?;
 
-    let (view, doc) = current!(cx.editor);
+    let (view_id, doc) = focused!(cx.editor);
+    let view = view_mut!(cx.editor, view_id);
     let success = doc.earlier(view, uk);
     if !success {
         cx.editor.set_status("Already at oldest change");
@@ -726,7 +730,8 @@ fn later(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow
     }
 
     let uk = args.join(" ").parse::<UndoKind>().map_err(|s| anyhow!(s))?;
-    let (view, doc) = current!(cx.editor);
+    let (view_id, doc) = focused!(cx.editor);
+    let view = view_mut!(cx.editor, view_id);
     let success = doc.later(view, uk);
     if !success {
         cx.editor.set_status("Already at newest change");
@@ -784,7 +789,7 @@ pub(super) fn buffers_remaining_impl(editor: &mut Editor) -> anyhow::Result<()> 
         .collect();
 
     if let Some(first) = modified_ids.first() {
-        let current = doc!(editor);
+        let (_, current) = focused_ref!(editor);
         // If the current document is unmodified, and there are modified
         // documents, switch focus to the first modified doc.
         if !modified_ids.contains(&current.id()) {
@@ -1084,11 +1089,12 @@ fn yank_joined(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> 
         return Ok(());
     }
 
-    let doc = doc!(cx.editor);
-    let default_sep = Cow::Borrowed(doc.line_ending.as_str());
+    let (_, doc) = focused_ref!(cx.editor);
+    let default_sep = Cow::Borrowed(doc.line_ending().as_str());
     let separator = args.first().unwrap_or(&default_sep);
     let register = cx
         .editor
+        .focused_modal_input
         .selected_register
         .unwrap_or(cx.editor.config().default_yank_register);
     yank_joined_impl(cx.editor, separator, register);
@@ -1104,8 +1110,8 @@ fn yank_joined_to_clipboard(
         return Ok(());
     }
 
-    let doc = doc!(cx.editor);
-    let default_sep = Cow::Borrowed(doc.line_ending.as_str());
+    let (_, doc) = focused_ref!(cx.editor);
+    let default_sep = Cow::Borrowed(doc.line_ending().as_str());
     let separator = args.first().unwrap_or(&default_sep);
     yank_joined_impl(cx.editor, separator, '+');
     Ok(())
@@ -1133,8 +1139,8 @@ fn yank_joined_to_primary_clipboard(
         return Ok(());
     }
 
-    let doc = doc!(cx.editor);
-    let default_sep = Cow::Borrowed(doc.line_ending.as_str());
+    let (_, doc) = focused_ref!(cx.editor);
+    let default_sep = Cow::Borrowed(doc.line_ending().as_str());
     let separator = args.first().unwrap_or(&default_sep);
     yank_joined_impl(cx.editor, separator, '*');
     Ok(())
@@ -1296,7 +1302,7 @@ fn set_encoding(
         return Ok(());
     }
 
-    let doc = doc_mut!(cx.editor);
+    let (_, doc) = focused!(cx.editor);
     if let Some(label) = args.first() {
         doc.set_encoding(label)
     } else {
@@ -1316,10 +1322,10 @@ fn get_character_info(
         return Ok(());
     }
 
-    let (view, doc) = current_ref!(cx.editor);
+    let (view_id, doc) = focused_ref!(cx.editor);
     let text = doc.text().slice(..);
 
-    let grapheme_start = doc.selection(view.id).primary().cursor(text);
+    let grapheme_start = doc.selection(view_id).primary().cursor(text);
     let grapheme_end = graphemes::next_grapheme_boundary(text, grapheme_start);
 
     if grapheme_start == grapheme_end {
@@ -1418,7 +1424,8 @@ fn reload(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> anyh
 
     let scrolloff = cx.editor.config().scrolloff;
     let auto_fetch = cx.editor.config().inline_blame.auto_fetch;
-    let (view, doc) = current!(cx.editor);
+    let (view_id, doc) = focused!(cx.editor);
+    let view = view_mut!(cx.editor, view_id);
     doc.reload(view, &cx.editor.diff_providers).map(|_| {
         view.ensure_cursor_in_view(doc, scrolloff);
     })?;
@@ -1442,7 +1449,7 @@ fn reload(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> anyh
             );
         }
     }
-    doc.is_blame_potentially_out_of_date = true;
+    doc.mark_blame_outdated();
 
     Ok(())
 }
@@ -1516,7 +1523,7 @@ pub fn reload_all(
                 );
             }
         }
-        doc.is_blame_potentially_out_of_date = true;
+        doc.mark_blame_outdated();
     }
 
     Ok(())
@@ -1528,7 +1535,7 @@ fn update(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyho
         return Ok(());
     }
 
-    let (_view, doc) = current!(cx.editor);
+    let (_view_id, doc) = focused!(cx.editor);
     if doc.is_modified() {
         write_impl(
             cx,
@@ -1552,7 +1559,7 @@ fn lsp_workspace_command(
         return Ok(());
     }
 
-    let doc = doc!(cx.editor);
+    let (_, doc) = focused_ref!(cx.editor);
     let ls_id_commands = doc
         .language_servers_with_feature(LanguageServerFeature::WorkspaceCommand)
         .flat_map(|ls| {
@@ -1649,7 +1656,7 @@ fn lsp_restart(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> 
     }
 
     let editor_config = cx.editor.config.load();
-    let doc = doc!(cx.editor);
+    let (_, doc) = focused_ref!(cx.editor);
     let config = doc
         .language_config()
         .context("LSP not defined for the current document")?;
@@ -1732,7 +1739,7 @@ fn lsp_stop(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> any
     if event != PromptEvent::Validate {
         return Ok(());
     }
-    let doc = doc!(cx.editor);
+    let (_, doc) = focused_ref!(cx.editor);
 
     let language_servers: Vec<_> = doc
         .language_servers()
@@ -1759,7 +1766,7 @@ fn lsp_stop(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> any
             if let Some(client) = doc.remove_language_server_by_name(ls_name) {
                 doc.clear_diagnostics_for_language_server(client.id());
                 doc.reset_all_inlay_hints();
-                doc.inlay_hints_oudated = true;
+                doc.mark_inlay_hints_outdated();
             }
         }
     }
@@ -1776,10 +1783,10 @@ fn tree_sitter_scopes(
         return Ok(());
     }
 
-    let (view, doc) = current!(cx.editor);
+    let (view_id, doc) = focused!(cx.editor);
     let text = doc.text().slice(..);
 
-    let pos = doc.selection(view.id).primary().cursor(text);
+    let pos = doc.selection(view_id).primary().cursor(text);
     let scopes = indent::get_scopes(doc.syntax(), text, pos);
 
     let contents = format!("```json\n{:?}\n````", scopes);
@@ -1809,20 +1816,21 @@ fn tree_sitter_highlight_name(
         return Ok(());
     }
 
-    let (view, doc) = current_ref!(cx.editor);
+    let (view_id, doc) = focused_ref!(cx.editor);
     let Some(syntax) = doc.syntax() else {
         return Ok(());
     };
     let text = doc.text().slice(..);
-    let cursor = doc.selection(view.id).primary().cursor(text);
+    let cursor = doc.selection(view_id).primary().cursor(text);
     let byte = text.char_to_byte(cursor) as u32;
     // Query the same range as the one used in syntax highlighting.
     let range = {
         // Calculate viewport byte ranges:
-        let row = text.char_to_line(doc.view_offset(view.id).anchor.min(text.len_chars()));
+        let row = text.char_to_line(doc.view_offset(view_id).anchor.min(text.len_chars()));
         // Saturating subs to make it inclusive zero indexing.
         let last_line = text.len_lines().saturating_sub(1);
-        let height = view.inner_area(doc).height;
+        let vw = view!(cx.editor, view_id);
+        let height = vw.inner_area(doc).height;
         let last_visible_line = (row + height as usize).saturating_sub(1).min(last_line);
         let start = text.line_to_byte(row.min(last_line)) as u32;
         let end = text.line_to_byte(last_visible_line + 1) as u32;
@@ -1877,14 +1885,14 @@ fn tree_sitter_layers(
         return Ok(());
     }
 
-    let (view, doc) = current_ref!(cx.editor);
+    let (view_id, doc) = focused_ref!(cx.editor);
     let Some(syntax) = doc.syntax() else {
         bail!("Syntax information is not available");
     };
 
     let loader: &helix_core::syntax::Loader = &cx.editor.syn_loader.load();
     let text = doc.text().slice(..);
-    let cursor = doc.selection(view.id).primary().cursor(text);
+    let cursor = doc.selection(view_id).primary().cursor(text);
     let byte = text.char_to_byte(cursor) as u32;
     let languages =
         syntax
@@ -2030,7 +2038,7 @@ fn tutor(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> anyho
     let path = helix_loader::runtime_file(Path::new("tutor"));
     cx.editor.open(&path, Action::Replace)?;
     // Unset path to prevent accidentally saving to the original tutor file.
-    doc_mut!(cx.editor).set_path(None);
+    focused!(cx.editor).1.set_path(None);
     Ok(())
 }
 
@@ -2038,16 +2046,17 @@ fn abort_goto_line_number_preview(cx: &mut compositor::Context) {
     if let Some(last_selection) = cx.editor.last_selection.take() {
         let scrolloff = cx.editor.config().scrolloff;
 
-        let (view, doc) = current!(cx.editor);
-        doc.set_selection(view.id, last_selection);
+        let (view_id, doc) = focused!(cx.editor);
+        doc.set_selection(view_id, last_selection);
+        let view = view_mut!(cx.editor, view_id);
         view.ensure_cursor_in_view(doc, scrolloff);
     }
 }
 
 fn update_goto_line_number_preview(cx: &mut compositor::Context, args: Args) -> anyhow::Result<()> {
     cx.editor.last_selection.get_or_insert_with(|| {
-        let (view, doc) = current!(cx.editor);
-        doc.selection(view.id).clone()
+        let (view_id, doc) = focused!(cx.editor);
+        doc.selection(view_id).clone()
     });
 
     let scrolloff = cx.editor.config().scrolloff;
@@ -2062,7 +2071,8 @@ fn update_goto_line_number_preview(cx: &mut compositor::Context, args: Args) -> 
         },
     );
 
-    let (view, doc) = current!(cx.editor);
+    let (view_id, doc) = focused!(cx.editor);
+    let view = view_mut!(cx.editor, view_id);
     view.ensure_cursor_in_view(doc, scrolloff);
 
     Ok(())
@@ -2087,8 +2097,9 @@ pub(super) fn goto_line_number(
                 .take()
                 .expect("update_goto_line_number_preview should always set last_selection");
 
-            let (view, doc) = current!(cx.editor);
-            view.jumps.push((doc.id(), last_selection));
+            let (view_id, doc) = focused!(cx.editor);
+            let view = view_mut!(cx.editor, view_id);
+            view.history.jumps.push((doc.id(), last_selection));
         }
 
         // When a user hits backspace and there are no numbers left,
@@ -2252,13 +2263,13 @@ fn language(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> any
     }
 
     if args.is_empty() {
-        let doc = doc!(cx.editor);
+        let (_, doc) = focused_ref!(cx.editor);
         let language = &doc.language_name().unwrap_or(DEFAULT_LANGUAGE_NAME);
         cx.editor.set_status(language.to_string());
         return Ok(());
     }
 
-    let doc = doc_mut!(cx.editor);
+    let (_, doc) = focused!(cx.editor);
 
     let loader = cx.editor.syn_loader.load();
     if &args[0] == DEFAULT_LANGUAGE_NAME {
@@ -2270,7 +2281,7 @@ fn language(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> any
 
     let id = doc.id();
     cx.editor.refresh_language_servers(id);
-    let doc = doc_mut!(cx.editor);
+    let (_, doc) = focused!(cx.editor);
     let diagnostics =
         Editor::doc_diagnostics(&cx.editor.language_servers, &cx.editor.diagnostics, doc);
     doc.replace_diagnostics(diagnostics, &[], None);
@@ -2283,10 +2294,10 @@ fn sort(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow:
     }
 
     let scrolloff = cx.editor.config().scrolloff;
-    let (view, doc) = current!(cx.editor);
+    let (view_id, doc) = focused!(cx.editor);
     let text = doc.text().slice(..);
 
-    let selection = doc.selection(view.id);
+    let selection = doc.selection(view_id);
 
     if selection.len() == 1 {
         bail!("Sorting requires multiple selections. Hint: split selection first");
@@ -2314,7 +2325,8 @@ fn sort(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow:
             .map(|(s, fragment)| (s.from(), s.to(), Some(fragment))),
     );
 
-    doc.apply(&transaction, view.id);
+    doc.apply(&transaction, view_id);
+    let view = view_mut!(cx.editor, view_id);
     doc.append_changes_to_history(view);
     view.ensure_cursor_in_view(doc, scrolloff);
 
@@ -2361,10 +2373,10 @@ fn index_impl(
     step: usize,
 ) -> anyhow::Result<()> {
     let scrolloff = cx.editor.config().scrolloff;
-    let (view, doc) = current!(cx.editor);
+    let (view_id, doc) = focused!(cx.editor);
     let text = doc.text().slice(..);
 
-    let selection = doc.selection(view.id);
+    let selection = doc.selection(view_id);
 
     if selection.len() == 1 {
         bail!("Sorting requires multiple selections. Hint: split selection first");
@@ -2424,7 +2436,8 @@ fn index_impl(
             .map(|(s, fragment)| (s.from(), s.to(), Some(fragment))),
     );
 
-    doc.apply(&transaction, view.id);
+    doc.apply(&transaction, view_id);
+    let view = view_mut!(cx.editor, view_id);
     doc.append_changes_to_history(view);
     view.ensure_cursor_in_view(doc, scrolloff);
 
@@ -2437,7 +2450,7 @@ fn reflow(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyho
     }
 
     let scrolloff = cx.editor.config().scrolloff;
-    let (view, doc) = current!(cx.editor);
+    let (view_id, doc) = focused!(cx.editor);
 
     // Find the text_width by checking the following sources in order:
     //   - The passed argument in `args`
@@ -2451,7 +2464,7 @@ fn reflow(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyho
 
     let rope = doc.text();
 
-    let selection = doc.selection(view.id);
+    let selection = doc.selection(view_id);
     let transaction = Transaction::change_by_selection(rope, selection, |range| {
         let fragment = range.fragment(rope.slice(..));
         let reflowed_text = helix_core::wrap::reflow_hard_wrap(&fragment, text_width);
@@ -2459,7 +2472,8 @@ fn reflow(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyho
         (range.from(), range.to(), Some(reflowed_text))
     });
 
-    doc.apply(&transaction, view.id);
+    doc.apply(&transaction, view_id);
+    let view = view_mut!(cx.editor, view_id);
     doc.append_changes_to_history(view);
     view.ensure_cursor_in_view(doc, scrolloff);
 
@@ -2475,10 +2489,10 @@ fn tree_sitter_subtree(
         return Ok(());
     }
 
-    let (view, doc) = current!(cx.editor);
+    let (view_id, doc) = focused!(cx.editor);
 
     if let Some(syntax) = doc.syntax() {
-        let primary_selection = doc.selection(view.id).primary();
+        let primary_selection = doc.selection(view_id).primary();
         let text = doc.text();
         let from = text.char_to_byte(primary_selection.from()) as u32;
         let to = text.char_to_byte(primary_selection.to()) as u32;
@@ -2648,10 +2662,9 @@ fn reset_diff_change(
         return Ok(());
     }
 
-    let editor = &mut cx.editor;
-    let scrolloff = editor.config().scrolloff;
+    let scrolloff = cx.editor.config().scrolloff;
 
-    let (view, doc) = current!(editor);
+    let (view_id, doc) = focused!(cx.editor);
     let Some(handle) = doc.diff_handle() else {
         bail!("Diff is not available in the current buffer")
     };
@@ -2663,7 +2676,7 @@ fn reset_diff_change(
 
     let transaction = Transaction::change(
         doc.text(),
-        diff.hunks_intersecting_line_ranges(doc.selection(view.id).line_ranges(doc_text))
+        diff.hunks_intersecting_line_ranges(doc.selection(view_id).line_ranges(doc_text))
             .map(|hunk| {
                 changes += 1;
                 let start = diff_base.line_to_char(hunk.before.start as usize);
@@ -2681,7 +2694,8 @@ fn reset_diff_change(
     }
 
     drop(diff); // make borrow check happy
-    doc.apply(&transaction, view.id);
+    doc.apply(&transaction, view_id);
+    let view = view_mut!(cx.editor, view_id);
     doc.append_changes_to_history(view);
     view.ensure_cursor_in_view(doc, scrolloff);
     cx.editor.set_status(format!(
@@ -2790,7 +2804,7 @@ fn move_buffer_impl(
     new_path: PathBuf,
     options: MoveBufferOptions,
 ) -> anyhow::Result<()> {
-    let doc = doc!(cx.editor);
+    let (_, doc) = focused_ref!(cx.editor);
     let old_path = doc
         .path()
         .context("Scratch buffer cannot be moved. Use :write instead")?
@@ -2841,8 +2855,8 @@ fn yank_diagnostic(
         None => '+',
     };
 
-    let (view, doc) = current_ref!(cx.editor);
-    let primary = doc.selection(view.id).primary();
+    let (view_id, doc) = focused_ref!(cx.editor);
+    let primary = doc.selection(view_id).primary();
 
     // Look only for diagnostics that intersect with the primary selection
     let diag: Vec<_> = doc
@@ -2870,7 +2884,7 @@ fn read(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow:
     }
 
     let scrolloff = cx.editor.config().scrolloff;
-    let (view, doc) = current!(cx.editor);
+    let (view_id, doc) = focused!(cx.editor);
 
     let filename = args.first().unwrap();
     let path = helix_stdx::path::expand_tilde(PathBuf::from(filename.to_string()));
@@ -2886,9 +2900,10 @@ fn read(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow:
     let (contents, _, _) = read_to_string(&mut reader, Some(doc.encoding()))
         .map_err(|err| anyhow!("error reading file: {}", err))?;
     let contents = Tendril::from(contents);
-    let selection = doc.selection(view.id);
+    let selection = doc.selection(view_id);
     let transaction = Transaction::insert(doc.text(), selection, contents);
-    doc.apply(&transaction, view.id);
+    doc.apply(&transaction, view_id);
+    let view = view_mut!(cx.editor, view_id);
     doc.append_changes_to_history(view);
     view.ensure_cursor_in_view(doc, scrolloff);
 
@@ -2944,7 +2959,8 @@ fn fold(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow:
         return Ok(());
     }
 
-    let (view, doc) = current!(cx.editor);
+    let (view_id, doc) = focused!(cx.editor);
+    let view = view!(cx.editor, view_id);
 
     if args.has_flag("selection") {
         fold_selection(doc, view, args)
@@ -3033,16 +3049,26 @@ pub fn fold_textobjects(
     let root_node = syntax.tree().root_node();
     let range = doc.selection(view.id).primary();
 
-    let textobjects: Vec<_> = ["class", "function", "comment"]
-        .into_iter()
-        .filter(|textobject| args.contains(textobject) ^ args.has_flag("all"))
-        .map(|textobject| match textobject {
-            "class" => "class.around",
-            "function" => "function.around",
-            "comment" => "comment.around",
-            other => unreachable!("Unexpected textobject {other}."),
-        })
-        .collect();
+    let textobjects: Vec<_> = [
+        "class",
+        "function",
+        "comment",
+        "test",
+        "conditional",
+        "loop",
+    ]
+    .into_iter()
+    .filter(|textobject| args.contains(textobject) ^ args.has_flag("all"))
+    .map(|textobject| match textobject {
+        "class" => "class.around",
+        "function" => "function.around",
+        "comment" => "comment.around",
+        "test" => "test.around",
+        "conditional" => "conditional.around",
+        "loop" => "loop.around",
+        other => unreachable!("Unexpected textobject {other}."),
+    })
+    .collect();
     if textobjects.is_empty() {
         return Err(anyhow!("The list of text objects is empty."));
     }
@@ -3126,10 +3152,14 @@ pub fn fold_textobjects(
         .filter_map(|(cap, range)| {
             let capture_name = cap.name(textobject_query.query());
             match capture_name {
-                "class.around" | "function.around" => {
+                "class.around" | "function.around" | "test.around" | "conditional.around"
+                | "loop.around" => {
                     let (capture, textobject) = match capture_name {
                         "class.around" => ("class.inside", "class"),
                         "function.around" => ("function.inside", "function"),
+                        "test.around" => ("test.inside", "test"),
+                        "conditional.around" => ("conditional.inside", "conditional"),
+                        "loop.around" => ("loop.inside", "loop"),
                         _ => unreachable!(),
                     };
                     let node = syntax
@@ -3208,7 +3238,8 @@ fn unfold(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyho
         return Ok(());
     }
 
-    let (view, doc) = current!(cx.editor);
+    let (view_id, doc) = focused!(cx.editor);
+    let view = view!(cx.editor, view_id);
 
     if args.has_flag("selection") {
         unfold_selection(doc, view, args)
@@ -3272,7 +3303,7 @@ fn unfold_selection(doc: &mut Document, view: &View, args: Args) -> anyhow::Resu
         return Err(anyhow!("Nothing to unfold."));
     }
 
-    doc.remove_folds(view, start_indices);
+    doc.remove_folds(view, &start_indices);
 
     Ok(())
 }
@@ -3305,16 +3336,26 @@ fn unfold_textobjects(
     let range = doc.selection(view.id).primary();
     let (start, end) = range.into_byte_range(text);
 
-    let textobjects: Vec<_> = ["class", "function", "comment"]
-        .into_iter()
-        .filter(|textobject| args.contains(textobject) ^ args.has_flag("all"))
-        .map(|textobject| match textobject {
-            "class" => "class.around",
-            "function" => "function.around",
-            "comment" => "comment.around",
-            _ => unreachable!(),
-        })
-        .collect();
+    let textobjects: Vec<_> = [
+        "class",
+        "function",
+        "comment",
+        "test",
+        "conditional",
+        "loop",
+    ]
+    .into_iter()
+    .filter(|textobject| args.contains(textobject) ^ args.has_flag("all"))
+    .map(|textobject| match textobject {
+        "class" => "class.around",
+        "function" => "function.around",
+        "comment" => "comment.around",
+        "test" => "test.around",
+        "conditional" => "conditional.around",
+        "loop" => "loop.around",
+        _ => unreachable!(),
+    })
+    .collect();
     if textobjects.is_empty() {
         return Err(anyhow!("The list of textobjects is empty."));
     }
@@ -3405,7 +3446,7 @@ fn unfold_textobjects(
         return Err(anyhow!("Nothing to unfold."));
     }
 
-    doc.remove_folds(view, start_indices);
+    doc.remove_folds(view, &start_indices);
 
     Ok(())
 }
@@ -3982,6 +4023,65 @@ fn acp_history(
         Ok(call)
     };
     cx.jobs.callback(callback);
+
+    Ok(())
+}
+
+#[cfg(feature = "bench-profile")]
+fn bench(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+
+    use helix_view::bench::{generate_bench_content, BenchState};
+
+    // Parse optional arguments: :bench [duration_secs] [seed]
+    let mut args_iter = args.iter();
+    let duration_secs: u64 = args_iter
+        .next()
+        .and_then(|a| a.as_ref().parse().ok())
+        .unwrap_or(60);
+    let seed: u64 = args_iter
+        .next()
+        .and_then(|a| a.as_ref().parse().ok())
+        .unwrap_or(42);
+
+    if cx.editor.bench.is_some() {
+        // Already running — cancel it
+        if let Some(mut bench) = cx.editor.bench.take() {
+            let report = bench.report();
+            eprintln!("{report}");
+            cx.editor
+                .set_status("Bench cancelled. Report printed to stderr.");
+        }
+        return Ok(());
+    }
+
+    // Generate synthetic content if the buffer is small
+    {
+        let (view_id, doc) = helix_view::focused!(cx.editor);
+        if doc.text().len_lines() < 100 {
+            let content = generate_bench_content(seed, 5000);
+            let sel = doc.selection(view_id).clone();
+            let text_len = doc.text().len_chars();
+            let trans = helix_core::Transaction::change_by_selection(doc.text(), &sel, |_| {
+                (0, text_len, Some(content.clone().into()))
+            });
+            doc.apply(&trans, view_id);
+        }
+    }
+
+    let duration = std::time::Duration::from_secs(duration_secs);
+    let bench = BenchState::new(seed, duration);
+    let log_msg = bench
+        .log_path
+        .as_ref()
+        .map(|p| format!(" Log: {}", p.display()))
+        .unwrap_or_default();
+    cx.editor.bench = Some(bench);
+    cx.editor.set_status(format!(
+        "Bench started: {duration_secs}s, seed={seed}. Ctrl+C or :bench to stop.{log_msg}"
+    ));
 
     Ok(())
 }
@@ -5224,6 +5324,18 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         completer: CommandCompleter::none(),
         signature: Signature {
             positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    #[cfg(feature = "bench-profile")]
+    TypableCommand {
+        name: "bench",
+        aliases: &["stress-test"],
+        doc: "Run a stress test for [duration_secs] with [seed]. Toggles if already running.",
+        fun: bench,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(2)),
             ..Signature::DEFAULT
         },
     },

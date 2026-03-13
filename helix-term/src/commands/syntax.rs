@@ -151,7 +151,7 @@ fn tags_iter<'a>(
 }
 
 pub fn syntax_symbol_picker(cx: &mut Context) {
-    let doc = doc!(cx.editor);
+    let (_, doc) = focused_ref!(cx.editor);
     let Some(syntax) = doc.syntax() else {
         cx.editor
             .set_error("Syntax tree is not available on this buffer");
@@ -207,7 +207,7 @@ pub fn syntax_workspace_symbol_picker(cx: &mut Context) {
 
     // Search from the workspace that the currently focused document is within. This behaves like global
     // search most of the time but helps when you have two projects open in splits.
-    let search_root = if let Some(path) = doc!(cx.editor).path() {
+    let search_root = if let Some(path) = focused_ref!(cx.editor).1.path() {
         helix_loader::find_workspace_in(path).0
     } else {
         helix_loader::find_workspace().0

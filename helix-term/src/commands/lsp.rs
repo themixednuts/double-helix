@@ -12,7 +12,8 @@ use helix_lsp::{
 use tokio_stream::StreamExt;
 use tui::{text::Span, widgets::Row};
 
-use super::{align_view, push_jump, Align, Context, Editor};
+use super::{align_view, Align, Context, Editor};
+use helix_view::view::push_jump;
 
 use helix_core::{
     diagnostic::DiagnosticProvider, syntax::config::LanguageServerFeature,
@@ -115,7 +116,8 @@ fn location_to_file_location(location: &Location) -> Option<FileLocation<'_>> {
 }
 
 fn jump_to_location(editor: &mut Editor, location: &Location, action: Action) {
-    let (view, doc) = current!(editor);
+    let (view_id, doc) = focused!(editor);
+    let view = view_mut!(editor, view_id);
     push_jump(view, doc);
 
     let Some(path) = location.uri.as_path() else {
@@ -316,9 +318,10 @@ fn diag_picker(
         styles,
         move |cx, diag, action| {
             jump_to_location(cx.editor, &diag.location, action);
-            let (view, doc) = current!(cx.editor);
+            let (view_id, doc) = focused!(cx.editor);
+            let view = view_mut!(cx.editor, view_id);
             view.diagnostics_handler
-                .immediately_show_diagnostic(doc, view.id);
+                .immediately_show_diagnostic(doc, view_id);
         },
     )
     .with_preview(move |_editor, diag| location_to_file_location(&diag.location))
@@ -353,7 +356,7 @@ pub fn symbol_picker(cx: &mut Context) {
             nested_to_flat(list, file, uri, child, offset_encoding);
         }
     }
-    let doc = doc!(cx.editor);
+    let (_, doc) = focused_ref!(cx.editor);
 
     let mut seen_language_servers = HashSet::new();
 
@@ -477,7 +480,7 @@ pub fn symbol_picker(cx: &mut Context) {
 pub fn workspace_symbol_picker(cx: &mut Context) {
     use crate::ui::picker::Injector;
 
-    let doc = doc!(cx.editor);
+    let (_, doc) = focused_ref!(cx.editor);
     if doc
         .language_servers_with_feature(LanguageServerFeature::WorkspaceSymbols)
         .count()
@@ -489,7 +492,7 @@ pub fn workspace_symbol_picker(cx: &mut Context) {
     }
 
     let get_symbols = |pattern: &str, editor: &mut Editor, _data, injector: &Injector<_, _>| {
-        let doc = doc!(editor);
+        let (_, doc) = focused_ref!(editor);
         let mut seen_language_servers = HashSet::new();
         let mut futures: FuturesOrdered<_> = doc
             .language_servers_with_feature(LanguageServerFeature::WorkspaceSymbols)
@@ -613,7 +616,7 @@ pub fn workspace_symbol_picker(cx: &mut Context) {
 }
 
 pub fn diagnostics_picker(cx: &mut Context) {
-    let doc = doc!(cx.editor);
+    let (_, doc) = focused_ref!(cx.editor);
     if let Some(uri) = doc.uri() {
         let diagnostics = cx.editor.diagnostics.get(&uri).cloned().unwrap_or_default();
         let picker = diag_picker(cx, [(uri, diagnostics)], DiagnosticsFormat::HideSourcePath);
@@ -709,9 +712,9 @@ pub fn code_action_picker(cx: &mut Context) {
 }
 
 pub fn code_action_inner(cx: &mut Context, use_picker: bool) {
-    let (view, doc) = current!(cx.editor);
+    let (view_id, doc) = focused!(cx.editor);
 
-    let selection_range = doc.selection(view.id).primary();
+    let selection_range = doc.selection(view_id).primary();
 
     let mut seen_language_servers = HashSet::new();
 
@@ -997,12 +1000,12 @@ where
     P: Fn(&Client, lsp::Position, lsp::TextDocumentIdentifier) -> Option<F>,
     F: Future<Output = helix_lsp::Result<Option<lsp::GotoDefinitionResponse>>> + 'static + Send,
 {
-    let (view, doc) = current_ref!(cx.editor);
+    let (view_id, doc) = focused_ref!(cx.editor);
     let mut futures: FuturesOrdered<_> = doc
         .language_servers_with_feature(feature)
         .map(|language_server| {
             let offset_encoding = language_server.offset_encoding();
-            let pos = doc.position(view.id, offset_encoding);
+            let pos = doc.position(view_id, offset_encoding);
             let future = request_provider(language_server, pos, doc.identifier()).unwrap();
             async move { anyhow::Ok((future.await?, offset_encoding)) }
         })
@@ -1092,13 +1095,13 @@ pub fn goto_implementation(cx: &mut Context) {
 
 pub fn goto_reference(cx: &mut Context) {
     let config = cx.editor.config();
-    let (view, doc) = current_ref!(cx.editor);
+    let (view_id, doc) = focused_ref!(cx.editor);
 
     let mut futures: FuturesOrdered<_> = doc
         .language_servers_with_feature(LanguageServerFeature::GotoReference)
         .map(|language_server| {
             let offset_encoding = language_server.offset_encoding();
-            let pos = doc.position(view.id, offset_encoding);
+            let pos = doc.position(view_id, offset_encoding);
             let future = language_server
                 .goto_reference(
                     doc.identifier(),
@@ -1149,7 +1152,7 @@ enum HoverDisplay {
 fn hover_impl(cx: &mut Context, hover_action: HoverDisplay) {
     use ui::lsp::hover::Hover;
 
-    let (view, doc) = current!(cx.editor);
+    let (view_id, doc) = focused!(cx.editor);
     if doc
         .language_servers_with_feature(LanguageServerFeature::Hover)
         .count()
@@ -1167,7 +1170,7 @@ fn hover_impl(cx: &mut Context, hover_action: HoverDisplay) {
         .map(|language_server| {
             let server_name = language_server.name().to_string();
             // TODO: factor out a doc.position_identifier() that returns lsp::TextDocumentPositionIdentifier
-            let pos = doc.position(view.id, language_server.offset_encoding());
+            let pos = doc.position(view_id, language_server.offset_encoding());
             let request = language_server
                 .text_document_hover(doc.identifier(), pos, None)
                 .unwrap();
@@ -1210,7 +1213,7 @@ fn hover_impl(cx: &mut Context, hover_action: HoverDisplay) {
                             Arc::clone(&editor.syn_loader),
                         ),
                     );
-                    let hover_doc = doc_mut!(editor);
+                    let (_, hover_doc) = focused!(editor);
 
                     let _ = hover_doc
                         .set_language_by_language_id("markdown", &editor.syn_loader.load());
@@ -1231,9 +1234,9 @@ pub fn goto_hover(cx: &mut Context) {
 
 pub fn rename_symbol(cx: &mut Context) {
     fn get_prefill_from_word_boundary(editor: &Editor) -> String {
-        let (view, doc) = current_ref!(editor);
+        let (view_id, doc) = focused_ref!(editor);
         let text = doc.text().slice(..);
-        let primary_selection = doc.selection(view.id).primary();
+        let primary_selection = doc.selection(view_id).primary();
         if primary_selection.len() > 1 {
             primary_selection
         } else {
@@ -1251,7 +1254,7 @@ pub fn rename_symbol(cx: &mut Context) {
     ) -> Result<String, &'static str> {
         match response {
             Some(lsp::PrepareRenameResponse::Range(range)) => {
-                let text = doc!(editor).text();
+                let text = focused_ref!(editor).1.text();
 
                 Ok(lsp_range_to_range(text, range, offset_encoding)
                     .ok_or("lsp sent invalid selection range for rename")?
@@ -1284,7 +1287,7 @@ pub fn rename_symbol(cx: &mut Context) {
                         if event != PromptEvent::Validate {
                             return;
                         }
-                        let (view, doc) = current!(cx.editor);
+                        let (view_id, doc) = focused!(cx.editor);
 
                         let Some(language_server) = doc
                             .language_servers_with_feature(LanguageServerFeature::RenameSymbol)
@@ -1297,7 +1300,7 @@ pub fn rename_symbol(cx: &mut Context) {
                         };
 
                         let offset_encoding = language_server.offset_encoding();
-                        let pos = doc.position(view.id, offset_encoding);
+                        let pos = doc.position(view_id, offset_encoding);
                         let future = language_server
                             .rename_symbol(doc.identifier(), pos, input.to_string())
                             .unwrap();
@@ -1327,7 +1330,7 @@ pub fn rename_symbol(cx: &mut Context) {
                         if event != PromptEvent::Validate {
                             return;
                         }
-                        let (view, doc) = current!(cx.editor);
+                        let (view_id, doc) = focused!(cx.editor);
 
                         let Some(language_server) = doc
                             .language_servers_with_feature(LanguageServerFeature::RenameSymbol)
@@ -1340,7 +1343,7 @@ pub fn rename_symbol(cx: &mut Context) {
                         };
 
                         let offset_encoding = language_server.offset_encoding();
-                        let pos = doc.position(view.id, offset_encoding);
+                        let pos = doc.position(view_id, offset_encoding);
                         let future = language_server
                             .rename_symbol(doc.identifier(), pos, input.to_string())
                             .unwrap();
@@ -1363,7 +1366,7 @@ pub fn rename_symbol(cx: &mut Context) {
         }
     }
 
-    let (view, doc) = current_ref!(cx.editor);
+    let (view_id, doc) = focused_ref!(cx.editor);
     let history_register = cx.register;
 
     if doc
@@ -1391,7 +1394,7 @@ pub fn rename_symbol(cx: &mut Context) {
     if let Some(language_server) = language_server_with_prepare_rename_support {
         let ls_id = language_server.id();
         let offset_encoding = language_server.offset_encoding();
-        let pos = doc.position(view.id, offset_encoding);
+        let pos = doc.position(view_id, offset_encoding);
         let future = language_server
             .prepare_rename(doc.identifier(), pos)
             .unwrap();
@@ -1420,11 +1423,11 @@ pub fn rename_symbol(cx: &mut Context) {
 }
 
 pub fn select_references_to_symbol_under_cursor(cx: &mut Context) {
-    let (view, doc) = current!(cx.editor);
+    let (view_id, doc) = focused!(cx.editor);
     let language_server =
         language_server_with_feature!(cx.editor, doc, LanguageServerFeature::DocumentHighlight);
     let offset_encoding = language_server.offset_encoding();
-    let pos = doc.position(view.id, offset_encoding);
+    let pos = doc.position(view_id, offset_encoding);
     let future = language_server
         .text_document_document_highlight(doc.identifier(), pos, None)
         .unwrap();
@@ -1436,9 +1439,9 @@ pub fn select_references_to_symbol_under_cursor(cx: &mut Context) {
                 Some(highlights) if !highlights.is_empty() => highlights,
                 _ => return,
             };
-            let (view, doc) = current!(editor);
+            let (view_id, doc) = focused!(editor);
             let text = doc.text();
-            let pos = doc.selection(view.id).primary().cursor(text.slice(..));
+            let pos = doc.selection(view_id).primary().cursor(text.slice(..));
 
             // We must find the range that contains our primary cursor to prevent our primary cursor to move
             let mut primary_index = 0;
@@ -1454,7 +1457,7 @@ pub fn select_references_to_symbol_under_cursor(cx: &mut Context) {
                 })
                 .collect();
             let selection = Selection::new(ranges, primary_index);
-            doc.set_selection(view.id, selection);
+            doc.set_selection(view_id, selection);
         },
     );
 }
@@ -1508,7 +1511,7 @@ fn compute_inlay_hints_for_view(
         last_line,
     };
     // Don't recompute the annotations in case nothing has changed about the view
-    if !doc.inlay_hints_oudated
+    if !doc.inlay_hints_outdated()
         && doc
             .inlay_hints(view_id)
             .is_some_and(|dih| dih.id == new_doc_inlay_hints_id)
@@ -1550,7 +1553,7 @@ fn compute_inlay_hints_for_view(
                         view_id,
                         DocumentInlayHints::empty_with_id(new_doc_inlay_hints_id),
                     );
-                    doc.inlay_hints_oudated = false;
+                    doc.clear_inlay_hints_outdated();
                     return;
                 }
             };
@@ -1641,7 +1644,7 @@ fn compute_inlay_hints_for_view(
                     padding_after_inlay_hints,
                 },
             );
-            doc.inlay_hints_oudated = false;
+            doc.clear_inlay_hints_outdated();
         },
     );
 

@@ -78,10 +78,10 @@ fn thread_picker(
 }
 
 fn get_breakpoint_at_current_line(editor: &mut Editor) -> Option<(usize, Breakpoint)> {
-    let (view, doc) = current!(editor);
+    let (view_id, doc) = focused!(editor);
     let text = doc.text().slice(..);
 
-    let line = doc.selection(view.id).primary().cursor_line(text);
+    let line = doc.selection(view_id).primary().cursor_line(text);
     let path = doc.path()?;
     editor.breakpoints.get(path).and_then(|breakpoints| {
         let i = breakpoints.iter().position(|b| b.line == line);
@@ -119,7 +119,7 @@ pub fn dap_start_impl(
     socket: Option<std::net::SocketAddr>,
     params: Option<Vec<std::borrow::Cow<str>>>,
 ) -> Result<(), anyhow::Error> {
-    let doc = doc!(cx.editor);
+    let (_, doc) = focused_ref!(cx.editor);
     let config = doc
         .language_config()
         .and_then(|config| config.debugger.as_ref())
@@ -238,7 +238,7 @@ pub fn dap_launch(cx: &mut Context) {
         return;
     }
 
-    let doc = doc!(cx.editor);
+    let (_, doc) = focused_ref!(cx.editor);
 
     let config = match doc
         .language_config()
@@ -388,7 +388,7 @@ fn debug_parameter_prompt(
 }
 
 pub fn dap_toggle_breakpoint(cx: &mut Context) {
-    let (view, doc) = current!(cx.editor);
+    let (view_id, doc) = focused!(cx.editor);
     let path = match doc.path() {
         Some(path) => path.clone(),
         None => {
@@ -398,7 +398,7 @@ pub fn dap_toggle_breakpoint(cx: &mut Context) {
         }
     };
     let text = doc.text().slice(..);
-    let line = doc.selection(view.id).primary().cursor_line(text);
+    let line = doc.selection(view_id).primary().cursor_line(text);
     dap_toggle_breakpoint_impl(cx, path, line);
 }
 
@@ -644,7 +644,7 @@ pub fn dap_disable_exceptions(cx: &mut Context) {
 // TODO: both edit condition and edit log need to be stable: we might get new breakpoints from the debugger which can change offsets
 pub fn dap_edit_condition(cx: &mut Context) {
     if let Some((pos, breakpoint)) = get_breakpoint_at_current_line(cx.editor) {
-        let path = match doc!(cx.editor).path() {
+        let path = match focused_ref!(cx.editor).1.path() {
             Some(path) => path.clone(),
             None => return,
         };
@@ -686,7 +686,7 @@ pub fn dap_edit_condition(cx: &mut Context) {
 
 pub fn dap_edit_log(cx: &mut Context) {
     if let Some((pos, breakpoint)) = get_breakpoint_at_current_line(cx.editor) {
-        let path = match doc!(cx.editor).path() {
+        let path = match focused_ref!(cx.editor).1.path() {
             Some(path) => path.clone(),
             None => return,
         };

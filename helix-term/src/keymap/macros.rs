@@ -80,7 +80,10 @@ macro_rules! alt {
 #[macro_export]
 macro_rules! keymap {
     (@trie $cmd:ident) => {
-        $crate::keymap::KeyTrie::MappableCommand($crate::commands::MappableCommand::$cmd)
+        $crate::keymap::KeyTrie::MappableCommand(
+            $crate::commands::MappableCommand::named(stringify!($cmd))
+                .expect("named keymap command must exist")
+        )
     };
 
     (@trie $cmd:literal) => {
@@ -93,8 +96,33 @@ macro_rules! keymap {
         keymap!({ $label $(sticky=$sticky)? $(fallback=$fallback)? $($($key)|+ => $value,)+ })
     };
 
+    // Fallback-only node (no child key bindings)
+    (@trie
+        { $label:literal fallback=$fallback:ident }
+    ) => {
+        keymap!({ $label fallback=$fallback })
+    };
+
     (@trie [$($cmd:ident),* $(,)?]) => {
-        $crate::keymap::KeyTrie::Sequence(vec![$($crate::commands::MappableCommand::$cmd),*])
+        $crate::keymap::KeyTrie::Sequence(vec![
+            $(
+                $crate::commands::MappableCommand::named(stringify!($cmd))
+                    .expect("named keymap command must exist")
+            ),*
+        ])
+    };
+
+    // Fallback-only node (no child key bindings)
+    (
+        { $label:literal fallback=$fallback:ident }
+    ) => {
+        {
+            let _map = ::std::collections::HashMap::new();
+            let _order = ::std::vec::Vec::new();
+            let mut _node = $crate::keymap::KeyTrieNode::new($label, _map, _order);
+            _node.fallback = Some($crate::commands::CharPendingBinding::$fallback);
+            $crate::keymap::KeyTrie::Node(_node)
+        }
     };
 
     (
@@ -117,7 +145,7 @@ macro_rules! keymap {
                 )+
             )*
             let mut _node = $crate::keymap::KeyTrieNode::new($label, _map, _order);
-            $( _node.fallback = Some($crate::commands::FallbackCommand::$fallback); )?
+            $( _node.fallback = Some($crate::commands::CharPendingBinding::$fallback); )?
             $( _node.is_sticky = $sticky; )?
             $crate::keymap::KeyTrie::Node(_node)
         }

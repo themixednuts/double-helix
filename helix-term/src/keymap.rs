@@ -1,13 +1,19 @@
 pub mod default;
 pub mod macros;
 
-use crate::commands::FallbackCommand;
 pub use crate::commands::MappableCommand;
 use arc_swap::{
     access::{DynAccess, DynGuard},
     ArcSwap,
 };
-use helix_view::{document::Mode, info::Info, input::KeyEvent};
+use helix_modal::registry::CommandScope;
+use helix_view::{
+    document::Mode,
+    engine::{CharPendingBinding, KeymapLookup},
+    info::Info,
+    input::KeyEvent,
+    keymap::{ModalCommandBinding, ModalKeyTrie, ModalKeyTrieNode},
+};
 use serde::Deserialize;
 use std::{
     borrow::Cow,
@@ -26,7 +32,7 @@ pub struct KeyTrieNode {
     map: HashMap<KeyEvent, KeyTrie>,
     order: Vec<KeyEvent>,
     is_sticky: bool,
-    fallback: Option<FallbackCommand>,
+    fallback: Option<CharPendingBinding>,
 }
 
 impl<'de> Deserialize<'de> for KeyTrieNode {
@@ -274,7 +280,7 @@ impl KeyTrie {
         Some(trie)
     }
 
-    pub fn search_fallback(&self, keys: &[KeyEvent]) -> Option<&FallbackCommand> {
+    pub fn search_fallback(&self, keys: &[KeyEvent]) -> Option<&CharPendingBinding> {
         // TODO: this is copied from above, hacky
         let mut trie = self;
         let mut keys = keys.iter().peekable();
@@ -309,14 +315,14 @@ pub enum KeymapResult {
     /// Key is invalid in combination with previous keys. Contains keys leading upto
     /// and including current (invalid) key.
     Cancelled(Vec<KeyEvent>),
-    Fallback(FallbackCommand, char),
+    Fallback(helix_view::engine::CharPendingId, char),
 }
 
 /// A map of command names to keybinds that will execute the command.
 pub type ReverseKeymap = HashMap<String, Vec<Vec<KeyEvent>>>;
 
 pub struct Keymaps {
-    pub map: Box<dyn DynAccess<HashMap<Mode, KeyTrie>>>,
+    pub map: Box<dyn DynAccess<HashMap<Mode, KeyTrie>> + Send + Sync>,
     /// Stores pending keys waiting for the next key. This is relative to a
     /// sticky node if one is in use.
     state: Vec<KeyEvent>,
@@ -325,7 +331,7 @@ pub struct Keymaps {
 }
 
 impl Keymaps {
-    pub fn new(map: Box<dyn DynAccess<HashMap<Mode, KeyTrie>>>) -> Self {
+    pub fn new(map: Box<dyn DynAccess<HashMap<Mode, KeyTrie>> + Send + Sync>) -> Self {
         Self {
             map,
             state: Vec::new(),
@@ -342,10 +348,6 @@ impl Keymaps {
         &self.state
     }
 
-    pub fn sticky(&self) -> Option<&KeyTrieNode> {
-        self.sticky.as_ref()
-    }
-
     pub fn contains_key(&self, mode: Mode, key: KeyEvent) -> bool {
         let keymaps = &*self.map();
         let keymap = &keymaps[&mode];
@@ -359,69 +361,253 @@ impl Keymaps {
     /// key cancels pending keystrokes. If there are no pending keystrokes but a
     /// sticky node is in use, it will be cleared.
     pub fn get(&mut self, mode: Mode, key: KeyEvent) -> KeymapResult {
-        // TODO: remove the sticky part and look up manually
         let keymaps = &*self.map();
         let keymap = &keymaps[&mode];
-
-        if key!(Esc) == key {
-            if !self.state.is_empty() {
-                // Note that Esc is not included here
-                return KeymapResult::Cancelled(self.state.drain(..).collect());
-            }
-            self.sticky = None;
-        }
-
-        let first = self.state.first().unwrap_or(&key);
-        let trie_node = match self.sticky {
-            Some(ref trie) => Cow::Owned(KeyTrie::Node(trie.clone())),
-            None => Cow::Borrowed(keymap),
-        };
-
-        let trie = match trie_node.search(&[*first]) {
-            Some(KeyTrie::MappableCommand(ref cmd)) => {
-                return KeymapResult::Matched(cmd.clone());
-            }
-            Some(KeyTrie::Sequence(ref cmds)) => {
-                return KeymapResult::MatchedSequence(cmds.clone());
-            }
-            None => return KeymapResult::NotFound,
-            Some(t) => t,
-        };
-
-        self.state.push(key);
-        match trie.search(&self.state[1..]) {
-            Some(KeyTrie::Node(map)) => {
-                if map.is_sticky {
-                    self.state.clear();
-                    self.sticky = Some(map.clone());
-                }
-                KeymapResult::Pending(map.clone())
-            }
-            Some(KeyTrie::MappableCommand(cmd)) => {
-                self.state.clear();
-                KeymapResult::Matched(cmd.clone())
-            }
-            Some(KeyTrie::Sequence(cmds)) => {
-                self.state.clear();
-                KeymapResult::MatchedSequence(cmds.clone())
-            }
-            None => {
-                if let Some(ch) = key.char() {
-                    if let Some(fallback) = trie.search_fallback(&self.state[1..]) {
-                        self.state.clear();
-                        return KeymapResult::Fallback(fallback.clone(), ch);
-                    }
-                }
-
-                KeymapResult::Cancelled(self.state.drain(..).collect())
-            }
-        }
+        lookup_keymap(keymap, &mut self.state, &mut self.sticky, key)
     }
 }
 
 impl Default for Keymaps {
     fn default() -> Self {
         Self::new(Box::new(ArcSwap::new(Arc::new(default()))))
+    }
+}
+
+fn lookup_keymap(
+    keymap: &KeyTrie,
+    state: &mut Vec<KeyEvent>,
+    sticky: &mut Option<KeyTrieNode>,
+    key: KeyEvent,
+) -> KeymapResult {
+    if key!(Esc) == key {
+        if !state.is_empty() {
+            return KeymapResult::Cancelled(std::mem::take(state));
+        }
+        *sticky = None;
+    }
+
+    let first = state.first().unwrap_or(&key);
+    let trie_node = match sticky.as_ref() {
+        Some(trie) => Cow::Owned(KeyTrie::Node(trie.clone())),
+        None => Cow::Borrowed(keymap),
+    };
+
+    let trie = match trie_node.search(&[*first]) {
+        Some(KeyTrie::MappableCommand(cmd)) => return KeymapResult::Matched(cmd.clone()),
+        Some(KeyTrie::Sequence(cmds)) => return KeymapResult::MatchedSequence(cmds.clone()),
+        None => return KeymapResult::NotFound,
+        Some(trie) => trie,
+    };
+
+    state.push(key);
+    match trie.search(&state[1..]) {
+        Some(KeyTrie::Node(map)) => {
+            if map.is_sticky {
+                state.clear();
+                *sticky = Some(map.clone());
+            }
+            KeymapResult::Pending(map.clone())
+        }
+        Some(KeyTrie::MappableCommand(cmd)) => {
+            state.clear();
+            KeymapResult::Matched(cmd.clone())
+        }
+        Some(KeyTrie::Sequence(cmds)) => {
+            state.clear();
+            KeymapResult::MatchedSequence(cmds.clone())
+        }
+        None => {
+            if let Some(ch) = key.char() {
+                if let Some(fallback) = trie.search_fallback(&state[1..]) {
+                    state.clear();
+                    return KeymapResult::Fallback(fallback.id(), ch);
+                }
+            }
+
+            KeymapResult::Cancelled(std::mem::take(state))
+        }
+    }
+}
+
+fn keytrie_is_frontend(trie: KeyTrie) -> bool {
+    match trie {
+        KeyTrie::MappableCommand(cmd) => is_frontend_command(&cmd),
+        KeyTrie::Sequence(cmds) => cmds.iter().all(is_frontend_command),
+        KeyTrie::Node(node) => {
+            node.values()
+                .all(|child| keytrie_is_frontend(child.clone()))
+                && node.fallback.is_none()
+        }
+    }
+}
+
+pub fn is_frontend_result(result: &KeymapResult) -> bool {
+    match result {
+        KeymapResult::Pending(node) => keytrie_is_frontend(KeyTrie::Node(node.clone())),
+        KeymapResult::Matched(cmd) => is_frontend_command(cmd),
+        KeymapResult::MatchedSequence(cmds) => cmds.iter().all(is_frontend_command),
+        KeymapResult::NotFound | KeymapResult::Cancelled(_) | KeymapResult::Fallback(_, _) => false,
+    }
+}
+
+pub fn is_frontend_command(cmd: &MappableCommand) -> bool {
+    cmd.scope() == CommandScope::Frontend
+}
+
+pub fn to_component_modal_keymaps(map: &HashMap<Mode, KeyTrie>) -> HashMap<Mode, ModalKeyTrie> {
+    map.iter()
+        .filter_map(|(&mode, trie)| to_component_modal_trie(trie).map(|trie| (mode, trie)))
+        .collect()
+}
+
+fn to_component_modal_trie(trie: &KeyTrie) -> Option<ModalKeyTrie> {
+    match trie {
+        KeyTrie::MappableCommand(cmd @ MappableCommand::Engine { spec })
+            if cmd.supports_component_region() =>
+        {
+            Some(ModalKeyTrie::Command(ModalCommandBinding::new(
+                spec.token(),
+                spec.doc(),
+            )))
+        }
+        KeyTrie::MappableCommand(
+            MappableCommand::Engine { .. }
+            | MappableCommand::Frontend { .. }
+            | MappableCommand::Typable { .. }
+            | MappableCommand::Macro { .. },
+        ) => None,
+        KeyTrie::Sequence(cmds) => {
+            let commands = cmds
+                .iter()
+                .filter(|cmd| cmd.supports_component_region())
+                .filter_map(|cmd| match cmd {
+                    MappableCommand::Engine { spec } => {
+                        Some(ModalCommandBinding::new(spec.token(), spec.doc()))
+                    }
+                    MappableCommand::Frontend { .. }
+                    | MappableCommand::Typable { .. }
+                    | MappableCommand::Macro { .. } => None,
+                })
+                .collect::<Vec<_>>();
+            if commands.is_empty() {
+                None
+            } else {
+                Some(ModalKeyTrie::Sequence(commands.into_boxed_slice()))
+            }
+        }
+        KeyTrie::Node(node) => {
+            let map = node
+                .iter()
+                .filter_map(|(&key, trie)| to_component_modal_trie(trie).map(|trie| (key, trie)))
+                .collect::<HashMap<_, _>>();
+            if map.is_empty() && node.fallback.is_none() {
+                return None;
+            }
+
+            let mut modal = ModalKeyTrieNode::new(&node.name, map, node.order.clone());
+            modal.is_sticky = node.is_sticky;
+            modal.fallback = node.fallback;
+            Some(ModalKeyTrie::Node(modal))
+        }
+    }
+}
+
+pub fn to_modal_keymaps(map: &HashMap<Mode, KeyTrie>) -> HashMap<Mode, ModalKeyTrie> {
+    map.iter()
+        .filter_map(|(&mode, trie)| to_modal_trie(trie).map(|trie| (mode, trie)))
+        .collect()
+}
+
+fn to_modal_trie(trie: &KeyTrie) -> Option<ModalKeyTrie> {
+    match trie {
+        KeyTrie::MappableCommand(MappableCommand::Engine { spec }) => Some(ModalKeyTrie::Command(
+            ModalCommandBinding::new(spec.token(), spec.doc()),
+        )),
+        KeyTrie::MappableCommand(
+            MappableCommand::Frontend { .. }
+            | MappableCommand::Typable { .. }
+            | MappableCommand::Macro { .. },
+        ) => None,
+        KeyTrie::Sequence(cmds) => {
+            let commands = cmds
+                .iter()
+                .filter_map(|cmd| match cmd {
+                    MappableCommand::Engine { spec } => {
+                        Some(ModalCommandBinding::new(spec.token(), spec.doc()))
+                    }
+                    MappableCommand::Frontend { .. }
+                    | MappableCommand::Typable { .. }
+                    | MappableCommand::Macro { .. } => None,
+                })
+                .collect::<Vec<_>>();
+            if commands.is_empty() {
+                None
+            } else {
+                Some(ModalKeyTrie::Sequence(commands.into_boxed_slice()))
+            }
+        }
+        KeyTrie::Node(node) => {
+            let map = node
+                .iter()
+                .filter_map(|(&key, trie)| to_modal_trie(trie).map(|trie| (key, trie)))
+                .collect::<HashMap<_, _>>();
+            if map.is_empty() && node.fallback.is_none() {
+                return None;
+            }
+
+            let mut modal = ModalKeyTrieNode::new(&node.name, map, node.order.clone());
+            modal.is_sticky = node.is_sticky;
+            modal.fallback = node.fallback;
+            Some(ModalKeyTrie::Node(modal))
+        }
+    }
+}
+
+/// Convert a frontend `KeymapResult` into an engine `KeymapLookup`.
+///
+/// Engine commands are resolved via `modal_command()` on `MappableCommand`.
+/// Frontend-only commands (those returning `None` from `modal_command()`)
+/// result in `NotFound` since the engine can't execute them.
+pub fn resolve_keymap_result(result: &KeymapResult) -> KeymapLookup {
+    match result {
+        KeymapResult::Matched(cmd) => match cmd.modal_command() {
+            Some(token) => KeymapLookup::Matched(token),
+            None => KeymapLookup::NotFound, // frontend-only command
+        },
+        KeymapResult::MatchedSequence(cmds) => {
+            let tokens: Vec<_> = cmds.iter().filter_map(|c| c.modal_command()).collect();
+            if tokens.is_empty() {
+                KeymapLookup::NotFound
+            } else {
+                KeymapLookup::MatchedSequence(tokens.into_boxed_slice())
+            }
+        }
+        KeymapResult::Pending(node) => KeymapLookup::Pending(Some(node.infobox())),
+        KeymapResult::NotFound => KeymapLookup::NotFound,
+        KeymapResult::Cancelled(keys) => KeymapLookup::Cancelled(keys.clone().into_boxed_slice()),
+        KeymapResult::Fallback(fallback, ch) => KeymapLookup::Fallback(*fallback, *ch),
+    }
+}
+
+impl helix_view::engine::KeymapQuery for Keymaps {
+    fn contains_key(&self, mode: Mode, key: KeyEvent) -> bool {
+        Keymaps::contains_key(self, mode, key)
+    }
+
+    fn pending(&self) -> &[KeyEvent] {
+        Keymaps::pending(self)
+    }
+
+    fn has_sticky(&self) -> bool {
+        self.sticky.is_some()
+    }
+
+    fn sticky_infobox(&self) -> Option<Info> {
+        self.sticky.as_ref().map(|node| node.infobox())
+    }
+
+    fn clear_sticky(&mut self) {
+        self.sticky = None;
     }
 }
 
@@ -440,8 +626,100 @@ pub fn merge_keys(dst: &mut HashMap<Mode, KeyTrie>, mut delta: HashMap<Mode, Key
 mod tests {
     use super::macros::keymap;
     use super::*;
-    use arc_swap::access::Constant;
-    use helix_core::hashmap;
+    use arc_swap::{access::Constant, ArcSwap};
+    use helix_core::{hashmap, Selection, Transaction};
+    use helix_view::{
+        document::Mode,
+        edit_region::EditRegion,
+        engine::{EditingEngine, EditingEngineFactory, EngineResult},
+        graphics::Rect,
+        handlers::Handlers,
+        theme,
+        traits::{Bounded, Focusable, Modal},
+        Editor,
+    };
+    use std::sync::Arc;
+
+    fn named_command(name: &str) -> MappableCommand {
+        MappableCommand::named(name).expect("named command must exist")
+    }
+
+    struct TestModalEngineFactory {
+        registry: Arc<helix_modal::registry::CommandRegistry>,
+    }
+
+    impl EditingEngineFactory for TestModalEngineFactory {
+        fn create(
+            &self,
+            config: helix_view::editor::EditingEngineConfig,
+        ) -> Box<dyn EditingEngine> {
+            match config {
+                helix_view::editor::EditingEngineConfig::Helix => {
+                    Box::new(helix_modal::helix::HelixEngine::new(self.registry.clone()))
+                }
+                helix_view::editor::EditingEngineConfig::Vim => {
+                    Box::new(helix_modal::vim::VimEngine::new(self.registry.clone()))
+                }
+            }
+        }
+    }
+
+    fn test_editor() -> Editor {
+        let theme_loader = theme::Loader::new(helix_loader::runtime_dirs());
+        let syn_loader = helix_core::config::default_lang_loader();
+        let config = helix_view::editor::Config::default();
+        let config = Arc::new(ArcSwap::from_pointee(config));
+        let handlers = Handlers::dummy();
+        let mut editor = Editor::new(
+            Rect::new(0, 0, 80, 24),
+            Arc::new(theme_loader),
+            Arc::new(ArcSwap::from_pointee(syn_loader)),
+            Arc::new(arc_swap::access::Map::new(
+                config,
+                |c: &helix_view::editor::Config| c,
+            )),
+            handlers,
+        );
+        editor.modal_keymaps = Some(Arc::new(ArcSwap::from_pointee(to_component_modal_keymaps(
+            &default(),
+        ))));
+        editor.engine_factory = Some(Arc::new(TestModalEngineFactory {
+            registry: Arc::new(helix_modal::populate::build_registry()),
+        }));
+        editor
+    }
+
+    fn test_edit_region() -> (Editor, EditRegion) {
+        let mut editor = test_editor();
+        let mut region = EditRegion::default();
+        region.set_area(Rect::new(0, 0, 40, 5));
+        region.set_focused(true);
+        region.ensure_init(&mut editor);
+        (editor, region)
+    }
+
+    fn set_region_text(region: &EditRegion, editor: &mut Editor, text: &str) {
+        let view_id = region.view_id();
+        let doc = region.document_mut(editor).expect("component document");
+        doc.set_selection(view_id, Selection::point(0));
+        let transaction = Transaction::change(
+            doc.text(),
+            [(0, doc.text().len_chars(), Some(text.into()))].into_iter(),
+        );
+        doc.apply(&transaction, view_id);
+    }
+
+    fn set_region_cursor(region: &EditRegion, editor: &mut Editor, pos: usize) {
+        let doc = region.document_mut(editor).expect("component document");
+        doc.set_selection(region.view_id(), Selection::point(pos));
+    }
+
+    fn region_cursor(region: &EditRegion, editor: &Editor) -> usize {
+        let doc = region.document(editor).expect("component document");
+        doc.selection(region.view_id())
+            .primary()
+            .cursor(doc.text().slice(..))
+    }
 
     #[test]
     #[should_panic]
@@ -478,18 +756,18 @@ mod tests {
         let mut keymap = Keymaps::new(Box::new(Constant(merged_keyamp.clone())));
         assert_eq!(
             keymap.get(Mode::Normal, key!('i')),
-            KeymapResult::Matched(MappableCommand::normal_mode),
+            KeymapResult::Matched(named_command("normal_mode")),
             "Leaf should replace leaf"
         );
         assert_eq!(
             keymap.get(Mode::Normal, key!('无')),
-            KeymapResult::Matched(MappableCommand::insert_mode),
+            KeymapResult::Matched(named_command("insert_mode")),
             "New leaf should be present in merged keymap"
         );
         // Assumes that z is a node in the default keymap
         assert_eq!(
             keymap.get(Mode::Normal, key!('z')),
-            KeymapResult::Matched(MappableCommand::jump_backward),
+            KeymapResult::Matched(named_command("jump_backward")),
             "Leaf should replace node"
         );
 
@@ -497,19 +775,19 @@ mod tests {
         // Assumes that `g` is a node in default keymap
         assert_eq!(
             keymap.search(&[key!('g'), key!('$')]).unwrap(),
-            &KeyTrie::MappableCommand(MappableCommand::goto_line_end),
+            &KeyTrie::MappableCommand(named_command("goto_line_end")),
             "Leaf should be present in merged subnode"
         );
         // Assumes that `gg` is in default keymap
         assert_eq!(
             keymap.search(&[key!('g'), key!('g')]).unwrap(),
-            &KeyTrie::MappableCommand(MappableCommand::delete_char_forward),
+            &KeyTrie::MappableCommand(named_command("delete_char_forward")),
             "Leaf should replace old leaf in merged subnode"
         );
         // Assumes that `ge` is in default keymap
         assert_eq!(
             keymap.search(&[key!('g'), key!('e')]).unwrap(),
-            &KeyTrie::MappableCommand(MappableCommand::goto_last_line),
+            &KeyTrie::MappableCommand(named_command("goto_last_line")),
             "Old leaves in subnode should be present in merged node"
         );
 
@@ -547,7 +825,7 @@ mod tests {
         // Make sure mapping works
         assert_eq!(
             keymap.search(&[key!(' '), key!('s'), key!('v')]).unwrap(),
-            &KeyTrie::MappableCommand(MappableCommand::vsplit),
+            &KeyTrie::MappableCommand(named_command("vsplit")),
             "Leaf should be present in merged subnode"
         );
         // Make sure an order was set during merge
@@ -633,7 +911,7 @@ mod tests {
             "",
             hashmap! {
                 key => KeyTrie::Sequence(vec!{
-                    MappableCommand::select_all,
+                    named_command("select_all"),
                     MappableCommand::Typable {
                         name: "pipe".to_string(),
                         args: "sed -E 's/\\s+$//g'".to_string(),
@@ -645,5 +923,160 @@ mod tests {
         ));
 
         assert_eq!(toml::from_str(keys), Ok(expectation));
+    }
+
+    #[test]
+    fn gw_dispatch_routes_to_frontend() {
+        // Verify that `gw` (goto_word) correctly routes through dispatch:
+        // 1. `g` → Pending (mixed subtree, not all frontend) → engine path
+        // 2. `w` → Matched(goto_word) which IS frontend → frontend path
+        let mut keymaps = Keymaps::default();
+
+        // First key: `g`
+        let g_result = keymaps.get(Mode::Normal, key!('g'));
+        assert!(
+            matches!(g_result, KeymapResult::Pending(_)),
+            "g should be Pending, got {g_result:?}"
+        );
+        // `g` subtree is mixed (engine + frontend), so is_frontend_result should be false
+        assert!(
+            !is_frontend_result(&g_result),
+            "g subtree should NOT be all-frontend (it contains engine motions like move_line_up)"
+        );
+
+        // Second key: `w` (with `g` pending in keymap state)
+        let w_result = keymaps.get(Mode::Normal, key!('w'));
+        assert!(
+            matches!(w_result, KeymapResult::Matched(ref cmd) if cmd.name() == "goto_word"),
+            "gw should resolve to goto_word, got {w_result:?}"
+        );
+        // goto_word is a frontend command
+        assert!(
+            is_frontend_result(&w_result),
+            "goto_word should be a frontend command"
+        );
+    }
+
+    #[test]
+    fn component_modal_keymaps_keep_viewport_safe_commands() {
+        let modal = to_component_modal_keymaps(&default());
+        let normal = modal.get(&Mode::Normal).expect("normal mode modal keymap");
+        let insert = modal.get(&Mode::Insert).expect("insert mode modal keymap");
+
+        assert!(
+            normal.search(&[key!('u')]).is_some(),
+            "component modal keymaps should keep viewport-backed undo"
+        );
+        assert!(
+            normal
+                .search(&["pageup".parse::<KeyEvent>().unwrap()])
+                .is_some(),
+            "component modal keymaps should keep viewport-backed page movement"
+        );
+        assert!(
+            normal
+                .search(&["C-o".parse::<KeyEvent>().unwrap()])
+                .is_none(),
+            "component modal keymaps must not expose editor jumplist traversal"
+        );
+        assert!(
+            normal
+                .search(&["C-s".parse::<KeyEvent>().unwrap()])
+                .is_some(),
+            "component modal keymaps should keep viewport-backed save-selection jumps"
+        );
+        assert!(
+            normal.search(&["G".parse::<KeyEvent>().unwrap()]).is_some(),
+            "component modal keymaps should keep viewport-backed goto-line motions"
+        );
+        assert!(
+            normal
+                .search(&[
+                    "g".parse::<KeyEvent>().unwrap(),
+                    "|".parse::<KeyEvent>().unwrap(),
+                ])
+                .is_some(),
+            "component modal keymaps should keep viewport-backed goto-column motions"
+        );
+        assert!(
+            normal.search(&["%".parse::<KeyEvent>().unwrap()]).is_some(),
+            "component modal keymaps should keep viewport-backed bracket matching"
+        );
+        assert!(
+            insert
+                .search(&["backspace".parse::<KeyEvent>().unwrap()])
+                .is_some(),
+            "component modal keymaps should keep core insert-mode editing"
+        );
+        assert!(
+            insert
+                .search(&["left".parse::<KeyEvent>().unwrap()])
+                .is_some(),
+            "component modal keymaps should keep viewport-backed cursor motions"
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_region_dispatch_keeps_mode_local_to_component() {
+        let (mut editor, mut region) = test_edit_region();
+
+        let result = region
+            .dispatch_key(&mut editor, key!('v'))
+            .expect("component dispatch result");
+        assert!(matches!(result, EngineResult::Executed));
+        assert_eq!(editor.mode(), Mode::Normal);
+        assert_eq!(region.mode(), Mode::Select);
+    }
+
+    #[tokio::test]
+    async fn edit_region_dispatch_supports_counted_multi_key_file_start_motion() {
+        let (mut editor, mut region) = test_edit_region();
+        set_region_text(&region, &mut editor, "one\ntwo\nthree\n");
+
+        let line_three = {
+            let doc = region.document(&editor).expect("component document");
+            doc.text().line_to_char(2)
+        };
+        set_region_cursor(&region, &mut editor, line_three);
+
+        let first = region
+            .dispatch_key(&mut editor, key!('g'))
+            .expect("pending goto prefix");
+        let second = region
+            .dispatch_key(&mut editor, key!('g'))
+            .expect("goto file start");
+        assert!(matches!(first, EngineResult::Pending));
+        assert!(matches!(second, EngineResult::Executed));
+        assert_eq!(region_cursor(&region, &editor), 0);
+
+        set_region_cursor(&region, &mut editor, line_three);
+        let count = region
+            .dispatch_key(&mut editor, key!('2'))
+            .expect("count accumulation");
+        let prefix = region
+            .dispatch_key(&mut editor, key!('g'))
+            .expect("goto prefix");
+        let motion = region
+            .dispatch_key(&mut editor, key!('g'))
+            .expect("counted goto file start");
+        assert!(matches!(count, EngineResult::Pending));
+        assert!(matches!(prefix, EngineResult::Pending));
+        assert!(matches!(motion, EngineResult::Executed));
+
+        let line_two = {
+            let doc = region.document(&editor).expect("component document");
+            doc.text().line_to_char(1)
+        };
+        assert_eq!(region_cursor(&region, &editor), line_two);
+    }
+
+    #[tokio::test]
+    async fn edit_region_dispatch_rejects_tree_only_jumplist_motion() {
+        let (mut editor, mut region) = test_edit_region();
+
+        let result = region
+            .dispatch_key(&mut editor, "C-o".parse::<KeyEvent>().unwrap())
+            .expect("component dispatch result");
+        assert!(matches!(result, EngineResult::Unbound));
     }
 }

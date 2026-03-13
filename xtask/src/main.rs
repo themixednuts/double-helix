@@ -83,6 +83,71 @@ pub mod tasks {
         }
     }
 
+    pub fn arch_check() -> Result<(), DynError> {
+        use std::process::Command;
+
+        let workspace_root = crate::path::project_root();
+
+        // helix-core must not depend on helix-term, helix-tui, or crossterm
+        let core_tree = Command::new("cargo")
+            .args(["tree", "-p", "helix-core", "--format", "{p}"])
+            .current_dir(&workspace_root)
+            .output()?;
+        if !core_tree.status.success() {
+            return Err(format!(
+                "cargo tree -p helix-core failed: {}",
+                String::from_utf8_lossy(&core_tree.stderr)
+            )
+            .into());
+        }
+        let core_deps = String::from_utf8_lossy(&core_tree.stdout);
+        for forbidden in ["helix-term", "helix-tui", "crossterm"] {
+            if core_deps.contains(forbidden) {
+                return Err(format!(
+                    "helix-core must not depend on {} (layering violation)",
+                    forbidden
+                )
+                .into());
+            }
+        }
+
+        // helix-view without term feature must not depend on termina or crossterm
+        // --edges no-dev excludes dev-deps (e.g. helix-tui) that pull in terminal crates
+        let view_tree = Command::new("cargo")
+            .args([
+                "tree",
+                "-p",
+                "helix-view",
+                "--no-default-features",
+                "--edges",
+                "no-dev",
+                "--format",
+                "{p}",
+            ])
+            .current_dir(&workspace_root)
+            .output()?;
+        if !view_tree.status.success() {
+            return Err(format!(
+                "cargo tree -p helix-view --no-default-features failed: {}",
+                String::from_utf8_lossy(&view_tree.stderr)
+            )
+            .into());
+        }
+        let view_deps = String::from_utf8_lossy(&view_tree.stdout);
+        for forbidden in ["termina", "crossterm"] {
+            if view_deps.contains(forbidden) {
+                return Err(format!(
+                    "helix-view (without term feature) must not depend on {} (layering violation)",
+                    forbidden
+                )
+                .into());
+            }
+        }
+
+        println!("Architectural checks passed.");
+        Ok(())
+    }
+
     pub fn print_help() {
         println!(
             "
@@ -94,6 +159,8 @@ Usage: Run with `cargo xtask <task>`, eg. `cargo xtask docgen`.
                                    languages, or all languages if none are specified.
         theme-check [themes]       Check that the theme files in runtime/themes/ are valid for the
                                    given themes, or all themes if none are specified.
+        arch-check                 Verify layering: helix-core has no frontend deps; helix-view
+                                   has no terminal deps when built without term feature.
 "
         );
     }
@@ -108,6 +175,7 @@ fn main() -> Result<(), DynError> {
             "docgen" => tasks::docgen()?,
             "query-check" => tasks::querycheck(args)?,
             "theme-check" => tasks::themecheck(args)?,
+            "arch-check" => tasks::arch_check()?,
             invalid => return Err(format!("Invalid task name: {}", invalid).into()),
         },
     };

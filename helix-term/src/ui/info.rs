@@ -1,4 +1,4 @@
-use crate::compositor::{Component, Context};
+use crate::compositor::{Component, RenderContext};
 use helix_view::graphics::{Margin, Rect};
 use helix_view::info::Info;
 use tui::buffer::Buffer as Surface;
@@ -6,7 +6,7 @@ use tui::text::Text;
 use tui::widgets::{Block, BorderType, Paragraph, Widget};
 
 impl Component for Info {
-    fn render(&mut self, viewport: Rect, surface: &mut Surface, cx: &mut Context) {
+    fn render(&mut self, viewport: Rect, surface: &mut Surface, cx: &RenderContext) {
         let text_style = cx.editor.theme.get("ui.text.info");
         let popup_style = cx.editor.theme.get("ui.popup.info");
 

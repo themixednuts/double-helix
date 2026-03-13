@@ -8,6 +8,7 @@ use tui::buffer::Buffer as Surface;
 type Rgb = (u8, u8, u8);
 
 /// A utility for rendering gradient borders around UI components
+#[derive(Clone)]
 pub struct GradientBorder {
     config: GradientBorderConfig,
     animation_frame: u32,
@@ -157,8 +158,18 @@ impl GradientBorder {
         }
     }
 
+    /// Render the gradient border without requiring a theme reference.
+    /// (The theme parameter on [`render`] is unused; this avoids the borrow.)
+    pub fn render_no_theme(&mut self, area: Rect, surface: &mut Surface, rounded: bool) {
+        self.render_inner(area, surface, rounded);
+    }
+
     /// Render the gradient border around the given area
     pub fn render(&mut self, area: Rect, surface: &mut Surface, _theme: &Theme, rounded: bool) {
+        self.render_inner(area, surface, rounded);
+    }
+
+    fn render_inner(&mut self, area: Rect, surface: &mut Surface, rounded: bool) {
         if !self.config.enable || area.width < 2 || area.height < 2 {
             return;
         }

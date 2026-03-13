@@ -9,7 +9,7 @@ use tui::layout::Alignment;
 use tui::text::Text;
 use tui::widgets::{BorderType, Paragraph, Widget, Wrap};
 
-use crate::compositor::{Component, Compositor, Context, EventResult};
+use crate::compositor::{Component, Compositor, Context, EventResult, RenderContext};
 
 use crate::alt;
 use crate::ui::Markdown;
@@ -93,7 +93,7 @@ impl Component for SignatureHelp {
         }
     }
 
-    fn render(&mut self, area: Rect, surface: &mut Buffer, cx: &mut Context) {
+    fn render(&mut self, area: Rect, surface: &mut Buffer, cx: &RenderContext) {
         let margin = Margin::all(1);
         let area = area.inner(margin);
 
@@ -133,7 +133,7 @@ impl Component for SignatureHelp {
 
         let sig_text_para = Paragraph::new(&sig_text)
             .wrap(Wrap { trim: false })
-            .scroll((cx.scroll.unwrap_or_default() as u16, 0));
+            .scroll((cx.scroll().unwrap_or_default() as u16, 0));
         let (_, sig_text_height) = sig_text_para.required_size(area.width);
         let sig_text_area = area.with_height(sig_text_height.min(area.height));
         let sig_text_area = sig_text_area.intersection(surface.area);
@@ -161,7 +161,7 @@ impl Component for SignatureHelp {
             .clip_bottom(u16::from(cx.editor.popup_border()));
         let sig_doc_para = Paragraph::new(&sig_doc)
             .wrap(Wrap { trim: false })
-            .scroll((cx.scroll.unwrap_or_default() as u16, 0));
+            .scroll((cx.scroll().unwrap_or_default() as u16, 0));
         sig_doc_para.render(sig_doc_area, surface);
     }
 

@@ -1,49 +1,100 @@
+use helix_core::diagnostic::Severity;
 use helix_core::indent::IndentStyle;
-use helix_core::{coords_at_pos, encoding, unicode::width::UnicodeWidthStr, Position};
-use helix_lsp::lsp::DiagnosticSeverity;
-use helix_view::document::DEFAULT_LANGUAGE_NAME;
-use helix_view::icons::ICONS;
-use helix_view::{
-    document::{Mode, SCRATCH_BUFFER_NAME},
-    graphics::Rect,
-    theme::Style,
-    Document, DocumentId, Editor, View, ViewId,
-};
-
-use crate::ui::ProgressSpinners;
-
+use helix_core::unicode::width::UnicodeWidthStr;
 use helix_core::{tree_sitter::Node as TsNode, RopeSlice};
-use helix_view::editor::StatusLineElement as StatusLineElementID;
+use helix_view::document::Mode;
+use helix_view::editor::{StatusLineConfig, StatusLineElement as StatusLineElementId};
+use helix_view::icons::ICONS;
+use helix_view::statusline::{
+    CursorStatusProvider, DiagnosticCounts, DiagnosticStatusProvider, DocumentStatusProvider,
+    SelectionStatusProvider, StatuslineSnapshot,
+};
+use helix_view::theme::{Style, Theme};
+use helix_view::{Document, DocumentId, Editor, View, ViewId};
+use std::borrow::Cow;
 use std::sync::{LazyLock, Mutex};
 use tui::buffer::Buffer as Surface;
 use tui::text::{Span, Spans};
 
-pub struct RenderContext<'a> {
-    pub editor: &'a Editor,
-    pub doc: &'a Document,
-    pub view: &'a View,
-    pub focused: bool,
-    pub spinners: &'a ProgressSpinners,
-    pub parts: RenderBuffer<'a>,
+use crate::ui::ProgressSpinners;
+
+#[derive(Debug, Clone, Copy)]
+pub struct BenchOverlay {
+    pub rolling_fps: f64,
+    pub actions_executed: usize,
+    pub remaining_seconds: f64,
 }
 
-impl<'a> RenderContext<'a> {
-    pub fn new(
-        editor: &'a Editor,
-        doc: &'a Document,
-        view: &'a View,
+#[derive(Clone)]
+pub struct StatuslineModel {
+    pub view_id: ViewId,
+    pub config: StatusLineConfig,
+    pub theme: Theme,
+    pub theme_name: String,
+    pub color_modes: bool,
+    pub snapshot: StatuslineSnapshot<'static>,
+    pub bench_overlay: Option<BenchOverlay>,
+}
+
+impl StatuslineModel {
+    pub fn collect(
+        editor: &Editor,
+        doc: &Document,
+        view: &View,
         focused: bool,
-        spinners: &'a ProgressSpinners,
+        mode: Mode,
+        selected_register: Option<char>,
+        spinners: &ProgressSpinners,
     ) -> Self {
-        RenderContext {
-            editor,
-            doc,
-            view,
-            focused,
-            spinners,
-            parts: RenderBuffer::default(),
+        let cursor = doc.cursor_status(view.id);
+        let selection = doc.selection_status(view.id);
+        let spinner_frame = doc
+            .language_servers()
+            .next()
+            .and_then(|server| spinners.get(server.id()).and_then(|spinner| spinner.frame()))
+            .unwrap_or(" ");
+        let current_working_directory = helix_stdx::env::current_working_dir()
+            .file_name()
+            .map(|name| Cow::Owned(name.to_string_lossy().into_owned()))
+            .unwrap_or_default();
+        let function_name = get_current_function_name_cached(doc, view.id, cursor.char_idx);
+
+        Self {
+            view_id: view.id,
+            config: editor.config().statusline.clone(),
+            theme: editor.theme.clone(),
+            theme_name: editor.theme.name().to_string(),
+            color_modes: editor.config().color_modes,
+            snapshot: StatuslineSnapshot {
+                modal: helix_view::statusline::ModalStatus {
+                    focused,
+                    mode,
+                    selected_register,
+                },
+                cursor,
+                selection,
+                document: doc.document_status(),
+                diagnostics: doc.diagnostic_counts(),
+                workspace_diagnostics: editor.workspace_diagnostic_counts(),
+                spinner_frame: Cow::Borrowed(spinner_frame),
+                current_working_directory,
+                function_name,
+            }
+            .into_owned(),
+            bench_overlay: editor.bench.as_ref().map(|bench| BenchOverlay {
+                rolling_fps: bench.rolling_fps,
+                actions_executed: bench.actions_executed as usize,
+                remaining_seconds: bench
+                    .duration
+                    .saturating_sub(bench.elapsed())
+                    .as_secs_f64(),
+            }),
         }
     }
+}
+
+pub(crate) fn cache_id(view_id: ViewId) -> crate::render::CacheId {
+    crate::render::CacheId::hashed(&("statusline", view_id))
 }
 
 #[derive(Default)]
@@ -53,74 +104,143 @@ pub struct RenderBuffer<'a> {
     pub right: Spans<'a>,
 }
 
-pub fn render(context: &mut RenderContext, viewport: Rect, surface: &mut Surface) {
-    let base_style = if context.focused {
-        context.editor.theme.get("ui.statusline")
-    } else {
-        context.editor.theme.get("ui.statusline.inactive")
-    };
+pub struct Statusline<'a> {
+    model: StatuslineModel,
+    parts: RenderBuffer<'a>,
+}
 
-    surface.set_style(viewport.with_height(1), base_style);
 
-    // Left side of the status line.
-
-    let config = context.editor.config();
-
-    for element_id in &config.statusline.left {
-        let render = get_render_function(*element_id);
-        (render)(context, |context, span| {
-            append(&mut context.parts.left, span, base_style)
-        });
+impl<'a> Statusline<'a> {
+    pub fn new(model: StatuslineModel) -> Self {
+        Self {
+            model,
+            parts: RenderBuffer::default(),
+        }
     }
 
-    surface.set_spans(
-        viewport.x,
-        viewport.y,
-        &context.parts.left,
-        context.parts.left.width() as u16,
-    );
+    pub fn prepare(model: StatuslineModel, area: helix_view::graphics::Rect) -> crate::render::PreparedRender {
+        use crate::render::{CacheKey, CacheTag, PreparedRender, RenderOutput};
 
-    // Right side of the status line.
-
-    for element_id in &config.statusline.right {
-        let render = get_render_function(*element_id);
-        (render)(context, |context, span| {
-            append(&mut context.parts.right, span, base_style)
+        let tag = CacheTag {
+            id: cache_id(model.view_id),
+            key: CacheKey::hashed(&(
+                &model.config,
+                &model.theme_name,
+                model.color_modes,
+                &model.snapshot,
+                model.bench_overlay.map(|overlay| {
+                    (
+                        overlay.rolling_fps.to_bits(),
+                        overlay.actions_executed,
+                        overlay.remaining_seconds.to_bits(),
+                    )
+                }),
+            )),
+            area,
+        };
+        PreparedRender::snapshot(tag, model, move |model| {
+            let mut component = Statusline::new(model);
+            let mut surface = Surface::empty(area);
+            component.render(area, &mut surface);
+            RenderOutput { area, surface }
         })
     }
 
-    surface.set_spans(
-        viewport.x
-            + viewport
-                .width
-                .saturating_sub(context.parts.right.width() as u16),
-        viewport.y,
-        &context.parts.right,
-        context.parts.right.width() as u16,
-    );
+    pub fn render(&mut self, viewport: helix_view::graphics::Rect, surface: &mut Surface) {
+        let base_style = if self.model.snapshot.modal.focused {
+            self.model.theme.get("ui.statusline")
+        } else {
+            self.model.theme.get("ui.statusline.inactive")
+        };
 
-    // Center of the status line.
+        surface.set_style(viewport.with_height(1), base_style);
 
-    for element_id in &config.statusline.center {
-        let render = get_render_function(*element_id);
-        (render)(context, |context, span| {
-            append(&mut context.parts.center, span, base_style)
-        })
+        for element_id in self.model.config.left.clone() {
+            let element_start = std::time::Instant::now();
+            let render = get_render_function(element_id);
+            (render)(self, |statusline, span| {
+                append(&mut statusline.parts.left, span, base_style)
+            });
+            helix_view::bench::log_run_phase(
+                "statusline",
+                "element",
+                element_start.elapsed(),
+                || format!("side=left element={element_id:?}"),
+            );
+        }
+
+        surface.set_spans(
+            viewport.x,
+            viewport.y,
+            &self.parts.left,
+            self.parts.left.width() as u16,
+        );
+
+        for element_id in self.model.config.right.clone() {
+            let element_start = std::time::Instant::now();
+            let render = get_render_function(element_id);
+            (render)(self, |statusline, span| {
+                append(&mut statusline.parts.right, span, base_style)
+            });
+            helix_view::bench::log_run_phase(
+                "statusline",
+                "element",
+                element_start.elapsed(),
+                || format!("side=right element={element_id:?}"),
+            );
+        }
+
+        if let Some(bench) = self.model.bench_overlay {
+            let fps_text = format!(
+                " BENCH {:.0}fps {}act {:.0}s ",
+                bench.rolling_fps, bench.actions_executed, bench.remaining_seconds,
+            );
+            let bench_style = self
+                .model
+                .theme
+                .get("ui.statusline")
+                .fg(helix_view::graphics::Color::Black)
+                .bg(helix_view::graphics::Color::Yellow);
+            append(
+                &mut self.parts.right,
+                Span::styled(fps_text, bench_style),
+                base_style,
+            );
+        }
+
+        surface.set_spans(
+            viewport.x + viewport.width.saturating_sub(self.parts.right.width() as u16),
+            viewport.y,
+            &self.parts.right,
+            self.parts.right.width() as u16,
+        );
+
+        for element_id in self.model.config.center.clone() {
+            let element_start = std::time::Instant::now();
+            let render = get_render_function(element_id);
+            (render)(self, |statusline, span| {
+                append(&mut statusline.parts.center, span, base_style)
+            });
+            helix_view::bench::log_run_phase(
+                "statusline",
+                "element",
+                element_start.elapsed(),
+                || format!("side=center element={element_id:?}"),
+            );
+        }
+
+        let spacing = 1u16;
+        let edge_width = self.parts.left.width().max(self.parts.right.width()) as u16;
+        let center_max_width = viewport.width.saturating_sub(2 * edge_width + 2 * spacing);
+        let center_width = center_max_width.min(self.parts.center.width() as u16);
+
+        surface.set_spans(
+            viewport.x + viewport.width / 2 - center_width / 2,
+            viewport.y,
+            &self.parts.center,
+            center_width,
+        );
     }
-
-    // Width of the empty space between the left and center area and between the center and right area.
-    let spacing = 1u16;
-
-    let edge_width = context.parts.left.width().max(context.parts.right.width()) as u16;
-    let center_max_width = viewport.width.saturating_sub(2 * edge_width + 2 * spacing);
-    let center_width = center_max_width.min(context.parts.center.width() as u16);
-
-    surface.set_spans(
-        viewport.x + viewport.width / 2 - center_width / 2,
-        viewport.y,
-        &context.parts.center,
-        center_width,
-    );
 }
 
 fn append<'a>(buffer: &mut Spans<'a>, mut span: Span<'a>, base_style: Style) {
@@ -128,50 +248,45 @@ fn append<'a>(buffer: &mut Spans<'a>, mut span: Span<'a>, base_style: Style) {
     buffer.0.push(span);
 }
 
-fn get_render_function<'a, F>(element_id: StatusLineElementID) -> impl Fn(&mut RenderContext<'a>, F)
+fn get_render_function<'a, F>(element_id: StatusLineElementId) -> impl Fn(&mut Statusline<'a>, F)
 where
-    F: Fn(&mut RenderContext<'a>, Span<'a>) + Copy,
+    F: Fn(&mut Statusline<'a>, Span<'a>) + Copy,
 {
     match element_id {
-        helix_view::editor::StatusLineElement::Mode => render_mode,
-        helix_view::editor::StatusLineElement::Spinner => render_lsp_spinner,
-        helix_view::editor::StatusLineElement::FileBaseName => render_file_base_name,
-        helix_view::editor::StatusLineElement::FileName => render_file_name,
-        helix_view::editor::StatusLineElement::FileAbsolutePath => render_file_absolute_path,
-        helix_view::editor::StatusLineElement::FileModificationIndicator => {
-            render_file_modification_indicator
-        }
-        helix_view::editor::StatusLineElement::ReadOnlyIndicator => render_read_only_indicator,
-        helix_view::editor::StatusLineElement::FileEncoding => render_file_encoding,
-        helix_view::editor::StatusLineElement::FileLineEnding => render_file_line_ending,
-        helix_view::editor::StatusLineElement::FileIndentStyle => render_file_indent_style,
-        helix_view::editor::StatusLineElement::FileType => render_file_type,
-        helix_view::editor::StatusLineElement::Diagnostics => render_diagnostics,
-        helix_view::editor::StatusLineElement::WorkspaceDiagnostics => render_workspace_diagnostics,
-        helix_view::editor::StatusLineElement::Selections => render_selections,
-        helix_view::editor::StatusLineElement::PrimarySelectionLength => {
-            render_primary_selection_length
-        }
-        helix_view::editor::StatusLineElement::Position => render_position,
-        helix_view::editor::StatusLineElement::PositionPercentage => render_position_percentage,
-        helix_view::editor::StatusLineElement::TotalLineNumbers => render_total_line_numbers,
-        helix_view::editor::StatusLineElement::Separator => render_separator,
-        helix_view::editor::StatusLineElement::Spacer => render_spacer,
-        helix_view::editor::StatusLineElement::VersionControl => render_version_control,
-        helix_view::editor::StatusLineElement::Register => render_register,
-        helix_view::editor::StatusLineElement::CurrentWorkingDirectory => render_cwd,
-        helix_view::editor::StatusLineElement::FunctionName => render_function_name,
+        StatusLineElementId::Mode => render_mode,
+        StatusLineElementId::Spinner => render_lsp_spinner,
+        StatusLineElementId::FileBaseName => render_file_base_name,
+        StatusLineElementId::FileName => render_file_name,
+        StatusLineElementId::FileAbsolutePath => render_file_absolute_path,
+        StatusLineElementId::FileModificationIndicator => render_file_modification_indicator,
+        StatusLineElementId::ReadOnlyIndicator => render_read_only_indicator,
+        StatusLineElementId::FileEncoding => render_file_encoding,
+        StatusLineElementId::FileLineEnding => render_file_line_ending,
+        StatusLineElementId::FileIndentStyle => render_file_indent_style,
+        StatusLineElementId::FileType => render_file_type,
+        StatusLineElementId::Diagnostics => render_diagnostics,
+        StatusLineElementId::WorkspaceDiagnostics => render_workspace_diagnostics,
+        StatusLineElementId::Selections => render_selections,
+        StatusLineElementId::PrimarySelectionLength => render_primary_selection_length,
+        StatusLineElementId::Position => render_position,
+        StatusLineElementId::PositionPercentage => render_position_percentage,
+        StatusLineElementId::TotalLineNumbers => render_total_line_numbers,
+        StatusLineElementId::Separator => render_separator,
+        StatusLineElementId::Spacer => render_spacer,
+        StatusLineElementId::VersionControl => render_version_control,
+        StatusLineElementId::Register => render_register,
+        StatusLineElementId::CurrentWorkingDirectory => render_cwd,
+        StatusLineElementId::FunctionName => render_function_name,
     }
 }
 
-fn render_mode<'a, F>(context: &mut RenderContext<'a>, write: F)
+fn render_mode<'a, F>(statusline: &mut Statusline<'a>, write: F)
 where
-    F: Fn(&mut RenderContext<'a>, Span<'a>) + Copy,
+    F: Fn(&mut Statusline<'a>, Span<'a>) + Copy,
 {
-    let visible = context.focused;
-    let config = context.editor.config();
-    let modenames = &config.statusline.mode;
-    let mode_str = match context.editor.mode() {
+    let visible = statusline.model.snapshot.modal.focused;
+    let modenames = &statusline.model.config.mode;
+    let mode_str = match statusline.model.snapshot.modal.mode {
         Mode::Insert => &modenames.insert,
         Mode::Select => &modenames.select,
         Mode::Normal => &modenames.normal,
@@ -179,463 +294,362 @@ where
     let content = if visible {
         format!(" {mode_str} ")
     } else {
-        // If not focused, explicitly leave an empty space instead of returning None.
         " ".repeat(mode_str.width() + 2)
     };
-    let style = if visible && config.color_modes {
-        match context.editor.mode() {
-            Mode::Insert => context.editor.theme.get("ui.statusline.insert"),
-            Mode::Select => context.editor.theme.get("ui.statusline.select"),
-            Mode::Normal => context.editor.theme.get("ui.statusline.normal"),
+    let style = if visible && statusline.model.color_modes {
+        match statusline.model.snapshot.modal.mode {
+            Mode::Insert => statusline.model.theme.get("ui.statusline.insert"),
+            Mode::Select => statusline.model.theme.get("ui.statusline.select"),
+            Mode::Normal => statusline.model.theme.get("ui.statusline.normal"),
         }
     } else {
         Style::default()
     };
-    write(context, Span::styled(content, style));
+    write(statusline, Span::styled(content, style));
 }
 
-// TODO think about handling multiple language servers
-fn render_lsp_spinner<'a, F>(context: &mut RenderContext<'a>, write: F)
+fn render_lsp_spinner<'a, F>(statusline: &mut Statusline<'a>, write: F)
 where
-    F: Fn(&mut RenderContext<'a>, Span<'a>) + Copy,
+    F: Fn(&mut Statusline<'a>, Span<'a>) + Copy,
 {
-    let language_server = context.doc.language_servers().next();
     write(
-        context,
-        language_server
-            .and_then(|srv| {
-                context
-                    .spinners
-                    .get(srv.id())
-                    .and_then(|spinner| spinner.frame())
-            })
-            // Even if there's no spinner; reserve its space to avoid elements frequently shifting.
-            .unwrap_or(" ")
-            .into(),
+        statusline,
+        statusline.model.snapshot.spinner_frame.as_ref().to_string().into(),
     );
 }
 
-fn render_diagnostics<'a, F>(context: &mut RenderContext<'a>, write: F)
+fn render_diagnostics<'a, F>(statusline: &mut Statusline<'a>, write: F)
 where
-    F: Fn(&mut RenderContext<'a>, Span<'a>) + Copy,
+    F: Fn(&mut Statusline<'a>, Span<'a>) + Copy,
 {
-    use helix_core::diagnostic::Severity;
-    let (hints, info, warnings, errors) =
-        context
-            .doc
-            .diagnostics()
-            .iter()
-            .fold((0, 0, 0, 0), |mut counts, diag| {
-                match diag.severity {
-                    Some(Severity::Hint) | None => counts.0 += 1,
-                    Some(Severity::Info) => counts.1 += 1,
-                    Some(Severity::Warning) => counts.2 += 1,
-                    Some(Severity::Error) => counts.3 += 1,
-                }
-                counts
-            });
-
-    let icons = ICONS.load();
-    for sev in &context.editor.config().statusline.diagnostics {
-        match sev {
-            Severity::Hint if hints > 0 => {
-                write(
-                    context,
-                    Span::styled(
-                        icons.diagnostic().hint().to_string(),
-                        context.editor.theme.get("hint"),
-                    ),
-                );
-                write(context, Span::raw(format!(" {hints} ")));
-            }
-            Severity::Info if info > 0 => {
-                write(
-                    context,
-                    Span::styled(
-                        icons.diagnostic().info().to_string(),
-                        context.editor.theme.get("info"),
-                    ),
-                );
-                write(context, Span::raw(format!(" {info} ")));
-            }
-            Severity::Warning if warnings > 0 => {
-                write(
-                    context,
-                    Span::styled(
-                        icons.diagnostic().warning().to_string(),
-                        context.editor.theme.get("warning"),
-                    ),
-                );
-                write(context, Span::raw(format!(" {warnings} ")));
-            }
-            Severity::Error if errors > 0 => {
-                write(
-                    context,
-                    Span::styled(
-                        icons.diagnostic().error().to_string(),
-                        context.editor.theme.get("error"),
-                    ),
-                );
-                write(context, Span::raw(format!(" {errors} ")));
-            }
-            _ => {}
-        }
-    }
+    render_diagnostic_counts(
+        statusline,
+        statusline.model.snapshot.diagnostics,
+        statusline.model.config.diagnostics.clone(),
+        write,
+    );
 }
 
-fn render_workspace_diagnostics<'a, F>(context: &mut RenderContext<'a>, write: F)
+fn render_workspace_diagnostics<'a, F>(statusline: &mut Statusline<'a>, write: F)
 where
-    F: Fn(&mut RenderContext<'a>, Span<'a>) + Copy,
+    F: Fn(&mut Statusline<'a>, Span<'a>) + Copy,
 {
-    use helix_core::diagnostic::Severity;
-    let (hints, info, warnings, errors) = context.editor.diagnostics.values().flatten().fold(
-        (0u32, 0u32, 0u32, 0u32),
-        |mut counts, (diag, _)| {
-            match diag.severity {
-                // PERF: For large workspace diagnostics, this loop can be very tight.
-                //
-                // Most often the diagnostics will be for warnings and errors.
-                // Errors should tend to be fixed fast, leaving warnings as the most common.
-                Some(DiagnosticSeverity::WARNING) => counts.2 += 1,
-                Some(DiagnosticSeverity::ERROR) => counts.3 += 1,
-                Some(DiagnosticSeverity::HINT) => counts.0 += 1,
-                Some(DiagnosticSeverity::INFORMATION) => counts.1 += 1,
-                // Fallback to `hint`.
-                _ => counts.0 += 1,
-            }
-            counts
-        },
-    );
-
-    let sevs = &context.editor.config().statusline.workspace_diagnostics;
-
-    // Avoid showing the ` W ` if no diagnostic counts will be shown.
-    if !sevs.iter().any(|sev| match sev {
-        Severity::Hint => hints != 0,
-        Severity::Info => info != 0,
-        Severity::Warning => warnings != 0,
-        Severity::Error => errors != 0,
+    let counts = DiagnosticCounts {
+        hints: statusline.model.snapshot.workspace_diagnostics.hints as usize,
+        info: statusline.model.snapshot.workspace_diagnostics.info as usize,
+        warnings: statusline.model.snapshot.workspace_diagnostics.warnings as usize,
+        errors: statusline.model.snapshot.workspace_diagnostics.errors as usize,
+    };
+    let severities = statusline.model.config.workspace_diagnostics.clone();
+    if !severities.iter().any(|severity| match severity {
+        Severity::Hint => counts.hints != 0,
+        Severity::Info => counts.info != 0,
+        Severity::Warning => counts.warnings != 0,
+        Severity::Error => counts.errors != 0,
     }) {
         return;
     }
 
     let icons = ICONS.load();
     let icon = icons.kind().workspace();
-
-    // NOTE: Special case when the `workspace` key is set to `""`:
-    //
-    // ```
-    // [icons.kind]
-    // workspace = ""
-    // ```
-    //
-    // This will remove the default ` W ` so that the rest of the icons are spaced correctly.
     if !icon.glyph().is_empty() {
         if let Some(style) = icon.color().map(|color| Style::default().fg(color)) {
-            write(context, Span::styled(format!("{} ", icon.glyph()), style));
+            write(statusline, Span::styled(format!("{} ", icon.glyph()), style));
         } else {
-            write(context, format!("{} ", icon.glyph()).into());
+            write(statusline, format!("{} ", icon.glyph()).into());
         }
     }
 
-    for sev in sevs {
-        match sev {
-            Severity::Hint if hints > 0 => {
+    render_diagnostic_counts(statusline, counts, severities, write);
+}
+
+fn render_diagnostic_counts<'a, F>(
+    statusline: &mut Statusline<'a>,
+    counts: DiagnosticCounts,
+    severities: Vec<Severity>,
+    write: F,
+) where
+    F: Fn(&mut Statusline<'a>, Span<'a>) + Copy,
+{
+    let icons = ICONS.load();
+    for severity in severities {
+        match severity {
+            Severity::Hint if counts.hints > 0 => {
                 write(
-                    context,
+                    statusline,
                     Span::styled(
                         icons.diagnostic().hint().to_string(),
-                        context.editor.theme.get("hint"),
+                        statusline.model.theme.get("hint"),
                     ),
                 );
-                write(context, Span::raw(format!(" {hints} ")));
+                write(statusline, Span::raw(format!(" {} ", counts.hints)));
             }
-            Severity::Info if info > 0 => {
+            Severity::Info if counts.info > 0 => {
                 write(
-                    context,
+                    statusline,
                     Span::styled(
-                        format!(" {} ", icons.diagnostic().info()),
-                        context.editor.theme.get("info"),
+                        icons.diagnostic().info().to_string(),
+                        statusline.model.theme.get("info"),
                     ),
                 );
-                write(context, Span::raw(format!(" {info} ")));
+                write(statusline, Span::raw(format!(" {} ", counts.info)));
             }
-            Severity::Warning if warnings > 0 => {
+            Severity::Warning if counts.warnings > 0 => {
                 write(
-                    context,
+                    statusline,
                     Span::styled(
                         icons.diagnostic().warning().to_string(),
-                        context.editor.theme.get("warning"),
+                        statusline.model.theme.get("warning"),
                     ),
                 );
-                write(context, Span::raw(format!(" {warnings} ")));
+                write(statusline, Span::raw(format!(" {} ", counts.warnings)));
             }
-            Severity::Error if errors > 0 => {
+            Severity::Error if counts.errors > 0 => {
                 write(
-                    context,
+                    statusline,
                     Span::styled(
                         icons.diagnostic().error().to_string(),
-                        context.editor.theme.get("error"),
+                        statusline.model.theme.get("error"),
                     ),
                 );
-                write(context, Span::raw(format!(" {errors} ")));
+                write(statusline, Span::raw(format!(" {} ", counts.errors)));
             }
             _ => {}
         }
     }
 }
 
-fn render_selections<'a, F>(context: &mut RenderContext<'a>, write: F)
+fn render_selections<'a, F>(statusline: &mut Statusline<'a>, write: F)
 where
-    F: Fn(&mut RenderContext<'a>, Span<'a>) + Copy,
+    F: Fn(&mut Statusline<'a>, Span<'a>) + Copy,
 {
-    let selection = context.doc.selection(context.view.id);
-    let count = selection.len();
+    let selection = statusline.model.snapshot.selection;
     write(
-        context,
-        if count == 1 {
+        statusline,
+        if selection.count == 1 {
             " 1 sel ".into()
         } else {
-            format!(" {}/{count} sels ", selection.primary_index() + 1).into()
+            format!(" {}/{} sels ", selection.primary_index + 1, selection.count).into()
         },
     );
 }
 
-fn render_primary_selection_length<'a, F>(context: &mut RenderContext<'a>, write: F)
+fn render_primary_selection_length<'a, F>(statusline: &mut Statusline<'a>, write: F)
 where
-    F: Fn(&mut RenderContext<'a>, Span<'a>) + Copy,
+    F: Fn(&mut Statusline<'a>, Span<'a>) + Copy,
 {
-    let tot_sel = context.doc.selection(context.view.id).primary().len();
+    let length = statusline.model.snapshot.selection.primary_length;
     write(
-        context,
-        format!(" {} char{} ", tot_sel, if tot_sel == 1 { "" } else { "s" }).into(),
+        statusline,
+        format!(" {} char{} ", length, if length == 1 { "" } else { "s" }).into(),
     );
 }
 
-fn get_position(context: &RenderContext) -> Position {
-    coords_at_pos(
-        context.doc.text().slice(..),
-        context
-            .doc
-            .selection(context.view.id)
-            .primary()
-            .cursor(context.doc.text().slice(..)),
-    )
-}
-
-fn render_position<'a, F>(context: &mut RenderContext<'a>, write: F)
+fn render_position<'a, F>(statusline: &mut Statusline<'a>, write: F)
 where
-    F: Fn(&mut RenderContext<'a>, Span<'a>) + Copy,
+    F: Fn(&mut Statusline<'a>, Span<'a>) + Copy,
 {
-    let position = get_position(context);
+    let position = statusline.model.snapshot.cursor.position;
     write(
-        context,
+        statusline,
         format!(" {}:{} ", position.row + 1, position.col + 1).into(),
     );
 }
 
-fn render_total_line_numbers<'a, F>(context: &mut RenderContext<'a>, write: F)
+fn render_total_line_numbers<'a, F>(statusline: &mut Statusline<'a>, write: F)
 where
-    F: Fn(&mut RenderContext<'a>, Span<'a>) + Copy,
+    F: Fn(&mut Statusline<'a>, Span<'a>) + Copy,
 {
-    let total_line_numbers = context.doc.text().len_lines();
-
-    write(context, format!(" {} ", total_line_numbers).into());
-}
-
-fn render_position_percentage<'a, F>(context: &mut RenderContext<'a>, write: F)
-where
-    F: Fn(&mut RenderContext<'a>, Span<'a>) + Copy,
-{
-    let position = get_position(context);
-    let maxrows = context.doc.text().len_lines();
     write(
-        context,
-        format!("{}%", (position.row + 1) * 100 / maxrows).into(),
+        statusline,
+        format!(" {} ", statusline.model.snapshot.cursor.total_lines).into(),
     );
 }
 
-fn render_file_encoding<'a, F>(context: &mut RenderContext<'a>, write: F)
+fn render_position_percentage<'a, F>(statusline: &mut Statusline<'a>, write: F)
 where
-    F: Fn(&mut RenderContext<'a>, Span<'a>) + Copy,
+    F: Fn(&mut Statusline<'a>, Span<'a>) + Copy,
 {
-    let enc = context.doc.encoding();
+    let position = statusline.model.snapshot.cursor.position;
+    let max_rows = statusline.model.snapshot.cursor.total_lines.max(1);
+    write(
+        statusline,
+        format!("{}%", (position.row + 1) * 100 / max_rows).into(),
+    );
+}
 
-    if enc != encoding::UTF_8 {
-        write(context, format!(" {} ", enc.name()).into());
+fn render_file_encoding<'a, F>(statusline: &mut Statusline<'a>, write: F)
+where
+    F: Fn(&mut Statusline<'a>, Span<'a>) + Copy,
+{
+    if let Some(encoding_name) = statusline.model.snapshot.document.encoding_name {
+        write(statusline, format!(" {} ", encoding_name).into());
     }
 }
 
-fn render_file_line_ending<'a, F>(context: &mut RenderContext<'a>, write: F)
+fn render_file_line_ending<'a, F>(statusline: &mut Statusline<'a>, write: F)
 where
-    F: Fn(&mut RenderContext<'a>, Span<'a>) + Copy,
+    F: Fn(&mut Statusline<'a>, Span<'a>) + Copy,
 {
     use helix_core::LineEnding::*;
-    let line_ending = match context.doc.line_ending {
+    let line_ending = match statusline.model.snapshot.document.line_ending {
         Crlf => "CRLF",
         LF => "LF",
         #[cfg(feature = "unicode-lines")]
-        VT => "VT", // U+000B -- VerticalTab
+        VT => "VT",
         #[cfg(feature = "unicode-lines")]
-        FF => "FF", // U+000C -- FormFeed
+        FF => "FF",
         #[cfg(feature = "unicode-lines")]
-        CR => "CR", // U+000D -- CarriageReturn
+        CR => "CR",
         #[cfg(feature = "unicode-lines")]
-        Nel => "NEL", // U+0085 -- NextLine
+        Nel => "NEL",
         #[cfg(feature = "unicode-lines")]
-        LS => "LS", // U+2028 -- Line Separator
+        LS => "LS",
         #[cfg(feature = "unicode-lines")]
-        PS => "PS", // U+2029 -- ParagraphSeparator
+        PS => "PS",
     };
 
-    write(context, format!(" {} ", line_ending).into());
+    write(statusline, format!(" {} ", line_ending).into());
 }
 
-fn render_file_type<'a, F>(context: &mut RenderContext<'a>, write: F)
+fn render_file_type<'a, F>(statusline: &mut Statusline<'a>, write: F)
 where
-    F: Fn(&mut RenderContext<'a>, Span<'a>) + Copy,
+    F: Fn(&mut Statusline<'a>, Span<'a>) + Copy,
 {
-    let file_type = context.doc.language_name().unwrap_or(DEFAULT_LANGUAGE_NAME);
-
+    let file_type = statusline.model.snapshot.document.language_name.as_ref();
     let icons = ICONS.load();
 
-    if let Some(icon) = icons.mime().get(context.doc.path(), Some(file_type)) {
+    if let Some(icon) = icons.mime().get(
+        statusline.model.snapshot.document.file_path.as_ref(),
+        Some(file_type),
+    ) {
         if let Some(style) = icon.color().map(|color| Style::default().fg(color)) {
-            write(context, Span::styled(format!(" {} ", icon.glyph()), style));
+            write(statusline, Span::styled(format!(" {} ", icon.glyph()), style));
         } else {
-            write(context, format!(" {} ", icon.glyph()).into());
+            write(statusline, format!(" {} ", icon.glyph()).into());
         }
     } else {
-        write(context, format!(" {} ", file_type).into());
+        write(statusline, format!(" {} ", file_type).into());
     }
 }
 
-fn render_file_name<'a, F>(context: &mut RenderContext<'a>, write: F)
+fn render_file_name<'a, F>(statusline: &mut Statusline<'a>, write: F)
 where
-    F: Fn(&mut RenderContext<'a>, Span<'a>) + Copy,
+    F: Fn(&mut Statusline<'a>, Span<'a>) + Copy,
 {
-    let title = {
-        let rel_path = context.doc.relative_path();
-        let path = rel_path
-            .as_ref()
-            .map(|p| p.to_string_lossy())
-            .unwrap_or_else(|| SCRATCH_BUFFER_NAME.into());
-        format!(" {} ", path)
-    };
-
-    write(context, title.into());
+    write(
+        statusline,
+        format!(" {} ", statusline.model.snapshot.document.file_name).into(),
+    );
 }
 
-fn render_file_absolute_path<'a, F>(context: &mut RenderContext<'a>, write: F)
+fn render_file_absolute_path<'a, F>(statusline: &mut Statusline<'a>, write: F)
 where
-    F: Fn(&mut RenderContext<'a>, Span<'a>) + Copy,
+    F: Fn(&mut Statusline<'a>, Span<'a>) + Copy,
 {
-    let title = {
-        let path = context.doc.path();
-        let path = path
-            .as_ref()
-            .map(|p| p.to_string_lossy())
-            .unwrap_or_else(|| SCRATCH_BUFFER_NAME.into());
-        format!(" {} ", path)
-    };
-
-    write(context, title.into());
+    write(
+        statusline,
+        format!(" {} ", statusline.model.snapshot.document.file_absolute_path).into(),
+    );
 }
 
-fn render_file_modification_indicator<'a, F>(context: &mut RenderContext<'a>, write: F)
+fn render_file_modification_indicator<'a, F>(statusline: &mut Statusline<'a>, write: F)
 where
-    F: Fn(&mut RenderContext<'a>, Span<'a>) + Copy,
+    F: Fn(&mut Statusline<'a>, Span<'a>) + Copy,
 {
-    let title = if context.doc.is_modified() {
-        "[+]"
-    } else {
-        "   "
-    };
-
-    write(context, title.into());
+    write(
+        statusline,
+        if statusline.model.snapshot.document.modified {
+            "[+]".into()
+        } else {
+            "   ".into()
+        },
+    );
 }
 
-fn render_read_only_indicator<'a, F>(context: &mut RenderContext<'a>, write: F)
+fn render_read_only_indicator<'a, F>(statusline: &mut Statusline<'a>, write: F)
 where
-    F: Fn(&mut RenderContext<'a>, Span<'a>) + Copy,
+    F: Fn(&mut Statusline<'a>, Span<'a>) + Copy,
 {
-    let title = if context.doc.readonly {
-        " [readonly] "
-    } else {
-        ""
-    };
-    write(context, title.into());
+    write(
+        statusline,
+        if statusline.model.snapshot.document.readonly {
+            " [readonly] ".into()
+        } else {
+            "".into()
+        },
+    );
 }
 
-fn render_file_base_name<'a, F>(context: &mut RenderContext<'a>, write: F)
+fn render_file_base_name<'a, F>(statusline: &mut Statusline<'a>, write: F)
 where
-    F: Fn(&mut RenderContext<'a>, Span<'a>) + Copy,
+    F: Fn(&mut Statusline<'a>, Span<'a>) + Copy,
 {
-    let title = {
-        let rel_path = context.doc.relative_path();
-        let path = rel_path
-            .as_ref()
-            .and_then(|p| p.file_name().map(|s| s.to_string_lossy()))
-            .unwrap_or_else(|| SCRATCH_BUFFER_NAME.into());
-        format!(" {} ", path)
-    };
-
-    write(context, title.into());
+    write(
+        statusline,
+        format!(" {} ", statusline.model.snapshot.document.file_base_name).into(),
+    );
 }
 
-fn render_separator<'a, F>(context: &mut RenderContext<'a>, write: F)
+fn render_separator<'a, F>(statusline: &mut Statusline<'a>, write: F)
 where
-    F: Fn(&mut RenderContext<'a>, Span<'a>) + Copy,
+    F: Fn(&mut Statusline<'a>, Span<'a>) + Copy,
 {
-    let sep = &context.editor.config().statusline.separator;
-    let style = context.editor.theme.get("ui.statusline.separator");
-
-    write(context, Span::styled(sep.to_string(), style));
+    write(
+        statusline,
+        Span::styled(
+            statusline.model.config.separator.to_string(),
+            statusline.model.theme.get("ui.statusline.separator"),
+        ),
+    );
 }
 
-fn render_spacer<'a, F>(context: &mut RenderContext<'a>, write: F)
+fn render_spacer<'a, F>(statusline: &mut Statusline<'a>, write: F)
 where
-    F: Fn(&mut RenderContext<'a>, Span<'a>) + Copy,
+    F: Fn(&mut Statusline<'a>, Span<'a>) + Copy,
 {
-    write(context, " ".into());
+    write(statusline, " ".into());
 }
 
-fn render_version_control<'a, F>(context: &mut RenderContext<'a>, write: F)
+fn render_version_control<'a, F>(statusline: &mut Statusline<'a>, write: F)
 where
-    F: Fn(&mut RenderContext<'a>, Span<'a>) + Copy,
+    F: Fn(&mut Statusline<'a>, Span<'a>) + Copy,
 {
-    let head = context.doc.version_control_head().unwrap_or_default();
-
+    let head = statusline
+        .model
+        .snapshot
+        .document
+        .version_control_head
+        .as_deref()
+        .unwrap_or_default();
     let icons = ICONS.load();
     let icon = icons.vcs().branch();
 
-    let vcs = if icon.is_empty() {
+    let text = if icon.is_empty() {
         format!(" {head} ")
     } else {
         format!(" {icon} {head} ")
     };
 
-    write(context, vcs.into());
+    write(statusline, text.into());
 }
 
-fn render_register<'a, F>(context: &mut RenderContext<'a>, write: F)
+fn render_register<'a, F>(statusline: &mut Statusline<'a>, write: F)
 where
-    F: Fn(&mut RenderContext<'a>, Span<'a>) + Copy,
+    F: Fn(&mut Statusline<'a>, Span<'a>) + Copy,
 {
-    if let Some(reg) = context.editor.selected_register {
-        write(context, format!(" reg={} ", reg).into())
+    if let Some(register) = statusline.model.snapshot.modal.selected_register {
+        write(statusline, format!(" reg={} ", register).into());
     }
 }
 
-fn render_file_indent_style<'a, F>(context: &mut RenderContext<'a>, write: F)
+fn render_file_indent_style<'a, F>(statusline: &mut Statusline<'a>, write: F)
 where
-    F: Fn(&mut RenderContext<'a>, Span<'a>) + Copy,
+    F: Fn(&mut Statusline<'a>, Span<'a>) + Copy,
 {
-    let style = context.doc.indent_style;
-
     write(
-        context,
-        match style {
+        statusline,
+        match statusline.model.snapshot.document.indent_style {
             IndentStyle::Tabs => " tabs ".into(),
             IndentStyle::Spaces(indent) => {
                 format!(" {} space{} ", indent, if indent == 1 { "" } else { "s" }).into()
@@ -644,40 +658,41 @@ where
     );
 }
 
-fn render_cwd<'a, F>(context: &mut RenderContext<'a>, write: F)
+fn render_cwd<'a, F>(statusline: &mut Statusline<'a>, write: F)
 where
-    F: Fn(&mut RenderContext<'a>, Span<'a>) + Copy,
+    F: Fn(&mut Statusline<'a>, Span<'a>) + Copy,
 {
-    let cwd = helix_stdx::env::current_working_dir();
-    let cwd = cwd
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_string();
-    write(context, cwd.into())
+    write(
+        statusline,
+        statusline
+            .model
+            .snapshot
+            .current_working_directory
+            .as_ref()
+            .to_string()
+            .into(),
+    );
 }
 
-fn render_function_name<'a, F>(context: &mut RenderContext<'a>, write: F)
+fn render_function_name<'a, F>(statusline: &mut Statusline<'a>, write: F)
 where
-    F: Fn(&mut RenderContext<'a>, Span<'a>) + Copy,
+    F: Fn(&mut Statusline<'a>, Span<'a>) + Copy,
 {
-    let function_name = get_current_function_name_cached(context);
-    if let Some(name) = function_name {
+    if let Some(name) = statusline.model.snapshot.function_name.as_deref() {
         let icons = ICONS.load();
         if let Some(icon) = icons.kind().get("function") {
             let glyph = icon.glyph();
             if let Some(style) = icon.color().map(|color| Style::default().fg(color)) {
-                write(context, Span::styled(format!(" {} {}", glyph, name), style));
+                write(statusline, Span::styled(format!(" {} {}", glyph, name), style));
             } else {
-                write(context, format!(" {} {} ", glyph, name).into());
+                write(statusline, format!(" {} {} ", glyph, name).into());
             }
         } else {
-            write(context, format!(" {} ", name).into());
+            write(statusline, format!(" {} ", name).into());
         }
     }
 }
 
-// Simple cache entry for function name lookups.
 #[derive(Clone)]
 struct FuncNameCacheEntry {
     doc_id: DocumentId,
@@ -690,19 +705,16 @@ struct FuncNameCacheEntry {
 static FUNC_NAME_CACHE: LazyLock<Mutex<Option<FuncNameCacheEntry>>> =
     LazyLock::new(|| Mutex::new(None));
 
-fn get_current_function_name_cached(context: &RenderContext) -> Option<String> {
-    let text = context.doc.text().slice(..);
-    let cursor_char = context
-        .doc
-        .selection(context.view.id)
-        .primary()
-        .cursor(text);
+fn get_current_function_name_cached(
+    doc: &Document,
+    view_id: ViewId,
+    cursor_char: usize,
+) -> Option<String> {
+    let text = doc.text().slice(..);
     let cursor_byte = text.char_to_byte(cursor_char) as u32;
-    let doc_id = context.doc.id();
-    let view_id = context.view.id;
-    let doc_version = context.doc.version();
+    let doc_id = doc.id();
+    let doc_version = doc.version();
 
-    // Fast path from cache
     if let Some(entry) = FUNC_NAME_CACHE.lock().unwrap().as_ref() {
         if entry.doc_id == doc_id
             && entry.view_id == view_id
@@ -713,7 +725,7 @@ fn get_current_function_name_cached(context: &RenderContext) -> Option<String> {
         }
     }
 
-    let name = get_current_function_name(context);
+    let name = get_current_function_name(doc, cursor_char);
     *FUNC_NAME_CACHE.lock().unwrap() = Some(FuncNameCacheEntry {
         doc_id,
         view_id,
@@ -724,35 +736,26 @@ fn get_current_function_name_cached(context: &RenderContext) -> Option<String> {
     name
 }
 
-/// Extract a function name from a C/C++ declarator chain.
-///
-/// In C/C++, the function name is not a direct child of `function_definition`
-/// but is nested inside a declarator chain:
-///   function_definition → function_declarator → (qualified_identifier →)* identifier
 fn extract_name_from_declarator(node: TsNode<'_>, text: RopeSlice<'_>) -> Option<String> {
-    let kind = node.kind();
-    match kind {
+    match node.kind() {
         "identifier" | "field_identifier" => {
-            let start_char = text.byte_to_char(node.start_byte() as usize);
-            let end_char = text.byte_to_char(node.end_byte() as usize);
+            let start_char = text.try_byte_to_char(node.start_byte() as usize).ok()?;
+            let end_char = text.try_byte_to_char(node.end_byte() as usize).ok()?;
             Some(text.slice(start_char..end_char).to_string())
         }
         "qualified_identifier" => {
-            // Iterate in reverse to get the rightmost (innermost) identifier,
-            // stripping any namespace/class prefix (e.g. "trace::is_valid" → "is_valid").
             for i in (0..node.child_count()).rev() {
                 if let Some(child) = node.child(i) {
                     if child.kind() == "identifier" || child.kind() == "field_identifier" {
-                        let start_char = text.byte_to_char(child.start_byte() as usize);
-                        let end_char = text.byte_to_char(child.end_byte() as usize);
+                        let start_char = text.try_byte_to_char(child.start_byte() as usize).ok()?;
+                        let end_char = text.try_byte_to_char(child.end_byte() as usize).ok()?;
                         return Some(text.slice(start_char..end_char).to_string());
                     }
                 }
             }
             None
         }
-        k if k.contains("declarator") => {
-            // Handles function_declarator, pointer_declarator, reference_declarator, etc.
+        kind if kind.contains("declarator") => {
             for i in 0..node.child_count() {
                 if let Some(child) = node.child(i) {
                     if let Some(name) = extract_name_from_declarator(child, text) {
@@ -766,44 +769,28 @@ fn extract_name_from_declarator(node: TsNode<'_>, text: RopeSlice<'_>) -> Option
     }
 }
 
-fn get_current_function_name(context: &RenderContext) -> Option<String> {
-    let syntax = context.doc.syntax()?;
-    let text = context.doc.text().slice(..);
-
+fn get_current_function_name(doc: &Document, cursor_char: usize) -> Option<String> {
+    let syntax = doc.syntax()?;
+    let text = doc.text().slice(..);
     let root = syntax.tree().root_node();
-    let cursor_char = context
-        .doc
-        .selection(context.view.id)
-        .primary()
-        .cursor(text);
     let byte_pos = text.char_to_byte(cursor_char) as u32;
 
-    // Start from the deepest node at cursor position and walk up
     let mut node = root.descendant_for_byte_range(byte_pos, byte_pos)?;
-
-    // Walk up the tree to find a function-like node
     loop {
         let kind = node.kind();
-
-        // Check if this is a function-like node
         if kind.contains("function") || kind.contains("method") || kind.contains("closure") {
-            // First, try to find a child node that has the name (for traditional function declarations)
             for i in 0..node.child_count() {
                 if let Some(child) = node.child(i) {
-                    // Check if this is the name field (identifier)
                     if child.kind() == "identifier" || child.kind() == "field_identifier" {
                         let start_byte = child.start_byte() as usize;
                         let end_byte = child.end_byte() as usize;
-                        let start_char = text.byte_to_char(start_byte);
-                        let end_char = text.byte_to_char(end_byte);
-                        let name = text.slice(start_char..end_char).to_string();
-                        return Some(name);
+                        let start_char = text.try_byte_to_char(start_byte).ok()?;
+                        let end_char = text.try_byte_to_char(end_byte).ok()?;
+                        return Some(text.slice(start_char..end_char).to_string());
                     }
                 }
             }
 
-            // C/C++: name is inside a declarator chain
-            // e.g. function_definition → function_declarator → qualified_identifier → identifier
             for i in 0..node.child_count() {
                 if let Some(child) = node.child(i) {
                     if child.kind().contains("declarator") {
@@ -814,12 +801,8 @@ fn get_current_function_name(context: &RenderContext) -> Option<String> {
                 }
             }
 
-            // For arrow functions or anonymous functions assigned to variables,
-            // check the parent for a variable_declarator, assignment_expression, or pair
             if let Some(parent) = node.parent() {
                 let parent_kind = parent.kind();
-
-                // Handle: const name = () => {} or let name = function() {}
                 if parent_kind == "variable_declarator" || parent_kind == "assignment_expression" {
                     for i in 0..parent.child_count() {
                         if let Some(child) = parent.child(i) {
@@ -828,16 +811,14 @@ fn get_current_function_name(context: &RenderContext) -> Option<String> {
                             {
                                 let start_byte = child.start_byte() as usize;
                                 let end_byte = child.end_byte() as usize;
-                                let start_char = text.byte_to_char(start_byte);
-                                let end_char = text.byte_to_char(end_byte);
-                                let name = text.slice(start_char..end_char).to_string();
-                                return Some(name);
+                                let start_char = text.try_byte_to_char(start_byte).ok()?;
+                                let end_char = text.try_byte_to_char(end_byte).ok()?;
+                                return Some(text.slice(start_char..end_char).to_string());
                             }
                         }
                     }
                 }
 
-                // Handle: { name: () => {} } or { name() {} }
                 if parent_kind == "pair" || parent_kind == "method_definition" {
                     for i in 0..parent.child_count() {
                         if let Some(child) = parent.child(i) {
@@ -847,10 +828,9 @@ fn get_current_function_name(context: &RenderContext) -> Option<String> {
                             {
                                 let start_byte = child.start_byte() as usize;
                                 let end_byte = child.end_byte() as usize;
-                                let start_char = text.byte_to_char(start_byte);
-                                let end_char = text.byte_to_char(end_byte);
-                                let name = text.slice(start_char..end_char).to_string();
-                                return Some(name);
+                                let start_char = text.try_byte_to_char(start_byte).ok()?;
+                                let end_char = text.try_byte_to_char(end_byte).ok()?;
+                                return Some(text.slice(start_char..end_char).to_string());
                             }
                         }
                     }
@@ -858,7 +838,6 @@ fn get_current_function_name(context: &RenderContext) -> Option<String> {
             }
         }
 
-        // Move to parent
         node = node.parent()?;
     }
 }

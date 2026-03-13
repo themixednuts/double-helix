@@ -1,12 +1,15 @@
 use crate::{
     commands::{self, OnKeyCallback, OnKeyCallbackKind},
-    compositor::{Component, Context, Event, EventResult},
+    compositor::{Component, Context, Event, EventResult, RenderContext},
     events::{OnModeSwitch, PostCommand},
     handlers::completion::CompletionItem,
     key,
-    keymap::{KeymapResult, Keymaps},
+    keymap::Keymaps,
+    render::{CacheStore, PreparedRender},
     ui::{
-        document::{render_document, LinePos, TextRenderer},
+        document::{
+            render_document, HighlighterInput, LinePos, RenderOutput, RenderSeed, TextRenderer,
+        },
         statusline,
         text_decorations::{
             self, Decoration, DecorationManager, FoldDecoration, InlineDiagnostics,
@@ -24,7 +27,7 @@ use helix_core::{
     text_annotations::TextAnnotations,
     text_folding::RopeSliceFoldExt,
     unicode::width::UnicodeWidthStr,
-    visual_offset_from_block, Change, Position, Range, Selection, Transaction,
+    plain_visual_col_at_char_idx, visual_offset_from_block, Position, Range, Selection,
 };
 use helix_loader::VERSION_AND_GIT_HASH;
 use helix_view::{
@@ -40,14 +43,15 @@ use helix_view::{
     Editor,
     Theme,
     View,
+    ViewId,
 };
 use std::{
+    collections::HashMap,
     mem::take,
-    num::NonZeroUsize,
     ops,
     path::{PathBuf, MAIN_SEPARATOR, MAIN_SEPARATOR_STR},
     rc::Rc,
-    sync::LazyLock,
+    sync::{Arc, LazyLock},
 };
 
 use tui::{
@@ -57,11 +61,149 @@ use tui::{
 
 use super::text_decorations::blame::InlineBlame;
 
+use helix_view::engine::{KeymapQuery, ModalInputState};
+use helix_view::model::FocusTarget;
+use helix_view::view::{LineMap, SyntaxStyleCache, ViewContentState};
+
+const MAX_SEED_LINE_MAP_GAP: usize = 4_096;
+
+/// View render context grouping parameters for `render_view`.
+pub(crate) struct ViewRenderContext<'a> {
+    pub editor: &'a Editor,
+    pub doc: &'a Document,
+    pub view: &'a View,
+    pub viewport: Rect,
+    pub is_focused: bool,
+    /// Cached syntax styles to replay instead of running tree-sitter.
+    pub cached_syntax: Option<&'a SyntaxStyleCache>,
+    /// Set of dirty visual rows. Only these rows will be re-rendered.
+    /// `None` means all rows are dirty (full render).
+    pub dirty_rows: Option<&'a std::collections::HashSet<u16>>,
+    pub seed_line_map: Option<&'a LineMap>,
+}
+
+fn choose_render_seed(
+    line_map: Option<&LineMap>,
+    top_doc_line: usize,
+    horizontal_offset: usize,
+) -> Option<RenderSeed> {
+    line_map.and_then(|line_map| {
+        line_map.best_horizontal_checkpoint_within_gap(
+            top_doc_line,
+            horizontal_offset,
+            MAX_SEED_LINE_MAP_GAP,
+        )
+    })
+        .map(|checkpoint| RenderSeed {
+            doc_line: top_doc_line,
+            char_idx: checkpoint.char_idx,
+            visual_col: checkpoint.visual_col,
+        })
+}
+
+fn can_reuse_seed_line_map(
+    previous: &ViewContentState,
+    current: &ViewContentState,
+) -> bool {
+    previous.doc_id == current.doc_id
+        && previous.doc_version == current.doc_version
+        && previous.annotation_gen == current.annotation_gen
+        && previous.config_gen == current.config_gen
+        && previous.theme_name == current.theme_name
+        && previous.area.width == current.area.width
+}
+
+fn cursor_position_from_line_map(doc: &Document, view: &View, line_map: &LineMap) -> Option<Position> {
+    let text = doc.text().slice(..);
+    let cursor = doc.selection(view.id).primary().cursor(text);
+    let tab_width = doc.tab_width();
+
+    line_map.lines.iter().find_map(|line| {
+        if line.visible_char_start == usize::MAX || line.visible_char_last == usize::MAX {
+            return None;
+        }
+        if cursor < line.visible_char_start || cursor > line.char_range_end {
+            return None;
+        }
+        if line.doc_line != text.char_to_line(cursor.min(text.len_chars())) {
+            return None;
+        }
+
+        let delta_chars = cursor.saturating_sub(line.visible_char_start);
+        let delta_col = plain_visual_col_at_char_idx(
+            text.slice(line.visible_char_start..cursor),
+            delta_chars,
+            tab_width,
+        );
+
+        let visual_col = line.visible_col_start + delta_col;
+        if visual_col < doc.view_offset(view.id).horizontal_offset {
+            return None;
+        }
+
+        Some(Position::new(
+            line.visual_row as usize,
+            visual_col - doc.view_offset(view.id).horizontal_offset,
+        ))
+    })
+}
+
+fn update_cursor_cache_from_line_map(editor: &Editor, doc: &Document, view: &View, line_map: &LineMap) {
+    if editor.tree.focus != view.id {
+        return;
+    }
+    editor
+        .cursor_cache
+        .set(cursor_position_from_line_map(doc, view, line_map));
+}
+
+/// Cached rendered cells for a single view.
+struct ViewRenderCacheEntry {
+    /// Content-level state (doc version, scroll, area, theme, config).
+    /// When this matches, syntax styles and line map can be reused.
+    content_state: ViewContentState,
+    /// The rendered cells for the view's area.
+    cells: tui::buffer::Buffer,
+    /// Cached syntax styles — reusable when content state is unchanged.
+    syntax_styles: SyntaxStyleCache,
+    /// Visual-line → document position mapping, built during rendering.
+    line_map: LineMap,
+    /// Per-line overlay fingerprints for dirty-line detection.
+    overlay_fingerprints: Arc<[u64]>,
+}
+
+/// Per-view render cache with two-tier invalidation:
+///
+/// 1. **Content hit** — content state matches → blit cached cells, compute dirty
+///    lines from overlay fingerprints, re-render only dirty lines. When 0 lines
+///    are dirty (nothing changed at all), this is a pure blit — zero extra work.
+/// 2. **Content miss** — content changed → full re-render + record syntax styles + line map
+#[derive(Default)]
+struct ViewRenderCache {
+    entries: HashMap<ViewId, ViewRenderCacheEntry>,
+    #[cfg(debug_assertions)]
+    hits: u64,
+    #[cfg(debug_assertions)]
+    misses: u64,
+    #[cfg(debug_assertions)]
+    dirty_lines: u64,
+    #[cfg(debug_assertions)]
+    clean_lines: u64,
+    #[cfg(debug_assertions)]
+    frames: u64,
+}
+
+
 pub struct EditorView {
     pub keymaps: Keymaps,
+    /// The editing engine. Always `Some` during normal operation; temporarily
+    /// `None` during `feed_key` to satisfy the borrow checker (engine and
+    /// editor are disjoint, but the compiler can't prove it).
+    engine: Option<Box<dyn helix_view::engine::EditingEngine>>,
+    /// Shared command registry — borrowed by Context for MappableCommand::Engine execution.
+    pub(crate) registry: std::sync::Arc<helix_modal::registry::CommandRegistry>,
     on_next_key: Option<(OnKeyCallback, OnKeyCallbackKind)>,
     pseudo_pending: Vec<KeyEvent>,
-    pub(crate) last_insert: (commands::MappableCommand, Vec<InsertEvent>),
     pub(crate) completion: Option<Completion>,
     spinners: ProgressSpinners,
     bufferline_info: BufferLineInfo,
@@ -71,26 +213,80 @@ pub struct EditorView {
     /// Tracks if there are prompt layers active (updated by compositor)
     pub prompt_active: bool,
     notification_popup: NotificationPopup,
-}
-
-#[derive(Debug, Clone)]
-pub enum InsertEvent {
-    Key(KeyEvent),
-    CompletionApply {
-        trigger_offset: usize,
-        changes: Vec<Change>,
-    },
-    TriggerCompletion,
-    RequestCompletion,
+    /// Per-view render cache for skipping re-render of unchanged views.
+    render_cache: ViewRenderCache,
+    chrome_cache: CacheStore,
 }
 
 impl EditorView {
-    pub fn new(keymaps: Keymaps) -> Self {
+    fn content_area(view: &View) -> Rect {
+        view.area.clip_bottom(1)
+    }
+
+    fn engine_input_state(&self) -> ModalInputState {
+        self.engine
+            .as_ref()
+            .map_or_else(ModalInputState::default, |engine| engine.input_state())
+    }
+
+    fn set_engine_input_state(&mut self, state: ModalInputState) {
+        if let Some(engine) = self.engine.as_mut() {
+            engine.set_input_state(state);
+        }
+    }
+
+    fn sync_context_from_engine(&self, cx: &mut commands::Context) {
+        let state = self.engine_input_state();
+        cx.count = state.count;
+        cx.register = state.selected_register;
+    }
+
+    fn sync_engine_from_context(&mut self, cx: &mut commands::Context) {
+        let state = ModalInputState {
+            count: cx.count,
+            selected_register: cx.register,
+        };
+        self.set_engine_input_state(state);
+        cx.editor.focused_modal_input = state;
+    }
+
+    fn publish_focused_modal_input(&self, editor: &mut Editor) {
+        editor.focused_modal_input = self.engine_input_state();
+    }
+
+    fn prepare_statusline(
+        &self,
+        editor: &Editor,
+        doc: &Document,
+        view: &View,
+        is_focused: bool,
+    ) -> PreparedRender {
+        let statusline_area = view.area.clip_top(view.area.height.saturating_sub(1));
+        let statusline_mode = editor.mode();
+        let statusline_register = self.engine_input_state().selected_register;
+        let statusline_model = statusline::StatuslineModel::collect(
+            editor,
+            doc,
+            view,
+            is_focused,
+            statusline_mode,
+            statusline_register,
+            &self.spinners,
+        );
+        statusline::Statusline::prepare(statusline_model, statusline_area)
+    }
+
+    pub fn new(
+        keymaps: Keymaps,
+        engine: Box<dyn helix_view::engine::EditingEngine>,
+        registry: std::sync::Arc<helix_modal::registry::CommandRegistry>,
+    ) -> Self {
         Self {
             keymaps,
+            engine: Some(engine),
+            registry,
             on_next_key: None,
             pseudo_pending: Vec::new(),
-            last_insert: (commands::MappableCommand::normal_mode, Vec::new()),
             completion: None,
             spinners: ProgressSpinners::default(),
             bufferline_info: BufferLineInfo::default(),
@@ -98,7 +294,30 @@ impl EditorView {
             bufferline_positions: Vec::new(),
             prompt_active: false,
             notification_popup: NotificationPopup::new(),
+            render_cache: ViewRenderCache::default(),
+            chrome_cache: CacheStore::default(),
         }
+    }
+
+    /// Blit cached cells onto the main surface.
+    fn blit(src: &tui::buffer::Buffer, dst: &mut Surface) {
+        let a = src.area;
+        for y in a.top()..a.bottom() {
+            for x in a.left()..a.right() {
+                dst[(x, y)] = src[(x, y)].clone();
+            }
+        }
+    }
+
+    /// Copy a rectangular region from the surface into a standalone buffer.
+    fn copy_region(src: &Surface, area: Rect) -> tui::buffer::Buffer {
+        let mut buf = tui::buffer::Buffer::empty(area);
+        for y in area.top()..area.bottom() {
+            for x in area.left()..area.right() {
+                buf[(x, y)] = src[(x, y)].clone();
+            }
+        }
+        buf
     }
 
     pub fn spinners_mut(&mut self) -> &mut ProgressSpinners {
@@ -360,15 +579,22 @@ impl EditorView {
         }
     }
 
-    pub fn render_view(
-        &self,
-        editor: &Editor,
-        doc: &Document,
-        view: &View,
-        viewport: Rect,
+    pub(crate) fn render_view(
+        &mut self,
+        vctx: &ViewRenderContext<'_>,
         surface: &mut Surface,
-        is_focused: bool,
-    ) {
+    ) -> RenderOutput {
+        let ViewRenderContext {
+            editor,
+            doc,
+            view,
+            viewport,
+            is_focused,
+            cached_syntax,
+            dirty_rows,
+            seed_line_map,
+        } = vctx;
+        let is_focused = *is_focused;
         let inner = view.inner_area(doc);
         let area = view.area;
         let theme = &editor.theme;
@@ -377,7 +603,15 @@ impl EditorView {
 
         let view_offset = doc.view_offset(view.id);
 
+        let render_view_start = std::time::Instant::now();
+        let text_annotations_start = std::time::Instant::now();
         let text_annotations = view.text_annotations(doc, Some(theme));
+        helix_view::bench::log_run_phase(
+            "render_view",
+            "text_annotations",
+            text_annotations_start.elapsed(),
+            || format!("view_id={:?}", view.id),
+        );
         let mut decorations = DecorationManager::default();
 
         if !(is_focused && self.terminal_focused) {
@@ -391,7 +625,14 @@ impl EditorView {
         decorations.add_decoration(FoldDecoration::new(&text_annotations, theme));
 
         if is_focused && config.cursorcolumn {
+            let cursorcolumn_start = std::time::Instant::now();
             Self::highlight_cursorcolumn(doc, view, surface, theme, inner, &text_annotations);
+            helix_view::bench::log_run_phase(
+                "render_view",
+                "cursorcolumn",
+                cursorcolumn_start.elapsed(),
+                || format!("view_id={:?}", view.id),
+            );
         }
 
         // Set DAP highlights, if needed.
@@ -408,15 +649,29 @@ impl EditorView {
             decorations.add_decoration(line_decoration);
         }
 
-        let syntax_highlighter = Self::doc_syntax_highlighter(
-            doc,
-            &text_annotations,
-            view_offset.anchor,
-            inner.height,
-            &loader,
+        let highlighter_start = std::time::Instant::now();
+        let highlighter_input = match cached_syntax {
+            Some(cache) => HighlighterInput::Cached(&cache.entries),
+            None => {
+                let syntax_highlighter = Self::doc_syntax_highlighter(
+                    doc,
+                    &text_annotations,
+                    view_offset.anchor,
+                    inner.height,
+                    &loader,
+                );
+                HighlighterInput::Live(syntax_highlighter)
+            }
+        };
+        helix_view::bench::log_run_phase(
+            "render_view",
+            "highlighter_input",
+            highlighter_start.elapsed(),
+            || format!("view_id={:?} cached={}", view.id, cached_syntax.is_some()),
         );
         let mut overlays = Vec::new();
 
+        let overlays_start = std::time::Instant::now();
         overlays.push(Self::overlay_syntax_highlights(
             doc,
             view_offset.anchor,
@@ -441,7 +696,13 @@ impl EditorView {
             }
         }
 
-        Self::doc_diagnostics_highlights_into(doc, theme, &mut overlays);
+        let viewport_range = Self::viewport_byte_range(
+            doc.text().slice(..),
+            &text_annotations,
+            view_offset.anchor,
+            inner.height,
+        );
+        Self::doc_diagnostics_highlights_into(doc, theme, &mut overlays, Some(viewport_range));
 
         if is_focused {
             if let Some(tabstops) = Self::tabstop_highlights(doc, theme) {
@@ -459,9 +720,16 @@ impl EditorView {
                 overlays.push(overlay);
             }
         }
+        helix_view::bench::log_run_phase(
+            "render_view",
+            "overlays",
+            overlays_start.elapsed(),
+            || format!("view_id={:?} count={}", view.id, overlays.len()),
+        );
 
         let gutter_overflow = view.gutter_offset(doc) == 0;
         if !gutter_overflow {
+            let gutter_start = std::time::Instant::now();
             Self::render_gutter(
                 editor,
                 doc,
@@ -471,11 +739,24 @@ impl EditorView {
                 is_focused & self.terminal_focused,
                 &mut decorations,
             );
+            helix_view::bench::log_run_phase(
+                "render_view",
+                "gutter",
+                gutter_start.elapsed(),
+                || format!("view_id={:?}", view.id),
+            );
         }
 
+        let inline_blame_start = std::time::Instant::now();
         Self::render_inline_blame(&config.inline_blame, doc, view, &mut decorations, theme);
+        helix_view::bench::log_run_phase(
+            "render_view",
+            "inline_blame",
+            inline_blame_start.elapsed(),
+            || format!("view_id={:?}", view.id),
+        );
 
-        if config.welcome_screen && doc.version() == 0 && doc.is_welcome {
+        if config.welcome_screen && doc.version() == 0 && doc.is_welcome() {
             Self::render_welcome(
                 theme,
                 view,
@@ -510,23 +791,46 @@ impl EditorView {
 
         decorations.add_decoration(PluginDecoration::new(doc, theme, view.id));
 
-        render_document(
+        let top_doc_line = doc
+            .text()
+            .char_to_line(view_offset.anchor.min(doc.text().len_chars()));
+        let render_seed =
+            choose_render_seed(*seed_line_map, top_doc_line, view_offset.horizontal_offset);
+        let render_document_start = std::time::Instant::now();
+        let render_output = render_document(
             surface,
             inner,
             doc,
             view_offset,
             &text_annotations,
-            syntax_highlighter,
+            highlighter_input,
             overlays,
             theme,
             decorations,
+            *dirty_rows,
+            render_seed,
+            *seed_line_map,
+        );
+        helix_view::bench::log_run_phase(
+            "render_view",
+            "render_document",
+            render_document_start.elapsed(),
+            || format!("view_id={:?}", view.id),
         );
 
         // Draw rulers after document. Skip cells that already have content.
+        let rulers_start = std::time::Instant::now();
         Self::render_rulers(editor, doc, view, inner, surface, theme);
+        helix_view::bench::log_run_phase(
+            "render_view",
+            "rulers",
+            rulers_start.elapsed(),
+            || format!("view_id={:?}", view.id),
+        );
 
         // if we're not at the edge of the screen, draw a right border
         if viewport.right() != view.area.right() {
+            let border_start = std::time::Instant::now();
             let x = area.right();
             let border_style = theme.get("ui.window");
             for y in area.top()..area.bottom() {
@@ -535,6 +839,12 @@ impl EditorView {
                     //.set_symbol(" ")
                     .set_style(border_style);
             }
+            helix_view::bench::log_run_phase(
+                "render_view",
+                "right_border",
+                border_start.elapsed(),
+                || format!("view_id={:?} height={}", view.id, area.height),
+            );
         }
 
         // if config.inline_diagnostics.disabled()
@@ -543,14 +853,14 @@ impl EditorView {
         //     Self::render_diagnostics(doc, view, inner, surface, theme);
         // }
 
-        // Statusline on the last row of the view area.
-        // The cmdline space reservation is handled at the top level in EditorView::render.
-        let statusline_area = view.area.clip_top(view.area.height.saturating_sub(1));
+        helix_view::bench::log_run_phase(
+            "render_view",
+            "total",
+            render_view_start.elapsed(),
+            || format!("view_id={:?}", view.id),
+        );
 
-        let mut context =
-            statusline::RenderContext::new(editor, doc, view, is_focused, &self.spinners);
-
-        statusline::render(&mut context, statusline_area, surface);
+        render_output
     }
 
     fn render_inline_blame(
@@ -568,7 +878,7 @@ impl EditorView {
                 let cursor_line_idx = doc.cursor_line(view.id);
 
                 // do not render inline blame for empty lines to reduce visual noise
-                if text.line(cursor_line_idx) != doc.line_ending.as_str() {
+                if text.line(cursor_line_idx) != doc.line_ending().as_str() {
                     if let Ok(line_blame) =
                         doc.line_blame(cursor_line_idx as u32, &inline_blame.format)
                     {
@@ -587,7 +897,7 @@ impl EditorView {
 
                 let blame_for_all_lines = view.line_range(doc).filter_map(|line_idx| {
                     // do not render inline blame for empty lines to reduce visual noise
-                    if text.line(line_idx) != doc.line_ending.as_str() {
+                    if text.line(line_idx) != doc.line_ending().as_str() {
                         doc.line_blame(line_idx as u32, &inline_blame.format)
                             .ok()
                             .map(|blame| (line_idx, blame))
@@ -652,7 +962,7 @@ impl EditorView {
                     for y in area.top()..area.bottom() {
                         let cell = &surface[(area.x, y)];
                         // Skip cells that have non-whitespace content (like diagnostic bubbles)
-                        if cell.symbol == " " || cell.symbol.is_empty() {
+                        if &*cell.symbol == " " || cell.symbol.is_empty() {
                             surface[(area.x, y)].set_style(bg_style);
                         }
                     }
@@ -666,7 +976,7 @@ impl EditorView {
                     for y in area.top()..area.bottom() {
                         let cell = &surface[(area.x, y)];
                         // Only draw ruler glyph on empty/space cells to avoid overwriting content
-                        if cell.symbol == " " || cell.symbol.is_empty() {
+                        if &*cell.symbol == " " || cell.symbol.is_empty() {
                             surface[(area.x, y)]
                                 .set_symbol(ruler_char)
                                 .set_style(glyph_style);
@@ -685,10 +995,11 @@ impl EditorView {
         // Calculate viewport byte ranges:
         // Saturating subs to make it inclusive zero indexing.
         let last_line = text.len_lines().saturating_sub(1);
+        let row = row.min(last_line);
         let last_visible_line = text
             .nth_next_folded_line(&annotations.folds, row, (height as usize).saturating_sub(1))
             .min(last_line);
-        let start = text.line_to_byte(row.min(last_line));
+        let start = text.line_to_byte(row);
         let end = text.line_to_byte(last_visible_line + 1);
 
         start..end
@@ -751,11 +1062,13 @@ impl EditorView {
         Some(syntax.rainbow_highlights(text, theme.rainbow_length(), loader, range))
     }
 
-    /// Get highlight spans for document diagnostics
+    /// Get highlight spans for document diagnostics.
+    /// If `viewport` is provided, only diagnostics overlapping that byte range are processed.
     pub fn doc_diagnostics_highlights_into(
         doc: &Document,
         theme: &Theme,
         overlay_highlights: &mut Vec<OverlayHighlights>,
+        viewport: Option<std::ops::Range<usize>>,
     ) {
         use helix_core::diagnostic::{DiagnosticTag, Range, Severity};
         let get_scope_of = |scope| {
@@ -798,7 +1111,19 @@ impl EditorView {
             }
         };
 
-        for diagnostic in doc.diagnostics() {
+        let diagnostics = doc.diagnostics();
+
+        // Cull diagnostics outside the viewport using binary search.
+        // Diagnostics are sorted by range.start, so we can efficiently skip.
+        let (diag_start, diag_end) = if let Some(ref vp) = viewport {
+            let start = diagnostics.partition_point(|d| d.range.end < vp.start);
+            let end = diagnostics.partition_point(|d| d.range.start <= vp.end);
+            (start, end)
+        } else {
+            (0, diagnostics.len())
+        };
+
+        for diagnostic in &diagnostics[diag_start..diag_end] {
             // Separate diagnostics into different Vecs by severity.
             let vec = match diagnostic.severity {
                 Some(Severity::Info) => &mut info_vec,
@@ -994,7 +1319,7 @@ impl EditorView {
     }
 
     pub fn tabstop_highlights(doc: &Document, theme: &Theme) -> Option<OverlayHighlights> {
-        let snippet = doc.active_snippet.as_ref()?;
+        let snippet = doc.active_snippet()?;
         let highlight = theme.find_highlight_exact("tabstop")?;
         let mut ranges = Vec::new();
         for tabstop in snippet.tabstops() {
@@ -1421,176 +1746,294 @@ impl EditorView {
         }
     }
 
-    /// Handle events by looking them up in `self.keymaps`. Returns None
-    /// if event was handled (a command was executed or a subkeymap was
-    /// activated). Only KeymapResult::{NotFound, Cancelled} is returned
-    /// otherwise.
-    fn handle_keymap_event(
+    /// Unified key dispatch: resolve keymap once, route to frontend or engine.
+    ///
+    /// Flow:
+    /// 1. Engine `pre_resolve` — count/register/dot-repeat (no keymap needed)
+    /// 2. If not consumed, resolve keymap ONCE
+    /// 3. If frontend result → execute frontend command
+    /// 4. Otherwise → convert to `KeymapLookup`, pass to engine's `process_lookup`
+    fn dispatch_key(&mut self, cx: &mut commands::Context, key: KeyEvent) {
+        let dispatch_start = std::time::Instant::now();
+        self.sync_context_from_engine(cx);
+        let mode_before = cx.editor.mode();
+
+        // Resolve the editing context from the focused view.
+        let focus = cx.editor.tree.focus;
+        let focused_view = cx.editor.tree.get(focus);
+        let view_id = focused_view.id;
+        let doc_id = focused_view.doc;
+
+        // Step 1: Engine pre-resolve (count, register, dot-repeat, escape).
+        let mut engine = self.engine.take().expect("engine is always present");
+        let pre_resolve_start = std::time::Instant::now();
+        if let Some(result) = engine.pre_resolve(cx.editor, view_id, doc_id, &self.keymaps, key) {
+            helix_view::bench::log_run_phase(
+                "editor_dispatch",
+                "pre_resolve",
+                pre_resolve_start.elapsed(),
+                || {
+                    format!(
+                        "key={} mode_before={:?} view_id={:?} doc_id={:?} consumed=true",
+                        key.key_sequence_format(),
+                        mode_before,
+                        view_id,
+                        doc_id
+                    )
+                },
+            );
+            self.engine = Some(engine);
+            self.handle_engine_result(cx, key, result, mode_before);
+            self.sync_context_from_engine(cx);
+            self.publish_focused_modal_input(cx.editor);
+            helix_view::bench::log_run_phase(
+                "editor_dispatch",
+                "total",
+                dispatch_start.elapsed(),
+                || format!("key={} path=pre_resolve", key.key_sequence_format()),
+            );
+            return;
+        }
+        helix_view::bench::log_run_phase(
+            "editor_dispatch",
+            "pre_resolve",
+            pre_resolve_start.elapsed(),
+            || {
+                format!(
+                    "key={} mode_before={:?} view_id={:?} doc_id={:?} consumed=false",
+                    key.key_sequence_format(),
+                    mode_before,
+                    view_id,
+                    doc_id
+                )
+            },
+        );
+        self.engine = Some(engine);
+
+        // Step 2: Resolve keymap ONCE.
+        let mode = cx.editor.mode();
+        let keymap_start = std::time::Instant::now();
+        let result = self.keymaps.get(mode, key);
+        helix_view::bench::log_run_phase(
+            "editor_dispatch",
+            "keymap_get",
+            keymap_start.elapsed(),
+            || format!("key={} mode={:?}", key.key_sequence_format(), mode),
+        );
+
+        let is_frontend = crate::keymap::is_frontend_result(&result);
+
+        // Step 3: If frontend result → execute frontend command.
+        if is_frontend {
+            // Reset engine pending state since frontend is taking over.
+            let mut engine = self.engine.take().expect("engine is always present");
+            if engine.is_pending() {
+                engine.reset();
+            }
+            self.engine = Some(engine);
+
+            // Update autoinfo from sticky keymap (clears stale Pending infobox).
+            cx.editor.autoinfo = self.keymaps.sticky_infobox();
+
+            let mut cmd_name: Option<&'static str> = None;
+            match result {
+                crate::keymap::KeymapResult::Pending(node) => {
+                    cx.editor.autoinfo = Some(node.infobox());
+                }
+                crate::keymap::KeymapResult::Matched(cmd) => {
+                    cmd_name = cmd.static_name();
+                    self.execute_frontend_command(cx, &cmd);
+                }
+                crate::keymap::KeymapResult::MatchedSequence(cmds) => {
+                    if let Some(first) = cmds.first() {
+                        cmd_name = first.static_name();
+                    }
+                    for cmd in &cmds {
+                        self.execute_frontend_command(cx, cmd);
+                    }
+                }
+                crate::keymap::KeymapResult::NotFound
+                | crate::keymap::KeymapResult::Cancelled(_)
+                | crate::keymap::KeymapResult::Fallback(_, _) => unreachable!(),
+            }
+
+            self.handle_mode_change(cx, mode_before, cmd_name.or(Some("unknown")));
+            self.sync_engine_from_context(cx);
+            self.publish_focused_modal_input(cx.editor);
+            helix_view::bench::log_run_phase(
+                "editor_dispatch",
+                "total",
+                dispatch_start.elapsed(),
+                || format!("key={} path=frontend", key.key_sequence_format()),
+            );
+            return;
+        }
+
+        // Step 4: Convert to engine KeymapLookup and process.
+        let lookup = crate::keymap::resolve_keymap_result(&result);
+
+        let mut engine = self.engine.take().expect("engine is always present");
+        let process_start = std::time::Instant::now();
+        let engine_result =
+            engine.process_lookup(cx.editor, view_id, doc_id, &mut self.keymaps, key, lookup);
+        helix_view::bench::log_run_phase(
+            "editor_dispatch",
+            "process_lookup",
+            process_start.elapsed(),
+            || {
+                format!(
+                    "key={} mode={:?} view_id={:?} doc_id={:?}",
+                    key.key_sequence_format(),
+                    mode,
+                    view_id,
+                    doc_id
+                )
+            },
+        );
+        self.engine = Some(engine);
+
+        self.handle_engine_result(cx, key, engine_result, mode_before);
+        self.sync_context_from_engine(cx);
+        self.publish_focused_modal_input(cx.editor);
+        helix_view::bench::log_run_phase(
+            "editor_dispatch",
+            "total",
+            dispatch_start.elapsed(),
+            || format!("key={} path=engine", key.key_sequence_format()),
+        );
+    }
+
+    fn handle_engine_result(
         &mut self,
-        mode: Mode,
-        cxt: &mut commands::Context,
-        event: KeyEvent,
-    ) -> Option<KeymapResult> {
-        let mut last_mode = mode;
-        self.pseudo_pending.extend(self.keymaps.pending());
-        let key_result = self.keymaps.get(mode, event);
-        cxt.editor.autoinfo = self.keymaps.sticky().map(|node| node.infobox());
+        cx: &mut commands::Context,
+        key: KeyEvent,
+        result: helix_view::engine::EngineResult,
+        mode_before: Mode,
+    ) {
+        use helix_view::engine::EngineResult;
 
-        let mut execute_command = |command: &commands::MappableCommand| {
-            command.execute(cxt);
-            helix_event::dispatch(PostCommand { command, cx: cxt });
+        match result {
+            EngineResult::Executed => {
+                self.handle_mode_change(cx, mode_before, None);
+            }
+            EngineResult::Pending => {
+                // Engine consumed the key, waiting for more input.
+            }
+            EngineResult::InsertChar(ch) => {
+                commands::insert::insert_char(cx, ch);
+            }
+            EngineResult::CancelledInsert(pending_keys) => {
+                for ev in pending_keys.iter() {
+                    if let Some(ch) = ev.char() {
+                        commands::insert::insert_char(cx, ch);
+                    }
+                }
+            }
+            EngineResult::Unbound => {
+                let is_synthetic_null = matches!(key.code, KeyCode::Null | KeyCode::Char('\0'));
+                if !is_synthetic_null {
+                    log::warn!("unbound key: {}", key.key_sequence_format());
+                }
+            }
+            EngineResult::ReplayInsert {
+                entry_command,
+                keys,
+            } => {
+                self.replay_insert(cx, &entry_command, &keys);
+            }
+        }
+    }
 
-            let current_mode = cxt.editor.mode();
-            if current_mode != last_mode {
+    /// Replay a recorded insert sequence for dot-repeat.
+    fn replay_insert(
+        &mut self,
+        cx: &mut commands::Context,
+        entry_command: &str,
+        keys: &[KeyEvent],
+    ) {
+        if let Some(cmd) = commands::MappableCommand::builtin_commands()
+            .iter()
+            .find(|cmd| cmd.name() == entry_command)
+        {
+            let mode_before = cx.editor.mode();
+            self.sync_context_from_engine(cx);
+            cmd.execute(cx);
+            self.sync_engine_from_context(cx);
+            let mode_after = cx.editor.mode();
+            if mode_after != mode_before {
                 helix_event::dispatch(OnModeSwitch {
-                    old_mode: last_mode,
-                    new_mode: current_mode,
-                    cx: cxt,
+                    old_mode: mode_before,
+                    new_mode: mode_after,
+                    cx,
                 });
-
-                // HAXX: if we just entered insert mode from normal, clear key buf
-                // and record the command that got us into this mode.
-                if current_mode == Mode::Insert {
-                    // how we entered insert mode is important, and we should track that so
-                    // we can repeat the side effect.
-                    self.last_insert.0 = command.clone();
-                    self.last_insert.1.clear();
-                }
             }
-
-            last_mode = current_mode;
-        };
-
-        match &key_result {
-            KeymapResult::Matched(command) => {
-                execute_command(command);
-            }
-            KeymapResult::Pending(node) => cxt.editor.autoinfo = Some(node.infobox()),
-            KeymapResult::MatchedSequence(commands) => {
-                for command in commands {
-                    execute_command(command);
-                }
-            }
-            KeymapResult::NotFound | KeymapResult::Cancelled(_) => return Some(key_result),
-            KeymapResult::Fallback(fallback, ch) => {
-                fallback.execute(cxt, *ch);
-            }
+        } else {
+            log::warn!("replay_insert: unknown entry command '{}'", entry_command);
+            return;
         }
-        None
-    }
 
-    fn insert_mode(&mut self, cx: &mut commands::Context, event: KeyEvent) {
-        if let Some(keyresult) = self.handle_keymap_event(Mode::Insert, cx, event) {
-            match keyresult {
-                KeymapResult::NotFound => {
-                    if !self.on_next_key(OnKeyCallbackKind::Fallback, cx, event) {
-                        if let Some(ch) = event.char() {
-                            commands::insert::insert_char(cx, ch)
-                        }
-                    }
-                }
-                KeymapResult::Cancelled(pending) => {
-                    for ev in pending {
-                        match ev.char() {
-                            Some(ch) => commands::insert::insert_char(cx, ch),
-                            None => {
-                                if let KeymapResult::Matched(command) =
-                                    self.keymaps.get(Mode::Insert, ev)
-                                {
-                                    command.execute(cx);
-                                }
-                            }
-                        }
-                    }
-                }
-                _ => unreachable!(),
+        for &key in keys {
+            if cx.editor.mode() != Mode::Insert {
+                break;
             }
+            self.dispatch_key(cx, key);
+        }
+
+        if cx.editor.mode() == Mode::Insert {
+            cx.editor.enter_normal_mode();
         }
     }
 
-    fn command_mode(&mut self, mode: Mode, cxt: &mut commands::Context, event: KeyEvent) {
-        match (event, cxt.editor.count) {
-            // If the count is already started and the input is a number, always continue the count.
-            (key!(i @ '0'..='9'), Some(count)) => {
-                let i = i.to_digit(10).unwrap() as usize;
-                let count = count.get() * 10 + i;
-                if count > 100_000_000 {
-                    return;
-                }
-                cxt.editor.count = NonZeroUsize::new(count);
-            }
-            // A non-zero digit will start the count if that number isn't used by a keymap.
-            (key!(i @ '1'..='9'), None) if !self.keymaps.contains_key(mode, event) => {
-                let i = i.to_digit(10).unwrap() as usize;
-                cxt.editor.count = NonZeroUsize::new(i);
-            }
-            // special handling for repeat operator
-            (key!('.'), _) if self.keymaps.pending().is_empty() => {
-                for _ in 0..cxt.editor.count.map_or(1, NonZeroUsize::into) {
-                    // first execute whatever put us into insert mode
-                    self.last_insert.0.execute(cxt);
-                    let mut last_savepoint = None;
-                    let mut last_request_savepoint = None;
-                    // then replay the inputs
-                    for key in self.last_insert.1.clone() {
-                        match key {
-                            InsertEvent::Key(key) => self.insert_mode(cxt, key),
-                            InsertEvent::CompletionApply {
-                                trigger_offset,
-                                changes,
-                            } => {
-                                let (view, doc) = current!(cxt.editor);
+    fn execute_frontend_command(
+        &mut self,
+        cx: &mut commands::Context,
+        command: &commands::MappableCommand,
+    ) {
+        self.sync_context_from_engine(cx);
+        command.execute(cx);
+        self.sync_engine_from_context(cx);
 
-                                if let Some(last_savepoint) = last_savepoint.as_deref() {
-                                    doc.restore(view, last_savepoint, true);
-                                }
+        if let Some(static_command) = commands::MappableCommand::builtin_commands()
+            .iter()
+            .find(|candidate| candidate.name() == command.name())
+        {
+            helix_event::dispatch(PostCommand {
+                command: static_command,
+                cx,
+            });
+        }
+    }
 
-                                let text = doc.text().slice(..);
-                                let cursor = doc.selection(view.id).primary().cursor(text);
+    /// Track mode changes, fire events, and manage insert recording for dot-repeat.
+    ///
+    /// `command_name` is the name of the command that triggered the mode change,
+    /// used as the entry command for insert recording. Pass `None` when the command
+    /// name is not known (e.g., engine-dispatched mode changes).
+    fn handle_mode_change(
+        &mut self,
+        cx: &mut commands::Context,
+        mode_before: Mode,
+        command_name: Option<&str>,
+    ) {
+        let mode_after = cx.editor.mode();
+        if mode_after != mode_before {
+            helix_event::dispatch(OnModeSwitch {
+                old_mode: mode_before,
+                new_mode: mode_after,
+                cx,
+            });
 
-                                let shift_position = |pos: usize| -> usize {
-                                    (pos + cursor).saturating_sub(trigger_offset)
-                                };
+            let engine = self.engine.as_mut().expect("engine is always present");
 
-                                let tx = Transaction::change(
-                                    doc.text(),
-                                    changes.iter().cloned().map(|(start, end, t)| {
-                                        (shift_position(start), shift_position(end), t)
-                                    }),
-                                );
-                                doc.apply(&tx, view.id);
-                            }
-                            InsertEvent::TriggerCompletion => {
-                                last_savepoint = take(&mut last_request_savepoint);
-                            }
-                            InsertEvent::RequestCompletion => {
-                                let (view, doc) = current!(cxt.editor);
-                                last_request_savepoint = Some(doc.savepoint(view));
-                            }
-                        }
-                    }
-                }
-                cxt.editor.count = None;
-            }
-            _ => {
-                // set the count
-                cxt.count = cxt.editor.count;
-                // TODO: edge case: 0j -> reset to 1
-                // if this fails, count was Some(0)
-                // debug_assert!(cxt.count != 0);
-
-                // set the register
-                cxt.register = cxt.editor.selected_register.take();
-
-                let res = self.handle_keymap_event(mode, cxt, event);
-                if matches!(&res, Some(KeymapResult::NotFound)) {
-                    self.on_next_key(OnKeyCallbackKind::Fallback, cxt, event);
-                }
-                if self.keymaps.pending().is_empty() {
-                    cxt.editor.count = None
-                } else {
-                    cxt.editor.selected_register = cxt.register.take();
-                }
+            if mode_after == Mode::Insert && mode_before != Mode::Insert {
+                // Entering insert mode — start recording for dot-repeat.
+                let entry = command_name
+                    .map(|n| std::borrow::Cow::Owned(n.to_string()))
+                    .unwrap_or(std::borrow::Cow::Borrowed("insert_mode"));
+                engine.begin_insert_recording(entry);
+            } else if mode_before == Mode::Insert && mode_after != Mode::Insert {
+                // Leaving insert mode — finalize recording.
+                engine.end_insert_recording();
             }
         }
     }
@@ -1612,7 +2055,6 @@ impl EditorView {
 
         let area = completion.area(size, editor);
         editor.last_completion = Some(CompleteAction::Triggered);
-        self.last_insert.1.push(InsertEvent::TriggerCompletion);
 
         // TODO : propagate required size on resize to completion too
         self.completion = Some(completion);
@@ -1620,6 +2062,9 @@ impl EditorView {
     }
 
     pub fn clear_completion(&mut self, editor: &mut Editor) -> Option<OnKeyCallback> {
+        if let Some(ref completion) = self.completion {
+            completion.remove_model_layer(editor);
+        }
         self.completion = None;
         let mut on_next_key: Option<OnKeyCallback> = None;
         editor.handlers.completions.request_controller.restart();
@@ -1628,26 +2073,23 @@ impl EditorView {
             match last_completion {
                 CompleteAction::Triggered => (),
                 CompleteAction::Applied {
-                    trigger_offset,
-                    changes,
+                    trigger_offset: _,
+                    changes: _,
                     placeholder,
                 } => {
-                    self.last_insert.1.push(InsertEvent::CompletionApply {
-                        trigger_offset,
-                        changes,
-                    });
                     on_next_key = placeholder.then_some(Box::new(|cx, key| {
                         if let Some(c) = key.char() {
-                            let (view, doc) = current!(cx.editor);
-                            if let Some(snippet) = &doc.active_snippet {
-                                doc.apply(&snippet.delete_placeholder(doc.text()), view.id);
+                            let (view_id, doc) = focused!(cx.editor);
+                            if let Some(snippet) = doc.active_snippet() {
+                                doc.apply(&snippet.delete_placeholder(doc.text()), view_id);
                             }
                             commands::insert::insert_char(cx, c);
                         }
                     }))
                 }
                 CompleteAction::Selected { savepoint } => {
-                    let (view, doc) = current!(editor);
+                    let (view_id, doc) = focused!(editor);
+                    let view = view_mut!(editor, view_id);
                     doc.restore(view, &savepoint, false);
                 }
             }
@@ -1679,7 +2121,8 @@ impl EditorView {
         if let Some((on_next_key, _)) = self.on_next_key.take() {
             on_next_key(cxt, null_key_event);
         }
-        self.handle_keymap_event(cxt.editor.mode, cxt, null_key_event);
+        // Feed the null key through the engine to dismiss any pending keymap state
+        self.dispatch_key(cxt, null_key_event);
         self.pseudo_pending.clear();
     }
 
@@ -1774,7 +2217,8 @@ impl EditorView {
                 if let Some((coords, view_id)) = gutter_coords_and_view(editor, row, column) {
                     editor.focus(view_id);
 
-                    let (view, doc) = current!(cxt.editor);
+                    let (view_id, doc) = focused!(cxt.editor);
+                    let view = view!(cxt.editor, view_id);
 
                     let path = match doc.path() {
                         Some(path) => path.clone(),
@@ -1794,24 +2238,24 @@ impl EditorView {
             }
 
             MouseEventKind::Drag(MouseButton::Left) => {
-                let (view, doc) = current!(cxt.editor);
+                let (view_id, doc) = focused!(cxt.editor);
+                let view = view!(cxt.editor, view_id);
 
                 let pos = match view.pos_at_screen_coords(doc, row, column, true) {
                     Some(pos) => pos,
                     None => return EventResult::Ignored(None),
                 };
 
-                let mut selection = doc.selection(view.id).clone();
+                let mut selection = doc.selection(view_id).clone();
                 let primary = selection.primary_mut();
                 *primary = primary.put_cursor(doc.text().slice(..), pos, true);
-                doc.set_selection(view.id, selection);
-                let view_id = view.id;
+                doc.set_selection(view_id, selection);
                 cxt.editor.ensure_cursor_in_view(view_id);
                 EventResult::Consumed(None)
             }
 
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
-                let current_view = cxt.editor.tree.focus;
+                let previous_view = cxt.editor.tree.focus;
 
                 let direction = match event.kind {
                     MouseEventKind::ScrollUp => Direction::Backward,
@@ -1819,16 +2263,18 @@ impl EditorView {
                     _ => unreachable!(),
                 };
 
-                match pos_and_view(cxt.editor, row, column, false) {
-                    Some((_, view_id)) => cxt.editor.tree.focus = view_id,
+                let scrolled_view = match pos_and_view(cxt.editor, row, column, false) {
+                    Some((_, view_id)) => {
+                        cxt.editor.tree.focus = view_id;
+                        view_id
+                    }
                     None => return EventResult::Ignored(None),
-                }
+                };
 
                 let offset = config.scroll_lines.unsigned_abs();
                 commands::scroll(cxt, offset, direction, false);
 
-                cxt.editor.tree.focus = current_view;
-                cxt.editor.ensure_cursor_in_view(current_view);
+                restore_focus_after_mouse_scroll(cxt.editor, previous_view, scrolled_view);
 
                 EventResult::Consumed(None)
             }
@@ -1838,14 +2284,14 @@ impl EditorView {
                     return EventResult::Ignored(None);
                 }
 
-                let (view, doc) = current!(cxt.editor);
+                let (view_id, doc) = focused!(cxt.editor);
 
                 let should_yank = match cxt.editor.mouse_down_range.take() {
-                    Some(down_range) => doc.selection(view.id).primary() != down_range,
+                    Some(down_range) => doc.selection(view_id).primary() != down_range,
                     None => {
                         // This should not happen under normal cases. We fall back to the original
                         // behavior of yanking on non-single-char selections.
-                        doc.selection(view.id)
+                        doc.selection(view_id)
                             .primary()
                             .slice(doc.text().slice(..))
                             .len_chars()
@@ -1854,8 +2300,10 @@ impl EditorView {
                 };
 
                 if should_yank {
-                    commands::MappableCommand::yank_main_selection_to_primary_clipboard
-                        .execute(cxt);
+                    commands::MappableCommand::builtin_named(
+                        "yank_main_selection_to_primary_clipboard",
+                    )
+                    .execute(cxt);
                     EventResult::Consumed(None)
                 } else {
                     EventResult::Ignored(None)
@@ -1867,17 +2315,22 @@ impl EditorView {
                     cxt.editor.focus(view_id);
 
                     if let Some((pos, _)) = pos_and_view(cxt.editor, row, column, true) {
-                        doc_mut!(cxt.editor).set_selection(view_id, Selection::point(pos));
+                        focused!(cxt.editor)
+                            .1
+                            .set_selection(view_id, Selection::point(pos));
                     } else {
-                        let (view, doc) = current!(cxt.editor);
+                        let (view_id, doc) = focused!(cxt.editor);
+                        let view = view!(cxt.editor, view_id);
 
                         if let Some(pos) = view.pos_at_visual_coords(doc, pos.row as u16, 0, true) {
                             doc.set_selection(view_id, Selection::point(pos));
                             match modifiers {
                                 KeyModifiers::ALT => {
-                                    commands::MappableCommand::dap_edit_log.execute(cxt)
+                                    commands::MappableCommand::builtin_named("dap_edit_log")
+                                        .execute(cxt)
                                 }
-                                _ => commands::MappableCommand::dap_edit_condition.execute(cxt),
+                                _ => commands::MappableCommand::builtin_named("dap_edit_condition")
+                                    .execute(cxt),
                             };
                         }
                     }
@@ -1895,8 +2348,10 @@ impl EditorView {
                 }
 
                 if modifiers == KeyModifiers::ALT {
-                    commands::MappableCommand::replace_selections_with_primary_clipboard
-                        .execute(cxt);
+                    commands::MappableCommand::builtin_named(
+                        "replace_selections_with_primary_clipboard",
+                    )
+                    .execute(cxt);
 
                     return EventResult::Consumed(None);
                 }
@@ -1905,7 +2360,9 @@ impl EditorView {
                     let doc = doc_mut!(editor, &view!(editor, view_id).doc);
                     doc.set_selection(view_id, Selection::point(pos));
                     cxt.editor.focus(view_id);
-                    commands::MappableCommand::paste_primary_clipboard_before.execute(cxt);
+                    commands::MappableCommand::named("paste_primary_clipboard_before")
+                        .expect("engine command must exist")
+                        .execute(cxt);
 
                     return EventResult::Consumed(None);
                 }
@@ -1942,10 +2399,12 @@ impl Component for EditorView {
         event: &Event,
         context: &mut crate::compositor::Context,
     ) -> EventResult {
+        self.publish_focused_modal_input(context.editor);
         let mut cx = commands::Context {
             editor: context.editor,
-            count: None,
-            register: None,
+            registry: self.registry.clone(),
+            count: self.engine_input_state().count,
+            register: self.engine_input_state().selected_register,
             callback: Vec::new(),
             on_next_key_callback: None,
             jobs: context.jobs,
@@ -1955,13 +2414,14 @@ impl Component for EditorView {
         match event {
             Event::Paste(contents) => {
                 self.handle_non_key_input(&mut cx);
-                cx.count = cx.editor.count;
                 commands::paste_bracketed_value(&mut cx, contents.clone());
-                cx.editor.count = None;
+                cx.count = None;
+                self.sync_engine_from_context(&mut cx);
 
                 let config = cx.editor.config();
                 let mode = cx.editor.mode();
-                let (view, doc) = current!(cx.editor);
+                let (view_id, doc) = focused!(cx.editor);
+                let view = view_mut!(cx.editor, view_id);
                 view.ensure_cursor_in_view(doc, config.scrolloff);
 
                 // Store a history state if not in insert mode. Otherwise wait till we exit insert
@@ -1975,9 +2435,11 @@ impl Component for EditorView {
             Event::Resize(_width, _height) => {
                 // Ignore this event, we handle resizing just before rendering to screen.
                 // Handling it here but not re-rendering will cause flashing
+                self.render_cache.entries.clear();
                 EventResult::Consumed(None)
             }
             Event::Key(mut key) => {
+                let key_dispatch_start = std::time::Instant::now();
                 cx.editor.reset_idle_timer();
                 canonicalize_key(&mut key);
 
@@ -1986,61 +2448,68 @@ impl Component for EditorView {
 
                 let mode = cx.editor.mode();
 
+                self.sync_context_from_engine(&mut cx);
                 if !self.on_next_key(OnKeyCallbackKind::PseudoPending, &mut cx, key) {
-                    match mode {
-                        Mode::Insert => {
-                            // let completion swallow the event if necessary
-                            let mut consumed = false;
-                            if let Some(completion) = &mut self.completion {
-                                let res = {
-                                    // use a fake context here
-                                    let mut cx = Context {
-                                        editor: cx.editor,
-                                        jobs: cx.jobs,
-                                        scroll: None,
-                                        plugin_manager: cx.plugin_manager.clone(),
-                                    };
-
-                                    if let EventResult::Consumed(callback) =
-                                        completion.handle_event(event, &mut cx)
-                                    {
-                                        consumed = true;
-                                        Some(callback)
-                                    } else if let EventResult::Consumed(callback) =
-                                        completion.handle_event(&Event::Key(key!(Enter)), &mut cx)
-                                    {
-                                        Some(callback)
-                                    } else {
-                                        None
-                                    }
+                    if mode == Mode::Insert {
+                        // Let completion swallow the event first
+                        let mut consumed = false;
+                        if let Some(completion) = &mut self.completion {
+                            let res = {
+                                let mut cx = Context {
+                                    editor: cx.editor,
+                                    jobs: cx.jobs,
+                                    scroll: None,
+                                    plugin_manager: cx.plugin_manager.clone(),
                                 };
-
-                                if let Some(callback) = res {
-                                    if callback.is_some() {
-                                        // assume close_fn
-                                        if let Some(cb) = self.clear_completion(cx.editor) {
-                                            if consumed {
-                                                cx.on_next_key_callback =
-                                                    Some((cb, OnKeyCallbackKind::Fallback))
-                                            } else {
-                                                self.on_next_key =
-                                                    Some((cb, OnKeyCallbackKind::Fallback));
-                                            }
+                                if let EventResult::Consumed(callback) =
+                                    completion.handle_event(event, &mut cx)
+                                {
+                                    consumed = true;
+                                    Some(callback)
+                                } else if let EventResult::Consumed(callback) =
+                                    completion.handle_event(&Event::Key(key!(Enter)), &mut cx)
+                                {
+                                    Some(callback)
+                                } else {
+                                    None
+                                }
+                            };
+                            if let Some(callback) = res {
+                                if callback.is_some() {
+                                    if let Some(cb) = self.clear_completion(cx.editor) {
+                                        if consumed {
+                                            cx.on_next_key_callback =
+                                                Some((cb, OnKeyCallbackKind::Fallback))
+                                        } else {
+                                            self.on_next_key =
+                                                Some((cb, OnKeyCallbackKind::Fallback));
                                         }
                                     }
                                 }
                             }
-
-                            // if completion didn't take the event, we pass it onto commands
-                            if !consumed {
-                                self.insert_mode(&mut cx, key);
-
-                                // record last_insert key
-                                self.last_insert.1.push(InsertEvent::Key(key));
-                            }
                         }
-                        mode => self.command_mode(mode, &mut cx, key),
+                        if !consumed {
+                            let dispatch_start = std::time::Instant::now();
+                            self.dispatch_key(&mut cx, key);
+                            helix_view::bench::log_run_phase(
+                                "editor_key",
+                                "dispatch_key",
+                                dispatch_start.elapsed(),
+                                || format!("key={} mode={:?}", key.key_sequence_format(), mode),
+                            );
+                        }
+                    } else {
+                        let dispatch_start = std::time::Instant::now();
+                        self.dispatch_key(&mut cx, key);
+                        helix_view::bench::log_run_phase(
+                            "editor_key",
+                            "dispatch_key",
+                            dispatch_start.elapsed(),
+                            || format!("key={} mode={:?}", key.key_sequence_format(), mode),
+                        );
                     }
+                } else {
+                    self.sync_engine_from_context(&mut cx);
                 }
 
                 self.on_next_key = cx.on_next_key_callback.take();
@@ -2060,14 +2529,45 @@ impl Component for EditorView {
 
                 let config = cx.editor.config();
                 let mode = cx.editor.mode();
-                let (view, doc) = current!(cx.editor);
+                let (view_id, doc) = focused!(cx.editor);
+                let view = view_mut!(cx.editor, view_id);
 
+                let ensure_cursor_start = std::time::Instant::now();
                 view.ensure_cursor_in_view(doc, config.scrolloff);
+                helix_view::bench::log_run_phase(
+                    "editor_key",
+                    "ensure_cursor_in_view",
+                    ensure_cursor_start.elapsed(),
+                    || {
+                        format!(
+                            "key={} mode={:?} view_id={:?} doc_id={:?}",
+                            key.key_sequence_format(),
+                            mode,
+                            view_id,
+                            doc.id()
+                        )
+                    },
+                );
 
                 // Store a history state if not in insert mode. This also takes care of
                 // committing changes when leaving insert mode.
                 if mode != Mode::Insert {
+                    let history_start = std::time::Instant::now();
                     doc.append_changes_to_history(view);
+                    helix_view::bench::log_run_phase(
+                        "editor_key",
+                        "append_changes_to_history",
+                        history_start.elapsed(),
+                        || {
+                            format!(
+                                "key={} mode={:?} view_id={:?} doc_id={:?}",
+                                key.key_sequence_format(),
+                                mode,
+                                view_id,
+                                doc.id()
+                            )
+                        },
+                    );
                 }
                 let callback = if callbacks.is_empty() {
                     None
@@ -2080,30 +2580,21 @@ impl Component for EditorView {
                     Some(callback)
                 };
 
+                helix_view::bench::log_run_phase(
+                    "editor_key",
+                    "total",
+                    key_dispatch_start.elapsed(),
+                    || format!("key={} mode={:?}", key.key_sequence_format(), mode),
+                );
+
                 EventResult::Consumed(callback)
             }
 
             Event::Mouse(event) => self.handle_mouse_event(event, &mut cx),
             Event::IdleTimeout => self.handle_idle_timeout(&mut cx),
             Event::FocusGained => {
-                if context.editor.config().auto_reload.focus_gained
-                    && crate::handlers::auto_reload::count_externally_modified_documents(
-                        context.editor.documents(),
-                    ) > 0
-                {
-                    if let Err(e) = commands::typed::reload_all(
-                        context,
-                        helix_core::command_line::Args::default(),
-                        super::PromptEvent::Validate,
-                    ) {
-                        context.editor.set_error(format!("{}", e));
-                    } else {
-                        context
-                            .editor
-                            .set_status("Reloaded files due to external changes");
-                    }
-                }
                 self.terminal_focused = true;
+                self.render_cache.entries.clear();
                 EventResult::Consumed(None)
             }
             Event::FocusLost => {
@@ -2118,14 +2609,38 @@ impl Component for EditorView {
                     }
                 }
                 self.terminal_focused = false;
+                self.render_cache.entries.clear();
                 EventResult::Consumed(None)
             }
         }
     }
 
-    fn render(&mut self, area: Rect, surface: &mut Surface, cx: &mut Context) {
+    fn sync(&mut self, editor: &mut Editor) {
+        if editor.model.focus == FocusTarget::Editor {
+            self.publish_focused_modal_input(editor);
+        }
+
+        // Pre-resolve completion item so the render phase doesn't need &mut Editor.
+        if let Some(completion) = self.completion.as_mut() {
+            completion.resolve_selected_item(editor);
+        }
+    }
+
+    fn layout_role(&self) -> crate::compositor::LayoutRole {
+        crate::compositor::LayoutRole::Fill
+    }
+
+    fn render(&mut self, area: Rect, surface: &mut Surface, cx: &RenderContext) {
+
         // clear with background color
+        static FRAME_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let frame_num = FRAME_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let render_start = std::time::Instant::now();
+        let clear_start = std::time::Instant::now();
         surface.set_style(area, cx.editor.theme.get("ui.background"));
+        helix_view::bench::log_run_phase("editor_render", "clear_background", clear_start.elapsed(), || {
+            format!("area={}x{}", area.width, area.height)
+        });
         let config = cx.editor.config();
 
         // check if bufferline should be rendered
@@ -2136,35 +2651,387 @@ impl Component for EditorView {
             _ => false,
         };
 
-        // Reserve bottom row for commandline only when NOT using popup with full-height
-        let mut editor_area = if config.cmdline.style == helix_view::editor::CmdlineStyle::Popup
-            && config.cmdline.use_full_height
-        {
-            area // Use full height
-        } else {
-            area.clip_bottom(1) // Reserve for commandline
-        };
+        // NOTE: editor.resize(editor_area) is now done in compositor pre-render.
 
         if use_bufferline {
-            editor_area = editor_area.clip_top(1);
+            let bufferline_start = std::time::Instant::now();
+            let bufferline_area = area.with_height(1);
+            let mut output = crate::render::RenderOutput::new(bufferline_area);
+            self.render_bufferline(cx.editor, bufferline_area, &mut output.surface);
+            let prepared = PreparedRender::ready(output);
+            self.chrome_cache.compose(prepared, surface);
+            helix_view::bench::log_run_phase(
+                "editor_render",
+                "bufferline",
+                bufferline_start.elapsed(),
+                || format!("area={}x{}", area.width, 1),
+            );
         }
 
-        // if the terminal size suddenly changed, we need to trigger a resize
-        cx.editor.resize(editor_area);
+        // Evict cache entries for views that no longer exist.
+        {
+            let active: std::collections::HashSet<ViewId> =
+                cx.editor.tree.views().map(|(v, _)| v.id).collect();
+            self.render_cache
+                .entries
+                .retain(|id, _| active.contains(id));
+            self.chrome_cache
+                .retain(|id| active.iter().any(|view_id| statusline::cache_id(*view_id) == id));
+        }
 
-        if use_bufferline {
-            self.render_bufferline(cx.editor, area.with_height(1), surface);
+        #[cfg(debug_assertions)]
+        {
+            self.render_cache.frames = self.render_cache.frames.wrapping_add(1);
         }
 
         for (view, is_focused) in cx.editor.tree.views() {
+            let view_render_start = std::time::Instant::now();
             let doc = cx.editor.document(view.doc).unwrap();
-            self.render_view(cx.editor, doc, view, area, surface, is_focused);
+
+            let primary_cursor = doc
+                .selection(view.id)
+                .primary()
+                .cursor(doc.text().slice(..));
+            let cursor_line = doc.text().char_to_line(primary_cursor);
+
+            let current_content = ViewContentState {
+                doc_id: view.doc,
+                doc_version: doc.version(),
+                view_position: doc.view_offset(view.id),
+                area: view.area,
+                theme_name: Arc::from(cx.editor.theme.name()),
+                config_gen: cx.editor.config_gen,
+                annotation_gen: doc.annotation_gen(),
+                cursor_line,
+            };
+
+            // Content hit — content unchanged, compute dirty lines from overlay fingerprints.
+            // When 0 lines are dirty, this is a pure blit (zero extra work).
+            if let Some(cached) = self.render_cache.entries.get(&view.id) {
+                if cached.content_state == current_content {
+                    let cached_syntax = cached.syntax_styles.clone();
+                    let cached_line_map = cached.line_map.clone();
+                    let old_fingerprints = cached.overlay_fingerprints.clone();
+
+                    let cached_linemap_count = cached_line_map.lines.len();
+
+                    // Blit entire cached surface as baseline
+                    let blit_start = std::time::Instant::now();
+                    Self::blit(&cached.cells, surface);
+                    helix_view::bench::log_run_phase(
+                        "editor_render_view",
+                        "blit",
+                        blit_start.elapsed(),
+                        || format!("view_id={:?} area={}x{}", view.id, view.area.width, view.area.height),
+                    );
+                    update_cursor_cache_from_line_map(cx.editor, doc, view, &cached_line_map);
+
+                    // Compute new per-line overlay fingerprints
+                    let selection = doc.selection(view.id);
+                    let fp_start = std::time::Instant::now();
+                    let new_fingerprints = cached_line_map.overlay_fingerprints(
+                        selection,
+                        cx.editor.mode,
+                        is_focused,
+                        self.terminal_focused,
+                    );
+                    helix_view::bench::log_run_phase(
+                        "editor_render_view",
+                        "overlay_fingerprints",
+                        fp_start.elapsed(),
+                        || format!("view_id={:?} rows={}", view.id, cached_line_map.lines.len()),
+                    );
+
+                    // Find which visual rows actually changed
+                    let dirty_start = std::time::Instant::now();
+                    let dirty = LineMap::dirty_rows(&old_fingerprints, &new_fingerprints);
+                    helix_view::bench::log_run_phase(
+                        "editor_render_view",
+                        "dirty_rows",
+                        dirty_start.elapsed(),
+                        || format!("view_id={:?} old={} new={}", view.id, old_fingerprints.len(), new_fingerprints.len()),
+                    );
+
+                    // Log selection + which linemap rows it touches
+                    {
+                        let sel = selection.primary();
+                        let (sel_start, sel_end) = if sel.anchor <= sel.head {
+                            (sel.anchor, sel.head)
+                        } else {
+                            (sel.head, sel.anchor)
+                        };
+                        let intersecting_rows: Vec<u16> = cached_line_map
+                            .lines
+                            .iter()
+                            .filter(|l| {
+                                sel_start < l.char_range_end && sel_end >= l.char_range_start
+                            })
+                            .map(|l| l.visual_row)
+                            .collect();
+                        log::info!(
+                            "F{} CACHE HIT sel=({},{}) dirty={:?} sel_rows={:?} lines={}",
+                            frame_num,
+                            sel.anchor,
+                            sel.head,
+                            dirty,
+                            intersecting_rows,
+                            cached_linemap_count,
+                        );
+                    }
+
+                    #[cfg(debug_assertions)]
+                    {
+                        self.render_cache.hits = self.render_cache.hits.wrapping_add(1);
+                        self.render_cache.dirty_lines = self
+                            .render_cache
+                            .dirty_lines
+                            .wrapping_add(dirty.len() as u64);
+                        let total_lines = cached_line_map.lines.len() as u64;
+                        self.render_cache.clean_lines = self
+                            .render_cache
+                            .clean_lines
+                            .wrapping_add(total_lines.saturating_sub(dirty.len() as u64));
+                    }
+
+                    if dirty.is_empty() {
+                        // Nothing changed — pure blit of content. Statusline
+                        // is batched with all other views below.
+                        log::info!("F{} CACHE PURE_BLIT view={:?}", frame_num, view.id);
+                        if let Some(entry) = self.render_cache.entries.get_mut(&view.id) {
+                            entry.overlay_fingerprints = new_fingerprints;
+                        }
+                        continue;
+                    }
+
+                    // Clear dirty rows before re-rendering.  Blitted cells may
+                    // carry stale backgrounds (e.g. old selection highlight) that
+                    // set_style(bg: None) wouldn't overwrite.
+                    {
+                        let inner = view.inner_area(doc);
+                        for &row in &dirty {
+                            if row < inner.height {
+                                let y = inner.y + row;
+                                let row_rect = Rect::new(inner.x, y, inner.width, 1);
+                                surface.clear(row_rect);
+                            }
+                        }
+                    }
+
+                    // Re-render only dirty lines using cached syntax styles
+                    let vctx = ViewRenderContext {
+                        editor: cx.editor,
+                        doc,
+                        view,
+                        viewport: area,
+                        is_focused,
+                        cached_syntax: Some(&cached_syntax),
+                        dirty_rows: Some(&dirty),
+                        seed_line_map: Some(&cached_line_map),
+                    };
+                    let render_output = self.render_view(&vctx, surface);
+                    helix_view::bench::log_run_phase(
+                        "editor_render_view",
+                        "dirty_render_view",
+                        render_start.elapsed(),
+                        || format!("view_id={:?} dirty_rows={}", view.id, dirty.len()),
+                    );
+
+                    let new_syntax_count = render_output.syntax_styles.len();
+                    let new_linemap_count = render_output.line_map.lines.len();
+                    log::info!(
+                        "F{} CACHE DIRTY_RERENDER view={:?} dirty_rows={:?} new_syntax={} new_linemap={} elapsed={:?}",
+                        frame_num, view.id, dirty, new_syntax_count, new_linemap_count, render_start.elapsed(),
+                    );
+
+                    // Preserve cached syntax styles — the dirty rerender used
+                    // SyntaxHighlighter::from_cache which doesn't record new styles.
+                    let preserved_syntax = if render_output.syntax_styles.is_empty() {
+                        cached_syntax
+                    } else {
+                        SyntaxStyleCache {
+                            entries: Arc::from(render_output.syntax_styles),
+                        }
+                    };
+
+                    // Update cache
+                    let cursor_pos = if cx.editor.tree.focus == view.id {
+                        cursor_position_from_line_map(doc, view, &render_output.line_map)
+                    } else {
+                        None
+                    };
+
+                    self.render_cache.entries.insert(
+                        view.id,
+                        ViewRenderCacheEntry {
+                            content_state: current_content,
+                            cells: {
+                                let copy_start = std::time::Instant::now();
+                                let cells = Self::copy_region(surface, Self::content_area(view));
+                                helix_view::bench::log_run_phase(
+                                    "editor_render_view",
+                                    "copy_region",
+                                    copy_start.elapsed(),
+                                    || {
+                                        let area = Self::content_area(view);
+                                        format!("view_id={:?} area={}x{}", view.id, area.width, area.height)
+                                    },
+                                );
+                                cells
+                            },
+                            syntax_styles: preserved_syntax,
+                            line_map: render_output.line_map,
+                            overlay_fingerprints: new_fingerprints,
+                        },
+                    );
+                    if cx.editor.tree.focus == view.id {
+                        cx.editor.cursor_cache.set(cursor_pos);
+                    }
+                    helix_view::bench::log_run_phase(
+                        "editor_render_view",
+                        "dirty_total",
+                        view_render_start.elapsed(),
+                        || format!("view_id={:?} path=dirty", view.id),
+                    );
+                    continue;
+                }
+            }
+
+            // Content miss — full re-render.
+            #[cfg(debug_assertions)]
+            {
+                self.render_cache.misses = self.render_cache.misses.wrapping_add(1);
+            }
+
+            let seed_line_map = self
+                .render_cache
+                .entries
+                .get(&view.id)
+                .filter(|entry| can_reuse_seed_line_map(&entry.content_state, &current_content))
+                .map(|entry| entry.line_map.clone());
+
+            let vctx = ViewRenderContext {
+                editor: cx.editor,
+                doc,
+                view,
+                viewport: area,
+                is_focused,
+                cached_syntax: None,
+                dirty_rows: None,
+                seed_line_map: seed_line_map.as_ref(),
+            };
+            let render_output = self.render_view(&vctx, surface);
+            helix_view::bench::log_run_phase(
+                "editor_render_view",
+                "full_render_view",
+                view_render_start.elapsed(),
+                || format!("view_id={:?} path=full_before_fp", view.id),
+            );
+
+            let selection = doc.selection(view.id);
+            let fp_start = std::time::Instant::now();
+            let overlay_fingerprints = render_output.line_map.overlay_fingerprints(
+                selection,
+                cx.editor.mode,
+                is_focused,
+                self.terminal_focused,
+            );
+            helix_view::bench::log_run_phase(
+                "editor_render_view",
+                "overlay_fingerprints",
+                fp_start.elapsed(),
+                || format!("view_id={:?} rows={}", view.id, render_output.line_map.lines.len()),
+            );
+
+            log::info!(
+                "F{} CACHE MISS view={:?} anchor={} voff={} area={}x{} syntax={} lines={} elapsed={:?}",
+                frame_num,
+                view.id,
+                current_content.view_position.anchor,
+                current_content.view_position.vertical_offset,
+                view.area.width, view.area.height,
+                render_output.syntax_styles.len(),
+                render_output.line_map.lines.len(),
+                render_start.elapsed(),
+            );
+
+            let cursor_pos = if cx.editor.tree.focus == view.id {
+                cursor_position_from_line_map(doc, view, &render_output.line_map)
+            } else {
+                None
+            };
+
+            self.render_cache.entries.insert(
+                view.id,
+                ViewRenderCacheEntry {
+                    content_state: current_content,
+                    cells: {
+                        let copy_start = std::time::Instant::now();
+                        let cells = Self::copy_region(surface, Self::content_area(view));
+                        helix_view::bench::log_run_phase(
+                            "editor_render_view",
+                            "copy_region",
+                            copy_start.elapsed(),
+                            || {
+                                let area = Self::content_area(view);
+                                format!("view_id={:?} area={}x{}", view.id, area.width, area.height)
+                            },
+                        );
+                        cells
+                    },
+                    syntax_styles: SyntaxStyleCache {
+                        entries: Arc::from(render_output.syntax_styles),
+                    },
+                    line_map: render_output.line_map,
+                    overlay_fingerprints,
+                },
+            );
+            if cx.editor.tree.focus == view.id {
+                cx.editor.cursor_cache.set(cursor_pos);
+            }
+            helix_view::bench::log_run_phase(
+                "editor_render_view",
+                "full_total",
+                view_render_start.elapsed(),
+                || format!("view_id={:?} path=full", view.id),
+            );
         }
 
-        if config.auto_info {
-            if let Some(mut info) = cx.editor.autoinfo.take() {
-                info.render(area, surface, cx);
-                cx.editor.autoinfo = Some(info)
+        // Batch all statusline renders and execute deferred work in parallel.
+        {
+            let statusline_start = std::time::Instant::now();
+            let batch: Vec<PreparedRender> = cx
+                .editor
+                .tree
+                .views()
+                .map(|(view, is_focused)| {
+                    let doc = cx.editor.document(view.doc).unwrap();
+                    self.prepare_statusline(cx.editor, doc, view, is_focused)
+                })
+                .collect();
+            let count = batch.len();
+            self.chrome_cache.compose_batch(batch, surface);
+            helix_view::bench::log_run_phase(
+                "editor_render",
+                "statusline_batch",
+                statusline_start.elapsed(),
+                || format!("count={}", count),
+            );
+        }
+
+        #[cfg(debug_assertions)]
+        {
+            if self.render_cache.frames.is_multiple_of(300) {
+                log::debug!(
+                    "ViewRenderCache: {} hits ({} dirty / {} clean lines), {} misses over 300 frames",
+                    self.render_cache.hits,
+                    self.render_cache.dirty_lines,
+                    self.render_cache.clean_lines,
+                    self.render_cache.misses,
+                );
+                self.render_cache.hits = 0;
+                self.render_cache.dirty_lines = 0;
+                self.render_cache.clean_lines = 0;
+                self.render_cache.misses = 0;
             }
         }
 
@@ -2173,6 +3040,7 @@ impl Component for EditorView {
 
         // render status msg
         if let Some((status_msg, severity)) = &cx.editor.status_msg {
+            let status_start = std::time::Instant::now();
             status_msg_width = status_msg.width();
             use helix_view::editor::Severity;
             let style = if *severity == Severity::Error {
@@ -2187,13 +3055,27 @@ impl Component for EditorView {
                 status_msg,
                 style,
             );
+            helix_view::bench::log_run_phase(
+                "editor_render",
+                "status_msg",
+                status_start.elapsed(),
+                || format!("width={}", status_msg_width),
+            );
         }
 
         if area.width.saturating_sub(status_msg_width as u16) > key_width {
+            let pending_start = std::time::Instant::now();
             let mut disp = String::new();
-            if let Some(count) = cx.editor.count {
+            if let Some(count) = self.engine_input_state().count {
                 disp.push_str(&count.to_string())
             }
+            if let Some(ref engine) = self.engine {
+                let pending = engine.pending_display();
+                if !pending.is_empty() {
+                    disp.push_str(pending);
+                }
+            }
+            // Also show raw pending keys from the keymaps (engine may not surface all)
             for key in self.keymaps.pending() {
                 disp.push_str(&key.key_sequence_format());
             }
@@ -2225,17 +3107,39 @@ impl Component for EditorView {
                     style,
                 );
             }
+            helix_view::bench::log_run_phase(
+                "editor_render",
+                "pending_keys",
+                pending_start.elapsed(),
+                || format!("display_width={}", disp.len()),
+            );
         }
 
-        if let Some(completion) = self.completion.as_mut() {
-            completion.render(area, surface, cx);
+        // Batch completion + notification renders for parallel deferred execution.
+        // NOTE: cleanup_notifications() is now done in compositor pre-render.
+        {
+            let chrome_start = std::time::Instant::now();
+
+            let mut chrome_batch = Vec::with_capacity(2);
+            if let Some(completion) = self.completion.as_mut() {
+                chrome_batch.push(completion.prepare_render(area, cx));
+            }
+            if let Some(prepared) = self.notification_popup.prepare_snapshot(area, cx.editor) {
+                chrome_batch.push(prepared);
+            }
+            if !chrome_batch.is_empty() {
+                self.chrome_cache.compose_batch(chrome_batch, surface);
+            }
+            helix_view::bench::log_run_phase(
+                "editor_render",
+                "chrome_batch",
+                chrome_start.elapsed(),
+                || format!("area={}x{}", area.width, area.height),
+            );
         }
-
-        // Cleanup expired notifications before rendering
-        cx.editor.cleanup_notifications();
-
-        // Render notification popup
-        self.notification_popup.render(area, surface, cx);
+        helix_view::bench::log_run_phase("editor_render", "final_total", render_start.elapsed(), || {
+            format!("area={}x{} frame={}", area.width, area.height, frame_num)
+        });
     }
 
     fn cursor(&self, _area: Rect, editor: &Editor) -> (Option<Position>, CursorKind) {
@@ -2287,5 +3191,292 @@ fn canonicalize_key(key: &mut KeyEvent) {
     } = key
     {
         key.modifiers.remove(KeyModifiers::SHIFT)
+    }
+}
+
+fn restore_focus_after_mouse_scroll(
+    editor: &mut Editor,
+    previous_view: ViewId,
+    scrolled_view: ViewId,
+) {
+    editor.tree.focus = previous_view;
+    if previous_view != scrolled_view {
+        editor.ensure_cursor_in_view(previous_view);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        can_reuse_seed_line_map, choose_render_seed, restore_focus_after_mouse_scroll,
+        EditorView, ViewRenderContext,
+    };
+    use crate::handlers::Handlers;
+    use crate::keymap::Keymaps;
+    use arc_swap::ArcSwap;
+    use helix_core::Rope;
+    use helix_loader::runtime_dirs;
+    use helix_modal::{helix::HelixEngine, populate::build_registry};
+    use helix_view::graphics::Rect;
+    use helix_view::theme;
+    use helix_view::view::{LineMap, ViewContentState, ViewPosition, VisualLineInfo};
+    use helix_view::{
+        editor::{Action, Config, Editor},
+        Document, DocumentId, View,
+    };
+    use std::sync::Arc;
+
+    fn content_state(doc_version: i32, annotation_gen: u64, width: u16) -> ViewContentState {
+        ViewContentState {
+            doc_id: DocumentId::default(),
+            doc_version,
+            view_position: ViewPosition::default(),
+            area: Rect::new(0, 0, width, 10),
+            theme_name: Arc::<str>::from("test-theme"),
+            config_gen: 1,
+            annotation_gen,
+            cursor_line: 0,
+        }
+    }
+
+    fn test_editor_with_text(text: &str) -> (Editor, helix_view::ViewId, DocumentId) {
+        let theme_loader = theme::Loader::new(runtime_dirs());
+        let syn_loader = helix_core::config::default_lang_loader();
+        let config = Arc::new(ArcSwap::from_pointee(Config::default()));
+        let mut editor = Editor::new(
+            Rect::new(0, 0, 80, 24),
+            Arc::new(theme_loader),
+            Arc::new(ArcSwap::from_pointee(syn_loader)),
+            Arc::new(arc_swap::access::Map::new(config, |cfg: &Config| cfg)),
+            Handlers::dummy(),
+        );
+        let doc = Document::from(
+            Rope::from(text),
+            None,
+            editor.config.clone(),
+            editor.syn_loader.clone(),
+        );
+        let doc_id = editor.new_file_from_document(Action::VerticalSplit, doc);
+        let view_id = editor.tree.focus;
+        (editor, view_id, doc_id)
+    }
+
+    fn test_editor_view() -> EditorView {
+        let registry = Arc::new(build_registry());
+        EditorView::new(
+            Keymaps::default(),
+            Box::new(HelixEngine::new(registry.clone())),
+            registry,
+        )
+    }
+
+    fn giant_multiline_fixture(lines: usize, bytes_per_line: usize) -> String {
+        (0..lines)
+            .map(|idx| char::from(b'a' + (idx % 26) as u8).to_string().repeat(bytes_per_line))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn render_seed_prefers_nearest_visible_checkpoint() {
+        let line_map = LineMap {
+            lines: Arc::from(vec![VisualLineInfo {
+                visual_row: 0,
+                doc_line: 7,
+                char_range_start: 0,
+                char_range_end: 200,
+                visible_char_start: 10,
+                visible_col_start: 10,
+                visible_char_last: 90,
+                visible_col_last: 90,
+                horizontal_checkpoints: Vec::new(),
+            }]),
+        };
+
+        assert_eq!(
+            choose_render_seed(Some(&line_map), 7, 100)
+                .map(|seed| (seed.doc_line, seed.char_idx, seed.visual_col)),
+            Some((7, 90, 90))
+        );
+    }
+
+    #[test]
+    fn render_seed_ignores_future_and_mismatched_rows() {
+        let line_map = LineMap {
+            lines: Arc::from(vec![
+                VisualLineInfo {
+                    visual_row: 1,
+                    doc_line: 7,
+                    char_range_start: 0,
+                    char_range_end: 50,
+                    visible_char_start: 10,
+                    visible_col_start: 10,
+                    visible_char_last: 20,
+                    visible_col_last: 20,
+                    horizontal_checkpoints: Vec::new(),
+                },
+                VisualLineInfo {
+                    visual_row: 0,
+                    doc_line: 8,
+                    char_range_start: 50,
+                    char_range_end: 100,
+                    visible_char_start: 60,
+                    visible_col_start: 60,
+                    visible_char_last: 80,
+                    visible_col_last: 120,
+                    horizontal_checkpoints: Vec::new(),
+                },
+            ]),
+        };
+
+        assert_eq!(
+            choose_render_seed(Some(&line_map), 8, 100)
+                .map(|seed| (seed.doc_line, seed.char_idx, seed.visual_col)),
+            Some((8, 60, 60))
+        );
+        assert!(choose_render_seed(Some(&line_map), 9, 100).is_none());
+    }
+
+    #[test]
+    fn render_seed_ignores_far_cached_checkpoint() {
+        let line_map = LineMap {
+            lines: Arc::from(vec![VisualLineInfo {
+                visual_row: 0,
+                doc_line: 7,
+                char_range_start: 0,
+                char_range_end: 300_000,
+                visible_char_start: 143_200,
+                visible_col_start: 143_200,
+                visible_char_last: 143_237,
+                visible_col_last: 143_237,
+                horizontal_checkpoints: Vec::new(),
+            }]),
+        };
+
+        assert!(choose_render_seed(Some(&line_map), 7, 290_989).is_none());
+        assert_eq!(
+            choose_render_seed(Some(&line_map), 7, 143_296)
+                .map(|seed| (seed.doc_line, seed.char_idx, seed.visual_col)),
+            Some((7, 143_237, 143_237))
+        );
+    }
+
+    #[test]
+    fn seed_line_map_reuse_requires_stable_text_layout_inputs() {
+        let previous = content_state(5, 7, 120);
+        let same_text = content_state(5, 7, 120);
+        let changed_doc = content_state(6, 7, 120);
+        let changed_annotations = content_state(5, 8, 120);
+        let changed_width = content_state(5, 7, 121);
+
+        assert!(can_reuse_seed_line_map(&previous, &same_text));
+        assert!(!can_reuse_seed_line_map(&previous, &changed_doc));
+        assert!(!can_reuse_seed_line_map(
+            &previous,
+            &changed_annotations
+        ));
+        assert!(!can_reuse_seed_line_map(&previous, &changed_width));
+    }
+
+    #[test]
+    fn restore_focus_after_mouse_scroll_does_not_recentre_same_view() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let _guard = runtime.enter();
+        let text = (0..200).map(|idx| format!("line {idx}")).collect::<Vec<_>>().join("\n");
+        let (mut editor, view_id, doc_id) = test_editor_with_text(&text);
+
+        {
+            let doc = editor.document_mut(doc_id).expect("document");
+            doc.set_view_offset(
+                view_id,
+                ViewPosition {
+                    anchor: doc.text().line_to_char(50),
+                    vertical_offset: 0,
+                    horizontal_offset: 0,
+                },
+            );
+        }
+
+        let before = editor.document(doc_id).expect("document").view_offset(view_id);
+        restore_focus_after_mouse_scroll(&mut editor, view_id, view_id);
+        let after = editor.document(doc_id).expect("document").view_offset(view_id);
+
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn content_area_excludes_statusline_row() {
+        let mut view = View::new(DocumentId::default(), Default::default());
+        view.area = Rect::new(5, 7, 80, 10);
+
+        assert_eq!(EditorView::content_area(&view), Rect::new(5, 7, 80, 9));
+    }
+
+    #[test]
+    #[ignore = "targeted local repro for full render_view on many giant lines"]
+    fn render_view_many_giant_lines_repro() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let _guard = runtime.enter();
+
+        for (lines, bytes_per_line) in [(20, 4_000), (50, 5_000), (100, 18_500), (2, 900_000)] {
+            let event_log_path = std::env::temp_dir().join(format!(
+                "helix-render-view-giant-lines-{}-{}-{}.log",
+                std::process::id(),
+                lines,
+                bytes_per_line
+            ));
+            let _ = std::fs::remove_file(&event_log_path);
+            let _run_guard =
+                helix_view::bench::enter_bench_run(helix_view::bench::BenchRunContext {
+                    seed: 0,
+                    event_log_path: event_log_path.clone(),
+                });
+
+            let text = giant_multiline_fixture(lines, bytes_per_line);
+            let (mut editor, view_id, doc_id) = test_editor_with_text(&text);
+            editor.resize(Rect::new(0, 0, 160, 61));
+
+            {
+                let doc = editor.document_mut(doc_id).expect("document");
+                doc.set_view_offset(
+                    view_id,
+                    ViewPosition {
+                        anchor: doc.text().line_to_char(lines / 2),
+                        vertical_offset: 0,
+                        horizontal_offset: 0,
+                    },
+                );
+            }
+
+            let mut editor_view = test_editor_view();
+            let area = Rect::new(0, 0, 160, 61);
+            let mut surface = tui::buffer::Buffer::empty(area);
+            let start = std::time::Instant::now();
+            let doc = editor.document(doc_id).expect("document");
+            let view = view!(editor, view_id);
+            let vctx = ViewRenderContext {
+                editor: &editor,
+                doc,
+                view,
+                viewport: area,
+                is_focused: true,
+                cached_syntax: None,
+                dirty_rows: None,
+                seed_line_map: None,
+            };
+            let output = editor_view.render_view(&vctx, &mut surface);
+
+            eprintln!(
+                "render_view_many_giant_lines_repro: lines={} bytes_per_line={} elapsed_us={} mapped_lines={} bytes={}",
+                lines,
+                bytes_per_line,
+                start.elapsed().as_micros(),
+                output.line_map.lines.len(),
+                doc.text().len_bytes(),
+            );
+            if let Ok(trace) = std::fs::read_to_string(&event_log_path) {
+                eprintln!("{trace}");
+            }
+        }
     }
 }

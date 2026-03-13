@@ -3,11 +3,11 @@ mod query;
 
 use crate::{
     alt,
-    compositor::{self, Component, Compositor, Context, Event, EventResult},
+    compositor::{self, Component, Compositor, Context, Event, EventResult, RenderContext},
     ctrl, key, shift,
     ui::{
         self,
-        document::{render_document, LinePos, TextRenderer},
+        document::{render_document, HighlighterInput, LinePos, TextRenderer},
         gradient_border::GradientBorder,
         picker::query::PickerQuery,
         text_decorations::DecorationManager,
@@ -24,7 +24,7 @@ use tui::{
     buffer::Buffer as Surface,
     layout::Constraint,
     text::{Span, Spans},
-    widgets::{Block, BorderType, Cell, Row, Table},
+    widgets::{Block, Cell, Row, Table},
 };
 
 use tui::widgets::Widget;
@@ -46,10 +46,12 @@ use helix_core::{
     text_annotations::TextAnnotations, unicode::segmentation::UnicodeSegmentation, Position,
 };
 use helix_view::{
+    content_region::ContentRegion,
     editor::Action,
     graphics::{CursorKind, Margin, Modifier, Rect},
     input::KeyEvent,
     theme::Style,
+    traits::{Bounded, Scrollable as ViewScrollable, Viewport},
     view::ViewPosition,
     Document, DocumentId, Editor,
 };
@@ -81,7 +83,7 @@ impl From<DocumentId> for PathOrId<'_> {
     }
 }
 
-type FileCallback<T> = Box<dyn for<'a> Fn(&'a Editor, &'a T) -> Option<FileLocation<'a>>>;
+type FileCallback<T> = Box<dyn for<'a> Fn(&'a Editor, &'a T) -> Option<FileLocation<'a>> + Send>;
 
 /// File path and range of lines (used to align and highlight lines)
 pub type FileLocation<'a> = (PathOrId<'a>, Option<(usize, usize)>);
@@ -241,6 +243,8 @@ impl<T, D> Column<T, D> {
 type DynQueryCallback<T, D> =
     fn(&str, &mut Editor, Arc<D>, &Injector<T, D>) -> BoxFuture<'static, anyhow::Result<()>>;
 
+type PickerItemDataFn<T> = Box<dyn Fn(&T) -> helix_view::model::PickerItemData + Send + Sync>;
+
 pub struct Picker<T: 'static + Send + Sync, D: 'static> {
     columns: Arc<[Column<T, D>]>,
     primary_column: usize,
@@ -259,6 +263,8 @@ pub struct Picker<T: 'static + Send + Sync, D: 'static> {
     show_preview: bool,
     /// Constraints for tabular formatting
     widths: Vec<Constraint>,
+    /// Read-only results viewport state.
+    list_region: ContentRegion<()>,
 
     callback_fn: PickerCallback<T>,
     custom_key_handlers: PickerKeyHandlers<T, D>,
@@ -271,9 +277,18 @@ pub struct Picker<T: 'static + Send + Sync, D: 'static> {
     file_fn: Option<FileCallback<T>>,
     /// An event handler for syntax highlighting the currently previewed file.
     preview_highlight_handler: Sender<Arc<Path>>,
+    /// Read-only preview viewport state.
+    preview_region: ContentRegion<()>,
     dynamic_query_handler: Option<Sender<DynamicQueryChange>>,
     /// Cached gradient border for rendering when enabled in config
     gradient_border: Option<GradientBorder>,
+
+    /// Layer ID in `Editor.model` for this picker. Set when the picker is first
+    /// pushed to the compositor; used to sync render state to the shared UI model.
+    model_layer_id: Option<helix_view::model::LayerId>,
+    /// Optional callback to convert a picker item `T` into `PickerItemData` for the UI model.
+    /// If `None`, items are stored as `PickerItemData::Plain`.
+    item_data_fn: Option<PickerItemDataFn<T>>,
 }
 
 impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
@@ -311,7 +326,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
     where
         C: IntoIterator<Item = Column<T, D>>,
         O: IntoIterator<Item = T>,
-        F: Fn(&mut Context, &T, Action) + 'static,
+        F: Fn(&mut Context, &T, Action) + Send + 'static,
     {
         let columns: Arc<[_]> = columns.into_iter().collect();
         let matcher_columns = columns.iter().filter(|col| col.filter).count() as u32;
@@ -340,7 +355,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
         matcher: Nucleo<T>,
         primary_column: usize,
         injector: Injector<T, D>,
-        callback_fn: impl Fn(&mut Context, &T, Action) + 'static,
+        callback_fn: impl Fn(&mut Context, &T, Action) + Send + 'static,
     ) -> Self {
         Self::with(
             matcher,
@@ -358,7 +373,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
         default_column: usize,
         editor_data: Arc<D>,
         version: Arc<AtomicUsize>,
-        callback_fn: impl Fn(&mut Context, &T, Action) + 'static,
+        callback_fn: impl Fn(&mut Context, &T, Action) + Send + 'static,
     ) -> Self {
         assert!(!columns.is_empty());
 
@@ -390,13 +405,17 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             callback_fn: Box::new(callback_fn),
             completion_height: 0,
             widths,
+            list_region: ContentRegion::default(),
             preview_cache: HashMap::new(),
             custom_key_handlers: HashMap::new(),
             read_buffer: Vec::with_capacity(1024),
             file_fn: None,
             preview_highlight_handler: PreviewHighlightHandler::<T, D>::default().spawn(),
+            preview_region: ContentRegion::default(),
             dynamic_query_handler: None,
             gradient_border: None,
+            model_layer_id: None,
+            item_data_fn: None,
         }
     }
 
@@ -423,7 +442,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
 
     pub fn with_preview(
         mut self,
-        preview_fn: impl for<'a> Fn(&'a Editor, &'a T) -> Option<FileLocation<'a>> + 'static,
+        preview_fn: impl for<'a> Fn(&'a Editor, &'a T) -> Option<FileLocation<'a>> + Send + 'static,
     ) -> Self {
         self.file_fn = Some(Box::new(preview_fn));
         // assumption: if we have a preview we are matching paths... If this is ever
@@ -530,6 +549,189 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
 
     pub fn toggle_preview(&mut self) {
         self.show_preview = !self.show_preview;
+    }
+
+    fn sync_list_region_view(&mut self, area: Rect, matched_count: u32) {
+        self.list_region.set_area(area);
+        self.list_region.set_content_height(matched_count as usize);
+
+        if matched_count == 0 || area.height == 0 {
+            ViewScrollable::scroll_to(&mut self.list_region, 0);
+            return;
+        }
+
+        let cursor = self.cursor.min(matched_count.saturating_sub(1)) as usize;
+        let scroll = ViewScrollable::scroll(&self.list_region);
+        let rows = area.height as usize;
+
+        let next_scroll = if cursor < scroll {
+            cursor
+        } else if cursor >= scroll.saturating_add(rows) {
+            cursor.saturating_add(1).saturating_sub(rows)
+        } else {
+            scroll
+        };
+
+        ViewScrollable::scroll_to(&mut self.list_region, next_scroll);
+    }
+
+    /// Set a callback to convert picker items into `PickerItemData` for the UI model.
+    /// Without this, items are stored as `PickerItemData::Plain`.
+    pub fn with_item_data(
+        mut self,
+        f: impl Fn(&T) -> helix_view::model::PickerItemData + Send + Sync + 'static,
+    ) -> Self {
+        self.item_data_fn = Some(Box::new(f));
+        self
+    }
+
+    /// Write a render-ready snapshot to `editor.model`.
+    ///
+    /// Called on each render frame. The snapshot contains the visible window of items
+    /// with text and fuzzy-match highlight indices, plus metadata. Frontends (terminal,
+    /// GUI, headless tests) can render or assert against this model without access to
+    /// Nucleo, Column<T,D>, or the theme.
+    pub fn sync_to_model(&mut self, editor: &mut Editor) {
+        use helix_core::fuzzy::MATCHER;
+        use helix_view::model::{
+            PickerCell, PickerColumnHeader, PickerItemData, PickerModel, PickerRow, Placement,
+        };
+
+        let snapshot = self.matcher.snapshot();
+        let matched_count = snapshot.matched_item_count() as usize;
+        let total_count = snapshot.item_count() as usize;
+        let is_running = self.matcher.active_injectors() > 0;
+
+        // Visible window pagination — mirrors render_picker logic.
+        let rows = self.completion_height.max(1) as u32;
+        let offset = ViewScrollable::scroll(&self.list_region) as u32;
+        let end = offset
+            .saturating_add(rows)
+            .min(snapshot.matched_item_count());
+
+        // Build visible items. Lock MATCHER briefly per-row to avoid holding it
+        // across the entire iteration (it's a global lock shared with render_picker).
+        let match_paths = self.file_fn.is_some();
+        let mut indices = Vec::new();
+
+        let visible_items: Box<[PickerRow]> = snapshot
+            .matched_items(offset..end)
+            .map(|item| {
+                let mut matcher_index = 0;
+                let cells: Box<[PickerCell]> = self
+                    .columns
+                    .iter()
+                    .filter(|c| !c.hidden)
+                    .map(|column| {
+                        let cell = column.format(item.data, &self.editor_data);
+                        let text: String = cell.content.into();
+
+                        let highlight_indices: Box<[u32]> = if column.filter {
+                            // Acquire lock only for the indices() call, release immediately.
+                            let mut matcher = MATCHER.lock();
+                            matcher.config = nucleo::Config::DEFAULT;
+                            if match_paths {
+                                matcher.config.set_match_paths();
+                            }
+                            indices.clear();
+                            snapshot.pattern().column_pattern(matcher_index).indices(
+                                item.matcher_columns[matcher_index].slice(..),
+                                &mut matcher,
+                                &mut indices,
+                            );
+                            drop(matcher);
+
+                            indices.sort_unstable();
+                            indices.dedup();
+                            matcher_index += 1;
+                            // Move the vec out; a new empty vec is left for reuse on next iter.
+                            std::mem::take(&mut indices).into_boxed_slice()
+                        } else {
+                            Box::default()
+                        };
+
+                        PickerCell {
+                            text,
+                            highlight_indices,
+                        }
+                    })
+                    .collect();
+
+                let data = self
+                    .item_data_fn
+                    .as_ref()
+                    .map(|f| f(item.data))
+                    .unwrap_or(PickerItemData::Plain);
+
+                PickerRow { cells, data }
+            })
+            .collect();
+
+        // Column headers (stable across frames — only rebuilt if multi-column).
+        let headers: Box<[PickerColumnHeader]> = if self.columns.len() > 1 {
+            self.columns
+                .iter()
+                .filter(|c| !c.hidden)
+                .map(|c| PickerColumnHeader {
+                    name: c.name.to_string().into_boxed_str(),
+                })
+                .collect()
+        } else {
+            Box::default()
+        };
+
+        let active_column = self
+            .query
+            .active_column(self.prompt.position())
+            .and_then(|name| {
+                self.columns
+                    .iter()
+                    .filter(|c| !c.hidden)
+                    .position(|c| Arc::ptr_eq(&c.name, name))
+            });
+
+        // Preview info from file_fn.
+        let preview = self.selection().and_then(|sel| {
+            let file_fn = self.file_fn.as_ref()?;
+            let (path_or_id, range) = file_fn(editor, sel)?;
+            match path_or_id {
+                PathOrId::Path(p) => Some(helix_view::model::PickerPreview::FilePath {
+                    path: p.to_path_buf(),
+                    line: range.map(|(start, _)| start),
+                }),
+                PathOrId::Id(_) => None,
+            }
+        });
+
+        let model = PickerModel {
+            query: self.prompt.line().to_string(),
+            cursor: self.cursor.saturating_sub(offset) as usize,
+            total_matched: matched_count,
+            total_items: total_count,
+            is_running,
+            headers,
+            active_column,
+            visible_items,
+            preview,
+            show_preview: self.show_preview && self.file_fn.is_some(),
+        };
+
+        // Upsert into editor.model.
+        let layer_id = self.model_layer_id;
+        if let Some(id) = layer_id {
+            if let Some(m) = editor.model.layer_model_mut::<PickerModel>(id) {
+                *m = model;
+                return;
+            }
+        }
+        // First sync or layer was removed externally — register.
+        self.model_layer_id = Some(editor.model.push_layer(
+            Box::new(model),
+            Placement::Centered {
+                width: 0,
+                height: 0,
+            },
+        ));
     }
 
     fn custom_key_event_handler(&mut self, event: &KeyEvent, cx: &mut Context) -> EventResult {
@@ -675,7 +877,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
                                     if let Some(language_config) =
                                         doc.detect_language_config(&loader)
                                     {
-                                        doc.language = Some(language_config);
+                                        doc.set_language_configuration(Some(language_config));
 
                                         // Asynchronously highlight the new document
                                         helix_event::send_blocking(
@@ -704,15 +906,17 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
         }
     }
 
-    fn render_picker(&mut self, area: Rect, surface: &mut Surface, cx: &mut Context) {
+    fn render_picker(&mut self, area: Rect, surface: &mut Surface, cx: &RenderContext) {
         let status = self.matcher.tick(10);
-        let snapshot = self.matcher.snapshot();
-        if status.changed {
-            self.cursor = self
-                .cursor
-                .min(snapshot.matched_item_count().saturating_sub(1))
-        }
-
+        let matched_count = {
+            let snapshot = self.matcher.snapshot();
+            if status.changed {
+                self.cursor = self
+                    .cursor
+                    .min(snapshot.matched_item_count().saturating_sub(1));
+            }
+            snapshot.matched_item_count()
+        };
         let text_style = cx.editor.theme.get("ui.text");
         let selected = cx.editor.theme.get("ui.text.focus");
         let highlight_style = cx.editor.theme.get("special").add_modifier(Modifier::BOLD);
@@ -750,8 +954,26 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             inner_area
         };
 
-        // -- Render the input bar:
+        // -- Layout: [prompt(1) | separator(1) | content(fill)]
+        use helix_view::layout::{split_vertical, Size};
+        let v_areas = split_vertical(
+            inner,
+            &[
+                Size::fixed(1), // prompt
+                Size::fixed(1), // separator
+                Size::Fill,     // content
+            ],
+        );
+        let prompt_row = v_areas[0];
+        let separator_row = v_areas[1];
+        let inner = v_areas[2]; // content area (reuse name for minimal diff below)
 
+        let list_area = inner.clip_top(self.header_height());
+        self.sync_list_region_view(list_area, matched_count);
+
+        let snapshot = self.matcher.snapshot();
+
+        // -- Render the input bar:
         let count = format!(
             "{}{}/{}",
             if status.running || self.matcher.active_injectors() > 0 {
@@ -763,38 +985,27 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             snapshot.item_count(),
         );
 
-        let area = inner.clip_left(1).with_height(1);
-        let line_area = area.clip_right(count.len() as u16 + 1);
+        let prompt_area = prompt_row.clip_left(1);
+        let line_area = prompt_area.clip_right(count.len() as u16 + 1);
 
         // render the prompt first since it will clear its background
         self.prompt.render(line_area, surface, cx);
 
         surface.set_stringn(
-            (area.x + area.width).saturating_sub(count.len() as u16 + 1),
-            area.y,
+            (prompt_area.x + prompt_area.width).saturating_sub(count.len() as u16 + 1),
+            prompt_area.y,
             &count,
-            (count.len()).min(area.width as usize),
+            (count.len()).min(prompt_area.width as usize),
             text_style,
         );
 
         // -- Separator
         let sep_style = cx.editor.theme.get("ui.background.separator");
-        let borders = BorderType::line_symbols(BorderType::Plain);
-        for x in inner.left()..inner.right() {
-            if let Some(cell) = surface.get_mut(x, inner.y + 1) {
-                cell.set_symbol(borders.horizontal).set_style(sep_style);
-            }
-        }
-
-        // -- Render the contents:
-        // subtract area of prompt from top
-        let inner = inner.clip_top(2);
+        crate::widgets::hdivider(surface, separator_row, sep_style);
         let rows = inner.height.saturating_sub(self.header_height()) as u32;
-        let offset = self.cursor - (self.cursor % std::cmp::max(1, rows));
+        let offset = ViewScrollable::scroll(&self.list_region) as u32;
         let cursor = self.cursor.saturating_sub(offset);
-        let end = offset
-            .saturating_add(rows)
-            .min(snapshot.matched_item_count());
+        let end = offset.saturating_add(rows).min(matched_count);
         let mut indices = Vec::new();
         let mut matcher = MATCHER.lock();
         matcher.config = Config::DEFAULT;
@@ -926,7 +1137,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
         );
     }
 
-    fn render_preview(&mut self, area: Rect, surface: &mut Surface, cx: &mut Context) {
+    fn render_preview(&mut self, area: Rect, surface: &mut Surface, cx: &RenderContext) {
         // -- Render the frame:
         // clear area
         let background = cx.editor.theme.get("ui.background");
@@ -1057,6 +1268,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
                 doc,
                 &cx.editor.theme,
                 &mut overlay_highlights,
+                None,
             );
 
             let mut decorations = DecorationManager::default();
@@ -1088,37 +1300,29 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
                 offset,
                 // TODO: compute text annotations asynchronously here (like inlay hints)
                 &TextAnnotations::default(),
-                syntax_highlighter,
+                HighlighterInput::Live(syntax_highlighter),
                 overlay_highlights,
                 &cx.editor.theme,
                 decorations,
+                None, // no dirty-row filtering for picker preview
+                None,
+                None,
             );
+
+            self.preview_region.set_offset(offset);
         }
     }
 }
 
 impl<I: 'static + Send + Sync, D: 'static + Send + Sync> Component for Picker<I, D> {
-    fn render(&mut self, area: Rect, surface: &mut Surface, cx: &mut Context) {
-        // default render
-        // +--title--+ +---------+
-        // +---------+ +---------+
-        // |prompt   | |preview  |
-        // +---------+ |         |
-        // |picker   | |         |
-        // |         | |         |
-        // +---------+ +---------+
-        //
-        // stack vertically
-        // +---------+
-        // |prompt   |
-        // +---------+
-        // |picker   |
-        // |         |
-        // +---------+
-        // |preview  |
-        // |         |
-        // |         |
-        // +---------+
+    fn sync(&mut self, editor: &mut Editor) {
+        self.list_region.ensure_init(editor);
+        self.preview_region.ensure_init(editor);
+        self.sync_to_model(editor);
+    }
+
+    fn render(&mut self, area: Rect, surface: &mut Surface, cx: &RenderContext) {
+        use helix_view::layout::{split_horizontal, split_vertical, Size};
 
         let render_preview = self.show_preview
             && self.file_fn.is_some()
@@ -1126,24 +1330,27 @@ impl<I: 'static + Send + Sync, D: 'static + Send + Sync> Component for Picker<I,
             && area.height >= MIN_AREA_HEIGHT_FOR_PREVIEW;
         let stack_vertically = area.width / 2 < MIN_AREA_WIDTH_FOR_PREVIEW;
 
-        let picker_area = if render_preview {
+        let (picker_area, preview_area) = if render_preview {
             if stack_vertically {
-                area.with_height(area.height / 3)
+                let areas = split_vertical(area, &[Size::Percent(33), Size::Fill]);
+                (areas[0], Some(areas[1]))
             } else {
-                area.with_width(area.width / 2)
+                let areas = split_horizontal(area, &[Size::Percent(50), Size::Fill]);
+                (areas[0], Some(areas[1]))
             }
         } else {
-            area
+            (area, None)
         };
+
+        // Update completion_height from the actual picker area BEFORE syncing
+        // to ensure the visible window calculation uses the correct row count.
+        // (required_size may not have been called yet on the first frame.)
+        self.completion_height = picker_area.height.saturating_sub(4 + self.header_height());
 
         self.render_picker(picker_area, surface, cx);
 
-        if render_preview {
-            let preview_area = if stack_vertically {
-                area.clip_top(picker_area.height)
-            } else {
-                area.clip_left(picker_area.width)
-            };
+        if let Some(preview_area) = preview_area {
+            self.preview_region.set_area(preview_area);
             self.render_preview(preview_area, surface, cx);
         }
     }
@@ -1159,13 +1366,17 @@ impl<I: 'static + Send + Sync, D: 'static + Send + Sync> Component for Picker<I,
         };
 
         let close_fn = |picker: &mut Self| {
+            let ui_layer_id = picker.model_layer_id.take();
             // if the picker is very large don't store it as last_picker to avoid
             // excessive memory consumption
             let callback: compositor::Callback = if picker.matcher.snapshot().item_count() > 100_000
             {
-                Box::new(|compositor: &mut Compositor, _ctx| {
+                Box::new(move |compositor: &mut Compositor, ctx| {
                     // remove the layer
                     compositor.pop();
+                    if let Some(id) = ui_layer_id {
+                        ctx.editor.model.remove_layer(id);
+                    }
                 })
             } else {
                 // stop streaming in new items in the background, really we should
@@ -1173,9 +1384,12 @@ impl<I: 'static + Send + Sync, D: 'static + Send + Sync> Component for Picker<I,
                 // reopened instead (like for an FS crawl) that would also remove the
                 // need for the special case above but that is pretty tricky
                 picker.version.fetch_add(1, atomic::Ordering::Relaxed);
-                Box::new(|compositor: &mut Compositor, _ctx| {
+                Box::new(move |compositor: &mut Compositor, ctx| {
                     // remove the layer
                     compositor.last_picker = compositor.pop();
+                    if let Some(id) = ui_layer_id {
+                        ctx.editor.model.remove_layer(id);
+                    }
                 })
             };
             EventResult::Consumed(Some(callback))
@@ -1317,6 +1531,6 @@ impl<T: 'static + Send + Sync, D> Drop for Picker<T, D> {
     }
 }
 
-type PickerCallback<T> = Box<dyn Fn(&mut Context, &T, Action)>;
-pub type PickerKeyHandler<T, D> = Box<dyn Fn(&mut Context, &T, Arc<D>, u32) + 'static>;
+type PickerCallback<T> = Box<dyn Fn(&mut Context, &T, Action) + Send>;
+pub type PickerKeyHandler<T, D> = Box<dyn Fn(&mut Context, &T, Arc<D>, u32) + Send + 'static>;
 pub type PickerKeyHandlers<T, D> = HashMap<KeyEvent, PickerKeyHandler<T, D>>;

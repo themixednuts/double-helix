@@ -147,6 +147,7 @@ pub fn file_explorer(
     let yank_path: KeyHandler = Box::new(|cx, (path, _), _, _| {
         let register = cx
             .editor
+            .focused_modal_input
             .selected_register
             .unwrap_or(cx.editor.config().default_yank_register);
         let path = helix_stdx::path::get_relative_path(path);

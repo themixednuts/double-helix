@@ -330,4 +330,8 @@ impl Decoration for InlineDiagnostics<'_> {
         self.state
             .proccess_anchor(grapheme, renderer.viewport.width, renderer.offset.col)
     }
+
+    fn fast_forward_to_char(&mut self, char_idx: usize, doc_line: usize) -> usize {
+        self.state.fast_forward_to_char(char_idx, doc_line)
+    }
 }

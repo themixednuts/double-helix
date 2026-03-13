@@ -1,6 +1,6 @@
 use crate::{
     commands::Open,
-    compositor::{Callback, Component, Context, Event, EventResult},
+    compositor::{Callback, Component, Context, Event, EventResult, RenderContext},
     ctrl, key,
 };
 use tui::{
@@ -32,9 +32,9 @@ struct RenderInfo {
 pub struct Popup<T: Component> {
     contents: T,
     position: Option<Position>,
-    area: Rect,
+    pub(crate) area: Rect,
     position_bias: Open,
-    scroll_half_pages: usize,
+    pub(crate) scroll_half_pages: usize,
     auto_close: bool,
     ignore_escape_key: bool,
     id: &'static str,
@@ -314,7 +314,7 @@ impl<T: Component> Component for Popup<T> {
         }
     }
 
-    fn render(&mut self, viewport: Rect, surface: &mut Surface, cx: &mut Context) {
+    fn render(&mut self, viewport: Rect, surface: &mut Surface, cx: &RenderContext) {
         let RenderInfo {
             area,
             child_height,
@@ -349,38 +349,33 @@ impl<T: Component> Component for Popup<T> {
         if let Some(div) = scroll.checked_div(half_page_size) {
             self.scroll_half_pages = div;
         }
-        cx.scroll = Some(scroll);
+        cx.set_scroll(Some(scroll));
         self.contents.render(inner, surface, cx);
 
         // render scrollbar if contents do not fit
         if self.has_scrollbar {
             let win_height = inner.height as usize;
             let len = child_height as usize;
-            let fits = len <= win_height;
-            let scroll_style = cx.editor.theme.get("ui.menu.scroll");
 
-            if !fits {
-                let scroll_height = win_height.pow(2).div_ceil(len).min(win_height);
-                let scroll_line = (win_height - scroll_height) * scroll
-                    / std::cmp::max(1, len.saturating_sub(win_height));
-
-                let mut cell;
-                for i in 0..win_height {
-                    cell =
-                        &mut surface[(inner.right() - 1 + border as u16, inner.top() + i as u16)];
-
-                    let half_block = if render_borders { "▌" } else { "▐" };
-
-                    if scroll_line <= i && i < scroll_line + scroll_height {
-                        // Draw scroll thumb
-                        cell.set_symbol(half_block);
-                        cell.set_fg(scroll_style.fg.unwrap_or(helix_view::theme::Color::Reset));
-                    } else if !render_borders {
-                        // Draw scroll track
-                        cell.set_symbol(half_block);
-                        cell.set_fg(scroll_style.bg.unwrap_or(helix_view::theme::Color::Reset));
-                    }
+            if len > win_height {
+                let scroll_style = cx.editor.theme.get("ui.menu.scroll");
+                let thumb_fg = scroll_style.fg.unwrap_or(helix_view::theme::Color::Reset);
+                let mut sb = crate::widgets::Scrollbar::new(len, scroll, win_height)
+                    .symbol(if render_borders { "▌" } else { "▐" })
+                    .thumb_style(helix_view::graphics::Style::default().fg(thumb_fg));
+                if !render_borders {
+                    let track_fg = scroll_style.bg.unwrap_or(helix_view::theme::Color::Reset);
+                    sb = sb.track("▐", helix_view::graphics::Style::default().fg(track_fg));
                 }
+                sb.render(
+                    Rect::new(
+                        inner.right() - 1 + border as u16,
+                        inner.top(),
+                        1,
+                        inner.height,
+                    ),
+                    surface,
+                );
             }
         }
     }

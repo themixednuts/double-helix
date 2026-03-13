@@ -1,11 +1,13 @@
 //! Marquee: scrolling text for fixed-width areas.
 //!
-//! Use when text may exceed the display width: scrolls from start → hold at end →
-//! reset → hold at start, and repeats. Stops scrolling after an inactivity timeout
-//! since last focus or user interaction (call `touch()` when the user interacts
-//! or when the container gains focus).
+//! Text that fits the viewport is rendered statically. Text that overflows scrolls
+//! in a cycle: hold at start → scroll to end → hold at end → snap back → repeat.
+//! Stops scrolling after an inactivity timeout; call `touch()` to resume.
+//!
+//! `render()` returns `Option<Instant>` — the next time the visual output changes.
+//! The caller should schedule a re-render at that time (e.g., via `request_redraw`).
 
-use helix_core::unicode::width::{UnicodeWidthChar, UnicodeWidthStr};
+use helix_core::unicode::width::UnicodeWidthChar;
 use helix_view::graphics::{Rect, Style};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -20,12 +22,95 @@ pub const DEFAULT_HOLD_END: Duration = Duration::from_millis(1500);
 /// Default hold time at the start after reset before scrolling again.
 pub const DEFAULT_HOLD_START: Duration = Duration::from_millis(1000);
 
-/// Marquee: optionally scrolling text in a fixed-width line. Call `touch()` on
-/// focus or user interaction so scrolling continues; after the inactivity
-/// timeout, the text is held at the start until the next `touch()`.
+/// Precomputed text layout for zero-allocation rendering.
+struct TextLayout {
+    text: Arc<str>,
+    /// Byte offset of each character, plus a sentinel at `text.len()`.
+    /// Length = char_count + 1.
+    byte_offsets: Box<[usize]>,
+    /// Cumulative display width at the start of each char.
+    /// `cum_widths[0] = 0`, `cum_widths[n] = total_width`.
+    /// Length = char_count + 1.
+    cum_widths: Box<[usize]>,
+    total_width: usize,
+}
+
+impl TextLayout {
+    fn new(text: Arc<str>) -> Self {
+        let mut byte_offsets = Vec::new();
+        let mut cum_widths = Vec::new();
+        let mut cum = 0usize;
+
+        for (byte_off, ch) in text.char_indices() {
+            byte_offsets.push(byte_off);
+            cum_widths.push(cum);
+            cum += ch.width().unwrap_or(0);
+        }
+        byte_offsets.push(text.len());
+        cum_widths.push(cum);
+
+        Self {
+            text,
+            byte_offsets: byte_offsets.into_boxed_slice(),
+            cum_widths: cum_widths.into_boxed_slice(),
+            total_width: cum,
+        }
+    }
+
+    /// Largest char offset where remaining text fits in `viewport_width`.
+    /// Uses binary search on the cumulative width table.
+    fn max_scroll_offset(&self, viewport_width: usize) -> usize {
+        if self.total_width <= viewport_width {
+            return 0;
+        }
+        let threshold = self.total_width - viewport_width;
+        // Find first i where cum_widths[i] >= threshold.
+        // Both Ok (exact) and Err (insertion point) give the right index.
+        match self.cum_widths.binary_search(&threshold) {
+            Ok(i) | Err(i) => i,
+        }
+    }
+
+    /// Render text starting at `char_offset` into the surface area.
+    /// Zero allocation — passes a `&str` slice directly to `set_stringn`.
+    fn render_at_offset(
+        &self,
+        char_offset: usize,
+        area: Rect,
+        surface: &mut Surface,
+        style: Style,
+    ) {
+        let byte_start = self
+            .byte_offsets
+            .get(char_offset)
+            .copied()
+            .unwrap_or(self.text.len());
+        surface.set_stringn(
+            area.x,
+            area.y,
+            &self.text[byte_start..],
+            area.width as usize,
+            style,
+        );
+    }
+}
+
+/// Scrolling text widget for fixed-width areas.
+///
+/// Call `touch()` on focus or user interaction so scrolling continues;
+/// after the inactivity timeout, text holds at the start until the next `touch()`.
+///
+/// # Render loop
+///
+/// ```ignore
+/// let next = marquee.render(area, surface, style);
+/// if let Some(when) = next {
+///     schedule_redraw_at(when);
+/// }
+/// ```
 #[derive(Debug)]
 pub struct Marquee {
-    text: Option<Arc<str>>,
+    layout: Option<TextLayout>,
     scroll_start: Option<Instant>,
     last_activity: Option<Instant>,
     inactivity_timeout: Duration,
@@ -34,10 +119,19 @@ pub struct Marquee {
     hold_start: Duration,
 }
 
+impl std::fmt::Debug for TextLayout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TextLayout")
+            .field("total_width", &self.total_width)
+            .field("char_count", &(self.byte_offsets.len().saturating_sub(1)))
+            .finish()
+    }
+}
+
 impl Default for Marquee {
     fn default() -> Self {
         Self {
-            text: None,
+            layout: None,
             scroll_start: None,
             last_activity: None,
             inactivity_timeout: DEFAULT_INACTIVITY_TIMEOUT,
@@ -72,18 +166,19 @@ impl Marquee {
         self
     }
 
-    /// Set or clear the text. When set, scroll and activity timers are reset.
+    /// Set or clear the text. Precomputes layout and resets timers.
     pub fn set_text(&mut self, text: Option<impl Into<Arc<str>>>) {
         let now = Instant::now();
-        self.text = text.map(Into::into);
-        self.scroll_start = self.text.as_ref().map(|_| now);
-        self.last_activity = self.text.as_ref().map(|_| now);
+        let text: Option<Arc<str>> = text.map(Into::into);
+        self.layout = text.map(TextLayout::new);
+        self.scroll_start = self.layout.as_ref().map(|_| now);
+        self.last_activity = self.layout.as_ref().map(|_| now);
     }
 
-    /// Call when the user interacts or when the container gains focus so that
-    /// scrolling continues (and the inactivity timeout is reset).
+    /// Reset the inactivity timeout. Call on user interaction or focus so
+    /// scrolling continues (or resumes if paused).
     pub fn touch(&mut self) {
-        if self.text.is_some() {
+        if self.layout.is_some() {
             self.last_activity = Some(Instant::now());
             if self.scroll_start.is_none() {
                 self.scroll_start = Some(Instant::now());
@@ -91,141 +186,97 @@ impl Marquee {
         }
     }
 
-    /// Whether there is text to show (even if empty string).
+    /// Whether there is text to show.
     pub fn has_text(&self) -> bool {
-        self.text.is_some()
+        self.layout.is_some()
     }
 
-    /// Render the current (possibly scrolled) text into the given line area.
-    /// Uses `Instant::now()` for timing. If the text fits in the width, it is
-    /// drawn static; otherwise the marquee cycle runs (or is frozen after
-    /// inactivity).
-    pub fn render(&mut self, area: Rect, surface: &mut Surface, style: Style) {
-        let Some(ref text) = self.text else {
-            return;
-        };
+    /// Render the marquee into `area`.
+    ///
+    /// Returns `Some(instant)` if the marquee is animating and needs another
+    /// render at that time. Returns `None` if static (text fits, inactive, or
+    /// no text).
+    pub fn render(&self, area: Rect, surface: &mut Surface, style: Style) -> Option<Instant> {
+        let layout = self.layout.as_ref()?;
+        let viewport = area.width as usize;
+        if viewport == 0 {
+            return None;
+        }
+
+        // Text fits — static render, no animation.
+        if layout.total_width <= viewport {
+            layout.render_at_offset(0, area, surface, style);
+            return None;
+        }
+
+        let scroll_start = self.scroll_start?;
+        let last_activity = self.last_activity?;
         let now = Instant::now();
-        let width_cols = area.width as usize;
-        if width_cols == 0 {
-            return;
-        }
 
-        let total_width = text.width();
-        if total_width <= width_cols {
-            surface.set_stringn(
-                area.x,
-                area.y,
-                text.as_ref(),
-                width_cols.saturating_add(8),
-                style,
-            );
-            return;
-        }
-
-        let scroll_start = match self.scroll_start {
-            Some(s) => s,
-            None => return,
-        };
-        let last_activity = match self.last_activity {
-            Some(a) => a,
-            None => return,
-        };
+        // Inactive — freeze at start.
         if now.saturating_duration_since(last_activity) > self.inactivity_timeout {
-            let visible = slice_to_width(text, 0, width_cols);
-            surface.set_stringn(
-                area.x,
-                area.y,
-                &visible,
-                width_cols.saturating_add(8),
-                style,
-            );
-            return;
+            layout.render_at_offset(0, area, surface, style);
+            return None;
         }
 
-        let max_offset = max_scroll_offset(text, width_cols);
+        let max_offset = layout.max_scroll_offset(viewport);
         if max_offset == 0 {
-            surface.set_stringn(
-                area.x,
-                area.y,
-                text.as_ref(),
-                width_cols.saturating_add(8),
-                style,
-            );
-            return;
+            layout.render_at_offset(0, area, surface, style);
+            return None;
         }
 
-        let cycle_duration = self.scroll_duration + self.hold_end + self.hold_start;
+        // Cycle timing.
+        let cycle = self.scroll_duration + self.hold_end + self.hold_start;
+        let cycle_secs = cycle.as_secs_f64();
+        if cycle_secs <= 0.0 {
+            layout.render_at_offset(0, area, surface, style);
+            return None;
+        }
+
         let elapsed = now.saturating_duration_since(scroll_start);
-        let pos_secs = elapsed.as_secs_f64();
-        let cycle_secs = cycle_duration.as_secs_f64();
-        let phase = if cycle_secs <= 0.0 {
-            0.0
+        let pos = elapsed.as_secs_f64() % cycle_secs;
+        let scroll_secs = self.scroll_duration.as_secs_f64();
+        let hold_end_secs = self.hold_end.as_secs_f64();
+
+        let (char_offset, next_frame) = if pos < scroll_secs {
+            // Scrolling phase: interpolate offset.
+            let t = pos / scroll_secs;
+            let offset = (t * max_offset as f64).round() as usize;
+            let offset = offset.min(max_offset);
+
+            // Next frame: when the next character boundary scrolls in.
+            let next_offset = (offset + 1).min(max_offset);
+            if next_offset > offset {
+                let next_t = next_offset as f64 / max_offset as f64;
+                let dt = Duration::from_secs_f64((next_t - t) * scroll_secs);
+                (offset, now + dt)
+            } else {
+                // At max offset — wait for hold_end transition.
+                let remaining = scroll_secs - pos;
+                (offset, now + Duration::from_secs_f64(remaining))
+            }
+        } else if pos < scroll_secs + hold_end_secs {
+            // Hold at end.
+            let remaining = (scroll_secs + hold_end_secs) - pos;
+            (max_offset, now + Duration::from_secs_f64(remaining))
         } else {
-            (pos_secs % cycle_secs) / cycle_secs
+            // Hold at start.
+            let remaining = cycle_secs - pos;
+            (0, now + Duration::from_secs_f64(remaining))
         };
 
-        let scroll_phase_duration = self.scroll_duration.as_secs_f64() / cycle_secs;
-        let hold_end_duration = self.hold_end.as_secs_f64() / cycle_secs;
-
-        let char_offset = if phase < scroll_phase_duration {
-            let t = phase / scroll_phase_duration;
-            (t * max_offset as f64).round() as usize
-        } else if phase < scroll_phase_duration + hold_end_duration {
-            max_offset
-        } else {
-            0
-        };
-
-        let char_offset = char_offset.min(max_offset);
-        let visible = slice_to_width(text, char_offset, width_cols);
-        surface.set_stringn(
-            area.x,
-            area.y,
-            &visible,
-            width_cols.saturating_add(8),
-            style,
-        );
+        layout.render_at_offset(char_offset, area, surface, style);
+        Some(next_frame)
     }
 }
 
-/// Slice `s` starting at character index `start_char`, taking characters until
-/// display width reaches `max_width` (or string ends). Returns a boxed slice for display.
-fn slice_to_width(s: &str, start_char: usize, max_width: usize) -> Box<str> {
-    let byte_start = s
-        .char_indices()
-        .nth(start_char)
-        .map(|(i, _)| i)
-        .unwrap_or(s.len());
-    let tail = &s[byte_start..];
-    let mut width = 0usize;
-    let mut end_byte = byte_start;
-    for (i, c) in tail.char_indices() {
-        let w = c.width().unwrap_or(0);
-        if width + w > max_width {
-            break;
-        }
-        width += w;
-        end_byte = byte_start + i + c.len_utf8();
-    }
-    s[byte_start..end_byte.min(s.len())]
-        .to_string()
-        .into_boxed_str()
-}
-
-/// Largest character index such that the substring from that index to the end
-/// has display width <= max_width (so we can scroll to show the tail).
-fn max_scroll_offset(s: &str, max_width: usize) -> usize {
-    if s.width() <= max_width {
-        return 0;
-    }
-    let chars: Box<[char]> = s.chars().collect();
-    for i in 0..=chars.len() {
-        let tail: String = chars[i..].iter().collect();
-        if tail.width() <= max_width {
-            return i;
-        }
-    }
-    chars.len()
+/// Schedule a `request_redraw` at the given instant (for marquee animation).
+/// Spawns a lightweight tokio task that sleeps then pokes the event loop.
+pub fn schedule_redraw_at(when: Instant) {
+    tokio::spawn(async move {
+        tokio::time::sleep_until(tokio::time::Instant::from_std(when)).await;
+        helix_event::request_redraw();
+    });
 }
 
 #[cfg(test)]
@@ -233,15 +284,61 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_slice_to_width() {
-        assert_eq!(&*slice_to_width("hello", 0, 5), "hello");
-        assert_eq!(&*slice_to_width("hello", 0, 3), "hel");
-        assert_eq!(&*slice_to_width("hello", 2, 3), "llo");
+    fn static_text_fits() {
+        let layout = TextLayout::new("hello".into());
+        assert_eq!(layout.total_width, 5);
+        assert_eq!(layout.max_scroll_offset(10), 0);
+        assert_eq!(layout.max_scroll_offset(5), 0);
     }
 
     #[test]
-    fn test_max_scroll_offset() {
-        assert_eq!(max_scroll_offset("hi", 10), 0);
-        assert_eq!(max_scroll_offset("hello world", 5), 6);
+    fn max_scroll_offset_ascii() {
+        let layout = TextLayout::new("hello world".into());
+        // 11 chars, viewport 5 → need to scroll 6 chars to see "world"
+        assert_eq!(layout.max_scroll_offset(5), 6);
+        assert_eq!(layout.max_scroll_offset(11), 0);
+        assert_eq!(layout.max_scroll_offset(1), 10);
+    }
+
+    #[test]
+    fn max_scroll_offset_wide() {
+        // 3 wide chars, each width 2, total width 6
+        let layout = TextLayout::new("あいう".into());
+        assert_eq!(layout.total_width, 6);
+        // viewport 4: need offset where remaining width ≤ 4
+        // offset 1 → "いう" (width 4) ✓
+        assert_eq!(layout.max_scroll_offset(4), 1);
+        // viewport 2: offset 2 → "う" (width 2) ✓
+        assert_eq!(layout.max_scroll_offset(2), 2);
+    }
+
+    #[test]
+    fn render_returns_none_when_fits() {
+        let mut marquee = Marquee::new();
+        marquee.set_text(Some("hi"));
+        let area = Rect::new(0, 0, 10, 1);
+        let mut surface = Surface::empty(Rect::new(0, 0, 10, 1));
+        let next = marquee.render(area, &mut surface, Style::default());
+        assert!(next.is_none());
+    }
+
+    #[test]
+    fn render_returns_some_when_scrolling() {
+        let mut marquee = Marquee::new();
+        marquee.set_text(Some("this is a long string that overflows"));
+        let area = Rect::new(0, 0, 10, 1);
+        let mut surface = Surface::empty(Rect::new(0, 0, 10, 1));
+        let next = marquee.render(area, &mut surface, Style::default());
+        assert!(next.is_some());
+    }
+
+    #[test]
+    fn no_text_returns_none() {
+        let marquee = Marquee::new();
+        let area = Rect::new(0, 0, 10, 1);
+        let mut surface = Surface::empty(Rect::new(0, 0, 10, 1));
+        assert!(marquee
+            .render(area, &mut surface, Style::default())
+            .is_none());
     }
 }

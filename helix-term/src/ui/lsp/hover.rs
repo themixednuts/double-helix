@@ -8,7 +8,7 @@ use helix_view::input::Event;
 use tui::buffer::Buffer;
 use tui::widgets::{BorderType, Paragraph, Widget, Wrap};
 
-use crate::compositor::{Component, Context, EventResult};
+use crate::compositor::{Component, Context, EventResult, RenderContext};
 
 use crate::alt;
 use crate::ui::Markdown;
@@ -86,7 +86,7 @@ const HEADER_HEIGHT: u16 = 1;
 const SEPARATOR_HEIGHT: u16 = 1;
 
 impl Component for Hover {
-    fn render(&mut self, area: Rect, surface: &mut Buffer, cx: &mut Context) {
+    fn render(&mut self, area: Rect, surface: &mut Buffer, cx: &RenderContext) {
         let margin = Margin::all(1);
         let area = area.inner(margin);
 
@@ -118,7 +118,7 @@ impl Component for Hover {
         });
         let contents_para = Paragraph::new(&contents)
             .wrap(Wrap { trim: false })
-            .scroll((cx.scroll.unwrap_or_default() as u16, 0));
+            .scroll((cx.scroll().unwrap_or_default() as u16, 0));
         contents_para.render(contents_area, surface);
     }
 

@@ -1,4 +1,4 @@
-use crate::compositor::{Component, Compositor, Context, Event, EventResult};
+use crate::compositor::{Component, Compositor, Context, Event, EventResult, RenderContext};
 use crate::{alt, ctrl, key, shift, ui};
 use arc_swap::ArcSwap;
 use helix_core::syntax;
@@ -22,12 +22,12 @@ use helix_view::{
     Editor,
 };
 
-type PromptCharHandler = Box<dyn Fn(&mut Prompt, char, &Context)>;
+type PromptCharHandler = Box<dyn Fn(&mut Prompt, char, &Context) + Send>;
 
 pub type Completion = (RangeFrom<usize>, Span<'static>);
-type CompletionFn = Box<dyn FnMut(&Editor, &str) -> Vec<Completion>>;
-type CallbackFn = Box<dyn FnMut(&mut Context, &str, PromptEvent)>;
-pub type DocFn = Box<dyn Fn(&str) -> Option<Cow<str>>>;
+type CompletionFn = Box<dyn FnMut(&Editor, &str) -> Vec<Completion> + Send>;
+type CallbackFn = Box<dyn FnMut(&mut Context, &str, PromptEvent) + Send>;
+pub type DocFn = Box<dyn Fn(&str) -> Option<Cow<str>> + Send>;
 
 pub struct Prompt {
     prompt: Cow<'static, str>,
@@ -38,6 +38,8 @@ pub struct Prompt {
     anchor: usize,
     truncate_start: bool,
     truncate_end: bool,
+    /// Last cursor screen position computed during render (used by cursor()).
+    last_cursor_pos: (u16, u16),
     // ---
     completion: Vec<Completion>,
     selection: Option<usize>,
@@ -48,6 +50,8 @@ pub struct Prompt {
     pub doc_fn: DocFn,
     next_char_handler: Option<PromptCharHandler>,
     language: Option<(&'static str, Arc<ArcSwap<syntax::Loader>>)>,
+    /// Model layer ID, set when this prompt is pushed to the layer stack.
+    model_layer_id: Option<helix_view::model::LayerId>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -84,8 +88,8 @@ impl Prompt {
     pub fn new(
         prompt: Cow<'static, str>,
         history_register: Option<char>,
-        completion_fn: impl FnMut(&Editor, &str) -> Vec<Completion> + 'static,
-        callback_fn: impl FnMut(&mut Context, &str, PromptEvent) + 'static,
+        completion_fn: impl FnMut(&Editor, &str) -> Vec<Completion> + Send + 'static,
+        callback_fn: impl FnMut(&mut Context, &str, PromptEvent) + Send + 'static,
     ) -> Self {
         Self {
             prompt,
@@ -95,6 +99,7 @@ impl Prompt {
             anchor: 0,
             truncate_start: false,
             truncate_end: false,
+            last_cursor_pos: (0, 0),
             completion: Vec::new(),
             selection: None,
             history_register,
@@ -104,6 +109,7 @@ impl Prompt {
             doc_fn: Box::new(|_| None),
             next_char_handler: None,
             language: None,
+            model_layer_id: None,
         }
     }
 
@@ -486,12 +492,49 @@ impl Prompt {
                 .unwrap_or(0);
         }
     }
+
+    /// Sync prompt state to the shared `Model` layer. Called during render so
+    /// any frontend can read the prompt's current state without accessing the
+    /// `Prompt` struct directly.
+    fn sync_to_model(&mut self, editor: &mut Editor) {
+        use helix_view::model::{Placement, PromptModel};
+
+        // Lazily push a layer on first sync.
+        let layer_id = match self.model_layer_id {
+            Some(id) => id,
+            None => {
+                let id = editor
+                    .model
+                    .push_layer(Box::new(PromptModel::default()), Placement::Fullscreen);
+                self.model_layer_id = Some(id);
+                id
+            }
+        };
+
+        let Some(model) = editor.model.layer_model_mut::<PromptModel>(layer_id) else {
+            return;
+        };
+
+        // Compute doc text eagerly so the model is render-ready.
+        let doc_text = (self.doc_fn)(&self.line).map(|c| c.into_owned());
+
+        model.prompt_text = self.prompt.clone();
+        model.input.clone_from(&self.line);
+        model.cursor = self.cursor;
+        model.completions = self
+            .completion
+            .iter()
+            .map(|(_, span)| span.content.to_string().into_boxed_str())
+            .collect();
+        model.selected_completion = self.selection;
+        model.doc = doc_text;
+    }
 }
 
 const BASE_WIDTH: u16 = 30;
 
 impl Prompt {
-    pub fn render_prompt(&mut self, area: Rect, surface: &mut Surface, cx: &mut Context) {
+    pub fn render_prompt(&mut self, area: Rect, surface: &mut Surface, cx: &RenderContext) {
         let theme = &cx.editor.theme;
         let prompt_color = theme.get("ui.text");
         let completion_color = theme.get("ui.menu");
@@ -629,6 +672,9 @@ impl Prompt {
                     suggestion_color,
                 );
             }
+            self.truncate_start = false;
+            self.truncate_end = false;
+            self.last_cursor_pos = (self.line_area.x, self.line_area.y);
         } else if let Some((language, loader)) = self.language.as_ref() {
             let mut text: ui::text::Text = crate::ui::markdown::highlighted_code_block(
                 &self.line,
@@ -639,63 +685,22 @@ impl Prompt {
             )
             .into();
             text.render(self.line_area, surface, cx);
+            let cursor_col = self.line[..self.cursor.min(self.line.len())].width() as u16;
+            self.truncate_start = false;
+            self.truncate_end = false;
+            self.last_cursor_pos = (self.line_area.x + cursor_col, self.line_area.y);
         } else {
-            let line_width = self.line_area.width as usize;
-
-            if self.line.width() < line_width {
-                self.anchor = 0;
-            } else if self.cursor <= self.anchor {
-                // Ensure the grapheme under the cursor is in view.
-                self.anchor = self.line[..self.cursor]
-                    .grapheme_indices(true)
-                    .next_back()
-                    .map(|(i, _)| i)
-                    .unwrap_or_default();
-            } else if self.line[self.anchor..self.cursor].width() > line_width {
-                // Set the anchor to the last grapheme cluster before the width is exceeded.
-                let mut width = 0;
-                self.anchor = self.line[..self.cursor]
-                    .grapheme_indices(true)
-                    .rev()
-                    .find_map(|(idx, g)| {
-                        width += g.width();
-                        if width > line_width {
-                            Some(idx + g.len())
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap();
-            }
-
-            self.truncate_start = self.anchor > 0;
-            self.truncate_end = self.line[self.anchor..].width() > line_width;
-
-            // if we keep inserting characters just before the end elipsis, we move the anchor
-            // so that those new characters are displayed
-            if self.truncate_end && self.line[self.anchor..self.cursor].width() >= line_width {
-                // Move the anchor forward by one non-zero-width grapheme.
-                self.anchor += self.line[self.anchor..]
-                    .grapheme_indices(true)
-                    .find_map(|(idx, g)| {
-                        if g.width() > 0 {
-                            Some(idx + g.len())
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap();
-            }
-
-            surface.set_string_anchored(
-                self.line_area.x,
-                self.line_area.y,
-                self.truncate_start,
-                self.truncate_end,
-                &self.line.as_str()[self.anchor..],
-                line_width,
-                |_| prompt_color,
+            let state = crate::widgets::text_input(
+                surface,
+                self.line_area,
+                &self.line,
+                self.cursor,
+                prompt_color,
+                prompt_color,
             );
+            self.truncate_start = state.truncated_start;
+            self.truncate_end = state.truncated_end;
+            self.last_cursor_pos = (state.cursor_x, state.cursor_y);
         }
     }
 }
@@ -713,10 +718,16 @@ impl Component for Prompt {
             _ => return EventResult::Ignored(None),
         };
 
-        let close_fn = EventResult::Consumed(Some(Box::new(|compositor: &mut Compositor, _| {
-            // remove the layer
-            compositor.pop();
-        })));
+        let ui_layer_id = self.model_layer_id;
+        let close_fn =
+            EventResult::Consumed(Some(Box::new(move |compositor: &mut Compositor, cx| {
+                // remove the layer
+                compositor.pop();
+                // clean up Model layer
+                if let Some(id) = ui_layer_id {
+                    cx.editor.model.remove_layer(id);
+                }
+            })));
 
         match event {
             ctrl!('c') | key!(Esc) => {
@@ -754,13 +765,13 @@ impl Component for Prompt {
                 (self.callback_fn)(cx, &self.line, PromptEvent::Update);
             }
             ctrl!('s') => {
-                let (view, doc) = current!(cx.editor);
+                let (view_id, doc) = focused!(cx.editor);
                 let text = doc.text().slice(..);
 
                 use helix_core::textobject;
                 let range = textobject::textobject_word(
                     text,
-                    doc.selection(view.id).primary(),
+                    doc.selection(view_id).primary(),
                     textobject::TextObject::Inside,
                     1,
                     false,
@@ -860,48 +871,18 @@ impl Component for Prompt {
         EventResult::Consumed(None)
     }
 
-    fn render(&mut self, area: Rect, surface: &mut Surface, cx: &mut Context) {
+    fn sync(&mut self, editor: &mut Editor) {
+        self.sync_to_model(editor);
+    }
+
+    fn render(&mut self, area: Rect, surface: &mut Surface, cx: &RenderContext) {
         self.render_prompt(area, surface, cx)
     }
 
-    fn cursor(&self, area: Rect, editor: &Editor) -> (Option<Position>, CursorKind) {
-        // Use the same label logic used in render_prompt so the cursor aligns with what is drawn.
-        // When using the traditional bottom cmdline, we draw ":" for Cmdline and "/" for Search.
-        let effective_label_len: u16 = if editor.config().cmdline.style == CmdlineStyle::Bottom {
-            if self.prompt == "Cmdline" || self.prompt == "Search" {
-                1
-            } else {
-                self.prompt.len() as u16
-            }
-        } else {
-            // Popup style renders no textual label inside the input area.
-            0
-        };
-
-        let area = area
-            .clip_left(effective_label_len)
-            .clip_right(if effective_label_len == 0 { 2 } else { 0 });
-
-        let mut col = area.left() as usize + self.line[self.anchor..self.cursor].width();
-
-        // ensure the cursor does not go beyond elipses
-        if self.truncate_end
-            && self.line[self.anchor..self.cursor].width() >= self.line_area.width as usize
-        {
-            col -= 1;
-        }
-
-        if self.truncate_start && self.cursor == self.anchor {
-            col += self.line[self.cursor..]
-                .graphemes(true)
-                .next()
-                .map_or(0, |g| g.width());
-        }
-
-        let line = area.height as usize - 1;
-
+    fn cursor(&self, _area: Rect, editor: &Editor) -> (Option<Position>, CursorKind) {
+        let (cx, cy) = self.last_cursor_pos;
         (
-            Some(Position::new(area.y as usize + line, col)),
+            Some(Position::new(cy as usize, cx as usize)),
             editor.config().cursor_shape.from_mode(Mode::Insert),
         )
     }

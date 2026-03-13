@@ -1,5 +1,5 @@
 use crate::{
-    compositor::{Callback, Component, Compositor, Context, Event, EventResult},
+    compositor::{Callback, Component, Compositor, Context, Event, EventResult, RenderContext},
     ctrl, key, shift,
 };
 use tui::{buffer::Buffer as Surface, widgets::Table};
@@ -16,7 +16,7 @@ pub trait Item: Sync + Send + 'static {
     fn format(&self, data: &Self::Data) -> Row<'_>;
 }
 
-pub type MenuCallback<T> = Box<dyn Fn(&mut Editor, Option<&T>, MenuEvent)>;
+pub type MenuCallback<T> = Box<dyn Fn(&mut Editor, Option<&T>, MenuEvent) + Send>;
 
 pub struct Menu<T: Item> {
     options: Vec<T>,
@@ -46,7 +46,7 @@ impl<T: Item> Menu<T> {
     pub fn new(
         options: Vec<T>,
         editor_data: <T as Item>::Data,
-        callback_fn: impl Fn(&mut Editor, Option<&T>, MenuEvent) + 'static,
+        callback_fn: impl Fn(&mut Editor, Option<&T>, MenuEvent) + Send + 'static,
     ) -> Self {
         let matches = (0..options.len() as u32).map(|i| (i, 0)).collect();
         Self {
@@ -216,6 +216,19 @@ impl<T: Item> Menu<T> {
     pub fn len(&self) -> usize {
         self.matches.len()
     }
+
+    /// Iterate matched items in display order. Each element is a reference to
+    /// the original option at the match index.
+    pub fn matched_items(&self) -> impl Iterator<Item = &T> + '_ {
+        self.matches
+            .iter()
+            .map(|(index, _score)| &self.options[*index as usize])
+    }
+
+    /// Current selection index (into matched items), if any.
+    pub fn cursor_index(&self) -> Option<usize> {
+        self.cursor
+    }
 }
 
 impl<T: Item + PartialEq> Menu<T> {
@@ -329,7 +342,7 @@ impl<T: Item + 'static> Component for Menu<T> {
         Some(self.size)
     }
 
-    fn render(&mut self, area: Rect, surface: &mut Surface, cx: &mut Context) {
+    fn render(&mut self, area: Rect, surface: &mut Surface, cx: &RenderContext) {
         let theme = &cx.editor.theme;
         let style = theme
             .try_get("ui.menu")
@@ -391,28 +404,20 @@ impl<T: Item + 'static> Component for Menu<T> {
 
         let fits = len <= win_height;
 
-        let scroll_style = theme.get("ui.menu.scroll");
         if !fits {
-            let scroll_height = win_height.pow(2).div_ceil(len).min(win_height);
-            let scroll_line = (win_height - scroll_height) * scroll
-                / std::cmp::max(1, len.saturating_sub(win_height));
-
-            let mut cell;
-            for i in 0..win_height {
-                cell = &mut surface[(area.right() - 1, area.top() + i as u16)];
-
-                let half_block = if render_borders { "▌" } else { "▐" };
-
-                if scroll_line <= i && i < scroll_line + scroll_height {
-                    // Draw scroll thumb
-                    cell.set_symbol(half_block);
-                    cell.set_fg(scroll_style.fg.unwrap_or(helix_view::theme::Color::Reset));
-                } else if !render_borders {
-                    // Draw scroll track
-                    cell.set_symbol(half_block);
-                    cell.set_fg(scroll_style.bg.unwrap_or(helix_view::theme::Color::Reset));
-                }
+            let scroll_style = theme.get("ui.menu.scroll");
+            let thumb_fg = scroll_style.fg.unwrap_or(helix_view::theme::Color::Reset);
+            let mut sb = crate::widgets::Scrollbar::new(len, scroll, win_height)
+                .symbol(if render_borders { "▌" } else { "▐" })
+                .thumb_style(helix_view::graphics::Style::default().fg(thumb_fg));
+            if !render_borders {
+                let track_fg = scroll_style.bg.unwrap_or(helix_view::theme::Color::Reset);
+                sb = sb.track("▐", helix_view::graphics::Style::default().fg(track_fg));
             }
+            sb.render(
+                Rect::new(area.right() - 1, area.top(), 1, area.height),
+                surface,
+            );
         }
     }
 }

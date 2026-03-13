@@ -90,6 +90,10 @@ pub trait Decoration {
     ) -> usize {
         usize::MAX
     }
+
+    fn fast_forward_to_char(&mut self, char_idx: usize, _doc_line: usize) -> usize {
+        self.reset_pos(char_idx)
+    }
 }
 
 impl<F: FnMut(&mut TextRenderer, LinePos)> Decoration for F {
@@ -111,6 +115,12 @@ impl<'a> DecorationManager<'a> {
     pub fn prepare_for_rendering(&mut self, first_visible_char: usize) {
         for (decoration, next_position) in &mut self.decorations {
             *next_position = decoration.reset_pos(first_visible_char)
+        }
+    }
+
+    pub fn fast_forward_to_char(&mut self, char_idx: usize, doc_line: usize) {
+        for (decoration, next_position) in &mut self.decorations {
+            *next_position = decoration.fast_forward_to_char(char_idx, doc_line);
         }
     }
 

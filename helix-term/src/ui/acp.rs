@@ -1,12 +1,15 @@
-use crate::compositor::{Component, Context, Event, EventResult};
-use crate::ui::prompt::Movement;
-use crate::ui::{completers, marquee::Marquee, Prompt, PromptEvent};
+use crate::component_traits;
+use crate::compositor::{Component, Context, Event, EventResult, RenderContext};
+use crate::ui::marquee::{schedule_redraw_at, Marquee};
+use crate::widgets::Focusable;
 use helix_core::Position;
+use helix_view::content_region::ContentRegion;
 use helix_view::document::Mode;
 use helix_view::graphics::{CursorKind, Rect};
 use helix_view::input::{KeyCode, KeyEvent, KeyModifiers};
 use helix_view::theme::Modifier;
 use helix_view::theme::Style;
+use helix_view::traits::{Bounded, Identified, Modal, Scrollable as ViewScrollable};
 use helix_view::Editor;
 use tui::buffer::Buffer as Surface;
 use tui::text::{Span, Spans, Text};
@@ -68,13 +71,11 @@ pub struct SessionRecord {
 // ---------------------------------------------------------------------------
 
 pub struct AcpPanel {
-    entries: Vec<ChatEntry>,
-    scroll: u16,
     focused: bool,
-    /// Chat input mode: false = Normal (modal), true = Insert (typing).
-    chat_insert_mode: bool,
-    /// Helix Prompt for the input line (used in Insert mode; Normal mode uses vim-style bindings).
-    prompt: Prompt,
+    /// Read-only chat/output area with component-owned scroll + viewport state.
+    output: ContentRegion<Vec<ChatEntry>>,
+    /// Editable input area backed by a component-owned document.
+    input: helix_view::edit_region::EditRegion,
     agent_name: String,
     agent_version: String,
     agent_busy: bool,
@@ -94,10 +95,10 @@ pub struct AcpPanel {
     plan_items: Option<Vec<PlanItem>>,
     /// Selected chat entry index (for j/k navigation and copy). None = no selection.
     selected_entry: Option<usize>,
-    /// Last content area dimensions and max scroll (for scroll/navigation). Set during render.
-    last_content_height: u16,
-    last_content_width: u16,
-    last_max_scroll: u16,
+    /// Last input cursor screen position (set during render, read by cursor()).
+    last_input_cursor: Option<(u16, u16)>,
+    /// Model panel ID, set on first sync.
+    model_panel_id: Option<helix_view::model::PanelId>,
 }
 
 impl Default for AcpPanel {
@@ -109,16 +110,9 @@ impl Default for AcpPanel {
 impl AcpPanel {
     pub fn new() -> Self {
         Self {
-            entries: Vec::new(),
-            scroll: 0,
             focused: true,
-            chat_insert_mode: false,
-            prompt: Prompt::new(
-                "".into(),
-                None,
-                completers::none,
-                |_cx: &mut Context, _s: &str, _e: PromptEvent| {},
-            ),
+            output: ContentRegion::default(),
+            input: helix_view::edit_region::EditRegion::default(),
             agent_name: String::from("No agent"),
             agent_version: String::new(),
             agent_busy: false,
@@ -130,28 +124,13 @@ impl AcpPanel {
             current_mode_id: None,
             plan_items: None,
             selected_entry: None,
-            last_content_height: 0,
-            last_content_width: 0,
-            last_max_scroll: 0,
+            last_input_cursor: None,
+            model_panel_id: None,
         }
     }
 
-    fn last_content_width(&self) -> u16 {
-        self.last_content_width
-    }
-
-    pub fn is_focused(&self) -> bool {
-        self.focused
-    }
-
-    pub fn set_focused(&mut self, focused: bool) {
-        self.focused = focused;
-        if focused {
-            self.error_marquee.touch();
-        }
-        if !focused {
-            self.chat_insert_mode = false;
-        }
+    pub fn model_panel_id(&self) -> Option<helix_view::model::PanelId> {
+        self.model_panel_id
     }
 
     /// Set or clear the panel error message (shown below status line; keeps ACP context in panel).
@@ -161,14 +140,8 @@ impl AcpPanel {
             .set_text(msg.map(|s| format!("ACP: {}", s)));
     }
 
-    pub fn toggle_focus(&mut self) {
-        self.set_focused(!self.focused);
-    }
-
-    /// Focus the panel and enter insert mode in the chat input.
     pub fn activate_input(&mut self) {
         self.set_focused(true);
-        self.chat_insert_mode = true;
     }
 
     pub fn set_agent_name(&mut self, name: String) {
@@ -335,19 +308,21 @@ impl AcpPanel {
         if matches!(entry, ChatEntry::UserMessage(_)) {
             self.plan_items = None;
         }
-        self.entries.push(entry);
-        self.scroll = 0;
+        self.output.content_mut().push(entry);
+        self.output.scroll_to_end();
         self.selected_entry = None;
     }
 
     /// Append text to the last AgentText entry, or create one.
     pub fn append_agent_text(&mut self, text: &str) {
-        if let Some(ChatEntry::AgentText(ref mut existing)) = self.entries.last_mut() {
+        if let Some(ChatEntry::AgentText(ref mut existing)) = self.output.content_mut().last_mut() {
             existing.push_str(text);
         } else {
-            self.entries.push(ChatEntry::AgentText(text.to_string()));
+            self.output
+                .content_mut()
+                .push(ChatEntry::AgentText(text.to_string()));
         }
-        self.scroll = 0;
+        self.output.scroll_to_end();
     }
 
     /// Add or update a tool call by id. Format: name (e.g. read_file), path on newline, status only.
@@ -359,7 +334,7 @@ impl AcpPanel {
         path: Option<&str>,
         status: &str,
     ) {
-        for entry in self.entries.iter_mut().rev() {
+        for entry in self.output.content_mut().iter_mut().rev() {
             if let ChatEntry::ToolCall {
                 id: ref existing_id,
                 status: ref mut existing_status,
@@ -377,13 +352,13 @@ impl AcpPanel {
             }
         }
         if let Some(n) = name {
-            self.entries.push(ChatEntry::ToolCall {
+            self.output.content_mut().push(ChatEntry::ToolCall {
                 id: id.to_string(),
                 name: n.to_string(),
                 path: path.map(|s| s.to_string()),
                 status: status.to_string(),
             });
-            self.scroll = 0;
+            self.output.scroll_to_end();
         }
     }
 
@@ -419,84 +394,185 @@ impl AcpPanel {
         self.message_queue.clear();
     }
 
+    /// Sync panel state to the shared `Model.panels` entry. Called during render
+    /// so any frontend can read the ACP panel's current state.
+    fn sync_to_model(&mut self, editor: &mut Editor) {
+        use helix_view::model::{
+            AcpChatEntry as UiEntry, AcpModel, AcpPlanItem as UiPlanItem,
+            AcpPlanStatus as UiPlanStatus, PanelSide, PanelSize,
+        };
+
+        // Lazily insert a model panel on first sync, or reclaim an orphaned one.
+        let panel_id = match self.model_panel_id {
+            Some(id) if editor.model.panels.contains_key(id) => id,
+            _ => {
+                // Check for an orphaned AcpModel panel (e.g., from a replaced component).
+                let existing = editor
+                    .model
+                    .panels
+                    .iter()
+                    .find(|(_, p)| p.content.as_any().is::<AcpModel>())
+                    .map(|(id, _)| id);
+                let id = existing.unwrap_or_else(|| {
+                    editor.model.insert_panel(
+                        "Agent",
+                        Box::new(AcpModel::default()),
+                        PanelSide::Right,
+                        PanelSize::Percent(35),
+                    )
+                });
+                self.model_panel_id = Some(id);
+                id
+            }
+        };
+
+        let input_text = self
+            .input
+            .document(editor)
+            .map(|doc| doc.text().to_string())
+            .unwrap_or_default();
+
+        let Some(model) = editor.model.panel_model_mut::<AcpModel>(panel_id) else {
+            return;
+        };
+
+        // Map chat entries.
+        model.entries = self
+            .output
+            .content()
+            .iter()
+            .map(|e| match e {
+                ChatEntry::UserMessage(s) => UiEntry::UserMessage(s.clone()),
+                ChatEntry::AgentText(s) => UiEntry::AgentText(s.clone()),
+                ChatEntry::ToolCall {
+                    id,
+                    name,
+                    path,
+                    status,
+                } => UiEntry::ToolCall {
+                    id: id.clone(),
+                    name: name.clone(),
+                    path: path.clone(),
+                    status: status.clone(),
+                },
+                ChatEntry::Status(s) => UiEntry::Status(s.clone()),
+            })
+            .collect();
+
+        model.scroll = self
+            .output
+            .max_scroll()
+            .saturating_sub(self.output.scroll()) as u16;
+        model.max_scroll = self.output.max_scroll() as u16;
+        model.selected_entry = self.selected_entry;
+        model.agent_name.clone_from(&self.agent_name);
+        model.agent_version.clone_from(&self.agent_version);
+        model.agent_busy = self.agent_busy;
+        model.focused = self.focused;
+        model.insert_mode = self.focused;
+        model.error = self.panel_error.clone();
+        model.input = input_text;
+        model.input_cursor = 0; // cursor position tracked by engine, not model
+        model.queued_messages = self.message_queue.len();
+
+        // Map plan items.
+        model.plan_items = self.plan_items.as_ref().map(|items| {
+            items
+                .iter()
+                .map(|p| UiPlanItem {
+                    content: p.content.clone(),
+                    status: match p.status {
+                        PlanStatus::Pending => UiPlanStatus::Pending,
+                        PlanStatus::InProgress => UiPlanStatus::InProgress,
+                        PlanStatus::Completed => UiPlanStatus::Completed,
+                        PlanStatus::Failed => UiPlanStatus::Failed,
+                    },
+                })
+                .collect()
+        });
+    }
+
+    /// Remove this panel's entry from the shared Model. Call before dropping.
+    pub fn remove_model_panel(&self, editor: &mut Editor) {
+        if let Some(id) = self.model_panel_id {
+            editor.model.remove_panel(id);
+        }
+    }
+
     /// Build styled text lines for rendering.
     fn build_text<'a>(&self, theme: &helix_view::Theme, width: u16) -> Text<'a> {
         let mut lines: Vec<Spans> = Vec::new();
 
-        let user_bubble = theme.get("ui.acp.user_bubble");
-        let agent_bubble = theme.get("ui.acp.agent_bubble");
-
-        let agent_style = theme.get("ui.text.info").patch(agent_bubble);
-        let user_label_style = theme
-            .get("keyword")
-            .add_modifier(Modifier::BOLD)
-            .patch(user_bubble);
-        let user_text_style = theme.get("ui.text").patch(user_bubble);
-        let tool_icon_style = theme.get("ui.text.inactive").patch(agent_bubble);
-        let tool_name_style = theme.get("ui.text.focus").patch(agent_bubble);
-        let tool_detail_style = theme.get("ui.text.inactive").patch(agent_bubble);
+        let border_style = theme.get("ui.window");
+        let agent_style = theme.get("ui.text.info");
+        let user_label_style = theme.get("keyword").add_modifier(Modifier::BOLD);
+        let user_text_style = theme.get("ui.text");
+        let tool_icon_style = theme.get("ui.text.inactive");
+        let tool_name_style = theme.get("ui.text.focus");
+        let tool_detail_style = theme.get("ui.text.inactive");
         let separator_style = theme.get("ui.statusline.separator");
-        let heading_style = theme.get("markup.heading.1").patch(agent_bubble);
-        let code_style = theme.get("markup.raw.inline").patch(agent_bubble);
+        let heading_style = theme.get("markup.heading.1");
+        let code_style = theme.get("markup.raw.inline");
         let bold_style = agent_style.add_modifier(Modifier::BOLD);
         let italic_style = agent_style.add_modifier(Modifier::ITALIC);
         let status_dim_style = theme.get("ui.text.inactive");
-        let selection_style = theme.get("ui.selection");
 
-        for (entry_idx, entry) in self.entries.iter().enumerate() {
-            let is_selected = self.selected_entry == Some(entry_idx);
-            let (user_style, agent_style_use, label_style, heading_sel, code_sel, bold_sel, italic_sel) =
-                if is_selected {
-                    (
-                        user_text_style.patch(selection_style),
-                        agent_style.patch(selection_style),
-                        user_label_style.patch(selection_style),
-                        heading_style.patch(selection_style),
-                        code_style.patch(selection_style),
-                        bold_style.patch(selection_style),
-                        italic_style.patch(selection_style),
-                    )
-                } else {
-                    (
-                        user_text_style,
-                        agent_style,
-                        user_label_style,
-                        heading_style,
-                        code_style,
-                        bold_style,
-                        italic_style,
-                    )
-                };
+        // Bubble width: 60% of panel, at least 20, at most full width
+        let bubble_w = ((width as u32 * 60 / 100) as u16).clamp(20, width) as usize;
+        // Inner content width (inside │ and │ with 1 space padding each side)
+        let inner_w = bubble_w.saturating_sub(4); // │ + space + content + space + │
+
+        for entry in self.output.content().iter() {
             match entry {
                 ChatEntry::UserMessage(text) => {
-                    // User: right-aligned (label and text), block background.
-                    // "You" label is never part of selection; only the message content is.
-                    let you_pad = width.saturating_sub(3).min(width);
+                    // User: right-aligned bordered bubble
+                    let pad = (width as usize).saturating_sub(bubble_w);
+
+                    // Label above bubble
+                    let label_pad = (width as usize).saturating_sub(4);
                     lines.push(Spans::from(vec![
-                        Span::styled(" ".repeat(you_pad as usize), user_text_style),
-                        Span::styled("You", user_label_style),
+                        Span::raw(" ".repeat(label_pad)),
+                        Span::styled(" You", user_label_style),
                     ]));
-                    for line in text.lines() {
-                        let pad = width.saturating_sub(line.len() as u16 + 2).min(width);
-                        let pad_str = " ".repeat(pad as usize);
+
+                    // Top border: ╭───╮
+                    let top = format!("╭{}╮", "─".repeat(bubble_w.saturating_sub(2)));
+                    lines.push(Spans::from(vec![
+                        Span::raw(" ".repeat(pad)),
+                        Span::styled(top, border_style),
+                    ]));
+
+                    // Wrapped content lines (right-aligned text within bubble)
+                    let wrapped = wrap_text(text, inner_w);
+                    for wline in &wrapped {
+                        let content_pad = inner_w.saturating_sub(wline.len());
                         lines.push(Spans::from(vec![
-                            Span::styled(pad_str, user_style),
-                            Span::styled(format!(" {line}"), user_style),
+                            Span::raw(" ".repeat(pad)),
+                            Span::styled(format!("│ {}", " ".repeat(content_pad)), border_style),
+                            Span::styled(wline.clone(), user_text_style),
+                            Span::styled(" │", border_style),
                         ]));
                     }
+
+                    // Bottom border: ╰───╯
+                    let bot = format!("╰{}╯", "─".repeat(bubble_w.saturating_sub(2)));
+                    lines.push(Spans::from(vec![
+                        Span::raw(" ".repeat(pad)),
+                        Span::styled(bot, border_style),
+                    ]));
                     lines.push(Spans::default());
                 }
                 ChatEntry::AgentText(text) => {
-                    // Agent: left-aligned, block background
+                    // Agent: left-aligned, no bubble border — just render markdown
                     render_markdown_lines(
                         text,
                         &mut lines,
-                        agent_style_use,
+                        agent_style,
                         &MarkdownLineStyles {
-                            heading: heading_sel,
-                            code: code_sel,
-                            bold: bold_sel,
-                            italic: italic_sel,
+                            heading: heading_style,
+                            code: code_style,
+                            bold: bold_style,
+                            italic: italic_style,
                             separator: separator_style,
                         },
                     );
@@ -505,108 +581,12 @@ impl AcpPanel {
                 ChatEntry::ToolCall {
                     name, path, status, ..
                 } => {
-                    let (icon_style, name_style, detail_style) = if is_selected {
-                        (
-                            tool_icon_style.patch(selection_style),
-                            tool_name_style.patch(selection_style),
-                            tool_detail_style.patch(selection_style),
-                        )
-                    } else {
-                        (tool_icon_style, tool_name_style, tool_detail_style)
-                    };
                     let icon = match status.as_str() {
                         "running" => "\u{25ce}",            // ◎
                         "completed" | "done" => "\u{25cf}", // ●
                         "failed" => "\u{2715}",             // ✕
                         "cancelled" => "\u{2013}",          // –
                         _ => "\u{25cb}",                    // ○
-                    };
-                    lines.push(Spans::from(vec![
-                        Span::styled(format!(" {icon} "), icon_style),
-                        Span::styled(name.clone(), name_style),
-                    ]));
-                    if let Some(ref p) = path {
-                        lines.push(Spans::from(Span::styled(
-                            format!("     {p}"),
-                            detail_style,
-                        )));
-                    }
-                }
-                ChatEntry::Status(text) => {
-                    let style = if is_selected {
-                        status_dim_style.patch(selection_style)
-                    } else {
-                        status_dim_style
-                    };
-                    lines.push(Spans::from(Span::styled(
-                        format!(" {text}"),
-                        style,
-                    )));
-                    lines.push(Spans::default());
-                }
-            }
-        }
-
-        Text::from(lines)
-    }
-
-    /// Wrapped line offset of each entry's start. Used for j/k entry navigation.
-    fn entry_line_offsets(&self, theme: &helix_view::Theme, width: u16) -> Vec<u16> {
-        let mut offsets = vec![0];
-        let user_bubble = theme.get("ui.acp.user_bubble");
-        let agent_bubble = theme.get("ui.acp.agent_bubble");
-        let agent_style = theme.get("ui.text.info").patch(agent_bubble);
-        let user_label_style = theme
-            .get("keyword")
-            .add_modifier(Modifier::BOLD)
-            .patch(user_bubble);
-        let user_text_style = theme.get("ui.text").patch(user_bubble);
-        let tool_icon_style = theme.get("ui.text.inactive").patch(agent_bubble);
-        let tool_name_style = theme.get("ui.text.focus").patch(agent_bubble);
-        let tool_detail_style = theme.get("ui.text.inactive").patch(agent_bubble);
-        let separator_style = theme.get("ui.statusline.separator");
-        let heading_style = theme.get("markup.heading.1").patch(agent_bubble);
-        let code_style = theme.get("markup.raw.inline").patch(agent_bubble);
-        let bold_style = agent_style.add_modifier(Modifier::BOLD);
-        let italic_style = agent_style.add_modifier(Modifier::ITALIC);
-        let status_dim_style = theme.get("ui.text.inactive");
-        let styles = MarkdownLineStyles {
-            heading: heading_style,
-            code: code_style,
-            bold: bold_style,
-            italic: italic_style,
-            separator: separator_style,
-        };
-
-        for entry in &self.entries {
-            let mut lines: Vec<Spans> = Vec::new();
-            match entry {
-                ChatEntry::UserMessage(text) => {
-                    let you_pad = width.saturating_sub(3).min(width);
-                    lines.push(Spans::from(vec![
-                        Span::styled(" ".repeat(you_pad as usize), user_text_style),
-                        Span::styled("You", user_label_style),
-                    ]));
-                    for line in text.lines() {
-                        let pad = width.saturating_sub(line.len() as u16 + 2).min(width);
-                        lines.push(Spans::from(vec![
-                            Span::styled(" ".repeat(pad as usize), user_text_style),
-                            Span::styled(format!(" {line}"), user_text_style),
-                        ]));
-                    }
-                    lines.push(Spans::default());
-                }
-                ChatEntry::AgentText(text) => {
-                    render_markdown_lines(text, &mut lines, agent_style, &styles);
-                    lines.push(Spans::default());
-                }
-                ChatEntry::ToolCall { name, path, status, .. } => {
-                    let icon = match status.as_str() {
-                        "running" => "\u{25ce}",
-                        "completed" | "done" => "\u{25cf}",
-                        "failed" => "\u{2715}",
-                        "cancelled" => "\u{2013}",
-                        _ => "\u{25cb}",
                     };
                     lines.push(Spans::from(vec![
                         Span::styled(format!(" {icon} "), tool_icon_style),
@@ -627,27 +607,9 @@ impl AcpPanel {
                     lines.push(Spans::default());
                 }
             }
-            let entry_text = Text::from(lines);
-            let (_, h) = Paragraph::new(&entry_text)
-                .wrap(Wrap { trim: false })
-                .required_size(width);
-            offsets.push(offsets.last().copied().unwrap_or(0) + h);
         }
-        offsets
-    }
 
-    /// Plain text of an entry (for copying).
-    fn entry_text(&self, idx: usize) -> Option<String> {
-        self.entries.get(idx).map(|e| match e {
-            ChatEntry::UserMessage(s) => s.clone(),
-            ChatEntry::AgentText(s) => s.clone(),
-            ChatEntry::ToolCall { name, path, .. } => {
-                path.as_ref()
-                    .map(|p| format!("{name}\n{p}"))
-                    .unwrap_or_else(|| name.clone())
-            }
-            ChatEntry::Status(s) => s.clone(),
-        })
+        Text::from(lines)
     }
 
     /// Send a prompt to the first connected agent. Returns true if sent.
@@ -724,6 +686,142 @@ impl AcpPanel {
         cx.jobs.callback(callback);
         true
     }
+
+    /// Dispatch a key through the input region's own engine + modal keymaps.
+    fn dispatch_input_key(&mut self, key: KeyEvent, cx: &mut Context) {
+        let Some(result) = self.input.dispatch_key(cx.editor, key) else {
+            return;
+        };
+        self.handle_engine_result(result, cx);
+    }
+
+    /// Handle the result of an engine dispatch in the input region.
+    fn handle_engine_result(&mut self, result: helix_view::engine::EngineResult, cx: &mut Context) {
+        use helix_view::engine::EngineResult;
+        match result {
+            EngineResult::Executed | EngineResult::Pending | EngineResult::Unbound => {}
+            EngineResult::InsertChar(ch) => {
+                self.insert_char_into_input(ch, cx.editor);
+            }
+            EngineResult::CancelledInsert(keys) => {
+                for ev in keys.iter() {
+                    if let Some(ch) = ev.char() {
+                        self.insert_char_into_input(ch, cx.editor);
+                    }
+                }
+            }
+            EngineResult::ReplayInsert { keys, .. } => {
+                // For dot-repeat in the input region, just replay the keys as chars.
+                for ev in keys.iter() {
+                    if let Some(ch) = ev.char() {
+                        self.insert_char_into_input(ch, cx.editor);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Insert a single character into the input region's component document.
+    fn insert_char_into_input(&self, ch: char, editor: &mut Editor) {
+        let Some(doc_id) = self.input.doc_id() else {
+            return;
+        };
+        let doc = editor
+            .component_docs
+            .get_mut(&doc_id)
+            .expect("input doc missing");
+        let text = doc.text();
+        let selection = doc.selection(self.input.view_id()).clone();
+        let cursors = selection.cursors(text.slice(..));
+        let mut t = helix_core::Tendril::new();
+        t.push(ch);
+        let transaction = helix_core::Transaction::insert(text, &cursors, t);
+        doc.apply(&transaction, self.input.view_id());
+    }
+
+    fn send_current_prompt(&mut self, cx: &mut Context) {
+        let text = match self.input.take_text(cx.editor) {
+            Some(t) => t,
+            None => return,
+        };
+        if !text.is_empty() {
+            self.panel_error = None;
+            if self.agent_busy {
+                self.push_entry(ChatEntry::Status(format!(
+                    "Queued: {}",
+                    text.chars().take(40).collect::<String>()
+                )));
+                self.enqueue_message(text);
+            } else {
+                self.push_entry(ChatEntry::UserMessage(text.clone()));
+                if Self::send_prompt(text, cx) {
+                    self.agent_busy = true;
+                }
+            }
+        }
+    }
+
+    /// Handle cycle key bindings (thinking, mode, model). Returns `Some` if consumed.
+    fn handle_cycle_key(&mut self, key: &KeyEvent, cx: &mut Context) -> Option<EventResult> {
+        let config = cx.editor.config();
+        let category = if *key == config.acp.cycle_thinking() {
+            "thinking"
+        } else if *key == config.acp.cycle_mode() {
+            "mode"
+        } else if *key == config.acp.cycle_model() {
+            "model"
+        } else {
+            return None;
+        };
+
+        let Some((config_id, next_value, prev_value)) = self.cycle_config_option(category) else {
+            cx.editor
+                .set_status(format!("No {category} options from agent"));
+            return Some(EventResult::Consumed(None));
+        };
+
+        self.apply_config_option_cycle(category, next_value.clone());
+        let agent = cx.editor.acp_agents.iter().next().map(|(_, a)| a.clone());
+        if let Some(agent) = agent {
+            let cat = category.to_string();
+            cx.jobs.callback(async move {
+                let session_id = match agent.session_id().await {
+                    Some(id) => id,
+                    None => {
+                        let prev = prev_value.clone();
+                        let cat2 = cat.clone();
+                        return Ok(crate::job::Callback::EditorCompositor(Box::new(
+                            move |editor, compositor| {
+                                if let Some(panel) = compositor.find_id::<AcpPanel>(ID) {
+                                    panel.apply_config_option_cycle(&cat2, prev);
+                                }
+                                editor.set_error(format!("No session to update {cat}"));
+                            },
+                        )));
+                    }
+                };
+                match agent
+                    .set_session_config_option(session_id, config_id.clone(), next_value.clone())
+                    .await
+                {
+                    Ok(_) => Ok(crate::job::Callback::EditorCompositor(Box::new(|_, _| {}))),
+                    Err(e) => {
+                        let cat2 = cat.clone();
+                        Ok(crate::job::Callback::EditorCompositor(Box::new(
+                            move |editor, compositor| {
+                                if let Some(panel) = compositor.find_id::<AcpPanel>(ID) {
+                                    panel.apply_config_option_cycle(&cat2, prev_value);
+                                }
+                                editor.set_error(format!("Failed to set {cat}: {e}"));
+                            },
+                        )))
+                    }
+                }
+            });
+        }
+        cx.editor.set_status(format!("Cycled {category}"));
+        Some(EventResult::Consumed(None))
+    }
 }
 
 /// Spawn an async task that sends a queued prompt and handles the completion.
@@ -795,6 +893,43 @@ struct MarkdownLineStyles {
 
 /// Render markdown-ish text into styled Spans lines.
 /// Handles: headings (#), bold (**), italic (*), inline code (`), code blocks (```), horizontal rules (---).
+/// Word-wrap text to fit within `max_width` columns.
+fn wrap_text(text: &str, max_width: usize) -> Vec<String> {
+    let mut result = Vec::new();
+    if max_width == 0 {
+        return result;
+    }
+    for line in text.lines() {
+        if line.is_empty() {
+            result.push(String::new());
+            continue;
+        }
+        let mut current = String::new();
+        let mut current_width = 0;
+        for word in line.split_whitespace() {
+            let word_width = word.len();
+            if current_width > 0 && current_width + 1 + word_width > max_width {
+                result.push(current);
+                current = String::new();
+                current_width = 0;
+            }
+            if current_width > 0 {
+                current.push(' ');
+                current_width += 1;
+            }
+            current.push_str(word);
+            current_width += word_width;
+        }
+        if !current.is_empty() || line.ends_with(' ') {
+            result.push(current);
+        }
+    }
+    if result.is_empty() {
+        result.push(String::new());
+    }
+    result
+}
+
 fn render_markdown_lines<'a>(
     text: &str,
     lines: &mut Vec<Spans<'a>>,
@@ -956,54 +1091,108 @@ fn parse_inline_markdown(
     spans
 }
 
+impl crate::widgets::Focusable for AcpPanel {
+    fn is_focused(&self) -> bool {
+        self.focused
+    }
+
+    fn set_focused(&mut self, focused: bool) {
+        self.focused = focused;
+        if focused {
+            self.error_marquee.touch();
+        }
+    }
+}
+
+impl crate::widgets::Scrollable for AcpPanel {
+    /// Scroll offset from top (0 = at top of chat).
+    fn scroll(&self) -> usize {
+        ViewScrollable::scroll(&self.output)
+    }
+
+    /// Total number of content lines.
+    fn len(&self) -> usize {
+        self.output.content_height()
+    }
+
+    fn scroll_to(&mut self, offset: usize) {
+        ViewScrollable::scroll_to(&mut self.output, offset);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Component impl
 // ---------------------------------------------------------------------------
 
 impl Component for AcpPanel {
-    fn render(&mut self, area: Rect, surface: &mut Surface, cx: &mut Context) {
+    fn sync(&mut self, editor: &mut Editor) {
+        self.output.ensure_init(editor);
+        self.input.ensure_init(editor);
+        if self.focused {
+            editor.focused_modal_input = self.input.input_state();
+        }
+        self.sync_to_model(editor);
+    }
+
+    fn render(&mut self, area: Rect, surface: &mut Surface, cx: &RenderContext) {
         if area.width < 20 || area.height < 6 {
             return;
         }
 
-        let panel_area = area;
-        let inner = Rect {
-            x: panel_area.x + 1,
-            y: panel_area.y,
-            width: panel_area.width.saturating_sub(1),
-            height: panel_area.height,
-        };
-        let error_rows = 1; // Always reserve row below status (like main editor)
-        let bar_y = inner.y + inner.height - 1 - error_rows;
+        use helix_view::layout::{split_horizontal, split_vertical, Size};
 
+        // Layout: [1px border | content]
+        let h_areas = split_horizontal(area, &[Size::fixed(1), Size::Fill]);
+        let border_area = h_areas[0];
+        let inner = h_areas[1];
+
+        let error_rows = 1u16;
+        let input_rows = 4u16;
+        let plan_rows = self
+            .plan_items
+            .as_ref()
+            .map(|p| (p.len() + 1).min(6) as u16)
+            .unwrap_or(0);
+
+        // Vertical layout: [header(1) | chat(fill) | plan | input | statusbar(1) | error(1)]
+        let v_areas = split_vertical(
+            inner,
+            &[
+                Size::fixed(1),          // header
+                Size::Fill,              // chat content
+                Size::fixed(plan_rows),  // plan
+                Size::fixed(input_rows), // input
+                Size::fixed(1),          // status bar
+                Size::fixed(error_rows), // error line
+            ],
+        );
+        let header_area = v_areas[0];
+        let content_area_raw = v_areas[1];
+        let plan_area = v_areas[2];
+        let input_area_raw = v_areas[3];
+        let bar_area = v_areas[4];
+        let error_area = v_areas[5];
+
+        // Inset content/plan/input by 1px on each side for padding.
+        let content_area = Rect::new(
+            content_area_raw.x + 1,
+            content_area_raw.y,
+            content_area_raw.width.saturating_sub(2),
+            content_area_raw.height,
+        );
         {
             let theme = cx.editor.acp_theme();
             let bg_style = theme.get("ui.background");
-            surface.clear_with(
-                Rect {
-                    x: panel_area.x + 1,
-                    y: panel_area.y,
-                    width: panel_area.width.saturating_sub(1),
-                    height: panel_area.height,
-                },
-                bg_style,
-            );
+            surface.clear_with(inner, bg_style);
+
+            // Left border
             let border_style = theme.get("ui.window");
-            for y in panel_area.y..panel_area.y + panel_area.height {
-                surface[(panel_area.x, y)]
-                    .set_symbol(tui::symbols::line::VERTICAL)
-                    .set_style(border_style);
-            }
+            crate::widgets::vdivider(surface, border_area, border_style);
+
             let header_style = if self.focused {
                 theme.get("ui.statusline")
             } else {
                 theme.get("ui.statusline.inactive")
-            };
-            let header_area = Rect {
-                x: inner.x,
-                y: inner.y,
-                width: inner.width,
-                height: 1,
             };
             surface.set_style(header_area, header_style);
             let dot_style = if self.agent_busy {
@@ -1011,12 +1200,12 @@ impl Component for AcpPanel {
             } else {
                 theme.get("hint")
             };
-            surface.set_stringn(inner.x + 1, inner.y, "\u{25cf}", 1, dot_style);
+            surface.set_stringn(header_area.x + 1, header_area.y, "\u{25cf}", 1, dot_style);
             surface.set_stringn(
-                inner.x + 3,
-                inner.y,
+                header_area.x + 3,
+                header_area.y,
                 &self.agent_name,
-                inner.width.saturating_sub(4) as usize,
+                header_area.width.saturating_sub(4) as usize,
                 header_style,
             );
             let right_info = if self.agent_busy {
@@ -1036,19 +1225,19 @@ impl Component for AcpPanel {
                 } else {
                     theme.get("ui.statusline.inactive")
                 };
-                let rx = inner.x + inner.width.saturating_sub(right_info.len() as u16);
-                surface.set_stringn(rx, inner.y, &right_info, right_info.len(), right_style);
+                let rx = header_area.x + header_area.width.saturating_sub(right_info.len() as u16);
+                surface.set_stringn(
+                    rx,
+                    header_area.y,
+                    &right_info,
+                    right_info.len(),
+                    right_style,
+                );
             }
             let bar_style = if self.focused {
                 theme.get("ui.statusline")
             } else {
                 theme.get("ui.statusline.inactive")
-            };
-            let bar_area = Rect {
-                x: inner.x,
-                y: bar_y,
-                width: inner.width,
-                height: 1,
             };
             surface.set_style(bar_area, bar_style);
             // Bottom status: mode  model (gap between, no separator)
@@ -1067,17 +1256,6 @@ impl Component for AcpPanel {
             let append_span = |spans: &mut Vec<Span>, content: String, style: Style| {
                 spans.push(Span::styled(content, bar_style.patch(style)));
             };
-            // Chat input mode: NORMAL | INSERT
-            let chat_mode_label = if self.chat_insert_mode {
-                "INSERT"
-            } else {
-                "NORMAL"
-            };
-            append_span(
-                &mut spans,
-                format!(" {chat_mode_label} "),
-                get_style("ui.acp.chat_mode", "ui.statusline.mode"),
-            );
             let mode_name = self.current_mode_name();
             let model_name = self.status_model_display();
             if let Some(ref v) = mode_name {
@@ -1100,38 +1278,30 @@ impl Component for AcpPanel {
             if !spans.is_empty() {
                 let combined = Spans::from(spans);
                 surface.set_spans(
-                    inner.x,
-                    bar_y,
+                    bar_area.x,
+                    bar_area.y,
                     &combined,
-                    combined.width().min(inner.width as usize) as u16,
+                    combined.width().min(bar_area.width as usize) as u16,
                 );
             }
         }
 
-        // ── Error line: below status bar (marquee if too long) ──
+        // ── Error line ──
         if self.error_marquee.has_text() {
-            let error_y = bar_y + 1;
-            let error_area = Rect {
-                x: inner.x + 1,
-                y: error_y,
-                width: inner.width.saturating_sub(2),
-                height: 1,
-            };
+            let error_inset = Rect::new(
+                error_area.x + 1,
+                error_area.y,
+                error_area.width.saturating_sub(2),
+                error_area.height,
+            );
             let error_style = cx.editor.acp_theme().get("error");
-            self.error_marquee.render(error_area, surface, error_style);
+            if let Some(when) = self.error_marquee.render(error_inset, surface, error_style) {
+                schedule_redraw_at(when);
+            }
         }
 
-        // ── Plan area: above input, static UI (not in chat history) ──
-        let plan_rows = self
-            .plan_items
-            .as_ref()
-            .map(|p| (p.len() + 1).min(6) as u16) // header + items, cap at 6
-            .unwrap_or(0);
-
-        // ── Input area: above status bar when active ──
-        let input_rows = if self.focused { 1 } else { 0 };
-        let plan_y = bar_y.saturating_sub(1 + input_rows + plan_rows);
-        if plan_rows > 0 && plan_y >= inner.y {
+        // ── Plan area ──
+        if plan_rows > 0 && plan_area.height > 0 {
             let theme = cx.editor.acp_theme();
             let plan_done_style = theme.get("diff.plus");
             let plan_progress_style = theme.get("warning");
@@ -1144,12 +1314,18 @@ impl Component for AcpPanel {
                 .filter(|i| i.status == PlanStatus::Completed)
                 .count();
             let total = items.len();
-            let bar_width = (inner.width as usize).saturating_sub(14).min(24);
+            let plan_inset = Rect::new(
+                plan_area.x + 1,
+                plan_area.y,
+                plan_area.width.saturating_sub(2),
+                plan_area.height,
+            );
+            let bar_width = (plan_inset.width as usize).saturating_sub(14).min(24);
             let filled = (done * bar_width).checked_div(total).unwrap_or(0);
             let empty = bar_width.saturating_sub(filled);
             surface.set_spans(
-                inner.x + 1,
-                plan_y,
+                plan_inset.x,
+                plan_inset.y,
                 &Spans::from(vec![
                     Span::styled("Plan ", tool_name_style),
                     Span::styled(
@@ -1161,7 +1337,7 @@ impl Component for AcpPanel {
                         plan_progress_style,
                     ),
                 ]),
-                inner.width.saturating_sub(2),
+                plan_inset.width,
             );
             for (i, item) in items.iter().take(5).enumerate() {
                 let (icon, style) = match item.status {
@@ -1170,61 +1346,117 @@ impl Component for AcpPanel {
                     PlanStatus::Failed => (" \u{2715} ", plan_failed_style),
                     PlanStatus::Pending => (" \u{25cb} ", plan_pending_style),
                 };
-                let y = plan_y + 1 + i as u16;
-                if y < bar_y {
+                let y = plan_inset.y + 1 + i as u16;
+                if y < plan_inset.bottom() {
                     surface.set_spans(
-                        inner.x + 1,
+                        plan_inset.x,
                         y,
                         &Spans::from(vec![
                             Span::styled(icon.to_string(), style),
                             Span::styled(item.content.clone(), style),
                         ]),
-                        inner.width.saturating_sub(2),
+                        plan_inset.width,
                     );
                 }
             }
         }
 
-        if self.focused {
-            let input_y = bar_y.saturating_sub(1);
-            if input_y >= inner.y {
-                let input_area = Rect {
-                    x: inner.x + 1,
-                    y: input_y,
-                    width: inner.width.saturating_sub(2),
-                    height: 1,
+        if input_area_raw.height > 0 {
+            let input_area = Rect::new(
+                input_area_raw.x + 1,
+                input_area_raw.y,
+                input_area_raw.width.saturating_sub(2),
+                input_area_raw.height,
+            );
+            let theme = cx.editor.acp_theme();
+            let text_style = theme.get("ui.text");
+            let placeholder_style = theme.get("ui.text.inactive");
+
+            // Render component document content in the input area.
+            // Acts like a normal document view: scroll to keep cursor visible.
+            let view_id = self.input.id();
+            let is_empty = if let Some(doc) = self.input.document(cx.editor) {
+                let text = doc.text();
+                let height = input_area.height as usize;
+                let total_lines = text.len_lines();
+
+                // Find cursor line to scroll around it.
+                let cursor_line = doc
+                    .selections()
+                    .get(&view_id)
+                    .map(|sel| {
+                        let cursor = sel.primary().cursor(text.slice(..));
+                        text.char_to_line(cursor)
+                    })
+                    .unwrap_or(0);
+
+                // Scroll so cursor is visible (keep cursor within the viewport).
+                let scroll = if cursor_line >= height {
+                    cursor_line + 1 - height
+                } else {
+                    0
                 };
-                let placeholder_style = cx.editor.acp_theme().get("ui.text.inactive");
-                self.prompt.render(input_area, surface, cx);
-                if self.prompt.line().is_empty() {
+
+                // Render visible lines.
+                for row in 0..height {
+                    let line_idx = scroll + row;
+                    if line_idx >= total_lines {
+                        break;
+                    }
+                    let line = text.line(line_idx);
+                    let s: String = line
+                        .chars()
+                        .take_while(|c| *c != '\n')
+                        .take(input_area.width as usize)
+                        .collect();
                     surface.set_stringn(
                         input_area.x,
-                        input_area.y,
-                        "Ask anything...",
+                        input_area.y + row as u16,
+                        &s,
                         input_area.width as usize,
-                        placeholder_style,
+                        text_style,
                     );
                 }
+
+                // Cursor position relative to scroll.
+                if let Some(sel) = doc.selections().get(&view_id) {
+                    let cursor = sel.primary().cursor(text.slice(..));
+                    let line_start = text.line_to_char(cursor_line);
+                    let col = cursor - line_start;
+                    let screen_row = cursor_line.saturating_sub(scroll);
+                    let cx_pos = input_area.x + col as u16;
+                    let cy_pos = input_area.y + screen_row as u16;
+                    if cy_pos < input_area.bottom() && cx_pos < input_area.right() {
+                        self.last_input_cursor = Some((cx_pos, cy_pos));
+                    }
+                }
+                text.len_chars() <= 1 // rope always has trailing newline
+            } else {
+                true
+            };
+
+            if is_empty {
+                surface.set_stringn(
+                    input_area.x,
+                    input_area.y,
+                    "Ask anything...",
+                    input_area.width as usize,
+                    placeholder_style,
+                );
             }
         }
 
         // ── Content area (chat history) ──────────────────────
-        let content_area = Rect {
-            x: inner.x + 1,
-            y: inner.y + 1,
-            width: inner.width.saturating_sub(2),
-            height: inner
-                .height
-                .saturating_sub(2 + error_rows + input_rows + plan_rows),
-        };
 
         if content_area.height == 0 || content_area.width == 0 {
             return;
         }
 
+        self.output.set_area(content_area);
+
         let theme = cx.editor.acp_theme();
         // Empty state
-        if self.entries.is_empty() {
+        if self.output.content().is_empty() {
             let empty_style = theme.get("ui.text.inactive");
             let center_y = content_area.y + content_area.height / 2;
 
@@ -1238,40 +1470,43 @@ impl Component for AcpPanel {
         }
 
         // Render chat content
-        self.last_content_height = content_area.height;
-        self.last_content_width = content_area.width;
-        let text = self.build_text(theme, content_area.width);
+        let mut text = self.build_text(theme, content_area.width);
+        // Trim trailing empty lines so scroll math matches rendered content.
+        while text.lines.last().is_some_and(|l| l.width() == 0) {
+            text.lines.pop();
+        }
         let par = Paragraph::new(&text).wrap(Wrap { trim: false });
         let (_, total_lines) = par.required_size(content_area.width);
-
-        let max_scroll = total_lines.saturating_sub(content_area.height);
-        self.last_max_scroll = max_scroll;
-        let scroll = self.scroll.min(max_scroll);
-        let scroll_from_top = max_scroll.saturating_sub(scroll);
+        self.output.set_content_height(total_lines as usize);
+        let scroll_from_top = ViewScrollable::scroll(&self.output) as u16;
 
         par.scroll((scroll_from_top, 0))
             .render(content_area, surface);
 
-        // Scrollbar — matches Popup's half-block convention
+        // Scrollbar
         if total_lines > content_area.height {
-            let win_height = content_area.height as usize;
-            let len = total_lines as usize;
             let scroll_style = theme.get("ui.menu.scroll");
-            let scroll_height = win_height.pow(2).div_ceil(len).min(win_height);
-            let scroll_line = (win_height - scroll_height) * scroll_from_top as usize
-                / std::cmp::max(1, len.saturating_sub(win_height));
-            let bar_x = inner.x + inner.width - 1;
-
-            for i in 0..win_height {
-                let cell = &mut surface[(bar_x, content_area.y + i as u16)];
-                if scroll_line <= i && i < scroll_line + scroll_height {
-                    cell.set_symbol("▐");
-                    cell.set_fg(scroll_style.fg.unwrap_or(helix_view::theme::Color::Reset));
-                } else {
-                    cell.set_symbol("▐");
-                    cell.set_fg(scroll_style.bg.unwrap_or(helix_view::theme::Color::Reset));
-                }
-            }
+            crate::widgets::Scrollbar::new(
+                total_lines as usize,
+                scroll_from_top as usize,
+                content_area.height as usize,
+            )
+            .thumb_style(
+                Style::default().fg(scroll_style.fg.unwrap_or(helix_view::theme::Color::Reset)),
+            )
+            .track(
+                "▐",
+                Style::default().fg(scroll_style.bg.unwrap_or(helix_view::theme::Color::Reset)),
+            )
+            .render(
+                Rect::new(
+                    content_area_raw.right() - 1,
+                    content_area.y,
+                    1,
+                    content_area.height,
+                ),
+                surface,
+            );
         }
     }
 
@@ -1280,569 +1515,141 @@ impl Component for AcpPanel {
             return EventResult::Ignored(None);
         };
 
-        // When unfocused, pass all events through to the editor
+        // When unfocused, pass all events through to the editor.
         if !self.focused {
             return EventResult::Ignored(None);
         }
         self.error_marquee.touch();
 
-        if self.chat_insert_mode {
-            // Insert mode: Esc -> Normal, Enter -> send, rest to Prompt.
-            match key {
-                KeyEvent {
-                    code: KeyCode::Esc, ..
-                } => {
-                    self.chat_insert_mode = false;
-                    EventResult::Consumed(None)
-                }
-                KeyEvent {
-                    code: KeyCode::Enter,
-                    ..
-                } => {
-                    let text = self.prompt.line().clone();
-                    if !text.is_empty() {
-                        self.prompt.set_line(String::new(), cx.editor);
-                        self.chat_insert_mode = false;
-                        self.panel_error = None;
-                        if self.agent_busy {
-                            self.push_entry(ChatEntry::Status(format!(
-                                "Queued: {}",
-                                text.chars().take(40).collect::<String>()
-                            )));
-                            self.enqueue_message(text);
-                        } else {
-                            self.push_entry(ChatEntry::UserMessage(text.clone()));
-                            if Self::send_prompt(text, cx) {
-                                self.agent_busy = true;
-                            }
-                        }
+        // Ctrl+c → cancel agent (any mode).
+        if matches!(
+            key,
+            KeyEvent {
+                code: KeyCode::Char('c'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            }
+        ) {
+            for (_id, agent) in cx.editor.acp_agents.iter() {
+                let agent = agent.clone();
+                tokio::spawn(async move {
+                    if let Some(session_id) = agent.session_id().await {
+                        agent.cancel(session_id);
                     }
-                    EventResult::Consumed(None)
-                }
-                _ => self.prompt.handle_event(event, cx),
+                });
+            }
+            self.clear_queue();
+            cx.editor.set_status("Cancelling agent...");
+            return EventResult::Consumed(None);
+        }
+
+        // Cycle keys work in any mode.
+        if let Some(result) = self.handle_cycle_key(key, cx) {
+            return result;
+        }
+
+        // ── Mode transitions ──
+        // The component modal keymaps filter out Frontend commands (insert_mode,
+        // command_mode, etc.), so we handle mode switching explicitly here.
+        if self.input.mode() == Mode::Insert {
+            // Escape in insert mode → back to normal.
+            if matches!(key.code, KeyCode::Esc) && key.modifiers.is_empty() {
+                self.input.exit_insert_mode();
+                return EventResult::Consumed(None);
             }
         } else {
-            match key {
-                // Unfocus panel (return to editor)
-                KeyEvent {
-                    code: KeyCode::Esc, ..
-                } => {
-                    self.set_focused(false);
-                    EventResult::Consumed(None)
-                }
-                // Send message (same as Insert mode)
-                KeyEvent {
-                    code: KeyCode::Enter,
-                    ..
-                } => {
-                    let text = self.prompt.line().clone();
-                    if !text.is_empty() {
-                        self.prompt.set_line(String::new(), cx.editor);
-                        self.panel_error = None;
-                        if self.agent_busy {
-                            self.push_entry(ChatEntry::Status(format!(
-                                "Queued: {}",
-                                text.chars().take(40).collect::<String>()
-                            )));
-                            self.enqueue_message(text);
-                        } else {
-                            self.push_entry(ChatEntry::UserMessage(text.clone()));
-                            if Self::send_prompt(text, cx) {
-                                self.agent_busy = true;
+            // Normal mode key handling.
+            if key.modifiers.is_empty() {
+                match key.code {
+                    // Enter → send prompt.
+                    KeyCode::Enter => {
+                        self.send_current_prompt(cx);
+                        return EventResult::Consumed(None);
+                    }
+                    // i/a/I/A → enter insert mode.
+                    KeyCode::Char('i') => {
+                        self.input.enter_insert_mode("insert_mode".into());
+                        return EventResult::Consumed(None);
+                    }
+                    KeyCode::Char('a') => {
+                        self.input.enter_insert_mode("append_mode".into());
+                        // Move cursor forward by one (append behavior).
+                        if let Some(doc_id) = self.input.doc_id() {
+                            if let Some(doc) = cx.editor.component_docs.get_mut(&doc_id) {
+                                let text = doc.text().slice(..);
+                                let selection = doc
+                                    .selection(self.input.view_id())
+                                    .clone()
+                                    .transform(|range| {
+                                        let pos = helix_core::graphemes::next_grapheme_boundary(
+                                            text,
+                                            range.cursor(text),
+                                        );
+                                        helix_core::Range::new(pos, pos)
+                                    });
+                                doc.set_selection(self.input.view_id(), selection);
                             }
                         }
+                        return EventResult::Consumed(None);
                     }
-                    EventResult::Consumed(None)
-                }
-                // Close panel
-                KeyEvent {
-                    code: KeyCode::Char('q'),
-                    ..
-                } => {
-                    let callback: crate::compositor::Callback = Box::new(|compositor, _cx| {
-                        compositor.remove(ID);
-                    });
-                    EventResult::Consumed(Some(callback))
-                }
-                // Enter insert mode
-                KeyEvent {
-                    code: KeyCode::Char('i'),
-                    modifiers: KeyModifiers::NONE,
-                    ..
-                } => {
-                    self.chat_insert_mode = true;
-                    EventResult::Consumed(None)
-                }
-                // Append (cursor at end, enter insert)
-                KeyEvent {
-                    code: KeyCode::Char('a'),
-                    modifiers: KeyModifiers::NONE,
-                    ..
-                } => {
-                    self.prompt.move_end();
-                    self.chat_insert_mode = true;
-                    EventResult::Consumed(None)
-                }
-                // Insert at start
-                KeyEvent {
-                    code: KeyCode::Char('I'),
-                    modifiers: KeyModifiers::SHIFT,
-                    ..
-                } => {
-                    self.prompt.move_start();
-                    self.chat_insert_mode = true;
-                    EventResult::Consumed(None)
-                }
-                // Append at end
-                KeyEvent {
-                    code: KeyCode::Char('A'),
-                    modifiers: KeyModifiers::SHIFT,
-                    ..
-                } => {
-                    self.prompt.move_end();
-                    self.chat_insert_mode = true;
-                    EventResult::Consumed(None)
-                }
-                // Normal mode: movement in the line
-                KeyEvent {
-                    code: KeyCode::Char('h'),
-                    modifiers: KeyModifiers::NONE,
-                    ..
-                } => {
-                    self.prompt.move_cursor(Movement::BackwardChar(1));
-                    EventResult::Consumed(None)
-                }
-                KeyEvent {
-                    code: KeyCode::Char('l'),
-                    modifiers: KeyModifiers::NONE,
-                    ..
-                } => {
-                    self.prompt.move_cursor(Movement::ForwardChar(1));
-                    EventResult::Consumed(None)
-                }
-                KeyEvent {
-                    code: KeyCode::Char('w'),
-                    modifiers: KeyModifiers::NONE,
-                    ..
-                } => {
-                    self.prompt.move_cursor(Movement::ForwardWord(1));
-                    EventResult::Consumed(None)
-                }
-                KeyEvent {
-                    code: KeyCode::Char('b'),
-                    modifiers: KeyModifiers::NONE,
-                    ..
-                } => {
-                    self.prompt.move_cursor(Movement::BackwardWord(1));
-                    EventResult::Consumed(None)
-                }
-                KeyEvent {
-                    code: KeyCode::Char('0'),
-                    modifiers: KeyModifiers::NONE,
-                    ..
-                } => {
-                    self.prompt.move_start();
-                    EventResult::Consumed(None)
-                }
-                KeyEvent {
-                    code: KeyCode::Char('$'),
-                    modifiers: KeyModifiers::SHIFT,
-                    ..
-                } => {
-                    self.prompt.move_end();
-                    EventResult::Consumed(None)
-                }
-                // Delete char under cursor
-                KeyEvent {
-                    code: KeyCode::Char('x'),
-                    modifiers: KeyModifiers::NONE,
-                    ..
-                } => {
-                    self.prompt.delete_char_forwards(cx.editor);
-                    EventResult::Consumed(None)
-                }
-                // Delete char before cursor
-                KeyEvent {
-                    code: KeyCode::Char('X'),
-                    modifiers: KeyModifiers::SHIFT,
-                    ..
-                } => {
-                    self.prompt.delete_char_backwards(cx.editor);
-                    EventResult::Consumed(None)
-                }
-                // Prev entry: Ctrl+p / Up / k (Shift+Tab reserved for cycle_mode)
-                KeyEvent {
-                    code: KeyCode::Char('p'),
-                    modifiers: KeyModifiers::CONTROL,
-                    ..
-                }
-                | KeyEvent { code: KeyCode::Up, .. }
-                | KeyEvent { code: KeyCode::Char('k'), .. } => {
-                    if self.entries.is_empty() || self.last_content_height == 0 {
-                        EventResult::Consumed(None)
-                    } else {
-                        let theme = cx.editor.acp_theme();
-                        let offsets = self.entry_line_offsets(theme, self.last_content_width());
-                        let max_scroll = offsets
-                            .last()
-                            .copied()
-                            .unwrap_or(0)
-                            .saturating_sub(self.last_content_height);
-                        match self.selected_entry {
-                            None => {
-                                self.selected_entry = Some(self.entries.len().saturating_sub(1));
-                                self.scroll = max_scroll
-                                    .saturating_sub(
-                                        offsets.get(self.selected_entry.unwrap()).copied().unwrap_or(0),
-                                    )
-                                    .min(max_scroll);
-                            }
-                            Some(0) => {
-                                self.scroll = self.scroll.saturating_add(1).min(max_scroll);
-                            }
-                            Some(i) => {
-                                self.selected_entry = Some(i - 1);
-                                let entry_start = offsets.get(i - 1).copied().unwrap_or(0);
-                                self.scroll = max_scroll
-                                    .saturating_sub(entry_start)
-                                    .min(max_scroll);
+                    KeyCode::Char('I') => {
+                        self.input.enter_insert_mode("insert_mode".into());
+                        // Move cursor to start of line.
+                        if let Some(doc_id) = self.input.doc_id() {
+                            if let Some(doc) = cx.editor.component_docs.get_mut(&doc_id) {
+                                let text = doc.text().slice(..);
+                                let selection = doc
+                                    .selection(self.input.view_id())
+                                    .clone()
+                                    .transform(|range| {
+                                        let line = text.char_to_line(range.cursor(text));
+                                        let pos = text.line_to_char(line);
+                                        helix_core::Range::new(pos, pos)
+                                    });
+                                doc.set_selection(self.input.view_id(), selection);
                             }
                         }
-                        EventResult::Consumed(None)
+                        return EventResult::Consumed(None);
                     }
-                }
-                // Next entry: Ctrl+n / Down / j (Tab reserved for potential future use)
-                KeyEvent {
-                    code: KeyCode::Char('n'),
-                    modifiers: KeyModifiers::CONTROL,
-                    ..
-                }
-                | KeyEvent { code: KeyCode::Down, .. }
-                | KeyEvent { code: KeyCode::Char('j'), .. } => {
-                    if self.entries.is_empty() || self.last_content_height == 0 {
-                        EventResult::Consumed(None)
-                    } else {
-                        let theme = cx.editor.acp_theme();
-                        let offsets = self.entry_line_offsets(theme, self.last_content_width());
-                        let max_scroll = offsets
-                            .last()
-                            .copied()
-                            .unwrap_or(0)
-                            .saturating_sub(self.last_content_height);
-                        match self.selected_entry {
-                            None => {
-                                self.selected_entry = Some(0);
-                                self.scroll = max_scroll;
-                            }
-                            Some(i) if i + 1 >= self.entries.len() => {
-                                self.scroll = self.scroll.saturating_sub(1);
-                            }
-                            Some(i) => {
-                                self.selected_entry = Some(i + 1);
-                                let entry_start = offsets.get(i + 1).copied().unwrap_or(0);
-                                self.scroll = max_scroll
-                                    .saturating_sub(entry_start)
-                                    .min(max_scroll);
+                    KeyCode::Char('A') => {
+                        self.input.enter_insert_mode("append_mode".into());
+                        // Move cursor to end of line.
+                        if let Some(doc_id) = self.input.doc_id() {
+                            if let Some(doc) = cx.editor.component_docs.get_mut(&doc_id) {
+                                let text = doc.text().slice(..);
+                                let selection = doc
+                                    .selection(self.input.view_id())
+                                    .clone()
+                                    .transform(|range| {
+                                        let line = text.char_to_line(range.cursor(text));
+                                        let pos = helix_core::line_ending::line_end_char_index(&text, line);
+                                        helix_core::Range::new(pos, pos)
+                                    });
+                                doc.set_selection(self.input.view_id(), selection);
                             }
                         }
-                        EventResult::Consumed(None)
+                        return EventResult::Consumed(None);
                     }
-                }
-                // Ctrl+u / PageUp: half page up
-                KeyEvent {
-                    code: KeyCode::Char('u'),
-                    modifiers: KeyModifiers::CONTROL,
-                }
-                | KeyEvent {
-                    code: KeyCode::PageUp,
-                    ..
-                } => {
-                    let half = (self.last_content_height / 2).max(1);
-                    self.scroll = self.scroll.saturating_add(half).min(self.last_max_scroll);
-                    self.selected_entry = None;
-                    EventResult::Consumed(None)
-                }
-                // Ctrl+d / PageDown: half page down
-                KeyEvent {
-                    code: KeyCode::Char('d'),
-                    modifiers: KeyModifiers::CONTROL,
-                }
-                | KeyEvent {
-                    code: KeyCode::PageDown,
-                    ..
-                } => {
-                    let half = (self.last_content_height / 2).max(1);
-                    self.scroll = self.scroll.saturating_sub(half);
-                    self.selected_entry = None;
-                    EventResult::Consumed(None)
-                }
-                // Scroll to bottom
-                KeyEvent {
-                    code: KeyCode::Char('G'),
-                    ..
-                } => {
-                    self.scroll = 0;
-                    self.selected_entry = None;
-                    EventResult::Consumed(None)
-                }
-                // Yank selected entry to clipboard
-                KeyEvent {
-                    code: KeyCode::Char('y'),
-                    modifiers: KeyModifiers::NONE,
-                    ..
-                } => {
-                    if let Some(idx) = self.selected_entry {
-                        if let Some(text) = self.entry_text(idx) {
-                            let reg = cx.editor.config().default_yank_register;
-                            if let Err(e) = cx.editor.registers.write(reg, vec![text]) {
-                                cx.editor.set_error(format!("Failed to yank: {e}"));
-                            } else {
-                                cx.editor.set_status("Yanked entry to clipboard");
-                            }
-                        }
-                    } else {
-                        cx.editor.set_status("Select an entry with j/k or Ctrl+p/n first");
+                    // : → pass through to the editor for command mode.
+                    KeyCode::Char(':') => {
+                        return EventResult::Ignored(None);
                     }
-                    EventResult::Consumed(None)
+                    _ => {}
                 }
-                // Cancel agent
-                KeyEvent {
-                    code: KeyCode::Char('c'),
-                    modifiers: KeyModifiers::CONTROL,
-                } => {
-                    for (_id, agent) in cx.editor.acp_agents.iter() {
-                        let agent = agent.clone();
-                        tokio::spawn(async move {
-                            if let Some(session_id) = agent.session_id().await {
-                                agent.cancel(session_id);
-                            }
-                        });
-                    }
-                    self.clear_queue();
-                    cx.editor.set_status("Cancelling agent...");
-                    EventResult::Consumed(None)
-                }
-                // Clear queue
-                KeyEvent {
-                    code: KeyCode::Char('Q'),
-                    ..
-                } => {
-                    let count = self.message_queue.len();
-                    self.clear_queue();
-                    if count > 0 {
-                        cx.editor
-                            .set_status(format!("Cleared {count} queued messages"));
-                    }
-                    EventResult::Consumed(None)
-                }
-                // Cycle thinking (Ctrl+T by default)
-                key if *key == cx.editor.config().acp.cycle_thinking() => {
-                    if let Some((config_id, next_value, prev_value)) =
-                        self.cycle_config_option("thinking")
-                    {
-                        self.apply_config_option_cycle("thinking", next_value.clone());
-                        let agent = cx.editor.acp_agents.iter().next().map(|(_, a)| a.clone());
-                        if let Some(agent) = agent {
-                            let category = "thinking".to_string();
-                            cx.jobs.callback(async move {
-                                let session_id = match agent.session_id().await {
-                                    Some(id) => id,
-                                    None => {
-                                        let prev = prev_value.clone();
-                                        return Ok(crate::job::Callback::EditorCompositor(
-                                            Box::new(move |editor, compositor| {
-                                                if let Some(panel) =
-                                                    compositor.find_id::<AcpPanel>(ID)
-                                                {
-                                                    panel
-                                                        .apply_config_option_cycle(&category, prev);
-                                                }
-                                                editor.set_error("No session to update thinking");
-                                            }),
-                                        ));
-                                    }
-                                };
-                                match agent
-                                    .set_session_config_option(
-                                        session_id,
-                                        config_id.clone(),
-                                        next_value.clone(),
-                                    )
-                                    .await
-                                {
-                                    Ok(_) => Ok(crate::job::Callback::EditorCompositor(Box::new(
-                                        |_, _| {},
-                                    ))),
-                                    Err(e) => Ok(crate::job::Callback::EditorCompositor(Box::new(
-                                        move |editor, compositor| {
-                                            if let Some(panel) = compositor.find_id::<AcpPanel>(ID)
-                                            {
-                                                panel.apply_config_option_cycle(
-                                                    &category, prev_value,
-                                                );
-                                            }
-                                            editor
-                                                .set_error(format!("Failed to set thinking: {e}"));
-                                        },
-                                    ))),
-                                }
-                            });
-                        }
-                        cx.editor.set_status("Cycled thinking");
-                    } else {
-                        cx.editor.set_status("No thinking options from agent");
-                    }
-                    EventResult::Consumed(None)
-                }
-                // Cycle mode (S-tab by default)
-                key if *key == cx.editor.config().acp.cycle_mode() => {
-                    if let Some((config_id, next_value, prev_value)) =
-                        self.cycle_config_option("mode")
-                    {
-                        self.apply_config_option_cycle("mode", next_value.clone());
-                        let agent = cx.editor.acp_agents.iter().next().map(|(_, a)| a.clone());
-                        if let Some(agent) = agent {
-                            let category = "mode".to_string();
-                            cx.jobs.callback(async move {
-                                let session_id = match agent.session_id().await {
-                                    Some(id) => id,
-                                    None => {
-                                        let prev = prev_value.clone();
-                                        return Ok(crate::job::Callback::EditorCompositor(
-                                            Box::new(move |editor, compositor| {
-                                                if let Some(panel) =
-                                                    compositor.find_id::<AcpPanel>(ID)
-                                                {
-                                                    panel
-                                                        .apply_config_option_cycle(&category, prev);
-                                                }
-                                                editor.set_error("No session to update mode");
-                                            }),
-                                        ));
-                                    }
-                                };
-                                match agent
-                                    .set_session_config_option(
-                                        session_id,
-                                        config_id.clone(),
-                                        next_value.clone(),
-                                    )
-                                    .await
-                                {
-                                    Ok(_) => Ok(crate::job::Callback::EditorCompositor(Box::new(
-                                        |_, _| {},
-                                    ))),
-                                    Err(e) => Ok(crate::job::Callback::EditorCompositor(Box::new(
-                                        move |editor, compositor| {
-                                            if let Some(panel) = compositor.find_id::<AcpPanel>(ID)
-                                            {
-                                                panel.apply_config_option_cycle(
-                                                    &category, prev_value,
-                                                );
-                                            }
-                                            editor.set_error(format!("Failed to set mode: {e}"));
-                                        },
-                                    ))),
-                                }
-                            });
-                        }
-                        cx.editor.set_status("Cycled mode");
-                    } else {
-                        cx.editor.set_status("No mode options from agent");
-                    }
-                    EventResult::Consumed(None)
-                }
-                // Cycle model (Ctrl+M by default)
-                key if *key == cx.editor.config().acp.cycle_model() => {
-                    if let Some((config_id, next_value, prev_value)) =
-                        self.cycle_config_option("model")
-                    {
-                        self.apply_config_option_cycle("model", next_value.clone());
-                        let agent = cx.editor.acp_agents.iter().next().map(|(_, a)| a.clone());
-                        if let Some(agent) = agent {
-                            let category = "model".to_string();
-                            cx.jobs.callback(async move {
-                                let session_id = match agent.session_id().await {
-                                    Some(id) => id,
-                                    None => {
-                                        let prev = prev_value.clone();
-                                        return Ok(crate::job::Callback::EditorCompositor(
-                                            Box::new(move |editor, compositor| {
-                                                if let Some(panel) =
-                                                    compositor.find_id::<AcpPanel>(ID)
-                                                {
-                                                    panel
-                                                        .apply_config_option_cycle(&category, prev);
-                                                }
-                                                editor.set_error("No session to update model");
-                                            }),
-                                        ));
-                                    }
-                                };
-                                match agent
-                                    .set_session_config_option(
-                                        session_id,
-                                        config_id.clone(),
-                                        next_value.clone(),
-                                    )
-                                    .await
-                                {
-                                    Ok(_) => Ok(crate::job::Callback::EditorCompositor(Box::new(
-                                        |_, _| {},
-                                    ))),
-                                    Err(e) => Ok(crate::job::Callback::EditorCompositor(Box::new(
-                                        move |editor, compositor| {
-                                            if let Some(panel) = compositor.find_id::<AcpPanel>(ID)
-                                            {
-                                                panel.apply_config_option_cycle(
-                                                    &category, prev_value,
-                                                );
-                                            }
-                                            editor.set_error(format!("Failed to set model: {e}"));
-                                        },
-                                    ))),
-                                }
-                            });
-                        }
-                        cx.editor.set_status("Cycled model");
-                    } else {
-                        cx.editor.set_status("No model options from agent");
-                    }
-                    EventResult::Consumed(None)
-                }
-                _ => EventResult::Ignored(None),
             }
         }
+
+        // Dispatch through the region's own engine + keymaps.
+        self.dispatch_input_key(*key, cx);
+        EventResult::Consumed(None)
     }
 
-    fn cursor(&self, area: Rect, ctx: &Editor) -> (Option<Position>, CursorKind) {
+    fn cursor(&self, _area: Rect, ctx: &Editor) -> (Option<Position>, CursorKind) {
         if self.focused {
-            let inner = Rect {
-                x: area.x + 1,
-                y: area.y,
-                width: area.width.saturating_sub(1),
-                height: area.height,
-            };
-            let error_rows = 1;
-            let bar_y = inner.y + inner.height - 1 - error_rows;
-            let input_y = bar_y.saturating_sub(1);
-            if input_y >= inner.y {
-                let input_area = Rect {
-                    x: inner.x + 1,
-                    y: input_y,
-                    width: inner.width.saturating_sub(2),
-                    height: 1,
-                };
-                let (pos, _) = self.prompt.cursor(input_area, ctx);
-                let kind = ctx
-                    .config()
-                    .cursor_shape
-                    .from_mode(if self.chat_insert_mode {
-                        Mode::Insert
-                    } else {
-                        Mode::Normal
-                    });
-                return (pos, kind);
+            if let Some((cx, cy)) = self.last_input_cursor {
+                let pos = Position::new(cy as usize, cx as usize);
+                let kind = ctx.config().cursor_shape.from_mode(self.input.mode());
+                return (Some(pos), kind);
             }
         }
         (None, CursorKind::Hidden)
@@ -1851,6 +1658,16 @@ impl Component for AcpPanel {
     fn id(&self) -> Option<&'static str> {
         Some(ID)
     }
+
+    fn layout_role(&self) -> crate::compositor::LayoutRole {
+        crate::compositor::LayoutRole::Docked
+    }
+
+    fn panel_id(&self) -> Option<helix_view::model::PanelId> {
+        self.model_panel_id
+    }
+
+    component_traits!(focusable, scrollable);
 }
 
 // ---------------------------------------------------------------------------
@@ -1902,7 +1719,7 @@ impl PermissionPopup {
 }
 
 impl Component for PermissionPopup {
-    fn render(&mut self, area: Rect, surface: &mut Surface, cx: &mut Context) {
+    fn render(&mut self, area: Rect, surface: &mut Surface, cx: &RenderContext) {
         let popup_width = 50u16.min(area.width.saturating_sub(4));
         let option_lines = self.options.len() as u16;
         let desc_lines = self

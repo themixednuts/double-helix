@@ -5,14 +5,14 @@ use helix_view::{
 };
 use tui::buffer::Buffer;
 
-use crate::compositor::{Component, Context, Event, EventResult};
+use crate::compositor::{Component, Context, Event, EventResult, RenderContext};
 
 /// Contains a component placed in the center of the parent component
 pub struct Overlay<T> {
     /// Child component
     pub content: T,
     /// Function to compute the size and position of the child component
-    pub calc_child_size: Box<dyn Fn(Rect) -> Rect>,
+    pub calc_child_size: Box<dyn Fn(Rect) -> Rect + Send>,
 }
 
 /// Surrounds the component with a margin of 5% on each side, and an additional 2 rows at the bottom
@@ -43,7 +43,11 @@ pub fn clip_rect_relative(rect: Rect, percent_horizontal: u8, percent_vertical: 
 }
 
 impl<T: Component + 'static> Component for Overlay<T> {
-    fn render(&mut self, area: Rect, frame: &mut Buffer, ctx: &mut Context) {
+    fn sync(&mut self, editor: &mut helix_view::Editor) {
+        self.content.sync(editor);
+    }
+
+    fn render(&mut self, area: Rect, frame: &mut Buffer, ctx: &RenderContext) {
         let dimensions = (self.calc_child_size)(area);
         self.content.render(dimensions, frame, ctx)
     }

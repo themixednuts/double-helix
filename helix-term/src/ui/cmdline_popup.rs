@@ -1,4 +1,4 @@
-use crate::compositor::{Component, Context, Event, EventResult};
+use crate::compositor::{Component, Context, Event, EventResult, RenderContext};
 use crate::ui::gradient_border::GradientBorder;
 use crate::ui::prompt::{Completion, Prompt, PromptEvent};
 use helix_core::{unicode::width::UnicodeWidthStr, Position};
@@ -29,8 +29,8 @@ impl CmdlinePopup {
     pub fn new(
         prompt_text: Cow<'static, str>,
         history_register: Option<char>,
-        completion_fn: impl FnMut(&Editor, &str) -> Vec<Completion> + 'static,
-        callback_fn: impl FnMut(&mut Context, &str, PromptEvent) + 'static,
+        completion_fn: impl FnMut(&Editor, &str) -> Vec<Completion> + Send + 'static,
+        callback_fn: impl FnMut(&mut Context, &str, PromptEvent) + Send + 'static,
         style: CmdlineStyle,
     ) -> Self {
         Self {
@@ -93,7 +93,7 @@ impl CmdlinePopup {
     }
 
     /// Render popup-style cmdline
-    fn render_popup(&mut self, area: Rect, surface: &mut Surface, cx: &mut Context) {
+    fn render_popup(&mut self, area: Rect, surface: &mut Surface, cx: &RenderContext) {
         let popup_area = self.calculate_popup_area(area);
         self.popup_area = popup_area;
 
@@ -189,7 +189,7 @@ impl CmdlinePopup {
     }
 
     /// Render the input text with horizontal scrolling support
-    fn render_input_text(&mut self, area: Rect, surface: &mut Surface, cx: &mut Context) {
+    fn render_input_text(&mut self, area: Rect, surface: &mut Surface, cx: &RenderContext) {
         let theme = &cx.editor.theme;
         let text_style = theme.get("ui.text");
         let line_width = area.width as usize;
@@ -214,7 +214,7 @@ impl CmdlinePopup {
     }
 
     /// Render completion popup
-    fn render_completion_popup(&mut self, base_area: Rect, surface: &mut Surface, cx: &Context) {
+    fn render_completion_popup(&mut self, base_area: Rect, surface: &mut Surface, cx: &RenderContext) {
         let theme = &cx.editor.theme;
         // Match global autocomplete/picker colors
         let completion_bg = theme.get("ui.menu");
@@ -353,7 +353,7 @@ impl CmdlinePopup {
     }
 
     /// Render traditional bottom cmdline
-    fn render_bottom(&mut self, area: Rect, surface: &mut Surface, cx: &mut Context) {
+    fn render_bottom(&mut self, area: Rect, surface: &mut Surface, cx: &RenderContext) {
         // Delegate to the original prompt rendering
         self.prompt.render_prompt(area, surface, cx);
     }
@@ -365,7 +365,7 @@ impl Component for CmdlinePopup {
         self.prompt.handle_event(event, cx)
     }
 
-    fn render(&mut self, area: Rect, surface: &mut Surface, cx: &mut Context) {
+    fn render(&mut self, area: Rect, surface: &mut Surface, cx: &RenderContext) {
         match self.style {
             CmdlineStyle::Popup => self.render_popup(area, surface, cx),
             CmdlineStyle::Bottom => self.render_bottom(area, surface, cx),

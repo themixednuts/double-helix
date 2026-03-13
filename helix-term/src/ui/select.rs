@@ -6,7 +6,7 @@ use tui::{
     widgets::{Block, Widget as _},
 };
 
-use crate::compositor::{Component, Context, Event, EventResult};
+use crate::compositor::{Component, Context, Event, EventResult, RenderContext};
 
 use super::{menu::Item, Menu, PromptEvent, Text};
 
@@ -20,7 +20,7 @@ impl<T: Item> Select<T> {
     where
         M: Into<Cow<'static, str>>,
         I: IntoIterator<Item = T>,
-        F: Fn(&mut Editor, &T, PromptEvent) + 'static,
+        F: Fn(&mut Editor, &T, PromptEvent) + Send + 'static,
     {
         let message = tui::text::Text::from(message.into()).into();
         let options: Vec<_> = options.into_iter().collect();
@@ -56,7 +56,7 @@ impl<T: Item> Component for Select<T> {
         ))
     }
 
-    fn render(&mut self, area: Rect, surface: &mut Surface, cx: &mut Context) {
+    fn render(&mut self, area: Rect, surface: &mut Surface, cx: &RenderContext) {
         const BLOCK: Block<'_> = Block::bordered();
 
         // +---------------------+

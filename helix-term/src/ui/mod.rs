@@ -13,6 +13,7 @@ pub mod menu;
 mod notification_popup;
 pub mod overlay;
 pub mod picker;
+pub mod plugin_panel;
 pub mod popup;
 pub mod prompt;
 mod select;
@@ -63,8 +64,8 @@ pub fn prompt(
     cx: &mut crate::commands::Context,
     prompt: std::borrow::Cow<'static, str>,
     history_register: Option<char>,
-    completion_fn: impl FnMut(&Editor, &str) -> Vec<prompt::Completion> + 'static,
-    callback_fn: impl FnMut(&mut crate::compositor::Context, &str, PromptEvent) + 'static,
+    completion_fn: impl FnMut(&Editor, &str) -> Vec<prompt::Completion> + Send + 'static,
+    callback_fn: impl FnMut(&mut crate::compositor::Context, &str, PromptEvent) + Send + 'static,
 ) {
     let mut prompt = Prompt::new(prompt, history_register, completion_fn, callback_fn);
     // Calculate the initial completion
@@ -77,8 +78,8 @@ pub fn prompt_with_input(
     prompt: std::borrow::Cow<'static, str>,
     input: String,
     history_register: Option<char>,
-    completion_fn: impl FnMut(&Editor, &str) -> Vec<prompt::Completion> + 'static,
-    callback_fn: impl FnMut(&mut crate::compositor::Context, &str, PromptEvent) + 'static,
+    completion_fn: impl FnMut(&Editor, &str) -> Vec<prompt::Completion> + Send + 'static,
+    callback_fn: impl FnMut(&mut crate::compositor::Context, &str, PromptEvent) + Send + 'static,
 ) {
     let prompt = Prompt::new(prompt, history_register, completion_fn, callback_fn)
         .with_line(input, cx.editor);
@@ -89,8 +90,8 @@ pub fn regex_prompt(
     cx: &mut crate::commands::Context,
     prompt: std::borrow::Cow<'static, str>,
     history_register: Option<char>,
-    completion_fn: impl FnMut(&Editor, &str) -> Vec<prompt::Completion> + 'static,
-    fun: impl Fn(&mut crate::compositor::Context, rope::Regex, PromptEvent) + 'static,
+    completion_fn: impl FnMut(&Editor, &str) -> Vec<prompt::Completion> + Send + 'static,
+    fun: impl Fn(&mut crate::compositor::Context, rope::Regex, PromptEvent) + Send + 'static,
 ) {
     raw_regex_prompt(
         cx,
@@ -104,16 +105,20 @@ pub fn raw_regex_prompt(
     cx: &mut crate::commands::Context,
     prompt: std::borrow::Cow<'static, str>,
     history_register: Option<char>,
-    completion_fn: impl FnMut(&Editor, &str) -> Vec<prompt::Completion> + 'static,
-    fun: impl Fn(&mut crate::compositor::Context, rope::Regex, &str, PromptEvent) + 'static,
+    completion_fn: impl FnMut(&Editor, &str) -> Vec<prompt::Completion> + Send + 'static,
+    fun: impl Fn(&mut crate::compositor::Context, rope::Regex, &str, PromptEvent) + Send + 'static,
 ) {
-    let (view, doc) = current!(cx.editor);
-    let doc_id = view.doc;
-    let snapshot = doc.selection(view.id).clone();
-    let offset_snapshot = doc.view_offset(view.id);
+    let (view_id, doc) = focused!(cx.editor);
+    let doc_id = doc.id();
+    let snapshot = doc.selection(view_id).clone();
+    let offset_snapshot = doc.view_offset(view_id);
     let config = cx.editor.config();
+    let cmdline_style = config.cmdline.style;
+    let smart_case = config.search.smart_case;
+    let scrolloff = config.scrolloff;
+    drop(config);
 
-    match config.cmdline.style {
+    match cmdline_style {
         CmdlineStyle::Popup => {
             let cmdline = CmdlinePopup::new(
                 prompt,
@@ -122,16 +127,16 @@ pub fn raw_regex_prompt(
                 move |cx: &mut crate::compositor::Context, input: &str, event: PromptEvent| {
                     match event {
                         PromptEvent::Abort => {
-                            let (view, doc) = current!(cx.editor);
-                            doc.set_selection(view.id, snapshot.clone());
-                            doc.set_view_offset(view.id, offset_snapshot);
+                            let (view_id, doc) = focused!(cx.editor);
+                            doc.set_selection(view_id, snapshot.clone());
+                            doc.set_view_offset(view_id, offset_snapshot);
                         }
                         PromptEvent::Update | PromptEvent::Validate => {
                             if input.is_empty() {
                                 return;
                             }
 
-                            let case_insensitive = if config.search.smart_case {
+                            let case_insensitive = if smart_case {
                                 !input.chars().any(char::is_uppercase)
                             } else {
                                 false
@@ -146,22 +151,24 @@ pub fn raw_regex_prompt(
                                 .build(input)
                             {
                                 Ok(regex) => {
-                                    let (view, doc) = current!(cx.editor);
-                                    doc.set_selection(view.id, snapshot.clone());
+                                    let (view_id, doc) = focused!(cx.editor);
+                                    doc.set_selection(view_id, snapshot.clone());
 
                                     if event == PromptEvent::Validate {
-                                        view.jumps.push((doc_id, snapshot.clone()));
+                                        let view = view_mut!(cx.editor, view_id);
+                                        view.history.jumps.push((doc_id, snapshot.clone()));
                                     }
 
                                     fun(cx, regex, input, event);
 
-                                    let (view, doc) = current!(cx.editor);
-                                    view.ensure_cursor_in_view(doc, config.scrolloff);
+                                    let (view_id, doc) = focused!(cx.editor);
+                                    let view = view_mut!(cx.editor, view_id);
+                                    view.ensure_cursor_in_view(doc, scrolloff);
                                 }
                                 Err(err) => {
-                                    let (view, doc) = current!(cx.editor);
-                                    doc.set_selection(view.id, snapshot.clone());
-                                    doc.set_view_offset(view.id, offset_snapshot);
+                                    let (view_id, doc) = focused!(cx.editor);
+                                    doc.set_selection(view_id, snapshot.clone());
+                                    doc.set_view_offset(view_id, offset_snapshot);
 
                                     if event == PromptEvent::Validate {
                                         let callback = async move {
@@ -202,16 +209,16 @@ pub fn raw_regex_prompt(
                 move |cx: &mut crate::compositor::Context, input: &str, event: PromptEvent| {
                     match event {
                         PromptEvent::Abort => {
-                            let (view, doc) = current!(cx.editor);
-                            doc.set_selection(view.id, snapshot.clone());
-                            doc.set_view_offset(view.id, offset_snapshot);
+                            let (view_id, doc) = focused!(cx.editor);
+                            doc.set_selection(view_id, snapshot.clone());
+                            doc.set_view_offset(view_id, offset_snapshot);
                         }
                         PromptEvent::Update | PromptEvent::Validate => {
                             if input.is_empty() {
                                 return;
                             }
 
-                            let case_insensitive = if config.search.smart_case {
+                            let case_insensitive = if smart_case {
                                 !input.chars().any(char::is_uppercase)
                             } else {
                                 false
@@ -226,25 +233,27 @@ pub fn raw_regex_prompt(
                                 .build(input)
                             {
                                 Ok(regex) => {
-                                    let (view, doc) = current!(cx.editor);
+                                    let (view_id, doc) = focused!(cx.editor);
 
                                     // revert state to what it was before the last update
-                                    doc.set_selection(view.id, snapshot.clone());
+                                    doc.set_selection(view_id, snapshot.clone());
 
                                     if event == PromptEvent::Validate {
                                         // Equivalent to push_jump to store selection just before jump
-                                        view.jumps.push((doc_id, snapshot.clone()));
+                                        let view = view_mut!(cx.editor, view_id);
+                                        view.history.jumps.push((doc_id, snapshot.clone()));
                                     }
 
                                     fun(cx, regex, input, event);
 
-                                    let (view, doc) = current!(cx.editor);
-                                    view.ensure_cursor_in_view(doc, config.scrolloff);
+                                    let (view_id, doc) = focused!(cx.editor);
+                                    let view = view_mut!(cx.editor, view_id);
+                                    view.ensure_cursor_in_view(doc, scrolloff);
                                 }
                                 Err(err) => {
-                                    let (view, doc) = current!(cx.editor);
-                                    doc.set_selection(view.id, snapshot.clone());
-                                    doc.set_view_offset(view.id, offset_snapshot);
+                                    let (view_id, doc) = focused!(cx.editor);
+                                    doc.set_selection(view_id, snapshot.clone());
+                                    doc.set_view_offset(view_id, offset_snapshot);
 
                                     if event == PromptEvent::Validate {
                                         let callback = async move {
@@ -381,7 +390,13 @@ pub fn file_picker(editor: &Editor, root: PathBuf) -> FilePicker {
         }
     })
     .with_preview(|_editor, path| Some((path.as_path().into(), None)))
-    .show_preview(!config.file_picker.hide_preview);
+    .show_preview(!config.file_picker.hide_preview)
+    .with_item_data(
+        |path: &PathBuf| helix_view::model::PickerItemData::FilePath {
+            path: path.clone(),
+            is_dir: false,
+        },
+    );
     let injector = picker.injector();
     let timeout = std::time::Instant::now() + std::time::Duration::from_millis(30);
 
@@ -495,7 +510,8 @@ pub fn default_folding(editor: &mut Editor) {
     let str = format!("--document {textobjects}");
     let args = Args::parse(&str, FOLD_SIGNATURE, true, |token| Ok(token.content)).unwrap();
 
-    let (view, doc) = current!(editor);
+    let (view_id, doc) = focused!(editor);
+    let view = view!(editor, view_id);
     _ = fold_textobjects(doc, view, &loader, args);
 }
 pub mod completers {
@@ -565,7 +581,10 @@ pub mod completers {
 
     /// Completes names of language servers which are running for the current document.
     pub fn active_language_servers(editor: &Editor, input: &str) -> Vec<Completion> {
-        let language_servers = doc!(editor).language_servers().map(|ls| ls.name());
+        let language_servers = focused_ref!(editor)
+            .1
+            .language_servers()
+            .map(|ls| ls.name());
 
         fuzzy_match(input, language_servers, false)
             .into_iter()
@@ -576,7 +595,8 @@ pub mod completers {
     /// Completes names of language servers which are configured for the language of the current
     /// document.
     pub fn configured_language_servers(editor: &Editor, input: &str) -> Vec<Completion> {
-        let language_servers = doc!(editor)
+        let language_servers = focused_ref!(editor)
+            .1
             .language_config()
             .into_iter()
             .flat_map(|config| &config.language_servers)
@@ -636,7 +656,8 @@ pub mod completers {
     }
 
     pub fn lsp_workspace_command(editor: &Editor, input: &str) -> Vec<Completion> {
-        let commands = doc!(editor)
+        let commands = focused_ref!(editor)
+            .1
             .language_servers_with_feature(LanguageServerFeature::WorkspaceCommand)
             .flat_map(|ls| {
                 ls.capabilities()
@@ -874,7 +895,14 @@ pub mod completers {
     }
 
     pub fn foldable_textobjects(_editor: &Editor, input: &str) -> Vec<Completion> {
-        let textobjects = ["class", "function", "comment"];
+        let textobjects = [
+            "class",
+            "function",
+            "comment",
+            "test",
+            "conditional",
+            "loop",
+        ];
         fuzzy_match(input, textobjects.iter(), false)
             .into_iter()
             .map(|(name, _)| ((0..), (*name).into()))

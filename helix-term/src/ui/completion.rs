@@ -1,12 +1,12 @@
 use crate::handlers::completion::LspCompletionItem;
 use crate::ui::{menu, Markdown, Menu, Popup, PromptEvent};
 use crate::{
-    compositor::{Component, Context, Event, EventResult},
+    compositor::{Component, Context, Event, EventResult, RenderContext},
     handlers::completion::{
         trigger_auto_completion, CompletionItem, CompletionResponse, ResolveHandler,
     },
 };
-use helix_core::snippets::{ActiveSnippet, RenderedSnippet, Snippet};
+use helix_core::snippets::{RenderedSnippet, Snippet};
 use helix_core::{self as core, chars, fuzzy::MATCHER, Change, Transaction};
 use helix_lsp::{lsp, util, OffsetEncoding};
 use helix_view::editor::CompletionHighlightType;
@@ -177,6 +177,8 @@ pub struct Completion {
     filter: String,
     // TODO: move to helix-view/central handler struct in the future
     resolve_handler: ResolveHandler,
+    /// Model layer ID, set when this completion popup is pushed to the layer stack.
+    model_layer_id: Option<helix_view::model::LayerId>,
 }
 
 impl Completion {
@@ -197,7 +199,8 @@ impl Completion {
             items,
             format_completion_data,
             move |editor: &mut Editor, item, event| {
-                let (view, doc) = current!(editor);
+                let (view_id, doc) = focused!(editor);
+                let view = view_mut!(editor, view_id);
 
                 macro_rules! language_server {
                 ($item:expr) => {
@@ -246,16 +249,16 @@ impl Completion {
                             CompletionItem::Lsp(item) => {
                                 let (transaction, _) = lsp_item_to_transaction(
                                     doc,
-                                    view.id,
+                                    view_id,
                                     &item.item,
                                     language_server!(item).offset_encoding(),
                                     trigger_offset,
                                     replace_mode,
                                 );
-                                doc.apply_temporary(&transaction, view.id)
+                                doc.apply_temporary(&transaction, view_id)
                             }
                             CompletionItem::Other(core::CompletionItem { transaction, .. }) => {
-                                doc.apply_temporary(transaction, view.id)
+                                doc.apply_temporary(transaction, view_id)
                             }
                         };
                     }
@@ -293,7 +296,7 @@ impl Completion {
                                 let encoding = language_server.offset_encoding();
                                 let (transaction, snippet) = lsp_item_to_transaction(
                                     doc,
-                                    view.id,
+                                    view_id,
                                     &item.item,
                                     encoding,
                                     trigger_offset,
@@ -312,13 +315,10 @@ impl Completion {
                             }
                         };
 
-                        doc.apply(&transaction, view.id);
+                        doc.apply(&transaction, view_id);
                         let placeholder = snippet.is_some();
                         if let Some(snippet) = snippet {
-                            doc.active_snippet = match doc.active_snippet.take() {
-                                Some(active) => active.insert_subsnippet(snippet),
-                                None => ActiveSnippet::new(snippet),
-                            };
+                            doc.apply_rendered_snippet(snippet);
                         }
 
                         editor.last_completion = Some(CompleteAction::Applied {
@@ -335,7 +335,7 @@ impl Completion {
                                     additional_edits,
                                     offset_encoding, // TODO: should probably transcode in Client
                                 );
-                                doc.apply(&transaction, view.id);
+                                doc.apply(&transaction, view_id);
                             }
                         }
                         // we could have just inserted a trigger char (like a `crate::` completion for rust
@@ -357,9 +357,9 @@ impl Completion {
             .with_scrollbar(false)
             .ignore_escape_key(true);
 
-        let (view, doc) = current_ref!(editor);
+        let (view_id, doc) = focused_ref!(editor);
         let text = doc.text().slice(..);
-        let cursor = doc.selection(view.id).primary().cursor(text);
+        let cursor = doc.selection(view_id).primary().cursor(text);
         let offset = text
             .chars_at(cursor)
             .reversed()
@@ -375,6 +375,7 @@ impl Completion {
             // and avoid allocation during matching
             filter: String::from(fragment),
             resolve_handler: ResolveHandler::new(),
+            model_layer_id: None,
         };
 
         // need to recompute immediately in case start_offset != trigger_offset
@@ -524,6 +525,101 @@ impl Completion {
     pub fn area(&mut self, viewport: Rect, editor: &Editor) -> Rect {
         self.popup.area(viewport, editor)
     }
+
+    /// Remove this completion's layer from the shared Model. Call before
+    /// dropping the Completion (e.g. in `clear_completion`).
+    pub fn remove_model_layer(&self, editor: &mut Editor) {
+        if let Some(id) = self.model_layer_id {
+            editor.model.remove_layer(id);
+        }
+    }
+
+    /// Sync completion state to the shared `Model` layer. Called during render
+    /// so any frontend can read the completion popup's current state.
+    fn sync_to_model(&mut self, editor: &mut Editor) {
+        use helix_view::model::{CompletionItem as UiCompletionItem, CompletionModel, Placement};
+
+        // Lazily push a layer on first sync.
+        let layer_id = match self.model_layer_id {
+            Some(id) => id,
+            None => {
+                let id = editor.model.push_layer(
+                    Box::new(CompletionModel::default()),
+                    Placement::Float {
+                        x: 0,
+                        y: 0,
+                        width: 0,
+                        height: 0,
+                    },
+                );
+                self.model_layer_id = Some(id);
+                id
+            }
+        };
+
+        let menu = self.popup.contents();
+        let cursor_idx = menu.cursor_index();
+
+        // Build the visible items list and extract doc text for the selected item
+        // in a single pass to avoid double-borrowing the menu.
+        let mut doc_text: Option<String> = None;
+        let items: Vec<UiCompletionItem> = menu
+            .matched_items()
+            .enumerate()
+            .map(|(i, item)| {
+                let (label, kind, detail) = match item {
+                    CompletionItem::Lsp(lsp_item) => {
+                        // Extract doc for the selected item.
+                        if cursor_idx == Some(i) {
+                            doc_text = match &lsp_item.item.documentation {
+                                Some(lsp::Documentation::String(s)) => Some(s.clone()),
+                                Some(lsp::Documentation::MarkupContent(mc)) => {
+                                    Some(mc.value.clone())
+                                }
+                                None => lsp_item.item.detail.clone(),
+                            };
+                        }
+                        let label = lsp_item.item.label.clone();
+                        let kind = lsp_item.item.kind.map(|k| format!("{k:?}"));
+                        let detail = lsp_item.item.detail.clone();
+                        (label, kind, detail)
+                    }
+                    CompletionItem::Other(core_item) => {
+                        if cursor_idx == Some(i) {
+                            doc_text = core_item.documentation.clone();
+                        }
+                        let label = core_item.label.to_string();
+                        let kind = Some(core_item.kind.to_string());
+                        let detail = core_item.documentation.clone();
+                        (label, kind, detail)
+                    }
+                };
+                UiCompletionItem {
+                    label,
+                    detail,
+                    kind,
+                }
+            })
+            .collect();
+
+        let selection = cursor_idx.unwrap_or(0);
+
+        let Some(model) = editor.model.layer_model_mut::<CompletionModel>(layer_id) else {
+            return;
+        };
+
+        model.items = items;
+        model.selection = selection;
+        model.doc = doc_text;
+    }
+
+    /// Pre-resolve the currently selected LSP completion item so the render
+    /// phase doesn't need `&mut Editor`. Called from `EditorView::sync`.
+    pub fn resolve_selected_item(&mut self, editor: &mut Editor) {
+        if let Some(CompletionItem::Lsp(option)) = self.popup.contents_mut().selection_mut() {
+            self.resolve_handler.ensure_item_resolved(editor, option);
+        }
+    }
 }
 
 impl Component for Completion {
@@ -535,17 +631,46 @@ impl Component for Completion {
         self.popup.required_size(viewport)
     }
 
-    fn render(&mut self, area: Rect, surface: &mut Surface, cx: &mut Context) {
+    fn sync(&mut self, editor: &mut Editor) {
+        self.sync_to_model(editor);
+    }
+
+    fn prepare_render(&mut self, area: Rect, ctx: &RenderContext) -> crate::render::PreparedRender {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        use crate::render::{CacheId, CacheKey, CacheTag, PreparedRender, RenderOutput};
+
+        let mut h = DefaultHasher::new();
+        self.filter.hash(&mut h);
+        let menu = self.popup.contents();
+        menu.cursor_index().hash(&mut h);
+        menu.len().hash(&mut h);
+        self.popup.scroll_half_pages.hash(&mut h);
+        self.popup.area.hash(&mut h);
+        if let Some(pos) = ctx.editor.cursor().0 {
+            pos.row.hash(&mut h);
+            pos.col.hash(&mut h);
+        }
+
+        let tag = CacheTag {
+            id: CacheId::hashed(&"completion"),
+            key: CacheKey::hashed(&h.finish()),
+            area,
+        };
+        let mut output = RenderOutput::new(area);
+        self.render(area, &mut output.surface, ctx);
+        PreparedRender::cached(tag, output)
+    }
+
+    fn render(&mut self, area: Rect, surface: &mut Surface, cx: &RenderContext) {
         self.popup.render(area, surface, cx);
 
         // if we have a selection, render a markdown popup on top/below with info
+        // NOTE: ensure_item_resolved is now called in EditorView::sync.
         let option = match self.popup.contents_mut().selection_mut() {
             Some(option) => option,
             None => return,
         };
-        if let CompletionItem::Lsp(option) = option {
-            self.resolve_handler.ensure_item_resolved(cx.editor, option);
-        }
         // need to render:
         // option.detail
         // ---
@@ -555,7 +680,7 @@ impl Component for Completion {
             return;
         };
         let cursor_pos = coords.row as u16;
-        let doc = doc!(cx.editor);
+        let (_, doc) = focused_ref!(cx.editor);
         let language = doc.language_name().unwrap_or("");
 
         let markdowned = |lang: &str, detail: Option<&str>, doc: Option<&str>| {

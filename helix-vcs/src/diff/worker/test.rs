@@ -12,7 +12,7 @@ impl DiffHandle {
         // dropping the channel terminates the task
         drop(self.channel);
         handle.await.unwrap();
-        let diff = diff.read();
+        let diff = diff.load_full();
         Vec::clone(&diff.hunks)
     }
 }
@@ -107,7 +107,7 @@ async fn add_use() {
 #[tokio::test]
 async fn update_document() {
     let (differ, handle) = DiffHandle::new_test("foo\nbar\ntest\nfoo", "foo\nbar\ntest\nfoo");
-    differ.update_document(Rope::from_str("foo\ntest\nfoo bar"), false);
+    differ.update_document(Rope::from_str("foo\ntest\nfoo bar"));
     let line_diffs = differ.into_diff(handle).await;
     assert_eq!(
         &line_diffs,

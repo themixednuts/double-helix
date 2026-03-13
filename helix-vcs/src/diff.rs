@@ -1,13 +1,11 @@
 use std::iter::Peekable;
 use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use helix_core::Rope;
-use helix_event::RenderLockGuard;
 use imara_diff::Algorithm;
-use parking_lot::{RwLock, RwLockReadGuard};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 use tokio::task::JoinHandle;
-use tokio::time::Instant;
 
 use crate::diff::worker::DiffWorker;
 
@@ -16,16 +14,9 @@ pub use imara_diff::Hunk;
 mod line_cache;
 mod worker;
 
-/// A rendering lock passed to the differ the prevents redraws from occurring
-struct RenderLock {
-    pub lock: RenderLockGuard,
-    pub timeout: Option<Instant>,
-}
-
 struct Event {
     text: Rope,
     is_base: bool,
-    render_lock: Option<RenderLock>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -39,7 +30,7 @@ struct DiffInner {
 #[derive(Clone, Debug)]
 pub struct DiffHandle {
     channel: UnboundedSender<Event>,
-    diff: Arc<RwLock<DiffInner>>,
+    diff: Arc<ArcSwap<DiffInner>>,
     inverted: bool,
 }
 
@@ -50,11 +41,10 @@ impl DiffHandle {
 
     fn new_with_handle(diff_base: Rope, doc: Rope) -> (DiffHandle, JoinHandle<()>) {
         let (sender, receiver) = unbounded_channel();
-        let diff: Arc<RwLock<DiffInner>> = Arc::default();
+        let diff: Arc<ArcSwap<DiffInner>> = Arc::new(ArcSwap::from_pointee(DiffInner::default()));
         let worker = DiffWorker {
             channel: receiver,
             diff: diff.clone(),
-            diff_finished_notify: Arc::default(),
             diff_alloc: imara_diff::Diff::default(),
         };
         let handle = tokio::spawn(worker.run(diff_base, doc));
@@ -71,60 +61,35 @@ impl DiffHandle {
         self.inverted = !self.inverted;
     }
 
-    /// Load the actual diff
-    pub fn load(&self) -> Diff<'_> {
+    /// Load the actual diff. Lock-free — never blocks.
+    pub fn load(&self) -> Diff {
         Diff {
-            diff: self.diff.read(),
+            diff: self.diff.load_full(),
             inverted: self.inverted,
         }
     }
 
-    pub fn try_load(&self) -> Option<Diff<'_>> {
-        Some(Diff {
-            diff: self.diff.try_read()?,
-            inverted: self.inverted,
-        })
-    }
-
-    /// Updates the document associated with this redraw handle
-    /// This function is only intended to be called from within the rendering loop
-    /// if called from elsewhere it may fail to acquire the render lock and panic
-    pub fn update_document(&self, doc: Rope, block: bool) -> bool {
-        let lock = helix_event::lock_frame();
-        let timeout = if block {
-            None
-        } else {
-            Some(Instant::now() + tokio::time::Duration::from_millis(SYNC_DIFF_TIMEOUT))
-        };
-        self.update_document_impl(doc, self.inverted, Some(RenderLock { lock, timeout }))
+    /// Updates the document associated with this diff handle.
+    ///
+    /// Updates are always processed asynchronously and coalesced so rendering
+    /// can continue using the most recent published diff snapshot.
+    pub fn update_document(&self, doc: Rope) -> bool {
+        self.update_document_impl(doc, self.inverted)
     }
 
     /// Updates the base text of the diff. Returns if the update was successful.
     pub fn update_diff_base(&self, diff_base: Rope) -> bool {
-        self.update_document_impl(diff_base, !self.inverted, None)
+        self.update_document_impl(diff_base, !self.inverted)
     }
 
-    fn update_document_impl(
-        &self,
-        text: Rope,
-        is_base: bool,
-        render_lock: Option<RenderLock>,
-    ) -> bool {
-        let event = Event {
-            text,
-            is_base,
-            render_lock,
-        };
+    fn update_document_impl(&self, text: Rope, is_base: bool) -> bool {
+        let event = Event { text, is_base };
         self.channel.send(event).is_ok()
     }
 }
 
-/// synchronous debounce value should be low
-/// so we can update synchronously most of the time
-const DIFF_DEBOUNCE_TIME_SYNC: u64 = 1;
-/// maximum time that rendering should be blocked until the diff finishes
-const SYNC_DIFF_TIMEOUT: u64 = 12;
-const DIFF_DEBOUNCE_TIME_ASYNC: u64 = 96;
+/// Coalesce bursts of edits, but keep diff snapshots fresh enough for interactive UI.
+const DIFF_DEBOUNCE_TIME_MS: u64 = 8;
 const ALGORITHM: Algorithm = Algorithm::Histogram;
 const MAX_DIFF_LINES: usize = 64 * u16::MAX as usize;
 // cap average line length to 128 for files with MAX_DIFF_LINES
@@ -133,12 +98,12 @@ const MAX_DIFF_BYTES: usize = MAX_DIFF_LINES * 128;
 /// A list of changes in a file sorted in ascending
 /// non-overlapping order
 #[derive(Debug)]
-pub struct Diff<'a> {
-    diff: RwLockReadGuard<'a, DiffInner>,
+pub struct Diff {
+    diff: Arc<DiffInner>,
     inverted: bool,
 }
 
-impl Diff<'_> {
+impl Diff {
     /// Returns the base [Rope] of the [Diff]
     pub fn diff_base(&self) -> &Rope {
         if self.inverted {

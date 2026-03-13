@@ -229,6 +229,10 @@ where
     where
         I: Iterator<Item = (u16, u16, &'a Cell)>,
     {
+        // Begin synchronized update — terminal holds display
+        // until the matching end sequence, preventing partial-frame flicker.
+        write!(self.buffer, "\x1b[?2026h")?;
+
         let mut fg = Color::Reset;
         let mut bg = Color::Reset;
         let mut underline_color = Color::Reset;
@@ -287,7 +291,10 @@ where
             SetForegroundColor(CColor::Reset),
             SetBackgroundColor(CColor::Reset),
             SetAttribute(CAttribute::Reset)
-        )
+        )?;
+
+        // End synchronized update — terminal renders the complete frame.
+        write!(self.buffer, "\x1b[?2026l")
     }
 
     fn hide_cursor(&mut self) -> io::Result<()> {

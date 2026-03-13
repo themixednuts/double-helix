@@ -256,11 +256,15 @@ impl LineBlame {
 #[cfg(test)]
 mod test {
     use super::*;
+    #[allow(unused_imports)]
     use crate::git::test::create_commit_with_message;
+    #[allow(unused_imports)]
     use crate::git::test::empty_git_repo;
+    #[allow(unused_imports)]
     use std::fs::File;
 
     /// describes how a line was modified
+    #[allow(dead_code)]
     #[derive(PartialEq, PartialOrd, Ord, Eq)]
     enum LineDiff {
         /// this line is added
@@ -272,6 +276,7 @@ mod test {
     }
 
     /// checks if the first argument is `no_commit` or not
+    #[allow(unused_macros)]
     macro_rules! no_commit_flag {
         (no_commit, $commit_msg:literal) => {
             false
@@ -288,6 +293,7 @@ mod test {
     }
 
     /// checks if the first argument is `insert` or `delete`
+    #[allow(unused_macros)]
     macro_rules! line_diff_flag {
         (insert, $commit_msg:literal, $line:expr) => {
             LineDiff::Insert
@@ -310,6 +316,7 @@ mod test {
 
     /// This macro exists because we can't pass a `match` statement into `concat!`
     /// we would like to exclude any lines that are `delete`
+    #[allow(unused_macros)]
     macro_rules! line_diff_flag_str {
         (insert, $commit_msg:literal, $line:expr) => {
             concat!($line, newline_literal!())
@@ -331,12 +338,14 @@ mod test {
     }
 
     #[cfg(windows)]
+    #[allow(unused_macros)]
     macro_rules! newline_literal {
         () => {
             "\r\n"
         };
     }
     #[cfg(not(windows))]
+    #[allow(unused_macros)]
     macro_rules! newline_literal {
         () => {
             "\n"
@@ -344,6 +353,7 @@ mod test {
     }
 
     /// Helper macro to create a history of the same file being modified.
+    #[allow(unused_macros)]
     macro_rules! assert_line_blame_progress {
         (
             $(

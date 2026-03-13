@@ -2,6 +2,7 @@
 use crate::text::{Span, Spans};
 use helix_core::unicode::width::UnicodeWidthStr;
 use std::cmp::min;
+use std::sync::Arc;
 use unicode_segmentation::UnicodeSegmentation;
 
 use helix_view::graphics::{Color, Modifier, Rect, Style, UnderlineStyle};
@@ -9,7 +10,7 @@ use helix_view::graphics::{Color, Modifier, Rect, Style, UnderlineStyle};
 /// One cell of the terminal. Contains one stylized grapheme.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cell {
-    pub symbol: String,
+    pub symbol: Arc<str>,
     pub fg: Color,
     pub bg: Color,
     pub underline_color: Color,
@@ -20,15 +21,14 @@ pub struct Cell {
 impl Cell {
     /// Set the cell's grapheme
     pub fn set_symbol(&mut self, symbol: &str) -> &mut Cell {
-        self.symbol.clear();
-        self.symbol.push_str(symbol);
+        self.symbol = Arc::from(symbol);
         self
     }
 
     /// Set the cell's grapheme to a [char]
     pub fn set_char(&mut self, ch: char) -> &mut Cell {
-        self.symbol.clear();
-        self.symbol.push(ch);
+        let mut buf = [0u8; 4];
+        self.symbol = Arc::from(ch.encode_utf8(&mut buf) as &str);
         self
     }
 
@@ -76,8 +76,7 @@ impl Cell {
 
     /// Resets the cell to a default blank state
     pub fn reset(&mut self) {
-        self.symbol.clear();
-        self.symbol.push(' ');
+        self.symbol = Arc::from(" ");
         self.fg = Color::Reset;
         self.bg = Color::Reset;
         self.underline_color = Color::Reset;
@@ -89,7 +88,7 @@ impl Cell {
 impl Default for Cell {
     fn default() -> Cell {
         Cell {
-            symbol: " ".into(),
+            symbol: Arc::from(" "),
             fg: Color::Reset,
             bg: Color::Reset,
             underline_color: Color::Reset,
@@ -111,13 +110,14 @@ impl Default for Cell {
 /// ```
 /// use helix_tui::buffer::{Buffer, Cell};
 /// use helix_view::graphics::{Rect, Color, UnderlineStyle, Style, Modifier};
+/// use std::sync::Arc;
 ///
 /// let mut buf = Buffer::empty(Rect{x: 0, y: 0, width: 10, height: 5});
 /// buf[(0, 2)].set_symbol("x");
-/// assert_eq!(buf[(0, 2)].symbol, "x");
+/// assert_eq!(&*buf[(0, 2)].symbol, "x");
 /// buf.set_string(3, 0, "string", Style::default().fg(Color::Red).bg(Color::White));
 /// assert_eq!(buf[(5, 0)], Cell{
-///     symbol: String::from("r"),
+///     symbol: Arc::from("r"),
 ///     fg: Color::Red,
 ///     bg: Color::White,
 ///     underline_color: Color::Reset,
@@ -125,7 +125,7 @@ impl Default for Cell {
 ///     modifier: Modifier::empty(),
 /// });
 /// buf[(5, 0)].set_char('x');
-/// assert_eq!(buf[(5, 0)].symbol, "x");
+/// assert_eq!(&*buf[(5, 0)].symbol, "x");
 /// ```
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Buffer {
@@ -714,26 +714,41 @@ impl Buffer {
     pub fn diff<'a>(&self, other: &'a Buffer) -> Vec<(u16, u16, &'a Cell)> {
         let previous_buffer = &self.content;
         let next_buffer = &other.content;
-        let width = self.area.width;
+        let width = self.area.width as usize;
+        let height = self.area.height as usize;
 
         let mut updates: Vec<(u16, u16, &Cell)> = vec![];
-        // Cells invalidated by drawing/replacing preceding multi-width characters:
-        let mut invalidated: usize = 0;
-        // Cells from the current buffer to skip due to preceding multi-width characters taking their
-        // place (the skipped cells should be blank anyway):
-        let mut to_skip: usize = 0;
-        for (i, (current, previous)) in next_buffer.iter().zip(previous_buffer.iter()).enumerate() {
-            if (current != previous || invalidated > 0) && to_skip == 0 {
-                let x = (i % width as usize) as u16;
-                let y = (i / width as usize) as u16;
-                updates.push((x, y, &next_buffer[i]));
+
+        for row in 0..height {
+            let row_start = row * width;
+            let row_end = row_start + width;
+
+            // Fast path: skip entire row if all cells are identical.
+            // This avoids expensive Unicode width calculations for unchanged rows.
+            let prev_row = &previous_buffer[row_start..row_end];
+            let next_row = &next_buffer[row_start..row_end];
+            if prev_row == next_row {
+                continue;
             }
 
-            let current_width = current.symbol.width();
-            to_skip = current_width.saturating_sub(1);
+            // Slow path: row has changes, do per-cell diff with multi-width handling.
+            let mut invalidated: usize = 0;
+            let mut to_skip: usize = 0;
+            for col in 0..width {
+                let i = row_start + col;
+                let current = &next_buffer[i];
+                let previous = &previous_buffer[i];
 
-            let affected_width = std::cmp::max(current_width, previous.symbol.width());
-            invalidated = std::cmp::max(affected_width, invalidated).saturating_sub(1);
+                if (current != previous || invalidated > 0) && to_skip == 0 {
+                    updates.push((col as u16, row as u16, current));
+                }
+
+                let current_width = current.symbol.width();
+                to_skip = current_width.saturating_sub(1);
+
+                let affected_width = std::cmp::max(current_width, previous.symbol.width());
+                invalidated = std::cmp::max(affected_width, invalidated).saturating_sub(1);
+            }
         }
         updates
     }

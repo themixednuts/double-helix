@@ -2,6 +2,7 @@
 //! Frontend for [Backend]
 
 use crate::{backend::Backend, buffer::Buffer};
+use helix_view::bench::log_run_phase;
 use helix_view::editor::{Config as EditorConfig, KittyKeyboardProtocolConfig};
 use helix_view::graphics::{CursorKind, Rect};
 use std::io;
@@ -138,6 +139,10 @@ where
         &mut self.buffers[self.current]
     }
 
+    pub fn viewport_area(&self) -> Rect {
+        self.viewport.area
+    }
+
     pub fn backend(&self) -> &B {
         &self.backend
     }
@@ -152,7 +157,24 @@ where
         let previous_buffer = &self.buffers[1 - self.current];
         let current_buffer = &self.buffers[self.current];
         let updates = previous_buffer.diff(current_buffer);
-        self.backend.draw(updates.into_iter())
+        let update_count = updates.len();
+        let touched_rows = updates
+            .iter()
+            .map(|(_, y, _)| *y)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
+        let draw_start = std::time::Instant::now();
+        let result = self.backend.draw(updates.into_iter());
+        log_run_phase("terminal_draw", "backend_draw", draw_start.elapsed(), || {
+            format!(
+                "updates={} rows={} area={}x{}",
+                update_count,
+                touched_rows,
+                current_buffer.area.width,
+                current_buffer.area.height
+            )
+        });
+        result
     }
 
     /// Updates the Terminal so that internal buffers match the requested size. Requested size will
@@ -209,7 +231,17 @@ where
         self.current = 1 - self.current;
 
         // Flush
+        let backend_flush_start = std::time::Instant::now();
         self.backend.flush()?;
+        log_run_phase("terminal_draw", "backend_flush", backend_flush_start.elapsed(), || {
+            format!(
+                "cursor={:?} kind={:?} viewport={}x{}",
+                cursor_position,
+                cursor_kind,
+                self.viewport.area.width,
+                self.viewport.area.height
+            )
+        });
         Ok(())
     }
 

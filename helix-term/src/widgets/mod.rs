@@ -7,25 +7,24 @@
 //!
 //! Layout combinators live in `helix_view::layout` (shared across frontends).
 //! These widgets are terminal-specific — they render to `tui::buffer::Buffer`.
+//!
+//! Trait-based capabilities (Focusable, Scrollable, Bounded, etc.) live in
+//! `helix_view::traits` — the single canonical source for all frontends.
 
 mod box_shadow;
 mod divider;
 mod header;
-mod input_line;
 mod item_list;
 mod scroll_region;
 mod scrollbar;
-mod text_box;
+mod style;
 mod text_input;
-pub mod traits;
 
 pub use box_shadow::BoxShadow;
 pub use divider::{hdivider, vdivider};
 pub use header::{header, header_with_counts};
-pub use input_line::InputLine;
 pub use item_list::{item_list, ListState, ListStyles};
 pub use scroll_region::{scroll_region, ScrollState, ScrollStyles};
 pub use scrollbar::Scrollbar;
-pub use text_box::TextBox;
+pub use style::WidgetStyle;
 pub use text_input::{text_input, TextInputState};
-pub use traits::{Focusable, Scrollable, TextBuffer, TextContent, TextCursor, WidgetStyle};

@@ -19,14 +19,14 @@
 macro_rules! component_traits {
     (focusable) => {
         fn is_focused(&self) -> bool {
-            $crate::widgets::Focusable::is_focused(self)
+            helix_view::traits::Focusable::is_focused(self)
         }
-        fn as_focusable(&mut self) -> Option<&mut dyn $crate::widgets::Focusable> {
+        fn as_focusable(&mut self) -> Option<&mut dyn helix_view::traits::Focusable> {
             Some(self)
         }
     };
     (scrollable) => {
-        fn as_scrollable(&mut self) -> Option<&mut dyn $crate::widgets::Scrollable> {
+        fn as_scrollable(&mut self) -> Option<&mut dyn helix_view::traits::Scrollable> {
             Some(self)
         }
     };
@@ -57,6 +57,8 @@ pub enum EventResult {
 use crate::job::Jobs;
 use crate::ui::picker;
 use helix_view::Editor;
+use helix_view::keyboard::{KeyCode, KeyModifiers};
+use log::warn;
 
 use helix_plugin::PluginManager;
 
@@ -137,6 +139,13 @@ pub(crate) fn compute_panel_layout(area: Rect, editor: &Editor) -> PanelLayout {
             }
         }
     }
+
+    warn!(
+        "[layout] terminal_area=({},{} {}x{}) editor_area=({},{} {}x{}) panels={:?}",
+        area.x, area.y, area.width, area.height,
+        editor_area.x, editor_area.y, editor_area.width, editor_area.height,
+        panel_areas.iter().map(|(id, r)| format!("{:?}=({},{} {}x{})", id, r.x, r.y, r.width, r.height)).collect::<Vec<_>>(),
+    );
 
     PanelLayout {
         editor_area,
@@ -303,13 +312,13 @@ pub trait Component: Any + AnyComponent + Send {
 
     /// Mutable focus access. Returns `Some` if this component supports
     /// focus management. The compositor calls this for mouse-click routing.
-    fn as_focusable(&mut self) -> Option<&mut dyn crate::widgets::Focusable> {
+    fn as_focusable(&mut self) -> Option<&mut dyn helix_view::traits::Focusable> {
         None
     }
 
     /// Mutable scroll access. Returns `Some` if this component supports
     /// scrolling. The compositor calls this for mouse wheel routing.
-    fn as_scrollable(&mut self) -> Option<&mut dyn crate::widgets::Scrollable> {
+    fn as_scrollable(&mut self) -> Option<&mut dyn helix_view::traits::Scrollable> {
         None
     }
 }
@@ -396,6 +405,20 @@ impl Compositor {
             .retain(|component| component.type_name() != type_name);
     }
     pub fn handle_event(&mut self, event: &Event, cx: &mut Context) -> bool {
+        // Canonicalize key events: strip SHIFT from Char keys so that e.g.
+        // <S-j> becomes 'J'. This is done once here so every component sees
+        // the same canonical form — no per-component canonicalization needed.
+        let event = &match event {
+            Event::Key(key) => {
+                let mut key = *key;
+                if let KeyCode::Char(_) = key.code {
+                    key.modifiers.remove(KeyModifiers::SHIFT);
+                }
+                Event::Key(key)
+            }
+            other => other.clone(),
+        };
+
         // If it is a key event, a macro is being recorded, and a macro isn't being replayed,
         // push the key event to the recording.
         if let (Event::Key(key), Some((_, keys))) = (event, &mut cx.editor.macro_recording) {
@@ -485,18 +508,41 @@ impl Compositor {
         match clicked_panel {
             Some((panel_id, _)) => {
                 let pid = *panel_id;
+                warn!(
+                    "[mouse_focus] click at ({},{}) → panel {:?}",
+                    col, row, pid
+                );
                 for layer in &mut self.layers {
                     let is_target = layer.panel_id() == Some(pid);
                     if let Some(focusable) = layer.as_focusable() {
+                        let was = focusable.is_focused();
                         focusable.set_focused(is_target);
+                        warn!(
+                            "[mouse_focus]   layer id={} panel_id={:?} was_focused={} now_focused={}",
+                            layer.id().unwrap_or("-"),
+                            layer.panel_id(),
+                            was,
+                            is_target,
+                        );
                     }
                 }
             }
             None => {
+                warn!(
+                    "[mouse_focus] click at ({},{}) → editor area (unfocus all)",
+                    col, row
+                );
                 // Click in editor area — unfocus all panels.
                 for layer in &mut self.layers {
                     if let Some(focusable) = layer.as_focusable() {
+                        let was = focusable.is_focused();
                         focusable.set_focused(false);
+                        warn!(
+                            "[mouse_focus]   layer id={} panel_id={:?} was_focused={} now_focused=false",
+                            layer.id().unwrap_or("-"),
+                            layer.panel_id(),
+                            was,
+                        );
                     }
                 }
             }
@@ -520,8 +566,8 @@ impl Compositor {
             .iter()
             .find(|(_, rect)| rect.contains(col, row));
 
-        let (pid, panel_rect) = match panel {
-            Some((id, rect)) => (*id, *rect),
+        let pid = match panel {
+            Some((id, _rect)) => *id,
             None => return false,
         };
 
@@ -530,14 +576,19 @@ impl Compositor {
             if layer.panel_id() == Some(pid) {
                 if let Some(scrollable) = layer.as_scrollable() {
                     let current = scrollable.scroll();
-                    let viewport_height = panel_rect.height as usize;
+                    let max = scrollable.max_scroll();
+                    let content_h = scrollable.content_height();
+                    let viewport_h = scrollable.area().height;
                     match mouse.kind {
                         MouseEventKind::ScrollUp => {
-                            scrollable.scroll_to(current.saturating_sub(3));
+                            let new = current.saturating_sub(3);
+                            warn!("[panel_scroll] UP current={current} new={new} max={max} content_h={content_h} viewport_h={viewport_h}");
+                            scrollable.scroll_to(new);
                         }
                         MouseEventKind::ScrollDown => {
-                            let max = scrollable.max_scroll(viewport_height);
-                            scrollable.scroll_to((current + 3).min(max));
+                            let new = (current + 3).min(max);
+                            warn!("[panel_scroll] DOWN current={current} new={new} max={max} content_h={content_h} viewport_h={viewport_h}");
+                            scrollable.scroll_to(new);
                         }
                         _ => {}
                     }
@@ -607,6 +658,12 @@ impl Compositor {
             if use_bufferline {
                 editor_area = editor_area.clip_top(1);
             }
+            warn!(
+                "[resize] editor.resize area=({},{} {}x{}) use_bufferline={} cmdline_popup={}",
+                editor_area.x, editor_area.y, editor_area.width, editor_area.height,
+                use_bufferline,
+                config.cmdline.style == CmdlineStyle::Popup && config.cmdline.use_full_height,
+            );
             cx.editor.resize(editor_area);
         }
 
@@ -672,20 +729,19 @@ impl Compositor {
         }
 
         // Phase 5: Overlay layers (pickers, popups, prompts) on top of everything.
-        // Sequential prepare (overlays depend on z-order and parent→child scroll),
-        // parallel deferred execution via compose_batch.
+        // Overlays render directly to the main surface (not through prepare_render/blit)
+        // because they only paint a small region — blitting a full-area surface would
+        // overwrite the editor content underneath with empty cells.
         {
             let overlay_start_time = std::time::Instant::now();
             let overlay_layers = &mut self.layers[overlay_start..];
-            let mut batch = Vec::with_capacity(overlay_layers.len());
+            let count = overlay_layers.len();
             for layer in overlay_layers.iter_mut() {
                 let layer_area = resolve_area(layer.as_ref(), area, &layout);
-                batch.push(layer.prepare_render(layer_area, &render_ctx));
+                layer.render(layer_area, surface, &render_ctx);
             }
-            let count = batch.len();
-            self.render_cache.compose_batch(batch, surface);
             log_run_phase("compositor_layer", "overlay_batch", overlay_start_time.elapsed(), || {
-                format!("count={count} phase=overlay_parallel")
+                format!("count={count} phase=overlay_direct")
             });
         }
     }

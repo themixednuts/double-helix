@@ -775,7 +775,7 @@ fn toggle_focus_window(cx: &mut Context) {
 fn toggle_agent_panel(cx: &mut Context) {
     use crate::commands::typed::do_acp_connect;
     use crate::ui::acp::{AcpPanel, ID as ACP_PANEL_ID};
-    use crate::widgets::Focusable;
+    use helix_view::traits::Focusable;
     let first_agent = cx.editor.acp_agents.iter().next();
     let has_agent = first_agent.is_some();
     let agent_name = first_agent.and_then(|(_, agent)| {

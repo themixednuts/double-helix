@@ -2438,10 +2438,11 @@ impl Component for EditorView {
                 self.render_cache.entries.clear();
                 EventResult::Consumed(None)
             }
-            Event::Key(mut key) => {
+            Event::Key(key) => {
+                let key = *key;
                 let key_dispatch_start = std::time::Instant::now();
                 cx.editor.reset_idle_timer();
-                canonicalize_key(&mut key);
+                // Key is already canonicalized by the compositor.
 
                 // clear status
                 cx.editor.status_msg = None;
@@ -2684,8 +2685,20 @@ impl Component for EditorView {
             self.render_cache.frames = self.render_cache.frames.wrapping_add(1);
         }
 
+        log::warn!(
+            "[editor_render] area=({},{} {}x{}) views={}",
+            area.x, area.y, area.width, area.height,
+            cx.editor.tree.views().count(),
+        );
         for (view, is_focused) in cx.editor.tree.views() {
             let view_render_start = std::time::Instant::now();
+            log::warn!(
+                "[view] id={:?} focused={} area=({},{} {}x{}) inner_height={} statusline_row={}",
+                view.id, is_focused,
+                view.area.x, view.area.y, view.area.width, view.area.height,
+                view.area.height.saturating_sub(1),
+                view.area.y + view.area.height.saturating_sub(1),
+            );
             let doc = cx.editor.document(view.doc).unwrap();
 
             let primary_cursor = doc
@@ -3184,15 +3197,8 @@ struct BufferInfo {
     columns: std::ops::Range<u16>,
 }
 
-fn canonicalize_key(key: &mut KeyEvent) {
-    if let KeyEvent {
-        code: KeyCode::Char(_),
-        modifiers: _,
-    } = key
-    {
-        key.modifiers.remove(KeyModifiers::SHIFT)
-    }
-}
+// Key canonicalization (SHIFT stripping from Char keys) is now done in
+// the compositor's handle_event, so all components receive canonical keys.
 
 fn restore_focus_after_mouse_scroll(
     editor: &mut Editor,

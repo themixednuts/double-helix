@@ -93,6 +93,10 @@ pub trait Selectable {
 pub trait Focusable {
     fn is_focused(&self) -> bool;
     fn set_focused(&mut self, focused: bool);
+    fn toggle_focus(&mut self) {
+        let current = self.is_focused();
+        self.set_focused(!current);
+    }
 }
 
 /// Has an editing mode (Normal, Insert, Select).

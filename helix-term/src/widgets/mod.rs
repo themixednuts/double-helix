@@ -12,6 +12,7 @@
 //! `helix_view::traits` — the single canonical source for all frontends.
 
 mod box_shadow;
+mod chat_bubble;
 mod divider;
 mod header;
 mod item_list;
@@ -21,6 +22,7 @@ mod style;
 mod text_input;
 
 pub use box_shadow::BoxShadow;
+pub use chat_bubble::{chat_bubble, BubbleAlign, BubbleState, BubbleStyle};
 pub use divider::{hdivider, vdivider};
 pub use header::{header, header_with_counts};
 pub use item_list::{item_list, ListState, ListStyles};

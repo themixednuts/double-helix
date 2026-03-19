@@ -210,6 +210,30 @@ pub struct RefreshState {
     seed_line_map: Option<LineMap>,
 }
 
+#[derive(Clone, Copy)]
+pub struct RenderScope<'a> {
+    pub selection: &'a Selection,
+    pub mode: Mode,
+    pub is_focused: bool,
+    pub terminal_focused: bool,
+}
+
+impl<'a> RenderScope<'a> {
+    pub fn new(
+        selection: &'a Selection,
+        mode: Mode,
+        is_focused: bool,
+        terminal_focused: bool,
+    ) -> Self {
+        Self {
+            selection,
+            mode,
+            is_focused,
+            terminal_focused,
+        }
+    }
+}
+
 impl<'a> ReusePlan<'a> {
     pub fn into_state(self, inputs: RenderInputs) -> ReuseState {
         ReuseState {
@@ -247,6 +271,10 @@ impl ReuseState {
 
     pub fn line_count(&self) -> usize {
         self.line_map.lines.len()
+    }
+
+    pub fn dirty_count(&self) -> usize {
+        self.dirty_rows.len()
     }
 
     pub fn fingerprint_counts(&self) -> (usize, usize) {
@@ -295,23 +323,16 @@ impl<'a> RefreshPlan<'a> {
 }
 
 impl RefreshState {
-    pub fn inputs(&self) -> &RenderInputs {
-        &self.inputs
-    }
-
     pub fn seed_line_map(&self) -> Option<&LineMap> {
         self.seed_line_map.as_ref()
     }
 
-    pub fn overlay_fingerprints(
-        &self,
-        line_map: &LineMap,
-        selection: &Selection,
-        mode: Mode,
-        is_focused: bool,
-        terminal_focused: bool,
-    ) -> Arc<[u64]> {
-        line_map.overlay_fingerprints(selection, mode, is_focused, terminal_focused)
+    pub fn view_position(&self) -> &ViewPosition {
+        &self.inputs.paint.layout.view_position
+    }
+
+    pub fn overlay_fingerprints(&self, line_map: &LineMap, cx: RenderScope<'_>) -> Arc<[u64]> {
+        line_map.overlay_fingerprints(cx.selection, cx.mode, cx.is_focused, cx.terminal_focused)
     }
 
     pub fn into_snapshots(
@@ -367,18 +388,10 @@ impl View {
         config_gen: u64,
         theme_name: Arc<str>,
         cached: Option<RenderSnapshotsRef<'a>>,
-        selection: &Selection,
-        mode: Mode,
-        is_focused: bool,
-        terminal_focused: bool,
+        cx: RenderScope<'_>,
     ) -> RenderState {
-        self.render_inputs(doc, config_gen, theme_name).resolve(
-            cached,
-            selection,
-            mode,
-            is_focused,
-            terminal_focused,
-        )
+        self.render_inputs(doc, config_gen, theme_name)
+            .resolve(cached, cx)
     }
 }
 
@@ -386,30 +399,23 @@ impl RenderInputs {
     pub fn resolve<'a>(
         self,
         cached: Option<RenderSnapshotsRef<'a>>,
-        selection: &Selection,
-        mode: Mode,
-        is_focused: bool,
-        terminal_focused: bool,
+        cx: RenderScope<'_>,
     ) -> RenderState {
-        self.plan(cached, selection, mode, is_focused, terminal_focused)
-            .into_state(self)
+        self.plan(cached, cx).into_state(self)
     }
 
     pub fn plan<'a>(
         &self,
         cached: Option<RenderSnapshotsRef<'a>>,
-        selection: &Selection,
-        mode: Mode,
-        is_focused: bool,
-        terminal_focused: bool,
+        cx: RenderScope<'_>,
     ) -> RenderPlan<'a> {
         match cached {
             Some(cached) if cached.paint.matches(&self.paint) => {
                 let overlay_fingerprints = cached.layout.line_map.overlay_fingerprints(
-                    selection,
-                    mode,
-                    is_focused,
-                    terminal_focused,
+                    cx.selection,
+                    cx.mode,
+                    cx.is_focused,
+                    cx.terminal_focused,
                 );
                 let dirty_rows =
                     LineMap::dirty_rows(&cached.paint.overlay_fingerprints, &overlay_fingerprints);
@@ -1796,7 +1802,9 @@ mod tests {
             ),
         };
 
-        match inputs.plan(Some(cached.as_ref()), &selection, Mode::Normal, true, true) {
+        let cx = RenderScope::new(&selection, Mode::Normal, true, true);
+
+        match inputs.plan(Some(cached.as_ref()), cx) {
             RenderPlan::Reuse(plan) => {
                 assert!(std::ptr::eq(plan.cached.layout, &cached.layout));
                 assert!(std::ptr::eq(plan.cached.paint, &cached.paint));
@@ -1841,7 +1849,9 @@ mod tests {
             ),
         };
 
-        match inputs.resolve(Some(cached.as_ref()), &selection, Mode::Normal, true, true) {
+        let cx = RenderScope::new(&selection, Mode::Normal, true, true);
+
+        match inputs.resolve(Some(cached.as_ref()), cx) {
             RenderState::Reuse(state) => assert!(state.is_clean()),
             RenderState::Refresh(_) => panic!("expected render reuse state"),
         }
@@ -1878,7 +1888,9 @@ mod tests {
             ),
         };
 
-        match inputs.plan(Some(cached.as_ref()), &selection, Mode::Normal, true, true) {
+        let cx = RenderScope::new(&selection, Mode::Normal, true, true);
+
+        match inputs.plan(Some(cached.as_ref()), cx) {
             RenderPlan::Reuse(plan) => {
                 let state = plan.into_state(inputs.clone());
                 assert!(state.is_clean());
@@ -1920,7 +1932,9 @@ mod tests {
         };
         let selection = Selection::point(0);
 
-        match inputs.plan(Some(cached.as_ref()), &selection, Mode::Normal, true, true) {
+        let cx = RenderScope::new(&selection, Mode::Normal, true, true);
+
+        match inputs.plan(Some(cached.as_ref()), cx) {
             RenderPlan::Refresh(plan) => {
                 let seed = plan.seed_line_map.expect("expected cached seed line map");
                 assert!(std::ptr::eq(seed, &cached.layout.line_map));
@@ -1957,7 +1971,9 @@ mod tests {
         };
         let selection = Selection::point(0);
 
-        match inputs.plan(Some(cached.as_ref()), &selection, Mode::Normal, true, true) {
+        let cx = RenderScope::new(&selection, Mode::Normal, true, true);
+
+        match inputs.plan(Some(cached.as_ref()), cx) {
             RenderPlan::Refresh(plan) => {
                 let state = plan.into_state(inputs.clone());
                 let seed = state
@@ -1990,7 +2006,9 @@ mod tests {
         };
         let selection = Selection::point(0);
 
-        match inputs.plan(Some(cached.as_ref()), &selection, Mode::Normal, true, true) {
+        let cx = RenderScope::new(&selection, Mode::Normal, true, true);
+
+        match inputs.plan(Some(cached.as_ref()), cx) {
             RenderPlan::Refresh(plan) => assert!(plan.seed_line_map.is_none()),
             RenderPlan::Reuse(_) => panic!("expected render refresh"),
         }

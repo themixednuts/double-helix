@@ -54,8 +54,8 @@ use super::text_decorations::blame::InlineBlame;
 use helix_view::engine::{KeymapQuery, ModalInputState};
 use helix_view::model::FocusTarget;
 use helix_view::view::{
-    LayoutSnapshot, LineMap, RefreshState, RenderSnapshots, RenderSnapshotsRef, RenderState,
-    ReuseState, SyntaxStyleCache,
+    LayoutSnapshot, LineMap, RefreshState, RenderScope, RenderSnapshots, RenderSnapshotsRef,
+    RenderState, ReuseState, SyntaxStyleCache,
 };
 
 const MAX_SEED_LINE_MAP_GAP: usize = 4_096;
@@ -157,11 +157,17 @@ impl ViewFrame<'_> {
         cached: Option<RenderSnapshotsRef<'a>>,
         terminal_focused: bool,
     ) -> RenderState {
-        self.trace.view.resolve_render_state(
+        self.view().resolve_render_state(
             self.doc,
             self.editor.config_gen,
             Arc::from(self.editor.theme.name()),
             cached,
+            self.render_scope(terminal_focused),
+        )
+    }
+
+    fn render_scope(&self, terminal_focused: bool) -> RenderScope<'_> {
+        RenderScope::new(
             self.trace.selection,
             self.editor.mode,
             self.trace.is_focused,
@@ -169,12 +175,20 @@ impl ViewFrame<'_> {
         )
     }
 
+    fn view(&self) -> &View {
+        self.trace.view
+    }
+
+    fn view_id(&self) -> ViewId {
+        self.view().id
+    }
+
     fn update_cursor_cache(&self, layout: &LayoutSnapshot) {
-        layout.update_cursor_cache(self.editor, self.doc, self.trace.view);
+        layout.update_cursor_cache(self.editor, self.doc, self.view());
     }
 
     fn clear_dirty_rows(&self, dirty_rows: &HashSet<u16>, surface: &mut Surface) {
-        let inner = self.trace.view.inner_area(self.doc);
+        let inner = self.view().inner_area(self.doc);
         for &row in dirty_rows {
             if row < inner.height {
                 let y = inner.y + row;
@@ -192,7 +206,7 @@ impl ViewFrame<'_> {
         ViewRenderContext {
             editor: self.editor,
             doc: self.doc,
-            view: self.trace.view,
+            view: self.view(),
             viewport: self.area,
             is_focused: self.trace.is_focused,
             cached_syntax,
@@ -218,13 +232,6 @@ impl ViewTrace<'_> {
     }
 
     fn log_reuse(&self, reuse: &ReuseState) {
-        let fp_start = std::time::Instant::now();
-        self.log_rows_phase("overlay_fingerprints", fp_start, reuse.line_count());
-
-        let (old_fingerprints, new_fingerprints) = reuse.fingerprint_counts();
-        let dirty_start = std::time::Instant::now();
-        self.log_dirty_rows_phase(dirty_start, old_fingerprints, new_fingerprints);
-
         let sel = self.selection.primary();
         let (sel_start, sel_end) = if sel.anchor <= sel.head {
             (sel.anchor, sel.head)
@@ -270,12 +277,13 @@ impl ViewTrace<'_> {
     }
 
     fn log_refresh(&self, refresh: &RefreshState, output: &RenderOutput) {
+        let view_position = refresh.view_position();
         log::info!(
             "F{} CACHE MISS view={:?} anchor={} voff={} area={}x{} syntax={} lines={} elapsed={:?}",
             self.frame_num,
             self.view.id,
-            refresh.inputs().paint.layout.view_position.anchor,
-            refresh.inputs().paint.layout.view_position.vertical_offset,
+            view_position.anchor,
+            view_position.vertical_offset,
             self.view.area.width,
             self.view.area.height,
             output.syntax_styles.len(),
@@ -284,7 +292,7 @@ impl ViewTrace<'_> {
         );
     }
 
-    fn log_view_phase(&self, phase: &'static str, start: std::time::Instant) {
+    fn log_area_phase(&self, phase: &'static str, start: std::time::Instant) {
         helix_view::bench::log_run_phase("editor_render_view", phase, start.elapsed(), || {
             format!(
                 "view_id={:?} area={}x{}",
@@ -293,29 +301,21 @@ impl ViewTrace<'_> {
         });
     }
 
-    fn log_rows_phase(&self, phase: &'static str, start: std::time::Instant, rows: usize) {
-        helix_view::bench::log_run_phase("editor_render_view", phase, start.elapsed(), || {
-            format!("view_id={:?} rows={}", self.view.id, rows)
-        });
-    }
-
-    fn log_dirty_rows_phase(
-        &self,
-        start: std::time::Instant,
-        old_fingerprints: usize,
-        new_fingerprints: usize,
-    ) {
+    fn log_overlay_fingerprints(&self, start: std::time::Instant, rows: usize) {
         helix_view::bench::log_run_phase(
             "editor_render_view",
-            "dirty_rows",
+            "overlay_fingerprints",
             start.elapsed(),
-            || {
-                format!(
-                    "view_id={:?} old={} new={}",
-                    self.view.id, old_fingerprints, new_fingerprints
-                )
-            },
+            || format!("view_id={:?} rows={}", self.view.id, rows),
         );
+    }
+
+    fn log_blit(&self, start: std::time::Instant) {
+        self.log_area_phase("blit", start);
+    }
+
+    fn log_copy_region(&self, start: std::time::Instant) {
+        self.log_area_phase("copy_region", start);
     }
 
     fn log_render_phase(&self, phase: RenderPhase) {
@@ -569,10 +569,9 @@ impl EditorView {
     ) {
         frame.update_cursor_cache(&snapshots.layout);
         let copy_start = std::time::Instant::now();
-        let cells = Self::copy_region(surface, Self::content_area(frame.trace.view));
-        frame.trace.log_view_phase("copy_region", copy_start);
-        self.render_cache
-            .store(frame.trace.view.id, snapshots, cells);
+        let cells = Self::copy_region(surface, Self::content_area(frame.view()));
+        frame.trace.log_copy_region(copy_start);
+        self.render_cache.store(frame.view_id(), snapshots, cells);
     }
 
     fn render_pass(
@@ -599,25 +598,25 @@ impl EditorView {
         reuse: ReuseState,
     ) {
         let blit_start = std::time::Instant::now();
-        self.blit_cached_view(frame.trace.view.id, surface);
-        frame.trace.log_view_phase("blit", blit_start);
+        self.blit_cached_view(frame.view_id(), surface);
+        frame.trace.log_blit(blit_start);
 
         frame.update_cursor_cache(&reuse.layout_snapshot());
         frame.trace.log_reuse(&reuse);
 
         self.render_cache
-            .record_hit(reuse.dirty_rows().len(), reuse.line_count());
+            .record_hit(reuse.dirty_count(), reuse.line_count());
 
         if reuse.is_clean() {
             frame.trace.log_pure_reuse();
             self.render_cache
-                .update_overlay_fingerprints(frame.trace.view.id, reuse.overlay_fingerprints());
+                .update_overlay_fingerprints(frame.view_id(), reuse.overlay_fingerprints());
             return;
         }
 
         frame.clear_dirty_rows(reuse.dirty_rows(), surface);
         let phase = RenderPhase::Dirty {
-            rows: reuse.dirty_rows().len(),
+            rows: reuse.dirty_count(),
         };
 
         let render_output = self.render_pass(
@@ -660,16 +659,11 @@ impl EditorView {
         let fp_start = std::time::Instant::now();
         let overlay_fingerprints = refresh.overlay_fingerprints(
             &render_output.line_map,
-            frame.trace.selection,
-            frame.editor.mode,
-            frame.trace.is_focused,
-            self.terminal_focused,
+            frame.render_scope(self.terminal_focused),
         );
-        frame.trace.log_rows_phase(
-            "overlay_fingerprints",
-            fp_start,
-            render_output.line_map.lines.len(),
-        );
+        frame
+            .trace
+            .log_overlay_fingerprints(fp_start, render_output.line_map.lines.len());
 
         frame.trace.log_refresh(&refresh, &render_output);
 

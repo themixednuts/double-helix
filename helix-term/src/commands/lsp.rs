@@ -1307,10 +1307,15 @@ pub fn rename_symbol(cx: &mut Context) {
 
                         match block_on(future) {
                             Ok(edits) => {
-                                let _ = cx.editor.apply_workspace_edit(
+                                if let Err(err) = cx.editor.apply_workspace_edit(
                                     offset_encoding,
                                     &edits.unwrap_or_default(),
-                                );
+                                ) {
+                                    cx.editor.set_error(format!(
+                                        "Failed to apply rename edits: {}",
+                                        err.kind
+                                    ));
+                                }
                             }
                             Err(err) => cx.editor.set_error(err.to_string()),
                         }
@@ -1350,10 +1355,15 @@ pub fn rename_symbol(cx: &mut Context) {
 
                         match block_on(future) {
                             Ok(edits) => {
-                                let _ = cx.editor.apply_workspace_edit(
+                                if let Err(err) = cx.editor.apply_workspace_edit(
                                     offset_encoding,
                                     &edits.unwrap_or_default(),
-                                );
+                                ) {
+                                    cx.editor.set_error(format!(
+                                        "Failed to apply rename edits: {}",
+                                        err.kind
+                                    ));
+                                }
                             }
                             Err(err) => cx.editor.set_error(err.to_string()),
                         }

@@ -7,6 +7,55 @@ use helix_core::{
     text_folding::FoldContainer,
 };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AnnotationSnapshot {
+    pub(crate) revision: crate::Revision,
+    pub(crate) inlay_hints_outdated: bool,
+    pub(crate) inlay_hint_views: usize,
+    pub(crate) jump_label_views: usize,
+    pub(crate) fold_views: usize,
+    pub(crate) plugin_annotation_views: usize,
+}
+
+impl AnnotationSnapshot {
+    pub const fn new(revision: crate::Revision) -> Self {
+        Self {
+            revision,
+            inlay_hints_outdated: false,
+            inlay_hint_views: 0,
+            jump_label_views: 0,
+            fold_views: 0,
+            plugin_annotation_views: 0,
+        }
+    }
+
+    pub const fn with_state(
+        revision: crate::Revision,
+        inlay_hints_outdated: bool,
+        inlay_hint_views: usize,
+        jump_label_views: usize,
+        fold_views: usize,
+        plugin_annotation_views: usize,
+    ) -> Self {
+        Self {
+            revision,
+            inlay_hints_outdated,
+            inlay_hint_views,
+            jump_label_views,
+            fold_views,
+            plugin_annotation_views,
+        }
+    }
+
+    pub const fn revision(self) -> crate::Revision {
+        self.revision
+    }
+
+    pub const fn inlay_hints_outdated(self) -> bool {
+        self.inlay_hints_outdated
+    }
+}
+
 #[derive(Debug)]
 pub struct DocumentPresentationState {
     annotations: AnnotationState,
@@ -87,8 +136,19 @@ impl DocumentPresentationState {
         self.annotations.set_inlay_hints(view_id, inlay_hints);
     }
 
-    pub fn annotation_gen(&self) -> u64 {
+    fn annotation_gen(&self) -> u64 {
         self.annotations.gen()
+    }
+
+    pub fn annotation_snapshot(&self) -> AnnotationSnapshot {
+        AnnotationSnapshot::with_state(
+            crate::Revision::from(self.annotation_gen()),
+            self.inlay_hints_outdated,
+            self.annotations.inlay_hints.len(),
+            self.annotations.jump_labels.len(),
+            self.annotations.fold_containers.len(),
+            self.annotations.plugin_annotations.len(),
+        )
     }
 
     pub fn set_jump_labels(&mut self, view_id: ViewId, labels: Vec<Overlay>) {

@@ -4,6 +4,7 @@ use crate::{
     clipboard::ClipboardProvider,
     document::{
         DocumentOpenError, DocumentSavedEventFuture, DocumentSavedEventResult, Mode, SavePoint,
+        SCRATCH_BUFFER_NAME,
     },
     events::{DocumentDidClose, DocumentDidOpen, DocumentFocusLost},
     graphics::{CursorKind, Rect},
@@ -527,6 +528,8 @@ pub struct AcpConfig {
     pub cycle_model: Option<String>,
     /// Cycle through mode options (e.g. Default, Accept Edits, Plan Mode). Default: S-tab
     pub cycle_mode: Option<String>,
+    /// Bubble border corner style: "rounded" (default) or "squared".
+    pub bubble_corners: Option<String>,
 }
 
 impl AcpConfig {
@@ -559,6 +562,13 @@ impl AcpConfig {
                 code: KeyCode::Tab,
                 modifiers: KeyModifiers::SHIFT,
             })
+    }
+    /// Whether bubble borders use rounded or squared corners.
+    pub fn bubble_corners_rounded(&self) -> bool {
+        match self.bubble_corners.as_deref() {
+            Some("squared") => false,
+            _ => true, // default: rounded
+        }
     }
 }
 
@@ -2125,6 +2135,61 @@ pub enum CloseError {
 pub use crate::bench::{BenchSnapshot, BenchState};
 
 impl Editor {
+    pub fn buffer_label(&self, doc: &Document) -> String {
+        let scratch = PathBuf::from(SCRATCH_BUFFER_NAME);
+
+        let paths: Vec<String> = self
+            .documents()
+            .map(|doc| {
+                doc.path()
+                    .unwrap_or(&scratch)
+                    .to_str()
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .collect();
+
+        let components: Vec<Vec<String>> = paths
+            .iter()
+            .map(|path| {
+                path.split(std::path::MAIN_SEPARATOR)
+                    .map(String::from)
+                    .collect()
+            })
+            .collect();
+
+        let doc_path = doc
+            .path()
+            .unwrap_or(&scratch)
+            .to_str()
+            .unwrap_or_default()
+            .to_string();
+        let doc_index = paths.iter().position(|path| path == &doc_path).unwrap_or(0);
+        let doc_components_len = components[doc_index].len();
+
+        let mut suffix_len = 1;
+        loop {
+            let start = doc_components_len.saturating_sub(suffix_len);
+            let current = &components[doc_index][start..];
+
+            let conflicts = components
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| *index != doc_index)
+                .filter(|(_, parts)| {
+                    let start = parts.len().saturating_sub(suffix_len);
+                    &parts[start..] == current
+                })
+                .count();
+
+            if conflicts == 0 {
+                return current.join(std::path::MAIN_SEPARATOR_STR);
+            }
+
+            suffix_len += 1;
+        }
+    }
+
     pub fn new(
         mut area: Rect,
         theme_loader: Arc<theme::Loader>,
@@ -3302,8 +3367,13 @@ impl Editor {
     }
 
     pub fn has_stale_syntax(&self) -> bool {
-        self.documents.values().any(Document::syntax_is_stale)
-            || self.component_docs.values().any(Document::syntax_is_stale)
+        self.documents
+            .values()
+            .any(|doc| doc.syntax_snapshot().is_stale())
+            || self
+                .component_docs
+                .values()
+                .any(|doc| doc.syntax_snapshot().is_stale())
     }
 
     pub fn refresh_one_stale_syntax(&mut self) -> bool {
@@ -3311,7 +3381,7 @@ impl Editor {
         let loader = self.syn_loader.load();
 
         if let Some(doc) = self.documents.get_mut(&focused_doc_id) {
-            if doc.syntax_is_stale() {
+            if doc.syntax_snapshot().is_stale() {
                 let refreshed = doc.refresh_stale_syntax(&loader);
                 log_run_event("syntax_refresh_attempt", || {
                     format!(
@@ -3327,7 +3397,7 @@ impl Editor {
         }
 
         for (doc_id, doc) in &mut self.documents {
-            if *doc_id == focused_doc_id || !doc.syntax_is_stale() {
+            if *doc_id == focused_doc_id || !doc.syntax_snapshot().is_stale() {
                 continue;
             }
             let refreshed = doc.refresh_stale_syntax(&loader);
@@ -3344,7 +3414,7 @@ impl Editor {
         }
 
         for doc in self.component_docs.values_mut() {
-            if !doc.syntax_is_stale() {
+            if !doc.syntax_snapshot().is_stale() {
                 continue;
             }
             let refreshed = doc.refresh_stale_syntax(&loader);

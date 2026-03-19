@@ -253,10 +253,7 @@ impl PlainViewportSupportReport {
         }
     }
 
-    pub const fn new(
-        support: PlainViewportSupport,
-        blocker: Option<&'static str>,
-    ) -> Self {
+    pub const fn new(support: PlainViewportSupport, blocker: Option<&'static str>) -> Self {
         Self { support, blocker }
     }
 }
@@ -474,7 +471,9 @@ impl<'a> TextAnnotations<'a> {
         let seek_end = target_char.min(line_end);
         let seek_range = line_start..=seek_end;
 
-        if layer_overlaps(&self.inline_annotations, line_start, seek_end, |annot| annot.char_idx) {
+        if layer_overlaps(&self.inline_annotations, line_start, seek_end, |annot| {
+            annot.char_idx
+        }) {
             return PlainLineSeekSupport::InlineAnnotations;
         }
 
@@ -658,10 +657,15 @@ impl<'a> TextAnnotations<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{LineAnnotation, PlainViewportSupport, PlainViewportSupportReport, TextAnnotations};
-    use crate::Rope;
-    use crate::text_folding::{FoldContainer, test_utils::{TEXT_SAMPLE, fold_points, new_fold_points}};
+    use super::{
+        LineAnnotation, PlainViewportSupport, PlainViewportSupportReport, TextAnnotations,
+    };
+    use crate::text_folding::{
+        test_utils::{fold_points, new_fold_points, TEXT_SAMPLE},
+        FoldContainer,
+    };
     use crate::Position;
+    use crate::Rope;
 
     #[test]
     fn plain_viewport_support_ignores_folds_outside_line_span() {

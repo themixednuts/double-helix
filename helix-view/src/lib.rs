@@ -29,6 +29,7 @@ pub mod layout;
 pub mod model;
 pub mod presentation_state;
 pub mod register;
+pub mod revision;
 pub mod selection_store;
 pub mod session_state;
 pub mod snippet_state;
@@ -106,5 +107,6 @@ pub fn align_view(doc: &mut Document, view: &View, align: Align) {
 pub use document::Document;
 pub use editor::Editor;
 use helix_core::char_idx_at_visual_offset;
+pub use revision::Revision;
 pub use theme::Theme;
 pub use view::View;

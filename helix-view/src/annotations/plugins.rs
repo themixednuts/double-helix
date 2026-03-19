@@ -225,8 +225,8 @@ mod tests {
     use super::plugin_plain_viewport_support;
     use crate::{document::PluginAnnotation, Document};
     use arc_swap::ArcSwap;
-    use helix_core::{syntax, Rope};
     use helix_core::text_annotations::PlainViewportSupport;
+    use helix_core::{syntax, Rope};
     use std::sync::Arc;
 
     fn test_doc(text: &str) -> Document {

@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -6,9 +7,7 @@ use imara_diff::{IndentHeuristic, IndentLevel, InternedInput};
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::time::{timeout, Duration};
 
-use crate::diff::{
-    DiffInner, Event, ALGORITHM, DIFF_DEBOUNCE_TIME_MS,
-};
+use crate::diff::{DiffInner, Event, ALGORITHM, DIFF_DEBOUNCE_TIME_MS};
 
 use super::line_cache::InternedRopeLines;
 
@@ -18,6 +17,7 @@ mod test;
 pub(super) struct DiffWorker {
     pub channel: UnboundedReceiver<Event>,
     pub diff: Arc<ArcSwap<DiffInner>>,
+    pub gen: Arc<AtomicU64>,
     pub diff_alloc: imara_diff::Diff,
 }
 
@@ -25,7 +25,9 @@ impl DiffWorker {
     async fn accumulate_events(&mut self, event: Event) -> (Option<Rope>, Option<Rope>) {
         let mut accumulator = EventAccumulator::new();
         accumulator.handle_event(event).await;
-        accumulator.accumulate_debounced_events(&mut self.channel).await;
+        accumulator
+            .accumulate_debounced_events(&mut self.channel)
+            .await;
         (accumulator.doc, accumulator.diff_base)
     }
 
@@ -73,6 +75,7 @@ impl DiffWorker {
             doc,
             hunks,
         }));
+        self.gen.fetch_add(1, Ordering::Relaxed);
     }
 
     fn perform_diff(&mut self, input: &InternedInput<RopeSlice>) {

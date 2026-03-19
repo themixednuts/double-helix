@@ -1,6 +1,6 @@
 use crate::doc_formatter::{DocumentFormatter, TextFormat};
-use crate::{Position, Rope};
 use crate::text_annotations::{InlineAnnotation, Overlay, TextAnnotations};
+use crate::{Position, Rope};
 
 impl TextFormat {
     fn new_test(softwrap: bool) -> Self {
@@ -250,7 +250,10 @@ fn checkpoint_resume_matches_full_formatter_stream() {
         checkpoint.visual_pos,
     );
 
-    assert_eq!(collect_graphemes(&mut resumed), full_graphemes[8..].to_vec());
+    assert_eq!(
+        collect_graphemes(&mut resumed),
+        full_graphemes[8..].to_vec()
+    );
 }
 
 #[test]

@@ -1,7 +1,6 @@
 use helix_core::diagnostic::Severity;
 use helix_core::indent::IndentStyle;
 use helix_core::unicode::width::UnicodeWidthStr;
-use helix_core::{tree_sitter::Node as TsNode, RopeSlice};
 use helix_view::document::Mode;
 use helix_view::editor::{StatusLineConfig, StatusLineElement as StatusLineElementId};
 use helix_view::icons::ICONS;
@@ -51,7 +50,11 @@ impl StatuslineModel {
         let spinner_frame = doc
             .language_servers()
             .next()
-            .and_then(|server| spinners.get(server.id()).and_then(|spinner| spinner.frame()))
+            .and_then(|server| {
+                spinners
+                    .get(server.id())
+                    .and_then(|spinner| spinner.frame())
+            })
             .unwrap_or(" ");
         let current_working_directory = helix_stdx::env::current_working_dir()
             .file_name()
@@ -84,10 +87,7 @@ impl StatuslineModel {
             bench_overlay: editor.bench.as_ref().map(|bench| BenchOverlay {
                 rolling_fps: bench.rolling_fps,
                 actions_executed: bench.actions_executed as usize,
-                remaining_seconds: bench
-                    .duration
-                    .saturating_sub(bench.elapsed())
-                    .as_secs_f64(),
+                remaining_seconds: bench.duration.saturating_sub(bench.elapsed()).as_secs_f64(),
             }),
         }
     }
@@ -109,7 +109,6 @@ pub struct Statusline<'a> {
     parts: RenderBuffer<'a>,
 }
 
-
 impl<'a> Statusline<'a> {
     pub fn new(model: StatuslineModel) -> Self {
         Self {
@@ -118,7 +117,10 @@ impl<'a> Statusline<'a> {
         }
     }
 
-    pub fn prepare(model: StatuslineModel, area: helix_view::graphics::Rect) -> crate::render::PreparedRender {
+    pub fn prepare(
+        model: StatuslineModel,
+        area: helix_view::graphics::Rect,
+    ) -> crate::render::PreparedRender {
         use crate::render::{CacheKey, CacheTag, PreparedRender, RenderOutput};
 
         let tag = CacheTag {
@@ -209,7 +211,10 @@ impl<'a> Statusline<'a> {
         }
 
         surface.set_spans(
-            viewport.x + viewport.width.saturating_sub(self.parts.right.width() as u16),
+            viewport.x
+                + viewport
+                    .width
+                    .saturating_sub(self.parts.right.width() as u16),
             viewport.y,
             &self.parts.right,
             self.parts.right.width() as u16,
@@ -314,7 +319,13 @@ where
 {
     write(
         statusline,
-        statusline.model.snapshot.spinner_frame.as_ref().to_string().into(),
+        statusline
+            .model
+            .snapshot
+            .spinner_frame
+            .as_ref()
+            .to_string()
+            .into(),
     );
 }
 
@@ -354,7 +365,10 @@ where
     let icon = icons.kind().workspace();
     if !icon.glyph().is_empty() {
         if let Some(style) = icon.color().map(|color| Style::default().fg(color)) {
-            write(statusline, Span::styled(format!("{} ", icon.glyph()), style));
+            write(
+                statusline,
+                Span::styled(format!("{} ", icon.glyph()), style),
+            );
         } else {
             write(statusline, format!("{} ", icon.glyph()).into());
         }
@@ -524,7 +538,10 @@ where
         Some(file_type),
     ) {
         if let Some(style) = icon.color().map(|color| Style::default().fg(color)) {
-            write(statusline, Span::styled(format!(" {} ", icon.glyph()), style));
+            write(
+                statusline,
+                Span::styled(format!(" {} ", icon.glyph()), style),
+            );
         } else {
             write(statusline, format!(" {} ", icon.glyph()).into());
         }
@@ -549,7 +566,11 @@ where
 {
     write(
         statusline,
-        format!(" {} ", statusline.model.snapshot.document.file_absolute_path).into(),
+        format!(
+            " {} ",
+            statusline.model.snapshot.document.file_absolute_path
+        )
+        .into(),
     );
 }
 
@@ -683,7 +704,10 @@ where
         if let Some(icon) = icons.kind().get("function") {
             let glyph = icon.glyph();
             if let Some(style) = icon.color().map(|color| Style::default().fg(color)) {
-                write(statusline, Span::styled(format!(" {} {}", glyph, name), style));
+                write(
+                    statusline,
+                    Span::styled(format!(" {} {}", glyph, name), style),
+                );
             } else {
                 write(statusline, format!(" {} {} ", glyph, name).into());
             }
@@ -736,108 +760,6 @@ fn get_current_function_name_cached(
     name
 }
 
-fn extract_name_from_declarator(node: TsNode<'_>, text: RopeSlice<'_>) -> Option<String> {
-    match node.kind() {
-        "identifier" | "field_identifier" => {
-            let start_char = text.try_byte_to_char(node.start_byte() as usize).ok()?;
-            let end_char = text.try_byte_to_char(node.end_byte() as usize).ok()?;
-            Some(text.slice(start_char..end_char).to_string())
-        }
-        "qualified_identifier" => {
-            for i in (0..node.child_count()).rev() {
-                if let Some(child) = node.child(i) {
-                    if child.kind() == "identifier" || child.kind() == "field_identifier" {
-                        let start_char = text.try_byte_to_char(child.start_byte() as usize).ok()?;
-                        let end_char = text.try_byte_to_char(child.end_byte() as usize).ok()?;
-                        return Some(text.slice(start_char..end_char).to_string());
-                    }
-                }
-            }
-            None
-        }
-        kind if kind.contains("declarator") => {
-            for i in 0..node.child_count() {
-                if let Some(child) = node.child(i) {
-                    if let Some(name) = extract_name_from_declarator(child, text) {
-                        return Some(name);
-                    }
-                }
-            }
-            None
-        }
-        _ => None,
-    }
-}
-
 fn get_current_function_name(doc: &Document, cursor_char: usize) -> Option<String> {
-    let syntax = doc.syntax()?;
-    let text = doc.text().slice(..);
-    let root = syntax.tree().root_node();
-    let byte_pos = text.char_to_byte(cursor_char) as u32;
-
-    let mut node = root.descendant_for_byte_range(byte_pos, byte_pos)?;
-    loop {
-        let kind = node.kind();
-        if kind.contains("function") || kind.contains("method") || kind.contains("closure") {
-            for i in 0..node.child_count() {
-                if let Some(child) = node.child(i) {
-                    if child.kind() == "identifier" || child.kind() == "field_identifier" {
-                        let start_byte = child.start_byte() as usize;
-                        let end_byte = child.end_byte() as usize;
-                        let start_char = text.try_byte_to_char(start_byte).ok()?;
-                        let end_char = text.try_byte_to_char(end_byte).ok()?;
-                        return Some(text.slice(start_char..end_char).to_string());
-                    }
-                }
-            }
-
-            for i in 0..node.child_count() {
-                if let Some(child) = node.child(i) {
-                    if child.kind().contains("declarator") {
-                        if let Some(name) = extract_name_from_declarator(child, text) {
-                            return Some(name);
-                        }
-                    }
-                }
-            }
-
-            if let Some(parent) = node.parent() {
-                let parent_kind = parent.kind();
-                if parent_kind == "variable_declarator" || parent_kind == "assignment_expression" {
-                    for i in 0..parent.child_count() {
-                        if let Some(child) = parent.child(i) {
-                            if child.kind() == "identifier"
-                                && child.byte_range().end <= node.byte_range().start
-                            {
-                                let start_byte = child.start_byte() as usize;
-                                let end_byte = child.end_byte() as usize;
-                                let start_char = text.try_byte_to_char(start_byte).ok()?;
-                                let end_char = text.try_byte_to_char(end_byte).ok()?;
-                                return Some(text.slice(start_char..end_char).to_string());
-                            }
-                        }
-                    }
-                }
-
-                if parent_kind == "pair" || parent_kind == "method_definition" {
-                    for i in 0..parent.child_count() {
-                        if let Some(child) = parent.child(i) {
-                            if child.kind() == "property_identifier"
-                                || (child.kind() == "identifier"
-                                    && child.byte_range().end <= node.byte_range().start)
-                            {
-                                let start_byte = child.start_byte() as usize;
-                                let end_byte = child.end_byte() as usize;
-                                let start_char = text.try_byte_to_char(start_byte).ok()?;
-                                let end_char = text.try_byte_to_char(end_byte).ok()?;
-                                return Some(text.slice(start_char..end_char).to_string());
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        node = node.parent()?;
-    }
+    doc.function_name_at_char(cursor_char)
 }

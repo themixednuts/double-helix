@@ -137,8 +137,8 @@ impl NotificationPopup {
         } else {
             editor.config().notifications.border.width as u16
         };
-        self.layout_rounded = editor.config().rounded_corners
-            || editor.config().notifications.border.radius > 0;
+        self.layout_rounded =
+            editor.config().rounded_corners || editor.config().notifications.border.radius > 0;
         self.layout_padding = editor.config().notifications.padding;
 
         if self.notifications.is_empty() {
@@ -167,10 +167,16 @@ impl NotificationPopup {
 
             let mut prefix = String::new();
             if config.show_emojis {
-                prefix.push_str(notification_emoji(&item.notification.severity, &config.emojis));
+                prefix.push_str(notification_emoji(
+                    &item.notification.severity,
+                    &config.emojis,
+                ));
                 prefix.push(' ');
             } else if config.show_icons {
-                prefix.push_str(notification_icon(&item.notification.severity, &config.icons));
+                prefix.push_str(notification_icon(
+                    &item.notification.severity,
+                    &config.icons,
+                ));
                 prefix.push(' ');
             }
             let prefix_width = prefix.width() as u16;
@@ -365,12 +371,9 @@ impl NotificationModel {
         };
 
         let gradient_border = if config.border.enable && editor.config().gradient_borders.enable {
-            let mut gb = popup
-                .gradient_border
-                .clone()
-                .unwrap_or_else(|| {
-                    GradientBorder::from_theme(theme, &editor.config().gradient_borders)
-                });
+            let mut gb = popup.gradient_border.clone().unwrap_or_else(|| {
+                GradientBorder::from_theme(theme, &editor.config().gradient_borders)
+            });
             gb.disable_animation();
             Some(gb)
         } else {
@@ -428,7 +431,10 @@ impl NotificationModel {
 // Renderer — produces PreparedRender directly via snapshot pattern.
 // ---------------------------------------------------------------------------
 
-fn prepare_notification_render(model: NotificationModel, area: Rect) -> crate::render::PreparedRender {
+fn prepare_notification_render(
+    model: NotificationModel,
+    area: Rect,
+) -> crate::render::PreparedRender {
     use crate::render::{CacheTag, PreparedRender, RenderOutput};
 
     let tag = CacheTag {
@@ -465,11 +471,17 @@ fn render_notification(
             width: item.area.width,
             height: item.area.height,
         };
-        let shadow = model.styles.popup.bg(Color::Rgb(0, 0, 0)).add_modifier(Modifier::DIM);
+        let shadow = model
+            .styles
+            .popup
+            .bg(Color::Rgb(0, 0, 0))
+            .add_modifier(Modifier::DIM);
         surface.clear_with(shadow_area, shadow);
     }
 
-    let notification_style = model.styles.for_severity(&item.severity, item.fade_progress);
+    let notification_style = model
+        .styles
+        .for_severity(&item.severity, item.fade_progress);
     let rounded = model.rounded_corners || item.corner_radius > 0;
 
     // Render border and compute inner area
@@ -552,7 +564,11 @@ fn render_notification(
             surface.set_string(content_area.x, y_pos, &prefix, notification_style);
         }
 
-        let x_offset = if i == 0 && show_prefix { prefix_width } else { 0 };
+        let x_offset = if i == 0 && show_prefix {
+            prefix_width
+        } else {
+            0
+        };
         let available = content_area.width.saturating_sub(x_offset).max(1) as usize;
         surface.set_stringn(
             content_area.x + x_offset,
@@ -636,13 +652,7 @@ fn wrap_text(text: &str, max_width: u16) -> Vec<String> {
     lines
 }
 
-fn render_simple_border(
-    area: Rect,
-    surface: &mut Surface,
-    style: Style,
-    rounded: bool,
-    width: u8,
-) {
+fn render_simple_border(area: Rect, surface: &mut Surface, style: Style, rounded: bool, width: u8) {
     let (h, v, tl, tr, bl, br) = if rounded {
         ("─", "│", "╭", "╮", "╰", "╯")
     } else {
@@ -661,8 +671,20 @@ fn render_simple_border(
         }
 
         for x in x0..=x1 {
-            let ch_top = if x == x0 { tl } else if x == x1 { tr } else { h };
-            let ch_bot = if x == x0 { bl } else if x == x1 { br } else { h };
+            let ch_top = if x == x0 {
+                tl
+            } else if x == x1 {
+                tr
+            } else {
+                h
+            };
+            let ch_bot = if x == x0 {
+                bl
+            } else if x == x1 {
+                br
+            } else {
+                h
+            };
             if let Some(cell) = surface.get_mut(x, y0) {
                 cell.set_symbol(ch_top).set_style(style);
             }

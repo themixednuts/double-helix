@@ -8,7 +8,7 @@ use crate::{
     graphics::Rect,
     handlers::diagnostics::DiagnosticsHandler,
     history_state::ViewHistoryState,
-    Align, Document, DocumentId, Theme, ViewId,
+    Align, Document, DocumentId, Editor, Theme, ViewId,
 };
 
 use helix_core::{
@@ -77,23 +77,296 @@ impl AnyViewMut<'_> {
     }
 }
 
-/// Content-level fingerprint — inputs that affect text layout and syntax highlighting.
-/// When this changes, the syntax highlighter must re-run (tree-sitter queries).
-/// When this is unchanged but overlays change, cached syntax styles can be reused.
+/// Inputs that determine viewport layout for a rendered view.
+///
+/// When this changes, line-map and wrapping data must be rebuilt.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ViewContentState {
+pub struct ViewLayoutInputs {
     pub doc_id: crate::DocumentId,
     pub doc_version: i32,
     pub view_position: ViewPosition,
     pub area: Rect,
-    pub theme_name: Arc<str>,
     pub config_gen: u64,
-    /// Annotation generation counter — changes when any text annotation
-    /// (jump labels, inlay hints, etc.) is added or removed.
-    pub annotation_gen: u64,
+    pub annotation: crate::presentation_state::AnnotationSnapshot,
+}
+
+impl ViewLayoutInputs {
+    pub fn can_reuse_seed_line_map(&self, current: &Self) -> bool {
+        self.doc_id == current.doc_id
+            && self.doc_version == current.doc_version
+            && self.annotation == current.annotation
+            && self.config_gen == current.config_gen
+            && self.area.width == current.area.width
+    }
+}
+
+impl LayoutSnapshot {
+    pub fn can_seed(&self, current: &ViewLayoutInputs) -> bool {
+        self.inputs.can_reuse_seed_line_map(current)
+    }
+}
+
+impl PaintSnapshot {
+    pub fn matches(&self, current: &ViewPaintInputs) -> bool {
+        &self.inputs == current
+    }
+}
+
+/// Inputs that determine painted cells for a rendered view.
+///
+/// When this changes, cached syntax styles or cell buffers may need to be rebuilt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ViewPaintInputs {
+    pub layout: ViewLayoutInputs,
+    pub syntax: crate::syntax_aware::SyntaxSnapshot,
+    pub theme_name: Arc<str>,
     /// Primary cursor line — invalidates cache when cursor moves (affects
     /// relative line numbers and gutter selection highlights).
     pub cursor_line: usize,
+    pub gutter: crate::document::GutterSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderInputs {
+    pub layout: ViewLayoutInputs,
+    pub paint: ViewPaintInputs,
+}
+
+#[derive(Debug, Clone)]
+pub struct RenderSnapshots {
+    pub layout: LayoutSnapshot,
+    pub paint: PaintSnapshot,
+}
+
+impl RenderSnapshots {
+    pub fn as_ref(&self) -> RenderSnapshotsRef<'_> {
+        RenderSnapshotsRef {
+            layout: &self.layout,
+            paint: &self.paint,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct RenderSnapshotsRef<'a> {
+    pub layout: &'a LayoutSnapshot,
+    pub paint: &'a PaintSnapshot,
+}
+
+pub enum RenderPlan<'a> {
+    Reuse(ReusePlan<'a>),
+    Refresh(RefreshPlan<'a>),
+}
+
+pub struct ReusePlan<'a> {
+    pub cached: RenderSnapshotsRef<'a>,
+    pub dirty_rows: std::collections::HashSet<u16>,
+    pub overlay_fingerprints: Arc<[u64]>,
+}
+
+pub struct RefreshPlan<'a> {
+    pub seed_line_map: Option<&'a LineMap>,
+}
+
+impl View {
+    pub fn layout_inputs(&self, doc: &Document, config_gen: u64) -> ViewLayoutInputs {
+        ViewLayoutInputs {
+            doc_id: self.doc,
+            doc_version: doc.version(),
+            view_position: doc.view_offset(self.id),
+            area: self.area,
+            config_gen,
+            annotation: doc.annotation_snapshot(),
+        }
+    }
+
+    pub fn render_inputs(
+        &self,
+        doc: &Document,
+        config_gen: u64,
+        theme_name: Arc<str>,
+    ) -> RenderInputs {
+        let primary_cursor = doc
+            .selection(self.id)
+            .primary()
+            .cursor(doc.text().slice(..));
+        let cursor_line = doc.text().char_to_line(primary_cursor);
+
+        let layout = self.layout_inputs(doc, config_gen);
+        let paint = ViewPaintInputs {
+            layout: layout.clone(),
+            syntax: doc.syntax_snapshot(),
+            theme_name,
+            cursor_line,
+            gutter: doc.gutter_snapshot(),
+        };
+
+        RenderInputs { layout, paint }
+    }
+}
+
+impl RenderInputs {
+    pub fn plan<'a>(
+        &self,
+        cached: Option<RenderSnapshotsRef<'a>>,
+        selection: &Selection,
+        mode: Mode,
+        is_focused: bool,
+        terminal_focused: bool,
+    ) -> RenderPlan<'a> {
+        match cached {
+            Some(cached) if cached.paint.matches(&self.paint) => {
+                let overlay_fingerprints = cached.layout.line_map.overlay_fingerprints(
+                    selection,
+                    mode,
+                    is_focused,
+                    terminal_focused,
+                );
+                let dirty_rows =
+                    LineMap::dirty_rows(&cached.paint.overlay_fingerprints, &overlay_fingerprints);
+                RenderPlan::Reuse(ReusePlan {
+                    cached,
+                    dirty_rows,
+                    overlay_fingerprints,
+                })
+            }
+            Some(cached) if cached.layout.can_seed(&self.layout) => {
+                RenderPlan::Refresh(RefreshPlan {
+                    seed_line_map: Some(&cached.layout.line_map),
+                })
+            }
+            _ => RenderPlan::Refresh(RefreshPlan {
+                seed_line_map: None,
+            }),
+        }
+    }
+
+    pub fn into_cached_snapshots(
+        self,
+        line_map: LineMap,
+        syntax_styles: SyntaxStyleCache,
+        overlay_fingerprints: Arc<[u64]>,
+    ) -> RenderSnapshots {
+        RenderSnapshots {
+            layout: LayoutSnapshot::new(self.layout, line_map),
+            paint: PaintSnapshot::new(self.paint, syntax_styles, overlay_fingerprints),
+        }
+    }
+
+    pub fn into_snapshots(
+        self,
+        line_map: LineMap,
+        syntax_entries: Vec<SyntaxStyleEntry>,
+        overlay_fingerprints: Arc<[u64]>,
+    ) -> RenderSnapshots {
+        RenderSnapshots {
+            layout: LayoutSnapshot::new(self.layout, line_map),
+            paint: PaintSnapshot::from_entries(self.paint, syntax_entries, overlay_fingerprints),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct LayoutSnapshot {
+    pub inputs: ViewLayoutInputs,
+    pub line_map: LineMap,
+}
+
+impl LayoutSnapshot {
+    pub fn new(inputs: ViewLayoutInputs, line_map: LineMap) -> Self {
+        Self { inputs, line_map }
+    }
+
+    pub fn cursor_position(&self, doc: &Document, view: &View) -> Option<Position> {
+        let text = doc.text().slice(..);
+        let cursor = doc.selection(view.id).primary().cursor(text);
+        let tab_width = doc.tab_width();
+
+        self.line_map.lines.iter().find_map(|line| {
+            if line.visible_char_start == usize::MAX || line.visible_char_last == usize::MAX {
+                return None;
+            }
+            if cursor < line.visible_char_start || cursor > line.char_range_end {
+                return None;
+            }
+            if line.doc_line != text.char_to_line(cursor.min(text.len_chars())) {
+                return None;
+            }
+
+            let delta_chars = cursor.saturating_sub(line.visible_char_start);
+            let delta_col = plain_visual_col_at_char_idx(
+                text.slice(line.visible_char_start..cursor),
+                delta_chars,
+                tab_width,
+            );
+
+            let visual_col = line.visible_col_start + delta_col;
+            if visual_col < doc.view_offset(view.id).horizontal_offset {
+                return None;
+            }
+
+            Some(Position::new(
+                line.visual_row as usize,
+                visual_col - doc.view_offset(view.id).horizontal_offset,
+            ))
+        })
+    }
+
+    pub fn update_cursor_cache(&self, editor: &Editor, doc: &Document, view: &View) {
+        if editor.tree.focus != view.id {
+            return;
+        }
+        editor.cursor_cache.set(self.cursor_position(doc, view));
+    }
+
+    pub fn render_seed(&self, top_doc_line: usize, max_gap: usize) -> Option<RenderSeed> {
+        self.line_map
+            .best_horizontal_checkpoint_within_gap(
+                top_doc_line,
+                self.inputs.view_position.horizontal_offset,
+                max_gap,
+            )
+            .map(|checkpoint| RenderSeed {
+                doc_line: top_doc_line,
+                char_idx: checkpoint.char_idx,
+                visual_col: checkpoint.visual_col,
+            })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PaintSnapshot {
+    pub inputs: ViewPaintInputs,
+    pub syntax_styles: SyntaxStyleCache,
+    pub overlay_fingerprints: Arc<[u64]>,
+}
+
+impl PaintSnapshot {
+    pub fn new(
+        inputs: ViewPaintInputs,
+        syntax_styles: SyntaxStyleCache,
+        overlay_fingerprints: Arc<[u64]>,
+    ) -> Self {
+        Self {
+            inputs,
+            syntax_styles,
+            overlay_fingerprints,
+        }
+    }
+
+    pub fn from_entries(
+        inputs: ViewPaintInputs,
+        syntax_entries: Vec<SyntaxStyleEntry>,
+        overlay_fingerprints: Arc<[u64]>,
+    ) -> Self {
+        Self::new(
+            inputs,
+            SyntaxStyleCache {
+                entries: Arc::from(syntax_entries),
+            },
+            overlay_fingerprints,
+        )
+    }
 }
 
 /// A cached syntax style entry: the char position where the style takes effect,
@@ -124,6 +397,13 @@ impl Default for SyntaxStyleCache {
 /// Used to map visual rows back to document positions for dirty-line detection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HorizontalCheckpoint {
+    pub char_idx: usize,
+    pub visual_col: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RenderSeed {
+    pub doc_line: usize,
     pub char_idx: usize,
     pub visual_col: usize,
 }
@@ -589,9 +869,8 @@ impl View {
             });
         }
 
-        text_annotations.add_line_annotation(Box::new(PluginLineAnnotations::new(
-            doc, self.id, width,
-        )));
+        text_annotations
+            .add_line_annotation(Box::new(PluginLineAnnotations::new(doc, self.id, width)));
 
         if let Some(fold_container) = doc.fold_container(self.id) {
             text_annotations.add_folds(fold_container);
@@ -801,8 +1080,7 @@ where
         let cursor_line = doc_text.char_to_line(cursor);
         let viewport_height = viewport.height as usize;
 
-        let vertical_support =
-            annotations.plain_viewport_support_report(top_line, cursor_line);
+        let vertical_support = annotations.plain_viewport_support_report(top_line, cursor_line);
 
         let cursor_line_start = doc_text.line_to_char(cursor_line);
         let cursor_line_end = helix_core::line_ending::line_end_char_index(&doc_text, cursor_line);
@@ -1180,8 +1458,8 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    fn make_content_state() -> ViewContentState {
-        ViewContentState {
+    fn make_layout_inputs() -> ViewLayoutInputs {
+        ViewLayoutInputs {
             doc_id: crate::DocumentId::default(),
             doc_version: 1,
             view_position: ViewPosition {
@@ -1190,56 +1468,249 @@ mod tests {
                 vertical_offset: 0,
             },
             area: Rect::new(0, 0, 80, 24),
-            theme_name: "default".into(),
             config_gen: 0,
-            annotation_gen: 0,
+            annotation: crate::presentation_state::AnnotationSnapshot::new(
+                crate::Revision::default(),
+            ),
+        }
+    }
+
+    fn make_paint_inputs() -> ViewPaintInputs {
+        ViewPaintInputs {
+            layout: make_layout_inputs(),
+            syntax: crate::syntax_aware::SyntaxSnapshot::new(
+                crate::Revision::default(),
+                crate::syntax_aware::SyntaxStatus::Disabled,
+            ),
+            theme_name: "default".into(),
             cursor_line: 0,
+            gutter: crate::document::GutterSnapshot::new(crate::Revision::default()),
         }
     }
 
     #[test]
-    fn content_state_equality() {
-        let a = make_content_state();
-        let b = make_content_state();
+    fn layout_inputs_equality() {
+        let a = make_layout_inputs();
+        let b = make_layout_inputs();
         assert_eq!(a, b);
     }
 
     #[test]
-    fn content_state_differs_on_doc_version() {
-        let a = make_content_state();
-        let mut b = make_content_state();
+    fn layout_inputs_differ_on_doc_version() {
+        let a = make_layout_inputs();
+        let mut b = make_layout_inputs();
         b.doc_version = 2;
         assert_ne!(a, b);
     }
 
     #[test]
-    fn content_state_differs_on_scroll() {
-        let a = make_content_state();
-        let mut b = make_content_state();
+    fn paint_inputs_differ_on_syntax_snapshot() {
+        let a = make_paint_inputs();
+        let mut b = make_paint_inputs();
+        b.syntax = crate::syntax_aware::SyntaxSnapshot::new(
+            crate::Revision::from(1),
+            crate::syntax_aware::SyntaxStatus::Fresh,
+        );
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn paint_inputs_differ_on_syntax_status() {
+        let mut a = make_paint_inputs();
+        let mut b = make_paint_inputs();
+        a.syntax = crate::syntax_aware::SyntaxSnapshot::new(
+            crate::Revision::from(7),
+            crate::syntax_aware::SyntaxStatus::Fresh,
+        );
+        b.syntax = crate::syntax_aware::SyntaxSnapshot::new(
+            crate::Revision::from(7),
+            crate::syntax_aware::SyntaxStatus::StalePendingRefresh,
+        );
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn layout_inputs_differ_on_scroll() {
+        let a = make_layout_inputs();
+        let mut b = make_layout_inputs();
         b.view_position.anchor = 100;
         assert_ne!(a, b);
     }
 
     #[test]
-    fn content_state_differs_on_theme() {
-        let a = make_content_state();
-        let mut b = make_content_state();
+    fn paint_inputs_differ_on_theme() {
+        let a = make_paint_inputs();
+        let mut b = make_paint_inputs();
         b.theme_name = "gruvbox".into();
         assert_ne!(a, b);
     }
 
     #[test]
-    fn content_state_differs_on_config() {
-        let a = make_content_state();
-        let mut b = make_content_state();
+    fn paint_inputs_differ_on_gutter_shape() {
+        let mut a = make_paint_inputs();
+        let mut b = make_paint_inputs();
+        a.gutter = crate::document::GutterSnapshot::with_state(crate::Revision::from(5), 0, false);
+        b.gutter = crate::document::GutterSnapshot::with_state(crate::Revision::from(5), 2, false);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn render_plan_reuses_matching_paint_inputs() {
+        let inputs = RenderInputs {
+            layout: make_layout_inputs(),
+            paint: make_paint_inputs(),
+        };
+        let line_map = LineMap {
+            lines: Arc::from([
+                VisualLineInfo {
+                    visual_row: 0,
+                    doc_line: 0,
+                    char_range_start: 0,
+                    char_range_end: 10,
+                    visible_char_start: 0,
+                    visible_col_start: 0,
+                    visible_char_last: 9,
+                    visible_col_last: 9,
+                    horizontal_checkpoints: Vec::new(),
+                },
+                VisualLineInfo {
+                    visual_row: 1,
+                    doc_line: 1,
+                    char_range_start: 10,
+                    char_range_end: 20,
+                    visible_char_start: 10,
+                    visible_col_start: 0,
+                    visible_char_last: 19,
+                    visible_col_last: 9,
+                    horizontal_checkpoints: Vec::new(),
+                },
+            ]),
+        };
+        let selection = Selection::point(0);
+        let overlay_fingerprints =
+            line_map.overlay_fingerprints(&selection, Mode::Normal, true, true);
+        let cached = RenderSnapshots {
+            layout: LayoutSnapshot::new(inputs.layout.clone(), line_map),
+            paint: PaintSnapshot::new(
+                inputs.paint.clone(),
+                SyntaxStyleCache::default(),
+                overlay_fingerprints.clone(),
+            ),
+        };
+
+        match inputs.plan(Some(cached.as_ref()), &selection, Mode::Normal, true, true) {
+            RenderPlan::Reuse(plan) => {
+                assert!(std::ptr::eq(plan.cached.layout, &cached.layout));
+                assert!(std::ptr::eq(plan.cached.paint, &cached.paint));
+                assert!(plan.dirty_rows.is_empty());
+                assert_eq!(
+                    plan.overlay_fingerprints.as_ref(),
+                    overlay_fingerprints.as_ref()
+                );
+            }
+            RenderPlan::Refresh(_) => panic!("expected render reuse"),
+        }
+    }
+
+    #[test]
+    fn render_plan_refreshes_with_seed_when_paint_changes() {
+        let inputs = RenderInputs {
+            layout: make_layout_inputs(),
+            paint: make_paint_inputs(),
+        };
+        let mut cached_paint = inputs.paint.clone();
+        cached_paint.theme_name = "gruvbox".into();
+        let line_map = LineMap {
+            lines: Arc::from([VisualLineInfo {
+                visual_row: 0,
+                doc_line: 0,
+                char_range_start: 0,
+                char_range_end: 10,
+                visible_char_start: 0,
+                visible_col_start: 0,
+                visible_char_last: 9,
+                visible_col_last: 9,
+                horizontal_checkpoints: Vec::new(),
+            }]),
+        };
+        let cached = RenderSnapshots {
+            layout: LayoutSnapshot::new(inputs.layout.clone(), line_map.clone()),
+            paint: PaintSnapshot::new(cached_paint, SyntaxStyleCache::default(), Arc::from([33])),
+        };
+        let selection = Selection::point(0);
+
+        match inputs.plan(Some(cached.as_ref()), &selection, Mode::Normal, true, true) {
+            RenderPlan::Refresh(plan) => {
+                let seed = plan.seed_line_map.expect("expected cached seed line map");
+                assert!(std::ptr::eq(seed, &cached.layout.line_map));
+                assert_eq!(seed.lines.len(), line_map.lines.len());
+            }
+            RenderPlan::Reuse(_) => panic!("expected render refresh"),
+        }
+    }
+
+    #[test]
+    fn render_plan_refreshes_without_seed_when_layout_changes() {
+        let inputs = RenderInputs {
+            layout: make_layout_inputs(),
+            paint: make_paint_inputs(),
+        };
+        let mut cached_layout = inputs.layout.clone();
+        cached_layout.area.width += 1;
+        let cached = RenderSnapshots {
+            layout: LayoutSnapshot::new(cached_layout.clone(), LineMap::default()),
+            paint: PaintSnapshot::new(
+                ViewPaintInputs {
+                    layout: cached_layout,
+                    ..inputs.paint.clone()
+                },
+                SyntaxStyleCache::default(),
+                Arc::from([]),
+            ),
+        };
+        let selection = Selection::point(0);
+
+        match inputs.plan(Some(cached.as_ref()), &selection, Mode::Normal, true, true) {
+            RenderPlan::Refresh(plan) => assert!(plan.seed_line_map.is_none()),
+            RenderPlan::Reuse(_) => panic!("expected render refresh"),
+        }
+    }
+
+    #[test]
+    fn layout_inputs_differ_on_config() {
+        let a = make_layout_inputs();
+        let mut b = make_layout_inputs();
         b.config_gen = 1;
         assert_ne!(a, b);
     }
 
     #[test]
-    fn content_state_differs_on_area() {
-        let a = make_content_state();
-        let mut b = make_content_state();
+    fn layout_inputs_differ_on_annotation_shape() {
+        let mut a = make_layout_inputs();
+        let mut b = make_layout_inputs();
+        a.annotation = crate::presentation_state::AnnotationSnapshot::with_state(
+            crate::Revision::from(3),
+            false,
+            1,
+            0,
+            0,
+            0,
+        );
+        b.annotation = crate::presentation_state::AnnotationSnapshot::with_state(
+            crate::Revision::from(3),
+            true,
+            1,
+            0,
+            0,
+            0,
+        );
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn layout_inputs_differ_on_area() {
+        let a = make_layout_inputs();
+        let mut b = make_layout_inputs();
         b.area = Rect::new(0, 0, 120, 40);
         assert_ne!(a, b);
     }

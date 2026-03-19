@@ -360,16 +360,21 @@ pub(super) fn register_hooks(handlers: &Handlers) {
             send_blocking(&tx, SignatureHelpEvent::ReTrigger);
         }
         let hook_dur = hook_start.elapsed();
-        log_command_phase("document_did_change_hook", "signature_help", hook_dur, || {
-            format!(
-                "doc_id={:?} ghost={} auto_signature_help={} lines={} bytes={}",
-                event.doc.id(),
-                event.ghost_transaction,
-                event.doc.config.load().lsp.auto_signature_help,
-                event.doc.text().len_lines(),
-                event.doc.text().len_bytes()
-            )
-        });
+        log_command_phase(
+            "document_did_change_hook",
+            "signature_help",
+            hook_dur,
+            || {
+                format!(
+                    "doc_id={:?} ghost={} auto_signature_help={} lines={} bytes={}",
+                    event.doc.id(),
+                    event.ghost_transaction,
+                    event.doc.config.load().lsp.auto_signature_help,
+                    event.doc.text().len_lines(),
+                    event.doc.text().len_bytes()
+                )
+            },
+        );
         Ok(())
     });
 

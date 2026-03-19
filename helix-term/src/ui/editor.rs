@@ -7,9 +7,7 @@ use crate::{
     keymap::Keymaps,
     render::{CacheStore, PreparedRender},
     ui::{
-        document::{
-            render_document, HighlighterInput, LinePos, RenderOutput, RenderSeed, TextRenderer,
-        },
+        document::{render_document, HighlighterInput, LinePos, RenderOutput, TextRenderer},
         statusline,
         text_decorations::{
             self, Decoration, DecorationManager, FoldDecoration, InlineDiagnostics,
@@ -20,20 +18,14 @@ use crate::{
 };
 
 use helix_core::{
-    diagnostic::NumberOrString,
-    graphemes::{next_grapheme_boundary, prev_grapheme_boundary},
-    movement::Direction,
-    syntax::{self, OverlayHighlights},
-    text_annotations::TextAnnotations,
-    text_folding::RopeSliceFoldExt,
-    unicode::width::UnicodeWidthStr,
-    plain_visual_col_at_char_idx, visual_offset_from_block, Position, Range, Selection,
+    diagnostic::NumberOrString, movement::Direction, text_annotations::TextAnnotations,
+    unicode::width::UnicodeWidthStr, visual_offset_from_block, Position, Range, Selection,
 };
 use helix_loader::VERSION_AND_GIT_HASH;
 use helix_view::{
     // annotations::diagnostics::DiagnosticFilter,
-    document::{Mode, SCRATCH_BUFFER_NAME},
-    editor::{CompleteAction, CursorShapeConfig, InlineBlameConfig, InlineBlameShow},
+    document::Mode,
+    editor::{CompleteAction, InlineBlameConfig, InlineBlameShow},
     graphics::{Color, CursorKind, Modifier, Rect, Style},
     icons::ICONS,
     input::{KeyEvent, MouseButton, MouseEvent, MouseEventKind},
@@ -48,8 +40,6 @@ use helix_view::{
 use std::{
     collections::HashMap,
     mem::take,
-    ops,
-    path::{PathBuf, MAIN_SEPARATOR, MAIN_SEPARATOR_STR},
     rc::Rc,
     sync::{Arc, LazyLock},
 };
@@ -63,7 +53,7 @@ use super::text_decorations::blame::InlineBlame;
 
 use helix_view::engine::{KeymapQuery, ModalInputState};
 use helix_view::model::FocusTarget;
-use helix_view::view::{LineMap, SyntaxStyleCache, ViewContentState};
+use helix_view::view::{LayoutSnapshot, LineMap, RenderPlan, RenderSnapshots, SyntaxStyleCache};
 
 const MAX_SEED_LINE_MAP_GAP: usize = 4_096;
 
@@ -82,94 +72,10 @@ pub(crate) struct ViewRenderContext<'a> {
     pub seed_line_map: Option<&'a LineMap>,
 }
 
-fn choose_render_seed(
-    line_map: Option<&LineMap>,
-    top_doc_line: usize,
-    horizontal_offset: usize,
-) -> Option<RenderSeed> {
-    line_map.and_then(|line_map| {
-        line_map.best_horizontal_checkpoint_within_gap(
-            top_doc_line,
-            horizontal_offset,
-            MAX_SEED_LINE_MAP_GAP,
-        )
-    })
-        .map(|checkpoint| RenderSeed {
-            doc_line: top_doc_line,
-            char_idx: checkpoint.char_idx,
-            visual_col: checkpoint.visual_col,
-        })
-}
-
-fn can_reuse_seed_line_map(
-    previous: &ViewContentState,
-    current: &ViewContentState,
-) -> bool {
-    previous.doc_id == current.doc_id
-        && previous.doc_version == current.doc_version
-        && previous.annotation_gen == current.annotation_gen
-        && previous.config_gen == current.config_gen
-        && previous.theme_name == current.theme_name
-        && previous.area.width == current.area.width
-}
-
-fn cursor_position_from_line_map(doc: &Document, view: &View, line_map: &LineMap) -> Option<Position> {
-    let text = doc.text().slice(..);
-    let cursor = doc.selection(view.id).primary().cursor(text);
-    let tab_width = doc.tab_width();
-
-    line_map.lines.iter().find_map(|line| {
-        if line.visible_char_start == usize::MAX || line.visible_char_last == usize::MAX {
-            return None;
-        }
-        if cursor < line.visible_char_start || cursor > line.char_range_end {
-            return None;
-        }
-        if line.doc_line != text.char_to_line(cursor.min(text.len_chars())) {
-            return None;
-        }
-
-        let delta_chars = cursor.saturating_sub(line.visible_char_start);
-        let delta_col = plain_visual_col_at_char_idx(
-            text.slice(line.visible_char_start..cursor),
-            delta_chars,
-            tab_width,
-        );
-
-        let visual_col = line.visible_col_start + delta_col;
-        if visual_col < doc.view_offset(view.id).horizontal_offset {
-            return None;
-        }
-
-        Some(Position::new(
-            line.visual_row as usize,
-            visual_col - doc.view_offset(view.id).horizontal_offset,
-        ))
-    })
-}
-
-fn update_cursor_cache_from_line_map(editor: &Editor, doc: &Document, view: &View, line_map: &LineMap) {
-    if editor.tree.focus != view.id {
-        return;
-    }
-    editor
-        .cursor_cache
-        .set(cursor_position_from_line_map(doc, view, line_map));
-}
-
-/// Cached rendered cells for a single view.
 struct ViewRenderCacheEntry {
-    /// Content-level state (doc version, scroll, area, theme, config).
-    /// When this matches, syntax styles and line map can be reused.
-    content_state: ViewContentState,
+    snapshots: RenderSnapshots,
     /// The rendered cells for the view's area.
     cells: tui::buffer::Buffer,
-    /// Cached syntax styles — reusable when content state is unchanged.
-    syntax_styles: SyntaxStyleCache,
-    /// Visual-line → document position mapping, built during rendering.
-    line_map: LineMap,
-    /// Per-line overlay fingerprints for dirty-line detection.
-    overlay_fingerprints: Arc<[u64]>,
 }
 
 /// Per-view render cache with two-tier invalidation:
@@ -192,7 +98,6 @@ struct ViewRenderCache {
     #[cfg(debug_assertions)]
     frames: u64,
 }
-
 
 pub struct EditorView {
     pub keymaps: Keymaps,
@@ -324,7 +229,7 @@ impl EditorView {
         &mut self.spinners
     }
 
-    pub fn render_welcome(theme: &Theme, view: &View, surface: &mut Surface, is_colorful: bool) {
+    pub fn draw_welcome(theme: &Theme, view: &View, surface: &mut Surface, is_colorful: bool) {
         /// Logo for Helix
         const LOGO_STR: &str = "\
 **             
@@ -619,14 +524,14 @@ impl EditorView {
         }
 
         if is_focused && config.cursorline {
-            decorations.add_decoration(Self::cursorline(doc, view, theme));
+            decorations.add_decoration(Self::cursor_line_decoration(doc, view, theme));
         }
 
         decorations.add_decoration(FoldDecoration::new(&text_annotations, theme));
 
         if is_focused && config.cursorcolumn {
             let cursorcolumn_start = std::time::Instant::now();
-            Self::highlight_cursorcolumn(doc, view, surface, theme, inner, &text_annotations);
+            Self::draw_cursor_column(doc, view, surface, theme, inner, &text_annotations);
             helix_view::bench::log_run_phase(
                 "render_view",
                 "cursorcolumn",
@@ -652,16 +557,12 @@ impl EditorView {
         let highlighter_start = std::time::Instant::now();
         let highlighter_input = match cached_syntax {
             Some(cache) => HighlighterInput::Cached(&cache.entries),
-            None => {
-                let syntax_highlighter = Self::doc_syntax_highlighter(
-                    doc,
-                    &text_annotations,
-                    view_offset.anchor,
-                    inner.height,
-                    &loader,
-                );
-                HighlighterInput::Live(syntax_highlighter)
-            }
+            None => HighlighterInput::Live(doc.viewport_syntax_highlighter(
+                &loader,
+                &text_annotations,
+                view_offset.anchor,
+                inner.height,
+            )),
         };
         helix_view::bench::log_run_phase(
             "render_view",
@@ -672,11 +573,10 @@ impl EditorView {
         let mut overlays = Vec::new();
 
         let overlays_start = std::time::Instant::now();
-        overlays.push(Self::overlay_syntax_highlights(
-            doc,
+        overlays.push(doc.viewport_overlay_highlights(
+            &text_annotations,
             view_offset.anchor,
             inner.height,
-            &text_annotations,
         ));
 
         if doc
@@ -684,8 +584,7 @@ impl EditorView {
             .and_then(|config| config.rainbow_brackets)
             .unwrap_or(config.rainbow_brackets)
         {
-            if let Some(overlay) = Self::doc_rainbow_highlights(
-                doc,
+            if let Some(overlay) = doc.viewport_rainbow_highlights(
                 &text_annotations,
                 view_offset.anchor,
                 inner.height,
@@ -696,27 +595,23 @@ impl EditorView {
             }
         }
 
-        let viewport_range = Self::viewport_byte_range(
-            doc.text().slice(..),
-            &text_annotations,
-            view_offset.anchor,
-            inner.height,
-        );
-        Self::doc_diagnostics_highlights_into(doc, theme, &mut overlays, Some(viewport_range));
+        let viewport_range =
+            doc.viewport_byte_range(&text_annotations, view_offset.anchor, inner.height);
+        overlays.extend(doc.diagnostic_highlights(theme, Some(viewport_range)));
 
         if is_focused {
-            if let Some(tabstops) = Self::tabstop_highlights(doc, theme) {
+            if let Some(tabstops) = doc.tabstop_highlights(theme) {
                 overlays.push(tabstops);
             }
-            overlays.push(self.doc_selection_highlights(
+            overlays.push(doc.selection_highlights(
+                view.id,
                 editor.mode(),
-                doc,
-                view,
                 theme,
                 &config.cursor_shape,
                 self.terminal_focused,
+                self.prompt_active,
             ));
-            if let Some(overlay) = Self::highlight_focused_view_elements(view, doc, theme) {
+            if let Some(overlay) = doc.matching_bracket_highlights(view.id, theme) {
                 overlays.push(overlay);
             }
         }
@@ -748,7 +643,7 @@ impl EditorView {
         }
 
         let inline_blame_start = std::time::Instant::now();
-        Self::render_inline_blame(&config.inline_blame, doc, view, &mut decorations, theme);
+        Self::add_inline_blame(&config.inline_blame, doc, view, &mut decorations, theme);
         helix_view::bench::log_run_phase(
             "render_view",
             "inline_blame",
@@ -757,7 +652,7 @@ impl EditorView {
         );
 
         if config.welcome_screen && doc.version() == 0 && doc.is_welcome() {
-            Self::render_welcome(
+            Self::draw_welcome(
                 theme,
                 view,
                 surface,
@@ -794,8 +689,10 @@ impl EditorView {
         let top_doc_line = doc
             .text()
             .char_to_line(view_offset.anchor.min(doc.text().len_chars()));
-        let render_seed =
-            choose_render_seed(*seed_line_map, top_doc_line, view_offset.horizontal_offset);
+        let render_seed = seed_line_map.and_then(|line_map| {
+            LayoutSnapshot::new(view.layout_inputs(doc, editor.config_gen), line_map.clone())
+                .render_seed(top_doc_line, MAX_SEED_LINE_MAP_GAP)
+        });
         let render_document_start = std::time::Instant::now();
         let render_output = render_document(
             surface,
@@ -820,13 +717,10 @@ impl EditorView {
 
         // Draw rulers after document. Skip cells that already have content.
         let rulers_start = std::time::Instant::now();
-        Self::render_rulers(editor, doc, view, inner, surface, theme);
-        helix_view::bench::log_run_phase(
-            "render_view",
-            "rulers",
-            rulers_start.elapsed(),
-            || format!("view_id={:?}", view.id),
-        );
+        Self::draw_rulers(editor, doc, view, inner, surface, theme);
+        helix_view::bench::log_run_phase("render_view", "rulers", rulers_start.elapsed(), || {
+            format!("view_id={:?}", view.id)
+        });
 
         // if we're not at the edge of the screen, draw a right border
         if viewport.right() != view.area.right() {
@@ -850,7 +744,7 @@ impl EditorView {
         // if config.inline_diagnostics.disabled()
         //     && config.end_of_line_diagnostics == DiagnosticFilter::Disable
         // {
-        //     Self::render_diagnostics(doc, view, inner, surface, theme);
+        //     Self::draw_diagnostics(doc, view, inner, surface, theme);
         // }
 
         helix_view::bench::log_run_phase(
@@ -863,7 +757,7 @@ impl EditorView {
         render_output
     }
 
-    fn render_inline_blame(
+    fn add_inline_blame(
         inline_blame: &InlineBlameConfig,
         doc: &Document,
         view: &View,
@@ -875,38 +769,17 @@ impl EditorView {
         match inline_blame.show {
             InlineBlameShow::Never => (),
             InlineBlameShow::CursorLine => {
-                let cursor_line_idx = doc.cursor_line(view.id);
-
-                // do not render inline blame for empty lines to reduce visual noise
-                if text.line(cursor_line_idx) != doc.line_ending().as_str() {
-                    if let Ok(line_blame) =
-                        doc.line_blame(cursor_line_idx as u32, &inline_blame.format)
-                    {
-                        decorations.add_decoration(InlineBlame::new(
-                            theme.get(INLINE_BLAME_SCOPE),
-                            text_decorations::blame::LineBlame::OneLine((
-                                cursor_line_idx,
-                                line_blame,
-                            )),
-                        ));
-                    };
+                if let Some(line_blame) = doc.line_blame_at_cursor(view.id, &inline_blame.format) {
+                    decorations.add_decoration(InlineBlame::new(
+                        theme.get(INLINE_BLAME_SCOPE),
+                        text_decorations::blame::LineBlame::OneLine(line_blame),
+                    ));
                 }
             }
             InlineBlameShow::AllLines => {
                 let mut blame_lines = vec![None; text.len_lines()];
 
-                let blame_for_all_lines = view.line_range(doc).filter_map(|line_idx| {
-                    // do not render inline blame for empty lines to reduce visual noise
-                    if text.line(line_idx) != doc.line_ending().as_str() {
-                        doc.line_blame(line_idx as u32, &inline_blame.format)
-                            .ok()
-                            .map(|blame| (line_idx, blame))
-                    } else {
-                        None
-                    }
-                });
-
-                for (line_idx, blame) in blame_for_all_lines {
+                for (line_idx, blame) in doc.line_blames(view, &inline_blame.format) {
                     blame_lines[line_idx] = Some(blame);
                 }
 
@@ -918,7 +791,7 @@ impl EditorView {
         }
     }
 
-    pub fn render_rulers(
+    pub fn draw_rulers(
         editor: &Editor,
         doc: &Document,
         view: &View,
@@ -942,19 +815,8 @@ impl EditorView {
             base_style
         };
 
-        let rulers = doc
-            .language_config()
-            .and_then(|config| config.rulers.as_ref())
-            .unwrap_or(editor_rulers);
-
-        let view_offset = doc.view_offset(view.id);
-
-        rulers
-            .iter()
-            // View might be horizontally scrolled, convert from absolute distance
-            // from the 1st column to relative distance from left of viewport
-            .filter_map(|ruler| ruler.checked_sub(1 + view_offset.horizontal_offset as u16))
-            .filter(|ruler| ruler < &viewport.width)
+        doc.ruler_columns(view, editor_rulers)
+            .into_iter()
             .map(|ruler| viewport.clip_left(ruler).with_width(1))
             .for_each(|area| {
                 if ruler_char.is_empty() {
@@ -986,350 +848,8 @@ impl EditorView {
             })
     }
 
-    fn viewport_byte_range(
-        text: helix_core::RopeSlice,
-        annotations: &TextAnnotations,
-        row: usize,
-        height: u16,
-    ) -> std::ops::Range<usize> {
-        // Calculate viewport byte ranges:
-        // Saturating subs to make it inclusive zero indexing.
-        let last_line = text.len_lines().saturating_sub(1);
-        let row = row.min(last_line);
-        let last_visible_line = text
-            .nth_next_folded_line(&annotations.folds, row, (height as usize).saturating_sub(1))
-            .min(last_line);
-        let start = text.line_to_byte(row);
-        let end = text.line_to_byte(last_visible_line + 1);
-
-        start..end
-    }
-
-    /// Get the syntax highlighter for a document in a view represented by the first line
-    /// and column (`offset`) and the last line. This is done instead of using a view
-    /// directly to enable rendering syntax highlighted docs anywhere (eg. picker preview)
-    pub fn doc_syntax_highlighter<'editor>(
-        doc: &'editor Document,
-        annotations: &TextAnnotations,
-        anchor: usize,
-        height: u16,
-        loader: &'editor syntax::Loader,
-    ) -> Option<syntax::Highlighter<'editor>> {
-        let syntax = doc.syntax()?;
-        let text = doc.text().slice(..);
-        let row = text.char_to_line(anchor.min(text.len_chars()));
-        let range = Self::viewport_byte_range(text, annotations, row, height);
-        let range = range.start as u32..range.end as u32;
-
-        let highlighter = syntax.highlighter(text, loader, range);
-        Some(highlighter)
-    }
-
-    pub fn overlay_syntax_highlights(
-        doc: &Document,
-        anchor: usize,
-        height: u16,
-        text_annotations: &TextAnnotations,
-    ) -> OverlayHighlights {
-        let text = doc.text().slice(..);
-        let row = text.char_to_line(anchor.min(text.len_chars()));
-
-        let mut range = Self::viewport_byte_range(text, text_annotations, row, height);
-        range = text.byte_to_char(range.start)..text.byte_to_char(range.end);
-
-        text_annotations.collect_overlay_highlights(range)
-    }
-
-    pub fn doc_rainbow_highlights(
-        doc: &Document,
-        annotations: &TextAnnotations,
-        anchor: usize,
-        height: u16,
-        theme: &Theme,
-        loader: &syntax::Loader,
-    ) -> Option<OverlayHighlights> {
-        let syntax = doc.syntax()?;
-        let text = doc.text().slice(..);
-        let row = text.char_to_line(anchor.min(text.len_chars()));
-        let visible_range = Self::viewport_byte_range(text, annotations, row, height);
-        let start = syntax::child_for_byte_range(
-            &syntax.tree().root_node(),
-            visible_range.start as u32..visible_range.end as u32,
-        )
-        .map_or(visible_range.start as u32, |node| node.start_byte());
-        let range = start..visible_range.end as u32;
-
-        Some(syntax.rainbow_highlights(text, theme.rainbow_length(), loader, range))
-    }
-
-    /// Get highlight spans for document diagnostics.
-    /// If `viewport` is provided, only diagnostics overlapping that byte range are processed.
-    pub fn doc_diagnostics_highlights_into(
-        doc: &Document,
-        theme: &Theme,
-        overlay_highlights: &mut Vec<OverlayHighlights>,
-        viewport: Option<std::ops::Range<usize>>,
-    ) {
-        use helix_core::diagnostic::{DiagnosticTag, Range, Severity};
-        let get_scope_of = |scope| {
-            theme
-                .find_highlight_exact(scope)
-                // get one of the themes below as fallback values
-                .or_else(|| theme.find_highlight_exact("diagnostic"))
-                .or_else(|| theme.find_highlight_exact("ui.cursor"))
-                .or_else(|| theme.find_highlight_exact("ui.selection"))
-                .expect(
-                    "at least one of the following scopes must be defined in the theme: `diagnostic`, `ui.cursor`, or `ui.selection`",
-                )
-        };
-
-        // Diagnostic tags
-        let unnecessary = theme.find_highlight_exact("diagnostic.unnecessary");
-        let deprecated = theme.find_highlight_exact("diagnostic.deprecated");
-
-        let mut default_vec = Vec::new();
-        let mut info_vec = Vec::new();
-        let mut hint_vec = Vec::new();
-        let mut warning_vec = Vec::new();
-        let mut error_vec = Vec::new();
-        let mut unnecessary_vec = Vec::new();
-        let mut deprecated_vec = Vec::new();
-
-        let push_diagnostic = |vec: &mut Vec<ops::Range<usize>>, range: Range| {
-            // If any diagnostic overlaps ranges with the prior diagnostic,
-            // merge the two together. Otherwise push a new span.
-            match vec.last_mut() {
-                Some(existing_range) if range.start <= existing_range.end => {
-                    // This branch merges overlapping diagnostics, assuming that the current
-                    // diagnostic starts on range.start or later. If this assertion fails,
-                    // we will discard some part of `diagnostic`. This implies that
-                    // `doc.diagnostics()` is not sorted by `diagnostic.range`.
-                    debug_assert!(existing_range.start <= range.start);
-                    existing_range.end = range.end.max(existing_range.end)
-                }
-                _ => vec.push(range.start..range.end),
-            }
-        };
-
-        let diagnostics = doc.diagnostics();
-
-        // Cull diagnostics outside the viewport using binary search.
-        // Diagnostics are sorted by range.start, so we can efficiently skip.
-        let (diag_start, diag_end) = if let Some(ref vp) = viewport {
-            let start = diagnostics.partition_point(|d| d.range.end < vp.start);
-            let end = diagnostics.partition_point(|d| d.range.start <= vp.end);
-            (start, end)
-        } else {
-            (0, diagnostics.len())
-        };
-
-        for diagnostic in &diagnostics[diag_start..diag_end] {
-            // Separate diagnostics into different Vecs by severity.
-            let vec = match diagnostic.severity {
-                Some(Severity::Info) => &mut info_vec,
-                Some(Severity::Hint) => &mut hint_vec,
-                Some(Severity::Warning) => &mut warning_vec,
-                Some(Severity::Error) => &mut error_vec,
-                _ => &mut default_vec,
-            };
-
-            // If the diagnostic has tags and a non-warning/error severity, skip rendering
-            // the diagnostic as info/hint/default and only render it as unnecessary/deprecated
-            // instead. For warning/error diagnostics, render both the severity highlight and
-            // the tag highlight.
-            if diagnostic.tags.is_empty()
-                || matches!(
-                    diagnostic.severity,
-                    Some(Severity::Warning | Severity::Error)
-                )
-            {
-                push_diagnostic(vec, diagnostic.range);
-            }
-
-            for tag in &diagnostic.tags {
-                match tag {
-                    DiagnosticTag::Unnecessary => {
-                        if unnecessary.is_some() {
-                            push_diagnostic(&mut unnecessary_vec, diagnostic.range)
-                        }
-                    }
-                    DiagnosticTag::Deprecated => {
-                        if deprecated.is_some() {
-                            push_diagnostic(&mut deprecated_vec, diagnostic.range)
-                        }
-                    }
-                }
-            }
-        }
-
-        overlay_highlights.push(OverlayHighlights::Homogeneous {
-            highlight: get_scope_of("diagnostic"),
-            ranges: default_vec,
-        });
-        if let Some(highlight) = unnecessary {
-            overlay_highlights.push(OverlayHighlights::Homogeneous {
-                highlight,
-                ranges: unnecessary_vec,
-            });
-        }
-        if let Some(highlight) = deprecated {
-            overlay_highlights.push(OverlayHighlights::Homogeneous {
-                highlight,
-                ranges: deprecated_vec,
-            });
-        }
-        overlay_highlights.extend([
-            OverlayHighlights::Homogeneous {
-                highlight: get_scope_of("diagnostic.info"),
-                ranges: info_vec,
-            },
-            OverlayHighlights::Homogeneous {
-                highlight: get_scope_of("diagnostic.hint"),
-                ranges: hint_vec,
-            },
-            OverlayHighlights::Homogeneous {
-                highlight: get_scope_of("diagnostic.warning"),
-                ranges: warning_vec,
-            },
-            OverlayHighlights::Homogeneous {
-                highlight: get_scope_of("diagnostic.error"),
-                ranges: error_vec,
-            },
-        ]);
-    }
-
-    /// Get highlight spans for selections in a document view.
-    fn doc_selection_highlights(
-        &self,
-        mode: Mode,
-        doc: &Document,
-        view: &View,
-        theme: &Theme,
-        cursor_shape_config: &CursorShapeConfig,
-        is_terminal_focused: bool,
-    ) -> OverlayHighlights {
-        let text = doc.text().slice(..);
-        let selection = doc.selection(view.id);
-        let primary_idx = selection.primary_index();
-
-        let cursorkind = cursor_shape_config.from_mode(mode);
-        let cursor_is_block = cursorkind == CursorKind::Block;
-
-        let selection_scope = theme
-            .find_highlight_exact("ui.selection")
-            .expect("could not find `ui.selection` scope in the theme!");
-        let primary_selection_scope = theme
-            .find_highlight_exact("ui.selection.primary")
-            .unwrap_or(selection_scope);
-
-        let base_cursor_scope = theme
-            .find_highlight_exact("ui.cursor")
-            .unwrap_or(selection_scope);
-        let base_primary_cursor_scope = theme
-            .find_highlight("ui.cursor.primary")
-            .unwrap_or(base_cursor_scope);
-
-        let cursor_scope = match mode {
-            Mode::Insert => theme.find_highlight_exact("ui.cursor.insert"),
-            Mode::Select => theme.find_highlight_exact("ui.cursor.select"),
-            Mode::Normal => theme.find_highlight_exact("ui.cursor.normal"),
-        }
-        .unwrap_or(base_cursor_scope);
-
-        let primary_cursor_scope = match mode {
-            Mode::Insert => theme.find_highlight_exact("ui.cursor.primary.insert"),
-            Mode::Select => theme.find_highlight_exact("ui.cursor.primary.select"),
-            Mode::Normal => theme.find_highlight_exact("ui.cursor.primary.normal"),
-        }
-        .unwrap_or(base_primary_cursor_scope);
-
-        let mut spans = Vec::new();
-        for (i, range) in selection.iter().enumerate() {
-            let selection_is_primary = i == primary_idx;
-            let (cursor_scope, selection_scope) = if selection_is_primary {
-                (primary_cursor_scope, primary_selection_scope)
-            } else {
-                (cursor_scope, selection_scope)
-            };
-
-            // Special-case: cursor at end of the rope.
-            if range.head == range.anchor && range.head == text.len_chars() {
-                if !selection_is_primary || !is_terminal_focused || self.prompt_active {
-                    // Primary cursor is drawn by the terminal when focused and no prompt is active
-                    // Secondary cursors, unfocused primary cursor, and editor cursor when prompt is active are drawn manually
-                    spans.push((cursor_scope, range.head..range.head + 1));
-                }
-                continue;
-            }
-
-            let range = range.min_width_1(text);
-            if range.head > range.anchor {
-                // Standard case.
-                let cursor_start = prev_grapheme_boundary(text, range.head);
-                // non block cursors look like they exclude the cursor
-                let selection_end =
-                    if selection_is_primary && !cursor_is_block && mode != Mode::Insert {
-                        range.head
-                    } else {
-                        cursor_start
-                    };
-                spans.push((selection_scope, range.anchor..selection_end));
-                // add cursors
-                // skip primary cursor if terminal is focused and no prompt is active - terminal cursor is used in that case
-                if !selection_is_primary || !is_terminal_focused || self.prompt_active {
-                    spans.push((cursor_scope, cursor_start..range.head));
-                }
-            } else {
-                // Reverse case.
-                let cursor_end = next_grapheme_boundary(text, range.head);
-                // add cursors
-                // skip primary cursor if terminal is focused and no prompt is active - terminal cursor is used in that case
-                if !selection_is_primary || !is_terminal_focused || self.prompt_active {
-                    spans.push((cursor_scope, range.head..cursor_end));
-                }
-                // non block cursors look like they exclude the cursor
-                let selection_start = if selection_is_primary
-                    && !cursor_is_block
-                    && !(mode == Mode::Insert && cursor_end == range.anchor)
-                {
-                    range.head
-                } else {
-                    cursor_end
-                };
-                spans.push((selection_scope, selection_start..range.anchor));
-            }
-        }
-
-        OverlayHighlights::Heterogenous { highlights: spans }
-    }
-
-    /// Render brace match, etc (meant for the focused view only)
-    pub fn highlight_focused_view_elements(
-        view: &View,
-        doc: &Document,
-        theme: &Theme,
-    ) -> Option<OverlayHighlights> {
-        // Highlight matching braces
-        let syntax = doc.syntax()?;
-        let highlight = theme.find_highlight_exact("ui.cursor.match")?;
-        let text = doc.text().slice(..);
-        let pos = doc.selection(view.id).primary().cursor(text);
-        let pos = helix_core::match_brackets::find_matching_bracket(syntax, text, pos)?;
-        Some(OverlayHighlights::single(highlight, pos..pos + 1))
-    }
-
-    pub fn tabstop_highlights(doc: &Document, theme: &Theme) -> Option<OverlayHighlights> {
-        let snippet = doc.active_snippet()?;
-        let highlight = theme.find_highlight_exact("tabstop")?;
-        let mut ranges = Vec::new();
-        for tabstop in snippet.tabstops() {
-            ranges.extend(tabstop.ranges.iter().map(|range| range.start..range.end));
-        }
-        Some(OverlayHighlights::Homogeneous { highlight, ranges })
-    }
-
     /// Render bufferline at the top
-    pub fn render_bufferline(&mut self, editor: &Editor, viewport: Rect, surface: &mut Surface) {
+    pub fn draw_bufferline(&mut self, editor: &Editor, viewport: Rect, surface: &mut Surface) {
         self.bufferline_positions.clear();
         surface.clear_with(
             viewport,
@@ -1359,7 +879,7 @@ impl EditorView {
         let mut buffer_widths = Vec::new();
 
         for (idx, doc) in editor.documents().enumerate() {
-            let fname = Self::make_document_name(doc, editor);
+            let fname = editor.buffer_label(doc);
 
             // Add separator width if not the first document
             if idx > 0 {
@@ -1475,63 +995,6 @@ impl EditorView {
         }
     }
 
-    fn make_document_name(doc: &Document, editor: &Editor) -> String {
-        let scratch = PathBuf::from(SCRATCH_BUFFER_NAME); // default filename to use for scratch buffer
-
-        let paths: Vec<String> = editor
-            .documents()
-            .map(|d| {
-                d.path()
-                    .unwrap_or(&scratch)
-                    .to_str()
-                    .unwrap_or_default()
-                    .to_string()
-            })
-            .collect();
-
-        let components: Vec<Vec<String>> = paths
-            .iter()
-            .map(|p| p.split(MAIN_SEPARATOR).map(String::from).collect())
-            .collect();
-
-        let doc_path = doc
-            .path()
-            .unwrap_or(&scratch)
-            .to_str()
-            .unwrap_or_default()
-            .to_string();
-
-        let doc_index = paths.iter().position(|p| p == &doc_path).unwrap();
-        let doc_components_len = components[doc_index].len();
-
-        let mut k = 1;
-
-        loop {
-            let start = doc_components_len.saturating_sub(k);
-            let curr_doc: Vec<&str> = components[doc_index][start..]
-                .iter()
-                .map(|s| s.as_str())
-                .collect();
-
-            let count = components
-                .iter()
-                .enumerate()
-                .filter(|&(index, _)| index != doc_index)
-                .filter(|&(_, parts)| {
-                    let len = parts.len();
-                    let start = len.saturating_sub(k);
-                    parts[start..] == curr_doc
-                })
-                .count();
-
-            if count == 0 {
-                return curr_doc.join(MAIN_SEPARATOR_STR);
-            }
-
-            k += 1;
-        }
-    }
-
     pub fn render_gutter<'d>(
         editor: &'d Editor,
         doc: &'d Document,
@@ -1541,12 +1004,8 @@ impl EditorView {
         is_focused: bool,
         decoration_manager: &mut DecorationManager<'d>,
     ) {
-        let text = doc.text().slice(..);
-        let cursors: Rc<[_]> = doc
-            .selection(view.id)
-            .iter()
-            .map(|range| range.cursor_line(text))
-            .collect();
+        let (_, cursor_lines) = doc.cursor_lines(view.id);
+        let cursors: Rc<[_]> = Rc::from(cursor_lines);
 
         let mut offset = 0;
 
@@ -1597,7 +1056,7 @@ impl EditorView {
         }
     }
 
-    pub fn render_diagnostics(
+    pub fn draw_diagnostics(
         doc: &Document,
         view: &View,
         viewport: Rect,
@@ -1611,14 +1070,7 @@ impl EditorView {
             widgets::{Paragraph, Widget, Wrap},
         };
 
-        let cursor = doc
-            .selection(view.id)
-            .primary()
-            .cursor(doc.text().slice(..));
-
-        let diagnostics = doc.diagnostics().iter().filter(|diagnostic| {
-            diagnostic.range.start <= cursor && diagnostic.range.end >= cursor
-        });
+        let diagnostics = doc.diagnostics_at_cursor(view.id);
 
         let warning = theme.get("warning");
         let error = theme.get("error");
@@ -1661,22 +1113,8 @@ impl EditorView {
     }
 
     /// Apply the highlighting on the lines where a cursor is active
-    pub fn cursorline(doc: &Document, view: &View, theme: &Theme) -> impl Decoration {
-        let text = doc.text().slice(..);
-        // TODO only highlight the visual line that contains the cursor instead of the full visual line
-        let primary_line = doc.selection(view.id).primary().cursor_line(text);
-
-        // The secondary_lines do contain the primary_line, it doesn't matter
-        // as the else-if clause in the loop later won't test for the
-        // secondary_lines if primary_line == line.
-        // It's used inside a loop so the collect isn't needless:
-        // https://github.com/rust-lang/rust-clippy/issues/6164
-        #[allow(clippy::needless_collect)]
-        let secondary_lines: Vec<_> = doc
-            .selection(view.id)
-            .iter()
-            .map(|range| range.cursor_line(text))
-            .collect();
+    pub fn cursor_line_decoration(doc: &Document, view: &View, theme: &Theme) -> impl Decoration {
+        let (primary_line, secondary_lines) = doc.cursor_lines(view.id);
 
         let primary_style = theme.get("ui.cursorline.primary");
         let secondary_style = theme.get("ui.cursorline.secondary");
@@ -1693,7 +1131,7 @@ impl EditorView {
     }
 
     /// Apply the highlighting on the columns where a cursor is active
-    pub fn highlight_cursorcolumn(
+    pub fn draw_cursor_column(
         doc: &Document,
         view: &View,
         surface: &mut Surface,
@@ -2632,16 +2070,18 @@ impl Component for EditorView {
     }
 
     fn render(&mut self, area: Rect, surface: &mut Surface, cx: &RenderContext) {
-
         // clear with background color
         static FRAME_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let frame_num = FRAME_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let render_start = std::time::Instant::now();
         let clear_start = std::time::Instant::now();
         surface.set_style(area, cx.editor.theme.get("ui.background"));
-        helix_view::bench::log_run_phase("editor_render", "clear_background", clear_start.elapsed(), || {
-            format!("area={}x{}", area.width, area.height)
-        });
+        helix_view::bench::log_run_phase(
+            "editor_render",
+            "clear_background",
+            clear_start.elapsed(),
+            || format!("area={}x{}", area.width, area.height),
+        );
         let config = cx.editor.config();
 
         // check if bufferline should be rendered
@@ -2658,7 +2098,7 @@ impl Component for EditorView {
             let bufferline_start = std::time::Instant::now();
             let bufferline_area = area.with_height(1);
             let mut output = crate::render::RenderOutput::new(bufferline_area);
-            self.render_bufferline(cx.editor, bufferline_area, &mut output.surface);
+            self.draw_bufferline(cx.editor, bufferline_area, &mut output.surface);
             let prepared = PreparedRender::ready(output);
             self.chrome_cache.compose(prepared, surface);
             helix_view::bench::log_run_phase(
@@ -2676,8 +2116,11 @@ impl Component for EditorView {
             self.render_cache
                 .entries
                 .retain(|id, _| active.contains(id));
-            self.chrome_cache
-                .retain(|id| active.iter().any(|view_id| statusline::cache_id(*view_id) == id));
+            self.chrome_cache.retain(|id| {
+                active
+                    .iter()
+                    .any(|view_id| statusline::cache_id(*view_id) == id)
+            });
         }
 
         #[cfg(debug_assertions)]
@@ -2687,139 +2130,153 @@ impl Component for EditorView {
 
         log::warn!(
             "[editor_render] area=({},{} {}x{}) views={}",
-            area.x, area.y, area.width, area.height,
+            area.x,
+            area.y,
+            area.width,
+            area.height,
             cx.editor.tree.views().count(),
         );
         for (view, is_focused) in cx.editor.tree.views() {
             let view_render_start = std::time::Instant::now();
             log::warn!(
                 "[view] id={:?} focused={} area=({},{} {}x{}) inner_height={} statusline_row={}",
-                view.id, is_focused,
-                view.area.x, view.area.y, view.area.width, view.area.height,
+                view.id,
+                is_focused,
+                view.area.x,
+                view.area.y,
+                view.area.width,
+                view.area.height,
                 view.area.height.saturating_sub(1),
                 view.area.y + view.area.height.saturating_sub(1),
             );
             let doc = cx.editor.document(view.doc).unwrap();
 
-            let primary_cursor = doc
-                .selection(view.id)
-                .primary()
-                .cursor(doc.text().slice(..));
-            let cursor_line = doc.text().char_to_line(primary_cursor);
+            let current_inputs =
+                view.render_inputs(doc, cx.editor.config_gen, Arc::from(cx.editor.theme.name()));
+            let current_paint = current_inputs.paint.clone();
+            let selection = doc.selection(view.id);
+            let seed_line_map = {
+                let plan = current_inputs.plan(
+                    self.render_cache
+                        .entries
+                        .get(&view.id)
+                        .map(|entry| entry.snapshots.as_ref()),
+                    selection,
+                    cx.editor.mode,
+                    is_focused,
+                    self.terminal_focused,
+                );
 
-            let current_content = ViewContentState {
-                doc_id: view.doc,
-                doc_version: doc.version(),
-                view_position: doc.view_offset(view.id),
-                area: view.area,
-                theme_name: Arc::from(cx.editor.theme.name()),
-                config_gen: cx.editor.config_gen,
-                annotation_gen: doc.annotation_gen(),
-                cursor_line,
-            };
+                // Content hit — content unchanged, compute dirty lines from overlay fingerprints.
+                // When 0 lines are dirty, this is a pure blit (zero extra work).
+                match plan {
+                    RenderPlan::Reuse(plan) => {
+                        let cached_syntax = plan.cached.paint.syntax_styles.clone();
+                        let cached_line_map = plan.cached.layout.line_map.clone();
+                        let old_fingerprints = plan.cached.paint.overlay_fingerprints.clone();
+                        let new_fingerprints = plan.overlay_fingerprints;
 
-            // Content hit — content unchanged, compute dirty lines from overlay fingerprints.
-            // When 0 lines are dirty, this is a pure blit (zero extra work).
-            if let Some(cached) = self.render_cache.entries.get(&view.id) {
-                if cached.content_state == current_content {
-                    let cached_syntax = cached.syntax_styles.clone();
-                    let cached_line_map = cached.line_map.clone();
-                    let old_fingerprints = cached.overlay_fingerprints.clone();
+                        let cached_linemap_count = cached_line_map.lines.len();
 
-                    let cached_linemap_count = cached_line_map.lines.len();
-
-                    // Blit entire cached surface as baseline
-                    let blit_start = std::time::Instant::now();
-                    Self::blit(&cached.cells, surface);
-                    helix_view::bench::log_run_phase(
-                        "editor_render_view",
-                        "blit",
-                        blit_start.elapsed(),
-                        || format!("view_id={:?} area={}x{}", view.id, view.area.width, view.area.height),
-                    );
-                    update_cursor_cache_from_line_map(cx.editor, doc, view, &cached_line_map);
-
-                    // Compute new per-line overlay fingerprints
-                    let selection = doc.selection(view.id);
-                    let fp_start = std::time::Instant::now();
-                    let new_fingerprints = cached_line_map.overlay_fingerprints(
-                        selection,
-                        cx.editor.mode,
-                        is_focused,
-                        self.terminal_focused,
-                    );
-                    helix_view::bench::log_run_phase(
-                        "editor_render_view",
-                        "overlay_fingerprints",
-                        fp_start.elapsed(),
-                        || format!("view_id={:?} rows={}", view.id, cached_line_map.lines.len()),
-                    );
-
-                    // Find which visual rows actually changed
-                    let dirty_start = std::time::Instant::now();
-                    let dirty = LineMap::dirty_rows(&old_fingerprints, &new_fingerprints);
-                    helix_view::bench::log_run_phase(
-                        "editor_render_view",
-                        "dirty_rows",
-                        dirty_start.elapsed(),
-                        || format!("view_id={:?} old={} new={}", view.id, old_fingerprints.len(), new_fingerprints.len()),
-                    );
-
-                    // Log selection + which linemap rows it touches
-                    {
-                        let sel = selection.primary();
-                        let (sel_start, sel_end) = if sel.anchor <= sel.head {
-                            (sel.anchor, sel.head)
-                        } else {
-                            (sel.head, sel.anchor)
-                        };
-                        let intersecting_rows: Vec<u16> = cached_line_map
-                            .lines
-                            .iter()
-                            .filter(|l| {
-                                sel_start < l.char_range_end && sel_end >= l.char_range_start
-                            })
-                            .map(|l| l.visual_row)
-                            .collect();
-                        log::info!(
-                            "F{} CACHE HIT sel=({},{}) dirty={:?} sel_rows={:?} lines={}",
-                            frame_num,
-                            sel.anchor,
-                            sel.head,
-                            dirty,
-                            intersecting_rows,
-                            cached_linemap_count,
-                        );
-                    }
-
-                    #[cfg(debug_assertions)]
-                    {
-                        self.render_cache.hits = self.render_cache.hits.wrapping_add(1);
-                        self.render_cache.dirty_lines = self
-                            .render_cache
-                            .dirty_lines
-                            .wrapping_add(dirty.len() as u64);
-                        let total_lines = cached_line_map.lines.len() as u64;
-                        self.render_cache.clean_lines = self
-                            .render_cache
-                            .clean_lines
-                            .wrapping_add(total_lines.saturating_sub(dirty.len() as u64));
-                    }
-
-                    if dirty.is_empty() {
-                        // Nothing changed — pure blit of content. Statusline
-                        // is batched with all other views below.
-                        log::info!("F{} CACHE PURE_BLIT view={:?}", frame_num, view.id);
-                        if let Some(entry) = self.render_cache.entries.get_mut(&view.id) {
-                            entry.overlay_fingerprints = new_fingerprints;
+                        let blit_start = std::time::Instant::now();
+                        if let Some(cached) = self.render_cache.entries.get(&view.id) {
+                            Self::blit(&cached.cells, surface);
                         }
-                        continue;
-                    }
+                        helix_view::bench::log_run_phase(
+                            "editor_render_view",
+                            "blit",
+                            blit_start.elapsed(),
+                            || {
+                                format!(
+                                    "view_id={:?} area={}x{}",
+                                    view.id, view.area.width, view.area.height
+                                )
+                            },
+                        );
+                        LayoutSnapshot::new(
+                            view.layout_inputs(doc, cx.editor.config_gen),
+                            cached_line_map.clone(),
+                        )
+                        .update_cursor_cache(cx.editor, doc, view);
 
-                    // Clear dirty rows before re-rendering.  Blitted cells may
-                    // carry stale backgrounds (e.g. old selection highlight) that
-                    // set_style(bg: None) wouldn't overwrite.
-                    {
+                        let fp_start = std::time::Instant::now();
+                        helix_view::bench::log_run_phase(
+                            "editor_render_view",
+                            "overlay_fingerprints",
+                            fp_start.elapsed(),
+                            || {
+                                format!(
+                                    "view_id={:?} rows={}",
+                                    view.id,
+                                    cached_line_map.lines.len()
+                                )
+                            },
+                        );
+
+                        let dirty_start = std::time::Instant::now();
+                        let dirty = plan.dirty_rows;
+                        helix_view::bench::log_run_phase(
+                            "editor_render_view",
+                            "dirty_rows",
+                            dirty_start.elapsed(),
+                            || {
+                                format!(
+                                    "view_id={:?} old={} new={}",
+                                    view.id,
+                                    old_fingerprints.len(),
+                                    new_fingerprints.len()
+                                )
+                            },
+                        );
+
+                        {
+                            let sel = selection.primary();
+                            let (sel_start, sel_end) = if sel.anchor <= sel.head {
+                                (sel.anchor, sel.head)
+                            } else {
+                                (sel.head, sel.anchor)
+                            };
+                            let intersecting_rows: Vec<u16> = cached_line_map
+                                .lines
+                                .iter()
+                                .filter(|l| {
+                                    sel_start < l.char_range_end && sel_end >= l.char_range_start
+                                })
+                                .map(|l| l.visual_row)
+                                .collect();
+                            log::info!(
+                                "F{} CACHE HIT sel=({},{}) dirty={:?} sel_rows={:?} lines={}",
+                                frame_num,
+                                sel.anchor,
+                                sel.head,
+                                dirty,
+                                intersecting_rows,
+                                cached_linemap_count,
+                            );
+                        }
+
+                        #[cfg(debug_assertions)]
+                        {
+                            self.render_cache.hits = self.render_cache.hits.wrapping_add(1);
+                            self.render_cache.dirty_lines = self
+                                .render_cache
+                                .dirty_lines
+                                .wrapping_add(dirty.len() as u64);
+                            let total_lines = cached_line_map.lines.len() as u64;
+                            self.render_cache.clean_lines = self
+                                .render_cache
+                                .clean_lines
+                                .wrapping_add(total_lines.saturating_sub(dirty.len() as u64));
+                        }
+
+                        if dirty.is_empty() {
+                            log::info!("F{} CACHE PURE_BLIT view={:?}", frame_num, view.id);
+                            if let Some(entry) = self.render_cache.entries.get_mut(&view.id) {
+                                entry.snapshots.paint.overlay_fingerprints = new_fingerprints;
+                            }
+                            continue;
+                        }
+
                         let inner = view.inner_area(doc);
                         for &row in &dirty {
                             if row < inner.height {
@@ -2828,99 +2285,103 @@ impl Component for EditorView {
                                 surface.clear(row_rect);
                             }
                         }
-                    }
 
-                    // Re-render only dirty lines using cached syntax styles
-                    let vctx = ViewRenderContext {
-                        editor: cx.editor,
-                        doc,
-                        view,
-                        viewport: area,
-                        is_focused,
-                        cached_syntax: Some(&cached_syntax),
-                        dirty_rows: Some(&dirty),
-                        seed_line_map: Some(&cached_line_map),
-                    };
-                    let render_output = self.render_view(&vctx, surface);
-                    helix_view::bench::log_run_phase(
-                        "editor_render_view",
-                        "dirty_render_view",
-                        render_start.elapsed(),
-                        || format!("view_id={:?} dirty_rows={}", view.id, dirty.len()),
-                    );
+                        let vctx = ViewRenderContext {
+                            editor: cx.editor,
+                            doc,
+                            view,
+                            viewport: area,
+                            is_focused,
+                            cached_syntax: Some(&cached_syntax),
+                            dirty_rows: Some(&dirty),
+                            seed_line_map: Some(&cached_line_map),
+                        };
+                        let render_output = self.render_view(&vctx, surface);
+                        helix_view::bench::log_run_phase(
+                            "editor_render_view",
+                            "dirty_render_view",
+                            render_start.elapsed(),
+                            || format!("view_id={:?} dirty_rows={}", view.id, dirty.len()),
+                        );
 
-                    let new_syntax_count = render_output.syntax_styles.len();
-                    let new_linemap_count = render_output.line_map.lines.len();
-                    log::info!(
-                        "F{} CACHE DIRTY_RERENDER view={:?} dirty_rows={:?} new_syntax={} new_linemap={} elapsed={:?}",
-                        frame_num, view.id, dirty, new_syntax_count, new_linemap_count, render_start.elapsed(),
-                    );
+                        let new_syntax_count = render_output.syntax_styles.len();
+                        let new_linemap_count = render_output.line_map.lines.len();
+                        log::info!(
+                            "F{} CACHE DIRTY_RERENDER view={:?} dirty_rows={:?} new_syntax={} new_linemap={} elapsed={:?}",
+                            frame_num,
+                            view.id,
+                            dirty,
+                            new_syntax_count,
+                            new_linemap_count,
+                            render_start.elapsed(),
+                        );
 
-                    // Preserve cached syntax styles — the dirty rerender used
-                    // SyntaxHighlighter::from_cache which doesn't record new styles.
-                    let preserved_syntax = if render_output.syntax_styles.is_empty() {
-                        cached_syntax
-                    } else {
-                        SyntaxStyleCache {
-                            entries: Arc::from(render_output.syntax_styles),
+                        let preserved_syntax = if render_output.syntax_styles.is_empty() {
+                            cached_syntax
+                        } else {
+                            SyntaxStyleCache {
+                                entries: Arc::from(render_output.syntax_styles),
+                            }
+                        };
+
+                        let cursor_pos = if cx.editor.tree.focus == view.id {
+                            LayoutSnapshot::new(
+                                view.layout_inputs(doc, cx.editor.config_gen),
+                                render_output.line_map.clone(),
+                            )
+                            .cursor_position(doc, view)
+                        } else {
+                            None
+                        };
+
+                        self.render_cache.entries.insert(view.id, {
+                            let snapshots = current_inputs.clone().into_cached_snapshots(
+                                render_output.line_map,
+                                preserved_syntax,
+                                new_fingerprints,
+                            );
+                            ViewRenderCacheEntry {
+                                snapshots,
+                                cells: {
+                                    let copy_start = std::time::Instant::now();
+                                    let cells =
+                                        Self::copy_region(surface, Self::content_area(view));
+                                    helix_view::bench::log_run_phase(
+                                        "editor_render_view",
+                                        "copy_region",
+                                        copy_start.elapsed(),
+                                        || {
+                                            let area = Self::content_area(view);
+                                            format!(
+                                                "view_id={:?} area={}x{}",
+                                                view.id, area.width, area.height
+                                            )
+                                        },
+                                    );
+                                    cells
+                                },
+                            }
+                        });
+                        if cx.editor.tree.focus == view.id {
+                            cx.editor.cursor_cache.set(cursor_pos);
                         }
-                    };
-
-                    // Update cache
-                    let cursor_pos = if cx.editor.tree.focus == view.id {
-                        cursor_position_from_line_map(doc, view, &render_output.line_map)
-                    } else {
-                        None
-                    };
-
-                    self.render_cache.entries.insert(
-                        view.id,
-                        ViewRenderCacheEntry {
-                            content_state: current_content,
-                            cells: {
-                                let copy_start = std::time::Instant::now();
-                                let cells = Self::copy_region(surface, Self::content_area(view));
-                                helix_view::bench::log_run_phase(
-                                    "editor_render_view",
-                                    "copy_region",
-                                    copy_start.elapsed(),
-                                    || {
-                                        let area = Self::content_area(view);
-                                        format!("view_id={:?} area={}x{}", view.id, area.width, area.height)
-                                    },
-                                );
-                                cells
-                            },
-                            syntax_styles: preserved_syntax,
-                            line_map: render_output.line_map,
-                            overlay_fingerprints: new_fingerprints,
-                        },
-                    );
-                    if cx.editor.tree.focus == view.id {
-                        cx.editor.cursor_cache.set(cursor_pos);
+                        helix_view::bench::log_run_phase(
+                            "editor_render_view",
+                            "dirty_total",
+                            view_render_start.elapsed(),
+                            || format!("view_id={:?} path=dirty", view.id),
+                        );
+                        continue;
                     }
-                    helix_view::bench::log_run_phase(
-                        "editor_render_view",
-                        "dirty_total",
-                        view_render_start.elapsed(),
-                        || format!("view_id={:?} path=dirty", view.id),
-                    );
-                    continue;
+                    RenderPlan::Refresh(plan) => plan.seed_line_map.cloned(),
                 }
-            }
+            };
 
             // Content miss — full re-render.
             #[cfg(debug_assertions)]
             {
                 self.render_cache.misses = self.render_cache.misses.wrapping_add(1);
             }
-
-            let seed_line_map = self
-                .render_cache
-                .entries
-                .get(&view.id)
-                .filter(|entry| can_reuse_seed_line_map(&entry.content_state, &current_content))
-                .map(|entry| entry.line_map.clone());
 
             let vctx = ViewRenderContext {
                 editor: cx.editor,
@@ -2940,7 +2401,6 @@ impl Component for EditorView {
                 || format!("view_id={:?} path=full_before_fp", view.id),
             );
 
-            let selection = doc.selection(view.id);
             let fp_start = std::time::Instant::now();
             let overlay_fingerprints = render_output.line_map.overlay_fingerprints(
                 selection,
@@ -2952,15 +2412,21 @@ impl Component for EditorView {
                 "editor_render_view",
                 "overlay_fingerprints",
                 fp_start.elapsed(),
-                || format!("view_id={:?} rows={}", view.id, render_output.line_map.lines.len()),
+                || {
+                    format!(
+                        "view_id={:?} rows={}",
+                        view.id,
+                        render_output.line_map.lines.len()
+                    )
+                },
             );
 
             log::info!(
                 "F{} CACHE MISS view={:?} anchor={} voff={} area={}x{} syntax={} lines={} elapsed={:?}",
                 frame_num,
                 view.id,
-                current_content.view_position.anchor,
-                current_content.view_position.vertical_offset,
+                current_paint.layout.view_position.anchor,
+                current_paint.layout.view_position.vertical_offset,
                 view.area.width, view.area.height,
                 render_output.syntax_styles.len(),
                 render_output.line_map.lines.len(),
@@ -2968,15 +2434,23 @@ impl Component for EditorView {
             );
 
             let cursor_pos = if cx.editor.tree.focus == view.id {
-                cursor_position_from_line_map(doc, view, &render_output.line_map)
+                LayoutSnapshot::new(
+                    view.layout_inputs(doc, cx.editor.config_gen),
+                    render_output.line_map.clone(),
+                )
+                .cursor_position(doc, view)
             } else {
                 None
             };
 
-            self.render_cache.entries.insert(
-                view.id,
+            self.render_cache.entries.insert(view.id, {
+                let snapshots = current_inputs.into_snapshots(
+                    render_output.line_map,
+                    render_output.syntax_styles,
+                    overlay_fingerprints,
+                );
                 ViewRenderCacheEntry {
-                    content_state: current_content,
+                    snapshots,
                     cells: {
                         let copy_start = std::time::Instant::now();
                         let cells = Self::copy_region(surface, Self::content_area(view));
@@ -2991,13 +2465,8 @@ impl Component for EditorView {
                         );
                         cells
                     },
-                    syntax_styles: SyntaxStyleCache {
-                        entries: Arc::from(render_output.syntax_styles),
-                    },
-                    line_map: render_output.line_map,
-                    overlay_fingerprints,
-                },
-            );
+                }
+            });
             if cx.editor.tree.focus == view.id {
                 cx.editor.cursor_cache.set(cursor_pos);
             }
@@ -3150,9 +2619,12 @@ impl Component for EditorView {
                 || format!("area={}x{}", area.width, area.height),
             );
         }
-        helix_view::bench::log_run_phase("editor_render", "final_total", render_start.elapsed(), || {
-            format!("area={}x{} frame={}", area.width, area.height, frame_num)
-        });
+        helix_view::bench::log_run_phase(
+            "editor_render",
+            "final_total",
+            render_start.elapsed(),
+            || format!("area={}x{} frame={}", area.width, area.height, frame_num),
+        );
     }
 
     fn cursor(&self, _area: Rect, editor: &Editor) -> (Option<Position>, CursorKind) {
@@ -3213,10 +2685,7 @@ fn restore_focus_after_mouse_scroll(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        can_reuse_seed_line_map, choose_render_seed, restore_focus_after_mouse_scroll,
-        EditorView, ViewRenderContext,
-    };
+    use super::{restore_focus_after_mouse_scroll, EditorView, ViewRenderContext};
     use crate::handlers::Handlers;
     use crate::keymap::Keymaps;
     use arc_swap::ArcSwap;
@@ -3225,24 +2694,38 @@ mod tests {
     use helix_modal::{helix::HelixEngine, populate::build_registry};
     use helix_view::graphics::Rect;
     use helix_view::theme;
-    use helix_view::view::{LineMap, ViewContentState, ViewPosition, VisualLineInfo};
+    use helix_view::view::{
+        LayoutSnapshot, LineMap, ViewLayoutInputs, ViewPosition, VisualLineInfo,
+    };
     use helix_view::{
         editor::{Action, Config, Editor},
         Document, DocumentId, View,
     };
     use std::sync::Arc;
 
-    fn content_state(doc_version: i32, annotation_gen: u64, width: u16) -> ViewContentState {
-        ViewContentState {
+    fn layout_inputs(
+        doc_version: i32,
+        annotation: helix_view::presentation_state::AnnotationSnapshot,
+        width: u16,
+    ) -> ViewLayoutInputs {
+        ViewLayoutInputs {
             doc_id: DocumentId::default(),
             doc_version,
             view_position: ViewPosition::default(),
             area: Rect::new(0, 0, width, 10),
-            theme_name: Arc::<str>::from("test-theme"),
             config_gen: 1,
-            annotation_gen,
-            cursor_line: 0,
+            annotation,
         }
+    }
+
+    fn layout_snapshot(line_map: LineMap, horizontal_offset: usize) -> LayoutSnapshot {
+        let mut inputs = layout_inputs(
+            1,
+            helix_view::presentation_state::AnnotationSnapshot::new(helix_view::Revision::default()),
+            120,
+        );
+        inputs.view_position.horizontal_offset = horizontal_offset;
+        LayoutSnapshot::new(inputs, line_map)
     }
 
     fn test_editor_with_text(text: &str) -> (Editor, helix_view::ViewId, DocumentId) {
@@ -3278,7 +2761,11 @@ mod tests {
 
     fn giant_multiline_fixture(lines: usize, bytes_per_line: usize) -> String {
         (0..lines)
-            .map(|idx| char::from(b'a' + (idx % 26) as u8).to_string().repeat(bytes_per_line))
+            .map(|idx| {
+                char::from(b'a' + (idx % 26) as u8)
+                    .to_string()
+                    .repeat(bytes_per_line)
+            })
             .collect::<Vec<_>>()
             .join("\n")
     }
@@ -3298,10 +2785,14 @@ mod tests {
                 horizontal_checkpoints: Vec::new(),
             }]),
         };
+        let layout = layout_snapshot(line_map, 100);
 
         assert_eq!(
-            choose_render_seed(Some(&line_map), 7, 100)
-                .map(|seed| (seed.doc_line, seed.char_idx, seed.visual_col)),
+            layout.render_seed(7, 4_096).map(|seed| (
+                seed.doc_line,
+                seed.char_idx,
+                seed.visual_col
+            )),
             Some((7, 90, 90))
         );
     }
@@ -3334,13 +2825,17 @@ mod tests {
                 },
             ]),
         };
+        let layout = layout_snapshot(line_map, 100);
 
         assert_eq!(
-            choose_render_seed(Some(&line_map), 8, 100)
-                .map(|seed| (seed.doc_line, seed.char_idx, seed.visual_col)),
+            layout.render_seed(8, 4_096).map(|seed| (
+                seed.doc_line,
+                seed.char_idx,
+                seed.visual_col
+            )),
             Some((8, 60, 60))
         );
-        assert!(choose_render_seed(Some(&line_map), 9, 100).is_none());
+        assert!(layout.render_seed(9, 4_096).is_none());
     }
 
     #[test]
@@ -3358,37 +2853,62 @@ mod tests {
                 horizontal_checkpoints: Vec::new(),
             }]),
         };
+        let far_layout = layout_snapshot(line_map.clone(), 290_989);
+        let near_layout = layout_snapshot(line_map, 143_296);
 
-        assert!(choose_render_seed(Some(&line_map), 7, 290_989).is_none());
+        assert!(far_layout.render_seed(7, 4_096).is_none());
         assert_eq!(
-            choose_render_seed(Some(&line_map), 7, 143_296)
-                .map(|seed| (seed.doc_line, seed.char_idx, seed.visual_col)),
+            near_layout.render_seed(7, 4_096).map(|seed| (
+                seed.doc_line,
+                seed.char_idx,
+                seed.visual_col
+            )),
             Some((7, 143_237, 143_237))
         );
     }
 
     #[test]
     fn seed_line_map_reuse_requires_stable_text_layout_inputs() {
-        let previous = content_state(5, 7, 120);
-        let same_text = content_state(5, 7, 120);
-        let changed_doc = content_state(6, 7, 120);
-        let changed_annotations = content_state(5, 8, 120);
-        let changed_width = content_state(5, 7, 121);
+        let previous = layout_inputs(
+            5,
+            helix_view::presentation_state::AnnotationSnapshot::new(helix_view::Revision::from(7)),
+            120,
+        );
+        let same_text = layout_inputs(
+            5,
+            helix_view::presentation_state::AnnotationSnapshot::new(helix_view::Revision::from(7)),
+            120,
+        );
+        let changed_doc = layout_inputs(
+            6,
+            helix_view::presentation_state::AnnotationSnapshot::new(helix_view::Revision::from(7)),
+            120,
+        );
+        let changed_annotations = layout_inputs(
+            5,
+            helix_view::presentation_state::AnnotationSnapshot::new(helix_view::Revision::from(8)),
+            120,
+        );
+        let changed_width = layout_inputs(
+            5,
+            helix_view::presentation_state::AnnotationSnapshot::new(helix_view::Revision::from(7)),
+            121,
+        );
 
-        assert!(can_reuse_seed_line_map(&previous, &same_text));
-        assert!(!can_reuse_seed_line_map(&previous, &changed_doc));
-        assert!(!can_reuse_seed_line_map(
-            &previous,
-            &changed_annotations
-        ));
-        assert!(!can_reuse_seed_line_map(&previous, &changed_width));
+        assert!(previous.can_reuse_seed_line_map(&same_text));
+        assert!(!previous.can_reuse_seed_line_map(&changed_doc));
+        assert!(!previous.can_reuse_seed_line_map(&changed_annotations));
+        assert!(!previous.can_reuse_seed_line_map(&changed_width));
     }
 
     #[test]
     fn restore_focus_after_mouse_scroll_does_not_recentre_same_view() {
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
         let _guard = runtime.enter();
-        let text = (0..200).map(|idx| format!("line {idx}")).collect::<Vec<_>>().join("\n");
+        let text = (0..200)
+            .map(|idx| format!("line {idx}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let (mut editor, view_id, doc_id) = test_editor_with_text(&text);
 
         {
@@ -3403,9 +2923,15 @@ mod tests {
             );
         }
 
-        let before = editor.document(doc_id).expect("document").view_offset(view_id);
+        let before = editor
+            .document(doc_id)
+            .expect("document")
+            .view_offset(view_id);
         restore_focus_after_mouse_scroll(&mut editor, view_id, view_id);
-        let after = editor.document(doc_id).expect("document").view_offset(view_id);
+        let after = editor
+            .document(doc_id)
+            .expect("document")
+            .view_offset(view_id);
 
         assert_eq!(after, before);
     }

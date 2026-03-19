@@ -228,11 +228,7 @@ pub enum HorizontalLineSeekResult<'t> {
 }
 
 impl<'t> DocumentFormatter<'t> {
-    pub fn reset_to_checkpoint(
-        &mut self,
-        char_idx: usize,
-        visual_pos: Position,
-    ) {
+    pub fn reset_to_checkpoint(&mut self, char_idx: usize, visual_pos: Position) {
         let char_idx = char_idx.min(self.text.len_chars());
         let line_idx = self.text.char_to_line(char_idx);
         self.annotations.reset_pos(char_idx);

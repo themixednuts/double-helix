@@ -214,7 +214,12 @@ impl CmdlinePopup {
     }
 
     /// Render completion popup
-    fn render_completion_popup(&mut self, base_area: Rect, surface: &mut Surface, cx: &RenderContext) {
+    fn render_completion_popup(
+        &mut self,
+        base_area: Rect,
+        surface: &mut Surface,
+        cx: &RenderContext,
+    ) {
         let theme = &cx.editor.theme;
         // Match global autocomplete/picker colors
         let completion_bg = theme.get("ui.menu");

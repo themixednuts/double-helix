@@ -30,13 +30,13 @@ use helix_core::{
     encoding, find_workspace,
     graphemes::{self, next_grapheme_boundary, prev_grapheme_boundary},
     history::UndoKind,
-    indent::{self, IndentStyle},
+    indent::IndentStyle,
     line_ending::{get_line_ending_of_str, line_end_char_index},
     match_brackets,
     movement::{self, move_vertically, Direction},
     pos_at_coords,
     regex::{self, Regex},
-    selection, surround,
+    selection,
     syntax::config::LanguageServerFeature,
     text_annotations::Overlay,
     text_folding::{self, RopeSliceFoldExt},
@@ -3104,9 +3104,6 @@ fn insert_with_indent(cx: &mut Context, cursor_fallback: IndentFallbackPos) {
     let contents = doc.text();
     let selection = doc.selection(view_id);
 
-    let syntax = doc.syntax();
-    let tab_width = doc.tab_width();
-
     let mut ranges = SmallVec::with_capacity(selection.len());
     let mut offs = 0;
 
@@ -3118,12 +3115,9 @@ fn insert_with_indent(cx: &mut Context, cursor_fallback: IndentFallbackPos) {
             // line is empty => auto indent
             let line_end_index = cursor_line_start;
 
-            let indent = indent::indent_for_newline(
+            let indent = doc.indent_for_newline(
                 &loader,
-                syntax,
                 &doc.config.load().indent_heuristic,
-                &doc.indent_style(),
-                tab_width,
                 text,
                 cursor_line,
                 line_end_index,
@@ -3316,12 +3310,9 @@ fn open(cx: &mut Context, open: Open, comment_continuation: CommentContinuation)
         let line = text.line(curr_line_num);
         let indent = match line.first_non_whitespace_char() {
             Some(pos) if continue_comment_token.is_some() => line.slice(..pos).to_string(),
-            _ => indent::indent_for_newline(
+            _ => doc.indent_for_newline(
                 &loader,
-                doc.syntax(),
                 &config.indent_heuristic,
-                &doc.indent_style(),
-                doc.tab_width(),
                 text,
                 above_next_new_line_num,
                 above_next_line_end_index,
@@ -4598,17 +4589,15 @@ fn surround_replace(cx: &mut Context) {
             None => return,
         };
         let (view_id, doc) = focused!(cx.editor);
-        let text = doc.text().slice(..);
         let selection = doc.selection(view_id);
 
-        let change_pos =
-            match surround::get_surround_pos(doc.syntax(), text, selection, surround_ch, count) {
-                Ok(c) => c,
-                Err(err) => {
-                    cx.editor.set_error(err.to_string());
-                    return;
-                }
-            };
+        let change_pos = match doc.surround_positions(view_id, surround_ch, count) {
+            Ok(c) => c,
+            Err(err) => {
+                cx.editor.set_error(err.to_string());
+                return;
+            }
+        };
 
         let selection = selection.clone();
         let ranges: SmallVec<[Range; 1]> = change_pos.iter().map(|&p| Range::point(p)).collect();
@@ -4669,17 +4658,14 @@ fn surround_delete(cx: &mut Context) {
             None => return,
         };
         let (view_id, doc) = focused!(cx.editor);
-        let text = doc.text().slice(..);
-        let selection = doc.selection(view_id);
 
-        let mut change_pos =
-            match surround::get_surround_pos(doc.syntax(), text, selection, surround_ch, count) {
-                Ok(c) => c,
-                Err(err) => {
-                    cx.editor.set_error(err.to_string());
-                    return;
-                }
-            };
+        let mut change_pos = match doc.surround_positions(view_id, surround_ch, count) {
+            Ok(c) => c,
+            Err(err) => {
+                cx.editor.set_error(err.to_string());
+                return;
+            }
+        };
         change_pos.sort_unstable(); // the changeset has to be sorted to allow nested surrounds
         let transaction =
             Transaction::change(doc.text(), change_pos.into_iter().map(|p| (p, p + 1, None)));
@@ -5292,7 +5278,7 @@ fn lsp_or_syntax_symbol_picker(cx: &mut Context) {
         .is_some()
     {
         lsp::symbol_picker(cx);
-    } else if doc.syntax().is_some() {
+    } else if doc.has_syntax() {
         syntax_symbol_picker(cx);
     } else {
         cx.editor
@@ -5333,13 +5319,12 @@ fn toggle_fold(cx: &mut Context) {
     let cursor = doc.selection(view_id).primary().cursor(text);
     let loader = cx.editor.syn_loader.load();
 
-    let Some(syntax) = doc.syntax() else {
+    if !doc.has_syntax() {
         cx.editor
             .set_error("Syntax is unavailable in the current buffer.");
         return;
-    };
-
-    let Some(textobject_query) = loader.textobject_query(syntax.root_language()) else {
+    }
+    let Some((syntax, textobject_query)) = doc.textobject_context(&loader) else {
         cx.editor.set_error("Failed to compile text object query.");
         return;
     };

@@ -10,6 +10,7 @@ pub mod dap;
 pub mod diagnostics;
 pub mod lsp;
 pub mod word_index;
+mod workspace_edit;
 
 #[derive(Debug)]
 pub enum AutoSaveEvent {

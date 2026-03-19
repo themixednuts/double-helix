@@ -1,4 +1,5 @@
 use std::iter::Peekable;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -31,6 +32,10 @@ struct DiffInner {
 pub struct DiffHandle {
     channel: UnboundedSender<Event>,
     diff: Arc<ArcSwap<DiffInner>>,
+    /// Monotonically increasing generation counter, incremented by the worker
+    /// each time new hunks are published. Used by the render cache to detect
+    /// when the gutter needs re-rendering.
+    gen: Arc<AtomicU64>,
     inverted: bool,
 }
 
@@ -42,15 +47,18 @@ impl DiffHandle {
     fn new_with_handle(diff_base: Rope, doc: Rope) -> (DiffHandle, JoinHandle<()>) {
         let (sender, receiver) = unbounded_channel();
         let diff: Arc<ArcSwap<DiffInner>> = Arc::new(ArcSwap::from_pointee(DiffInner::default()));
+        let gen: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
         let worker = DiffWorker {
             channel: receiver,
             diff: diff.clone(),
+            gen: gen.clone(),
             diff_alloc: imara_diff::Diff::default(),
         };
         let handle = tokio::spawn(worker.run(diff_base, doc));
         let differ = DiffHandle {
             channel: sender,
             diff,
+            gen,
             inverted: false,
         };
         (differ, handle)
@@ -85,6 +93,14 @@ impl DiffHandle {
     fn update_document_impl(&self, text: Rope, is_base: bool) -> bool {
         let event = Event { text, is_base };
         self.channel.send(event).is_ok()
+    }
+
+    /// Returns a monotonically increasing generation counter that changes
+    /// each time the diff worker publishes new hunks. Useful for cache
+    /// invalidation (e.g. the render cache uses this to know when the
+    /// gutter needs re-rendering).
+    pub fn gen(&self) -> u64 {
+        self.gen.load(Ordering::Relaxed)
     }
 }
 

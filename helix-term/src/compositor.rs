@@ -36,12 +36,12 @@ macro_rules! component_traits {
     };
 }
 
+use crate::render::{CacheStore, PreparedRender, RenderOutput};
 use helix_core::Position;
+use helix_view::bench::log_run_phase;
 use helix_view::graphics::{CursorKind, Rect};
 use helix_view::input::{MouseButton, MouseEvent, MouseEventKind};
 use helix_view::model::{PanelId, PanelSide, PanelSize};
-use helix_view::bench::log_run_phase;
-use crate::render::{CacheStore, PreparedRender, RenderOutput};
 
 use tui::buffer::Buffer as Surface;
 
@@ -56,8 +56,8 @@ pub enum EventResult {
 
 use crate::job::Jobs;
 use crate::ui::picker;
-use helix_view::Editor;
 use helix_view::keyboard::{KeyCode, KeyModifiers};
+use helix_view::Editor;
 use log::warn;
 
 use helix_plugin::PluginManager;
@@ -142,9 +142,18 @@ pub(crate) fn compute_panel_layout(area: Rect, editor: &Editor) -> PanelLayout {
 
     warn!(
         "[layout] terminal_area=({},{} {}x{}) editor_area=({},{} {}x{}) panels={:?}",
-        area.x, area.y, area.width, area.height,
-        editor_area.x, editor_area.y, editor_area.width, editor_area.height,
-        panel_areas.iter().map(|(id, r)| format!("{:?}=({},{} {}x{})", id, r.x, r.y, r.width, r.height)).collect::<Vec<_>>(),
+        area.x,
+        area.y,
+        area.width,
+        area.height,
+        editor_area.x,
+        editor_area.y,
+        editor_area.width,
+        editor_area.height,
+        panel_areas
+            .iter()
+            .map(|(id, r)| format!("{:?}=({},{} {}x{})", id, r.x, r.y, r.width, r.height))
+            .collect::<Vec<_>>(),
     );
 
     PanelLayout {
@@ -217,7 +226,11 @@ const SCROLL_NONE: usize = usize::MAX;
 impl RenderContext<'_> {
     pub fn scroll(&self) -> Option<usize> {
         let v = self.scroll.load(std::sync::atomic::Ordering::Relaxed);
-        if v == SCROLL_NONE { None } else { Some(v) }
+        if v == SCROLL_NONE {
+            None
+        } else {
+            Some(v)
+        }
     }
 
     pub fn set_scroll(&self, value: Option<usize>) {
@@ -451,22 +464,27 @@ impl Compositor {
         for layer in self.layers.iter_mut().rev() {
             let layer_start = std::time::Instant::now();
             let result = layer.handle_event(event, cx);
-            log_run_phase("dispatch_layer", layer.type_name(), layer_start.elapsed(), || {
-                format!(
-                    "id={} event={} role={:?}",
-                    layer.id().unwrap_or("-"),
-                    match event {
-                        Event::Key(_) => "key",
-                        Event::Mouse(_) => "mouse",
-                        Event::Resize(..) => "resize",
-                        Event::IdleTimeout => "idle",
-                        Event::Paste(_) => "paste",
-                        Event::FocusGained => "focus_gained",
-                        Event::FocusLost => "focus_lost",
-                    },
-                    layer.layout_role()
-                )
-            });
+            log_run_phase(
+                "dispatch_layer",
+                layer.type_name(),
+                layer_start.elapsed(),
+                || {
+                    format!(
+                        "id={} event={} role={:?}",
+                        layer.id().unwrap_or("-"),
+                        match event {
+                            Event::Key(_) => "key",
+                            Event::Mouse(_) => "mouse",
+                            Event::Resize(..) => "resize",
+                            Event::IdleTimeout => "idle",
+                            Event::Paste(_) => "paste",
+                            Event::FocusGained => "focus_gained",
+                            Event::FocusLost => "focus_lost",
+                        },
+                        layer.layout_role()
+                    )
+                },
+            );
             match result {
                 EventResult::Consumed(Some(callback)) => {
                     callbacks.push(callback);
@@ -508,10 +526,7 @@ impl Compositor {
         match clicked_panel {
             Some((panel_id, _)) => {
                 let pid = *panel_id;
-                warn!(
-                    "[mouse_focus] click at ({},{}) → panel {:?}",
-                    col, row, pid
-                );
+                warn!("[mouse_focus] click at ({},{}) → panel {:?}", col, row, pid);
                 for layer in &mut self.layers {
                     let is_target = layer.panel_id() == Some(pid);
                     if let Some(focusable) = layer.as_focusable() {
@@ -606,13 +621,18 @@ impl Compositor {
         for layer in &mut self.layers {
             let sync_start = std::time::Instant::now();
             layer.sync(cx.editor);
-            log_run_phase("compositor_sync", layer.type_name(), sync_start.elapsed(), || {
-                format!(
-                    "id={} role={:?}",
-                    layer.id().unwrap_or("-"),
-                    layer.layout_role()
-                )
-            });
+            log_run_phase(
+                "compositor_sync",
+                layer.type_name(),
+                sync_start.elapsed(),
+                || {
+                    format!(
+                        "id={} role={:?}",
+                        layer.id().unwrap_or("-"),
+                        layer.layout_role()
+                    )
+                },
+            );
         }
 
         // Pre-render mutations (need &mut Editor, done before freeze).
@@ -623,18 +643,23 @@ impl Compositor {
         let has_prompt = self.has_component("helix_term::ui::prompt::Prompt");
         let layout = compute_panel_layout(area, cx.editor);
         self.last_layout = Some(layout.clone());
-        log_run_phase("compositor_layout", "compute", layout_start.elapsed(), || {
-            format!(
-                "layers={} panel_areas={} editor_area={}x{}+{},{} has_prompt={}",
-                self.layers.len(),
-                layout.panel_areas.len(),
-                layout.editor_area.width,
-                layout.editor_area.height,
-                layout.editor_area.x,
-                layout.editor_area.y,
-                has_prompt,
-            )
-        });
+        log_run_phase(
+            "compositor_layout",
+            "compute",
+            layout_start.elapsed(),
+            || {
+                format!(
+                    "layers={} panel_areas={} editor_area={}x{}+{},{} has_prompt={}",
+                    self.layers.len(),
+                    layout.panel_areas.len(),
+                    layout.editor_area.width,
+                    layout.editor_area.height,
+                    layout.editor_area.x,
+                    layout.editor_area.y,
+                    has_prompt,
+                )
+            },
+        );
 
         // Pre-render mutation: resize editor area (was in EditorView::render,
         // moved here so render phase can be fully immutable).
@@ -648,19 +673,21 @@ impl Compositor {
                 BufferLineRenderMode::Multiple if cx.editor.documents.len() > 1 => true,
                 _ => false,
             };
-            let mut editor_area = if config.cmdline.style == CmdlineStyle::Popup
-                && config.cmdline.use_full_height
-            {
-                layout.editor_area
-            } else {
-                layout.editor_area.clip_bottom(1)
-            };
+            let mut editor_area =
+                if config.cmdline.style == CmdlineStyle::Popup && config.cmdline.use_full_height {
+                    layout.editor_area
+                } else {
+                    layout.editor_area.clip_bottom(1)
+                };
             if use_bufferline {
                 editor_area = editor_area.clip_top(1);
             }
             warn!(
                 "[resize] editor.resize area=({},{} {}x{}) use_bufferline={} cmdline_popup={}",
-                editor_area.x, editor_area.y, editor_area.width, editor_area.height,
+                editor_area.x,
+                editor_area.y,
+                editor_area.width,
+                editor_area.height,
                 use_bufferline,
                 config.cmdline.style == CmdlineStyle::Popup && config.cmdline.use_full_height,
             );
@@ -671,9 +698,7 @@ impl Compositor {
         // use &RenderContext — no &mut Editor access.
         let render_ctx = RenderContext {
             editor: cx.editor,
-            scroll: std::sync::atomic::AtomicUsize::new(
-                cx.scroll.unwrap_or(SCROLL_NONE),
-            ),
+            scroll: std::sync::atomic::AtomicUsize::new(cx.scroll.unwrap_or(SCROLL_NONE)),
             plugin_manager: cx.plugin_manager.clone(),
         };
 
@@ -689,7 +714,9 @@ impl Compositor {
         use rayon::prelude::*;
 
         // Find where overlays begin.
-        let overlay_start = self.layers.iter()
+        let overlay_start = self
+            .layers
+            .iter()
             .position(|l| l.layout_role() == LayoutRole::Overlay)
             .unwrap_or(self.layers.len());
 
@@ -697,11 +724,13 @@ impl Compositor {
         let base_batch: Vec<PreparedRender> = {
             let base_layers = &mut self.layers[..overlay_start];
 
-            let base_areas: Vec<Rect> = base_layers.iter()
+            let base_areas: Vec<Rect> = base_layers
+                .iter()
                 .map(|l| resolve_area(l.as_ref(), area, &layout))
                 .collect();
 
-            base_layers.par_iter_mut()
+            base_layers
+                .par_iter_mut()
                 .zip(base_areas.par_iter())
                 .map(|(layer, &layer_area)| layer.prepare_render(layer_area, &render_ctx))
                 .collect()
@@ -711,9 +740,12 @@ impl Compositor {
             let base_start = std::time::Instant::now();
             let count = base_batch.len();
             self.render_cache.compose_batch(base_batch, surface);
-            log_run_phase("compositor_layer", "base_batch", base_start.elapsed(), || {
-                format!("count={count} phase=base_parallel")
-            });
+            log_run_phase(
+                "compositor_layer",
+                "base_batch",
+                base_start.elapsed(),
+                || format!("count={count} phase=base_parallel"),
+            );
         }
 
         // Phase 4: Info popup — on top of panels but below overlays.
@@ -723,7 +755,10 @@ impl Compositor {
                 let mut info_copy = info.clone();
                 info_copy.render(area, surface, &render_ctx);
                 log_run_phase("compositor_layer", "autoinfo", info_start.elapsed(), || {
-                    format!("id=autoinfo role=overlay area={}x{}+{},{}", area.width, area.height, area.x, area.y)
+                    format!(
+                        "id=autoinfo role=overlay area={}x{}+{},{}",
+                        area.width, area.height, area.x, area.y
+                    )
                 });
             }
         }
@@ -740,9 +775,12 @@ impl Compositor {
                 let layer_area = resolve_area(layer.as_ref(), area, &layout);
                 layer.render(layer_area, surface, &render_ctx);
             }
-            log_run_phase("compositor_layer", "overlay_batch", overlay_start_time.elapsed(), || {
-                format!("count={count} phase=overlay_direct")
-            });
+            log_run_phase(
+                "compositor_layer",
+                "overlay_batch",
+                overlay_start_time.elapsed(),
+                || format!("count={count} phase=overlay_direct"),
+            );
         }
     }
 

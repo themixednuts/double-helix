@@ -1,10 +1,8 @@
 use std::collections::btree_map::Entry;
 use std::collections::HashSet;
-use std::fmt::Display;
 use std::time::Instant;
 
 use crate::bench::log_command_phase;
-use crate::editor::Action;
 use crate::events::{
     DiagnosticsDidChange, DocumentDidChange, DocumentDidClose, LanguageServerInitialized,
 };
@@ -12,9 +10,9 @@ use crate::{DocumentId, Editor};
 use helix_core::diagnostic::DiagnosticProvider;
 use helix_core::Uri;
 use helix_event::register_hook;
-use helix_lsp::util::generate_transaction_from_edits;
-use helix_lsp::{lsp, LanguageServerId, OffsetEncoding};
+use helix_lsp::{lsp, LanguageServerId};
 
+pub use super::workspace_edit::{ApplyEditError, ApplyEditErrorKind};
 use super::Handlers;
 
 pub struct DocumentColorsEvent(pub DocumentId);
@@ -41,258 +39,7 @@ pub struct PullAllDocumentsDiagnosticsEvent {
     pub language_servers: HashSet<LanguageServerId>,
 }
 
-#[derive(Debug)]
-pub struct ApplyEditError {
-    pub kind: ApplyEditErrorKind,
-    pub failed_change_idx: usize,
-}
-
-#[derive(Debug)]
-pub enum ApplyEditErrorKind {
-    DocumentChanged,
-    FileNotFound,
-    InvalidUrl(helix_core::uri::UrlConversionError),
-    IoError(std::io::Error),
-    // TODO: check edits before applying and propagate failure
-    // InvalidEdit,
-}
-
-impl From<std::io::Error> for ApplyEditErrorKind {
-    fn from(err: std::io::Error) -> Self {
-        ApplyEditErrorKind::IoError(err)
-    }
-}
-
-impl From<helix_core::uri::UrlConversionError> for ApplyEditErrorKind {
-    fn from(err: helix_core::uri::UrlConversionError) -> Self {
-        ApplyEditErrorKind::InvalidUrl(err)
-    }
-}
-
-impl Display for ApplyEditErrorKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ApplyEditErrorKind::DocumentChanged => f.write_str("document has changed"),
-            ApplyEditErrorKind::FileNotFound => f.write_str("file not found"),
-            ApplyEditErrorKind::InvalidUrl(err) => f.write_str(&format!("{err}")),
-            ApplyEditErrorKind::IoError(err) => f.write_str(&format!("{err}")),
-        }
-    }
-}
-
 impl Editor {
-    fn apply_text_edits(
-        &mut self,
-        url: &helix_lsp::Url,
-        version: Option<i32>,
-        text_edits: Vec<lsp::TextEdit>,
-        offset_encoding: OffsetEncoding,
-    ) -> Result<(), ApplyEditErrorKind> {
-        let uri = match Uri::try_from(url) {
-            Ok(uri) => uri,
-            Err(err) => {
-                log::error!("{err}");
-                return Err(err.into());
-            }
-        };
-        let path = uri.as_path().expect("URIs are valid paths");
-
-        let doc_id = match self.open(path, Action::Load) {
-            Ok(doc_id) => doc_id,
-            Err(err) => {
-                let err = format!(
-                    "failed to open document: {}: {}",
-                    path.to_string_lossy(),
-                    err
-                );
-                log::error!("{}", err);
-                self.set_error(err);
-                return Err(ApplyEditErrorKind::FileNotFound);
-            }
-        };
-
-        let doc = doc_mut!(self, &doc_id);
-        if let Some(version) = version {
-            if version != doc.version() {
-                let err = format!("outdated workspace edit for {path:?}");
-                log::error!("{err}, expected {} but got {version}", doc.version());
-                self.set_error(err);
-                return Err(ApplyEditErrorKind::DocumentChanged);
-            }
-        }
-
-        // Need to determine a view for apply/append_changes_to_history
-        let view_id = self.get_synced_view_id(doc_id);
-        let doc = doc_mut!(self, &doc_id);
-
-        let transaction = generate_transaction_from_edits(doc.text(), text_edits, offset_encoding);
-        let view = view_mut!(self, view_id);
-        doc.apply(&transaction, view.id);
-        doc.append_changes_to_history(view);
-        Ok(())
-    }
-
-    // TODO make this transactional (and set failureMode to transactional)
-    pub fn apply_workspace_edit(
-        &mut self,
-        offset_encoding: OffsetEncoding,
-        workspace_edit: &lsp::WorkspaceEdit,
-    ) -> Result<(), ApplyEditError> {
-        if let Some(ref document_changes) = workspace_edit.document_changes {
-            match document_changes {
-                lsp::DocumentChanges::Edits(document_edits) => {
-                    for (i, document_edit) in document_edits.iter().enumerate() {
-                        let edits = document_edit
-                            .edits
-                            .iter()
-                            .map(|edit| match edit {
-                                lsp::OneOf::Left(text_edit) => text_edit,
-                                lsp::OneOf::Right(annotated_text_edit) => {
-                                    &annotated_text_edit.text_edit
-                                }
-                            })
-                            .cloned()
-                            .collect();
-                        self.apply_text_edits(
-                            &document_edit.text_document.uri,
-                            document_edit.text_document.version,
-                            edits,
-                            offset_encoding,
-                        )
-                        .map_err(|kind| ApplyEditError {
-                            kind,
-                            failed_change_idx: i,
-                        })?;
-                    }
-                }
-                lsp::DocumentChanges::Operations(operations) => {
-                    log::debug!("document changes - operations: {:?}", operations);
-                    for (i, operation) in operations.iter().enumerate() {
-                        match operation {
-                            lsp::DocumentChangeOperation::Op(op) => {
-                                self.apply_document_resource_op(op).map_err(|err| {
-                                    ApplyEditError {
-                                        kind: err,
-                                        failed_change_idx: i,
-                                    }
-                                })?;
-                            }
-
-                            lsp::DocumentChangeOperation::Edit(document_edit) => {
-                                let edits = document_edit
-                                    .edits
-                                    .iter()
-                                    .map(|edit| match edit {
-                                        lsp::OneOf::Left(text_edit) => text_edit,
-                                        lsp::OneOf::Right(annotated_text_edit) => {
-                                            &annotated_text_edit.text_edit
-                                        }
-                                    })
-                                    .cloned()
-                                    .collect();
-                                self.apply_text_edits(
-                                    &document_edit.text_document.uri,
-                                    document_edit.text_document.version,
-                                    edits,
-                                    offset_encoding,
-                                )
-                                .map_err(|kind| {
-                                    ApplyEditError {
-                                        kind,
-                                        failed_change_idx: i,
-                                    }
-                                })?;
-                            }
-                        }
-                    }
-                }
-            }
-
-            return Ok(());
-        }
-
-        if let Some(ref changes) = workspace_edit.changes {
-            log::debug!("workspace changes: {:?}", changes);
-            for (i, (uri, text_edits)) in changes.iter().enumerate() {
-                let text_edits = text_edits.to_vec();
-                self.apply_text_edits(uri, None, text_edits, offset_encoding)
-                    .map_err(|kind| ApplyEditError {
-                        kind,
-                        failed_change_idx: i,
-                    })?;
-            }
-        }
-
-        Ok(())
-    }
-
-    fn apply_document_resource_op(
-        &mut self,
-        op: &lsp::ResourceOp,
-    ) -> Result<(), ApplyEditErrorKind> {
-        use lsp::ResourceOp;
-        use std::fs;
-        // NOTE: If `Uri` gets another variant than `Path`, the below `expect`s
-        // may no longer be valid.
-        match op {
-            ResourceOp::Create(op) => {
-                let uri = Uri::try_from(&op.uri)?;
-                let path = uri.as_path().expect("URIs are valid paths");
-                let ignore_if_exists = op.options.as_ref().is_some_and(|options| {
-                    !options.overwrite.unwrap_or(false) && options.ignore_if_exists.unwrap_or(false)
-                });
-                if !ignore_if_exists || !path.exists() {
-                    // Create directory if it does not exist
-                    if let Some(dir) = path.parent() {
-                        if !dir.is_dir() {
-                            fs::create_dir_all(dir)?;
-                        }
-                    }
-
-                    fs::write(path, [])?;
-                    self.language_servers
-                        .file_event_handler
-                        .file_changed(path.to_path_buf());
-                }
-            }
-            ResourceOp::Delete(op) => {
-                let uri = Uri::try_from(&op.uri)?;
-                let path = uri.as_path().expect("URIs are valid paths");
-                if path.is_dir() {
-                    let recursive = op
-                        .options
-                        .as_ref()
-                        .and_then(|options| options.recursive)
-                        .unwrap_or(false);
-
-                    if recursive {
-                        fs::remove_dir_all(path)?
-                    } else {
-                        fs::remove_dir(path)?
-                    }
-                    self.language_servers
-                        .file_event_handler
-                        .file_changed(path.to_path_buf());
-                } else if path.is_file() {
-                    fs::remove_file(path)?;
-                }
-            }
-            ResourceOp::Rename(op) => {
-                let from_uri = Uri::try_from(&op.old_uri)?;
-                let from = from_uri.as_path().expect("URIs are valid paths");
-                let to_uri = Uri::try_from(&op.new_uri)?;
-                let to = to_uri.as_path().expect("URIs are valid paths");
-                let ignore_if_exists = op.options.as_ref().is_some_and(|options| {
-                    !options.overwrite.unwrap_or(false) && options.ignore_if_exists.unwrap_or(false)
-                });
-                if !ignore_if_exists || !to.exists() {
-                    self.move_path(from, to)?;
-                }
-            }
-        }
-        Ok(())
-    }
-
     pub fn handle_lsp_diagnostics(
         &mut self,
         provider: &DiagnosticProvider,
@@ -436,16 +183,21 @@ pub fn register_hooks(_handlers: &Handlers) {
             }
         }
         let hook_dur = hook_start.elapsed();
-        log_command_phase("document_did_change_hook", "lsp_did_change", hook_dur, || {
-            format!(
-                "doc_id={:?} ghost={} language_servers={} lines={} bytes={}",
-                event.doc.id(),
-                event.ghost_transaction,
-                event.doc.language_servers().count(),
-                event.doc.text().len_lines(),
-                event.doc.text().len_bytes()
-            )
-        });
+        log_command_phase(
+            "document_did_change_hook",
+            "lsp_did_change",
+            hook_dur,
+            || {
+                format!(
+                    "doc_id={:?} ghost={} language_servers={} lines={} bytes={}",
+                    event.doc.id(),
+                    event.ghost_transaction,
+                    event.doc.language_servers().count(),
+                    event.doc.text().len_lines(),
+                    event.doc.text().len_bytes()
+                )
+            },
+        );
         Ok(())
     });
 
@@ -457,4 +209,331 @@ pub fn register_hooks(_handlers: &Handlers) {
 
         Ok(())
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::editor::Action;
+    use crate::editor::Config;
+    use arc_swap::ArcSwap;
+    use helix_core::Rope;
+    use helix_loader::runtime_dirs;
+    use helix_lsp::OffsetEncoding;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static TEMP_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn make_editor() -> Editor {
+        let theme_loader = crate::theme::Loader::new(runtime_dirs());
+        let syn_loader = helix_core::config::default_lang_loader();
+        let config = Arc::new(ArcSwap::from_pointee(Config::default()));
+        let mut editor = Editor::new(
+            crate::graphics::Rect::new(0, 0, 80, 24),
+            Arc::new(theme_loader),
+            Arc::new(ArcSwap::from_pointee(syn_loader)),
+            Arc::new(arc_swap::access::Map::new(config, |cfg: &Config| cfg)),
+            Handlers::dummy(),
+        );
+        let doc = crate::Document::from(
+            Rope::from(""),
+            None,
+            editor.config.clone(),
+            editor.syn_loader.clone(),
+        );
+        editor.new_file_from_document(Action::VerticalSplit, doc);
+        editor
+    }
+
+    fn make_temp_dir() -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time before epoch")
+            .as_nanos();
+        let counter = TEMP_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "helix-lsp-workspace-edit-{}-{}-{}",
+            std::process::id(),
+            unique,
+            counter
+        ));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    fn text_edit(range: std::ops::Range<usize>, replacement: &str) -> lsp::TextEdit {
+        lsp::TextEdit {
+            range: lsp::Range {
+                start: lsp::Position {
+                    line: 0,
+                    character: range.start as u32,
+                },
+                end: lsp::Position {
+                    line: 0,
+                    character: range.end as u32,
+                },
+            },
+            new_text: replacement.to_string(),
+        }
+    }
+
+    #[test]
+    fn workspace_edit_text_edits_are_planned_before_apply() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let _guard = runtime.enter();
+
+        let temp_dir = make_temp_dir();
+        let first_path = temp_dir.join("first.txt");
+        let second_path = temp_dir.join("second.txt");
+        fs::write(&first_path, "alpha\n").expect("write first file");
+        fs::write(&second_path, "bravo\n").expect("write second file");
+
+        let mut editor = make_editor();
+        let first_doc = editor
+            .open(&first_path, Action::Load)
+            .expect("open first file");
+        let second_doc = editor
+            .open(&second_path, Action::Load)
+            .expect("open second file");
+
+        let first_version = editor.document(first_doc).expect("first doc").version();
+        let second_version = editor.document(second_doc).expect("second doc").version();
+
+        let workspace_edit = lsp::WorkspaceEdit {
+            changes: None,
+            document_changes: Some(lsp::DocumentChanges::Edits(vec![
+                lsp::TextDocumentEdit {
+                    text_document: lsp::OptionalVersionedTextDocumentIdentifier {
+                        uri: helix_lsp::Url::from_file_path(&first_path).expect("first url"),
+                        version: Some(first_version),
+                    },
+                    edits: vec![lsp::OneOf::Left(text_edit(0..5, "omega"))],
+                },
+                lsp::TextDocumentEdit {
+                    text_document: lsp::OptionalVersionedTextDocumentIdentifier {
+                        uri: helix_lsp::Url::from_file_path(&second_path).expect("second url"),
+                        version: Some(second_version + 1),
+                    },
+                    edits: vec![lsp::OneOf::Left(text_edit(0..5, "delta"))],
+                },
+            ])),
+            change_annotations: None,
+        };
+
+        let result = editor.apply_workspace_edit(OffsetEncoding::Utf8, &workspace_edit);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().failed_change_idx, 1);
+
+        assert_eq!(
+            editor.document(first_doc).expect("first doc").text(),
+            &Rope::from("alpha\n")
+        );
+        assert_eq!(
+            editor.document(second_doc).expect("second doc").text(),
+            &Rope::from("bravo\n")
+        );
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn mixed_workspace_edit_operations_are_planned_before_apply() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let _guard = runtime.enter();
+
+        let temp_dir = make_temp_dir();
+        let rename_from = temp_dir.join("rename-from.txt");
+        let rename_to = temp_dir.join("rename-to.txt");
+        let second_path = temp_dir.join("second.txt");
+        fs::write(&rename_from, "alpha\n").expect("write rename source");
+        fs::write(&second_path, "bravo\n").expect("write second file");
+
+        let mut editor = make_editor();
+        let second_doc = editor
+            .open(&second_path, Action::Load)
+            .expect("open second file");
+        let second_version = editor.document(second_doc).expect("second doc").version();
+
+        let workspace_edit = lsp::WorkspaceEdit {
+            changes: None,
+            document_changes: Some(lsp::DocumentChanges::Operations(vec![
+                lsp::DocumentChangeOperation::Op(lsp::ResourceOp::Rename(lsp::RenameFile {
+                    old_uri: helix_lsp::Url::from_file_path(&rename_from).expect("rename from url"),
+                    new_uri: helix_lsp::Url::from_file_path(&rename_to).expect("rename to url"),
+                    options: None,
+                    annotation_id: None,
+                })),
+                lsp::DocumentChangeOperation::Edit(lsp::TextDocumentEdit {
+                    text_document: lsp::OptionalVersionedTextDocumentIdentifier {
+                        uri: helix_lsp::Url::from_file_path(&second_path).expect("second url"),
+                        version: Some(second_version + 1),
+                    },
+                    edits: vec![lsp::OneOf::Left(text_edit(0..5, "delta"))],
+                }),
+            ])),
+            change_annotations: None,
+        };
+
+        let result = editor.apply_workspace_edit(OffsetEncoding::Utf8, &workspace_edit);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().failed_change_idx, 1);
+
+        assert!(rename_from.exists());
+        assert!(!rename_to.exists());
+        assert_eq!(
+            editor.document(second_doc).expect("second doc").text(),
+            &Rope::from("bravo\n")
+        );
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn directory_rename_workspace_edit_maps_descendant_text_edits() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let _guard = runtime.enter();
+
+        let temp_dir = make_temp_dir();
+        let old_dir = temp_dir.join("old-dir");
+        let new_dir = temp_dir.join("new-dir");
+        let old_file = old_dir.join("file.txt");
+        let new_file = new_dir.join("file.txt");
+        fs::create_dir_all(&old_dir).expect("create old dir");
+        fs::write(&old_file, "alpha\n").expect("write old file");
+
+        let mut editor = make_editor();
+        let workspace_edit = lsp::WorkspaceEdit {
+            changes: None,
+            document_changes: Some(lsp::DocumentChanges::Operations(vec![
+                lsp::DocumentChangeOperation::Op(lsp::ResourceOp::Rename(lsp::RenameFile {
+                    old_uri: helix_lsp::Url::from_file_path(&old_dir).expect("old dir url"),
+                    new_uri: helix_lsp::Url::from_file_path(&new_dir).expect("new dir url"),
+                    options: None,
+                    annotation_id: None,
+                })),
+                lsp::DocumentChangeOperation::Edit(lsp::TextDocumentEdit {
+                    text_document: lsp::OptionalVersionedTextDocumentIdentifier {
+                        uri: helix_lsp::Url::from_file_path(&new_file).expect("new file url"),
+                        version: None,
+                    },
+                    edits: vec![lsp::OneOf::Left(text_edit(0..5, "omega"))],
+                }),
+            ])),
+            change_annotations: None,
+        };
+
+        editor
+            .apply_workspace_edit(OffsetEncoding::Utf8, &workspace_edit)
+            .expect("apply workspace edit");
+
+        assert!(!old_dir.exists());
+        assert_eq!(
+            fs::read_to_string(&new_file).expect("read new file"),
+            "alpha\n"
+        );
+        assert_eq!(
+            editor
+                .document_by_path(&new_file)
+                .expect("renamed file should be open")
+                .text(),
+            &Rope::from("omega\n")
+        );
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn deleted_directory_blocks_descendant_text_edits_during_planning() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let _guard = runtime.enter();
+
+        let temp_dir = make_temp_dir();
+        let dir_path = temp_dir.join("dir");
+        let file_path = dir_path.join("file.txt");
+        fs::create_dir_all(&dir_path).expect("create dir");
+        fs::write(&file_path, "alpha\n").expect("write file");
+
+        let mut editor = make_editor();
+        let workspace_edit = lsp::WorkspaceEdit {
+            changes: None,
+            document_changes: Some(lsp::DocumentChanges::Operations(vec![
+                lsp::DocumentChangeOperation::Op(lsp::ResourceOp::Delete(lsp::DeleteFile {
+                    uri: helix_lsp::Url::from_file_path(&dir_path).expect("dir url"),
+                    options: Some(lsp::DeleteFileOptions {
+                        recursive: Some(true),
+                        ignore_if_not_exists: None,
+                        annotation_id: None,
+                    }),
+                })),
+                lsp::DocumentChangeOperation::Edit(lsp::TextDocumentEdit {
+                    text_document: lsp::OptionalVersionedTextDocumentIdentifier {
+                        uri: helix_lsp::Url::from_file_path(&file_path).expect("file url"),
+                        version: None,
+                    },
+                    edits: vec![lsp::OneOf::Left(text_edit(0..5, "omega"))],
+                }),
+            ])),
+            change_annotations: None,
+        };
+
+        let result = editor.apply_workspace_edit(OffsetEncoding::Utf8, &workspace_edit);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().failed_change_idx, 1);
+        assert!(dir_path.exists());
+        assert_eq!(
+            fs::read_to_string(&file_path).expect("read file"),
+            "alpha\n"
+        );
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn created_file_can_be_edited_later_in_same_workspace_edit() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let _guard = runtime.enter();
+
+        let temp_dir = make_temp_dir();
+        let file_path = temp_dir.join("created.txt");
+
+        let mut editor = make_editor();
+        let workspace_edit = lsp::WorkspaceEdit {
+            changes: None,
+            document_changes: Some(lsp::DocumentChanges::Operations(vec![
+                lsp::DocumentChangeOperation::Op(lsp::ResourceOp::Create(lsp::CreateFile {
+                    uri: helix_lsp::Url::from_file_path(&file_path).expect("file url"),
+                    options: None,
+                    annotation_id: None,
+                })),
+                lsp::DocumentChangeOperation::Edit(lsp::TextDocumentEdit {
+                    text_document: lsp::OptionalVersionedTextDocumentIdentifier {
+                        uri: helix_lsp::Url::from_file_path(&file_path).expect("file url"),
+                        version: None,
+                    },
+                    edits: vec![lsp::OneOf::Left(text_edit(0..0, "hello"))],
+                }),
+            ])),
+            change_annotations: None,
+        };
+
+        editor
+            .apply_workspace_edit(OffsetEncoding::Utf8, &workspace_edit)
+            .expect("apply workspace edit");
+
+        assert!(file_path.exists());
+        assert_eq!(fs::read_to_string(&file_path).expect("read file"), "");
+        assert_eq!(
+            editor
+                .document_by_path(&file_path)
+                .expect("created file should be open")
+                .text(),
+            &Rope::from("hello")
+        );
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
 }

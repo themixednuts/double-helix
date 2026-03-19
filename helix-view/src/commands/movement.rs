@@ -925,7 +925,11 @@ fn goto_para_impl<F>(
     count: usize,
     move_fn: F,
 ) where
-    F: Fn(RopeSlice, &TextAnnotations, Range, usize, Movement) -> Range + Copy + Send + Sync + 'static,
+    F: Fn(RopeSlice, &TextAnnotations, Range, usize, Movement) -> Range
+        + Copy
+        + Send
+        + Sync
+        + 'static,
 {
     let movement = movement_from_mode(editor);
     editor.apply_motion(move |ed: &mut Editor| {
@@ -1506,8 +1510,7 @@ pub fn goto_ts_object(
     let loader = editor.syn_loader.load();
     let mut syntax_missing = false;
     editor.with_view_doc_mut(view_id, doc_id, |view, doc| {
-        if let Some(syntax) = doc.syntax() {
-            let text = doc.text().slice(..);
+        if let Some((syntax, text)) = doc.syntax_text() {
             let root = syntax.tree().root_node();
             let annotations = view.text_annotations(doc);
 

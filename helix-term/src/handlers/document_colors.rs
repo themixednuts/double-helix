@@ -1,7 +1,4 @@
-use std::{
-    collections::HashSet,
-    time::Duration,
-};
+use std::{collections::HashSet, time::Duration};
 
 use futures_util::{stream::FuturesOrdered, StreamExt};
 use helix_core::{syntax::config::LanguageServerFeature, text_annotations::InlineAnnotation};
@@ -173,16 +170,21 @@ pub(super) fn register_hooks(handlers: &Handlers) {
         }
 
         let hook_dur = hook_start.elapsed();
-        log_command_phase("document_did_change_hook", "document_colors", hook_dur, || {
-            format!(
-                "doc_id={:?} ghost={} lines={} bytes={} has_swatches={}",
-                event.doc.id(),
-                event.ghost_transaction,
-                event.doc.text().len_lines(),
-                event.doc.text().len_bytes(),
-                event.doc.color_swatches().is_some()
-            )
-        });
+        log_command_phase(
+            "document_did_change_hook",
+            "document_colors",
+            hook_dur,
+            || {
+                format!(
+                    "doc_id={:?} ghost={} lines={} bytes={} has_swatches={}",
+                    event.doc.id(),
+                    event.ghost_transaction,
+                    event.doc.text().len_lines(),
+                    event.doc.text().len_bytes(),
+                    event.doc.color_swatches().is_some()
+                )
+            },
+        );
         Ok(())
     });
 

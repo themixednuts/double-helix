@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 use std::path::PathBuf;
 
-use crate::document::{DEFAULT_LANGUAGE_NAME, Mode, SCRATCH_BUFFER_NAME};
+use crate::document::{Mode, DEFAULT_LANGUAGE_NAME, SCRATCH_BUFFER_NAME};
 use crate::editor::WorkspaceDiagnosticCounts;
 use crate::traits::{Selectable, TextContent};
 use crate::Document;
@@ -136,10 +136,13 @@ impl DocumentStatusProvider for Document {
         let file_base_name = self
             .relative_path()
             .as_ref()
-            .and_then(|path| path.file_name().map(|name| Cow::Owned(name.to_string_lossy().into_owned())))
+            .and_then(|path| {
+                path.file_name()
+                    .map(|name| Cow::Owned(name.to_string_lossy().into_owned()))
+            })
             .unwrap_or(Cow::Borrowed(SCRATCH_BUFFER_NAME));
-        let encoding_name = (self.encoding() != helix_core::encoding::UTF_8)
-            .then(|| self.encoding().name());
+        let encoding_name =
+            (self.encoding() != helix_core::encoding::UTF_8).then(|| self.encoding().name());
 
         DocumentStatus {
             file_path: self.path().cloned(),

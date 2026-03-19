@@ -3,10 +3,7 @@ use helix_tui::{
     buffer::Buffer,
     terminal::{Terminal, TerminalOptions, Viewport},
 };
-use helix_view::{
-    editor::KittyKeyboardProtocolConfig,
-    graphics::Rect,
-};
+use helix_view::{editor::KittyKeyboardProtocolConfig, graphics::Rect};
 
 #[test]
 fn terminal_buffer_size_should_not_be_limited() {

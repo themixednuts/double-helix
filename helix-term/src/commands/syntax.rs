@@ -150,17 +150,27 @@ fn tags_iter<'a>(
     })
 }
 
+fn document_tags_iter<'a>(
+    doc: &'a Document,
+    loader: &'a Loader,
+    doc_ref: UriOrDocumentId,
+    pattern: Option<&'a rope::Regex>,
+) -> Option<impl Iterator<Item = Tag> + 'a> {
+    let (syntax, text) = doc.syntax_text()?;
+    Some(tags_iter(syntax, loader, text, doc_ref, pattern))
+}
+
 pub fn syntax_symbol_picker(cx: &mut Context) {
     let (_, doc) = focused_ref!(cx.editor);
-    let Some(syntax) = doc.syntax() else {
+    if !doc.has_syntax() {
         cx.editor
             .set_error("Syntax tree is not available on this buffer");
         return;
-    };
+    }
     let doc_id = doc.id();
-    let text = doc.text().slice(..);
     let loader = cx.editor.syn_loader.load();
-    let tags = tags_iter(syntax, &loader, text, UriOrDocumentId::Id(doc.id()), None);
+    let tags = document_tags_iter(doc, &loader, UriOrDocumentId::Id(doc.id()), None)
+        .expect("syntax existence checked above");
 
     let columns = vec![
         PickerColumn::new("kind", |tag: &Tag, _| tag.kind.as_str().into()),
@@ -285,13 +295,14 @@ pub fn syntax_workspace_symbol_picker(cx: &mut Context) {
         };
         let loader = editor.syn_loader.load();
         for doc in editor.documents() {
-            let Some(syntax) = doc.syntax() else { continue };
-            let text = doc.text().slice(..);
             let uri_or_id = doc
                 .uri()
                 .map(UriOrDocumentId::Uri)
                 .unwrap_or_else(|| UriOrDocumentId::Id(doc.id()));
-            for tag in tags_iter(syntax, &loader, text.slice(..), uri_or_id, Some(&pattern)) {
+            let Some(tags) = document_tags_iter(doc, &loader, uri_or_id, Some(&pattern)) else {
+                continue;
+            };
+            for tag in tags {
                 if injector.push(tag).is_err() {
                     return async { Ok(()) }.boxed();
                 }

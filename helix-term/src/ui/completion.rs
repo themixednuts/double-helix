@@ -636,9 +636,9 @@ impl Component for Completion {
     }
 
     fn prepare_render(&mut self, area: Rect, ctx: &RenderContext) -> crate::render::PreparedRender {
+        use crate::render::{CacheId, CacheKey, CacheTag, PreparedRender, RenderOutput};
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
-        use crate::render::{CacheId, CacheKey, CacheTag, PreparedRender, RenderOutput};
 
         let mut h = DefaultHasher::new();
         self.filter.hash(&mut h);

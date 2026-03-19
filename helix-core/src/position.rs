@@ -324,9 +324,8 @@ fn plain_char_idx_and_visual_col_at_visual_column(
             // (leading byte 0xCC or 0xCD for U+0300..U+036F). If so, the last
             // ASCII byte is the base of a multi-char grapheme — exclude it from
             // the fast-path count so the grapheme iterator handles the full cluster.
-            let next_is_combining = i < bytes.len()
-                && i > ascii_start
-                && (bytes[i] == 0xCC || bytes[i] == 0xCD);
+            let next_is_combining =
+                i < bytes.len() && i > ascii_start && (bytes[i] == 0xCC || bytes[i] == 0xCD);
             let ascii_len = if next_is_combining {
                 i - ascii_start - 1
             } else {
@@ -434,9 +433,8 @@ pub fn plain_visual_col_at_char_idx(text: RopeSlice, pos: usize, tab_width: usiz
             // Exclude last ASCII byte if followed by a combining character
             // (0xCC/0xCD lead byte for U+0300..U+036F) so the grapheme
             // iterator can see the full cluster.
-            let next_is_combining = i < bytes.len()
-                && i > ascii_start
-                && (bytes[i] == 0xCC || bytes[i] == 0xCD);
+            let next_is_combining =
+                i < bytes.len() && i > ascii_start && (bytes[i] == 0xCC || bytes[i] == 0xCD);
             let ascii_len = if next_is_combining {
                 i - ascii_start - 1
             } else {
@@ -1097,14 +1095,7 @@ mod test {
         let fmt = TextFormat::default();
 
         let (char_idx, visual_pos, virtual_lines) =
-            char_idx_and_visual_offset_at_visual_block_offset(
-                slice,
-                0,
-                0,
-                4,
-                &fmt,
-                &annotations,
-            );
+            char_idx_and_visual_offset_at_visual_block_offset(slice, 0, 0, 4, &fmt, &annotations);
 
         assert_eq!(char_idx, 4);
         assert_eq!(visual_pos, Position::new(0, 4));
@@ -1119,28 +1110,14 @@ mod test {
         let fmt = TextFormat::default();
 
         let (char_idx, visual_pos, virtual_lines) =
-            char_idx_and_visual_offset_at_visual_block_offset(
-                slice,
-                0,
-                0,
-                2,
-                &fmt,
-                &annotations,
-            );
+            char_idx_and_visual_offset_at_visual_block_offset(slice, 0, 0, 2, &fmt, &annotations);
 
         assert_eq!(char_idx, 0);
         assert_eq!(visual_pos, Position::new(0, 0));
         assert_eq!(virtual_lines, 0);
 
         let (char_idx, visual_pos, virtual_lines) =
-            char_idx_and_visual_offset_at_visual_block_offset(
-                slice,
-                0,
-                0,
-                4,
-                &fmt,
-                &annotations,
-            );
+            char_idx_and_visual_offset_at_visual_block_offset(slice, 0, 0, 4, &fmt, &annotations);
 
         assert_eq!(char_idx, 1);
         assert_eq!(visual_pos, Position::new(0, 4));

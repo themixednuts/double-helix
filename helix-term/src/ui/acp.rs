@@ -1,6 +1,7 @@
 use crate::component_traits;
 use crate::compositor::{Component, Context, Event, EventResult, RenderContext};
 use crate::ui::marquee::{schedule_redraw_at, Marquee};
+use crate::widgets::{chat_bubble, BubbleAlign, BubbleCorners, BubbleStyle};
 use helix_core::Position;
 use helix_view::content_region::ContentRegion;
 use helix_view::document::Mode;
@@ -12,7 +13,6 @@ use helix_view::traits::{Bounded, Focusable, Identified, Modal, Scrollable};
 use helix_view::Editor;
 use tui::buffer::Buffer as Surface;
 use tui::text::{Span, Spans};
-use crate::widgets::{chat_bubble, BubbleAlign, BubbleStyle};
 
 pub const ID: &str = "acp-panel";
 pub const PERMISSION_ID: &str = "acp-permission";
@@ -535,7 +535,12 @@ impl AcpPanel {
     }
 
     /// Build renderable blocks from chat entries.
-    fn build_blocks<'a>(&self, theme: &helix_view::Theme, width: u16) -> Vec<ChatBlock<'a>> {
+    fn build_blocks<'a>(
+        &self,
+        theme: &helix_view::Theme,
+        width: u16,
+        corners: BubbleCorners,
+    ) -> Vec<ChatBlock<'a>> {
         let border_style = theme.get("ui.window");
         let agent_style = theme.get("ui.text.info");
         let user_label_style = theme.get("keyword").add_modifier(Modifier::BOLD);
@@ -561,9 +566,9 @@ impl AcpPanel {
             .try_get("ui.acp.agent_bubble")
             .unwrap_or_else(|| Style::default());
 
-        // Flex width: min 60%, max 90% of panel.
-        let min_bubble = ((width as u32 * 60 / 100) as u16).max(20);
-        let max_bubble = ((width as u32 * 90 / 100) as u16).min(width);
+        // Flex width: min 60%, max 90% of panel — but never panic on tiny sizes.
+        let max_bubble = ((width as u32 * 90 / 100) as u16).min(width).max(4);
+        let min_bubble = ((width as u32 * 60 / 100) as u16).max(20).min(max_bubble);
 
         let mut blocks = Vec::new();
 
@@ -576,7 +581,12 @@ impl AcpPanel {
                     let wrapped = wrap_text(text, inner_w);
                     let content_lines: Vec<Spans> = wrapped
                         .iter()
-                        .map(|wl| Spans::from(Span::styled(wl.clone(), user_text_style.patch(user_bubble_bg))))
+                        .map(|wl| {
+                            Spans::from(Span::styled(
+                                wl.clone(),
+                                user_text_style.patch(user_bubble_bg),
+                            ))
+                        })
                         .collect();
                     blocks.push(ChatBlock {
                         kind: ChatBlockKind::Bubble {
@@ -587,6 +597,7 @@ impl AcpPanel {
                             style: BubbleStyle {
                                 border: border_style.patch(user_bubble_bg),
                                 background: user_bubble_bg,
+                                corners,
                             },
                         },
                     });
@@ -633,16 +644,14 @@ impl AcpPanel {
 
                     blocks.push(ChatBlock {
                         kind: ChatBlockKind::Bubble {
-                            label: Some((
-                                format!(" {}", self.agent_name),
-                                agent_label_style,
-                            )),
+                            label: Some((format!(" {}", self.agent_name), agent_label_style)),
                             lines: content_lines,
                             bubble_width: bubble_w,
                             align: BubbleAlign::Left,
                             style: BubbleStyle {
                                 border: border_style.patch(agent_bubble_bg),
                                 background: agent_bubble_bg,
+                                corners,
                             },
                         },
                     });
@@ -673,9 +682,10 @@ impl AcpPanel {
                 }
                 ChatEntry::Status(text) => {
                     blocks.push(ChatBlock {
-                        kind: ChatBlockKind::Plain(vec![
-                            Spans::from(Span::styled(format!(" {text}"), status_dim_style)),
-                        ]),
+                        kind: ChatBlockKind::Plain(vec![Spans::from(Span::styled(
+                            format!(" {text}"),
+                            status_dim_style,
+                        ))]),
                     });
                 }
             }
@@ -685,12 +695,7 @@ impl AcpPanel {
     }
 
     /// Render chat blocks directly to the surface with proper scroll.
-    fn render_content(
-        &mut self,
-        blocks: &[ChatBlock],
-        area: Rect,
-        surface: &mut Surface,
-    ) {
+    fn render_content(&mut self, blocks: &[ChatBlock], area: Rect, surface: &mut Surface) {
         if area.height == 0 || area.width == 0 {
             return;
         }
@@ -751,63 +756,23 @@ impl AcpPanel {
                     if cur_y < (area.y + area.height) as isize
                         && cur_y + lines.len() as isize + 2 > area.y as isize
                     {
-                        // Clip to visible area.
                         let bubble_y = cur_y.max(area.y as isize) as u16;
-                        let bubble_bottom = ((cur_y + lines.len() as isize + 2) as u16)
-                            .min(area.y + area.height);
+                        let bubble_bottom =
+                            ((cur_y + lines.len() as isize + 2) as u16).min(area.y + area.height);
                         let visible_h = bubble_bottom.saturating_sub(bubble_y);
 
                         if visible_h > 0 {
-                            // We need to handle partial scroll: if cur_y < area.y,
-                            // skip the top rows of the bubble.
                             let skip_top = (area.y as isize - cur_y).max(0) as usize;
-
-                            // Build the set of lines to render, accounting for skip.
-                            let bubble_area =
-                                Rect::new(area.x, bubble_y, area.width, visible_h);
-
-                            // Render using the chat_bubble widget.
-                            // If skip_top > 0, we need to adjust what we render.
-                            if skip_top == 0 {
-                                chat_bubble(
-                                    surface,
-                                    bubble_area,
-                                    lines,
-                                    *bubble_width,
-                                    *align,
-                                    *style,
-                                );
-                            } else {
-                                // Partial render: skip_top rows clipped from top.
-                                // Skip 1 = top border hidden, rest = content lines.
-                                let content_skip = skip_top.saturating_sub(1);
-                                let remaining_lines: Vec<_> =
-                                    lines.iter().skip(content_skip).cloned().collect();
-                                if skip_top <= 1 {
-                                    // Top border partially visible or just hidden.
-                                    chat_bubble(
-                                        surface,
-                                        bubble_area,
-                                        &remaining_lines,
-                                        *bubble_width,
-                                        *align,
-                                        *style,
-                                    );
-                                } else {
-                                    // Deep scroll: render remaining content + bottom border.
-                                    // Use chat_bubble which always draws top border,
-                                    // so it's slightly off. Accept the visual trade-off
-                                    // for scroll — it's only visible during fast scroll.
-                                    chat_bubble(
-                                        surface,
-                                        bubble_area,
-                                        &remaining_lines,
-                                        *bubble_width,
-                                        *align,
-                                        *style,
-                                    );
-                                }
-                            }
+                            let bubble_area = Rect::new(area.x, bubble_y, area.width, visible_h);
+                            chat_bubble(
+                                surface,
+                                bubble_area,
+                                lines,
+                                *bubble_width,
+                                *align,
+                                *style,
+                                skip_top,
+                            );
                         }
                     }
                 }
@@ -926,7 +891,11 @@ impl AcpPanel {
 
     /// Handle the result of an engine dispatch in the input region.
     /// Returns `true` if consumed, `false` if the key was unbound and should bubble.
-    fn handle_engine_result(&mut self, result: helix_view::engine::EngineResult, cx: &mut Context) -> bool {
+    fn handle_engine_result(
+        &mut self,
+        result: helix_view::engine::EngineResult,
+        cx: &mut Context,
+    ) -> bool {
         use helix_view::engine::EngineResult;
         match result {
             EngineResult::Executed | EngineResult::Pending => true,
@@ -1128,10 +1097,11 @@ struct MarkdownLineStyles {
 /// Compute the ideal bubble width for `text`: fit to the longest wrapped
 /// line, then clamp to [min_w, max_w].
 fn fit_bubble_width(text: &str, min_w: usize, max_w: usize) -> usize {
-    let inner_max = max_w.saturating_sub(4);
+    let max_w = max_w.max(4);
+    let min_w = min_w.min(max_w);
+    let inner_max = max_w.saturating_sub(4).max(1);
     let wrapped = wrap_text(text, inner_max);
     let longest = wrapped.iter().map(|l| l.len()).max().unwrap_or(0);
-    // bubble = longest line + 4 (border + padding)
     (longest + 4).clamp(min_w, max_w)
 }
 
@@ -1390,7 +1360,10 @@ impl Component for AcpPanel {
     fn render(&mut self, area: Rect, surface: &mut Surface, cx: &RenderContext) {
         log::warn!(
             "[acp_panel] render area=({},{} {}x{})",
-            area.x, area.y, area.width, area.height,
+            area.x,
+            area.y,
+            area.width,
+            area.height,
         );
         if area.width < 20 || area.height < 6 {
             return;
@@ -1632,20 +1605,23 @@ impl Component for AcpPanel {
                 .try_get("ui.acp.input.border")
                 .unwrap_or_else(|| theme.get("ui.window"));
 
-            // Draw rounded border around input area.
+            // Draw border around input area.
             if inset.width >= 4 && inset.height >= 3 {
                 let bw = inset.width as usize;
-                // Top border: ╭───╮
-                let top = format!("╭{}╮", "─".repeat(bw.saturating_sub(2)));
+                let rounded = cx.editor.config().acp.bubble_corners_rounded();
+                let (tl, tr, bl, br) = if rounded {
+                    ("╭", "╮", "╰", "╯")
+                } else {
+                    ("┌", "┐", "└", "┘")
+                };
+                let top = format!("{tl}{}{tr}", "─".repeat(bw.saturating_sub(2)));
                 surface.set_stringn(inset.x, inset.y, &top, bw, input_border_style);
-                // Side borders for inner rows.
                 for row in 1..inset.height.saturating_sub(1) {
                     let y = inset.y + row;
                     surface.set_stringn(inset.x, y, "│", 1, input_border_style);
                     surface.set_stringn(inset.right() - 1, y, "│", 1, input_border_style);
                 }
-                // Bottom border: ╰───╯
-                let bot = format!("╰{}╯", "─".repeat(bw.saturating_sub(2)));
+                let bot = format!("{bl}{}{br}", "─".repeat(bw.saturating_sub(2)));
                 surface.set_stringn(
                     inset.x,
                     inset.y + inset.height - 1,
@@ -1765,7 +1741,12 @@ impl Component for AcpPanel {
         }
 
         // Render chat content using block-based rendering with chat_bubble widget.
-        let blocks = self.build_blocks(theme, content_area.width);
+        let corners = if cx.editor.config().acp.bubble_corners_rounded() {
+            BubbleCorners::Rounded
+        } else {
+            BubbleCorners::Squared
+        };
+        let blocks = self.build_blocks(theme, content_area.width, corners);
         self.render_content(&blocks, content_area, surface);
 
         // Scrollbar
@@ -1851,9 +1832,7 @@ impl Component for AcpPanel {
                 return EventResult::Consumed(None);
             }
             // Shift+Tab → dedent (remove leading whitespace on current line).
-            if matches!(key.code, KeyCode::Tab)
-                && key.modifiers.contains(KeyModifiers::SHIFT)
-            {
+            if matches!(key.code, KeyCode::Tab) && key.modifiers.contains(KeyModifiers::SHIFT) {
                 if let Some(doc_id) = self.input.doc_id() {
                     if let Some(doc) = cx.editor.component_docs.get_mut(&doc_id) {
                         let text = doc.text();
@@ -1950,7 +1929,9 @@ impl Component for AcpPanel {
                                     .clone()
                                     .transform(|range| {
                                         let line = text.char_to_line(range.cursor(text));
-                                        let pos = helix_core::line_ending::line_end_char_index(&text, line);
+                                        let pos = helix_core::line_ending::line_end_char_index(
+                                            &text, line,
+                                        );
                                         helix_core::Range::new(pos, pos)
                                     });
                                 doc.set_selection(self.input.view_id(), selection);
@@ -1967,10 +1948,18 @@ impl Component for AcpPanel {
         // If the engine says the key is unbound, let it bubble up to the editor
         // (e.g. `:` for command mode, or any other user-bound Frontend command).
         if self.dispatch_input_key(*key, cx) {
-            log::warn!("[acp_event] key={} mode={:?} → Consumed (engine handled)", key.key_sequence_format(), self.input.mode());
+            log::warn!(
+                "[acp_event] key={} mode={:?} → Consumed (engine handled)",
+                key.key_sequence_format(),
+                self.input.mode()
+            );
             EventResult::Consumed(None)
         } else {
-            log::warn!("[acp_event] key={} mode={:?} → Ignored (unbound, bubbling)", key.key_sequence_format(), self.input.mode());
+            log::warn!(
+                "[acp_event] key={} mode={:?} → Ignored (unbound, bubbling)",
+                key.key_sequence_format(),
+                self.input.mode()
+            );
             EventResult::Ignored(None)
         }
     }

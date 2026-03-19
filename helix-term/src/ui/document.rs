@@ -11,14 +11,14 @@ use helix_core::str_utils::char_to_byte_idx;
 use helix_core::syntax::{self, HighlightEvent, Highlighter, OverlayHighlights};
 use helix_core::text_annotations::TextAnnotations;
 use helix_core::{
-    char_idx_and_visual_offset_at_visual_block_offset_with_kind, visual_offset_from_block_with_metrics,
-    Position, RopeSlice, VisualBlockOffsetSeekKind,
+    char_idx_and_visual_offset_at_visual_block_offset_with_kind,
+    visual_offset_from_block_with_metrics, Position, RopeSlice, VisualBlockOffsetSeekKind,
 };
 use helix_stdx::rope::RopeSliceExt;
 use helix_view::editor::{WhitespaceConfig, WhitespaceRenderValue};
 use helix_view::graphics::Rect;
 use helix_view::theme::Style;
-use helix_view::view::ViewPosition;
+use helix_view::view::{RenderSeed, ViewPosition};
 use helix_view::{Document, Theme};
 use tui::buffer::Buffer as Surface;
 
@@ -31,13 +31,6 @@ pub enum HighlighterInput<'a> {
     Live(Option<Highlighter<'a>>),
     /// Cached styles — replays pre-computed styles. No tree-sitter queries.
     Cached(&'a [helix_view::view::SyntaxStyleEntry]),
-}
-
-#[derive(Clone, Copy)]
-pub struct RenderSeed {
-    pub doc_line: usize,
-    pub char_idx: usize,
-    pub visual_col: usize,
 }
 
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
@@ -123,11 +116,7 @@ pub fn render_text(
 
     const HORIZONTAL_CHECKPOINT_STRIDE: usize = 4096;
 
-    fn record_horizontal_checkpoint(
-        line: &mut VisualLineInfo,
-        char_idx: usize,
-        visual_col: usize,
-    ) {
+    fn record_horizontal_checkpoint(line: &mut VisualLineInfo, char_idx: usize, visual_col: usize) {
         if line
             .horizontal_checkpoints
             .last()
@@ -160,8 +149,7 @@ pub fn render_text(
         && matches!(
             text_annotations.plain_viewport_support(anchor_line, anchor_line),
             helix_core::text_annotations::PlainViewportSupport::Supported
-        )
-    {
+        ) {
         (
             0,
             format!(
@@ -177,13 +165,8 @@ pub fn render_text(
             ),
         )
     } else {
-        let row_offset = visual_offset_from_block_with_metrics(
-            text,
-            anchor,
-            anchor,
-            text_fmt,
-            text_annotations,
-        );
+        let row_offset =
+            visual_offset_from_block_with_metrics(text, anchor, anchor, text_fmt, text_annotations);
         (
             row_offset.result.0.row,
             format!(
@@ -210,12 +193,18 @@ pub fn render_text(
             ),
         )
     };
-    helix_view::bench::log_run_phase("render_document", "row_offset", row_offset_start.elapsed(), || {
-        row_offset_details.clone()
-    });
+    helix_view::bench::log_run_phase(
+        "render_document",
+        "row_offset",
+        row_offset_start.elapsed(),
+        || row_offset_details.clone(),
+    );
     let mut reached_view_top = false;
     let mut formatter = if let Some(seed) = seed.filter(|seed| {
-        !text_fmt.soft_wrap && row_off == 0 && seed.doc_line == anchor_line && seed.char_idx <= text.len_chars()
+        !text_fmt.soft_wrap
+            && row_off == 0
+            && seed.doc_line == anchor_line
+            && seed.char_idx <= text.len_chars()
     }) {
         reached_view_top = true;
         decorations.fast_forward_to_char(seed.char_idx, seed.doc_line);
@@ -240,7 +229,10 @@ pub fn render_text(
     let mut overlay_highlighter = OverlayHighlighter::new(overlay_highlights, theme);
 
     if let Some(seed) = seed.filter(|seed| {
-        !text_fmt.soft_wrap && row_off == 0 && seed.doc_line == anchor_line && seed.char_idx <= text.len_chars()
+        !text_fmt.soft_wrap
+            && row_off == 0
+            && seed.doc_line == anchor_line
+            && seed.char_idx <= text.len_chars()
     }) {
         syntax_highlighter.advance_to(seed.char_idx);
         overlay_highlighter.advance_to(seed.char_idx);
@@ -564,12 +556,15 @@ pub fn render_text(
             skipped_left += 1;
             if !text_fmt.soft_wrap && !grapheme.is_virtual() && grapheme.doc_chars() != 0 {
                 if let Some(last_entry) = line_map_lines.last_mut() {
-                    let next_target = last_entry
-                        .horizontal_checkpoints
-                        .last()
-                        .map_or(0, |checkpoint| {
-                            checkpoint.visual_col.saturating_add(HORIZONTAL_CHECKPOINT_STRIDE)
-                        });
+                    let next_target =
+                        last_entry
+                            .horizontal_checkpoints
+                            .last()
+                            .map_or(0, |checkpoint| {
+                                checkpoint
+                                    .visual_col
+                                    .saturating_add(HORIZONTAL_CHECKPOINT_STRIDE)
+                            });
                     if grapheme.visual_pos.col >= next_target {
                         record_horizontal_checkpoint(
                             last_entry,
@@ -609,7 +604,10 @@ pub fn render_text(
         let bookkeeping_start = Instant::now();
         if visible_left_edge && visible_right_edge {
             if let Some(last_entry) = line_map_lines.last_mut() {
-                if !grapheme.is_virtual() && grapheme.doc_chars() != 0 && last_entry.visible_char_start == usize::MAX {
+                if !grapheme.is_virtual()
+                    && grapheme.doc_chars() != 0
+                    && last_entry.visible_char_start == usize::MAX
+                {
                     last_entry.visible_char_start = grapheme.char_idx;
                     last_entry.visible_col_start = grapheme.visual_pos.col;
                     first_visible_char.get_or_insert(grapheme.char_idx);
@@ -1298,12 +1296,7 @@ mod tests {
 
     use arc_swap::ArcSwap;
     use helix_core::syntax;
-    use helix_view::{
-        editor::Config,
-        graphics::Rect,
-        theme::Theme,
-        view::ViewPosition,
-    };
+    use helix_view::{editor::Config, graphics::Rect, theme::Theme, view::ViewPosition};
     use tui::buffer::Buffer as Surface;
 
     use super::*;
@@ -1318,7 +1311,11 @@ mod tests {
     }
 
     fn giant_two_line_fixture(bytes_per_line: usize) -> String {
-        format!("{}\n{}", "a".repeat(bytes_per_line), "b".repeat(bytes_per_line))
+        format!(
+            "{}\n{}",
+            "a".repeat(bytes_per_line),
+            "b".repeat(bytes_per_line)
+        )
     }
 
     #[test]

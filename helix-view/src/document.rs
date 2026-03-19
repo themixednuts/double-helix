@@ -11,8 +11,8 @@ use helix_core::doc_formatter::TextFormat;
 use helix_core::encoding::Encoding;
 use helix_core::snippets::{ActiveSnippet, RenderedSnippet, SnippetRenderCtx};
 use helix_core::syntax::config::LanguageServerFeature;
-use helix_core::text_annotations::{InlineAnnotation, Overlay};
-use helix_core::text_folding::{EndFoldPoint, FoldContainer, StartFoldPoint};
+use helix_core::text_annotations::{InlineAnnotation, Overlay, TextAnnotations};
+use helix_core::text_folding::{EndFoldPoint, FoldContainer, RopeSliceFoldExt, StartFoldPoint};
 use helix_lsp::util::lsp_pos_to_pos;
 use helix_stdx::faccess::{copy_metadata, readonly};
 use helix_vcs::{DiffHandle, DiffProviderRegistry};
@@ -25,6 +25,7 @@ use std::collections::HashMap;
 use std::fmt::Display;
 use std::future::Future;
 use std::io;
+use std::ops;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -33,30 +34,103 @@ use std::time::{Instant, SystemTime};
 use helix_core::{
     editor_config::EditorConfig,
     encoding,
+    graphemes::{next_grapheme_boundary, prev_grapheme_boundary},
     history::{State, UndoKind},
+    indent,
     indent::{auto_detect_indent_style, IndentStyle},
     line_ending::auto_detect_line_ending,
-    syntax::{self, config::LanguageConfiguration},
+    syntax::{
+        self,
+        config::{IndentationHeuristic, LanguageConfiguration},
+        Highlight, OverlayHighlights, TextObjectQuery,
+    },
     ChangeSet, Diagnostic, LineEnding, Range, Rope, RopeBuilder, Selection, Syntax, Transaction,
 };
 
 use crate::{
     bench::{current_bench_command_context, log_command_phase},
     document_lsp::{DocumentColorSwatches, DocumentLspState},
-    editor::Config,
+    editor::{Config, CursorShapeConfig},
     events::{DocumentDidChange, SelectionDidChange},
     expansion,
     file_bound::FileBoundState,
+    graphics::CursorKind,
     presentation_state::DocumentPresentationState,
     selection_store::SelectionStore,
     session_state::DocumentSessionState,
     snippet_state::DocumentSnippetState,
-    syntax_aware::SyntaxAwareState,
+    syntax_aware::{SyntaxAwareState, SyntaxSnapshot},
     text_buffer::TextBuffer,
     vcs_state::{LineBlameError, VcsState},
     view::ViewPosition,
     DocumentId, Editor, Theme, View, ViewId,
 };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GutterSnapshot {
+    pub(crate) revision: crate::Revision,
+    pub(crate) diagnostic_count: usize,
+    pub(crate) diff_active: bool,
+}
+
+impl GutterSnapshot {
+    pub const fn new(revision: crate::Revision) -> Self {
+        Self {
+            revision,
+            diagnostic_count: 0,
+            diff_active: false,
+        }
+    }
+
+    pub const fn with_state(
+        revision: crate::Revision,
+        diagnostic_count: usize,
+        diff_active: bool,
+    ) -> Self {
+        Self {
+            revision,
+            diagnostic_count,
+            diff_active,
+        }
+    }
+
+    pub const fn revision(self) -> crate::Revision {
+        self.revision
+    }
+
+    pub const fn diagnostic_count(self) -> usize {
+        self.diagnostic_count
+    }
+
+    pub const fn diff_active(self) -> bool {
+        self.diff_active
+    }
+}
+
+fn extract_name_from_declarator(
+    node: helix_core::tree_sitter::Node,
+    text: helix_core::RopeSlice<'_>,
+) -> Option<String> {
+    for i in 0..node.child_count() {
+        let child = node.child(i)?;
+        match child.kind() {
+            "identifier" | "field_identifier" | "property_identifier" => {
+                let start_byte = child.start_byte() as usize;
+                let end_byte = child.end_byte() as usize;
+                let start_char = text.try_byte_to_char(start_byte).ok()?;
+                let end_char = text.try_byte_to_char(end_byte).ok()?;
+                return Some(text.slice(start_char..end_char).to_string());
+            }
+            kind if kind.contains("declarator") => {
+                if let Some(name) = extract_name_from_declarator(child, text) {
+                    return Some(name);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
 
 /// 8kB of buffer space for encoding and decoding `Rope`s.
 const BUF_SIZE: usize = 8192;
@@ -2134,6 +2208,28 @@ impl Document {
         self.vcs.diff_handle()
     }
 
+    /// Returns the diff generation counter. Changes each time the diff worker
+    /// publishes new hunks, so the render cache can invalidate the gutter.
+    pub fn diff_gen(&self) -> u64 {
+        self.vcs.diff_handle().map_or(0, |h| h.gen())
+    }
+
+    fn gutter_gen(&self) -> u64 {
+        self.diff_gen().wrapping_add(self.diagnostics_gen())
+    }
+
+    pub fn gutter_snapshot(&self) -> GutterSnapshot {
+        GutterSnapshot::with_state(
+            crate::Revision::from(self.gutter_gen()),
+            self.diagnostics().len(),
+            self.diff_handle().is_some(),
+        )
+    }
+
+    pub fn syntax_snapshot(&self) -> SyntaxSnapshot {
+        self.syntax_aware.syntax_snapshot()
+    }
+
     /// Intialize/updates the differ for this document with a new base.
     pub fn set_diff_base(&mut self, diff_base: Vec<u8>) {
         if let Ok((diff_base, ..)) = from_reader(&mut diff_base.as_slice(), Some(self.encoding())) {
@@ -2160,12 +2256,584 @@ impl Document {
         self.syntax_aware.syntax()
     }
 
-    pub fn set_syntax(&mut self, syntax: Option<Syntax>) {
-        self.syntax_aware.set_syntax(syntax);
+    pub fn has_syntax(&self) -> bool {
+        self.syntax().is_some()
     }
 
-    pub fn syntax_is_stale(&self) -> bool {
-        self.syntax_aware.syntax_is_stale()
+    pub fn syntax_text(&self) -> Option<(&Syntax, helix_core::RopeSlice<'_>)> {
+        Some((self.syntax()?, self.text().slice(..)))
+    }
+
+    pub fn syntax_highlighter<'a>(
+        &'a self,
+        loader: &'a syntax::Loader,
+        byte_range: std::ops::Range<u32>,
+    ) -> Option<syntax::Highlighter<'a>> {
+        let syntax = self.syntax()?;
+        Some(syntax.highlighter(self.text().slice(..), loader, byte_range))
+    }
+
+    pub fn viewport_syntax_highlighter<'a>(
+        &'a self,
+        loader: &'a syntax::Loader,
+        annotations: &TextAnnotations,
+        anchor: usize,
+        height: u16,
+    ) -> Option<syntax::Highlighter<'a>> {
+        let range = self.viewport_byte_range(annotations, anchor, height);
+        self.syntax_highlighter(loader, range.start as u32..range.end as u32)
+    }
+
+    pub fn textobject_context<'a>(
+        &'a self,
+        loader: &'a syntax::Loader,
+    ) -> Option<(&'a Syntax, &'a TextObjectQuery)> {
+        let syntax = self.syntax()?;
+        let query = loader.textobject_query(syntax.root_language())?;
+        Some((syntax, query))
+    }
+
+    pub fn syntax_highlights_at_char(
+        &self,
+        loader: &syntax::Loader,
+        visible_byte_range: std::ops::Range<u32>,
+        char_idx: usize,
+    ) -> Option<Vec<Highlight>> {
+        let byte = self.text().slice(..).char_to_byte(char_idx) as u32;
+        let mut highlighter = self.syntax_highlighter(loader, visible_byte_range)?;
+        let mut highlights = Vec::new();
+
+        while highlighter.next_event_offset() <= byte {
+            let (event, new_highlights) = highlighter.advance();
+            if event == helix_core::syntax::HighlightEvent::Refresh {
+                highlights.clear();
+            }
+            highlights.extend(new_highlights);
+        }
+
+        Some(highlights)
+    }
+
+    pub fn syntax_layer_language_ids_at_char(
+        &self,
+        loader: &syntax::Loader,
+        char_idx: usize,
+    ) -> Option<Vec<String>> {
+        let syntax = self.syntax()?;
+        let text = self.text().slice(..);
+        let byte = text.char_to_byte(char_idx) as u32;
+        Some(
+            syntax
+                .layers_for_byte_range(byte, byte)
+                .map(|layer| {
+                    loader
+                        .language(syntax.layer(layer).language)
+                        .config()
+                        .language_id
+                        .clone()
+                })
+                .collect(),
+        )
+    }
+
+    pub fn viewport_byte_range(
+        &self,
+        annotations: &TextAnnotations,
+        anchor: usize,
+        height: u16,
+    ) -> std::ops::Range<usize> {
+        let text = self.text().slice(..);
+        let row = text.char_to_line(anchor.min(text.len_chars()));
+        let last_line = text.len_lines().saturating_sub(1);
+        let row = row.min(last_line);
+        let last_visible_line = text
+            .nth_next_folded_line(&annotations.folds, row, (height as usize).saturating_sub(1))
+            .min(last_line);
+        let start = text.line_to_byte(row);
+        let end = text.line_to_byte(last_visible_line + 1);
+
+        start..end
+    }
+
+    pub fn viewport_overlay_highlights(
+        &self,
+        annotations: &TextAnnotations,
+        anchor: usize,
+        height: u16,
+    ) -> OverlayHighlights {
+        let text = self.text().slice(..);
+        let byte_range = self.viewport_byte_range(annotations, anchor, height);
+        let char_range = text.byte_to_char(byte_range.start)..text.byte_to_char(byte_range.end);
+        annotations.collect_overlay_highlights(char_range)
+    }
+
+    pub fn diagnostic_highlights(
+        &self,
+        theme: &Theme,
+        viewport: Option<std::ops::Range<usize>>,
+    ) -> Vec<OverlayHighlights> {
+        use helix_core::diagnostic::{DiagnosticTag, Range, Severity};
+
+        let get_scope = |scope| {
+            theme
+                .find_highlight_exact(scope)
+                .or_else(|| theme.find_highlight_exact("diagnostic"))
+                .or_else(|| theme.find_highlight_exact("ui.cursor"))
+                .or_else(|| theme.find_highlight_exact("ui.selection"))
+                .expect(
+                    "at least one of the following scopes must be defined in the theme: `diagnostic`, `ui.cursor`, or `ui.selection`",
+                )
+        };
+
+        let unnecessary = theme.find_highlight_exact("diagnostic.unnecessary");
+        let deprecated = theme.find_highlight_exact("diagnostic.deprecated");
+
+        let mut default_ranges = Vec::new();
+        let mut info_ranges = Vec::new();
+        let mut hint_ranges = Vec::new();
+        let mut warning_ranges = Vec::new();
+        let mut error_ranges = Vec::new();
+        let mut unnecessary_ranges = Vec::new();
+        let mut deprecated_ranges = Vec::new();
+
+        let push_range = |ranges: &mut Vec<ops::Range<usize>>, range: Range| match ranges.last_mut()
+        {
+            Some(existing) if range.start <= existing.end => {
+                debug_assert!(existing.start <= range.start);
+                existing.end = range.end.max(existing.end);
+            }
+            _ => ranges.push(range.start..range.end),
+        };
+
+        let diagnostics = self.diagnostics();
+        let (diag_start, diag_end) = if let Some(ref vp) = viewport {
+            let start = diagnostics.partition_point(|d| d.range.end < vp.start);
+            let end = diagnostics.partition_point(|d| d.range.start <= vp.end);
+            (start, end)
+        } else {
+            (0, diagnostics.len())
+        };
+
+        for diagnostic in &diagnostics[diag_start..diag_end] {
+            let ranges = match diagnostic.severity {
+                Some(Severity::Info) => &mut info_ranges,
+                Some(Severity::Hint) => &mut hint_ranges,
+                Some(Severity::Warning) => &mut warning_ranges,
+                Some(Severity::Error) => &mut error_ranges,
+                _ => &mut default_ranges,
+            };
+
+            if diagnostic.tags.is_empty()
+                || matches!(
+                    diagnostic.severity,
+                    Some(Severity::Warning | Severity::Error)
+                )
+            {
+                push_range(ranges, diagnostic.range);
+            }
+
+            for tag in &diagnostic.tags {
+                match tag {
+                    DiagnosticTag::Unnecessary => {
+                        if unnecessary.is_some() {
+                            push_range(&mut unnecessary_ranges, diagnostic.range);
+                        }
+                    }
+                    DiagnosticTag::Deprecated => {
+                        if deprecated.is_some() {
+                            push_range(&mut deprecated_ranges, diagnostic.range);
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut overlays = vec![OverlayHighlights::Homogeneous {
+            highlight: get_scope("diagnostic"),
+            ranges: default_ranges,
+        }];
+        if let Some(highlight) = unnecessary {
+            overlays.push(OverlayHighlights::Homogeneous {
+                highlight,
+                ranges: unnecessary_ranges,
+            });
+        }
+        if let Some(highlight) = deprecated {
+            overlays.push(OverlayHighlights::Homogeneous {
+                highlight,
+                ranges: deprecated_ranges,
+            });
+        }
+        overlays.extend([
+            OverlayHighlights::Homogeneous {
+                highlight: get_scope("diagnostic.info"),
+                ranges: info_ranges,
+            },
+            OverlayHighlights::Homogeneous {
+                highlight: get_scope("diagnostic.hint"),
+                ranges: hint_ranges,
+            },
+            OverlayHighlights::Homogeneous {
+                highlight: get_scope("diagnostic.warning"),
+                ranges: warning_ranges,
+            },
+            OverlayHighlights::Homogeneous {
+                highlight: get_scope("diagnostic.error"),
+                ranges: error_ranges,
+            },
+        ]);
+        overlays
+    }
+
+    pub fn ruler_columns(&self, view: &View, fallback_rulers: &[u16]) -> Vec<u16> {
+        let rulers = self
+            .language_config()
+            .and_then(|config| config.rulers.as_ref())
+            .map_or(fallback_rulers, |rulers| rulers.as_slice());
+        let view_offset = self.view_offset(view.id);
+
+        rulers
+            .iter()
+            .filter_map(|ruler| ruler.checked_sub(1 + view_offset.horizontal_offset as u16))
+            .filter(|ruler| *ruler < view.area.width)
+            .collect()
+    }
+
+    pub fn line_blame_at_cursor(&self, view_id: ViewId, format: &str) -> Option<(usize, String)> {
+        let text = self.text();
+        let cursor_line_idx = self.cursor_line(view_id);
+        if text.line(cursor_line_idx) == self.line_ending().as_str() {
+            return None;
+        }
+
+        self.line_blame(cursor_line_idx as u32, format)
+            .ok()
+            .map(|blame| (cursor_line_idx, blame))
+    }
+
+    pub fn line_blames(&self, view: &View, format: &str) -> Vec<(usize, String)> {
+        let text = self.text();
+        view.line_range(self)
+            .filter_map(|line_idx| {
+                if text.line(line_idx) == self.line_ending().as_str() {
+                    return None;
+                }
+
+                self.line_blame(line_idx as u32, format)
+                    .ok()
+                    .map(|blame| (line_idx, blame))
+            })
+            .collect()
+    }
+
+    pub fn diagnostics_at_cursor(&self, view_id: ViewId) -> impl Iterator<Item = &Diagnostic> + '_ {
+        let cursor = self
+            .selection(view_id)
+            .primary()
+            .cursor(self.text().slice(..));
+        self.diagnostics().iter().filter(move |diagnostic| {
+            diagnostic.range.start <= cursor && diagnostic.range.end >= cursor
+        })
+    }
+
+    pub fn selection_highlights(
+        &self,
+        view_id: ViewId,
+        mode: Mode,
+        theme: &Theme,
+        cursor_shape: &CursorShapeConfig,
+        terminal_focused: bool,
+        prompt_active: bool,
+    ) -> OverlayHighlights {
+        let text = self.text().slice(..);
+        let selection = self.selection(view_id);
+        let primary_idx = selection.primary_index();
+
+        let cursor_is_block = cursor_shape.from_mode(mode) == CursorKind::Block;
+        let selection_scope = theme
+            .find_highlight_exact("ui.selection")
+            .expect("could not find `ui.selection` scope in the theme!");
+        let primary_selection_scope = theme
+            .find_highlight_exact("ui.selection.primary")
+            .unwrap_or(selection_scope);
+
+        let base_cursor_scope = theme
+            .find_highlight_exact("ui.cursor")
+            .unwrap_or(selection_scope);
+        let base_primary_cursor_scope = theme
+            .find_highlight("ui.cursor.primary")
+            .unwrap_or(base_cursor_scope);
+
+        let cursor_scope = match mode {
+            Mode::Insert => theme.find_highlight_exact("ui.cursor.insert"),
+            Mode::Select => theme.find_highlight_exact("ui.cursor.select"),
+            Mode::Normal => theme.find_highlight_exact("ui.cursor.normal"),
+        }
+        .unwrap_or(base_cursor_scope);
+
+        let primary_cursor_scope = match mode {
+            Mode::Insert => theme.find_highlight_exact("ui.cursor.primary.insert"),
+            Mode::Select => theme.find_highlight_exact("ui.cursor.primary.select"),
+            Mode::Normal => theme.find_highlight_exact("ui.cursor.primary.normal"),
+        }
+        .unwrap_or(base_primary_cursor_scope);
+
+        let mut spans = Vec::new();
+        for (i, range) in selection.iter().enumerate() {
+            let selection_is_primary = i == primary_idx;
+            let (cursor_scope, selection_scope) = if selection_is_primary {
+                (primary_cursor_scope, primary_selection_scope)
+            } else {
+                (cursor_scope, selection_scope)
+            };
+
+            if range.head == range.anchor && range.head == text.len_chars() {
+                if !selection_is_primary || !terminal_focused || prompt_active {
+                    spans.push((cursor_scope, range.head..range.head + 1));
+                }
+                continue;
+            }
+
+            let range = range.min_width_1(text);
+            if range.head > range.anchor {
+                let cursor_start = prev_grapheme_boundary(text, range.head);
+                let selection_end =
+                    if selection_is_primary && !cursor_is_block && mode != Mode::Insert {
+                        range.head
+                    } else {
+                        cursor_start
+                    };
+                spans.push((selection_scope, range.anchor..selection_end));
+                if !selection_is_primary || !terminal_focused || prompt_active {
+                    spans.push((cursor_scope, cursor_start..range.head));
+                }
+            } else {
+                let cursor_end = next_grapheme_boundary(text, range.head);
+                if !selection_is_primary || !terminal_focused || prompt_active {
+                    spans.push((cursor_scope, range.head..cursor_end));
+                }
+                let selection_start = if selection_is_primary
+                    && !cursor_is_block
+                    && !(mode == Mode::Insert && cursor_end == range.anchor)
+                {
+                    range.head
+                } else {
+                    cursor_end
+                };
+                spans.push((selection_scope, selection_start..range.anchor));
+            }
+        }
+
+        OverlayHighlights::Heterogenous { highlights: spans }
+    }
+
+    pub fn cursor_lines(&self, view_id: ViewId) -> (usize, Vec<usize>) {
+        let text = self.text().slice(..);
+        let primary = self.selection(view_id).primary().cursor_line(text);
+        let secondary = self
+            .selection(view_id)
+            .iter()
+            .map(|range| range.cursor_line(text))
+            .collect();
+        (primary, secondary)
+    }
+
+    pub fn syntax_scopes_at_char(&self, char_idx: usize) -> Vec<&str> {
+        indent::get_scopes(self.syntax(), self.text().slice(..), char_idx)
+    }
+
+    pub fn pretty_selection_tree(&self, view_id: ViewId) -> Option<anyhow::Result<String>> {
+        let syntax = self.syntax()?;
+        let primary_selection = self.selection(view_id).primary();
+        let text = self.text();
+        let from = text.char_to_byte(primary_selection.from()) as u32;
+        let to = text.char_to_byte(primary_selection.to()) as u32;
+        let selected_node = syntax.descendant_for_byte_range(from, to)?;
+        let mut contents = String::from("```tsq\n");
+        Some(
+            helix_core::syntax::pretty_print_tree(&mut contents, selected_node)
+                .map_err(anyhow::Error::from)
+                .map(|_| {
+                    contents.push_str("\n```");
+                    contents
+                }),
+        )
+    }
+
+    pub fn function_name_at_char(&self, cursor_char: usize) -> Option<String> {
+        let syntax = self.syntax()?;
+        let text = self.text().slice(..);
+        let root = syntax.tree().root_node();
+        let byte_pos = text.char_to_byte(cursor_char) as u32;
+
+        let mut node = root.descendant_for_byte_range(byte_pos, byte_pos)?;
+        loop {
+            let kind = node.kind();
+            if kind.contains("function") || kind.contains("method") || kind.contains("closure") {
+                for i in 0..node.child_count() {
+                    if let Some(child) = node.child(i) {
+                        if child.kind() == "identifier" || child.kind() == "field_identifier" {
+                            let start_byte = child.start_byte() as usize;
+                            let end_byte = child.end_byte() as usize;
+                            let start_char = text.try_byte_to_char(start_byte).ok()?;
+                            let end_char = text.try_byte_to_char(end_byte).ok()?;
+                            return Some(text.slice(start_char..end_char).to_string());
+                        }
+                    }
+                }
+
+                for i in 0..node.child_count() {
+                    if let Some(child) = node.child(i) {
+                        if child.kind().contains("declarator") {
+                            if let Some(name) = extract_name_from_declarator(child, text) {
+                                return Some(name);
+                            }
+                        }
+                    }
+                }
+
+                if let Some(parent) = node.parent() {
+                    let parent_kind = parent.kind();
+                    if parent_kind == "variable_declarator"
+                        || parent_kind == "assignment_expression"
+                    {
+                        for i in 0..parent.child_count() {
+                            if let Some(child) = parent.child(i) {
+                                if child.kind() == "identifier"
+                                    && child.byte_range().end <= node.byte_range().start
+                                {
+                                    let start_byte = child.start_byte() as usize;
+                                    let end_byte = child.end_byte() as usize;
+                                    let start_char = text.try_byte_to_char(start_byte).ok()?;
+                                    let end_char = text.try_byte_to_char(end_byte).ok()?;
+                                    return Some(text.slice(start_char..end_char).to_string());
+                                }
+                            }
+                        }
+                    }
+
+                    if parent_kind == "pair" || parent_kind == "method_definition" {
+                        for i in 0..parent.child_count() {
+                            if let Some(child) = parent.child(i) {
+                                if child.kind() == "property_identifier"
+                                    || (child.kind() == "identifier"
+                                        && child.byte_range().end <= node.byte_range().start)
+                                {
+                                    let start_byte = child.start_byte() as usize;
+                                    let end_byte = child.end_byte() as usize;
+                                    let start_char = text.try_byte_to_char(start_byte).ok()?;
+                                    let end_char = text.try_byte_to_char(end_byte).ok()?;
+                                    return Some(text.slice(start_char..end_char).to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            node = node.parent()?;
+        }
+    }
+
+    pub fn rainbow_highlights(
+        &self,
+        visible_byte_range: std::ops::Range<usize>,
+        theme: &Theme,
+        loader: &syntax::Loader,
+    ) -> Option<OverlayHighlights> {
+        let syntax = self.syntax()?;
+        let text = self.text().slice(..);
+        let start = syntax::child_for_byte_range(
+            &syntax.tree().root_node(),
+            visible_byte_range.start as u32..visible_byte_range.end as u32,
+        )
+        .map_or(visible_byte_range.start as u32, |node| node.start_byte());
+        Some(syntax.rainbow_highlights(
+            text,
+            theme.rainbow_length(),
+            loader,
+            start..visible_byte_range.end as u32,
+        ))
+    }
+
+    pub fn viewport_rainbow_highlights(
+        &self,
+        annotations: &TextAnnotations,
+        anchor: usize,
+        height: u16,
+        theme: &Theme,
+        loader: &syntax::Loader,
+    ) -> Option<OverlayHighlights> {
+        let visible_range = self.viewport_byte_range(annotations, anchor, height);
+        self.rainbow_highlights(visible_range, theme, loader)
+    }
+
+    pub fn matching_bracket_pos(&self, view_id: ViewId) -> Option<usize> {
+        let syntax = self.syntax()?;
+        let text = self.text().slice(..);
+        let pos = self.selection(view_id).primary().cursor(text);
+        helix_core::match_brackets::find_matching_bracket(syntax, text, pos)
+    }
+
+    pub fn matching_bracket_highlights(
+        &self,
+        view_id: ViewId,
+        theme: &Theme,
+    ) -> Option<OverlayHighlights> {
+        let highlight = theme.find_highlight_exact("ui.cursor.match")?;
+        let pos = self.matching_bracket_pos(view_id)?;
+        Some(OverlayHighlights::single(highlight, pos..pos + 1))
+    }
+
+    pub fn indent_for_newline(
+        &self,
+        loader: &syntax::Loader,
+        indent_heuristic: &IndentationHeuristic,
+        text: helix_core::RopeSlice<'_>,
+        line_before: usize,
+        line_before_end_pos: usize,
+        current_line: usize,
+    ) -> String {
+        indent::indent_for_newline(
+            loader,
+            self.syntax(),
+            indent_heuristic,
+            &self.indent_style(),
+            self.tab_width(),
+            text,
+            line_before,
+            line_before_end_pos,
+            current_line,
+        )
+    }
+
+    pub fn surround_positions(
+        &self,
+        view_id: ViewId,
+        ch: Option<char>,
+        skip: usize,
+    ) -> std::result::Result<Vec<usize>, helix_core::surround::Error> {
+        helix_core::surround::get_surround_pos(
+            self.syntax(),
+            self.text().slice(..),
+            self.selection(view_id),
+            ch,
+            skip,
+        )
+    }
+
+    pub fn tabstop_highlights(&self, theme: &Theme) -> Option<OverlayHighlights> {
+        let snippet = self.active_snippet()?;
+        let highlight = theme.find_highlight_exact("tabstop")?;
+        let mut ranges = Vec::new();
+        for tabstop in snippet.tabstops() {
+            ranges.extend(tabstop.ranges.iter().map(|range| range.start..range.end));
+        }
+        Some(OverlayHighlights::Homogeneous { highlight, ranges })
+    }
+
+    pub fn set_syntax(&mut self, syntax: Option<Syntax>) {
+        self.syntax_aware.set_syntax(syntax);
     }
 
     pub fn refresh_stale_syntax(&mut self, loader: &syntax::Loader) -> bool {
@@ -2540,11 +3208,8 @@ impl Document {
         self.presentation.set_inlay_hints(view_id, inlay_hints);
     }
 
-    /// Generation counter for text annotations. Bumped whenever annotation
-    /// state changes (jump labels, inlay hints, etc.), enabling the render
-    /// cache to detect changes without tracking each annotation type.
-    pub fn annotation_gen(&self) -> u64 {
-        self.presentation.annotation_gen()
+    pub fn annotation_snapshot(&self) -> crate::presentation_state::AnnotationSnapshot {
+        self.presentation.annotation_snapshot()
     }
 
     pub fn set_jump_labels(&mut self, view_id: ViewId, labels: Vec<Overlay>) {

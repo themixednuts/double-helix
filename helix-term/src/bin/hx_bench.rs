@@ -17,10 +17,10 @@ use std::time::Duration;
 
 use helix_core::{syntax, Selection};
 use helix_term::{application::Application, args::Args, config::Config};
-use helix_view::commands::editing;
 use helix_view::bench::{
     enter_bench_command, generate_bench_content, log_run_event, BenchCommandContext, BenchState,
 };
+use helix_view::commands::editing;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
 // ---------------------------------------------------------------------------
@@ -166,7 +166,10 @@ async fn main() -> anyhow::Result<()> {
         eprintln!("Helix Benchmark (deterministic render fixture)");
         eprintln!(
             "  fixture:  {}",
-            bench_args.fixture.as_deref().unwrap_or("giant-lines-render")
+            bench_args
+                .fixture
+                .as_deref()
+                .unwrap_or("giant-lines-render")
         );
         eprintln!("  lines:    {}", bench_args.lines);
         eprintln!("  bytes:    {}", bench_args.bytes_per_line);
@@ -191,8 +194,10 @@ async fn main() -> anyhow::Result<()> {
                     install_fixture_document(&mut app, &content, scenario_requested_lines);
 
                 let pre = app.render_timed().await;
-                let snippet =
-                    generate_bench_content(bench_args.seed.wrapping_add(scenario_lines as u64 + 1), 120);
+                let snippet = generate_bench_content(
+                    bench_args.seed.wrapping_add(scenario_lines as u64 + 1),
+                    120,
+                );
                 let snippet_chars = snippet.chars().count();
                 let mutation_context = BenchCommandContext {
                     seed: bench_args.seed,
@@ -324,8 +329,18 @@ async fn main() -> anyhow::Result<()> {
             log_run_event("collapse_fixture", || {
                 format!(
                     "phase=before_collapse lines={} bytes={}",
-                    app.editor.documents.get(&doc_id).unwrap().text().len_lines(),
-                    app.editor.documents.get(&doc_id).unwrap().text().len_bytes()
+                    app.editor
+                        .documents
+                        .get(&doc_id)
+                        .unwrap()
+                        .text()
+                        .len_lines(),
+                    app.editor
+                        .documents
+                        .get(&doc_id)
+                        .unwrap()
+                        .text()
+                        .len_bytes()
                 )
             });
 
@@ -447,7 +462,11 @@ async fn main() -> anyhow::Result<()> {
 
 fn giant_lines_fixture(lines: usize, bytes_per_line: usize) -> String {
     (0..lines)
-        .map(|idx| char::from(b'a' + (idx % 26) as u8).to_string().repeat(bytes_per_line))
+        .map(|idx| {
+            char::from(b'a' + (idx % 26) as u8)
+                .to_string()
+                .repeat(bytes_per_line)
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -484,7 +503,8 @@ fn install_fixture_document(
             horizontal_offset: 0,
         },
     );
-    app.editor
-        .with_view_doc_mut(view_id, doc_id, |view, doc| doc.append_changes_to_history(view));
+    app.editor.with_view_doc_mut(view_id, doc_id, |view, doc| {
+        doc.append_changes_to_history(view)
+    });
     (view_id, doc_id)
 }

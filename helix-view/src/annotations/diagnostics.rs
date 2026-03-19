@@ -384,7 +384,9 @@ impl LineAnnotation for InlineDiagnostics<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::{inline_diagnostics_plain_viewport_support, DiagnosticFilter, InlineDiagnosticsConfig};
+    use super::{
+        inline_diagnostics_plain_viewport_support, DiagnosticFilter, InlineDiagnosticsConfig,
+    };
     use helix_core::{
         diagnostic::{Diagnostic, DiagnosticProvider, Range, Severity},
         Rope,
@@ -394,10 +396,7 @@ mod tests {
     fn diagnostic_at_line(text: &Rope, line: usize) -> Diagnostic {
         let start = text.line_to_char(line);
         Diagnostic {
-            range: Range {
-                start,
-                end: start,
-            },
+            range: Range { start, end: start },
             ends_at_word: false,
             starts_at_word: false,
             zero_width: true,

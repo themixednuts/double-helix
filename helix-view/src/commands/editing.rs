@@ -10,7 +10,7 @@ use std::time::Instant;
 use helix_core::{
     auto_pairs, comment,
     graphemes::{self, prev_grapheme_boundary},
-    increment as hx_increment, indent,
+    increment as hx_increment,
     line_ending::line_end_char_index,
     movement::{self, Direction, Movement},
     object,
@@ -26,7 +26,7 @@ use helix_stdx::rope::RopeSliceExt;
 use crate::document::Mode;
 use crate::traits::{
     Identified, Indentation, Jumpable, Modal, MutableText, NavigableViewport, Selectable,
-    SyntaxAware, TextContent, TextMetrics, TextViewport, Undoable,
+    SyntaxAware, SyntaxContext, TextContent, TextMetrics, TextViewport, Undoable,
 };
 use crate::{bench::log_command_phase, Document, DocumentId, Editor, ViewId};
 
@@ -513,15 +513,14 @@ pub fn match_brackets_in(
     doc: &mut (impl TextContent + Selectable + SyntaxAware),
     movement: Movement,
 ) {
-    let text = doc.text();
-    let text_slice = text.slice(..);
+    let (text_slice, syntax) = doc.text_syntax();
 
     let selection = doc.selection(target.id()).clone().transform(|range| {
         let pos = range.cursor(text_slice);
-        if let Some(matched_pos) = doc.syntax().map_or_else(
-            || helix_core::match_brackets::find_matching_bracket_plaintext(text.slice(..), pos),
+        if let Some(matched_pos) = syntax.map_or_else(
+            || helix_core::match_brackets::find_matching_bracket_plaintext(text_slice, pos),
             |syntax| {
-                helix_core::match_brackets::find_matching_bracket_fuzzy(syntax, text.slice(..), pos)
+                helix_core::match_brackets::find_matching_bracket_fuzzy(syntax, text_slice, pos)
             },
         ) {
             range.put_cursor(text_slice, matched_pos, movement == Movement::Extend)
@@ -2371,12 +2370,9 @@ pub fn insert_newline(editor: &mut Editor, view_id: ViewId, doc_id: DocumentId) 
 
             let indent_val = match line.first_non_whitespace_char() {
                 Some(p) if continue_comment_token.is_some() => line.slice(..p).to_string(),
-                _ => indent::indent_for_newline(
+                _ => doc.indent_for_newline(
                     &loader,
-                    doc.syntax(),
                     &config.indent_heuristic,
-                    &doc.indent_style(),
-                    doc.tab_width(),
                     text,
                     current_line,
                     pos,
@@ -2545,10 +2541,9 @@ pub fn textobject_treesitter_in(
     object_name: &str,
     count: usize,
 ) -> bool {
-    let Some(syntax) = doc.syntax() else {
+    let Some((syntax, text)) = doc.syntax_text() else {
         return false;
     };
-    let text = doc.text().slice(..);
     let selection = doc.selection(target.id()).clone().transform(|range| {
         textobject::textobject_treesitter(text, range, obj_type, object_name, syntax, loader, count)
     });
@@ -2606,8 +2601,7 @@ pub fn textobject_closest_surrounding_pair_in(
     obj: textobject::TextObject,
     count: usize,
 ) {
-    let text = doc.text().slice(..);
-    let syntax = doc.syntax();
+    let (text, syntax) = doc.text_syntax();
     let selection = doc.selection(target.id()).clone().transform(|range| {
         textobject::textobject_pair_surround_closest(syntax, text, range, obj, count)
     });
@@ -2635,8 +2629,7 @@ pub fn textobject_surrounding_pair_in(
     direction: Option<Direction>,
     count: usize,
 ) {
-    let text = doc.text().slice(..);
-    let syntax = doc.syntax();
+    let (text, syntax) = doc.text_syntax();
     let selection = doc.selection(target.id()).clone().transform(|range| {
         let find_type = match direction {
             None => FindType::Surround,
@@ -2676,8 +2669,7 @@ pub fn textobject_surrounding_pair(
 /// Expand selection to parent syntax node.
 pub fn expand_selection(editor: &mut Editor, view_id: ViewId, doc_id: DocumentId) {
     editor.with_view_doc_mut(view_id, doc_id, |view, doc| {
-        if let Some(syntax) = doc.syntax() {
-            let text = doc.text().slice(..);
+        if let Some((syntax, text)) = doc.syntax_text() {
             let current_selection = doc.selection(view_id);
             let selection = object::expand_selection(syntax, text, current_selection.clone());
 
@@ -2703,8 +2695,7 @@ pub fn shrink_selection(editor: &mut Editor, view_id: ViewId, doc_id: DocumentId
             view.object_selections_mut().clear();
         }
 
-        if let Some(syntax) = doc.syntax() {
-            let text = doc.text().slice(..);
+        if let Some((syntax, text)) = doc.syntax_text() {
             let current_selection = doc.selection(view_id).clone();
             let selection = object::shrink_selection(syntax, text, current_selection);
             doc.set_selection(view_id, selection);
@@ -2743,10 +2734,9 @@ pub fn syntax_select_in<F>(
 where
     F: Fn(&Syntax, RopeSlice, Selection) -> Selection,
 {
-    let Some(syntax) = doc.syntax() else {
+    let Some((syntax, text)) = doc.syntax_text() else {
         return false;
     };
-    let text = doc.text().slice(..);
     let current_selection = doc.selection(target.id());
     let selection = select_fn(syntax, text, current_selection.clone());
     doc.set_selection(target.id(), selection);
@@ -2801,10 +2791,9 @@ pub fn move_node_bound_in(
     dir: Direction,
     movement: Movement,
 ) -> bool {
-    let Some(syntax) = doc.syntax() else {
+    let Some((syntax, text)) = doc.syntax_text() else {
         return false;
     };
-    let text = doc.text().slice(..);
     let current_selection = doc.selection(target.id());
     let selection = helix_core::movement::move_parent_node_end(
         syntax,
@@ -3103,7 +3092,11 @@ mod tests {
 
         let text = giant_line_fixture(256, 256);
         let (mut editor, view_id, doc_id) = test_editor_with_text(&text);
-        let before_lines = editor.document(doc_id).expect("document").text().len_lines();
+        let before_lines = editor
+            .document(doc_id)
+            .expect("document")
+            .text()
+            .len_lines();
 
         join_selections_impl(&mut editor, view_id, doc_id, false);
 

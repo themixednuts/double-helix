@@ -66,7 +66,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> AsyncHook
                 return;
             };
 
-            if doc.syntax().is_some() {
+            if doc.has_syntax() {
                 return;
             }
 

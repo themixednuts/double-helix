@@ -24,7 +24,7 @@ use helix_core::indent::IndentStyle;
 use helix_core::line_ending::LineEnding;
 use helix_core::syntax::Syntax;
 use helix_core::text_annotations::TextAnnotations;
-use helix_core::{Rope, Selection, Transaction};
+use helix_core::{Rope, RopeSlice, Selection, Transaction};
 
 // ---------------------------------------------------------------------------
 // Tier 0 — Atomic traits
@@ -82,6 +82,22 @@ pub trait LineEndingAware {
 pub trait SyntaxAware {
     fn syntax(&self) -> Option<&Syntax>;
 }
+
+pub trait SyntaxContext: SyntaxAware + TextContent {
+    fn syntax_text(&self) -> Option<(&Syntax, RopeSlice<'_>)> {
+        Some((self.syntax()?, self.text().slice(..)))
+    }
+
+    fn text_syntax(&self) -> (RopeSlice<'_>, Option<&Syntax>) {
+        (self.text().slice(..), self.syntax())
+    }
+
+    fn has_syntax(&self) -> bool {
+        self.syntax().is_some()
+    }
+}
+
+impl<T> SyntaxContext for T where T: SyntaxAware + TextContent {}
 
 /// Stores per-viewport cursor selections.
 pub trait Selectable {

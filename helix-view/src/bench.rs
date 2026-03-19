@@ -111,12 +111,12 @@ pub fn enter_bench_command(ctx: BenchCommandContext) -> Option<BenchCommandGuard
 
     #[cfg(feature = "bench-profile")]
     {
-    ctx.event_log_path.as_ref()?;
+        ctx.event_log_path.as_ref()?;
 
-    BENCH_COMMAND_CONTEXT.with(|slot| {
-        *slot.borrow_mut() = Some(ctx);
-    });
-    Some(BenchCommandGuard)
+        BENCH_COMMAND_CONTEXT.with(|slot| {
+            *slot.borrow_mut() = Some(ctx);
+        });
+        Some(BenchCommandGuard)
     }
 }
 
@@ -129,10 +129,10 @@ pub fn enter_bench_run(ctx: BenchRunContext) -> BenchRunGuard {
 
     #[cfg(feature = "bench-profile")]
     {
-    BENCH_RUN_CONTEXT.with(|slot| {
-        *slot.borrow_mut() = Some(ctx);
-    });
-    BenchRunGuard
+        BENCH_RUN_CONTEXT.with(|slot| {
+            *slot.borrow_mut() = Some(ctx);
+        });
+        BenchRunGuard
     }
 }
 
@@ -144,7 +144,7 @@ pub fn current_bench_command_context() -> Option<BenchCommandContext> {
 
     #[cfg(feature = "bench-profile")]
     {
-    BENCH_COMMAND_CONTEXT.with(|ctx| ctx.borrow().clone())
+        BENCH_COMMAND_CONTEXT.with(|ctx| ctx.borrow().clone())
     }
 }
 
@@ -164,59 +164,59 @@ pub fn log_command_phase<F>(
 
     #[cfg(feature = "bench-profile")]
     {
-    let elapsed_us = elapsed.as_micros() as u64;
-    if elapsed_us < SLOW_COMMAND_PHASE_US {
-        return;
-    }
-
-    BENCH_COMMAND_CONTEXT.with(|ctx| {
-        let binding = ctx.borrow();
-        let Some(ctx) = binding.as_ref() else {
+        let elapsed_us = elapsed.as_micros() as u64;
+        if elapsed_us < SLOW_COMMAND_PHASE_US {
             return;
-        };
-        let Some(path) = &ctx.event_log_path else {
-            return;
-        };
-
-        use std::io::Write;
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-        {
-            let macro_name = if ctx.macro_str.is_empty() {
-                "<insert>"
-            } else {
-                ctx.macro_str
-            };
-            let _ = writeln!(
-                f,
-                concat!(
-                    "phase",
-                    " seed={}",
-                    " elapsed_s={:.3}",
-                    " action_index={}",
-                    " category={:?}",
-                    " macro={:?}",
-                    " force_insert={}",
-                    " command={:?}",
-                    " phase={:?}",
-                    " elapsed_us={}",
-                    " details={:?}"
-                ),
-                ctx.seed,
-                ctx.elapsed_secs,
-                ctx.action_index,
-                ctx.category,
-                macro_name,
-                ctx.force_insert,
-                command,
-                phase,
-                elapsed_us,
-                details(),
-            );
         }
-    });
+
+        BENCH_COMMAND_CONTEXT.with(|ctx| {
+            let binding = ctx.borrow();
+            let Some(ctx) = binding.as_ref() else {
+                return;
+            };
+            let Some(path) = &ctx.event_log_path else {
+                return;
+            };
+
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+            {
+                let macro_name = if ctx.macro_str.is_empty() {
+                    "<insert>"
+                } else {
+                    ctx.macro_str
+                };
+                let _ = writeln!(
+                    f,
+                    concat!(
+                        "phase",
+                        " seed={}",
+                        " elapsed_s={:.3}",
+                        " action_index={}",
+                        " category={:?}",
+                        " macro={:?}",
+                        " force_insert={}",
+                        " command={:?}",
+                        " phase={:?}",
+                        " elapsed_us={}",
+                        " details={:?}"
+                    ),
+                    ctx.seed,
+                    ctx.elapsed_secs,
+                    ctx.action_index,
+                    ctx.category,
+                    macro_name,
+                    ctx.force_insert,
+                    command,
+                    phase,
+                    elapsed_us,
+                    details(),
+                );
+            }
+        });
     }
 }
 
@@ -232,61 +232,61 @@ where
 
     #[cfg(feature = "bench-profile")]
     {
-    BENCH_RUN_CONTEXT.with(|run_ctx| {
-        let run_binding = run_ctx.borrow();
-        let Some(run_ctx) = run_binding.as_ref() else {
-            return;
-        };
+        BENCH_RUN_CONTEXT.with(|run_ctx| {
+            let run_binding = run_ctx.borrow();
+            let Some(run_ctx) = run_binding.as_ref() else {
+                return;
+            };
 
-        BENCH_COMMAND_CONTEXT.with(|cmd_ctx| {
-            let cmd_binding = cmd_ctx.borrow();
+            BENCH_COMMAND_CONTEXT.with(|cmd_ctx| {
+                let cmd_binding = cmd_ctx.borrow();
 
-            use std::io::Write;
-            if let Ok(mut f) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&run_ctx.event_log_path)
-            {
-                if let Some(cmd_ctx) = cmd_binding.as_ref() {
-                    let macro_name = if cmd_ctx.macro_str.is_empty() {
-                        "<insert>"
+                use std::io::Write;
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&run_ctx.event_log_path)
+                {
+                    if let Some(cmd_ctx) = cmd_binding.as_ref() {
+                        let macro_name = if cmd_ctx.macro_str.is_empty() {
+                            "<insert>"
+                        } else {
+                            cmd_ctx.macro_str
+                        };
+                        let _ = writeln!(
+                            f,
+                            concat!(
+                                "event",
+                                " seed={}",
+                                " elapsed_s={:.3}",
+                                " action_index={}",
+                                " category={:?}",
+                                " macro={:?}",
+                                " force_insert={}",
+                                " event={:?}",
+                                " details={:?}"
+                            ),
+                            cmd_ctx.seed,
+                            cmd_ctx.elapsed_secs,
+                            cmd_ctx.action_index,
+                            cmd_ctx.category,
+                            macro_name,
+                            cmd_ctx.force_insert,
+                            event,
+                            details(),
+                        );
                     } else {
-                        cmd_ctx.macro_str
-                    };
-                    let _ = writeln!(
-                        f,
-                        concat!(
-                            "event",
-                            " seed={}",
-                            " elapsed_s={:.3}",
-                            " action_index={}",
-                            " category={:?}",
-                            " macro={:?}",
-                            " force_insert={}",
-                            " event={:?}",
-                            " details={:?}"
-                        ),
-                        cmd_ctx.seed,
-                        cmd_ctx.elapsed_secs,
-                        cmd_ctx.action_index,
-                        cmd_ctx.category,
-                        macro_name,
-                        cmd_ctx.force_insert,
-                        event,
-                        details(),
-                    );
-                } else {
-                    let _ = writeln!(
-                        f,
-                        concat!("event", " seed={}", " event={:?}", " details={:?}"),
-                        run_ctx.seed,
-                        event,
-                        details(),
-                    );
+                        let _ = writeln!(
+                            f,
+                            concat!("event", " seed={}", " event={:?}", " details={:?}"),
+                            run_ctx.seed,
+                            event,
+                            details(),
+                        );
+                    }
                 }
-            }
+            });
         });
-    });
     }
 }
 
@@ -302,79 +302,79 @@ where
 
     #[cfg(feature = "bench-profile")]
     {
-    let elapsed_us = elapsed.as_micros() as u64;
-    if elapsed_us < SLOW_RUN_PHASE_US {
-        return;
-    }
-
-    BENCH_RUN_CONTEXT.with(|run_ctx| {
-        let run_binding = run_ctx.borrow();
-        let Some(run_ctx) = run_binding.as_ref() else {
+        let elapsed_us = elapsed.as_micros() as u64;
+        if elapsed_us < SLOW_RUN_PHASE_US {
             return;
-        };
+        }
 
-        BENCH_COMMAND_CONTEXT.with(|cmd_ctx| {
-            let cmd_binding = cmd_ctx.borrow();
+        BENCH_RUN_CONTEXT.with(|run_ctx| {
+            let run_binding = run_ctx.borrow();
+            let Some(run_ctx) = run_binding.as_ref() else {
+                return;
+            };
 
-            use std::io::Write;
-            if let Ok(mut f) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&run_ctx.event_log_path)
-            {
-                if let Some(cmd_ctx) = cmd_binding.as_ref() {
-                    let macro_name = if cmd_ctx.macro_str.is_empty() {
-                        "<insert>"
+            BENCH_COMMAND_CONTEXT.with(|cmd_ctx| {
+                let cmd_binding = cmd_ctx.borrow();
+
+                use std::io::Write;
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&run_ctx.event_log_path)
+                {
+                    if let Some(cmd_ctx) = cmd_binding.as_ref() {
+                        let macro_name = if cmd_ctx.macro_str.is_empty() {
+                            "<insert>"
+                        } else {
+                            cmd_ctx.macro_str
+                        };
+                        let _ = writeln!(
+                            f,
+                            concat!(
+                                "phase",
+                                " seed={}",
+                                " elapsed_s={:.3}",
+                                " action_index={}",
+                                " category={:?}",
+                                " macro={:?}",
+                                " force_insert={}",
+                                " command={:?}",
+                                " phase={:?}",
+                                " elapsed_us={}",
+                                " details={:?}"
+                            ),
+                            cmd_ctx.seed,
+                            cmd_ctx.elapsed_secs,
+                            cmd_ctx.action_index,
+                            cmd_ctx.category,
+                            macro_name,
+                            cmd_ctx.force_insert,
+                            component,
+                            phase,
+                            elapsed_us,
+                            details(),
+                        );
                     } else {
-                        cmd_ctx.macro_str
-                    };
-                    let _ = writeln!(
-                        f,
-                        concat!(
-                            "phase",
-                            " seed={}",
-                            " elapsed_s={:.3}",
-                            " action_index={}",
-                            " category={:?}",
-                            " macro={:?}",
-                            " force_insert={}",
-                            " command={:?}",
-                            " phase={:?}",
-                            " elapsed_us={}",
-                            " details={:?}"
-                        ),
-                        cmd_ctx.seed,
-                        cmd_ctx.elapsed_secs,
-                        cmd_ctx.action_index,
-                        cmd_ctx.category,
-                        macro_name,
-                        cmd_ctx.force_insert,
-                        component,
-                        phase,
-                        elapsed_us,
-                        details(),
-                    );
-                } else {
-                    let _ = writeln!(
-                        f,
-                        concat!(
-                            "phase",
-                            " seed={}",
-                            " command={:?}",
-                            " phase={:?}",
-                            " elapsed_us={}",
-                            " details={:?}"
-                        ),
-                        run_ctx.seed,
-                        component,
-                        phase,
-                        elapsed_us,
-                        details(),
-                    );
+                        let _ = writeln!(
+                            f,
+                            concat!(
+                                "phase",
+                                " seed={}",
+                                " command={:?}",
+                                " phase={:?}",
+                                " elapsed_us={}",
+                                " details={:?}"
+                            ),
+                            run_ctx.seed,
+                            component,
+                            phase,
+                            elapsed_us,
+                            details(),
+                        );
+                    }
                 }
-            }
+            });
         });
-    });
     }
 }
 

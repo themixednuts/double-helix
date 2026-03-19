@@ -504,16 +504,21 @@ impl Application {
             .autoresize()
             .expect("Unable to determine terminal size");
         let autoresize_elapsed = autoresize_start.elapsed();
-        log_run_phase("render_setup", "terminal_autoresize", autoresize_elapsed, || {
-            format!(
-                "prev={}x{} next={}x{} changed={}",
-                previous_area.width,
-                previous_area.height,
-                area.width,
-                area.height,
-                previous_area != area
-            )
-        });
+        log_run_phase(
+            "render_setup",
+            "terminal_autoresize",
+            autoresize_elapsed,
+            || {
+                format!(
+                    "prev={}x{} next={}x{} changed={}",
+                    previous_area.width,
+                    previous_area.height,
+                    area.width,
+                    area.height,
+                    previous_area != area
+                )
+            },
+        );
 
         let t1 = std::time::Instant::now(); // setup done
 

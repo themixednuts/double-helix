@@ -22,9 +22,9 @@ mod config;
 pub mod highlighter;
 mod injections_query;
 mod parse;
-mod trace;
 #[cfg(all(test, feature = "fixtures"))]
 mod tests;
+mod trace;
 // mod pretty_print;
 #[cfg(feature = "fixtures")]
 pub mod fixtures;
@@ -498,7 +498,10 @@ mod unit_tests {
         syntax.cleanup_stale_layer_refs();
 
         assert!(syntax.layer(root).injections.is_empty());
-        assert_eq!(syntax.layers_for_byte_range(0, 8).collect::<Vec<_>>(), vec![root]);
+        assert_eq!(
+            syntax.layers_for_byte_range(0, 8).collect::<Vec<_>>(),
+            vec![root]
+        );
     }
 
     #[test]

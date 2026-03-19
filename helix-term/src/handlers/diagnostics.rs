@@ -10,8 +10,8 @@ use helix_core::syntax::config::LanguageServerFeature;
 use helix_core::Uri;
 use helix_event::{cancelable_future, register_hook, send_blocking};
 use helix_lsp::{lsp, LanguageServerId};
-use helix_view::document::Mode;
 use helix_view::bench::log_command_phase;
+use helix_view::document::Mode;
 use helix_view::events::{
     DiagnosticsDidChange, DocumentDidChange, DocumentDidOpen, LanguageServerInitialized,
 };
@@ -82,15 +82,20 @@ pub(super) fn register_hooks(handlers: &Handlers) {
             );
         }
         let hook_dur = hook_start.elapsed();
-        log_command_phase("document_did_change_hook", "diagnostics_pull", hook_dur, || {
-            format!(
-                "doc_id={:?} ghost={} lines={} bytes={}",
-                event.doc.id(),
-                event.ghost_transaction,
-                event.doc.text().len_lines(),
-                event.doc.text().len_bytes()
-            )
-        });
+        log_command_phase(
+            "document_did_change_hook",
+            "diagnostics_pull",
+            hook_dur,
+            || {
+                format!(
+                    "doc_id={:?} ghost={} lines={} bytes={}",
+                    event.doc.id(),
+                    event.ghost_transaction,
+                    event.doc.text().len_lines(),
+                    event.doc.text().len_bytes()
+                )
+            },
+        );
         Ok(())
     });
 

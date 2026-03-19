@@ -1787,7 +1787,7 @@ fn tree_sitter_scopes(
     let text = doc.text().slice(..);
 
     let pos = doc.selection(view_id).primary().cursor(text);
-    let scopes = indent::get_scopes(doc.syntax(), text, pos);
+    let scopes = doc.syntax_scopes_at_char(pos);
 
     let contents = format!("```json\n{:?}\n````", scopes);
 
@@ -1817,12 +1817,8 @@ fn tree_sitter_highlight_name(
     }
 
     let (view_id, doc) = focused_ref!(cx.editor);
-    let Some(syntax) = doc.syntax() else {
-        return Ok(());
-    };
     let text = doc.text().slice(..);
     let cursor = doc.selection(view_id).primary().cursor(text);
-    let byte = text.char_to_byte(cursor) as u32;
     // Query the same range as the one used in syntax highlighting.
     let range = {
         // Calculate viewport byte ranges:
@@ -1839,16 +1835,9 @@ fn tree_sitter_highlight_name(
     };
 
     let loader = cx.editor.syn_loader.load();
-    let mut highlighter = syntax.highlighter(text, &loader, range);
-    let mut highlights = Vec::new();
-
-    while highlighter.next_event_offset() <= byte {
-        let (event, new_highlights) = highlighter.advance();
-        if event == helix_core::syntax::HighlightEvent::Refresh {
-            highlights.clear();
-        }
-        highlights.extend(new_highlights);
-    }
+    let Some(highlights) = doc.syntax_highlights_at_char(&loader, range, cursor) else {
+        return Ok(());
+    };
 
     let content = highlights
         .into_iter()
@@ -1886,29 +1875,13 @@ fn tree_sitter_layers(
     }
 
     let (view_id, doc) = focused_ref!(cx.editor);
-    let Some(syntax) = doc.syntax() else {
-        bail!("Syntax information is not available");
-    };
-
     let loader: &helix_core::syntax::Loader = &cx.editor.syn_loader.load();
     let text = doc.text().slice(..);
     let cursor = doc.selection(view_id).primary().cursor(text);
-    let byte = text.char_to_byte(cursor) as u32;
-    let languages =
-        syntax
-            .layers_for_byte_range(byte, byte)
-            .fold(String::new(), |mut acc, layer| {
-                if !acc.is_empty() {
-                    acc.push_str(", ");
-                }
-                acc.push_str(
-                    &loader
-                        .language(syntax.layer(layer).language)
-                        .config()
-                        .language_id,
-                );
-                acc
-            });
+    let Some(languages) = doc.syntax_layer_language_ids_at_char(loader, cursor) else {
+        bail!("Syntax information is not available");
+    };
+    let languages = languages.join(", ");
 
     let callback = async move {
         let call: job::Callback = Callback::EditorCompositor(Box::new(
@@ -2491,29 +2464,19 @@ fn tree_sitter_subtree(
 
     let (view_id, doc) = focused!(cx.editor);
 
-    if let Some(syntax) = doc.syntax() {
-        let primary_selection = doc.selection(view_id).primary();
-        let text = doc.text();
-        let from = text.char_to_byte(primary_selection.from()) as u32;
-        let to = text.char_to_byte(primary_selection.to()) as u32;
-        if let Some(selected_node) = syntax.descendant_for_byte_range(from, to) {
-            let mut contents = String::from("```tsq\n");
-            helix_core::syntax::pretty_print_tree(&mut contents, selected_node)?;
-            contents.push_str("\n```");
+    if let Some(contents) = doc.pretty_selection_tree(view_id).transpose()? {
+        let callback = async move {
+            let call: job::Callback = Callback::EditorCompositor(Box::new(
+                move |editor: &mut Editor, compositor: &mut Compositor| {
+                    let contents = ui::Markdown::new(contents, editor.syn_loader.clone());
+                    let popup = Popup::new("hover", contents).auto_close(true);
+                    compositor.replace_or_push("hover", popup);
+                },
+            ));
+            Ok(call)
+        };
 
-            let callback = async move {
-                let call: job::Callback = Callback::EditorCompositor(Box::new(
-                    move |editor: &mut Editor, compositor: &mut Compositor| {
-                        let contents = ui::Markdown::new(contents, editor.syn_loader.clone());
-                        let popup = Popup::new("hover", contents).auto_close(true);
-                        compositor.replace_or_push("hover", popup);
-                    },
-                ));
-                Ok(call)
-            };
-
-            cx.jobs.callback(callback);
-        }
+        cx.jobs.callback(callback);
     }
 
     Ok(())
@@ -3037,11 +3000,10 @@ pub fn fold_textobjects(
     use graphemes::{ensure_grapheme_boundary_prev, prev_grapheme_boundary};
     use text_folding::{Fold, FoldObject};
 
-    let Some(syntax) = doc.syntax() else {
+    if !doc.has_syntax() {
         return Err(anyhow!("Syntax is unavailable in the current buffer."));
-    };
-
-    let Some(textobject_query) = loader.textobject_query(syntax.root_language()) else {
+    }
+    let Some((syntax, textobject_query)) = doc.textobject_context(loader) else {
         return Err(anyhow!("Failed to compile text object query."));
     };
 
@@ -3320,11 +3282,10 @@ fn unfold_textobjects(
     use graphemes::prev_grapheme_boundary;
     use text_folding::FoldObject;
 
-    let Some(syntax) = doc.syntax() else {
+    if !doc.has_syntax() {
         return Err(anyhow!("Syntax is unavailable in the current buffer."));
-    };
-
-    let Some(textobject_query) = loader.textobject_query(syntax.root_language()) else {
+    }
+    let Some((syntax, textobject_query)) = doc.textobject_context(loader) else {
         return Err(anyhow!("Failed to compile text object query."));
     };
 

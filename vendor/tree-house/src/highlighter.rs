@@ -7,8 +7,8 @@ use std::ops::RangeBounds;
 use std::slice;
 use std::sync::Arc;
 
-use crate::config::{LanguageConfig, LanguageLoader};
 use crate::checked_byte_slice;
+use crate::config::{LanguageConfig, LanguageLoader};
 use crate::locals::ScopeCursor;
 use crate::query_iter::{MatchedNode, QueryIter, QueryIterEvent, QueryLoader};
 use crate::{Injection, Language, Layer, Syntax};

@@ -49,7 +49,10 @@ impl Locals {
     }
 
     pub(crate) fn definition_count(&self) -> usize {
-        self.scopes.iter().map(|scope| scope.definitions.len()).sum()
+        self.scopes
+            .iter()
+            .map(|scope| scope.definitions.len())
+            .sum()
     }
 
     fn push(&mut self, scope: ScopeData) -> Scope {

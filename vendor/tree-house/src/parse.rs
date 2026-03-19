@@ -1,5 +1,5 @@
-use std::mem::take;
 use std::collections::HashSet;
+use std::mem::take;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -107,8 +107,12 @@ impl Syntax {
                 layers_before_prune.saturating_sub(layers_after)
             )
         });
-        log_trace_phase("tree_house", "defer_interactive_update", stats.update_start.elapsed(), || {
-            format!(
+        log_trace_phase(
+            "tree_house",
+            "defer_interactive_update",
+            stats.update_start.elapsed(),
+            || {
+                format!(
                 "reason={} layer={} source_bytes={} edits={} timeout_ms={} layers_before={} layers_after={} visited_layers={} queue_len={} skipped_empty_layers={} reset_incomplete_layers={} fresh_parse_layers={} reparsed_layers={} parse_timeout_layers={} incomplete_before={} incomplete_after={}",
                 reason,
                 layer_idx,
@@ -127,9 +131,14 @@ impl Syntax {
                 stats.incomplete_before,
                 incomplete_after
             )
-        });
-        log_trace_phase("tree_house", "update_summary", stats.update_start.elapsed(), || {
-            format!(
+            },
+        );
+        log_trace_phase(
+            "tree_house",
+            "update_summary",
+            stats.update_start.elapsed(),
+            || {
+                format!(
                 "result=query_deferred_interactive_budget source_bytes={} edits={} timeout_ms={} layers_before={} layers_after={} visited_layers={} skipped_empty_layers={} reset_incomplete_layers={} fresh_parse_layers={} reparsed_layers={} parse_timeout_layers={} incomplete_before={} incomplete_after={}",
                 request.source.len_bytes(),
                 request.edits.len(),
@@ -145,7 +154,8 @@ impl Syntax {
                 stats.incomplete_before,
                 incomplete_after
             )
-        });
+            },
+        );
 
         Err(Error::Timeout)
     }
@@ -208,7 +218,8 @@ impl Syntax {
         queue.push(self.root);
 
         let has_edits = !edits.is_empty();
-        let interactive_update = has_edits && timeout.as_millis() <= INTERACTIVE_QUERY_TIMEOUT_MAX_MS;
+        let interactive_update =
+            has_edits && timeout.as_millis() <= INTERACTIVE_QUERY_TIMEOUT_MAX_MS;
         let mut visited_layers = 0usize;
         let mut skipped_empty_layers = 0usize;
         let mut reset_incomplete_layers = 0usize;
@@ -219,8 +230,12 @@ impl Syntax {
         if let Some((min_start, max_old_end, max_new_end, total_old_bytes, net_new_bytes)) =
             summarize_edits(edits)
         {
-            log_trace_phase("tree_house", "edit_summary", Duration::from_micros(2_000), || {
-                format!(
+            log_trace_phase(
+                "tree_house",
+                "edit_summary",
+                Duration::from_micros(2_000),
+                || {
+                    format!(
                     "source_bytes={} edits={} min_start={} max_old_end={} max_new_end={} total_old_bytes={} net_new_bytes={} timeout_ms={}",
                     source.len_bytes(),
                     edits.len(),
@@ -231,7 +246,8 @@ impl Syntax {
                     net_new_bytes,
                     timeout.as_millis()
                 )
-            });
+                },
+            );
         }
 
         while let Some(layer) = queue.pop() {
@@ -321,7 +337,6 @@ impl Syntax {
                         "deferred_incomplete",
                     )
                 } else {
-
                     if has_edits && layer_data.parse_incomplete {
                         reset_incomplete_layers += 1;
                         layer_data.parser = tree_sitter::Parser::new();
@@ -492,8 +507,8 @@ impl Syntax {
                 )
             });
 
-            let defer_after_root_injection = interactive_root
-                && enqueued_layers >= DEFER_ROOT_QUERIES_ENQUEUED_LAYERS_THRESHOLD;
+            let defer_after_root_injection =
+                interactive_root && enqueued_layers >= DEFER_ROOT_QUERIES_ENQUEUED_LAYERS_THRESHOLD;
             if defer_after_root_injection {
                 let stats = InteractiveUpdateStats {
                     update_start,
@@ -506,8 +521,12 @@ impl Syntax {
                     reparsed_layers,
                     parse_timeout_layers,
                 };
-                log_trace_phase("tree_house", "defer_root_queries_post_injection", injection_elapsed, || {
-                    format!(
+                log_trace_phase(
+                    "tree_house",
+                    "defer_root_queries_post_injection",
+                    injection_elapsed,
+                    || {
+                        format!(
                         "layer={} root=true source_bytes={} edits={} timeout_ms={} injections_before={} injections_after={} enqueued_layers={} visited_layers={} parse_elapsed_us={} parse_outcome={}",
                         layer_idx,
                         source.len_bytes(),
@@ -520,7 +539,8 @@ impl Syntax {
                         parse_elapsed.as_micros(),
                         parse_outcome,
                     )
-                });
+                    },
+                );
                 return self.defer_interactive_update(
                     request,
                     stats,
@@ -607,8 +627,12 @@ impl Syntax {
         }
 
         if self.layer(self.root).parse_tree.is_none() {
-            log_trace_phase("tree_house", "update_summary", update_start.elapsed(), || {
-                format!(
+            log_trace_phase(
+                "tree_house",
+                "update_summary",
+                update_start.elapsed(),
+                || {
+                    format!(
                     "result=no_root_config source_bytes={} edits={} timeout_ms={} layers_before={} visited_layers={} skipped_empty_layers={} reset_incomplete_layers={} fresh_parse_layers={} reparsed_layers={} parse_timeout_layers={} incomplete_before={}",
                     source.len_bytes(),
                     edits.len(),
@@ -622,7 +646,8 @@ impl Syntax {
                     parse_timeout_layers,
                     incomplete_before
                 )
-            });
+                },
+            );
             return Err(Error::NoRootConfig);
         }
 
@@ -644,8 +669,12 @@ impl Syntax {
                 layers_before_prune.saturating_sub(layers_after)
             )
         });
-        log_trace_phase("tree_house", "update_summary", update_start.elapsed(), || {
-            format!(
+        log_trace_phase(
+            "tree_house",
+            "update_summary",
+            update_start.elapsed(),
+            || {
+                format!(
                 "result=ok source_bytes={} edits={} timeout_ms={} layers_before={} layers_after={} visited_layers={} skipped_empty_layers={} reset_incomplete_layers={} fresh_parse_layers={} reparsed_layers={} parse_timeout_layers={} incomplete_before={} incomplete_after={}",
                 source.len_bytes(),
                 edits.len(),
@@ -661,7 +690,8 @@ impl Syntax {
                 incomplete_before,
                 incomplete_after
             )
-        });
+            },
+        );
         Ok(())
     }
 

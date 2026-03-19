@@ -11,7 +11,6 @@ use crate::{
         gradient_border::GradientBorder,
         picker::query::PickerQuery,
         text_decorations::DecorationManager,
-        EditorView,
     },
 };
 use futures_util::future::BoxFuture;
@@ -1238,22 +1237,16 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             let loader = cx.editor.syn_loader.load();
             let config = cx.editor.config();
 
-            let syntax_highlighter = EditorView::doc_syntax_highlighter(
-                doc,
-                &TextAnnotations::default(),
-                offset.anchor,
-                area.height,
-                &loader,
-            );
             let annotations = TextAnnotations::default();
+            let syntax_highlighter =
+                doc.viewport_syntax_highlighter(&loader, &annotations, offset.anchor, area.height);
             let mut overlay_highlights = Vec::new();
             if doc
                 .language_config()
                 .and_then(|config| config.rainbow_brackets)
                 .unwrap_or(config.rainbow_brackets)
             {
-                if let Some(overlay) = EditorView::doc_rainbow_highlights(
-                    doc,
+                if let Some(overlay) = doc.viewport_rainbow_highlights(
                     &annotations,
                     offset.anchor,
                     area.height,
@@ -1264,12 +1257,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
                 }
             }
 
-            EditorView::doc_diagnostics_highlights_into(
-                doc,
-                &cx.editor.theme,
-                &mut overlay_highlights,
-                None,
-            );
+            overlay_highlights.extend(doc.diagnostic_highlights(&cx.editor.theme, None));
 
             let mut decorations = DecorationManager::default();
 

@@ -165,15 +165,20 @@ where
             .len();
         let draw_start = std::time::Instant::now();
         let result = self.backend.draw(updates.into_iter());
-        log_run_phase("terminal_draw", "backend_draw", draw_start.elapsed(), || {
-            format!(
-                "updates={} rows={} area={}x{}",
-                update_count,
-                touched_rows,
-                current_buffer.area.width,
-                current_buffer.area.height
-            )
-        });
+        log_run_phase(
+            "terminal_draw",
+            "backend_draw",
+            draw_start.elapsed(),
+            || {
+                format!(
+                    "updates={} rows={} area={}x{}",
+                    update_count,
+                    touched_rows,
+                    current_buffer.area.width,
+                    current_buffer.area.height
+                )
+            },
+        );
         result
     }
 
@@ -233,15 +238,20 @@ where
         // Flush
         let backend_flush_start = std::time::Instant::now();
         self.backend.flush()?;
-        log_run_phase("terminal_draw", "backend_flush", backend_flush_start.elapsed(), || {
-            format!(
-                "cursor={:?} kind={:?} viewport={}x{}",
-                cursor_position,
-                cursor_kind,
-                self.viewport.area.width,
-                self.viewport.area.height
-            )
-        });
+        log_run_phase(
+            "terminal_draw",
+            "backend_flush",
+            backend_flush_start.elapsed(),
+            || {
+                format!(
+                    "cursor={:?} kind={:?} viewport={}x{}",
+                    cursor_position,
+                    cursor_kind,
+                    self.viewport.area.width,
+                    self.viewport.area.height
+                )
+            },
+        );
         Ok(())
     }
 

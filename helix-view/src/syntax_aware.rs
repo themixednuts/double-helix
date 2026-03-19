@@ -9,11 +9,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::bench::log_run_event;
+use crate::revision::Revision;
 
 #[derive(Debug, Default)]
 pub struct SyntaxAwareState {
-    syntax: Option<Syntax>,
-    syntax_stale: bool,
+    syntax_snapshot: SyntaxSnapshotState,
     language: Option<Arc<LanguageConfiguration>>,
     diagnostics: Vec<Diagnostic>,
     diagnostics_gen: u64,
@@ -55,6 +55,45 @@ enum SyntaxBudget {
     Interactive(InteractiveSyntaxReason),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SyntaxStatus {
+    Fresh,
+    StalePendingRefresh,
+    #[default]
+    Disabled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SyntaxSnapshot {
+    revision: Revision,
+    status: SyntaxStatus,
+}
+
+impl SyntaxSnapshot {
+    pub const fn new(revision: Revision, status: SyntaxStatus) -> Self {
+        Self { revision, status }
+    }
+
+    pub const fn revision(self) -> Revision {
+        self.revision
+    }
+
+    pub const fn status(self) -> SyntaxStatus {
+        self.status
+    }
+
+    pub const fn is_stale(self) -> bool {
+        matches!(self.status, SyntaxStatus::StalePendingRefresh)
+    }
+}
+
+#[derive(Debug, Default)]
+struct SyntaxSnapshotState {
+    revision: Revision,
+    status: SyntaxStatus,
+    tree: Option<Syntax>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InteractiveSyntaxReason {
     Stale,
@@ -74,12 +113,64 @@ impl InteractiveSyntaxReason {
     }
 }
 
+impl SyntaxSnapshotState {
+    fn snapshot(&self) -> SyntaxSnapshot {
+        SyntaxSnapshot::new(self.revision, self.status)
+    }
+
+    fn syntax(&self) -> Option<&Syntax> {
+        self.tree.as_ref()
+    }
+
+    fn syntax_mut(&mut self) -> Option<&mut Syntax> {
+        self.tree.as_mut()
+    }
+
+    fn status(&self) -> SyntaxStatus {
+        self.status
+    }
+
+    fn set_tree(&mut self, tree: Option<Syntax>) {
+        self.tree = tree;
+        self.status = if self.tree.is_some() {
+            SyntaxStatus::Fresh
+        } else {
+            SyntaxStatus::Disabled
+        };
+        self.revision.next();
+    }
+
+    fn mark_updated(&mut self) {
+        if self.tree.is_some() {
+            self.status = SyntaxStatus::Fresh;
+            self.revision.next();
+        } else {
+            self.mark_disabled();
+        }
+    }
+
+    fn mark_stale(&mut self) {
+        if self.tree.is_some() && self.status != SyntaxStatus::StalePendingRefresh {
+            self.status = SyntaxStatus::StalePendingRefresh;
+            self.revision.next();
+        }
+    }
+
+    fn mark_disabled(&mut self) {
+        if self.tree.is_some() || self.status != SyntaxStatus::Disabled {
+            self.tree = None;
+            self.status = SyntaxStatus::Disabled;
+            self.revision.next();
+        }
+    }
+}
+
 fn syntax_budget(
-    syntax_stale: bool,
+    syntax_status: SyntaxStatus,
     shape: DocumentShape,
     complexity: syntax::SyntaxComplexity,
 ) -> SyntaxBudget {
-    if syntax_stale {
+    if matches!(syntax_status, SyntaxStatus::StalePendingRefresh) {
         return SyntaxBudget::Interactive(InteractiveSyntaxReason::Stale);
     }
 
@@ -107,8 +198,7 @@ impl SyntaxAwareState {
         display_name: &str,
     ) {
         self.language = language_config;
-        self.syntax_stale = false;
-        self.syntax = self.language.as_ref().and_then(|config| {
+        let syntax = self.language.as_ref().and_then(|config| {
             Syntax::new(text, config.language(), loader)
                 .map_err(|err| {
                     if err != syntax::HighlighterError::NoRootConfig {
@@ -117,6 +207,7 @@ impl SyntaxAwareState {
                 })
                 .ok()
         });
+        self.syntax_snapshot.set_tree(syntax);
     }
 
     pub fn set_language_configuration(
@@ -295,16 +386,15 @@ impl SyntaxAwareState {
     }
 
     pub fn syntax(&self) -> Option<&Syntax> {
-        self.syntax.as_ref()
+        self.syntax_snapshot.syntax()
     }
 
     pub fn set_syntax(&mut self, syntax: Option<Syntax>) {
-        self.syntax_stale = false;
-        self.syntax = syntax;
+        self.syntax_snapshot.set_tree(syntax);
     }
 
-    pub fn syntax_is_stale(&self) -> bool {
-        self.syntax_stale
+    pub fn syntax_snapshot(&self) -> SyntaxSnapshot {
+        self.syntax_snapshot.snapshot()
     }
 
     pub fn update_syntax(
@@ -314,11 +404,20 @@ impl SyntaxAwareState {
         changes: &ChangeSet,
         loader: &syntax::Loader,
     ) {
-        if let Some(syntax) = &mut self.syntax {
+        let syntax_status = self.syntax_snapshot.status();
+        if self.syntax_snapshot.syntax().is_some() {
             let shape = DocumentShape::from_text(current_doc);
-            let complexity = syntax.complexity();
-            let budget = syntax_budget(self.syntax_stale, shape, complexity);
+            let complexity = self
+                .syntax_snapshot
+                .syntax()
+                .expect("syntax presence checked above")
+                .complexity();
+            let budget = syntax_budget(syntax_status, shape, complexity);
             let result = if matches!(budget, SyntaxBudget::Interactive(_)) {
+                let syntax = self
+                    .syntax_snapshot
+                    .syntax_mut()
+                    .expect("syntax presence checked above");
                 syntax.update_with_timeout(
                     old_doc,
                     current_doc,
@@ -327,15 +426,19 @@ impl SyntaxAwareState {
                     syntax::INTERACTIVE_PARSE_TIMEOUT,
                 )
             } else {
+                let syntax = self
+                    .syntax_snapshot
+                    .syntax_mut()
+                    .expect("syntax presence checked above");
                 syntax.update(old_doc, current_doc, changes, loader)
             };
 
             match result {
                 Ok(()) => {
-                    self.syntax_stale = false;
+                    self.syntax_snapshot.mark_updated();
                 }
                 Err(syntax::HighlighterError::Timeout) => {
-                    self.syntax_stale = true;
+                    self.syntax_snapshot.mark_stale();
                     log_run_event("syntax_timeout_stale", || {
                         format!(
                             "lines={} bytes={} avg_bytes_per_line={} giant_lines={} use_interactive_budget={} reason={} changes={} total_layers={} root_injections={}",
@@ -363,8 +466,7 @@ impl SyntaxAwareState {
                             current_doc.len_bytes()
                         )
                     });
-                    self.syntax = None;
-                    self.syntax_stale = false;
+                    self.syntax_snapshot.mark_disabled();
                 }
             }
         }
@@ -375,18 +477,29 @@ impl SyntaxAwareState {
         current_doc: RopeSlice<'_>,
         loader: &syntax::Loader,
     ) -> bool {
-        if !self.syntax_stale {
+        if !matches!(
+            self.syntax_snapshot.status(),
+            SyntaxStatus::StalePendingRefresh
+        ) {
             return false;
         }
 
-        let Some(syntax) = &mut self.syntax else {
-            self.syntax_stale = false;
-            return false;
+        if self.syntax_snapshot.syntax().is_none() {
+            self.syntax_snapshot.mark_disabled();
+            return true;
+        }
+
+        let result = {
+            let syntax = self
+                .syntax_snapshot
+                .syntax_mut()
+                .expect("syntax presence checked above");
+            syntax.refresh_with_timeout(current_doc, loader, syntax::IDLE_PARSE_TIMEOUT)
         };
 
-        match syntax.refresh_with_timeout(current_doc, loader, syntax::IDLE_PARSE_TIMEOUT) {
+        match result {
             Ok(()) => {
-                self.syntax_stale = false;
+                self.syntax_snapshot.mark_updated();
                 log_run_event("syntax_idle_refresh_ok", || {
                     format!(
                         "lines={} bytes={}",
@@ -415,8 +528,7 @@ impl SyntaxAwareState {
                         current_doc.len_bytes()
                     )
                 });
-                self.syntax = None;
-                self.syntax_stale = false;
+                self.syntax_snapshot.mark_disabled();
                 true
             }
         }
@@ -435,7 +547,9 @@ impl SyntaxAwareState {
 
 #[cfg(test)]
 mod tests {
-    use super::{syntax_budget, DocumentShape, InteractiveSyntaxReason, SyntaxBudget};
+    use super::{
+        syntax_budget, DocumentShape, InteractiveSyntaxReason, SyntaxBudget, SyntaxStatus,
+    };
     use helix_core::syntax::SyntaxComplexity;
 
     #[test]
@@ -449,7 +563,10 @@ mod tests {
             root_injections: 1,
         };
 
-        assert_eq!(syntax_budget(false, shape, complexity), SyntaxBudget::Idle);
+        assert_eq!(
+            syntax_budget(SyntaxStatus::Fresh, shape, complexity),
+            SyntaxBudget::Idle
+        );
     }
 
     #[test]
@@ -464,7 +581,7 @@ mod tests {
         };
 
         assert_eq!(
-            syntax_budget(true, shape, complexity),
+            syntax_budget(SyntaxStatus::StalePendingRefresh, shape, complexity),
             SyntaxBudget::Interactive(InteractiveSyntaxReason::Stale)
         );
     }
@@ -481,7 +598,7 @@ mod tests {
         };
 
         assert_eq!(
-            syntax_budget(false, shape, complexity),
+            syntax_budget(SyntaxStatus::Fresh, shape, complexity),
             SyntaxBudget::Interactive(InteractiveSyntaxReason::GiantLines)
         );
     }
@@ -498,7 +615,7 @@ mod tests {
         };
 
         assert_eq!(
-            syntax_budget(false, shape, complexity),
+            syntax_budget(SyntaxStatus::Fresh, shape, complexity),
             SyntaxBudget::Interactive(InteractiveSyntaxReason::LayerFanout)
         );
     }
@@ -515,7 +632,7 @@ mod tests {
         };
 
         assert_eq!(
-            syntax_budget(false, shape, complexity),
+            syntax_budget(SyntaxStatus::Fresh, shape, complexity),
             SyntaxBudget::Interactive(InteractiveSyntaxReason::RootInjections)
         );
     }

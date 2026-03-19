@@ -54,8 +54,8 @@ use super::text_decorations::blame::InlineBlame;
 use helix_view::engine::{KeymapQuery, ModalInputState};
 use helix_view::model::FocusTarget;
 use helix_view::view::{
-    LayoutSnapshot, LineMap, RenderInputs, RenderPlan, RenderSnapshots, RenderSnapshotsRef,
-    ReusePlan, SyntaxStyleCache,
+    LayoutSnapshot, LineMap, RefreshState, RenderSnapshots, RenderSnapshotsRef, RenderState,
+    ReuseState, SyntaxStyleCache,
 };
 
 const MAX_SEED_LINE_MAP_GAP: usize = 4_096;
@@ -81,139 +81,48 @@ struct ViewRenderCacheEntry {
     cells: tui::buffer::Buffer,
 }
 
-struct ReuseState {
-    syntax: SyntaxStyleCache,
-    line_map: LineMap,
-    old_fingerprints: Arc<[u64]>,
-    overlay_fingerprints: Arc<[u64]>,
-    dirty_rows: HashSet<u16>,
-}
-
-impl ReuseState {
-    fn from_plan(plan: ReusePlan<'_>) -> Self {
-        Self {
-            syntax: plan.cached.paint.syntax_styles.clone(),
-            line_map: plan.cached.layout.line_map.clone(),
-            old_fingerprints: plan.cached.paint.overlay_fingerprints.clone(),
-            overlay_fingerprints: plan.overlay_fingerprints,
-            dirty_rows: plan.dirty_rows,
-        }
-    }
-
-    fn syntax(&self) -> &SyntaxStyleCache {
-        &self.syntax
-    }
-
-    fn line_map(&self) -> &LineMap {
-        &self.line_map
-    }
-
-    fn dirty_rows(&self) -> &HashSet<u16> {
-        &self.dirty_rows
-    }
-
-    fn line_count(&self) -> usize {
-        self.line_map.lines.len()
-    }
-
-    fn fingerprint_counts(&self) -> (usize, usize) {
-        (self.old_fingerprints.len(), self.overlay_fingerprints.len())
-    }
-
-    fn is_clean(&self) -> bool {
-        self.dirty_rows.is_empty()
-    }
-
-    fn update_cursor_cache(&self, frame: &ViewFrame<'_>) {
-        let layout = LayoutSnapshot::new(
-            frame.view.layout_inputs(frame.doc, frame.editor.config_gen),
-            self.line_map.clone(),
-        );
-        frame.update_cursor_cache(&layout);
-    }
-
-    fn clear_dirty_rows(&self, view: &View, doc: &Document, surface: &mut Surface) {
-        let inner = view.inner_area(doc);
-        for &row in &self.dirty_rows {
-            if row < inner.height {
-                let y = inner.y + row;
-                surface.clear(Rect::new(inner.x, y, inner.width, 1));
-            }
-        }
-    }
-
-    fn overlay_fingerprints(&self) -> Arc<[u64]> {
-        self.overlay_fingerprints.clone()
-    }
-
-    fn into_snapshots(self, inputs: RenderInputs, output: RenderOutput) -> RenderSnapshots {
-        let syntax = if output.syntax_styles.is_empty() {
-            self.syntax
-        } else {
-            SyntaxStyleCache {
-                entries: Arc::from(output.syntax_styles),
-            }
-        };
-
-        inputs.into_cached_snapshots(output.line_map, syntax, self.overlay_fingerprints)
-    }
-}
-
-struct RefreshState {
-    inputs: RenderInputs,
-    seed_line_map: Option<LineMap>,
-}
-
-impl RefreshState {
-    fn new(inputs: RenderInputs, seed_line_map: Option<LineMap>) -> Self {
-        Self {
-            inputs,
-            seed_line_map,
-        }
-    }
-
-    fn render_context<'a>(&'a self, frame: &'a ViewFrame<'_>) -> ViewRenderContext<'a> {
-        frame.render_context(None, None, self.seed_line_map.as_ref())
-    }
-
-    fn overlay_fingerprints(
-        &self,
-        frame: &ViewFrame<'_>,
-        output: &RenderOutput,
-        terminal_focused: bool,
-    ) -> Arc<[u64]> {
-        output.line_map.overlay_fingerprints(
-            frame.selection,
-            frame.editor.mode,
-            frame.is_focused,
-            terminal_focused,
-        )
-    }
-
-    fn into_snapshots(
-        self,
-        output: RenderOutput,
-        overlay_fingerprints: Arc<[u64]>,
-    ) -> RenderSnapshots {
-        self.inputs
-            .into_snapshots(output.line_map, output.syntax_styles, overlay_fingerprints)
-    }
-
-    fn inputs(&self) -> &RenderInputs {
-        &self.inputs
-    }
-}
-
 struct ViewFrame<'a> {
     editor: &'a Editor,
     doc: &'a Document,
-    view: &'a View,
+    trace: ViewTrace<'a>,
     area: Rect,
+}
+
+struct ViewTrace<'a> {
+    view: &'a View,
     selection: &'a Selection,
     is_focused: bool,
     frame_num: u64,
     view_render_start: std::time::Instant,
     render_start: std::time::Instant,
+}
+
+struct RenderRequest<'a> {
+    cached_syntax: Option<&'a SyntaxStyleCache>,
+    dirty_rows: Option<&'a HashSet<u16>>,
+    seed_line_map: Option<&'a LineMap>,
+}
+
+#[derive(Clone, Copy)]
+enum RenderPhase {
+    Dirty { rows: usize },
+    Full,
+}
+
+impl RenderPhase {
+    fn total_phase(self) -> &'static str {
+        match self {
+            Self::Dirty { .. } => "dirty_total",
+            Self::Full => "full_total",
+        }
+    }
+
+    fn path_label(self) -> &'static str {
+        match self {
+            Self::Dirty { .. } => "dirty",
+            Self::Full => "full",
+        }
+    }
 }
 
 impl ViewFrame<'_> {
@@ -231,39 +140,69 @@ impl ViewFrame<'_> {
         ViewFrame {
             editor,
             doc,
-            view,
+            trace: ViewTrace {
+                view,
+                selection,
+                is_focused,
+                frame_num,
+                view_render_start,
+                render_start,
+            },
             area,
-            selection,
-            is_focused,
-            frame_num,
-            view_render_start,
-            render_start,
         }
     }
 
-    fn inputs(&self) -> RenderInputs {
-        self.view.render_inputs(
+    fn render_state<'a>(
+        &self,
+        cached: Option<RenderSnapshotsRef<'a>>,
+        terminal_focused: bool,
+    ) -> RenderState {
+        self.trace.view.resolve_render_state(
             self.doc,
             self.editor.config_gen,
             Arc::from(self.editor.theme.name()),
-        )
-    }
-
-    fn plan<'a>(
-        &self,
-        inputs: &RenderInputs,
-        cached: Option<RenderSnapshotsRef<'a>>,
-        terminal_focused: bool,
-    ) -> RenderPlan<'a> {
-        inputs.plan(
             cached,
-            self.selection,
+            self.trace.selection,
             self.editor.mode,
-            self.is_focused,
+            self.trace.is_focused,
             terminal_focused,
         )
     }
 
+    fn update_cursor_cache(&self, layout: &LayoutSnapshot) {
+        layout.update_cursor_cache(self.editor, self.doc, self.trace.view);
+    }
+
+    fn clear_dirty_rows(&self, dirty_rows: &HashSet<u16>, surface: &mut Surface) {
+        let inner = self.trace.view.inner_area(self.doc);
+        for &row in dirty_rows {
+            if row < inner.height {
+                let y = inner.y + row;
+                surface.clear(Rect::new(inner.x, y, inner.width, 1));
+            }
+        }
+    }
+
+    fn render_context<'a>(
+        &'a self,
+        cached_syntax: Option<&'a SyntaxStyleCache>,
+        dirty_rows: Option<&'a HashSet<u16>>,
+        seed_line_map: Option<&'a LineMap>,
+    ) -> ViewRenderContext<'a> {
+        ViewRenderContext {
+            editor: self.editor,
+            doc: self.doc,
+            view: self.trace.view,
+            viewport: self.area,
+            is_focused: self.trace.is_focused,
+            cached_syntax,
+            dirty_rows,
+            seed_line_map,
+        }
+    }
+}
+
+impl ViewTrace<'_> {
     fn log_state(&self) {
         log::warn!(
             "[view] id={:?} focused={} area=({},{} {}x{}) inner_height={} statusline_row={}",
@@ -278,14 +217,22 @@ impl ViewFrame<'_> {
         );
     }
 
-    fn log_cache_hit(&self, dirty_rows: &HashSet<u16>, line_map: &LineMap) {
+    fn log_reuse(&self, reuse: &ReuseState) {
+        let fp_start = std::time::Instant::now();
+        self.log_rows_phase("overlay_fingerprints", fp_start, reuse.line_count());
+
+        let (old_fingerprints, new_fingerprints) = reuse.fingerprint_counts();
+        let dirty_start = std::time::Instant::now();
+        self.log_dirty_rows_phase(dirty_start, old_fingerprints, new_fingerprints);
+
         let sel = self.selection.primary();
         let (sel_start, sel_end) = if sel.anchor <= sel.head {
             (sel.anchor, sel.head)
         } else {
             (sel.head, sel.anchor)
         };
-        let intersecting_rows: Vec<u16> = line_map
+        let intersecting_rows: Vec<u16> = reuse
+            .line_map()
             .lines
             .iter()
             .filter(|line| sel_start < line.char_range_end && sel_end >= line.char_range_start)
@@ -296,13 +243,13 @@ impl ViewFrame<'_> {
             self.frame_num,
             sel.anchor,
             sel.head,
-            dirty_rows,
+            reuse.dirty_rows(),
             intersecting_rows,
-            line_map.lines.len(),
+            reuse.line_count(),
         );
     }
 
-    fn log_pure_blit(&self) {
+    fn log_pure_reuse(&self) {
         log::info!(
             "F{} CACHE PURE_BLIT view={:?}",
             self.frame_num,
@@ -310,50 +257,30 @@ impl ViewFrame<'_> {
         );
     }
 
-    fn log_dirty_rerender(&self, dirty_rows: &HashSet<u16>, output: &RenderOutput) {
+    fn log_dirty_reuse(&self, reuse: &ReuseState, output: &RenderOutput) {
         log::info!(
             "F{} CACHE DIRTY_RERENDER view={:?} dirty_rows={:?} new_syntax={} new_linemap={} elapsed={:?}",
             self.frame_num,
             self.view.id,
-            dirty_rows,
+            reuse.dirty_rows(),
             output.syntax_styles.len(),
             output.line_map.lines.len(),
             self.render_start.elapsed(),
         );
     }
 
-    fn log_cache_miss(&self, inputs: &RenderInputs, output: &RenderOutput) {
+    fn log_refresh(&self, refresh: &RefreshState, output: &RenderOutput) {
         log::info!(
             "F{} CACHE MISS view={:?} anchor={} voff={} area={}x{} syntax={} lines={} elapsed={:?}",
             self.frame_num,
             self.view.id,
-            inputs.paint.layout.view_position.anchor,
-            inputs.paint.layout.view_position.vertical_offset,
+            refresh.inputs().paint.layout.view_position.anchor,
+            refresh.inputs().paint.layout.view_position.vertical_offset,
             self.view.area.width,
             self.view.area.height,
             output.syntax_styles.len(),
             output.line_map.lines.len(),
             self.render_start.elapsed(),
-        );
-    }
-
-    fn log_total(&self, phase: &'static str, label: &'static str) {
-        helix_view::bench::log_run_phase(
-            "editor_render_view",
-            phase,
-            self.view_render_start.elapsed(),
-            || format!("view_id={:?} path={}", self.view.id, label),
-        );
-    }
-
-    fn log_render_total(&self, label: &'static str) {
-        self.log_total(
-            match label {
-                "dirty" => "dirty_total",
-                "full" => "full_total",
-                other => other,
-            },
-            label,
         );
     }
 
@@ -391,26 +318,32 @@ impl ViewFrame<'_> {
         );
     }
 
-    fn update_cursor_cache(&self, layout: &LayoutSnapshot) {
-        layout.update_cursor_cache(self.editor, self.doc, self.view);
+    fn log_render_phase(&self, phase: RenderPhase) {
+        match phase {
+            RenderPhase::Dirty { rows } => {
+                helix_view::bench::log_run_phase(
+                    "editor_render_view",
+                    "dirty_render_view",
+                    self.render_start.elapsed(),
+                    || format!("view_id={:?} dirty_rows={}", self.view.id, rows),
+                );
+            }
+            RenderPhase::Full => helix_view::bench::log_run_phase(
+                "editor_render_view",
+                "full_render_view",
+                self.view_render_start.elapsed(),
+                || format!("view_id={:?} path=full_before_fp", self.view.id),
+            ),
+        }
     }
 
-    fn render_context<'a>(
-        &'a self,
-        cached_syntax: Option<&'a SyntaxStyleCache>,
-        dirty_rows: Option<&'a HashSet<u16>>,
-        seed_line_map: Option<&'a LineMap>,
-    ) -> ViewRenderContext<'a> {
-        ViewRenderContext {
-            editor: self.editor,
-            doc: self.doc,
-            view: self.view,
-            viewport: self.area,
-            is_focused: self.is_focused,
-            cached_syntax,
-            dirty_rows,
-            seed_line_map,
-        }
+    fn log_render_total(&self, phase: RenderPhase) {
+        helix_view::bench::log_run_phase(
+            "editor_render_view",
+            phase.total_phase(),
+            self.view_render_start.elapsed(),
+            || format!("view_id={:?} path={}", self.view.id, phase.path_label()),
+        );
     }
 }
 
@@ -636,73 +569,75 @@ impl EditorView {
     ) {
         frame.update_cursor_cache(&snapshots.layout);
         let copy_start = std::time::Instant::now();
-        let cells = Self::copy_region(surface, Self::content_area(frame.view));
-        frame.log_view_phase("copy_region", copy_start);
-        self.render_cache.store(frame.view.id, snapshots, cells);
+        let cells = Self::copy_region(surface, Self::content_area(frame.trace.view));
+        frame.trace.log_view_phase("copy_region", copy_start);
+        self.render_cache
+            .store(frame.trace.view.id, snapshots, cells);
     }
 
-    #[allow(clippy::too_many_arguments)]
+    fn render_pass(
+        &mut self,
+        frame: &ViewFrame<'_>,
+        surface: &mut Surface,
+        request: RenderRequest<'_>,
+        phase: RenderPhase,
+    ) -> RenderOutput {
+        let vctx = frame.render_context(
+            request.cached_syntax,
+            request.dirty_rows,
+            request.seed_line_map,
+        );
+        let output = self.render_view(&vctx, surface);
+        frame.trace.log_render_phase(phase);
+        output
+    }
+
     fn render_reuse_plan(
         &mut self,
         frame: ViewFrame<'_>,
         surface: &mut Surface,
-        current_inputs: RenderInputs,
         reuse: ReuseState,
     ) {
         let blit_start = std::time::Instant::now();
-        self.blit_cached_view(frame.view.id, surface);
-        frame.log_view_phase("blit", blit_start);
+        self.blit_cached_view(frame.trace.view.id, surface);
+        frame.trace.log_view_phase("blit", blit_start);
 
-        reuse.update_cursor_cache(&frame);
-
-        let fp_start = std::time::Instant::now();
-        frame.log_rows_phase("overlay_fingerprints", fp_start, reuse.line_count());
-
-        let (old_fingerprints, new_fingerprints) = reuse.fingerprint_counts();
-        let dirty_start = std::time::Instant::now();
-        frame.log_dirty_rows_phase(dirty_start, old_fingerprints, new_fingerprints);
-
-        frame.log_cache_hit(reuse.dirty_rows(), reuse.line_map());
+        frame.update_cursor_cache(&reuse.layout_snapshot());
+        frame.trace.log_reuse(&reuse);
 
         self.render_cache
             .record_hit(reuse.dirty_rows().len(), reuse.line_count());
 
         if reuse.is_clean() {
-            frame.log_pure_blit();
+            frame.trace.log_pure_reuse();
             self.render_cache
-                .update_overlay_fingerprints(frame.view.id, reuse.overlay_fingerprints());
+                .update_overlay_fingerprints(frame.trace.view.id, reuse.overlay_fingerprints());
             return;
         }
 
-        reuse.clear_dirty_rows(frame.view, frame.doc, surface);
+        frame.clear_dirty_rows(reuse.dirty_rows(), surface);
+        let phase = RenderPhase::Dirty {
+            rows: reuse.dirty_rows().len(),
+        };
 
-        let vctx = frame.render_context(
-            Some(reuse.syntax()),
-            Some(reuse.dirty_rows()),
-            Some(reuse.line_map()),
-        );
-        let render_output = self.render_view(&vctx, surface);
-        helix_view::bench::log_run_phase(
-            "editor_render_view",
-            "dirty_render_view",
-            frame.render_start.elapsed(),
-            || {
-                format!(
-                    "view_id={:?} dirty_rows={}",
-                    frame.view.id,
-                    reuse.dirty_rows().len()
-                )
+        let render_output = self.render_pass(
+            &frame,
+            surface,
+            RenderRequest {
+                cached_syntax: Some(reuse.syntax_styles()),
+                dirty_rows: Some(reuse.dirty_rows()),
+                seed_line_map: Some(reuse.line_map()),
             },
+            phase,
         );
 
-        frame.log_dirty_rerender(reuse.dirty_rows(), &render_output);
+        frame.trace.log_dirty_reuse(&reuse, &render_output);
 
-        let snapshots = reuse.into_snapshots(current_inputs, render_output);
+        let snapshots = reuse.into_snapshots(render_output.line_map, render_output.syntax_styles);
         self.store_view_render(&frame, snapshots, surface);
-        frame.log_render_total("dirty");
+        frame.trace.log_render_total(phase);
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn render_refresh_plan(
         &mut self,
         frame: ViewFrame<'_>,
@@ -711,24 +646,40 @@ impl EditorView {
     ) {
         self.render_cache.record_miss();
 
-        let vctx = refresh.render_context(&frame);
-        let render_output = self.render_view(&vctx, surface);
-        frame.log_total("full_render_view", "full_before_fp");
+        let render_output = self.render_pass(
+            &frame,
+            surface,
+            RenderRequest {
+                cached_syntax: None,
+                dirty_rows: None,
+                seed_line_map: refresh.seed_line_map(),
+            },
+            RenderPhase::Full,
+        );
 
         let fp_start = std::time::Instant::now();
-        let overlay_fingerprints =
-            refresh.overlay_fingerprints(&frame, &render_output, self.terminal_focused);
-        frame.log_rows_phase(
+        let overlay_fingerprints = refresh.overlay_fingerprints(
+            &render_output.line_map,
+            frame.trace.selection,
+            frame.editor.mode,
+            frame.trace.is_focused,
+            self.terminal_focused,
+        );
+        frame.trace.log_rows_phase(
             "overlay_fingerprints",
             fp_start,
             render_output.line_map.lines.len(),
         );
 
-        frame.log_cache_miss(refresh.inputs(), &render_output);
+        frame.trace.log_refresh(&refresh, &render_output);
 
-        let snapshots = refresh.into_snapshots(render_output, overlay_fingerprints);
+        let snapshots = refresh.into_snapshots(
+            render_output.line_map,
+            render_output.syntax_styles,
+            overlay_fingerprints,
+        );
         self.store_view_render(&frame, snapshots, surface);
-        frame.log_render_total("full");
+        frame.trace.log_render_total(RenderPhase::Full);
     }
 
     pub fn spinners_mut(&mut self) -> &mut ProgressSpinners {
@@ -1195,9 +1146,9 @@ impl EditorView {
         let top_doc_line = doc
             .text()
             .char_to_line(view_offset.anchor.min(doc.text().len_chars()));
+        let layout_inputs = view.layout_inputs(doc, editor.config_gen);
         let render_seed = seed_line_map.and_then(|line_map| {
-            LayoutSnapshot::new(view.layout_inputs(doc, editor.config_gen), line_map.clone())
-                .render_seed(top_doc_line, MAX_SEED_LINE_MAP_GAP)
+            layout_inputs.render_seed(line_map, top_doc_line, MAX_SEED_LINE_MAP_GAP)
         });
         let render_document_start = std::time::Instant::now();
         let render_output = render_document(
@@ -2655,28 +2606,17 @@ impl Component for EditorView {
                 view_render_start,
                 render_start,
             );
-            frame.log_state();
+            frame.trace.log_state();
 
-            let current_inputs = frame.inputs();
-            match frame.plan(
-                &current_inputs,
+            match frame.render_state(
                 self.render_cache
                     .entries
                     .get(&view.id)
                     .map(|entry| entry.snapshots.as_ref()),
                 self.terminal_focused,
             ) {
-                RenderPlan::Reuse(plan) => self.render_reuse_plan(
-                    frame,
-                    surface,
-                    current_inputs,
-                    ReuseState::from_plan(plan),
-                ),
-                RenderPlan::Refresh(plan) => self.render_refresh_plan(
-                    frame,
-                    surface,
-                    RefreshState::new(current_inputs, plan.seed_line_map.cloned()),
-                ),
+                RenderState::Reuse(reuse) => self.render_reuse_plan(frame, surface, reuse),
+                RenderState::Refresh(refresh) => self.render_refresh_plan(frame, surface, refresh),
             }
         }
 

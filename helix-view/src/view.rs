@@ -98,6 +98,29 @@ impl ViewLayoutInputs {
             && self.config_gen == current.config_gen
             && self.area.width == current.area.width
     }
+
+    pub fn render_seed(
+        &self,
+        line_map: &LineMap,
+        top_doc_line: usize,
+        max_gap: usize,
+    ) -> Option<RenderSeed> {
+        line_map
+            .best_horizontal_checkpoint_within_gap(
+                top_doc_line,
+                self.view_position.horizontal_offset,
+                max_gap,
+            )
+            .map(|checkpoint| RenderSeed {
+                doc_line: top_doc_line,
+                char_idx: checkpoint.char_idx,
+                visual_col: checkpoint.visual_col,
+            })
+    }
+
+    pub fn into_snapshot(self, line_map: LineMap) -> LayoutSnapshot {
+        LayoutSnapshot::new(self, line_map)
+    }
 }
 
 impl LayoutSnapshot {
@@ -158,6 +181,11 @@ pub enum RenderPlan<'a> {
     Refresh(RefreshPlan<'a>),
 }
 
+pub enum RenderState {
+    Reuse(ReuseState),
+    Refresh(RefreshState),
+}
+
 pub struct ReusePlan<'a> {
     pub cached: RenderSnapshotsRef<'a>,
     pub dirty_rows: std::collections::HashSet<u16>,
@@ -166,6 +194,135 @@ pub struct ReusePlan<'a> {
 
 pub struct RefreshPlan<'a> {
     pub seed_line_map: Option<&'a LineMap>,
+}
+
+pub struct ReuseState {
+    inputs: RenderInputs,
+    syntax_styles: SyntaxStyleCache,
+    line_map: LineMap,
+    old_overlay_fingerprints: Arc<[u64]>,
+    overlay_fingerprints: Arc<[u64]>,
+    dirty_rows: std::collections::HashSet<u16>,
+}
+
+pub struct RefreshState {
+    inputs: RenderInputs,
+    seed_line_map: Option<LineMap>,
+}
+
+impl<'a> ReusePlan<'a> {
+    pub fn into_state(self, inputs: RenderInputs) -> ReuseState {
+        ReuseState {
+            inputs,
+            syntax_styles: self.cached.paint.syntax_styles.clone(),
+            line_map: self.cached.layout.line_map.clone(),
+            old_overlay_fingerprints: self.cached.paint.overlay_fingerprints.clone(),
+            overlay_fingerprints: self.overlay_fingerprints,
+            dirty_rows: self.dirty_rows,
+        }
+    }
+}
+
+impl<'a> RenderPlan<'a> {
+    pub fn into_state(self, inputs: RenderInputs) -> RenderState {
+        match self {
+            Self::Reuse(plan) => RenderState::Reuse(plan.into_state(inputs)),
+            Self::Refresh(plan) => RenderState::Refresh(plan.into_state(inputs)),
+        }
+    }
+}
+
+impl ReuseState {
+    pub fn syntax_styles(&self) -> &SyntaxStyleCache {
+        &self.syntax_styles
+    }
+
+    pub fn line_map(&self) -> &LineMap {
+        &self.line_map
+    }
+
+    pub fn dirty_rows(&self) -> &std::collections::HashSet<u16> {
+        &self.dirty_rows
+    }
+
+    pub fn line_count(&self) -> usize {
+        self.line_map.lines.len()
+    }
+
+    pub fn fingerprint_counts(&self) -> (usize, usize) {
+        (
+            self.old_overlay_fingerprints.len(),
+            self.overlay_fingerprints.len(),
+        )
+    }
+
+    pub fn is_clean(&self) -> bool {
+        self.dirty_rows.is_empty()
+    }
+
+    pub fn overlay_fingerprints(&self) -> Arc<[u64]> {
+        self.overlay_fingerprints.clone()
+    }
+
+    pub fn layout_snapshot(&self) -> LayoutSnapshot {
+        self.inputs
+            .layout
+            .clone()
+            .into_snapshot(self.line_map.clone())
+    }
+
+    pub fn into_snapshots(
+        self,
+        line_map: LineMap,
+        syntax_entries: Vec<SyntaxStyleEntry>,
+    ) -> RenderSnapshots {
+        self.inputs.into_reuse_snapshots(
+            line_map,
+            syntax_entries,
+            self.syntax_styles,
+            self.overlay_fingerprints,
+        )
+    }
+}
+
+impl<'a> RefreshPlan<'a> {
+    pub fn into_state(self, inputs: RenderInputs) -> RefreshState {
+        RefreshState {
+            inputs,
+            seed_line_map: self.seed_line_map.cloned(),
+        }
+    }
+}
+
+impl RefreshState {
+    pub fn inputs(&self) -> &RenderInputs {
+        &self.inputs
+    }
+
+    pub fn seed_line_map(&self) -> Option<&LineMap> {
+        self.seed_line_map.as_ref()
+    }
+
+    pub fn overlay_fingerprints(
+        &self,
+        line_map: &LineMap,
+        selection: &Selection,
+        mode: Mode,
+        is_focused: bool,
+        terminal_focused: bool,
+    ) -> Arc<[u64]> {
+        line_map.overlay_fingerprints(selection, mode, is_focused, terminal_focused)
+    }
+
+    pub fn into_snapshots(
+        self,
+        line_map: LineMap,
+        syntax_entries: Vec<SyntaxStyleEntry>,
+        overlay_fingerprints: Arc<[u64]>,
+    ) -> RenderSnapshots {
+        self.inputs
+            .into_snapshots(line_map, syntax_entries, overlay_fingerprints)
+    }
 }
 
 impl View {
@@ -203,9 +360,41 @@ impl View {
 
         RenderInputs { layout, paint }
     }
+
+    pub fn resolve_render_state<'a>(
+        &self,
+        doc: &Document,
+        config_gen: u64,
+        theme_name: Arc<str>,
+        cached: Option<RenderSnapshotsRef<'a>>,
+        selection: &Selection,
+        mode: Mode,
+        is_focused: bool,
+        terminal_focused: bool,
+    ) -> RenderState {
+        self.render_inputs(doc, config_gen, theme_name).resolve(
+            cached,
+            selection,
+            mode,
+            is_focused,
+            terminal_focused,
+        )
+    }
 }
 
 impl RenderInputs {
+    pub fn resolve<'a>(
+        self,
+        cached: Option<RenderSnapshotsRef<'a>>,
+        selection: &Selection,
+        mode: Mode,
+        is_focused: bool,
+        terminal_focused: bool,
+    ) -> RenderState {
+        self.plan(cached, selection, mode, is_focused, terminal_focused)
+            .into_state(self)
+    }
+
     pub fn plan<'a>(
         &self,
         cached: Option<RenderSnapshotsRef<'a>>,
@@ -248,9 +437,27 @@ impl RenderInputs {
         overlay_fingerprints: Arc<[u64]>,
     ) -> RenderSnapshots {
         RenderSnapshots {
-            layout: LayoutSnapshot::new(self.layout, line_map),
+            layout: self.layout.into_snapshot(line_map),
             paint: PaintSnapshot::new(self.paint, syntax_styles, overlay_fingerprints),
         }
+    }
+
+    pub fn into_reuse_snapshots(
+        self,
+        line_map: LineMap,
+        syntax_entries: Vec<SyntaxStyleEntry>,
+        cached_syntax: SyntaxStyleCache,
+        overlay_fingerprints: Arc<[u64]>,
+    ) -> RenderSnapshots {
+        let syntax_styles = if syntax_entries.is_empty() {
+            cached_syntax
+        } else {
+            SyntaxStyleCache {
+                entries: Arc::from(syntax_entries),
+            }
+        };
+
+        self.into_cached_snapshots(line_map, syntax_styles, overlay_fingerprints)
     }
 
     pub fn into_snapshots(
@@ -260,7 +467,7 @@ impl RenderInputs {
         overlay_fingerprints: Arc<[u64]>,
     ) -> RenderSnapshots {
         RenderSnapshots {
-            layout: LayoutSnapshot::new(self.layout, line_map),
+            layout: self.layout.into_snapshot(line_map),
             paint: PaintSnapshot::from_entries(self.paint, syntax_entries, overlay_fingerprints),
         }
     }
@@ -320,17 +527,8 @@ impl LayoutSnapshot {
     }
 
     pub fn render_seed(&self, top_doc_line: usize, max_gap: usize) -> Option<RenderSeed> {
-        self.line_map
-            .best_horizontal_checkpoint_within_gap(
-                top_doc_line,
-                self.inputs.view_position.horizontal_offset,
-                max_gap,
-            )
-            .map(|checkpoint| RenderSeed {
-                doc_line: top_doc_line,
-                char_idx: checkpoint.char_idx,
-                visual_col: checkpoint.visual_col,
-            })
+        self.inputs
+            .render_seed(&self.line_map, top_doc_line, max_gap)
     }
 }
 
@@ -1613,6 +1811,89 @@ mod tests {
     }
 
     #[test]
+    fn render_inputs_resolve_reuse_state() {
+        let inputs = RenderInputs {
+            layout: make_layout_inputs(),
+            paint: make_paint_inputs(),
+        };
+        let line_map = LineMap {
+            lines: Arc::from([VisualLineInfo {
+                visual_row: 0,
+                doc_line: 0,
+                char_range_start: 0,
+                char_range_end: 10,
+                visible_char_start: 0,
+                visible_col_start: 0,
+                visible_char_last: 9,
+                visible_col_last: 9,
+                horizontal_checkpoints: Vec::new(),
+            }]),
+        };
+        let selection = Selection::point(0);
+        let overlay_fingerprints =
+            line_map.overlay_fingerprints(&selection, Mode::Normal, true, true);
+        let cached = RenderSnapshots {
+            layout: LayoutSnapshot::new(inputs.layout.clone(), line_map),
+            paint: PaintSnapshot::new(
+                inputs.paint.clone(),
+                SyntaxStyleCache::default(),
+                overlay_fingerprints,
+            ),
+        };
+
+        match inputs.resolve(Some(cached.as_ref()), &selection, Mode::Normal, true, true) {
+            RenderState::Reuse(state) => assert!(state.is_clean()),
+            RenderState::Refresh(_) => panic!("expected render reuse state"),
+        }
+    }
+
+    #[test]
+    fn reuse_plan_state_preserves_cached_metadata() {
+        let inputs = RenderInputs {
+            layout: make_layout_inputs(),
+            paint: make_paint_inputs(),
+        };
+        let line_map = LineMap {
+            lines: Arc::from([VisualLineInfo {
+                visual_row: 0,
+                doc_line: 0,
+                char_range_start: 0,
+                char_range_end: 10,
+                visible_char_start: 0,
+                visible_col_start: 0,
+                visible_char_last: 9,
+                visible_col_last: 9,
+                horizontal_checkpoints: Vec::new(),
+            }]),
+        };
+        let selection = Selection::point(0);
+        let overlay_fingerprints =
+            line_map.overlay_fingerprints(&selection, Mode::Normal, true, true);
+        let cached = RenderSnapshots {
+            layout: LayoutSnapshot::new(inputs.layout.clone(), line_map),
+            paint: PaintSnapshot::new(
+                inputs.paint.clone(),
+                SyntaxStyleCache::default(),
+                overlay_fingerprints.clone(),
+            ),
+        };
+
+        match inputs.plan(Some(cached.as_ref()), &selection, Mode::Normal, true, true) {
+            RenderPlan::Reuse(plan) => {
+                let state = plan.into_state(inputs.clone());
+                assert!(state.is_clean());
+                assert_eq!(state.line_count(), 1);
+                assert_eq!(state.fingerprint_counts(), (1, 1));
+                assert_eq!(
+                    state.overlay_fingerprints().as_ref(),
+                    overlay_fingerprints.as_ref()
+                );
+            }
+            RenderPlan::Refresh(_) => panic!("expected render reuse"),
+        }
+    }
+
+    #[test]
     fn render_plan_refreshes_with_seed_when_paint_changes() {
         let inputs = RenderInputs {
             layout: make_layout_inputs(),
@@ -1650,6 +1931,45 @@ mod tests {
     }
 
     #[test]
+    fn refresh_plan_state_preserves_seed_line_map() {
+        let inputs = RenderInputs {
+            layout: make_layout_inputs(),
+            paint: make_paint_inputs(),
+        };
+        let mut cached_paint = inputs.paint.clone();
+        cached_paint.theme_name = "gruvbox".into();
+        let line_map = LineMap {
+            lines: Arc::from([VisualLineInfo {
+                visual_row: 0,
+                doc_line: 0,
+                char_range_start: 0,
+                char_range_end: 10,
+                visible_char_start: 0,
+                visible_col_start: 0,
+                visible_char_last: 9,
+                visible_col_last: 9,
+                horizontal_checkpoints: Vec::new(),
+            }]),
+        };
+        let cached = RenderSnapshots {
+            layout: LayoutSnapshot::new(inputs.layout.clone(), line_map.clone()),
+            paint: PaintSnapshot::new(cached_paint, SyntaxStyleCache::default(), Arc::from([33])),
+        };
+        let selection = Selection::point(0);
+
+        match inputs.plan(Some(cached.as_ref()), &selection, Mode::Normal, true, true) {
+            RenderPlan::Refresh(plan) => {
+                let state = plan.into_state(inputs.clone());
+                let seed = state
+                    .seed_line_map()
+                    .expect("expected cached seed line map");
+                assert_eq!(seed.lines.len(), line_map.lines.len());
+            }
+            RenderPlan::Reuse(_) => panic!("expected render refresh"),
+        }
+    }
+
+    #[test]
     fn render_plan_refreshes_without_seed_when_layout_changes() {
         let inputs = RenderInputs {
             layout: make_layout_inputs(),
@@ -1674,6 +1994,63 @@ mod tests {
             RenderPlan::Refresh(plan) => assert!(plan.seed_line_map.is_none()),
             RenderPlan::Reuse(_) => panic!("expected render refresh"),
         }
+    }
+
+    #[test]
+    fn reuse_snapshots_keep_cached_syntax_when_output_is_empty() {
+        let inputs = RenderInputs {
+            layout: make_layout_inputs(),
+            paint: make_paint_inputs(),
+        };
+        let cached_syntax = SyntaxStyleCache {
+            entries: Arc::from([SyntaxStyleEntry {
+                char_idx: 7,
+                style: crate::graphics::Style::default(),
+            }]),
+        };
+        let snapshots = inputs.into_reuse_snapshots(
+            LineMap::default(),
+            Vec::new(),
+            cached_syntax.clone(),
+            Arc::from([5]),
+        );
+
+        assert_eq!(snapshots.paint.syntax_styles.entries.len(), 1);
+        assert_eq!(snapshots.paint.syntax_styles.entries[0].char_idx, 7);
+        assert!(Arc::ptr_eq(
+            &snapshots.paint.syntax_styles.entries,
+            &cached_syntax.entries,
+        ));
+    }
+
+    #[test]
+    fn layout_inputs_render_seed_uses_horizontal_offset() {
+        let mut inputs = make_layout_inputs();
+        inputs.view_position.horizontal_offset = 12;
+        let line_map = LineMap {
+            lines: Arc::from([VisualLineInfo {
+                visual_row: 0,
+                doc_line: 4,
+                char_range_start: 40,
+                char_range_end: 60,
+                visible_char_start: 40,
+                visible_col_start: 0,
+                visible_char_last: 59,
+                visible_col_last: 19,
+                horizontal_checkpoints: vec![HorizontalCheckpoint {
+                    char_idx: 48,
+                    visual_col: 12,
+                }],
+            }]),
+        };
+
+        let seed = inputs
+            .render_seed(&line_map, 4, 16)
+            .expect("expected render seed");
+
+        assert_eq!(seed.doc_line, 4);
+        assert_eq!(seed.char_idx, 48);
+        assert_eq!(seed.visual_col, 12);
     }
 
     #[test]

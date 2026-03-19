@@ -11,7 +11,7 @@ repository.workspace = true
 
 [features]
 default = []
-bench-profile = ["helix-core/bench-profile", "helix-view/bench-profile"]
+bench = ["helix-core/bench", "helix-view/bench"]
 
 [dependencies]
 helix-core = { path = "../helix-core" }

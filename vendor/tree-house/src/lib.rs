@@ -33,7 +33,7 @@ pub mod query_iter;
 pub mod text_object;
 mod tree_cursor;
 
-#[cfg(feature = "bench-profile")]
+#[cfg(feature = "bench")]
 const SLOW_TRACE_US: u64 = 2_000;
 
 thread_local! {

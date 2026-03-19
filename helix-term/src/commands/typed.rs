@@ -3988,7 +3988,7 @@ fn acp_history(
     Ok(())
 }
 
-#[cfg(feature = "bench-profile")]
+#[cfg(feature = "bench")]
 fn bench(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow::Result<()> {
     if event != PromptEvent::Validate {
         return Ok(());
@@ -5288,7 +5288,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
             ..Signature::DEFAULT
         },
     },
-    #[cfg(feature = "bench-profile")]
+    #[cfg(feature = "bench")]
     TypableCommand {
         name: "bench",
         aliases: &["stress-test"],

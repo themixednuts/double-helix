@@ -31,7 +31,7 @@ repository = "https://github.com/helix-editor/tree-house"
 
 [features]
 default = ["fixtures"]
-bench-profile = []
+bench = []
 fixtures = [
     "dep:unicode-width",
     "dep:pretty_assertions",

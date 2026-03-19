@@ -35,10 +35,10 @@ default = ["git"]
 unicode-lines = ["helix-core/unicode-lines", "helix-view/unicode-lines"]
 integration = ["helix-event/integration_test"]
 git = ["helix-vcs/git"]
-bench-profile = [
-  "helix-core/bench-profile",
-  "helix-view/bench-profile",
-  "helix-modal/bench-profile",
+bench = [
+  "helix-core/bench",
+  "helix-view/bench",
+  "helix-modal/bench",
 ]
 
 [[bin]]
@@ -48,7 +48,7 @@ path = "src/main.rs"
 [[bin]]
 name = "hx-bench"
 path = "src/bin/hx_bench.rs"
-required-features = ["integration", "bench-profile"]
+required-features = ["integration", "bench"]
 
 [dependencies]
 helix-stdx = { path = "../helix-stdx" }

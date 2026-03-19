@@ -14,7 +14,7 @@ homepage.workspace = true
 [features]
 unicode-lines = ["ropey/unicode_lines"]
 integration = []
-bench-profile = ["tree-house/bench-profile"]
+bench = ["tree-house/bench"]
 
 [dependencies]
 helix-stdx = { path = "../helix-stdx" }

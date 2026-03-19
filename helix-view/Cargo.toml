@@ -14,7 +14,7 @@ homepage.workspace = true
 default = []
 term = ["termina", "crossterm"]
 unicode-lines = []
-bench-profile = ["helix-core/bench-profile"]
+bench = ["helix-core/bench"]
 
 [dependencies]
 helix-stdx = { path = "../helix-stdx" }

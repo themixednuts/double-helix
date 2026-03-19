@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-#[cfg(feature = "bench-profile")]
+#[cfg(feature = "bench")]
 use crate::{SLOW_TRACE_US, TRACE_CONTEXT};
 
 pub(crate) fn log_trace_phase<F>(
@@ -11,13 +11,13 @@ pub(crate) fn log_trace_phase<F>(
 ) where
     F: FnOnce() -> String,
 {
-    #[cfg(not(feature = "bench-profile"))]
+    #[cfg(not(feature = "bench"))]
     {
         let _ = (component, phase, elapsed);
         let _ = details;
     }
 
-    #[cfg(feature = "bench-profile")]
+    #[cfg(feature = "bench")]
     {
         let elapsed_us = elapsed.as_micros() as u64;
         if elapsed_us < SLOW_TRACE_US {

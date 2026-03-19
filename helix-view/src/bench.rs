@@ -9,9 +9,9 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-#[cfg(feature = "bench-profile")]
+#[cfg(feature = "bench")]
 const SLOW_COMMAND_PHASE_US: u64 = 5_000;
-#[cfg(feature = "bench-profile")]
+#[cfg(feature = "bench")]
 const SLOW_RUN_PHASE_US: u64 = 2_000;
 
 thread_local! {
@@ -103,13 +103,13 @@ impl Drop for BenchRunGuard {
 }
 
 pub fn enter_bench_command(ctx: BenchCommandContext) -> Option<BenchCommandGuard> {
-    #[cfg(not(feature = "bench-profile"))]
+    #[cfg(not(feature = "bench"))]
     {
         let _ = ctx;
         None
     }
 
-    #[cfg(feature = "bench-profile")]
+    #[cfg(feature = "bench")]
     {
         ctx.event_log_path.as_ref()?;
 
@@ -121,13 +121,13 @@ pub fn enter_bench_command(ctx: BenchCommandContext) -> Option<BenchCommandGuard
 }
 
 pub fn enter_bench_run(ctx: BenchRunContext) -> BenchRunGuard {
-    #[cfg(not(feature = "bench-profile"))]
+    #[cfg(not(feature = "bench"))]
     {
         let _ = ctx;
         BenchRunGuard
     }
 
-    #[cfg(feature = "bench-profile")]
+    #[cfg(feature = "bench")]
     {
         BENCH_RUN_CONTEXT.with(|slot| {
             *slot.borrow_mut() = Some(ctx);
@@ -137,12 +137,12 @@ pub fn enter_bench_run(ctx: BenchRunContext) -> BenchRunGuard {
 }
 
 pub fn current_bench_command_context() -> Option<BenchCommandContext> {
-    #[cfg(not(feature = "bench-profile"))]
+    #[cfg(not(feature = "bench"))]
     {
         None
     }
 
-    #[cfg(feature = "bench-profile")]
+    #[cfg(feature = "bench")]
     {
         BENCH_COMMAND_CONTEXT.with(|ctx| ctx.borrow().clone())
     }
@@ -156,13 +156,13 @@ pub fn log_command_phase<F>(
 ) where
     F: FnOnce() -> String,
 {
-    #[cfg(not(feature = "bench-profile"))]
+    #[cfg(not(feature = "bench"))]
     {
         let _ = (command, phase, elapsed);
         let _ = details;
     }
 
-    #[cfg(feature = "bench-profile")]
+    #[cfg(feature = "bench")]
     {
         let elapsed_us = elapsed.as_micros() as u64;
         if elapsed_us < SLOW_COMMAND_PHASE_US {
@@ -224,13 +224,13 @@ pub fn log_run_event<F>(event: &'static str, details: F)
 where
     F: FnOnce() -> String,
 {
-    #[cfg(not(feature = "bench-profile"))]
+    #[cfg(not(feature = "bench"))]
     {
         let _ = event;
         let _ = details;
     }
 
-    #[cfg(feature = "bench-profile")]
+    #[cfg(feature = "bench")]
     {
         BENCH_RUN_CONTEXT.with(|run_ctx| {
             let run_binding = run_ctx.borrow();
@@ -294,13 +294,13 @@ pub fn log_run_phase<F>(component: &'static str, phase: &'static str, elapsed: D
 where
     F: FnOnce() -> String,
 {
-    #[cfg(not(feature = "bench-profile"))]
+    #[cfg(not(feature = "bench"))]
     {
         let _ = (component, phase, elapsed);
         let _ = details;
     }
 
-    #[cfg(feature = "bench-profile")]
+    #[cfg(feature = "bench")]
     {
         let elapsed_us = elapsed.as_micros() as u64;
         if elapsed_us < SLOW_RUN_PHASE_US {
@@ -436,12 +436,12 @@ impl BenchState {
         let log_dir = helix_loader::log_file()
             .parent()
             .map(std::path::Path::to_path_buf);
-        let log_path = if cfg!(feature = "bench-profile") {
+        let log_path = if cfg!(feature = "bench") {
             log_dir.as_ref().map(|dir| dir.join("bench.log"))
         } else {
             None
         };
-        let event_log_path = if cfg!(feature = "bench-profile") {
+        let event_log_path = if cfg!(feature = "bench") {
             log_dir.as_ref().map(|dir| dir.join("bench-events.log"))
         } else {
             None
@@ -823,7 +823,7 @@ impl BenchState {
     }
 
     fn log_run_start(&self) {
-        if !cfg!(feature = "bench-profile") {
+        if !cfg!(feature = "bench") {
             return;
         }
 

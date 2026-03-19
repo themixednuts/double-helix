@@ -38,7 +38,7 @@ use helix_view::{
     ViewId,
 };
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     mem::take,
     rc::Rc,
     sync::{Arc, LazyLock},
@@ -53,7 +53,9 @@ use super::text_decorations::blame::InlineBlame;
 
 use helix_view::engine::{KeymapQuery, ModalInputState};
 use helix_view::model::FocusTarget;
-use helix_view::view::{LayoutSnapshot, LineMap, RenderPlan, RenderSnapshots, SyntaxStyleCache};
+use helix_view::view::{
+    LayoutSnapshot, LineMap, RenderInputs, RenderPlan, RenderSnapshots, ReusePlan, SyntaxStyleCache,
+};
 
 const MAX_SEED_LINE_MAP_GAP: usize = 4_096;
 
@@ -76,6 +78,26 @@ struct ViewRenderCacheEntry {
     snapshots: RenderSnapshots,
     /// The rendered cells for the view's area.
     cells: tui::buffer::Buffer,
+}
+
+struct CachedViewState {
+    syntax: SyntaxStyleCache,
+    line_map: LineMap,
+    old_fingerprints: Arc<[u64]>,
+    overlay_fingerprints: Arc<[u64]>,
+    dirty_rows: HashSet<u16>,
+}
+
+impl CachedViewState {
+    fn from_plan(plan: ReusePlan<'_>) -> Self {
+        Self {
+            syntax: plan.cached.paint.syntax_styles.clone(),
+            line_map: plan.cached.layout.line_map.clone(),
+            old_fingerprints: plan.cached.paint.overlay_fingerprints.clone(),
+            overlay_fingerprints: plan.overlay_fingerprints,
+            dirty_rows: plan.dirty_rows,
+        }
+    }
 }
 
 /// Per-view render cache with two-tier invalidation:
@@ -223,6 +245,311 @@ impl EditorView {
             }
         }
         buf
+    }
+
+    fn blit_cached_view(&self, view_id: ViewId, surface: &mut Surface) {
+        if let Some(cached) = self.render_cache.entries.get(&view_id) {
+            Self::blit(&cached.cells, surface);
+        }
+    }
+
+    fn update_cached_overlay_fingerprints(
+        &mut self,
+        view_id: ViewId,
+        overlay_fingerprints: Arc<[u64]>,
+    ) {
+        if let Some(entry) = self.render_cache.entries.get_mut(&view_id) {
+            entry.snapshots.paint.overlay_fingerprints = overlay_fingerprints;
+        }
+    }
+
+    fn store_view_render(
+        &mut self,
+        editor: &Editor,
+        doc: &Document,
+        view: &View,
+        snapshots: RenderSnapshots,
+        surface: &Surface,
+    ) {
+        snapshots.layout.update_cursor_cache(editor, doc, view);
+        self.render_cache.entries.insert(
+            view.id,
+            ViewRenderCacheEntry {
+                snapshots,
+                cells: {
+                    let copy_start = std::time::Instant::now();
+                    let cells = Self::copy_region(surface, Self::content_area(view));
+                    helix_view::bench::log_run_phase(
+                        "editor_render_view",
+                        "copy_region",
+                        copy_start.elapsed(),
+                        || {
+                            let area = Self::content_area(view);
+                            format!("view_id={:?} area={}x{}", view.id, area.width, area.height)
+                        },
+                    );
+                    cells
+                },
+            },
+        );
+    }
+
+    fn record_cache_hit(&mut self, dirty_rows: usize, total_lines: usize) {
+        #[cfg(debug_assertions)]
+        {
+            self.render_cache.hits = self.render_cache.hits.wrapping_add(1);
+            self.render_cache.dirty_lines = self
+                .render_cache
+                .dirty_lines
+                .wrapping_add(dirty_rows as u64);
+            self.render_cache.clean_lines = self
+                .render_cache
+                .clean_lines
+                .wrapping_add(total_lines.saturating_sub(dirty_rows) as u64);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_reuse_plan(
+        &mut self,
+        editor: &Editor,
+        doc: &Document,
+        view: &View,
+        area: Rect,
+        surface: &mut Surface,
+        current_inputs: RenderInputs,
+        selection: &Selection,
+        is_focused: bool,
+        frame_num: u64,
+        view_render_start: std::time::Instant,
+        render_start: std::time::Instant,
+        cached: CachedViewState,
+    ) {
+        let CachedViewState {
+            syntax,
+            line_map,
+            old_fingerprints,
+            overlay_fingerprints,
+            dirty_rows,
+        } = cached;
+
+        let cached_linemap_count = line_map.lines.len();
+
+        let blit_start = std::time::Instant::now();
+        self.blit_cached_view(view.id, surface);
+        helix_view::bench::log_run_phase(
+            "editor_render_view",
+            "blit",
+            blit_start.elapsed(),
+            || {
+                format!(
+                    "view_id={:?} area={}x{}",
+                    view.id, view.area.width, view.area.height
+                )
+            },
+        );
+
+        LayoutSnapshot::new(view.layout_inputs(doc, editor.config_gen), line_map.clone())
+            .update_cursor_cache(editor, doc, view);
+
+        let fp_start = std::time::Instant::now();
+        helix_view::bench::log_run_phase(
+            "editor_render_view",
+            "overlay_fingerprints",
+            fp_start.elapsed(),
+            || format!("view_id={:?} rows={}", view.id, line_map.lines.len()),
+        );
+
+        let dirty_start = std::time::Instant::now();
+        helix_view::bench::log_run_phase(
+            "editor_render_view",
+            "dirty_rows",
+            dirty_start.elapsed(),
+            || {
+                format!(
+                    "view_id={:?} old={} new={}",
+                    view.id,
+                    old_fingerprints.len(),
+                    overlay_fingerprints.len()
+                )
+            },
+        );
+
+        {
+            let sel = selection.primary();
+            let (sel_start, sel_end) = if sel.anchor <= sel.head {
+                (sel.anchor, sel.head)
+            } else {
+                (sel.head, sel.anchor)
+            };
+            let intersecting_rows: Vec<u16> = line_map
+                .lines
+                .iter()
+                .filter(|line| sel_start < line.char_range_end && sel_end >= line.char_range_start)
+                .map(|line| line.visual_row)
+                .collect();
+            log::info!(
+                "F{} CACHE HIT sel=({},{}) dirty={:?} sel_rows={:?} lines={}",
+                frame_num,
+                sel.anchor,
+                sel.head,
+                dirty_rows,
+                intersecting_rows,
+                cached_linemap_count,
+            );
+        }
+
+        self.record_cache_hit(dirty_rows.len(), line_map.lines.len());
+
+        if dirty_rows.is_empty() {
+            log::info!("F{} CACHE PURE_BLIT view={:?}", frame_num, view.id);
+            self.update_cached_overlay_fingerprints(view.id, overlay_fingerprints);
+            return;
+        }
+
+        let inner = view.inner_area(doc);
+        for &row in &dirty_rows {
+            if row < inner.height {
+                let y = inner.y + row;
+                surface.clear(Rect::new(inner.x, y, inner.width, 1));
+            }
+        }
+
+        let vctx = ViewRenderContext {
+            editor,
+            doc,
+            view,
+            viewport: area,
+            is_focused,
+            cached_syntax: Some(&syntax),
+            dirty_rows: Some(&dirty_rows),
+            seed_line_map: Some(&line_map),
+        };
+        let render_output = self.render_view(&vctx, surface);
+        helix_view::bench::log_run_phase(
+            "editor_render_view",
+            "dirty_render_view",
+            render_start.elapsed(),
+            || format!("view_id={:?} dirty_rows={}", view.id, dirty_rows.len()),
+        );
+
+        log::info!(
+            "F{} CACHE DIRTY_RERENDER view={:?} dirty_rows={:?} new_syntax={} new_linemap={} elapsed={:?}",
+            frame_num,
+            view.id,
+            dirty_rows,
+            render_output.syntax_styles.len(),
+            render_output.line_map.lines.len(),
+            render_start.elapsed(),
+        );
+
+        let preserved_syntax = if render_output.syntax_styles.is_empty() {
+            syntax
+        } else {
+            SyntaxStyleCache {
+                entries: Arc::from(render_output.syntax_styles),
+            }
+        };
+
+        let snapshots = current_inputs.into_cached_snapshots(
+            render_output.line_map,
+            preserved_syntax,
+            overlay_fingerprints,
+        );
+        self.store_view_render(editor, doc, view, snapshots, surface);
+        helix_view::bench::log_run_phase(
+            "editor_render_view",
+            "dirty_total",
+            view_render_start.elapsed(),
+            || format!("view_id={:?} path=dirty", view.id),
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_refresh_plan(
+        &mut self,
+        editor: &Editor,
+        doc: &Document,
+        view: &View,
+        area: Rect,
+        surface: &mut Surface,
+        current_inputs: RenderInputs,
+        selection: &Selection,
+        is_focused: bool,
+        frame_num: u64,
+        view_render_start: std::time::Instant,
+        render_start: std::time::Instant,
+        seed_line_map: Option<LineMap>,
+    ) {
+        #[cfg(debug_assertions)]
+        {
+            self.render_cache.misses = self.render_cache.misses.wrapping_add(1);
+        }
+
+        let current_paint = current_inputs.paint.clone();
+        let vctx = ViewRenderContext {
+            editor,
+            doc,
+            view,
+            viewport: area,
+            is_focused,
+            cached_syntax: None,
+            dirty_rows: None,
+            seed_line_map: seed_line_map.as_ref(),
+        };
+        let render_output = self.render_view(&vctx, surface);
+        helix_view::bench::log_run_phase(
+            "editor_render_view",
+            "full_render_view",
+            view_render_start.elapsed(),
+            || format!("view_id={:?} path=full_before_fp", view.id),
+        );
+
+        let fp_start = std::time::Instant::now();
+        let overlay_fingerprints = render_output.line_map.overlay_fingerprints(
+            selection,
+            editor.mode,
+            is_focused,
+            self.terminal_focused,
+        );
+        helix_view::bench::log_run_phase(
+            "editor_render_view",
+            "overlay_fingerprints",
+            fp_start.elapsed(),
+            || {
+                format!(
+                    "view_id={:?} rows={}",
+                    view.id,
+                    render_output.line_map.lines.len()
+                )
+            },
+        );
+
+        log::info!(
+            "F{} CACHE MISS view={:?} anchor={} voff={} area={}x{} syntax={} lines={} elapsed={:?}",
+            frame_num,
+            view.id,
+            current_paint.layout.view_position.anchor,
+            current_paint.layout.view_position.vertical_offset,
+            view.area.width,
+            view.area.height,
+            render_output.syntax_styles.len(),
+            render_output.line_map.lines.len(),
+            render_start.elapsed(),
+        );
+
+        let snapshots = current_inputs.into_snapshots(
+            render_output.line_map,
+            render_output.syntax_styles,
+            overlay_fingerprints,
+        );
+        self.store_view_render(editor, doc, view, snapshots, surface);
+        helix_view::bench::log_run_phase(
+            "editor_render_view",
+            "full_total",
+            view_render_start.elapsed(),
+            || format!("view_id={:?} path=full", view.id),
+        );
     }
 
     pub fn spinners_mut(&mut self) -> &mut ProgressSpinners {
@@ -2153,329 +2480,46 @@ impl Component for EditorView {
 
             let current_inputs =
                 view.render_inputs(doc, cx.editor.config_gen, Arc::from(cx.editor.theme.name()));
-            let current_paint = current_inputs.paint.clone();
             let selection = doc.selection(view.id);
-            let seed_line_map = {
-                let plan = current_inputs.plan(
-                    self.render_cache
-                        .entries
-                        .get(&view.id)
-                        .map(|entry| entry.snapshots.as_ref()),
-                    selection,
-                    cx.editor.mode,
-                    is_focused,
-                    self.terminal_focused,
-                );
-
-                // Content hit — content unchanged, compute dirty lines from overlay fingerprints.
-                // When 0 lines are dirty, this is a pure blit (zero extra work).
-                match plan {
-                    RenderPlan::Reuse(plan) => {
-                        let cached_syntax = plan.cached.paint.syntax_styles.clone();
-                        let cached_line_map = plan.cached.layout.line_map.clone();
-                        let old_fingerprints = plan.cached.paint.overlay_fingerprints.clone();
-                        let new_fingerprints = plan.overlay_fingerprints;
-
-                        let cached_linemap_count = cached_line_map.lines.len();
-
-                        let blit_start = std::time::Instant::now();
-                        if let Some(cached) = self.render_cache.entries.get(&view.id) {
-                            Self::blit(&cached.cells, surface);
-                        }
-                        helix_view::bench::log_run_phase(
-                            "editor_render_view",
-                            "blit",
-                            blit_start.elapsed(),
-                            || {
-                                format!(
-                                    "view_id={:?} area={}x{}",
-                                    view.id, view.area.width, view.area.height
-                                )
-                            },
-                        );
-                        LayoutSnapshot::new(
-                            view.layout_inputs(doc, cx.editor.config_gen),
-                            cached_line_map.clone(),
-                        )
-                        .update_cursor_cache(cx.editor, doc, view);
-
-                        let fp_start = std::time::Instant::now();
-                        helix_view::bench::log_run_phase(
-                            "editor_render_view",
-                            "overlay_fingerprints",
-                            fp_start.elapsed(),
-                            || {
-                                format!(
-                                    "view_id={:?} rows={}",
-                                    view.id,
-                                    cached_line_map.lines.len()
-                                )
-                            },
-                        );
-
-                        let dirty_start = std::time::Instant::now();
-                        let dirty = plan.dirty_rows;
-                        helix_view::bench::log_run_phase(
-                            "editor_render_view",
-                            "dirty_rows",
-                            dirty_start.elapsed(),
-                            || {
-                                format!(
-                                    "view_id={:?} old={} new={}",
-                                    view.id,
-                                    old_fingerprints.len(),
-                                    new_fingerprints.len()
-                                )
-                            },
-                        );
-
-                        {
-                            let sel = selection.primary();
-                            let (sel_start, sel_end) = if sel.anchor <= sel.head {
-                                (sel.anchor, sel.head)
-                            } else {
-                                (sel.head, sel.anchor)
-                            };
-                            let intersecting_rows: Vec<u16> = cached_line_map
-                                .lines
-                                .iter()
-                                .filter(|l| {
-                                    sel_start < l.char_range_end && sel_end >= l.char_range_start
-                                })
-                                .map(|l| l.visual_row)
-                                .collect();
-                            log::info!(
-                                "F{} CACHE HIT sel=({},{}) dirty={:?} sel_rows={:?} lines={}",
-                                frame_num,
-                                sel.anchor,
-                                sel.head,
-                                dirty,
-                                intersecting_rows,
-                                cached_linemap_count,
-                            );
-                        }
-
-                        #[cfg(debug_assertions)]
-                        {
-                            self.render_cache.hits = self.render_cache.hits.wrapping_add(1);
-                            self.render_cache.dirty_lines = self
-                                .render_cache
-                                .dirty_lines
-                                .wrapping_add(dirty.len() as u64);
-                            let total_lines = cached_line_map.lines.len() as u64;
-                            self.render_cache.clean_lines = self
-                                .render_cache
-                                .clean_lines
-                                .wrapping_add(total_lines.saturating_sub(dirty.len() as u64));
-                        }
-
-                        if dirty.is_empty() {
-                            log::info!("F{} CACHE PURE_BLIT view={:?}", frame_num, view.id);
-                            if let Some(entry) = self.render_cache.entries.get_mut(&view.id) {
-                                entry.snapshots.paint.overlay_fingerprints = new_fingerprints;
-                            }
-                            continue;
-                        }
-
-                        let inner = view.inner_area(doc);
-                        for &row in &dirty {
-                            if row < inner.height {
-                                let y = inner.y + row;
-                                let row_rect = Rect::new(inner.x, y, inner.width, 1);
-                                surface.clear(row_rect);
-                            }
-                        }
-
-                        let vctx = ViewRenderContext {
-                            editor: cx.editor,
-                            doc,
-                            view,
-                            viewport: area,
-                            is_focused,
-                            cached_syntax: Some(&cached_syntax),
-                            dirty_rows: Some(&dirty),
-                            seed_line_map: Some(&cached_line_map),
-                        };
-                        let render_output = self.render_view(&vctx, surface);
-                        helix_view::bench::log_run_phase(
-                            "editor_render_view",
-                            "dirty_render_view",
-                            render_start.elapsed(),
-                            || format!("view_id={:?} dirty_rows={}", view.id, dirty.len()),
-                        );
-
-                        let new_syntax_count = render_output.syntax_styles.len();
-                        let new_linemap_count = render_output.line_map.lines.len();
-                        log::info!(
-                            "F{} CACHE DIRTY_RERENDER view={:?} dirty_rows={:?} new_syntax={} new_linemap={} elapsed={:?}",
-                            frame_num,
-                            view.id,
-                            dirty,
-                            new_syntax_count,
-                            new_linemap_count,
-                            render_start.elapsed(),
-                        );
-
-                        let preserved_syntax = if render_output.syntax_styles.is_empty() {
-                            cached_syntax
-                        } else {
-                            SyntaxStyleCache {
-                                entries: Arc::from(render_output.syntax_styles),
-                            }
-                        };
-
-                        let cursor_pos = if cx.editor.tree.focus == view.id {
-                            LayoutSnapshot::new(
-                                view.layout_inputs(doc, cx.editor.config_gen),
-                                render_output.line_map.clone(),
-                            )
-                            .cursor_position(doc, view)
-                        } else {
-                            None
-                        };
-
-                        self.render_cache.entries.insert(view.id, {
-                            let snapshots = current_inputs.clone().into_cached_snapshots(
-                                render_output.line_map,
-                                preserved_syntax,
-                                new_fingerprints,
-                            );
-                            ViewRenderCacheEntry {
-                                snapshots,
-                                cells: {
-                                    let copy_start = std::time::Instant::now();
-                                    let cells =
-                                        Self::copy_region(surface, Self::content_area(view));
-                                    helix_view::bench::log_run_phase(
-                                        "editor_render_view",
-                                        "copy_region",
-                                        copy_start.elapsed(),
-                                        || {
-                                            let area = Self::content_area(view);
-                                            format!(
-                                                "view_id={:?} area={}x{}",
-                                                view.id, area.width, area.height
-                                            )
-                                        },
-                                    );
-                                    cells
-                                },
-                            }
-                        });
-                        if cx.editor.tree.focus == view.id {
-                            cx.editor.cursor_cache.set(cursor_pos);
-                        }
-                        helix_view::bench::log_run_phase(
-                            "editor_render_view",
-                            "dirty_total",
-                            view_render_start.elapsed(),
-                            || format!("view_id={:?} path=dirty", view.id),
-                        );
-                        continue;
-                    }
-                    RenderPlan::Refresh(plan) => plan.seed_line_map.cloned(),
-                }
-            };
-
-            // Content miss — full re-render.
-            #[cfg(debug_assertions)]
-            {
-                self.render_cache.misses = self.render_cache.misses.wrapping_add(1);
-            }
-
-            let vctx = ViewRenderContext {
-                editor: cx.editor,
-                doc,
-                view,
-                viewport: area,
-                is_focused,
-                cached_syntax: None,
-                dirty_rows: None,
-                seed_line_map: seed_line_map.as_ref(),
-            };
-            let render_output = self.render_view(&vctx, surface);
-            helix_view::bench::log_run_phase(
-                "editor_render_view",
-                "full_render_view",
-                view_render_start.elapsed(),
-                || format!("view_id={:?} path=full_before_fp", view.id),
-            );
-
-            let fp_start = std::time::Instant::now();
-            let overlay_fingerprints = render_output.line_map.overlay_fingerprints(
+            match current_inputs.plan(
+                self.render_cache
+                    .entries
+                    .get(&view.id)
+                    .map(|entry| entry.snapshots.as_ref()),
                 selection,
                 cx.editor.mode,
                 is_focused,
                 self.terminal_focused,
-            );
-            helix_view::bench::log_run_phase(
-                "editor_render_view",
-                "overlay_fingerprints",
-                fp_start.elapsed(),
-                || {
-                    format!(
-                        "view_id={:?} rows={}",
-                        view.id,
-                        render_output.line_map.lines.len()
-                    )
-                },
-            );
-
-            log::info!(
-                "F{} CACHE MISS view={:?} anchor={} voff={} area={}x{} syntax={} lines={} elapsed={:?}",
-                frame_num,
-                view.id,
-                current_paint.layout.view_position.anchor,
-                current_paint.layout.view_position.vertical_offset,
-                view.area.width, view.area.height,
-                render_output.syntax_styles.len(),
-                render_output.line_map.lines.len(),
-                render_start.elapsed(),
-            );
-
-            let cursor_pos = if cx.editor.tree.focus == view.id {
-                LayoutSnapshot::new(
-                    view.layout_inputs(doc, cx.editor.config_gen),
-                    render_output.line_map.clone(),
-                )
-                .cursor_position(doc, view)
-            } else {
-                None
-            };
-
-            self.render_cache.entries.insert(view.id, {
-                let snapshots = current_inputs.into_snapshots(
-                    render_output.line_map,
-                    render_output.syntax_styles,
-                    overlay_fingerprints,
-                );
-                ViewRenderCacheEntry {
-                    snapshots,
-                    cells: {
-                        let copy_start = std::time::Instant::now();
-                        let cells = Self::copy_region(surface, Self::content_area(view));
-                        helix_view::bench::log_run_phase(
-                            "editor_render_view",
-                            "copy_region",
-                            copy_start.elapsed(),
-                            || {
-                                let area = Self::content_area(view);
-                                format!("view_id={:?} area={}x{}", view.id, area.width, area.height)
-                            },
-                        );
-                        cells
-                    },
-                }
-            });
-            if cx.editor.tree.focus == view.id {
-                cx.editor.cursor_cache.set(cursor_pos);
+            ) {
+                RenderPlan::Reuse(plan) => self.render_reuse_plan(
+                    cx.editor,
+                    doc,
+                    view,
+                    area,
+                    surface,
+                    current_inputs,
+                    selection,
+                    is_focused,
+                    frame_num,
+                    view_render_start,
+                    render_start,
+                    CachedViewState::from_plan(plan),
+                ),
+                RenderPlan::Refresh(plan) => self.render_refresh_plan(
+                    cx.editor,
+                    doc,
+                    view,
+                    area,
+                    surface,
+                    current_inputs,
+                    selection,
+                    is_focused,
+                    frame_num,
+                    view_render_start,
+                    render_start,
+                    plan.seed_line_map.cloned(),
+                ),
             }
-            helix_view::bench::log_run_phase(
-                "editor_render_view",
-                "full_total",
-                view_render_start.elapsed(),
-                || format!("view_id={:?} path=full", view.id),
-            );
         }
 
         // Batch all statusline renders and execute deferred work in parallel.

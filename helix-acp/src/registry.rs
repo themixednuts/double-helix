@@ -50,12 +50,17 @@ impl Registry {
 
     /// Remove an agent from the registry.
     pub fn remove(&mut self, id: AgentId) -> Option<Arc<AcpAgent>> {
+        log::warn!("[acp_transport] removing agent from registry id={:?}", id);
         self.inner.remove(id)
     }
 
     /// Close all agents. Drops each agent, which kills the child process via `kill_on_drop`.
     /// Call this during application shutdown to ensure clean process termination.
     pub fn close_all(&mut self) {
+        log::warn!(
+            "[acp_transport] closing all agents count={}",
+            self.inner.len()
+        );
         self.inner.clear();
     }
 

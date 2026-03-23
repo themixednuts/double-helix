@@ -2156,6 +2156,12 @@ impl Application {
                         self.handle_acp_session_update(agent_id, notif);
                     }
                     Err(helix_acp::Error::Unhandled(method)) => {
+                        if method == "exit" {
+                            log::warn!(
+                                "[acp_transport] application received synthetic exit notification agent={:?}",
+                                agent_id
+                            );
+                        }
                         log::debug!("Ignoring unhandled ACP notification: {method}");
                     }
                     Err(err) => {

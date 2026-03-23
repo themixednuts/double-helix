@@ -485,6 +485,40 @@ impl Compositor {
                     )
                 },
             );
+            if let Event::Key(key) = event {
+                let result_label = match &result {
+                    EventResult::Consumed(Some(_)) => "consumed+callback",
+                    EventResult::Consumed(None) => "consumed",
+                    EventResult::Ignored(Some(_)) => "ignored+callback",
+                    EventResult::Ignored(None) => "ignored",
+                };
+                warn!(
+                    "[acp_dispatch] key={:?} mods={:?} layer_id={} type={} focused={} result={}",
+                    key.code,
+                    key.modifiers,
+                    layer.id().unwrap_or("-"),
+                    layer.type_name(),
+                    layer.is_focused(),
+                    result_label
+                );
+            } else if let Event::Mouse(mouse) = event {
+                let result_label = match &result {
+                    EventResult::Consumed(Some(_)) => "consumed+callback",
+                    EventResult::Consumed(None) => "consumed",
+                    EventResult::Ignored(Some(_)) => "ignored+callback",
+                    EventResult::Ignored(None) => "ignored",
+                };
+                warn!(
+                    "[acp_dispatch] mouse={:?} col={} row={} layer_id={} type={} focused={} result={}",
+                    mouse.kind,
+                    mouse.column,
+                    mouse.row,
+                    layer.id().unwrap_or("-"),
+                    layer.type_name(),
+                    layer.is_focused(),
+                    result_label
+                );
+            }
             match result {
                 EventResult::Consumed(Some(callback)) => {
                     callbacks.push(callback);

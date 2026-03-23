@@ -5,7 +5,7 @@
 
 use crate::{jsonrpc, AgentId, Error, Result};
 use anyhow::Context;
-use log::{error, info};
+use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -47,6 +47,17 @@ pub struct Transport {
 }
 
 impl Transport {
+    fn payload_label(payload: &Payload) -> String {
+        match payload {
+            Payload::Request { value, .. } => format!("request:{}:{}", value.method, value.id),
+            Payload::Notification(value) => format!("notification:{}", value.method),
+            Payload::Response(output) => match output {
+                jsonrpc::Output::Success(success) => format!("response:{}", success.id),
+                jsonrpc::Output::Failure(failure) => format!("response:{}", failure.id),
+            },
+        }
+    }
+
     pub fn start(
         agent_stdout: BufReader<ChildStdout>,
         agent_stdin: BufWriter<ChildStdin>,
@@ -204,7 +215,13 @@ impl Transport {
                     }
                 }
                 Err(Error::StreamClosed) => {
+                    let pending = transport.pending_requests.lock().await.len();
                     info!("{} agent process closed stdout", transport.name);
+                    warn!(
+                        "[acp_transport] stdout closed agent={} pending_requests={}",
+                        transport.name,
+                        pending
+                    );
 
                     // Close all pending requests
                     for (id, tx) in transport.pending_requests.lock().await.drain() {
@@ -219,6 +236,10 @@ impl Transport {
                         method: "exit".to_string(),
                         params: jsonrpc::Params::None,
                     });
+                    warn!(
+                        "[acp_transport] injecting synthetic exit notification agent={}",
+                        transport.name
+                    );
                     let _ = client_tx.send((transport.id, exit));
                     break;
                 }
@@ -268,6 +289,11 @@ impl Transport {
                 biased;
                 _ = initialize_notify.notified() => {
                     is_pending = false;
+                    warn!(
+                        "[acp_transport] initialize complete agent={} draining_pending={}",
+                        transport.name,
+                        pending_messages.len()
+                    );
 
                     // Drain buffered messages
                     for msg in pending_messages.drain(..) {
@@ -281,8 +307,17 @@ impl Transport {
                         if is_pending && !is_initialize(&msg) {
                             // Buffer non-initialize messages until ready
                             if let Payload::Notification(_) = msg {
+                                warn!(
+                                    "[acp_transport] dropping pre-init notification agent={}",
+                                    transport.name
+                                );
                                 continue; // drop notifications before init
                             }
+                            warn!(
+                                "[acp_transport] buffering pre-init payload agent={} payload={}",
+                                transport.name,
+                                Self::payload_label(&msg)
+                            );
                             pending_messages.push(msg);
                         } else if let Err(err) =
                             transport.send_payload_to_agent(&mut agent_stdin, msg).await
@@ -291,6 +326,7 @@ impl Transport {
                         }
                     } else {
                         // Channel closed
+                        warn!("[acp_transport] client send channel closed agent={}", transport.name);
                         break;
                     }
                 }

@@ -1,18 +1,30 @@
 use crate::component_traits;
 use crate::compositor::{Component, Context, Event, EventResult, RenderContext};
+use crate::ui::animation::{
+    Animation, AnimationDirection, AnimationFillMode, AnimationIterationCount, AnimationSpec,
+    AnimationTimingFunction,
+};
 use crate::ui::marquee::{schedule_redraw_at, Marquee};
-use crate::widgets::{chat_bubble, BubbleAlign, BubbleCorners, BubbleStyle};
+use crate::widgets::{
+    message_list, Message, MessageAccessoryAlign, MessageAlign, MessageCorners, MessageCursor,
+    MessageListState, MessageStyle, Spinner,
+};
+use helix_core::unicode::width::UnicodeWidthStr;
+use helix_core::NATIVE_LINE_ENDING;
 use helix_core::Position;
+use helix_view::document::Document;
+use helix_view::editor::Action;
 use helix_view::content_region::ContentRegion;
 use helix_view::document::Mode;
-use helix_view::graphics::{CursorKind, Rect};
-use helix_view::input::{KeyCode, KeyEvent, KeyModifiers};
-use helix_view::theme::Modifier;
-use helix_view::theme::Style;
+use helix_view::graphics::{CursorKind, Rect, Style as GraphicsStyle};
+use helix_view::input::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use helix_view::theme::{Modifier, Style};
 use helix_view::traits::{Bounded, Focusable, Identified, Modal, Scrollable};
 use helix_view::Editor;
 use tui::buffer::Buffer as Surface;
 use tui::text::{Span, Spans};
+use std::collections::HashSet;
+use std::time::Duration;
 
 pub const ID: &str = "acp-panel";
 pub const PERMISSION_ID: &str = "acp-permission";
@@ -54,42 +66,6 @@ pub enum PlanStatus {
 }
 
 // ---------------------------------------------------------------------------
-// Chat block types for rendering
-// ---------------------------------------------------------------------------
-
-/// A renderable block in the chat output area.
-struct ChatBlock<'a> {
-    kind: ChatBlockKind<'a>,
-}
-
-enum ChatBlockKind<'a> {
-    /// A bordered bubble with optional label, styled content, and background fill.
-    Bubble {
-        label: Option<(String, Style)>,
-        lines: Vec<Spans<'a>>,
-        bubble_width: u16,
-        align: BubbleAlign,
-        style: BubbleStyle,
-    },
-    /// Plain styled lines (tool calls, status messages).
-    Plain(Vec<Spans<'a>>),
-}
-
-impl<'a> ChatBlock<'a> {
-    /// Total rows this block occupies (excluding trailing spacing).
-    fn height(&self) -> u16 {
-        match &self.kind {
-            ChatBlockKind::Bubble { label, lines, .. } => {
-                let label_h = if label.is_some() { 1 } else { 0 };
-                let bubble_h = lines.len() as u16 + 2; // top + content + bottom border
-                label_h + bubble_h
-            }
-            ChatBlockKind::Plain(lines) => lines.len() as u16,
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Session history entry
 // ---------------------------------------------------------------------------
 
@@ -99,6 +75,12 @@ pub struct SessionRecord {
     pub agent_name: String,
     pub started: std::time::Instant,
     pub message_count: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FocusTarget {
+    Input,
+    Messages,
 }
 
 // ---------------------------------------------------------------------------
@@ -128,12 +110,26 @@ pub struct AcpPanel {
     current_mode_id: Option<String>,
     /// Plan/tasks shown above input (static UI, not in chat history).
     plan_items: Option<Vec<PlanItem>>,
-    /// Selected chat entry index (for j/k navigation and copy). None = no selection.
-    selected_entry: Option<usize>,
+    /// Message cursor state for future entry navigation and reveal behavior.
+    message_cursor: MessageCursor,
+    /// Current ACP subfocus between the composer and the message list.
+    focus_target: FocusTarget,
     /// Last input cursor screen position (set during render, read by cursor()).
     last_input_cursor: Option<(u16, u16)>,
     /// Model panel ID, set on first sync.
     model_panel_id: Option<helix_view::model::PanelId>,
+    /// Latest chat-thread layout information for future chat-entry navigation.
+    chat_layout: MessageListState,
+    /// Shared spinner primitive for lightweight running-status animation.
+    spinner: Spinner,
+    /// Selection animation that replays when message focus moves back onto a row.
+    message_focus_animation: Animation,
+    /// Currently expanded message for inline details.
+    expanded_message: Option<usize>,
+    /// Collapsed text messages in the ACP list.
+    collapsed_messages: HashSet<usize>,
+    /// Scratch docs opened from ACP message details, keyed by message index.
+    opened_message_docs: std::collections::HashMap<usize, helix_view::DocumentId>,
 }
 
 impl Default for AcpPanel {
@@ -143,6 +139,64 @@ impl Default for AcpPanel {
 }
 
 impl AcpPanel {
+    fn accent_style(style: Style) -> Style {
+        let mut accent = Style::default();
+        if let Some(fg) = style.fg {
+            accent = accent.fg(fg);
+        }
+        if let Some(bg) = style.bg {
+            accent = accent.bg(bg);
+        }
+        if let Some(underline_color) = style.underline_color {
+            accent = accent.underline_color(underline_color);
+        }
+        if let Some(underline_style) = style.underline_style {
+            accent = accent.underline_style(underline_style);
+        }
+        accent
+    }
+
+    fn focus_badge(&self, theme: &helix_view::Theme) -> (&'static str, Style) {
+        let active = Self::accent_style(theme.get("ui.menu.selected"));
+        let inactive = Self::accent_style(theme.get("ui.statusline.inactive"));
+        match self.focus_target {
+            FocusTarget::Input => (" INPUT ", active),
+            FocusTarget::Messages => (" MESSAGES ", inactive.patch(active)),
+        }
+    }
+
+    fn status_style(
+        theme: &helix_view::Theme,
+        status: &str,
+    ) -> (Style, Style) {
+        match status {
+            "running" => (theme.get("warning"), theme.get("warning")),
+            "completed" | "done" => (theme.get("diff.plus"), theme.get("diff.plus")),
+            "failed" => (theme.get("error"), theme.get("error")),
+            "cancelled" => (theme.get("ui.text.inactive"), theme.get("ui.text.inactive")),
+            _ => (theme.get("ui.text.inactive"), theme.get("ui.text.inactive")),
+        }
+    }
+
+    fn status_icon(&self, status: &str) -> &'static str {
+        match status {
+            "running" => self.spinner.frame(),
+            "completed" | "done" => "●",
+            "failed" => "✕",
+            "cancelled" => "–",
+            _ => "○",
+        }
+    }
+
+    fn has_running_activity(&self) -> bool {
+        self.output.content().iter().any(|entry| {
+            matches!(entry, ChatEntry::ToolCall { status, .. } if status == "running")
+        }) || self
+            .plan_items
+            .as_ref()
+            .is_some_and(|items| items.iter().any(|item| item.status == PlanStatus::InProgress))
+    }
+
     pub fn new() -> Self {
         Self {
             focused: true,
@@ -158,9 +212,24 @@ impl AcpPanel {
             session_modes: Vec::new(),
             current_mode_id: None,
             plan_items: None,
-            selected_entry: None,
+            message_cursor: MessageCursor::default(),
+            focus_target: FocusTarget::Input,
             last_input_cursor: None,
             model_panel_id: None,
+            chat_layout: MessageListState::default(),
+            spinner: Spinner::default(),
+            message_focus_animation: Animation::new({
+                let mut spec = AnimationSpec::new(Duration::from_millis(220));
+                spec.timing_function = AnimationTimingFunction::EaseOut;
+                spec.iteration_count = AnimationIterationCount::Count(1);
+                spec.direction = AnimationDirection::Normal;
+                spec.fill_mode = AnimationFillMode::Forwards;
+                spec.frame_interval = Duration::from_millis(16);
+                spec
+            }),
+            expanded_message: None,
+            collapsed_messages: HashSet::new(),
+            opened_message_docs: std::collections::HashMap::new(),
         }
     }
 
@@ -176,7 +245,182 @@ impl AcpPanel {
     }
 
     pub fn activate_input(&mut self) {
+        self.focus_target = FocusTarget::Input;
+        self.message_focus_animation.stop();
         self.set_focused(true);
+    }
+
+    pub fn focus_target(&self) -> FocusTarget {
+        self.focus_target
+    }
+
+    pub fn focus_messages(&mut self) {
+        if self.input.mode() == Mode::Insert {
+            self.input.exit_insert_mode();
+        }
+        self.set_focused(true);
+        self.focus_target = FocusTarget::Messages;
+        self.restart_message_focus_animation();
+    }
+
+    fn focus_messages_without_animation(&mut self) {
+        if self.input.mode() == Mode::Insert {
+            self.input.exit_insert_mode();
+        }
+        self.set_focused(true);
+        self.focus_target = FocusTarget::Messages;
+    }
+
+    pub fn focus_input_region(&mut self) {
+        self.set_focused(true);
+        self.focus_target = FocusTarget::Input;
+        self.message_focus_animation.stop();
+    }
+
+    fn restart_message_focus_animation(&mut self) {
+        if self.focus_target == FocusTarget::Messages && self.message_cursor.selected().is_some() {
+            self.message_focus_animation.restart();
+        }
+    }
+
+    fn set_message_selection(&mut self, index: Option<usize>, animate: bool) -> Option<usize> {
+        let previous = self.message_cursor.selected();
+        self.message_cursor.select(index);
+        self.message_cursor.clamp_selection(&self.chat_layout);
+
+        if self.message_cursor.selected().is_some() {
+            self.focus_target = FocusTarget::Messages;
+            if animate && previous != self.message_cursor.selected() {
+                self.restart_message_focus_animation();
+            }
+        } else {
+            self.message_focus_animation.stop();
+        }
+
+        self.message_cursor.selected()
+    }
+
+    fn current_message_accent(&self, theme: &helix_view::Theme) -> Option<(GraphicsStyle, f32)> {
+        if self.focus_target != FocusTarget::Messages || self.message_cursor.selected().is_none() {
+            return None;
+        }
+
+        let sample = self.message_focus_animation.sample();
+        let accent = theme
+            .try_get("ui.accent")
+            .or_else(|| theme.try_get("ui.cursor.primary"))
+            .unwrap_or_else(|| theme.get("ui.menu.selected"));
+        let color = accent.bg.or(accent.fg).or(accent.underline_color)?;
+        Some((GraphicsStyle::default().fg(color), sample.progress))
+    }
+
+    fn action_hints(
+        theme: &helix_view::Theme,
+        align: MessageAccessoryAlign,
+    ) -> (Vec<Spans<'static>>, MessageAccessoryAlign) {
+        let key_style = theme.get("ui.text.focus").add_modifier(Modifier::BOLD);
+        let text_style = theme.get("ui.text.inactive");
+        (
+            vec![Spans::from(vec![
+                Span::styled(" y", key_style),
+                Span::styled(" yank  ", text_style),
+                Span::styled("enter", key_style),
+                Span::styled(" open  ", text_style),
+                Span::styled("tab", key_style),
+                Span::styled(" fold", text_style),
+            ])],
+            align,
+        )
+    }
+
+    fn expanded_details(&self, entry: &ChatEntry, theme: &helix_view::Theme) -> Vec<Spans<'static>> {
+        let heading = theme.get("ui.text.info").add_modifier(Modifier::BOLD);
+        let text = theme.get("ui.text.inactive");
+        match entry {
+            ChatEntry::UserMessage(message) => vec![
+                Spans::from(Span::styled(" user", heading)),
+                Spans::from(Span::styled(message.clone(), text)),
+            ],
+            ChatEntry::AgentText(message) => vec![
+                Spans::from(Span::styled(format!(" {}", self.agent_name), heading)),
+                Spans::from(Span::styled(message.clone(), text)),
+            ],
+            ChatEntry::ToolCall {
+                id,
+                name,
+                path,
+                status,
+            } => {
+                let mut lines = vec![
+                    Spans::from(Span::styled(format!(" tool {name}"), heading)),
+                    Spans::from(Span::styled(format!(" id: {id}"), text)),
+                    Spans::from(Span::styled(format!(" status: {status}"), text)),
+                ];
+                if let Some(path) = path {
+                    lines.push(Spans::from(Span::styled(format!(" path: {path}"), text)));
+                }
+                lines
+            }
+            ChatEntry::Status(message) => vec![
+                Spans::from(Span::styled(" status", heading)),
+                Spans::from(Span::styled(message.clone(), text)),
+            ],
+        }
+    }
+
+    fn yank_selected_message(&mut self, editor: &mut Editor) -> bool {
+        let Some(text) = self.selected_entry_ref().map(|entry| match entry {
+            ChatEntry::UserMessage(message) | ChatEntry::AgentText(message) | ChatEntry::Status(message) => {
+                message.clone()
+            }
+            ChatEntry::ToolCall {
+                id,
+                name,
+                path,
+                status,
+            } => {
+                let mut lines = vec![format!("id: {id}"), format!("name: {name}"), format!("status: {status}")];
+                if let Some(path) = path {
+                    lines.push(format!("path: {path}"));
+                }
+                lines.join(NATIVE_LINE_ENDING.as_str())
+            }
+        }) else {
+            return false;
+        };
+
+        match editor.registers.write('"', vec![text]) {
+            Ok(()) => {
+                editor.set_status("ACP message yanked");
+                true
+            }
+            Err(err) => {
+                editor.set_error(err.to_string());
+                false
+            }
+        }
+    }
+
+    fn toggle_selected_message_fold(&mut self) -> bool {
+        let Some(index) = self.message_cursor.selected() else {
+            return false;
+        };
+        match self.output.content().get(index) {
+            Some(ChatEntry::UserMessage(_)) | Some(ChatEntry::AgentText(_)) => {
+                if !self.collapsed_messages.insert(index) {
+                    self.collapsed_messages.remove(&index);
+                }
+            }
+            Some(_) => {
+                if self.expanded_message == Some(index) {
+                    self.expanded_message = None;
+                } else {
+                    self.expanded_message = Some(index);
+                }
+            }
+            None => return false,
+        }
+        true
     }
 
     pub fn set_agent_name(&mut self, name: String) {
@@ -345,7 +589,29 @@ impl AcpPanel {
         }
         self.output.content_mut().push(entry);
         self.output.scroll_to_end();
-        self.selected_entry = None;
+        self.message_cursor = MessageCursor::default();
+        self.expanded_message = None;
+        self.collapsed_messages.clear();
+        self.opened_message_docs.clear();
+        self.focus_target = FocusTarget::Input;
+    }
+
+    fn collapse_preview(text: &str, width: usize) -> String {
+        let compact = text
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let max = width.max(4);
+        if compact.chars().count() <= max {
+            return compact;
+        }
+
+        let mut preview = String::new();
+        for ch in compact.chars().take(max.saturating_sub(1)) {
+            preview.push(ch);
+        }
+        preview.push('…');
+        preview
     }
 
     /// Append text to the last AgentText entry, or create one.
@@ -499,7 +765,7 @@ impl AcpPanel {
             .max_scroll()
             .saturating_sub(self.output.scroll()) as u16;
         model.max_scroll = self.output.max_scroll() as u16;
-        model.selected_entry = self.selected_entry;
+        model.selected_entry = self.message_cursor.selected();
         model.agent_name.clone_from(&self.agent_name);
         model.agent_version.clone_from(&self.agent_version);
         model.agent_busy = self.agent_busy;
@@ -539,32 +805,23 @@ impl AcpPanel {
         &self,
         theme: &helix_view::Theme,
         width: u16,
-        corners: BubbleCorners,
-    ) -> Vec<ChatBlock<'a>> {
-        let border_style = theme.get("ui.window");
+        corners: MessageCorners,
+    ) -> Vec<Message<'a>> {
+        let border_style = Self::accent_style(theme.get("ui.window"));
         let agent_style = theme.get("ui.text.info");
         let user_label_style = theme.get("keyword").add_modifier(Modifier::BOLD);
         let agent_label_style = theme
             .try_get("ui.acp.agent.label")
             .unwrap_or_else(|| theme.get("ui.text.info").add_modifier(Modifier::BOLD));
         let user_text_style = theme.get("ui.text");
-        let tool_icon_style = theme.get("ui.text.inactive");
         let tool_name_style = theme.get("ui.text.focus");
-        let tool_detail_style = theme.get("ui.text.inactive");
         let separator_style = theme.get("ui.statusline.separator");
         let heading_style = theme.get("markup.heading.1");
         let code_style = theme.get("markup.raw.inline");
         let bold_style = agent_style.add_modifier(Modifier::BOLD);
         let italic_style = agent_style.add_modifier(Modifier::ITALIC);
         let status_dim_style = theme.get("ui.text.inactive");
-
-        // Bubble background colors (distinguishable, theme-configurable).
-        let user_bubble_bg = theme
-            .try_get("ui.acp.user_bubble")
-            .unwrap_or_else(|| Style::default());
-        let agent_bubble_bg = theme
-            .try_get("ui.acp.agent_bubble")
-            .unwrap_or_else(|| Style::default());
+        let active_accent = self.current_message_accent(theme);
 
         // Flex width: min 60%, max 90% of panel — but never panic on tiny sizes.
         let max_bubble = ((width as u32 * 90 / 100) as u16).min(width).max(4);
@@ -572,35 +829,54 @@ impl AcpPanel {
 
         let mut blocks = Vec::new();
 
-        for entry in self.output.content().iter() {
+        for (index, entry) in self.output.content().iter().enumerate() {
+            let message_accent = if self.message_cursor.selected() == Some(index) {
+                active_accent
+            } else {
+                None
+            };
+            let selected = self.message_cursor.selected() == Some(index);
+            let expanded = self.expanded_message == Some(index);
+            let collapsed = self.collapsed_messages.contains(&index);
             match entry {
                 ChatEntry::UserMessage(text) => {
                     let bubble_w =
                         fit_bubble_width(text, min_bubble as usize, max_bubble as usize) as u16;
                     let inner_w = bubble_w.saturating_sub(4) as usize;
-                    let wrapped = wrap_text(text, inner_w);
+                    let wrapped = if collapsed {
+                        vec![Self::collapse_preview(text, inner_w)]
+                    } else {
+                        wrap_text(text, inner_w)
+                    };
                     let content_lines: Vec<Spans> = wrapped
                         .iter()
                         .map(|wl| {
                             Spans::from(Span::styled(
                                 wl.clone(),
-                                user_text_style.patch(user_bubble_bg),
+                                user_text_style,
                             ))
                         })
                         .collect();
-                    blocks.push(ChatBlock {
-                        kind: ChatBlockKind::Bubble {
-                            label: Some((" You".to_string(), user_label_style)),
-                            lines: content_lines,
-                            bubble_width: bubble_w,
-                            align: BubbleAlign::Right,
-                            style: BubbleStyle {
-                                border: border_style.patch(user_bubble_bg),
-                                background: user_bubble_bg,
-                                corners,
-                            },
+                    let mut message = Message::bubble(
+                        Some((" you".to_string(), user_label_style)),
+                        content_lines,
+                        bubble_w,
+                        MessageAlign::Right,
+                        MessageStyle {
+                            border: border_style,
+                            corners,
+                            accent: message_accent.map(|(style, _)| style),
+                            accent_progress: message_accent.map(|(_, progress)| progress).unwrap_or(0.0),
                         },
-                    });
+                    );
+                    if expanded {
+                        message = message.with_details(self.expanded_details(entry, theme));
+                    }
+                    if selected {
+                        let (lines, align) = Self::action_hints(theme, MessageAccessoryAlign::Right);
+                        message = message.with_selected_accessory(lines, align);
+                    }
+                    blocks.push(message);
                 }
                 ChatEntry::AgentText(text) => {
                     let bubble_w =
@@ -609,18 +885,25 @@ impl AcpPanel {
 
                     // Render markdown then re-wrap into bubble-sized lines.
                     let mut md_lines: Vec<Spans> = Vec::new();
-                    render_markdown_lines(
-                        text,
-                        &mut md_lines,
-                        agent_style.patch(agent_bubble_bg),
-                        &MarkdownLineStyles {
-                            heading: heading_style.patch(agent_bubble_bg),
-                            code: code_style.patch(agent_bubble_bg),
-                            bold: bold_style.patch(agent_bubble_bg),
-                            italic: italic_style.patch(agent_bubble_bg),
-                            separator: separator_style.patch(agent_bubble_bg),
-                        },
-                    );
+                    if collapsed {
+                        md_lines.push(Spans::from(Span::styled(
+                            Self::collapse_preview(text, inner_w),
+                            agent_style,
+                        )));
+                    } else {
+                        render_markdown_lines(
+                            text,
+                            &mut md_lines,
+                            agent_style,
+                            &MarkdownLineStyles {
+                                heading: heading_style,
+                                code: code_style,
+                                bold: bold_style,
+                                italic: italic_style,
+                                separator: separator_style,
+                            },
+                        );
+                    }
 
                     // Re-wrap markdown lines to fit inside the bubble.
                     let mut content_lines: Vec<Spans> = Vec::new();
@@ -635,58 +918,70 @@ impl AcpPanel {
                                 .0
                                 .first()
                                 .map(|s| s.style)
-                                .unwrap_or(agent_style.patch(agent_bubble_bg));
+                                .unwrap_or(agent_style);
                             for wl in &wrapped {
                                 content_lines.push(Spans::from(Span::styled(wl.clone(), style)));
                             }
                         }
                     }
 
-                    blocks.push(ChatBlock {
-                        kind: ChatBlockKind::Bubble {
-                            label: Some((format!(" {}", self.agent_name), agent_label_style)),
-                            lines: content_lines,
-                            bubble_width: bubble_w,
-                            align: BubbleAlign::Left,
-                            style: BubbleStyle {
-                                border: border_style.patch(agent_bubble_bg),
-                                background: agent_bubble_bg,
-                                corners,
-                            },
+                    let mut message = Message::bubble(
+                        Some((format!(" {}", self.agent_name), agent_label_style)),
+                        content_lines,
+                        bubble_w,
+                        MessageAlign::Left,
+                        MessageStyle {
+                            border: border_style,
+                            corners,
+                            accent: message_accent.map(|(style, _)| style),
+                            accent_progress: message_accent.map(|(_, progress)| progress).unwrap_or(0.0),
                         },
-                    });
+                    );
+                    if expanded {
+                        message = message.with_details(self.expanded_details(entry, theme));
+                    }
+                    if selected {
+                        let (lines, align) = Self::action_hints(theme, MessageAccessoryAlign::Left);
+                        message = message.with_selected_accessory(lines, align);
+                    }
+                    blocks.push(message);
                 }
-                ChatEntry::ToolCall {
-                    name, path, status, ..
-                } => {
-                    let icon = match status.as_str() {
-                        "running" => "\u{25ce}",            // ◎
-                        "completed" | "done" => "\u{25cf}", // ●
-                        "failed" => "\u{2715}",             // ✕
-                        "cancelled" => "\u{2013}",          // –
-                        _ => "\u{25cb}",                    // ○
-                    };
-                    let mut lines = vec![Spans::from(vec![
+                ChatEntry::ToolCall { name, status, .. } => {
+                    let icon = self.status_icon(status);
+                    let (tool_icon_style, tool_status_style) = Self::status_style(theme, status);
+                    let lines = vec![Spans::from(vec![
                         Span::styled(format!(" {icon} "), tool_icon_style),
                         Span::styled(name.clone(), tool_name_style),
                     ])];
-                    if let Some(ref p) = path {
-                        lines.push(Spans::from(Span::styled(
-                            format!("     {p}"),
-                            tool_detail_style,
-                        )));
+                    let mut message = Message::plain(lines).with_accessory(
+                        vec![Spans::from(Span::styled(
+                            format!(" {status}"),
+                            tool_status_style,
+                        ))],
+                        MessageAccessoryAlign::Right,
+                    );
+                    if expanded {
+                        message = message.with_details(self.expanded_details(entry, theme));
                     }
-                    blocks.push(ChatBlock {
-                        kind: ChatBlockKind::Plain(lines),
-                    });
+                    if selected {
+                        let (lines, align) = Self::action_hints(theme, MessageAccessoryAlign::Right);
+                        message = message.with_selected_accessory(lines, align);
+                    }
+                    blocks.push(message);
                 }
                 ChatEntry::Status(text) => {
-                    blocks.push(ChatBlock {
-                        kind: ChatBlockKind::Plain(vec![Spans::from(Span::styled(
+                    let mut message = Message::plain(vec![Spans::from(Span::styled(
                             format!(" {text}"),
                             status_dim_style,
-                        ))]),
-                    });
+                        ))]);
+                    if expanded {
+                        message = message.with_details(self.expanded_details(entry, theme));
+                    }
+                    if selected {
+                        let (lines, align) = Self::action_hints(theme, MessageAccessoryAlign::Right);
+                        message = message.with_selected_accessory(lines, align);
+                    }
+                    blocks.push(message);
                 }
             }
         }
@@ -695,112 +990,263 @@ impl AcpPanel {
     }
 
     /// Render chat blocks directly to the surface with proper scroll.
-    fn render_content(&mut self, blocks: &[ChatBlock], area: Rect, surface: &mut Surface) {
+    fn render_content(&mut self, blocks: &[Message], area: Rect, surface: &mut Surface) {
         if area.height == 0 || area.width == 0 {
+            self.chat_layout = MessageListState::default();
             return;
         }
 
-        // Compute total height (each block's height + 1 spacing line after).
-        let total_height: usize = blocks.iter().map(|b| b.height() as usize + 1).sum();
-        self.output.set_content_height(total_height);
+        self.message_cursor = MessageCursor::new(
+            self.message_cursor.selected(),
+            Scrollable::scroll(&self.output),
+        );
+        self.chat_layout = message_list(
+            surface,
+            area,
+            blocks,
+            self.message_cursor.scroll(),
+            self.message_cursor.selected(),
+        );
+        let scroll = self.message_cursor.scroll();
+        self.message_cursor.clamp_selection(&self.chat_layout);
+        self.output.scroll_to(scroll);
+        self.output.set_content_height(self.chat_layout.total_height);
+    }
 
-        let scroll = Scrollable::scroll(&self.output);
-        let mut y_offset: isize = area.y as isize - scroll as isize;
+    pub fn selected_message(&self) -> Option<usize> {
+        self.message_cursor.selected()
+    }
 
-        for block in blocks {
-            let block_h = block.height();
-            let block_total = block_h as usize + 1; // +1 for spacing
+    pub fn clear_message_selection(&mut self) {
+        self.message_cursor.select(None);
+        self.focus_target = FocusTarget::Input;
+        self.message_focus_animation.stop();
+    }
 
-            // Skip blocks entirely above the viewport.
-            if y_offset + block_total as isize <= area.y as isize {
-                y_offset += block_total as isize;
-                continue;
-            }
+    pub fn select_message(&mut self, index: Option<usize>) -> Option<usize> {
+        let viewport_height = self.output.area().height as usize;
+        let selected = self.set_message_selection(index, true);
+        if let Some(index) = selected {
+            let scroll = self
+                .chat_layout
+                .scroll_to_item(index, self.message_cursor.scroll(), viewport_height);
+            self.message_cursor = MessageCursor::new(selected, scroll);
+            self.output.scroll_to(scroll);
+        }
+        selected
+    }
 
-            // Stop if we're past the bottom of the viewport.
-            if y_offset >= (area.y + area.height) as isize {
-                break;
-            }
+    pub fn select_prev_message(&mut self) -> Option<usize> {
+        let selected = self
+            .message_cursor
+            .move_prev(&self.chat_layout, self.output.area().height as usize);
+        if selected.is_some() {
+            self.focus_target = FocusTarget::Messages;
+            self.output.scroll_to(self.message_cursor.scroll());
+            self.restart_message_focus_animation();
+        }
+        selected
+    }
 
-            match &block.kind {
-                ChatBlockKind::Bubble {
-                    label,
-                    lines,
-                    bubble_width,
-                    align,
-                    style,
-                } => {
-                    let mut cur_y = y_offset;
+    pub fn select_next_message(&mut self) -> Option<usize> {
+        let selected = self
+            .message_cursor
+            .move_next(&self.chat_layout, self.output.area().height as usize);
+        if selected.is_some() {
+            self.focus_target = FocusTarget::Messages;
+            self.output.scroll_to(self.message_cursor.scroll());
+            self.restart_message_focus_animation();
+        }
+        selected
+    }
 
-                    // Label line.
-                    if let Some((text, label_style)) = label {
-                        if cur_y >= area.y as isize && cur_y < (area.y + area.height) as isize {
-                            let lx = match align {
-                                BubbleAlign::Right => {
-                                    area.x + area.width.saturating_sub(text.len() as u16)
-                                }
-                                BubbleAlign::Left => area.x,
-                            };
-                            surface.set_stringn(
-                                lx,
-                                cur_y as u16,
-                                text,
-                                area.width as usize,
-                                *label_style,
-                            );
-                        }
-                        cur_y += 1;
-                    }
+    pub fn select_message_at_offset(&mut self, offset: usize) -> Option<usize> {
+        self.select_message(self.chat_layout.item_at_offset(offset))
+    }
 
-                    // Bubble (only render the visible portion).
-                    if cur_y < (area.y + area.height) as isize
-                        && cur_y + lines.len() as isize + 2 > area.y as isize
-                    {
-                        let bubble_y = cur_y.max(area.y as isize) as u16;
-                        let bubble_bottom =
-                            ((cur_y + lines.len() as isize + 2) as u16).min(area.y + area.height);
-                        let visible_h = bubble_bottom.saturating_sub(bubble_y);
+    pub fn select_first_message(&mut self) -> Option<usize> {
+        self.select_message(if self.chat_layout.is_empty() { None } else { Some(0) })
+    }
 
-                        if visible_h > 0 {
-                            let skip_top = (area.y as isize - cur_y).max(0) as usize;
-                            let bubble_area = Rect::new(area.x, bubble_y, area.width, visible_h);
-                            chat_bubble(
-                                surface,
-                                bubble_area,
-                                lines,
-                                *bubble_width,
-                                *align,
-                                *style,
-                                skip_top,
-                            );
-                        }
-                    }
+    pub fn select_last_message(&mut self) -> Option<usize> {
+        self.select_message(self.chat_layout.len().checked_sub(1))
+    }
+
+    pub fn select_prev_message_page(&mut self) -> Option<usize> {
+        let selected = self
+            .message_cursor
+            .move_prev_page(&self.chat_layout, self.output.area().height as usize);
+        if selected.is_some() {
+            self.focus_target = FocusTarget::Messages;
+            self.output.scroll_to(self.message_cursor.scroll());
+            self.restart_message_focus_animation();
+        }
+        selected
+    }
+
+    pub fn select_next_message_page(&mut self) -> Option<usize> {
+        let selected = self
+            .message_cursor
+            .move_next_page(&self.chat_layout, self.output.area().height as usize);
+        if selected.is_some() {
+            self.focus_target = FocusTarget::Messages;
+            self.output.scroll_to(self.message_cursor.scroll());
+        }
+        selected
+    }
+
+    pub fn selected_entry_ref(&self) -> Option<&ChatEntry> {
+        let index = self.message_cursor.selected()?;
+        self.output.content().get(index)
+    }
+
+    pub fn selected_message_details(&self) -> Option<String> {
+        let entry = self.selected_entry_ref()?;
+        Some(match entry {
+            ChatEntry::UserMessage(text) => format!("# User Message\n\n{text}\n"),
+            ChatEntry::AgentText(text) => format!("# Agent Message\n\n{text}\n"),
+            ChatEntry::ToolCall {
+                id,
+                name,
+                path,
+                status,
+            } => {
+                let mut body = format!("# Tool Call\n\n- id: {id}\n- name: {name}\n- status: {status}\n");
+                if let Some(path) = path {
+                    body.push_str(&format!("- path: {path}\n"));
                 }
-                ChatBlockKind::Plain(lines) => {
-                    for (i, line) in lines.iter().enumerate() {
-                        let ly = y_offset + i as isize;
-                        if ly < area.y as isize {
-                            continue;
-                        }
-                        if ly >= (area.y + area.height) as isize {
-                            break;
-                        }
-                        let mut x = area.x;
-                        for span in &line.0 {
-                            let remaining = area.right().saturating_sub(x) as usize;
-                            if remaining == 0 {
-                                break;
-                            }
-                            let text: &str = &span.content;
-                            let width = text.len().min(remaining);
-                            surface.set_stringn(x, ly as u16, text, width, span.style);
-                            x += width as u16;
-                        }
-                    }
-                }
+                body
             }
+            ChatEntry::Status(text) => format!("# Status\n\n{text}\n"),
+        })
+    }
 
-            y_offset += block_total as isize;
+    pub fn open_selected_message_details(&mut self, editor: &mut Editor, action: Action) -> bool {
+        let Some(index) = self.message_cursor.selected() else {
+            log::warn!("[acp_scratch] open requested without selected message");
+            return false;
+        };
+        let Some(details) = self.selected_message_details() else {
+            log::warn!("[acp_scratch] open requested for index={} without details", index);
+            return false;
+        };
+
+        log::warn!(
+            "[acp_scratch] open index={} action={:?} existing_doc={:?} details_len={}",
+            index,
+            action,
+            self.opened_message_docs.get(&index),
+            details.len()
+        );
+
+        if let Some(doc_id) = self.opened_message_docs.get(&index).copied() {
+            if editor.documents.contains_key(&doc_id) {
+                log::warn!(
+                    "[acp_scratch] reusing existing doc index={} doc_id={:?}",
+                    index,
+                    doc_id
+                );
+                editor.switch(doc_id, Action::Replace);
+                self.set_focused(false);
+                self.message_focus_animation.stop();
+                log::warn!(
+                    "[acp_ui] released panel focus after reusing scratch index={} focused={} focus_target={:?}",
+                    index,
+                    self.focused,
+                    self.focus_target
+                );
+                return true;
+            }
+            log::warn!(
+                "[acp_scratch] dropping stale tracked doc index={} doc_id={:?}",
+                index,
+                doc_id
+            );
+            self.opened_message_docs.remove(&index);
+        }
+
+        let doc = Document::from(
+            details.into(),
+            None,
+            editor.config.clone(),
+            editor.syn_loader.clone(),
+        )
+        .with_persistent_scratch();
+        let mut doc = doc;
+        let _ = doc.set_language_by_language_id("markdown", &editor.syn_loader.load());
+        let doc_id = editor.new_file_from_document(action, doc);
+        if let Some(doc) = editor.documents.get(&doc_id) {
+            log::warn!(
+                "[acp_scratch] created doc index={} doc_id={:?} path={:?} modified={} persistent={} lang={:?}",
+                index,
+                doc_id,
+                doc.path(),
+                doc.is_modified(),
+                doc.is_persistent_scratch(),
+                doc.language_name()
+            );
+        }
+        self.opened_message_docs.insert(index, doc_id);
+        self.set_focused(false);
+        self.message_focus_animation.stop();
+        log::warn!(
+            "[acp_ui] released panel focus after creating scratch index={} focused={} focus_target={:?}",
+            index,
+            self.focused,
+            self.focus_target
+        );
+        true
+    }
+
+    fn handle_mouse_event(&mut self, event: &MouseEvent) -> EventResult {
+        let MouseEvent {
+            kind,
+            column: x,
+            row: y,
+            ..
+        } = *event;
+
+        let output_area = self.output.area();
+        let input_area = self.input.area();
+        let in_output = x >= output_area.left()
+            && x < output_area.right()
+            && y >= output_area.top()
+            && y < output_area.bottom();
+        let in_input = x >= input_area.left()
+            && x < input_area.right()
+            && y >= input_area.top()
+            && y < input_area.bottom();
+
+        match kind {
+            MouseEventKind::Down(MouseButton::Left) if in_output => {
+                let row_offset = y.saturating_sub(output_area.y) as usize;
+                let offset = Scrollable::scroll(&self.output) + row_offset;
+                let selected = self.chat_layout.item_at_offset(offset);
+                let same_selection = selected == self.message_cursor.selected();
+                log::warn!(
+                    "[acp_ui] output click row_offset={} offset={} selected={:?} same_selection={} tracked_docs={}",
+                    row_offset,
+                    offset,
+                    selected,
+                    same_selection,
+                    self.opened_message_docs.len()
+                );
+                if same_selection {
+                    self.focus_messages_without_animation();
+                } else {
+                    self.focus_messages();
+                }
+                self.set_message_selection(selected, !same_selection);
+                EventResult::Consumed(None)
+            }
+            MouseEventKind::Down(MouseButton::Left) if in_input => {
+                self.activate_input();
+                if self.input.mode() != Mode::Insert {
+                    self.input.enter_insert_mode("insert_mode".into());
+                }
+                EventResult::Consumed(None)
+            }
+            _ => EventResult::Ignored(None),
         }
     }
 
@@ -1438,16 +1884,17 @@ impl Component for AcpPanel {
                 header_area.width.saturating_sub(4) as usize,
                 header_style,
             );
+            let (focus_label, focus_style) = self.focus_badge(theme);
             let right_info = if self.agent_busy {
                 if !self.message_queue.is_empty() {
-                    format!("{} queued ", self.message_queue.len())
+                    format!("{focus_label}  {} queued ", self.message_queue.len())
                 } else {
-                    "working ".to_string()
+                    format!("{focus_label}  working ")
                 }
             } else if !self.agent_version.is_empty() {
-                format!("v{} ", self.agent_version)
+                format!("{focus_label}  v{} ", self.agent_version)
             } else {
-                String::new()
+                focus_label.to_string()
             };
             if !right_info.is_empty() {
                 let right_style = if self.agent_busy {
@@ -1455,14 +1902,34 @@ impl Component for AcpPanel {
                 } else {
                     theme.get("ui.statusline.inactive")
                 };
-                let rx = header_area.x + header_area.width.saturating_sub(right_info.len() as u16);
-                surface.set_stringn(
-                    rx,
-                    header_area.y,
-                    &right_info,
-                    right_info.len(),
-                    right_style,
-                );
+                let rx = header_area.x
+                    + header_area
+                        .width
+                        .saturating_sub(UnicodeWidthStr::width(right_info.as_str()) as u16);
+                if let Some((prefix, suffix)) = right_info.split_once("  ") {
+                    surface.set_stringn(
+                        rx,
+                        header_area.y,
+                        prefix,
+                        UnicodeWidthStr::width(prefix),
+                        focus_style,
+                    );
+                    surface.set_stringn(
+                        rx + UnicodeWidthStr::width(prefix) as u16 + 2,
+                        header_area.y,
+                        suffix,
+                        UnicodeWidthStr::width(suffix),
+                        right_style,
+                    );
+                } else {
+                    surface.set_stringn(
+                        rx,
+                        header_area.y,
+                        &right_info,
+                        UnicodeWidthStr::width(right_info.as_str()),
+                        focus_style,
+                    );
+                }
             }
             let bar_style = if self.focused {
                 theme.get("ui.statusline")
@@ -1591,6 +2058,18 @@ impl Component for AcpPanel {
             }
         }
 
+        if self.has_running_activity() {
+            schedule_redraw_at(self.spinner.next_redraw());
+        }
+
+        if let Some((_, progress)) = self.current_message_accent(cx.editor.acp_theme()) {
+            if progress < 1.0 {
+                if let Some(when) = self.message_focus_animation.sample().next_redraw {
+                    schedule_redraw_at(when);
+                }
+            }
+        }
+
         if input_area_raw.height > 0 {
             let inset = Rect::new(
                 input_area_raw.x + 1,
@@ -1638,6 +2117,7 @@ impl Component for AcpPanel {
                 inset.width.saturating_sub(4),
                 inset.height.saturating_sub(2),
             );
+            self.input.set_area(input_area);
 
             // Render component document content in the input area.
             let view_id = self.input.id();
@@ -1732,7 +2212,11 @@ impl Component for AcpPanel {
             let center_y = content_area.y + content_area.height / 2;
 
             let msg = "Space A for menu";
-            let mx = content_area.x + content_area.width.saturating_sub(msg.len() as u16) / 2;
+            let mx = content_area.x
+                + content_area
+                    .width
+                    .saturating_sub(UnicodeWidthStr::width(msg) as u16)
+                    / 2;
             if center_y >= content_area.y && center_y < content_area.y + content_area.height {
                 surface.set_stringn(mx, center_y, msg, content_area.width as usize, empty_style);
             }
@@ -1740,12 +2224,8 @@ impl Component for AcpPanel {
             return;
         }
 
-        // Render chat content using block-based rendering with chat_bubble widget.
-        let corners = if cx.editor.config().acp.bubble_corners_rounded() {
-            BubbleCorners::Rounded
-        } else {
-            BubbleCorners::Squared
-        };
+        // Render chat content using message list primitives.
+        let corners = MessageCorners::Squared;
         let blocks = self.build_blocks(theme, content_area.width, corners);
         self.render_content(&blocks, content_area, surface);
 
@@ -1779,8 +2259,10 @@ impl Component for AcpPanel {
     }
 
     fn handle_event(&mut self, event: &Event, cx: &mut Context) -> EventResult {
-        let Event::Key(key) = event else {
-            return EventResult::Ignored(None);
+        let key = match event {
+            Event::Key(key) => *key,
+            Event::Mouse(event) => return self.handle_mouse_event(event),
+            _ => return EventResult::Ignored(None),
         };
 
         // When unfocused, pass all events through to the editor.
@@ -1815,6 +2297,95 @@ impl Component for AcpPanel {
         // Cycle keys work in any mode.
         if let Some(result) = self.handle_cycle_key(&key, cx) {
             return result;
+        }
+
+        if self.focus_target == FocusTarget::Input
+            && matches!(key.code, KeyCode::Char(' '))
+            && key.modifiers.is_empty()
+        {
+            log::warn!(
+                "[acp_ui] bubbling plain space focus_target={:?} input_mode={:?}",
+                self.focus_target,
+                self.input.mode()
+            );
+            return EventResult::Ignored(None);
+        }
+
+        if self.focus_target == FocusTarget::Messages {
+            let viewport_height = self.output.area().height as usize;
+            let handled = match (key.code, key.modifiers) {
+                (KeyCode::Esc, KeyModifiers::NONE) => {
+                    self.focus_input_region();
+                    true
+                }
+                (KeyCode::Char('i'), KeyModifiers::NONE) => {
+                    self.focus_input_region();
+                    self.input.enter_insert_mode("insert_mode".into());
+                    true
+                }
+                (KeyCode::Enter, KeyModifiers::NONE) => {
+                    log::warn!(
+                        "[acp_ui] enter open selected={:?} tracked_docs={} focus_target={:?}",
+                        self.message_cursor.selected(),
+                        self.opened_message_docs.len(),
+                        self.focus_target
+                    );
+                    if !self.open_selected_message_details(cx.editor, Action::Replace) {
+                        cx.editor.set_status("No ACP message selected");
+                    }
+                    true
+                }
+                (KeyCode::Tab, KeyModifiers::NONE) => {
+                    self.toggle_selected_message_fold();
+                    true
+                }
+                (KeyCode::Char('y'), KeyModifiers::NONE) => {
+                    self.yank_selected_message(cx.editor);
+                    true
+                }
+                (KeyCode::Up, KeyModifiers::NONE) | (KeyCode::Char('k'), KeyModifiers::NONE) => {
+                    self.select_prev_message();
+                    true
+                }
+                (KeyCode::Down, KeyModifiers::NONE) | (KeyCode::Char('j'), KeyModifiers::NONE) => {
+                    self.select_next_message();
+                    true
+                }
+                (KeyCode::Home, KeyModifiers::NONE) => {
+                    self.select_first_message();
+                    true
+                }
+                (KeyCode::End, KeyModifiers::NONE) => {
+                    self.select_last_message();
+                    true
+                }
+                (KeyCode::PageUp, KeyModifiers::NONE)
+                | (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
+                    self.select_prev_message_page();
+                    true
+                }
+                (KeyCode::PageDown, KeyModifiers::NONE)
+                | (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
+                    self.select_next_message_page();
+                    true
+                }
+                (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
+                    self.select_prev_message();
+                    true
+                }
+                (KeyCode::Char('n'), KeyModifiers::CONTROL) => {
+                    self.select_next_message();
+                    true
+                }
+                _ => false,
+            };
+
+            if handled {
+                if self.selected_message().is_some() {
+                    self.message_cursor.sync(&self.chat_layout, viewport_height);
+                }
+                return EventResult::Consumed(None);
+            }
         }
 
         // ── Mode transitions ──
@@ -1947,7 +2518,7 @@ impl Component for AcpPanel {
         // Dispatch through the region's own engine + keymaps.
         // If the engine says the key is unbound, let it bubble up to the editor
         // (e.g. `:` for command mode, or any other user-bound Frontend command).
-        if self.dispatch_input_key(*key, cx) {
+        if self.dispatch_input_key(key, cx) {
             log::warn!(
                 "[acp_event] key={} mode={:?} → Consumed (engine handled)",
                 key.key_sequence_format(),
@@ -1965,7 +2536,7 @@ impl Component for AcpPanel {
     }
 
     fn cursor(&self, _area: Rect, ctx: &Editor) -> (Option<Position>, CursorKind) {
-        if self.focused {
+        if self.focused && self.focus_target == FocusTarget::Input {
             if let Some((cx, cy)) = self.last_input_cursor {
                 let pos = Position::new(cy as usize, cx as usize);
                 let kind = ctx.config().cursor_shape.from_mode(self.input.mode());
@@ -2178,5 +2749,161 @@ impl Component for PermissionPopup {
 
     fn id(&self) -> Option<&'static str> {
         Some(PERMISSION_ID)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::handlers::Handlers;
+    use arc_swap::ArcSwap;
+    use helix_core::Rope;
+    use helix_loader::runtime_dirs;
+    use helix_view::editor::Config;
+    use helix_view::theme;
+    use std::path::Path;
+    use std::sync::Arc;
+
+    fn test_editor() -> Editor {
+        let theme_loader = theme::Loader::new(runtime_dirs());
+        let syn_loader = helix_core::config::default_lang_loader();
+        let config = Arc::new(ArcSwap::from_pointee(Config::default()));
+        Editor::new(
+            Rect::new(0, 0, 120, 40),
+            Arc::new(theme_loader),
+            Arc::new(ArcSwap::from_pointee(syn_loader)),
+            Arc::new(arc_swap::access::Map::new(config, |cfg: &Config| cfg)),
+            Handlers::dummy(),
+        )
+    }
+
+    fn seed_editor_with_file(editor: &mut Editor) -> helix_view::DocumentId {
+        let mut doc = Document::from(
+            Rope::from("fn main() {}\n"),
+            None,
+            editor.config.clone(),
+            editor.syn_loader.clone(),
+        );
+        doc.set_path(Some(Path::new("main.rs")));
+        let _ = doc.set_language_by_language_id("rust", &editor.syn_loader.load());
+        editor.new_file_from_document(Action::VerticalSplit, doc)
+    }
+
+    fn seeded_panel() -> AcpPanel {
+        let mut panel = AcpPanel::new();
+        panel.push_entry(ChatEntry::AgentText(
+            "Echo: \"hello\"\n\nLorem ipsum dolor sit amet, consectetur adipiscing elit."
+                .into(),
+        ));
+        panel.push_entry(ChatEntry::UserMessage("hi there from user".into()));
+        panel
+    }
+
+    fn with_test_runtime<T>(f: impl FnOnce() -> T) -> T {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let _guard = runtime.enter();
+        f()
+    }
+
+    #[test]
+    fn opening_message_details_creates_markdown_scratch_doc() {
+        with_test_runtime(|| {
+            let mut editor = test_editor();
+            seed_editor_with_file(&mut editor);
+            let mut panel = seeded_panel();
+
+            panel.message_cursor.select(Some(0));
+            assert!(panel.open_selected_message_details(&mut editor, Action::Replace));
+
+            let (_view_id, doc) = focused!(editor);
+            assert_eq!(doc.path(), None);
+            assert!(doc.is_persistent_scratch());
+            assert_eq!(doc.language_name(), Some("markdown"));
+            assert!(doc.text().slice(..).to_string().starts_with("# Agent Message\n"));
+        });
+    }
+
+    #[test]
+    fn reopening_same_message_reuses_existing_doc() {
+        with_test_runtime(|| {
+            let mut editor = test_editor();
+            let base = seed_editor_with_file(&mut editor);
+            let mut panel = seeded_panel();
+
+            panel.message_cursor.select(Some(0));
+            assert!(panel.open_selected_message_details(&mut editor, Action::Replace));
+            let first = focused!(editor).1.id();
+
+            editor.switch(base, Action::Replace);
+            assert!(panel.open_selected_message_details(&mut editor, Action::Replace));
+            let reopened = focused!(editor).1.id();
+
+            assert_eq!(reopened, first);
+        });
+    }
+
+    #[test]
+    fn opening_different_messages_creates_distinct_docs() {
+        with_test_runtime(|| {
+            let mut editor = test_editor();
+            let base = seed_editor_with_file(&mut editor);
+            let mut panel = seeded_panel();
+
+            panel.message_cursor.select(Some(0));
+            assert!(panel.open_selected_message_details(&mut editor, Action::Replace));
+            let first = focused!(editor).1.id();
+
+            editor.switch(base, Action::Replace);
+            assert!(editor.documents.contains_key(&first));
+            panel.message_cursor.select(Some(1));
+            assert!(panel.open_selected_message_details(&mut editor, Action::Replace));
+            let second = focused!(editor).1.id();
+
+            assert_ne!(first, second);
+            assert!(editor.documents.contains_key(&first));
+            assert!(editor.documents.contains_key(&second));
+
+            let first_label = editor.buffer_label(editor.documents.get(&first).unwrap());
+            let second_label = editor.buffer_label(editor.documents.get(&second).unwrap());
+            assert_ne!(first_label, second_label);
+        });
+    }
+
+    #[test]
+    fn opening_message_details_releases_panel_focus() {
+        with_test_runtime(|| {
+            let mut editor = test_editor();
+            seed_editor_with_file(&mut editor);
+            let mut panel = seeded_panel();
+            panel.focus_messages();
+            panel.message_cursor.select(Some(0));
+
+            assert!(panel.open_selected_message_details(&mut editor, Action::Replace));
+            assert!(!helix_view::traits::Focusable::is_focused(&panel));
+        });
+    }
+
+    #[test]
+    fn fold_toggle_collapses_agent_message_to_single_preview_line() {
+        with_test_runtime(|| {
+            let editor = test_editor();
+            let mut panel = AcpPanel::new();
+            panel.push_entry(ChatEntry::AgentText(
+                "Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua."
+                    .into(),
+            ));
+            panel.message_cursor.select(Some(0));
+
+            let expanded_blocks = panel.build_blocks(editor.acp_theme(), 30, MessageCorners::Squared);
+            let expanded_height = expanded_blocks[0].height(true);
+
+            assert!(panel.toggle_selected_message_fold());
+
+            let collapsed_blocks = panel.build_blocks(editor.acp_theme(), 30, MessageCorners::Squared);
+            let collapsed_height = collapsed_blocks[0].height(true);
+
+            assert!(expanded_height > collapsed_height);
+            assert!(panel.collapsed_messages.contains(&0));
+        });
     }
 }

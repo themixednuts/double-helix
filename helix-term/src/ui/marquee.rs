@@ -273,10 +273,24 @@ impl Marquee {
 /// Schedule a `request_redraw` at the given instant (for marquee animation).
 /// Spawns a lightweight tokio task that sleeps then pokes the event loop.
 pub fn schedule_redraw_at(when: Instant) {
-    tokio::spawn(async move {
-        tokio::time::sleep_until(tokio::time::Instant::from_std(when)).await;
+    let delay = when.saturating_duration_since(Instant::now());
+
+    if delay.is_zero() {
         helix_event::request_redraw();
-    });
+        return;
+    }
+
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(async move {
+            tokio::time::sleep_until(tokio::time::Instant::from_std(when)).await;
+            helix_event::request_redraw();
+        });
+    } else {
+        std::thread::spawn(move || {
+            std::thread::sleep(delay);
+            helix_event::request_redraw();
+        });
+    }
 }
 
 #[cfg(test)]

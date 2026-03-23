@@ -284,6 +284,8 @@ pub fn default() -> HashMap<Mode, KeyTrie> {
                 "x" => ":acp-cancel",
                 "h" => ":acp-history",
                 "i" => acp_chat,
+                "m" => acp_focus_messages,
+                "d" => acp_open_message,
                 "q" => acp_close,
                 "C-t" => acp_cycle_thinking,
                 "C-m" => acp_cycle_model,

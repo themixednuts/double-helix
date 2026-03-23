@@ -540,6 +540,8 @@ impl MappableCommand {
         toggle_agent_panel => "Toggle ACP agent panel",
         acp_close => "Close ACP panel",
         acp_chat => "Focus ACP panel and activate chat input",
+        acp_focus_messages => "Focus ACP panel message list",
+        acp_open_message => "Open selected ACP message details in current view",
         acp_cycle_thinking => "Cycle thinking options",
         acp_cycle_model => "Cycle model options",
         acp_cycle_mode => "Cycle mode options",
@@ -880,6 +882,74 @@ fn acp_chat(cx: &mut Context) {
                 panel.set_agent_name("No agent".to_string());
                 panel.activate_input();
                 compositor.push(Box::new(panel));
+            }
+        },
+    ));
+}
+
+fn acp_focus_messages(cx: &mut Context) {
+    use crate::commands::typed::do_acp_connect;
+    use crate::ui::acp::{AcpPanel, ID as ACP_PANEL_ID};
+    let first_agent = cx.editor.acp_agents.iter().next();
+    let has_agent = first_agent.is_some();
+    let agent_name = first_agent.and_then(|(_, agent)| {
+        agent
+            .agent_info()
+            .map(|info| info.title.as_deref().unwrap_or(&info.name).to_string())
+    });
+    let agents = cx.editor.config().agents.clone();
+    let last_index = cx.editor.current_acp_agent_index;
+
+    cx.callback.push(Box::new(
+        move |compositor: &mut Compositor, cx: &mut crate::compositor::Context| {
+            if let Some(panel) = compositor.find_id::<AcpPanel>(ACP_PANEL_ID) {
+                panel.focus_messages();
+                if panel.selected_message().is_none() {
+                    panel.select_last_message();
+                }
+            } else if has_agent {
+                let mut panel = AcpPanel::new();
+                if let Some(name) = agent_name {
+                    panel.set_agent_name(name);
+                } else {
+                    panel.set_agent_name("Agent".to_string());
+                }
+                panel.focus_messages();
+                compositor.push(Box::new(panel));
+            } else if !agents.is_empty() {
+                let idx = last_index.unwrap_or(0).min(agents.len().saturating_sub(1));
+                let agent = agents[idx].clone();
+                if let Err(e) = do_acp_connect(
+                    cx.editor,
+                    cx.jobs,
+                    agent.command,
+                    agent.args,
+                    Some(idx),
+                    true,
+                ) {
+                    cx.editor.set_error(format!("Agent failed: {e}"));
+                }
+            } else {
+                let mut panel = AcpPanel::new();
+                panel.set_agent_name("No agent".to_string());
+                panel.focus_messages();
+                compositor.push(Box::new(panel));
+            }
+        },
+    ));
+}
+
+fn acp_open_message(cx: &mut Context) {
+    use crate::ui::acp::{AcpPanel, ID as ACP_PANEL_ID};
+    cx.callback.push(Box::new(
+        move |compositor: &mut Compositor, cx: &mut crate::compositor::Context| {
+            let Some(panel) = compositor.find_id::<AcpPanel>(ACP_PANEL_ID) else {
+                cx.editor.set_status("ACP panel not open");
+                return;
+            };
+
+            if !panel.open_selected_message_details(cx.editor, Action::Replace) {
+                cx.editor.set_status("No ACP message selected");
             }
         },
     ));

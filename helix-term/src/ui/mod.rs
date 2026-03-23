@@ -1,4 +1,5 @@
 pub mod acp;
+pub mod animation;
 mod cmdline_popup;
 mod completion;
 mod document;

@@ -64,6 +64,7 @@ pub struct DocumentPresentationState {
     indent_style: IndentStyle,
     editor_config: EditorConfig,
     is_welcome: bool,
+    persistent_scratch: bool,
 }
 
 impl Default for DocumentPresentationState {
@@ -75,6 +76,7 @@ impl Default for DocumentPresentationState {
             indent_style: IndentStyle::Tabs,
             editor_config: EditorConfig::default(),
             is_welcome: false,
+            persistent_scratch: false,
         }
     }
 }
@@ -98,6 +100,14 @@ impl DocumentPresentationState {
 
     pub fn set_welcome(&mut self, is_welcome: bool) {
         self.is_welcome = is_welcome;
+    }
+
+    pub fn is_persistent_scratch(&self) -> bool {
+        self.persistent_scratch
+    }
+
+    pub fn set_persistent_scratch(&mut self, persistent_scratch: bool) {
+        self.persistent_scratch = persistent_scratch;
     }
 
     pub fn indent_style(&self) -> IndentStyle {

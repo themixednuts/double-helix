@@ -2,6 +2,7 @@ use crate::ui::document::{LinePos, TextRenderer};
 use crate::ui::text_decorations::Decoration;
 use helix_core::doc_formatter::{DocumentFormatter, FormattedGrapheme, TextFormat};
 use helix_core::text_annotations::TextAnnotations;
+use helix_core::unicode::width::UnicodeWidthStr;
 use helix_core::Position;
 use helix_view::{Document, Theme, ViewId};
 use std::collections::BTreeMap;
@@ -208,8 +209,8 @@ impl Decoration for PluginDecoration<'_> {
                 } else {
                     // Non-dropped: row 0 on code line, wrapped rows on virtual lines
                     inline_extra_rows = inline_extra_rows.max(last_row as u16);
-                    inline_col_used =
-                        inline_col_used.max(annot.offset + annot.text.len() as u16 + 2);
+                    inline_col_used = inline_col_used
+                        .max(annot.offset + UnicodeWidthStr::width(annot.text.as_str()) as u16 + 2);
                 }
             }
 

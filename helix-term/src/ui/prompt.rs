@@ -546,7 +546,7 @@ impl Prompt {
         let max_len = self
             .completion
             .iter()
-            .map(|(_, completion)| completion.content.len() as u16)
+            .map(|(_, completion)| UnicodeWidthStr::width(completion.content.as_ref()) as u16)
             .max()
             .unwrap_or(BASE_WIDTH)
             .max(BASE_WIDTH);
@@ -658,7 +658,7 @@ impl Prompt {
         };
         surface.set_string(area.x, area.y + line, label, prompt_color);
 
-        let label_len = label.len() as u16;
+        let label_len = UnicodeWidthStr::width(label) as u16;
         self.line_area = area.clip_left(label_len).clip_top(line).clip_right(2);
 
         if self.line.is_empty() {

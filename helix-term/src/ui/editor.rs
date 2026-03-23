@@ -1335,24 +1335,28 @@ impl EditorView {
             // Add separator width if not the first document
             if idx > 0 {
                 let sep = &editor.config().bufferline.separator;
-                total_width += sep.len() as u16;
+                total_width += UnicodeWidthStr::width(sep.as_str()) as u16;
             }
 
             let icons = ICONS.load();
 
-            let text = if let Some(icon) = icons.mime().get(doc.path(), doc.language_name()) {
-                format!(
-                    " {}  {} {}",
-                    icon.glyph(),
-                    fname,
-                    if doc.is_modified() { "[+] " } else { "" }
-                )
+            let text = if doc.path().is_some() {
+                if let Some(icon) = icons.mime().get(doc.path(), doc.language_name()) {
+                    format!(
+                        "{} {}{}",
+                        icon.glyph(),
+                        fname,
+                        if doc.is_modified() { " [+]" } else { "" }
+                    )
+                } else {
+                    format!("{}{}", fname, if doc.is_modified() { " [+]" } else { "" })
+                }
             } else {
-                format!(" {} {}", fname, if doc.is_modified() { "[+] " } else { "" })
+                format!("{}{}", fname, if doc.is_modified() { " [+]" } else { "" })
             };
 
             self.bufferline_positions.push(total_width);
-            let text_width = text.len() as u16;
+            let text_width = UnicodeWidthStr::width(text.as_str()) as u16;
             buffer_texts.push(text);
             buffer_widths.push(text_width);
             total_width += text_width;
@@ -1385,7 +1389,7 @@ impl EditorView {
             if idx > 0 {
                 let sep = &editor.config().bufferline.separator;
                 let sep_x = buffer_x
-                    .saturating_sub(sep.len() as u16)
+                    .saturating_sub(UnicodeWidthStr::width(sep.as_str()) as u16)
                     .saturating_sub(scroll_offset);
                 if sep_x < viewport.width {
                     let render_x = viewport.x + sep_x;
@@ -1439,8 +1443,8 @@ impl EditorView {
 
             // Track buffer info for mouse clicks (adjust for scroll offset)
             let start_x = actual_render_x;
-            let end_x =
-                (actual_render_x + visible_text.len() as u16).min(viewport.x + viewport.width);
+            let end_x = (actual_render_x + UnicodeWidthStr::width(visible_text.as_str()) as u16)
+                .min(viewport.x + viewport.width);
             self.bufferline_info
                 .add_buffer_info(doc.id(), start_x..end_x);
         }
@@ -2822,6 +2826,7 @@ mod tests {
         editor::{Action, Config, Editor},
         Document, DocumentId, View,
     };
+    use std::path::Path;
     use std::sync::Arc;
 
     fn layout_inputs(
@@ -3063,6 +3068,74 @@ mod tests {
         view.area = Rect::new(5, 7, 80, 10);
 
         assert_eq!(EditorView::content_area(&view), Rect::new(5, 7, 80, 9));
+    }
+
+    #[test]
+    fn bufferline_renders_scratch_labels_without_leading_gap() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let _guard = runtime.enter();
+        let (mut editor, _view_id, doc_id) = test_editor_with_text("fn main() {}\n");
+        let syn_loader = editor.syn_loader.load();
+
+        {
+            let doc = editor.document_mut(doc_id).expect("document");
+            doc.set_path(Some(Path::new("main.rs")));
+            let _ = doc.set_language_by_language_id("rust", &syn_loader);
+        }
+
+        let scratch_one = Document::from(
+            Rope::from("# One\n"),
+            None,
+            editor.config.clone(),
+            editor.syn_loader.clone(),
+        )
+        .with_persistent_scratch();
+        editor.new_file_from_document(Action::VerticalSplit, scratch_one);
+
+        let scratch_two = Document::from(
+            Rope::from("# Two\n"),
+            None,
+            editor.config.clone(),
+            editor.syn_loader.clone(),
+        )
+        .with_persistent_scratch();
+        editor.new_file_from_document(Action::VerticalSplit, scratch_two);
+
+        let mut editor_view = test_editor_view();
+        let area = Rect::new(0, 0, 80, 1);
+        let mut surface = tui::buffer::Buffer::empty(area);
+        editor_view.draw_bufferline(&editor, area, &mut surface);
+
+        let second_x = editor_view.bufferline_positions[1];
+        let third_x = editor_view.bufferline_positions[2];
+        let row: String = (0..area.width)
+            .map(|x| surface[(area.x + x, area.y)].symbol.as_ref())
+            .collect();
+
+        assert_eq!(
+            surface[(second_x - 1, 0)].symbol.as_ref(),
+            "│",
+            "row={row:?} positions={:?}",
+            editor_view.bufferline_positions
+        );
+        assert_eq!(
+            surface[(second_x, 0)].symbol.as_ref(),
+            "[",
+            "row={row:?} positions={:?}",
+            editor_view.bufferline_positions
+        );
+        assert_eq!(
+            surface[(third_x - 1, 0)].symbol.as_ref(),
+            "│",
+            "row={row:?} positions={:?}",
+            editor_view.bufferline_positions
+        );
+        assert_eq!(
+            surface[(third_x, 0)].symbol.as_ref(),
+            "[",
+            "row={row:?} positions={:?}",
+            editor_view.bufferline_positions
+        );
     }
 
     #[test]

@@ -748,6 +748,11 @@ impl Document {
         self
     }
 
+    pub fn with_persistent_scratch(mut self) -> Self {
+        self.presentation.set_persistent_scratch(true);
+        self
+    }
+
     // TODO: async fn?
     /// Create a new document from `path`. Encoding is auto-detected, but it can be manually
     /// overwritten with the `encoding` parameter.
@@ -2142,6 +2147,14 @@ impl Document {
 
     pub fn is_welcome(&self) -> bool {
         self.presentation.is_welcome()
+    }
+
+    pub fn is_persistent_scratch(&self) -> bool {
+        self.presentation.is_persistent_scratch()
+    }
+
+    pub fn set_persistent_scratch(&mut self, persistent_scratch: bool) {
+        self.presentation.set_persistent_scratch(persistent_scratch);
     }
 
     pub fn indent_style(&self) -> IndentStyle {

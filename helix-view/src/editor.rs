@@ -2138,6 +2138,23 @@ impl Editor {
     pub fn buffer_label(&self, doc: &Document) -> String {
         let scratch = PathBuf::from(SCRATCH_BUFFER_NAME);
 
+        if doc.path().is_none() {
+            let scratch_docs: Vec<_> = self
+                .documents()
+                .filter(|candidate| candidate.path().is_none())
+                .map(|candidate| candidate.id)
+                .collect();
+            if scratch_docs.len() > 1 {
+                if let Some(index) = scratch_docs.iter().position(|id| *id == doc.id) {
+                    let ordinal = index + 1;
+                    return SCRATCH_BUFFER_NAME
+                        .strip_suffix(']')
+                        .map(|prefix| format!("{prefix} {ordinal}]"))
+                        .unwrap_or_else(|| format!("{SCRATCH_BUFFER_NAME} {ordinal}"));
+                }
+            }
+        }
+
         let paths: Vec<String> = self
             .documents()
             .map(|doc| {
@@ -2850,6 +2867,7 @@ impl Editor {
                 let remove_empty_scratch = !doc.is_modified()
                     // If the buffer has no path and is not modified, it is an empty scratch buffer.
                     && doc.path().is_none()
+                    && !doc.is_persistent_scratch()
                     // If the buffer we are changing to is not this buffer
                     && id != doc.id
                     // Ensure the buffer is not displayed in any other splits.
@@ -2858,6 +2876,19 @@ impl Editor {
                         .traverse()
                         .any(|(_, v)| v.doc == doc.id && v.id != view_id);
 
+                if doc.path().is_none() || doc.is_persistent_scratch() {
+                    log::warn!(
+                        "[acp_scratch] switch action={:?} from_doc={:?} to_doc={:?} modified={} persistent={} remove_empty_scratch={} view_id={:?}",
+                        action,
+                        doc.id,
+                        id,
+                        doc.is_modified(),
+                        doc.is_persistent_scratch(),
+                        remove_empty_scratch,
+                        view_id
+                    );
+                }
+
                 let (view_id, doc) = focused!(self);
 
                 // Append any outstanding changes to history in the old document.
@@ -2865,6 +2896,11 @@ impl Editor {
                 doc.append_changes_to_history(view);
 
                 if remove_empty_scratch {
+                    log::warn!(
+                        "[acp_scratch] removing empty scratch doc={:?} while switching to {:?}",
+                        doc.id,
+                        id
+                    );
                     // Copy `doc.id` into a variable before calling `self.documents.remove`, which requires a mutable
                     // borrow, invalidating direct access to `doc.id`.
                     let id = doc.id;

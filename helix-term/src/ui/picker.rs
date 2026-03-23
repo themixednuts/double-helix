@@ -14,6 +14,7 @@ use crate::{
     },
 };
 use futures_util::future::BoxFuture;
+use helix_core::unicode::width::UnicodeWidthStr;
 use helix_event::AsyncHook;
 use nucleo::pattern::{CaseMatching, Normalization};
 use nucleo::{Config, Nucleo};
@@ -985,16 +986,17 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
         );
 
         let prompt_area = prompt_row.clip_left(1);
-        let line_area = prompt_area.clip_right(count.len() as u16 + 1);
+        let count_width = UnicodeWidthStr::width(count.as_str()) as u16;
+        let line_area = prompt_area.clip_right(count_width + 1);
 
         // render the prompt first since it will clear its background
         self.prompt.render(line_area, surface, cx);
 
         surface.set_stringn(
-            (prompt_area.x + prompt_area.width).saturating_sub(count.len() as u16 + 1),
+            (prompt_area.x + prompt_area.width).saturating_sub(count_width + 1),
             prompt_area.y,
             &count,
-            (count.len()).min(prompt_area.width as usize),
+            count_width.min(prompt_area.width) as usize,
             text_style,
         );
 
@@ -1200,7 +1202,11 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
                     }
 
                     let alt_text = preview.placeholder();
-                    let x = inner.x + inner.width.saturating_sub(alt_text.len() as u16) / 2;
+                    let x = inner.x
+                        + inner
+                            .width
+                            .saturating_sub(UnicodeWidthStr::width(alt_text) as u16)
+                            / 2;
                     let y = inner.y + inner.height / 2;
                     surface.set_stringn(x, y, alt_text, inner.width as usize, text);
                     return;

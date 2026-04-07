@@ -1,107 +1,69 @@
-use std::sync::atomic::{self, AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use helix_core::command_line::Args;
-use helix_event::{register_hook, send_blocking};
+use crate::events::OnModeSwitch;
+use crate::runtime::{send_task_event_with, RuntimeEvent, RuntimeTaskEvent};
+use helix_event::register_hook;
+use helix_runtime::{send_blocking, Runtime, Work};
 use helix_view::document::Mode;
 use helix_view::events::{DocumentDidClose, DocumentDidOpen};
 use helix_view::file_watcher::FileWatcher;
 use helix_view::handlers::{AutoReloadEvent, Handlers};
-use helix_view::{Document, Editor};
-use tokio::time::Instant;
-
-use crate::commands;
-use crate::events::OnModeSwitch;
-use crate::job::{self, Jobs};
-use crate::ui::PromptEvent;
+use helix_view::Editor;
 
 #[derive(Debug)]
 pub(super) struct AutoReloadHandler {
     reload_pending: Arc<AtomicBool>,
+    work: Work,
+    ingress: helix_runtime::Sender<RuntimeEvent>,
 }
 
 impl AutoReloadHandler {
-    pub fn new() -> AutoReloadHandler {
+    fn new(work: Work, ingress: helix_runtime::Sender<RuntimeEvent>) -> AutoReloadHandler {
         AutoReloadHandler {
             reload_pending: Default::default(),
+            work,
+            ingress,
         }
     }
-}
 
-impl helix_event::AsyncHook for AutoReloadHandler {
-    type Event = AutoReloadEvent;
-
-    fn handle_event(
-        &mut self,
-        event: Self::Event,
-        _existing_debounce: Option<Instant>,
-    ) -> Option<Instant> {
+    fn event(&mut self, event: AutoReloadEvent) {
         match event {
-            Self::Event::FileChanged { .. } => {
-                self.finish_debounce();
-                None
+            AutoReloadEvent::FileChanged { .. } => {
+                let reload_pending = self.reload_pending.clone();
+                let ingress = self.ingress.clone();
+                self.work.spawn(async move {
+                    send_task_event_with(RuntimeTaskEvent::AutoReloadRun { reload_pending }, ingress)
+                        .await;
+                }).detach();
             }
-            Self::Event::LeftInsertMode => {
+            AutoReloadEvent::LeftInsertMode => {
                 if self.reload_pending.load(Ordering::Relaxed) {
-                    self.finish_debounce();
+                    let reload_pending = self.reload_pending.clone();
+                    let ingress = self.ingress.clone();
+                    self.work.spawn(async move {
+                        send_task_event_with(RuntimeTaskEvent::AutoReloadRun { reload_pending }, ingress)
+                            .await;
+                    }).detach();
                 }
-                None
             }
         }
     }
 
-    fn finish_debounce(&mut self) {
-        let reload_pending = self.reload_pending.clone();
-        job::dispatch_blocking(move |editor, _compositor| {
-            if editor.mode() == Mode::Insert {
-                reload_pending.store(true, atomic::Ordering::Relaxed);
-            } else {
-                reload_changed_documents(editor);
-                reload_pending.store(false, atomic::Ordering::Relaxed);
+    pub fn spawn(
+        runtime: Runtime,
+        ingress: helix_runtime::Sender<RuntimeEvent>,
+    ) -> helix_runtime::Sender<AutoReloadEvent> {
+        let (tx, mut rx) = helix_runtime::channel(128);
+        let work = runtime.work().clone();
+        work.clone().spawn(async move {
+            let mut handler = AutoReloadHandler::new(work, ingress);
+            while let Some(event) = rx.recv().await {
+                handler.event(event);
             }
-        });
+        }).detach();
+        tx
     }
-}
-
-/// Reload documents that have been modified externally.
-/// Only reloads unmodified buffers; modified buffers are left alone.
-fn reload_changed_documents(editor: &mut Editor) {
-    if count_externally_modified_documents(editor.documents()) == 0 {
-        return;
-    }
-
-    let mut cx = crate::compositor::Context {
-        editor,
-        scroll: None,
-        jobs: &mut Jobs::new(),
-        plugin_manager: None,
-    };
-
-    match commands::typed::reload_all(&mut cx, Args::default(), PromptEvent::Validate) {
-        Ok(_) => cx.editor.set_status("Reloaded modified documents"),
-        Err(err) => cx
-            .editor
-            .set_error(format!("Failed to reload document: {err}")),
-    }
-}
-
-pub fn count_externally_modified_documents<'a>(docs: impl Iterator<Item = &'a Document>) -> usize {
-    docs.filter(|doc| !doc.is_modified())
-        .filter(|doc| {
-            let last_saved_time = doc.get_last_saved_time();
-            let Some(path) = doc.path() else {
-                return false;
-            };
-            if let Ok(metadata) = std::fs::metadata(path) {
-                if let Ok(modified_time) = metadata.modified() {
-                    if modified_time > last_saved_time {
-                        return true;
-                    }
-                }
-            }
-            false
-        })
-        .count()
 }
 
 /// Initialize the file watcher and spawn the bridge task that forwards
@@ -122,7 +84,7 @@ pub fn setup_file_watcher(editor: &mut Editor) {
     editor.file_watcher = Some(watcher);
 
     let tx = editor.handlers.auto_reload.clone();
-    tokio::spawn(async move {
+    editor.runtime().work().clone().spawn(async move {
         while let Some(event) = rx.recv().await {
             send_blocking(
                 &tx,
@@ -130,9 +92,9 @@ pub fn setup_file_watcher(editor: &mut Editor) {
                     path: event.path,
                     doc_ids: event.doc_ids,
                 },
-            );
+                );
         }
-    });
+    }).detach();
 }
 
 pub(super) fn register_hooks(handlers: &Handlers) {

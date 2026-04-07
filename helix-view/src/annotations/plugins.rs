@@ -21,11 +21,11 @@ impl<'a> PluginLineAnnotations<'a> {
     }
 
     fn plain_viewport_support(&self, top_line: usize, cursor_line: usize) -> PlainViewportSupport {
-        let Some(annotations) = self.doc.plugin_annotations(self.view_id) else {
+        let Some(annotations) = self.doc.visual_annotations(self.view_id) else {
             return PlainViewportSupport::Supported;
         };
 
-        plugin_plain_viewport_support(annotations, self.doc.text(), top_line, cursor_line)
+        plugin_plain_viewport_support(&annotations, self.doc.text(), top_line, cursor_line)
     }
 }
 
@@ -80,7 +80,7 @@ impl LineAnnotation for PluginLineAnnotations<'_> {
         let mut max_virt_idx: i32 = -1;
         let mut next_auto_idx: u16 = 0;
 
-        if let Some(annots) = self.doc.plugin_annotations(self.view_id) {
+        if let Some(annots) = self.doc.visual_annotations(self.view_id) {
             let line_start = self.doc.text().line_to_char(doc_line);
             let line_end = self.doc.text().line_to_char(doc_line + 1);
 

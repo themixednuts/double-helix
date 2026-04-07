@@ -9,94 +9,83 @@ use std::{
 use anyhow::Ok;
 use arc_swap::access::Access;
 
-use helix_event::{register_hook, send_blocking};
+use crate::{events::OnModeSwitch, runtime::{send_task_event_with, RuntimeEvent, RuntimeTaskEvent}};
+use helix_event::register_hook;
+use helix_runtime::{send_blocking, Clock, Debounce, Runtime, Work};
 use helix_view::bench::log_command_phase;
 use helix_view::{
     document::Mode,
     events::DocumentDidChange,
     handlers::{AutoSaveEvent, Handlers},
-    Editor,
-};
-use tokio::time::Instant;
-
-use crate::{
-    commands, compositor,
-    events::OnModeSwitch,
-    job::{self, Jobs},
 };
 
 #[derive(Debug)]
 pub(super) struct AutoSaveHandler {
     save_pending: Arc<AtomicBool>,
+    armed: Arc<AtomicBool>,
+    debounce: Debounce,
+    work: Work,
+    clock: Clock,
+    ingress: helix_runtime::Sender<RuntimeEvent>,
 }
 
 impl AutoSaveHandler {
-    pub fn new() -> AutoSaveHandler {
+    fn new(work: Work, clock: Clock, ingress: helix_runtime::Sender<RuntimeEvent>) -> AutoSaveHandler {
         AutoSaveHandler {
             save_pending: Default::default(),
+            armed: Default::default(),
+            debounce: Debounce::new(Duration::from_millis(1)),
+            work,
+            clock,
+            ingress,
         }
     }
-}
 
-impl helix_event::AsyncHook for AutoSaveHandler {
-    type Event = AutoSaveEvent;
-
-    fn handle_event(
-        &mut self,
-        event: Self::Event,
-        existing_debounce: Option<tokio::time::Instant>,
-    ) -> Option<Instant> {
+    fn event(&mut self, event: AutoSaveEvent) {
         match event {
-            Self::Event::DocumentChanged { save_after } => {
-                Some(Instant::now() + Duration::from_millis(save_after))
+            AutoSaveEvent::DocumentChanged { save_after } => {
+                self.armed.store(true, atomic::Ordering::Relaxed);
+                let save_pending = self.save_pending.clone();
+                let armed = self.armed.clone();
+                let ingress = self.ingress.clone();
+                self.debounce = Debounce::new(Duration::from_millis(save_after));
+                self.debounce.restart(&self.work, &self.clock, async move {
+                    armed.store(false, atomic::Ordering::Relaxed);
+                    send_task_event_with(RuntimeTaskEvent::AutoSaveRun { save_pending }, ingress)
+                        .await;
+                });
             }
-            Self::Event::LeftInsertMode => {
-                if existing_debounce.is_some() {
-                    // If the change happened more recently than the debounce, let the
-                    // debounce run down before saving.
-                    existing_debounce
-                } else {
-                    // Otherwise if there is a save pending, save immediately.
-                    if self.save_pending.load(atomic::Ordering::Relaxed) {
-                        self.finish_debounce();
-                    }
-                    None
+            AutoSaveEvent::LeftInsertMode => {
+                if !self.armed.load(atomic::Ordering::Relaxed)
+                    && self.save_pending.load(atomic::Ordering::Relaxed)
+                {
+                    let save_pending = self.save_pending.clone();
+                    let ingress = self.ingress.clone();
+                    self.work
+                        .spawn(async move {
+                            send_task_event_with(RuntimeTaskEvent::AutoSaveRun { save_pending }, ingress)
+                            .await;
+                        })
+                        .detach();
                 }
             }
         }
     }
 
-    fn finish_debounce(&mut self) {
-        let save_pending = self.save_pending.clone();
-        job::dispatch_blocking(move |editor, _| {
-            if editor.mode() == Mode::Insert {
-                // Avoid saving while in insert mode since this mixes up
-                // the modification indicator and prevents future saves.
-                save_pending.store(true, atomic::Ordering::Relaxed);
-            } else {
-                request_auto_save(editor);
-                save_pending.store(false, atomic::Ordering::Relaxed);
+    pub fn spawn(
+        runtime: Runtime,
+        ingress: helix_runtime::Sender<RuntimeEvent>,
+    ) -> helix_runtime::Sender<AutoSaveEvent> {
+        let (tx, mut rx) = helix_runtime::channel(128);
+        let work = runtime.work().clone();
+        let clock = runtime.clock().clone();
+        work.clone().spawn(async move {
+            let mut handler = AutoSaveHandler::new(work, clock, ingress);
+            while let Some(event) = rx.recv().await {
+                handler.event(event);
             }
-        })
-    }
-}
-
-fn request_auto_save(editor: &mut Editor) {
-    let context = &mut compositor::Context {
-        editor,
-        scroll: None,
-        jobs: &mut Jobs::new(),
-        plugin_manager: None,
-    };
-
-    let options = commands::WriteAllOptions {
-        force: false,
-        write_scratch: false,
-        auto_format: false,
-    };
-
-    if let Err(e) = commands::typed::write_all_impl(context, options) {
-        context.editor.set_error(format!("{}", e));
+        }).detach();
+        tx
     }
 }
 

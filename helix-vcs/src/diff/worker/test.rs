@@ -5,7 +5,8 @@ use crate::diff::{DiffHandle, Hunk};
 
 impl DiffHandle {
     fn new_test(diff_base: &str, doc: &str) -> (DiffHandle, JoinHandle<()>) {
-        DiffHandle::new_with_handle(Rope::from_str(diff_base), Rope::from_str(doc))
+        let gate = helix_runtime::FrameGate::new(1);
+        DiffHandle::new_with_handle(Rope::from_str(diff_base), Rope::from_str(doc), gate.handle())
     }
     async fn into_diff(self, handle: JoinHandle<()>) -> Vec<Hunk> {
         let diff = self.diff;

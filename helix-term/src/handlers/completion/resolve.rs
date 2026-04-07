@@ -1,15 +1,16 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use helix_lsp::lsp;
-use tokio::sync::mpsc::Sender;
-use tokio::time::{Duration, Instant};
+use helix_runtime::{send_blocking, Debounce, Runtime, Token, Work};
+use helix_runtime::Sender as IngressSender;
 
-use helix_event::{send_blocking, AsyncHook, TaskController, TaskHandle};
 use helix_view::Editor;
 
 use super::LspCompletionItem;
 use crate::handlers::completion::CompletionItem;
-use crate::job;
+use crate::runtime::{send_ui_command_with, RuntimeEvent};
+use crate::runtime::ui::{CompletionCommand, UiCommand};
 
 /// A hook for resolving incomplete completion items.
 ///
@@ -24,14 +25,14 @@ use crate::job;
 /// > The returned completion item should have the documentation property filled in.
 pub struct ResolveHandler {
     last_request: Option<Arc<LspCompletionItem>>,
-    resolver: Sender<ResolveRequest>,
+    resolver: helix_runtime::Sender<ResolveRequest>,
 }
 
 impl ResolveHandler {
-    pub fn new() -> ResolveHandler {
+    pub fn new(runtime: Runtime, ingress: IngressSender<RuntimeEvent>) -> ResolveHandler {
         ResolveHandler {
             last_request: None,
-            resolver: ResolveTimeout::default().spawn(),
+            resolver: ResolveTimeout::spawn(runtime.work().clone(), runtime.clock().clone(), ingress),
         }
     }
 
@@ -82,92 +83,162 @@ impl ResolveHandler {
         ) {
             let item = Arc::new(item.clone());
             self.last_request = Some(item.clone());
-            send_blocking(&self.resolver, ResolveRequest { item, ls })
+            send_blocking(&self.resolver, ResolveRequest::Resolve { item, ls })
         } else {
             item.resolved = true;
         }
     }
 }
 
-struct ResolveRequest {
+impl Drop for ResolveHandler {
+    fn drop(&mut self) {
+        let _ = self.resolver.try_send(ResolveRequest::Cancel);
+    }
+}
+
+enum ResolveRequest {
+    Resolve {
+        item: Arc<LspCompletionItem>,
+        ls: Arc<helix_lsp::Client>,
+    },
+    Start,
+    Cancel,
+}
+
+struct PendingResolve {
     item: Arc<LspCompletionItem>,
     ls: Arc<helix_lsp::Client>,
+    ingress: IngressSender<RuntimeEvent>,
 }
 
-#[derive(Default)]
 struct ResolveTimeout {
-    next_request: Option<ResolveRequest>,
+    next_request: Option<PendingResolve>,
     in_flight: Option<Arc<LspCompletionItem>>,
-    task_controller: TaskController,
+    cancel: Option<Token>,
+    debounce: Debounce,
+    work: Work,
+    clock: helix_runtime::Clock,
+    tx: helix_runtime::Sender<ResolveRequest>,
+    ingress: IngressSender<RuntimeEvent>,
 }
 
-impl AsyncHook for ResolveTimeout {
-    type Event = ResolveRequest;
+impl ResolveTimeout {
+    fn spawn(
+        work: Work,
+        clock: helix_runtime::Clock,
+        ingress: IngressSender<RuntimeEvent>,
+    ) -> helix_runtime::Sender<ResolveRequest> {
+        let (tx, mut rx) = helix_runtime::channel(128);
+        let mut timeout = Self {
+            next_request: None,
+            in_flight: None,
+            cancel: None,
+            debounce: Debounce::new(Duration::from_millis(150)),
+            work,
+            clock,
+            tx: tx.clone(),
+            ingress,
+        };
+        timeout.work.clone().spawn(async move {
+            while let Some(request) = rx.recv().await {
+                timeout.event(request);
+            }
+            timeout.cancel();
+        }).detach();
+        tx
+    }
 
-    fn handle_event(
-        &mut self,
-        request: Self::Event,
-        timeout: Option<tokio::time::Instant>,
-    ) -> Option<tokio::time::Instant> {
+    fn event(&mut self, request: ResolveRequest) {
+        match request {
+            ResolveRequest::Resolve { item, ls } => {
+                self.handle_resolve(PendingResolve {
+                    item,
+                    ls,
+                    ingress: self.ingress.clone(),
+                })
+            }
+            ResolveRequest::Start => self.start(),
+            ResolveRequest::Cancel => self.cancel(),
+        }
+    }
+
+    fn handle_resolve(&mut self, request: PendingResolve) {
         if self
             .next_request
             .as_ref()
             .is_some_and(|old_request| old_request.item == request.item)
         {
-            timeout
-        } else if self
+            return;
+        }
+        if self
             .in_flight
             .as_ref()
-            .is_some_and(|old_request| old_request.item == request.item.item)
+            .is_some_and(|old_request| old_request == &request.item)
         {
             self.next_request = None;
-            None
-        } else {
-            self.next_request = Some(request);
-            Some(Instant::now() + Duration::from_millis(150))
+            self.debounce.cancel();
+            return;
         }
+
+        self.next_request = Some(request);
+        let tx = self.tx.clone();
+        self.debounce.restart(&self.work, &self.clock, async move {
+            let _ = tx.send(ResolveRequest::Start).await;
+        });
     }
 
-    fn finish_debounce(&mut self) {
+    fn start(&mut self) {
         let Some(request) = self.next_request.take() else {
             return;
         };
-        let token = self.task_controller.restart();
+
+        let cancel = Token::new();
+        if let Some(current) = self.cancel.replace(cancel.clone()) {
+            current.cancel();
+        }
         self.in_flight = Some(request.item.clone());
-        tokio::spawn(request.execute(token));
+        self.work.spawn(request.execute(cancel)).detach();
+    }
+
+    fn cancel(&mut self) {
+        self.next_request = None;
+        self.debounce.cancel();
+        if let Some(cancel) = self.cancel.take() {
+            cancel.cancel();
+        }
+        self.in_flight = None;
     }
 }
 
-impl ResolveRequest {
-    async fn execute(self, cancel: TaskHandle) {
+impl PendingResolve {
+    async fn execute(self, cancel: Token) {
         let future = self.ls.resolve_completion_item(&self.item.item);
-        let Some(resolved_item) = helix_event::cancelable_future(future, cancel).await else {
-            return;
+        let resolved_item = tokio::select! {
+            _ = cancel.canceled() => return,
+            resolved_item = future => resolved_item,
         };
-        job::dispatch(move |_, compositor| {
-            if let Some(completion) = &mut compositor
-                .find::<crate::ui::EditorView>()
-                .unwrap()
-                .completion
-            {
-                let resolved_item = CompletionItem::Lsp(match resolved_item {
-                    Ok(item) => LspCompletionItem {
-                        item,
-                        resolved: true,
-                        ..*self.item
-                    },
-                    Err(err) => {
-                        log::error!("completion resolve request failed: {err}");
-                        // set item to resolved so we don't request it again
-                        // we could also remove it but that oculd be odd ui
-                        let mut item = (*self.item).clone();
-                        item.resolved = true;
-                        item
-                    }
-                });
-                completion.replace_item(&*self.item, resolved_item);
-            };
-        })
+        let previous = self.item.clone();
+        let resolved_item = CompletionItem::Lsp(match resolved_item {
+            Ok(item) => LspCompletionItem {
+                item,
+                resolved: true,
+                ..*previous
+            },
+            Err(err) => {
+                log::error!("completion resolve request failed: {err}");
+                // set item to resolved so we don't request it again
+                // we could also remove it but that oculd be odd ui
+                let mut item = (*previous).clone();
+                item.resolved = true;
+                item
+            }
+        });
+        send_ui_command_with(UiCommand::Completion(
+            CompletionCommand::ReplaceResolvedItem {
+                previous,
+                resolved: resolved_item,
+            },
+        ), self.ingress)
         .await
     }
 }

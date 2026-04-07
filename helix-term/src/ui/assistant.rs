@@ -10,110 +10,44 @@ use crate::widgets::{
     MessageListState, MessageStyle, Spinner,
 };
 use helix_core::unicode::width::UnicodeWidthStr;
-use helix_core::NATIVE_LINE_ENDING;
 use helix_core::Position;
-use helix_view::document::Document;
-use helix_view::editor::Action;
 use helix_view::content_region::ContentRegion;
 use helix_view::document::Mode;
+use helix_view::editor::Action;
 use helix_view::graphics::{CursorKind, Rect, Style as GraphicsStyle};
 use helix_view::input::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use helix_view::theme::{Modifier, Style};
 use helix_view::traits::{Bounded, Focusable, Identified, Modal, Scrollable};
 use helix_view::Editor;
+use std::time::Duration;
 use tui::buffer::Buffer as Surface;
 use tui::text::{Span, Spans};
-use std::collections::HashSet;
-use std::time::Duration;
 
-pub const ID: &str = "acp-panel";
-pub const PERMISSION_ID: &str = "acp-permission";
+pub const ID: &str = "assistant-panel";
+pub const PERMISSION_ID: &str = "assistant-permission";
 
 // ---------------------------------------------------------------------------
 // Chat entries
 // ---------------------------------------------------------------------------
 
-/// An entry in the ACP chat log.
-#[derive(Clone)]
-pub enum ChatEntry {
-    /// User prompt text.
-    UserMessage(String),
-    /// Agent text chunk (accumulated streaming).
-    AgentText(String),
-    /// Tool call: name (e.g. read_file), optional path on newline, status only (no output).
-    ToolCall {
-        id: String,
-        name: String,
-        path: Option<String>,
-        status: String,
-    },
-    /// A status/separator line.
-    Status(String),
-}
-
-#[derive(Clone)]
-pub struct PlanItem {
-    pub content: String,
-    pub status: PlanStatus,
-}
-
-#[derive(Clone, Copy, PartialEq)]
-pub enum PlanStatus {
-    Pending,
-    InProgress,
-    Completed,
-    Failed,
-}
+type ChatEntry = helix_view::model::AssistantEntry;
+#[cfg(test)]
+type ChatEntryKind = helix_view::model::AssistantEntryKind;
 
 // ---------------------------------------------------------------------------
-// Session history entry
+// Assistant Panel
 // ---------------------------------------------------------------------------
 
-#[derive(Clone)]
-pub struct SessionRecord {
-    pub session_id: String,
-    pub agent_name: String,
-    pub started: std::time::Instant,
-    pub message_count: usize,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FocusTarget {
-    Input,
-    Messages,
-}
-
-// ---------------------------------------------------------------------------
-// ACP Panel
-// ---------------------------------------------------------------------------
-
-pub struct AcpPanel {
+pub struct AssistantPanel {
     focused: bool,
     /// Read-only chat/output area with component-owned scroll + viewport state.
     output: ContentRegion<Vec<ChatEntry>>,
     /// Editable input area backed by a component-owned document.
     input: helix_view::edit_region::EditRegion,
-    agent_name: String,
-    agent_version: String,
-    agent_busy: bool,
-    /// Last ACP/agent error message, shown below the status line (keeps agent context in panel).
+    /// Last assistant/backend error message, shown below the status line.
     panel_error: Option<String>,
     /// Marquee for long error text (scroll, hold, reset, repeat; pauses after inactivity).
     error_marquee: Marquee,
-    /// Queued messages to send after the current turn completes.
-    message_queue: Vec<String>,
-    /// Config options reported by the agent (model, thinking, etc.).
-    config_options: Vec<helix_acp::types::ConfigOption>,
-    /// Available session modes.
-    session_modes: Vec<helix_acp::types::SessionMode>,
-    /// Currently active mode id.
-    current_mode_id: Option<String>,
-    /// Plan/tasks shown above input (static UI, not in chat history).
-    plan_items: Option<Vec<PlanItem>>,
-    /// Message cursor state for future entry navigation and reveal behavior.
-    message_cursor: MessageCursor,
-    /// Current ACP subfocus between the composer and the message list.
-    focus_target: FocusTarget,
     /// Last input cursor screen position (set during render, read by cursor()).
     last_input_cursor: Option<(u16, u16)>,
     /// Model panel ID, set on first sync.
@@ -124,21 +58,168 @@ pub struct AcpPanel {
     spinner: Spinner,
     /// Selection animation that replays when message focus moves back onto a row.
     message_focus_animation: Animation,
-    /// Currently expanded message for inline details.
-    expanded_message: Option<usize>,
-    /// Collapsed text messages in the ACP list.
-    collapsed_messages: HashSet<usize>,
-    /// Scratch docs opened from ACP message details, keyed by message index.
-    opened_message_docs: std::collections::HashMap<usize, helix_view::DocumentId>,
 }
 
-impl Default for AcpPanel {
+#[derive(Clone, Copy)]
+struct MessageNavigationState {
+    selected: Option<usize>,
+    scroll: usize,
+}
+
+impl Default for AssistantPanel {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl AcpPanel {
+impl AssistantPanel {
+    fn assistant_model(editor: &Editor) -> helix_view::model::AssistantModel {
+        editor.assistant_model(false)
+    }
+
+    fn assistant_model_with_focus(
+        editor: &Editor,
+        focused: bool,
+    ) -> helix_view::model::AssistantModel {
+        editor.assistant_model(focused)
+    }
+
+    fn sync_from_assistant(&mut self, editor: &mut Editor) {
+        let model = Self::assistant_model(editor);
+        if model.active_thread.is_none() {
+            self.output.set_content(Vec::new());
+            self.output.scroll_to(0);
+            return;
+        }
+
+        self.sync_input_from_assistant(editor, &model.input);
+        self.output.set_content(model.entries);
+        self.output.scroll_to(model.content_scroll);
+    }
+
+    fn entry_id_at(
+        &self,
+        _editor: &Editor,
+        index: usize,
+    ) -> Option<helix_view::assistant::thread::EntryId> {
+        self.output.content().get(index).map(|entry| entry.id)
+    }
+
+    fn apply(editor: &mut Editor, action: helix_view::assistant::Action) {
+        let effects = editor.assistant_act(action);
+        Self::apply_assistant_effects(editor, effects);
+    }
+
+    fn set_focus(&mut self, editor: &mut Editor, focus: helix_view::assistant::thread::Focus) {
+        if Self::assistant_model(editor).active_thread.is_none() {
+            return;
+        }
+        if let Ok(effects) = editor.set_active_assistant_focus(focus) {
+            Self::apply_assistant_effects(editor, effects);
+        }
+        if focus == helix_view::assistant::thread::Focus::Messages {
+            self.restart_message_focus_animation(editor);
+        } else {
+            self.message_focus_animation.stop();
+        }
+    }
+
+    fn selected_index_in(&self, model: &helix_view::model::AssistantModel) -> Option<usize> {
+        let selected = model.selected_entry_id()?;
+        self.output
+            .content()
+            .iter()
+            .position(|entry| entry.id == selected)
+    }
+
+    fn selected_index(&self, editor: &Editor) -> Option<usize> {
+        let model = Self::assistant_model(editor);
+        self.selected_index_in(&model)
+    }
+
+    fn set_selected_entry(
+        &mut self,
+        editor: &mut Editor,
+        entry: Option<helix_view::assistant::thread::EntryId>,
+        animate: bool,
+    ) -> Option<helix_view::assistant::thread::EntryId> {
+        let model = Self::assistant_model(editor);
+        if model.active_thread.is_none() {
+            return None;
+        }
+        let previous = model.selected_entry_id();
+        if let Ok(effects) = editor.select_active_assistant_entry(entry) {
+            Self::apply_assistant_effects(editor, effects);
+        }
+
+        if entry.is_some() {
+            self.set_focus(editor, helix_view::assistant::thread::Focus::Messages);
+            if animate && previous != entry {
+                self.restart_message_focus_animation(editor);
+            }
+        } else {
+            self.message_focus_animation.stop();
+        }
+
+        entry
+    }
+
+    fn set_content_scroll(&mut self, editor: &mut Editor, content_scroll: usize) {
+        let Some(thread) = Self::assistant_model(editor).active_thread else {
+            return;
+        };
+        Self::apply(
+            editor,
+            helix_view::assistant::Action::SetContentScroll {
+                thread,
+                content_scroll,
+            },
+        );
+        self.output.scroll_to(content_scroll);
+    }
+
+    fn set_folded(
+        &mut self,
+        editor: &mut Editor,
+        entry: helix_view::assistant::thread::EntryId,
+        folded: bool,
+    ) {
+        let Some(thread) = Self::assistant_model(editor).active_thread else {
+            return;
+        };
+        Self::apply(
+            editor,
+            helix_view::assistant::Action::SetFolded {
+                thread,
+                entry,
+                folded,
+            },
+        );
+    }
+
+    fn navigation_state(&self, editor: &Editor) -> MessageNavigationState {
+        let model = Self::assistant_model(editor);
+        MessageNavigationState {
+            selected: self.selected_index_in(&model),
+            scroll: model.content_scroll(),
+        }
+    }
+
+    fn navigation_cursor(&self, editor: &Editor) -> MessageCursor {
+        let navigation = self.navigation_state(editor);
+        MessageCursor::new(navigation.selected, navigation.scroll)
+    }
+
+    fn cycle_thread(&mut self, editor: &mut Editor, delta: isize) -> bool {
+        let effects = match editor.cycle_active_assistant_thread(delta) {
+            Ok(effects) => effects,
+            Err(_) => return false,
+        };
+        Self::apply_assistant_effects(editor, effects);
+        self.message_focus_animation.stop();
+        true
+    }
+
     fn accent_style(style: Style) -> Style {
         let mut accent = Style::default();
         if let Some(fg) = style.fg {
@@ -156,45 +237,50 @@ impl AcpPanel {
         accent
     }
 
-    fn focus_badge(&self, theme: &helix_view::Theme) -> (&'static str, Style) {
-        let active = Self::accent_style(theme.get("ui.menu.selected"));
-        let inactive = Self::accent_style(theme.get("ui.statusline.inactive"));
-        match self.focus_target {
-            FocusTarget::Input => (" INPUT ", active),
-            FocusTarget::Messages => (" MESSAGES ", inactive.patch(active)),
-        }
-    }
-
-    fn status_style(
+    fn header_item_style(
         theme: &helix_view::Theme,
-        status: &str,
-    ) -> (Style, Style) {
-        match status {
-            "running" => (theme.get("warning"), theme.get("warning")),
-            "completed" | "done" => (theme.get("diff.plus"), theme.get("diff.plus")),
-            "failed" => (theme.get("error"), theme.get("error")),
-            "cancelled" => (theme.get("ui.text.inactive"), theme.get("ui.text.inactive")),
-            _ => (theme.get("ui.text.inactive"), theme.get("ui.text.inactive")),
+        default: Style,
+        tone: helix_view::model::AssistantHeaderTone,
+    ) -> Style {
+        match tone {
+            helix_view::model::AssistantHeaderTone::Default => default,
+            helix_view::model::AssistantHeaderTone::Active => theme.get("ui.menu.selected"),
+            helix_view::model::AssistantHeaderTone::Warning => theme.get("warning"),
         }
     }
 
-    fn status_icon(&self, status: &str) -> &'static str {
-        match status {
-            "running" => self.spinner.frame(),
-            "completed" | "done" => "●",
-            "failed" => "✕",
-            "cancelled" => "–",
-            _ => "○",
+    fn entry_tone_style(
+        theme: &helix_view::Theme,
+        tone: helix_view::model::AssistantEntryTone,
+    ) -> Style {
+        match tone {
+            helix_view::model::AssistantEntryTone::Default => theme.get("ui.text"),
+            helix_view::model::AssistantEntryTone::Inactive => theme.get("ui.text.inactive"),
+            helix_view::model::AssistantEntryTone::Focus => theme.get("ui.text.focus"),
+            helix_view::model::AssistantEntryTone::Warning => theme.get("warning"),
+            helix_view::model::AssistantEntryTone::Success => theme.get("diff.plus"),
+            helix_view::model::AssistantEntryTone::Error => theme.get("error"),
         }
     }
 
-    fn has_running_activity(&self) -> bool {
-        self.output.content().iter().any(|entry| {
-            matches!(entry, ChatEntry::ToolCall { status, .. } if status == "running")
-        }) || self
-            .plan_items
-            .as_ref()
-            .is_some_and(|items| items.iter().any(|item| item.status == PlanStatus::InProgress))
+    fn bubble_message_align(side: helix_view::model::AssistantBubbleSide) -> MessageAlign {
+        match side {
+            helix_view::model::AssistantBubbleSide::Left => MessageAlign::Left,
+            helix_view::model::AssistantBubbleSide::Right => MessageAlign::Right,
+        }
+    }
+
+    fn bubble_accessory_align(
+        side: helix_view::model::AssistantBubbleSide,
+    ) -> MessageAccessoryAlign {
+        match side {
+            helix_view::model::AssistantBubbleSide::Left => MessageAccessoryAlign::Left,
+            helix_view::model::AssistantBubbleSide::Right => MessageAccessoryAlign::Right,
+        }
+    }
+
+    fn plain_accessory_align() -> MessageAccessoryAlign {
+        MessageAccessoryAlign::Right
     }
 
     pub fn new() -> Self {
@@ -202,18 +288,8 @@ impl AcpPanel {
             focused: true,
             output: ContentRegion::default(),
             input: helix_view::edit_region::EditRegion::default(),
-            agent_name: String::from("No agent"),
-            agent_version: String::new(),
-            agent_busy: false,
             panel_error: None,
             error_marquee: Marquee::new(),
-            message_queue: Vec::new(),
-            config_options: Vec::new(),
-            session_modes: Vec::new(),
-            current_mode_id: None,
-            plan_items: None,
-            message_cursor: MessageCursor::default(),
-            focus_target: FocusTarget::Input,
             last_input_cursor: None,
             model_panel_id: None,
             chat_layout: MessageListState::default(),
@@ -227,9 +303,6 @@ impl AcpPanel {
                 spec.frame_interval = Duration::from_millis(16);
                 spec
             }),
-            expanded_message: None,
-            collapsed_messages: HashSet::new(),
-            opened_message_docs: std::collections::HashMap::new(),
         }
     }
 
@@ -237,71 +310,59 @@ impl AcpPanel {
         self.model_panel_id
     }
 
-    /// Set or clear the panel error message (shown below status line; keeps ACP context in panel).
+    /// Set or clear the panel error message shown below the status line.
     pub fn set_panel_error(&mut self, msg: Option<String>) {
         self.panel_error = msg.clone();
         self.error_marquee
-            .set_text(msg.map(|s| format!("ACP: {}", s)));
+            .set_text(msg.map(|s| format!("Assistant: {}", s)));
     }
 
-    pub fn activate_input(&mut self) {
-        self.focus_target = FocusTarget::Input;
+    pub fn activate_input(&mut self, editor: &mut Editor) {
+        self.set_focus(editor, helix_view::assistant::thread::Focus::Input);
         self.message_focus_animation.stop();
         self.set_focused(true);
     }
 
-    pub fn focus_target(&self) -> FocusTarget {
-        self.focus_target
-    }
-
-    pub fn focus_messages(&mut self) {
+    pub fn focus_messages(&mut self, editor: &mut Editor) {
         if self.input.mode() == Mode::Insert {
             self.input.exit_insert_mode();
         }
         self.set_focused(true);
-        self.focus_target = FocusTarget::Messages;
-        self.restart_message_focus_animation();
+        self.set_focus(editor, helix_view::assistant::thread::Focus::Messages);
     }
 
-    fn focus_messages_without_animation(&mut self) {
+    fn focus_messages_without_animation(&mut self, editor: &mut Editor) {
         if self.input.mode() == Mode::Insert {
             self.input.exit_insert_mode();
         }
         self.set_focused(true);
-        self.focus_target = FocusTarget::Messages;
+        self.set_focus(editor, helix_view::assistant::thread::Focus::Messages);
     }
 
-    pub fn focus_input_region(&mut self) {
+    pub fn focus_input_region(&mut self, editor: &mut Editor) {
         self.set_focused(true);
-        self.focus_target = FocusTarget::Input;
+        self.set_focus(editor, helix_view::assistant::thread::Focus::Input);
         self.message_focus_animation.stop();
     }
 
-    fn restart_message_focus_animation(&mut self) {
-        if self.focus_target == FocusTarget::Messages && self.message_cursor.selected().is_some() {
+    fn restart_message_focus_animation(&mut self, editor: &Editor) {
+        let model = Self::assistant_model(editor);
+        if model.focus() == helix_view::assistant::thread::Focus::Messages
+            && model.selected_entry_id().is_some()
+        {
             self.message_focus_animation.restart();
         }
     }
 
-    fn set_message_selection(&mut self, index: Option<usize>, animate: bool) -> Option<usize> {
-        let previous = self.message_cursor.selected();
-        self.message_cursor.select(index);
-        self.message_cursor.clamp_selection(&self.chat_layout);
-
-        if self.message_cursor.selected().is_some() {
-            self.focus_target = FocusTarget::Messages;
-            if animate && previous != self.message_cursor.selected() {
-                self.restart_message_focus_animation();
-            }
-        } else {
-            self.message_focus_animation.stop();
-        }
-
-        self.message_cursor.selected()
-    }
-
-    fn current_message_accent(&self, theme: &helix_view::Theme) -> Option<(GraphicsStyle, f32)> {
-        if self.focus_target != FocusTarget::Messages || self.message_cursor.selected().is_none() {
+    fn current_message_accent(
+        &self,
+        editor: &Editor,
+        theme: &helix_view::Theme,
+    ) -> Option<(GraphicsStyle, f32)> {
+        let model = Self::assistant_model(editor);
+        if model.focus() != helix_view::assistant::thread::Focus::Messages
+            || model.selected_entry_id().is_none()
+        {
             return None;
         }
 
@@ -327,71 +388,80 @@ impl AcpPanel {
                 Span::styled("enter", key_style),
                 Span::styled(" open  ", text_style),
                 Span::styled("tab", key_style),
-                Span::styled(" fold", text_style),
+                Span::styled(" fold  ", text_style),
+                Span::styled("t", key_style),
+                Span::styled(" follow", text_style),
             ])],
             align,
         )
     }
 
-    fn expanded_details(&self, entry: &ChatEntry, theme: &helix_view::Theme) -> Vec<Spans<'static>> {
+    fn expanded_details(
+        &self,
+        entry: &ChatEntry,
+        theme: &helix_view::Theme,
+        agent_name: &str,
+    ) -> Vec<Spans<'static>> {
         let heading = theme.get("ui.text.info").add_modifier(Modifier::BOLD);
         let text = theme.get("ui.text.inactive");
-        match entry {
-            ChatEntry::UserMessage(message) => vec![
-                Spans::from(Span::styled(" user", heading)),
-                Spans::from(Span::styled(message.clone(), text)),
-            ],
-            ChatEntry::AgentText(message) => vec![
-                Spans::from(Span::styled(format!(" {}", self.agent_name), heading)),
-                Spans::from(Span::styled(message.clone(), text)),
-            ],
-            ChatEntry::ToolCall {
-                id,
-                name,
-                path,
-                status,
-            } => {
-                let mut lines = vec![
-                    Spans::from(Span::styled(format!(" tool {name}"), heading)),
-                    Spans::from(Span::styled(format!(" id: {id}"), text)),
-                    Spans::from(Span::styled(format!(" status: {status}"), text)),
-                ];
-                if let Some(path) = path {
-                    lines.push(Spans::from(Span::styled(format!(" path: {path}"), text)));
-                }
-                lines
-            }
-            ChatEntry::Status(message) => vec![
-                Spans::from(Span::styled(" status", heading)),
-                Spans::from(Span::styled(message.clone(), text)),
-            ],
+        let details = entry.details(agent_name);
+        let mut lines = vec![Spans::from(Span::styled(
+            format!(" {}", details.heading),
+            heading,
+        ))];
+        if let Some(body) = details.body {
+            lines.push(Spans::from(Span::styled(body, text)));
         }
+        for line in details.lines {
+            lines.push(Spans::from(Span::styled(
+                format!(" {}: {}", line.label, line.value),
+                text,
+            )));
+        }
+        lines
+    }
+
+    fn decorate_selected_plain_message(
+        &self,
+        mut message: Message<'static>,
+        selected: bool,
+        entry: &ChatEntry,
+        theme: &helix_view::Theme,
+        agent_name: &str,
+    ) -> Message<'static> {
+        if selected {
+            message = message.with_details(self.expanded_details(entry, theme, agent_name));
+            message = Self::decorate_selected_message(
+                message,
+                true,
+                theme,
+                Self::plain_accessory_align(),
+            );
+        }
+        message
+    }
+
+    fn decorate_selected_message(
+        mut message: Message<'static>,
+        selected: bool,
+        theme: &helix_view::Theme,
+        align: MessageAccessoryAlign,
+    ) -> Message<'static> {
+        if selected {
+            let (lines, align) = Self::action_hints(theme, align);
+            message = message.with_selected_accessory(lines, align);
+        }
+        message
     }
 
     fn yank_selected_message(&mut self, editor: &mut Editor) -> bool {
-        let Some(text) = self.selected_entry_ref().map(|entry| match entry {
-            ChatEntry::UserMessage(message) | ChatEntry::AgentText(message) | ChatEntry::Status(message) => {
-                message.clone()
-            }
-            ChatEntry::ToolCall {
-                id,
-                name,
-                path,
-                status,
-            } => {
-                let mut lines = vec![format!("id: {id}"), format!("name: {name}"), format!("status: {status}")];
-                if let Some(path) = path {
-                    lines.push(format!("path: {path}"));
-                }
-                lines.join(NATIVE_LINE_ENDING.as_str())
-            }
-        }) else {
+        let Some(text) = self.selected_entry_ref(editor).map(ChatEntry::plain_text) else {
             return false;
         };
 
         match editor.registers.write('"', vec![text]) {
             Ok(()) => {
-                editor.set_status("ACP message yanked");
+                editor.set_status("Assistant entry yanked");
                 true
             }
             Err(err) => {
@@ -401,206 +471,20 @@ impl AcpPanel {
         }
     }
 
-    fn toggle_selected_message_fold(&mut self) -> bool {
-        let Some(index) = self.message_cursor.selected() else {
+    fn toggle_selected_message_fold(&mut self, editor: &mut Editor) -> bool {
+        let model = Self::assistant_model(editor);
+        let Some(entry) = model.selected_entry_id() else {
             return false;
         };
-        match self.output.content().get(index) {
-            Some(ChatEntry::UserMessage(_)) | Some(ChatEntry::AgentText(_)) => {
-                if !self.collapsed_messages.insert(index) {
-                    self.collapsed_messages.remove(&index);
-                }
-            }
-            Some(_) => {
-                if self.expanded_message == Some(index) {
-                    self.expanded_message = None;
-                } else {
-                    self.expanded_message = Some(index);
-                }
-            }
-            None => return false,
+        if self.selected_entry_ref(editor).is_none() {
+            return false;
         }
+        self.set_folded(editor, entry, !model.is_folded(entry));
         true
     }
 
-    pub fn set_agent_name(&mut self, name: String) {
-        self.agent_name = name;
-    }
-
-    pub fn set_agent_version(&mut self, version: String) {
-        self.agent_version = version;
-    }
-
-    pub fn set_busy(&mut self, busy: bool) {
-        self.agent_busy = busy;
-    }
-
-    pub fn is_busy(&self) -> bool {
-        self.agent_busy
-    }
-
-    pub fn set_config_options(&mut self, opts: Vec<helix_acp::types::ConfigOption>) {
-        self.config_options = opts;
-    }
-
-    pub fn set_session_modes(&mut self, modes: Vec<helix_acp::types::SessionMode>) {
-        self.session_modes = modes;
-    }
-
-    pub fn set_current_mode_id(&mut self, mode_id: String) {
-        self.current_mode_id = Some(mode_id);
-    }
-
-    /// Returns the display name of the current model (from config_options with category "model").
-    pub fn current_model_name(&self) -> Option<&str> {
-        for opt in &self.config_options {
-            if opt.category.as_deref() == Some("model") {
-                // Find the option value matching current_value
-                for v in &opt.options {
-                    if v.value == opt.current_value {
-                        return Some(&v.name);
-                    }
-                }
-                // Fallback to the raw current_value
-                if !opt.current_value.is_empty() {
-                    return Some(&opt.current_value);
-                }
-            }
-        }
-        None
-    }
-
-    /// Display string for status bar: show model display name (e.g. "Sonnet", "Default (recommended)").
-    pub fn status_model_display(&self) -> Option<String> {
-        self.status_config_name("model")
-    }
-
-    /// Display string for a config option by category (e.g. "model", "thinking").
-    /// Prefers the option's value (id) over display name when available.
-    pub fn status_config_display(&self, category: &str) -> Option<String> {
-        for opt in &self.config_options {
-            if opt.category.as_deref() == Some(category) {
-                for v in &opt.options {
-                    if v.value == opt.current_value || v.name == opt.current_value {
-                        return Some(v.value.clone());
-                    }
-                }
-                if !opt.current_value.is_empty() {
-                    return Some(opt.current_value.clone());
-                }
-            }
-        }
-        None
-    }
-
-    /// Display name for a config option by category (e.g. "mode").
-    /// Used when session_modes is empty but config_options has the category (e.g. claude-acp).
-    pub fn status_config_name(&self, category: &str) -> Option<String> {
-        for opt in &self.config_options {
-            if opt.category.as_deref() == Some(category) {
-                for v in &opt.options {
-                    if v.value == opt.current_value || v.name == opt.current_value {
-                        return Some(v.name.clone());
-                    }
-                }
-                if !opt.current_value.is_empty() {
-                    return Some(opt.current_value.clone());
-                }
-            }
-        }
-        None
-    }
-
-    /// Look up mode display name by id in config_options (for agents like claude-acp that use
-    /// config_options category "mode" instead of session_modes).
-    fn mode_name_for_id(&self, mode_id: &str) -> Option<String> {
-        for opt in &self.config_options {
-            if opt.category.as_deref() == Some("mode") {
-                for v in &opt.options {
-                    if v.value == mode_id {
-                        return Some(v.name.clone());
-                    }
-                }
-            }
-        }
-        None
-    }
-
-    /// Returns the display name of the current session mode.
-    /// Uses session_modes when available (e.g. Codex), else config_options with category "mode"
-    /// (e.g. claude-acp which sends mode in config_options, not session_modes).
-    pub fn current_mode_name(&self) -> Option<String> {
-        if let Some(mode_id) = &self.current_mode_id {
-            if let Some(mode) = self.session_modes.iter().find(|m| m.id == *mode_id) {
-                return Some(mode.name.clone());
-            }
-            if let Some(name) = self.mode_name_for_id(mode_id) {
-                return Some(name);
-            }
-        }
-        self.status_config_name("mode")
-    }
-
-    pub fn config_options(&self) -> &[helix_acp::types::ConfigOption] {
-        &self.config_options
-    }
-
-    /// Cycle to the next value for a config option by category.
-    /// Returns (config_id, next_value_id, prev_value_id) or None if category not found or no options.
-    pub fn cycle_config_option(&self, category: &str) -> Option<(String, String, String)> {
-        for opt in &self.config_options {
-            if opt.category.as_deref() != Some(category) || opt.options.is_empty() {
-                continue;
-            }
-            let prev_value = opt.current_value.clone();
-            let current_idx = opt
-                .options
-                .iter()
-                .position(|v| v.value == opt.current_value)
-                .unwrap_or(0);
-            let next_idx = (current_idx + 1) % opt.options.len();
-            let next_value = opt.options[next_idx].value.clone();
-            return Some((opt.id.clone(), next_value, prev_value));
-        }
-        None
-    }
-
-    /// Optimistically update config_options so the UI reflects the new value immediately.
-    /// The agent will send config_option_update to confirm; this avoids waiting for the round-trip.
-    pub fn apply_config_option_cycle(&mut self, category: &str, next_value: String) {
-        for opt in &mut self.config_options {
-            if opt.category.as_deref() == Some(category) {
-                opt.current_value = next_value.clone();
-                if category == "mode" {
-                    self.current_mode_id = Some(next_value);
-                }
-                break;
-            }
-        }
-    }
-
-    pub fn session_modes(&self) -> &[helix_acp::types::SessionMode] {
-        &self.session_modes
-    }
-
-    pub fn push_entry(&mut self, entry: ChatEntry) {
-        if matches!(entry, ChatEntry::UserMessage(_)) {
-            self.plan_items = None;
-        }
-        self.output.content_mut().push(entry);
-        self.output.scroll_to_end();
-        self.message_cursor = MessageCursor::default();
-        self.expanded_message = None;
-        self.collapsed_messages.clear();
-        self.opened_message_docs.clear();
-        self.focus_target = FocusTarget::Input;
-    }
-
     fn collapse_preview(text: &str, width: usize) -> String {
-        let compact = text
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ");
+        let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
         let max = width.max(4);
         if compact.chars().count() <= max {
             return compact;
@@ -614,110 +498,72 @@ impl AcpPanel {
         preview
     }
 
-    /// Append text to the last AgentText entry, or create one.
-    pub fn append_agent_text(&mut self, text: &str) {
-        if let Some(ChatEntry::AgentText(ref mut existing)) = self.output.content_mut().last_mut() {
-            existing.push_str(text);
-        } else {
-            self.output
-                .content_mut()
-                .push(ChatEntry::AgentText(text.to_string()));
-        }
-        self.output.scroll_to_end();
-    }
-
-    /// Add or update a tool call by id. Format: name (e.g. read_file), path on newline, status only.
-    /// When name is None, only updates existing (by id).
-    pub fn update_tool_call(
-        &mut self,
-        id: &str,
-        name: Option<&str>,
-        path: Option<&str>,
-        status: &str,
+    fn apply_assistant_effects(
+        editor: &mut Editor,
+        effects: Vec<helix_view::assistant::effect::Effect>,
     ) {
-        for entry in self.output.content_mut().iter_mut().rev() {
-            if let ChatEntry::ToolCall {
-                id: ref existing_id,
-                status: ref mut existing_status,
-                path: ref mut existing_path,
-                ..
-            } = entry
-            {
-                if existing_id == id {
-                    *existing_status = status.to_string();
-                    if let Some(p) = path {
-                        *existing_path = Some(p.to_string());
-                    }
-                    return;
-                }
-            }
-        }
-        if let Some(n) = name {
-            self.output.content_mut().push(ChatEntry::ToolCall {
-                id: id.to_string(),
-                name: n.to_string(),
-                path: path.map(|s| s.to_string()),
-                status: status.to_string(),
-            });
-            self.output.scroll_to_end();
+        editor.apply_assistant_effects(effects);
+    }
+
+    fn set_draft(&mut self, editor: &mut Editor, text: String) {
+        if let Some(effects) = editor.set_active_assistant_draft_if_changed(text) {
+            Self::apply_assistant_effects(editor, effects);
         }
     }
 
-    /// Set plan items (shown in dedicated area above input, not in chat).
-    pub fn update_plan(&mut self, items: Vec<PlanItem>) {
-        self.plan_items = Some(items);
+    fn sync_draft_to_assistant(&mut self, editor: &mut Editor) {
+        let text = self
+            .input
+            .document(editor)
+            .map(|doc| doc.text().to_string())
+            .unwrap_or_default();
+        self.set_draft(editor, text);
     }
 
-    /// Clear the plan area so it disappears from the UI.
-    pub fn clear_plan(&mut self) {
-        self.plan_items = None;
-    }
+    fn sync_input_from_assistant(&mut self, editor: &mut Editor, draft: &str) {
+        let Some(doc) = self.input.document_mut(editor) else {
+            return;
+        };
 
-    /// Enqueue a follow-up message to send after the current turn finishes.
-    pub fn enqueue_message(&mut self, msg: String) {
-        self.message_queue.push(msg);
-    }
+        if doc.text().to_string() == draft {
+            return;
+        }
 
-    /// Take the next queued message, if any.
-    pub fn dequeue_message(&mut self) -> Option<String> {
-        if self.message_queue.is_empty() {
+        let len = doc.text().len_chars();
+        let replacement = if draft.is_empty() {
             None
         } else {
-            Some(self.message_queue.remove(0))
-        }
-    }
-
-    pub fn queue_len(&self) -> usize {
-        self.message_queue.len()
-    }
-
-    pub fn clear_queue(&mut self) {
-        self.message_queue.clear();
+            Some(helix_core::Tendril::from(draft))
+        };
+        let transaction =
+            helix_core::Transaction::change(doc.text(), [(0, len, replacement)].into_iter());
+        doc.apply(&transaction, self.input.view_id());
+        doc.set_selection(
+            self.input.view_id(),
+            helix_core::Selection::point(doc.text().len_chars()),
+        );
     }
 
     /// Sync panel state to the shared `Model.panels` entry. Called during render
-    /// so any frontend can read the ACP panel's current state.
+    /// so any frontend can read the assistant panel's current state.
     fn sync_to_model(&mut self, editor: &mut Editor) {
-        use helix_view::model::{
-            AcpChatEntry as UiEntry, AcpModel, AcpPlanItem as UiPlanItem,
-            AcpPlanStatus as UiPlanStatus, PanelSide, PanelSize,
-        };
+        use helix_view::model::{AssistantModel, PanelSide, PanelSize};
 
         // Lazily insert a model panel on first sync, or reclaim an orphaned one.
         let panel_id = match self.model_panel_id {
             Some(id) if editor.model.panels.contains_key(id) => id,
             _ => {
-                // Check for an orphaned AcpModel panel (e.g., from a replaced component).
+                // Check for an orphaned AssistantModel panel (e.g., from a replaced component).
                 let existing = editor
                     .model
                     .panels
                     .iter()
-                    .find(|(_, p)| p.content.as_any().is::<AcpModel>())
+                    .find(|(_, p)| p.content.as_any().is::<AssistantModel>())
                     .map(|(id, _)| id);
                 let id = existing.unwrap_or_else(|| {
                     editor.model.insert_panel(
                         "Agent",
-                        Box::new(AcpModel::default()),
+                        Box::new(AssistantModel::default()),
                         PanelSide::Right,
                         PanelSize::Percent(35),
                     )
@@ -727,70 +573,23 @@ impl AcpPanel {
             }
         };
 
-        let input_text = self
-            .input
-            .document(editor)
-            .map(|doc| doc.text().to_string())
-            .unwrap_or_default();
+        let mut snapshot = Self::assistant_model_with_focus(editor, self.focused);
 
-        let Some(model) = editor.model.panel_model_mut::<AcpModel>(panel_id) else {
+        let Some(model) = editor.model.panel_model_mut::<AssistantModel>(panel_id) else {
             return;
         };
 
-        // Map chat entries.
-        model.entries = self
-            .output
-            .content()
-            .iter()
-            .map(|e| match e {
-                ChatEntry::UserMessage(s) => UiEntry::UserMessage(s.clone()),
-                ChatEntry::AgentText(s) => UiEntry::AgentText(s.clone()),
-                ChatEntry::ToolCall {
-                    id,
-                    name,
-                    path,
-                    status,
-                } => UiEntry::ToolCall {
-                    id: id.clone(),
-                    name: name.clone(),
-                    path: path.clone(),
-                    status: status.clone(),
-                },
-                ChatEntry::Status(s) => UiEntry::Status(s.clone()),
-            })
-            .collect();
-
-        model.scroll = self
+        snapshot.viewport_scroll = self
             .output
             .max_scroll()
             .saturating_sub(self.output.scroll()) as u16;
-        model.max_scroll = self.output.max_scroll() as u16;
-        model.selected_entry = self.message_cursor.selected();
-        model.agent_name.clone_from(&self.agent_name);
-        model.agent_version.clone_from(&self.agent_version);
-        model.agent_busy = self.agent_busy;
-        model.focused = self.focused;
-        model.insert_mode = self.focused;
-        model.error = self.panel_error.clone();
-        model.input = input_text;
-        model.input_cursor = 0; // cursor position tracked by engine, not model
-        model.queued_messages = self.message_queue.len();
+        snapshot.viewport_max_scroll = self.output.max_scroll() as u16;
+        snapshot.focused = self.focused;
+        snapshot.insert_mode = self.focused && self.input.mode() == Mode::Insert;
+        snapshot.error = self.panel_error.clone();
+        snapshot.input_cursor = 0; // cursor position tracked by engine, not model
 
-        // Map plan items.
-        model.plan_items = self.plan_items.as_ref().map(|items| {
-            items
-                .iter()
-                .map(|p| UiPlanItem {
-                    content: p.content.clone(),
-                    status: match p.status {
-                        PlanStatus::Pending => UiPlanStatus::Pending,
-                        PlanStatus::InProgress => UiPlanStatus::InProgress,
-                        PlanStatus::Completed => UiPlanStatus::Completed,
-                        PlanStatus::Failed => UiPlanStatus::Failed,
-                    },
-                })
-                .collect()
-        });
+        *model = snapshot;
     }
 
     /// Remove this panel's entry from the shared Model. Call before dropping.
@@ -803,6 +602,7 @@ impl AcpPanel {
     /// Build renderable blocks from chat entries.
     fn build_blocks<'a>(
         &self,
+        editor: &Editor,
         theme: &helix_view::Theme,
         width: u16,
         corners: MessageCorners,
@@ -811,176 +611,153 @@ impl AcpPanel {
         let agent_style = theme.get("ui.text.info");
         let user_label_style = theme.get("keyword").add_modifier(Modifier::BOLD);
         let agent_label_style = theme
-            .try_get("ui.acp.agent.label")
+            .try_get("ui.assistant.agent.label")
             .unwrap_or_else(|| theme.get("ui.text.info").add_modifier(Modifier::BOLD));
         let user_text_style = theme.get("ui.text");
-        let tool_name_style = theme.get("ui.text.focus");
         let separator_style = theme.get("ui.statusline.separator");
         let heading_style = theme.get("markup.heading.1");
         let code_style = theme.get("markup.raw.inline");
         let bold_style = agent_style.add_modifier(Modifier::BOLD);
         let italic_style = agent_style.add_modifier(Modifier::ITALIC);
-        let status_dim_style = theme.get("ui.text.inactive");
-        let active_accent = self.current_message_accent(theme);
+        let active_accent = self.current_message_accent(editor, theme);
+        let model = Self::assistant_model(editor);
+        let agent_name = model.agent_name.as_str();
 
         // Flex width: min 60%, max 90% of panel — but never panic on tiny sizes.
         let max_bubble = ((width as u32 * 90 / 100) as u16).min(width).max(4);
         let min_bubble = ((width as u32 * 60 / 100) as u16).max(20).min(max_bubble);
 
         let mut blocks = Vec::new();
+        let selected = model.selected_entry_id();
 
-        for (index, entry) in self.output.content().iter().enumerate() {
-            let message_accent = if self.message_cursor.selected() == Some(index) {
+        for entry in self.output.content().iter() {
+            let entry_id = Some(entry.id);
+            let display = entry.display(agent_name);
+            let message_accent = if entry_id == selected {
                 active_accent
             } else {
                 None
             };
-            let selected = self.message_cursor.selected() == Some(index);
-            let expanded = self.expanded_message == Some(index);
-            let collapsed = self.collapsed_messages.contains(&index);
-            match entry {
-                ChatEntry::UserMessage(text) => {
+            let selected = entry_id == selected;
+            let collapsed = model.is_folded(entry.id);
+            match &display {
+                helix_view::model::AssistantEntryDisplay::Bubble(display) => {
                     let bubble_w =
-                        fit_bubble_width(text, min_bubble as usize, max_bubble as usize) as u16;
+                        fit_bubble_width(&display.text, min_bubble as usize, max_bubble as usize)
+                            as u16;
                     let inner_w = bubble_w.saturating_sub(4) as usize;
-                    let wrapped = if collapsed {
-                        vec![Self::collapse_preview(text, inner_w)]
-                    } else {
-                        wrap_text(text, inner_w)
+                    let (label_style, content_lines) = match display.format {
+                        helix_view::model::AssistantTextFormat::Plain => {
+                            let wrapped = if collapsed {
+                                vec![Self::collapse_preview(&display.text, inner_w)]
+                            } else {
+                                wrap_text(&display.text, inner_w)
+                            };
+                            let lines = wrapped
+                                .iter()
+                                .map(|wl| Spans::from(Span::styled(wl.clone(), user_text_style)))
+                                .collect();
+                            (user_label_style, lines)
+                        }
+                        helix_view::model::AssistantTextFormat::Markdown => {
+                            let mut md_lines: Vec<Spans> = Vec::new();
+                            if collapsed {
+                                md_lines.push(Spans::from(Span::styled(
+                                    Self::collapse_preview(&display.text, inner_w),
+                                    agent_style,
+                                )));
+                            } else {
+                                render_markdown_lines(
+                                    &display.text,
+                                    &mut md_lines,
+                                    agent_style,
+                                    &MarkdownLineStyles {
+                                        heading: heading_style,
+                                        code: code_style,
+                                        bold: bold_style,
+                                        italic: italic_style,
+                                        separator: separator_style,
+                                    },
+                                );
+                            }
+
+                            let mut lines: Vec<Spans> = Vec::new();
+                            for md_line in md_lines {
+                                let line_text: String =
+                                    md_line.0.iter().map(|s| s.content.as_ref()).collect();
+                                if line_text.len() <= inner_w {
+                                    lines.push(md_line);
+                                } else {
+                                    let wrapped = wrap_text(&line_text, inner_w);
+                                    let style =
+                                        md_line.0.first().map(|s| s.style).unwrap_or(agent_style);
+                                    for wl in &wrapped {
+                                        lines.push(Spans::from(Span::styled(wl.clone(), style)));
+                                    }
+                                }
+                            }
+                            (agent_label_style, lines)
+                        }
                     };
-                    let content_lines: Vec<Spans> = wrapped
-                        .iter()
-                        .map(|wl| {
-                            Spans::from(Span::styled(
-                                wl.clone(),
-                                user_text_style,
-                            ))
-                        })
-                        .collect();
                     let mut message = Message::bubble(
-                        Some((" you".to_string(), user_label_style)),
+                        Some((display.meta.heading.clone(), label_style)),
                         content_lines,
                         bubble_w,
-                        MessageAlign::Right,
+                        Self::bubble_message_align(display.meta.side),
                         MessageStyle {
                             border: border_style,
                             corners,
                             accent: message_accent.map(|(style, _)| style),
-                            accent_progress: message_accent.map(|(_, progress)| progress).unwrap_or(0.0),
+                            accent_progress: message_accent
+                                .map(|(_, progress)| progress)
+                                .unwrap_or(0.0),
                         },
                     );
-                    if expanded {
-                        message = message.with_details(self.expanded_details(entry, theme));
-                    }
-                    if selected {
-                        let (lines, align) = Self::action_hints(theme, MessageAccessoryAlign::Right);
-                        message = message.with_selected_accessory(lines, align);
-                    }
+                    message = Self::decorate_selected_message(
+                        message,
+                        selected,
+                        theme,
+                        Self::bubble_accessory_align(display.meta.side),
+                    );
                     blocks.push(message);
                 }
-                ChatEntry::AgentText(text) => {
-                    let bubble_w =
-                        fit_bubble_width(text, min_bubble as usize, max_bubble as usize) as u16;
-                    let inner_w = bubble_w.saturating_sub(4) as usize;
-
-                    // Render markdown then re-wrap into bubble-sized lines.
-                    let mut md_lines: Vec<Spans> = Vec::new();
-                    if collapsed {
-                        md_lines.push(Spans::from(Span::styled(
-                            Self::collapse_preview(text, inner_w),
-                            agent_style,
-                        )));
+                helix_view::model::AssistantEntryDisplay::Plain(row) => {
+                    let icon = if row.animate_leading {
+                        format!(" {} ", self.spinner.frame())
                     } else {
-                        render_markdown_lines(
-                            text,
-                            &mut md_lines,
-                            agent_style,
-                            &MarkdownLineStyles {
-                                heading: heading_style,
-                                code: code_style,
-                                bold: bold_style,
-                                italic: italic_style,
-                                separator: separator_style,
-                            },
+                        row.leading.clone()
+                    };
+                    let lines = if row.leading.is_empty() {
+                        vec![Spans::from(Span::styled(
+                            row.body.clone(),
+                            Self::entry_tone_style(theme, row.body_tone),
+                        ))]
+                    } else {
+                        vec![Spans::from(vec![
+                            Span::styled(icon, Self::entry_tone_style(theme, row.leading_tone)),
+                            Span::styled(
+                                row.body.clone(),
+                                Self::entry_tone_style(theme, row.body_tone),
+                            ),
+                        ])]
+                    };
+                    let mut message = Message::plain(lines);
+                    if let Some(accessory) = &row.accessory {
+                        message = message.with_accessory(
+                            vec![Spans::from(Span::styled(
+                                accessory.clone(),
+                                Self::entry_tone_style(theme, row.accessory_tone),
+                            ))],
+                            Self::plain_accessory_align(),
                         );
                     }
-
-                    // Re-wrap markdown lines to fit inside the bubble.
-                    let mut content_lines: Vec<Spans> = Vec::new();
-                    for md_line in md_lines {
-                        let line_text: String =
-                            md_line.0.iter().map(|s| s.content.as_ref()).collect();
-                        if line_text.len() <= inner_w {
-                            content_lines.push(md_line);
-                        } else {
-                            let wrapped = wrap_text(&line_text, inner_w);
-                            let style = md_line
-                                .0
-                                .first()
-                                .map(|s| s.style)
-                                .unwrap_or(agent_style);
-                            for wl in &wrapped {
-                                content_lines.push(Spans::from(Span::styled(wl.clone(), style)));
-                            }
-                        }
-                    }
-
-                    let mut message = Message::bubble(
-                        Some((format!(" {}", self.agent_name), agent_label_style)),
-                        content_lines,
-                        bubble_w,
-                        MessageAlign::Left,
-                        MessageStyle {
-                            border: border_style,
-                            corners,
-                            accent: message_accent.map(|(style, _)| style),
-                            accent_progress: message_accent.map(|(_, progress)| progress).unwrap_or(0.0),
-                        },
+                    message = self.decorate_selected_plain_message(
+                        message,
+                        selected,
+                        entry,
+                        theme,
+                        &agent_name,
                     );
-                    if expanded {
-                        message = message.with_details(self.expanded_details(entry, theme));
-                    }
-                    if selected {
-                        let (lines, align) = Self::action_hints(theme, MessageAccessoryAlign::Left);
-                        message = message.with_selected_accessory(lines, align);
-                    }
-                    blocks.push(message);
-                }
-                ChatEntry::ToolCall { name, status, .. } => {
-                    let icon = self.status_icon(status);
-                    let (tool_icon_style, tool_status_style) = Self::status_style(theme, status);
-                    let lines = vec![Spans::from(vec![
-                        Span::styled(format!(" {icon} "), tool_icon_style),
-                        Span::styled(name.clone(), tool_name_style),
-                    ])];
-                    let mut message = Message::plain(lines).with_accessory(
-                        vec![Spans::from(Span::styled(
-                            format!(" {status}"),
-                            tool_status_style,
-                        ))],
-                        MessageAccessoryAlign::Right,
-                    );
-                    if expanded {
-                        message = message.with_details(self.expanded_details(entry, theme));
-                    }
-                    if selected {
-                        let (lines, align) = Self::action_hints(theme, MessageAccessoryAlign::Right);
-                        message = message.with_selected_accessory(lines, align);
-                    }
-                    blocks.push(message);
-                }
-                ChatEntry::Status(text) => {
-                    let mut message = Message::plain(vec![Spans::from(Span::styled(
-                            format!(" {text}"),
-                            status_dim_style,
-                        ))]);
-                    if expanded {
-                        message = message.with_details(self.expanded_details(entry, theme));
-                    }
-                    if selected {
-                        let (lines, align) = Self::action_hints(theme, MessageAccessoryAlign::Right);
-                        message = message.with_selected_accessory(lines, align);
-                    }
                     blocks.push(message);
                 }
             }
@@ -990,215 +767,189 @@ impl AcpPanel {
     }
 
     /// Render chat blocks directly to the surface with proper scroll.
-    fn render_content(&mut self, blocks: &[Message], area: Rect, surface: &mut Surface) {
+    fn render_content(
+        &mut self,
+        editor: &Editor,
+        blocks: &[Message],
+        area: Rect,
+        surface: &mut Surface,
+    ) {
         if area.height == 0 || area.width == 0 {
             self.chat_layout = MessageListState::default();
             return;
         }
 
-        self.message_cursor = MessageCursor::new(
-            self.message_cursor.selected(),
-            Scrollable::scroll(&self.output),
-        );
-        self.chat_layout = message_list(
-            surface,
-            area,
-            blocks,
-            self.message_cursor.scroll(),
-            self.message_cursor.selected(),
-        );
-        let scroll = self.message_cursor.scroll();
-        self.message_cursor.clamp_selection(&self.chat_layout);
-        self.output.scroll_to(scroll);
-        self.output.set_content_height(self.chat_layout.total_height);
+        let cursor = self.navigation_cursor(editor);
+        self.chat_layout = message_list(surface, area, blocks, cursor.scroll(), cursor.selected());
+        let mut cursor = cursor;
+        cursor.clamp_selection(&self.chat_layout);
+        self.output.scroll_to(cursor.scroll());
+        self.output
+            .set_content_height(self.chat_layout.total_height);
     }
 
-    pub fn selected_message(&self) -> Option<usize> {
-        self.message_cursor.selected()
+    pub fn selected_message(&self, editor: &Editor) -> Option<usize> {
+        self.selected_index(editor)
     }
 
-    pub fn clear_message_selection(&mut self) {
-        self.message_cursor.select(None);
-        self.focus_target = FocusTarget::Input;
+    pub fn clear_message_selection(&mut self, editor: &mut Editor) {
+        self.set_selected_entry(editor, None, false);
+        self.set_focus(editor, helix_view::assistant::thread::Focus::Input);
         self.message_focus_animation.stop();
     }
 
-    pub fn select_message(&mut self, index: Option<usize>) -> Option<usize> {
+    pub fn select_message(&mut self, editor: &mut Editor, index: Option<usize>) -> Option<usize> {
         let viewport_height = self.output.area().height as usize;
-        let selected = self.set_message_selection(index, true);
-        if let Some(index) = selected {
+        let entry = index.and_then(|index| self.entry_id_at(editor, index));
+        let selected = self.set_selected_entry(editor, entry, true);
+        if let Some(index) = selected.and_then(|entry| {
+            self.output
+                .content()
+                .iter()
+                .position(|item| item.id == entry)
+        }) {
+            let cursor = MessageCursor::new(Some(index), self.navigation_state(editor).scroll);
             let scroll = self
                 .chat_layout
-                .scroll_to_item(index, self.message_cursor.scroll(), viewport_height);
-            self.message_cursor = MessageCursor::new(selected, scroll);
-            self.output.scroll_to(scroll);
+                .scroll_to_item(index, cursor.scroll(), viewport_height);
+            self.set_content_scroll(editor, scroll);
         }
-        selected
+        self.selected_index(editor)
     }
 
-    pub fn select_prev_message(&mut self) -> Option<usize> {
-        let selected = self
-            .message_cursor
-            .move_prev(&self.chat_layout, self.output.area().height as usize);
+    pub fn select_prev_message(&mut self, editor: &mut Editor) -> Option<usize> {
+        let mut cursor = self.navigation_cursor(editor);
+        let selected = cursor.move_prev(&self.chat_layout, self.output.area().height as usize);
         if selected.is_some() {
-            self.focus_target = FocusTarget::Messages;
-            self.output.scroll_to(self.message_cursor.scroll());
-            self.restart_message_focus_animation();
+            self.set_content_scroll(editor, cursor.scroll());
+            self.set_selected_entry(
+                editor,
+                selected.and_then(|index| self.entry_id_at(editor, index)),
+                true,
+            );
         }
         selected
     }
 
-    pub fn select_next_message(&mut self) -> Option<usize> {
-        let selected = self
-            .message_cursor
-            .move_next(&self.chat_layout, self.output.area().height as usize);
+    pub fn select_next_message(&mut self, editor: &mut Editor) -> Option<usize> {
+        let mut cursor = self.navigation_cursor(editor);
+        let selected = cursor.move_next(&self.chat_layout, self.output.area().height as usize);
         if selected.is_some() {
-            self.focus_target = FocusTarget::Messages;
-            self.output.scroll_to(self.message_cursor.scroll());
-            self.restart_message_focus_animation();
+            self.set_content_scroll(editor, cursor.scroll());
+            self.set_selected_entry(
+                editor,
+                selected.and_then(|index| self.entry_id_at(editor, index)),
+                true,
+            );
         }
         selected
     }
 
-    pub fn select_message_at_offset(&mut self, offset: usize) -> Option<usize> {
-        self.select_message(self.chat_layout.item_at_offset(offset))
+    pub fn select_message_at_offset(
+        &mut self,
+        editor: &mut Editor,
+        offset: usize,
+    ) -> Option<usize> {
+        self.select_message(editor, self.chat_layout.item_at_offset(offset))
     }
 
-    pub fn select_first_message(&mut self) -> Option<usize> {
-        self.select_message(if self.chat_layout.is_empty() { None } else { Some(0) })
+    pub fn select_first_message(&mut self, editor: &mut Editor) -> Option<usize> {
+        self.select_message(
+            editor,
+            if self.chat_layout.is_empty() {
+                None
+            } else {
+                Some(0)
+            },
+        )
     }
 
-    pub fn select_last_message(&mut self) -> Option<usize> {
-        self.select_message(self.chat_layout.len().checked_sub(1))
+    pub fn select_last_message(&mut self, editor: &mut Editor) -> Option<usize> {
+        self.select_message(editor, self.chat_layout.len().checked_sub(1))
     }
 
-    pub fn select_prev_message_page(&mut self) -> Option<usize> {
-        let selected = self
-            .message_cursor
-            .move_prev_page(&self.chat_layout, self.output.area().height as usize);
+    pub fn select_prev_message_page(&mut self, editor: &mut Editor) -> Option<usize> {
+        let mut cursor = self.navigation_cursor(editor);
+        let selected = cursor.move_prev_page(&self.chat_layout, self.output.area().height as usize);
         if selected.is_some() {
-            self.focus_target = FocusTarget::Messages;
-            self.output.scroll_to(self.message_cursor.scroll());
-            self.restart_message_focus_animation();
+            self.set_content_scroll(editor, cursor.scroll());
+            self.set_selected_entry(
+                editor,
+                selected.and_then(|index| self.entry_id_at(editor, index)),
+                true,
+            );
         }
         selected
     }
 
-    pub fn select_next_message_page(&mut self) -> Option<usize> {
-        let selected = self
-            .message_cursor
-            .move_next_page(&self.chat_layout, self.output.area().height as usize);
+    pub fn select_next_message_page(&mut self, editor: &mut Editor) -> Option<usize> {
+        let mut cursor = self.navigation_cursor(editor);
+        let selected = cursor.move_next_page(&self.chat_layout, self.output.area().height as usize);
         if selected.is_some() {
-            self.focus_target = FocusTarget::Messages;
-            self.output.scroll_to(self.message_cursor.scroll());
+            self.set_content_scroll(editor, cursor.scroll());
+            self.set_selected_entry(
+                editor,
+                selected.and_then(|index| self.entry_id_at(editor, index)),
+                true,
+            );
         }
         selected
     }
 
-    pub fn selected_entry_ref(&self) -> Option<&ChatEntry> {
-        let index = self.message_cursor.selected()?;
+    pub fn selected_entry_ref(&self, editor: &Editor) -> Option<&ChatEntry> {
+        let index = self.selected_index(editor)?;
         self.output.content().get(index)
     }
 
-    pub fn selected_message_details(&self) -> Option<String> {
-        let entry = self.selected_entry_ref()?;
-        Some(match entry {
-            ChatEntry::UserMessage(text) => format!("# User Message\n\n{text}\n"),
-            ChatEntry::AgentText(text) => format!("# Agent Message\n\n{text}\n"),
-            ChatEntry::ToolCall {
-                id,
-                name,
-                path,
-                status,
-            } => {
-                let mut body = format!("# Tool Call\n\n- id: {id}\n- name: {name}\n- status: {status}\n");
-                if let Some(path) = path {
-                    body.push_str(&format!("- path: {path}\n"));
-                }
-                body
-            }
-            ChatEntry::Status(text) => format!("# Status\n\n{text}\n"),
-        })
+    pub fn selected_message_details(&self, editor: &Editor) -> Option<String> {
+        let entry = Self::assistant_model(editor).selected_entry_id()?;
+        editor.assistant_entry_details(entry)
     }
 
     pub fn open_selected_message_details(&mut self, editor: &mut Editor, action: Action) -> bool {
-        let Some(index) = self.message_cursor.selected() else {
-            log::warn!("[acp_scratch] open requested without selected message");
+        let model = Self::assistant_model(editor);
+        let Some(entry) = model.selected_entry_id() else {
+            log::warn!("[assistant_scratch] open requested without selected message");
             return false;
         };
-        let Some(details) = self.selected_message_details() else {
-            log::warn!("[acp_scratch] open requested for index={} without details", index);
+        let index = self.selected_index(editor).unwrap_or_default();
+        let Some(details) = self.selected_message_details(editor) else {
+            log::warn!(
+                "[assistant_scratch] open requested for entry={:?} without details",
+                entry
+            );
             return false;
         };
 
         log::warn!(
-            "[acp_scratch] open index={} action={:?} existing_doc={:?} details_len={}",
+            "[assistant_scratch] open entry={:?} index={} action={:?} existing_doc={:?} details_len={}",
+            entry,
             index,
             action,
-            self.opened_message_docs.get(&index),
+            model.opened_doc(entry),
             details.len()
         );
 
-        if let Some(doc_id) = self.opened_message_docs.get(&index).copied() {
-            if editor.documents.contains_key(&doc_id) {
-                log::warn!(
-                    "[acp_scratch] reusing existing doc index={} doc_id={:?}",
-                    index,
-                    doc_id
-                );
-                editor.switch(doc_id, Action::Replace);
-                self.set_focused(false);
-                self.message_focus_animation.stop();
-                log::warn!(
-                    "[acp_ui] released panel focus after reusing scratch index={} focused={} focus_target={:?}",
-                    index,
-                    self.focused,
-                    self.focus_target
-                );
-                return true;
-            }
-            log::warn!(
-                "[acp_scratch] dropping stale tracked doc index={} doc_id={:?}",
-                index,
-                doc_id
-            );
-            self.opened_message_docs.remove(&index);
-        }
-
-        let doc = Document::from(
-            details.into(),
-            None,
-            editor.config.clone(),
-            editor.syn_loader.clone(),
-        )
-        .with_persistent_scratch();
-        let mut doc = doc;
-        let _ = doc.set_language_by_language_id("markdown", &editor.syn_loader.load());
-        let doc_id = editor.new_file_from_document(action, doc);
-        if let Some(doc) = editor.documents.get(&doc_id) {
-            log::warn!(
-                "[acp_scratch] created doc index={} doc_id={:?} path={:?} modified={} persistent={} lang={:?}",
-                index,
-                doc_id,
-                doc.path(),
-                doc.is_modified(),
-                doc.is_persistent_scratch(),
-                doc.language_name()
-            );
-        }
-        self.opened_message_docs.insert(index, doc_id);
+        let Some(thread) = model.active_thread else {
+            return false;
+        };
+        let Some(effects) = editor.open_assistant_entry_scratch(thread, entry, action) else {
+            return false;
+        };
+        Self::apply_assistant_effects(editor, effects);
         self.set_focused(false);
         self.message_focus_animation.stop();
         log::warn!(
-            "[acp_ui] released panel focus after creating scratch index={} focused={} focus_target={:?}",
+            "[assistant_ui] released panel focus after opening scratch entry={:?} index={} focused={} focus={:?}",
+            entry,
             index,
             self.focused,
-            self.focus_target
+            model.focus()
         );
         true
     }
 
-    fn handle_mouse_event(&mut self, event: &MouseEvent) -> EventResult {
+    fn handle_mouse_event(&mut self, event: &MouseEvent, editor: &mut Editor) -> EventResult {
         let MouseEvent {
             kind,
             column: x,
@@ -1222,25 +973,24 @@ impl AcpPanel {
                 let row_offset = y.saturating_sub(output_area.y) as usize;
                 let offset = Scrollable::scroll(&self.output) + row_offset;
                 let selected = self.chat_layout.item_at_offset(offset);
-                let same_selection = selected == self.message_cursor.selected();
+                let same_selection = selected == self.selected_index(editor);
                 log::warn!(
-                    "[acp_ui] output click row_offset={} offset={} selected={:?} same_selection={} tracked_docs={}",
+                    "[assistant_ui] output click row_offset={} offset={} selected={:?} same_selection={}",
                     row_offset,
                     offset,
                     selected,
-                    same_selection,
-                    self.opened_message_docs.len()
+                    same_selection
                 );
                 if same_selection {
-                    self.focus_messages_without_animation();
+                    self.focus_messages_without_animation(editor);
                 } else {
-                    self.focus_messages();
+                    self.focus_messages(editor);
                 }
-                self.set_message_selection(selected, !same_selection);
+                self.select_message(editor, selected);
                 EventResult::Consumed(None)
             }
             MouseEventKind::Down(MouseButton::Left) if in_input => {
-                self.activate_input();
+                self.activate_input(editor);
                 if self.input.mode() != Mode::Insert {
                     self.input.enter_insert_mode("insert_mode".into());
                 }
@@ -1250,78 +1000,17 @@ impl AcpPanel {
         }
     }
 
-    /// Send a prompt to the first connected agent. Returns true if sent.
-    fn send_prompt(text: String, cx: &mut Context) -> bool {
-        let agent = cx.editor.acp_agents.iter().next().map(|(_, a)| a.clone());
-
-        let Some(agent) = agent else {
-            cx.editor
-                .set_error("No ACP agents connected. Use :acp-connect first.");
-            return false;
-        };
-
-        let prompt = vec![helix_acp::ContentBlock::from(text)];
-        let callback = async move {
-            let result = async {
-                let session_id = match agent.session_id().await {
-                    Some(id) => id,
-                    None => {
-                        let cwd = std::env::current_dir().unwrap_or_default();
-                        let session = agent.new_session(cwd).await?;
-                        session.session_id
-                    }
-                };
-                agent.prompt(session_id, prompt).await
+    /// Send a prompt through the assistant store/backend flow. Returns true if sent.
+    fn submit_prompt(text: String, cx: &mut Context) -> bool {
+        let effects = match cx.editor.submit_active_assistant_prompt(text) {
+            Ok(effects) => effects,
+            Err(err) => {
+                cx.editor
+                    .set_error(format!("{err}. Use :assistant-connect first."));
+                return false;
             }
-            .await;
-
-            let cb: crate::job::Callback = match result {
-                Ok(response) => {
-                    let msg = format!(
-                        "Done ({})",
-                        match response.stop_reason {
-                            helix_acp::types::StopReason::EndTurn => "completed",
-                            helix_acp::types::StopReason::Cancelled => "cancelled",
-                            helix_acp::types::StopReason::MaxTokens => "max tokens",
-                            helix_acp::types::StopReason::MaxTurnRequests => "max turns",
-                            helix_acp::types::StopReason::Refusal => "refused",
-                        }
-                    );
-                    crate::job::Callback::EditorCompositor(Box::new(
-                        move |editor: &mut Editor, compositor| {
-                            editor.set_status(msg);
-                            if let Some(panel) = compositor.find_id::<AcpPanel>(ID) {
-                                panel.set_busy(false);
-                                panel.set_panel_error(None);
-                                if let Some(next_msg) = panel.dequeue_message() {
-                                    let agent =
-                                        editor.acp_agents.iter().next().map(|(_, a)| a.clone());
-                                    if let Some(agent) = agent {
-                                        panel.push_entry(ChatEntry::UserMessage(next_msg.clone()));
-                                        panel.set_busy(true);
-                                        dispatch_queued_prompt(agent, next_msg);
-                                    }
-                                }
-                            }
-                        },
-                    ))
-                }
-                Err(e) => {
-                    let err_msg = format!("{e}");
-                    crate::job::Callback::EditorCompositor(Box::new(
-                        move |_editor: &mut Editor, compositor| {
-                            if let Some(panel) = compositor.find_id::<AcpPanel>(ID) {
-                                panel.set_panel_error(Some(err_msg));
-                                panel.set_busy(false);
-                            }
-                        },
-                    ))
-                }
-            };
-            Ok(cb)
         };
-
-        cx.jobs.callback(callback);
+        Self::apply_assistant_effects(cx.editor, effects);
         true
     }
 
@@ -1332,7 +1021,11 @@ impl AcpPanel {
         let Some(result) = self.input.dispatch_key(cx.editor, key) else {
             return true;
         };
-        self.handle_engine_result(result, cx)
+        let handled = self.handle_engine_result(result, cx);
+        if handled {
+            self.sync_draft_to_assistant(cx.editor);
+        }
+        handled
     }
 
     /// Handle the result of an engine dispatch in the input region.
@@ -1395,17 +1088,15 @@ impl AcpPanel {
         };
         if !text.is_empty() {
             self.panel_error = None;
-            if self.agent_busy {
-                self.push_entry(ChatEntry::Status(format!(
-                    "Queued: {}",
-                    text.chars().take(40).collect::<String>()
-                )));
-                self.enqueue_message(text);
-            } else {
-                self.push_entry(ChatEntry::UserMessage(text.clone()));
-                if Self::send_prompt(text, cx) {
-                    self.agent_busy = true;
-                }
+            if Self::assistant_model(cx.editor).agent_busy {
+                self.sync_draft_to_assistant(cx.editor);
+                cx.editor
+                    .set_status("Assistant is busy; wait for the current turn or cancel it.");
+                return;
+            }
+
+            if !Self::submit_prompt(text, cx) {
+                self.sync_draft_to_assistant(cx.editor);
             }
         }
     }
@@ -1423,109 +1114,21 @@ impl AcpPanel {
             return None;
         };
 
-        let Some((config_id, next_value, prev_value)) = self.cycle_config_option(category) else {
-            cx.editor
-                .set_status(format!("No {category} options from agent"));
-            return Some(EventResult::Consumed(None));
+        let result = if category == "mode" {
+            cx.editor.cycle_active_assistant_mode()
+        } else {
+            cx.editor.cycle_active_assistant_config(category)
         };
 
-        self.apply_config_option_cycle(category, next_value.clone());
-        let agent = cx.editor.acp_agents.iter().next().map(|(_, a)| a.clone());
-        if let Some(agent) = agent {
-            let cat = category.to_string();
-            cx.jobs.callback(async move {
-                let session_id = match agent.session_id().await {
-                    Some(id) => id,
-                    None => {
-                        let prev = prev_value.clone();
-                        let cat2 = cat.clone();
-                        return Ok(crate::job::Callback::EditorCompositor(Box::new(
-                            move |editor, compositor| {
-                                if let Some(panel) = compositor.find_id::<AcpPanel>(ID) {
-                                    panel.apply_config_option_cycle(&cat2, prev);
-                                }
-                                editor.set_error(format!("No session to update {cat}"));
-                            },
-                        )));
-                    }
-                };
-                match agent
-                    .set_session_config_option(session_id, config_id.clone(), next_value.clone())
-                    .await
-                {
-                    Ok(_) => Ok(crate::job::Callback::EditorCompositor(Box::new(|_, _| {}))),
-                    Err(e) => {
-                        let cat2 = cat.clone();
-                        Ok(crate::job::Callback::EditorCompositor(Box::new(
-                            move |editor, compositor| {
-                                if let Some(panel) = compositor.find_id::<AcpPanel>(ID) {
-                                    panel.apply_config_option_cycle(&cat2, prev_value);
-                                }
-                                editor.set_error(format!("Failed to set {cat}: {e}"));
-                            },
-                        )))
-                    }
-                }
-            });
+        match result {
+            Ok(effects) => {
+                Self::apply_assistant_effects(cx.editor, effects);
+                cx.editor.set_status(format!("Cycled {category}"));
+            }
+            Err(err) => cx.editor.set_status(err.to_string()),
         }
-        cx.editor.set_status(format!("Cycled {category}"));
         Some(EventResult::Consumed(None))
     }
-}
-
-/// Spawn an async task that sends a queued prompt and handles the completion.
-/// On completion, dispatches a callback to mark the panel idle and dequeue the next message.
-pub fn dispatch_queued_prompt(agent: std::sync::Arc<helix_acp::AcpAgent>, text: String) {
-    tokio::spawn(async move {
-        let session_id = match agent.session_id().await {
-            Some(id) => id,
-            None => return,
-        };
-        let prompt = vec![helix_acp::ContentBlock::from(text)];
-        let result = agent.prompt(session_id, prompt).await;
-        let cb = match result {
-            Ok(response) => {
-                let done_msg = format!(
-                    "Done ({})",
-                    match response.stop_reason {
-                        helix_acp::types::StopReason::EndTurn => "completed",
-                        helix_acp::types::StopReason::Cancelled => "cancelled",
-                        helix_acp::types::StopReason::MaxTokens => "max tokens",
-                        helix_acp::types::StopReason::MaxTurnRequests => "max turns",
-                        helix_acp::types::StopReason::Refusal => "refused",
-                    }
-                );
-                crate::job::Callback::EditorCompositor(Box::new(
-                    move |editor: &mut Editor, compositor| {
-                        editor.set_status(done_msg);
-                        if let Some(panel) = compositor.find_id::<AcpPanel>(ID) {
-                            panel.set_busy(false);
-                            if let Some(next_msg) = panel.dequeue_message() {
-                                let agent = editor.acp_agents.iter().next().map(|(_, a)| a.clone());
-                                if let Some(agent) = agent {
-                                    panel.push_entry(ChatEntry::UserMessage(next_msg.clone()));
-                                    panel.set_busy(true);
-                                    dispatch_queued_prompt(agent, next_msg);
-                                }
-                            }
-                        }
-                    },
-                ))
-            }
-            Err(e) => {
-                let err_msg = format!("{e}");
-                crate::job::Callback::EditorCompositor(Box::new(
-                    move |_editor: &mut Editor, compositor| {
-                        if let Some(panel) = compositor.find_id::<AcpPanel>(ID) {
-                            panel.set_panel_error(Some(err_msg));
-                            panel.set_busy(false);
-                        }
-                    },
-                ))
-            }
-        };
-        crate::job::dispatch_callback(cb).await;
-    });
 }
 
 // ---------------------------------------------------------------------------
@@ -1751,7 +1354,7 @@ fn parse_inline_markdown(
     spans
 }
 
-impl Focusable for AcpPanel {
+impl Focusable for AssistantPanel {
     fn is_focused(&self) -> bool {
         self.focused
     }
@@ -1764,7 +1367,7 @@ impl Focusable for AcpPanel {
     }
 }
 
-impl Bounded for AcpPanel {
+impl Bounded for AssistantPanel {
     fn area(&self) -> helix_view::graphics::Rect {
         self.output.area()
     }
@@ -1774,7 +1377,7 @@ impl Bounded for AcpPanel {
     }
 }
 
-impl Scrollable for AcpPanel {
+impl Scrollable for AssistantPanel {
     fn scroll(&self) -> usize {
         Scrollable::scroll(&self.output)
     }
@@ -1793,19 +1396,20 @@ impl Scrollable for AcpPanel {
 // Component impl
 // ---------------------------------------------------------------------------
 
-impl Component for AcpPanel {
+impl Component for AssistantPanel {
     fn sync(&mut self, editor: &mut Editor) {
         self.output.ensure_init(editor);
         self.input.ensure_init(editor);
         if self.focused {
             editor.focused_modal_input = self.input.input_state();
         }
+        self.sync_from_assistant(editor);
         self.sync_to_model(editor);
     }
 
     fn render(&mut self, area: Rect, surface: &mut Surface, cx: &RenderContext) {
         log::warn!(
-            "[acp_panel] render area=({},{} {}x{})",
+            "[assistant_panel] render area=({},{} {}x{})",
             area.x,
             area.y,
             area.width,
@@ -1824,19 +1428,25 @@ impl Component for AcpPanel {
 
         let error_rows = 1u16;
         let input_rows = 5u16; // 1 top border + 3 content + 1 bottom border
-        let plan_rows = self
-            .plan_items
+        let model = Self::assistant_model(cx.editor);
+        let plan = model.plan_section();
+        let context_items = &model.context_items;
+        let context_line = model.context_line();
+        let status_items = model.status_items();
+        let plan_rows = plan
             .as_ref()
-            .map(|p| (p.len() + 1).min(6) as u16)
+            .map(|section| (section.rows.len() + 1).min(6) as u16)
             .unwrap_or(0);
+        let context_rows = if context_items.is_empty() { 0 } else { 1 };
 
-        // Vertical layout: [header(1) | chat(fill) | plan | input | statusbar(1) | error(1)]
+        // Vertical layout: [header | chat | plan | context pills | input | status | error]
         let v_areas = split_vertical(
             inner,
             &[
-                Size::fixed(1),          // header
-                Size::Fill,              // chat content
-                Size::fixed(plan_rows),  // plan
+                Size::fixed(1),         // header
+                Size::Fill,             // chat content
+                Size::fixed(plan_rows), // plan
+                Size::fixed(context_rows),
                 Size::fixed(input_rows), // input
                 Size::fixed(1),          // status bar
                 Size::fixed(error_rows), // error line
@@ -1845,9 +1455,10 @@ impl Component for AcpPanel {
         let header_area = v_areas[0];
         let content_area_raw = v_areas[1];
         let plan_area = v_areas[2];
-        let input_area_raw = v_areas[3];
-        let bar_area = v_areas[4];
-        let error_area = v_areas[5];
+        let context_area = v_areas[3];
+        let input_area_raw = v_areas[4];
+        let bar_area = v_areas[5];
+        let error_area = v_areas[6];
 
         // Inset content/plan/input by 1px on each side for padding.
         let content_area = Rect::new(
@@ -1857,7 +1468,7 @@ impl Component for AcpPanel {
             content_area_raw.height,
         );
         {
-            let theme = cx.editor.acp_theme();
+            let theme = cx.editor.assistant_theme();
             let bg_style = theme.get("ui.background");
             surface.clear_with(inner, bg_style);
 
@@ -1871,65 +1482,50 @@ impl Component for AcpPanel {
                 theme.get("ui.statusline.inactive")
             };
             surface.set_style(header_area, header_style);
-            let dot_style = if self.agent_busy {
+            let header = model.header();
+            let agent_busy = model.agent_busy;
+            let dot_style = if agent_busy {
                 theme.get("warning")
             } else {
                 theme.get("hint")
             };
             surface.set_stringn(header_area.x + 1, header_area.y, "\u{25cf}", 1, dot_style);
-            surface.set_stringn(
-                header_area.x + 3,
-                header_area.y,
-                &self.agent_name,
-                header_area.width.saturating_sub(4) as usize,
-                header_style,
-            );
-            let (focus_label, focus_style) = self.focus_badge(theme);
-            let right_info = if self.agent_busy {
-                if !self.message_queue.is_empty() {
-                    format!("{focus_label}  {} queued ", self.message_queue.len())
-                } else {
-                    format!("{focus_label}  working ")
+            let trailing_width = header
+                .trailing
+                .iter()
+                .enumerate()
+                .map(|(index, item)| {
+                    UnicodeWidthStr::width(item.label.as_str()) + usize::from(index > 0) * 2
+                })
+                .sum::<usize>() as u16;
+            if !header.trailing.is_empty() {
+                let mut rx = header_area.x + header_area.width.saturating_sub(trailing_width);
+                for (index, item) in header.trailing.iter().enumerate() {
+                    if index > 0 {
+                        surface.set_stringn(rx, header_area.y, "  ", 2, header_style);
+                        rx += 2;
+                    }
+                    let style = Self::header_item_style(theme, header_style, item.tone);
+                    let width = UnicodeWidthStr::width(item.label.as_str());
+                    surface.set_stringn(rx, header_area.y, &item.label, width, style);
+                    rx += width as u16;
                 }
-            } else if !self.agent_version.is_empty() {
-                format!("{focus_label}  v{} ", self.agent_version)
+            }
+            let mut x = header_area.x + 3;
+            let right_edge = if header.trailing.is_empty() {
+                header_area.x + header_area.width
             } else {
-                focus_label.to_string()
+                header_area.x + header_area.width - trailing_width - 1
             };
-            if !right_info.is_empty() {
-                let right_style = if self.agent_busy {
-                    theme.get("warning")
-                } else {
-                    theme.get("ui.statusline.inactive")
-                };
-                let rx = header_area.x
-                    + header_area
-                        .width
-                        .saturating_sub(UnicodeWidthStr::width(right_info.as_str()) as u16);
-                if let Some((prefix, suffix)) = right_info.split_once("  ") {
-                    surface.set_stringn(
-                        rx,
-                        header_area.y,
-                        prefix,
-                        UnicodeWidthStr::width(prefix),
-                        focus_style,
-                    );
-                    surface.set_stringn(
-                        rx + UnicodeWidthStr::width(prefix) as u16 + 2,
-                        header_area.y,
-                        suffix,
-                        UnicodeWidthStr::width(suffix),
-                        right_style,
-                    );
-                } else {
-                    surface.set_stringn(
-                        rx,
-                        header_area.y,
-                        &right_info,
-                        UnicodeWidthStr::width(right_info.as_str()),
-                        focus_style,
-                    );
+            for item in &header.leading {
+                if x >= right_edge {
+                    break;
                 }
+                let style = Self::header_item_style(theme, header_style, item.tone);
+                let width = UnicodeWidthStr::width(item.label.as_str()) as u16;
+                let budget = right_edge.saturating_sub(x) as usize;
+                surface.set_stringn(x, header_area.y, &item.label, budget, style);
+                x = x.saturating_add(width.min(right_edge.saturating_sub(x)) + 1);
             }
             let bar_style = if self.focused {
                 theme.get("ui.statusline")
@@ -1939,38 +1535,34 @@ impl Component for AcpPanel {
             surface.set_style(bar_area, bar_style);
             // Bottom status: mode  model (gap between, no separator)
             let use_status_colors = cx.editor.config().color_modes;
-            let theme = cx.editor.acp_theme();
-            let get_style = |acp_scope: &str, statusline_fallback: &str| -> Style {
+            let theme = cx.editor.assistant_theme();
+            let get_style = |assistant_scope: &str, statusline_fallback: &str| -> Style {
                 if use_status_colors {
                     theme
-                        .try_get(acp_scope)
+                        .try_get(assistant_scope)
                         .unwrap_or_else(|| theme.get(statusline_fallback))
                 } else {
                     bar_style
                 }
             };
             let mut spans: Vec<Span> = Vec::new();
-            let append_span = |spans: &mut Vec<Span>, content: String, style: Style| {
-                spans.push(Span::styled(content, bar_style.patch(style)));
-            };
-            let mode_name = self.current_mode_name();
-            let model_name = self.status_model_display();
-            if let Some(ref v) = mode_name {
-                append_span(
-                    &mut spans,
-                    format!(" {v} "),
-                    get_style("ui.acp.mode", "ui.statusline.select"),
-                );
-            }
-            if mode_name.is_some() && model_name.is_some() {
-                append_span(&mut spans, "  ".to_string(), bar_style); // gap
-            }
-            if let Some(ref v) = model_name {
-                append_span(
-                    &mut spans,
-                    format!(" {v} "),
-                    get_style("ui.acp.model", "ui.statusline.normal"),
-                );
+            for (index, item) in status_items.iter().enumerate() {
+                if index > 0 {
+                    spans.push(Span::styled("  ".to_string(), bar_style));
+                }
+                let style = match item.kind {
+                    helix_view::model::AssistantStatusItemKind::Mode => {
+                        get_style("ui.assistant.mode", "ui.statusline.select")
+                    }
+                    helix_view::model::AssistantStatusItemKind::Model => {
+                        get_style("ui.assistant.model", "ui.statusline.normal")
+                    }
+                    helix_view::model::AssistantStatusItemKind::Follow => theme.get("ui.text.info"),
+                };
+                spans.push(Span::styled(
+                    format!(" {} ", item.label),
+                    bar_style.patch(style),
+                ));
             }
             if !spans.is_empty() {
                 let combined = Spans::from(spans);
@@ -1991,26 +1583,23 @@ impl Component for AcpPanel {
                 error_area.width.saturating_sub(2),
                 error_area.height,
             );
-            let error_style = cx.editor.acp_theme().get("error");
+            let error_style = cx.editor.assistant_theme().get("error");
             if let Some(when) = self.error_marquee.render(error_inset, surface, error_style) {
-                schedule_redraw_at(when);
+                schedule_redraw_at(cx.editor.runtime().work().clone(), when, cx.ingress.clone());
             }
         }
 
         // ── Plan area ──
         if plan_rows > 0 && plan_area.height > 0 {
-            let theme = cx.editor.acp_theme();
+            let theme = cx.editor.assistant_theme();
             let plan_done_style = theme.get("diff.plus");
             let plan_progress_style = theme.get("warning");
             let plan_pending_style = theme.get("ui.text.inactive");
             let plan_failed_style = theme.get("error");
             let tool_name_style = theme.get("ui.text.focus");
-            let items = self.plan_items.as_ref().unwrap();
-            let done = items
-                .iter()
-                .filter(|i| i.status == PlanStatus::Completed)
-                .count();
-            let total = items.len();
+            let section = plan.as_ref().unwrap();
+            let done = section.done;
+            let total = section.total;
             let plan_inset = Rect::new(
                 plan_area.x + 1,
                 plan_area.y,
@@ -2024,7 +1613,7 @@ impl Component for AcpPanel {
                 plan_inset.x,
                 plan_inset.y,
                 &Spans::from(vec![
-                    Span::styled("Plan ", tool_name_style),
+                    Span::styled(format!("{} ", section.title), tool_name_style),
                     Span::styled(
                         format!(
                             "\u{2590}{}{}\u{258c} {done}/{total}",
@@ -2036,12 +1625,12 @@ impl Component for AcpPanel {
                 ]),
                 plan_inset.width,
             );
-            for (i, item) in items.iter().take(5).enumerate() {
-                let (icon, style) = match item.status {
-                    PlanStatus::Completed => (" \u{25cf} ", plan_done_style),
-                    PlanStatus::InProgress => (" \u{25ce} ", plan_progress_style),
-                    PlanStatus::Failed => (" \u{2715} ", plan_failed_style),
-                    PlanStatus::Pending => (" \u{25cb} ", plan_pending_style),
+            for (i, item) in section.rows.iter().take(5).enumerate() {
+                let style = match item.tone {
+                    helix_view::model::AssistantPlanTone::Completed => plan_done_style,
+                    helix_view::model::AssistantPlanTone::InProgress => plan_progress_style,
+                    helix_view::model::AssistantPlanTone::Failed => plan_failed_style,
+                    helix_view::model::AssistantPlanTone::Pending => plan_pending_style,
                 };
                 let y = plan_inset.y + 1 + i as u16;
                 if y < plan_inset.bottom() {
@@ -2049,7 +1638,7 @@ impl Component for AcpPanel {
                         plan_inset.x,
                         y,
                         &Spans::from(vec![
-                            Span::styled(icon.to_string(), style),
+                            Span::styled(item.icon.to_string(), style),
                             Span::styled(item.content.clone(), style),
                         ]),
                         plan_inset.width,
@@ -2058,16 +1647,37 @@ impl Component for AcpPanel {
             }
         }
 
-        if self.has_running_activity() {
-            schedule_redraw_at(self.spinner.next_redraw());
+        if model.has_running_activity() {
+            schedule_redraw_at(
+                cx.editor.runtime().work().clone(),
+                self.spinner.next_redraw(),
+                cx.ingress.clone(),
+            );
         }
 
-        if let Some((_, progress)) = self.current_message_accent(cx.editor.acp_theme()) {
+        if let Some((_, progress)) =
+            self.current_message_accent(cx.editor, cx.editor.assistant_theme())
+        {
             if progress < 1.0 {
                 if let Some(when) = self.message_focus_animation.sample().next_redraw {
-                    schedule_redraw_at(when);
+                    schedule_redraw_at(
+                        cx.editor.runtime().work().clone(),
+                        when,
+                        cx.ingress.clone(),
+                    );
                 }
             }
+        }
+
+        if context_rows > 0 && context_area.height > 0 {
+            let style = cx.editor.assistant_theme().get("ui.text.info");
+            surface.set_stringn(
+                context_area.x + 1,
+                context_area.y,
+                context_line.as_deref().unwrap_or_default(),
+                context_area.width.saturating_sub(2) as usize,
+                style,
+            );
         }
 
         if input_area_raw.height > 0 {
@@ -2077,11 +1687,11 @@ impl Component for AcpPanel {
                 input_area_raw.width.saturating_sub(2),
                 input_area_raw.height,
             );
-            let theme = cx.editor.acp_theme();
+            let theme = cx.editor.assistant_theme();
             let text_style = theme.get("ui.text");
             let placeholder_style = theme.get("ui.text.inactive");
             let input_border_style = theme
-                .try_get("ui.acp.input.border")
+                .try_get("ui.assistant.input.border")
                 .unwrap_or_else(|| theme.get("ui.window"));
 
             // Draw border around input area.
@@ -2205,7 +1815,7 @@ impl Component for AcpPanel {
 
         self.output.set_area(content_area);
 
-        let theme = cx.editor.acp_theme();
+        let theme = cx.editor.assistant_theme();
         // Empty state
         if self.output.content().is_empty() {
             let empty_style = theme.get("ui.text.inactive");
@@ -2226,8 +1836,8 @@ impl Component for AcpPanel {
 
         // Render chat content using message list primitives.
         let corners = MessageCorners::Squared;
-        let blocks = self.build_blocks(theme, content_area.width, corners);
-        self.render_content(&blocks, content_area, surface);
+        let blocks = self.build_blocks(cx.editor, theme, content_area.width, corners);
+        self.render_content(cx.editor, &blocks, content_area, surface);
 
         // Scrollbar
         let total_height = self.output.content_height();
@@ -2261,7 +1871,7 @@ impl Component for AcpPanel {
     fn handle_event(&mut self, event: &Event, cx: &mut Context) -> EventResult {
         let key = match event {
             Event::Key(key) => *key,
-            Event::Mouse(event) => return self.handle_mouse_event(event),
+            Event::Mouse(event) => return self.handle_mouse_event(event, cx.editor),
             _ => return EventResult::Ignored(None),
         };
 
@@ -2281,15 +1891,9 @@ impl Component for AcpPanel {
                 ..
             }
         ) {
-            for (_id, agent) in cx.editor.acp_agents.iter() {
-                let agent = agent.clone();
-                tokio::spawn(async move {
-                    if let Some(session_id) = agent.session_id().await {
-                        agent.cancel(session_id);
-                    }
-                });
+            if let Some(effects) = cx.editor.cancel_active_assistant_thread() {
+                Self::apply_assistant_effects(cx.editor, effects);
             }
-            self.clear_queue();
             cx.editor.set_status("Cancelling agent...");
             return EventResult::Consumed(None);
         }
@@ -2299,90 +1903,120 @@ impl Component for AcpPanel {
             return result;
         }
 
-        if self.focus_target == FocusTarget::Input
+        if matches!(
+            (key.code, key.modifiers),
+            (KeyCode::PageUp, KeyModifiers::CONTROL)
+                | (KeyCode::Left, KeyModifiers::ALT)
+                | (KeyCode::Char('h'), KeyModifiers::ALT)
+        ) && self.cycle_thread(cx.editor, -1)
+        {
+            return EventResult::Consumed(None);
+        }
+
+        if matches!(
+            (key.code, key.modifiers),
+            (KeyCode::PageDown, KeyModifiers::CONTROL)
+                | (KeyCode::Right, KeyModifiers::ALT)
+                | (KeyCode::Char('l'), KeyModifiers::ALT)
+        ) && self.cycle_thread(cx.editor, 1)
+        {
+            return EventResult::Consumed(None);
+        }
+
+        let model = Self::assistant_model(cx.editor);
+
+        if model.focus() == helix_view::assistant::thread::Focus::Input
             && matches!(key.code, KeyCode::Char(' '))
             && key.modifiers.is_empty()
         {
             log::warn!(
-                "[acp_ui] bubbling plain space focus_target={:?} input_mode={:?}",
-                self.focus_target,
+                "[assistant_ui] bubbling plain space focus_target={:?} input_mode={:?}",
+                model.focus(),
                 self.input.mode()
             );
             return EventResult::Ignored(None);
         }
 
-        if self.focus_target == FocusTarget::Messages {
+        if model.focus() == helix_view::assistant::thread::Focus::Messages {
             let viewport_height = self.output.area().height as usize;
             let handled = match (key.code, key.modifiers) {
                 (KeyCode::Esc, KeyModifiers::NONE) => {
-                    self.focus_input_region();
+                    self.focus_input_region(cx.editor);
                     true
                 }
                 (KeyCode::Char('i'), KeyModifiers::NONE) => {
-                    self.focus_input_region();
+                    self.focus_input_region(cx.editor);
                     self.input.enter_insert_mode("insert_mode".into());
                     true
                 }
                 (KeyCode::Enter, KeyModifiers::NONE) => {
                     log::warn!(
-                        "[acp_ui] enter open selected={:?} tracked_docs={} focus_target={:?}",
-                        self.message_cursor.selected(),
-                        self.opened_message_docs.len(),
-                        self.focus_target
+                        "[assistant_ui] enter open selected={:?} focus={:?}",
+                        model.selected_entry_id(),
+                        model.focus()
                     );
                     if !self.open_selected_message_details(cx.editor, Action::Replace) {
-                        cx.editor.set_status("No ACP message selected");
+                        cx.editor.set_status("No assistant entry selected");
                     }
                     true
                 }
                 (KeyCode::Tab, KeyModifiers::NONE) => {
-                    self.toggle_selected_message_fold();
+                    self.toggle_selected_message_fold(cx.editor);
                     true
                 }
                 (KeyCode::Char('y'), KeyModifiers::NONE) => {
                     self.yank_selected_message(cx.editor);
                     true
                 }
+                (KeyCode::Char('t'), KeyModifiers::NONE) => {
+                    if let Ok((status, effects)) = cx.editor.toggle_active_assistant_follow() {
+                        Self::apply_assistant_effects(cx.editor, effects);
+                        cx.editor.set_status(status);
+                    }
+                    true
+                }
                 (KeyCode::Up, KeyModifiers::NONE) | (KeyCode::Char('k'), KeyModifiers::NONE) => {
-                    self.select_prev_message();
+                    self.select_prev_message(cx.editor);
                     true
                 }
                 (KeyCode::Down, KeyModifiers::NONE) | (KeyCode::Char('j'), KeyModifiers::NONE) => {
-                    self.select_next_message();
+                    self.select_next_message(cx.editor);
                     true
                 }
                 (KeyCode::Home, KeyModifiers::NONE) => {
-                    self.select_first_message();
+                    self.select_first_message(cx.editor);
                     true
                 }
                 (KeyCode::End, KeyModifiers::NONE) => {
-                    self.select_last_message();
+                    self.select_last_message(cx.editor);
                     true
                 }
                 (KeyCode::PageUp, KeyModifiers::NONE)
                 | (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
-                    self.select_prev_message_page();
+                    self.select_prev_message_page(cx.editor);
                     true
                 }
                 (KeyCode::PageDown, KeyModifiers::NONE)
                 | (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
-                    self.select_next_message_page();
+                    self.select_next_message_page(cx.editor);
                     true
                 }
                 (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
-                    self.select_prev_message();
+                    self.select_prev_message(cx.editor);
                     true
                 }
                 (KeyCode::Char('n'), KeyModifiers::CONTROL) => {
-                    self.select_next_message();
+                    self.select_next_message(cx.editor);
                     true
                 }
                 _ => false,
             };
 
             if handled {
-                if self.selected_message().is_some() {
-                    self.message_cursor.sync(&self.chat_layout, viewport_height);
+                if let Some(index) = self.selected_message(cx.editor) {
+                    let mut cursor = MessageCursor::new(Some(index), model.content_scroll());
+                    cursor.sync(&self.chat_layout, viewport_height);
+                    self.set_content_scroll(cx.editor, cursor.scroll());
                 }
                 return EventResult::Consumed(None);
             }
@@ -2520,14 +2154,14 @@ impl Component for AcpPanel {
         // (e.g. `:` for command mode, or any other user-bound Frontend command).
         if self.dispatch_input_key(key, cx) {
             log::warn!(
-                "[acp_event] key={} mode={:?} → Consumed (engine handled)",
+                "[assistant_event] key={} mode={:?} → Consumed (engine handled)",
                 key.key_sequence_format(),
                 self.input.mode()
             );
             EventResult::Consumed(None)
         } else {
             log::warn!(
-                "[acp_event] key={} mode={:?} → Ignored (unbound, bubbling)",
+                "[assistant_event] key={} mode={:?} → Ignored (unbound, bubbling)",
                 key.key_sequence_format(),
                 self.input.mode()
             );
@@ -2536,7 +2170,9 @@ impl Component for AcpPanel {
     }
 
     fn cursor(&self, _area: Rect, ctx: &Editor) -> (Option<Position>, CursorKind) {
-        if self.focused && self.focus_target == FocusTarget::Input {
+        if self.focused
+            && Self::assistant_model(ctx).focus() == helix_view::assistant::thread::Focus::Input
+        {
             if let Some((cx, cy)) = self.last_input_cursor {
                 let pos = Position::new(cy as usize, cx as usize);
                 let kind = ctx.config().cursor_shape.from_mode(self.input.mode());
@@ -2565,7 +2201,7 @@ impl Component for AcpPanel {
 // Permission popup
 // ---------------------------------------------------------------------------
 
-/// A popup that shows when an ACP agent requests permission.
+/// A popup that shows when an assistant backend requests permission.
 pub struct PermissionPopup {
     title: String,
     description: Option<String>,
@@ -2631,7 +2267,7 @@ impl Component for PermissionPopup {
         };
 
         // Background
-        let bg = cx.editor.acp_theme().get("ui.popup");
+        let bg = cx.editor.assistant_theme().get("ui.popup");
         for py in popup_area.y..popup_area.y + popup_area.height {
             for px in popup_area.x..popup_area.x + popup_area.width {
                 surface[(px, py)].set_style(bg).set_symbol(" ");
@@ -2639,14 +2275,14 @@ impl Component for PermissionPopup {
         }
 
         // Border top
-        let border_style = cx.editor.acp_theme().get("ui.popup");
+        let border_style = cx.editor.assistant_theme().get("ui.popup");
         let top_border = format!("┌{}┐", "─".repeat(popup_width.saturating_sub(2) as usize));
         surface.set_stringn(x, y, &top_border, popup_width as usize, border_style);
 
         // Title
         let title_style = cx
             .editor
-            .acp_theme()
+            .assistant_theme()
             .get("ui.text")
             .add_modifier(Modifier::BOLD);
         let title_line = format!(
@@ -2660,7 +2296,7 @@ impl Component for PermissionPopup {
 
         // Description
         if let Some(ref desc) = self.description {
-            let desc_style = cx.editor.acp_theme().get("ui.text.inactive");
+            let desc_style = cx.editor.assistant_theme().get("ui.text.inactive");
             for line in desc.lines() {
                 let padded = format!("│ {:<width$}│", line, width = (popup_width - 4) as usize);
                 surface.set_stringn(x, row, &padded, popup_width as usize, desc_style);
@@ -2678,9 +2314,9 @@ impl Component for PermissionPopup {
             let is_selected = i == self.selected;
             let marker = if is_selected { ">" } else { " " };
             let style = if is_selected {
-                cx.editor.acp_theme().get("ui.menu.selected")
+                cx.editor.assistant_theme().get("ui.menu.selected")
             } else {
-                cx.editor.acp_theme().get("ui.text")
+                cx.editor.assistant_theme().get("ui.text")
             };
             let opt_line = format!(
                 "│{marker} {:<width$}│",
@@ -2718,27 +2354,24 @@ impl Component for PermissionPopup {
                 if let Some(opt) = self.options.get(self.selected) {
                     self.send_response(PermissionResponse::Selected(opt.id.clone()));
                 }
-                let callback: crate::compositor::Callback = Box::new(|compositor, _cx| {
-                    compositor.remove(PERMISSION_ID);
-                });
-                EventResult::Consumed(Some(callback))
+                EventResult::Consumed(Some(crate::compositor::PostAction::RemoveById(
+                    PERMISSION_ID,
+                )))
             }
             KeyCode::Esc | KeyCode::Char('q') => {
                 self.send_response(PermissionResponse::Dismissed);
-                let callback: crate::compositor::Callback = Box::new(|compositor, _cx| {
-                    compositor.remove(PERMISSION_ID);
-                });
-                EventResult::Consumed(Some(callback))
+                EventResult::Consumed(Some(crate::compositor::PostAction::RemoveById(
+                    PERMISSION_ID,
+                )))
             }
             // Number shortcuts: 1-9 to select
             KeyCode::Char(c @ '1'..='9') => {
                 let idx = (c as usize) - ('1' as usize);
                 if idx < self.options.len() {
                     self.send_response(PermissionResponse::Selected(self.options[idx].id.clone()));
-                    let callback: crate::compositor::Callback = Box::new(|compositor, _cx| {
-                        compositor.remove(PERMISSION_ID);
-                    });
-                    EventResult::Consumed(Some(callback))
+                    EventResult::Consumed(Some(crate::compositor::PostAction::RemoveById(
+                        PERMISSION_ID,
+                    )))
                 } else {
                     EventResult::Consumed(None)
                 }
@@ -2761,6 +2394,7 @@ mod tests {
     use helix_loader::runtime_dirs;
     use helix_view::editor::Config;
     use helix_view::theme;
+    use helix_view::Document;
     use std::path::Path;
     use std::sync::Arc;
 
@@ -2773,6 +2407,7 @@ mod tests {
             Arc::new(theme_loader),
             Arc::new(ArcSwap::from_pointee(syn_loader)),
             Arc::new(arc_swap::access::Map::new(config, |cfg: &Config| cfg)),
+            helix_runtime::test::runtime(),
             Handlers::dummy(),
         )
     }
@@ -2789,20 +2424,118 @@ mod tests {
         editor.new_file_from_document(Action::VerticalSplit, doc)
     }
 
-    fn seeded_panel() -> AcpPanel {
-        let mut panel = AcpPanel::new();
-        panel.push_entry(ChatEntry::AgentText(
-            "Echo: \"hello\"\n\nLorem ipsum dolor sit amet, consectetur adipiscing elit."
-                .into(),
-        ));
-        panel.push_entry(ChatEntry::UserMessage("hi there from user".into()));
-        panel
-    }
-
     fn with_test_runtime<T>(f: impl FnOnce() -> T) -> T {
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
         let _guard = runtime.enter();
         f()
+    }
+
+    fn seed_assistant(
+        editor: &mut Editor,
+        entries: Vec<ChatEntry>,
+    ) -> helix_view::assistant::thread::Id {
+        let thread = editor.assistant.create(
+            helix_view::assistant::thread::Origin::Local,
+            helix_view::assistant::thread::Scope::new(std::path::PathBuf::from(".")),
+        );
+        for entry in entries {
+            let kind = match entry.kind {
+                ChatEntryKind::UserMessage(text) => {
+                    helix_view::assistant::thread::EntryKind::UserPrompt { text }
+                }
+                ChatEntryKind::AgentText(text) => {
+                    helix_view::assistant::thread::EntryKind::AssistantText { text }
+                }
+                ChatEntryKind::ToolCall { id, name, status } => {
+                    helix_view::assistant::thread::EntryKind::ToolCall(
+                        helix_view::assistant::tool::Call {
+                            id: helix_view::assistant::tool::Id::new(id),
+                            name,
+                            state: match status.as_str() {
+                                "running" => helix_view::assistant::tool::State::Running,
+                                "completed" | "done" => {
+                                    helix_view::assistant::tool::State::Completed
+                                }
+                                "failed" => {
+                                    helix_view::assistant::tool::State::Failed { message: None }
+                                }
+                                "cancelled" => helix_view::assistant::tool::State::Canceled,
+                                _ => helix_view::assistant::tool::State::Pending,
+                            },
+                        },
+                    )
+                }
+                ChatEntryKind::Status(text) => {
+                    helix_view::assistant::thread::EntryKind::Status { text }
+                }
+                ChatEntryKind::ChangeSummary { files } => {
+                    helix_view::assistant::thread::EntryKind::ChangeSummary(
+                        helix_view::assistant::change::Summary {
+                            files: vec![
+                                helix_view::assistant::change::File {
+                                    path: std::path::PathBuf::from("change.txt"),
+                                    hunks: Vec::new(),
+                                };
+                                files
+                            ],
+                        },
+                    )
+                }
+            };
+            let effects = editor
+                .assistant
+                .apply(helix_view::assistant::event::Event::Thread {
+                    thread,
+                    event: helix_view::assistant::thread::Event::Content(
+                        helix_view::assistant::thread::Content::Append(
+                            helix_view::assistant::thread::NewEntry {
+                                turn: None,
+                                kind,
+                                locations: Vec::new(),
+                            },
+                        ),
+                    ),
+                });
+            AssistantPanel::apply_assistant_effects(editor, effects);
+        }
+        thread
+    }
+
+    fn seed_default_thread(editor: &mut Editor) -> helix_view::assistant::thread::Id {
+        seed_assistant(
+            editor,
+            vec![
+                ChatEntry {
+                    id: helix_view::assistant::thread::EntryId::new(
+                        std::num::NonZeroU64::new(1).unwrap(),
+                    ),
+                    locations: 0,
+                    kind: ChatEntryKind::AgentText(
+                        "Echo: \"hello\"\n\nLorem ipsum dolor sit amet, consectetur adipiscing elit."
+                            .into(),
+                    ),
+                },
+                ChatEntry {
+                    id: helix_view::assistant::thread::EntryId::new(
+                        std::num::NonZeroU64::new(2).unwrap(),
+                    ),
+                    locations: 0,
+                    kind: ChatEntryKind::UserMessage("hi there from user".into()),
+                },
+            ],
+        )
+    }
+
+    fn select_thread_entry(editor: &mut Editor, index: usize) {
+        let entry = editor.assistant_entry_id_at(index).expect("entry");
+        let effects = editor
+            .set_active_assistant_focus(helix_view::assistant::thread::Focus::Messages)
+            .expect("focus active messages");
+        editor.apply_assistant_effects(effects);
+        let effects = editor
+            .select_active_assistant_entry(Some(entry))
+            .expect("select active entry");
+        editor.apply_assistant_effects(effects);
     }
 
     #[test]
@@ -2810,16 +2543,22 @@ mod tests {
         with_test_runtime(|| {
             let mut editor = test_editor();
             seed_editor_with_file(&mut editor);
-            let mut panel = seeded_panel();
+            seed_default_thread(&mut editor);
+            let mut panel = AssistantPanel::new();
+            panel.sync_from_assistant(&mut editor);
 
-            panel.message_cursor.select(Some(0));
+            select_thread_entry(&mut editor, 0);
             assert!(panel.open_selected_message_details(&mut editor, Action::Replace));
 
             let (_view_id, doc) = focused!(editor);
             assert_eq!(doc.path(), None);
             assert!(doc.is_persistent_scratch());
             assert_eq!(doc.language_name(), Some("markdown"));
-            assert!(doc.text().slice(..).to_string().starts_with("# Agent Message\n"));
+            assert!(doc
+                .text()
+                .slice(..)
+                .to_string()
+                .starts_with("# Agent Message\n"));
         });
     }
 
@@ -2828,9 +2567,11 @@ mod tests {
         with_test_runtime(|| {
             let mut editor = test_editor();
             let base = seed_editor_with_file(&mut editor);
-            let mut panel = seeded_panel();
+            seed_default_thread(&mut editor);
+            let mut panel = AssistantPanel::new();
+            panel.sync_from_assistant(&mut editor);
 
-            panel.message_cursor.select(Some(0));
+            select_thread_entry(&mut editor, 0);
             assert!(panel.open_selected_message_details(&mut editor, Action::Replace));
             let first = focused!(editor).1.id();
 
@@ -2847,15 +2588,17 @@ mod tests {
         with_test_runtime(|| {
             let mut editor = test_editor();
             let base = seed_editor_with_file(&mut editor);
-            let mut panel = seeded_panel();
+            seed_default_thread(&mut editor);
+            let mut panel = AssistantPanel::new();
+            panel.sync_from_assistant(&mut editor);
 
-            panel.message_cursor.select(Some(0));
+            select_thread_entry(&mut editor, 0);
             assert!(panel.open_selected_message_details(&mut editor, Action::Replace));
             let first = focused!(editor).1.id();
 
             editor.switch(base, Action::Replace);
             assert!(editor.documents.contains_key(&first));
-            panel.message_cursor.select(Some(1));
+            select_thread_entry(&mut editor, 1);
             assert!(panel.open_selected_message_details(&mut editor, Action::Replace));
             let second = focused!(editor).1.id();
 
@@ -2874,9 +2617,11 @@ mod tests {
         with_test_runtime(|| {
             let mut editor = test_editor();
             seed_editor_with_file(&mut editor);
-            let mut panel = seeded_panel();
-            panel.focus_messages();
-            panel.message_cursor.select(Some(0));
+            seed_default_thread(&mut editor);
+            let mut panel = AssistantPanel::new();
+            panel.sync_from_assistant(&mut editor);
+            panel.focus_messages(&mut editor);
+            select_thread_entry(&mut editor, 0);
 
             assert!(panel.open_selected_message_details(&mut editor, Action::Replace));
             assert!(!helix_view::traits::Focusable::is_focused(&panel));
@@ -2886,24 +2631,45 @@ mod tests {
     #[test]
     fn fold_toggle_collapses_agent_message_to_single_preview_line() {
         with_test_runtime(|| {
-            let editor = test_editor();
-            let mut panel = AcpPanel::new();
-            panel.push_entry(ChatEntry::AgentText(
-                "Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua."
-                    .into(),
-            ));
-            panel.message_cursor.select(Some(0));
+            let mut editor = test_editor();
+            seed_assistant(
+                &mut editor,
+                vec![ChatEntry {
+                    id: helix_view::assistant::thread::EntryId::new(
+                        std::num::NonZeroU64::new(1).unwrap(),
+                    ),
+                    locations: 0,
+                    kind: ChatEntryKind::AgentText(
+                        "Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua."
+                            .into(),
+                    ),
+                }],
+            );
+            let mut panel = AssistantPanel::new();
+            panel.sync_from_assistant(&mut editor);
+            select_thread_entry(&mut editor, 0);
 
-            let expanded_blocks = panel.build_blocks(editor.acp_theme(), 30, MessageCorners::Squared);
+            let expanded_blocks = panel.build_blocks(
+                &editor,
+                editor.assistant_theme(),
+                30,
+                MessageCorners::Squared,
+            );
             let expanded_height = expanded_blocks[0].height(true);
 
-            assert!(panel.toggle_selected_message_fold());
+            assert!(panel.toggle_selected_message_fold(&mut editor));
 
-            let collapsed_blocks = panel.build_blocks(editor.acp_theme(), 30, MessageCorners::Squared);
+            let collapsed_blocks = panel.build_blocks(
+                &editor,
+                editor.assistant_theme(),
+                30,
+                MessageCorners::Squared,
+            );
             let collapsed_height = collapsed_blocks[0].height(true);
 
             assert!(expanded_height > collapsed_height);
-            assert!(panel.collapsed_messages.contains(&0));
+            let entry = editor.assistant_entry_id_at(0).expect("entry");
+            assert!(editor.assistant_entry_is_folded(entry));
         });
     }
 }

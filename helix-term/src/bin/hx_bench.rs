@@ -15,6 +15,7 @@
 
 use std::time::Duration;
 
+use anyhow::Context;
 use helix_core::{syntax, Selection};
 use helix_term::{application::Application, args::Args, config::Config};
 use helix_view::bench::{
@@ -111,8 +112,16 @@ fn parse_args() -> BenchArgs {
 // Main driver
 // ---------------------------------------------------------------------------
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
+    let tokio_runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("unable to build tokio runtime")?;
+    let runtime = helix_runtime::Runtime::new(tokio_runtime.handle().clone());
+    tokio_runtime.block_on(main_impl(runtime))
+}
+
+async fn main_impl(runtime: helix_runtime::Runtime) -> anyhow::Result<()> {
     let bench_args = parse_args();
     let duration = Duration::from_secs(bench_args.duration_secs);
 
@@ -129,7 +138,7 @@ async fn main() -> anyhow::Result<()> {
     let config = Config::default();
     let lang_config = helix_loader::config::default_lang_config();
     let syn_loader = syntax::Loader::new(lang_config.try_into().unwrap()).unwrap();
-    let mut app = Application::new(Args::default(), config, syn_loader)?;
+    let mut app = Application::new(Args::default(), config, syn_loader, runtime)?;
 
     if let Some(fixture_name) = bench_args.fixture.as_deref() {
         let event_log_path = std::env::temp_dir().join(format!(

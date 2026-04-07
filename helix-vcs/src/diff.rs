@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use helix_core::Rope;
+use helix_runtime::{FrameHandle, Sender};
 use imara_diff::Algorithm;
-use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 use tokio::task::JoinHandle;
 
 use crate::diff::worker::DiffWorker;
@@ -30,7 +30,7 @@ struct DiffInner {
 /// Representation of a diff that can be updated.
 #[derive(Clone, Debug)]
 pub struct DiffHandle {
-    channel: UnboundedSender<Event>,
+    channel: Sender<Event>,
     diff: Arc<ArcSwap<DiffInner>>,
     /// Monotonically increasing generation counter, incremented by the worker
     /// each time new hunks are published. Used by the render cache to detect
@@ -40,12 +40,16 @@ pub struct DiffHandle {
 }
 
 impl DiffHandle {
-    pub fn new(diff_base: Rope, doc: Rope) -> DiffHandle {
-        DiffHandle::new_with_handle(diff_base, doc).0
+    pub fn new(diff_base: Rope, doc: Rope, redraw: FrameHandle) -> DiffHandle {
+        DiffHandle::new_with_handle(diff_base, doc, redraw).0
     }
 
-    fn new_with_handle(diff_base: Rope, doc: Rope) -> (DiffHandle, JoinHandle<()>) {
-        let (sender, receiver) = unbounded_channel();
+    fn new_with_handle(
+        diff_base: Rope,
+        doc: Rope,
+        redraw: FrameHandle,
+    ) -> (DiffHandle, JoinHandle<()>) {
+        let (sender, receiver) = helix_runtime::channel(64);
         let diff: Arc<ArcSwap<DiffInner>> = Arc::new(ArcSwap::from_pointee(DiffInner::default()));
         let gen: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
         let worker = DiffWorker {
@@ -53,6 +57,7 @@ impl DiffHandle {
             diff: diff.clone(),
             gen: gen.clone(),
             diff_alloc: imara_diff::Diff::default(),
+            redraw,
         };
         let handle = tokio::spawn(worker.run(diff_base, doc));
         let differ = DiffHandle {
@@ -92,7 +97,7 @@ impl DiffHandle {
 
     fn update_document_impl(&self, text: Rope, is_base: bool) -> bool {
         let event = Event { text, is_base };
-        self.channel.send(event).is_ok()
+        self.channel.try_send(event).is_ok()
     }
 
     /// Returns a monotonically increasing generation counter that changes

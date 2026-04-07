@@ -5,6 +5,7 @@ use crate::{
     Error, Result,
 };
 use helix_core::syntax::config::{DebugAdapterConfig, DebuggerQuirks};
+use helix_runtime::{channel, Receiver, Sender};
 use helix_dap_types::*;
 
 use serde_json::Value;
@@ -22,7 +23,6 @@ use tokio::{
     io::{AsyncBufRead, AsyncWrite, BufReader, BufWriter},
     net::TcpStream,
     process::{Child, Command},
-    sync::mpsc::{channel, unbounded_channel, UnboundedReceiver, UnboundedSender},
     time,
 };
 
@@ -30,7 +30,7 @@ use tokio::{
 pub struct Client {
     id: DebugAdapterId,
     _process: Option<Child>,
-    server_tx: UnboundedSender<Payload>,
+    server_tx: Sender<Payload>,
     request_counter: AtomicU64,
     connection_type: Option<ConnectionType>,
     starting_request_args: Option<Value>,
@@ -57,7 +57,7 @@ impl Client {
         args: Vec<&str>,
         port_arg: Option<&str>,
         id: DebugAdapterId,
-    ) -> Result<(Self, UnboundedReceiver<(DebugAdapterId, Payload)>)> {
+    ) -> Result<(Self, Receiver<(DebugAdapterId, Payload)>)> {
         if command.is_empty() {
             return Result::Err(Error::Other(anyhow!("Command not provided")));
         }
@@ -74,9 +74,9 @@ impl Client {
         err: Option<Box<dyn AsyncBufRead + Unpin + Send>>,
         id: DebugAdapterId,
         process: Option<Child>,
-    ) -> Result<(Self, UnboundedReceiver<(DebugAdapterId, Payload)>)> {
+    ) -> Result<(Self, Receiver<(DebugAdapterId, Payload)>)> {
         let (server_rx, server_tx) = Transport::start(rx, tx, err, id);
-        let (client_tx, client_rx) = unbounded_channel();
+        let (client_tx, client_rx) = channel(256);
 
         let client = Self {
             id,
@@ -103,7 +103,7 @@ impl Client {
     pub async fn tcp(
         addr: std::net::SocketAddr,
         id: DebugAdapterId,
-    ) -> Result<(Self, UnboundedReceiver<(DebugAdapterId, Payload)>)> {
+    ) -> Result<(Self, Receiver<(DebugAdapterId, Payload)>)> {
         let stream = TcpStream::connect(addr).await?;
         let (rx, tx) = stream.into_split();
         Self::streams(Box::new(BufReader::new(rx)), Box::new(tx), None, id, None)
@@ -113,7 +113,7 @@ impl Client {
         cmd: &str,
         args: Vec<&str>,
         id: DebugAdapterId,
-    ) -> Result<(Self, UnboundedReceiver<(DebugAdapterId, Payload)>)> {
+    ) -> Result<(Self, Receiver<(DebugAdapterId, Payload)>)> {
         // Resolve path to the binary
         let cmd = helix_stdx::env::which(cmd)?;
 
@@ -165,7 +165,7 @@ impl Client {
         args: Vec<&str>,
         port_format: &str,
         id: DebugAdapterId,
-    ) -> Result<(Self, UnboundedReceiver<(DebugAdapterId, Payload)>)> {
+    ) -> Result<(Self, Receiver<(DebugAdapterId, Payload)>)> {
         let port = Self::get_port().await.unwrap();
 
         let process = Command::new(cmd)
@@ -202,21 +202,17 @@ impl Client {
 
     async fn recv(
         id: DebugAdapterId,
-        mut server_rx: UnboundedReceiver<Payload>,
-        client_tx: UnboundedSender<(DebugAdapterId, Payload)>,
+        mut server_rx: Receiver<Payload>,
+        client_tx: Sender<(DebugAdapterId, Payload)>,
     ) {
         while let Some(msg) = server_rx.recv().await {
             match msg {
                 Payload::Event(ev) => {
-                    client_tx
-                        .send((id, Payload::Event(ev)))
-                        .expect("Failed to send");
+                    let _ = client_tx.send((id, Payload::Event(ev))).await;
                 }
                 Payload::Response(_) => unreachable!(),
                 Payload::Request(req) => {
-                    client_tx
-                        .send((id, Payload::Request(req)))
-                        .expect("Failed to send");
+                    let _ = client_tx.send((id, Payload::Request(req))).await;
                 }
             }
         }
@@ -276,6 +272,7 @@ impl Client {
 
             server_tx
                 .send(Payload::Request(req))
+                .await
                 .map_err(|e| Error::Other(e.into()))?;
 
             // TODO: specifiable timeout, delay other calls until initialize success
@@ -331,6 +328,7 @@ impl Client {
 
             server_tx
                 .send(Payload::Response(response))
+                .await
                 .map_err(|e| Error::Other(e.into()))?;
 
             Ok(())
@@ -450,6 +448,25 @@ impl Client {
 
         let response = self.request::<requests::StackTrace>(args).await?;
         Ok((response.stack_frames, response.total_frames))
+    }
+
+    pub fn stack_trace_request(
+        &self,
+        thread_id: ThreadId,
+    ) -> impl Future<Output = Result<(Vec<StackFrame>, Option<usize>)>> {
+        let args = requests::StackTraceArguments {
+            thread_id,
+            start_frame: None,
+            levels: None,
+            format: None,
+        };
+
+        let future = self.call::<requests::StackTrace>(args);
+        async move {
+            let json = future.await?;
+            let response: requests::StackTraceResponse = serde_json::from_value(json)?;
+            Ok((response.stack_frames, response.total_frames))
+        }
     }
 
     pub fn threads(&self) -> impl Future<Output = Result<Value>> {

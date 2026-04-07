@@ -4,6 +4,7 @@
 //! may not be registered (will cause a panic to ensure soundness)
 
 use std::any::TypeId;
+use std::sync::Arc;
 
 use anyhow::{bail, Result};
 use hashbrown::hash_map::Entry;
@@ -11,7 +12,37 @@ use hashbrown::HashMap;
 use parking_lot::RwLock;
 
 use crate::hook::ErasedHook;
-use crate::runtime_local;
+
+static ERROR_REPORTER: RwLock<Option<Arc<dyn Fn(anyhow::Error) + Send + Sync>>> = RwLock::new(None);
+
+#[derive(Default)]
+pub struct ErrorReporterGuard {
+    previous: Option<Arc<dyn Fn(anyhow::Error) + Send + Sync>>,
+}
+
+pub fn install_error_reporter(
+    reporter: Arc<dyn Fn(anyhow::Error) + Send + Sync>,
+) -> ErrorReporterGuard {
+    let previous = ERROR_REPORTER.write().replace(reporter);
+    ErrorReporterGuard { previous }
+}
+
+impl Drop for ErrorReporterGuard {
+    fn drop(&mut self) {
+        *ERROR_REPORTER.write() = self.previous.take();
+    }
+}
+
+#[cfg(feature = "integration_test")]
+pub fn clear_error_reporter() {
+    *ERROR_REPORTER.write() = None;
+}
+
+fn report_error(err: anyhow::Error) {
+    if let Some(reporter) = ERROR_REPORTER.read().as_ref() {
+        reporter(err);
+    }
+}
 
 pub struct Registry {
     events: HashMap<&'static str, TypeId, foldhash::fast::FixedState>,
@@ -95,7 +126,7 @@ impl Registry {
             // safety: event type is the same
             if let Err(err) = unsafe { hook.call(&mut event) } {
                 log::error!("{} hook failed: {err:#?}", E::ID);
-                crate::status::report_blocking(err);
+                report_error(err);
             }
         }
     }
@@ -108,14 +139,12 @@ impl Registry {
     }
 }
 
-runtime_local! {
-    static REGISTRY: RwLock<Registry> = RwLock::new(Registry {
-        // hardcoded random number is good enough here we don't care about DOS resistance
-        // and avoids the additional complexity of `Option<Registry>`
-        events: HashMap::with_hasher(foldhash::fast::FixedState::with_seed(72536814787)),
-        handlers: HashMap::with_hasher(foldhash::fast::FixedState::with_seed(72536814787)),
-    });
-}
+static REGISTRY: RwLock<Registry> = RwLock::new(Registry {
+    // hardcoded random number is good enough here we don't care about DOS resistance
+    // and avoids the additional complexity of `Option<Registry>`
+    events: HashMap::with_hasher(foldhash::fast::FixedState::with_seed(72536814787)),
+    handlers: HashMap::with_hasher(foldhash::fast::FixedState::with_seed(72536814787)),
+});
 
 pub(crate) fn with<T>(f: impl FnOnce(&Registry) -> T) -> T {
     f(&REGISTRY.read())

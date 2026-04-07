@@ -138,7 +138,7 @@ From `session/new`:
 ### ACP status line
 
 Shows **mode** (with background) and **model** with a gap between (no separator).
-Theme scopes: ui.acp.mode, ui.acp.model. No agent name, thinking, or key hints
+Theme scopes: ui.assistant.mode, ui.assistant.model. No agent name, thinking, or key hints
 in the status bar.
 
 ### Auto-connect on open

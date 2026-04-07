@@ -12,47 +12,33 @@
 //!
 //! Hooks run synchronously which can be advantageous since they can modify the
 //! current editor state right away (for example to immediately hide the completion
-//! popup). However, they can not contain their own state without locking since
-//! they only receive immutable references. For handler that want to track state, do
-//! expensive background computations or debouncing an [`AsyncHook`] is preferable.
-//! Async hooks are based around a channels that receive events specific to
-//! that `AsyncHook` (usually an enum). These events can be sent by synchronous
-//! hooks. Due to some limitations around tokio channels the [`send_blocking`]
-//! function exported in this crate should be used instead of the builtin
-//! `blocking_send`.
+//! popup).
 //!
-//! In addition to the core event system, this crate contains some message queues
-//! that allow transfer of data back to the main event loop from async hooks and
-//! hooks that may not have access to all application data (for example in helix-view).
-//! This include the ability to control rendering ([`lock_frame`], [`request_redraw`]) and
-//! display status messages ([`status`]).
+//! In addition to the core event system, this crate contains runtime-local support
+//! used by hooks and integration-test isolation.
 //!
 //! Hooks declared in helix-term can furthermore dispatch synchronous jobs to be run on the
 //! main loop (including access to the compositor). Ideally that queue will be moved
 //! to helix-view in the future if we manage to detach the compositor from its rendering backend.
 
 use anyhow::Result;
-pub use cancel::{cancelable_future, TaskController, TaskHandle};
-pub use debounce::{send_blocking, AsyncHook};
-pub use redraw::{
-    lock_frame, redraw_requested, request_redraw, start_frame, RenderLockGuard, RequestRedrawOnDrop,
-};
+pub use registry::ErrorReporterGuard;
 pub use registry::Event;
 
-mod cancel;
-mod debounce;
 mod hook;
-mod redraw;
 mod registry;
-#[doc(hidden)]
-pub mod runtime;
-pub mod status;
 
 #[cfg(test)]
 mod test;
 
 pub fn register_event<E: Event + 'static>() {
     registry::with_mut(|registry| registry.register_event::<E>())
+}
+
+pub fn scoped_error_reporter(
+    reporter: std::sync::Arc<dyn Fn(anyhow::Error) + Send + Sync>,
+) -> registry::ErrorReporterGuard {
+    registry::install_error_reporter(reporter)
 }
 
 /// Registers a hook that will be called when an event of type `E` is dispatched.
@@ -88,6 +74,7 @@ pub fn dispatch(e: impl Event) {
 #[cfg(feature = "integration_test")]
 pub fn reset() {
     registry::with_mut(|registry| registry.clear_handlers());
+    registry::clear_error_reporter();
 }
 
 /// Macro to declare events

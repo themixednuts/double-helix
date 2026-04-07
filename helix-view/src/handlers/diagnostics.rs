@@ -1,11 +1,9 @@
 use std::num::NonZeroUsize;
 use std::sync::atomic::{self, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use helix_event::{request_redraw, send_blocking, AsyncHook};
-use tokio::sync::mpsc::Sender;
-use tokio::time::Instant;
+use helix_runtime::{send_blocking, Clock, Debounce, FrameHandle, Runtime, Sender, Work};
 
 use crate::{Document, DocumentId, ViewId};
 
@@ -13,42 +11,86 @@ use crate::{Document, DocumentId, ViewId};
 pub enum DiagnosticEvent {
     CursorLineChanged { generation: usize },
     Refresh,
+    FlushDebounced,
 }
 
 struct DiagnosticTimeout {
     active_generation: Arc<AtomicUsize>,
-    generation: usize,
+    pending_generation: Option<usize>,
+    debounce: Debounce,
+    work: Work,
+    clock: Clock,
+    tx: Sender<DiagnosticEvent>,
+    redraw: FrameHandle,
 }
 
 const TIMEOUT: Duration = Duration::from_millis(350);
 
-impl AsyncHook for DiagnosticTimeout {
-    type Event = DiagnosticEvent;
+impl DiagnosticTimeout {
+    fn spawn(
+        active_generation: Arc<AtomicUsize>,
+        work: Work,
+        clock: Clock,
+        redraw: FrameHandle,
+    ) -> Sender<DiagnosticEvent> {
+        let (tx, mut rx) = helix_runtime::channel(128);
+        let mut timeout = Self {
+            active_generation,
+            pending_generation: None,
+            debounce: Debounce::new(TIMEOUT),
+            work,
+            clock,
+            tx: tx.clone(),
+            redraw,
+        };
+        timeout
+            .work
+            .clone()
+            .spawn(async move {
+                while let Some(event) = rx.recv().await {
+                    timeout.handle_event(event);
+                }
+                timeout.debounce.cancel();
+            })
+            .detach();
+        tx
+    }
 
-    fn handle_event(
-        &mut self,
-        event: DiagnosticEvent,
-        timeout: Option<Instant>,
-    ) -> Option<Instant> {
+    fn handle_event(&mut self, event: DiagnosticEvent) {
         match event {
             DiagnosticEvent::CursorLineChanged { generation } => {
-                if generation > self.generation {
-                    self.generation = generation;
-                    Some(Instant::now() + TIMEOUT)
-                } else {
-                    timeout
+                if self
+                    .pending_generation
+                    .is_none_or(|pending| generation > pending)
+                {
+                    self.pending_generation = Some(generation);
+                    self.restart();
                 }
             }
-            DiagnosticEvent::Refresh if timeout.is_some() => Some(Instant::now() + TIMEOUT),
-            DiagnosticEvent::Refresh => None,
+            DiagnosticEvent::Refresh => {
+                if self.pending_generation.is_some() {
+                    self.restart();
+                }
+            }
+            DiagnosticEvent::FlushDebounced => self.commit_pending_generation(),
         }
     }
 
-    fn finish_debounce(&mut self) {
-        if self.active_generation.load(atomic::Ordering::Relaxed) < self.generation {
+    fn restart(&mut self) {
+        let tx = self.tx.clone();
+        self.debounce.restart(&self.work, &self.clock, async move {
+            let _ = tx.send(DiagnosticEvent::FlushDebounced).await;
+        });
+    }
+
+    fn commit_pending_generation(&mut self) {
+        let Some(generation) = self.pending_generation.take() else {
+            return;
+        };
+        if self.active_generation.load(atomic::Ordering::Relaxed) < generation {
             self.active_generation
-                .store(self.generation, atomic::Ordering::Relaxed);
-            request_redraw();
+                .store(generation, atomic::Ordering::Relaxed);
+            self.redraw.request_redraw();
         }
     }
 }
@@ -59,7 +101,9 @@ pub struct DiagnosticsHandler {
     last_doc: AtomicUsize,
     last_cursor_line: AtomicUsize,
     pub active: bool,
-    pub events: Sender<DiagnosticEvent>,
+    events: Mutex<Option<Sender<DiagnosticEvent>>>,
+    redraw: Mutex<Option<FrameHandle>>,
+    runtime: Mutex<Option<Runtime>>,
 }
 
 // make sure we never share handlers across multiple views this is a stop
@@ -75,21 +119,25 @@ impl Clone for DiagnosticsHandler {
 impl DiagnosticsHandler {
     #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
-        let active_generation = Arc::new(AtomicUsize::new(0));
-        let events = DiagnosticTimeout {
-            active_generation: active_generation.clone(),
-            generation: 0,
-        }
-        .spawn();
         Self {
-            active_generation,
+            active_generation: Arc::new(AtomicUsize::new(0)),
             generation: AtomicUsize::new(0),
-            events,
+            events: Mutex::new(None),
+            redraw: Mutex::new(None),
+            runtime: Mutex::new(None),
             // usize::MAX encodes a "no document" sentinel.
             last_doc: AtomicUsize::new(usize::MAX),
             last_cursor_line: AtomicUsize::new(usize::MAX),
             active: true,
         }
+    }
+
+    pub fn bind_runtime(&mut self, runtime: Runtime) {
+        *self.runtime.lock().expect("diagnostics runtime lock poisoned") = Some(runtime);
+    }
+
+    pub fn bind_redraw(&mut self, redraw: FrameHandle) {
+        *self.redraw.lock().expect("diagnostics redraw lock poisoned") = Some(redraw);
     }
 
     fn load_last_doc(&self) -> DocumentId {
@@ -102,9 +150,46 @@ impl DiagnosticsHandler {
     fn store_last_doc(&self, id: DocumentId) {
         self.last_doc.store(id.value().get(), Ordering::Relaxed);
     }
+
+    fn events(&self) -> Option<Sender<DiagnosticEvent>> {
+        let mut events = self
+            .events
+            .lock()
+            .expect("diagnostics handler lock poisoned");
+        if let Some(tx) = events.as_ref() {
+            return Some(tx.clone());
+        }
+        let runtime = self
+            .runtime
+            .lock()
+            .expect("diagnostics runtime lock poisoned")
+            .as_ref()?
+            .clone();
+        let redraw = self
+            .redraw
+            .lock()
+            .expect("diagnostics redraw lock poisoned")
+            .as_ref()
+            .expect("editor-owned diagnostics handler requires redraw sender")
+            .clone();
+        let tx = DiagnosticTimeout::spawn(
+            self.active_generation.clone(),
+            runtime.work().clone(),
+            runtime.clock().clone(),
+            redraw,
+        );
+        *events = Some(tx.clone());
+        Some(tx)
+    }
 }
 
 impl DiagnosticsHandler {
+    pub fn refresh(&self) {
+        if let Some(events) = self.events() {
+            send_blocking(&events, DiagnosticEvent::Refresh);
+        }
+    }
+
     pub fn immediately_show_diagnostic(&self, doc: &Document, view: ViewId) {
         self.store_last_doc(doc.id());
         let cursor_line = doc
@@ -133,12 +218,14 @@ impl DiagnosticsHandler {
             self.last_cursor_line.store(cursor_line, Ordering::Relaxed);
             let new_gen = self.generation.load(Ordering::Relaxed) + 1;
             self.generation.store(new_gen, Ordering::Relaxed);
-            send_blocking(
-                &self.events,
-                DiagnosticEvent::CursorLineChanged {
-                    generation: new_gen,
-                },
-            );
+            if let Some(events) = self.events() {
+                send_blocking(
+                    &events,
+                    DiagnosticEvent::CursorLineChanged {
+                        generation: new_gen,
+                    },
+                );
+            }
             false
         }
     }

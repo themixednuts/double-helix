@@ -1,3 +1,4 @@
+use crate::runtime::RuntimeEvent;
 use crate::{
     commands::{self, OnKeyCallback, OnKeyCallbackKind},
     compositor::{Component, Context, Event, EventResult, RenderContext},
@@ -1938,8 +1939,15 @@ impl EditorView {
         items: Vec<CompletionItem>,
         trigger_offset: usize,
         size: Rect,
+        ingress: helix_runtime::Sender<RuntimeEvent>,
     ) -> Option<Rect> {
-        let mut completion = Completion::new(editor, items, trigger_offset);
+        let mut completion = Completion::new(
+            editor,
+            items,
+            trigger_offset,
+            editor.runtime().clone(),
+            ingress,
+        );
 
         if completion.is_empty() {
             // skip if we got no completion results
@@ -1960,7 +1968,7 @@ impl EditorView {
         }
         self.completion = None;
         let mut on_next_key: Option<OnKeyCallback> = None;
-        editor.handlers.completions.request_controller.restart();
+        editor.handlers.completions.cancel_request();
         editor.handlers.completions.active_completions.clear();
         if let Some(last_completion) = editor.last_completion.take() {
             match last_completion {
@@ -1991,7 +1999,7 @@ impl EditorView {
     }
 
     pub fn handle_idle_timeout(&mut self, cx: &mut commands::Context) -> EventResult {
-        commands::compute_inlay_hints_for_all_views(cx.editor, cx.jobs);
+        commands::compute_inlay_hints_for_all_views(cx.editor, cx.ingress.clone());
 
         EventResult::Ignored(None)
     }
@@ -2003,7 +2011,7 @@ impl EditorView {
     /// key callbacks must be canceled.
     fn handle_non_key_input(&mut self, cxt: &mut commands::Context) {
         cxt.editor.status_msg = None;
-        cxt.editor.reset_idle_timer();
+        cxt.reset_idle_timer();
         // HACKS: create a fake key event that will never trigger any actual map
         // and therefore simply acts as "dismiss"
         let null_key_event = KeyEvent {
@@ -2300,7 +2308,10 @@ impl Component for EditorView {
             register: self.engine_input_state().selected_register,
             callback: Vec::new(),
             on_next_key_callback: None,
-            jobs: context.jobs,
+            exit_tasks: context.exit_tasks,
+            exit_task_work: context.exit_task_work.clone(),
+            ingress: context.ingress.clone(),
+            idle_reset_tx: context.idle_reset_tx.clone(),
             plugin_manager: context.plugin_manager.clone(),
         };
 
@@ -2334,7 +2345,7 @@ impl Component for EditorView {
             Event::Key(key) => {
                 let key = *key;
                 let key_dispatch_start = std::time::Instant::now();
-                cx.editor.reset_idle_timer();
+                cx.reset_idle_timer();
                 // Key is already canonicalized by the compositor.
 
                 // clear status
@@ -2351,8 +2362,11 @@ impl Component for EditorView {
                             let res = {
                                 let mut cx = Context {
                                     editor: cx.editor,
-                                    jobs: cx.jobs,
+                                    exit_tasks: cx.exit_tasks,
+                                    exit_task_work: cx.exit_task_work.clone(),
                                     scroll: None,
+                                    ingress: cx.ingress.clone(),
+                                    idle_reset_tx: cx.idle_reset_tx.clone(),
                                     plugin_manager: cx.plugin_manager.clone(),
                                 };
                                 if let EventResult::Consumed(callback) =
@@ -2466,12 +2480,7 @@ impl Component for EditorView {
                 let callback = if callbacks.is_empty() {
                     None
                 } else {
-                    let callback: crate::compositor::Callback = Box::new(move |compositor, cx| {
-                        for callback in callbacks {
-                            callback(compositor, cx)
-                        }
-                    });
-                    Some(callback)
+                    Some(crate::compositor::PostAction::Batch(callbacks))
                 };
 
                 helix_view::bench::log_run_phase(
@@ -2731,7 +2740,7 @@ impl Component for EditorView {
             if let Some(completion) = self.completion.as_mut() {
                 chrome_batch.push(completion.prepare_render(area, cx));
             }
-            if let Some(prepared) = self.notification_popup.prepare_snapshot(area, cx.editor) {
+            if let Some(prepared) = self.notification_popup.prepare_snapshot(area, cx) {
                 chrome_batch.push(prepared);
             }
             if !chrome_batch.is_empty() {
@@ -2863,6 +2872,7 @@ mod tests {
             Arc::new(theme_loader),
             Arc::new(ArcSwap::from_pointee(syn_loader)),
             Arc::new(arc_swap::access::Map::new(config, |cfg: &Config| cfg)),
+            helix_runtime::test::runtime(),
             Handlers::dummy(),
         );
         let doc = Document::from(

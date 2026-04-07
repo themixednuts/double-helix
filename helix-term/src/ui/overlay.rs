@@ -5,7 +5,7 @@ use helix_view::{
 };
 use tui::buffer::Buffer;
 
-use crate::compositor::{Component, Context, Event, EventResult, RenderContext};
+use crate::compositor::{Component, Context, Event, EventResult, PickerComponent, RenderContext};
 
 /// Contains a component placed in the center of the parent component
 pub struct Overlay<T> {
@@ -76,5 +76,9 @@ impl<T: Component + 'static> Component for Overlay<T> {
 
     fn id(&self) -> Option<&'static str> {
         self.content.id()
+    }
+
+    fn as_picker_component(&mut self) -> Option<&mut dyn PickerComponent> {
+        self.content.as_picker_component()
     }
 }

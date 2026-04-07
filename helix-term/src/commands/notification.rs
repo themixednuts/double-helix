@@ -1,60 +1,21 @@
 use crate::compositor::Context;
-use crate::job::{self, Callback};
-use helix_view::editor::Severity;
+use crate::runtime::{send_ui_command_with, LayerCommand, UiCommand};
 
 /// Show notification history
 pub fn show_notification_history(cx: &mut Context) {
-    let history = cx.editor.get_notification_history();
-
-    if history.is_empty() {
+    if cx.editor.get_notification_history().is_empty() {
         cx.editor.set_status("No notifications in history");
         return;
     }
 
-    let mut content = String::new();
-    content.push_str("Notification History:\n\n");
-
-    for (i, notification) in history.iter().enumerate().rev().take(50) {
-        let severity_icon = match notification.severity {
-            Severity::Error => "❌",
-            Severity::Warning => "⚠️",
-            Severity::Info => "ℹ️",
-            Severity::Hint => "💡",
-        };
-
-        let timestamp = notification.timestamp.elapsed().as_secs();
-        let time_str = if timestamp < 60 {
-            format!("{}s ago", timestamp)
-        } else if timestamp < 3600 {
-            format!("{}m ago", timestamp / 60)
-        } else {
-            format!("{}h ago", timestamp / 3600)
-        };
-
-        content.push_str(&format!(
-            "{:2}. {} {} ({})\n    {}\n\n",
-            history.len() - i,
-            severity_icon,
-            time_str,
-            if notification.dismissed {
-                "dismissed"
-            } else {
-                "active"
-            },
-            notification.message
-        ));
-    }
-
-    let popup = crate::ui::Popup::new("notification-history", crate::ui::Text::new(content))
-        .auto_close(true);
-
-    cx.jobs.callback(async move {
-        let call: job::Callback =
-            Callback::EditorCompositor(Box::new(move |_editor, compositor| {
-                compositor.push(Box::new(popup));
-            }));
-        Ok(call)
-    });
+    let ingress = cx.ingress.clone();
+    cx.editor.runtime().work().clone().spawn(async move {
+        send_ui_command_with(
+            UiCommand::Layer(LayerCommand::PushNotificationHistory),
+            ingress,
+        )
+        .await;
+    }).detach();
 }
 
 /// Clear notification history

@@ -1,155 +1,91 @@
-use std::{collections::HashSet, time::Duration};
+use std::{
+    collections::HashSet,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
-use futures_util::{stream::FuturesOrdered, StreamExt};
-use helix_core::{syntax::config::LanguageServerFeature, text_annotations::InlineAnnotation};
-use helix_event::{cancelable_future, register_hook};
-use helix_lsp::lsp;
+use helix_event::register_hook;
+use helix_runtime::{Clock, Debounce, Runtime, Work};
 use helix_view::bench::log_command_phase;
 use helix_view::{
-    document_lsp::DocumentColorSwatches,
     events::{DocumentDidChange, DocumentDidOpen, LanguageServerExited, LanguageServerInitialized},
     handlers::{lsp::DocumentColorsEvent, Handlers},
-    DocumentId, Editor, Theme,
+    DocumentId,
 };
-use tokio::time::Instant;
 
-use crate::job;
+use crate::{
+    effect::language_server::request_document_colors,
+    runtime::{send_task_event_with, RuntimeEvent, RuntimeTaskEvent},
+};
 
-#[derive(Default)]
 pub(super) struct DocumentColorsHandler {
-    docs: HashSet<DocumentId>,
+    docs: Arc<Mutex<HashSet<DocumentId>>>,
+    debounce: Debounce,
+    work: Work,
+    clock: Clock,
+    ingress: helix_runtime::Sender<RuntimeEvent>,
 }
 
 const DOCUMENT_CHANGE_DEBOUNCE: Duration = Duration::from_millis(250);
 
-impl helix_event::AsyncHook for DocumentColorsHandler {
-    type Event = DocumentColorsEvent;
-
-    fn handle_event(&mut self, event: Self::Event, _timeout: Option<Instant>) -> Option<Instant> {
-        let DocumentColorsEvent(doc_id) = event;
-        self.docs.insert(doc_id);
-        Some(Instant::now() + DOCUMENT_CHANGE_DEBOUNCE)
+impl DocumentColorsHandler {
+    fn new(work: Work, clock: Clock, ingress: helix_runtime::Sender<RuntimeEvent>) -> Self {
+        Self {
+            docs: Default::default(),
+            debounce: Debounce::new(DOCUMENT_CHANGE_DEBOUNCE),
+            work,
+            clock,
+            ingress,
+        }
     }
 
-    fn finish_debounce(&mut self) {
-        let docs = std::mem::take(&mut self.docs);
+    fn event(&mut self, event: DocumentColorsEvent) {
+        let DocumentColorsEvent(doc_id) = event;
+        self.docs
+            .lock()
+            .expect("document colors lock poisoned")
+            .insert(doc_id);
 
-        job::dispatch_blocking(move |editor, _compositor| {
-            for doc in docs {
-                request_document_colors(editor, doc);
+        let docs = self.docs.clone();
+        let ingress = self.ingress.clone();
+        self.debounce.restart(&self.work, &self.clock, async move {
+            let doc_ids = {
+                let mut docs = docs.lock().expect("document colors lock poisoned");
+                std::mem::take(&mut *docs)
+            };
+            if !doc_ids.is_empty() {
+                send_task_event_with(
+                    RuntimeTaskEvent::RequestDocumentColorsDebounced { doc_ids },
+                    ingress,
+                )
+                .await;
             }
         });
     }
-}
 
-fn request_document_colors(editor: &mut Editor, doc_id: DocumentId) {
-    if !editor.config().lsp.display_color_swatches {
-        return;
-    }
-
-    let Some(doc) = editor.document_mut(doc_id) else {
-        return;
-    };
-
-    let cancel = doc.restart_color_swatches();
-
-    let mut seen_language_servers = HashSet::new();
-    let mut futures: FuturesOrdered<_> = doc
-        .language_servers_with_feature(LanguageServerFeature::DocumentColors)
-        .filter(|ls| seen_language_servers.insert(ls.id()))
-        .map(|language_server| {
-            let text = doc.text().clone();
-            let offset_encoding = language_server.offset_encoding();
-            let future = language_server
-                .text_document_document_color(doc.identifier(), None)
-                .unwrap();
-
-            async move {
-                let colors: Vec<_> = future
-                    .await?
-                    .into_iter()
-                    .filter_map(|color_info| {
-                        let pos = helix_lsp::util::lsp_pos_to_pos(
-                            &text,
-                            color_info.range.start,
-                            offset_encoding,
-                        )?;
-                        Some((pos, color_info.color))
-                    })
-                    .collect();
-                anyhow::Ok(colors)
+    pub fn spawn(
+        runtime: Runtime,
+        ingress: helix_runtime::Sender<RuntimeEvent>,
+    ) -> helix_runtime::Sender<DocumentColorsEvent> {
+        let (tx, mut rx) = helix_runtime::channel(128);
+        let work = runtime.work().clone();
+        let clock = runtime.clock().clone();
+        work.clone().spawn(async move {
+            let mut handler = DocumentColorsHandler::new(work, clock, ingress);
+            while let Some(event) = rx.recv().await {
+                handler.event(event);
             }
-        })
-        .collect();
-
-    if futures.is_empty() {
-        return;
+            handler.debounce.cancel();
+        }).detach();
+        tx
     }
-
-    tokio::spawn(async move {
-        let mut all_colors = Vec::new();
-        loop {
-            match cancelable_future(futures.next(), &cancel).await {
-                Some(Some(Ok(items))) => all_colors.extend(items),
-                Some(Some(Err(err))) => log::error!("document color request failed: {err}"),
-                Some(None) => break,
-                // The request was cancelled.
-                None => return,
-            }
-        }
-        job::dispatch(move |editor, _| attach_document_colors(editor, doc_id, all_colors)).await;
-    });
 }
 
-fn attach_document_colors(
-    editor: &mut Editor,
-    doc_id: DocumentId,
-    mut doc_colors: Vec<(usize, lsp::Color)>,
-) {
-    let config = editor.config();
-
-    if !config.lsp.display_color_swatches {
-        return;
-    }
-
-    let color_swatch_string = &config.lsp.color_swatches_string;
-
-    let Some(doc) = editor.documents.get_mut(&doc_id) else {
-        return;
-    };
-
-    if doc_colors.is_empty() {
-        doc.clear_color_swatches();
-        return;
-    }
-
-    doc_colors.sort_by_key(|(pos, _)| *pos);
-
-    let mut color_swatches = Vec::with_capacity(doc_colors.len());
-    let mut color_swatches_padding = Vec::with_capacity(doc_colors.len());
-    let mut colors = Vec::with_capacity(doc_colors.len());
-
-    for (pos, color) in doc_colors {
-        color_swatches_padding.push(InlineAnnotation::new(pos, " "));
-        color_swatches.push(InlineAnnotation::new(pos, color_swatch_string));
-        colors.push(Theme::rgb_highlight(
-            (color.red * 255.) as u8,
-            (color.green * 255.) as u8,
-            (color.blue * 255.) as u8,
-        ));
-    }
-
-    doc.set_color_swatches(DocumentColorSwatches {
-        color_swatches,
-        colors,
-        color_swatches_padding,
-    });
-}
-
-pub(super) fn register_hooks(handlers: &Handlers) {
+pub(super) fn register_hooks(handlers: &Handlers, ingress: helix_runtime::Sender<RuntimeEvent>) {
+    let open_ingress = ingress.clone();
     register_hook!(move |event: &mut DocumentDidOpen<'_>| {
         // when a document is initially opened, request colors for it
-        request_document_colors(event.editor, event.doc);
+        request_document_colors(event.editor, event.doc, open_ingress.clone());
 
         Ok(())
     });
@@ -166,7 +102,7 @@ pub(super) fn register_hooks(handlers: &Handlers) {
         if !event.ghost_transaction {
             // Cancel the ongoing request, if present.
             event.doc.cancel_color_swatches();
-            helix_event::send_blocking(&tx, DocumentColorsEvent(event.doc.id()));
+            helix_runtime::send_blocking(&tx, DocumentColorsEvent(event.doc.id()));
         }
 
         let hook_dur = hook_start.elapsed();
@@ -188,16 +124,18 @@ pub(super) fn register_hooks(handlers: &Handlers) {
         Ok(())
     });
 
+    let init_ingress = ingress.clone();
     register_hook!(move |event: &mut LanguageServerInitialized<'_>| {
         let doc_ids: Vec<_> = event.editor.documents().map(|doc| doc.id()).collect();
 
         for doc_id in doc_ids {
-            request_document_colors(event.editor, doc_id);
+            request_document_colors(event.editor, doc_id, init_ingress.clone());
         }
 
         Ok(())
     });
 
+    let exit_ingress = ingress;
     register_hook!(move |event: &mut LanguageServerExited<'_>| {
         // Clear and re-request all color swatches when a server exits.
         for doc in event.editor.documents_mut() {
@@ -209,7 +147,7 @@ pub(super) fn register_hooks(handlers: &Handlers) {
         let doc_ids: Vec<_> = event.editor.documents().map(|doc| doc.id()).collect();
 
         for doc_id in doc_ids {
-            request_document_colors(event.editor, doc_id);
+            request_document_colors(event.editor, doc_id, exit_ingress.clone());
         }
 
         Ok(())

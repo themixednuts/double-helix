@@ -4,6 +4,7 @@ use crate::{
     Error, LanguageServerId, Result,
 };
 use anyhow::Context;
+use helix_runtime::{channel, Receiver, Sender};
 use log::{error, info};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -12,10 +13,7 @@ use std::sync::Arc;
 use tokio::{
     io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter},
     process::{ChildStderr, ChildStdin, ChildStdout},
-    sync::{
-        mpsc::{unbounded_channel, Sender, UnboundedReceiver, UnboundedSender},
-        Mutex, Notify,
-    },
+    sync::{Mutex, Notify},
 };
 
 #[derive(Debug)]
@@ -53,13 +51,9 @@ impl Transport {
         server_stderr: BufReader<ChildStderr>,
         id: LanguageServerId,
         name: String,
-    ) -> (
-        UnboundedReceiver<(LanguageServerId, jsonrpc::Call)>,
-        UnboundedSender<Payload>,
-        Arc<Notify>,
-    ) {
-        let (client_tx, rx) = unbounded_channel();
-        let (tx, client_rx) = unbounded_channel();
+    ) -> (Receiver<(LanguageServerId, jsonrpc::Call)>, Sender<Payload>, Arc<Notify>) {
+        let (client_tx, rx) = channel(256);
+        let (tx, client_rx) = channel(256);
         let notify = Arc::new(Notify::new());
 
         let transport = Self {
@@ -201,7 +195,7 @@ impl Transport {
 
     async fn process_server_message(
         &self,
-        client_tx: &UnboundedSender<(LanguageServerId, jsonrpc::Call)>,
+        client_tx: &Sender<(LanguageServerId, jsonrpc::Call)>,
         msg: ServerMessage,
         language_server_name: &str,
     ) -> Result<()> {
@@ -213,6 +207,7 @@ impl Transport {
             ServerMessage::Call(call) => {
                 client_tx
                     .send((self.id, call))
+                    .await
                     .context("failed to send a message to server")?;
                 // let notification = Notification::parse(&method, params);
             }
@@ -255,7 +250,7 @@ impl Transport {
     async fn recv(
         transport: Arc<Self>,
         mut server_stdout: BufReader<ChildStdout>,
-        client_tx: UnboundedSender<(LanguageServerId, jsonrpc::Call)>,
+        client_tx: Sender<(LanguageServerId, jsonrpc::Call)>,
     ) {
         let mut recv_buffer = String::new();
         let mut content_buffer = Vec::new();
@@ -338,8 +333,8 @@ impl Transport {
     async fn send(
         transport: Arc<Self>,
         mut server_stdin: BufWriter<ChildStdin>,
-        client_tx: UnboundedSender<(LanguageServerId, jsonrpc::Call)>,
-        mut client_rx: UnboundedReceiver<Payload>,
+        client_tx: Sender<(LanguageServerId, jsonrpc::Call)>,
+        mut client_rx: Receiver<Payload>,
         initialize_notify: Arc<Notify>,
     ) {
         let mut pending_messages: Vec<Payload> = Vec::new();

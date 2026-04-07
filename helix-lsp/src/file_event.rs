@@ -1,7 +1,7 @@
 use std::{collections::HashMap, path::PathBuf, sync::Weak};
 
 use globset::{GlobBuilder, GlobSetBuilder};
-use tokio::sync::mpsc;
+use helix_runtime::{channel, send_blocking, Receiver, Sender};
 
 use crate::{lsp, Client, LanguageServerId};
 
@@ -41,7 +41,7 @@ struct ClientState {
 /// is closed and the Handler isn't properly notified.
 #[derive(Clone, Debug)]
 pub struct Handler {
-    tx: mpsc::UnboundedSender<Event>,
+    tx: Sender<Event>,
 }
 
 impl Default for Handler {
@@ -52,7 +52,7 @@ impl Default for Handler {
 
 impl Handler {
     pub fn new() -> Self {
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = channel(256);
         tokio::spawn(Self::run(rx));
         Self { tx }
     }
@@ -64,7 +64,7 @@ impl Handler {
         registration_id: String,
         options: lsp::DidChangeWatchedFilesRegistrationOptions,
     ) {
-        let _ = self.tx.send(Event::Register {
+        send_blocking(&self.tx, Event::Register {
             client_id,
             client,
             registration_id,
@@ -73,21 +73,21 @@ impl Handler {
     }
 
     pub fn unregister(&self, client_id: LanguageServerId, registration_id: String) {
-        let _ = self.tx.send(Event::Unregister {
+        send_blocking(&self.tx, Event::Unregister {
             client_id,
             registration_id,
         });
     }
 
     pub fn file_changed(&self, path: PathBuf) {
-        let _ = self.tx.send(Event::FileChanged { path });
+        send_blocking(&self.tx, Event::FileChanged { path });
     }
 
     pub fn remove_client(&self, client_id: LanguageServerId) {
-        let _ = self.tx.send(Event::RemoveClient { client_id });
+        send_blocking(&self.tx, Event::RemoveClient { client_id });
     }
 
-    async fn run(mut rx: mpsc::UnboundedReceiver<Event>) {
+    async fn run(mut rx: Receiver<Event>) {
         let mut state: HashMap<LanguageServerId, ClientState> = HashMap::new();
         while let Some(event) = rx.recv().await {
             match event {

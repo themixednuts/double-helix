@@ -5,6 +5,7 @@ use std::time::Duration;
 use parking_lot::Mutex;
 
 use crate::{dispatch, events, register_dynamic_hook, register_event, register_hook};
+
 #[tokio::test]
 async fn smoke_test() {
     events! {
@@ -88,4 +89,60 @@ async fn dynamic() {
     dispatch(Event4 { count: 0 });
     dispatch(Event3 {});
     assert_eq!(count.load(Ordering::Relaxed), 7)
+}
+
+#[tokio::test]
+async fn scoped_error_reporter_restores_previous_reporter() {
+    let first = Arc::new(AtomicUsize::new(0));
+    let second = Arc::new(AtomicUsize::new(0));
+
+    let guard = crate::scoped_error_reporter(Arc::new({
+        let first = first.clone();
+        move |_| {
+            first.fetch_add(1, Ordering::Relaxed);
+        }
+    }));
+
+    let events = format!("ScopedErrorReporterRestoresPreviousReporter{}", std::process::id());
+
+    crate::register_dynamic_hook(
+        || Err(anyhow::anyhow!("boom")),
+        &events,
+    )
+    .err();
+
+    {
+        let _inner = crate::scoped_error_reporter(Arc::new({
+            let second = second.clone();
+            move |_| {
+                second.fetch_add(1, Ordering::Relaxed);
+            }
+        }));
+        crate::events! {
+            ScopedErrorReporterRestoresPreviousReporterTest {}
+        }
+        crate::register_event::<ScopedErrorReporterRestoresPreviousReporterTest>();
+        crate::register_dynamic_hook(
+            || Err(anyhow::anyhow!("inner")),
+            "ScopedErrorReporterRestoresPreviousReporterTest",
+        )
+        .unwrap();
+        crate::dispatch(ScopedErrorReporterRestoresPreviousReporterTest {});
+    }
+
+    crate::events! {
+        ScopedErrorReporterRestoresPreviousReporterOuter {}
+    }
+    crate::register_event::<ScopedErrorReporterRestoresPreviousReporterOuter>();
+    crate::register_dynamic_hook(
+        || Err(anyhow::anyhow!("outer")),
+        "ScopedErrorReporterRestoresPreviousReporterOuter",
+    )
+    .unwrap();
+    crate::dispatch(ScopedErrorReporterRestoresPreviousReporterOuter {});
+
+    drop(guard);
+
+    assert_eq!(second.load(Ordering::Relaxed), 1);
+    assert_eq!(first.load(Ordering::Relaxed), 1);
 }

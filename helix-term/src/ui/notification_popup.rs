@@ -1,7 +1,8 @@
 use crate::compositor::{Component, Context, Event, EventResult, RenderContext};
+use crate::runtime::{RuntimeEvent, RuntimeTaskEvent};
 use crate::ui::gradient_border::GradientBorder;
+use helix_runtime::Sender as IngressSender;
 use helix_core::unicode::width::UnicodeWidthStr;
-use helix_event::request_redraw;
 use helix_view::theme::Modifier;
 use helix_view::{
     editor::{
@@ -65,7 +66,7 @@ impl NotificationPopup {
         }
     }
 
-    pub fn update(&mut self, editor: &Editor) {
+    pub fn update(&mut self, editor: &Editor, ingress: IngressSender<RuntimeEvent>) {
         let config = &editor.config().notifications;
 
         if !config.enable
@@ -96,7 +97,6 @@ impl NotificationPopup {
                 let timeout_opt = notification.timeout;
                 self.notifications
                     .push(NotificationItem::new(notification.clone()));
-                request_redraw();
 
                 if let Some(timeout) = timeout_opt {
                     let started = notification.timestamp;
@@ -106,17 +106,16 @@ impl NotificationPopup {
                     } else {
                         std::time::Duration::from_millis(0)
                     };
+                    let ingress = ingress.clone();
 
-                    tokio::spawn(async move {
+                    editor.runtime().work().clone().spawn(async move {
                         tokio_sleep(remaining).await;
-                        crate::job::dispatch(
-                            move |editor: &mut helix_view::Editor, _compositor| {
-                                editor.dismiss_notification(id);
-                                helix_event::request_redraw();
-                            },
+                        crate::runtime::send_task_event_with(
+                            RuntimeTaskEvent::DismissNotification { id },
+                            ingress,
                         )
                         .await;
-                    });
+                    }).detach();
                 }
             }
         }
@@ -128,9 +127,14 @@ impl NotificationPopup {
     pub fn prepare_snapshot(
         &mut self,
         area: Rect,
-        editor: &Editor,
+        cx: &RenderContext,
     ) -> Option<crate::render::PreparedRender> {
-        self.update(editor);
+        self.update(
+            cx.editor,
+            cx.ingress.clone(),
+        );
+
+        let editor = cx.editor;
 
         self.layout_thickness = if editor.config().gradient_borders.enable {
             editor.config().gradient_borders.thickness as u16
@@ -248,7 +252,10 @@ impl Component for NotificationPopup {
     fn render(&mut self, area: Rect, surface: &mut Surface, cx: &RenderContext) {
         // Legacy eager path — kept for Component trait compliance.
         // EditorView now uses prepare_snapshot() directly.
-        self.update(cx.editor);
+        self.update(
+            cx.editor,
+            cx.ingress.clone(),
+        );
 
         self.layout_thickness = if cx.editor.config().gradient_borders.enable {
             cx.editor.config().gradient_borders.thickness as u16

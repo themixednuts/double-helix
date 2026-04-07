@@ -1,6 +1,5 @@
 use completion::{CompletionEvent, CompletionHandler};
-use helix_event::send_blocking;
-use tokio::sync::mpsc::Sender;
+use helix_runtime::{channel, send_blocking, Sender};
 
 use crate::handlers::lsp::SignatureHelpInvoked;
 use crate::{DocumentId, Editor, ViewId};
@@ -59,14 +58,14 @@ impl Handlers {
     /// fail silently.  This is fine for tests that don't exercise async
     /// handler behaviour.
     pub fn dummy() -> Self {
-        let (comp_tx, _) = tokio::sync::mpsc::channel(1);
-        let (sig_tx, _) = tokio::sync::mpsc::channel(1);
-        let (auto_save_tx, _) = tokio::sync::mpsc::channel(1);
-        let (auto_reload_tx, _) = tokio::sync::mpsc::channel(1);
-        let (doc_colors_tx, _) = tokio::sync::mpsc::channel(1);
-        let (blame_tx, _) = tokio::sync::mpsc::channel(1);
-        let (pull_diag_tx, _) = tokio::sync::mpsc::channel(1);
-        let (pull_all_diag_tx, _) = tokio::sync::mpsc::channel(1);
+        let (comp_tx, _) = channel(1);
+        let (sig_tx, _) = channel(1);
+        let (auto_save_tx, _) = channel(1);
+        let (auto_reload_tx, _) = channel(1);
+        let (doc_colors_tx, _) = channel(1);
+        let (blame_tx, _) = channel(1);
+        let (pull_diag_tx, _) = channel(1);
+        let (pull_all_diag_tx, _) = channel(1);
         Self {
             completions: CompletionHandler::new(comp_tx),
             signature_hints: sig_tx,

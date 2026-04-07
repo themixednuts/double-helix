@@ -9,9 +9,17 @@ use tui::layout::Alignment;
 use tui::text::Text;
 use tui::widgets::{BorderType, Paragraph, Widget, Wrap};
 
+use helix_lsp::lsp::{self, SignatureInformation};
+use helix_runtime::send_blocking;
+use helix_view::document::Mode;
+use helix_view::handlers::lsp::{SignatureHelpEvent, SignatureHelpInvoked, SignatureHelpRequestId};
+use helix_view::Editor;
+
 use crate::compositor::{Component, Compositor, Context, EventResult, RenderContext};
 
 use crate::alt;
+use crate::commands::Open;
+use crate::ui;
 use crate::ui::Markdown;
 
 use crate::ui::Popup;
@@ -208,4 +216,152 @@ impl Component for SignatureHelp {
 
         Some((width + PADDING + sig_index_width as u16, height + PADDING))
     }
+}
+
+fn active_param_range(
+    signature: &SignatureInformation,
+    response_active_parameter: Option<u32>,
+) -> Option<(usize, usize)> {
+    let param_idx = signature
+        .active_parameter
+        .or(response_active_parameter)
+        .unwrap_or(0) as usize;
+    let param = signature.parameters.as_ref()?.get(param_idx)?;
+    match &param.label {
+        lsp::ParameterLabel::Simple(string) => {
+            let start = signature.label.find(string.as_str())?;
+            Some((start, start + string.len()))
+        }
+        lsp::ParameterLabel::LabelOffsets([start, end]) => {
+            use helix_core::str_utils::char_to_byte_idx;
+            let from = char_to_byte_idx(&signature.label, *start as usize);
+            let to = char_to_byte_idx(&signature.label, *end as usize);
+            Some((from, to))
+        }
+    }
+}
+
+/// Apply LSP signature help on the main thread (invoked from [`crate::runtime::ingress::RuntimeEvent::Ui`] / [`crate::runtime::UiCommand::Lsp`]).
+pub(crate) fn show_signature(
+    editor: &mut Editor,
+    compositor: &mut Compositor,
+    invoked: SignatureHelpInvoked,
+    request: SignatureHelpRequestId,
+    response: Option<lsp::SignatureHelp>,
+) {
+    let config = &editor.config();
+
+    if !(config.lsp.auto_signature_help
+        || SignatureHelp::visible_popup(compositor).is_some()
+        || invoked == SignatureHelpInvoked::Manual)
+    {
+        return;
+    }
+
+    if invoked == SignatureHelpInvoked::Automatic && editor.mode != Mode::Insert {
+        return;
+    }
+
+    let response = match response {
+        Some(s) if !s.signatures.is_empty() => s,
+        _ => {
+            send_blocking(
+                &editor.handlers.signature_hints,
+                SignatureHelpEvent::RequestComplete {
+                    request,
+                    open: false,
+                },
+            );
+            compositor.remove(SignatureHelp::ID);
+            return;
+        }
+    };
+    send_blocking(
+        &editor.handlers.signature_hints,
+        SignatureHelpEvent::RequestComplete {
+            request,
+            open: true,
+        },
+    );
+
+    let (_, doc) = focused_ref!(editor);
+    let language = doc.language_name().unwrap_or("");
+
+    if response.signatures.is_empty() {
+        return;
+    }
+
+    let signatures: Vec<Signature> = response
+        .signatures
+        .into_iter()
+        .map(|s| {
+            let active_param_range = active_param_range(&s, response.active_parameter);
+
+            let signature_doc = if config.lsp.display_signature_help_docs {
+                s.documentation.map(|doc| match doc {
+                    lsp::Documentation::String(s) => s,
+                    lsp::Documentation::MarkupContent(markup) => markup.value,
+                })
+            } else {
+                None
+            };
+
+            Signature {
+                signature: s.label,
+                signature_doc,
+                active_param_range,
+            }
+        })
+        .collect();
+
+    let old_popup = compositor.find_id::<Popup<SignatureHelp>>(SignatureHelp::ID);
+    let lsp_signature = response.active_signature.map(|s| s as usize);
+
+    let active_signature = old_popup
+        .as_ref()
+        .map(|popup| {
+            let old_lsp_sig = popup.contents().lsp_signature();
+            let old_sig = popup
+                .contents()
+                .active_signature()
+                .min(signatures.len() - 1);
+
+            if old_lsp_sig != lsp_signature {
+                lsp_signature.unwrap_or(old_sig)
+            } else {
+                old_sig
+            }
+        })
+        .unwrap_or(lsp_signature.unwrap_or_default());
+
+    let contents = SignatureHelp::new(
+        language.to_string(),
+        Arc::clone(&editor.syn_loader),
+        active_signature,
+        lsp_signature,
+        signatures,
+    );
+
+    let position_bias =
+        Open::from_signature_help_position(&editor.config().lsp.signature_help_position);
+
+    let mut popup = Popup::new(SignatureHelp::ID, contents)
+        .position(old_popup.and_then(|p| p.get_position()))
+        .position_bias(position_bias)
+        .ignore_escape_key(true);
+
+    let size = compositor.size();
+    if compositor
+        .find::<ui::EditorView>()
+        .unwrap()
+        .completion
+        .as_mut()
+        .map(|completion| completion.area(size, editor))
+        .filter(|area| area.intersects(popup.area(size, editor)))
+        .is_some()
+    {
+        return;
+    }
+
+    compositor.replace_or_push(SignatureHelp::ID, popup);
 }

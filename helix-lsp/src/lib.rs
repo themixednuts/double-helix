@@ -15,9 +15,9 @@ use futures_util::stream::select_all::SelectAll;
 use helix_core::syntax::config::{
     LanguageConfiguration, LanguageServerConfiguration, LanguageServerFeatures, RootMarkers,
 };
+use helix_runtime::Receiver;
 use helix_stdx::path;
 use slotmap::SlotMap;
-use tokio::sync::mpsc::UnboundedReceiver;
 
 use std::{
     collections::HashMap,
@@ -27,7 +27,6 @@ use std::{
 };
 
 use thiserror::Error;
-use tokio_stream::wrappers::UnboundedReceiverStream;
 
 pub type Result<T, E = Error> = core::result::Result<T, E>;
 pub type LanguageServerName = String;
@@ -572,7 +571,7 @@ pub struct Registry {
     inner: SlotMap<LanguageServerId, Arc<Client>>,
     inner_by_name: HashMap<LanguageServerName, Vec<Arc<Client>>>,
     syn_loader: Arc<ArcSwap<helix_core::syntax::Loader>>,
-    pub incoming: SelectAll<UnboundedReceiverStream<(LanguageServerId, Call)>>,
+    pub incoming: SelectAll<Receiver<(LanguageServerId, Call)>>,
     pub file_event_handler: file_event::Handler,
 }
 
@@ -631,7 +630,7 @@ impl Registry {
                 enable_snippets,
             )
             .map(|client| {
-                self.incoming.push(UnboundedReceiverStream::new(client.1));
+                self.incoming.push(client.1);
                 client.0
             })
         })?;
@@ -867,7 +866,7 @@ impl LspProgressMap {
     }
 }
 
-struct NewClient(Arc<Client>, UnboundedReceiver<(LanguageServerId, Call)>);
+struct NewClient(Arc<Client>, Receiver<(LanguageServerId, Call)>);
 
 enum StartupError {
     NoRequiredRootFound,

@@ -1,9 +1,10 @@
 use crate::{
+    assistant::BackendDriver,
     annotations::diagnostics::{DiagnosticFilter, InlineDiagnosticsConfig},
     bench::log_run_event,
     clipboard::ClipboardProvider,
     document::{
-        DocumentOpenError, DocumentSavedEventFuture, DocumentSavedEventResult, Mode, SavePoint,
+        DocumentOpenError, DocumentSavedEventFuture, Mode, SavePoint,
         SCRATCH_BUFFER_NAME,
     },
     events::{DocumentDidClose, DocumentDidOpen, DocumentFocusLost},
@@ -12,18 +13,20 @@ use crate::{
     info::Info,
     input::{KeyCode, KeyEvent, KeyModifiers},
     register::Registers,
+    traits::HistoryViewport,
     theme::{self, Theme},
     tree::{self, Dimension, Resize, Tree},
-    view::{ensure_cursor_in_view_center_in, AnyViewMut, ComponentViewState},
+    view::{ensure_cursor_in_view_center_in, AnyViewMut, AnyViewRef, ComponentViewState},
     Document, DocumentId, View, ViewId,
 };
+use anyhow::Context;
 use helix_event::dispatch;
 use helix_vcs::DiffProviderRegistry;
 
-use futures_util::stream::select_all::SelectAll;
-use futures_util::{future, StreamExt};
+use futures_util::future;
+use futures_util::stream::SelectAll;
 use helix_lsp::{Call, LanguageServerId};
-use tokio_stream::wrappers::UnboundedReceiverStream;
+use helix_runtime::{Receiver as RuntimeReceiver, Runtime, Sender as RuntimeSender};
 
 use std::{
     borrow::Cow,
@@ -32,16 +35,12 @@ use std::{
     io::{self, stdin},
     num::{NonZeroU8, NonZeroUsize},
     path::{Path, PathBuf},
-    pin::Pin,
     sync::Arc,
 };
 
-use tokio::{
-    sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
-    time::{sleep, Duration, Instant, Sleep},
-};
+use tokio::time::{Duration, Instant};
 
-use anyhow::{anyhow, bail, Error};
+use anyhow::{bail, Error};
 
 pub use helix_core::diagnostic::Severity;
 use helix_core::{
@@ -53,7 +52,7 @@ use helix_core::{
     },
     Change, LineEnding, Position, Range, Selection, Uri, NATIVE_LINE_ENDING,
 };
-use helix_dap::{self as dap, registry::DebugAdapterId};
+use helix_dap::{self as dap};
 use helix_lsp::lsp;
 use helix_stdx::path::canonicalize;
 
@@ -507,10 +506,10 @@ pub struct Config {
     /// Defines which text objects will be folded when a document is opened.
     #[serde(default)]
     pub fold_textobjects: Vec<String>,
-    /// Preconfigured ACP agents.
+    /// Preconfigured assistant agents.
     #[serde(default = "default_agents")]
     pub agents: Vec<AgentConfig>,
-    /// ACP panel configuration (keybindings for cycle agent, thinking, model).
+    /// Assistant panel configuration (keybindings for cycle agent, thinking, model).
     #[serde(default)]
     pub acp: AcpConfig,
     /// Which editing engine to use. Defaults to `"helix"`.
@@ -1814,8 +1813,6 @@ pub struct Breakpoint {
     pub log_message: Option<String>,
 }
 
-use futures_util::stream::{Flatten, Once};
-
 type Diagnostics = BTreeMap<Uri, Vec<(lsp::Diagnostic, DiagnosticProvider)>>;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
@@ -1966,10 +1963,9 @@ pub struct Editor {
     /// Per-viewport state for component-owned viewports that are not in the tree.
     pub component_views: BTreeMap<ViewId, ComponentViewState>,
 
-    // We Flatten<> to resolve the inner DocumentSavedEventFuture. For that we need a stream of streams, hence the Once<>.
-    // https://stackoverflow.com/a/66875668
-    pub saves: HashMap<DocumentId, UnboundedSender<Once<DocumentSavedEventFuture>>>,
-    pub save_queue: SelectAll<Flatten<UnboundedReceiverStream<Once<DocumentSavedEventFuture>>>>,
+    pub saves: HashMap<DocumentId, RuntimeSender<DocumentSavedEventFuture>>,
+    save_tx: RuntimeSender<DocumentSavedEventFuture>,
+    pub save_queue: RuntimeReceiver<DocumentSavedEventFuture>,
     pub write_count: usize,
 
     /// Snapshot of the currently focused editing surface's transient modal input state.
@@ -1985,20 +1981,9 @@ pub struct Editor {
     pub diff_providers: DiffProviderRegistry,
 
     pub debug_adapters: dap::registry::Registry,
-    pub acp_agents: helix_acp::Registry,
-    pub acp_terminals: helix_acp::TerminalManager,
-    /// Lines of ACP agent output for the chat buffer.
-    pub acp_output: Vec<String>,
-    /// History of past ACP sessions.
-    pub acp_session_history: Vec<(String, String, std::time::Instant)>, // (session_id, agent_name, started)
-    /// Latest ACP config options (model, etc.) from session; used when opening panel via :acp-open.
-    pub acp_config_options: Vec<helix_acp::types::ConfigOption>,
-    /// Latest ACP session modes from session; used when opening panel via :acp-open.
-    pub acp_session_modes: Vec<helix_acp::types::SessionMode>,
-    /// Index in config.agents of the currently connected agent (for cycling).
-    pub current_acp_agent_index: Option<usize>,
-    /// Theme for the ACP panel only (when agent has theme configured). None = use global theme.
-    pub acp_panel_theme: Option<Theme>,
+    pub assistant_terminals: std::sync::Arc<helix_acp::TerminalManager>,
+    /// Theme for the assistant panel only (when an agent has a theme configured).
+    pub assistant_panel_theme: Option<Theme>,
     /// Shared engine factory for component-owned edit regions.
     pub engine_factory: Option<std::sync::Arc<dyn crate::engine::EditingEngineFactory>>,
     /// Shared modal keymap source for component-owned edit regions.
@@ -2008,6 +1993,9 @@ pub struct Editor {
         >,
     >,
     pub breakpoints: HashMap<PathBuf, Vec<Breakpoint>>,
+
+    /// Async runtime (UI / work / block / clock) threaded in from the application or test harness.
+    runtime: helix_runtime::Runtime,
 
     pub syn_loader: Arc<ArcSwap<syntax::Loader>>,
     pub theme_loader: Arc<theme::Loader>,
@@ -2030,15 +2018,14 @@ pub struct Editor {
     pub config: Arc<dyn DynAccess<Config> + Send + Sync>,
     pub auto_pairs: Option<AutoPairs>,
 
-    pub idle_timer: Pin<Box<Sleep>>,
-    pub redraw_timer: Pin<Box<Sleep>>,
     last_motion: Option<Motion>,
     pub last_completion: Option<CompleteAction>,
     last_cwd: Option<PathBuf>,
 
     pub exit_code: i32,
 
-    pub config_events: (UnboundedSender<ConfigEvent>, UnboundedReceiver<ConfigEvent>),
+    pub config_events: (RuntimeSender<ConfigEvent>, RuntimeReceiver<ConfigEvent>),
+    pub frame_gate: helix_runtime::FrameGate,
     pub needs_redraw: bool,
     /// Generation counter incremented on config changes. Used for render cache invalidation.
     pub config_gen: u64,
@@ -2064,6 +2051,24 @@ pub struct Editor {
     /// Shared UI state (layers, panels, focus). Commands mutate this; frontends render it.
     pub model: crate::model::Model,
 
+    /// Collaboration-aware surface registry.
+    pub surface_registry: crate::collab::Registry,
+
+    /// Collaboration substrate (Phase 5+).
+    pub collab: crate::collab::Store,
+    /// Assistant durable state (Phase 6+).
+    pub assistant: crate::assistant::Store,
+    pub assistant_history: Option<crate::assistant::history::Backend>,
+    pub assistant_context: crate::assistant::context::Registry,
+    pub assistant_saves: BTreeMap<crate::assistant::thread::Id, helix_runtime::Debounce>,
+    pub assistant_layout_save: helix_runtime::Debounce,
+    pub assistant_backends:
+        BTreeMap<crate::assistant::backend::Id, crate::assistant::BackendHandle>,
+    pub assistant_updates_tx: RuntimeSender<crate::assistant::backend::Update>,
+    pub assistant_updates_rx: RuntimeReceiver<crate::assistant::backend::Update>,
+    assistant_follow_snapshot: Option<AssistantFollowSnapshot>,
+    suppress_assistant_follow_pause: bool,
+
     /// Active benchmark state, set by `:bench` command.
     pub bench: Option<BenchState>,
 }
@@ -2072,13 +2077,27 @@ pub type Motion = Box<dyn Fn(&mut Editor) + Send + Sync>;
 
 #[derive(Debug)]
 pub enum EditorEvent {
-    DocumentSaved(DocumentSavedEventResult),
-    ConfigEvent(ConfigEvent),
-    LanguageServerMessage((LanguageServerId, Call)),
-    DebuggerEvent((DebugAdapterId, dap::Payload)),
-    AcpMessage((helix_acp::AgentId, helix_acp::jsonrpc::Call)),
-    IdleTimer,
+    CursorMoved,
+    Scrolled,
+    Edited,
+    BufferSwitched,
     Redraw,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AssistantFollowSnapshot {
+    doc: DocumentId,
+    version: i32,
+    cursor: usize,
+    scroll: usize,
+}
+
+pub struct AssistantUpdateOutcome {
+    pub effects: Vec<crate::assistant::effect::Effect>,
+    pub permission_request: Option<(
+        crate::assistant::thread::Id,
+        crate::assistant::permission::Request,
+    )>,
 }
 
 #[derive(Debug, Clone)]
@@ -2107,7 +2126,7 @@ pub enum CompleteAction {
     },
 }
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum Action {
     Load,
     Replace,
@@ -2133,6 +2152,24 @@ pub enum CloseError {
 }
 
 pub use crate::bench::{BenchSnapshot, BenchState};
+
+fn render_assistant_change_summary(summary: &crate::assistant::change::Summary, title: &str) -> String {
+    let mut body = format!("# {title}\n\n");
+    for file in &summary.files {
+        use std::fmt::Write as _;
+
+        let _ = writeln!(body, "## {}\n", file.path.display());
+        if file.hunks.is_empty() {
+            body.push_str("- changed\n\n");
+            continue;
+        }
+        for hunk in &file.hunks {
+            let _ = writeln!(body, "- {}", hunk.summary);
+        }
+        body.push('\n');
+    }
+    body
+}
 
 impl Editor {
     pub fn buffer_label(&self, doc: &Document) -> String {
@@ -2212,14 +2249,18 @@ impl Editor {
         theme_loader: Arc<theme::Loader>,
         syn_loader: Arc<ArcSwap<syntax::Loader>>,
         config: Arc<dyn DynAccess<Config> + Send + Sync>,
+        runtime: Runtime,
         handlers: Handlers,
     ) -> Self {
         let language_servers = helix_lsp::Registry::new(syn_loader.clone());
         let conf = config.load();
         let auto_pairs = (&conf.auto_pairs).into();
+        let (assistant_updates_tx, assistant_updates_rx) = helix_runtime::channel(128);
 
         // HAXX: offset the render area height by 1 to account for prompt/commandline
         area.height -= 1;
+
+        let (save_tx, save_queue) = helix_runtime::channel(64);
 
         Self {
             mode: Mode::Normal,
@@ -2230,7 +2271,8 @@ impl Editor {
             next_virtual_view_idx: 0,
             component_views: BTreeMap::new(),
             saves: HashMap::new(),
-            save_queue: SelectAll::new(),
+            save_tx,
+            save_queue,
             write_count: 0,
             focused_modal_input: crate::engine::ModalInputState::default(),
             macro_recording: None,
@@ -2241,17 +2283,12 @@ impl Editor {
             workspace_diagnostic_counts: WorkspaceDiagnosticCounts::default(),
             diff_providers: DiffProviderRegistry::default(),
             debug_adapters: dap::registry::Registry::new(),
-            acp_agents: helix_acp::Registry::new(),
-            acp_terminals: helix_acp::TerminalManager::new(),
-            acp_output: Vec::new(),
-            acp_session_history: Vec::new(),
-            acp_config_options: Vec::new(),
-            acp_session_modes: Vec::new(),
-            current_acp_agent_index: None,
-            acp_panel_theme: None,
+            assistant_terminals: std::sync::Arc::new(helix_acp::TerminalManager::new()),
+            assistant_panel_theme: None,
             engine_factory: None,
             modal_keymaps: None,
             breakpoints: HashMap::new(),
+            runtime,
             syn_loader,
             theme_loader,
             last_theme: None,
@@ -2263,15 +2300,14 @@ impl Editor {
             status_msg: None,
             notifications: NotificationManager::new(conf.notifications.max_history),
             autoinfo: None,
-            idle_timer: Box::pin(sleep(conf.idle_timeout)),
-            redraw_timer: Box::pin(sleep(Duration::MAX)),
             last_motion: None,
             last_completion: None,
             last_cwd: None,
             config,
             auto_pairs,
             exit_code: 0,
-            config_events: unbounded_channel(),
+            config_events: helix_runtime::channel(64),
+            frame_gate: helix_runtime::FrameGate::new(64),
             needs_redraw: false,
             config_gen: 0,
             handlers,
@@ -2279,6 +2315,20 @@ impl Editor {
             mouse_down_range: None,
             cursor_cache: CursorCache::default(),
             model: crate::model::Model::default(),
+            surface_registry: crate::collab::Registry::new(),
+            collab: crate::collab::Store::default(),
+            assistant: crate::assistant::Store::default(),
+            assistant_history: None,
+            assistant_context: crate::assistant::context::Registry::default(),
+            assistant_saves: BTreeMap::new(),
+            assistant_layout_save: helix_runtime::Debounce::new(std::time::Duration::from_millis(
+                300,
+            )),
+            assistant_backends: BTreeMap::new(),
+            assistant_updates_tx,
+            assistant_updates_rx,
+            assistant_follow_snapshot: None,
+            suppress_assistant_follow_pause: false,
             bench: None,
         }
     }
@@ -2288,6 +2338,77 @@ impl Editor {
             || self.config().popup_border == PopupBorderConfig::Popup
     }
 
+    pub fn take_save_queue(&mut self) -> RuntimeReceiver<DocumentSavedEventFuture> {
+        std::mem::replace(&mut self.save_queue, helix_runtime::channel(1).1)
+    }
+
+    pub fn take_config_rx(&mut self) -> RuntimeReceiver<ConfigEvent> {
+        std::mem::replace(&mut self.config_events.1, helix_runtime::channel(1).1)
+    }
+
+    pub fn take_redraw_rx(&mut self) -> RuntimeReceiver<()> {
+        self.frame_gate.take_receiver()
+    }
+
+    pub fn take_assistant_updates_rx(
+        &mut self,
+    ) -> RuntimeReceiver<crate::assistant::backend::Update> {
+        std::mem::replace(&mut self.assistant_updates_rx, helix_runtime::channel(1).1)
+    }
+
+    pub fn take_lsp_incoming(
+        &mut self,
+    ) -> SelectAll<helix_runtime::Receiver<(LanguageServerId, Call)>> {
+        std::mem::replace(&mut self.language_servers.incoming, SelectAll::new())
+    }
+
+    pub fn take_debugger_incoming(
+        &mut self,
+    ) -> SelectAll<helix_runtime::Receiver<(dap::registry::DebugAdapterId, dap::Payload)>> {
+        std::mem::replace(&mut self.debug_adapters.incoming, SelectAll::new())
+    }
+
+    fn bind_view_redraw(&self, view: &mut View) {
+        view.diagnostics_handler.bind_runtime(self.runtime.clone());
+        view.diagnostics_handler.bind_redraw(self.frame_gate.handle());
+    }
+
+    fn track_tree_surface(&mut self, view_id: ViewId) -> Option<crate::collab::SurfaceId> {
+        if !self.tree.contains(view_id) {
+            self.surface_registry.remove_view(view_id);
+            return None;
+        }
+
+        let view = self.tree.get(view_id);
+        Some(self.surface_registry.track(
+            crate::collab::surface::kind::EDITOR,
+            crate::collab::surface::Role::Editor,
+            view.id,
+            view.doc,
+        ))
+    }
+
+    fn track_component_surface(
+        &mut self,
+        view_id: ViewId,
+        doc_id: DocumentId,
+    ) -> crate::collab::SurfaceId {
+        self.surface_registry.track(
+            crate::collab::surface::kind::ASSISTANT_THREAD,
+            crate::collab::surface::Role::Auxiliary,
+            view_id,
+            doc_id,
+        )
+    }
+
+    pub fn request_redraw(&self) {
+        self.frame_gate.request_redraw();
+    }
+
+    pub fn runtime(&self) -> &Runtime {
+        &self.runtime
+    }
+
     pub fn menu_border(&self) -> bool {
         self.config().popup_border == PopupBorderConfig::All
             || self.config().popup_border == PopupBorderConfig::Menu
@@ -2295,6 +2416,1388 @@ impl Editor {
 
     pub fn workspace_diagnostic_counts(&self) -> WorkspaceDiagnosticCounts {
         self.workspace_diagnostic_counts
+    }
+
+    pub fn active_thread(
+        &self,
+    ) -> Option<(
+        crate::assistant::thread::Id,
+        &crate::assistant::thread::Thread,
+    )> {
+        let thread = self.assistant.active()?;
+        Some((thread, self.assistant.thread(thread)?))
+    }
+
+    pub fn assistant_thread(
+        &self,
+        thread: crate::assistant::thread::Id,
+    ) -> Option<&crate::assistant::thread::Thread> {
+        self.assistant.thread(thread)
+    }
+
+    pub fn assistant_threads(
+        &self,
+    ) -> Box<dyn Iterator<Item = &crate::assistant::thread::Thread> + '_> {
+        self.assistant.threads()
+    }
+
+    pub fn assistant_view(&self, focused: bool) -> crate::assistant::view::View {
+        self.assistant.view(focused)
+    }
+
+    pub fn active_assistant_view_thread(&self) -> Option<crate::assistant::view::Thread> {
+        self.assistant_view(false).active
+    }
+
+    pub fn assistant_view_tabs(&self) -> Vec<crate::assistant::view::ThreadTab> {
+        self.assistant_view(false).tabs
+    }
+
+    pub fn assistant_view_entry(
+        &self,
+        entry: crate::assistant::thread::EntryId,
+    ) -> Option<crate::assistant::view::Entry> {
+        self.active_assistant_view_thread()?
+            .entries
+            .into_iter()
+            .find(|current| current.id == entry)
+    }
+
+    pub fn assistant_entry_details(
+        &self,
+        entry: crate::assistant::thread::EntryId,
+    ) -> Option<String> {
+        let model = self.assistant_model(false);
+        let entry = model.entries.into_iter().find(|current| current.id == entry)?;
+        Some(entry.details_markdown(&model.agent_name))
+    }
+
+    pub fn selected_assistant_thread_entry(
+        &self,
+    ) -> Option<(
+        crate::assistant::thread::Id,
+        crate::assistant::thread::Thread,
+        crate::assistant::thread::Entry,
+    )> {
+        let (thread, state) = self.active_thread().map(|(thread, state)| (thread, state.clone()))?;
+        let entry = state
+            .selected_entry()
+            .and_then(|id| state.entries().iter().find(|entry| entry.id == id))
+            .cloned()?;
+        Some((thread, state, entry))
+    }
+
+    pub fn assistant_thread_change_summary(
+        &self,
+        thread: &crate::assistant::thread::Thread,
+    ) -> Option<crate::assistant::change::Summary> {
+        let files = thread
+            .entries()
+            .iter()
+            .filter_map(|entry| match &entry.kind {
+                crate::assistant::thread::EntryKind::ChangeSummary(summary) => {
+                    Some(summary.files.clone())
+                }
+                _ => None,
+            })
+            .flatten()
+            .collect::<Vec<_>>();
+        (!files.is_empty()).then_some(crate::assistant::change::Summary { files })
+    }
+
+    pub fn assistant_turn_change_summary(
+        &self,
+        thread: &crate::assistant::thread::Thread,
+        entry: &crate::assistant::thread::Entry,
+    ) -> Option<crate::assistant::change::Summary> {
+        if let crate::assistant::thread::EntryKind::ChangeSummary(summary) = &entry.kind {
+            return Some(summary.clone());
+        }
+
+        let turn = entry.turn?;
+        let files = thread
+            .entries()
+            .iter()
+            .filter(|candidate| candidate.turn == Some(turn))
+            .filter_map(|candidate| match &candidate.kind {
+                crate::assistant::thread::EntryKind::ChangeSummary(summary) => {
+                    Some(summary.files.clone())
+                }
+                _ => None,
+            })
+            .flatten()
+            .collect::<Vec<_>>();
+        (!files.is_empty()).then_some(crate::assistant::change::Summary { files })
+    }
+
+    pub fn selected_assistant_turn_change_summary(
+        &self,
+    ) -> Option<crate::assistant::change::Summary> {
+        let (_thread_id, thread, entry) = self.selected_assistant_thread_entry()?;
+        self.assistant_turn_change_summary(&thread, &entry)
+    }
+
+    pub fn active_assistant_thread_change_summary(
+        &self,
+    ) -> Option<crate::assistant::change::Summary> {
+        let (_thread_id, thread) = self.active_thread()?;
+        self.assistant_thread_change_summary(thread)
+    }
+
+    pub fn selected_assistant_entry(&self) -> Option<crate::assistant::thread::EntryId> {
+        self.active_assistant_view_thread()?.selected
+    }
+
+    pub fn selected_assistant_entry_locations(
+        &self,
+    ) -> Option<Vec<crate::collab::Location>> {
+        let entry = self.selected_assistant_entry()?;
+        Some(self.assistant_view_entry(entry)?.locations)
+    }
+
+    pub fn assistant_entry_id_at(&self, index: usize) -> Option<crate::assistant::thread::EntryId> {
+        self.active_assistant_view_thread()?
+            .entries
+            .get(index)
+            .map(|entry| entry.id)
+    }
+
+    pub fn assistant_entry_is_folded(
+        &self,
+        entry: crate::assistant::thread::EntryId,
+    ) -> bool {
+        self.active_assistant_view_thread()
+            .is_some_and(|thread| thread.folded.contains(&entry))
+    }
+
+    pub fn assistant_history_entries(
+        &self,
+        scope: &crate::assistant::thread::Scope,
+    ) -> Option<Vec<crate::assistant::history::Stub>> {
+        self.assistant.history(scope).map(|page| page.entries.clone())
+    }
+
+    pub fn assistant_layout_history_entries(&self) -> Vec<crate::assistant::history::Stub> {
+        self.assistant_history_entries(&crate::assistant::layout::current_scope())
+            .unwrap_or_default()
+    }
+
+    pub fn assistant_model(&self, focused: bool) -> crate::model::AssistantModel {
+        self.assistant.model(
+            focused,
+            self.assistant_layout_history_entries(),
+            self.active_thread()
+                .and_then(|(_, thread)| thread.title().map(ToOwned::to_owned))
+                .unwrap_or_else(|| {
+                    if self.assistant.threads().next().is_none() {
+                        "No agent".to_string()
+                    } else {
+                        "Agent".to_string()
+                    }
+                }),
+        )
+    }
+
+    pub fn assistant_history_backend(
+        &self,
+    ) -> Option<crate::assistant::history::Backend> {
+        self.assistant_history.clone()
+    }
+
+    pub fn set_assistant_history_backend(
+        &mut self,
+        history: crate::assistant::history::Backend,
+    ) {
+        self.assistant_history = Some(history);
+    }
+
+    pub fn set_assistant_context_registry(
+        &mut self,
+        registry: crate::assistant::context::Registry,
+    ) {
+        self.assistant_context = registry;
+    }
+
+    pub fn assistant_history_records(&self) -> Vec<crate::assistant::history::Record> {
+        self.assistant_threads()
+            .map(crate::assistant::history::Record::from_thread)
+            .collect()
+    }
+
+    pub fn persist_assistant_layout(&self) {
+        let scope = crate::assistant::layout::current_scope();
+        let (open, active) = self.assistant_layout_threads(&scope);
+        self.runtime
+            .work()
+            .spawn(async move {
+                let _ = crate::assistant::layout::save_layout(&scope, open, active).await;
+            })
+            .detach();
+    }
+
+    pub async fn flush_assistant_persistence(&self) -> Vec<anyhow::Error> {
+        let Some(history) = self.assistant_history_backend() else {
+            return Vec::new();
+        };
+
+        let mut errors = Vec::new();
+        let records = self.assistant_history_records();
+        let scope = crate::assistant::layout::current_scope();
+        let (open, active) = self.assistant_layout_threads(&scope);
+
+        for record in records {
+            if let Err(err) = history.save(record).await {
+                errors.push(err);
+            }
+        }
+        if let Err(err) = crate::assistant::layout::save_layout(&scope, open, active).await {
+            errors.push(err);
+        }
+        errors
+    }
+
+    pub fn apply_assistant_effects(&mut self, effects: Vec<crate::assistant::effect::Effect>) {
+        for effect in effects {
+            match effect {
+                crate::assistant::effect::Effect::EnsureParticipant { thread } => {
+                    self.ensure_assistant_participant(thread);
+                }
+                crate::assistant::effect::Effect::LeaveParticipant { thread } => {
+                    let _ = self.leave_participant(crate::assistant::thread::participant(thread));
+                }
+                crate::assistant::effect::Effect::PublishLocation { thread, location } => {
+                    self.ensure_assistant_participant(thread);
+                    let participant = crate::assistant::thread::participant(thread);
+                    let _ = self.publish_location(participant, location);
+                }
+                crate::assistant::effect::Effect::RevealLocation { location } => {
+                    self.suppress_assistant_follow_pause = true;
+                    let _ = self.reveal_location(&location, Action::Replace);
+                }
+                crate::assistant::effect::Effect::SendBackendCommand { backend, command } => {
+                    let Some(handle) = self.ensure_assistant_backend(&backend) else {
+                        self.set_error(format!("Assistant backend missing: {backend}"));
+                        continue;
+                    };
+                    self.runtime
+                        .work()
+                        .spawn(async move {
+                            let _ = handle.send(command).await;
+                        })
+                        .detach();
+                }
+                crate::assistant::effect::Effect::OpenEntryDoc {
+                    thread,
+                    entry,
+                    action,
+                } => {
+                    if let Some(effects) = self.open_assistant_entry_scratch(thread, entry, action) {
+                        self.apply_assistant_effects(effects);
+                    }
+                }
+                crate::assistant::effect::Effect::SetStatus { message } => {
+                    self.set_status(message);
+                }
+                crate::assistant::effect::Effect::Save { thread } => {
+                    self.save_assistant_thread(thread);
+                }
+                crate::assistant::effect::Effect::SaveNow { record } => {
+                    self.save_assistant_record_now(record);
+                }
+                crate::assistant::effect::Effect::Delete { thread } => {
+                    self.delete_assistant_thread(thread);
+                }
+                crate::assistant::effect::Effect::SyncModel => {
+                    let scope = crate::assistant::layout::current_scope();
+                    let (open, active) = self.assistant_layout_threads(&scope);
+                    self.debounce_assistant_layout(async move {
+                        let _ = crate::assistant::layout::save_layout(&scope, open, active).await;
+                    });
+                    self.request_redraw();
+                }
+            }
+        }
+    }
+
+    pub fn assistant_record(
+        &self,
+        thread: crate::assistant::thread::Id,
+    ) -> Option<crate::assistant::history::Record> {
+        self.assistant.record(thread)
+    }
+
+    pub fn assistant_layout_threads(
+        &self,
+        scope: &crate::assistant::thread::Scope,
+    ) -> (Vec<crate::assistant::thread::Id>, Option<crate::assistant::thread::Id>) {
+        let open = self
+            .assistant_threads()
+            .filter(|thread| thread.scope() == scope)
+            .map(|thread| thread.id)
+            .collect();
+        let active = self.active_thread().map(|(thread, _)| thread).filter(|thread| {
+            self.assistant_thread(*thread)
+                .is_some_and(|state| state.scope() == scope)
+        });
+        (open, active)
+    }
+
+    pub fn assistant_update_tx(
+        &self,
+    ) -> RuntimeSender<crate::assistant::backend::Update> {
+        self.assistant_updates_tx.clone()
+    }
+
+    pub fn assistant_backend(
+        &self,
+        backend: &crate::assistant::backend::Id,
+    ) -> Option<crate::assistant::BackendHandle> {
+        self.assistant_backends.get(backend).cloned()
+    }
+
+    pub fn assistant_terminals(&self) -> std::sync::Arc<helix_acp::TerminalManager> {
+        self.assistant_terminals.clone()
+    }
+
+    pub fn assistant_runtime(&self) -> Runtime {
+        self.runtime.clone()
+    }
+
+    pub fn assistant_agent(
+        &self,
+        backend: &crate::assistant::backend::Id,
+    ) -> Option<crate::editor::AgentConfig> {
+        self.config()
+            .agents
+            .iter()
+            .find(|agent| agent.command == backend.as_ref())
+            .cloned()
+    }
+
+    pub fn cache_assistant_backend(&mut self, handle: crate::assistant::BackendHandle) {
+        self.assistant_backends.insert(handle.id.clone(), handle);
+    }
+
+    pub fn spawn_assistant_backend(
+        &mut self,
+        command: String,
+        args: Vec<String>,
+    ) -> anyhow::Result<crate::assistant::BackendHandle> {
+        let runtime = self.assistant_runtime();
+        let cwd = std::env::current_dir().unwrap_or_default();
+        let config = helix_acp::client::AgentConfig {
+            command: command.clone(),
+            args,
+            env: Vec::new(),
+            cwd: cwd.clone(),
+            timeout_secs: 120,
+        };
+        let client_info = helix_acp::types::Implementation {
+            name: "helix".to_string(),
+            title: Some("Helix Editor".to_string()),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+        };
+
+        let driver = crate::assistant::acp::Driver::new(config, client_info);
+        let handle = driver.spawn(
+            &runtime,
+            crate::assistant::host::local_set(self),
+            self.assistant_update_tx(),
+            crate::assistant::backend::Connect {
+                scope: crate::assistant::thread::Scope::new(cwd),
+                context_servers: Vec::new(),
+            },
+        )?;
+        self.cache_assistant_backend(handle.clone());
+        Ok(handle)
+    }
+
+    pub fn ensure_assistant_backend(
+        &mut self,
+        backend: &crate::assistant::backend::Id,
+    ) -> Option<crate::assistant::BackendHandle> {
+        if let Some(handle) = self.assistant_backend(backend) {
+            return Some(handle);
+        }
+
+        let agent = self.assistant_agent(backend)?;
+        self.spawn_assistant_backend(agent.command, agent.args).ok()
+    }
+
+    pub fn connect_assistant_backend(
+        &mut self,
+        command: String,
+        args: Vec<String>,
+    ) -> anyhow::Result<(
+        crate::assistant::backend::Id,
+        Vec<crate::assistant::effect::Effect>,
+    )> {
+        let cwd = std::env::current_dir().unwrap_or_default();
+        let handle = self.spawn_assistant_backend(command, args)?;
+        let effects = self.new_assistant_thread(
+            handle.id.clone(),
+            crate::assistant::thread::Scope::new(cwd),
+        );
+        Ok((handle.id, effects))
+    }
+
+    pub fn close_active_assistant_thread(
+        &mut self,
+    ) -> anyhow::Result<Vec<crate::assistant::effect::Effect>> {
+        let (thread, _) = self.active_thread().context("No active assistant thread")?;
+        Ok(self.close_assistant_thread(thread))
+    }
+
+    pub fn new_assistant_thread_from_active_backend(
+        &mut self,
+    ) -> anyhow::Result<Vec<crate::assistant::effect::Effect>> {
+        let (_, thread) = self.active_thread_owned().context("No active assistant thread")?;
+        let crate::assistant::thread::Origin::Backend { backend, .. } = thread.origin() else {
+            anyhow::bail!("Active assistant thread is not backend-backed")
+        };
+        Ok(self.new_assistant_thread(backend.clone(), thread.clone_scope()))
+    }
+
+    pub fn cancel_active_assistant_thread(
+        &mut self,
+    ) -> Option<Vec<crate::assistant::effect::Effect>> {
+        let (thread, _) = self.active_thread()?;
+        Some(self.cancel_assistant_thread(thread))
+    }
+
+    pub fn submit_active_assistant_prompt(
+        &mut self,
+        text: String,
+    ) -> anyhow::Result<Vec<crate::assistant::effect::Effect>> {
+        let thread = self
+            .active_backend_thread()
+            .context("Active assistant thread is not bound to a backend")?;
+        Ok(self.submit_assistant_prompt(thread, text))
+    }
+
+    pub fn set_active_assistant_draft_if_changed(
+        &mut self,
+        text: String,
+    ) -> Option<Vec<crate::assistant::effect::Effect>> {
+        let (thread, state) = self.active_thread_owned()?;
+        if state.draft() == text {
+            return None;
+        }
+        Some(self.set_assistant_draft(thread, text))
+    }
+
+    pub fn attach_active_assistant_context(
+        &mut self,
+        item: crate::assistant::context::Kind,
+    ) -> anyhow::Result<Vec<crate::assistant::effect::Effect>> {
+        let (thread, _) = self.active_thread().context("No active assistant thread")?;
+        Ok(self.attach_assistant_context(thread, item))
+    }
+
+    pub fn detach_active_assistant_context(
+        &mut self,
+        item: crate::assistant::context::Id,
+    ) -> anyhow::Result<Vec<crate::assistant::effect::Effect>> {
+        let (thread, _) = self.active_thread().context("No active assistant thread")?;
+        Ok(self.detach_assistant_context(thread, item))
+    }
+
+    pub fn cycle_active_assistant_config(
+        &mut self,
+        key: &str,
+    ) -> anyhow::Result<Vec<crate::assistant::effect::Effect>> {
+        let (thread, state) = self.active_thread_owned().context("No active assistant thread")?;
+        let Some((option, value)) = state.config().cycle(key) else {
+            anyhow::bail!("No {key} options from assistant backend")
+        };
+        Ok(self.set_assistant_config(thread, option, value))
+    }
+
+    pub fn cycle_active_assistant_mode(
+        &mut self,
+    ) -> anyhow::Result<Vec<crate::assistant::effect::Effect>> {
+        let (thread, state) = self.active_thread_owned().context("No active assistant thread")?;
+        let Some(mode) = state.mode() else {
+            anyhow::bail!("No mode options from assistant backend")
+        };
+        let next = match mode.selected() {
+            crate::assistant::mode::Selected::Current(current) => {
+                let ids: Vec<_> = mode.items().map(|item| item.id.clone()).collect();
+                let idx = ids.iter().position(|id| id == current).unwrap_or(0);
+                ids[(idx + 1) % ids.len()].clone()
+            }
+            crate::assistant::mode::Selected::Pending { next, .. } => next.clone(),
+        };
+        Ok(self.set_assistant_mode(thread, next))
+    }
+
+    pub fn toggle_active_assistant_follow(
+        &mut self,
+    ) -> anyhow::Result<(&'static str, Vec<crate::assistant::effect::Effect>)> {
+        let (thread, _) = self.active_thread().context("No active assistant thread")?;
+        Ok(self.toggle_assistant_follow(thread))
+    }
+
+    pub fn pause_active_assistant_follow(
+        &mut self,
+        reason: crate::collab::FollowPause,
+    ) -> Option<Vec<crate::assistant::effect::Effect>> {
+        let (thread, state) = self.active_thread_owned()?;
+        if !matches!(state.follow(), crate::collab::FollowState::On { .. }) {
+            return None;
+        }
+        Some(self.pause_assistant_follow(thread, reason))
+    }
+
+    pub fn assistant_act(
+        &mut self,
+        action: crate::assistant::Action,
+    ) -> Vec<crate::assistant::effect::Effect> {
+        self.assistant.act(action)
+    }
+
+    pub fn apply_assistant_thread_event(
+        &mut self,
+        thread: crate::assistant::thread::Id,
+        event: crate::assistant::thread::Event,
+    ) -> Vec<crate::assistant::effect::Effect> {
+        self.assistant
+            .apply(crate::assistant::event::Event::Thread { thread, event })
+    }
+
+    pub fn apply_assistant_backend_event(
+        &mut self,
+        backend: crate::assistant::backend::Id,
+        event: crate::assistant::backend::Event,
+    ) -> Vec<crate::assistant::effect::Effect> {
+        self.assistant
+            .apply(crate::assistant::event::Event::Backend { backend, event })
+    }
+
+    pub fn replace_assistant_history(
+        &mut self,
+        scope: crate::assistant::thread::Scope,
+        entries: Vec<crate::assistant::history::Stub>,
+        next: Option<crate::assistant::history::Cursor>,
+    ) -> Vec<crate::assistant::effect::Effect> {
+        self.assistant.replace_history(scope, entries, next)
+    }
+
+    pub fn apply_assistant_location_update(
+        &mut self,
+        thread: crate::assistant::thread::Id,
+        location: crate::collab::Location,
+    ) -> Vec<crate::assistant::effect::Effect> {
+        self.apply_assistant_thread_event(thread, crate::assistant::thread::Event::Follow(location))
+    }
+
+    pub fn apply_assistant_terminal_event(
+        &mut self,
+        thread: crate::assistant::thread::Id,
+        event: crate::assistant::terminal::Event,
+    ) -> Vec<crate::assistant::effect::Effect> {
+        self.apply_assistant_thread_event(thread, crate::assistant::thread::Event::Terminal(event))
+    }
+
+    pub fn apply_assistant_update(
+        &mut self,
+        update: crate::assistant::backend::Update,
+    ) -> AssistantUpdateOutcome {
+        use crate::assistant::backend;
+
+        match update {
+            backend::Update::Thread { thread, event } => AssistantUpdateOutcome {
+                effects: self.apply_assistant_thread_event(thread, event),
+                permission_request: None,
+            },
+            backend::Update::Permission { thread, request } => AssistantUpdateOutcome {
+                effects: Vec::new(),
+                permission_request: Some((thread, request)),
+            },
+            backend::Update::Backend { backend, event } => AssistantUpdateOutcome {
+                effects: self.apply_assistant_backend_event(backend, event),
+                permission_request: None,
+            },
+            backend::Update::History {
+                scope,
+                entries,
+                next,
+            } => AssistantUpdateOutcome {
+                effects: self.replace_assistant_history(scope, entries, next),
+                permission_request: None,
+            },
+            backend::Update::Location { thread, location } => AssistantUpdateOutcome {
+                effects: self.apply_assistant_location_update(thread, location),
+                permission_request: None,
+            },
+            backend::Update::Terminal { thread, event } => AssistantUpdateOutcome {
+                effects: self.apply_assistant_terminal_event(thread, event),
+                permission_request: None,
+            },
+            backend::Update::Error { at, error } => {
+                match at {
+                    backend::Target::Backend(_) => self.set_error(error.to_string()),
+                    backend::Target::Thread(_) => self.set_status(error.to_string()),
+                }
+                AssistantUpdateOutcome {
+                    effects: Vec::new(),
+                    permission_request: None,
+                }
+            }
+        }
+    }
+
+    pub fn untrack_assistant_doc(
+        &mut self,
+        doc: DocumentId,
+    ) -> Vec<crate::assistant::effect::Effect> {
+        self.assistant_act(crate::assistant::Action::UntrackDoc { doc })
+    }
+
+    pub fn activate_assistant_thread(
+        &mut self,
+        thread: crate::assistant::thread::Id,
+    ) -> Vec<crate::assistant::effect::Effect> {
+        self.assistant_act(crate::assistant::Action::Activate { thread })
+    }
+
+    pub fn focus_assistant_thread(
+        &mut self,
+        thread: crate::assistant::thread::Id,
+        focus: crate::assistant::thread::Focus,
+    ) -> Vec<crate::assistant::effect::Effect> {
+        self.assistant_act(crate::assistant::Action::Focus { thread, focus })
+    }
+
+    pub fn select_assistant_entry(
+        &mut self,
+        thread: crate::assistant::thread::Id,
+        entry: Option<crate::assistant::thread::EntryId>,
+    ) -> Vec<crate::assistant::effect::Effect> {
+        self.assistant_act(crate::assistant::Action::SelectEntry { thread, entry })
+    }
+
+    pub fn cycle_active_assistant_thread(
+        &mut self,
+        delta: isize,
+    ) -> anyhow::Result<Vec<crate::assistant::effect::Effect>> {
+        let tabs = self.assistant_view_tabs();
+        if tabs.len() < 2 {
+            anyhow::bail!("Need at least two assistant threads")
+        }
+
+        let active = self.active_thread().context("No active assistant thread")?.0;
+        let index = tabs
+            .iter()
+            .position(|tab| tab.id == active)
+            .context("Active assistant thread missing from tabs")?;
+        let next = (index as isize + delta).rem_euclid(tabs.len() as isize) as usize;
+        Ok(self.activate_assistant_thread(tabs[next].id))
+    }
+
+    pub fn set_active_assistant_focus(
+        &mut self,
+        focus: crate::assistant::thread::Focus,
+    ) -> anyhow::Result<Vec<crate::assistant::effect::Effect>> {
+        let (thread, _) = self.active_thread().context("No active assistant thread")?;
+        Ok(self.focus_assistant_thread(thread, focus))
+    }
+
+    pub fn select_active_assistant_entry(
+        &mut self,
+        entry: Option<crate::assistant::thread::EntryId>,
+    ) -> anyhow::Result<Vec<crate::assistant::effect::Effect>> {
+        let (thread, _) = self.active_thread().context("No active assistant thread")?;
+        Ok(self.select_assistant_entry(thread, entry))
+    }
+
+    pub fn load_assistant_thread(
+        &mut self,
+        record: crate::assistant::history::Record,
+        activate: bool,
+    ) -> Vec<crate::assistant::effect::Effect> {
+        self.assistant_act(crate::assistant::Action::LoadThread { record, activate })
+    }
+
+    pub fn close_assistant_thread(
+        &mut self,
+        thread: crate::assistant::thread::Id,
+    ) -> Vec<crate::assistant::effect::Effect> {
+        self.assistant_act(crate::assistant::Action::Close { thread })
+    }
+
+    pub fn new_assistant_thread(
+        &mut self,
+        backend: crate::assistant::backend::Id,
+        scope: crate::assistant::thread::Scope,
+    ) -> Vec<crate::assistant::effect::Effect> {
+        self.assistant_act(crate::assistant::Action::NewThread { backend, scope })
+    }
+
+    pub fn cancel_assistant_thread(
+        &mut self,
+        thread: crate::assistant::thread::Id,
+    ) -> Vec<crate::assistant::effect::Effect> {
+        self.assistant_act(crate::assistant::Action::Cancel { thread })
+    }
+
+    pub fn attach_assistant_context(
+        &mut self,
+        thread: crate::assistant::thread::Id,
+        item: crate::assistant::context::Kind,
+    ) -> Vec<crate::assistant::effect::Effect> {
+        self.assistant_act(crate::assistant::Action::AttachContext { thread, item })
+    }
+
+    pub fn detach_assistant_context(
+        &mut self,
+        thread: crate::assistant::thread::Id,
+        item: crate::assistant::context::Id,
+    ) -> Vec<crate::assistant::effect::Effect> {
+        self.assistant_act(crate::assistant::Action::DetachContext { thread, item })
+    }
+
+    pub fn set_assistant_config(
+        &mut self,
+        thread: crate::assistant::thread::Id,
+        option: crate::assistant::config::Id,
+        value: crate::assistant::config::ValueId,
+    ) -> Vec<crate::assistant::effect::Effect> {
+        self.assistant_act(crate::assistant::Action::SetConfig {
+            thread,
+            option,
+            value,
+        })
+    }
+
+    pub fn set_assistant_mode(
+        &mut self,
+        thread: crate::assistant::thread::Id,
+        mode: crate::assistant::mode::Id,
+    ) -> Vec<crate::assistant::effect::Effect> {
+        self.assistant_act(crate::assistant::Action::SetMode { thread, mode })
+    }
+
+    pub fn set_assistant_draft(
+        &mut self,
+        thread: crate::assistant::thread::Id,
+        text: String,
+    ) -> Vec<crate::assistant::effect::Effect> {
+        self.assistant_act(crate::assistant::Action::SetDraft { thread, text })
+    }
+
+    pub fn resolve_assistant_permission(
+        &mut self,
+        thread: crate::assistant::thread::Id,
+        request: crate::assistant::permission::RequestId,
+        decision: crate::assistant::permission::Decision,
+    ) -> Vec<crate::assistant::effect::Effect> {
+        self.assistant_act(crate::assistant::Action::ResolvePermission {
+            thread,
+            request,
+            decision,
+        })
+    }
+
+    pub fn submit_assistant_prompt(
+        &mut self,
+        thread: crate::assistant::thread::Id,
+        text: String,
+    ) -> Vec<crate::assistant::effect::Effect> {
+        self.assistant_act(crate::assistant::Action::Submit { thread, text })
+    }
+
+    pub fn open_assistant_entry_doc(
+        &mut self,
+        thread: crate::assistant::thread::Id,
+        entry: crate::assistant::thread::EntryId,
+        action: Action,
+    ) -> Vec<crate::assistant::effect::Effect> {
+        self.assistant_act(crate::assistant::Action::OpenEntryDoc {
+            thread,
+            entry,
+            action,
+        })
+    }
+
+    pub fn open_assistant_entry_scratch(
+        &mut self,
+        thread: crate::assistant::thread::Id,
+        entry: crate::assistant::thread::EntryId,
+        action: Action,
+    ) -> Option<Vec<crate::assistant::effect::Effect>> {
+        let Some(details) = self.assistant_entry_details(entry) else {
+            return None;
+        };
+        let opened = self
+            .active_assistant_view_thread()
+            .and_then(|thread| thread.opened_docs.get(&entry).copied());
+
+        if let Some(doc_id) = opened {
+            if self.switch_document_if_exists(doc_id, action) {
+                return Some(Vec::new());
+            }
+            let effects = self.untrack_assistant_entry_doc(thread, entry);
+            let doc_id = self.open_markdown_scratch(action, details);
+            let mut next = self.track_assistant_entry_doc(thread, entry, doc_id);
+            let mut all = effects;
+            all.append(&mut next);
+            return Some(all);
+        }
+
+        let doc_id = self.open_markdown_scratch(action, details);
+        Some(self.track_assistant_entry_doc(thread, entry, doc_id))
+    }
+
+    pub fn open_selected_assistant_entry_scratch(
+        &mut self,
+        action: Action,
+    ) -> Option<Vec<crate::assistant::effect::Effect>> {
+        let Some(entry) = self.selected_assistant_entry() else {
+            return None;
+        };
+        let Some((thread, _)) = self.active_thread() else {
+            return None;
+        };
+        self.open_assistant_entry_scratch(thread, entry, action)
+    }
+
+    pub fn untrack_assistant_entry_doc(
+        &mut self,
+        thread: crate::assistant::thread::Id,
+        entry: crate::assistant::thread::EntryId,
+    ) -> Vec<crate::assistant::effect::Effect> {
+        self.assistant_act(crate::assistant::Action::UntrackEntryDoc { thread, entry })
+    }
+
+    pub fn track_assistant_entry_doc(
+        &mut self,
+        thread: crate::assistant::thread::Id,
+        entry: crate::assistant::thread::EntryId,
+        doc: DocumentId,
+    ) -> Vec<crate::assistant::effect::Effect> {
+        self.assistant_act(crate::assistant::Action::TrackEntryDoc { thread, entry, doc })
+    }
+
+    pub fn pause_assistant_follow(
+        &mut self,
+        thread: crate::assistant::thread::Id,
+        reason: crate::collab::FollowPause,
+    ) -> Vec<crate::assistant::effect::Effect> {
+        self.assistant_act(crate::assistant::Action::PauseFollow { thread, reason })
+    }
+
+    pub fn follow_assistant_thread(
+        &mut self,
+        thread: crate::assistant::thread::Id,
+    ) -> Vec<crate::assistant::effect::Effect> {
+        self.assistant_act(crate::assistant::Action::Follow { thread })
+    }
+
+    pub fn unfollow_assistant_thread(
+        &mut self,
+        thread: crate::assistant::thread::Id,
+    ) -> Vec<crate::assistant::effect::Effect> {
+        self.assistant_act(crate::assistant::Action::Unfollow { thread })
+    }
+
+    pub fn toggle_assistant_follow(
+        &mut self,
+        thread: crate::assistant::thread::Id,
+    ) -> (&'static str, Vec<crate::assistant::effect::Effect>) {
+        let follow = self
+            .assistant_thread(thread)
+            .map(|thread| thread.follow().clone())
+            .unwrap_or(crate::collab::FollowState::Off);
+
+        let status = match follow {
+            crate::collab::FollowState::Off => "Assistant follow enabled",
+            crate::collab::FollowState::On { .. } => "Assistant follow disabled",
+            crate::collab::FollowState::Paused { .. } => "Assistant follow resumed",
+        };
+
+        let effects = match follow {
+            crate::collab::FollowState::Off | crate::collab::FollowState::Paused { .. } => {
+                self.follow_assistant_thread(thread)
+            }
+            crate::collab::FollowState::On { .. } => self.unfollow_assistant_thread(thread),
+        };
+        (status, effects)
+    }
+
+    pub fn open_selected_assistant_turn_changes(&mut self) -> bool {
+        let Some(summary) = self.selected_assistant_turn_change_summary() else {
+            return false;
+        };
+        self.open_markdown_scratch(
+            Action::Replace,
+            render_assistant_change_summary(&summary, "Turn Changes"),
+        );
+        true
+    }
+
+    pub fn open_active_assistant_thread_changes(&mut self) -> bool {
+        let Some(summary) = self.active_assistant_thread_change_summary() else {
+            return false;
+        };
+        self.open_markdown_scratch(
+            Action::Replace,
+            render_assistant_change_summary(&summary, "Thread Changes"),
+        );
+        true
+    }
+
+    pub fn save_assistant_thread(&mut self, thread: crate::assistant::thread::Id) {
+        let (Some(history), Some(record)) = (
+            self.assistant_history.clone(),
+            self.assistant_record(thread),
+        ) else {
+            return;
+        };
+
+        self.assistant_saves
+            .entry(thread)
+            .or_insert_with(|| helix_runtime::Debounce::new(std::time::Duration::from_millis(300)))
+            .restart(&self.runtime.work(), &self.runtime.clock(), async move {
+                let _ = history.save(record).await;
+            });
+    }
+
+    pub fn save_assistant_record_now(&mut self, record: crate::assistant::history::Record) {
+        if let Some(debounce) = self.assistant_saves.get_mut(&record.id) {
+            debounce.cancel();
+        }
+        if let Some(history) = self.assistant_history.clone() {
+            self.runtime
+                .work()
+                .spawn(async move {
+                    let _ = history.save(record).await;
+                })
+                .detach();
+        }
+    }
+
+    pub fn delete_assistant_thread(&mut self, thread: crate::assistant::thread::Id) {
+        if let Some(debounce) = self.assistant_saves.get_mut(&thread) {
+            debounce.cancel();
+        }
+        if let Some(history) = self.assistant_history.clone() {
+            self.runtime
+                .work()
+                .spawn(async move {
+                    let _ = history.delete(thread).await;
+                })
+                .detach();
+        }
+    }
+
+    pub fn debounce_assistant_layout<F>(&mut self, future: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        self.assistant_layout_save
+            .restart(&self.runtime.work(), &self.runtime.clock(), future);
+    }
+
+    pub fn active_thread_mut(
+        &mut self,
+    ) -> Option<(
+        crate::assistant::thread::Id,
+        &mut crate::assistant::thread::Thread,
+    )> {
+        let thread = self.assistant.active()?;
+        Some((thread, self.assistant.thread_mut(thread)?))
+    }
+
+    pub fn active_backend_thread(&self) -> Option<crate::assistant::thread::Id> {
+        let (thread, state) = self.active_thread()?;
+        matches!(state.origin(), crate::assistant::thread::Origin::Backend { .. }).then_some(thread)
+    }
+
+    pub fn active_thread_owned(
+        &self,
+    ) -> Option<(
+        crate::assistant::thread::Id,
+        crate::assistant::thread::Thread,
+    )> {
+        self.active_thread().map(|(thread, state)| (thread, state.clone()))
+    }
+
+    pub fn active_thread_snapshot(&self) -> Option<crate::assistant::thread::Snapshot> {
+        let (_, thread) = self.active_thread()?;
+        Some(thread.snapshot())
+    }
+
+    pub fn active_thread_context(&self) -> Option<Vec<crate::assistant::context::Item>> {
+        let (_, thread) = self.active_thread()?;
+        Some(thread.context_items().to_vec())
+    }
+
+    pub fn active_thread_scope_or_layout(&self) -> crate::assistant::thread::Scope {
+        self.active_thread()
+            .map(|(_, thread)| thread.clone_scope())
+            .unwrap_or_else(crate::assistant::layout::current_scope)
+    }
+
+    pub fn publish_location(
+        &mut self,
+        participant: crate::collab::ParticipantId,
+        location: crate::collab::Location,
+    ) -> Result<Vec<crate::collab::Effect>, crate::collab::MissingParticipant> {
+        let location = self.resolve_location_surface(location);
+        self.collab.publish_location(participant, location)
+    }
+
+    pub fn apply_collab_effects(&mut self, effects: Vec<crate::collab::Effect>) {
+        let mut sync_presence = false;
+        let mut reveals = Vec::new();
+
+        for effect in effects {
+            match effect {
+                crate::collab::Effect::Open { .. } | crate::collab::Effect::ClearPresence { .. } => {
+                    sync_presence = true;
+                }
+                crate::collab::Effect::Reveal { location, .. } => {
+                    sync_presence = true;
+                    reveals.push(location);
+                }
+                crate::collab::Effect::ShowPresence { surface, presence } => {
+                    self.render_presence(surface, &presence);
+                }
+            }
+        }
+
+        if sync_presence {
+            self.sync_collab_presence();
+        }
+
+        for location in reveals {
+            let _ = self.reveal_location(&location, Action::Replace);
+        }
+    }
+
+    fn current_assistant_follow_snapshot(&self) -> Option<AssistantFollowSnapshot> {
+        let view = self.tree.get(self.tree.focus);
+        let doc = self.document(view.doc)?;
+        Some(AssistantFollowSnapshot {
+            doc: view.doc,
+            version: doc.version(),
+            cursor: doc.selection(view.id).primary().cursor(doc.text().slice(..)),
+            scroll: doc.view_offset(view.id).vertical_offset,
+        })
+    }
+
+    pub fn pause_assistant_follow_if_local_change(&mut self) {
+        let current = self.current_assistant_follow_snapshot();
+        let Some(snapshot) = current.clone() else {
+            self.assistant_follow_snapshot = current;
+            self.suppress_assistant_follow_pause = false;
+            return;
+        };
+
+        let Some(previous) = self.assistant_follow_snapshot.replace(snapshot.clone()) else {
+            self.suppress_assistant_follow_pause = false;
+            return;
+        };
+
+        if previous == snapshot {
+            self.suppress_assistant_follow_pause = false;
+            return;
+        }
+
+        if self.suppress_assistant_follow_pause {
+            self.suppress_assistant_follow_pause = false;
+            return;
+        }
+
+        let event = if previous.doc != snapshot.doc {
+            EditorEvent::BufferSwitched
+        } else if previous.version != snapshot.version {
+            EditorEvent::Edited
+        } else if previous.cursor != snapshot.cursor {
+            EditorEvent::CursorMoved
+        } else if previous.scroll != snapshot.scroll {
+            EditorEvent::Scrolled
+        } else {
+            return;
+        };
+
+        let Some(reason) = self.pause_current_surface(&event) else {
+            return;
+        };
+        if let Some(effects) = self.pause_active_assistant_follow(reason) {
+            self.apply_assistant_effects(effects);
+        }
+    }
+
+    pub fn participant(
+        &self,
+        participant: crate::collab::ParticipantId,
+    ) -> Option<&crate::collab::Participant> {
+        self.collab.participant(participant)
+    }
+
+    pub fn join_participant(
+        &mut self,
+        participant: crate::collab::Participant,
+    ) -> Vec<crate::collab::Effect> {
+        self.collab.join(participant)
+    }
+
+    pub fn leave_participant(
+        &mut self,
+        participant: crate::collab::ParticipantId,
+    ) -> Vec<crate::collab::Effect> {
+        self.collab.leave(participant)
+    }
+
+    pub fn ensure_assistant_participant(&mut self, thread: crate::assistant::thread::Id) {
+        let participant = crate::assistant::thread::participant(thread);
+        if self.participant(participant).is_some() {
+            return;
+        }
+
+        let name = self
+            .assistant_thread(thread)
+            .and_then(|thread| thread.title().map(ToOwned::to_owned))
+            .unwrap_or_else(|| format!("assistant-{}", thread.value().get()));
+        let effects = self.join_participant(crate::collab::Participant {
+            id: participant,
+            kind: crate::collab::participant::Kind::Agent,
+            name,
+            access: crate::collab::participant::Access::Read,
+        });
+        self.apply_collab_effects(effects);
+    }
+
+    fn resolve_location_surface(&self, mut location: crate::collab::Location) -> crate::collab::Location {
+        if location.surface.is_none() {
+            location.surface = self.surface_for_location(&location);
+        }
+        location
+    }
+
+    fn surface_for_location(&self, location: &crate::collab::Location) -> Option<crate::collab::SurfaceId> {
+        if let Some(surface) = location.surface.filter(|id| self.surface_registry.get(*id).is_some()) {
+            return Some(surface);
+        }
+
+        let doc_id = self.document_id_by_path(&location.path)?;
+        self.surface_registry
+            .surfaces()
+            .filter(|surface| surface.doc == doc_id)
+            .min_by_key(|surface| match surface.role {
+                crate::collab::surface::Role::Editor => 0,
+                crate::collab::surface::Role::Auxiliary => 1,
+            })
+            .map(|surface| surface.id)
+    }
+
+    fn snapshot_presence(
+        &self,
+        participant: crate::collab::ParticipantId,
+        location: &crate::collab::Location,
+    ) -> Option<crate::collab::Presence> {
+        let surface = self.surface_for_location(location)?;
+        let viewport = self
+            .with_surface(surface, |surface_ref| match surface_ref {
+                crate::collab::surface::Ref::Tree { view, doc } => {
+                    let offset = doc.view_offset(view.id);
+                    crate::collab::ViewportAnchor::new(
+                        location.range.map(|range| range.head).unwrap_or(offset.anchor),
+                        offset.vertical_offset,
+                        offset.horizontal_offset,
+                    )
+                }
+                crate::collab::surface::Ref::Component { view, doc } => {
+                    let offset = doc.view_offset(view.id);
+                    crate::collab::ViewportAnchor::new(
+                        location.range.map(|range| range.head).unwrap_or(offset.anchor),
+                        offset.vertical_offset,
+                        offset.horizontal_offset,
+                    )
+                }
+            })
+            .ok();
+
+        let cursor = location
+            .range
+            .map(|range| crate::collab::RangeAnchor::new(range.head, range.head));
+        let selection = location.range.filter(|range| range.anchor != range.head);
+
+        Some(crate::collab::Presence {
+            participant,
+            surface,
+            cursor,
+            selection,
+            viewport,
+        })
+    }
+
+    fn derived_presence_for_surface(
+        &self,
+        surface: crate::collab::SurfaceId,
+    ) -> Vec<crate::collab::Presence> {
+        self.collab
+            .locations()
+            .filter_map(|(participant, location)| self.snapshot_presence(participant, location))
+            .filter(|presence| presence.surface == surface)
+            .collect()
+    }
+
+    fn render_presence(
+        &mut self,
+        surface: crate::collab::SurfaceId,
+        presence: &[crate::collab::Presence],
+    ) {
+        let annotations = crate::collab::surface::presence_annotations(self, presence);
+        let _ = self.with_surface_mut(surface, |surface_ref| match surface_ref {
+            crate::collab::surface::Mut::Tree { view, doc } => {
+                doc.set_presence_annotations(view.id, annotations.clone());
+            }
+            crate::collab::surface::Mut::Component { view, doc } => {
+                doc.set_presence_annotations(view.id, annotations.clone());
+            }
+        });
+    }
+
+    fn clear_surface_presence(&mut self, surface: crate::collab::SurfaceId) {
+        let _ = self.collab.clear_presence(surface);
+        self.render_presence(surface, &[]);
+    }
+
+    fn sync_collab_presence(&mut self) {
+        let surfaces: Vec<_> = self.surface_registry.surfaces().map(|surface| surface.id).collect();
+        let snapshots: Vec<_> = surfaces
+            .iter()
+            .copied()
+            .map(|surface| (surface, self.derived_presence_for_surface(surface)))
+            .collect();
+
+        for (surface, presence) in snapshots {
+            if presence.is_empty() {
+                self.clear_surface_presence(surface);
+            } else {
+                let _ = self.collab.show_presence(surface, presence.clone());
+                self.render_presence(surface, &presence);
+            }
+        }
+    }
+
+    pub fn reveal_location(
+        &mut self,
+        location: &crate::collab::Location,
+        action: crate::editor::Action,
+    ) -> Result<(), DocumentOpenError> {
+        let doc_id = self.open(&location.path, action)?;
+        let target_view = location
+            .surface
+            .and_then(|id| self.surface_registry.get(id))
+            .map(|surface| surface.view)
+            .filter(|view_id| self.tree.contains(*view_id))
+            .or_else(|| {
+                self.tree
+                    .views()
+                    .find(|(view, _)| view.doc == doc_id)
+                    .map(|(view, _)| view.id)
+            })
+            .unwrap_or(self.tree.focus);
+        self.reveal_location_in_view(target_view, doc_id, location);
+        Ok(())
+    }
+
+    fn reveal_location_in_view(
+        &mut self,
+        view_id: ViewId,
+        doc_id: DocumentId,
+        location: &crate::collab::Location,
+    ) {
+        if self.tree.contains(view_id) && self.tree.focus != view_id {
+            self.focus(view_id);
+        }
+
+        let scrolloff = self.config().scrolloff;
+        self.with_view_doc_mut(view_id, doc_id, |view, doc| {
+            if view.doc_id() != doc_id {
+                return;
+            }
+
+            doc.ensure_view_init(view_id);
+            view.sync_changes(doc);
+
+            if let Some(range) = location.range {
+                doc.set_selection(view_id, Selection::single(range.anchor, range.head));
+            }
+
+            ensure_cursor_in_view_center_in(view, doc, scrolloff);
+        });
+    }
+
+    pub fn apply_presence(
+        &mut self,
+        surface: crate::collab::SurfaceId,
+        presence: Vec<crate::collab::Presence>,
+    ) -> Vec<crate::collab::Effect> {
+        let effects = self.collab.show_presence(surface, presence.clone());
+        self.render_presence(surface, &presence);
+        effects
+    }
+
+    #[cfg(test)]
+    fn collab_test_editor() -> Self {
+        let theme_loader = Arc::new(theme::Loader::new(&[]));
+        let syn_loader = Arc::new(ArcSwap::from_pointee(syntax::Loader::default()));
+        let config = Arc::new(ArcSwap::from_pointee(Config::default()));
+        let tokio = Box::leak(Box::new(tokio::runtime::Runtime::new().expect("runtime")));
+        let _guard = tokio.enter();
+        let runtime = helix_runtime::Runtime::new(tokio.handle().clone());
+        let handlers = crate::handlers::Handlers::dummy();
+        let mut editor = Editor::new(
+            Rect::new(0, 0, 120, 40),
+            theme_loader,
+            syn_loader,
+            config,
+            runtime,
+            handlers,
+        );
+        let doc_id = editor.new_document(Document::default(editor.config.clone(), editor.syn_loader.clone()));
+        let mut view = View::new(doc_id, editor.config().gutters.clone());
+        editor.bind_view_redraw(&mut view);
+        let view_id = editor.tree.insert(view);
+        let _ = editor.track_tree_surface(view_id);
+        let doc = doc_mut!(editor, &doc_id);
+        doc.ensure_view_init(view_id);
+        doc.mark_as_focused();
+        editor
+    }
+
+    #[cfg(test)]
+    fn collab_test_location(
+        editor: &Editor,
+        participant: crate::collab::ParticipantId,
+        range: std::ops::Range<usize>,
+    ) -> crate::collab::Location {
+        let view = editor.tree.get(editor.tree.focus);
+        let doc = editor.document(view.doc).expect("doc");
+        let path = doc.path().map(|path| path.to_path_buf()).unwrap_or_else(|| {
+            PathBuf::from(format!("participant-{}.rs", participant.value().get()))
+        });
+
+        let mut location = crate::collab::Location::new(path, crate::collab::location::Source::Tool)
+            .with_range(crate::collab::RangeAnchor::new(range.start, range.end));
+        if let Some(surface) = editor.surface_registry.get_by_view(view.id) {
+            location = location.on_surface(surface);
+        }
+        location
+    }
+
+    #[cfg(test)]
+    fn collab_test_path(&self) -> PathBuf {
+        let view = self.tree.get(self.tree.focus);
+        let doc = self.document(view.doc).expect("doc");
+        doc.path()
+            .map(|path| path.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("collab-test.rs"))
     }
 
     pub fn refresh_workspace_diagnostic_counts(&mut self) {
@@ -2338,30 +3841,12 @@ impl Editor {
     pub fn refresh_config(&mut self, old_config: &Config) {
         let config = self.config();
         self.auto_pairs = (&config.auto_pairs).into();
-        self.reset_idle_timer();
         self._refresh();
         helix_event::dispatch(crate::events::ConfigDidChange {
             editor: self,
             old: old_config,
             new: &config,
         })
-    }
-
-    pub fn clear_idle_timer(&mut self) {
-        // equivalent to internal Instant::far_future() (30 years)
-        self.idle_timer
-            .as_mut()
-            .reset(Instant::now() + Duration::from_secs(86400 * 365 * 30));
-    }
-
-    pub fn reset_idle_timer(&mut self) {
-        let config = self.config();
-        self.idle_timer
-            .as_mut()
-            .reset(Instant::now() + config.idle_timeout);
-
-        // Cleanup expired notifications periodically
-        self.cleanup_notifications();
     }
 
     pub fn clear_status(&mut self) {
@@ -2492,10 +3977,13 @@ impl Editor {
             let timeout = config.notifications.default_timeout;
             notification = notification.with_timeout(timeout);
             // Schedule a redraw at the timeout moment so the UI can expire/fade it immediately
-            tokio::spawn(async move {
+            let runtime = self.runtime.clone();
+            let redraw = self.frame_gate.handle();
+            let redraw = async move {
                 tokio::time::sleep(timeout).await;
-                helix_event::request_redraw();
-            });
+                redraw.request_redraw();
+            };
+            runtime.work().spawn(redraw).detach();
         }
 
         let id = self.notifications.add(notification);
@@ -2578,8 +4066,9 @@ impl Editor {
         self.set_theme_impl(theme, ThemeAction::Set);
     }
 
-    /// Set the ACP panel theme based on the connected agent. Only affects the ACP panel, not the rest of Helix.
-    pub fn apply_acp_agent_theme(&mut self, agent_index: Option<usize>) {
+    /// Set the assistant panel theme based on the connected agent.
+    /// Only affects the assistant panel, not the rest of Helix.
+    pub fn apply_assistant_agent_theme(&mut self, agent_index: Option<usize>) {
         let theme_name = agent_index.and_then(|i| {
             self.config
                 .load()
@@ -2589,12 +4078,12 @@ impl Editor {
                 .cloned()
         });
 
-        self.acp_panel_theme = theme_name.and_then(|name| self.theme_loader.load(&name).ok());
+        self.assistant_panel_theme = theme_name.and_then(|name| self.theme_loader.load(&name).ok());
     }
 
-    /// Theme to use when rendering the ACP panel. Returns panel-specific theme if set, else global.
-    pub fn acp_theme(&self) -> &Theme {
-        self.acp_panel_theme.as_ref().unwrap_or(&self.theme)
+    /// Theme to use when rendering the assistant panel.
+    pub fn assistant_theme(&self) -> &Theme {
+        self.assistant_panel_theme.as_ref().unwrap_or(&self.theme)
     }
 
     fn set_theme_impl(&mut self, theme: Theme, preview: ThemeAction) {
@@ -2950,6 +4439,8 @@ impl Editor {
                     .filter(|v| id == v.doc) // Different Document
                     .cloned()
                     .unwrap_or_else(|| View::new(id, self.config().gutters.clone()));
+                let mut view = view;
+                self.bind_view_redraw(&mut view);
                 let view_id = self.tree.split(
                     view,
                     match action {
@@ -2983,14 +4474,12 @@ impl Editor {
         self.next_document_id = DocumentId::new(unsafe {
             NonZeroUsize::new_unchecked(self.next_document_id.value().get() + 1)
         });
+        doc.bind_redraw(self.frame_gate.handle());
         doc.id = id;
         self.documents.insert(id, doc);
 
-        let (save_sender, save_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let save_sender = self.save_tx.clone();
         self.saves.insert(id, save_sender);
-
-        let stream = UnboundedReceiverStream::new(save_receiver).flatten();
-        self.save_queue.push(stream);
 
         id
     }
@@ -3003,6 +4492,7 @@ impl Editor {
         self.next_document_id = DocumentId::new(unsafe {
             std::num::NonZeroUsize::new_unchecked(self.next_document_id.value().get() + 1)
         });
+        doc.bind_redraw(self.frame_gate.handle());
         doc.id = id;
         self.component_docs.insert(id, doc);
         id
@@ -3032,8 +4522,10 @@ impl Editor {
         id: ViewId,
         doc: DocumentId,
     ) -> &mut ComponentViewState {
+        self.track_component_surface(id, doc);
         self.component_views
             .entry(id)
+            .and_modify(|view| view.doc = doc)
             .or_insert_with(|| ComponentViewState::new(id, doc))
     }
 
@@ -3051,11 +4543,12 @@ impl Editor {
             ..
         } = self;
 
+        let is_tree = tree.contains(view_id);
         let doc = documents
             .get_mut(&doc_id)
             .or_else(|| component_docs.get_mut(&doc_id))
             .expect("document not found in documents or component_docs");
-        let mut view = if tree.contains(view_id) {
+        let mut view = if is_tree {
             AnyViewMut::Tree(tree.get_mut(view_id))
         } else {
             AnyViewMut::Component(
@@ -3067,32 +4560,96 @@ impl Editor {
         f(&mut view, doc)
     }
 
+    pub fn with_view<R>(&self, view_id: ViewId, f: impl FnOnce(AnyViewRef<'_>) -> R) -> R {
+        f(AnyViewRef::from_editor(self, view_id))
+    }
+
+    pub fn with_view_doc<R>(
+        &self,
+        view_id: ViewId,
+        doc_id: DocumentId,
+        f: impl FnOnce(AnyViewRef<'_>, &Document) -> R,
+    ) -> R {
+        let doc = self
+            .document(doc_id)
+            .expect("document not found in documents or component_docs");
+        self.with_view(view_id, |view| f(view, doc))
+    }
+
     pub fn with_view_mut<R>(
         &mut self,
         view_id: ViewId,
         f: impl FnOnce(&mut AnyViewMut<'_>) -> R,
     ) -> R {
-        let Self {
-            tree,
-            component_views,
-            ..
-        } = self;
-        let mut view = if tree.contains(view_id) {
-            AnyViewMut::Tree(tree.get_mut(view_id))
-        } else {
-            AnyViewMut::Component(
-                component_views
-                    .get_mut(&view_id)
-                    .expect("component view not found"),
-            )
-        };
+        let mut view = AnyViewMut::from_editor(self, view_id);
         f(&mut view)
+    }
+
+    pub fn with_surface<R>(
+        &self,
+        id: crate::collab::SurfaceId,
+        f: impl FnOnce(crate::collab::surface::Ref<'_>) -> R,
+    ) -> Result<R, crate::collab::surface::Missing> {
+        let surface = self.surface_registry.require(id)?;
+        let value = self.with_view_doc(surface.view, surface.doc, |view, doc| {
+            f(view.as_surface_ref(doc))
+        });
+        Ok(value)
+    }
+
+    pub fn capture_current_surface(
+        &self,
+        capture: crate::collab::surface::Capture,
+    ) -> Option<crate::assistant::context::Kind> {
+        let view = self.tree.get(self.tree.focus);
+        let doc = self.document(view.doc)?;
+        crate::collab::surface::Context::capture(
+            &crate::collab::surface::Ref::Tree { view, doc },
+            self,
+            capture,
+        )
+    }
+
+    pub fn pause_current_surface(&self, event: &EditorEvent) -> Option<crate::collab::FollowPause> {
+        let view = self.tree.get(self.tree.focus);
+        let doc = self.document(view.doc)?;
+        crate::collab::surface::PauseFollow::pause(
+            &crate::collab::surface::Ref::Tree { view, doc },
+            event,
+        )
+    }
+
+    pub fn with_surface_mut<R>(
+        &mut self,
+        id: crate::collab::SurfaceId,
+        f: impl FnOnce(crate::collab::surface::Mut<'_>) -> R,
+    ) -> Result<R, crate::collab::surface::Missing> {
+        let surface = self.surface_registry.require(id)?;
+        let doc_id = surface.doc;
+        let view_id = surface.view;
+        let value = self.with_view_doc_mut(view_id, doc_id, |view, doc| f(view.as_surface_mut(doc)));
+        Ok(value)
     }
 
     pub fn new_file_from_document(&mut self, action: Action, doc: Document) -> DocumentId {
         let id = self.new_document(doc);
         self.switch(id, action);
         id
+    }
+
+    pub fn open_markdown_scratch(&mut self, action: Action, text: String) -> DocumentId {
+        let mut doc = Document::from(text.into(), None, self.config.clone(), self.syn_loader.clone())
+            .with_persistent_scratch();
+        let _ = doc.set_language_by_language_id("markdown", &self.syn_loader.load());
+        self.new_file_from_document(action, doc)
+    }
+
+    pub fn switch_document_if_exists(&mut self, id: DocumentId, action: Action) -> bool {
+        if self.document(id).is_none() {
+            return false;
+        }
+        self.switch(id, action);
+        true
     }
 
     pub fn new_file(&mut self, action: Action) -> DocumentId {
@@ -3251,8 +4808,10 @@ impl Editor {
                         self.syn_loader.clone(),
                     ))
                 });
-            let view = View::new(doc_id, self.config().gutters.clone());
+            let mut view = View::new(doc_id, self.config().gutters.clone());
+            self.bind_view_redraw(&mut view);
             let view_id = self.tree.insert(view);
+            let _ = self.track_tree_surface(view_id);
             let doc = doc_mut!(self, &doc_id);
             doc.ensure_view_init(view_id);
             doc.mark_as_focused();
@@ -3289,13 +4848,12 @@ impl Editor {
             res
         };
 
-        use futures_util::stream;
-
-        self.saves
-            .get(&doc_id)
-            .ok_or_else(|| anyhow::format_err!("saves are closed for this document!"))?
-            .send(stream::once(Box::pin(future)))
-            .map_err(|err| anyhow!("failed to send save event: {}", err))?;
+        helix_runtime::send_blocking(
+            self.saves
+                .get(&doc_id)
+                .ok_or_else(|| anyhow::format_err!("saves are closed for this document!"))?,
+            Box::pin(future),
+        );
 
         self.write_count += 1;
 
@@ -3383,6 +4941,14 @@ impl Editor {
         self.documents
             .get(&id)
             .or_else(|| self.component_docs.get(&id))
+    }
+
+    pub fn focused_document_id(&self) -> DocumentId {
+        self.tree.get(self.tree.focus).doc
+    }
+
+    pub fn focused_document(&self) -> Option<&Document> {
+        self.document(self.focused_document_id())
     }
 
     #[inline]
@@ -3572,63 +5138,12 @@ impl Editor {
         .map(|_| ())
     }
 
-    /// Closes all ACP agents. Drops each agent, which kills the child process via `kill_on_drop`.
-    /// Call this during application shutdown to ensure clean process termination.
-    pub fn close_acp_agents(&mut self) {
-        self.acp_agents.close_all();
-    }
-
-    pub async fn wait_event(&mut self) -> EditorEvent {
-        // the loop only runs once or twice and would be better implemented with a recursion + const generic
-        // however due to limitations with async functions that can not be implemented right now
-        loop {
-            tokio::select! {
-                biased;
-
-                Some(event) = self.save_queue.next() => {
-                    self.write_count -= 1;
-                    return EditorEvent::DocumentSaved(event)
-                }
-                Some(config_event) = self.config_events.1.recv() => {
-                    return EditorEvent::ConfigEvent(config_event)
-                }
-                Some(message) = self.language_servers.incoming.next() => {
-                    return EditorEvent::LanguageServerMessage(message)
-                }
-                Some(event) = self.debug_adapters.incoming.next() => {
-                    return EditorEvent::DebuggerEvent(event)
-                }
-                Some(message) = self.acp_agents.incoming().next() => {
-                    return EditorEvent::AcpMessage(message)
-                }
-
-                _ = helix_event::redraw_requested() => {
-                    if  !self.needs_redraw{
-                        self.needs_redraw = true;
-                        let timeout = Instant::now() + Duration::from_millis(33);
-                        if timeout < self.idle_timer.deadline() && timeout < self.redraw_timer.deadline(){
-                            self.redraw_timer.as_mut().reset(timeout)
-                        }
-                    }
-                }
-
-                _ = &mut self.redraw_timer  => {
-                    self.redraw_timer.as_mut().reset(Instant::now() + Duration::from_secs(86400 * 365 * 30));
-                    return EditorEvent::Redraw
-                }
-                _ = &mut self.idle_timer  => {
-                    return EditorEvent::IdleTimer
-                }
-            }
-        }
-    }
-
     pub async fn flush_writes(&mut self) -> anyhow::Result<()> {
         while self.write_count > 0 {
-            if let Some(save_event) = self.save_queue.next().await {
+            if let Some(save_event) = self.save_queue.recv().await {
                 self.write_count -= 1;
 
-                let save_event = match save_event {
+                let save_event = match save_event.await {
                     Ok(event) => event,
                     Err(err) => {
                         self.set_error(err.to_string());
@@ -3714,10 +5229,7 @@ impl Editor {
     }
 
     pub fn jump_forward(&mut self, view_id: ViewId, count: usize) {
-        let jump = self.with_view_mut(view_id, |view| match view {
-            AnyViewMut::Tree(view) => view.history.jumps.forward(count).cloned(),
-            AnyViewMut::Component(view) => view.history.jumps.forward(count).cloned(),
-        });
+        let jump = self.with_view_mut(view_id, |view| view.jumps_mut().forward(count).cloned());
         if let Some((doc_id, selection)) = jump {
             self.jump_to(view_id, doc_id, selection);
         }
@@ -3725,11 +5237,8 @@ impl Editor {
 
     pub fn jump_backward(&mut self, view_id: ViewId, count: usize) {
         let current_doc_id = self.with_view_mut(view_id, |view| view.doc_id());
-        let jump = self.with_view_doc_mut(view_id, current_doc_id, |view, doc| match view {
-            AnyViewMut::Tree(view) => view.history.jumps.backward(view_id, doc, count).cloned(),
-            AnyViewMut::Component(view) => {
-                view.history.jumps.backward(view_id, doc, count).cloned()
-            }
+        let jump = self.with_view_doc_mut(view_id, current_doc_id, |view, doc| {
+            view.jumps_mut().backward(view_id, doc, count).cloned()
         });
         if let Some((doc_id, selection)) = jump {
             self.jump_to(view_id, doc_id, selection);
@@ -3737,12 +5246,14 @@ impl Editor {
     }
 
     fn jump_to(&mut self, view_id: ViewId, dest_doc_id: DocumentId, mut selection: Selection) {
-        if self.tree.contains(view_id) {
+        if self.with_view(view_id, |view| view.is_tree()) {
             let view = view_mut!(self, view_id);
             let old_doc_id = view.doc;
             if old_doc_id != dest_doc_id {
-                let new_doc = doc_mut!(self, &dest_doc_id);
-                if let Some(transaction) = view.changes_to_sync(new_doc) {
+                if let Some(transaction) = self.with_view_doc_mut(view_id, dest_doc_id, |view, doc| {
+                    view.changes_to_sync(doc)
+                }) {
+                    let new_doc = doc_mut!(self, &dest_doc_id);
                     let text = new_doc.text().slice(..);
                     selection = selection.map(transaction.changes()).ensure_invariants(text);
                 }
@@ -3814,6 +5325,169 @@ fn try_restore_indent(doc: &mut Document, view: &mut View) {
         let transaction =
             Transaction::change(doc.text(), [(line_start_pos, pos, None)].into_iter());
         doc.apply(&transaction, view.id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Editor;
+    use crate::collab::{participant, Participant, ParticipantId};
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn participant(id: u64, name: &str) -> Participant {
+        Participant {
+            id: ParticipantId::new(std::num::NonZeroU64::new(id).unwrap()),
+            kind: participant::Kind::Agent,
+            name: name.to_string(),
+            access: participant::Access::Read,
+        }
+    }
+
+    fn temp_file(name: &str, contents: &str) -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("helix-collab-{name}-{stamp}.rs"));
+        fs::write(&path, contents).expect("write temp file");
+        helix_stdx::path::canonicalize(path)
+    }
+
+    #[test]
+    fn collab_effects_publish_presence_for_open_locations() {
+        let mut editor = Editor::collab_test_editor();
+        let alice = participant(1, "alice");
+        let bob = participant(2, "bob");
+
+        let join_alice = editor.join_participant(alice.clone());
+        editor.apply_collab_effects(join_alice);
+        let join_bob = editor.join_participant(bob.clone());
+        editor.apply_collab_effects(join_bob);
+
+        let alice_location = Editor::collab_test_location(&editor, alice.id, 2..5);
+        let alice_effects = editor.publish_location(alice.id, alice_location).expect("location");
+        editor.apply_collab_effects(alice_effects);
+
+        let bob_location = Editor::collab_test_location(&editor, bob.id, 8..8);
+        let bob_effects = editor.publish_location(bob.id, bob_location).expect("location");
+        editor.apply_collab_effects(bob_effects);
+
+        let surface = editor.surface_registry.get_by_view(editor.tree.focus).expect("surface");
+        let presence = editor.collab.presence(surface).expect("presence");
+        assert_eq!(presence.len(), 2);
+        assert!(presence.iter().any(|item| item.participant == alice.id && item.selection.is_some()));
+        assert!(presence.iter().any(|item| item.participant == bob.id && item.cursor.is_some()));
+    }
+
+    #[test]
+    fn surface_resolution_prefers_editor_role_over_auxiliary() {
+        let mut editor = Editor::collab_test_editor();
+        let alice = participant(1, "alice");
+
+        let join_effects = editor.join_participant(alice.clone());
+        editor.apply_collab_effects(join_effects);
+
+        let editor_view = editor.tree.focus;
+        let editor_surface = editor.surface_registry.get_by_view(editor_view).expect("editor surface");
+        let doc_id = editor.tree.get(editor_view).doc;
+        let path = editor.collab_test_path();
+        let doc = doc_mut!(editor, &doc_id);
+        doc.set_path(Some(&path));
+
+        let component_view_id = editor.allocate_view_id();
+        editor.ensure_component_view(component_view_id, doc_id);
+        let auxiliary_surface = editor
+            .surface_registry
+            .get_by_view(component_view_id)
+            .expect("auxiliary surface");
+        assert_ne!(editor_surface, auxiliary_surface);
+
+        let mut location = Editor::collab_test_location(&editor, alice.id, 4..9);
+        location.surface = None;
+
+        let effects = editor.publish_location(alice.id, location).expect("location");
+        editor.apply_collab_effects(effects);
+
+        let presence = editor.collab.presence(editor_surface).expect("presence");
+        assert_eq!(presence.len(), 1);
+        assert_eq!(presence[0].surface, editor_surface);
+        assert!(editor.collab.presence(auxiliary_surface).is_none_or(|items| items.is_empty()));
+    }
+
+    #[test]
+    fn leaving_participant_clears_derived_presence() {
+        let mut editor = Editor::collab_test_editor();
+        let alice = participant(1, "alice");
+
+        let join_effects = editor.join_participant(alice.clone());
+        editor.apply_collab_effects(join_effects);
+
+        let location = Editor::collab_test_location(&editor, alice.id, 3..7);
+        let location_effects = editor.publish_location(alice.id, location).expect("location");
+        editor.apply_collab_effects(location_effects);
+
+        let surface = editor.surface_registry.get_by_view(editor.tree.focus).expect("surface");
+        assert!(editor.collab.presence(surface).is_some());
+
+        let leave_effects = editor.leave_participant(alice.id);
+        editor.apply_collab_effects(leave_effects);
+
+        let presence = editor.collab.presence(surface).unwrap_or(&[]);
+        assert!(presence.is_empty());
+
+        let view = editor.tree.get(editor.tree.focus);
+        let doc = editor.document(view.doc).expect("doc");
+        let annotations = doc.presence_annotations(view.id).cloned().unwrap_or_default();
+        assert!(annotations.is_empty());
+    }
+
+    #[test]
+    fn collab_open_keeps_current_focus_while_loading_target_document() {
+        let mut editor = Editor::collab_test_editor();
+        let active_doc = editor.tree.get(editor.tree.focus).doc;
+        let alice = participant(1, "alice");
+
+        let join_effects = editor.join_participant(alice.clone());
+        editor.apply_collab_effects(join_effects);
+        let new_path = temp_file("open-target", "fn open_target() {}\n");
+
+        let location = crate::collab::Location::new(new_path.clone(), crate::collab::location::Source::Tool)
+            .with_range(crate::collab::RangeAnchor::new(0, 0));
+        editor.apply_collab_effects(vec![crate::collab::Effect::Open {
+            participant: alice.id,
+            location,
+        }]);
+
+        assert_eq!(editor.tree.get(editor.tree.focus).doc, active_doc);
+        let opened_doc = editor.open(&new_path, super::Action::Load).expect("open target");
+        assert!(editor.document(opened_doc).is_some());
+        assert_eq!(editor.tree.get(editor.tree.focus).doc, active_doc);
+        let _ = fs::remove_file(new_path);
+    }
+
+    #[test]
+    fn collab_reveal_switches_focus_to_target_document() {
+        let mut editor = Editor::collab_test_editor();
+        let active_doc = editor.tree.get(editor.tree.focus).doc;
+        let alice = participant(1, "alice");
+
+        let join_effects = editor.join_participant(alice.clone());
+        editor.apply_collab_effects(join_effects);
+        let new_path = temp_file("reveal-target", "fn reveal_target() {}\n");
+
+        let location = crate::collab::Location::new(new_path.clone(), crate::collab::location::Source::Tool)
+            .with_range(crate::collab::RangeAnchor::new(0, 0));
+        editor.apply_collab_effects(vec![crate::collab::Effect::Reveal {
+            participant: alice.id,
+            location,
+        }]);
+
+        let new_doc_id = editor.document_id_by_path(&new_path).expect("target doc");
+        assert_eq!(editor.tree.get(editor.tree.focus).doc, new_doc_id);
+        assert_ne!(editor.tree.get(editor.tree.focus).doc, active_doc);
+        let _ = fs::remove_file(new_path);
     }
 }
 

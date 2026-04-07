@@ -1,0 +1,47 @@
+use crate::collab::{location, Location};
+
+slotmap::new_key_type! {
+    pub struct Id;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Hunk {
+    pub range: Option<Location>,
+    pub summary: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct File {
+    pub path: std::path::PathBuf,
+    pub hunks: Vec<Hunk>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Summary {
+    pub files: Vec<File>,
+}
+
+impl Hunk {
+    #[must_use]
+    pub fn location(&self) -> Option<Location> {
+        self.range.clone()
+    }
+}
+
+impl File {
+    #[must_use]
+    pub fn locations(&self) -> Vec<Location> {
+        let mut locations: Vec<_> = self.hunks.iter().filter_map(Hunk::location).collect();
+        if locations.is_empty() {
+            locations.push(Location::new(self.path.clone(), location::Source::Change));
+        }
+        locations
+    }
+}
+
+impl Summary {
+    #[must_use]
+    pub fn locations(&self) -> Vec<Location> {
+        self.files.iter().flat_map(File::locations).collect()
+    }
+}

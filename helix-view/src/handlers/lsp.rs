@@ -1,5 +1,6 @@
 use std::collections::btree_map::Entry;
 use std::collections::HashSet;
+use std::num::NonZeroU64;
 use std::time::Instant;
 
 use crate::bench::log_command_phase;
@@ -23,12 +24,25 @@ pub enum SignatureHelpInvoked {
     Manual,
 }
 
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
+pub struct SignatureHelpRequestId(NonZeroU64);
+
+impl SignatureHelpRequestId {
+    #[must_use]
+    pub const fn new(id: NonZeroU64) -> Self {
+        Self(id)
+    }
+}
+
 pub enum SignatureHelpEvent {
     Invoked,
     Trigger,
     ReTrigger,
     Cancel,
-    RequestComplete { open: bool },
+    RequestComplete {
+        request: SignatureHelpRequestId,
+        open: bool,
+    },
 }
 
 pub struct PullDiagnosticsEvent {
@@ -130,22 +144,28 @@ impl Editor {
     }
 
     pub fn execute_lsp_command(&mut self, command: lsp::Command, server_id: LanguageServerId) {
-        // the command is executed on the server and communicated back
-        // to the client asynchronously using workspace edits
-        let Some(future) = self
-            .language_server_by_id(server_id)
-            .and_then(|server| server.command(command))
-        else {
-            self.set_error("Language server does not support executing commands");
-            return;
-        };
-
-        tokio::spawn(async move {
-            if let Err(err) = future.await {
-                log::error!("Error executing LSP command: {err}");
-            }
-        });
+        crate::handlers::lsp::request_execute_lsp_command(self, command, server_id);
     }
+}
+
+pub fn request_execute_lsp_command(
+    editor: &mut Editor,
+    command: lsp::Command,
+    server_id: LanguageServerId,
+) {
+    let Some(future) = editor
+        .language_server_by_id(server_id)
+        .and_then(|server| server.command(command))
+    else {
+        editor.set_error("Language server does not support executing commands");
+        return;
+    };
+
+    tokio::spawn(async move {
+        if let Err(err) = future.await {
+            log::error!("Error executing LSP command: {err}");
+        }
+    });
 }
 
 pub fn register_hooks(_handlers: &Handlers) {
@@ -237,6 +257,7 @@ mod tests {
             Arc::new(theme_loader),
             Arc::new(ArcSwap::from_pointee(syn_loader)),
             Arc::new(arc_swap::access::Map::new(config, |cfg: &Config| cfg)),
+            helix_runtime::test::runtime(),
             Handlers::dummy(),
         );
         let doc = crate::Document::from(

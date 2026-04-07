@@ -24,6 +24,7 @@ helix-loader = { path = "../helix-loader" }
 helix-lsp = { path = "../helix-lsp" }
 helix-dap = { path = "../helix-dap" }
 helix-acp = { path = "../helix-acp" }
+helix-runtime = { path = "../helix-runtime" }
 helix-vcs = { path = "../helix-vcs", features = ["git"] }
 
 bitflags.workspace = true
@@ -50,10 +51,12 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml.workspace = true
 log = "~0.4"
+base64 = "0.22"
 
 parking_lot.workspace = true
 thiserror.workspace = true
 notify.workspace = true
+indexmap = "2.13"
 
 kstring = "2.0"
 [target.'cfg(windows)'.dependencies]

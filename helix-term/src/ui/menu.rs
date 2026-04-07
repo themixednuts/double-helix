@@ -1,5 +1,5 @@
 use crate::{
-    compositor::{Callback, Component, Compositor, Context, Event, EventResult, RenderContext},
+    compositor::{Component, Context, Event, EventResult, PostAction, RenderContext},
     ctrl, key, shift,
 };
 use tui::{buffer::Buffer as Surface, widgets::Table};
@@ -243,7 +243,6 @@ impl<T: Item + PartialEq> Menu<T> {
 }
 
 use super::PromptEvent as MenuEvent;
-
 impl<T: Item + 'static> Component for Menu<T> {
     fn handle_event(&mut self, event: &Event, cx: &mut Context) -> EventResult {
         let event = match event {
@@ -251,10 +250,10 @@ impl<T: Item + 'static> Component for Menu<T> {
             _ => return EventResult::Ignored(None),
         };
 
-        let close_fn: Option<Callback> = Some(Box::new(|compositor: &mut Compositor, _| {
-            // remove the layer
-            compositor.pop();
-        }));
+        let close_fn = Some(PostAction::PopLayer {
+            model_layer: None,
+            remember_picker: false,
+        });
 
         // Ignore tab key when supertab is turned on in order not to interfere
         // with it. (Is there a better way to do this?)

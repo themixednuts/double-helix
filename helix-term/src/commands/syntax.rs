@@ -182,7 +182,9 @@ pub fn syntax_symbol_picker(cx: &mut Context) {
         1, // name
         tags,
         (),
-        move |cx, tag, action| {
+        cx.editor.runtime().clone(),
+        cx.ingress.clone(),
+        move |cx: &mut crate::compositor::Context, tag: &Tag, action| {
             cx.editor.switch(doc_id, action);
             let view = view_mut!(cx.editor);
             let doc = doc_mut!(cx.editor, &doc_id);
@@ -408,9 +410,11 @@ pub fn syntax_workspace_symbol_picker(cx: &mut Context) {
         1, // name
         [],
         state,
-        move |cx, tag, action| {
+        cx.editor.runtime().clone(),
+        cx.ingress.clone(),
+        move |cx: &mut crate::compositor::Context, tag: &Tag, action| {
             let doc_id = match &tag.doc {
-                UriOrDocumentId::Id(id) => *id,
+                UriOrDocumentId::Id(id) => id.clone(),
                 UriOrDocumentId::Uri(uri) => match cx.editor.open(uri.as_path().expect(""), action) {
                     Ok(id) => id,
                     Err(e) => {

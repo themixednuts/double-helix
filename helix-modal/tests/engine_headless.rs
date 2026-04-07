@@ -180,6 +180,7 @@ fn test_editor() -> Editor {
         Arc::new(theme_loader),
         Arc::new(ArcSwap::from_pointee(syn_loader)),
         Arc::new(arc_swap::access::Map::new(config, |c: &Config| c)),
+        helix_runtime::test::runtime(),
         handlers,
     )
 }

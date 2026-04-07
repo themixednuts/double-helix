@@ -2876,6 +2876,7 @@ mod tests {
             Arc::new(theme_loader),
             Arc::new(ArcSwap::from_pointee(syn_loader)),
             Arc::new(arc_swap::access::Map::new(config, |cfg: &Config| cfg)),
+            helix_runtime::test::runtime(),
             Handlers::dummy(),
         );
         let doc = Document::from(

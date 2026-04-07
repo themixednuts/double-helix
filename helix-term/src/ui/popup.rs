@@ -1,6 +1,6 @@
 use crate::{
     commands::Open,
-    compositor::{Callback, Component, Context, Event, EventResult, RenderContext},
+    compositor::{Component, Context, Event, EventResult, PostAction, RenderContext},
     ctrl, key,
 };
 use tui::{
@@ -227,10 +227,7 @@ impl<T: Component> Popup<T> {
         }: &MouseEvent,
     ) -> EventResult {
         if self.auto_close && matches!(kind, MouseEventKind::Down(_)) {
-            let close_fn: Callback = Box::new(|compositor, _| {
-                // remove the layer
-                compositor.remove(self.id.as_ref());
-            });
+            let close_fn = PostAction::RemoveById(self.id);
 
             return EventResult::Ignored(Some(close_fn));
         }
@@ -274,10 +271,7 @@ impl<T: Component> Component for Popup<T> {
             return EventResult::Ignored(None);
         }
 
-        let close_fn: Callback = Box::new(|compositor, _| {
-            // remove the layer
-            compositor.remove(self.id.as_ref());
-        });
+        let close_fn = PostAction::RemoveById(self.id);
 
         // Code completion handles arrows and page up/down itself,
         // but code lens does not. First check whether content knows

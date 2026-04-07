@@ -17,6 +17,7 @@ helix-stdx = { path = "../helix-stdx" }
 helix-core = { path = "../helix-core" }
 helix-loader = { path = "../helix-loader" }
 helix-lsp-types = { path = "../helix-lsp-types" }
+helix-runtime = { path = "../helix-runtime" }
 
 anyhow = "1.0"
 futures-executor.workspace = true

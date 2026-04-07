@@ -6,16 +6,16 @@ use crate::{
     client::{AcpAgent, AgentConfig},
     jsonrpc, AgentId,
 };
+use helix_runtime::Receiver;
 use slotmap::SlotMap;
 use std::sync::Arc;
-use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use futures_util::stream::select_all::SelectAll;
 
 /// Manages all active ACP agent connections.
 pub struct Registry {
     inner: SlotMap<AgentId, Arc<AcpAgent>>,
-    incoming: SelectAll<UnboundedReceiverStream<(AgentId, jsonrpc::Call)>>,
+    incoming: SelectAll<Receiver<(AgentId, jsonrpc::Call)>>,
 }
 
 impl Registry {
@@ -32,8 +32,7 @@ impl Registry {
     pub fn launch(&mut self, config: &AgentConfig) -> crate::Result<(AgentId, Arc<AcpAgent>)> {
         let id = self.inner.try_insert_with_key(|id| {
             AcpAgent::start(id, config).map(|(agent, incoming_rx)| {
-                self.incoming
-                    .push(UnboundedReceiverStream::new(incoming_rx));
+                self.incoming.push(incoming_rx);
                 agent
             })
         })?;
@@ -82,9 +81,7 @@ impl Registry {
     ///
     /// This stream yields `(AgentId, Call)` pairs from all connected agents.
     /// The caller should poll this in a select loop (like `Application::handle_acp_message`).
-    pub fn incoming(
-        &mut self,
-    ) -> &mut SelectAll<UnboundedReceiverStream<(AgentId, jsonrpc::Call)>> {
+    pub fn incoming(&mut self) -> &mut SelectAll<Receiver<(AgentId, jsonrpc::Call)>> {
         &mut self.incoming
     }
 }

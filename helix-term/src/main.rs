@@ -33,12 +33,16 @@ fn setup_logging(verbosity: u64) -> Result<()> {
 }
 
 fn main() -> Result<()> {
-    let exit_code = main_impl()?;
+    let tokio_runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("unable to build tokio runtime")?;
+    let runtime = helix_runtime::Runtime::new(tokio_runtime.handle().clone());
+    let exit_code = tokio_runtime.block_on(main_impl(runtime))?;
     std::process::exit(exit_code);
 }
 
-#[tokio::main]
-async fn main_impl() -> Result<i32> {
+async fn main_impl(runtime: helix_runtime::Runtime) -> Result<i32> {
     let args = Args::parse_args().context("could not parse arguments")?;
 
     helix_loader::initialize_config_file(args.config_file.clone());
@@ -149,8 +153,8 @@ FLAGS:
         helix_core::config::default_lang_loader()
     });
 
-    // TODO: use the thread local executor to spawn the application task separately from the work pool
-    let mut app = Application::new(args, config, lang_loader).context("unable to start Helix")?;
+    let mut app =
+        Application::new(args, config, lang_loader, runtime).context("unable to start Helix")?;
     let mut events = app.event_stream();
 
     let exit_code = app.run(&mut events).await?;

@@ -16,6 +16,7 @@ use helix_core::{
     ChangeSet, Rope,
 };
 use helix_loader::VERSION_AND_GIT_HASH;
+use helix_runtime::{channel, send_blocking, Receiver, Sender};
 use helix_stdx::path;
 use parking_lot::Mutex;
 use serde::Deserialize;
@@ -33,10 +34,7 @@ use std::{path::Path, process::Stdio};
 use tokio::{
     io::{BufReader, BufWriter},
     process::{Child, Command},
-    sync::{
-        mpsc::{channel, UnboundedReceiver, UnboundedSender},
-        Notify, OnceCell,
-    },
+    sync::{Notify, OnceCell},
 };
 
 fn workspace_for_uri(uri: lsp::Url) -> WorkspaceFolder {
@@ -55,7 +53,7 @@ pub struct Client {
     id: LanguageServerId,
     name: String,
     _process: Child,
-    server_tx: UnboundedSender<Payload>,
+    server_tx: Sender<Payload>,
     request_counter: AtomicU64,
     pub(crate) capabilities: OnceCell<lsp::ServerCapabilities>,
     pub(crate) file_operation_interest: OnceLock<FileOperationsInterest>,
@@ -216,7 +214,7 @@ impl Client {
         req_timeout: u64,
     ) -> Result<(
         Self,
-        UnboundedReceiver<(LanguageServerId, Call)>,
+        Receiver<(LanguageServerId, Call)>,
         Arc<Notify>,
     )> {
         // Resolve path to the binary
@@ -453,33 +451,27 @@ impl Client {
     {
         let server_tx = self.server_tx.clone();
         let id = self.next_request_id();
-
-        // It's important that this is not part of the future so that it gets executed right away
-        // and the request order stays consistent.
-        let rx = serde_json::to_value(params)
-            .map_err(Error::from)
-            .and_then(|params| {
-                let request = jsonrpc::MethodCall {
-                    jsonrpc: Some(jsonrpc::Version::V2),
-                    id: id.clone(),
-                    method: R::METHOD.to_string(),
-                    params: Self::value_into_params(params),
-                };
-                let (tx, rx) = channel::<Result<Value>>(1);
-                server_tx
-                    .send(Payload::Request {
-                        chan: tx,
-                        value: request,
-                    })
-                    .map_err(|e| Error::Other(e.into()))?;
-                Ok(rx)
-            });
+        let request = serde_json::to_value(params).map_err(Error::from).map(|params| jsonrpc::MethodCall {
+            jsonrpc: Some(jsonrpc::Version::V2),
+            id: id.clone(),
+            method: R::METHOD.to_string(),
+            params: Self::value_into_params(params),
+        });
 
         async move {
             use std::time::Duration;
             use tokio::time::timeout;
+            let request = request?;
+            let (tx, mut rx) = channel::<Result<Value>>(1);
+            server_tx
+                .send(Payload::Request {
+                    chan: tx,
+                    value: request,
+                })
+                .await
+                .map_err(|e| Error::Other(e.into()))?;
             // TODO: delay other calls until initialize success
-            timeout(Duration::from_secs(timeout_secs), rx?.recv())
+            timeout(Duration::from_secs(timeout_secs), rx.recv())
                 .await
                 .map_err(|_| Error::Timeout(id))? // return Timeout
                 .ok_or(Error::StreamClosed)?
@@ -512,13 +504,7 @@ impl Client {
             params: Self::value_into_params(params),
         };
 
-        if let Err(err) = server_tx.send(Payload::Notification(notification)) {
-            log::error!(
-                "Failed to send notification '{}' to server '{}': {err}",
-                R::METHOD,
-                self.name
-            );
-        }
+        send_blocking(&server_tx, Payload::Notification(notification));
     }
 
     /// Reply to a language server RPC call.
@@ -544,9 +530,7 @@ impl Client {
             }),
         };
 
-        server_tx
-            .send(Payload::Response(output))
-            .map_err(|e| Error::Other(e.into()))?;
+        send_blocking(&server_tx, Payload::Response(output));
 
         Ok(())
     }

@@ -1,16 +1,16 @@
 use arc_swap::{access::Map, ArcSwap};
 use futures_util::Stream;
-use helix_core::{diagnostic::Severity, pos_at_coords, syntax, Range, Selection};
+use helix_core::{pos_at_coords, syntax, Range, Selection};
 use helix_lsp::{
     lsp::{self, notification::Notification},
     util::lsp_range_to_range,
-    LanguageServerId, LspProgressMap,
+    Call, LanguageServerId, LspProgressMap,
 };
 use helix_stdx::path::get_relative_path;
 use helix_view::{
     align_view,
     bench::{enter_bench_run, log_run_event, log_run_phase, BenchRunContext},
-    document::{DocumentOpenError, DocumentSavedEventResult},
+    document::{DocumentOpenError, DocumentSavedEventFuture, DocumentSavedEventResult},
     editor::{ConfigEvent, EditorEvent},
     events::EditorConfigDidChange,
     graphics::Rect,
@@ -27,26 +27,29 @@ use crate::{
     config::Config,
     events::OnModeSwitch,
     handlers,
-    job::Jobs,
     keymap::Keymaps,
+    runtime::ExitTaskSet,
     ui::{self, overlay::overlaid},
 };
+use helix_runtime::{channel, Receiver, Runtime, Sender, Work};
+use tokio::time::{sleep, Instant, Sleep};
+use futures_util::stream::select_all::SelectAll;
+use helix_dap::{self as dap, registry::DebugAdapterId};
+
+use crate::runtime::ingress::{self, RuntimeEvent};
 
 use log::{debug, error, info, warn};
 use std::{
+    borrow::Cow,
     io::{stdin, IsTerminal},
     path::Path,
+    pin::Pin,
     sync::Arc,
 };
 
 use helix_event::register_hook;
 use helix_plugin::{EventData, EventType, PluginConfig, PluginEvent, PluginManager};
 use helix_view::events::{DiagnosticsDidChange, DocumentDidOpen, SelectionDidChange};
-use std::sync::Mutex;
-
-helix_event::runtime_local! {
-    static PENDING_PLUGIN_EVENTS: Mutex<Vec<PluginEvent>> = Mutex::new(Vec::new());
-}
 
 #[cfg_attr(windows, allow(unused_imports))]
 use anyhow::{Context, Error};
@@ -106,11 +109,30 @@ pub struct Application {
 
     config: Arc<ArcSwap<Config>>,
 
+    /// Shared async runtime (UI/work/block/clock domains).
+    runtime: Runtime,
+    /// Send typed events from background/UI tasks into [`Self::event_loop_until_idle`].
+    ingress_tx: Sender<RuntimeEvent>,
+    ingress_rx: Receiver<RuntimeEvent>,
+    _status_bridge: crate::runtime::StatusBridge,
+
     signals: Signals,
-    jobs: Jobs,
+    exit_tasks: ExitTaskSet,
+    exit_task_work: Work,
+    save_queue: helix_runtime::Receiver<DocumentSavedEventFuture>,
+    lsp_incoming: SelectAll<helix_runtime::Receiver<(LanguageServerId, Call)>>,
+    debugger_incoming: SelectAll<helix_runtime::Receiver<(DebugAdapterId, dap::Payload)>>,
+    config_rx: helix_runtime::Receiver<ConfigEvent>,
+    assistant_updates_rx: helix_runtime::Receiver<helix_view::assistant::backend::Update>,
+    redraw_rx: helix_runtime::Receiver<()>,
+    idle_reset_rx: helix_runtime::Receiver<()>,
+    idle_reset_tx: helix_runtime::Sender<()>,
+    plugin_event_rx: helix_runtime::Receiver<PluginEvent>,
+    plugin_event_tx: helix_runtime::Sender<PluginEvent>,
+    redraw_timer: Pin<Box<Sleep>>,
+    idle_timer: Pin<Box<Sleep>>,
     lsp_progress: LspProgressMap,
     plugin_manager: Arc<PluginManager>,
-    ui_receiver: tokio::sync::mpsc::UnboundedReceiver<crate::plugin_registry::UiRequest>,
 
     /// Native shutdown channel (Windows: console ctrl; Unix: None, uses signal stream).
     shutdown_rx: Option<tokio::sync::mpsc::UnboundedReceiver<()>>,
@@ -147,7 +169,12 @@ use helix_view::bench::{
 };
 
 impl Application {
-    pub fn new(args: Args, config: Config, lang_loader: syntax::Loader) -> Result<Self, Error> {
+    pub fn new(
+        args: Args,
+        config: Config,
+        lang_loader: syntax::Loader,
+        runtime: Runtime,
+    ) -> Result<Self, Error> {
         #[cfg(feature = "integration")]
         setup_integration_logging();
 
@@ -171,7 +198,9 @@ impl Application {
         let area = terminal.size();
         let mut compositor = Compositor::new(area);
         let config = Arc::new(ArcSwap::from_pointee(config));
-        let handlers = handlers::setup(config.clone());
+        let (ingress_tx, ingress_rx) = channel(ingress::BOUND);
+        let status_bridge = crate::runtime::install_status_bridge(ingress_tx.clone());
+        let handlers = handlers::setup(config.clone(), ingress_tx.clone(), runtime.clone());
         let mut editor = Editor::new(
             area,
             Arc::new(theme_loader),
@@ -179,8 +208,30 @@ impl Application {
             Arc::new(Map::new(Arc::clone(&config), |config: &Config| {
                 &config.editor
             })),
+            runtime.clone(),
             handlers,
         );
+        editor.set_assistant_history_backend(helix_view::assistant::history::local_backend());
+        editor.set_assistant_context_registry(helix_view::assistant::context::core_registry());
+        let save_queue = editor.take_save_queue();
+        let lsp_incoming = editor.take_lsp_incoming();
+        let debugger_incoming = editor.take_debugger_incoming();
+        let config_rx = editor.take_config_rx();
+        let assistant_updates_rx = editor.take_assistant_updates_rx();
+        let redraw_rx = editor.take_redraw_rx();
+        let (idle_reset_tx, idle_reset_rx) = helix_runtime::channel(64);
+        let (plugin_event_tx, plugin_event_rx) = helix_runtime::channel(256);
+        let idle_timeout = editor.config().idle_timeout;
+        if editor.assistant_history_backend().is_some() {
+            helix_runtime::send_blocking(
+                &ingress_tx,
+                crate::runtime::RuntimeEvent::Task(
+                    crate::runtime::RuntimeTaskEvent::BootstrapAssistantHistory {
+                        scope: helix_view::assistant::layout::current_scope(),
+                    },
+                ),
+            );
+        }
         // Initialize OS-native file watcher for auto-reload
         crate::handlers::auto_reload::setup_file_watcher(&mut editor);
 
@@ -213,7 +264,8 @@ impl Application {
         let editor_view = Box::new(ui::EditorView::new(Keymaps::new(keys), engine, registry));
         compositor.push(editor_view);
 
-        let jobs = Jobs::new();
+        let exit_task_work = runtime.work().clone();
+        let exit_tasks = ExitTaskSet::new();
 
         if args.load_tutor {
             let path = helix_loader::runtime_file(Path::new("tutor"));
@@ -225,7 +277,7 @@ impl Application {
 
             // If the first file is a directory, skip it and open a picker
             if let Some((first, _)) = files_it.next_if(|(p, _)| p.is_dir()) {
-                let picker = ui::file_picker(&editor, first);
+                let picker = ui::file_picker(&editor, first, ingress_tx.clone());
                 compositor.push(Box::new(overlaid(picker)));
             }
 
@@ -326,13 +378,15 @@ impl Application {
         let plugin_manager =
             PluginManager::new(PluginConfig::default()).expect("Failed to create plugin manager");
 
-        let (ui_handler, ui_receiver) = crate::plugin_registry::get_ui_handler();
+        let ui_handler = crate::plugin_registry::get_ui_handler(ingress_tx.clone());
 
         // Register registries
         {
             let engine_arc = plugin_manager.engine();
             let mut engine = engine_arc.write();
-            engine.set_builtin_command_registry(crate::plugin_registry::get_registry());
+            engine.set_builtin_command_registry(crate::plugin_registry::get_registry(
+                ingress_tx.clone(),
+            ));
             engine.set_ui_handler(ui_handler);
         }
 
@@ -351,59 +405,57 @@ impl Application {
         #[cfg(not(windows))]
         let shutdown_rx = None;
 
+        let redraw_ingress = ingress_tx.clone();
+        let plugin_events = plugin_event_tx.clone();
         register_hook!(move |event: &mut DocumentDidOpen<'_>| {
-            if let Ok(mut events) = PENDING_PLUGIN_EVENTS.lock() {
-                events.push(PluginEvent {
-                    event_type: EventType::OnBufferOpen,
-                    data: EventData::Buffer {
-                        document_id: event.doc,
-                        path: Some(event.path.clone()),
-                    },
-                });
-            }
-            helix_event::request_redraw();
+            let _ = plugin_events.send(PluginEvent {
+                event_type: EventType::OnBufferOpen,
+                data: EventData::Buffer {
+                    document_id: event.doc,
+                    path: Some(event.path.clone()),
+                },
+            });
+            helix_runtime::send_blocking(&redraw_ingress, RuntimeEvent::Redraw);
             Ok(())
         });
 
+        let plugin_events = plugin_event_tx.clone();
         register_hook!(move |event: &mut SelectionDidChange<'_>| {
-            if let Ok(mut events) = PENDING_PLUGIN_EVENTS.lock() {
-                events.push(PluginEvent {
-                    event_type: EventType::OnSelectionChange,
-                    data: EventData::Buffer {
-                        document_id: event.doc.id(),
-                        path: event
-                            .doc
-                            .path()
-                            .map(|p: &std::path::PathBuf| p.to_path_buf()),
-                    },
-                });
-            }
+            let _ = plugin_events.send(PluginEvent {
+                event_type: EventType::OnSelectionChange,
+                data: EventData::Buffer {
+                    document_id: event.doc.id(),
+                    path: event
+                        .doc
+                        .path()
+                        .map(|p: &std::path::PathBuf| p.to_path_buf()),
+                },
+            });
             Ok(())
         });
 
+        let plugin_events = plugin_event_tx.clone();
         register_hook!(move |event: &mut DiagnosticsDidChange<'_>| {
-            if let Ok(mut events) = PENDING_PLUGIN_EVENTS.lock() {
-                events.push(PluginEvent {
-                    event_type: EventType::OnLspDiagnostic,
-                    data: EventData::Buffer {
-                        document_id: event.doc,
-                        path: None, // We could look it up but doc_id is usually enough
-                    },
-                });
-            }
+            let _ = plugin_events.send(PluginEvent {
+                event_type: EventType::OnLspDiagnostic,
+                data: EventData::Buffer {
+                    document_id: event.doc,
+                    path: None,
+                },
+            });
             Ok(())
         });
 
+        let redraw_ingress = ingress_tx.clone();
+        let plugin_events = plugin_event_tx.clone();
         register_hook!(move |event: &mut OnModeSwitch<'_, '_>| {
             let old_mode = format!("{:?}", event.old_mode);
             let new_mode = format!("{:?}", event.new_mode);
-            if let Ok(mut events) = PENDING_PLUGIN_EVENTS.lock() {
-                events.push(PluginEvent {
-                    event_type: EventType::OnModeChange,
-                    data: EventData::ModeChange { old_mode, new_mode },
-                });
-            }
-            helix_event::request_redraw();
+            let _ = plugin_events.send(PluginEvent {
+                event_type: EventType::OnModeChange,
+                data: EventData::ModeChange { old_mode, new_mode },
+            });
+            helix_runtime::send_blocking(&redraw_ingress, RuntimeEvent::Redraw);
             Ok(())
         });
 
@@ -433,11 +485,27 @@ impl Application {
             terminal,
             editor,
             config,
+            runtime,
+            ingress_tx,
+            ingress_rx,
+            _status_bridge: status_bridge,
             signals,
-            jobs,
+            exit_tasks,
+            exit_task_work,
+            save_queue,
+            lsp_incoming,
+            debugger_incoming,
+            config_rx,
+            assistant_updates_rx,
+            redraw_rx,
+            idle_reset_rx,
+            idle_reset_tx,
+            plugin_event_rx,
+            plugin_event_tx,
+            redraw_timer: Box::pin(sleep(std::time::Duration::MAX)),
+            idle_timer: Box::pin(sleep(idle_timeout)),
             lsp_progress: LspProgressMap::new(),
             plugin_manager,
-            ui_receiver,
             shutdown_rx,
             theme_mode,
         };
@@ -445,31 +513,89 @@ impl Application {
         Ok(app)
     }
 
-    fn handle_plugin_events(&mut self) {
-        let events = {
-            let mut lock = match PENDING_PLUGIN_EVENTS.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            std::mem::take(&mut *lock)
-        };
+    pub fn runtime(&self) -> &Runtime {
+        &self.runtime
+    }
 
-        for event in events {
-            if let Err(e) = self.plugin_manager.fire_event(&mut self.editor, event) {
-                log::error!("Failed to fire plugin event: {}", e);
+    /// Clone of the sender for [`RuntimeEvent`] delivery into the main loop.
+    pub fn ingress_sender(&self) -> Sender<RuntimeEvent> {
+        self.ingress_tx.clone()
+    }
+
+    #[inline]
+    fn queue_redraw(&self) {
+        self.editor.request_redraw();
+    }
+
+    async fn handle_runtime_event(&mut self, event: RuntimeEvent) {
+        match event {
+            RuntimeEvent::Redraw => {
+                self.queue_redraw();
             }
+            RuntimeEvent::Status { message, severity } => {
+                self.editor.status_msg = Some((Cow::Owned(message), severity));
+                self.queue_redraw();
+            }
+            RuntimeEvent::Timer(id) => {
+                log::trace!("runtime timer fired: {:?}", id);
+                self.queue_redraw();
+            }
+            RuntimeEvent::Task(task) => {
+                crate::effect::apply_runtime_task_event(
+                    &mut self.editor,
+                    self.ingress_tx.clone(),
+                    self.plugin_manager.clone(),
+                    task,
+                );
+                self.render().await;
+            }
+            RuntimeEvent::AssistantPermissionResolved {
+                thread,
+                request,
+                decision,
+            } => {
+                let effects = self.editor.resolve_assistant_permission(thread, request, decision);
+                self.editor.apply_assistant_effects(effects);
+            }
+            RuntimeEvent::Ui(cmd) => {
+                crate::runtime::apply_ui_command(
+                    &mut self.editor,
+                    &mut self.compositor,
+                    self.ingress_tx.clone(),
+                    self.plugin_manager.clone(),
+                    cmd,
+                );
+                self.render().await;
+            }
+        }
+    }
+
+    /// Schedule UI timer requests collected during compositor render via [`UiHost::request_timer`](crate::host::UiHost::request_timer).
+    fn schedule_pending_timers(&mut self) {
+        let timers = self.compositor.take_pending_timers();
+        if timers.is_empty() {
+            return;
+        }
+        let work = self.runtime.work().clone();
+        let clock = self.runtime.clock().clone();
+        let ingress = self.ingress_tx.clone();
+        for (id, after) in timers {
+            let ingress = ingress.clone();
+            let timer_task = clock.timer(after);
+            let _ = work
+                .spawn(async move {
+                    if timer_task.await.is_ok() {
+                        let _ = ingress.send(RuntimeEvent::Timer(id)).await;
+                    }
+                })
+                .detach();
         }
     }
 
     async fn render(&mut self) {
         let t0 = std::time::Instant::now();
 
-        let plugin_start = std::time::Instant::now();
-        self.handle_plugin_events();
-        let plugin_elapsed = plugin_start.elapsed();
-        log_run_phase("render_setup", "plugin_events", plugin_elapsed, || {
-            "handled plugin event queue".to_string()
-        });
+        self.editor.pause_assistant_follow_if_local_change();
 
         let clear_start = std::time::Instant::now();
         let did_full_redraw_clear = self.compositor.full_redraw;
@@ -485,12 +611,14 @@ impl Application {
         let frame_setup_start = std::time::Instant::now();
         let mut cx = crate::compositor::Context {
             editor: &mut self.editor,
-            jobs: &mut self.jobs,
+            exit_tasks: &mut self.exit_tasks,
+            exit_task_work: self.exit_task_work.clone(),
             scroll: None,
+            ingress: self.ingress_tx.clone(),
+            idle_reset_tx: self.idle_reset_tx.clone(),
             plugin_manager: Some(self.plugin_manager.clone()),
         };
 
-        helix_event::start_frame();
         cx.editor.needs_redraw = false;
         let frame_setup_elapsed = frame_setup_start.elapsed();
         log_run_phase("render_setup", "frame_state", frame_setup_elapsed, || {
@@ -530,6 +658,7 @@ impl Application {
         });
 
         self.compositor.render(area, surface, &mut cx);
+        self.schedule_pending_timers();
         let render_done = std::time::Instant::now();
         log_run_phase("render", "compositor_render_only", render_done - t1, || {
             format!("area={}x{}", area.width, area.height)
@@ -634,8 +763,11 @@ impl Application {
             // Feed keys through compositor
             let mut cx = crate::compositor::Context {
                 editor: &mut self.editor,
-                jobs: &mut self.jobs,
+                exit_tasks: &mut self.exit_tasks,
+                exit_task_work: self.exit_task_work.clone(),
                 scroll: None,
+                ingress: self.ingress_tx.clone(),
+                idle_reset_tx: self.idle_reset_tx.clone(),
                 plugin_manager: Some(self.plugin_manager.clone()),
             };
 
@@ -665,7 +797,7 @@ impl Application {
             });
         }
 
-        self.editor.needs_redraw = true;
+        self.editor.request_redraw();
         true
     }
 
@@ -755,8 +887,11 @@ impl Application {
             stats.escapes_sent += 1;
             let mut cx = crate::compositor::Context {
                 editor: &mut self.editor,
-                jobs: &mut self.jobs,
+                exit_tasks: &mut self.exit_tasks,
+                exit_task_work: self.exit_task_work.clone(),
                 scroll: None,
+                ingress: self.ingress_tx.clone(),
+                idle_reset_tx: self.idle_reset_tx.clone(),
                 plugin_manager: Some(self.plugin_manager.clone()),
             };
             self.compositor.handle_event(&ViewEvent::Key(esc), &mut cx);
@@ -861,7 +996,7 @@ impl Application {
 
             let action_dur = batch_start.elapsed();
 
-            if tokio::time::Instant::now() >= self.editor.idle_timer.deadline() {
+            if tokio::time::Instant::now() >= self.idle_timer.deadline() {
                 self.service_idle_timeout(false).await;
             }
 
@@ -941,32 +1076,66 @@ impl Application {
                 Some(event) = input_stream.next() => {
                     self.handle_terminal_events(event).await;
                 }
-                Some(callback) = self.jobs.callbacks.recv() => {
-                    self.jobs.handle_callback(&mut self.editor, &mut self.compositor, Ok(Some(callback)));
+                Some(evt) = self.ingress_rx.recv() => {
+                    self.handle_runtime_event(evt).await;
+                }
+                Some(event) = self.save_queue.recv() => {
+                    self.editor.write_count -= 1;
+                    self.handle_document_write(event.await);
                     self.render().await;
                 }
-                Some(msg) = self.jobs.status_messages.recv() => {
-                    let severity = match msg.severity{
-                        helix_event::status::Severity::Hint => Severity::Hint,
-                        helix_event::status::Severity::Info => Severity::Info,
-                        helix_event::status::Severity::Warning => Severity::Warning,
-                        helix_event::status::Severity::Error => Severity::Error,
-                    };
-                    // TODO: show multiple status messages at once to avoid clobbering
-                    self.editor.status_msg = Some((msg.message, severity));
-                    helix_event::request_redraw();
+                Some((id, call)) = self.lsp_incoming.next() => {
+                    self.handle_language_server_message(call, id).await;
+                    self.queue_redraw();
                 }
-                Some(callback) = self.jobs.wait_futures.next() => {
-                    self.jobs.handle_callback(&mut self.editor, &mut self.compositor, callback);
+                Some((id, payload)) = self.debugger_incoming.next() => {
+                    let needs_render = self.editor.handle_debugger_message(id, payload).await;
+                    if needs_render {
+                        self.render().await;
+                    }
+                }
+                Some(config_event) = self.config_rx.recv() => {
+                    self.handle_config_events(config_event);
                     self.render().await;
                 }
-                Some(request) = self.ui_receiver.recv() => {
-                    self.handle_ui_request(request).await;
-                    self.render().await;
+                Some(update) = self.assistant_updates_rx.recv() => {
+                    self.handle_assistant_update(update).await;
+                    self.queue_redraw();
                 }
-                event = self.editor.wait_event() => {
-                    let _idle_handled = self.handle_editor_event(event).await;
+                Some(plugin_event) = self.plugin_event_rx.recv() => {
+                    if let Err(err) = self.plugin_manager.fire_event(&mut self.editor, plugin_event) {
+                        log::error!("Failed to fire plugin event: {}", err);
+                    }
+                }
+                Some(()) = self.redraw_rx.recv() => {
+                    if !self.editor.needs_redraw {
+                        self.editor.needs_redraw = true;
+                        let timeout = Instant::now() + std::time::Duration::from_millis(33);
+                        if timeout < self.idle_timer.deadline() && timeout < self.redraw_timer.deadline() {
+                            self.redraw_timer.as_mut().reset(timeout);
+                        }
+                    }
+                }
+                Some(()) = self.idle_reset_rx.recv() => {
+                    let timeout = self.editor.config().idle_timeout;
+                    self.idle_timer.as_mut().reset(Instant::now() + timeout);
+                }
+                _ = &mut self.idle_timer => {
+                    self.idle_timer.as_mut().reset(
+                        Instant::now() + std::time::Duration::from_secs(86400 * 365 * 30),
+                    );
+                    self.handle_idle_timeout().await;
 
+                    #[cfg(feature = "integration")]
+                    {
+                        return true;
+                    }
+                }
+                _ = &mut self.redraw_timer => {
+                    self.redraw_timer
+                        .as_mut()
+                        .reset(Instant::now() + std::time::Duration::from_secs(86400 * 365 * 30));
+                    let _idle_handled = self.handle_editor_event(EditorEvent::Redraw).await;
                     #[cfg(feature = "integration")]
                     {
                         if _idle_handled {
@@ -974,13 +1143,25 @@ impl Application {
                         }
                     }
                 }
+                Some(res) = self.exit_tasks.next() => {
+                    if let Err(err) = crate::effect::apply_exit_task_result(
+                        &mut self.editor,
+                        self.ingress_tx.clone(),
+                        self.plugin_manager.clone(),
+                        res,
+                    ) {
+                        self.editor.set_error(format!("Async task failed: {}", err));
+                    }
+                    self.render().await;
+                }
             }
 
             // for integration tests only, reset the idle timer after every
             // event to signal when test events are done processing
             #[cfg(feature = "integration")]
             {
-                self.editor.reset_idle_timer();
+                let timeout = self.editor.config().idle_timeout;
+                self.idle_timer.as_mut().reset(Instant::now() + timeout);
             }
 
             if self.editor.bench.is_some() {
@@ -1193,14 +1374,18 @@ impl Application {
     async fn service_idle_timeout(&mut self, render_immediately: bool) {
         let mut cx = crate::compositor::Context {
             editor: &mut self.editor,
-            jobs: &mut self.jobs,
+            exit_tasks: &mut self.exit_tasks,
+            exit_task_work: self.exit_task_work.clone(),
             scroll: None,
+            ingress: self.ingress_tx.clone(),
+            idle_reset_tx: self.idle_reset_tx.clone(),
             plugin_manager: Some(self.plugin_manager.clone()),
         };
         let should_render = self.compositor.handle_event(&Event::IdleTimeout, &mut cx);
         let syntax_refreshed = self.editor.refresh_one_stale_syntax();
         if self.editor.has_stale_syntax() {
-            self.editor.reset_idle_timer();
+            let timeout = self.editor.config().idle_timeout;
+            self.idle_timer.as_mut().reset(Instant::now() + timeout);
         }
         if syntax_refreshed || self.editor.has_stale_syntax() {
             log_run_event("bench_idle_service", || {
@@ -1304,192 +1489,20 @@ impl Application {
         }
     }
 
-    async fn handle_ui_request(&mut self, request: crate::plugin_registry::UiRequest) {
-        use crate::plugin_registry::UiRequest;
-        match request {
-            UiRequest::Prompt {
-                message,
-                default,
-                plugin_name,
-                callback_id,
-            } => {
-                let plugin_manager = self.plugin_manager.clone();
-                let prompt = crate::ui::Prompt::new(
-                    message.into(),
-                    None,
-                    |_editor, _input| Vec::new(),
-                    move |cx, input, event| {
-                        if event == crate::ui::PromptEvent::Validate {
-                            let _ = plugin_manager.handle_ui_callback(
-                                cx.editor,
-                                plugin_name.clone(),
-                                callback_id,
-                                serde_json::Value::String(input.to_string()),
-                            );
-                        } else if event == crate::ui::PromptEvent::Abort {
-                            // Optionally handle abort
-                        }
-                    },
-                );
-                let prompt = if let Some(default) = default {
-                    prompt.with_line(default, &self.editor)
-                } else {
-                    prompt
-                };
-                self.compositor.push(Box::new(prompt));
-            }
-            UiRequest::Confirm {
-                message,
-                plugin_name,
-                callback_id,
-            } => {
-                let plugin_manager = self.plugin_manager.clone();
-                let prompt = crate::ui::Prompt::new(
-                    format!("{} (y/n) ", message).into(),
-                    None,
-                    |_editor, _input| Vec::new(),
-                    move |cx, input, event| {
-                        if event == crate::ui::PromptEvent::Validate {
-                            let confirmed =
-                                input.to_lowercase() == "y" || input.to_lowercase() == "yes";
-                            let _ = plugin_manager.handle_ui_callback(
-                                cx.editor,
-                                plugin_name.clone(),
-                                callback_id,
-                                serde_json::Value::Bool(confirmed),
-                            );
-                        } else if event == crate::ui::PromptEvent::Abort {
-                            let _ = plugin_manager.handle_ui_callback(
-                                cx.editor,
-                                plugin_name.clone(),
-                                callback_id,
-                                serde_json::Value::Bool(false),
-                            );
-                        }
-                    },
-                );
-                self.compositor.push(Box::new(prompt));
-            }
-            UiRequest::Picker {
-                items,
-                prompt: _prompt,
-                plugin_name,
-                callback_id,
-            } => {
-                let plugin_manager = self.plugin_manager.clone();
-                let columns = [ui::PickerColumn::new("item", |item: &String, _data| {
-                    item.as_str().into()
-                })];
-                let picker =
-                    crate::ui::Picker::new(columns, 0, items, (), move |cx, item, _action| {
-                        let _ = plugin_manager.handle_ui_callback(
-                            cx.editor,
-                            plugin_name.clone(),
-                            callback_id,
-                            serde_json::Value::String(item.clone()),
-                        );
-                    });
-                self.compositor.push(Box::new(overlaid(picker)));
-            }
-            UiRequest::RegisterPanel {
-                plugin_name,
-                panel_id,
-                title,
-                side,
-                width,
-                render_callback_id,
-                event_callback_id,
-            } => {
-                use helix_view::model::{PanelSide, PanelSize, PluginPanelModel};
-
-                let panel_side = match side.as_str() {
-                    "left" => PanelSide::Left,
-                    "bottom" => PanelSide::Bottom,
-                    _ => PanelSide::Right,
-                };
-                let model = PluginPanelModel {
-                    plugin_name: plugin_name.clone(),
-                    panel_id: panel_id.clone(),
-                    render_callback_id,
-                    event_callback_id,
-                };
-                self.editor.model.insert_panel(
-                    title,
-                    Box::new(model),
-                    panel_side,
-                    PanelSize::fixed(width),
-                );
-
-                let panel = crate::ui::plugin_panel::PluginPanel::new(
-                    plugin_name,
-                    panel_id,
-                    render_callback_id,
-                    event_callback_id,
-                );
-                self.compositor.push(Box::new(panel));
-            }
-            UiRequest::RemovePanel {
-                plugin_name: _,
-                panel_id,
-            } => {
-                // Remove the component from the compositor by ID.
-                let target_id = format!("plugin_panel:{panel_id}");
-                self.compositor.remove_by_id(&target_id);
-                // Remove from model.
-                self.editor.model.panels.retain(|_, entry| {
-                    entry.tag() != "plugin_panel"
-                        || entry
-                            .content
-                            .as_any()
-                            .downcast_ref::<helix_view::model::PluginPanelModel>()
-                            .is_none_or(|m| m.panel_id != panel_id)
-                });
-            }
-        }
-    }
-
     #[inline(always)]
     pub async fn handle_editor_event(&mut self, event: EditorEvent) -> bool {
         log::debug!("received editor event: {:?}", event);
 
         match event {
-            EditorEvent::DocumentSaved(event) => {
-                self.handle_document_write(event);
-                self.render().await;
-            }
-            EditorEvent::ConfigEvent(event) => {
-                self.handle_config_events(event);
-                self.render().await;
-            }
-            EditorEvent::LanguageServerMessage((id, call)) => {
-                self.handle_language_server_message(call, id).await;
-                // limit render calls for fast language server messages
-                helix_event::request_redraw();
-            }
-            EditorEvent::DebuggerEvent((id, payload)) => {
-                let needs_render = self.editor.handle_debugger_message(id, payload).await;
-                if needs_render {
-                    self.render().await;
-                }
-            }
-            EditorEvent::AcpMessage((id, call)) => {
-                self.handle_acp_message(call, id).await;
-                helix_event::request_redraw();
-            }
+            EditorEvent::CursorMoved
+            | EditorEvent::Scrolled
+            | EditorEvent::Edited
+            | EditorEvent::BufferSwitched => {}
             EditorEvent::Redraw => {
                 // Skip render here when bench is active — the bench tick
                 // does its own render, avoiding double-render per iteration.
                 if self.editor.bench.is_none() {
                     self.render().await;
-                }
-            }
-            EditorEvent::IdleTimer => {
-                self.editor.clear_idle_timer();
-                self.handle_idle_timeout().await;
-
-                #[cfg(feature = "integration")]
-                {
-                    return true;
                 }
             }
         }
@@ -1532,8 +1545,11 @@ impl Application {
 
         let mut cx = crate::compositor::Context {
             editor: &mut self.editor,
-            jobs: &mut self.jobs,
+            exit_tasks: &mut self.exit_tasks,
+            exit_task_work: self.exit_task_work.clone(),
             scroll: None,
+            ingress: self.ingress_tx.clone(),
+            idle_reset_tx: self.idle_reset_tx.clone(),
             plugin_manager: Some(self.plugin_manager.clone()),
         };
         // Handle key events
@@ -1611,14 +1627,12 @@ impl Application {
             event => {
                 let event: helix_view::input::Event = event.into();
                 if let helix_view::input::Event::Key(key) = &event {
-                    if let Ok(mut events) = PENDING_PLUGIN_EVENTS.lock() {
-                        events.push(PluginEvent {
-                            event_type: EventType::OnKeyPress,
-                            data: EventData::KeyPress {
-                                key: key.to_string(),
-                            },
-                        });
-                    }
+                    let _ = self.plugin_event_tx.send(PluginEvent {
+                        event_type: EventType::OnKeyPress,
+                        data: EventData::KeyPress {
+                            key: key.to_string(),
+                        },
+                    });
                 }
                 self.compositor.handle_event(&event, &mut cx)
             }
@@ -2001,9 +2015,10 @@ impl Application {
                             .collect();
 
                         for document in documents {
-                            handlers::diagnostics::request_document_diagnostics(
+                            crate::effect::language_server::request_document_diagnostics(
                                 &mut self.editor,
                                 document,
+                                self.ingress_tx.clone(),
                             );
                         }
 
@@ -2080,7 +2095,11 @@ impl Application {
             ..
         } = params
         {
-            self.jobs.callback(crate::open_external_url_callback(uri));
+            crate::runtime::ingress::spawn_task_event_with_future(
+                self.runtime.work().clone(),
+                crate::open_external_url_task_event(uri),
+                self.ingress_tx.clone(),
+            );
             return lsp::ShowDocumentResult { success: true };
         };
 
@@ -2133,408 +2152,17 @@ impl Application {
         lsp::ShowDocumentResult { success: true }
     }
 
-    pub async fn handle_acp_message(
-        &mut self,
-        call: helix_acp::jsonrpc::Call,
-        agent_id: helix_acp::AgentId,
-    ) {
-        use helix_acp::jsonrpc::Call;
-        use helix_acp::types::{AgentMethodCall, AgentNotification};
-
-        let agent = match self.editor.acp_agents.get(agent_id) {
-            Some(agent) => agent.clone(),
-            None => {
-                log::warn!("ACP message from unknown agent {:?}", agent_id);
-                return;
-            }
-        };
-
-        match call {
-            Call::Notification(helix_acp::jsonrpc::Notification { method, params, .. }) => {
-                match AgentNotification::parse(&method, params) {
-                    Ok(AgentNotification::SessionUpdate(notif)) => {
-                        self.handle_acp_session_update(agent_id, notif);
-                    }
-                    Err(helix_acp::Error::Unhandled(method)) => {
-                        if method == "exit" {
-                            log::warn!(
-                                "[acp_transport] application received synthetic exit notification agent={:?}",
-                                agent_id
-                            );
-                        }
-                        log::debug!("Ignoring unhandled ACP notification: {method}");
-                    }
-                    Err(err) => {
-                        log::error!("Error parsing ACP notification: {err}");
-                    }
-                }
-            }
-            Call::MethodCall(helix_acp::jsonrpc::MethodCall {
-                method, params, id, ..
-            }) => {
-                match AgentMethodCall::parse(&method, params) {
-                    Ok(AgentMethodCall::ReadTextFile(req)) => {
-                        let result = self.handle_acp_read_file(&req);
-                        match result {
-                            Ok(resp) => agent.reply(id, serde_json::to_value(resp).unwrap()),
-                            Err(e) => agent.reply_error(
-                                id,
-                                helix_acp::jsonrpc::Error::internal_error(e.to_string()),
-                            ),
-                        }
-                    }
-                    Ok(AgentMethodCall::WriteTextFile(req)) => {
-                        let result = self.handle_acp_write_file(&req);
-                        match result {
-                            Ok(resp) => agent.reply(id, serde_json::to_value(resp).unwrap()),
-                            Err(e) => agent.reply_error(
-                                id,
-                                helix_acp::jsonrpc::Error::internal_error(e.to_string()),
-                            ),
-                        }
-                    }
-                    Ok(AgentMethodCall::CreateTerminal(req)) => {
-                        match self.handle_acp_create_terminal(&req).await {
-                            Ok(resp) => agent.reply(id, serde_json::to_value(resp).unwrap()),
-                            Err(e) => agent.reply_error(
-                                id,
-                                helix_acp::jsonrpc::Error::internal_error(e.to_string()),
-                            ),
-                        }
-                    }
-                    Ok(AgentMethodCall::TerminalOutput(req)) => {
-                        match self.handle_acp_terminal_output(&req).await {
-                            Ok(resp) => agent.reply(id, serde_json::to_value(resp).unwrap()),
-                            Err(e) => agent.reply_error(
-                                id,
-                                helix_acp::jsonrpc::Error::internal_error(e.to_string()),
-                            ),
-                        }
-                    }
-                    Ok(AgentMethodCall::WaitForTerminalExit(req)) => {
-                        match self.handle_acp_wait_terminal(&req).await {
-                            Ok(resp) => agent.reply(id, serde_json::to_value(resp).unwrap()),
-                            Err(e) => agent.reply_error(
-                                id,
-                                helix_acp::jsonrpc::Error::internal_error(e.to_string()),
-                            ),
-                        }
-                    }
-                    Ok(AgentMethodCall::KillTerminal(req)) => {
-                        match self.handle_acp_kill_terminal(&req).await {
-                            Ok(resp) => agent.reply(id, serde_json::to_value(resp).unwrap()),
-                            Err(e) => agent.reply_error(
-                                id,
-                                helix_acp::jsonrpc::Error::internal_error(e.to_string()),
-                            ),
-                        }
-                    }
-                    Ok(AgentMethodCall::ReleaseTerminal(req)) => {
-                        match self.handle_acp_release_terminal(&req).await {
-                            Ok(resp) => agent.reply(id, serde_json::to_value(resp).unwrap()),
-                            Err(e) => agent.reply_error(
-                                id,
-                                helix_acp::jsonrpc::Error::internal_error(e.to_string()),
-                            ),
-                        }
-                    }
-                    Ok(AgentMethodCall::RequestPermission(req)) => {
-                        use crate::ui::acp::{
-                            PermissionChoice, PermissionPopup, PermissionResponse, PERMISSION_ID,
-                        };
-
-                        if req.permissions.is_empty() {
-                            let resp = helix_acp::types::RequestPermissionResponse {
-                                outcome: helix_acp::types::RequestPermissionOutcome::Dismissed,
-                            };
-                            agent.reply(id, serde_json::to_value(resp).unwrap());
-                        } else {
-                            let (tx, rx) = tokio::sync::oneshot::channel::<PermissionResponse>();
-
-                            let choices: Vec<PermissionChoice> = req
-                                .permissions
-                                .iter()
-                                .map(|p| PermissionChoice {
-                                    id: p.id.clone(),
-                                    title: p.title.clone(),
-                                    description: p.description.clone(),
-                                })
-                                .collect();
-
-                            let popup = PermissionPopup::new(
-                                req.title.clone(),
-                                req.description.clone(),
-                                choices,
-                                tx,
-                            );
-                            self.compositor.replace_or_push(PERMISSION_ID, popup);
-
-                            // Spawn a task to wait for the user's response
-                            let agent_for_reply = agent.clone();
-                            let reply_id = id;
-                            tokio::spawn(async move {
-                                let outcome = match rx.await {
-                                    Ok(PermissionResponse::Selected(selected_id)) => {
-                                        helix_acp::types::RequestPermissionOutcome::Selected {
-                                            id: selected_id,
-                                        }
-                                    }
-                                    _ => helix_acp::types::RequestPermissionOutcome::Dismissed,
-                                };
-                                let resp = helix_acp::types::RequestPermissionResponse { outcome };
-                                agent_for_reply
-                                    .reply(reply_id, serde_json::to_value(resp).unwrap());
-                            });
-                        }
-                    }
-                    Err(helix_acp::Error::Unhandled(method)) => {
-                        log::warn!("Unhandled ACP method call: {method}");
-                        agent.reply_error(id, helix_acp::jsonrpc::Error::method_not_found(method));
-                    }
-                    Err(err) => {
-                        log::error!("Error parsing ACP method call: {err}");
-                        agent.reply_error(
-                            id,
-                            helix_acp::jsonrpc::Error::internal_error(err.to_string()),
-                        );
-                    }
-                }
-            }
-            Call::Invalid { id } => {
-                log::error!("Invalid ACP message (id={id})");
-            }
-        }
-    }
-
-    fn handle_acp_session_update(
-        &mut self,
-        _agent_id: helix_acp::AgentId,
-        notif: helix_acp::types::SessionNotification,
-    ) {
-        use crate::ui::acp::{AcpPanel, PlanItem, PlanStatus, ID as ACP_PANEL_ID};
-        use helix_acp::types::SessionUpdate;
-
-        match notif.update {
-            SessionUpdate::AgentMessageChunk(chunk) => {
-                if let helix_acp::ContentBlock::Text(text) = chunk.content {
-                    // Accumulate for fallback
-                    self.acp_append_output(&text.text);
-                    // Route to panel
-                    if let Some(panel) = self.compositor.find_id::<AcpPanel>(ACP_PANEL_ID) {
-                        panel.append_agent_text(&text.text);
-                    }
-                    // Status bar shows latest
-                    let truncated: String = text.text.chars().take(80).collect();
-                    self.editor.set_status(truncated);
-                }
-            }
-            SessionUpdate::ToolCall(tool_call) => {
-                let status_str = match tool_call.status {
-                    helix_acp::types::ToolCallStatus::Running => "running",
-                    helix_acp::types::ToolCallStatus::Completed => "completed",
-                    helix_acp::types::ToolCallStatus::Failed => "failed",
-                    helix_acp::types::ToolCallStatus::Cancelled => "cancelled",
-                };
-                let name = tool_call.title.as_deref().unwrap_or("unknown");
-                if let Some(panel) = self.compositor.find_id::<AcpPanel>(ACP_PANEL_ID) {
-                    panel.update_tool_call(&tool_call.tool_call_id, Some(name), None, status_str);
-                }
-                self.editor
-                    .set_status(format!("[ACP] Tool: {name} ({status_str})"));
-            }
-            SessionUpdate::ToolCallUpdate(update) => {
-                let path = update.content.as_ref().and_then(|blocks| {
-                    blocks.iter().find_map(|b| {
-                        if let helix_acp::ContentBlock::Text(t) = b {
-                            Some(t.text.lines().next().unwrap_or(&t.text).to_string())
-                        } else {
-                            None
-                        }
-                    })
-                });
-                if let Some(status) = update.status {
-                    let status_str = match status {
-                        helix_acp::types::ToolCallStatus::Running => "running",
-                        helix_acp::types::ToolCallStatus::Completed => "completed",
-                        helix_acp::types::ToolCallStatus::Failed => "failed",
-                        helix_acp::types::ToolCallStatus::Cancelled => "cancelled",
-                    };
-                    if let Some(panel) = self.compositor.find_id::<AcpPanel>(ACP_PANEL_ID) {
-                        panel.update_tool_call(
-                            &update.tool_call_id,
-                            None,
-                            path.as_deref(),
-                            status_str,
-                        );
-                    }
-                }
-            }
-            SessionUpdate::Plan(plan) => {
-                if plan.entries.is_empty() {
-                    if let Some(panel) = self.compositor.find_id::<AcpPanel>(ACP_PANEL_ID) {
-                        panel.clear_plan();
-                    }
-                } else {
-                    let items: Vec<PlanItem> = plan
-                        .entries
-                        .iter()
-                        .map(|e| PlanItem {
-                            content: e.content.clone(),
-                            status: match e.status {
-                                Some(helix_acp::types::PlanEntryStatus::Completed) => {
-                                    PlanStatus::Completed
-                                }
-                                Some(helix_acp::types::PlanEntryStatus::InProgress) => {
-                                    PlanStatus::InProgress
-                                }
-                                Some(helix_acp::types::PlanEntryStatus::Failed) => {
-                                    PlanStatus::Failed
-                                }
-                                _ => PlanStatus::Pending,
-                            },
-                        })
-                        .collect();
-                    if let Some(panel) = self.compositor.find_id::<AcpPanel>(ACP_PANEL_ID) {
-                        panel.update_plan(items);
-                    }
-                }
-            }
-            SessionUpdate::ConfigOptionUpdate(data) => {
-                self.editor.acp_config_options = data.config_options.clone();
-                if let Some(panel) = self.compositor.find_id::<AcpPanel>(ACP_PANEL_ID) {
-                    panel.set_config_options(data.config_options);
-                }
-            }
-            SessionUpdate::CurrentModeUpdate(data) => {
-                if let Some(panel) = self.compositor.find_id::<AcpPanel>(ACP_PANEL_ID) {
-                    panel.set_current_mode_id(data.mode_id.clone());
-                    panel.apply_config_option_cycle("mode", data.mode_id);
-                }
-            }
-            _ => {
-                log::debug!("Unhandled ACP session update type");
-            }
-        }
-    }
-
-    /// Append text to the ACP output log (fallback for when panel is not open).
-    fn acp_append_output(&mut self, text: &str) {
-        for ch in text.chars() {
-            if ch == '\n' {
-                self.editor.acp_output.push(String::new());
-            } else {
-                if self.editor.acp_output.is_empty() {
-                    self.editor.acp_output.push(String::new());
-                }
-                self.editor.acp_output.last_mut().unwrap().push(ch);
-            }
-        }
-    }
-
-    fn handle_acp_read_file(
-        &self,
-        req: &helix_acp::types::ReadTextFileRequest,
-    ) -> anyhow::Result<helix_acp::types::ReadTextFileResponse> {
-        let path = std::path::Path::new(&req.path);
-        let content = std::fs::read_to_string(path)
-            .map_err(|e| anyhow::anyhow!("Failed to read {}: {}", req.path, e))?;
-
-        let content = match (req.line, req.limit) {
-            (Some(start_line), Some(limit)) => {
-                let start = (start_line.saturating_sub(1)) as usize;
-                content
-                    .lines()
-                    .skip(start)
-                    .take(limit as usize)
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            }
-            (Some(start_line), None) => {
-                let start = (start_line.saturating_sub(1)) as usize;
-                content.lines().skip(start).collect::<Vec<_>>().join("\n")
-            }
-            (None, Some(limit)) => content
-                .lines()
-                .take(limit as usize)
-                .collect::<Vec<_>>()
-                .join("\n"),
-            (None, None) => content,
-        };
-
-        Ok(helix_acp::types::ReadTextFileResponse { content })
-    }
-
-    fn handle_acp_write_file(
-        &mut self,
-        req: &helix_acp::types::WriteTextFileRequest,
-    ) -> anyhow::Result<helix_acp::types::WriteTextFileResponse> {
-        let path = std::path::Path::new(&req.path);
-
-        // If the document is open in the editor, update it in-place
-        let doc_id = self
-            .editor
-            .documents()
-            .find(|doc| doc.path().is_some_and(|p| p == path))
-            .map(|doc| doc.id());
-
-        if let Some(doc_id) = doc_id {
-            let doc = doc_mut!(self.editor, &doc_id);
-            let view_id = self.editor.tree.focus;
-            let transaction = helix_core::Transaction::change(
-                doc.text(),
-                [(
-                    0,
-                    doc.text().len_chars(),
-                    Some(helix_core::Tendril::from(req.content.as_str())),
-                )]
-                .into_iter(),
+    async fn handle_assistant_update(&mut self, update: helix_view::assistant::backend::Update) {
+        let outcome = self.editor.apply_assistant_update(update);
+        if let Some((thread, request)) = outcome.permission_request {
+            crate::runtime::ui::assistant::apply_assistant_command(
+                &mut self.editor,
+                &mut self.compositor,
+                self.ingress_tx.clone(),
+                crate::runtime::AssistantCommand::ShowPermissionRequest { thread, request },
             );
-            doc.apply(&transaction, view_id);
-        } else {
-            // Write directly to disk
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::write(path, &req.content)
-                .map_err(|e| anyhow::anyhow!("Failed to write {}: {}", req.path, e))?;
         }
-
-        Ok(helix_acp::types::WriteTextFileResponse {})
-    }
-
-    async fn handle_acp_create_terminal(
-        &mut self,
-        req: &helix_acp::types::CreateTerminalRequest,
-    ) -> anyhow::Result<helix_acp::types::CreateTerminalResponse> {
-        self.editor.acp_terminals.create(req).await
-    }
-
-    async fn handle_acp_terminal_output(
-        &self,
-        req: &helix_acp::types::TerminalOutputRequest,
-    ) -> anyhow::Result<helix_acp::types::TerminalOutputResponse> {
-        self.editor.acp_terminals.output(req).await
-    }
-
-    async fn handle_acp_wait_terminal(
-        &self,
-        req: &helix_acp::types::WaitForTerminalExitRequest,
-    ) -> anyhow::Result<helix_acp::types::WaitForTerminalExitResponse> {
-        self.editor.acp_terminals.wait_for_exit(req).await
-    }
-
-    async fn handle_acp_kill_terminal(
-        &mut self,
-        req: &helix_acp::types::KillTerminalRequest,
-    ) -> anyhow::Result<helix_acp::types::KillTerminalResponse> {
-        self.editor.acp_terminals.kill(req).await
-    }
-
-    async fn handle_acp_release_terminal(
-        &mut self,
-        req: &helix_acp::types::ReleaseTerminalRequest,
-    ) -> anyhow::Result<helix_acp::types::ReleaseTerminalResponse> {
-        self.editor.acp_terminals.release(req).await
+        self.editor.apply_assistant_effects(outcome.effects);
     }
 
     fn restore_term(&mut self) -> std::io::Result<()> {
@@ -2612,19 +2240,25 @@ impl Application {
         //        errors along the way
         let mut errs = Vec::new();
 
-        if let Err(err) = self
-            .jobs
-            .finish(&mut self.editor, Some(&mut self.compositor))
-            .await
-        {
-            log::error!("Error executing job: {}", err);
-            errs.push(err);
-        };
+        log::debug!("waiting on pending exit-bound task work...");
+        for result in std::mem::take(&mut self.exit_tasks).drain().await {
+            if let Err(err) = crate::effect::apply_exit_task_result(
+                &mut self.editor,
+                self.ingress_tx.clone(),
+                self.plugin_manager.clone(),
+                result,
+            ) {
+                log::error!("Error finishing async UI work: {}", err);
+                errs.push(err);
+            }
+        }
 
         if let Err(err) = self.editor.flush_writes().await {
             log::error!("Error writing: {}", err);
             errs.push(err);
         }
+
+        errs.extend(self.editor.flush_assistant_persistence().await);
 
         if self.editor.close_language_servers(None).await.is_err() {
             log::error!("Timed out waiting for language servers to shutdown");
@@ -2632,8 +2266,6 @@ impl Application {
                 "Timed out waiting for language servers to shutdown"
             ));
         }
-
-        self.editor.close_acp_agents();
 
         errs
     }

@@ -2,7 +2,9 @@ use std::fmt::Write;
 use std::io::BufReader;
 use std::ops::{self, Deref};
 
-use crate::job::Job;
+use crate::runtime::{
+    AssistantCommand, LayerCommand, UiCommand,
+};
 
 use super::*;
 
@@ -156,15 +158,11 @@ fn open_impl(cx: &mut compositor::Context, args: Args, action: Action) -> anyhow
         // message
         if let Ok(true) = std::fs::canonicalize(&path).map(|p| p.is_dir()) {
             let callback = async move {
-                let call: job::Callback = job::Callback::EditorCompositor(Box::new(
-                    move |editor: &mut Editor, compositor: &mut Compositor| {
-                        let picker = ui::file_picker(editor, path.into_owned());
-                        compositor.push(Box::new(overlaid(picker)));
-                    },
-                ));
-                Ok(call)
+                Ok(UiCommand::Layer(LayerCommand::PushFilePicker {
+                    root: path.into_owned(),
+                }))
             };
-            cx.jobs.callback(callback);
+            cx.spawn_ui(callback);
         } else {
             // Otherwise, just open the file
             let _ = cx.editor.open(&path, action)?;
@@ -386,7 +384,6 @@ fn write_impl(
     options: WriteOptions,
 ) -> anyhow::Result<()> {
     let config = cx.editor.config();
-    let jobs = &mut cx.jobs;
     let (view_id, doc) = focused!(cx.editor);
 
     if doc.trim_trailing_whitespace() {
@@ -403,26 +400,28 @@ fn write_impl(
     let view = view_mut!(cx.editor, view_id);
     doc.append_changes_to_history(view);
 
-    let (view_id, doc) = focused_ref!(cx.editor);
-    let fmt = if config.auto_format && options.auto_format {
-        doc.auto_format(cx.editor).map(|fmt| {
-            let callback = make_format_callback(
-                doc.id(),
-                doc.version(),
-                view_id,
-                fmt,
-                Some((path.map(Into::into), options.force)),
-            );
-
-            jobs.add(Job::with_callback(callback).wait_before_exiting());
-        })
-    } else {
-        None
+    let (format_task, doc_id) = {
+        let (view_id, doc) = focused_ref!(cx.editor);
+        let format_task = if config.auto_format && options.auto_format {
+            doc.auto_format(cx.editor).map(|fmt| {
+                make_format_task_event(
+                    doc.id(),
+                    doc.version(),
+                    view_id,
+                    fmt,
+                    Some((path.map(Into::into), options.force)),
+                )
+            })
+        } else {
+            None
+        };
+        (format_task, doc.id())
     };
 
-    if fmt.is_none() {
-        let id = doc.id();
-        cx.editor.save(id, path, options.force)?;
+    if let Some(task) = format_task {
+        cx.exit_task_event(task);
+    } else {
+        cx.editor.save(doc_id, path, options.force)?;
     }
 
     Ok(())
@@ -586,8 +585,13 @@ fn format(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> anyh
     let format = doc.format(cx.editor).context(
         "A formatter isn't available, and no language server provides formatting capabilities",
     )?;
-    let callback = make_format_callback(doc.id(), doc.version(), view_id, format, None);
-    cx.jobs.callback(callback);
+    cx.spawn_task_event(make_format_task_event(
+        doc.id(),
+        doc.version(),
+        view_id,
+        format,
+        None,
+    ));
 
     Ok(())
 }
@@ -822,18 +826,25 @@ pub fn write_all_impl(
     cx: &mut compositor::Context,
     options: WriteAllOptions,
 ) -> anyhow::Result<()> {
+    write_all_editor_impl(cx.editor, Some(cx.exit_tasks), Some(&cx.exit_task_work), options)
+}
+
+pub fn write_all_editor_impl(
+    editor: &mut Editor,
+    mut exit_tasks: Option<&mut crate::runtime::ExitTaskSet>,
+    exit_task_work: Option<&helix_runtime::Work>,
+    options: WriteAllOptions,
+) -> anyhow::Result<()> {
     let mut errors: Vec<&'static str> = Vec::new();
-    let config = cx.editor.config();
-    let jobs = &mut cx.jobs;
-    let saves: Vec<_> = cx
-        .editor
+    let config = editor.config();
+    let saves: Vec<_> = editor
         .documents
         .keys()
         .cloned()
         .collect::<Vec<_>>()
         .into_iter()
         .filter_map(|id| {
-            let doc = doc!(cx.editor, &id);
+            let doc = doc!(editor, &id);
             if !doc.is_modified() {
                 return None;
             }
@@ -845,14 +856,14 @@ pub fn write_all_impl(
             }
 
             // Look for a view to apply the formatting change to.
-            let target_view = cx.editor.get_synced_view_id(doc.id());
+            let target_view = editor.get_synced_view_id(doc.id());
             Some((id, target_view))
         })
         .collect();
 
     for (doc_id, target_view) in saves {
-        let doc = doc_mut!(cx.editor, &doc_id);
-        let view = view_mut!(cx.editor, target_view);
+        let doc = doc_mut!(editor, &doc_id);
+        let view = view_mut!(editor, target_view);
 
         if doc.trim_trailing_whitespace() {
             trim_trailing_whitespace(doc, target_view);
@@ -868,23 +879,32 @@ pub fn write_all_impl(
         doc.append_changes_to_history(view);
 
         let fmt = if options.auto_format && config.auto_format {
-            let doc = doc!(cx.editor, &doc_id);
-            doc.auto_format(cx.editor).map(|fmt| {
-                let callback = make_format_callback(
+            let doc = doc!(editor, &doc_id);
+            doc.auto_format(editor).map(|fmt| {
+                let task = make_format_task_event(
                     doc_id,
                     doc.version(),
                     target_view,
                     fmt,
                     Some((None, options.force)),
                 );
-                jobs.add(Job::with_callback(callback).wait_before_exiting());
+                let exit_tasks = exit_tasks
+                    .as_deref_mut()
+                    .expect("write_all_editor_impl requires exit_tasks when auto_format is enabled");
+                exit_tasks.push(
+                    exit_task_work
+                        .expect(
+                            "write_all_editor_impl requires exit_task_work when auto_format is enabled",
+                        )
+                        .spawn(task),
+                );
             })
         } else {
             None
         };
 
         if fmt.is_none() {
-            cx.editor.save::<PathBuf>(doc_id, None, options.force)?;
+            editor.save::<PathBuf>(doc_id, None, options.force)?;
         }
     }
 
@@ -1439,7 +1459,7 @@ fn reload(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> anyh
 
     if doc.should_request_full_file_blame(auto_fetch) {
         if let Some(path) = doc.path() {
-            helix_event::send_blocking(
+            helix_runtime::send_blocking(
                 &cx.editor.handlers.blame,
                 BlameEvent {
                     path: path.to_path_buf(),
@@ -1463,11 +1483,14 @@ pub fn reload_all(
         return Ok(());
     }
 
-    let scrolloff = cx.editor.config().scrolloff;
-    let view_id = view!(cx.editor).id;
+    reload_all_impl(cx.editor)
+}
 
-    let docs_view_ids: Vec<(DocumentId, Vec<ViewId>)> = cx
-        .editor
+pub fn reload_all_impl(editor: &mut Editor) -> anyhow::Result<()> {
+    let scrolloff = editor.config().scrolloff;
+    let view_id = view!(editor).id;
+
+    let docs_view_ids: Vec<(DocumentId, Vec<ViewId>)> = editor
         .documents_mut()
         .map(|doc| {
             let mut view_ids: Vec<_> = doc.selections().keys().cloned().collect();
@@ -1481,31 +1504,31 @@ pub fn reload_all(
         })
         .collect();
 
-    let blame_compute = cx.editor.config().inline_blame.auto_fetch;
+    let blame_compute = editor.config().inline_blame.auto_fetch;
 
     for (doc_id, view_ids) in docs_view_ids {
-        let doc = doc_mut!(cx.editor, &doc_id);
+        let doc = doc_mut!(editor, &doc_id);
 
         // Every doc is guaranteed to have at least 1 view at this point.
-        let view = view_mut!(cx.editor, view_ids[0]);
+        let view = view_mut!(editor, view_ids[0]);
 
         // Ensure that the view is synced with the document's history.
         view.sync_changes(doc);
 
-        if let Err(error) = doc.reload(view, &cx.editor.diff_providers) {
-            cx.editor.set_error(format!("{}", error));
+        if let Err(error) = doc.reload(view, &editor.diff_providers) {
+            editor.set_error(format!("{}", error));
             continue;
         }
 
         if let Some(path) = doc.path() {
-            cx.editor
+            editor
                 .language_servers
                 .file_event_handler
                 .file_changed(path.clone());
         }
 
         for view_id in view_ids {
-            let view = view_mut!(cx.editor, view_id);
+            let view = view_mut!(editor, view_id);
             if view.doc.eq(&doc_id) {
                 view.ensure_cursor_in_view(doc, scrolloff);
             }
@@ -1513,8 +1536,8 @@ pub fn reload_all(
 
         if doc.should_request_full_file_blame(blame_compute) {
             if let Some(path) = doc.path() {
-                helix_event::send_blocking(
-                    &cx.editor.handlers.blame,
+                helix_runtime::send_blocking(
+                    &editor.handlers.blame,
                     BlameEvent {
                         path: path.to_path_buf(),
                         doc_id,
@@ -1584,29 +1607,11 @@ fn lsp_workspace_command(
             })
             .collect::<Vec<_>>();
         let callback = async move {
-            let call: job::Callback = Callback::EditorCompositor(Box::new(
-                move |_editor: &mut Editor, compositor: &mut Compositor| {
-                    let columns = [ui::PickerColumn::new(
-                        "title",
-                        |(_ls_id, command): &(_, helix_lsp::lsp::Command), _| {
-                            command.title.as_str().into()
-                        },
-                    )];
-                    let picker = ui::Picker::new(
-                        columns,
-                        0,
-                        commands,
-                        (),
-                        move |cx, (ls_id, command), _action| {
-                            cx.editor.execute_lsp_command(command.clone(), *ls_id);
-                        },
-                    );
-                    compositor.push(Box::new(overlaid(picker)))
-                },
-            ));
-            Ok(call)
+            Ok(UiCommand::Layer(LayerCommand::LspCommandPicker {
+                commands,
+            }))
         };
-        cx.jobs.callback(callback);
+        cx.spawn_ui(callback);
     } else {
         let command = args[0].to_string();
         let matches: Vec<_> = ls_id_commands
@@ -1626,13 +1631,18 @@ fn lsp_workspace_command(
                     .transpose()?
                     .filter(|args| !args.is_empty());
 
-                cx.editor.execute_lsp_command(
-                    helix_lsp::lsp::Command {
-                        title: command.clone(),
-                        arguments,
-                        command,
-                    },
-                    *ls_id,
+                helix_runtime::send_blocking(
+                    &cx.ingress,
+                    crate::runtime::RuntimeEvent::Task(
+                        crate::runtime::RuntimeTaskEvent::ExecuteLspCommand {
+                            command: helix_lsp::lsp::Command {
+                                title: command.clone(),
+                                arguments,
+                                command,
+                            },
+                            server_id: *ls_id,
+                        },
+                    ),
                 );
             }
             [] => {
@@ -1792,17 +1802,13 @@ fn tree_sitter_scopes(
     let contents = format!("```json\n{:?}\n````", scopes);
 
     let callback = async move {
-        let call: job::Callback = Callback::EditorCompositor(Box::new(
-            move |editor: &mut Editor, compositor: &mut Compositor| {
-                let contents = ui::Markdown::new(contents, editor.syn_loader.clone());
-                let popup = Popup::new("hover", contents).auto_close(true);
-                compositor.replace_or_push("hover", popup);
-            },
-        ));
-        Ok(call)
+        Ok(UiCommand::Layer(LayerCommand::MarkdownPopup {
+            layer_id: "hover",
+            markdown: contents,
+        }))
     };
 
-    cx.jobs.callback(callback);
+    cx.spawn_ui(callback);
 
     Ok(())
 }
@@ -1850,17 +1856,13 @@ fn tree_sitter_highlight_name(
         });
 
     let callback = async move {
-        let call: job::Callback = Callback::EditorCompositor(Box::new(
-            move |editor: &mut Editor, compositor: &mut Compositor| {
-                let content = ui::Markdown::new(content, editor.syn_loader.clone());
-                let popup = Popup::new("hover", content).auto_close(true);
-                compositor.replace_or_push("hover", popup);
-            },
-        ));
-        Ok(call)
+        Ok(UiCommand::Layer(LayerCommand::MarkdownPopup {
+            layer_id: "hover",
+            markdown: content,
+        }))
     };
 
-    cx.jobs.callback(callback);
+    cx.spawn_ui(callback);
 
     Ok(())
 }
@@ -1884,17 +1886,13 @@ fn tree_sitter_layers(
     let languages = languages.join(", ");
 
     let callback = async move {
-        let call: job::Callback = Callback::EditorCompositor(Box::new(
-            move |editor: &mut Editor, compositor: &mut Compositor| {
-                let content = ui::Markdown::new(languages, editor.syn_loader.clone());
-                let popup = Popup::new("hover", content).auto_close(true);
-                compositor.replace_or_push("hover", popup);
-            },
-        ));
-        Ok(call)
+        Ok(UiCommand::Layer(LayerCommand::MarkdownPopup {
+            layer_id: "hover",
+            markdown: languages,
+        }))
     };
 
-    cx.jobs.callback(callback);
+    cx.spawn_ui(callback);
 
     Ok(())
 }
@@ -2126,10 +2124,7 @@ fn set_option(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> a
     };
     let config = serde_json::from_value(config).map_err(field_error)?;
 
-    cx.editor
-        .config_events
-        .0
-        .send(ConfigEvent::Update(config))?;
+    helix_runtime::send_blocking(&cx.editor.config_events.0, ConfigEvent::Update(config));
     Ok(())
 }
 
@@ -2221,10 +2216,7 @@ fn toggle_option(
     let config = serde_json::from_value(config)
         .map_err(|err| anyhow::anyhow!("Failed to parse config: {err}"))?;
 
-    cx.editor
-        .config_events
-        .0
-        .send(ConfigEvent::Update(config))?;
+    helix_runtime::send_blocking(&cx.editor.config_events.0, ConfigEvent::Update(config));
     cx.editor.set_status(status);
     Ok(())
 }
@@ -2466,17 +2458,13 @@ fn tree_sitter_subtree(
 
     if let Some(contents) = doc.pretty_selection_tree(view_id).transpose()? {
         let callback = async move {
-            let call: job::Callback = Callback::EditorCompositor(Box::new(
-                move |editor: &mut Editor, compositor: &mut Compositor| {
-                    let contents = ui::Markdown::new(contents, editor.syn_loader.clone());
-                    let popup = Popup::new("hover", contents).auto_close(true);
-                    compositor.replace_or_push("hover", popup);
-                },
-            ));
-            Ok(call)
+            Ok(UiCommand::Layer(LayerCommand::MarkdownPopup {
+                layer_id: "hover",
+                markdown: contents,
+            }))
         };
 
-        cx.jobs.callback(callback);
+        cx.spawn_ui(callback);
     }
 
     Ok(())
@@ -2528,7 +2516,7 @@ fn refresh_config(
         return Ok(());
     }
 
-    cx.editor.config_events.0.send(ConfigEvent::Refresh)?;
+    helix_runtime::send_blocking(&cx.editor.config_events.0, ConfigEvent::Refresh);
     Ok(())
 }
 
@@ -2594,24 +2582,11 @@ fn run_shell_command(
 
     let callback = async move {
         let output = shell_impl_async(&shell, &args, None).await?;
-        let call: job::Callback = Callback::EditorCompositor(Box::new(
-            move |editor: &mut Editor, compositor: &mut Compositor| {
-                if !output.trim().is_empty() {
-                    let contents = ui::Markdown::new(
-                        format!("```sh\n{}\n```", output.trim_end()),
-                        editor.syn_loader.clone(),
-                    );
-                    let popup = Popup::new("shell", contents).position(Some(
-                        helix_core::Position::new(editor.cursor().0.unwrap_or_default().row, 2),
-                    ));
-                    compositor.replace_or_push("shell", popup);
-                }
-                editor.set_status("Command run");
-            },
-        ));
-        Ok(call)
+        Ok(UiCommand::Layer(LayerCommand::ShellRunOutput {
+            output: output.to_string(),
+        }))
     };
-    cx.jobs.callback(callback);
+    cx.spawn_ui(callback);
 
     Ok(())
 }
@@ -2721,16 +2696,9 @@ fn redraw(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> anyh
         return Ok(());
     }
 
-    let callback = Box::pin(async move {
-        let call: job::Callback =
-            job::Callback::EditorCompositor(Box::new(|_editor, compositor| {
-                compositor.need_full_redraw();
-            }));
+    let callback = Box::pin(async move { Ok(UiCommand::NeedFullRedraw) });
 
-        Ok(call)
-    });
-
-    cx.jobs.callback(callback);
+    cx.spawn_ui(callback);
 
     Ok(())
 }
@@ -3526,104 +3494,34 @@ fn reload_all_plugins(
     Ok(())
 }
 
-/// Launch and initialize an ACP agent, then open the panel.
+/// Launch and initialize an assistant backend, then open the panel.
 /// `agent_index` is the index in config.agents (for cycling); None when connecting with explicit command.
 /// `activate_input` when true, focuses the chat input line when the panel is created.
-pub(crate) fn do_acp_connect(
-    editor: &mut helix_view::Editor,
-    jobs: &mut crate::job::Jobs,
+pub(crate) fn do_assistant_connect(
+    _editor: &mut helix_view::Editor,
     command: String,
     cmd_args: Vec<String>,
-    agent_index: Option<usize>,
-    activate_input: bool,
+    ingress: helix_runtime::Sender<crate::runtime::RuntimeEvent>,
+    _agent_index: Option<usize>,
+    _activate_input: bool,
 ) -> anyhow::Result<()> {
-    let cwd = std::env::current_dir().unwrap_or_default();
-
-    let config = helix_acp::client::AgentConfig {
-        command: command.clone(),
-        args: cmd_args,
-        env: Vec::new(),
-        cwd: cwd.clone(),
-        timeout_secs: 120,
-    };
-
-    let (_id, agent) = editor.acp_agents.launch(&config)?;
-
-    let client_info = helix_acp::types::Implementation {
-        name: "helix".to_string(),
-        title: Some("Helix Editor".to_string()),
-        version: env!("CARGO_PKG_VERSION").to_string(),
-    };
-
-    let client_caps = helix_acp::types::ClientCapabilities {
-        fs: Some(helix_acp::types::FileSystemCapabilities {
-            read_text_file: Some(true),
-            write_text_file: Some(true),
+    helix_runtime::send_blocking(
+        &ingress,
+        crate::runtime::RuntimeEvent::Task(crate::runtime::RuntimeTaskEvent::ConnectAssistantBackend {
+            command,
+            args: cmd_args,
+            open_panel: true,
         }),
-        terminal: Some(true),
-    };
-
-    let agent_clone = agent.clone();
-    let cwd_clone = cwd.clone();
-    let callback = async move {
-        let init_resp = agent_clone.initialize(client_info, client_caps).await?;
-        let agent_info = init_resp.agent_info.as_ref();
-        let agent_name = agent_info
-            .map(|i| i.title.as_deref().unwrap_or(&i.name))
-            .unwrap_or("agent")
-            .to_string();
-        let agent_version = agent_info.map(|i| i.version.clone()).unwrap_or_default();
-
-        let session_resp = agent_clone.new_session(cwd_clone).await?;
-
-        let msg = format!(
-            "Connected to {} (session: {})",
-            agent_name, session_resp.session_id
-        );
-
-        let agent_name_for_panel = agent_name.clone();
-        let agent_version_for_panel = agent_version.clone();
-        let config_options = session_resp.config_options.unwrap_or_default();
-        let session_modes = session_resp.session_modes.unwrap_or_default();
-        let session_id_for_history = session_resp.session_id.clone();
-        let agent_name_for_history = agent_name.clone();
-        let callback: crate::job::Callback = crate::job::Callback::EditorCompositor(Box::new(
-            move |editor: &mut helix_view::Editor, compositor| {
-                editor.set_status(msg);
-
-                editor.acp_session_history.push((
-                    session_id_for_history,
-                    agent_name_for_history,
-                    std::time::Instant::now(),
-                ));
-
-                use crate::ui::acp::{AcpPanel, ID as ACP_PANEL_ID};
-                let mut panel = AcpPanel::new();
-                panel.set_agent_name(agent_name_for_panel);
-                panel.set_agent_version(agent_version_for_panel);
-                panel.set_config_options(config_options.clone());
-                panel.set_session_modes(session_modes.clone());
-                editor.acp_config_options = config_options;
-                editor.acp_session_modes = session_modes;
-                editor.current_acp_agent_index = agent_index;
-                editor.apply_acp_agent_theme(agent_index);
-                if activate_input {
-                    panel.activate_input();
-                }
-                compositor.replace_or_push(ACP_PANEL_ID, panel);
-            },
-        ));
-        Ok(callback)
-    };
-
-    jobs.callback(callback);
-
-    editor.set_status(format!("Connecting to ACP agent: {command}..."));
+    );
 
     Ok(())
 }
 
-fn acp_connect(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow::Result<()> {
+fn assistant_connect(
+    cx: &mut compositor::Context,
+    args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
     if event != PromptEvent::Validate {
         return Ok(());
     }
@@ -3632,78 +3530,37 @@ fn acp_connect(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> 
     if let Some(first) = args.first() {
         let command = first.to_string();
         let cmd_args: Vec<String> = args.iter().skip(1).map(|a| a.to_string()).collect();
-        return do_acp_connect(cx.editor, cx.jobs, command, cmd_args, None, false);
+        return do_assistant_connect(
+            cx.editor,
+            command,
+            cmd_args,
+            cx.ingress.clone(),
+            None,
+            false,
+        );
     }
 
     // No args — show picker from configured agents
     let agents = cx.editor.config().agents.clone();
     if agents.is_empty() {
-        bail!("No agents configured. Add [[editor.agents]] to config.toml or use :acp-connect <command> [args...]");
+        bail!("No agents configured. Add [[editor.agents]] to config.toml or use :assistant-connect <command> [args...]");
     }
 
     let callback = async move {
-        let call: crate::job::Callback = crate::job::Callback::EditorCompositor(Box::new(
-            move |_editor: &mut helix_view::Editor, compositor: &mut compositor::Compositor| {
-                let columns = [
-                    crate::ui::PickerColumn::new(
-                        "name",
-                        |item: &helix_view::editor::AgentConfig, _: &()| item.name.as_str().into(),
-                    ),
-                    crate::ui::PickerColumn::new(
-                        "command",
-                        |item: &helix_view::editor::AgentConfig, _: &()| {
-                            let mut cmd = item.command.clone();
-                            if !item.args.is_empty() {
-                                cmd.push(' ');
-                                cmd.push_str(&item.args.join(" "));
-                            }
-                            cmd.into()
-                        },
-                    ),
-                ];
-
-                let agents_for_callback = agents.clone();
-                let picker = crate::ui::Picker::new(
-                    columns,
-                    0,
-                    agents,
-                    (),
-                    move |cx, item: &helix_view::editor::AgentConfig, _action| {
-                        let idx = agents_for_callback
-                            .iter()
-                            .position(|a| a.name == item.name && a.command == item.command)
-                            .or_else(|| {
-                                agents_for_callback
-                                    .iter()
-                                    .position(|a| a.command == item.command)
-                            });
-                        match do_acp_connect(
-                            cx.editor,
-                            cx.jobs,
-                            item.command.clone(),
-                            item.args.clone(),
-                            idx,
-                            false,
-                        ) {
-                            Ok(()) => {}
-                            Err(e) => {
-                                cx.editor.set_error(format!("Agent failed: {e}"));
-                            }
-                        }
-                    },
-                );
-
-                compositor.push(Box::new(crate::ui::overlay::overlaid(picker)));
-            },
-        ));
-        Ok(call)
+        Ok(UiCommand::Assistant(
+            AssistantCommand::PushConfiguredAgentsPicker { agents },
+        ))
     };
-    cx.jobs.callback(callback);
+    cx.spawn_ui(callback);
 
     Ok(())
 }
 
-fn acp_prompt(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow::Result<()> {
+fn assistant_prompt(
+    cx: &mut compositor::Context,
+    args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
     if event != PromptEvent::Validate {
         return Ok(());
     }
@@ -3714,186 +3571,20 @@ fn acp_prompt(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> a
         .collect::<Vec<_>>()
         .join(" ");
     if prompt_text.is_empty() {
-        bail!("Usage: acp-prompt <message>");
+        bail!("Usage: assistant-prompt <message>");
     }
 
-    // Find the first connected agent
-    let (_agent_id, agent) = cx
-        .editor
-        .acp_agents
-        .iter()
-        .next()
-        .map(|(id, a)| (id, a.clone()))
-        .context("No ACP agents connected. Use :acp-connect first.")?;
-
-    let cwd = std::env::current_dir().unwrap_or_default();
-    let prompt = vec![helix_acp::ContentBlock::from(prompt_text.clone())];
-
-    let callback = async move {
-        let result = async {
-            let session_id = match agent.session_id().await {
-                Some(id) => id,
-                None => {
-                    let session = agent.new_session(cwd).await?;
-                    session.session_id
-                }
-            };
-            agent.prompt(session_id, prompt).await
-        }
-        .await;
-
-        let cb: crate::job::Callback = match result {
-            Ok(response) => {
-                let msg = format!(
-                    "[ACP] Done ({})",
-                    match response.stop_reason {
-                        helix_acp::types::StopReason::EndTurn => "completed",
-                        helix_acp::types::StopReason::Cancelled => "cancelled",
-                        helix_acp::types::StopReason::MaxTokens => "max tokens",
-                        helix_acp::types::StopReason::MaxTurnRequests => "max turns",
-                        helix_acp::types::StopReason::Refusal => "refused",
-                    }
-                );
-                crate::job::Callback::EditorCompositor(Box::new(
-                    move |editor: &mut helix_view::Editor, compositor| {
-                        editor.set_status(msg);
-                        if let Some(panel) =
-                            compositor.find_id::<crate::ui::acp::AcpPanel>(crate::ui::acp::ID)
-                        {
-                            panel.set_busy(false);
-                            panel.set_panel_error(None);
-                            if let Some(next_msg) = panel.dequeue_message() {
-                                let agent = editor.acp_agents.iter().next().map(|(_, a)| a.clone());
-                                if let Some(agent) = agent {
-                                    panel.push_entry(crate::ui::acp::ChatEntry::UserMessage(
-                                        next_msg.clone(),
-                                    ));
-                                    panel.set_busy(true);
-                                    crate::ui::acp::dispatch_queued_prompt(agent, next_msg);
-                                }
-                            }
-                        }
-                    },
-                ))
-            }
-            Err(e) => {
-                let err_msg = format!("{e}");
-                crate::job::Callback::EditorCompositor(Box::new(
-                    move |_editor: &mut helix_view::Editor, compositor| {
-                        if let Some(panel) =
-                            compositor.find_id::<crate::ui::acp::AcpPanel>(crate::ui::acp::ID)
-                        {
-                            panel.set_panel_error(Some(err_msg));
-                            panel.set_busy(false);
-                        }
-                    },
-                ))
-            }
-        };
-        Ok(cb)
-    };
-
-    cx.jobs.callback(callback);
-
-    // Add user message to panel and mark busy
-    let callback2 = crate::job::Callback::EditorCompositor(Box::new(
-        move |_editor: &mut helix_view::Editor, compositor| {
-            if let Some(panel) = compositor.find_id::<crate::ui::acp::AcpPanel>(crate::ui::acp::ID)
-            {
-                panel.push_entry(crate::ui::acp::ChatEntry::UserMessage(prompt_text));
-                panel.set_busy(true);
-            }
-        },
-    ));
-    cx.jobs.callback(async { Ok(callback2) });
-
-    cx.editor
-        .set_status("Sending prompt to agent...".to_string());
+    helix_runtime::send_blocking(
+        &cx.ingress,
+        crate::runtime::RuntimeEvent::Task(
+            crate::runtime::RuntimeTaskEvent::SubmitAssistantPrompt { text: prompt_text },
+        ),
+    );
 
     Ok(())
 }
 
-fn acp_open(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> anyhow::Result<()> {
-    if event != PromptEvent::Validate {
-        return Ok(());
-    }
-
-    use crate::ui::acp::{AcpPanel, ChatEntry, ID as ACP_PANEL_ID};
-
-    let has_agent = cx.editor.acp_agents.iter().next().is_some();
-    let agents = cx.editor.config().agents.clone();
-    let last_index = cx.editor.current_acp_agent_index;
-
-    if !has_agent && !agents.is_empty() {
-        let idx = last_index.unwrap_or(0).min(agents.len().saturating_sub(1));
-        let agent = agents[idx].clone();
-        return do_acp_connect(
-            cx.editor,
-            cx.jobs,
-            agent.command,
-            agent.args,
-            Some(idx),
-            false,
-        );
-    }
-
-    let agent_name = cx
-        .editor
-        .acp_agents
-        .iter()
-        .next()
-        .map(|(_id, agent)| {
-            agent
-                .agent_info()
-                .and_then(|info| info.title.clone())
-                .unwrap_or_else(|| agent.name().to_string())
-        })
-        .unwrap_or_else(|| "No agent".to_string());
-    let accumulated_text = if cx.editor.acp_output.is_empty() {
-        None
-    } else {
-        Some(cx.editor.acp_output.join("\n"))
-    };
-    let config_options = cx.editor.acp_config_options.clone();
-    let session_modes = cx.editor.acp_session_modes.clone();
-
-    let callback = crate::job::Callback::EditorCompositor(Box::new(
-        move |_editor, compositor: &mut crate::compositor::Compositor| {
-            let mut panel = AcpPanel::new();
-            panel.set_agent_name(agent_name);
-            panel.set_config_options(config_options);
-            panel.set_session_modes(session_modes);
-            if let Some(text) = accumulated_text {
-                panel.push_entry(ChatEntry::AgentText(text));
-            }
-            compositor.replace_or_push(ACP_PANEL_ID, panel);
-        },
-    ));
-    cx.jobs.callback(async { Ok(callback) });
-
-    Ok(())
-}
-
-fn acp_cancel(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> anyhow::Result<()> {
-    if event != PromptEvent::Validate {
-        return Ok(());
-    }
-
-    // Cancel the active prompt on all agents
-    for (_id, agent) in cx.editor.acp_agents.iter() {
-        let agent = agent.clone();
-        tokio::spawn(async move {
-            if let Some(session_id) = agent.session_id().await {
-                agent.cancel(session_id);
-            }
-        });
-    }
-
-    cx.editor.set_status("Cancelling ACP agent...");
-    Ok(())
-}
-
-fn acp_history(
+fn assistant_open(
     cx: &mut compositor::Context,
     _args: Args,
     event: PromptEvent,
@@ -3902,89 +3593,389 @@ fn acp_history(
         return Ok(());
     }
 
-    if cx.editor.acp_session_history.is_empty() {
-        cx.editor.set_status("No ACP session history.");
+    let has_agent = cx.editor.assistant_threads().next().is_some();
+    let agents = cx.editor.config().agents.clone();
+
+    if !has_agent && !agents.is_empty() {
+        let agent = agents[0].clone();
+        return do_assistant_connect(
+            cx.editor,
+            agent.command,
+            agent.args,
+            cx.ingress.clone(),
+            Some(0),
+            false,
+        );
+    }
+
+    cx.spawn_ui(async { Ok(UiCommand::Assistant(AssistantCommand::OpenPanel)) });
+
+    Ok(())
+}
+
+fn assistant_cancel(
+    cx: &mut compositor::Context,
+    _args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
         return Ok(());
     }
 
-    let callback = async move {
-        let call: crate::job::Callback = crate::job::Callback::EditorCompositor(Box::new(
-            move |editor: &mut helix_view::Editor, compositor: &mut compositor::Compositor| {
-                let columns = [
-                    crate::ui::PickerColumn::new(
-                        "agent",
-                        |item: &(String, String, String), _: &()| item.1.as_str().into(),
-                    ),
-                    crate::ui::PickerColumn::new(
-                        "session",
-                        |item: &(String, String, String), _: &()| {
-                            item.0.chars().take(12).collect::<String>().into()
-                        },
-                    ),
-                    crate::ui::PickerColumn::new(
-                        "when",
-                        |item: &(String, String, String), _: &()| item.2.as_str().into(),
-                    ),
-                ];
+    helix_runtime::send_blocking(
+        &cx.ingress,
+        crate::runtime::RuntimeEvent::Task(
+            crate::runtime::RuntimeTaskEvent::CancelActiveAssistantThread,
+        ),
+    );
+    Ok(())
+}
 
-                let history: Vec<(String, String, String)> = editor
-                    .acp_session_history
-                    .iter()
-                    .rev()
-                    .map(|(session_id, agent_name, started)| {
-                        let elapsed = started.elapsed();
-                        let time_ago = if elapsed.as_secs() < 60 {
-                            format!("{}s ago", elapsed.as_secs())
-                        } else if elapsed.as_secs() < 3600 {
-                            format!("{}m ago", elapsed.as_secs() / 60)
-                        } else {
-                            format!("{}h ago", elapsed.as_secs() / 3600)
-                        };
-                        (session_id.clone(), agent_name.clone(), time_ago)
-                    })
-                    .collect();
+fn assistant_open_history(
+    cx: &mut compositor::Context,
+    _args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
 
-                let picker = crate::ui::Picker::new(
-                    columns,
-                    0,
-                    history,
-                    (),
-                    move |cx, item: &(String, String, String), _action| {
-                        let session_id = item.0.clone();
-                        let agent_name = item.1.clone();
+    let scope = cx.editor.active_thread_scope_or_layout();
 
-                        let agent = cx.editor.acp_agents.iter().next().map(|(_, a)| a.clone());
-                        if let Some(agent) = agent {
-                            let callback = async move {
-                                agent.load_session(session_id.clone()).await?;
+    if let Some(entries) = cx.editor.assistant_history_entries(&scope) {
+        cx.spawn_ui(async move {
+            Ok(UiCommand::Assistant(AssistantCommand::PushHistoryPicker {
+                entries,
+            }))
+        });
+        return Ok(());
+    }
 
-                                let callback: crate::job::Callback =
-                                    crate::job::Callback::EditorCompositor(Box::new(
-                                        move |editor: &mut helix_view::Editor, compositor: &mut compositor::Compositor| {
-                                            editor.set_status(format!("Loaded session from {agent_name}"));
-                                            use crate::ui::acp::{AcpPanel, ID as ACP_PANEL_ID};
-                                            let mut panel = AcpPanel::new();
-                                            panel.set_agent_name(agent_name);
-                                            compositor.replace_or_push(ACP_PANEL_ID, panel);
-                                        },
-                                    ));
-                                Ok(callback)
-                            };
-                            cx.jobs.callback(callback);
-                        } else {
-                            cx.editor
-                                .set_error("No ACP agents connected. Use :acp-connect first.");
-                        }
-                    },
-                );
+    helix_runtime::send_blocking(
+        &cx.ingress,
+        crate::runtime::RuntimeEvent::Task(
+            crate::runtime::RuntimeTaskEvent::BootstrapAssistantHistory { scope },
+        ),
+    );
 
-                compositor.push(Box::new(crate::ui::overlay::overlaid(picker)));
-            },
-        ));
-        Ok(call)
-    };
-    cx.jobs.callback(callback);
+    cx.editor.set_status("Loading assistant history...");
 
+    Ok(())
+}
+
+fn cycle_assistant_thread(cx: &mut compositor::Context, delta: isize) -> anyhow::Result<()> {
+    helix_runtime::send_blocking(
+        &cx.ingress,
+        crate::runtime::RuntimeEvent::Task(
+            crate::runtime::RuntimeTaskEvent::CycleAssistantThread { delta },
+        ),
+    );
+    Ok(())
+}
+
+fn assistant_next_thread(
+    cx: &mut compositor::Context,
+    _args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+    cycle_assistant_thread(cx, 1)
+}
+
+fn assistant_prev_thread(
+    cx: &mut compositor::Context,
+    _args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+    cycle_assistant_thread(cx, -1)
+}
+
+fn assistant_close_thread(
+    cx: &mut compositor::Context,
+    _args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+
+    helix_runtime::send_blocking(
+        &cx.ingress,
+        crate::runtime::RuntimeEvent::Task(
+            crate::runtime::RuntimeTaskEvent::CloseActiveAssistantThread,
+        ),
+    );
+    Ok(())
+}
+
+fn assistant_new_thread(
+    cx: &mut compositor::Context,
+    _args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+
+    helix_runtime::send_blocking(
+        &cx.ingress,
+        crate::runtime::RuntimeEvent::Task(
+            crate::runtime::RuntimeTaskEvent::NewAssistantThreadFromActiveBackend,
+        ),
+    );
+    Ok(())
+}
+
+fn assistant_toggle_follow(
+    cx: &mut compositor::Context,
+    _args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+
+    helix_runtime::send_blocking(
+        &cx.ingress,
+        crate::runtime::RuntimeEvent::Task(
+            crate::runtime::RuntimeTaskEvent::ToggleActiveAssistantFollow,
+        ),
+    );
+    Ok(())
+}
+
+async fn resolve_context_provider(
+    editor: &helix_view::Editor,
+    key: &helix_view::assistant::context::Key,
+) -> anyhow::Result<helix_view::assistant::context::Kind> {
+    let snapshot = editor.active_thread_snapshot().context("No active assistant thread")?;
+    let provider = editor
+        .assistant_context
+        .provider(key)
+        .cloned()
+        .context("Assistant context provider missing")?;
+    provider
+        .provide(editor, &snapshot, None)
+        .await
+        .map_err(anyhow::Error::from)
+}
+
+fn assistant_attach_selection(
+    cx: &mut compositor::Context,
+    _args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+    helix_runtime::send_blocking(
+        &cx.ingress,
+        crate::runtime::RuntimeEvent::Task(crate::runtime::RuntimeTaskEvent::AttachAssistantContext {
+            item: cx
+                .editor
+                .capture_current_surface(helix_view::collab::surface::Capture::Selection)
+                .context("Selection context unavailable")?,
+            status: "Attached selection context",
+        }),
+    );
+    Ok(())
+}
+
+fn assistant_attach_symbol(
+    cx: &mut compositor::Context,
+    _args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+    helix_runtime::send_blocking(
+        &cx.ingress,
+        crate::runtime::RuntimeEvent::Task(crate::runtime::RuntimeTaskEvent::AttachAssistantContext {
+            item: cx
+                .editor
+                .capture_current_surface(helix_view::collab::surface::Capture::Symbol)
+                .context("Symbol context unavailable")?,
+            status: "Attached symbol context",
+        }),
+    );
+    Ok(())
+}
+
+fn assistant_attach_file(
+    cx: &mut compositor::Context,
+    _args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+    let item = helix_lsp::block_on(resolve_context_provider(
+        cx.editor,
+        &helix_view::assistant::context::Key::core("file"),
+    ))?;
+    helix_runtime::send_blocking(
+        &cx.ingress,
+        crate::runtime::RuntimeEvent::Task(crate::runtime::RuntimeTaskEvent::AttachAssistantContext {
+            item,
+            status: "Attached file context",
+        }),
+    );
+    Ok(())
+}
+
+fn assistant_attach_diagnostics(
+    cx: &mut compositor::Context,
+    _args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+    let item = helix_lsp::block_on(resolve_context_provider(
+        cx.editor,
+        &helix_view::assistant::context::Key::core("diagnostics"),
+    ))?;
+    helix_runtime::send_blocking(
+        &cx.ingress,
+        crate::runtime::RuntimeEvent::Task(crate::runtime::RuntimeTaskEvent::AttachAssistantContext {
+            item,
+            status: "Attached diagnostics context",
+        }),
+    );
+    Ok(())
+}
+
+fn assistant_attach_diff(
+    cx: &mut compositor::Context,
+    _args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+    let item = helix_lsp::block_on(resolve_context_provider(
+        cx.editor,
+        &helix_view::assistant::context::Key::core("diff"),
+    ))?;
+    helix_runtime::send_blocking(
+        &cx.ingress,
+        crate::runtime::RuntimeEvent::Task(crate::runtime::RuntimeTaskEvent::AttachAssistantContext {
+            item,
+            status: "Attached diff context",
+        }),
+    );
+    Ok(())
+}
+
+fn assistant_detach_context(
+    cx: &mut compositor::Context,
+    _args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+
+    let items = cx.editor.active_thread_context().context("No active assistant thread")?;
+    if items.is_empty() {
+        bail!("No attached assistant context")
+    }
+    if items.len() == 1 {
+        helix_runtime::send_blocking(
+            &cx.ingress,
+            crate::runtime::RuntimeEvent::Task(
+                crate::runtime::RuntimeTaskEvent::DetachAssistantContext {
+                    item: items[0].id.clone(),
+                },
+            ),
+        );
+        return Ok(());
+    }
+
+    cx.spawn_ui(async move {
+        Ok(UiCommand::Assistant(
+            AssistantCommand::PushDetachContextPicker { items },
+        ))
+    });
+    Ok(())
+}
+
+fn assistant_open_entry_scratch(
+    cx: &mut compositor::Context,
+    _args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+
+    helix_runtime::send_blocking(
+        &cx.ingress,
+        crate::runtime::RuntimeEvent::Task(
+            crate::runtime::RuntimeTaskEvent::OpenSelectedAssistantEntryScratch,
+        ),
+    );
+    Ok(())
+}
+
+fn assistant_reveal_entry_location(
+    cx: &mut compositor::Context,
+    _args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+
+    let location = cx.editor
+        .selected_assistant_entry_locations()
+        .context("No assistant entry selected")?
+        .into_iter()
+        .next()
+        .context("Selected assistant entry has no location")?;
+    cx.editor.open(&location.path, Action::Replace)?;
+    Ok(())
+}
+
+fn assistant_open_turn_changes(
+    cx: &mut compositor::Context,
+    _args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+
+    helix_runtime::send_blocking(
+        &cx.ingress,
+        crate::runtime::RuntimeEvent::Task(
+            crate::runtime::RuntimeTaskEvent::OpenSelectedAssistantTurnChanges,
+        ),
+    );
+    Ok(())
+}
+
+fn assistant_open_thread_changes(
+    cx: &mut compositor::Context,
+    _args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+
+    helix_runtime::send_blocking(
+        &cx.ingress,
+        crate::runtime::RuntimeEvent::Task(
+            crate::runtime::RuntimeTaskEvent::OpenActiveAssistantThreadChanges,
+        ),
+    );
     Ok(())
 }
 
@@ -5234,10 +5225,10 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         },
     },
     TypableCommand {
-        name: "acp-connect",
+        name: "assistant-connect",
         aliases: &["agent"],
-        doc: "Connect to an ACP agent. Shows picker if no args, or use: :acp-connect <command> [args...]",
-        fun: acp_connect,
+        doc: "Connect to an assistant backend. Shows picker if no args, or use: :assistant-connect <command> [args...]",
+        fun: assistant_connect,
         completer: CommandCompleter::none(),
         signature: Signature {
             positionals: (0, None),
@@ -5245,10 +5236,10 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         },
     },
     TypableCommand {
-        name: "acp-prompt",
+        name: "assistant-prompt",
         aliases: &["ask"],
-        doc: "Send a prompt to a connected ACP agent. Usage: :acp-prompt <message>",
-        fun: acp_prompt,
+        doc: "Send a prompt to the active assistant thread. Usage: :assistant-prompt <message>",
+        fun: assistant_prompt,
         completer: CommandCompleter::none(),
         signature: Signature {
             positionals: (1, None),
@@ -5256,10 +5247,10 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         },
     },
     TypableCommand {
-        name: "acp-open",
-        aliases: &["acp"],
-        doc: "Open the ACP agent output buffer.",
-        fun: acp_open,
+        name: "assistant-open",
+        aliases: &["assistant"],
+        doc: "Open the assistant panel.",
+        fun: assistant_open,
         completer: CommandCompleter::none(),
         signature: Signature {
             positionals: (0, Some(0)),
@@ -5267,10 +5258,10 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         },
     },
     TypableCommand {
-        name: "acp-cancel",
+        name: "assistant-cancel",
         aliases: &["stop"],
-        doc: "Cancel the current ACP agent prompt.",
-        fun: acp_cancel,
+        doc: "Cancel the active assistant run.",
+        fun: assistant_cancel,
         completer: CommandCompleter::none(),
         signature: Signature {
             positionals: (0, Some(0)),
@@ -5278,10 +5269,175 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         },
     },
     TypableCommand {
-        name: "acp-history",
+        name: "assistant-open-history",
         aliases: &["sessions"],
-        doc: "Browse and load previous ACP sessions.",
-        fun: acp_history,
+        doc: "Browse and load assistant history for the current scope.",
+        fun: assistant_open_history,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "assistant-new-thread",
+        aliases: &[],
+        doc: "Create a new assistant thread on the active backend.",
+        fun: assistant_new_thread,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "assistant-close-thread",
+        aliases: &[],
+        doc: "Close the active assistant thread.",
+        fun: assistant_close_thread,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "assistant-next-thread",
+        aliases: &[],
+        doc: "Activate the next assistant thread tab.",
+        fun: assistant_next_thread,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "assistant-prev-thread",
+        aliases: &[],
+        doc: "Activate the previous assistant thread tab.",
+        fun: assistant_prev_thread,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "assistant-toggle-follow",
+        aliases: &[],
+        doc: "Toggle following for the active assistant thread.",
+        fun: assistant_toggle_follow,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "assistant-open-entry-scratch",
+        aliases: &[],
+        doc: "Open the selected assistant entry in a scratch buffer.",
+        fun: assistant_open_entry_scratch,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "assistant-open-turn-changes",
+        aliases: &[],
+        doc: "Open the selected assistant turn changes in a scratch buffer.",
+        fun: assistant_open_turn_changes,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "assistant-open-thread-changes",
+        aliases: &[],
+        doc: "Open aggregated changes for the active assistant thread.",
+        fun: assistant_open_thread_changes,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "assistant-attach-selection",
+        aliases: &[],
+        doc: "Attach the current selection as assistant context.",
+        fun: assistant_attach_selection,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "assistant-attach-symbol",
+        aliases: &[],
+        doc: "Attach the current selection as symbol context.",
+        fun: assistant_attach_symbol,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "assistant-attach-file",
+        aliases: &[],
+        doc: "Attach the current file as assistant context.",
+        fun: assistant_attach_file,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "assistant-attach-diagnostics",
+        aliases: &[],
+        doc: "Attach current-file diagnostics as assistant context.",
+        fun: assistant_attach_diagnostics,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "assistant-attach-diff",
+        aliases: &[],
+        doc: "Attach current-file diff summary as assistant context.",
+        fun: assistant_attach_diff,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "assistant-detach-context",
+        aliases: &[],
+        doc: "Detach an attached assistant context item.",
+        fun: assistant_detach_context,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "assistant-reveal-entry-location",
+        aliases: &[],
+        doc: "Reveal the first location associated with the selected assistant entry.",
+        fun: assistant_reveal_entry_location,
         completer: CommandCompleter::none(),
         signature: Signature {
             positionals: (0, Some(0)),

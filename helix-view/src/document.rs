@@ -705,6 +705,10 @@ use helix_lsp::{lsp, Client, LanguageServerId, LanguageServerName};
 use url::Url;
 
 impl Document {
+    pub fn bind_redraw(&mut self, redraw: helix_runtime::FrameHandle) {
+        self.vcs.bind_redraw(redraw);
+    }
+
     pub fn from(
         text: Rope,
         encoding_with_bom_info: Option<(&'static Encoding, bool)>,
@@ -2177,7 +2181,7 @@ impl Document {
         self.presentation.clear_inlay_hints_outdated();
     }
 
-    pub fn restart_pull_diagnostics(&mut self) -> helix_event::TaskHandle {
+    pub fn restart_pull_diagnostics(&mut self) -> helix_runtime::Token {
         self.lsp.restart_pull_diagnostics()
     }
 
@@ -2193,7 +2197,7 @@ impl Document {
         self.lsp.set_previous_diagnostic_id(previous_diagnostic_id);
     }
 
-    pub fn restart_color_swatches(&mut self) -> helix_event::TaskHandle {
+    pub fn restart_color_swatches(&mut self) -> helix_runtime::Token {
         self.lsp.restart_color_swatches()
     }
 
@@ -3268,6 +3272,29 @@ impl Document {
     pub fn set_plugin_annotations(&mut self, view_id: ViewId, annotations: Vec<PluginAnnotation>) {
         self.presentation
             .set_plugin_annotations(view_id, annotations);
+    }
+
+    pub fn presence_annotations(&self, view_id: ViewId) -> Option<&Vec<PluginAnnotation>> {
+        self.presentation.presence_annotations(view_id)
+    }
+
+    pub fn set_presence_annotations(&mut self, view_id: ViewId, annotations: Vec<PluginAnnotation>) {
+        self.presentation.set_presence_annotations(view_id, annotations);
+    }
+
+    pub fn visual_annotations(&self, view_id: ViewId) -> Option<Vec<PluginAnnotation>> {
+        let plugin = self.plugin_annotations(view_id);
+        let presence = self.presence_annotations(view_id);
+        match (plugin, presence) {
+            (None, None) => None,
+            (Some(plugin), None) => Some(plugin.clone()),
+            (None, Some(presence)) => Some(presence.clone()),
+            (Some(plugin), Some(presence)) => {
+                let mut merged = plugin.clone();
+                merged.extend_from_slice(presence);
+                Some(merged)
+            }
+        }
     }
 
     fn add_folds_impl(

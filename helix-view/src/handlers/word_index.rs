@@ -10,9 +10,9 @@ use helix_core::{
     chars::char_is_word, fuzzy::fuzzy_match, movement, text_annotations::TextAnnotations,
     ChangeSet, Range, Rope, RopeSlice,
 };
-use helix_event::{register_hook, AsyncHook};
+use helix_event::register_hook;
+use helix_runtime::{channel, send_blocking, Clock, Debounce, Runtime, Sender, Work};
 use helix_stdx::rope::RopeSliceExt as _;
-use tokio::{sync::mpsc, time::Instant};
 
 use crate::{
     bench::log_command_phase,
@@ -37,26 +37,27 @@ enum Event {
     /// Clear the entire word index.
     /// This is used to clear memory when the feature is turned off.
     Clear,
+    FlushDebounced,
 }
 
 #[derive(Debug)]
 pub struct Handler {
     pub(super) index: WordIndex,
-    /// A sender into an async hook which debounces updates to the index.
-    hook: mpsc::Sender<Event>,
+    /// A sender into the debounced update actor for index maintenance.
+    hook: Sender<Event>,
     /// A sender to a tokio task which coordinates the indexing of documents.
     ///
     /// See [WordIndex::run]. A supervisor-like task is in charge of spawning tasks to update the
     /// index. This ensures that consecutive edits to a document trigger the correct order of
     /// insertions and deletions into the word set.
-    coordinator: mpsc::UnboundedSender<Event>,
+    coordinator: Sender<Event>,
 }
 
 impl Handler {
     /// Create a dummy handler for headless testing (no async tasks spawned).
     pub fn dummy() -> Self {
-        let (hook_tx, _) = mpsc::channel(1);
-        let (coord_tx, _) = mpsc::unbounded_channel();
+        let (hook_tx, _) = helix_runtime::channel(1);
+        let (coord_tx, _) = channel(1);
         Self {
             index: WordIndex::default(),
             hook: hook_tx,
@@ -64,16 +65,19 @@ impl Handler {
         }
     }
 
-    pub fn spawn() -> Self {
+    pub fn spawn(runtime: Runtime) -> Self {
         let index = WordIndex::default();
-        let (tx, rx) = mpsc::unbounded_channel();
-        tokio::spawn(index.clone().run(rx));
+        let (tx, rx) = channel(128);
+        runtime.work().spawn(index.clone().run(rx)).detach();
         Self {
-            hook: Hook {
+            hook: Hook::spawn(Hook {
                 changes: HashMap::default(),
                 coordinator: tx.clone(),
-            }
-            .spawn(),
+                debounce: Debounce::new(DEBOUNCE),
+                work: runtime.work().clone(),
+                clock: runtime.clock().clone(),
+                tx: None,
+            }),
             index,
             coordinator: tx,
         }
@@ -83,15 +87,31 @@ impl Handler {
 #[derive(Debug)]
 struct Hook {
     changes: HashMap<DocumentId, Change>,
-    coordinator: mpsc::UnboundedSender<Event>,
+    coordinator: Sender<Event>,
+    debounce: Debounce,
+    work: Work,
+    clock: Clock,
+    tx: Option<Sender<Event>>,
 }
 
 const DEBOUNCE: Duration = Duration::from_secs(1);
 
-impl AsyncHook for Hook {
-    type Event = Event;
+impl Hook {
+    fn spawn(mut hook: Self) -> Sender<Event> {
+        let (tx, mut rx) = helix_runtime::channel(128);
+        hook.tx = Some(tx.clone());
+        let work = hook.work.clone();
+        work.spawn(async move {
+            while let Some(event) = rx.recv().await {
+                hook.handle_event(event);
+            }
+            hook.debounce.cancel();
+        })
+        .detach();
+        tx
+    }
 
-    fn handle_event(&mut self, event: Self::Event, timeout: Option<Instant>) -> Option<Instant> {
+    fn handle_event(&mut self, event: Event) {
         match event {
             Event::Insert(_) => unreachable!("inserts are sent to the worker directly"),
             Event::Update(doc, change) => {
@@ -105,36 +125,47 @@ impl AsyncHook for Hook {
                         change.changes
                     };
                     pending_change.text = change.text;
-                    Some(Instant::now() + DEBOUNCE)
+                    self.restart_debounce();
                 } else if !is_changeset_significant(&change.changes) {
                     // If the changeset is fairly large, debounce before updating the index.
                     self.changes.insert(doc, change);
-                    Some(Instant::now() + DEBOUNCE)
+                    self.restart_debounce();
                 } else {
                     // Otherwise if the change is small, queue the update to the index immediately.
-                    self.coordinator.send(Event::Update(doc, change)).unwrap();
-                    timeout
+                    send_blocking(&self.coordinator, Event::Update(doc, change));
                 }
             }
             Event::Delete(doc, text) => {
                 // If there are pending changes that haven't been indexed since the last debounce,
                 // forget them and delete the old text.
                 if let Some(change) = self.changes.remove(&doc) {
-                    self.coordinator
-                        .send(Event::Delete(doc, change.old_text))
-                        .unwrap();
+                    send_blocking(&self.coordinator, Event::Delete(doc, change.old_text));
                 } else {
-                    self.coordinator.send(Event::Delete(doc, text)).unwrap();
+                    send_blocking(&self.coordinator, Event::Delete(doc, text));
                 }
-                timeout
             }
-            Event::Clear => unreachable!("clear is sent to the worker directly"),
+            Event::Clear => {
+                self.flush();
+                send_blocking(&self.coordinator, Event::Clear);
+            }
+            Event::FlushDebounced => self.flush(),
         }
     }
 
-    fn finish_debounce(&mut self) {
+    fn restart_debounce(&mut self) {
+        let tx = self
+            .tx
+            .as_ref()
+            .expect("word index hook sender initialized")
+            .clone();
+        self.debounce.restart(&self.work, &self.clock, async move {
+            let _ = tx.send(Event::FlushDebounced).await;
+        });
+    }
+
+    fn flush(&mut self) {
         for (doc, change) in self.changes.drain() {
-            self.coordinator.send(Event::Update(doc, change)).unwrap();
+            send_blocking(&self.coordinator, Event::Update(doc, change));
         }
     }
 }
@@ -219,7 +250,7 @@ impl WordIndex {
     ///
     /// The worker owns a local mutable copy of the index and publishes immutable
     /// snapshots via ArcSwap after each batch — readers never block.
-    async fn run(self, mut events: mpsc::UnboundedReceiver<Event>) {
+    async fn run(self, mut events: helix_runtime::Receiver<Event>) {
         let shared = self.inner;
         let mut local = WordIndexInner::default();
         while let Some(event) = events.recv().await {
@@ -259,6 +290,7 @@ impl WordIndex {
                     Event::Clear => {
                         local.clear();
                     }
+                    Event::FlushDebounced => unreachable!("flush stays in hook actor"),
                 }
                 shared.store(Arc::new(local.clone()));
                 local
@@ -392,7 +424,7 @@ pub(crate) fn register_hooks(handlers: &Handlers) {
     register_hook!(move |event: &mut DocumentDidOpen<'_>| {
         let doc = doc!(event.editor, &event.doc);
         if doc.word_completion_enabled() {
-            coordinator.send(Event::Insert(doc.text().clone())).unwrap();
+            send_blocking(&coordinator, Event::Insert(doc.text().clone()));
         }
         Ok(())
     });
@@ -401,7 +433,7 @@ pub(crate) fn register_hooks(handlers: &Handlers) {
     register_hook!(move |event: &mut DocumentDidChange<'_>| {
         let hook_start = std::time::Instant::now();
         if !event.ghost_transaction && event.doc.word_completion_enabled() {
-            helix_event::send_blocking(
+            helix_runtime::send_blocking(
                 &tx,
                 Event::Update(
                     event.doc.id(),
@@ -431,7 +463,7 @@ pub(crate) fn register_hooks(handlers: &Handlers) {
     let tx = handlers.word_index.hook.clone();
     register_hook!(move |event: &mut DocumentDidClose<'_>| {
         if event.doc.word_completion_enabled() {
-            helix_event::send_blocking(
+            helix_runtime::send_blocking(
                 &tx,
                 Event::Delete(event.doc.id(), event.doc.text().clone()),
             );
@@ -443,14 +475,14 @@ pub(crate) fn register_hooks(handlers: &Handlers) {
     register_hook!(move |event: &mut ConfigDidChange<'_>| {
         // The feature has been turned off. Clear the index and reclaim any used memory.
         if event.old.word_completion.enable && !event.new.word_completion.enable {
-            coordinator.send(Event::Clear).unwrap();
+            send_blocking(&coordinator, Event::Clear);
         }
 
         // The feature has been turned on. Index open documents.
         if !event.old.word_completion.enable && event.new.word_completion.enable {
             for doc in event.editor.documents() {
                 if doc.word_completion_enabled() {
-                    coordinator.send(Event::Insert(doc.text().clone())).unwrap();
+                    send_blocking(&coordinator, Event::Insert(doc.text().clone()));
                 }
             }
         }

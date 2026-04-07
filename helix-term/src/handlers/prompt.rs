@@ -1,17 +1,16 @@
 use helix_event::register_hook;
+use helix_runtime::{send_blocking, Sender as IngressSender};
 use helix_view::events::DocumentFocusLost;
 use helix_view::handlers::Handlers;
 
-use crate::job::{self};
-use crate::ui;
+use crate::runtime::{LayerCommand, RuntimeEvent, UiCommand};
 
-pub(super) fn register_hooks(_handlers: &Handlers) {
+pub(super) fn register_hooks(_handlers: &Handlers, ingress: IngressSender<RuntimeEvent>) {
     register_hook!(move |_event: &mut DocumentFocusLost<'_>| {
-        job::dispatch_blocking(move |_, compositor| {
-            if compositor.find::<ui::Prompt>().is_some() {
-                compositor.remove_type::<ui::Prompt>();
-            }
-        });
+        send_blocking(
+            &ingress,
+            RuntimeEvent::Ui(UiCommand::Layer(LayerCommand::DismissPromptIfPresent)),
+        );
         Ok(())
     });
 }

@@ -6,13 +6,15 @@ pub mod args;
 pub mod commands;
 pub mod compositor;
 pub mod config;
+pub(crate) mod effect;
 pub mod events;
 pub mod health;
 pub mod host;
-pub mod job;
 pub mod keymap;
 pub mod plugin_registry;
 pub mod render;
+pub mod runtime;
+pub use runtime::AppEvent;
 pub mod shutdown;
 pub mod ui;
 pub mod widgets;
@@ -76,20 +78,21 @@ fn filter_picker_entry(entry: &DirEntry, root: &Path, dedup_symlinks: bool) -> b
     true
 }
 
-/// Opens URL in external program.
-fn open_external_url_callback(
+/// Opens URL in external program; completes with a typed task event for the main loop.
+pub(crate) fn open_external_url_task_event(
     url: Url,
-) -> impl Future<Output = Result<job::Callback, anyhow::Error>> + Send + 'static {
+) -> impl Future<Output = Result<crate::runtime::RuntimeTaskEvent, anyhow::Error>> + Send + 'static
+{
     let commands = open::commands(url.as_str());
-    async {
+    async move {
         for cmd in commands {
             let mut command: tokio::process::Command = cmd.into();
             if command.output().await.is_ok() {
-                return Ok(job::Callback::Editor(Box::new(|_| {})));
+                return Ok(crate::runtime::RuntimeTaskEvent::Stub);
             }
         }
-        Ok(job::Callback::Editor(Box::new(move |editor| {
-            editor.set_error("Opening URL in external program failed")
-        })))
+        Ok(crate::runtime::RuntimeTaskEvent::SetEditorError {
+            message: "Opening URL in external program failed".to_owned(),
+        })
     }
 }

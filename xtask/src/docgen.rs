@@ -69,7 +69,7 @@ pub fn static_commands() -> Result<String, DynError> {
         "Default keybinds".to_owned(),
     ]));
 
-    for cmd in MappableCommand::STATIC_COMMAND_LIST {
+    for cmd in MappableCommand::builtin_commands() {
         let keymap_strings: Vec<_> = keymaps
             .iter()
             .map(|(mode, keymap)| {

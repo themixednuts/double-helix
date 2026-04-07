@@ -12,18 +12,15 @@ use helix_lsp::{
 use tokio_stream::StreamExt;
 use tui::{text::Span, widgets::Row};
 
-use super::{align_view, Align, Context, Editor};
-use helix_view::view::push_jump;
+use super::{Context, Editor};
 
 use helix_core::{
     diagnostic::DiagnosticProvider, syntax::config::LanguageServerFeature,
-    text_annotations::InlineAnnotation, text_folding::ropex::RopeSliceFoldExt, Rope, Selection,
-    Uri,
+    text_folding::ropex::RopeSliceFoldExt, Uri,
 };
 use helix_stdx::path;
 use helix_view::{
-    document::{DocumentInlayHints, DocumentInlayHintsId},
-    editor::Action,
+    document::DocumentInlayHintsId,
     handlers::lsp::SignatureHelpInvoked,
     icons::ICONS,
     theme::Style,
@@ -31,14 +28,19 @@ use helix_view::{
 };
 
 use crate::{
-    compositor::{self, Component, Compositor},
-    job::Callback,
-    ui::{self, overlay::overlaid, FileLocation, Picker, Popup, PromptEvent},
+    compositor::{self, Component},
+    runtime::ui::command::{
+        DocumentSymbolPickerItem, LspCodeActionItem, LspCodeActionPresentation, LspCommand,
+        LspHoverDisplay, LspLocation,
+    },
+    runtime::{RuntimeTaskEvent, UiCommand},
+    ui::{
+        self, lsp::document_symbols::display_symbol_kind, lsp::navigation, overlay::overlaid,
+        Picker, PromptEvent,
+    },
 };
 
-use std::{
-    cmp::Ordering, collections::HashSet, fmt::Display, future::Future, path::Path, sync::Arc,
-};
+use std::{cmp::Ordering, collections::HashSet, fmt::Display, future::Future};
 
 /// Gets the first language server that is attached to a document which supports a specific feature.
 /// If there is no configured language server that supports the feature, this displays a status message.
@@ -62,38 +64,6 @@ macro_rules! language_server_with_feature {
     }};
 }
 
-/// A wrapper around `lsp::Location` that swaps out the LSP URI for `helix_core::Uri` and adds
-/// the server's  offset encoding.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Location {
-    uri: Uri,
-    range: lsp::Range,
-    offset_encoding: OffsetEncoding,
-}
-
-fn lsp_location_to_location(
-    location: lsp::Location,
-    offset_encoding: OffsetEncoding,
-) -> Option<Location> {
-    let uri = match location.uri.try_into() {
-        Ok(uri) => uri,
-        Err(err) => {
-            log::warn!("discarding invalid or unsupported URI: {err}");
-            return None;
-        }
-    };
-    Some(Location {
-        uri,
-        range: location.range,
-        offset_encoding,
-    })
-}
-
-struct SymbolInformationItem {
-    location: Location,
-    symbol: lsp::SymbolInformation,
-}
-
 struct DiagnosticStyles {
     hint: Style,
     info: Style,
@@ -102,103 +72,8 @@ struct DiagnosticStyles {
 }
 
 struct PickerDiagnostic {
-    location: Location,
+    location: LspLocation,
     diag: lsp::Diagnostic,
-}
-
-fn location_to_file_location(location: &Location) -> Option<FileLocation<'_>> {
-    let path = location.uri.as_path()?;
-    let line = Some((
-        location.range.start.line as usize,
-        location.range.end.line as usize,
-    ));
-    Some((path.into(), line))
-}
-
-fn jump_to_location(editor: &mut Editor, location: &Location, action: Action) {
-    let (view_id, doc) = focused!(editor);
-    let view = view_mut!(editor, view_id);
-    push_jump(view, doc);
-
-    let Some(path) = location.uri.as_path() else {
-        let err = format!("unable to convert URI to filepath: {:?}", location.uri);
-        editor.set_error(err);
-        return;
-    };
-    jump_to_position(
-        editor,
-        path,
-        location.range,
-        location.offset_encoding,
-        action,
-    );
-}
-
-fn jump_to_position(
-    editor: &mut Editor,
-    path: &Path,
-    range: lsp::Range,
-    offset_encoding: OffsetEncoding,
-    action: Action,
-) {
-    let doc = match editor.open(path, action) {
-        Ok(id) => doc_mut!(editor, &id),
-        Err(err) => {
-            let err = format!("failed to open path: {:?}: {:?}", path, err);
-            editor.set_error(err);
-            return;
-        }
-    };
-    let view = view_mut!(editor);
-    // TODO: convert inside server
-    let new_range = if let Some(new_range) = lsp_range_to_range(doc.text(), range, offset_encoding)
-    {
-        new_range
-    } else {
-        log::warn!("lsp position out of bounds - {:?}", range);
-        return;
-    };
-    // we flip the range so that the cursor sits on the start of the symbol
-    // (for example start of the function).
-    doc.set_selection(view.id, Selection::single(new_range.head, new_range.anchor));
-    if action.align_view(view, doc.id()) {
-        align_view(doc, view, Align::Center);
-    }
-}
-
-fn display_symbol_kind(kind: lsp::SymbolKind) -> &'static str {
-    match kind {
-        lsp::SymbolKind::FILE => "file",
-        lsp::SymbolKind::MODULE => "module",
-        lsp::SymbolKind::NAMESPACE => "namespace",
-        lsp::SymbolKind::PACKAGE => "package",
-        lsp::SymbolKind::CLASS => "class",
-        lsp::SymbolKind::METHOD => "method",
-        lsp::SymbolKind::PROPERTY => "property",
-        lsp::SymbolKind::FIELD => "field",
-        lsp::SymbolKind::CONSTRUCTOR => "construct",
-        lsp::SymbolKind::ENUM => "enum",
-        lsp::SymbolKind::INTERFACE => "interface",
-        lsp::SymbolKind::FUNCTION => "function",
-        lsp::SymbolKind::VARIABLE => "variable",
-        lsp::SymbolKind::CONSTANT => "constant",
-        lsp::SymbolKind::STRING => "string",
-        lsp::SymbolKind::NUMBER => "number",
-        lsp::SymbolKind::BOOLEAN => "boolean",
-        lsp::SymbolKind::ARRAY => "array",
-        lsp::SymbolKind::OBJECT => "object",
-        lsp::SymbolKind::KEY => "key",
-        lsp::SymbolKind::NULL => "null",
-        lsp::SymbolKind::ENUM_MEMBER => "enum_member",
-        lsp::SymbolKind::STRUCT => "struct",
-        lsp::SymbolKind::EVENT => "event",
-        lsp::SymbolKind::OPERATOR => "operator",
-        lsp::SymbolKind::TYPE_PARAMETER => "typeparam",
-        _ => {
-            log::warn!("Unknown symbol kind: {:?}", kind);
-            ""
-        }
-    }
 }
 
 #[derive(Copy, Clone, PartialEq)]
@@ -227,7 +102,7 @@ fn diag_picker(
                 .and_then(|id| cx.editor.language_server_by_id(id))
             {
                 flat_diag.push(PickerDiagnostic {
-                    location: Location {
+                    location: LspLocation {
                         uri: uri.clone(),
                         range: diag.range,
                         offset_encoding: ls.offset_encoding(),
@@ -316,28 +191,30 @@ fn diag_picker(
         primary_column,
         flat_diag,
         styles,
-        move |cx, diag, action| {
-            jump_to_location(cx.editor, &diag.location, action);
+        cx.editor.runtime().clone(),
+        cx.ingress.clone(),
+        move |cx: &mut crate::compositor::Context, diag: &PickerDiagnostic, action| {
+            navigation::jump_to_location(cx.editor, &diag.location, action);
             let (view_id, doc) = focused!(cx.editor);
             let view = view_mut!(cx.editor, view_id);
             view.diagnostics_handler
                 .immediately_show_diagnostic(doc, view_id);
         },
     )
-    .with_preview(move |_editor, diag| location_to_file_location(&diag.location))
+    .with_preview(move |_editor, diag| navigation::location_to_file_location(&diag.location))
     .truncate_start(false)
 }
 
 pub fn symbol_picker(cx: &mut Context) {
     fn nested_to_flat(
-        list: &mut Vec<SymbolInformationItem>,
+        list: &mut Vec<DocumentSymbolPickerItem>,
         file: &lsp::TextDocumentIdentifier,
         uri: &Uri,
         symbol: lsp::DocumentSymbol,
         offset_encoding: OffsetEncoding,
     ) {
         #[allow(deprecated)]
-        list.push(SymbolInformationItem {
+        list.push(DocumentSymbolPickerItem {
             symbol: lsp::SymbolInformation {
                 name: symbol.name,
                 kind: symbol.kind,
@@ -346,7 +223,7 @@ pub fn symbol_picker(cx: &mut Context) {
                 location: lsp::Location::new(file.uri.clone(), symbol.selection_range),
                 container_name: None,
             },
-            location: Location {
+            location: LspLocation {
                 uri: uri.clone(),
                 range: symbol.selection_range,
                 offset_encoding,
@@ -381,8 +258,8 @@ pub fn symbol_picker(cx: &mut Context) {
                 let symbols = match symbols {
                     lsp::DocumentSymbolResponse::Flat(symbols) => symbols
                         .into_iter()
-                        .map(|symbol| SymbolInformationItem {
-                            location: Location {
+                        .map(|symbol| DocumentSymbolPickerItem {
+                            location: LspLocation {
                                 uri: doc_uri.clone(),
                                 range: symbol.location.range,
                                 offset_encoding,
@@ -415,7 +292,7 @@ pub fn symbol_picker(cx: &mut Context) {
         return;
     }
 
-    cx.jobs.callback(async move {
+    cx.spawn_ui(async move {
         let mut symbols = Vec::new();
         while let Some(response) = futures.next().await {
             match response {
@@ -423,57 +300,7 @@ pub fn symbol_picker(cx: &mut Context) {
                 Err(err) => log::error!("Error requesting document symbols: {err}"),
             }
         }
-        let call = move |_editor: &mut Editor, compositor: &mut Compositor| {
-            let columns = [
-                ui::PickerColumn::new("kind", |item: &SymbolInformationItem, _| {
-                    let icons = ICONS.load();
-                    let name = display_symbol_kind(item.symbol.kind);
-
-                    if let Some(icon) = icons.kind().get(name) {
-                        if let Some(color) = icon.color() {
-                            Span::styled(
-                                format!("{}  {name}", icon.glyph()),
-                                Style::default().fg(color),
-                            )
-                            .into()
-                        } else {
-                            format!("{}  {name}", icon.glyph()).into()
-                        }
-                    } else {
-                        name.into()
-                    }
-                }),
-                // Some symbols in the document symbol picker may have a URI that isn't
-                // the current file. It should be rare though, so we concatenate that
-                // URI in with the symbol name in this picker.
-                ui::PickerColumn::new("name", |item: &SymbolInformationItem, _| {
-                    item.symbol.name.as_str().into()
-                }),
-                ui::PickerColumn::new("container", |item: &SymbolInformationItem, _| {
-                    item.symbol
-                        .container_name
-                        .as_deref()
-                        .unwrap_or_default()
-                        .into()
-                }),
-            ];
-
-            let picker = Picker::new(
-                columns,
-                1, // name column
-                symbols,
-                (),
-                move |cx, item, action| {
-                    jump_to_location(cx.editor, &item.location, action);
-                },
-            )
-            .with_preview(move |_editor, item| location_to_file_location(&item.location))
-            .truncate_start(false);
-
-            compositor.push(Box::new(overlaid(picker)))
-        };
-
-        Ok(Callback::EditorCompositor(Box::new(call)))
+        Ok(UiCommand::Lsp(LspCommand::DocumentSymbols { symbols }))
     });
 }
 
@@ -521,8 +348,8 @@ pub fn workspace_symbol_picker(cx: &mut Context) {
                                     return None;
                                 }
                             };
-                            Some(SymbolInformationItem {
-                                location: Location {
+                            Some(DocumentSymbolPickerItem {
+                                location: LspLocation {
                                     uri,
                                     range: symbol.location.range,
                                     offset_encoding,
@@ -558,7 +385,7 @@ pub fn workspace_symbol_picker(cx: &mut Context) {
         .boxed()
     };
     let columns = [
-        ui::PickerColumn::new("kind", |item: &SymbolInformationItem, _| {
+        ui::PickerColumn::new("kind", |item: &DocumentSymbolPickerItem, _| {
             let icons = ICONS.load();
             let name = display_symbol_kind(item.symbol.kind);
 
@@ -576,18 +403,18 @@ pub fn workspace_symbol_picker(cx: &mut Context) {
                 name.into()
             }
         }),
-        ui::PickerColumn::new("name", |item: &SymbolInformationItem, _| {
+        ui::PickerColumn::new("name", |item: &DocumentSymbolPickerItem, _| {
             item.symbol.name.as_str().into()
         })
         .without_filtering(),
-        ui::PickerColumn::new("container", |item: &SymbolInformationItem, _| {
+        ui::PickerColumn::new("container", |item: &DocumentSymbolPickerItem, _| {
             item.symbol
                 .container_name
                 .as_deref()
                 .unwrap_or_default()
                 .into()
         }),
-        ui::PickerColumn::new("path", |item: &SymbolInformationItem, _| {
+        ui::PickerColumn::new("path", |item: &DocumentSymbolPickerItem, _| {
             if let Some(path) = item.location.uri.as_path() {
                 path::get_relative_path(path)
                     .to_string_lossy()
@@ -604,11 +431,13 @@ pub fn workspace_symbol_picker(cx: &mut Context) {
         1, // name column
         [],
         (),
-        move |cx, item, action| {
-            jump_to_location(cx.editor, &item.location, action);
+        cx.editor.runtime().clone(),
+        cx.ingress.clone(),
+        move |cx: &mut crate::compositor::Context, item: &DocumentSymbolPickerItem, action| {
+            navigation::jump_to_location(cx.editor, &item.location, action);
         },
     )
-    .with_preview(|_editor, item| location_to_file_location(&item.location))
+    .with_preview(|_editor, item| navigation::location_to_file_location(&item.location))
     .with_dynamic_query(get_symbols, None)
     .truncate_start(false);
 
@@ -631,12 +460,7 @@ pub fn workspace_diagnostics_picker(cx: &mut Context) {
     cx.push_layer(Box::new(overlaid(picker)));
 }
 
-struct CodeActionOrCommandItem {
-    lsp_item: lsp::CodeActionOrCommand,
-    language_server_id: LanguageServerId,
-}
-
-impl ui::menu::Item for CodeActionOrCommandItem {
+impl ui::menu::Item for LspCodeActionItem {
     type Data = ();
     fn format(&self, _data: &Self::Data) -> Row<'_> {
         match &self.lsp_item {
@@ -795,7 +619,7 @@ pub fn code_action_inner(cx: &mut Context, use_picker: bool) {
 
             Ok(actions
                 .into_iter()
-                .map(|lsp_item| CodeActionOrCommandItem {
+                .map(|lsp_item| LspCodeActionItem {
                     lsp_item,
                     language_server_id: ls_id,
                 })
@@ -809,7 +633,7 @@ pub fn code_action_inner(cx: &mut Context, use_picker: bool) {
         return;
     }
 
-    cx.jobs.callback(async move {
+    cx.spawn_ui(async move {
         let mut actions = Vec::new();
 
         while let Some(output) = futures.next().await {
@@ -819,116 +643,15 @@ pub fn code_action_inner(cx: &mut Context, use_picker: bool) {
             }
         }
 
-        if use_picker {
-            code_action_inner_picker(actions)
-        } else {
-            code_action_inner_menu(actions)
-        }
+        Ok(UiCommand::Lsp(LspCommand::CodeActions {
+            items: actions,
+            presentation: if use_picker {
+                LspCodeActionPresentation::Picker
+            } else {
+                LspCodeActionPresentation::Menu
+            },
+        }))
     });
-}
-
-fn code_action_inner_menu(
-    actions: Vec<CodeActionOrCommandItem>,
-) -> Result<Callback, anyhow::Error> {
-    let call = move |editor: &mut Editor, compositor: &mut Compositor| {
-        if actions.is_empty() {
-            editor.set_error("No code actions available");
-            return;
-        }
-        let mut picker = ui::Menu::new(actions, (), move |editor, action, event| {
-            if event != PromptEvent::Validate {
-                return;
-            }
-
-            // always present here
-            let action = action.unwrap();
-
-            code_action_handle_lsp_item(editor, &action.lsp_item, action.language_server_id);
-        });
-        picker.move_down(); // pre-select the first item
-
-        let popup = Popup::new("code-action", picker).with_scrollbar(false);
-
-        compositor.replace_or_push("code-action", popup);
-    };
-
-    Ok(Callback::EditorCompositor(Box::new(call)))
-}
-
-fn code_action_inner_picker(
-    actions: Vec<CodeActionOrCommandItem>,
-) -> Result<Callback, anyhow::Error> {
-    let call = move |editor: &mut Editor, compositor: &mut Compositor| {
-        if actions.is_empty() {
-            editor.set_error("No code actions available");
-            return;
-        }
-        let columns = [ui::PickerColumn::new(
-            "action",
-            |item: &CodeActionOrCommandItem, _| match &item.lsp_item {
-                lsp::CodeActionOrCommand::CodeAction(action) => action.title.as_str().into(),
-                lsp::CodeActionOrCommand::Command(command) => command.title.as_str().into(),
-            },
-        )];
-
-        let picker = ui::Picker::new(
-            columns,
-            0, // action column
-            actions,
-            (),
-            move |cx: &mut crate::compositor::Context, lsp_item, _action| {
-                code_action_handle_lsp_item(
-                    cx.editor,
-                    &lsp_item.lsp_item,
-                    lsp_item.language_server_id,
-                );
-            },
-        );
-        compositor.push(Box::new(overlaid(picker)));
-    };
-    Ok(Callback::EditorCompositor(Box::new(call)))
-}
-
-fn code_action_handle_lsp_item(
-    editor: &mut Editor,
-    lsp_item: &CodeActionOrCommand,
-    language_server_id: LanguageServerId,
-) {
-    let Some(language_server) = editor.language_server_by_id(language_server_id) else {
-        editor.set_error("Language Server disappeared");
-        return;
-    };
-    let offset_encoding = language_server.offset_encoding();
-
-    match lsp_item {
-        lsp::CodeActionOrCommand::Command(command) => {
-            log::debug!("code action command: {:?}", command);
-            editor.execute_lsp_command(command.clone(), language_server_id);
-        }
-        lsp::CodeActionOrCommand::CodeAction(code_action) => {
-            log::debug!("code action: {:?}", code_action);
-            // we support lsp "codeAction/resolve" for `edit` and `command` fields
-            let mut resolved_code_action = None;
-            if code_action.edit.is_none() || code_action.command.is_none() {
-                if let Some(future) = language_server.resolve_code_action(code_action) {
-                    if let Ok(response) = helix_lsp::block_on(future) {
-                        resolved_code_action = Some(response);
-                    }
-                }
-            }
-            let resolved_code_action = resolved_code_action.as_ref().unwrap_or(code_action);
-
-            if let Some(ref workspace_edit) = resolved_code_action.edit {
-                let _ = editor.apply_workspace_edit(offset_encoding, workspace_edit);
-            }
-
-            // if code action provides both edit and command first the edit
-            // should be applied and then the command
-            if let Some(command) = &code_action.command {
-                editor.execute_lsp_command(command.clone(), language_server_id);
-            }
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -958,43 +681,6 @@ impl Display for ApplyEditErrorKind {
     }
 }
 
-/// Precondition: `locations` should be non-empty.
-fn goto_impl(
-    _title: &'static str,
-    editor: &mut Editor,
-    compositor: &mut Compositor,
-    locations: Vec<Location>,
-) {
-    let cwdir = helix_stdx::env::current_working_dir();
-
-    match locations.as_slice() {
-        [location] => {
-            jump_to_location(editor, location, Action::Replace);
-        }
-        [] => unreachable!("`locations` should be non-empty for `goto_impl`"),
-        _locations => {
-            let columns = [ui::PickerColumn::new(
-                "location",
-                |item: &Location, cwdir: &std::path::PathBuf| {
-                    let path = if let Some(path) = item.uri.as_path() {
-                        path.strip_prefix(cwdir).unwrap_or(path).to_string_lossy()
-                    } else {
-                        item.uri.to_string().into()
-                    };
-
-                    format!("{path}:{}", item.range.start.line + 1).into()
-                },
-            )];
-
-            let picker = Picker::new(columns, 0, locations, cwdir, |cx, location, action| {
-                jump_to_location(cx.editor, location, action)
-            })
-            .with_preview(|_editor, location| location_to_file_location(location));
-            compositor.push(Box::new(overlaid(picker)));
-        }
-    }
-}
-
 fn goto_single_impl<P, F>(cx: &mut Context, feature: LanguageServerFeature, request_provider: P)
 where
     P: Fn(&Client, lsp::Position, lsp::TextDocumentIdentifier) -> Option<F>,
@@ -1011,17 +697,20 @@ where
         })
         .collect();
 
-    cx.jobs.callback(async move {
+    cx.spawn_ui(async move {
         let mut locations = Vec::new();
         while let Some(response) = futures.next().await {
             match response {
                 Ok((response, offset_encoding)) => match response {
                     Some(lsp::GotoDefinitionResponse::Scalar(lsp_location)) => {
-                        locations.extend(lsp_location_to_location(lsp_location, offset_encoding));
+                        locations.extend(navigation::lsp_location_to_lsp_location(
+                            lsp_location,
+                            offset_encoding,
+                        ));
                     }
                     Some(lsp::GotoDefinitionResponse::Array(lsp_locations)) => {
                         locations.extend(lsp_locations.into_iter().flat_map(|location| {
-                            lsp_location_to_location(location, offset_encoding)
+                            navigation::lsp_location_to_lsp_location(location, offset_encoding)
                         }));
                     }
                     Some(lsp::GotoDefinitionResponse::Link(lsp_locations)) => {
@@ -1035,7 +724,10 @@ where
                                     )
                                 })
                                 .flat_map(|location| {
-                                    lsp_location_to_location(location, offset_encoding)
+                                    navigation::lsp_location_to_lsp_location(
+                                        location,
+                                        offset_encoding,
+                                    )
                                 }),
                         );
                     }
@@ -1044,20 +736,17 @@ where
                 Err(err) => log::error!("Error requesting locations: {err}"),
             }
         }
-        let call = move |editor: &mut Editor, compositor: &mut Compositor| {
-            if locations.is_empty() {
-                editor.set_error(match feature {
-                    LanguageServerFeature::GotoDeclaration => "No declaration found.",
-                    LanguageServerFeature::GotoDefinition => "No definition found.",
-                    LanguageServerFeature::GotoTypeDefinition => "No type definition found.",
-                    LanguageServerFeature::GotoImplementation => "No implementation found.",
-                    _ => "No location found.",
-                });
-            } else {
-                goto_impl("Goto Implementation", editor, compositor, locations);
-            }
+        let empty_message = match feature {
+            LanguageServerFeature::GotoDeclaration => "No declaration found.",
+            LanguageServerFeature::GotoDefinition => "No definition found.",
+            LanguageServerFeature::GotoTypeDefinition => "No type definition found.",
+            LanguageServerFeature::GotoImplementation => "No implementation found.",
+            _ => "No location found.",
         };
-        Ok(Callback::EditorCompositor(Box::new(call)))
+        Ok(UiCommand::Lsp(LspCommand::Goto {
+            locations,
+            empty_message,
+        }))
     });
 }
 
@@ -1114,27 +803,22 @@ pub fn goto_reference(cx: &mut Context) {
         })
         .collect();
 
-    cx.jobs.callback(async move {
+    cx.spawn_ui(async move {
         let mut locations = Vec::new();
         while let Some(response) = futures.next().await {
             match response {
-                Ok((lsp_locations, offset_encoding)) => locations.extend(
-                    lsp_locations
-                        .into_iter()
-                        .flatten()
-                        .flat_map(|location| lsp_location_to_location(location, offset_encoding)),
-                ),
+                Ok((lsp_locations, offset_encoding)) => {
+                    locations.extend(lsp_locations.into_iter().flatten().flat_map(|location| {
+                        navigation::lsp_location_to_lsp_location(location, offset_encoding)
+                    }))
+                }
                 Err(err) => log::error!("Error requesting references: {err}"),
             }
         }
-        let call = move |editor: &mut Editor, compositor: &mut Compositor| {
-            if locations.is_empty() {
-                editor.set_error("No references found.");
-            } else {
-                goto_impl("Goto Reference", editor, compositor, locations);
-            }
-        };
-        Ok(Callback::EditorCompositor(Box::new(call)))
+        Ok(UiCommand::Lsp(LspCommand::Goto {
+            locations,
+            empty_message: "No references found.",
+        }))
     });
 }
 
@@ -1144,14 +828,7 @@ pub fn signature_help(cx: &mut Context) {
         .trigger_signature_help(SignatureHelpInvoked::Manual, cx.editor)
 }
 
-enum HoverDisplay {
-    Popup,
-    File,
-}
-
-fn hover_impl(cx: &mut Context, hover_action: HoverDisplay) {
-    use ui::lsp::hover::Hover;
-
+fn hover_impl(cx: &mut Context, display: LspHoverDisplay) {
     let (view_id, doc) = focused!(cx.editor);
     if doc
         .language_servers_with_feature(LanguageServerFeature::Hover)
@@ -1179,7 +856,7 @@ fn hover_impl(cx: &mut Context, hover_action: HoverDisplay) {
         })
         .collect();
 
-    cx.jobs.callback(async move {
+    cx.spawn_ui(async move {
         let mut hovers: Vec<(String, lsp::Hover)> = Vec::new();
 
         while let Some(response) = futures.next().await {
@@ -1190,241 +867,200 @@ fn hover_impl(cx: &mut Context, hover_action: HoverDisplay) {
             }
         }
 
-        let call = move |editor: &mut Editor, compositor: &mut Compositor| {
-            if hovers.is_empty() {
-                editor.set_status("No hover results available.");
-                return;
-            }
-
-            let hover = Hover::new(hovers, editor.syn_loader.clone());
-
-            match hover_action {
-                HoverDisplay::Popup => {
-                    let popup = Popup::new(Hover::ID, hover).auto_close(true);
-                    compositor.replace_or_push(Hover::ID, popup);
-                }
-                HoverDisplay::File => {
-                    editor.new_file_from_document(
-                        Action::Replace,
-                        Document::from(
-                            Rope::from(hover.content_string()),
-                            None,
-                            Arc::clone(&editor.config),
-                            Arc::clone(&editor.syn_loader),
-                        ),
-                    );
-                    let (_, hover_doc) = focused!(editor);
-
-                    let _ = hover_doc
-                        .set_language_by_language_id("markdown", &editor.syn_loader.load());
-                }
-            }
-        };
-        Ok(Callback::EditorCompositor(Box::new(call)))
+        Ok(UiCommand::Lsp(LspCommand::Hover { hovers, display }))
     });
 }
 
 pub fn hover(cx: &mut Context) {
-    hover_impl(cx, HoverDisplay::Popup)
+    hover_impl(cx, LspHoverDisplay::Popup)
 }
 
 pub fn goto_hover(cx: &mut Context) {
-    hover_impl(cx, HoverDisplay::File)
+    hover_impl(cx, LspHoverDisplay::FileBuffer)
+}
+
+fn get_prefill_from_word_boundary(editor: &Editor) -> String {
+    let (view_id, doc) = focused_ref!(editor);
+    let text = doc.text().slice(..);
+    let primary_selection = doc.selection(view_id).primary();
+    if primary_selection.len() > 1 {
+        primary_selection
+    } else {
+        use helix_core::textobject::{textobject_word, TextObject};
+        textobject_word(text, primary_selection, TextObject::Inside, 1, false)
+    }
+    .fragment(text)
+    .into()
+}
+
+fn get_prefill_from_lsp_response(
+    text: &helix_core::Rope,
+    fallback_prefill: &str,
+    offset_encoding: OffsetEncoding,
+    response: Option<lsp::PrepareRenameResponse>,
+) -> Result<String, &'static str> {
+    match response {
+        Some(lsp::PrepareRenameResponse::Range(range)) => Ok(lsp_range_to_range(text, range, offset_encoding)
+        .ok_or("lsp sent invalid selection range for rename")?
+        .fragment(text.slice(..))
+        .into()),
+        Some(lsp::PrepareRenameResponse::RangeWithPlaceholder { placeholder, .. }) => {
+            Ok(placeholder)
+        }
+        Some(lsp::PrepareRenameResponse::DefaultBehavior { .. }) => Ok(fallback_prefill.to_owned()),
+        None => Err("lsp did not respond to prepare rename request"),
+    }
+}
+
+pub(crate) fn create_rename_prompt(
+    editor: &Editor,
+    prefill: String,
+    history_register: Option<char>,
+    language_server_id: Option<LanguageServerId>,
+) -> Box<dyn Component> {
+    match editor.config().cmdline.style {
+        helix_view::editor::CmdlineStyle::Popup => {
+            let cmdline = ui::CmdlinePopup::new(
+                "rename-to:".into(),
+                history_register,
+                ui::completers::none,
+                move |cx: &mut compositor::Context, input: &str, event: PromptEvent| {
+                    if event != PromptEvent::Validate {
+                        return;
+                    }
+                    let (view_id, doc) = focused!(cx.editor);
+
+                    let Some(language_server) = doc
+                        .language_servers_with_feature(LanguageServerFeature::RenameSymbol)
+                        .find(|ls| language_server_id.is_none_or(|id| id == ls.id()))
+                    else {
+                        cx.editor
+                            .set_error("No configured language server supports symbol renaming");
+                        return;
+                    };
+
+                    let offset_encoding = language_server.offset_encoding();
+                    let pos = doc.position(view_id, offset_encoding);
+                    let future = language_server
+                        .rename_symbol(doc.identifier(), pos, input.to_string())
+                        .unwrap();
+
+                    match block_on(future) {
+                        Ok(edits) => {
+                            if let Err(err) =
+                                cx.editor.apply_workspace_edit(offset_encoding, &edits.unwrap_or_default())
+                            {
+                                cx.editor
+                                    .set_error(format!("Failed to apply rename edits: {}", err.kind));
+                            }
+                        }
+                        Err(err) => cx.editor.set_error(err.to_string()),
+                    }
+                },
+                helix_view::editor::CmdlineStyle::Popup,
+            )
+            .with_line(prefill, editor);
+
+            Box::new(cmdline)
+        }
+        helix_view::editor::CmdlineStyle::Bottom => {
+            let prompt = ui::Prompt::new(
+                "rename-to:".into(),
+                history_register,
+                ui::completers::none,
+                move |cx: &mut compositor::Context, input: &str, event: PromptEvent| {
+                    if event != PromptEvent::Validate {
+                        return;
+                    }
+                    let (view_id, doc) = focused!(cx.editor);
+
+                    let Some(language_server) = doc
+                        .language_servers_with_feature(LanguageServerFeature::RenameSymbol)
+                        .find(|ls| language_server_id.is_none_or(|id| id == ls.id()))
+                    else {
+                        cx.editor
+                            .set_error("No configured language server supports symbol renaming");
+                        return;
+                    };
+
+                    let offset_encoding = language_server.offset_encoding();
+                    let pos = doc.position(view_id, offset_encoding);
+                    let future = language_server
+                        .rename_symbol(doc.identifier(), pos, input.to_string())
+                        .unwrap();
+
+                    match block_on(future) {
+                        Ok(edits) => {
+                            if let Err(err) =
+                                cx.editor.apply_workspace_edit(offset_encoding, &edits.unwrap_or_default())
+                            {
+                                cx.editor
+                                    .set_error(format!("Failed to apply rename edits: {}", err.kind));
+                            }
+                        }
+                        Err(err) => cx.editor.set_error(err.to_string()),
+                    }
+                },
+            )
+            .with_line(prefill, editor);
+
+            Box::new(prompt)
+        }
+    }
 }
 
 pub fn rename_symbol(cx: &mut Context) {
-    fn get_prefill_from_word_boundary(editor: &Editor) -> String {
-        let (view_id, doc) = focused_ref!(editor);
-        let text = doc.text().slice(..);
-        let primary_selection = doc.selection(view_id).primary();
-        if primary_selection.len() > 1 {
-            primary_selection
-        } else {
-            use helix_core::textobject::{textobject_word, TextObject};
-            textobject_word(text, primary_selection, TextObject::Inside, 1, false)
-        }
-        .fragment(text)
-        .into()
-    }
-
-    fn get_prefill_from_lsp_response(
-        editor: &Editor,
-        offset_encoding: OffsetEncoding,
-        response: Option<lsp::PrepareRenameResponse>,
-    ) -> Result<String, &'static str> {
-        match response {
-            Some(lsp::PrepareRenameResponse::Range(range)) => {
-                let text = focused_ref!(editor).1.text();
-
-                Ok(lsp_range_to_range(text, range, offset_encoding)
-                    .ok_or("lsp sent invalid selection range for rename")?
-                    .fragment(text.slice(..))
-                    .into())
-            }
-            Some(lsp::PrepareRenameResponse::RangeWithPlaceholder { placeholder, .. }) => {
-                Ok(placeholder)
-            }
-            Some(lsp::PrepareRenameResponse::DefaultBehavior { .. }) => {
-                Ok(get_prefill_from_word_boundary(editor))
-            }
-            None => Err("lsp did not respond to prepare rename request"),
-        }
-    }
-
-    fn create_rename_prompt(
-        editor: &Editor,
-        prefill: String,
-        history_register: Option<char>,
-        language_server_id: Option<LanguageServerId>,
-    ) -> Box<dyn Component> {
-        match editor.config().cmdline.style {
-            helix_view::editor::CmdlineStyle::Popup => {
-                let cmdline = ui::CmdlinePopup::new(
-                    "rename-to:".into(),
-                    history_register,
-                    ui::completers::none,
-                    move |cx: &mut compositor::Context, input: &str, event: PromptEvent| {
-                        if event != PromptEvent::Validate {
-                            return;
-                        }
-                        let (view_id, doc) = focused!(cx.editor);
-
-                        let Some(language_server) = doc
-                            .language_servers_with_feature(LanguageServerFeature::RenameSymbol)
-                            .find(|ls| language_server_id.is_none_or(|id| id == ls.id()))
-                        else {
-                            cx.editor.set_error(
-                                "No configured language server supports symbol renaming",
-                            );
-                            return;
-                        };
-
-                        let offset_encoding = language_server.offset_encoding();
-                        let pos = doc.position(view_id, offset_encoding);
-                        let future = language_server
-                            .rename_symbol(doc.identifier(), pos, input.to_string())
-                            .unwrap();
-
-                        match block_on(future) {
-                            Ok(edits) => {
-                                if let Err(err) = cx.editor.apply_workspace_edit(
-                                    offset_encoding,
-                                    &edits.unwrap_or_default(),
-                                ) {
-                                    cx.editor.set_error(format!(
-                                        "Failed to apply rename edits: {}",
-                                        err.kind
-                                    ));
-                                }
-                            }
-                            Err(err) => cx.editor.set_error(err.to_string()),
-                        }
-                    },
-                    helix_view::editor::CmdlineStyle::Popup,
-                )
-                .with_line(prefill, editor);
-
-                Box::new(cmdline)
-            }
-            helix_view::editor::CmdlineStyle::Bottom => {
-                let prompt = ui::Prompt::new(
-                    "rename-to:".into(),
-                    history_register,
-                    ui::completers::none,
-                    move |cx: &mut compositor::Context, input: &str, event: PromptEvent| {
-                        if event != PromptEvent::Validate {
-                            return;
-                        }
-                        let (view_id, doc) = focused!(cx.editor);
-
-                        let Some(language_server) = doc
-                            .language_servers_with_feature(LanguageServerFeature::RenameSymbol)
-                            .find(|ls| language_server_id.is_none_or(|id| id == ls.id()))
-                        else {
-                            cx.editor.set_error(
-                                "No configured language server supports symbol renaming",
-                            );
-                            return;
-                        };
-
-                        let offset_encoding = language_server.offset_encoding();
-                        let pos = doc.position(view_id, offset_encoding);
-                        let future = language_server
-                            .rename_symbol(doc.identifier(), pos, input.to_string())
-                            .unwrap();
-
-                        match block_on(future) {
-                            Ok(edits) => {
-                                if let Err(err) = cx.editor.apply_workspace_edit(
-                                    offset_encoding,
-                                    &edits.unwrap_or_default(),
-                                ) {
-                                    cx.editor.set_error(format!(
-                                        "Failed to apply rename edits: {}",
-                                        err.kind
-                                    ));
-                                }
-                            }
-                            Err(err) => cx.editor.set_error(err.to_string()),
-                        }
-                    },
-                )
-                .with_line(prefill, editor);
-
-                Box::new(prompt)
-            }
-        }
-    }
-
-    let (view_id, doc) = focused_ref!(cx.editor);
     let history_register = cx.register;
 
-    if doc
-        .language_servers_with_feature(LanguageServerFeature::RenameSymbol)
-        .next()
-        .is_none()
-    {
+    let (has_rename_support, prepare_rename) = {
+        let (view_id, doc) = focused_ref!(cx.editor);
+        let mut language_servers = doc.language_servers_with_feature(LanguageServerFeature::RenameSymbol);
+        let has_rename_support = language_servers.next().is_some();
+        let prepare_rename = doc
+            .language_servers_with_feature(LanguageServerFeature::RenameSymbol)
+            .find(|ls| {
+                matches!(
+                    ls.capabilities().rename_provider,
+                    Some(lsp::OneOf::Right(lsp::RenameOptions {
+                        prepare_provider: Some(true),
+                        ..
+                    }))
+                )
+            })
+            .map(|language_server| {
+                let ls_id = language_server.id();
+                let offset_encoding = language_server.offset_encoding();
+                let pos = doc.position(view_id, offset_encoding);
+                let text = doc.text().clone();
+                let future = language_server.prepare_rename(doc.identifier(), pos).unwrap();
+                (ls_id, offset_encoding, text, future)
+            });
+        (has_rename_support, prepare_rename)
+    };
+
+    if !has_rename_support {
         cx.editor
             .set_error("No configured language server supports symbol renaming");
         return;
     }
 
-    let language_server_with_prepare_rename_support = doc
-        .language_servers_with_feature(LanguageServerFeature::RenameSymbol)
-        .find(|ls| {
-            matches!(
-                ls.capabilities().rename_provider,
-                Some(lsp::OneOf::Right(lsp::RenameOptions {
-                    prepare_provider: Some(true),
-                    ..
-                }))
+    if let Some((ls_id, offset_encoding, text, future)) = prepare_rename {
+        let fallback_prefill = get_prefill_from_word_boundary(cx.editor);
+        cx.spawn_ui(async move {
+            let response = future.await?;
+            let prefill = get_prefill_from_lsp_response(
+                &text,
+                &fallback_prefill,
+                offset_encoding,
+                response,
             )
+            .map_err(anyhow::Error::msg)?;
+            Ok(UiCommand::Lsp(LspCommand::PrepareRename {
+                prefill,
+                history_register,
+                language_server_id: Some(ls_id),
+            }))
         });
-
-    if let Some(language_server) = language_server_with_prepare_rename_support {
-        let ls_id = language_server.id();
-        let offset_encoding = language_server.offset_encoding();
-        let pos = doc.position(view_id, offset_encoding);
-        let future = language_server
-            .prepare_rename(doc.identifier(), pos)
-            .unwrap();
-        cx.callback(
-            future,
-            move |editor, compositor, response: Option<lsp::PrepareRenameResponse>| {
-                let prefill = match get_prefill_from_lsp_response(editor, offset_encoding, response)
-                {
-                    Ok(p) => p,
-                    Err(e) => {
-                        editor.set_error(e);
-                        return;
-                    }
-                };
-
-                let prompt = create_rename_prompt(editor, prefill, history_register, Some(ls_id));
-
-                compositor.push(prompt);
-            },
-        );
     } else {
         let prefill = get_prefill_from_word_boundary(cx.editor);
         let prompt = create_rename_prompt(cx.editor, prefill, history_register, None);
@@ -1442,37 +1078,19 @@ pub fn select_references_to_symbol_under_cursor(cx: &mut Context) {
         .text_document_document_highlight(doc.identifier(), pos, None)
         .unwrap();
 
-    cx.callback(
-        future,
-        move |editor, _compositor, response: Option<Vec<lsp::DocumentHighlight>>| {
-            let document_highlights = match response {
-                Some(highlights) if !highlights.is_empty() => highlights,
-                _ => return,
-            };
-            let (view_id, doc) = focused!(editor);
-            let text = doc.text();
-            let pos = doc.selection(view_id).primary().cursor(text.slice(..));
-
-            // We must find the range that contains our primary cursor to prevent our primary cursor to move
-            let mut primary_index = 0;
-            let ranges = document_highlights
-                .iter()
-                .filter_map(|highlight| lsp_range_to_range(text, highlight.range, offset_encoding))
-                .enumerate()
-                .map(|(i, range)| {
-                    if range.contains(pos) {
-                        primary_index = i;
-                    }
-                    range
-                })
-                .collect();
-            let selection = Selection::new(ranges, primary_index);
-            doc.set_selection(view_id, selection);
-        },
-    );
+    cx.spawn_task_event(async move {
+        let highlights = future.await?.unwrap_or_default();
+        Ok(RuntimeTaskEvent::SelectDocumentHighlights {
+            highlights,
+            offset_encoding,
+        })
+    });
 }
 
-pub fn compute_inlay_hints_for_all_views(editor: &mut Editor, jobs: &mut crate::job::Jobs) {
+pub fn compute_inlay_hints_for_all_views(
+    editor: &mut Editor,
+    ingress: helix_runtime::Sender<crate::runtime::RuntimeEvent>,
+) {
     if !editor.config().lsp.display_inlay_hints {
         return;
     }
@@ -1483,7 +1101,11 @@ pub fn compute_inlay_hints_for_all_views(editor: &mut Editor, jobs: &mut crate::
             None => continue,
         };
         if let Some(callback) = compute_inlay_hints_for_view(view, doc) {
-            jobs.callback(callback);
+            crate::runtime::ingress::spawn_task_event_with_future(
+                editor.runtime().work().clone(),
+                callback,
+                ingress.clone(),
+            );
         }
     }
 }
@@ -1491,7 +1113,9 @@ pub fn compute_inlay_hints_for_all_views(editor: &mut Editor, jobs: &mut crate::
 fn compute_inlay_hints_for_view(
     view: &View,
     doc: &Document,
-) -> Option<std::pin::Pin<Box<impl Future<Output = Result<crate::job::Callback, anyhow::Error>>>>> {
+) -> Option<
+    std::pin::Pin<Box<impl Future<Output = Result<crate::runtime::RuntimeTaskEvent, anyhow::Error>>>>,
+> {
     let view_id = view.id;
     let doc_id = view.doc;
 
@@ -1539,124 +1163,19 @@ fn compute_inlay_hints_for_view(
         language_server.offset_encoding(),
     );
 
+    let request = language_server.text_document_range_inlay_hints(doc.identifier(), range, None)?;
     let offset_encoding = language_server.offset_encoding();
 
-    let callback = super::make_job_callback(
-        language_server.text_document_range_inlay_hints(doc.identifier(), range, None)?,
-        move |editor, _compositor, response: Option<Vec<lsp::InlayHint>>| {
-            // The config was modified or the window was closed while the request was in flight
-            if !editor.config().lsp.display_inlay_hints || editor.tree.try_get(view_id).is_none() {
-                return;
-            }
-
-            // Add annotations to relevant document, not the current one (it may have changed in between)
-            let doc = match editor.documents.get_mut(&doc_id) {
-                Some(doc) => doc,
-                None => return,
-            };
-
-            // If we have neither hints nor an LSP, empty the inlay hints since they're now oudated
-            let mut hints = match response {
-                Some(hints) if !hints.is_empty() => hints,
-                _ => {
-                    doc.set_inlay_hints(
-                        view_id,
-                        DocumentInlayHints::empty_with_id(new_doc_inlay_hints_id),
-                    );
-                    doc.clear_inlay_hints_outdated();
-                    return;
-                }
-            };
-
-            // Most language servers will already send them sorted but ensure this is the case to
-            // avoid errors on our end.
-            hints.sort_by_key(|inlay_hint| inlay_hint.position);
-
-            let mut padding_before_inlay_hints = Vec::new();
-            let mut type_inlay_hints = Vec::new();
-            let mut parameter_inlay_hints = Vec::new();
-            let mut other_inlay_hints = Vec::new();
-            let mut padding_after_inlay_hints = Vec::new();
-
-            let doc_text = doc.text();
-            let inlay_hints_length_limit = doc.config.load().lsp.inlay_hints_length_limit;
-
-            for hint in hints {
-                let char_idx =
-                    match helix_lsp::util::lsp_pos_to_pos(doc_text, hint.position, offset_encoding)
-                    {
-                        Some(pos) => pos,
-                        // Skip inlay hints that have no "real" position
-                        None => continue,
-                    };
-
-                let mut label = match hint.label {
-                    lsp::InlayHintLabel::String(s) => s,
-                    lsp::InlayHintLabel::LabelParts(parts) => parts
-                        .into_iter()
-                        .map(|p| p.value)
-                        .collect::<Vec<_>>()
-                        .join(""),
-                };
-                // Truncate the hint if too long
-                if let Some(limit) = inlay_hints_length_limit {
-                    // Limit on displayed width
-                    use helix_core::unicode::{
-                        segmentation::UnicodeSegmentation, width::UnicodeWidthStr,
-                    };
-
-                    let width = label.width();
-                    let limit = limit.get().into();
-                    if width > limit {
-                        let mut floor_boundary = 0;
-                        let mut acc = 0;
-                        for (i, grapheme_cluster) in label.grapheme_indices(true) {
-                            acc += grapheme_cluster.width();
-
-                            if acc > limit {
-                                floor_boundary = i;
-                                break;
-                            }
-                        }
-
-                        label.truncate(floor_boundary);
-                        label.push('…');
-                    }
-                }
-
-                let inlay_hints_vec = match hint.kind {
-                    Some(lsp::InlayHintKind::TYPE) => &mut type_inlay_hints,
-                    Some(lsp::InlayHintKind::PARAMETER) => &mut parameter_inlay_hints,
-                    // We can't warn on unknown kind here since LSPs are free to set it or not, for
-                    // example Rust Analyzer does not: every kind will be `None`.
-                    _ => &mut other_inlay_hints,
-                };
-
-                if let Some(true) = hint.padding_left {
-                    padding_before_inlay_hints.push(InlineAnnotation::new(char_idx, " "));
-                }
-
-                inlay_hints_vec.push(InlineAnnotation::new(char_idx, label));
-
-                if let Some(true) = hint.padding_right {
-                    padding_after_inlay_hints.push(InlineAnnotation::new(char_idx, " "));
-                }
-            }
-
-            doc.set_inlay_hints(
-                view_id,
-                DocumentInlayHints {
-                    id: new_doc_inlay_hints_id,
-                    type_inlay_hints,
-                    parameter_inlay_hints,
-                    other_inlay_hints,
-                    padding_before_inlay_hints,
-                    padding_after_inlay_hints,
-                },
-            );
-            doc.clear_inlay_hints_outdated();
-        },
-    );
+    let callback = Box::pin(async move {
+        let hints = request.await?.unwrap_or_default();
+        Ok(RuntimeTaskEvent::ApplyInlayHints {
+            view_id,
+            doc_id,
+            offset_encoding,
+            id: new_doc_inlay_hints_id,
+            hints,
+        })
+    });
 
     Some(callback)
 }

@@ -1,7 +1,8 @@
-pub mod acp;
 pub mod animation;
+pub mod assistant;
 mod cmdline_popup;
 mod completion;
+pub(crate) mod completion_ingress;
 mod document;
 pub(crate) mod editor;
 mod file_explorer;
@@ -23,9 +24,8 @@ mod statusline;
 mod text;
 mod text_decorations;
 
-use crate::compositor::Compositor;
 use crate::filter_picker_entry;
-use crate::job::{self, Callback};
+use crate::runtime::{send_ui_command_with, LayerCommand, UiCommand};
 pub use cmdline_popup::CmdlinePopup;
 pub use completion::Completion;
 pub use editor::EditorView;
@@ -172,24 +172,17 @@ pub fn raw_regex_prompt(
                                     doc.set_view_offset(view_id, offset_snapshot);
 
                                     if event == PromptEvent::Validate {
-                                        let callback = async move {
-                                            let call: job::Callback = Callback::EditorCompositor(Box::new(
-                                                move |_editor: &mut Editor, compositor: &mut Compositor| {
-                                                    let contents = Text::new(format!("{}", err));
-                                                    let size = compositor.size();
-                                                    let popup = Popup::new("invalid-regex", contents)
-                                                        .position(Some(helix_core::Position::new(
-                                                            size.height as usize - 2,
-                                                            0,
-                                                        )))
-                                                        .auto_close(true);
-                                                    compositor.replace_or_push("invalid-regex", popup);
-                                                },
-                                            ));
-                                            Ok(call)
-                                        };
-
-                                        cx.jobs.callback(callback);
+                                        let msg = err.to_string();
+                                        let ingress = cx.ingress.clone();
+                                        cx.editor.runtime().work().clone().spawn(async move {
+                                            send_ui_command_with(
+                                                UiCommand::Layer(LayerCommand::InvalidRegexPopup {
+                                                    message: msg,
+                                                }),
+                                                ingress,
+                                            )
+                                            .await;
+                                        }).detach();
                                     }
                                 }
                             }
@@ -257,24 +250,17 @@ pub fn raw_regex_prompt(
                                     doc.set_view_offset(view_id, offset_snapshot);
 
                                     if event == PromptEvent::Validate {
-                                        let callback = async move {
-                                            let call: job::Callback = Callback::EditorCompositor(Box::new(
-                                                move |_editor: &mut Editor, compositor: &mut Compositor| {
-                                                    let contents = Text::new(format!("{}", err));
-                                                    let size = compositor.size();
-                                                    let popup = Popup::new("invalid-regex", contents)
-                                                        .position(Some(helix_core::Position::new(
-                                                            size.height as usize - 2, // 2 = statusline + commandline
-                                                            0,
-                                                        )))
-                                                        .auto_close(true);
-                                                    compositor.replace_or_push("invalid-regex", popup);
-                                                },
-                                            ));
-                                            Ok(call)
-                                        };
-
-                                        cx.jobs.callback(callback);
+                                        let msg = err.to_string();
+                                        let ingress = cx.ingress.clone();
+                                        cx.editor.runtime().work().clone().spawn(async move {
+                                            send_ui_command_with(
+                                                UiCommand::Layer(LayerCommand::InvalidRegexPopup {
+                                                    message: msg,
+                                                }),
+                                                ingress,
+                                            )
+                                            .await;
+                                        }).detach();
                                     }
                                 }
                             }
@@ -298,7 +284,11 @@ pub struct FilePickerData {
 }
 type FilePicker = Picker<PathBuf, FilePickerData>;
 
-pub fn file_picker(editor: &Editor, root: PathBuf) -> FilePicker {
+pub fn file_picker(
+    editor: &Editor,
+    root: PathBuf,
+    ingress: helix_runtime::Sender<crate::runtime::RuntimeEvent>,
+) -> FilePicker {
     use ignore::{types::TypesBuilder, WalkBuilder};
     use std::time::Instant;
 
@@ -370,7 +360,7 @@ pub fn file_picker(editor: &Editor, root: PathBuf) -> FilePicker {
             Spans::from(spans).into()
         },
     )];
-    let picker = Picker::new(columns, 0, [], data, move |cx, path: &PathBuf, action| {
+    let picker = Picker::new(columns, 0, [], data, editor.runtime().clone(), ingress.clone(), move |cx, path: &PathBuf, action| {
         let path = helix_stdx::path::canonicalize(path);
         let old_id = cx.editor.document_id_by_path(&path);
 

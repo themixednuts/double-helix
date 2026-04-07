@@ -4,7 +4,7 @@ use helix_core::{
     self as core, chars::char_is_word, completion::CompletionProvider, movement,
     text_annotations::TextAnnotations, Transaction,
 };
-use helix_event::TaskHandle;
+use helix_runtime::Token;
 use helix_stdx::rope::RopeSliceExt as _;
 use helix_view::{
     document::SavePoint, handlers::completion::ResponseContext, Document, Editor, ViewId,
@@ -14,10 +14,10 @@ use super::{request::TriggerKind, CompletionItem, CompletionItems, CompletionRes
 
 const COMPLETION_KIND: &str = "word";
 
-pub(super) fn completion(
+pub(crate) fn completion(
     editor: &Editor,
     trigger: Trigger,
-    handle: TaskHandle,
+    cancel: Token,
     savepoint: Arc<SavePoint>,
 ) -> Option<impl FnOnce() -> CompletionResponse> {
     if !focused_ref!(editor).1.word_completion_enabled() {
@@ -72,7 +72,7 @@ pub(super) fn completion(
         typed_word.len_chars()
     };
 
-    if handle.is_canceled() {
+    if cancel.is_canceled() {
         return None;
     }
 

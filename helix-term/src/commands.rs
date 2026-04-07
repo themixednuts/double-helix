@@ -6,7 +6,6 @@ pub(crate) mod typed;
 
 pub use dap::*;
 use futures_util::FutureExt;
-use helix_event::status;
 use helix_stdx::{
     path::{self, find_paths},
     rope::{self, RopeSliceExt},
@@ -67,11 +66,11 @@ use movement::Movement;
 use crate::{
     compositor::{self, Component, Compositor},
     filter_picker_entry,
-    job::Callback,
-    ui::{self, overlay::overlaid, Picker, PickerColumn, Popup, Prompt, PromptEvent},
+    runtime::ingress::{RuntimeEvent, RuntimeTaskEvent},
+    runtime::{send_task_event_with, AssistantCommand, ExitTaskSet, UiCommand},
+    ui::{self, overlay::overlaid, Picker, PickerColumn, Prompt, PromptEvent},
 };
-
-use crate::job::{self, Jobs};
+use helix_runtime::Sender as IngressSender;
 use std::{
     collections::{HashMap, HashSet},
     error::Error,
@@ -110,9 +109,14 @@ pub struct Context<'a> {
     pub editor: &'a mut Editor,
     pub registry: std::sync::Arc<helix_modal::registry::CommandRegistry>,
 
-    pub callback: Vec<crate::compositor::Callback>,
+    pub callback: Vec<crate::compositor::PostAction>,
     pub on_next_key_callback: Option<(OnKeyCallback, OnKeyCallbackKind)>,
-    pub jobs: &'a mut Jobs,
+    /// Exit-bound task sink for commands that must complete typed task work before shutdown.
+    pub exit_tasks: &'a mut ExitTaskSet,
+    pub exit_task_work: helix_runtime::Work,
+    /// Mirrors [`compositor::Context::ingress`] when built from the live app (Phase 3).
+    pub ingress: IngressSender<RuntimeEvent>,
+    pub idle_reset_tx: helix_runtime::Sender<()>,
     pub plugin_manager: Option<std::sync::Arc<PluginManager>>,
 }
 
@@ -120,17 +124,16 @@ impl Context<'_> {
     /// Push a new component onto the compositor.
     pub fn push_layer(&mut self, component: Box<dyn Component>) {
         self.callback
-            .push(Box::new(|compositor: &mut Compositor, _| {
-                compositor.push(component)
-            }));
+            .push(crate::compositor::PostAction::PushLayer(component));
     }
 
     /// Call `replace_or_push` on the Compositor
     pub fn replace_or_push_layer<T: Component>(&mut self, id: &'static str, component: T) {
         self.callback
-            .push(Box::new(move |compositor: &mut Compositor, _| {
-                compositor.replace_or_push(id, component);
-            }));
+            .push(crate::compositor::PostAction::ReplaceOrPushLayer {
+                id,
+                layer: Box::new(component),
+            });
     }
 
     #[inline]
@@ -154,15 +157,39 @@ impl Context<'_> {
     }
 
     #[inline]
-    pub fn callback<T, F>(
+    pub fn spawn_ui(
         &mut self,
-        call: impl Future<Output = helix_lsp::Result<T>> + 'static + Send,
-        callback: F,
-    ) where
-        T: Send + 'static,
-        F: FnOnce(&mut Editor, &mut Compositor, T) + Send + 'static,
-    {
-        self.jobs.callback(make_job_callback(call, callback));
+        future: impl Future<Output = anyhow::Result<UiCommand>> + Send + 'static,
+    ) {
+        crate::runtime::ingress::spawn_ui_command_with_future(
+            self.editor.runtime().work().clone(),
+            future,
+            self.ingress.clone(),
+        );
+    }
+
+    #[inline]
+    pub fn spawn_task_event(
+        &mut self,
+        future: impl Future<Output = anyhow::Result<RuntimeTaskEvent>> + Send + 'static,
+    ) {
+        crate::runtime::ingress::spawn_task_event_with_future(
+            self.editor.runtime().work().clone(),
+            future,
+            self.ingress.clone(),
+        );
+    }
+
+    pub fn reset_idle_timer(&self) {
+        helix_runtime::send_blocking(&self.idle_reset_tx, ());
+    }
+
+    #[inline]
+    pub fn exit_task_event(
+        &mut self,
+        future: impl Future<Output = anyhow::Result<RuntimeTaskEvent>> + Send + 'static,
+    ) {
+        self.exit_tasks.push(self.exit_task_work.spawn(future));
     }
 
     /// Returns 1 if no explicit count was provided
@@ -234,37 +261,20 @@ impl Context<'_> {
         }
     }
 
-    /// Waits on all pending jobs, and then tries to flush all pending write
+    /// Waits on all pending async UI work, then tries to flush all pending write
     /// operations for all documents.
     pub fn block_try_flush_writes(&mut self) -> anyhow::Result<()> {
         compositor::Context {
             editor: self.editor,
-            jobs: self.jobs,
+            exit_tasks: self.exit_tasks,
+            exit_task_work: self.exit_task_work.clone(),
             scroll: None,
+            ingress: self.ingress.clone(),
+            idle_reset_tx: self.idle_reset_tx.clone(),
             plugin_manager: self.plugin_manager.clone(),
         }
         .block_try_flush_writes()
     }
-}
-
-#[inline]
-fn make_job_callback<T, F>(
-    call: impl Future<Output = helix_lsp::Result<T>> + 'static + Send,
-    callback: F,
-) -> std::pin::Pin<Box<impl Future<Output = Result<Callback, anyhow::Error>>>>
-where
-    T: Send + 'static,
-    F: FnOnce(&mut Editor, &mut Compositor, T) + Send + 'static,
-{
-    Box::pin(async move {
-        let response = call.await?;
-        let call: job::Callback = Callback::EditorCompositor(Box::new(
-            move |editor: &mut Editor, compositor: &mut Compositor| {
-                callback(editor, compositor, response)
-            },
-        ));
-        Ok(call)
-    })
 }
 
 use helix_view::{align_view, Align};
@@ -325,8 +335,11 @@ impl MappableCommand {
                 if let Some(command) = typed::TYPABLE_COMMAND_MAP.get(name.as_str()) {
                     let mut cx = compositor::Context {
                         editor: cx.editor,
-                        jobs: cx.jobs,
+                        exit_tasks: cx.exit_tasks,
+                        exit_task_work: cx.exit_task_work.clone(),
                         scroll: None,
+                        ingress: cx.ingress.clone(),
+                        idle_reset_tx: cx.idle_reset_tx.clone(),
                         plugin_manager: cx.plugin_manager.clone(),
                     };
                     if let Err(e) =
@@ -358,12 +371,11 @@ impl MappableCommand {
                 }
                 cx.editor.macro_replaying.push('@');
                 let keys = keys.clone();
-                cx.callback.push(Box::new(move |compositor, cx| {
-                    for key in keys.into_iter() {
-                        compositor.handle_event(&compositor::Event::Key(key), cx);
-                    }
-                    cx.editor.macro_replaying.pop();
-                }));
+                cx.callback.push(crate::compositor::PostAction::ReplayKeys {
+                    keys,
+                    count: 1,
+                    pop_macro_replaying: true,
+                });
             }
         }
     }
@@ -537,14 +549,15 @@ impl MappableCommand {
         grow_buffer_height => "Grow focused container height",
         shrink_buffer_height => "Shrink focused container height",
         toggle_focus_window => "Toggle focus mode on buffer",
-        toggle_agent_panel => "Toggle ACP agent panel",
-        acp_close => "Close ACP panel",
-        acp_chat => "Focus ACP panel and activate chat input",
-        acp_focus_messages => "Focus ACP panel message list",
-        acp_open_message => "Open selected ACP message details in current view",
-        acp_cycle_thinking => "Cycle thinking options",
-        acp_cycle_model => "Cycle model options",
-        acp_cycle_mode => "Cycle mode options",
+        assistant_panel => "Toggle assistant panel",
+        assistant_close_panel => "Close assistant panel",
+        assistant_focus_input => "Focus assistant panel and activate input",
+        assistant_focus_entries => "Focus assistant panel entry list",
+        assistant_open_entry_scratch => "Open selected assistant entry details in current view",
+        assistant_cycle_thinking => "Cycle assistant thinking options",
+        assistant_cycle_model => "Cycle assistant model options",
+        assistant_cycle_mode => "Cycle assistant mode options",
+        assistant_toggle_follow => "Toggle following for the active assistant thread",
         goto_next_buffer => "Goto next buffer",
         goto_previous_buffer => "Goto previous buffer",
         signature_help => "Show signature help",
@@ -774,372 +787,68 @@ fn toggle_focus_window(cx: &mut Context) {
     cx.editor.toggle_focus_window();
 }
 
-fn toggle_agent_panel(cx: &mut Context) {
-    use crate::commands::typed::do_acp_connect;
-    use crate::ui::acp::{AcpPanel, ID as ACP_PANEL_ID};
-    use helix_view::traits::Focusable;
-    let first_agent = cx.editor.acp_agents.iter().next();
-    let has_agent = first_agent.is_some();
-    let agent_name = first_agent.and_then(|(_, agent)| {
-        agent
-            .agent_info()
-            .map(|info| info.title.as_deref().unwrap_or(&info.name).to_string())
-    });
-    let agents = cx.editor.config().agents.clone();
-    let last_index = cx.editor.current_acp_agent_index;
-
-    cx.callback.push(Box::new(
-        move |compositor: &mut Compositor, cx: &mut crate::compositor::Context| {
-            if let Some(panel) = compositor.find_id::<AcpPanel>(ACP_PANEL_ID) {
-                panel.toggle_focus();
-            } else if has_agent {
-                let mut panel = AcpPanel::new();
-                if let Some(name) = agent_name {
-                    panel.set_agent_name(name);
-                } else {
-                    panel.set_agent_name("Agent".to_string());
-                }
-                compositor.push(Box::new(panel));
-            } else if !agents.is_empty() {
-                let idx = last_index.unwrap_or(0).min(agents.len().saturating_sub(1));
-                let agent = agents[idx].clone();
-                if let Err(e) = do_acp_connect(
-                    cx.editor,
-                    cx.jobs,
-                    agent.command,
-                    agent.args,
-                    Some(idx),
-                    false,
-                ) {
-                    cx.editor.set_error(format!("Agent failed: {e}"));
-                }
-            } else {
-                let mut panel = AcpPanel::new();
-                panel.set_agent_name("No agent".to_string());
-                compositor.push(Box::new(panel));
-            }
-        },
-    ));
+fn assistant_panel(cx: &mut Context) {
+    cx.spawn_ui(async { Ok(UiCommand::Assistant(AssistantCommand::TogglePanelFocus)) });
 }
 
-fn acp_close(cx: &mut Context) {
-    use crate::ui::acp::{AcpPanel, ID as ACP_PANEL_ID};
-    cx.callback.push(Box::new(
-        move |compositor: &mut Compositor, cx: &mut crate::compositor::Context| {
-            // Remove the model panel before removing the component so layout
-            // doesn't keep allocating space for an orphaned panel.
-            if let Some(panel) = compositor.find_id::<AcpPanel>(ACP_PANEL_ID) {
-                if let Some(id) = panel.model_panel_id() {
-                    cx.editor.model.remove_panel(id);
-                }
-            }
-            compositor.remove(ACP_PANEL_ID);
-        },
-    ));
+fn assistant_close_panel(cx: &mut Context) {
+    cx.spawn_ui(async { Ok(UiCommand::Assistant(AssistantCommand::ClosePanel)) });
 }
 
-fn acp_chat(cx: &mut Context) {
-    use crate::commands::typed::do_acp_connect;
-    use crate::ui::acp::{AcpPanel, ID as ACP_PANEL_ID};
-    let first_agent = cx.editor.acp_agents.iter().next();
-    let has_agent = first_agent.is_some();
-    let agent_name = first_agent.and_then(|(_, agent)| {
-        agent
-            .agent_info()
-            .map(|info| info.title.as_deref().unwrap_or(&info.name).to_string())
-    });
-    let agents = cx.editor.config().agents.clone();
-    let last_index = cx.editor.current_acp_agent_index;
-
-    cx.callback.push(Box::new(
-        move |compositor: &mut Compositor, cx: &mut crate::compositor::Context| {
-            if let Some(panel) = compositor.find_id::<AcpPanel>(ACP_PANEL_ID) {
-                panel.activate_input();
-            } else if has_agent {
-                let mut panel = AcpPanel::new();
-                if let Some(name) = agent_name {
-                    panel.set_agent_name(name);
-                } else {
-                    panel.set_agent_name("Agent".to_string());
-                }
-                panel.activate_input();
-                compositor.push(Box::new(panel));
-            } else if !agents.is_empty() {
-                let idx = last_index.unwrap_or(0).min(agents.len().saturating_sub(1));
-                let agent = agents[idx].clone();
-                if let Err(e) = do_acp_connect(
-                    cx.editor,
-                    cx.jobs,
-                    agent.command,
-                    agent.args,
-                    Some(idx),
-                    true,
-                ) {
-                    cx.editor.set_error(format!("Agent failed: {e}"));
-                }
-            } else {
-                let mut panel = AcpPanel::new();
-                panel.set_agent_name("No agent".to_string());
-                panel.activate_input();
-                compositor.push(Box::new(panel));
-            }
-        },
-    ));
+fn assistant_focus_input(cx: &mut Context) {
+    cx.spawn_ui(async { Ok(UiCommand::Assistant(AssistantCommand::FocusPanelInput)) });
 }
 
-fn acp_focus_messages(cx: &mut Context) {
-    use crate::commands::typed::do_acp_connect;
-    use crate::ui::acp::{AcpPanel, ID as ACP_PANEL_ID};
-    let first_agent = cx.editor.acp_agents.iter().next();
-    let has_agent = first_agent.is_some();
-    let agent_name = first_agent.and_then(|(_, agent)| {
-        agent
-            .agent_info()
-            .map(|info| info.title.as_deref().unwrap_or(&info.name).to_string())
-    });
-    let agents = cx.editor.config().agents.clone();
-    let last_index = cx.editor.current_acp_agent_index;
-
-    cx.callback.push(Box::new(
-        move |compositor: &mut Compositor, cx: &mut crate::compositor::Context| {
-            if let Some(panel) = compositor.find_id::<AcpPanel>(ACP_PANEL_ID) {
-                panel.focus_messages();
-                if panel.selected_message().is_none() {
-                    panel.select_last_message();
-                }
-            } else if has_agent {
-                let mut panel = AcpPanel::new();
-                if let Some(name) = agent_name {
-                    panel.set_agent_name(name);
-                } else {
-                    panel.set_agent_name("Agent".to_string());
-                }
-                panel.focus_messages();
-                compositor.push(Box::new(panel));
-            } else if !agents.is_empty() {
-                let idx = last_index.unwrap_or(0).min(agents.len().saturating_sub(1));
-                let agent = agents[idx].clone();
-                if let Err(e) = do_acp_connect(
-                    cx.editor,
-                    cx.jobs,
-                    agent.command,
-                    agent.args,
-                    Some(idx),
-                    true,
-                ) {
-                    cx.editor.set_error(format!("Agent failed: {e}"));
-                }
-            } else {
-                let mut panel = AcpPanel::new();
-                panel.set_agent_name("No agent".to_string());
-                panel.focus_messages();
-                compositor.push(Box::new(panel));
-            }
-        },
-    ));
+fn assistant_focus_entries(cx: &mut Context) {
+    cx.spawn_ui(async { Ok(UiCommand::Assistant(AssistantCommand::FocusPanelEntries)) });
 }
 
-fn acp_open_message(cx: &mut Context) {
-    use crate::ui::acp::{AcpPanel, ID as ACP_PANEL_ID};
-    cx.callback.push(Box::new(
-        move |compositor: &mut Compositor, cx: &mut crate::compositor::Context| {
-            let Some(panel) = compositor.find_id::<AcpPanel>(ACP_PANEL_ID) else {
-                cx.editor.set_status("ACP panel not open");
-                return;
-            };
-
-            if !panel.open_selected_message_details(cx.editor, Action::Replace) {
-                cx.editor.set_status("No ACP message selected");
-            }
-        },
-    ));
+fn assistant_open_entry_scratch(cx: &mut Context) {
+    let Some(effects) = cx.editor.open_selected_assistant_entry_scratch(Action::Replace) else {
+        cx.editor.set_status("No assistant entry selected");
+        return;
+    };
+    cx.editor.apply_assistant_effects(effects);
 }
 
-fn acp_cycle_thinking(cx: &mut Context) {
-    use crate::ui::acp::{AcpPanel, ID as ACP_PANEL_ID};
-    cx.callback.push(Box::new(
-        move |compositor: &mut Compositor, cx: &mut crate::compositor::Context| {
-            let Some(panel) = compositor.find_id::<AcpPanel>(ACP_PANEL_ID) else {
-                cx.editor.set_status("ACP panel not open");
-                return;
-            };
-            if let Some((config_id, next_value, prev_value)) = panel.cycle_config_option("thinking")
-            {
-                panel.apply_config_option_cycle("thinking", next_value.clone());
-                let agent = cx.editor.acp_agents.iter().next().map(|(_, a)| a.clone());
-                if let Some(agent) = agent {
-                    let category = "thinking".to_string();
-                    cx.jobs.callback(async move {
-                        let session_id = match agent.session_id().await {
-                            Some(id) => id,
-                            None => {
-                                let prev = prev_value.clone();
-                                return Ok(crate::job::Callback::EditorCompositor(Box::new(
-                                    move |editor, compositor| {
-                                        if let Some(panel) =
-                                            compositor.find_id::<AcpPanel>(ACP_PANEL_ID)
-                                        {
-                                            panel.apply_config_option_cycle(&category, prev);
-                                        }
-                                        editor.set_error("No session to update thinking");
-                                    },
-                                )));
-                            }
-                        };
-                        match agent
-                            .set_session_config_option(
-                                session_id,
-                                config_id.clone(),
-                                next_value.clone(),
-                            )
-                            .await
-                        {
-                            Ok(_) => {
-                                Ok(crate::job::Callback::EditorCompositor(Box::new(|_, _| {})))
-                            }
-                            Err(e) => Ok(crate::job::Callback::EditorCompositor(Box::new(
-                                move |editor, compositor| {
-                                    if let Some(panel) =
-                                        compositor.find_id::<AcpPanel>(ACP_PANEL_ID)
-                                    {
-                                        panel.apply_config_option_cycle(&category, prev_value);
-                                    }
-                                    editor.set_error(format!("Failed to set thinking: {e}"));
-                                },
-                            ))),
-                        }
-                    });
-                }
-                cx.editor.set_status("Cycled thinking");
-            } else {
-                cx.editor.set_status("No thinking options from agent");
-            }
-        },
-    ));
+fn assistant_cycle_thinking(cx: &mut Context) {
+    match cx.editor.cycle_active_assistant_config("thinking") {
+        Ok(effects) => {
+            cx.editor.apply_assistant_effects(effects);
+            cx.editor.set_status("Cycled thinking")
+        }
+        Err(err) => cx.editor.set_status(err.to_string()),
+    }
 }
 
-fn acp_cycle_model(cx: &mut Context) {
-    use crate::ui::acp::{AcpPanel, ID as ACP_PANEL_ID};
-    cx.callback.push(Box::new(
-        move |compositor: &mut Compositor, cx: &mut crate::compositor::Context| {
-            let Some(panel) = compositor.find_id::<AcpPanel>(ACP_PANEL_ID) else {
-                cx.editor.set_status("ACP panel not open");
-                return;
-            };
-            if let Some((config_id, next_value, prev_value)) = panel.cycle_config_option("model") {
-                panel.apply_config_option_cycle("model", next_value.clone());
-                let agent = cx.editor.acp_agents.iter().next().map(|(_, a)| a.clone());
-                if let Some(agent) = agent {
-                    let category = "model".to_string();
-                    cx.jobs.callback(async move {
-                        let session_id = match agent.session_id().await {
-                            Some(id) => id,
-                            None => {
-                                let prev = prev_value.clone();
-                                return Ok(crate::job::Callback::EditorCompositor(Box::new(
-                                    move |editor, compositor| {
-                                        if let Some(panel) =
-                                            compositor.find_id::<AcpPanel>(ACP_PANEL_ID)
-                                        {
-                                            panel.apply_config_option_cycle(&category, prev);
-                                        }
-                                        editor.set_error("No session to update model");
-                                    },
-                                )));
-                            }
-                        };
-                        match agent
-                            .set_session_config_option(
-                                session_id,
-                                config_id.clone(),
-                                next_value.clone(),
-                            )
-                            .await
-                        {
-                            Ok(_) => {
-                                Ok(crate::job::Callback::EditorCompositor(Box::new(|_, _| {})))
-                            }
-                            Err(e) => Ok(crate::job::Callback::EditorCompositor(Box::new(
-                                move |editor, compositor| {
-                                    if let Some(panel) =
-                                        compositor.find_id::<AcpPanel>(ACP_PANEL_ID)
-                                    {
-                                        panel.apply_config_option_cycle(&category, prev_value);
-                                    }
-                                    editor.set_error(format!("Failed to set model: {e}"));
-                                },
-                            ))),
-                        }
-                    });
-                }
-                cx.editor.set_status("Cycled model");
-            } else {
-                cx.editor.set_status("No model options from agent");
-            }
-        },
-    ));
+fn assistant_cycle_model(cx: &mut Context) {
+    match cx.editor.cycle_active_assistant_config("model") {
+        Ok(effects) => {
+            cx.editor.apply_assistant_effects(effects);
+            cx.editor.set_status("Cycled model")
+        }
+        Err(err) => cx.editor.set_status(err.to_string()),
+    }
 }
 
-fn acp_cycle_mode(cx: &mut Context) {
-    use crate::ui::acp::{AcpPanel, ID as ACP_PANEL_ID};
-    cx.callback.push(Box::new(
-        move |compositor: &mut Compositor, cx: &mut crate::compositor::Context| {
-            let Some(panel) = compositor.find_id::<AcpPanel>(ACP_PANEL_ID) else {
-                cx.editor.set_status("ACP panel not open");
-                return;
-            };
-            if let Some((config_id, next_value, prev_value)) = panel.cycle_config_option("mode") {
-                panel.apply_config_option_cycle("mode", next_value.clone());
-                let agent = cx.editor.acp_agents.iter().next().map(|(_, a)| a.clone());
-                if let Some(agent) = agent {
-                    let category = "mode".to_string();
-                    cx.jobs.callback(async move {
-                        let session_id = match agent.session_id().await {
-                            Some(id) => id,
-                            None => {
-                                let prev = prev_value.clone();
-                                return Ok(crate::job::Callback::EditorCompositor(Box::new(
-                                    move |editor, compositor| {
-                                        if let Some(panel) =
-                                            compositor.find_id::<AcpPanel>(ACP_PANEL_ID)
-                                        {
-                                            panel.apply_config_option_cycle(&category, prev);
-                                        }
-                                        editor.set_error("No session to update mode");
-                                    },
-                                )));
-                            }
-                        };
-                        match agent
-                            .set_session_config_option(
-                                session_id,
-                                config_id.clone(),
-                                next_value.clone(),
-                            )
-                            .await
-                        {
-                            Ok(_) => {
-                                Ok(crate::job::Callback::EditorCompositor(Box::new(|_, _| {})))
-                            }
-                            Err(e) => Ok(crate::job::Callback::EditorCompositor(Box::new(
-                                move |editor, compositor| {
-                                    if let Some(panel) =
-                                        compositor.find_id::<AcpPanel>(ACP_PANEL_ID)
-                                    {
-                                        panel.apply_config_option_cycle(&category, prev_value);
-                                    }
-                                    editor.set_error(format!("Failed to set mode: {e}"));
-                                },
-                            ))),
-                        }
-                    });
-                }
-                cx.editor.set_status("Cycled mode");
-            } else {
-                cx.editor.set_status("No mode options from agent");
-            }
-        },
-    ));
+fn assistant_cycle_mode(cx: &mut Context) {
+    match cx.editor.cycle_active_assistant_mode() {
+        Ok(effects) => {
+            cx.editor.apply_assistant_effects(effects);
+            cx.editor.set_status("Cycled mode")
+        }
+        Err(err) => cx.editor.set_status(err.to_string()),
+    }
+}
+
+fn assistant_toggle_follow(cx: &mut Context) {
+    match cx.editor.toggle_active_assistant_follow() {
+        Ok((status, effects)) => {
+            cx.editor.apply_assistant_effects(effects);
+            cx.editor.set_status(status)
+        }
+        Err(err) => cx.editor.set_status(err.to_string()),
+    }
 }
 
 fn goto_next_buffer(cx: &mut Context) {
@@ -1289,7 +998,11 @@ fn goto_file_impl(cx: &mut Context, action: Action) {
         let path = path::expand(&sel);
         let path = &rel_path.join(path);
         if path.is_dir() {
-            let picker = ui::file_picker(cx.editor, path.into());
+            let picker = ui::file_picker(
+                cx.editor,
+                path.into(),
+                cx.ingress.clone(),
+            );
             cx.push_layer(Box::new(overlaid(picker)));
         } else if let Err(e) = cx.editor.open(path, action) {
             cx.editor.set_error(format!("Open file failed: {:?}", e));
@@ -1307,7 +1020,8 @@ fn open_url(cx: &mut Context, url: Url, action: Action) {
         .unwrap_or_default();
 
     if url.scheme() != "file" {
-        return cx.jobs.callback(crate::open_external_url_callback(url));
+        cx.spawn_task_event(crate::open_external_url_task_event(url));
+        return;
     }
 
     let content_type = std::fs::File::open(url.path()).and_then(|file| {
@@ -1321,12 +1035,16 @@ fn open_url(cx: &mut Context, url: Url, action: Action) {
     // program as well, e.g. pdf files or images
     match content_type {
         Ok(content_inspector::ContentType::BINARY) => {
-            cx.jobs.callback(crate::open_external_url_callback(url))
+            cx.spawn_task_event(crate::open_external_url_task_event(url))
         }
         Ok(_) | Err(_) => {
             let path = &rel_path.join(url.path());
             if path.is_dir() {
-                let picker = ui::file_picker(cx.editor, path.into());
+                let picker = ui::file_picker(
+                    cx.editor,
+                    path.into(),
+                    cx.ingress.clone(),
+                );
                 cx.push_layer(Box::new(overlaid(picker)));
             } else if let Err(e) = cx.editor.open(path, action) {
                 cx.editor.set_error(format!("Open file failed: {:?}", e));
@@ -1984,6 +1702,8 @@ fn global_search(cx: &mut Context) {
         1, // contents
         [],
         config,
+        cx.editor.runtime().clone(),
+        cx.ingress.clone(),
         move |cx, FileResult { path, line_num, .. }, action| {
             let doc = match cx.editor.open(path, action) {
                 Ok(id) => doc_mut!(cx.editor, &id),
@@ -2225,6 +1945,8 @@ fn local_search_grep(cx: &mut Context) {
         1, // contents
         [],
         config,
+        cx.editor.runtime().clone(),
+        cx.ingress.clone(),
         move |cx, FileResult { path, line_num, .. }, action| {
             let doc = match cx.editor.open(path, action) {
                 Ok(id) => doc_mut!(cx.editor, &id),
@@ -2362,6 +2084,8 @@ fn local_search_fuzzy(cx: &mut Context) {
         1, // contents
         [],
         config,
+        cx.editor.runtime().clone(),
+        cx.ingress.clone(),
         move |cx, FileResult { path, line_num, .. }, action| {
             let doc = match cx.editor.open(path, action) {
                 Ok(id) => doc_mut!(cx.editor, &id),
@@ -2470,7 +2194,11 @@ fn file_picker(cx: &mut Context) {
         cx.editor.set_error("Workspace directory does not exist");
         return;
     }
-    let picker = ui::file_picker(cx.editor, root);
+    let picker = ui::file_picker(
+        cx.editor,
+        root,
+        cx.ingress.clone(),
+    );
     if cx.editor.config().file_picker.hide_preview {
         let overlay = ui::overlay::Overlay {
             content: picker,
@@ -2507,7 +2235,11 @@ fn file_picker_in_current_buffer_directory(cx: &mut Context) {
         }
     };
 
-    let picker = ui::file_picker(cx.editor, path);
+    let picker = ui::file_picker(
+        cx.editor,
+        path,
+        cx.ingress.clone(),
+    );
     cx.push_layer(Box::new(overlaid(picker)));
 }
 
@@ -2518,7 +2250,11 @@ fn file_picker_in_current_directory(cx: &mut Context) {
             .set_error("Current working directory does not exist");
         return;
     }
-    let picker = ui::file_picker(cx.editor, cwd);
+    let picker = ui::file_picker(
+        cx.editor,
+        cwd,
+        cx.ingress.clone(),
+    );
     cx.push_layer(Box::new(overlaid(picker)));
 }
 
@@ -2529,7 +2265,12 @@ fn file_explorer(cx: &mut Context) {
         return;
     }
 
-    if let Ok(picker) = ui::file_explorer(None, root, cx.editor) {
+    if let Ok(picker) = ui::file_explorer(
+        None,
+        root,
+        cx.editor,
+        cx.ingress.clone(),
+    ) {
         cx.push_layer(Box::new(overlaid(picker)));
     }
 }
@@ -2557,7 +2298,12 @@ fn file_explorer_in_current_buffer_directory(cx: &mut Context) {
         }
     };
 
-    if let Ok(picker) = ui::file_explorer(None, path, cx.editor) {
+    if let Ok(picker) = ui::file_explorer(
+        None,
+        path,
+        cx.editor,
+        cx.ingress.clone(),
+    ) {
         cx.push_layer(Box::new(overlaid(picker)));
     }
 }
@@ -2570,7 +2316,12 @@ fn file_explorer_in_current_directory(cx: &mut Context) {
         return;
     }
 
-    if let Ok(picker) = ui::file_explorer(None, cwd, cx.editor) {
+    if let Ok(picker) = ui::file_explorer(
+        None,
+        cwd,
+        cx.editor,
+        cx.ingress.clone(),
+    ) {
         cx.push_layer(Box::new(overlaid(picker)));
     }
 }
@@ -2663,7 +2414,7 @@ fn buffer_picker(cx: &mut Context) {
         0
     };
 
-    let picker = Picker::new(columns, 2, items, (), |cx, meta, action| {
+    let picker = Picker::new(columns, 2, items, (), cx.editor.runtime().clone(), cx.ingress.clone(), |cx, meta, action| {
         cx.editor.switch(meta.id, action);
     })
     .with_cursor(initial_cursor)
@@ -2780,6 +2531,8 @@ fn jumplist_picker(cx: &mut Context) {
                 .map(|(doc_id, selection)| new_meta(view, *doc_id, selection.clone()))
         }),
         (),
+        cx.editor.runtime().clone(),
+        cx.ingress.clone(),
         |cx, meta, action| {
             cx.editor.switch(meta.id, action);
             let config = cx.editor.config();
@@ -2880,6 +2633,8 @@ fn changed_file_picker(cx: &mut Context) {
             style_deleted: deleted,
             style_renamed: renamed,
         },
+        cx.editor.runtime().clone(),
+        cx.ingress.clone(),
         |cx, meta: &FileChange, action| {
             let path_to_open = meta.path();
             if let Err(e) = cx.editor.open(path_to_open, action) {
@@ -2894,6 +2649,7 @@ fn changed_file_picker(cx: &mut Context) {
     )
     .with_preview(|_editor, meta| Some((meta.path().into(), None)));
     let injector = picker.injector();
+    let ingress = cx.ingress.clone();
 
     cx.editor
         .diff_providers
@@ -2901,7 +2657,14 @@ fn changed_file_picker(cx: &mut Context) {
         .for_each_changed_file(cwd, move |change| match change {
             Ok(change) => injector.push(change).is_ok(),
             Err(err) => {
-                status::report_blocking(err);
+                let message = crate::runtime::ingress::StatusMessage::from(err);
+                helix_runtime::send_blocking(
+                    &ingress,
+                    RuntimeEvent::Status {
+                        message: message.message.into_owned(),
+                        severity: message.severity,
+                    },
+                );
                 true
             }
         });
@@ -2911,111 +2674,105 @@ fn changed_file_picker(cx: &mut Context) {
 pub fn command_palette(cx: &mut Context) {
     let register = cx.register;
     let count = cx.count;
-
-    cx.callback.push(Box::new(
-        move |compositor: &mut Compositor, cx: &mut compositor::Context| {
-            let keymap = compositor.find::<ui::EditorView>().unwrap().keymaps.map()
-                [&cx.editor.mode]
-                .reverse_map();
-
-            let mut commands: Vec<MappableCommand> = MappableCommand::builtin_commands().to_vec();
-            commands.extend(typed::TYPABLE_COMMAND_MAP.values().map(|cmd| {
-                MappableCommand::Typable {
-                    name: cmd.name.to_owned(),
-                    args: String::new(),
-                    doc: cmd.doc.to_owned(),
-                }
-            }));
-
-            if let Some(pm) = &cx.plugin_manager {
-                commands.extend(pm.get_commands().into_iter().map(|meta| {
-                    MappableCommand::Typable {
-                        name: meta.name,
-                        args: String::new(),
-                        doc: meta.doc,
-                    }
-                }));
-            }
-
-            let columns = [
-                ui::PickerColumn::new("name", |item, _| match item {
-                    MappableCommand::Typable { name, .. } => format!(":{name}").into(),
-                    MappableCommand::Engine { spec } => spec.name().into(),
-                    MappableCommand::Frontend { spec } => spec.name().into(),
-                    MappableCommand::Macro { .. } => {
-                        unreachable!("macros aren't included in the command palette")
-                    }
-                }),
-                ui::PickerColumn::new(
-                    "bindings",
-                    |item: &MappableCommand, keymap: &crate::keymap::ReverseKeymap| {
-                        keymap
-                            .get(item.name())
-                            .map(|bindings| {
-                                bindings.iter().fold(String::new(), |mut acc, bind| {
-                                    if !acc.is_empty() {
-                                        acc.push(' ');
-                                    }
-                                    for key in bind {
-                                        acc.push_str(&key.key_sequence_format());
-                                    }
-                                    acc
-                                })
-                            })
-                            .unwrap_or_default()
-                            .into()
-                    },
-                ),
-                ui::PickerColumn::new("doc", |item: &MappableCommand, _| item.doc().into()),
-            ];
-
-            let registry = compositor
-                .find::<ui::EditorView>()
-                .unwrap()
-                .registry
-                .clone();
-            let picker = Picker::new(columns, 0, commands, keymap, move |cx, command, _action| {
-                let mut ctx = Context {
-                    register,
-                    count,
-                    editor: cx.editor,
-                    registry: registry.clone(),
-                    callback: Vec::new(),
-                    on_next_key_callback: None,
-                    jobs: cx.jobs,
-                    plugin_manager: cx.plugin_manager.clone(),
-                };
-                let focus = view!(ctx.editor).id;
-
-                command.execute(&mut ctx);
-
-                if ctx.editor.tree.contains(focus) {
-                    let config = ctx.editor.config();
-                    let mode = ctx.editor.mode();
-                    let view = view_mut!(ctx.editor, focus);
-                    let doc = doc_mut!(ctx.editor, &view.doc);
-
-                    view.ensure_cursor_in_view(doc, config.scrolloff);
-
-                    if mode != Mode::Insert {
-                        doc.append_changes_to_history(view);
-                    }
-                }
-            });
-            compositor.push(Box::new(overlaid(picker)));
-        },
-    ));
+    cx.callback.push(crate::compositor::PostAction::ShowCommandPalette {
+        register,
+        count,
+    });
 }
 
 fn last_picker(cx: &mut Context) {
     // TODO: last picker does not seem to work well with buffer_picker
-    cx.callback.push(Box::new(|compositor, cx| {
-        if let Some(picker) = compositor.last_picker.take() {
-            compositor.push(picker);
-        } else {
-            cx.editor.set_error("no last picker")
-        }
+    cx.callback.push(crate::compositor::PostAction::RestoreLastPicker);
+}
+
+pub(crate) fn show_command_palette(
+    compositor: &mut Compositor,
+    cx: &mut compositor::Context,
+    register: Option<char>,
+    count: Option<NonZeroUsize>,
+) {
+    let keymap = compositor.find::<ui::EditorView>().unwrap().keymaps.map()[&cx.editor.mode].reverse_map();
+
+    let mut commands: Vec<MappableCommand> = MappableCommand::builtin_commands().to_vec();
+    commands.extend(typed::TYPABLE_COMMAND_MAP.values().map(|cmd| MappableCommand::Typable {
+        name: cmd.name.to_owned(),
+        args: String::new(),
+        doc: cmd.doc.to_owned(),
     }));
+
+    if let Some(pm) = &cx.plugin_manager {
+        commands.extend(pm.get_commands().into_iter().map(|meta| MappableCommand::Typable {
+            name: meta.name,
+            args: String::new(),
+            doc: meta.doc,
+        }));
+    }
+
+    let columns = [
+        ui::PickerColumn::new("name", |item, _| match item {
+            MappableCommand::Typable { name, .. } => format!(":{name}").into(),
+            MappableCommand::Engine { spec } => spec.name().into(),
+            MappableCommand::Frontend { spec } => spec.name().into(),
+            MappableCommand::Macro { .. } => {
+                unreachable!("macros aren't included in the command palette")
+            }
+        }),
+        ui::PickerColumn::new(
+            "bindings",
+            |item: &MappableCommand, keymap: &crate::keymap::ReverseKeymap| {
+                keymap
+                    .get(item.name())
+                    .map(|bindings| {
+                        bindings.iter().fold(String::new(), |mut acc, bind| {
+                            if !acc.is_empty() {
+                                acc.push(' ');
+                            }
+                            for key in bind {
+                                acc.push_str(&key.key_sequence_format());
+                            }
+                            acc
+                        })
+                    })
+                    .unwrap_or_default()
+                    .into()
+            },
+        ),
+        ui::PickerColumn::new("doc", |item: &MappableCommand, _| item.doc().into()),
+    ];
+
+    let registry = compositor.find::<ui::EditorView>().unwrap().registry.clone();
+    let picker = Picker::new(columns, 0, commands, keymap, cx.editor.runtime().clone(), cx.ingress.clone(), move |cx, command, _action| {
+        let mut ctx = Context {
+            register,
+            count,
+            editor: cx.editor,
+            registry: registry.clone(),
+            callback: Vec::new(),
+            on_next_key_callback: None,
+            exit_tasks: cx.exit_tasks,
+            exit_task_work: cx.exit_task_work.clone(),
+            ingress: cx.ingress.clone(),
+            idle_reset_tx: cx.idle_reset_tx.clone(),
+            plugin_manager: cx.plugin_manager.clone(),
+        };
+        let focus = view!(ctx.editor).id;
+
+        command.execute(&mut ctx);
+
+        if ctx.editor.tree.contains(focus) {
+            let config = ctx.editor.config();
+            let mode = ctx.editor.mode();
+            let view = view_mut!(ctx.editor, focus);
+            let doc = doc_mut!(ctx.editor, &view.doc);
+
+            view.ensure_cursor_in_view(doc, config.scrolloff);
+
+            if mode != Mode::Insert {
+                doc.append_changes_to_history(view);
+            }
+        }
+    });
+    compositor.push(Box::new(overlaid(picker)));
 }
 
 /// Fallback position to use for [`insert_with_indent`].
@@ -3042,7 +2799,7 @@ pub(crate) fn blame_line_impl(editor: &mut Editor, doc_id: DocumentId, cursor_li
         {
             if let Some(path) = doc.path() {
                 let tx = editor.handlers.blame.clone();
-                helix_event::send_blocking(
+                helix_runtime::send_blocking(
                     &tx,
                     helix_view::handlers::BlameEvent {
                         path: path.to_path_buf(),
@@ -3222,58 +2979,25 @@ fn insert_with_indent(cx: &mut Context, cursor_fallback: IndentFallbackPos) {
     doc.apply(&transaction, view_id);
 }
 
-// Creates an LspCallback that waits for formatting changes to be computed. When they're done,
-// it applies them, but only if the doc hasn't changed.
-//
-// TODO: provide some way to cancel this, probably as part of a more general job cancellation
-// scheme
-async fn make_format_callback(
+/// Waits for formatting changes, then returns a typed [`RuntimeTaskEvent`] for the main loop.
+///
+/// TODO: provide some way to cancel this, probably as part of a more general job cancellation
+/// scheme
+pub(crate) async fn make_format_task_event(
     doc_id: DocumentId,
     doc_version: i32,
     view_id: ViewId,
     format: impl Future<Output = Result<Transaction, FormatterError>> + Send + 'static,
     write: Option<(Option<PathBuf>, bool)>,
-) -> anyhow::Result<job::Callback> {
-    let format = format.await;
-
-    let call: job::Callback = Callback::Editor(Box::new(move |editor| {
-        if !editor.documents.contains_key(&doc_id) || !editor.tree.contains(view_id) {
-            return;
-        }
-
-        let scrolloff = editor.config().scrolloff;
-        let doc = doc_mut!(editor, &doc_id);
-        let view = view_mut!(editor, view_id);
-
-        match format {
-            Ok(format) => {
-                if doc.version() == doc_version {
-                    doc.apply(&format, view.id);
-                    doc.append_changes_to_history(view);
-                    doc.detect_indent_and_line_ending();
-                    view.ensure_cursor_in_view(doc, scrolloff);
-                } else {
-                    log::info!("discarded formatting changes because the document changed");
-                }
-            }
-            Err(err) => {
-                if write.is_none() {
-                    editor.set_error(err.to_string());
-                    return;
-                }
-                log::info!("failed to format '{}': {err}", doc.display_name());
-            }
-        }
-
-        if let Some((path, force)) = write {
-            let id = doc.id();
-            if let Err(err) = editor.save(id, path, force) {
-                editor.set_error(format!("Error saving: {}", err));
-            }
-        }
-    }));
-
-    Ok(call)
+) -> anyhow::Result<RuntimeTaskEvent> {
+    let format_result = format.await;
+    Ok(RuntimeTaskEvent::ApplyFormattingResult {
+        doc_id,
+        view_id,
+        expected_version: doc_version,
+        format_result,
+        write,
+    })
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -4161,28 +3885,28 @@ fn format_selections(cx: &mut Context) {
     let text = doc.text().clone();
     let doc_id = doc.id();
     let doc_version = doc.version();
+    let ingress = cx.ingress.clone();
 
-    tokio::spawn(async move {
+    cx.editor.runtime().work().clone().spawn(async move {
         match future.await {
             Ok(Some(res)) => {
                 let transaction =
                     helix_lsp::util::generate_transaction_from_edits(&text, res, offset_encoding);
-                job::dispatch(move |editor, _compositor| {
-                    let Some(doc) = editor.document_mut(doc_id) else {
-                        return;
-                    };
-                    // Updating a desynced document causes problems with applying the transaction
-                    if doc.version() != doc_version {
-                        return;
-                    }
-                    doc.apply(&transaction, view_id);
-                })
+                send_task_event_with(
+                    RuntimeTaskEvent::ApplyTransactionIfCurrent {
+                        doc_id,
+                        view_id,
+                        expected_version: doc_version,
+                        transaction,
+                    },
+                    ingress,
+                )
                 .await
             }
             Err(err) => log::error!("format sections failed: {err}"),
             Ok(None) => (),
         }
-    });
+    }).detach();
 }
 
 fn keep_or_remove_selections_impl(cx: &mut Context, remove: bool) {
@@ -4837,17 +4561,15 @@ async fn shell_impl_async(
         }
     };
     let output = if let Some(mut stdin) = process.stdin.take() {
-        let input_task = tokio::spawn(async move {
+        let write_input = async move {
             if let Some(input) = input {
                 helix_view::document::to_writer(&mut stdin, (encoding::UTF_8, false), &input)
                     .await?;
             }
             anyhow::Ok(())
-        });
-        let (output, _) = tokio::join! {
-            process.wait_with_output(),
-            input_task,
         };
+        let (output, input_result) = tokio::join!(process.wait_with_output(), write_input);
+        input_result?;
         output?
     } else {
         // Process has no stdin, so we just take the output
@@ -5106,17 +4828,11 @@ fn replay_macro(cx: &mut Context) {
     cx.editor.macro_replaying.push(reg);
 
     let count = cx.count();
-    cx.callback.push(Box::new(move |compositor, cx| {
-        for _ in 0..count {
-            for &key in keys.iter() {
-                compositor.handle_event(&compositor::Event::Key(key), cx);
-            }
-        }
-        // The macro under replay is cleared at the end of the callback, not in the
-        // macro replay context, or it will not correctly protect the user from
-        // replaying recursively.
-        cx.editor.macro_replaying.pop();
-    }));
+    cx.callback.push(crate::compositor::PostAction::ReplayKeys {
+        keys: keys.to_vec(),
+        count,
+        pop_macro_replaying: true,
+    });
 }
 
 fn goto_word(cx: &mut Context) {

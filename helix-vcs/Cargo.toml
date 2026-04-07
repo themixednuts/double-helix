@@ -11,7 +11,7 @@ homepage.workspace = true
 
 [dependencies]
 helix-core = { path = "../helix-core" }
-helix-event = { path = "../helix-event" }
+helix-runtime = { path = "../helix-runtime" }
 helix-stdx = { path = "../helix-stdx" }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "time", "sync", "parking_lot", "macros"] }
 parking_lot.workspace = true

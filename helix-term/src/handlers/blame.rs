@@ -1,57 +1,58 @@
-use std::{mem, time::Duration};
+use std::time::Duration;
 
 use helix_event::register_hook;
-use helix_vcs::FileBlame;
+use helix_runtime::{Clock, Debounce, Runtime, Work};
 use helix_view::{
     events::{DocumentDidOpen, EditorConfigDidChange},
     handlers::{BlameEvent, Handlers},
-    DocumentId,
 };
-use tokio::time::Instant;
 
-use crate::job;
+use crate::runtime::{send_task_event_with, RuntimeEvent, RuntimeTaskEvent};
 
-#[derive(Default)]
+#[derive(Debug)]
 pub struct BlameHandler {
-    pending_path: Option<std::path::PathBuf>,
-    doc_id: DocumentId,
-    show_blame_for_line_in_statusline: Option<u32>,
+    debounce: Debounce,
+    work: Work,
+    clock: Clock,
+    ingress: helix_runtime::Sender<RuntimeEvent>,
 }
 
-impl helix_event::AsyncHook for BlameHandler {
-    type Event = BlameEvent;
-
-    fn handle_event(
-        &mut self,
-        event: Self::Event,
-        _timeout: Option<tokio::time::Instant>,
-    ) -> Option<tokio::time::Instant> {
-        self.doc_id = event.doc_id;
-        self.show_blame_for_line_in_statusline = event.line;
-        self.pending_path = Some(event.path);
-        Some(Instant::now() + Duration::from_millis(50))
+impl BlameHandler {
+    fn new(work: Work, clock: Clock, ingress: helix_runtime::Sender<RuntimeEvent>) -> Self {
+        Self {
+            debounce: Debounce::new(Duration::from_millis(50)),
+            work,
+            clock,
+            ingress,
+        }
     }
 
-    fn finish_debounce(&mut self) {
-        let doc_id = self.doc_id;
-        let line_blame = self.show_blame_for_line_in_statusline;
-        let path = mem::take(&mut self.pending_path);
-        if let Some(path) = path {
-            job::dispatch_blocking(move |editor, _| {
-                let Some(doc) = editor.document_mut(doc_id) else {
-                    return;
-                };
-                let result = FileBlame::try_new(path);
-                doc.set_file_blame(result);
-                if !editor.config().inline_blame.auto_fetch {
-                    if let Some(line) = line_blame {
-                        crate::commands::blame_line_impl(editor, doc_id, line);
-                    } else {
-                        editor.set_status("Blame for this file is now available")
-                    }
-                }
-            });
-        }
+    fn event(&mut self, event: BlameEvent) {
+        let BlameEvent { path, doc_id, line } = event;
+        let ingress = self.ingress.clone();
+        self.debounce.restart(&self.work, &self.clock, async move {
+            send_task_event_with(
+                RuntimeTaskEvent::BlameFetchDebounced { doc_id, path, line },
+                ingress,
+            )
+            .await;
+        });
+    }
+
+    pub fn spawn(
+        runtime: Runtime,
+        ingress: helix_runtime::Sender<RuntimeEvent>,
+    ) -> helix_runtime::Sender<BlameEvent> {
+        let (tx, mut rx) = helix_runtime::channel(128);
+        let work = runtime.work().clone();
+        let clock = runtime.clock().clone();
+        work.clone().spawn(async move {
+            let mut handler = BlameHandler::new(work, clock, ingress);
+            while let Some(event) = rx.recv().await {
+                handler.event(event);
+            }
+        }).detach();
+        tx
     }
 }
 
@@ -59,7 +60,7 @@ pub(super) fn register_hooks(handlers: &Handlers) {
     let tx = handlers.blame.clone();
     register_hook!(move |event: &mut DocumentDidOpen<'_>| {
         if event.editor.config().inline_blame.auto_fetch {
-            helix_event::send_blocking(
+            helix_runtime::send_blocking(
                 &tx,
                 BlameEvent {
                     path: event.path.to_path_buf(),
@@ -80,7 +81,7 @@ pub(super) fn register_hooks(handlers: &Handlers) {
             // outdated blame
             for doc in event.editor.documents() {
                 if let Some(path) = doc.path() {
-                    helix_event::send_blocking(
+                    helix_runtime::send_blocking(
                         &tx,
                         BlameEvent {
                             path: path.to_path_buf(),

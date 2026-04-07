@@ -1,7 +1,10 @@
 //! Component model structs — frontend-agnostic state for picker, prompt, completion.
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::path::PathBuf;
+
+use crate::assistant::{context, thread};
 
 /// Picker render state — a snapshot of the visible window.
 ///
@@ -126,23 +129,44 @@ pub struct CompletionItem {
     pub kind: Option<String>,
 }
 
-// ─── ACP (Agent Client Protocol) panel ──────────────────────────────────────
+// ─── Assistant panel ─────────────────────────────────────────────────────────
 
-/// ACP panel render state — the full chat + agent state snapshot.
+/// Assistant panel render state — the full chat + agent state snapshot.
 ///
-/// The AcpPanel controller in helix-term writes this after each tick.
+/// The editor/view layer owns and publishes this derived snapshot.
 /// Frontends read it to render a chat panel with agent interactions,
-/// tool calls, plan progress, and input.
+/// tool calls, plan progress, and input without reconstructing domain state.
 #[derive(Debug, Clone, Default)]
-pub struct AcpModel {
+pub struct AssistantModel {
+    /// Open assistant session tabs.
+    pub tabs: Vec<AssistantTab>,
+    /// Current assistant history entries for the active scope.
+    pub history: Vec<AssistantHistoryEntry>,
+    /// Active thread id.
+    pub active_thread: Option<thread::Id>,
     /// Chat history entries in display order.
-    pub entries: Vec<AcpChatEntry>,
-    /// Vertical scroll offset (0 = showing newest at bottom).
-    pub scroll: u16,
-    /// Maximum scroll value (total content height - visible height).
-    pub max_scroll: u16,
+    pub entries: Vec<AssistantEntry>,
+    /// Panel viewport scroll offset (0 = showing newest at bottom).
+    pub viewport_scroll: u16,
+    /// Maximum panel viewport scroll value (total content height - visible height).
+    pub viewport_max_scroll: u16,
     /// Which chat entry is selected for copy/navigation (Normal mode).
-    pub selected_entry: Option<usize>,
+    pub selected_entry: Option<thread::EntryId>,
+    /// Active thread focus target.
+    pub focus: Option<crate::assistant::thread::Focus>,
+    /// Folded chat entries for the active thread.
+    pub folded_entries: Vec<thread::EntryId>,
+    /// Opened document mappings for active thread entries.
+    pub opened_docs: HashMap<thread::EntryId, crate::DocumentId>,
+    /// Durable active thread content scroll position.
+    pub content_scroll: usize,
+
+    /// Active assistant mode label.
+    pub mode_name: Option<String>,
+    /// Active assistant model label.
+    pub model_label: Option<String>,
+    /// Active assistant follow status.
+    pub follow: Option<AssistantFollow>,
 
     /// Agent display name (e.g. "Claude Code", "No agent").
     pub agent_name: String,
@@ -160,19 +184,388 @@ pub struct AcpModel {
 
     /// Current input text in the prompt.
     pub input: String,
+    /// Context items attached to the active thread.
+    pub context_items: Vec<AssistantContextItem>,
     /// Cursor byte-offset within `input`.
     pub input_cursor: usize,
 
     /// Optional plan/task list displayed above the input area.
-    pub plan_items: Option<Vec<AcpPlanItem>>,
+    pub plan_items: Option<Vec<AssistantPlanItem>>,
 
     /// Number of queued messages waiting to send after current turn.
     pub queued_messages: usize,
+
+    /// Terminals associated with the active thread.
+    pub terminals: Vec<AssistantTerminal>,
 }
 
-/// A chat entry in the ACP panel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssistantHeaderTone {
+    Default,
+    Active,
+    Warning,
+}
+
 #[derive(Debug, Clone)]
-pub enum AcpChatEntry {
+pub struct AssistantHeaderItem {
+    pub label: String,
+    pub tone: AssistantHeaderTone,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct AssistantHeaderModel {
+    pub leading: Vec<AssistantHeaderItem>,
+    pub trailing: Vec<AssistantHeaderItem>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssistantPlanTone {
+    Pending,
+    InProgress,
+    Completed,
+    Failed,
+}
+
+#[derive(Debug, Clone)]
+pub struct AssistantPlanRow {
+    pub icon: &'static str,
+    pub tone: AssistantPlanTone,
+    pub content: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct AssistantPlanSection {
+    pub title: &'static str,
+    pub done: usize,
+    pub total: usize,
+    pub rows: Vec<AssistantPlanRow>,
+}
+
+impl AssistantModel {
+    #[must_use]
+    pub fn focus(&self) -> thread::Focus {
+        self.focus.unwrap_or_default()
+    }
+
+    #[must_use]
+    pub fn selected_entry_id(&self) -> Option<thread::EntryId> {
+        self.selected_entry
+    }
+
+    #[must_use]
+    pub fn content_scroll(&self) -> usize {
+        self.content_scroll
+    }
+
+    #[must_use]
+    pub fn is_folded(&self, entry: thread::EntryId) -> bool {
+        self.folded_entries.contains(&entry)
+    }
+
+    #[must_use]
+    pub fn opened_doc(&self, entry: thread::EntryId) -> Option<crate::DocumentId> {
+        self.opened_docs.get(&entry).copied()
+    }
+
+    #[must_use]
+    pub fn plan_items(&self) -> Option<&[AssistantPlanItem]> {
+        self.plan_items.as_deref()
+    }
+
+    #[must_use]
+    pub fn follow_label(&self) -> Option<&'static str> {
+        self.follow.map(AssistantFollow::label)
+    }
+
+    #[must_use]
+    pub fn status_items(&self) -> Vec<AssistantStatusItem> {
+        let mut items = Vec::new();
+        if let Some(mode_name) = &self.mode_name {
+            items.push(AssistantStatusItem {
+                kind: AssistantStatusItemKind::Mode,
+                label: mode_name.clone(),
+            });
+        }
+        if let Some(model_label) = &self.model_label {
+            items.push(AssistantStatusItem {
+                kind: AssistantStatusItemKind::Model,
+                label: model_label.clone(),
+            });
+        }
+        if let Some(follow_label) = self.follow_label() {
+            items.push(AssistantStatusItem {
+                kind: AssistantStatusItemKind::Follow,
+                label: format!("follow:{follow_label}"),
+            });
+        }
+        items
+    }
+
+    #[must_use]
+    pub fn has_running_activity(&self) -> bool {
+        self.entries.iter().any(|entry| {
+            matches!(
+                &entry.kind,
+                AssistantEntryKind::ToolCall { status, .. } if status == "running"
+            )
+        }) || self.plan_items().is_some_and(|items| {
+            items
+                .iter()
+                .any(|item| item.status == AssistantPlanStatus::InProgress)
+        })
+    }
+
+    #[must_use]
+    pub fn context_line(&self) -> Option<String> {
+        if self.context_items.is_empty() {
+            return None;
+        }
+
+        Some(
+            self.context_items
+                .iter()
+                .map(|item| format!("[{}]", item.label))
+                .collect::<Vec<_>>()
+                .join(" "),
+        )
+    }
+
+    #[must_use]
+    pub fn header(&self) -> AssistantHeaderModel {
+        let mut leading = Vec::new();
+        if self.tabs.is_empty() {
+            leading.push(AssistantHeaderItem {
+                label: self.agent_name.clone(),
+                tone: AssistantHeaderTone::Default,
+            });
+        } else {
+            for tab in &self.tabs {
+                leading.push(AssistantHeaderItem {
+                    label: tab.label(),
+                    tone: if Some(tab.id) == self.active_thread {
+                        AssistantHeaderTone::Active
+                    } else if tab.unread {
+                        AssistantHeaderTone::Warning
+                    } else {
+                        AssistantHeaderTone::Default
+                    },
+                });
+            }
+        }
+
+        let mut trailing = Vec::new();
+        trailing.push(AssistantHeaderItem {
+            label: match self.focus() {
+                thread::Focus::Input => " INPUT ".to_string(),
+                thread::Focus::Messages => " MESSAGES ".to_string(),
+            },
+            tone: AssistantHeaderTone::Active,
+        });
+        if self.agent_busy {
+            trailing.push(AssistantHeaderItem {
+                label: "working".to_string(),
+                tone: AssistantHeaderTone::Warning,
+            });
+        }
+
+        AssistantHeaderModel { leading, trailing }
+    }
+
+    #[must_use]
+    pub fn plan_section(&self) -> Option<AssistantPlanSection> {
+        let items = self.plan_items()?;
+        if items.is_empty() {
+            return None;
+        }
+
+        Some(AssistantPlanSection {
+            title: "Plan",
+            done: items
+                .iter()
+                .filter(|item| item.status == AssistantPlanStatus::Completed)
+                .count(),
+            total: items.len(),
+            rows: items
+                .iter()
+                .map(|item| AssistantPlanRow {
+                    icon: item.status.icon(),
+                    tone: item.status.tone(),
+                    content: item.content.clone(),
+                })
+                .collect(),
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AssistantContextItem {
+    pub id: context::Id,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssistantStatusItemKind {
+    Mode,
+    Model,
+    Follow,
+}
+
+#[derive(Debug, Clone)]
+pub struct AssistantStatusItem {
+    pub kind: AssistantStatusItemKind,
+    pub label: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct AssistantTab {
+    pub id: thread::Id,
+    pub title: String,
+    pub run: thread::Run,
+    pub unread: bool,
+    pub follow: AssistantFollow,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssistantFollow {
+    Off,
+    On,
+    Paused,
+}
+
+impl AssistantFollow {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::On => "on",
+            Self::Paused => "paused",
+        }
+    }
+
+    #[must_use]
+    pub const fn tab_marker(self) -> &'static str {
+        match self {
+            Self::Off => "",
+            Self::On => "@",
+            Self::Paused => "|",
+        }
+    }
+}
+
+impl AssistantTab {
+    #[must_use]
+    pub fn label(&self) -> String {
+        let run = match &self.run {
+            thread::Run::Running | thread::Run::Waiting => "~",
+            thread::Run::Failed { .. } => "!",
+            thread::Run::Idle => "",
+        };
+        let unread = if self.unread { "*" } else { "" };
+        let follow = self.follow.tab_marker();
+        format!(" {run}{unread}{}{follow} ", self.title)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AssistantHistoryEntry {
+    pub id: thread::Id,
+    pub title: Option<String>,
+    pub unread: bool,
+    pub run: thread::Run,
+}
+
+#[derive(Debug, Clone)]
+pub struct AssistantTerminal {
+    pub id: String,
+    pub title: Option<String>,
+    pub state: String,
+    pub output: String,
+}
+
+/// A chat entry in the assistant panel.
+#[derive(Debug, Clone)]
+pub struct AssistantEntry {
+    pub id: thread::EntryId,
+    pub locations: usize,
+    pub kind: AssistantEntryKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssistantEntryRole {
+    User,
+    Agent,
+    Tool,
+    Status,
+    Change,
+}
+
+#[derive(Debug, Clone)]
+pub struct AssistantEntryDetailLine {
+    pub label: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct AssistantEntryDetails {
+    pub heading: String,
+    pub body: Option<String>,
+    pub lines: Vec<AssistantEntryDetailLine>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssistantEntryTone {
+    Default,
+    Inactive,
+    Focus,
+    Warning,
+    Success,
+    Error,
+}
+
+#[derive(Debug, Clone)]
+pub struct AssistantEntryRow {
+    pub leading: String,
+    pub leading_tone: AssistantEntryTone,
+    pub animate_leading: bool,
+    pub body: String,
+    pub body_tone: AssistantEntryTone,
+    pub accessory: Option<String>,
+    pub accessory_tone: AssistantEntryTone,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssistantBubbleSide {
+    Left,
+    Right,
+}
+
+#[derive(Debug, Clone)]
+pub struct AssistantBubbleMeta {
+    pub heading: String,
+    pub side: AssistantBubbleSide,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssistantTextFormat {
+    Plain,
+    Markdown,
+}
+
+#[derive(Debug, Clone)]
+pub struct AssistantBubbleDisplay {
+    pub meta: AssistantBubbleMeta,
+    pub format: AssistantTextFormat,
+    pub text: String,
+}
+
+#[derive(Debug, Clone)]
+pub enum AssistantEntryDisplay {
+    Bubble(AssistantBubbleDisplay),
+    Plain(AssistantEntryRow),
+}
+
+#[derive(Debug, Clone)]
+pub enum AssistantEntryKind {
     /// User-sent message.
     UserMessage(String),
     /// Agent response text (may contain markdown).
@@ -181,25 +574,259 @@ pub enum AcpChatEntry {
     ToolCall {
         id: String,
         name: String,
-        path: Option<String>,
         status: String,
     },
     /// Status separator (e.g. "Session started", "Connected").
     Status(String),
+    ChangeSummary {
+        files: usize,
+    },
 }
 
-/// A plan/task item displayed in the ACP panel.
+impl AssistantEntry {
+    #[must_use]
+    pub const fn is_foldable(&self) -> bool {
+        matches!(
+            self.kind,
+            AssistantEntryKind::UserMessage(_) | AssistantEntryKind::AgentText(_)
+        )
+    }
+
+    #[must_use]
+    pub const fn role(&self) -> AssistantEntryRole {
+        match self.kind {
+            AssistantEntryKind::UserMessage(_) => AssistantEntryRole::User,
+            AssistantEntryKind::AgentText(_) => AssistantEntryRole::Agent,
+            AssistantEntryKind::ToolCall { .. } => AssistantEntryRole::Tool,
+            AssistantEntryKind::Status(_) => AssistantEntryRole::Status,
+            AssistantEntryKind::ChangeSummary { .. } => AssistantEntryRole::Change,
+        }
+    }
+
+    #[must_use]
+    pub fn plain_text(&self) -> String {
+        match &self.kind {
+            AssistantEntryKind::UserMessage(message)
+            | AssistantEntryKind::AgentText(message)
+            | AssistantEntryKind::Status(message) => message.clone(),
+            AssistantEntryKind::ToolCall { id, name, status } => {
+                let mut lines = vec![
+                    format!("id: {id}"),
+                    format!("name: {name}"),
+                    format!("status: {status}"),
+                ];
+                if self.locations > 0 {
+                    lines.push(format!("locations: {}", self.locations));
+                }
+                lines.join(helix_core::NATIVE_LINE_ENDING.as_str())
+            }
+            AssistantEntryKind::ChangeSummary { files } => format!("{files} changed files"),
+        }
+    }
+
+    #[must_use]
+    pub fn details(&self, agent_name: &str) -> AssistantEntryDetails {
+        match &self.kind {
+            AssistantEntryKind::UserMessage(message) => AssistantEntryDetails {
+                heading: "user".to_string(),
+                body: Some(message.clone()),
+                lines: Vec::new(),
+            },
+            AssistantEntryKind::AgentText(message) => AssistantEntryDetails {
+                heading: agent_name.to_string(),
+                body: Some(message.clone()),
+                lines: Vec::new(),
+            },
+            AssistantEntryKind::ToolCall { id, name, status } => {
+                let mut lines = vec![
+                    AssistantEntryDetailLine {
+                        label: "id".to_string(),
+                        value: id.clone(),
+                    },
+                    AssistantEntryDetailLine {
+                        label: "status".to_string(),
+                        value: status.clone(),
+                    },
+                ];
+                if self.locations > 0 {
+                    lines.push(AssistantEntryDetailLine {
+                        label: "locations".to_string(),
+                        value: self.locations.to_string(),
+                    });
+                }
+                AssistantEntryDetails {
+                    heading: format!("tool {name}"),
+                    body: None,
+                    lines,
+                }
+            }
+            AssistantEntryKind::Status(message) => AssistantEntryDetails {
+                heading: "status".to_string(),
+                body: Some(message.clone()),
+                lines: Vec::new(),
+            },
+            AssistantEntryKind::ChangeSummary { files } => AssistantEntryDetails {
+                heading: "changes".to_string(),
+                body: Some(format!("{files} changed files")),
+                lines: Vec::new(),
+            },
+        }
+    }
+
+    #[must_use]
+    pub fn details_markdown(&self, agent_name: &str) -> String {
+        let details = self.details(agent_name);
+        let heading = match self.role() {
+            AssistantEntryRole::User => "User Message",
+            AssistantEntryRole::Agent => "Agent Message",
+            AssistantEntryRole::Tool => "Tool Call",
+            AssistantEntryRole::Status => "Status",
+            AssistantEntryRole::Change => "Change Summary",
+        };
+
+        let mut text = format!("# {heading}\n\n");
+        if let Some(body) = details.body {
+            text.push_str(&body);
+            text.push('\n');
+        }
+        for line in details.lines {
+            text.push_str(&format!("- {}: {}\n", line.label, line.value));
+        }
+        text
+    }
+
+    #[must_use]
+    pub fn plain_row(&self) -> Option<AssistantEntryRow> {
+        match &self.kind {
+            AssistantEntryKind::ToolCall { name, status, .. } => Some(AssistantEntryRow {
+                leading: format!(" {} ", Self::status_icon(status)),
+                leading_tone: Self::status_tone(status),
+                animate_leading: status == "running",
+                body: name.clone(),
+                body_tone: AssistantEntryTone::Focus,
+                accessory: Some(format!(" {status}")),
+                accessory_tone: Self::status_tone(status),
+            }),
+            AssistantEntryKind::Status(text) => Some(AssistantEntryRow {
+                leading: String::new(),
+                leading_tone: AssistantEntryTone::Inactive,
+                animate_leading: false,
+                body: format!(" {text}"),
+                body_tone: AssistantEntryTone::Inactive,
+                accessory: None,
+                accessory_tone: AssistantEntryTone::Default,
+            }),
+            AssistantEntryKind::ChangeSummary { files } => Some(AssistantEntryRow {
+                leading: String::new(),
+                leading_tone: AssistantEntryTone::Inactive,
+                animate_leading: false,
+                body: format!(" changes: {files} files"),
+                body_tone: AssistantEntryTone::Inactive,
+                accessory: None,
+                accessory_tone: AssistantEntryTone::Default,
+            }),
+            AssistantEntryKind::UserMessage(_) | AssistantEntryKind::AgentText(_) => None,
+        }
+    }
+
+    #[must_use]
+    pub fn bubble_meta(&self, agent_name: &str) -> Option<AssistantBubbleMeta> {
+        match self.role() {
+            AssistantEntryRole::User => Some(AssistantBubbleMeta {
+                heading: " you".to_string(),
+                side: AssistantBubbleSide::Right,
+            }),
+            AssistantEntryRole::Agent => Some(AssistantBubbleMeta {
+                heading: format!(" {agent_name}"),
+                side: AssistantBubbleSide::Left,
+            }),
+            AssistantEntryRole::Tool | AssistantEntryRole::Status | AssistantEntryRole::Change => {
+                None
+            }
+        }
+    }
+
+    #[must_use]
+    pub fn display(&self, agent_name: &str) -> AssistantEntryDisplay {
+        match &self.kind {
+            AssistantEntryKind::UserMessage(text) => {
+                AssistantEntryDisplay::Bubble(AssistantBubbleDisplay {
+                    meta: self.bubble_meta(agent_name).expect("user bubble metadata"),
+                    format: AssistantTextFormat::Plain,
+                    text: text.clone(),
+                })
+            }
+            AssistantEntryKind::AgentText(text) => {
+                AssistantEntryDisplay::Bubble(AssistantBubbleDisplay {
+                    meta: self.bubble_meta(agent_name).expect("agent bubble metadata"),
+                    format: AssistantTextFormat::Markdown,
+                    text: text.clone(),
+                })
+            }
+            AssistantEntryKind::ToolCall { .. }
+            | AssistantEntryKind::Status(_)
+            | AssistantEntryKind::ChangeSummary { .. } => {
+                AssistantEntryDisplay::Plain(self.plain_row().expect("plain row display"))
+            }
+        }
+    }
+
+    #[must_use]
+    pub fn status_tone(status: &str) -> AssistantEntryTone {
+        match status {
+            "running" => AssistantEntryTone::Warning,
+            "completed" | "done" => AssistantEntryTone::Success,
+            "failed" => AssistantEntryTone::Error,
+            "cancelled" => AssistantEntryTone::Inactive,
+            _ => AssistantEntryTone::Inactive,
+        }
+    }
+
+    #[must_use]
+    pub fn status_icon(status: &str) -> &'static str {
+        match status {
+            "completed" | "done" => "●",
+            "failed" => "✕",
+            "cancelled" => "–",
+            _ => "○",
+        }
+    }
+}
+
+/// A plan/task item displayed in the assistant panel.
 #[derive(Debug, Clone)]
-pub struct AcpPlanItem {
+pub struct AssistantPlanItem {
     pub content: String,
-    pub status: AcpPlanStatus,
+    pub status: AssistantPlanStatus,
 }
 
 /// Status of a plan item.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AcpPlanStatus {
+pub enum AssistantPlanStatus {
     Pending,
     InProgress,
     Completed,
     Failed,
+}
+
+impl AssistantPlanStatus {
+    #[must_use]
+    pub const fn tone(self) -> AssistantPlanTone {
+        match self {
+            Self::Pending => AssistantPlanTone::Pending,
+            Self::InProgress => AssistantPlanTone::InProgress,
+            Self::Completed => AssistantPlanTone::Completed,
+            Self::Failed => AssistantPlanTone::Failed,
+        }
+    }
+
+    #[must_use]
+    pub const fn icon(self) -> &'static str {
+        match self {
+            Self::Pending => " ○ ",
+            Self::InProgress => " ◎ ",
+            Self::Completed => " ● ",
+            Self::Failed => " ✕ ",
+        }
+    }
 }

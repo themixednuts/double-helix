@@ -2,9 +2,9 @@ use crate::{Client, Payload, Result, StackFrame};
 use futures_executor::block_on;
 use futures_util::stream::SelectAll;
 use helix_core::syntax::config::DebugAdapterConfig;
+use helix_runtime::Receiver;
 use slotmap::SlotMap;
 use std::fmt;
-use tokio_stream::wrappers::UnboundedReceiverStream;
 
 /// The resgistry is a struct that manages and owns multiple debugger clients
 /// This holds the responsibility of managing the lifecycle of each client
@@ -17,7 +17,7 @@ pub struct Registry {
     /// may need to be changed
     current_client_id: Option<DebugAdapterId>,
     /// A stream of incoming messages from all debuggers
-    pub incoming: SelectAll<UnboundedReceiverStream<(DebugAdapterId, Payload)>>,
+    pub incoming: SelectAll<Receiver<(DebugAdapterId, Payload)>>,
 }
 
 impl Registry {
@@ -48,7 +48,7 @@ impl Registry {
             };
 
             let (mut client, receiver) = result?;
-            self.incoming.push(UnboundedReceiverStream::new(receiver));
+            self.incoming.push(receiver);
 
             client.config = Some(config.clone());
             block_on(client.initialize(config.name.clone()))?;

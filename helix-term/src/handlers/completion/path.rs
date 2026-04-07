@@ -7,7 +7,7 @@ use std::{
 };
 
 use helix_core::{self as core, completion::CompletionProvider, Selection, Transaction};
-use helix_event::TaskHandle;
+use helix_runtime::Token;
 use helix_stdx::path::{self, canonicalize, fold_home_dir, get_path_suffix};
 use helix_view::{document::SavePoint, handlers::completion::ResponseContext, Document};
 use url::Url;
@@ -17,7 +17,7 @@ use crate::handlers::completion::{item::CompletionResponse, CompletionItem, Comp
 pub(crate) fn path_completion(
     selection: Selection,
     doc: &Document,
-    handle: TaskHandle,
+    cancel: Token,
     savepoint: Arc<SavePoint>,
 ) -> Option<impl FnOnce() -> CompletionResponse> {
     if !doc.path_completion_enabled() {
@@ -64,7 +64,7 @@ pub(crate) fn path_completion(
             }
         })?;
 
-    if handle.is_canceled() {
+    if cancel.is_canceled() {
         return None;
     }
 
@@ -97,7 +97,7 @@ pub(crate) fn path_completion(
                     .and_then(|md| Some((dir_entry.file_name().into_string().ok()?, md)))
             })
             .map_while(|(file_name, md)| {
-                if handle.is_canceled() {
+                if cancel.is_canceled() {
                     return None;
                 }
 

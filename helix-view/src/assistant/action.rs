@@ -1,0 +1,97 @@
+use super::{config, context, history, mode, permission, thread};
+use crate::DocumentId;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Action {
+    NewThread {
+        backend: super::backend::Id,
+        scope: thread::Scope,
+    },
+    LoadThread {
+        record: history::Record,
+        activate: bool,
+    },
+    Activate {
+        thread: thread::Id,
+    },
+    Focus {
+        thread: thread::Id,
+        focus: thread::Focus,
+    },
+    Close {
+        thread: thread::Id,
+    },
+    SelectEntry {
+        thread: thread::Id,
+        entry: Option<thread::EntryId>,
+    },
+    SetContentScroll {
+        thread: thread::Id,
+        content_scroll: usize,
+    },
+    SetFolded {
+        thread: thread::Id,
+        entry: thread::EntryId,
+        folded: bool,
+    },
+    TrackEntryDoc {
+        thread: thread::Id,
+        entry: thread::EntryId,
+        doc: DocumentId,
+    },
+    UntrackEntryDoc {
+        thread: thread::Id,
+        entry: thread::EntryId,
+    },
+    OpenEntryDoc {
+        thread: thread::Id,
+        entry: thread::EntryId,
+        action: crate::editor::Action,
+    },
+    UntrackDoc {
+        doc: DocumentId,
+    },
+    SetDraft {
+        thread: thread::Id,
+        text: String,
+    },
+    Submit {
+        thread: thread::Id,
+        text: String,
+    },
+    Cancel {
+        thread: thread::Id,
+    },
+    AttachContext {
+        thread: thread::Id,
+        item: context::Kind,
+    },
+    DetachContext {
+        thread: thread::Id,
+        item: context::Id,
+    },
+    Follow {
+        thread: thread::Id,
+    },
+    PauseFollow {
+        thread: thread::Id,
+        reason: crate::collab::FollowPause,
+    },
+    Unfollow {
+        thread: thread::Id,
+    },
+    SetMode {
+        thread: thread::Id,
+        mode: mode::Id,
+    },
+    SetConfig {
+        thread: thread::Id,
+        option: config::Id,
+        value: config::ValueId,
+    },
+    ResolvePermission {
+        thread: thread::Id,
+        request: permission::RequestId,
+        decision: permission::Decision,
+    },
+}

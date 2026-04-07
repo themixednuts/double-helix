@@ -5,6 +5,7 @@
 
 use crate::{jsonrpc, AgentId, Error, Result};
 use anyhow::Context;
+use helix_runtime::{channel, Receiver, Sender};
 use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -13,10 +14,7 @@ use std::sync::Arc;
 use tokio::{
     io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter},
     process::{ChildStderr, ChildStdin, ChildStdout},
-    sync::{
-        mpsc::{unbounded_channel, Sender, UnboundedReceiver, UnboundedSender},
-        Mutex, Notify,
-    },
+    sync::{Mutex, Notify},
 };
 
 #[derive(Debug)]
@@ -64,13 +62,9 @@ impl Transport {
         agent_stderr: BufReader<ChildStderr>,
         id: AgentId,
         name: String,
-    ) -> (
-        UnboundedReceiver<(AgentId, jsonrpc::Call)>,
-        UnboundedSender<Payload>,
-        Arc<Notify>,
-    ) {
-        let (client_tx, rx) = unbounded_channel();
-        let (tx, client_rx) = unbounded_channel();
+    ) -> (Receiver<(AgentId, jsonrpc::Call)>, Sender<Payload>, Arc<Notify>) {
+        let (client_tx, rx) = channel(256);
+        let (tx, client_rx) = channel(256);
         let notify = Arc::new(Notify::new());
 
         let transport = Arc::new(Self {
@@ -164,7 +158,7 @@ impl Transport {
     /// Route an incoming message from the agent.
     async fn process_agent_message(
         &self,
-        client_tx: &UnboundedSender<(AgentId, jsonrpc::Call)>,
+        client_tx: &Sender<(AgentId, jsonrpc::Call)>,
         msg: AgentMessage,
     ) -> Result<()> {
         match msg {
@@ -172,6 +166,7 @@ impl Transport {
             AgentMessage::Call(call) => {
                 client_tx
                     .send((self.id, call))
+                    .await
                     .context("failed to forward agent message")?;
             }
         }
@@ -203,7 +198,7 @@ impl Transport {
     async fn recv(
         transport: Arc<Self>,
         mut agent_stdout: BufReader<ChildStdout>,
-        client_tx: UnboundedSender<(AgentId, jsonrpc::Call)>,
+        client_tx: Sender<(AgentId, jsonrpc::Call)>,
     ) {
         let mut buffer = String::new();
         loop {
@@ -219,8 +214,7 @@ impl Transport {
                     info!("{} agent process closed stdout", transport.name);
                     warn!(
                         "[acp_transport] stdout closed agent={} pending_requests={}",
-                        transport.name,
-                        pending
+                        transport.name, pending
                     );
 
                     // Close all pending requests
@@ -240,7 +234,7 @@ impl Transport {
                         "[acp_transport] injecting synthetic exit notification agent={}",
                         transport.name
                     );
-                    let _ = client_tx.send((transport.id, exit));
+                    let _ = client_tx.send((transport.id, exit)).await;
                     break;
                 }
                 Err(err) => {
@@ -267,8 +261,8 @@ impl Transport {
     async fn send(
         transport: Arc<Self>,
         mut agent_stdin: BufWriter<ChildStdin>,
-        _client_tx: UnboundedSender<(AgentId, jsonrpc::Call)>,
-        mut client_rx: UnboundedReceiver<Payload>,
+        _client_tx: Sender<(AgentId, jsonrpc::Call)>,
+        mut client_rx: Receiver<Payload>,
         initialize_notify: Arc<Notify>,
     ) {
         let mut pending_messages: Vec<Payload> = Vec::new();

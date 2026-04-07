@@ -316,7 +316,7 @@ pub fn register_ui_api(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
     // helix.ui.redraw() - Force redraw
     let redraw = lua.create_function(|_lua, ()| {
         let editor = crate::lua::get_editor_mut()?;
-        editor.needs_redraw = true;
+        editor.request_redraw();
         Ok(())
     })?;
     ui_module.set("redraw", redraw)?;

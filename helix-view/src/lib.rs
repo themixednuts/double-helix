@@ -2,8 +2,10 @@
 pub mod macros;
 
 pub mod annotations;
+pub mod assistant;
 pub mod bench;
 pub mod clipboard;
+pub mod collab;
 pub mod commands;
 pub mod content_region;
 pub mod document;

@@ -54,6 +54,61 @@ impl ComponentViewState {
             object_selections: Vec::new(),
         }
     }
+
+    pub fn apply(&mut self, transaction: &Transaction, doc: &mut Document) {
+        self.history.apply(transaction, doc);
+    }
+
+    pub fn sync_changes(&mut self, doc: &mut Document) {
+        self.history.sync_changes(doc);
+    }
+
+    pub(crate) fn changes_to_sync(&mut self, doc: &mut Document) -> Option<Transaction> {
+        self.history.changes_to_sync(doc)
+    }
+}
+
+pub enum AnyViewRef<'a> {
+    Tree(&'a View),
+    Component(&'a ComponentViewState),
+}
+
+impl<'a> AnyViewRef<'a> {
+    pub fn from_editor(editor: &'a crate::Editor, view_id: ViewId) -> Self {
+        if editor.tree.contains(view_id) {
+            AnyViewRef::Tree(editor.tree.get(view_id))
+        } else {
+            AnyViewRef::Component(
+                editor
+                    .component_views
+                    .get(&view_id)
+                    .expect("component view not found"),
+            )
+        }
+    }
+}
+
+impl AnyViewRef<'_> {
+    pub fn is_tree(&self) -> bool {
+        matches!(self, Self::Tree(_))
+    }
+
+    pub fn doc_id(&self) -> DocumentId {
+        match self {
+            Self::Tree(view) => view.doc,
+            Self::Component(view) => view.doc,
+        }
+    }
+
+    pub fn as_surface_ref<'a>(
+        &'a self,
+        doc: &'a crate::Document,
+    ) -> crate::collab::surface::Ref<'a> {
+        match self {
+            Self::Tree(view) => crate::collab::surface::Ref::Tree { view, doc },
+            Self::Component(view) => crate::collab::surface::Ref::Component { view, doc },
+        }
+    }
 }
 
 pub enum AnyViewMut<'a> {
@@ -61,7 +116,26 @@ pub enum AnyViewMut<'a> {
     Component(&'a mut ComponentViewState),
 }
 
+impl<'a> AnyViewMut<'a> {
+    pub fn from_editor(editor: &'a mut crate::Editor, view_id: ViewId) -> Self {
+        if editor.tree.contains(view_id) {
+            AnyViewMut::Tree(editor.tree.get_mut(view_id))
+        } else {
+            AnyViewMut::Component(
+                editor
+                    .component_views
+                    .get_mut(&view_id)
+                    .expect("component view not found"),
+            )
+        }
+    }
+}
+
 impl AnyViewMut<'_> {
+    pub fn is_tree(&self) -> bool {
+        matches!(self, Self::Tree(_))
+    }
+
     pub fn doc_id(&self) -> DocumentId {
         match self {
             Self::Tree(view) => view.doc,
@@ -73,6 +147,30 @@ impl AnyViewMut<'_> {
         match self {
             Self::Tree(view) => &mut view.object_selections,
             Self::Component(view) => &mut view.object_selections,
+        }
+    }
+
+    pub fn as_surface_mut<'a>(
+        &'a mut self,
+        doc: &'a mut crate::Document,
+    ) -> crate::collab::surface::Mut<'a> {
+        match self {
+            Self::Tree(view) => crate::collab::surface::Mut::Tree { view, doc },
+            Self::Component(view) => crate::collab::surface::Mut::Component { view, doc },
+        }
+    }
+
+    pub fn jumps_mut(&mut self) -> &mut crate::history_state::JumpList {
+        match self {
+            Self::Tree(view) => &mut view.history.jumps,
+            Self::Component(view) => &mut view.history.jumps,
+        }
+    }
+
+    pub(crate) fn changes_to_sync(&mut self, doc: &mut Document) -> Option<Transaction> {
+        match self {
+            Self::Tree(view) => view.changes_to_sync(doc),
+            Self::Component(view) => view.changes_to_sync(doc),
         }
     }
 }
@@ -1444,6 +1542,15 @@ where
 impl crate::traits::Identified for View {
     fn id(&self) -> ViewId {
         self.id
+    }
+}
+
+impl crate::traits::Identified for AnyViewRef<'_> {
+    fn id(&self) -> ViewId {
+        match self {
+            Self::Tree(view) => view.id,
+            Self::Component(view) => view.id,
+        }
     }
 }
 

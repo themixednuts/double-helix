@@ -1,114 +1,103 @@
-use std::{
-    path::Path,
-    sync::{atomic, Arc},
-    time::Duration,
+use std::{path::Path, sync::Arc, time::Duration};
+
+use helix_runtime::{channel, Clock, Debounce, Sender, Work};
+
+use crate::{
+    runtime::{ui::command::PickerCommand, RuntimeEvent, UiCommand},
 };
 
-use helix_event::AsyncHook;
-use tokio::time::Instant;
+use super::SharedIngress;
 
-use crate::{job, ui::overlay::Overlay};
-
-use super::{CachedPreview, DynQueryCallback, Picker};
-
-pub(super) struct PreviewHighlightHandler<T: 'static + Send + Sync, D: 'static + Send + Sync> {
+pub(super) struct PreviewHighlightHandler {
     trigger: Option<Arc<Path>>,
-    phantom_data: std::marker::PhantomData<(T, D)>,
+    debounce: Debounce,
+    work: Work,
+    clock: Clock,
+    tx: Option<Sender<PreviewHighlightEvent>>,
+    ingress: SharedIngress,
 }
 
-impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Default for PreviewHighlightHandler<T, D> {
-    fn default() -> Self {
-        Self {
+enum PreviewHighlightEvent {
+    Set(Arc<Path>),
+    Flush,
+}
+
+impl PreviewHighlightHandler {
+    pub(super) fn spawn(
+        work: Work,
+        clock: Clock,
+        ingress: SharedIngress,
+    ) -> Sender<Arc<Path>> {
+        let (tx, mut rx) = channel(128);
+        let mut handler = Self {
             trigger: None,
-            phantom_data: Default::default(),
+            debounce: Debounce::new(Duration::from_millis(150)),
+            work: work.clone(),
+            clock,
+            tx: None,
+            ingress,
+        };
+        handler.tx = Some(tx.clone());
+        handler
+            .work
+            .clone()
+            .spawn(async move {
+                while let Some(event) = rx.recv().await {
+                    handler.handle_event(event);
+                }
+                handler.debounce.cancel();
+            })
+            .detach();
+        let (frontend_tx, mut frontend_rx) = channel(128);
+        work.spawn(async move {
+            while let Some(path) = frontend_rx.recv().await {
+                let _ = tx.send(PreviewHighlightEvent::Set(path)).await;
+            }
+        })
+        .detach();
+        frontend_tx
+    }
+
+    fn handle_event(&mut self, event: PreviewHighlightEvent) {
+        match event {
+            PreviewHighlightEvent::Set(path) => {
+                if self
+                    .trigger
+                    .as_ref()
+                    .is_some_and(|trigger| trigger == &path)
+                {
+                    return;
+                }
+                self.trigger = Some(path);
+                self.restart();
+            }
+            PreviewHighlightEvent::Flush => self.finish_debounce(),
         }
     }
-}
 
-impl<T: 'static + Send + Sync, D: 'static + Send + Sync> AsyncHook
-    for PreviewHighlightHandler<T, D>
-{
-    type Event = Arc<Path>;
-
-    fn handle_event(
-        &mut self,
-        path: Self::Event,
-        timeout: Option<tokio::time::Instant>,
-    ) -> Option<tokio::time::Instant> {
-        if self
-            .trigger
+    fn restart(&mut self) {
+        let tx = self
+            .tx
             .as_ref()
-            .is_some_and(|trigger| trigger == &path)
-        {
-            // If the path hasn't changed, don't reset the debounce
-            timeout
-        } else {
-            self.trigger = Some(path);
-            Some(Instant::now() + Duration::from_millis(150))
-        }
+            .expect("picker preview sender initialized")
+            .clone();
+        self.debounce.restart(&self.work, &self.clock, async move {
+            let _ = tx.send(PreviewHighlightEvent::Flush).await;
+        });
     }
 
     fn finish_debounce(&mut self) {
         let Some(path) = self.trigger.take() else {
             return;
         };
+        let ingress = (*self.ingress).clone();
 
-        job::dispatch_blocking(move |editor, compositor| {
-            let Some(Overlay {
-                content: picker, ..
-            }) = compositor.find::<Overlay<Picker<T, D>>>()
-            else {
-                return;
-            };
-
-            let Some(CachedPreview::Document(ref mut doc)) = picker.preview_cache.get_mut(&path)
-            else {
-                return;
-            };
-
-            if doc.has_syntax() {
-                return;
-            }
-
-            let Some(language) = doc.language_config().map(|config| config.language()) else {
-                return;
-            };
-
-            let loader = editor.syn_loader.load();
-            let text = doc.text().clone();
-
-            tokio::task::spawn_blocking(move || {
-                let syntax = match helix_core::Syntax::new(text.slice(..), language, &loader) {
-                    Ok(syntax) => syntax,
-                    Err(err) => {
-                        log::info!("highlighting picker preview failed: {err}");
-                        return;
-                    }
-                };
-
-                job::dispatch_blocking(move |editor, compositor| {
-                    let Some(Overlay {
-                        content: picker, ..
-                    }) = compositor.find::<Overlay<Picker<T, D>>>()
-                    else {
-                        log::info!("picker closed before syntax highlighting finished");
-                        return;
-                    };
-                    let Some(CachedPreview::Document(ref mut doc)) =
-                        picker.preview_cache.get_mut(&path)
-                    else {
-                        return;
-                    };
-                    let diagnostics = helix_view::Editor::doc_diagnostics(
-                        &editor.language_servers,
-                        &editor.diagnostics,
-                        doc,
-                    );
-                    doc.replace_diagnostics(diagnostics, &[], None);
-                    doc.set_syntax(Some(syntax));
-                });
-            });
-        });
+        helix_runtime::send_blocking(
+            &ingress,
+            RuntimeEvent::Ui(UiCommand::Picker(PickerCommand::RequestPreviewHighlight {
+                path: path.to_path_buf(),
+            })),
+        );
     }
 }
 
@@ -117,46 +106,94 @@ pub(super) struct DynamicQueryChange {
     pub is_paste: bool,
 }
 
-pub(super) struct DynamicQueryHandler<T: 'static + Send + Sync, D: 'static + Send + Sync> {
-    callback: Arc<DynQueryCallback<T, D>>,
+enum DynamicQueryEvent {
+    Change(DynamicQueryChange),
+    Flush,
+}
+
+pub(super) struct DynamicQueryHandler {
     // Duration used as a debounce.
     // Defaults to 100ms if not provided via `Picker::with_dynamic_query`. Callers may want to set
     // this higher if the dynamic query is expensive - for example global search.
     debounce: Duration,
+    timer: Debounce,
+    work: Work,
+    clock: Clock,
+    tx: Option<Sender<DynamicQueryEvent>>,
     last_query: Arc<str>,
     query: Option<Arc<str>>,
+    ingress: SharedIngress,
 }
 
-impl<T: 'static + Send + Sync, D: 'static + Send + Sync> DynamicQueryHandler<T, D> {
-    pub(super) fn new(callback: DynQueryCallback<T, D>, duration_ms: Option<u64>) -> Self {
+impl DynamicQueryHandler {
+    pub(super) fn new(duration_ms: Option<u64>, work: Work, clock: Clock, ingress: SharedIngress) -> Self {
         Self {
-            callback: Arc::new(callback),
             debounce: Duration::from_millis(duration_ms.unwrap_or(100)),
+            timer: Debounce::new(Duration::from_millis(duration_ms.unwrap_or(100))),
+            work,
+            clock,
+            tx: None,
             last_query: "".into(),
             query: None,
+            ingress,
         }
     }
-}
 
-impl<T: 'static + Send + Sync, D: 'static + Send + Sync> AsyncHook for DynamicQueryHandler<T, D> {
-    type Event = DynamicQueryChange;
-
-    fn handle_event(&mut self, change: Self::Event, _timeout: Option<Instant>) -> Option<Instant> {
-        let DynamicQueryChange { query, is_paste } = change;
-        if query == self.last_query {
-            // If the search query reverts to the last one we requested, no need to
-            // make a new request.
-            self.query = None;
-            None
-        } else {
-            self.query = Some(query);
-            if is_paste {
-                self.finish_debounce();
-                None
-            } else {
-                Some(Instant::now() + self.debounce)
+    pub(super) fn spawn(mut self) -> Sender<DynamicQueryChange> {
+        let (tx, mut rx) = channel(128);
+        self.tx = Some(tx.clone());
+        let internal_tx = tx.clone();
+        let work = self.work.clone();
+        self.work
+            .clone()
+            .spawn(async move {
+                while let Some(event) = rx.recv().await {
+                    self.handle_event(event);
+                }
+                self.timer.cancel();
+            })
+            .detach();
+        let (frontend_tx, mut frontend_rx) = channel(128);
+        work.spawn(async move {
+            while let Some(change) = frontend_rx.recv().await {
+                let _ = internal_tx.send(DynamicQueryEvent::Change(change)).await;
             }
+        })
+        .detach();
+        frontend_tx
+    }
+
+    fn handle_event(&mut self, event: DynamicQueryEvent) {
+        match event {
+            DynamicQueryEvent::Change(change) => {
+                let DynamicQueryChange { query, is_paste } = change;
+                if query == self.last_query {
+                    self.query = None;
+                    self.timer.cancel();
+                    return;
+                }
+                self.query = Some(query);
+                if is_paste {
+                    self.timer.cancel();
+                    self.finish_debounce();
+                } else {
+                    self.restart();
+                }
+            }
+            DynamicQueryEvent::Flush => self.finish_debounce(),
         }
+    }
+
+    fn restart(&mut self) {
+        let tx = self
+            .tx
+            .as_ref()
+            .expect("picker dynamic query sender initialized")
+            .clone();
+        self.timer = Debounce::new(self.debounce);
+        self.timer.restart(&self.work, &self.clock, async move {
+            let _ = tx.send(DynamicQueryEvent::Flush).await;
+        });
     }
 
     fn finish_debounce(&mut self) {
@@ -164,27 +201,11 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> AsyncHook for DynamicQu
             return;
         };
         self.last_query = query.clone();
-        let callback = self.callback.clone();
+        let ingress = (*self.ingress).clone();
 
-        job::dispatch_blocking(move |editor, compositor| {
-            let Some(Overlay {
-                content: picker, ..
-            }) = compositor.find::<Overlay<Picker<T, D>>>()
-            else {
-                return;
-            };
-            // Increment the version number to cancel any ongoing requests.
-            picker.version.fetch_add(1, atomic::Ordering::Relaxed);
-            picker.matcher.restart(false);
-            let injector = picker.injector();
-            let get_options = (callback)(&query, editor, picker.editor_data.clone(), &injector);
-            tokio::spawn(async move {
-                if let Err(err) = get_options.await {
-                    log::info!("Dynamic request failed: {err}");
-                }
-                // NOTE: the Drop implementation of Injector will request a redraw when the
-                // injector falls out of scope here, clearing the "running" indicator.
-            });
-        })
+        helix_runtime::send_blocking(
+            &ingress,
+            RuntimeEvent::Ui(UiCommand::Picker(PickerCommand::RunDynamicQuery { query })),
+        );
     }
 }

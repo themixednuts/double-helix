@@ -1,5 +1,6 @@
 use crate::{registry::DebugAdapterId, Error, Result};
 use anyhow::Context;
+use helix_runtime::{channel, Receiver, Sender};
 use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -7,10 +8,7 @@ use std::sync::Arc;
 use std::{collections::HashMap, fmt::Debug};
 use tokio::{
     io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt},
-    sync::{
-        mpsc::{unbounded_channel, Sender, UnboundedReceiver, UnboundedSender},
-        Mutex,
-    },
+    sync::Mutex,
 };
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -62,9 +60,9 @@ impl Transport {
         server_stdin: Box<dyn AsyncWrite + Unpin + Send>,
         server_stderr: Option<Box<dyn AsyncBufRead + Unpin + Send>>,
         id: DebugAdapterId,
-    ) -> (UnboundedReceiver<Payload>, UnboundedSender<Payload>) {
-        let (client_tx, rx) = unbounded_channel();
-        let (tx, client_rx) = unbounded_channel();
+    ) -> (Receiver<Payload>, Sender<Payload>) {
+        let (client_tx, rx) = channel(256);
+        let (tx, client_rx) = channel(256);
 
         let transport = Self {
             id,
@@ -202,7 +200,7 @@ impl Transport {
 
     async fn process_server_message(
         &self,
-        client_tx: &UnboundedSender<Payload>,
+        client_tx: &Sender<Payload>,
         msg: Payload,
     ) -> Result<()> {
         match msg {
@@ -220,7 +218,7 @@ impl Transport {
                     }
                     None => {
                         warn!("Response to nonexistent request #{}", res.request_seq);
-                        client_tx.send(Payload::Response(res)).expect("Failed to send");
+                        let _ = client_tx.send(Payload::Response(res)).await;
                     }
                 }
 
@@ -232,12 +230,12 @@ impl Transport {
                 ..
             }) => {
                 info!("[{}] <- DAP request {} #{}", self.id, command, seq);
-                client_tx.send(msg).expect("Failed to send");
+                let _ = client_tx.send(msg).await;
                 Ok(())
             }
             Payload::Event(ref event) => {
                 info!("[{}] <- DAP event {:?}", self.id, event);
-                client_tx.send(msg).expect("Failed to send");
+                let _ = client_tx.send(msg).await;
                 Ok(())
             }
         }
@@ -247,7 +245,7 @@ impl Transport {
         id: DebugAdapterId,
         transport: Arc<Self>,
         mut server_stdout: Box<dyn AsyncBufRead + Unpin + Send>,
-        client_tx: UnboundedSender<Payload>,
+        client_tx: Sender<Payload>,
     ) {
         let mut recv_buffer = String::new();
         let mut content_buffer = Vec::new();
@@ -289,7 +287,7 @@ impl Transport {
     async fn send_inner(
         transport: Arc<Self>,
         mut server_stdin: Box<dyn AsyncWrite + Unpin + Send>,
-        mut client_rx: UnboundedReceiver<Payload>,
+        mut client_rx: Receiver<Payload>,
     ) -> Result<()> {
         while let Some(payload) = client_rx.recv().await {
             transport
@@ -302,7 +300,7 @@ impl Transport {
     async fn send(
         transport: Arc<Self>,
         server_stdin: Box<dyn AsyncWrite + Unpin + Send>,
-        client_rx: UnboundedReceiver<Payload>,
+        client_rx: Receiver<Payload>,
     ) {
         if let Err(err) = Self::send_inner(transport, server_stdin, client_rx).await {
             error!("err: <- {:?}", err);

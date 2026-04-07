@@ -1,47 +1,16 @@
 use crate::compositor::Context;
-use crate::job::Jobs;
+use crate::runtime::ui::command::PluginCommand;
+use crate::runtime::ExitTaskSet;
+use crate::runtime::{RuntimeEvent, RuntimeTaskEvent, UiCommand};
 use crate::ui::PromptEvent;
 use helix_core::command_line::Args;
 use helix_plugin::types::{EditorCommandRegistry, UiHandler};
+use helix_runtime::{send_blocking, Sender};
 use helix_view::Editor;
 use std::sync::Arc;
-use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
-
-pub enum UiRequest {
-    Prompt {
-        message: String,
-        default: Option<String>,
-        plugin_name: String,
-        callback_id: u64,
-    },
-    Confirm {
-        message: String,
-        plugin_name: String,
-        callback_id: u64,
-    },
-    Picker {
-        items: Vec<String>,
-        prompt: String,
-        plugin_name: String,
-        callback_id: u64,
-    },
-    RegisterPanel {
-        plugin_name: String,
-        panel_id: String,
-        title: String,
-        side: String,
-        width: u16,
-        render_callback_id: u64,
-        event_callback_id: Option<u64>,
-    },
-    RemovePanel {
-        plugin_name: String,
-        panel_id: String,
-    },
-}
 
 pub struct TermUiHandler {
-    sender: UnboundedSender<UiRequest>,
+    sender: Sender<RuntimeEvent>,
 }
 
 impl UiHandler for TermUiHandler {
@@ -53,12 +22,15 @@ impl UiHandler for TermUiHandler {
         plugin_name: String,
         callback_id: u64,
     ) {
-        let _ = self.sender.send(UiRequest::Prompt {
-            message,
-            default,
-            plugin_name,
-            callback_id,
-        });
+        send_blocking(
+            &self.sender,
+            RuntimeEvent::Ui(UiCommand::Plugin(PluginCommand::Prompt {
+                message,
+                default,
+                plugin_name,
+                callback_id,
+            })),
+        );
     }
 
     fn confirm(
@@ -68,11 +40,14 @@ impl UiHandler for TermUiHandler {
         plugin_name: String,
         callback_id: u64,
     ) {
-        let _ = self.sender.send(UiRequest::Confirm {
-            message,
-            plugin_name,
-            callback_id,
-        });
+        send_blocking(
+            &self.sender,
+            RuntimeEvent::Ui(UiCommand::Plugin(PluginCommand::Confirm {
+                message,
+                plugin_name,
+                callback_id,
+            })),
+        );
     }
 
     fn picker(
@@ -83,12 +58,15 @@ impl UiHandler for TermUiHandler {
         plugin_name: String,
         callback_id: u64,
     ) {
-        let _ = self.sender.send(UiRequest::Picker {
-            items,
-            prompt,
-            plugin_name,
-            callback_id,
-        });
+        send_blocking(
+            &self.sender,
+            RuntimeEvent::Ui(UiCommand::Plugin(PluginCommand::Picker {
+                items,
+                prompt,
+                plugin_name,
+                callback_id,
+            })),
+        );
     }
 
     fn register_panel(
@@ -102,26 +80,31 @@ impl UiHandler for TermUiHandler {
         render_callback_id: u64,
         event_callback_id: Option<u64>,
     ) {
-        let _ = self.sender.send(UiRequest::RegisterPanel {
-            plugin_name,
-            panel_id,
-            title,
-            side,
-            width,
-            render_callback_id,
-            event_callback_id,
-        });
+        send_blocking(
+            &self.sender,
+            RuntimeEvent::Task(RuntimeTaskEvent::RegisterPluginPanel {
+                plugin_name,
+                panel_id,
+                title,
+                side,
+                width,
+                render_callback_id,
+                event_callback_id,
+            }),
+        );
     }
 
-    fn remove_panel(&self, _editor: &mut Editor, plugin_name: String, panel_id: String) {
-        let _ = self.sender.send(UiRequest::RemovePanel {
-            plugin_name,
-            panel_id,
-        });
+    fn remove_panel(&self, _editor: &mut Editor, _plugin_name: String, panel_id: String) {
+        send_blocking(
+            &self.sender,
+            RuntimeEvent::Task(RuntimeTaskEvent::RemovePluginPanel { panel_id }),
+        );
     }
 }
 
-pub struct TermCommandRegistry {}
+pub struct TermCommandRegistry {
+    ingress: crate::runtime::RuntimeEventSender,
+}
 
 impl EditorCommandRegistry for TermCommandRegistry {
     fn execute(
@@ -136,12 +119,16 @@ impl EditorCommandRegistry for TermCommandRegistry {
             .find(|c| c.name == name || c.aliases.contains(&name))
             .ok_or_else(|| anyhow::anyhow!("Command not found: {}", name))?;
 
-        // We need a Context. Let's try to create a minimal one.
-        let mut jobs = Jobs::new();
+        let work = editor.runtime().work().clone();
+        let exit_task_work = work;
+        let mut exit_tasks = ExitTaskSet::new();
         let mut cx = Context {
             editor,
             scroll: None,
-            jobs: &mut jobs,
+            exit_tasks: &mut exit_tasks,
+            exit_task_work,
+            ingress: self.ingress.clone(),
+            idle_reset_tx: helix_runtime::channel(1).0,
             plugin_manager: None,
         };
 
@@ -155,11 +142,10 @@ impl EditorCommandRegistry for TermCommandRegistry {
     }
 }
 
-pub fn get_registry() -> Arc<dyn EditorCommandRegistry> {
-    Arc::new(TermCommandRegistry {})
+pub fn get_registry(ingress: crate::runtime::RuntimeEventSender) -> Arc<dyn EditorCommandRegistry> {
+    Arc::new(TermCommandRegistry { ingress })
 }
 
-pub fn get_ui_handler() -> (Arc<dyn UiHandler>, UnboundedReceiver<UiRequest>) {
-    let (tx, rx) = unbounded_channel();
-    (Arc::new(TermUiHandler { sender: tx }), rx)
+pub fn get_ui_handler(ingress: crate::runtime::RuntimeEventSender) -> Arc<dyn UiHandler> {
+    Arc::new(TermUiHandler { sender: ingress })
 }

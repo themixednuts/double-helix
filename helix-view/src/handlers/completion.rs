@@ -1,16 +1,17 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, num::NonZeroU64, sync::Arc};
 
 use helix_core::completion::CompletionProvider;
-use helix_event::{send_blocking, TaskController};
+use helix_runtime::{send_blocking, Token};
 
 use crate::{document::SavePoint, DocumentId, ViewId};
 
-use tokio::sync::mpsc::Sender;
+use helix_runtime::Sender;
 
 pub struct CompletionHandler {
     event_tx: Sender<CompletionEvent>,
     pub active_completions: HashMap<CompletionProvider, ResponseContext>,
-    pub request_controller: TaskController,
+    current_request: Option<(RequestId, Token)>,
+    next_request: u64,
 }
 
 impl CompletionHandler {
@@ -18,12 +19,44 @@ impl CompletionHandler {
         Self {
             event_tx,
             active_completions: HashMap::new(),
-            request_controller: TaskController::new(),
+            current_request: None,
+            next_request: 1,
         }
     }
 
     pub fn event(&self, event: CompletionEvent) {
         send_blocking(&self.event_tx, event);
+    }
+
+    pub fn begin_request(&mut self) -> (RequestId, Token) {
+        self.cancel_request();
+        let id = RequestId::new(NonZeroU64::new(self.next_request).expect("non-zero request id"));
+        self.next_request += 1;
+        let token = Token::new();
+        self.current_request = Some((id, token.clone()));
+        (id, token)
+    }
+
+    pub fn cancel_request(&mut self) {
+        if let Some((_, token)) = self.current_request.take() {
+            token.cancel();
+        }
+    }
+
+    pub fn is_current(&self, id: RequestId) -> bool {
+        self.current_request
+            .as_ref()
+            .is_some_and(|(current, token)| *current == id && !token.is_canceled())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RequestId(NonZeroU64);
+
+impl RequestId {
+    #[must_use]
+    pub const fn new(id: NonZeroU64) -> Self {
+        Self(id)
     }
 }
 

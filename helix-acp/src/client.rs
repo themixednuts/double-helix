@@ -6,6 +6,7 @@
 use crate::{
     jsonrpc, methods, transport::Payload, types::*, AgentId, Error, Result, PROTOCOL_VERSION,
 };
+use helix_runtime::{channel, send_blocking, Receiver, Sender};
 use log::warn;
 use serde::Serialize;
 use serde_json::Value;
@@ -18,14 +19,14 @@ use std::time::Duration;
 use tokio::{
     io::{BufReader, BufWriter},
     process::{Child, Command},
-    sync::{mpsc::UnboundedSender, Mutex, Notify, OnceCell},
+    sync::{Mutex, Notify, OnceCell},
     time::timeout,
 };
 
 use crate::transport::Transport;
 
 /// Receiver for incoming agent requests/notifications from the transport.
-pub type IncomingReceiver = tokio::sync::mpsc::UnboundedReceiver<(AgentId, jsonrpc::Call)>;
+pub type IncomingReceiver = Receiver<(AgentId, jsonrpc::Call)>;
 
 /// Configuration for launching an ACP agent.
 #[derive(Debug, Clone)]
@@ -59,7 +60,7 @@ pub struct AcpAgent {
     id: AgentId,
     name: String,
     _process: Arc<Mutex<Child>>,
-    server_tx: UnboundedSender<Payload>,
+    server_tx: Sender<Payload>,
     request_counter: AtomicU64,
     capabilities: OnceCell<AgentCapabilities>,
     agent_info: OnceCell<Implementation>,
@@ -109,15 +110,11 @@ impl AcpAgent {
             match process_waiter.lock().await.wait().await {
                 Ok(status) => warn!(
                     "[acp_transport] child exited agent={} id={:?} status={:?}",
-                    process_name,
-                    process_id,
-                    status
+                    process_name, process_id, status
                 ),
                 Err(err) => warn!(
                     "[acp_transport] child wait failed agent={} id={:?} err={}",
-                    process_name,
-                    process_id,
-                    err
+                    process_name, process_id, err
                 ),
             }
         });
@@ -198,46 +195,35 @@ impl AcpAgent {
         let id = self.next_request_id();
         let method_name = method.to_string();
 
-        let rx = serde_json::to_value(params).and_then(|params| {
+        async move {
+            let params = serde_json::to_value(params).map_err(|e| Error::Other(e.into()))?;
             let request = jsonrpc::MethodCall {
                 jsonrpc: Some(jsonrpc::Version::V2),
                 id: jsonrpc::Id::Num(id),
                 method: method_name.clone(),
                 params: Self::value_into_params(params),
             };
-            let (tx, rx) = tokio::sync::mpsc::channel::<Result<Value>>(1);
+            let (tx, mut rx) = channel::<Result<Value>>(1);
             server_tx
                 .send(Payload::Request {
                     chan: tx,
                     value: request,
                 })
-                .map_err(|e| {
-                    serde_json::Error::io(std::io::Error::new(
-                        std::io::ErrorKind::BrokenPipe,
-                        e.to_string(),
-                    ))
-                })?;
-            Ok(rx)
-        });
-
-        async move {
-            let mut rx = rx.map_err(|e| Error::Other(e.into()))?;
+                .await
+                .map_err(|e| Error::Other(e.into()))?;
             let response = match timeout(Duration::from_secs(timeout_secs), rx.recv()).await {
                 Ok(Some(response)) => response,
                 Ok(None) => {
                     warn!(
                         "[acp_transport] response stream closed method={} id={}",
-                        method_name,
-                        id
+                        method_name, id
                     );
                     return Err(Error::StreamClosed);
                 }
                 Err(_) => {
                     warn!(
                         "[acp_transport] request timed out method={} id={} timeout_secs={}",
-                        method_name,
-                        id,
-                        timeout_secs
+                        method_name, id, timeout_secs
                     );
                     return Err(Error::Timeout(jsonrpc::Id::Num(id)));
                 }
@@ -247,9 +233,7 @@ impl AcpAgent {
                 Err(err) => {
                     warn!(
                         "[acp_transport] request failed method={} id={} err={:?}",
-                        method_name,
-                        id,
-                        err
+                        method_name, id, err
                     );
                     return Err(err);
                 }
@@ -274,9 +258,7 @@ impl AcpAgent {
             params: Self::value_into_params(params),
         };
 
-        if let Err(err) = self.server_tx.send(Payload::Notification(notification)) {
-            log::error!("Failed to send notification: {err}");
-        }
+        send_blocking(&self.server_tx, Payload::Notification(notification));
     }
 
     /// Send a JSON-RPC response to an agent request.
@@ -287,9 +269,7 @@ impl AcpAgent {
             id,
         });
 
-        if let Err(err) = self.server_tx.send(Payload::Response(output)) {
-            log::error!("Failed to send response: {err}");
-        }
+        send_blocking(&self.server_tx, Payload::Response(output));
     }
 
     /// Send a JSON-RPC error response to an agent request.
@@ -300,9 +280,7 @@ impl AcpAgent {
             id,
         });
 
-        if let Err(err) = self.server_tx.send(Payload::Response(output)) {
-            log::error!("Failed to send error response: {err}");
-        }
+        send_blocking(&self.server_tx, Payload::Response(output));
     }
 
     // -----------------------------------------------------------------------

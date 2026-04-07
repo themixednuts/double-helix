@@ -157,7 +157,7 @@ impl DocumentPresentationState {
             self.annotations.inlay_hints.len(),
             self.annotations.jump_labels.len(),
             self.annotations.fold_containers.len(),
-            self.annotations.plugin_annotations.len(),
+            self.annotations.plugin_annotations.len() + self.annotations.presence_annotations.len(),
         )
     }
 
@@ -212,5 +212,18 @@ impl DocumentPresentationState {
     pub fn set_plugin_annotations(&mut self, view_id: ViewId, annotations: Vec<PluginAnnotation>) {
         self.annotations
             .set_plugin_annotations(view_id, annotations);
+    }
+
+    pub fn presence_annotations(&self, view_id: ViewId) -> Option<&Vec<PluginAnnotation>> {
+        self.annotations.presence_annotations(view_id)
+    }
+
+    pub fn set_presence_annotations(
+        &mut self,
+        view_id: ViewId,
+        annotations: Vec<PluginAnnotation>,
+    ) {
+        self.annotations
+            .set_presence_annotations(view_id, annotations);
     }
 }

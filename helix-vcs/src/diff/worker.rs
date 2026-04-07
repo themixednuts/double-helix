@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use helix_core::{Rope, RopeSlice};
+use helix_runtime::{FrameHandle, Receiver};
 use imara_diff::{IndentHeuristic, IndentLevel, InternedInput};
-use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::time::{timeout, Duration};
 
 use crate::diff::{DiffInner, Event, ALGORITHM, DIFF_DEBOUNCE_TIME_MS};
@@ -15,10 +15,11 @@ use super::line_cache::InternedRopeLines;
 mod test;
 
 pub(super) struct DiffWorker {
-    pub channel: UnboundedReceiver<Event>,
+    pub channel: Receiver<Event>,
     pub diff: Arc<ArcSwap<DiffInner>>,
     pub gen: Arc<AtomicU64>,
     pub diff_alloc: imara_diff::Diff,
+    pub redraw: FrameHandle,
 }
 
 impl DiffWorker {
@@ -61,7 +62,7 @@ impl DiffWorker {
             tokio::task::block_in_place(process_accumulated_events);
 
             self.apply_hunks(interner.diff_base(), interner.doc());
-            helix_event::request_redraw();
+            let _ = self.redraw.request_redraw_async().await;
         }
     }
 
@@ -118,7 +119,7 @@ impl EventAccumulator {
         *dst = Some(event.text);
     }
 
-    async fn accumulate_debounced_events(&mut self, channel: &mut UnboundedReceiver<Event>) {
+    async fn accumulate_debounced_events(&mut self, channel: &mut Receiver<Event>) {
         let debounce = Duration::from_millis(DIFF_DEBOUNCE_TIME_MS);
         while let Ok(Some(event)) = timeout(debounce, channel.recv()).await {
             self.handle_event(event).await;

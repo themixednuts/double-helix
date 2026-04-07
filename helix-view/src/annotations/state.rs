@@ -23,6 +23,7 @@ pub struct AnnotationState {
     pub(crate) jump_labels: HashMap<ViewId, Box<[Overlay]>>,
     pub(crate) fold_containers: HashMap<ViewId, FoldContainer>,
     pub(crate) plugin_annotations: HashMap<ViewId, Vec<PluginAnnotation>>,
+    pub(crate) presence_annotations: HashMap<ViewId, Vec<PluginAnnotation>>,
     gen: u64,
 }
 
@@ -123,6 +124,19 @@ impl AnnotationState {
         self.bump();
     }
 
+    pub fn presence_annotations(&self, view_id: ViewId) -> Option<&Vec<PluginAnnotation>> {
+        self.presence_annotations.get(&view_id)
+    }
+
+    pub fn set_presence_annotations(
+        &mut self,
+        view_id: ViewId,
+        annotations: Vec<PluginAnnotation>,
+    ) {
+        self.presence_annotations.insert(view_id, annotations);
+        self.bump();
+    }
+
     // -- View cleanup -------------------------------------------------------
 
     /// Remove all annotation state for a view.
@@ -130,7 +144,8 @@ impl AnnotationState {
         let changed = self.inlay_hints.remove(&view_id).is_some()
             | self.jump_labels.remove(&view_id).is_some()
             | self.fold_containers.remove(&view_id).is_some()
-            | self.plugin_annotations.remove(&view_id).is_some();
+            | self.plugin_annotations.remove(&view_id).is_some()
+            | self.presence_annotations.remove(&view_id).is_some();
         if changed {
             self.bump();
         }
@@ -145,6 +160,7 @@ impl std::fmt::Debug for AnnotationState {
             .field("jump_labels", &self.jump_labels.len())
             .field("fold_containers", &self.fold_containers.len())
             .field("plugin_annotations", &self.plugin_annotations.len())
+            .field("presence_annotations", &self.presence_annotations.len())
             .finish()
     }
 }

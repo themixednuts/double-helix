@@ -1,4 +1,4 @@
-use crate::compositor::{Component, Compositor, Context, Event, EventResult, RenderContext};
+use crate::compositor::{Component, Context, Event, EventResult, PostAction, RenderContext};
 use crate::{alt, ctrl, key, shift, ui};
 use arc_swap::ArcSwap;
 use helix_core::syntax;
@@ -719,15 +719,10 @@ impl Component for Prompt {
         };
 
         let ui_layer_id = self.model_layer_id;
-        let close_fn =
-            EventResult::Consumed(Some(Box::new(move |compositor: &mut Compositor, cx| {
-                // remove the layer
-                compositor.pop();
-                // clean up Model layer
-                if let Some(id) = ui_layer_id {
-                    cx.editor.model.remove_layer(id);
-                }
-            })));
+        let close_fn = EventResult::Consumed(Some(PostAction::PopLayer {
+            model_layer: ui_layer_id,
+            remember_picker: false,
+        }));
 
         match event {
             ctrl!('c') | key!(Esc) => {

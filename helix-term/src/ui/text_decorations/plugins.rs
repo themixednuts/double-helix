@@ -18,7 +18,7 @@ pub struct PluginDecoration<'a> {
 impl<'a> PluginDecoration<'a> {
     pub fn new(doc: &'a Document, theme: &'a Theme, view_id: ViewId) -> Self {
         let mut anchors = Vec::new();
-        if let Some(annots) = doc.plugin_annotations(view_id) {
+        if let Some(annots) = doc.visual_annotations(view_id) {
             for annot in annots {
                 if annot.is_line {
                     anchors.push(annot.char_idx);
@@ -79,7 +79,7 @@ impl Decoration for PluginDecoration<'_> {
         let mut virt_lines_drawn = 0;
         let mut inline_col_used: u16 = 0;
 
-        if let Some(annots) = self.doc.plugin_annotations(self.view_id) {
+        if let Some(annots) = self.doc.visual_annotations(self.view_id) {
             let line_start = self.doc.text().line_to_char(pos.doc_line);
             let line_end = self.doc.text().line_to_char(pos.doc_line + 1);
 

@@ -678,6 +678,7 @@ mod tests {
                 config,
                 |c: &helix_view::editor::Config| c,
             )),
+            helix_runtime::test::runtime(),
             handlers,
         );
         editor.modal_keymaps = Some(Arc::new(ArcSwap::from_pointee(to_component_modal_keymaps(

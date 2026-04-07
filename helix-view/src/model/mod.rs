@@ -10,9 +10,14 @@
 mod models;
 
 pub use models::{
-    AcpChatEntry, AcpModel, AcpPlanItem, AcpPlanStatus, CompletionItem, CompletionModel,
-    PickerCell, PickerColumnHeader, PickerItemData, PickerModel, PickerPreview, PickerRow,
-    PromptModel,
+    AssistantBubbleDisplay, AssistantBubbleMeta, AssistantBubbleSide, AssistantContextItem,
+    AssistantEntry, AssistantEntryDetailLine, AssistantEntryDetails, AssistantEntryDisplay,
+    AssistantEntryKind, AssistantEntryRole, AssistantEntryRow, AssistantEntryTone, AssistantFollow,
+    AssistantHeaderItem, AssistantHeaderModel, AssistantHeaderTone, AssistantHistoryEntry,
+    AssistantModel, AssistantPlanItem, AssistantPlanRow, AssistantPlanSection, AssistantPlanStatus,
+    AssistantPlanTone, AssistantStatusItem, AssistantStatusItemKind, AssistantTab,
+    AssistantTerminal, AssistantTextFormat, CompletionItem, CompletionModel, PickerCell,
+    PickerColumnHeader, PickerItemData, PickerModel, PickerPreview, PickerRow, PromptModel,
 };
 // Re-export PluginPanelModel (defined here, not in models submodule)
 
@@ -58,10 +63,10 @@ pub trait PanelModel: Debug + Send + Sync + Any {
 macro_rules! impl_layer_model {
     ($ty:ty, $tag:expr) => {
         impl $crate::model::LayerModel for $ty {
-            fn as_any(&self) -> &dyn ::std::any::Any {
+            fn as_any(&self) -> &dyn::std::any::Any {
                 self
             }
-            fn as_any_mut(&mut self) -> &mut dyn ::std::any::Any {
+            fn as_any_mut(&mut self) -> &mut dyn::std::any::Any {
                 self
             }
             fn tag(&self) -> &str {
@@ -76,10 +81,10 @@ macro_rules! impl_layer_model {
 macro_rules! impl_panel_model {
     ($ty:ty, $tag:expr) => {
         impl $crate::model::PanelModel for $ty {
-            fn as_any(&self) -> &dyn ::std::any::Any {
+            fn as_any(&self) -> &dyn::std::any::Any {
                 self
             }
-            fn as_any_mut(&mut self) -> &mut dyn ::std::any::Any {
+            fn as_any_mut(&mut self) -> &mut dyn::std::any::Any {
                 self
             }
             fn tag(&self) -> &str {
@@ -98,7 +103,7 @@ crate::impl_layer_model!(PluginLayerModel, "plugin");
 
 // ─── Built-in PanelModel impls ──────────────────────────────────────────
 
-crate::impl_panel_model!(AcpModel, "acp-panel");
+crate::impl_panel_model!(AssistantModel, "assistant-panel");
 crate::impl_panel_model!(ListPanelModel, "list");
 crate::impl_panel_model!(TreePanelModel, "tree");
 crate::impl_panel_model!(BlocksPanelModel, "blocks");
@@ -112,7 +117,7 @@ pub struct Model {
     /// Ordered layer stack (bottom to top), rendered in order.
     pub layers: Vec<LayerEntry>,
 
-    /// Persistent side panels (ACP, file tree, diagnostics, etc.).
+    /// Persistent side panels (assistant, file tree, diagnostics, etc.).
     /// SlotMap for stable IDs — panels can be added/removed without index shifts.
     pub panels: SlotMap<PanelId, PanelEntry>,
 
@@ -425,7 +430,7 @@ pub enum FocusTarget {
 }
 
 // Re-export the old type alias for transition period.
-pub type ChatPanelModel = AcpModel;
+pub type ChatPanelModel = AssistantModel;
 
 #[cfg(test)]
 mod tests {
@@ -544,7 +549,7 @@ mod tests {
         let mut ui = Model::default();
         let id = ui.insert_panel(
             "Agent",
-            Box::new(AcpModel::default()),
+            Box::new(AssistantModel::default()),
             PanelSide::Right,
             PanelSize::Percent(35),
         );
@@ -558,14 +563,14 @@ mod tests {
         let mut ui = Model::default();
         let id = ui.insert_panel(
             "Agent",
-            Box::new(AcpModel::default()),
+            Box::new(AssistantModel::default()),
             PanelSide::Right,
             PanelSize::Percent(35),
         );
-        let model = ui.panel_model_mut::<AcpModel>(id).unwrap();
+        let model = ui.panel_model_mut::<AssistantModel>(id).unwrap();
         model.agent_name = "Claude Code".into();
         assert_eq!(
-            ui.panel_model_mut::<AcpModel>(id).unwrap().agent_name,
+            ui.panel_model_mut::<AssistantModel>(id).unwrap().agent_name,
             "Claude Code"
         );
     }

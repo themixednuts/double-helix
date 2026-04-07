@@ -1,7 +1,7 @@
 use helix_core::syntax;
 use helix_core::text_annotations::InlineAnnotation;
 use helix_core::{Assoc, ChangeSet};
-use helix_event::{TaskController, TaskHandle};
+use helix_runtime::Token;
 
 #[derive(Debug, Clone, Default)]
 pub struct DocumentColorSwatches {
@@ -14,17 +14,25 @@ pub struct DocumentColorSwatches {
 pub struct DocumentLspState {
     previous_diagnostic_id: Option<String>,
     color_swatches: Option<DocumentColorSwatches>,
-    color_swatch_controller: TaskController,
-    pull_diagnostic_controller: TaskController,
+    color_swatch_cancel: Option<Token>,
+    pull_diagnostic_cancel: Option<Token>,
 }
 
 impl DocumentLspState {
-    pub fn restart_pull_diagnostics(&mut self) -> TaskHandle {
-        self.pull_diagnostic_controller.restart()
+    pub fn restart_pull_diagnostics(&mut self) -> Token {
+        self.cancel_pull_diagnostics();
+        let token = Token::new();
+        self.pull_diagnostic_cancel = Some(token.clone());
+        token
     }
 
     pub fn cancel_pull_diagnostics(&mut self) -> bool {
-        self.pull_diagnostic_controller.cancel()
+        let Some(token) = self.pull_diagnostic_cancel.take() else {
+            return false;
+        };
+        let was_active = !token.is_canceled();
+        token.cancel();
+        was_active
     }
 
     pub fn previous_diagnostic_id(&self) -> Option<&str> {
@@ -35,12 +43,20 @@ impl DocumentLspState {
         self.previous_diagnostic_id = previous_diagnostic_id;
     }
 
-    pub fn restart_color_swatches(&mut self) -> TaskHandle {
-        self.color_swatch_controller.restart()
+    pub fn restart_color_swatches(&mut self) -> Token {
+        self.cancel_color_swatches();
+        let token = Token::new();
+        self.color_swatch_cancel = Some(token.clone());
+        token
     }
 
     pub fn cancel_color_swatches(&mut self) -> bool {
-        self.color_swatch_controller.cancel()
+        let Some(token) = self.color_swatch_cancel.take() else {
+            return false;
+        };
+        let was_active = !token.is_canceled();
+        token.cancel();
+        was_active
     }
 
     pub fn color_swatches(&self) -> Option<&DocumentColorSwatches> {

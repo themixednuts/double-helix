@@ -37,7 +37,9 @@ macro_rules! component_traits {
 }
 
 use crate::render::{CacheStore, PreparedRender, RenderOutput};
+use crate::runtime::ingress::RuntimeEvent;
 use helix_core::Position;
+use helix_runtime::Sender as IngressSender;
 use helix_view::bench::log_run_phase;
 use helix_view::graphics::{CursorKind, Rect};
 use helix_view::input::{MouseButton, MouseEvent, MouseEventKind};
@@ -45,16 +47,39 @@ use helix_view::model::{PanelId, PanelSide, PanelSize};
 
 use tui::buffer::Buffer as Surface;
 
-pub type Callback = Box<dyn FnOnce(&mut Compositor, &mut Context) + Send>;
-pub type SyncCallback = Box<dyn FnOnce(&mut Compositor, &mut Context) + Send + Sync>;
+pub enum PostAction {
+    PopLayer {
+        model_layer: Option<helix_view::model::LayerId>,
+        remember_picker: bool,
+    },
+    RemoveById(&'static str),
+    PushLayer(Box<dyn Component>),
+    ReplaceOrPushLayer {
+        id: &'static str,
+        layer: Box<dyn Component>,
+    },
+    UpdateCompletionFilter(Option<char>),
+    ClearCompletion,
+    ShowCommandPalette {
+        register: Option<char>,
+        count: Option<std::num::NonZeroUsize>,
+    },
+    RestoreLastPicker,
+    ReplayKeys {
+        keys: Vec<helix_view::input::KeyEvent>,
+        count: usize,
+        pop_macro_replaying: bool,
+    },
+    Batch(Vec<PostAction>),
+}
 
 // Cursive-inspired
 pub enum EventResult {
-    Ignored(Option<Callback>),
-    Consumed(Option<Callback>),
+    Ignored(Option<PostAction>),
+    Consumed(Option<PostAction>),
 }
 
-use crate::job::Jobs;
+use crate::runtime::ExitTaskSet;
 use crate::ui::picker;
 use helix_view::keyboard::{KeyCode, KeyModifiers};
 use helix_view::Editor;
@@ -197,15 +222,74 @@ pub enum LayoutRole {
 pub struct Context<'a> {
     pub editor: &'a mut Editor,
     pub scroll: Option<usize>,
-    pub jobs: &'a mut Jobs,
+    /// Exit-bound task sink for compositor-owned flows that must finish typed task work.
+    pub exit_tasks: &'a mut ExitTaskSet,
+    pub exit_task_work: helix_runtime::Work,
+    /// When `Some`, async work can send [`RuntimeEvent`] without the process-global ingress cell.
+    pub ingress: IngressSender<RuntimeEvent>,
+    pub idle_reset_tx: helix_runtime::Sender<()>,
     pub plugin_manager: Option<std::sync::Arc<PluginManager>>,
 }
 
 impl Context<'_> {
-    /// Waits on all pending jobs, and then tries to flush all pending write
+    pub fn spawn_ui(
+        &mut self,
+        future: impl std::future::Future<Output = anyhow::Result<crate::runtime::UiCommand>>
+            + Send
+            + 'static,
+    ) {
+        crate::runtime::ingress::spawn_ui_command_with_future(
+            self.editor.runtime().work().clone(),
+            future,
+            self.ingress.clone(),
+        );
+    }
+
+    pub fn spawn_task_event(
+        &mut self,
+        future: impl std::future::Future<Output = anyhow::Result<crate::runtime::RuntimeTaskEvent>>
+            + Send
+            + 'static,
+    ) {
+        crate::runtime::ingress::spawn_task_event_with_future(
+            self.editor.runtime().work().clone(),
+            future,
+            self.ingress.clone(),
+        );
+    }
+
+    pub fn reset_idle_timer(&self) {
+        helix_runtime::send_blocking(&self.idle_reset_tx, ());
+    }
+
+    pub fn exit_task_event(
+        &mut self,
+        future: impl std::future::Future<Output = anyhow::Result<crate::runtime::RuntimeTaskEvent>>
+            + Send
+            + 'static,
+    ) {
+        self.exit_tasks.push(self.exit_task_work.spawn(future));
+    }
+
+    /// Waits on all pending async UI work, then tries to flush all pending write
     /// operations for all documents.
     pub fn block_try_flush_writes(&mut self) -> anyhow::Result<()> {
-        tokio::task::block_in_place(|| helix_lsp::block_on(self.jobs.finish(self.editor, None)))?;
+        log::debug!("waiting on pending exit-bound task work...");
+        let results = tokio::task::block_in_place(|| {
+            helix_lsp::block_on(std::mem::take(self.exit_tasks).drain())
+        });
+        for result in results {
+            let plugin_manager = self
+                .plugin_manager
+                .clone()
+                .expect("plugin manager must be available when flushing exit tasks");
+            crate::effect::apply_exit_task_result(
+                self.editor,
+                self.ingress.clone(),
+                plugin_manager,
+                result,
+            )?;
+        }
         tokio::task::block_in_place(|| helix_lsp::block_on(self.editor.flush_writes()))?;
         Ok(())
     }
@@ -218,6 +302,7 @@ pub struct RenderContext<'a> {
     /// Scroll offset communicated from parent (e.g. Popup) to child during render.
     /// Uses `AtomicUsize` for Sync-safe interior mutability. `usize::MAX` = None.
     scroll: std::sync::atomic::AtomicUsize,
+    pub ingress: IngressSender<RuntimeEvent>,
     pub plugin_manager: Option<std::sync::Arc<PluginManager>>,
 }
 
@@ -334,6 +419,27 @@ pub trait Component: Any + AnyComponent + Send {
     fn as_scrollable(&mut self) -> Option<&mut dyn helix_view::traits::Scrollable> {
         None
     }
+
+    fn as_picker_component(&mut self) -> Option<&mut dyn PickerComponent> {
+        None
+    }
+}
+
+pub trait PickerComponent {
+    fn request_preview_highlight(
+        &mut self,
+        editor: &mut Editor,
+        path: std::path::PathBuf,
+    );
+
+    fn apply_preview_syntax(
+        &mut self,
+        editor: &mut Editor,
+        path: std::path::PathBuf,
+        syntax: helix_core::Syntax,
+    );
+
+    fn run_dynamic_query(&mut self, editor: &mut Editor, query: std::sync::Arc<str>);
 }
 
 pub struct Compositor {
@@ -455,7 +561,7 @@ impl Compositor {
             }
         }
 
-        let mut callbacks = Vec::new();
+        let mut post_actions = Vec::new();
         let mut consumed = false;
 
         // propagate events through the layers until we either find a layer that consumes it or we
@@ -493,7 +599,7 @@ impl Compositor {
                     EventResult::Ignored(None) => "ignored",
                 };
                 warn!(
-                    "[acp_dispatch] key={:?} mods={:?} layer_id={} type={} focused={} result={}",
+                    "[assistant_dispatch] key={:?} mods={:?} layer_id={} type={} focused={} result={}",
                     key.code,
                     key.modifiers,
                     layer.id().unwrap_or("-"),
@@ -509,7 +615,7 @@ impl Compositor {
                     EventResult::Ignored(None) => "ignored",
                 };
                 warn!(
-                    "[acp_dispatch] mouse={:?} col={} row={} layer_id={} type={} focused={} result={}",
+                    "[assistant_dispatch] mouse={:?} col={} row={} layer_id={} type={} focused={} result={}",
                     mouse.kind,
                     mouse.column,
                     mouse.row,
@@ -520,8 +626,8 @@ impl Compositor {
                 );
             }
             match result {
-                EventResult::Consumed(Some(callback)) => {
-                    callbacks.push(callback);
+                EventResult::Consumed(Some(action)) => {
+                    post_actions.push(action);
                     consumed = true;
                     break;
                 }
@@ -529,15 +635,15 @@ impl Compositor {
                     consumed = true;
                     break;
                 }
-                EventResult::Ignored(Some(callback)) => {
-                    callbacks.push(callback);
+                EventResult::Ignored(Some(action)) => {
+                    post_actions.push(action);
                 }
                 EventResult::Ignored(None) => {}
             };
         }
 
-        for callback in callbacks {
-            callback(self, cx)
+        for action in post_actions {
+            self.apply_post_action(cx, action);
         }
 
         consumed
@@ -593,6 +699,82 @@ impl Compositor {
                             was,
                         );
                     }
+                }
+            }
+        }
+    }
+
+    fn apply_post_action(&mut self, cx: &mut Context, action: PostAction) {
+        match action {
+            PostAction::PopLayer {
+                model_layer,
+                remember_picker,
+            } => {
+                if remember_picker {
+                    self.last_picker = self.pop();
+                } else {
+                    self.pop();
+                }
+                if let Some(id) = model_layer {
+                    cx.editor.model.remove_layer(id);
+                }
+            }
+            PostAction::RemoveById(id) => {
+                self.remove(id);
+            }
+            PostAction::PushLayer(layer) => self.push(layer),
+            PostAction::ReplaceOrPushLayer { id, layer } => {
+                self.remove(id);
+                self.push(layer);
+            }
+            PostAction::UpdateCompletionFilter(c) => {
+                let editor_view = self.find::<crate::ui::EditorView>().unwrap();
+                if let Some(completion) = &mut editor_view.completion {
+                    completion.update_filter(c);
+                    if completion.is_empty() || c.is_some_and(|c| !helix_core::chars::char_is_word(c)) {
+                        editor_view.clear_completion(cx.editor);
+                        if c.is_some() {
+                            crate::handlers::completion::trigger_auto_completion(cx.editor, false);
+                        }
+                    } else {
+                        crate::ui::completion_ingress::request_incomplete_completion_list(
+                            cx.editor,
+                            cx.ingress.clone(),
+                        );
+                    }
+                }
+            }
+            PostAction::ClearCompletion => {
+                let editor_view = self.find::<crate::ui::EditorView>().unwrap();
+                editor_view.clear_completion(cx.editor);
+            }
+            PostAction::ShowCommandPalette { register, count } => {
+                crate::commands::show_command_palette(self, cx, register, count);
+            }
+            PostAction::RestoreLastPicker => {
+                if let Some(picker) = self.last_picker.take() {
+                    self.push(picker);
+                } else {
+                    cx.editor.set_error("no last picker")
+                }
+            }
+            PostAction::ReplayKeys {
+                keys,
+                count,
+                pop_macro_replaying,
+            } => {
+                for _ in 0..count {
+                    for key in &keys {
+                        self.handle_event(&Event::Key(*key), cx);
+                    }
+                }
+                if pop_macro_replaying {
+                    cx.editor.macro_replaying.pop();
+                }
+            }
+            PostAction::Batch(actions) => {
+                for action in actions {
+                    self.apply_post_action(cx, action);
                 }
             }
         }
@@ -733,6 +915,7 @@ impl Compositor {
         let render_ctx = RenderContext {
             editor: cx.editor,
             scroll: std::sync::atomic::AtomicUsize::new(cx.scroll.unwrap_or(SCROLL_NONE)),
+            ingress: cx.ingress.clone(),
             plugin_manager: cx.plugin_manager.clone(),
         };
 
@@ -869,6 +1052,13 @@ impl Compositor {
             .and_then(|component| component.as_any_mut().downcast_mut())
     }
 
+    pub fn find_picker(&mut self) -> Option<&mut dyn PickerComponent> {
+        self.layers
+            .iter_mut()
+            .find(|component| component.id() == Some(crate::ui::picker::ID))
+            .and_then(|component| component.as_picker_component())
+    }
+
     pub fn need_full_redraw(&mut self) {
         self.full_redraw = true;
     }
@@ -973,7 +1163,7 @@ impl dyn AnyComponent {
 mod tests {
     use super::*;
     use arc_swap::ArcSwap;
-    use helix_view::model::AcpModel;
+    use helix_view::model::AssistantModel;
     use std::sync::Arc;
 
     fn test_editor(width: u16, height: u16) -> Editor {
@@ -990,6 +1180,7 @@ mod tests {
                 config,
                 |c: &helix_view::editor::Config| c,
             )),
+            helix_runtime::test::runtime(),
             handlers,
         )
     }
@@ -998,8 +1189,8 @@ mod tests {
     async fn panel_layout_right_percent35_splits_correctly() {
         let mut editor = test_editor(120, 40);
         editor.model.insert_panel(
-            "ACP",
-            Box::new(AcpModel::default()),
+            "Assistant",
+            Box::new(AssistantModel::default()),
             PanelSide::Right,
             PanelSize::Percent(35),
         );
@@ -1018,8 +1209,8 @@ mod tests {
     async fn panel_layout_right_hidden_when_narrow() {
         let mut editor = test_editor(50, 24);
         editor.model.insert_panel(
-            "ACP",
-            Box::new(AcpModel::default()),
+            "Assistant",
+            Box::new(AssistantModel::default()),
             PanelSide::Right,
             PanelSize::Percent(35),
         );
@@ -1034,8 +1225,8 @@ mod tests {
     async fn panel_layout_uses_panel_id_not_string() {
         let mut editor = test_editor(120, 40);
         let panel_id = editor.model.insert_panel(
-            "ACP",
-            Box::new(AcpModel::default()),
+            "Assistant",
+            Box::new(AssistantModel::default()),
             PanelSide::Right,
             PanelSize::Percent(35),
         );
@@ -1051,8 +1242,8 @@ mod tests {
     async fn panel_layout_editor_area_never_zero() {
         let mut editor = test_editor(80, 24);
         editor.model.insert_panel(
-            "ACP",
-            Box::new(AcpModel::default()),
+            "Assistant",
+            Box::new(AssistantModel::default()),
             PanelSide::Right,
             PanelSize::Percent(90),
         );

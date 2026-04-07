@@ -2,9 +2,8 @@ use crate::handlers::completion::LspCompletionItem;
 use crate::ui::{menu, Markdown, Menu, Popup, PromptEvent};
 use crate::{
     compositor::{Component, Context, Event, EventResult, RenderContext},
-    handlers::completion::{
-        trigger_auto_completion, CompletionItem, CompletionResponse, ResolveHandler,
-    },
+    handlers::completion::{CompletionItem, CompletionResponse, ResolveHandler},
+    ui::completion_ingress::trigger_auto_completion,
 };
 use helix_core::snippets::{RenderedSnippet, Snippet};
 use helix_core::{self as core, chars, fuzzy::MATCHER, Change, Transaction};
@@ -184,7 +183,13 @@ pub struct Completion {
 impl Completion {
     pub const ID: &'static str = "completion";
 
-    pub fn new(editor: &Editor, items: Vec<CompletionItem>, trigger_offset: usize) -> Self {
+    pub fn new(
+        editor: &Editor,
+        items: Vec<CompletionItem>,
+        trigger_offset: usize,
+        runtime: helix_runtime::Runtime,
+        ingress: helix_runtime::Sender<crate::runtime::RuntimeEvent>,
+    ) -> Self {
         let preview_completion_insert = editor.config().preview_completion_insert;
         let replace_mode = editor.config().completion_replace;
 
@@ -374,7 +379,7 @@ impl Completion {
             // TODO: expand nucleo api to allow moving straight to a Utf32String here
             // and avoid allocation during matching
             filter: String::from(fragment),
-            resolve_handler: ResolveHandler::new(),
+            resolve_handler: ResolveHandler::new(runtime, ingress),
             model_layer_id: None,
         };
 

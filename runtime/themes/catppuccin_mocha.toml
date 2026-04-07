@@ -77,12 +77,12 @@
 "ui.statusline.insert" = { fg = "base", bg = "green", modifiers = ["bold"] }
 "ui.statusline.select" = { fg = "base", bg = "lavender", modifiers = ["bold"] }
 
-"ui.acp.agent" = { fg = "base", bg = "rosewater", modifiers = ["bold"] }
-"ui.acp.model" = { fg = "base", bg = "rosewater", modifiers = ["bold"] }
-"ui.acp.thinking" = { fg = "base", bg = "green", modifiers = ["bold"] }
-"ui.acp.mode" = { fg = "base", bg = "lavender", modifiers = ["bold"] }
-"ui.acp.user_bubble" = { bg = "surface1" }
-"ui.acp.agent_bubble" = { bg = "surface2" }
+"ui.assistant.agent" = { fg = "base", bg = "rosewater", modifiers = ["bold"] }
+"ui.assistant.model" = { fg = "base", bg = "rosewater", modifiers = ["bold"] }
+"ui.assistant.thinking" = { fg = "base", bg = "green", modifiers = ["bold"] }
+"ui.assistant.mode" = { fg = "base", bg = "lavender", modifiers = ["bold"] }
+"ui.assistant.user_bubble" = { bg = "surface1" }
+"ui.assistant.agent_bubble" = { bg = "surface2" }
 
 "ui.popup" = { fg = "text", bg = "surface0" }
 "ui.window" = { fg = "crust" }

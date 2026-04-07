@@ -1,14 +1,18 @@
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-use helix_core::syntax;
+use helix_core::{syntax, Rope};
 use helix_lsp::lsp;
+use helix_view::editor::Action;
 use helix_view::graphics::{Margin, Rect, Style};
 use helix_view::input::Event;
+use helix_view::{Document, Editor};
 use tui::buffer::Buffer;
 use tui::widgets::{BorderType, Paragraph, Widget, Wrap};
 
-use crate::compositor::{Component, Context, EventResult, RenderContext};
+use crate::compositor::{Component, Compositor, Context, EventResult, RenderContext};
+use crate::runtime::ui::command::LspHoverDisplay;
+use crate::ui::Popup;
 
 use crate::alt;
 use crate::ui::Markdown;
@@ -169,6 +173,42 @@ impl Component for Hover {
                 EventResult::Consumed(None)
             }
             _ => EventResult::Ignored(None),
+        }
+    }
+}
+
+/// Apply [`crate::runtime::ui::command::LspCommand::Hover`] on the main thread.
+pub fn show_hover(
+    editor: &mut Editor,
+    compositor: &mut Compositor,
+    hovers: Vec<(String, lsp::Hover)>,
+    display: LspHoverDisplay,
+) {
+    if hovers.is_empty() {
+        editor.set_status("No hover results available.");
+        return;
+    }
+
+    let hover = Hover::new(hovers, editor.syn_loader.clone());
+
+    match display {
+        LspHoverDisplay::Popup => {
+            let popup = Popup::new(Hover::ID, hover).auto_close(true);
+            compositor.replace_or_push(Hover::ID, popup);
+        }
+        LspHoverDisplay::FileBuffer => {
+            editor.new_file_from_document(
+                Action::Replace,
+                Document::from(
+                    Rope::from(hover.content_string()),
+                    None,
+                    Arc::clone(&editor.config),
+                    Arc::clone(&editor.syn_loader),
+                ),
+            );
+            let (_, hover_doc) = focused!(editor);
+
+            let _ = hover_doc.set_language_by_language_id("markdown", &editor.syn_loader.load());
         }
     }
 }

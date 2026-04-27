@@ -33,7 +33,7 @@ pub enum Effect {
         thread: thread::Id,
     },
     SaveNow {
-        record: history::Record,
+        record: Box<history::Record>,
     },
     Delete {
         thread: thread::Id,

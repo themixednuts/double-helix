@@ -60,6 +60,22 @@ pub enum Run {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistedState {
+    pub title: Option<String>,
+    pub entries: Vec<Entry>,
+    pub turns: Vec<Turn>,
+    pub plan: Vec<plan::Item>,
+    pub draft: String,
+    pub context: Vec<context::Item>,
+    pub follow: FollowState,
+    pub run: Run,
+    pub unread: bool,
+    pub mode: Option<mode::Set>,
+    pub config: config::State,
+    pub terminals: Vec<terminal::Terminal>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Thread {
     pub id: Id,
     origin: Origin,
@@ -214,6 +230,11 @@ impl Thread {
         &self.entries
     }
 
+    #[must_use]
+    pub fn entry(&self, id: EntryId) -> Option<&Entry> {
+        self.entries.iter().find(|entry| entry.id == id)
+    }
+
     pub fn turns(&self) -> &[Turn] {
         &self.turns
     }
@@ -312,33 +333,51 @@ impl Thread {
         self.scope.clone()
     }
 
-    pub fn restore_persisted_state(
-        &mut self,
-        title: Option<String>,
-        entries: Vec<Entry>,
-        turns: Vec<Turn>,
-        plan: Vec<plan::Item>,
-        draft: String,
-        context: Vec<context::Item>,
-        follow: FollowState,
-        run: Run,
-        unread: bool,
-        mode: Option<mode::Set>,
-        config: config::State,
-        terminals: Vec<terminal::Terminal>,
-    ) {
-        self.title = title;
-        self.entries = entries;
-        self.turns = turns;
-        self.plan = plan;
-        self.draft = draft;
-        self.context = context;
-        self.follow = follow;
-        self.run = run;
-        self.unread = unread;
-        self.mode = mode;
-        self.config = config;
-        self.terminals = terminals;
+    #[must_use]
+    pub fn is_backend(&self) -> bool {
+        matches!(self.origin, Origin::Backend { .. })
+    }
+
+    #[must_use]
+    pub fn backend_id(&self) -> Option<backend::Id> {
+        match &self.origin {
+            Origin::Backend { backend, .. } => Some(backend.clone()),
+            Origin::Local => None,
+        }
+    }
+
+    pub fn cycle_config(&self, category: &str) -> Option<(config::Id, config::ValueId)> {
+        self.config.cycle(category)
+    }
+
+    pub fn next_mode(&self) -> Option<mode::Id> {
+        let mode = self.mode.as_ref()?;
+        match mode.selected() {
+            mode::Selected::Current(current) => {
+                let ids: Vec<_> = mode.items().map(|item| item.id.clone()).collect();
+                if ids.is_empty() {
+                    return None;
+                }
+                let idx = ids.iter().position(|id| id == current).unwrap_or(0);
+                Some(ids[(idx + 1) % ids.len()].clone())
+            }
+            mode::Selected::Pending { next, .. } => Some(next.clone()),
+        }
+    }
+
+    pub fn restore_persisted_state(&mut self, state: PersistedState) {
+        self.title = state.title;
+        self.entries = state.entries;
+        self.turns = state.turns;
+        self.plan = state.plan;
+        self.draft = state.draft;
+        self.context = state.context;
+        self.follow = state.follow;
+        self.run = state.run;
+        self.unread = state.unread;
+        self.mode = state.mode;
+        self.config = state.config;
+        self.terminals = state.terminals;
     }
 
     #[must_use]
@@ -358,6 +397,11 @@ impl Thread {
     #[must_use]
     pub fn selected_entry(&self) -> Option<EntryId> {
         self.view.selected
+    }
+
+    #[must_use]
+    pub fn selected(&self) -> Option<&Entry> {
+        self.selected_entry().and_then(|id| self.entry(id))
     }
 
     pub fn folded_entries(&self) -> impl Iterator<Item = EntryId> + '_ {
@@ -575,6 +619,42 @@ impl Thread {
     fn next_entry_id(&self) -> EntryId {
         EntryId::new(NonZeroU64::new(self.entries.len() as u64 + 1).unwrap())
     }
+
+    #[must_use]
+    pub fn change_summary(&self) -> Option<change::Summary> {
+        collect_change_summaries(self.entries.iter().filter_map(Entry::change_summary))
+    }
+
+    #[must_use]
+    pub fn change_summary_for(&self, entry: &Entry) -> Option<change::Summary> {
+        if let Some(summary) = entry.change_summary() {
+            return Some(summary);
+        }
+
+        let turn = entry.turn?;
+        collect_change_summaries(
+            self.entries
+                .iter()
+                .filter(|candidate| candidate.turn == Some(turn))
+                .filter_map(Entry::change_summary),
+        )
+    }
+
+    #[must_use]
+    pub fn selected_change_summary(&self) -> Option<change::Summary> {
+        self.selected()
+            .and_then(|entry| self.change_summary_for(entry))
+    }
+}
+
+impl Entry {
+    #[must_use]
+    pub fn change_summary(&self) -> Option<change::Summary> {
+        match &self.kind {
+            EntryKind::ChangeSummary(summary) => Some(summary.clone()),
+            _ => None,
+        }
+    }
 }
 
 fn normalize_locations(entry: EntryId, locations: Vec<Location>) -> Vec<Location> {
@@ -582,4 +662,13 @@ fn normalize_locations(entry: EntryId, locations: Vec<Location>) -> Vec<Location
         .into_iter()
         .map(|location| location.for_entry(entry))
         .collect()
+}
+
+fn collect_change_summaries(
+    summaries: impl Iterator<Item = change::Summary>,
+) -> Option<change::Summary> {
+    let files = summaries
+        .flat_map(|summary| summary.files)
+        .collect::<Vec<_>>();
+    (!files.is_empty()).then_some(change::Summary { files })
 }

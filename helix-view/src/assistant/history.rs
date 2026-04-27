@@ -175,20 +175,20 @@ impl Record {
     #[must_use]
     pub fn into_thread(self) -> thread::Thread {
         let mut thread = thread::Thread::new(self.id, self.origin, self.scope);
-        thread.restore_persisted_state(
-            self.title,
-            self.entries,
-            self.turns,
-            self.plan,
-            self.draft,
-            self.context,
-            self.follow,
-            self.run,
-            self.unread,
-            self.mode,
-            self.config,
-            self.terminals,
-        );
+        thread.restore_persisted_state(thread::PersistedState {
+            title: self.title,
+            entries: self.entries,
+            turns: self.turns,
+            plan: self.plan,
+            draft: self.draft,
+            context: self.context,
+            follow: self.follow,
+            run: self.run,
+            unread: self.unread,
+            mode: self.mode,
+            config: self.config,
+            terminals: self.terminals,
+        });
         thread.restore_transient_view(
             self.view.focus,
             self.view.selected,

@@ -44,4 +44,23 @@ impl Summary {
     pub fn locations(&self) -> Vec<Location> {
         self.files.iter().flat_map(File::locations).collect()
     }
+
+    #[must_use]
+    pub fn to_markdown(&self, title: &str) -> String {
+        let mut body = format!("# {title}\n\n");
+        for file in &self.files {
+            use std::fmt::Write as _;
+
+            let _ = writeln!(body, "## {}\n", file.path.display());
+            if file.hunks.is_empty() {
+                body.push_str("- changed\n\n");
+                continue;
+            }
+            for hunk in &file.hunks {
+                let _ = writeln!(body, "- {}", hunk.summary);
+            }
+            body.push('\n');
+        }
+        body
+    }
 }

@@ -47,7 +47,11 @@ pub async fn save_layout(
         open,
         active,
     });
-    if let Some(entry) = state.scopes.iter_mut().find(|entry| entry.scope == layout.scope) {
+    if let Some(entry) = state
+        .scopes
+        .iter_mut()
+        .find(|entry| entry.scope == layout.scope)
+    {
         *entry = layout;
     } else {
         state.scopes.push(layout);

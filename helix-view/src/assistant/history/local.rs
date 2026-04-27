@@ -170,9 +170,21 @@ impl PersistedRecord {
             id: record.id.value().get(),
             origin: PersistedOrigin::from(&record.origin),
             title: record.title.clone(),
-            entries: record.entries.iter().map(PersistedEntry::from_domain).collect(),
-            turns: record.turns.iter().map(PersistedTurn::from_domain).collect(),
-            plan: record.plan.iter().map(PersistedPlanItem::from_domain).collect(),
+            entries: record
+                .entries
+                .iter()
+                .map(PersistedEntry::from_domain)
+                .collect(),
+            turns: record
+                .turns
+                .iter()
+                .map(PersistedTurn::from_domain)
+                .collect(),
+            plan: record
+                .plan
+                .iter()
+                .map(PersistedPlanItem::from_domain)
+                .collect(),
             draft: record.draft.clone(),
             context: record
                 .context
@@ -199,9 +211,21 @@ impl PersistedRecord {
             id: thread_id(self.id),
             origin: self.origin.into_domain(),
             title: self.title,
-            entries: self.entries.into_iter().map(PersistedEntry::into_domain).collect(),
-            turns: self.turns.into_iter().map(PersistedTurn::into_domain).collect(),
-            plan: self.plan.into_iter().map(PersistedPlanItem::into_domain).collect(),
+            entries: self
+                .entries
+                .into_iter()
+                .map(PersistedEntry::into_domain)
+                .collect(),
+            turns: self
+                .turns
+                .into_iter()
+                .map(PersistedTurn::into_domain)
+                .collect(),
+            plan: self
+                .plan
+                .into_iter()
+                .map(PersistedPlanItem::into_domain)
+                .collect(),
             draft: self.draft,
             context: self
                 .context
@@ -433,7 +457,11 @@ impl PersistedEntry {
             id: entry.id.value().get(),
             turn: entry.turn.map(|turn| turn.value().get()),
             kind: PersistedEntryKind::from(&entry.kind),
-            locations: entry.locations.iter().map(PersistedLocation::from).collect(),
+            locations: entry
+                .locations
+                .iter()
+                .map(PersistedLocation::from)
+                .collect(),
         }
     }
 
@@ -468,7 +496,11 @@ impl From<&thread::EntryKind> for PersistedEntryKind {
             thread::EntryKind::ToolCall(call) => Self::ToolCall(PersistedToolCall::from(call)),
             thread::EntryKind::Status { text } => Self::Status { text: text.clone() },
             thread::EntryKind::ChangeSummary(summary) => Self::ChangeSummary {
-                files: summary.files.iter().map(PersistedChangeFile::from).collect(),
+                files: summary
+                    .files
+                    .iter()
+                    .map(PersistedChangeFile::from)
+                    .collect(),
             },
         }
     }
@@ -481,11 +513,12 @@ impl PersistedEntryKind {
             Self::AssistantText { text } => thread::EntryKind::AssistantText { text },
             Self::ToolCall(call) => thread::EntryKind::ToolCall(call.into_domain()),
             Self::Status { text } => thread::EntryKind::Status { text },
-            Self::ChangeSummary { files } => {
-                thread::EntryKind::ChangeSummary(change::Summary {
-                    files: files.into_iter().map(PersistedChangeFile::into_domain).collect(),
-                })
-            }
+            Self::ChangeSummary { files } => thread::EntryKind::ChangeSummary(change::Summary {
+                files: files
+                    .into_iter()
+                    .map(PersistedChangeFile::into_domain)
+                    .collect(),
+            }),
         }
     }
 }
@@ -574,7 +607,11 @@ impl PersistedChangeFile {
     fn into_domain(self) -> change::File {
         change::File {
             path: self.path,
-            hunks: self.hunks.into_iter().map(PersistedHunk::into_domain).collect(),
+            hunks: self
+                .hunks
+                .into_iter()
+                .map(PersistedHunk::into_domain)
+                .collect(),
         }
     }
 }
@@ -655,7 +692,11 @@ impl PersistedTurn {
         Self {
             id: turn.id.value().get(),
             prompt: turn.prompt.value().get(),
-            entries: turn.entries.iter().map(|entry| entry.value().get()).collect(),
+            entries: turn
+                .entries
+                .iter()
+                .map(|entry| entry.value().get())
+                .collect(),
             changes: Vec::new(),
         }
     }
@@ -950,7 +991,10 @@ impl PersistedModeSet {
 
     fn into_domain(self) -> anyhow::Result<mode::Set> {
         mode::Set::new(
-            self.items.into_iter().map(PersistedModeItem::into_domain).collect(),
+            self.items
+                .into_iter()
+                .map(PersistedModeItem::into_domain)
+                .collect(),
             self.selected.into_mode(),
         )
         .map_err(Into::into)
@@ -990,7 +1034,10 @@ struct PersistedConfigState {
 impl PersistedConfigState {
     fn from_domain(state: &config::State) -> Self {
         Self {
-            items: state.items().map(PersistedConfigItem::from_domain).collect(),
+            items: state
+                .items()
+                .map(PersistedConfigItem::from_domain)
+                .collect(),
         }
     }
 
@@ -1019,7 +1066,11 @@ impl PersistedConfigItem {
             name: item.name.clone(),
             category: item.category.clone(),
             selected: PersistedSelected::from_config(&item.selected),
-            values: item.values.iter().map(PersistedConfigValue::from_domain).collect(),
+            values: item
+                .values
+                .iter()
+                .map(PersistedConfigValue::from_domain)
+                .collect(),
         }
     }
 

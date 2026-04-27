@@ -65,15 +65,17 @@ impl backend::Driver for Driver {
             .work()
             .spawn(async move {
                 run_agent(
-                    backend_loop,
-                    work,
-                    agent,
+                    RunAgent {
+                        backend_id: backend_loop,
+                        work,
+                        agent,
+                        tx: tx_loop,
+                        host: host_loop,
+                        connect: connect_loop,
+                        client_info,
+                    },
                     &mut handle_rx,
                     &mut incoming,
-                    tx_loop,
-                    host_loop,
-                    connect_loop,
-                    client_info,
                 )
                 .await;
             })
@@ -108,17 +110,31 @@ fn thread_for_session(state: &State, session_id: &str) -> Option<thread::Id> {
         .map(|(&thread, _)| thread)
 }
 
-async fn run_agent(
+struct RunAgent {
     backend_id: backend::Id,
     work: helix_runtime::Work,
     agent: Arc<AcpAgent>,
-    handle_rx: &mut helix_runtime::Receiver<backend::Command>,
-    incoming: &mut IncomingReceiver,
     tx: helix_runtime::Sender<backend::Update>,
     host: host::Set,
     connect: backend::Connect,
     client_info: acp::Implementation,
+}
+
+async fn run_agent(
+    runner: RunAgent,
+    handle_rx: &mut helix_runtime::Receiver<backend::Command>,
+    incoming: &mut IncomingReceiver,
 ) {
+    let RunAgent {
+        backend_id,
+        work,
+        agent,
+        tx,
+        host,
+        connect,
+        client_info,
+    } = runner;
+
     let init = agent
         .initialize(client_info, client_caps(&host))
         .await
@@ -322,30 +338,30 @@ async fn handle_command(
             let tx2 = tx.clone();
             let agent = agent.clone();
             work.spawn(async move {
-                    let result = agent
-                        .prompt(
-                            session.to_string(),
-                            prompt
-                                .parts()
-                                .iter()
-                                .cloned()
-                                .map(translate::content_block)
-                                .collect(),
-                        )
-                        .await;
-                    let event = match result {
-                        Ok(_) => backend::Update::Thread {
-                            thread,
-                            event: thread::Event::Run(thread::Run::Idle),
-                        },
-                        Err(err) => backend::Update::Error {
-                            at: backend::Target::Thread(thread),
-                            error: backend::Error::Other(anyhow::anyhow!(err.to_string())),
-                        },
-                    };
-                    let _ = tx2.send(event).await;
-                })
-                .detach();
+                let result = agent
+                    .prompt(
+                        session.to_string(),
+                        prompt
+                            .parts()
+                            .iter()
+                            .cloned()
+                            .map(translate::content_block)
+                            .collect(),
+                    )
+                    .await;
+                let event = match result {
+                    Ok(_) => backend::Update::Thread {
+                        thread,
+                        event: thread::Event::Run(thread::Run::Idle),
+                    },
+                    Err(err) => backend::Update::Error {
+                        at: backend::Target::Thread(thread),
+                        error: backend::Error::Other(anyhow::anyhow!(err.to_string())),
+                    },
+                };
+                let _ = tx2.send(event).await;
+            })
+            .detach();
         }
         backend::Command::Cancel { thread } => {
             if let Some(session) = state.sessions.get(&thread) {
@@ -358,19 +374,19 @@ async fn handle_command(
                 let agent = agent.clone();
                 let session = session.clone();
                 work.spawn(async move {
-                        let result = agent
-                            .set_session_mode(session.to_string(), mode.to_string())
+                    let result = agent
+                        .set_session_mode(session.to_string(), mode.to_string())
+                        .await;
+                    if let Err(err) = result {
+                        let _ = tx2
+                            .send(backend::Update::Error {
+                                at: backend::Target::Thread(thread),
+                                error: backend::Error::Other(anyhow::anyhow!(err.to_string())),
+                            })
                             .await;
-                        if let Err(err) = result {
-                            let _ = tx2
-                                .send(backend::Update::Error {
-                                    at: backend::Target::Thread(thread),
-                                    error: backend::Error::Other(anyhow::anyhow!(err.to_string())),
-                                })
-                                .await;
-                        }
-                    })
-                    .detach();
+                    }
+                })
+                .detach();
             }
         }
         backend::Command::SetConfig {
@@ -383,23 +399,23 @@ async fn handle_command(
                 let agent = agent.clone();
                 let session = session.clone();
                 work.spawn(async move {
-                        let result = agent
-                            .set_session_config_option(
-                                session.to_string(),
-                                option.to_string(),
-                                value.to_string(),
-                            )
+                    let result = agent
+                        .set_session_config_option(
+                            session.to_string(),
+                            option.to_string(),
+                            value.to_string(),
+                        )
+                        .await;
+                    if let Err(err) = result {
+                        let _ = tx2
+                            .send(backend::Update::Error {
+                                at: backend::Target::Thread(thread),
+                                error: backend::Error::Other(anyhow::anyhow!(err.to_string())),
+                            })
                             .await;
-                        if let Err(err) = result {
-                            let _ = tx2
-                                .send(backend::Update::Error {
-                                    at: backend::Target::Thread(thread),
-                                    error: backend::Error::Other(anyhow::anyhow!(err.to_string())),
-                                })
-                                .await;
-                        }
-                    })
-                    .detach();
+                    }
+                })
+                .detach();
             }
         }
         backend::Command::ResolvePermission {

@@ -144,9 +144,7 @@ impl AssistantPanel {
         animate: bool,
     ) -> Option<helix_view::assistant::thread::EntryId> {
         let model = Self::assistant_model(editor);
-        if model.active_thread.is_none() {
-            return None;
-        }
+        model.active_thread?;
         let previous = model.selected_entry_id();
         if let Ok(effects) = editor.select_active_assistant_entry(entry) {
             Self::apply_assistant_effects(editor, effects);
@@ -525,7 +523,7 @@ impl AssistantPanel {
             return;
         };
 
-        if doc.text().to_string() == draft {
+        if doc.text() == draft {
             return;
         }
 
@@ -558,7 +556,7 @@ impl AssistantPanel {
                     .model
                     .panels
                     .iter()
-                    .find(|(_, p)| p.content.as_any().is::<AssistantModel>())
+                    .find(|(_, p)| p.content.is::<AssistantModel>())
                     .map(|(id, _)| id);
                 let id = existing.unwrap_or_else(|| {
                     editor.model.insert_panel(
@@ -752,11 +750,7 @@ impl AssistantPanel {
                         );
                     }
                     message = self.decorate_selected_plain_message(
-                        message,
-                        selected,
-                        entry,
-                        theme,
-                        &agent_name,
+                        message, selected, entry, theme, agent_name,
                     );
                     blocks.push(message);
                 }
@@ -903,7 +897,7 @@ impl AssistantPanel {
 
     pub fn selected_message_details(&self, editor: &Editor) -> Option<String> {
         let entry = Self::assistant_model(editor).selected_entry_id()?;
-        editor.assistant_entry_details(entry)
+        editor.assistant_entry_markdown(false, entry)
     }
 
     pub fn open_selected_message_details(&mut self, editor: &mut Editor, action: Action) -> bool {
@@ -1401,7 +1395,7 @@ impl Component for AssistantPanel {
         self.output.ensure_init(editor);
         self.input.ensure_init(editor);
         if self.focused {
-            editor.focused_modal_input = self.input.input_state();
+            editor.frontend_mut().focused_modal_input = self.input.input_state();
         }
         self.sync_from_assistant(editor);
         self.sync_to_model(editor);
@@ -1585,7 +1579,7 @@ impl Component for AssistantPanel {
             );
             let error_style = cx.editor.assistant_theme().get("error");
             if let Some(when) = self.error_marquee.render(error_inset, surface, error_style) {
-                schedule_redraw_at(cx.editor.runtime().work().clone(), when, cx.ingress.clone());
+                schedule_redraw_at(cx.editor.work(), when, cx.ingress.clone());
             }
         }
 
@@ -1649,7 +1643,7 @@ impl Component for AssistantPanel {
 
         if model.has_running_activity() {
             schedule_redraw_at(
-                cx.editor.runtime().work().clone(),
+                cx.editor.work(),
                 self.spinner.next_redraw(),
                 cx.ingress.clone(),
             );
@@ -1660,11 +1654,7 @@ impl Component for AssistantPanel {
         {
             if progress < 1.0 {
                 if let Some(when) = self.message_focus_animation.sample().next_redraw {
-                    schedule_redraw_at(
-                        cx.editor.runtime().work().clone(),
-                        when,
-                        cx.ingress.clone(),
-                    );
+                    schedule_redraw_at(cx.editor.work(), when, cx.ingress.clone());
                 }
             }
         }
@@ -2434,8 +2424,7 @@ mod tests {
         editor: &mut Editor,
         entries: Vec<ChatEntry>,
     ) -> helix_view::assistant::thread::Id {
-        let thread = editor.assistant.create(
-            helix_view::assistant::thread::Origin::Local,
+        let thread = editor.create_local_assistant_thread(
             helix_view::assistant::thread::Scope::new(std::path::PathBuf::from(".")),
         );
         for entry in entries {
@@ -2527,7 +2516,11 @@ mod tests {
     }
 
     fn select_thread_entry(editor: &mut Editor, index: usize) {
-        let entry = editor.assistant_entry_id_at(index).expect("entry");
+        let entry = editor
+            .assistant
+            .panel(false)
+            .entry_id_at(index)
+            .expect("entry");
         let effects = editor
             .set_active_assistant_focus(helix_view::assistant::thread::Focus::Messages)
             .expect("focus active messages");
@@ -2668,8 +2661,8 @@ mod tests {
             let collapsed_height = collapsed_blocks[0].height(true);
 
             assert!(expanded_height > collapsed_height);
-            let entry = editor.assistant_entry_id_at(0).expect("entry");
-            assert!(editor.assistant_entry_is_folded(entry));
+            let entry = editor.assistant_entry_id_at(false, 0).expect("entry");
+            assert!(editor.is_assistant_entry_folded(false, entry));
         });
     }
 }

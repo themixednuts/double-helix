@@ -12,7 +12,7 @@ pub mod history;
 pub mod host;
 pub mod layout;
 pub mod mode;
-pub mod view;
+pub mod model;
 pub mod permission;
 pub mod plan;
 pub mod prompt;
@@ -23,6 +23,6 @@ pub mod tool;
 
 pub use action::Action;
 pub use backend::{Command as BackendCommand, Driver as BackendDriver, Handle as BackendHandle};
-pub use view::View as AssistantView;
+pub use model::{EntryView, Follow, Panel, Pill, Tab, ThreadView};
 pub use store::Store;
 pub use thread::Id as ThreadId;

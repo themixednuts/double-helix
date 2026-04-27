@@ -30,7 +30,7 @@ fn connect_assistant_backend(
         RuntimeEvent::Task(RuntimeTaskEvent::ConnectAssistantBackend {
             command,
             args,
-            open_panel: true,
+            panel: helix_view::editor::PanelBehavior::Open,
         }),
     );
 }
@@ -48,7 +48,7 @@ pub(crate) fn apply_assistant_command(
 
             if let Some(panel) = compositor.find_id::<AssistantPanel>(ASSISTANT_PANEL_ID) {
                 panel.toggle_focus();
-            } else if editor.assistant_threads().next().is_some() {
+            } else if editor.has_assistant_threads() {
                 compositor.push(Box::new(AssistantPanel::new()));
             } else if let Some(agent) = editor.config().agents.first().cloned() {
                 connect_assistant_backend(&ingress, agent.command, agent.args);
@@ -70,7 +70,7 @@ pub(crate) fn apply_assistant_command(
 
             if let Some(panel) = compositor.find_id::<AssistantPanel>(ASSISTANT_PANEL_ID) {
                 panel.activate_input(editor);
-            } else if editor.assistant_threads().next().is_some() {
+            } else if editor.has_assistant_threads() {
                 let mut panel = AssistantPanel::new();
                 panel.activate_input(editor);
                 compositor.push(Box::new(panel));
@@ -90,7 +90,7 @@ pub(crate) fn apply_assistant_command(
                 if panel.selected_message(editor).is_none() {
                     panel.select_last_message(editor);
                 }
-            } else if editor.assistant_threads().next().is_some() {
+            } else if editor.has_assistant_threads() {
                 let mut panel = AssistantPanel::new();
                 panel.focus_messages(editor);
                 compositor.push(Box::new(panel));
@@ -131,23 +131,26 @@ pub(crate) fn apply_assistant_command(
             compositor.replace_or_push(PERMISSION_ID, popup);
 
             let request_id = request.id().clone();
-            editor.runtime().work().clone().spawn(async move {
-                let decision = match rx.await {
-                    Ok(PermissionResponse::Selected(id)) => {
-                        helix_view::assistant::permission::Decision::Choose(
-                            helix_view::assistant::permission::ChoiceId::new(id),
-                        )
-                    }
-                    _ => helix_view::assistant::permission::Decision::Dismiss,
-                };
-                let _ = ingress
-                    .send(RuntimeEvent::AssistantPermissionResolved {
-                        thread,
-                        request: request_id,
-                        decision,
-                    })
-                    .await;
-            }).detach();
+            editor
+                .work()
+                .spawn(async move {
+                    let decision = match rx.await {
+                        Ok(PermissionResponse::Selected(id)) => {
+                            helix_view::assistant::permission::Decision::Choose(
+                                helix_view::assistant::permission::ChoiceId::new(id),
+                            )
+                        }
+                        _ => helix_view::assistant::permission::Decision::Dismiss,
+                    };
+                    let _ = ingress
+                        .send(RuntimeEvent::AssistantPermissionResolved {
+                            thread,
+                            request: request_id,
+                            decision,
+                        })
+                        .await;
+                })
+                .detach();
         }
         AssistantCommand::PushHistoryPicker { entries } => {
             if entries.is_empty() {
@@ -189,15 +192,17 @@ pub(crate) fn apply_assistant_command(
                 0,
                 entries,
                 (),
-                editor.runtime().clone(),
+                crate::ui::PickerRuntime::new(editor.runtime()),
                 ingress.clone(),
-                move |cx: &mut crate::compositor::Context, item: &helix_view::assistant::history::Stub, _action| {
-                    if cx.editor.assistant_thread(item.id).is_some() {
+                move |cx: &mut crate::compositor::Context,
+                      item: &helix_view::assistant::history::Stub,
+                      _action| {
+                    if cx.editor.assistant_thread_exists(item.id) {
                         helix_runtime::send_blocking(
                             &cx.ingress,
                             RuntimeEvent::Task(RuntimeTaskEvent::ActivateAssistantThread {
                                 thread: item.id,
-                                open_panel: true,
+                                panel: helix_view::editor::PanelBehavior::Open,
                             }),
                         );
                         return;
@@ -207,8 +212,8 @@ pub(crate) fn apply_assistant_command(
                         &cx.ingress,
                         RuntimeEvent::Task(RuntimeTaskEvent::LoadAssistantHistoryThread {
                             thread: item.id,
-                            activate: true,
-                            open_panel: true,
+                            activation: helix_view::editor::Activation::Activate,
+                            panel: helix_view::editor::PanelBehavior::Open,
                         }),
                     );
                 },
@@ -227,9 +232,11 @@ pub(crate) fn apply_assistant_command(
                 0,
                 items,
                 (),
-                editor.runtime().clone(),
+                crate::ui::PickerRuntime::new(editor.runtime()),
                 ingress,
-                move |cx: &mut crate::compositor::Context, item: &helix_view::assistant::context::Item, _action| {
+                move |cx: &mut crate::compositor::Context,
+                      item: &helix_view::assistant::context::Item,
+                      _action| {
                     helix_runtime::send_blocking(
                         &cx.ingress,
                         RuntimeEvent::Task(RuntimeTaskEvent::DetachAssistantContext {
@@ -266,9 +273,11 @@ pub(crate) fn apply_assistant_command(
                 0,
                 agents,
                 (),
-                editor.runtime().clone(),
+                crate::ui::PickerRuntime::new(editor.runtime()),
                 ingress.clone(),
-                move |cx: &mut crate::compositor::Context, item: &helix_view::editor::AgentConfig, _action| {
+                move |cx: &mut crate::compositor::Context,
+                      item: &helix_view::editor::AgentConfig,
+                      _action| {
                     let idx = agents_for_callback
                         .iter()
                         .position(|a| a.name == item.name && a.command == item.command)

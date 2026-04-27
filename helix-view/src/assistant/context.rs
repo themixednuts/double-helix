@@ -1,6 +1,6 @@
 use std::borrow::Cow;
-use std::fmt;
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::Arc;
 
 use crate::collab::{Location, SurfaceId};
@@ -122,6 +122,7 @@ pub enum Provider {
     Diff,
 }
 
+#[derive(Default)]
 pub struct Registry {
     providers: HashMap<Key, Provider>,
 }
@@ -137,14 +138,6 @@ impl Registry {
 
     pub fn providers(&self) -> impl Iterator<Item = &Provider> {
         self.providers.values()
-    }
-}
-
-impl Default for Registry {
-    fn default() -> Self {
-        Self {
-            providers: HashMap::default(),
-        }
     }
 }
 

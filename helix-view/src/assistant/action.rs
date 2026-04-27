@@ -8,8 +8,8 @@ pub enum Action {
         scope: thread::Scope,
     },
     LoadThread {
-        record: history::Record,
-        activate: bool,
+        record: Box<history::Record>,
+        activation: crate::editor::Activation,
     },
     Activate {
         thread: thread::Id,

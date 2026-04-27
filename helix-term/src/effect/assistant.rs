@@ -1,25 +1,20 @@
 use helix_runtime::{send_blocking, Sender as IngressSender};
 
-use crate::runtime::{
-    ingress::RuntimeEvent,
-    send_task_event_with,
-    RuntimeTaskEvent,
-    UiCommand,
-};
+use crate::runtime::{ingress::RuntimeEvent, send_task_event_with, RuntimeTaskEvent, UiCommand};
 use helix_view::{editor::Action, Editor};
 
 pub(crate) fn apply_restore_assistant_history_thread(
     editor: &mut Editor,
     ingress: IngressSender<RuntimeEvent>,
     record: helix_view::assistant::history::Record,
-    activate: bool,
-    open_panel: bool,
+    activation: helix_view::editor::Activation,
+    panel: helix_view::editor::PanelBehavior,
 ) {
-    let effects = editor.load_assistant_thread(record, activate);
+    let effects = editor.load_assistant_thread(record, activation);
     editor.apply_assistant_effects(effects);
     editor.persist_assistant_layout();
 
-    if open_panel {
+    if panel.should_open() {
         send_blocking(
             &ingress,
             RuntimeEvent::Ui(UiCommand::Assistant(
@@ -33,13 +28,13 @@ pub(crate) fn apply_activate_assistant_thread(
     editor: &mut Editor,
     ingress: IngressSender<RuntimeEvent>,
     thread: helix_view::assistant::thread::Id,
-    open_panel: bool,
+    panel: helix_view::editor::PanelBehavior,
 ) {
     let effects = editor.activate_assistant_thread(thread);
     editor.apply_assistant_effects(effects);
     editor.persist_assistant_layout();
 
-    if open_panel {
+    if panel.should_open() {
         send_blocking(
             &ingress,
             RuntimeEvent::Ui(UiCommand::Assistant(
@@ -74,7 +69,6 @@ pub(crate) fn apply_remove_assistant_panel(editor: &mut Editor) {
         .filter_map(|(id, entry)| {
             entry
                 .content
-                .as_any()
                 .is::<helix_view::model::AssistantModel>()
                 .then_some(id)
         })
@@ -90,7 +84,7 @@ pub(crate) fn apply_connect_assistant_backend(
     ingress: IngressSender<RuntimeEvent>,
     command: String,
     args: Vec<String>,
-    open_panel: bool,
+    panel: helix_view::editor::PanelBehavior,
 ) {
     let (_, effects) = match editor.connect_assistant_backend(command.clone(), args) {
         Ok(result) => result,
@@ -102,7 +96,7 @@ pub(crate) fn apply_connect_assistant_backend(
     editor.apply_assistant_effects(effects);
     editor.persist_assistant_layout();
 
-    if open_panel {
+    if panel.should_open() {
         send_blocking(
             &ingress,
             RuntimeEvent::Ui(UiCommand::Assistant(
@@ -263,47 +257,50 @@ pub(crate) fn request_load_assistant_history_thread(
     editor: &mut Editor,
     ingress: IngressSender<RuntimeEvent>,
     thread: helix_view::assistant::thread::Id,
-    activate: bool,
-    open_panel: bool,
+    activation: helix_view::editor::Activation,
+    panel: helix_view::editor::PanelBehavior,
 ) {
     let Some(history) = editor.assistant_history_backend() else {
         editor.set_error("Assistant history backend missing");
         return;
     };
 
-    editor.runtime().work().clone().spawn(async move {
-        match history.load(thread).await {
-            Ok(Some(record)) => {
-                send_task_event_with(
-                    RuntimeTaskEvent::RestoreAssistantHistoryThread {
-                        record,
-                        activate,
-                        open_panel,
-                    },
-                    ingress,
-                )
-                .await;
+    editor
+        .work()
+        .spawn(async move {
+            match history.load(thread).await {
+                Ok(Some(record)) => {
+                    send_task_event_with(
+                        RuntimeTaskEvent::RestoreAssistantHistoryThread {
+                            record: Box::new(record),
+                            activation,
+                            panel,
+                        },
+                        ingress,
+                    )
+                    .await;
+                }
+                Ok(None) => {
+                    send_task_event_with(
+                        RuntimeTaskEvent::SetEditorError {
+                            message: "Assistant history record missing".to_string(),
+                        },
+                        ingress,
+                    )
+                    .await;
+                }
+                Err(error) => {
+                    send_task_event_with(
+                        RuntimeTaskEvent::SetEditorError {
+                            message: error.to_string(),
+                        },
+                        ingress,
+                    )
+                    .await;
+                }
             }
-            Ok(None) => {
-                send_task_event_with(
-                    RuntimeTaskEvent::SetEditorError {
-                        message: "Assistant history record missing".to_string(),
-                    },
-                    ingress,
-                )
-                .await;
-            }
-            Err(error) => {
-                send_task_event_with(
-                    RuntimeTaskEvent::SetEditorError {
-                        message: error.to_string(),
-                    },
-                    ingress,
-                )
-                .await;
-            }
-        }
-    }).detach();
+        })
+        .detach();
 }
 
 pub(crate) fn request_bootstrap_assistant_history(
@@ -315,30 +312,37 @@ pub(crate) fn request_bootstrap_assistant_history(
         return;
     };
 
-    editor.runtime().work().clone().spawn(async move {
-        if let Ok(entries) = history.load_scope(&scope).await {
-            send_task_event_with(
-                RuntimeTaskEvent::ApplyAssistantHistoryEntries {
-                    scope: scope.clone(),
-                    entries,
-                },
-                ingress.clone(),
-            )
-            .await;
-        }
-
-        if let Ok(Some(layout)) = helix_view::assistant::layout::load_layout(&scope).await {
-            for thread in layout.open {
+    editor
+        .work()
+        .spawn(async move {
+            if let Ok(entries) = history.load_scope(&scope).await {
                 send_task_event_with(
-                    RuntimeTaskEvent::LoadAssistantHistoryThread {
-                        thread,
-                        activate: layout.active == Some(thread),
-                        open_panel: false,
+                    RuntimeTaskEvent::ApplyAssistantHistoryEntries {
+                        scope: scope.clone(),
+                        entries,
                     },
                     ingress.clone(),
                 )
                 .await;
             }
-        }
-    }).detach();
+
+            if let Ok(Some(layout)) = helix_view::assistant::layout::load_layout(&scope).await {
+                for thread in layout.open {
+                    send_task_event_with(
+                        RuntimeTaskEvent::LoadAssistantHistoryThread {
+                            thread,
+                            activation: if layout.active == Some(thread) {
+                                helix_view::editor::Activation::Activate
+                            } else {
+                                helix_view::editor::Activation::Preserve
+                            },
+                            panel: helix_view::editor::PanelBehavior::Preserve,
+                        },
+                        ingress.clone(),
+                    )
+                    .await;
+                }
+            }
+        })
+        .detach();
 }

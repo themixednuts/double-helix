@@ -1,45 +1,44 @@
 use std::collections::HashMap;
 
-use super::{context, history, terminal, thread, Store};
-use crate::assistant::{mode, plan};
+use super::{context, history, mode, plan, terminal, thread, Store};
 use crate::collab::Location;
 use crate::DocumentId;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct View {
-    pub tabs: Vec<ThreadTab>,
-    pub active: Option<Thread>,
+pub struct Panel {
+    pub tabs: Vec<Tab>,
+    pub active: Option<ThreadView>,
     pub focused: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ThreadTab {
+pub struct Tab {
     pub id: thread::Id,
     pub title: String,
     pub run: thread::Run,
     pub unread: bool,
-    pub follow: FollowStatus,
+    pub follow: Follow,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FollowStatus {
+pub enum Follow {
     Off,
     On,
     Paused,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Thread {
+pub struct ThreadView {
     pub id: thread::Id,
     pub title: Option<String>,
     pub is_remote: bool,
-    pub entries: Vec<Entry>,
+    pub entries: Vec<EntryView>,
     pub draft: String,
-    pub context: Vec<ContextPill>,
+    pub context: Vec<Pill>,
     pub run: thread::Run,
     pub unread: bool,
     pub focus: thread::Focus,
-    pub follow: FollowStatus,
+    pub follow: Follow,
     pub mode_name: Option<String>,
     pub model_label: Option<String>,
     pub plan: Vec<plan::Item>,
@@ -51,7 +50,7 @@ pub struct Thread {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Entry {
+pub struct EntryView {
     pub id: thread::EntryId,
     pub kind: EntryKind,
     pub locations: Vec<Location>,
@@ -79,7 +78,7 @@ pub enum EntryKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ContextPill {
+pub struct Pill {
     pub id: context::Id,
     pub label: String,
 }
@@ -107,7 +106,7 @@ pub struct HistoryThread {
     pub run: thread::Run,
 }
 
-impl FollowStatus {
+impl Follow {
     #[must_use]
     pub fn to_model(self) -> crate::model::AssistantFollow {
         match self {
@@ -118,7 +117,7 @@ impl FollowStatus {
     }
 }
 
-impl Entry {
+impl EntryView {
     #[must_use]
     pub fn to_model(self) -> crate::model::AssistantEntry {
         crate::model::AssistantEntry {
@@ -145,9 +144,93 @@ impl Entry {
             },
         }
     }
+
+    #[must_use]
+    pub fn markdown(&self, agent_name: &str) -> String {
+        self.clone().to_model().details_markdown(agent_name)
+    }
 }
 
-impl ThreadTab {
+impl ThreadView {
+    #[must_use]
+    pub fn entry(&self, id: thread::EntryId) -> Option<&EntryView> {
+        self.entries.iter().find(|entry| entry.id == id)
+    }
+
+    #[must_use]
+    pub fn selected_entry(&self) -> Option<thread::EntryId> {
+        self.selected
+    }
+
+    #[must_use]
+    pub fn entry_at(&self, index: usize) -> Option<thread::EntryId> {
+        self.entries.get(index).map(|entry| entry.id)
+    }
+
+    #[must_use]
+    pub fn is_folded(&self, entry: thread::EntryId) -> bool {
+        self.folded.contains(&entry)
+    }
+
+    #[must_use]
+    pub fn opened_doc(&self, entry: thread::EntryId) -> Option<DocumentId> {
+        self.opened_docs.get(&entry).copied()
+    }
+}
+
+impl Panel {
+    #[must_use]
+    pub fn active_entry(&self, id: thread::EntryId) -> Option<&EntryView> {
+        self.active.as_ref()?.entry(id)
+    }
+
+    #[must_use]
+    pub fn entry_markdown(&self, id: thread::EntryId) -> Option<String> {
+        let thread = self.active.as_ref()?;
+        let agent_name = thread.title.as_deref().unwrap_or("Agent");
+        Some(thread.entry(id)?.markdown(agent_name))
+    }
+
+    #[must_use]
+    pub fn selected_entry(&self) -> Option<&EntryView> {
+        let thread = self.active.as_ref()?;
+        thread.selected_entry().and_then(|id| thread.entry(id))
+    }
+
+    #[must_use]
+    pub fn selected_entry_id(&self) -> Option<thread::EntryId> {
+        self.active.as_ref()?.selected_entry()
+    }
+
+    #[must_use]
+    pub fn selected_entry_locations(&self) -> Option<Vec<Location>> {
+        Some(self.selected_entry()?.locations.clone())
+    }
+
+    #[must_use]
+    pub fn entry_id_at(&self, index: usize) -> Option<thread::EntryId> {
+        self.active.as_ref()?.entry_at(index)
+    }
+
+    #[must_use]
+    pub fn is_entry_folded(&self, entry: thread::EntryId) -> bool {
+        self.active
+            .as_ref()
+            .is_some_and(|thread| thread.is_folded(entry))
+    }
+
+    #[must_use]
+    pub fn opened_doc(&self, entry: thread::EntryId) -> Option<DocumentId> {
+        self.active.as_ref()?.opened_doc(entry)
+    }
+
+    #[must_use]
+    pub fn active_id(&self) -> Option<thread::Id> {
+        Some(self.active.as_ref()?.id)
+    }
+}
+
+impl Tab {
     #[must_use]
     pub fn to_model(self) -> crate::model::AssistantTab {
         crate::model::AssistantTab {
@@ -192,8 +275,8 @@ impl Store {
         history: Vec<history::Stub>,
         fallback_agent_name: String,
     ) -> crate::model::AssistantModel {
-        let view = self.view(focused);
-        let tabs = view.tabs.into_iter().map(ThreadTab::to_model).collect();
+        let panel = self.panel(focused);
+        let tabs = panel.tabs.into_iter().map(Tab::to_model).collect();
         let history = history
             .into_iter()
             .map(|entry| HistoryThread {
@@ -205,12 +288,16 @@ impl Store {
             .map(HistoryThread::to_model)
             .collect();
 
-        if let Some(active) = view.active {
+        if let Some(active) = panel.active {
             crate::model::AssistantModel {
                 tabs,
                 history,
                 active_thread: Some(active.id),
-                entries: active.entries.into_iter().map(Entry::to_model).collect(),
+                entries: active
+                    .entries
+                    .into_iter()
+                    .map(EntryView::to_model)
+                    .collect(),
                 agent_busy: matches!(active.run, thread::Run::Running),
                 input: active.draft,
                 context_items: active
@@ -295,11 +382,9 @@ impl Store {
             }
         }
     }
-}
 
-impl Store {
     #[must_use]
-    pub fn history_view(&self, scope: &thread::Scope) -> Option<History> {
+    pub fn history_model(&self, scope: &thread::Scope) -> Option<History> {
         self.history(scope).map(|page| History {
             scope: page.scope.clone(),
             entries: page
@@ -317,10 +402,10 @@ impl Store {
     }
 
     #[must_use]
-    pub fn view(&self, focused: bool) -> View {
+    pub fn panel(&self, focused: bool) -> Panel {
         let tabs: Vec<_> = self
             .threads()
-            .map(|thread| ThreadTab {
+            .map(|thread| Tab {
                 id: thread.id,
                 title: thread
                     .title()
@@ -329,9 +414,9 @@ impl Store {
                 run: thread.run().clone(),
                 unread: thread.unread(),
                 follow: match thread.follow() {
-                    crate::collab::FollowState::Off => FollowStatus::Off,
-                    crate::collab::FollowState::On { .. } => FollowStatus::On,
-                    crate::collab::FollowState::Paused { .. } => FollowStatus::Paused,
+                    crate::collab::FollowState::Off => Follow::Off,
+                    crate::collab::FollowState::On { .. } => Follow::On,
+                    crate::collab::FollowState::Paused { .. } => Follow::Paused,
                 },
             })
             .collect();
@@ -339,14 +424,14 @@ impl Store {
         let active = self
             .active()
             .and_then(|id| self.thread(id))
-            .map(|thread| Thread {
+            .map(|thread| ThreadView {
                 id: thread.id,
                 title: thread.title().map(ToOwned::to_owned),
                 is_remote: matches!(thread.origin(), thread::Origin::Backend { .. }),
                 entries: thread
                     .entries()
                     .iter()
-                    .map(|entry| Entry {
+                    .map(|entry| EntryView {
                         id: entry.id,
                         locations: {
                             let mut locations = entry.locations.clone();
@@ -385,7 +470,7 @@ impl Store {
                 context: thread
                     .context_items()
                     .iter()
-                    .map(|item| ContextPill {
+                    .map(|item| Pill {
                         id: item.id.clone(),
                         label: match &item.kind {
                             context::Kind::Selection(sel) => {
@@ -402,9 +487,9 @@ impl Store {
                 unread: thread.unread(),
                 focus: thread.focus(),
                 follow: match thread.follow() {
-                    crate::collab::FollowState::Off => FollowStatus::Off,
-                    crate::collab::FollowState::On { .. } => FollowStatus::On,
-                    crate::collab::FollowState::Paused { .. } => FollowStatus::Paused,
+                    crate::collab::FollowState::Off => Follow::Off,
+                    crate::collab::FollowState::On { .. } => Follow::On,
+                    crate::collab::FollowState::Paused { .. } => Follow::Paused,
                 },
                 mode_name: thread.mode().map(|mode| match mode.selected() {
                     mode::Selected::Current(id) => mode
@@ -440,7 +525,7 @@ impl Store {
                     .collect(),
             });
 
-        View {
+        Panel {
             tabs,
             active,
             focused,

@@ -2,7 +2,7 @@ use std::num::NonZeroU64;
 
 use indexmap::IndexMap;
 
-use super::{action, backend, context, effect, event, history, thread};
+use super::{action, backend, config, context, effect, event, history, mode, thread};
 
 #[derive(Debug, Clone)]
 pub enum Store {
@@ -92,6 +92,120 @@ impl Store {
 
     pub fn record(&self, id: thread::Id) -> Option<history::Record> {
         self.thread(id).map(history::Record::from_thread)
+    }
+
+    pub fn active_thread(&self) -> Option<(thread::Id, &thread::Thread)> {
+        let id = self.active()?;
+        Some((id, self.thread(id)?))
+    }
+
+    pub fn active_thread_mut(&mut self) -> Option<(thread::Id, &mut thread::Thread)> {
+        let id = self.active()?;
+        Some((id, self.thread_mut(id)?))
+    }
+
+    pub fn active_thread_owned(&self) -> Option<(thread::Id, thread::Thread)> {
+        self.active_thread()
+            .map(|(id, thread)| (id, thread.clone()))
+    }
+
+    pub fn active_snapshot(&self) -> Option<thread::Snapshot> {
+        let (_, thread) = self.active_thread()?;
+        Some(thread.snapshot())
+    }
+
+    pub fn active_context(&self) -> Option<Vec<context::Item>> {
+        let (_, thread) = self.active_thread()?;
+        Some(thread.context_items().to_vec())
+    }
+
+    pub fn active_scope(&self) -> Option<thread::Scope> {
+        let (_, thread) = self.active_thread()?;
+        Some(thread.clone_scope())
+    }
+
+    #[must_use]
+    pub fn active_scope_or_layout(&self) -> thread::Scope {
+        self.active_scope()
+            .unwrap_or_else(super::layout::current_scope)
+    }
+
+    pub fn active_change_summary(&self) -> Option<super::change::Summary> {
+        let (_, thread) = self.active_thread()?;
+        thread.change_summary()
+    }
+
+    pub fn selected_change_summary(&self) -> Option<super::change::Summary> {
+        let (_, thread) = self.active_thread()?;
+        thread.selected_change_summary()
+    }
+
+    pub fn active_backend_id(&self) -> Option<backend::Id> {
+        let (_, thread) = self.active_thread()?;
+        thread.backend_id()
+    }
+
+    pub fn active_id(&self) -> Option<thread::Id> {
+        self.active_thread().map(|(id, _)| id)
+    }
+
+    pub fn active_cycle_config(
+        &self,
+        category: &str,
+    ) -> Option<(thread::Id, config::Id, config::ValueId)> {
+        let (id, thread) = self.active_thread()?;
+        let (option, value) = thread.cycle_config(category)?;
+        Some((id, option, value))
+    }
+
+    pub fn active_next_mode(&self) -> Option<(thread::Id, mode::Id)> {
+        let (id, thread) = self.active_thread()?;
+        Some((id, thread.next_mode()?))
+    }
+
+    pub fn history_entries(&self, scope: &thread::Scope) -> Option<Vec<history::Stub>> {
+        self.history(scope).map(|page| page.entries.clone())
+    }
+
+    pub fn history_records(&self) -> Vec<history::Record> {
+        self.threads().map(history::Record::from_thread).collect()
+    }
+
+    #[must_use]
+    pub fn has_threads(&self) -> bool {
+        self.threads().next().is_some()
+    }
+
+    #[must_use]
+    pub fn layout_history_entries(&self) -> Vec<history::Stub> {
+        self.history_entries(&super::layout::current_scope())
+            .unwrap_or_default()
+    }
+
+    #[must_use]
+    pub fn assistant_model(&self, focused: bool) -> crate::model::AssistantModel {
+        let fallback_agent_name = self
+            .active_thread()
+            .and_then(|(_, thread)| thread.title().map(ToOwned::to_owned))
+            .unwrap_or_else(|| {
+                if self.threads().next().is_none() {
+                    "No agent".to_string()
+                } else {
+                    "Agent".to_string()
+                }
+            });
+        self.model(focused, self.layout_history_entries(), fallback_agent_name)
+    }
+
+    pub fn next_thread(&self, delta: isize) -> Option<thread::Id> {
+        let (active, _) = self.active_thread()?;
+        let tabs: Vec<_> = self.threads().map(|thread| thread.id).collect();
+        if tabs.len() < 2 {
+            return None;
+        }
+        let index = tabs.iter().position(|id| *id == active)?;
+        let next = (index as isize + delta).rem_euclid(tabs.len() as isize) as usize;
+        Some(tabs[next])
     }
 
     pub fn activate(&mut self, id: thread::Id) -> Result<(), MissingThread> {
@@ -286,7 +400,9 @@ impl Store {
                         effects.push(effect);
                     }
                     effects.push(effect::Effect::LeaveParticipant { thread });
-                    effects.push(effect::Effect::SaveNow { record });
+                    effects.push(effect::Effect::SaveNow {
+                        record: Box::new(record),
+                    });
                     effects.push(effect::Effect::SyncModel);
                     effects
                 } else {
@@ -595,7 +711,7 @@ impl Store {
                     effect::Effect::SyncModel,
                 ]
             }
-            action::Action::LoadThread { record, activate } => {
+            action::Action::LoadThread { record, activation } => {
                 let backend_command = match &record.origin {
                     thread::Origin::Backend { backend, remote } => {
                         Some(effect::Effect::SendBackendCommand {
@@ -608,10 +724,10 @@ impl Store {
                     }
                     thread::Origin::Local => None,
                 };
-                let thread = record.into_thread();
+                let thread = (*record).into_thread();
                 let id = thread.id;
                 self.insert(thread);
-                if activate {
+                if activation.should_activate() {
                     let _ = self.activate(id);
                 }
                 self.sync_history(id);
@@ -1087,8 +1203,8 @@ mod tests {
         let mut store = Store::default();
 
         let effects = store.act(action::Action::LoadThread {
-            record,
-            activate: true,
+            record: Box::new(record),
+            activation: crate::editor::Activation::Activate,
         });
 
         assert!(effects.iter().any(|effect| {

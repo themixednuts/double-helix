@@ -16,16 +16,11 @@ pub enum MessageAlign {
 }
 
 /// Corner style for bubble borders.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MessageCorners {
+    #[default]
     Rounded,
     Squared,
-}
-
-impl Default for MessageCorners {
-    fn default() -> Self {
-        Self::Rounded
-    }
 }
 
 /// Resolved styles for a chat bubble.
@@ -83,6 +78,14 @@ pub fn message(
     } else {
         visible_rows
     };
+    let accent = BorderAccent {
+        horizontal_span: bubble_w,
+        vertical_span: content_rows as usize,
+        align,
+        base: style.border,
+        accent: accent_style,
+        progress: accent_progress,
+    };
 
     for row in 0..content_rows {
         let fy = y + row;
@@ -104,12 +107,7 @@ pub fn message(
                 .set_style(border_style_for_edge(
                     BorderEdge::Left,
                     row as usize,
-                    bubble_w,
-                    content_rows as usize,
-                    align,
-                    style.border,
-                    accent_style,
-                    accent_progress,
+                    accent,
                 ));
         }
 
@@ -120,12 +118,7 @@ pub fn message(
                 .set_style(border_style_for_edge(
                     BorderEdge::Right,
                     row as usize,
-                    bubble_w,
-                    content_rows as usize,
-                    align,
-                    style.border,
-                    accent_style,
-                    accent_progress,
+                    accent,
                 ));
         }
     }
@@ -161,16 +154,7 @@ pub fn message(
             }
             surface[(x, y)]
                 .set_symbol(border_cells.bottom(dx, bubble_w, align))
-                .set_style(border_style_for_edge(
-                    BorderEdge::Bottom,
-                    dx,
-                    bubble_w,
-                    content_rows as usize,
-                    align,
-                    style.border,
-                    accent_style,
-                    accent_progress,
-                ));
+                .set_style(border_style_for_edge(BorderEdge::Bottom, dx, accent));
         }
     }
 
@@ -207,6 +191,16 @@ enum BorderEdge {
     Right,
 }
 
+#[derive(Clone, Copy)]
+struct BorderAccent {
+    horizontal_span: usize,
+    vertical_span: usize,
+    align: MessageAlign,
+    base: Style,
+    accent: Style,
+    progress: f32,
+}
+
 fn directional_border_cells(align: MessageAlign, corners: MessageCorners) -> BorderCells {
     let (left_corner, right_corner, left_cap, right_cap) = match corners {
         MessageCorners::Rounded => ("╰", "╯", "╴", "╶"),
@@ -231,31 +225,28 @@ fn directional_border_cells(align: MessageAlign, corners: MessageCorners) -> Bor
     }
 }
 
-fn border_style_for_edge(
-    edge: BorderEdge,
-    offset: usize,
-    horizontal_span: usize,
-    vertical_span: usize,
-    align: MessageAlign,
-    base: Style,
-    accent: Style,
-    progress: f32,
-) -> Style {
-    if progress <= 0.0 {
-        return base;
+fn border_style_for_edge(edge: BorderEdge, offset: usize, accent: BorderAccent) -> Style {
+    if accent.progress <= 0.0 {
+        return accent.base;
     }
 
-    let Some(perimeter) = perimeter_position(edge, offset, horizontal_span, vertical_span, align)
-    else {
-        return base;
+    let Some(perimeter) = perimeter_position(
+        edge,
+        offset,
+        accent.horizontal_span,
+        accent.vertical_span,
+        accent.align,
+    ) else {
+        return accent.base;
     };
-    let lit = ((perimeter_total(horizontal_span, vertical_span) as f32) * progress)
+    let lit = ((perimeter_total(accent.horizontal_span, accent.vertical_span) as f32)
+        * accent.progress)
         .ceil()
         .max(1.0) as usize;
     if perimeter < lit {
-        merge_border_style(base, accent)
+        merge_border_style(accent.base, accent.accent)
     } else {
-        base
+        accent.base
     }
 }
 
@@ -332,32 +323,20 @@ mod tests {
     fn accent_starts_at_bottom_left_for_agent_border() {
         let base = Style::default();
         let accent = Style::default().fg(Color::Blue);
+        let border = BorderAccent {
+            horizontal_span: 10,
+            vertical_span: 2,
+            align: MessageAlign::Left,
+            base,
+            accent,
+            progress: 0.2,
+        };
         assert_eq!(
-            border_style_for_edge(
-                BorderEdge::Bottom,
-                0,
-                10,
-                2,
-                MessageAlign::Left,
-                base,
-                accent,
-                0.2
-            )
-            .fg,
+            border_style_for_edge(BorderEdge::Bottom, 0, border).fg,
             accent.fg
         );
         assert_eq!(
-            border_style_for_edge(
-                BorderEdge::Bottom,
-                9,
-                10,
-                2,
-                MessageAlign::Left,
-                base,
-                accent,
-                0.2
-            )
-            .fg,
+            border_style_for_edge(BorderEdge::Bottom, 9, border).fg,
             base.fg
         );
     }

@@ -172,7 +172,7 @@ impl Terminal {
                         session_id: "assistant".to_string(),
                     })
                     .await
-                    .map_err(|err| Error::Other(err.into()))?;
+                    .map_err(Error::Other)?;
                 Ok(TerminalId::new(response.terminal_id))
             }
         }
@@ -187,7 +187,7 @@ impl Terminal {
                 })
                 .await
                 .map(|out| out.output)
-                .map_err(|err| Error::Other(err.into())),
+                .map_err(Error::Other),
         }
     }
 
@@ -200,7 +200,7 @@ impl Terminal {
                         terminal_id: id.to_string(),
                     })
                     .await
-                    .map_err(|err| Error::Other(err.into()))?;
+                    .map_err(Error::Other)?;
                 Ok(match out.exit_code {
                     Some(code) => ExitStatus::Code(code),
                     None => ExitStatus::Other,
@@ -218,7 +218,7 @@ impl Terminal {
                 })
                 .await
                 .map(|_| ())
-                .map_err(|err| Error::Other(err.into())),
+                .map_err(Error::Other),
         }
     }
 
@@ -231,7 +231,7 @@ impl Terminal {
                 })
                 .await
                 .map(|_| ())
-                .map_err(|err| Error::Other(err.into())),
+                .map_err(Error::Other),
         }
     }
 }

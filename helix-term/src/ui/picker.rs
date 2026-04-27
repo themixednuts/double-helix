@@ -59,6 +59,13 @@ use self::handlers::{DynamicQueryChange, DynamicQueryHandler, PreviewHighlightHa
 
 pub(super) type SharedIngress = Arc<helix_runtime::Sender<crate::runtime::RuntimeEvent>>;
 
+fn request_redraw(ingress: &SharedIngress) {
+    // Redraw requests are lossy: if the ingress queue already has pending work,
+    // dropping this signal is preferable to blocking or panicking from picker
+    // worker threads that do not run inside Tokio.
+    let _ = ingress.try_send(crate::runtime::RuntimeEvent::Redraw);
+}
+
 #[derive(Clone)]
 pub struct PickerRuntime {
     work: helix_runtime::Work,
@@ -186,7 +193,7 @@ struct RuntimeRedrawOnDrop {
 
 impl Drop for RuntimeRedrawOnDrop {
     fn drop(&mut self) {
-        helix_runtime::send_blocking(&self.ingress, crate::runtime::RuntimeEvent::Redraw);
+        request_redraw(&self.ingress);
     }
 }
 
@@ -348,7 +355,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             Config::DEFAULT,
             Arc::new({
                 let ingress = ingress.clone();
-                move || helix_runtime::send_blocking(&ingress, crate::runtime::RuntimeEvent::Redraw)
+                move || request_redraw(&ingress)
             }),
             None,
             matcher_columns,
@@ -387,7 +394,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             Config::DEFAULT,
             Arc::new({
                 let ingress = ingress.clone();
-                move || helix_runtime::send_blocking(&ingress, crate::runtime::RuntimeEvent::Redraw)
+                move || request_redraw(&ingress)
             }),
             None,
             matcher_columns,

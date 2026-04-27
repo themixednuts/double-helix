@@ -1141,6 +1141,7 @@ mod tests {
     use super::*;
     use arc_swap::ArcSwap;
     use helix_view::model::AssistantModel;
+    use std::path::PathBuf;
     use std::sync::Arc;
 
     fn test_editor(width: u16, height: u16) -> Editor {
@@ -1160,6 +1161,30 @@ mod tests {
             helix_runtime::test::runtime(),
             handlers,
         )
+    }
+
+    #[tokio::test]
+    async fn file_picker_renders_workspace_root() {
+        let mut editor = test_editor(151, 43);
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("helix-term has workspace parent")
+            .to_path_buf();
+        let (ingress, _rx) = helix_runtime::channel(16);
+        let mut picker = crate::ui::file_picker(&editor, root, ingress.clone());
+        picker.required_size((151, 43));
+        picker.sync(&mut editor);
+
+        let area = Rect::new(0, 0, 151, 43);
+        let mut surface = Surface::empty(area);
+        let render_ctx = RenderContext {
+            editor: &editor,
+            scroll: std::sync::atomic::AtomicUsize::new(SCROLL_NONE),
+            ingress,
+            plugin_manager: None,
+        };
+
+        picker.render(area, &mut surface, &render_ctx);
     }
 
     #[tokio::test]

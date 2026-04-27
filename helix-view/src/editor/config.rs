@@ -866,8 +866,20 @@ pub enum BufferLineRenderMode {
     Multiple,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case", default, deny_unknown_fields)]
+fn bufferline_render_mode_from_str<E>(value: &str) -> Result<BufferLineRenderMode, E>
+where
+    E: serde::de::Error,
+{
+    match value {
+        "never" => Ok(BufferLineRenderMode::Never),
+        "always" => Ok(BufferLineRenderMode::Always),
+        "multiple" => Ok(BufferLineRenderMode::Multiple),
+        other => Err(E::unknown_variant(other, &["never", "always", "multiple"])),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub struct BufferLineConfig {
     pub render_mode: BufferLineRenderMode,
     pub separator: String,
@@ -879,6 +891,69 @@ impl Default for BufferLineConfig {
             render_mode: BufferLineRenderMode::default(),
             separator: String::from("│"),
         }
+    }
+}
+
+impl<'de> Deserialize<'de> for BufferLineConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct BufferLineVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for BufferLineVisitor {
+            type Value = BufferLineConfig;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                write!(
+                    formatter,
+                    "a bufferline render mode string or a detailed bufferline configuration"
+                )
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(BufferLineConfig {
+                    render_mode: bufferline_render_mode_from_str(value)?,
+                    ..Default::default()
+                })
+            }
+
+            fn visit_map<M>(self, map: M) -> Result<Self::Value, M::Error>
+            where
+                M: serde::de::MapAccess<'de>,
+            {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "kebab-case", default, deny_unknown_fields)]
+                struct BufferLineConfigFields {
+                    render_mode: BufferLineRenderMode,
+                    separator: String,
+                }
+
+                impl Default for BufferLineConfigFields {
+                    fn default() -> Self {
+                        let config = BufferLineConfig::default();
+                        Self {
+                            render_mode: config.render_mode,
+                            separator: config.separator,
+                        }
+                    }
+                }
+
+                let fields = BufferLineConfigFields::deserialize(
+                    serde::de::value::MapAccessDeserializer::new(map),
+                )?;
+
+                Ok(BufferLineConfig {
+                    render_mode: fields.render_mode,
+                    separator: fields.separator,
+                })
+            }
+        }
+
+        deserializer.deserialize_any(BufferLineVisitor)
     }
 }
 
@@ -1417,5 +1492,36 @@ impl Default for Config {
             acp: AcpConfig::default(),
             editing_engine: EditingEngineConfig::default(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BufferLineRenderMode, Config};
+
+    #[test]
+    fn bufferline_accepts_render_mode_string() {
+        let config: Config = toml::from_str(r#"bufferline = "multiple""#).unwrap();
+
+        assert_eq!(
+            config.bufferline.render_mode,
+            BufferLineRenderMode::Multiple
+        );
+        assert_eq!(config.bufferline.separator, "│");
+    }
+
+    #[test]
+    fn bufferline_accepts_detailed_config_table() {
+        let config: Config = toml::from_str(
+            r#"
+            [bufferline]
+            render-mode = "always"
+            separator = ">"
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(config.bufferline.render_mode, BufferLineRenderMode::Always);
+        assert_eq!(config.bufferline.separator, ">");
     }
 }

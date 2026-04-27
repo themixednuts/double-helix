@@ -202,6 +202,22 @@ mod tests {
     }
 
     #[test]
+    fn parsing_bufferline_string_config_file() {
+        let config = Config::load_test(
+            r#"
+            [editor]
+            bufferline = "multiple"
+            "#,
+        );
+
+        assert_eq!(
+            config.editor.bufferline.render_mode,
+            helix_view::editor::BufferLineRenderMode::Multiple
+        );
+        assert_eq!(config.editor.bufferline.separator, "│");
+    }
+
+    #[test]
     fn keys_resolve_to_correct_defaults() {
         // From serde default
         let default_keys = Config::load_test("").keys;

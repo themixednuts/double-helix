@@ -1,6 +1,6 @@
 # Runtime + Collaboration Implementation Plan
 
-Status: draft
+Status: complete
 
 This document turns the two architecture specs into an execution plan:
 
@@ -174,7 +174,7 @@ For each phase below:
 - `serial` means it should land before the next phase starts
 - `parallel-safe` means tracks can proceed concurrently once the phase contract is agreed
 
-## Phase 0 - Lock The Contracts
+## Phase 0 - Lock The Contracts ✅
 
 Goal:
 
@@ -195,7 +195,7 @@ Parallel-safe tracks:
 
 - none; this is the agreement phase
 
-## Phase 1 - `helix-runtime` Core
+## Phase 1 - `helix-runtime` Core ✅
 
 Goal:
 
@@ -269,7 +269,7 @@ Merge condition:
 - core tests pass
 - no feature crate depends on ambient Tokio APIs from new code added after this point
 
-## Phase 2 - Runtime Ownership In `helix-term`
+## Phase 2 - Runtime Ownership In `helix-term` ✅
 
 Goal:
 
@@ -317,7 +317,7 @@ Exit criteria:
 - new feature code can re-enter main-loop mutation through typed mailbox events
 - no new runtime-local global queues are introduced
 
-## Phase 3 - Typed UI/Main-Thread Ingress
+## Phase 3 - Typed UI/Main-Thread Ingress ✅
 
 Goal:
 
@@ -369,7 +369,7 @@ Current note:
 - detached scheduling and typed ingress have already moved out of `RuntimeDispatch`
 - the remaining exit-task helpers in `helix-term/src/runtime/mod.rs` are now an app-owned wait-on-exit sink around `WaitSet`
 
-## Phase 4 - Remove `job` As A First-Class Runtime Concept
+## Phase 4 - Remove `job` As A First-Class Runtime Concept ✅
 
 Goal:
 
@@ -422,7 +422,7 @@ Current note:
 - the remaining work is to decide whether the wait-on-exit helpers in `runtime/mod.rs` should stay there or be folded even further into a smaller shutdown-only surface
 - the old `runtime/spawn.rs` helper has already been folded into `runtime/mod.rs`
 
-## Phase 5 - Retire Old Async Helper Paths
+## Phase 5 - Retire Old Async Helper Paths ✅
 
 Goal:
 
@@ -515,7 +515,7 @@ Exit criteria:
 - no duplicate "official" debounce/latest/cancel path remains
 - old helpers are deleted or fully demoted out of the main architecture
 
-## Phase 6 - Collaboration Core In `helix-view`
+## Phase 6 - Collaboration Core In `helix-view` ✅
 
 Goal:
 
@@ -563,7 +563,7 @@ Exit criteria:
 - editor can resolve surfaces by `surface::Id`
 - no assistant-specific types leak into `collab`
 
-## Phase 7 - Assistant Core In `helix-view`
+## Phase 7 - Assistant Core In `helix-view` ✅
 
 Goal:
 
@@ -632,7 +632,7 @@ Exit criteria:
 - ACP wire ids are converted at the boundary into assistant domain ids/origin
 - no panel-owned durable thread data remains as a required source of truth
 
-## Phase 8 - Route ACP Through Assistant Store
+## Phase 8 - Route ACP Through Assistant Store ✅
 
 Goal:
 
@@ -690,7 +690,7 @@ Exit criteria:
 - application no longer directly mutates ACP durable thread state
 - assistant store is the source of truth
 
-## Phase 9 - ACP Tabs And View-State Migration
+## Phase 9 - ACP Tabs And View-State Migration ✅
 
 Goal:
 
@@ -729,7 +729,7 @@ Exit criteria:
 - background threads are real
 - ACP panel no longer keys durable UI state by row index
 
-## Phase 10 - Follow
+## Phase 10 - Follow ✅
 
 Goal:
 
@@ -769,7 +769,7 @@ Exit criteria:
 - follow pause semantics are deterministic
 - inactive threads do not steal focus just because they are busy
 
-## Phase 11 - Context Attachments
+## Phase 11 - Context Attachments ✅
 
 Goal:
 
@@ -806,7 +806,7 @@ Exit criteria:
 
 - text-object prompting is built on typed context refs, not prompt string hacks
 
-## Phase 12 - Persistence
+## Phase 12 - Persistence ✅
 
 Goal:
 
@@ -844,7 +844,7 @@ Exit criteria:
 - assistant persistence is fully runtime-driven
 - no assistant store method performs persistence I/O directly
 
-## Phase 13 - Cleanup And Deletion Pass
+## Phase 13 - Cleanup And Deletion Pass ✅
 
 Goal:
 

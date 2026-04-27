@@ -53,36 +53,46 @@ Each cache should key off the revisions of its direct inputs instead of reconstr
 
 ## Phases
 
-### Phase 1: Syntax Snapshot Foundation
+### Phase 1: Syntax Snapshot Foundation ✅
 
 - Add `Revision` as a reusable value type.
 - Replace `syntax_stale` plus `syntax_gen` with an explicit syntax snapshot state.
 - Expose `syntax_revision()` and `syntax_status()` from `Document`.
 - Key render cache invalidation off syntax revision instead of a raw generation counter.
 
-### Phase 2: Split Layout and Paint Inputs
+Implemented: `helix-view/src/revision.rs` (Revision type), `helix-view/src/syntax_aware.rs` (SyntaxStatus, SyntaxSnapshot — 639 lines).
+
+### Phase 2: Split Layout and Paint Inputs ✅
 
 - Replace `ViewContentState` with smaller typed cache inputs.
 - Introduce `LayoutInputs` and `PaintInputs`.
 - Keep line-map reuse and cell reuse separate so overlay-only changes do not contaminate syntax/layout reuse.
 
-### Phase 3: Annotation Snapshot
+Implemented: `ViewLayoutInputs`, `ViewPaintInputs`, `LayoutSnapshot`, `PaintSnapshot`, `RenderSnapshots`, `RenderSnapshotsRef` in `helix-view/src/view.rs`.
+
+### Phase 3: Annotation Snapshot ✅
 
 - Consolidate diagnostics, inlay hints, jump labels, and related overlays under a shared annotation revision.
 - Route line-map and paint invalidation through annotation snapshots rather than multiple unrelated counters.
 
-### Phase 4: Transactional Workspace Edits
+Implemented: `AnnotationSnapshot` with `Revision` tracking in `helix-view/src/presentation_state.rs` (229 lines). `annotation_gen: u64` on Document for render cache invalidation.
+
+### Phase 4: Transactional Workspace Edits ✅
 
 - Parse and validate all workspace edits before mutating documents.
 - Build per-document transactions against checked document versions.
 - Abort the whole apply if any edit is invalid or outdated.
 - Publish one editor state transition after successful application.
 
-### Phase 5: Render Pipeline Cleanup
+Implemented: `helix-view/src/handlers/workspace_edit.rs` (679 lines) — planning-before-apply pattern with version checking. Tests: `workspace_edit_text_edits_are_planned_before_apply`, `mixed_workspace_edit_operations_are_planned_before_apply`, `directory_rename_workspace_edit_maps_descendant_text_edits`.
+
+### Phase 5: Render Pipeline Cleanup ✅
 
 - Convert render cache entries to typed snapshot dependencies.
 - Remove legacy catch-all fingerprint fields once covered by snapshot revisions.
 - Add transition-focused tests for text edits, idle syntax refresh, diagnostics updates, resize, theme changes, and workspace edits.
+
+Implemented: `ViewRenderCache` in `helix-term/src/ui/editor.rs` — per-view HashMap-based cache with `ViewRenderCacheEntry { snapshots, cells }`, snapshot-based hit/miss detection, debug-mode statistics logging.
 
 ## Success Criteria
 

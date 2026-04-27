@@ -10,6 +10,7 @@ pub const VERSION_AND_GIT_HASH: &str = env!("VERSION_AND_GIT_HASH");
 pub const PRODUCT_CONFIG_DIR: &str = "double-helix";
 pub const LEGACY_CONFIG_DIR: &str = "helix";
 pub const WORKSPACE_CONFIG_DIR: &str = ".double-helix";
+pub const WORKSPACE_IGNORE_FILE: &str = ".double-helix/ignore";
 
 static RUNTIME_DIRS: once_cell::sync::Lazy<Vec<PathBuf>> =
     once_cell::sync::Lazy::new(prioritize_runtime_dirs);
@@ -155,8 +156,8 @@ pub fn workspace_config_file() -> PathBuf {
         .join("config.toml")
 }
 
-pub fn workspace_ignore_file_name() -> PathBuf {
-    PathBuf::from(WORKSPACE_CONFIG_DIR).join("ignore")
+pub fn workspace_ignore_file_name() -> &'static str {
+    WORKSPACE_IGNORE_FILE
 }
 
 pub fn lang_config_file() -> PathBuf {
@@ -286,6 +287,17 @@ fn ensure_parent_dir(path: &Path) {
         if !parent.exists() {
             std::fs::create_dir_all(parent).ok();
         }
+    }
+}
+
+#[cfg(test)]
+mod config_path_tests {
+    use super::{workspace_ignore_file_name, WORKSPACE_IGNORE_FILE};
+
+    #[test]
+    fn workspace_ignore_file_name_uses_slash_separator() {
+        assert_eq!(workspace_ignore_file_name(), WORKSPACE_IGNORE_FILE);
+        assert_eq!(workspace_ignore_file_name(), ".double-helix/ignore");
     }
 }
 

@@ -1,4 +1,4 @@
-This is a just a fork of Helix. All claims rest with Helix maintainers and its copyright holders. I am just maintaining a fork. 
+Double Helix is a fork of Helix. All upstream claims rest with Helix maintainers and its copyright holders.
 For more information please see Helix's readme file. 
 
 New Features
@@ -59,7 +59,7 @@ Summary for commands:
 
 ```bash
 git clone https://github.com/<owner>/double-helix.git
-cd helix
+cd double-helix
 cargo install --path helix-term --locked
 
 ```
@@ -69,8 +69,8 @@ Or if you have `just` installed, you can simply run `just` recipes in the folder
 THEN THE IMPORTANT PART that is missing from the docs page(this way you get all the default themes and gramars), [source](https://github.com/helix-editor/helix/discussions/7549#discussioncomment-6948696)
 ```bash
 cp -R runtime ~/.config/helix/
-hx -g fetch
-hx -g build
+dhx -g fetch
+dhx -g build
 ```
 
 **Full Height Mode:**

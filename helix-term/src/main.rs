@@ -57,7 +57,7 @@ async fn main_impl(runtime: helix_runtime::Runtime) -> Result<i32> {
 {}
 
 USAGE:
-    hx [FLAGS] [files]...
+    dhx [FLAGS] [files]...
 
 ARGS:
     <files>...    Set the input file to use, position can also be specified via file[:row[:col]]
@@ -92,7 +92,7 @@ FLAGS:
     }
 
     if args.display_version {
-        println!("helix {}", VERSION_AND_GIT_HASH);
+        println!("double-helix {}", VERSION_AND_GIT_HASH);
         std::process::exit(0);
     }
 

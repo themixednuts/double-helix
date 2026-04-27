@@ -47,14 +47,14 @@ RUSTFLAGS="-C target-feature=-crt-static"
       --locked
    ```
 
-   Either command will create the `hx` executable and construct the tree-sitter
+   Either command will create the `dhx` executable and construct the tree-sitter
    grammars in the local `runtime` folder.
 
 > 💡 If you do not want to fetch or build grammars, set an environment variable `HELIX_DISABLE_AUTO_GRAMMAR_BUILD`
 
 > 💡 Tree-sitter grammars can be fetched and compiled if not pre-packaged. Fetch
-> grammars with `hx --grammar fetch` and compile them with
-> `hx --grammar build`. This will install them in
+> grammars with `dhx --grammar fetch` and compile them with
+> `dhx --grammar build`. This will install them in
 > the `runtime` directory within the user's helix config directory (more
 > [details below](#multiple-runtime-directories)).
 
@@ -127,9 +127,9 @@ script could follow are:
 1. `export HELIX_DEFAULT_RUNTIME=/usr/lib/helix/runtime`
 1. `cargo build --profile opt --locked`
 1. `cp -r runtime $BUILD_DIR/usr/lib/helix/`
-1. `cp target/opt/hx $BUILD_DIR/usr/bin/hx`
+1. `cp target/opt/dhx $BUILD_DIR/usr/bin/dhx`
 
-This way the resulting `hx` binary will always look for its runtime directory in
+This way the resulting `dhx` binary will always look for its runtime directory in
 `/usr/lib/helix/runtime` if the user has no custom runtime in `~/.config/helix`
 or `HELIX_RUNTIME`.
 
@@ -139,7 +139,7 @@ To make sure everything is set up as expected you should run the Helix health
 check:
 
 ```sh
-hx --health
+dhx --health
 ```
 
 For more information on the health check results refer to
@@ -159,7 +159,7 @@ cp contrib/helix.png ~/.icons # or ~/.local/share/icons
 It is recommended to convert the links in the `.desktop` file to absolute paths to avoid potential problems:
 
 ```sh
-sed -i -e "s|Exec=hx %F|Exec=$(readlink -f ~/.cargo/bin/hx) %F|g" \
+sed -i -e "s|Exec=dhx %F|Exec=$(readlink -f ~/.cargo/bin/dhx) %F|g" \
   -e "s|Icon=helix|Icon=$(readlink -f ~/.icons/helix.png)|g" ~/.local/share/applications/Helix.desktop
 ```
 
@@ -167,7 +167,7 @@ To use another terminal than the system default, you can modify the `.desktop`
 file. For example, to use `kitty`:
 
 ```sh
-sed -i "s|Exec=hx %F|Exec=kitty hx %F|g" ~/.local/share/applications/Helix.desktop
+sed -i "s|Exec=dhx %F|Exec=kitty dhx %F|g" ~/.local/share/applications/Helix.desktop
 sed -i "s|Terminal=true|Terminal=false|g" ~/.local/share/applications/Helix.desktop
 ```
 
@@ -191,7 +191,7 @@ cargo deb -- --locked
 ```
 
 > 💡 This locks you into the `--release` profile. But you can also build helix in any way you like.
-> As long as you leave a `target/release/hx` file, it will get packaged with `cargo deb --no-build`
+> As long as you leave a `target/release/dhx` file, it will get packaged with `cargo deb --no-build`
 
 > 💡 Don't worry about the following:
 > ```
@@ -204,5 +204,5 @@ You can find the resulted `.deb` in `target/debian/`. It should contain everythi
 
 - completions for bash, fish, zsh
 - .desktop file
-- icon (though desktop environments might use their own since the name of the package is correctly `helix`)
+- icon (though desktop environments might use their own since the name of the package is correctly `double-helix`)
 - launcher to the binary with the runtime

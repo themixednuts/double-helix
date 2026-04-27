@@ -54,4 +54,4 @@ cursor-line = "hint"
 [[editor.agents]]
 name = "Mock Echo"
 command = "node"
-args = ["E:/helix/helix-fork/scripts/mock-acp-agent.js"]
+args = ["scripts/mock-acp-agent.js"]

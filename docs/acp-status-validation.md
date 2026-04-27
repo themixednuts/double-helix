@@ -12,8 +12,8 @@ Add to your `config.toml` (e.g. `~/.config/helix/config.toml` or project root):
 [[editor.agents]]
 name = "Mock Echo"
 command = "node"
-args = ["E:/helix/helix-fork/scripts/mock-acp-agent.js"]
-# Use the absolute path to the script on your machine
+args = ["scripts/mock-acp-agent.js"]
+# Use a path that resolves from your working directory, or an absolute path on your machine.
 ```
 
 Then run `hx`, press **Space A c** to connect, choose "Mock Echo", **Space A i** to

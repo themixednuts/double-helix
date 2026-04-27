@@ -58,7 +58,7 @@ This fork of Helix implements the following pull requests. Future pull requests 
 Summary for commands:
 
 ```bash
-git clone https://github.com/gj1118/helix.git
+git clone https://github.com/<owner>/double-helix.git
 cd helix
 cargo install --path helix-term --locked
 

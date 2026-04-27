@@ -5,5 +5,13 @@ result
 runtime/grammars
 .DS_Store
 
+# Local agent/editor state and scratch artifacts
+.claude/
+.cursor/
+NUL
+bench_latest_only.txt
+*.pdb
+*.exe
+
 runtime/queries/harneet/highlights.scm
 runtime/queries/harneet/indents.scm

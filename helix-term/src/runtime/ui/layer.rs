@@ -1,5 +1,3 @@
-use std::path::PathBuf;
-
 use crate::{
     compositor::Compositor,
     runtime::{ui::command::LayerCommand, RuntimeEvent},
@@ -16,17 +14,6 @@ pub(crate) fn apply_layer_command(
     match cmd {
         LayerCommand::PushNotificationHistory => push_notification_history(editor, compositor),
         LayerCommand::InvalidRegexPopup { message } => invalid_regex_popup(compositor, message),
-        LayerCommand::RefreshFileExplorer { cursor, root } => {
-            refresh_file_explorer_layer(editor, compositor, ingress, cursor, root);
-        }
-        LayerCommand::PushFileExplorer { cursor, root } => {
-            match crate::ui::file_explorer(cursor, root, editor, ingress) {
-                Ok(picker) => {
-                    compositor.push(Box::new(crate::ui::overlay::overlaid(picker)));
-                }
-                Err(err) => editor.set_error(format!("{err}")),
-            }
-        }
         LayerCommand::DismissPromptIfPresent => {
             if compositor.find::<crate::ui::Prompt>().is_some() {
                 compositor.remove_type::<crate::ui::Prompt>();
@@ -126,19 +113,6 @@ fn push_notification_history(editor: &mut helix_view::Editor, compositor: &mut C
     let popup = crate::ui::Popup::new("notification-history", crate::ui::Text::new(content))
         .auto_close(true);
     compositor.push(Box::new(popup));
-}
-
-fn refresh_file_explorer_layer(
-    editor: &helix_view::Editor,
-    compositor: &mut Compositor,
-    ingress: IngressSender<RuntimeEvent>,
-    cursor: u32,
-    root: PathBuf,
-) {
-    compositor.pop();
-    if let Ok(picker) = crate::ui::file_explorer(Some(cursor), root, editor, ingress) {
-        compositor.push(Box::new(crate::ui::overlay::overlaid(picker)));
-    }
 }
 
 fn invalid_regex_popup(compositor: &mut Compositor, message: String) {

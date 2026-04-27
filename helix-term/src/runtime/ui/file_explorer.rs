@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use crate::{
     compositor::Compositor,
     runtime::{ui::command::FileExplorerCommand, RuntimeEvent, UiCommand},
-    ui::{Prompt, PromptEvent},
+    ui::{FileExplorerPanel, Prompt, PromptEvent, FILE_EXPLORER_ID},
 };
 use helix_view::Editor;
 
@@ -17,10 +17,7 @@ fn refresh_file_explorer(cursor: u32, cx: &mut crate::compositor::Context, root:
         .work()
         .spawn(async move {
             crate::runtime::send_ui_command_with(
-                UiCommand::Layer(crate::runtime::LayerCommand::RefreshFileExplorer {
-                    cursor,
-                    root,
-                }),
+                UiCommand::FileExplorer(FileExplorerCommand::RefreshPanel { cursor, root }),
                 ingress,
             )
             .await;
@@ -35,6 +32,24 @@ pub(crate) fn apply_file_explorer_command(
     cmd: FileExplorerCommand,
 ) {
     match cmd {
+        FileExplorerCommand::RefreshPanel { root, cursor } => {
+            let cursor = usize::try_from(cursor).unwrap_or(usize::MAX);
+            if let Some(panel) = compositor.find_id::<FileExplorerPanel>(FILE_EXPLORER_ID) {
+                if let Err(err) = panel.refresh(editor, Some(root), Some(cursor)) {
+                    editor.set_error(format!("{err}"));
+                }
+            } else {
+                match FileExplorerPanel::new(root, editor) {
+                    Ok(mut panel) => {
+                        if let Err(err) = panel.refresh(editor, None, Some(cursor)) {
+                            editor.set_error(format!("{err}"));
+                        }
+                        compositor.push(Box::new(panel));
+                    }
+                    Err(err) => editor.set_error(format!("{err}")),
+                }
+            }
+        }
         FileExplorerCommand::PromptCreate {
             root,
             cursor,

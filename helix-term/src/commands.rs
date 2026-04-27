@@ -501,9 +501,9 @@ impl MappableCommand {
         file_picker => "Open file picker",
         file_picker_in_current_buffer_directory => "Open file picker at current buffer's directory",
         file_picker_in_current_directory => "Open file picker at current working directory",
-        file_explorer => "Open file explorer in workspace root",
-        file_explorer_in_current_buffer_directory => "Open file explorer at current buffer's directory",
-        file_explorer_in_current_directory => "Open file explorer at current working directory",
+        file_explorer => "Open file explorer panel in workspace root",
+        file_explorer_in_current_buffer_directory => "Open file explorer panel at current buffer's directory",
+        file_explorer_in_current_directory => "Open file explorer panel at current working directory",
         code_action => "Perform code action",
         code_action_picker => "Perform code action in a picker",
         buffer_picker => "Open buffer picker",
@@ -2250,9 +2250,7 @@ fn file_explorer(cx: &mut Context) {
         return;
     }
 
-    if let Ok(picker) = ui::file_explorer(None, root, cx.editor, cx.ingress.clone()) {
-        cx.push_layer(Box::new(overlaid(picker)));
-    }
+    open_file_explorer_panel(cx, root);
 }
 
 fn file_explorer_in_current_buffer_directory(cx: &mut Context) {
@@ -2278,9 +2276,7 @@ fn file_explorer_in_current_buffer_directory(cx: &mut Context) {
         }
     };
 
-    if let Ok(picker) = ui::file_explorer(None, path, cx.editor, cx.ingress.clone()) {
-        cx.push_layer(Box::new(overlaid(picker)));
-    }
+    open_file_explorer_panel(cx, path);
 }
 
 fn file_explorer_in_current_directory(cx: &mut Context) {
@@ -2291,8 +2287,13 @@ fn file_explorer_in_current_directory(cx: &mut Context) {
         return;
     }
 
-    if let Ok(picker) = ui::file_explorer(None, cwd, cx.editor, cx.ingress.clone()) {
-        cx.push_layer(Box::new(overlaid(picker)));
+    open_file_explorer_panel(cx, cwd);
+}
+
+fn open_file_explorer_panel(cx: &mut Context, root: PathBuf) {
+    match ui::FileExplorerPanel::new(root, cx.editor) {
+        Ok(panel) => cx.replace_or_push_layer(ui::FILE_EXPLORER_ID, panel),
+        Err(err) => cx.editor.set_error(format!("{err}")),
     }
 }
 

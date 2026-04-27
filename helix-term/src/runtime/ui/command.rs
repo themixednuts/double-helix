@@ -237,6 +237,10 @@ pub enum AssistantCommand {
 
 #[derive(Debug, Clone)]
 pub enum FileExplorerCommand {
+    RefreshPanel {
+        root: PathBuf,
+        cursor: u32,
+    },
     PromptCreate {
         root: PathBuf,
         cursor: u32,
@@ -356,10 +360,6 @@ pub enum LayerCommand {
     PushNotificationHistory,
     /// Regex compile failed in cmdline; show error in a small overlay.
     InvalidRegexPopup { message: String },
-    /// Pop the top layer and push a refreshed file explorer (same root / cursor).
-    RefreshFileExplorer { cursor: u32, root: PathBuf },
-    /// Push a file explorer overlay (e.g. directory navigation in the explorer picker).
-    PushFileExplorer { cursor: Option<u32>, root: PathBuf },
     /// Remove cmdline prompt overlay if present (focus lost).
     DismissPromptIfPresent,
     /// Markdown in a popup (`Markdown::new` uses editor `syn_loader` at apply time).

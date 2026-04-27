@@ -885,6 +885,53 @@ impl Tree {
     pub fn area(&self) -> Rect {
         self.area
     }
+
+    /// The root node ID.
+    pub fn root(&self) -> ViewId {
+        self.root
+    }
+
+    /// Walk the tree topology depth-first. The visitor transforms each node
+    /// bottom-up: leaves are visited first, then containers receive the
+    /// already-transformed children.
+    pub fn visit_topology<F, R>(&self, visitor: &F) -> Option<R>
+    where
+        F: Fn(TopologyNode<R>) -> R,
+    {
+        self.visit_node(self.root, visitor)
+    }
+
+    fn visit_node<F, R>(&self, id: ViewId, visitor: &F) -> Option<R>
+    where
+        F: Fn(TopologyNode<R>) -> R,
+    {
+        let node = self.nodes.get(id)?;
+        match &node.content {
+            Content::View(_) => Some(visitor(TopologyNode::Leaf(id))),
+            Content::Container(container) => {
+                let children: Vec<R> = container
+                    .children
+                    .iter()
+                    .filter_map(|&child| self.visit_node(child, visitor))
+                    .collect();
+                Some(visitor(TopologyNode::Container {
+                    layout: container.layout,
+                    children,
+                }))
+            }
+        }
+    }
+}
+
+/// A node in the tree topology, produced by [`Tree::visit_topology`].
+///
+/// `R` is the visitor's return type. For containers, `children` holds the
+/// already-visited results from child nodes.
+pub enum TopologyNode<R> {
+    /// A leaf view.
+    Leaf(ViewId),
+    /// A container with its layout and children (already transformed by the visitor).
+    Container { layout: Layout, children: Vec<R> },
 }
 
 #[derive(Debug)]

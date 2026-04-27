@@ -2,23 +2,31 @@
 //!
 //! This crate provides a Lua-based plugin system for the Helix text editor.
 //! Plugins can register event handlers, custom commands, and interact with
-//! the editor through a safe API.
+//! the editor through a host-agnostic contract API.
 //!
 //! # Example Plugin
 //!
 //! ```lua
 //! -- init.lua
-//! helix.on("buffer_open", function(event)
-//!     print("Buffer opened!")
+//! helix.events.subscribe("document_opened", function(event)
+//!     helix.log.info("Document opened: " .. (event.path or "untitled"))
 //! end)
 //!
-//! helix.on("buffer_save", function(event)
-//!     print("Saving buffer...")
-//!     -- Auto-format on save
-//!     helix.lsp.format()
+//! helix.events.subscribe("document_pre_save", function(event)
+//!     helix.log.info("Saving document...")
 //! end)
+//!
+//! helix.commands.register({
+//!     name = "greet",
+//!     doc = "Prompt for a name and greet",
+//!     handler = function()
+//!         local name = helix.ui.prompt("Name:")
+//!         helix.ui.info("Hello, " .. (name or "world") .. "!")
+//!     end,
+//! })
 //! ```
 
+pub mod contract;
 pub mod error;
 pub mod lua;
 pub mod types;
@@ -28,7 +36,7 @@ pub use error::{PluginError, Result};
 pub use lua::LuaEngine;
 pub use mlua;
 pub use types::{
-    EventData, EventType, IndividualPluginConfig, Plugin, PluginConfig, PluginEvent, PluginMetadata,
+    IndividualPluginConfig, Plugin, PluginConfig, PluginMetadata, PluginNotification, UiCallbackId,
 };
 
 use helix_view::Editor;
@@ -90,20 +98,11 @@ impl PluginManager {
             }
 
             info!("Loading plugin: {}", plugin.metadata.name);
-            if let Err(e) = engine.load_plugin(plugin) {
+            if let Err(e) = engine.load_plugin(editor, plugin) {
                 log::error!("Failed to load plugin: {}", e);
             }
         }
         drop(engine);
-
-        // Fire init event
-        self.fire_event(
-            editor,
-            PluginEvent {
-                event_type: EventType::OnInit,
-                data: EventData::None,
-            },
-        )?;
 
         Ok(())
     }
@@ -134,10 +133,14 @@ impl PluginManager {
         true
     }
 
-    /// Fire an event to all registered handlers
-    pub fn fire_event(&self, editor: &mut Editor, event: PluginEvent) -> Result<()> {
+    /// Fire a contract event to all subscribed plugin handlers.
+    pub fn fire_event(
+        &self,
+        editor: &mut Editor,
+        event: &crate::contract::events::PluginEvent,
+    ) -> Result<()> {
         let engine = self.engine.read();
-        engine.call_event_handlers(editor, &event)
+        engine.call_event_handlers(editor, event)
     }
 
     /// Get plugin configuration for a specific plugin
@@ -173,12 +176,11 @@ impl PluginManager {
     pub fn handle_ui_callback(
         &self,
         editor: &mut Editor,
-        plugin_name: String,
-        callback_id: u64,
-        value: serde_json::Value,
+        callback_id: UiCallbackId,
+        value: contract::DynamicValue,
     ) -> Result<()> {
         let engine = self.engine.read();
-        engine.handle_ui_callback(editor, plugin_name, callback_id, value)
+        engine.handle_ui_callback(editor, callback_id, value)
     }
 }
 

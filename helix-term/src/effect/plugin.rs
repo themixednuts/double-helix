@@ -1,91 +1,84 @@
-use helix_plugin::PluginManager;
-use helix_runtime::{send_blocking, Sender as IngressSender};
-
-use crate::runtime::{ingress::RuntimeEvent, UiCommand};
+use helix_plugin::contract::UiCallbackToken;
+use helix_plugin::contract::{adapt, events};
+use helix_plugin::{PluginManager, PluginNotification};
 use helix_view::Editor;
 
-pub(crate) fn apply_register_plugin_panel(
-    editor: &mut Editor,
-    ingress: IngressSender<RuntimeEvent>,
-    plugin_name: String,
-    panel_id: String,
-    title: String,
-    side: String,
-    width: u16,
-    render_callback_id: u64,
-    event_callback_id: Option<u64>,
-) {
-    use helix_view::model::{PanelSide, PanelSize, PluginPanelModel};
-
-    let panel_side = match side.as_str() {
-        "left" => PanelSide::Left,
-        "bottom" => PanelSide::Bottom,
-        _ => PanelSide::Right,
-    };
-    let model = PluginPanelModel {
-        plugin_name: plugin_name.clone(),
-        panel_id: panel_id.clone(),
-        render_callback_id,
-        event_callback_id,
-    };
-    let model_panel_id =
-        editor
-            .model
-            .insert_panel(title, Box::new(model), panel_side, PanelSize::fixed(width));
-
-    send_blocking(
-        &ingress,
-        RuntimeEvent::Ui(UiCommand::Plugin(
-            crate::runtime::ui::command::PluginCommand::PushPanel {
-                plugin_name,
-                panel_id,
-                model_panel_id,
-                render_callback_id,
-                event_callback_id,
+/// Convert a [`PluginNotification`] (lightweight channel signal) to a full
+/// [`events::PluginEvent`] (contract event with enriched editor context).
+///
+/// Returns `None` when the notification requires editor context that isn't
+/// available (e.g. the focused view doesn't exist for selection changes).
+pub(crate) fn notification_to_event(
+    notification: &PluginNotification,
+    editor: &Editor,
+) -> Option<events::PluginEvent> {
+    match notification {
+        PluginNotification::BufferOpen {
+            document_id, path, ..
+        } => {
+            let lang = editor
+                .documents
+                .get(document_id)
+                .and_then(|d| d.language_name().map(|s| s.to_string()));
+            Some(events::PluginEvent::DocumentOpened(
+                events::DocumentOpenedEvent {
+                    document: adapt::document_handle(*document_id),
+                    path: path.as_ref().map(|p| p.to_string_lossy().into_owned()),
+                    language: lang,
+                },
+            ))
+        }
+        PluginNotification::SelectionChange { document_id, .. } => {
+            let focused_view_id = editor.tree.focus;
+            let view = editor.tree.try_get(focused_view_id)?;
+            let doc = editor.documents.get(document_id)?;
+            let cursor_char = doc
+                .selection(view.id)
+                .primary()
+                .cursor(doc.text().slice(..));
+            Some(events::PluginEvent::SelectionChanged(
+                events::SelectionChangedEvent {
+                    document: adapt::document_handle(*document_id),
+                    view: adapt::view_handle(view.id),
+                    primary_cursor: adapt::char_to_position(doc.text(), cursor_char),
+                },
+            ))
+        }
+        PluginNotification::ModeChange { old_mode, new_mode } => {
+            Some(events::PluginEvent::ModeChanged(events::ModeChangedEvent {
+                old: adapt::mode_str_to_contract(old_mode),
+                new: adapt::mode_str_to_contract(new_mode),
+            }))
+        }
+        PluginNotification::KeyPress { key } => {
+            Some(events::PluginEvent::KeyPressed(events::KeyPressedEvent {
+                key: key.clone(),
+                mode: adapt::mode_to_contract(editor.mode),
+            }))
+        }
+        PluginNotification::LspDiagnostic {
+            document_id,
+            diagnostic_count,
+        } => Some(events::PluginEvent::DiagnosticsUpdated(
+            events::DiagnosticsUpdatedEvent {
+                document: adapt::document_handle(*document_id),
+                count: *diagnostic_count,
             },
         )),
-    );
-}
-
-pub(crate) fn apply_remove_plugin_panel(
-    editor: &mut Editor,
-    ingress: IngressSender<RuntimeEvent>,
-    panel_id: String,
-) {
-    let matching: Vec<_> = editor
-        .model
-        .panels
-        .iter()
-        .filter_map(|(id, entry)| {
-            entry
-                .content
-                .as_any()
-                .downcast_ref::<helix_view::model::PluginPanelModel>()
-                .filter(|model| model.panel_id == panel_id)
-                .map(|_| id)
-        })
-        .collect();
-
-    for id in matching {
-        editor.model.remove_panel(id);
     }
-
-    send_blocking(
-        &ingress,
-        RuntimeEvent::Ui(UiCommand::Plugin(
-            crate::runtime::ui::command::PluginCommand::RemovePanel { panel_id },
-        )),
-    );
 }
 
 pub(crate) fn apply_plugin_ui_callback(
     editor: &mut Editor,
     plugin_manager: std::sync::Arc<PluginManager>,
-    plugin_name: String,
-    callback_id: u64,
-    value: serde_json::Value,
+    callback: UiCallbackToken,
+    value: helix_plugin::contract::DynamicValue,
 ) {
-    if let Err(err) = plugin_manager.handle_ui_callback(editor, plugin_name, callback_id, value) {
+    let Some(callback_id) = helix_plugin::UiCallbackId::new(callback.raw().get()) else {
+        editor.set_error("invalid plugin UI callback token");
+        return;
+    };
+    if let Err(err) = plugin_manager.handle_ui_callback(editor, callback_id, value) {
         editor.set_error(err.to_string());
     }
 }

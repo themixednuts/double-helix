@@ -107,6 +107,9 @@ pub(crate) fn compute_panel_layout(area: Rect, editor: &Editor) -> PanelLayout {
     let mut panel_areas = Vec::new();
 
     for (panel_id, panel) in &editor.model.panels {
+        if !panel.visible {
+            continue;
+        }
         let axis_total = match panel.side {
             PanelSide::Left | PanelSide::Right => area.width,
             PanelSide::Bottom => area.height,
@@ -225,6 +228,7 @@ pub struct Context<'a> {
     /// Exit-bound task sink for compositor-owned flows that must finish typed task work.
     pub exit_tasks: &'a mut ExitTaskSet,
     pub exit_task_work: helix_runtime::Work,
+    pub notifier: crate::handlers::local::Notifier,
     /// When `Some`, async work can send [`RuntimeEvent`] without the process-global ingress cell.
     pub ingress: IngressSender<RuntimeEvent>,
     pub idle_reset_tx: helix_runtime::Sender<()>,
@@ -239,7 +243,7 @@ impl Context<'_> {
             + 'static,
     ) {
         crate::runtime::ingress::spawn_ui_command_with_future(
-            self.editor.runtime().work().clone(),
+            self.editor.work(),
             future,
             self.ingress.clone(),
         );
@@ -252,7 +256,7 @@ impl Context<'_> {
             + 'static,
     ) {
         crate::runtime::ingress::spawn_task_event_with_future(
-            self.editor.runtime().work().clone(),
+            self.editor.work(),
             future,
             self.ingress.clone(),
         );
@@ -268,28 +272,20 @@ impl Context<'_> {
             + Send
             + 'static,
     ) {
-        self.exit_tasks.push(self.exit_task_work.spawn(future));
+        crate::runtime::schedule_exit_task(self.exit_tasks, &self.exit_task_work, future);
     }
 
     /// Waits on all pending async UI work, then tries to flush all pending write
     /// operations for all documents.
     pub fn block_try_flush_writes(&mut self) -> anyhow::Result<()> {
-        log::debug!("waiting on pending exit-bound task work...");
-        let results = tokio::task::block_in_place(|| {
-            helix_lsp::block_on(std::mem::take(self.exit_tasks).drain())
-        });
-        for result in results {
-            let plugin_manager = self
-                .plugin_manager
+        crate::runtime::drain_exit_tasks_blocking(
+            self.editor,
+            self.exit_tasks,
+            self.ingress.clone(),
+            self.plugin_manager
                 .clone()
-                .expect("plugin manager must be available when flushing exit tasks");
-            crate::effect::apply_exit_task_result(
-                self.editor,
-                self.ingress.clone(),
-                plugin_manager,
-                result,
-            )?;
-        }
+                .expect("plugin manager must be available when flushing exit tasks"),
+        )?;
         tokio::task::block_in_place(|| helix_lsp::block_on(self.editor.flush_writes()))?;
         Ok(())
     }
@@ -330,12 +326,12 @@ impl RenderContext<'_> {
 /// is accessed immutably (no mutations). The `scroll` field uses `AtomicUsize`.
 /// The remaining field (`plugin_manager`) is `Arc` which is already Sync.
 /// `Editor` itself contains some non-Sync fields (e.g. `save_queue` with
-/// `dyn Future + Send`) but these are never accessed during rendering — only
+/// async task handles) but these are never accessed during rendering - only
 /// read-only config/document/view data is used. This `Sync` impl enables
 /// sharing `&RenderContext` across rayon threads for parallel component render.
 unsafe impl Sync for RenderContext<'_> {}
 
-pub trait Component: Any + AnyComponent + Send {
+pub trait Component: Any + Send {
     /// Process input events, return true if handled.
     fn handle_event(&mut self, _event: &Event, _ctx: &mut Context) -> EventResult {
         EventResult::Ignored(None)
@@ -426,11 +422,7 @@ pub trait Component: Any + AnyComponent + Send {
 }
 
 pub trait PickerComponent {
-    fn request_preview_highlight(
-        &mut self,
-        editor: &mut Editor,
-        path: std::path::PathBuf,
-    );
+    fn request_preview_highlight(&mut self, editor: &mut Editor, path: std::path::PathBuf);
 
     fn apply_preview_syntax(
         &mut self,
@@ -731,7 +723,9 @@ impl Compositor {
                 let editor_view = self.find::<crate::ui::EditorView>().unwrap();
                 if let Some(completion) = &mut editor_view.completion {
                     completion.update_filter(c);
-                    if completion.is_empty() || c.is_some_and(|c| !helix_core::chars::char_is_word(c)) {
+                    if completion.is_empty()
+                        || c.is_some_and(|c| !helix_core::chars::char_is_word(c))
+                    {
                         editor_view.clear_completion(cx.editor);
                         if c.is_some() {
                             crate::handlers::completion::trigger_auto_completion(cx.editor, false);
@@ -886,7 +880,7 @@ impl Compositor {
             use helix_view::editor::{BufferLineRenderMode, CmdlineStyle};
             let use_bufferline = match config.bufferline.render_mode {
                 BufferLineRenderMode::Always => true,
-                BufferLineRenderMode::Multiple if cx.editor.documents.len() > 1 => true,
+                BufferLineRenderMode::Multiple if cx.editor.has_multiple_documents() => true,
                 _ => false,
             };
             let mut editor_area =
@@ -921,7 +915,7 @@ impl Compositor {
 
         // Set prompt_active on EditorView before render.
         for layer in &mut self.layers {
-            if let Some(editor_view) = layer.as_any_mut().downcast_mut::<crate::ui::EditorView>() {
+            if let Some(editor_view) = layer.downcast_mut::<crate::ui::EditorView>() {
                 editor_view.prompt_active = has_prompt;
             }
         }
@@ -980,7 +974,20 @@ impl Compositor {
             }
         }
 
-        // Phase 5: Overlay layers (pickers, popups, prompts) on top of everything.
+        // Phase 5: Model floats — above editor/panels/autoinfo, below modal overlays.
+        let float_count = render_ctx.editor.model.floats.len();
+        if float_count > 0 {
+            let floats_start = std::time::Instant::now();
+            crate::ui::plugin_float::render_model_floats(area, surface, &render_ctx);
+            log_run_phase(
+                "compositor_layer",
+                "model_floats",
+                floats_start.elapsed(),
+                || format!("count={float_count} phase=model_floats"),
+            );
+        }
+
+        // Phase 6: Overlay layers (pickers, popups, prompts) on top of everything.
         // Overlays render directly to the main surface (not through prepare_render/blit)
         // because they only paint a small region — blitting a full-area surface would
         // overwrite the editor content underneath with empty cells.
@@ -1042,14 +1049,14 @@ impl Compositor {
         self.layers
             .iter_mut()
             .find(|component| component.type_name() == type_name)
-            .and_then(|component| component.as_any_mut().downcast_mut())
+            .and_then(|component| component.downcast_mut())
     }
 
     pub fn find_id<T: 'static>(&mut self, id: &'static str) -> Option<&mut T> {
         self.layers
             .iter_mut()
             .find(|component| component.id() == Some(id))
-            .and_then(|component| component.as_any_mut().downcast_mut())
+            .and_then(|component| component.downcast_mut())
     }
 
     pub fn find_picker(&mut self) -> Option<&mut dyn PickerComponent> {
@@ -1087,75 +1094,45 @@ impl crate::host::UiHost for Compositor {
     }
 }
 
-// View casting, taken straight from Cursive
+// Downcasting via trait upcasting (stable since Rust 1.76).
+// `Component: Any` allows `&dyn Component` → `&dyn Any` coercion,
+// eliminating the need for a separate `AnyComponent` trait.
 
 use std::any::Any;
 
-/// A view that can be downcasted to its concrete type.
-///
-/// This trait is automatically implemented for any `T: Component`.
-pub trait AnyComponent {
-    /// Downcast self to a `Any`.
-    fn as_any(&self) -> &dyn Any;
+impl dyn Component {
+    /// Attempts to downcast `self` to a concrete type.
+    pub fn downcast_ref<T: Any>(&self) -> Option<&T> {
+        (self as &dyn Any).downcast_ref()
+    }
 
-    /// Downcast self to a mutable `Any`.
-    fn as_any_mut(&mut self) -> &mut dyn Any;
+    /// Attempts to downcast `self` to a concrete type.
+    pub fn downcast_mut<T: Any>(&mut self) -> Option<&mut T> {
+        (self as &mut dyn Any).downcast_mut()
+    }
 
-    /// Returns a boxed any from a boxed self.
-    ///
-    /// Can be used before `Box::downcast()`.
+    /// Attempts to downcast `Box<Self>` to a concrete type.
     ///
     /// # Examples
     ///
     /// ```rust
     /// use helix_term::{ui::Text, compositor::Component};
     /// let boxed: Box<dyn Component> = Box::new(Text::new("text".to_string()));
-    /// let text: Box<Text> = boxed.as_boxed_any().downcast().unwrap();
+    /// let text: Box<Text> = boxed.downcast().unwrap();
     /// ```
-    fn as_boxed_any(self: Box<Self>) -> Box<dyn Any>;
-}
-
-impl<T: Component> AnyComponent for T {
-    /// Downcast self to a `Any`.
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    /// Downcast self to a mutable `Any`.
-    fn as_any_mut(&mut self) -> &mut dyn Any {
-        self
-    }
-
-    fn as_boxed_any(self: Box<Self>) -> Box<dyn Any> {
-        self
-    }
-}
-
-impl dyn AnyComponent {
-    /// Attempts to downcast `self` to a concrete type.
-    pub fn downcast_ref<T: Any>(&self) -> Option<&T> {
-        self.as_any().downcast_ref()
-    }
-
-    /// Attempts to downcast `self` to a concrete type.
-    pub fn downcast_mut<T: Any>(&mut self) -> Option<&mut T> {
-        self.as_any_mut().downcast_mut()
-    }
-
-    /// Attempts to downcast `Box<Self>` to a concrete type.
     pub fn downcast<T: Any>(self: Box<Self>) -> Result<Box<T>, Box<Self>> {
-        // Do the check here + unwrap, so the error
-        // value is `Self` and not `dyn Any`.
-        if self.as_any().is::<T>() {
-            Ok(self.as_boxed_any().downcast().unwrap())
+        if (self.as_ref() as &dyn Any).is::<T>() {
+            // Upcast Box<dyn Component> to Box<dyn Any>, then downcast.
+            let boxed_any: Box<dyn Any> = self;
+            Ok(boxed_any.downcast().unwrap())
         } else {
             Err(self)
         }
     }
 
-    /// Checks if this view is of type `T`.
-    pub fn is<T: Any>(&mut self) -> bool {
-        self.as_any().is::<T>()
+    /// Checks if this component is of type `T`.
+    pub fn is<T: Any>(&self) -> bool {
+        (self as &dyn Any).is::<T>()
     }
 }
 
@@ -1219,6 +1196,23 @@ mod tests {
         // Terminal too narrow (≤60) — panel should be skipped
         assert!(layout.panel_areas.is_empty());
         assert_eq!(layout.editor_area.width, 50);
+    }
+
+    #[tokio::test]
+    async fn panel_layout_skips_hidden_panels() {
+        let mut editor = test_editor(120, 40);
+        let panel_id = editor.model.insert_panel(
+            "Assistant",
+            Box::new(AssistantModel::default()),
+            PanelSide::Right,
+            PanelSize::Percent(35),
+        );
+        assert_eq!(editor.model.toggle_panel(panel_id), Some(false));
+
+        let layout = compute_panel_layout(Rect::new(0, 0, 120, 40), &editor);
+
+        assert!(layout.panel_areas.is_empty());
+        assert_eq!(layout.editor_area, Rect::new(0, 0, 120, 40));
     }
 
     #[tokio::test]

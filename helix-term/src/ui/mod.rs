@@ -15,6 +15,7 @@ pub mod menu;
 mod notification_popup;
 pub mod overlay;
 pub mod picker;
+pub(crate) mod plugin_float;
 pub mod plugin_panel;
 pub mod popup;
 pub mod prompt;
@@ -35,7 +36,7 @@ use helix_view::theme::Style;
 pub use markdown::Markdown;
 pub use menu::Menu;
 pub use notification_popup::NotificationPopup;
-pub use picker::{Column as PickerColumn, FileLocation, Picker};
+pub use picker::{Column as PickerColumn, FileLocation, Picker, PickerRuntime};
 pub use popup::Popup;
 pub use prompt::{Prompt, PromptEvent};
 pub use select::Select;
@@ -174,15 +175,20 @@ pub fn raw_regex_prompt(
                                     if event == PromptEvent::Validate {
                                         let msg = err.to_string();
                                         let ingress = cx.ingress.clone();
-                                        cx.editor.runtime().work().clone().spawn(async move {
-                                            send_ui_command_with(
-                                                UiCommand::Layer(LayerCommand::InvalidRegexPopup {
-                                                    message: msg,
-                                                }),
-                                                ingress,
-                                            )
-                                            .await;
-                                        }).detach();
+                                        cx.editor
+                                            .work()
+                                            .spawn(async move {
+                                                send_ui_command_with(
+                                                    UiCommand::Layer(
+                                                        LayerCommand::InvalidRegexPopup {
+                                                            message: msg,
+                                                        },
+                                                    ),
+                                                    ingress,
+                                                )
+                                                .await;
+                                            })
+                                            .detach();
                                     }
                                 }
                             }
@@ -252,15 +258,20 @@ pub fn raw_regex_prompt(
                                     if event == PromptEvent::Validate {
                                         let msg = err.to_string();
                                         let ingress = cx.ingress.clone();
-                                        cx.editor.runtime().work().clone().spawn(async move {
-                                            send_ui_command_with(
-                                                UiCommand::Layer(LayerCommand::InvalidRegexPopup {
-                                                    message: msg,
-                                                }),
-                                                ingress,
-                                            )
-                                            .await;
-                                        }).detach();
+                                        cx.editor
+                                            .work()
+                                            .spawn(async move {
+                                                send_ui_command_with(
+                                                    UiCommand::Layer(
+                                                        LayerCommand::InvalidRegexPopup {
+                                                            message: msg,
+                                                        },
+                                                    ),
+                                                    ingress,
+                                                )
+                                                .await;
+                                            })
+                                            .detach();
                                     }
                                 }
                             }
@@ -360,26 +371,34 @@ pub fn file_picker(
             Spans::from(spans).into()
         },
     )];
-    let picker = Picker::new(columns, 0, [], data, editor.runtime().clone(), ingress.clone(), move |cx, path: &PathBuf, action| {
-        let path = helix_stdx::path::canonicalize(path);
-        let old_id = cx.editor.document_id_by_path(&path);
+    let picker = Picker::new(
+        columns,
+        0,
+        [],
+        data,
+        PickerRuntime::new(editor.runtime()),
+        ingress.clone(),
+        move |cx, path: &PathBuf, action| {
+            let path = helix_stdx::path::canonicalize(path);
+            let old_id = cx.editor.document_id_by_path(&path);
 
-        match cx.editor.open(&path, action) {
-            Ok(doc_id) => {
-                if old_id != Some(doc_id) {
-                    default_folding(cx.editor);
+            match cx.editor.open(&path, action) {
+                Ok(doc_id) => {
+                    if old_id != Some(doc_id) {
+                        default_folding(cx.editor);
+                    }
+                }
+                Err(e) => {
+                    let err = if let Some(err) = e.source() {
+                        format!("{}", err)
+                    } else {
+                        format!("unable to open \"{}\"", path.display())
+                    };
+                    cx.editor.set_error(err);
                 }
             }
-            Err(e) => {
-                let err = if let Some(err) = e.source() {
-                    format!("{}", err)
-                } else {
-                    format!("unable to open \"{}\"", path.display())
-                };
-                cx.editor.set_error(err);
-            }
-        }
-    })
+        },
+    )
     .with_preview(|_editor, path| Some((path.as_path().into(), None)))
     .show_preview(!config.file_picker.hide_preview)
     .with_item_data(

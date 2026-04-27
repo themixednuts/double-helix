@@ -4,12 +4,13 @@ A Lua-based plugin system for the Helix text editor, enabling users to extend fu
 
 ## Features
 
-- **Event-driven architecture**: React to editor events like buffer open, save, mode changes, etc.
+- **Event-driven architecture**: React to editor events (document open, save, mode change, etc.)
+- **Handle-centric API**: Operate on document and view handles with method syntax
+- **Coroutine-based async**: UI prompts/pickers suspend with `coroutine.yield`, no callbacks
 - **Custom commands**: Register new commands accessible from the command palette
-- **UI integration**: Create custom pickers and UI components
-- **LSP integration**: Interact with Language Server Protocol features
-- **Safe sandboxing**: Plugins run in a sandboxed Lua environment
-- **Hot reloading**: Reload plugins without restarting the editor (planned)
+- **UI integration**: Panels, prompts, pickers, notifications
+- **Host-agnostic contract**: Serializable types for future WASM/RPC transport
+- **Safe sandboxing**: Plugins run in a sandboxed Lua 5.4 environment
 
 ## Quick Start
 
@@ -25,13 +26,11 @@ plugin-dir = "~/.config/helix/plugins"
 
 ### 2. Create Your First Plugin
 
-Create a directory structure:
-
 ```
 ~/.config/helix/plugins/
-└── my-plugin/
-    ├── plugin.toml    # Metadata (optional)
-    └── init.lua       # Entry point (required)
+  my-plugin/
+    plugin.toml    # Metadata (optional)
+    init.lua       # Entry point (required)
 ```
 
 **plugin.toml**:
@@ -44,10 +43,22 @@ author = "Your Name"
 
 **init.lua**:
 ```lua
--- Simple plugin that logs when buffers are opened
-helix.on("buffer_open", function(event)
-    print("Buffer opened!")
+-- Log when documents are opened
+helix.events.subscribe("document_opened", function(event)
+    helix.log.info("Opened: " .. (event.path or "untitled"))
 end)
+
+-- Register a custom command (runs as a coroutine, so it can yield)
+helix.commands.register({
+    name = "greet",
+    doc = "Ask for a name and greet",
+    handler = function()
+        local name = helix.ui.prompt("Your name:")
+        if name then
+            helix.ui.info("Hello, " .. name .. "!")
+        end
+    end,
+})
 ```
 
 ### 3. Restart Helix
@@ -56,160 +67,291 @@ Plugins are loaded on startup. Your plugin should now be active!
 
 ## API Reference
 
-### Event System
-
-Subscribe to editor events using `helix.on(event_name, callback)`:
+### `helix.workspace` — Workspace queries and state
 
 ```lua
--- Available events:
--- "init"              - Plugin system initialized
--- "ready"             - Editor ready
--- "buffer_open"       - Buffer opened
--- "buffer_pre_save"   - Before buffer save
--- "buffer_post_save"  - After buffer save
--- "buffer_close"      - Buffer closed
--- "buffer_changed"    - Buffer content changed
--- "mode_change"       - Editor mode changed
--- "key_press"         - Key pressed
--- "lsp_attach"        - LSP attached to buffer
--- "lsp_diagnostic"    - LSP diagnostics received
--- "selection_change"  - Selection changed
--- "view_change"       - View/window changed
+local doc = helix.workspace.focused_document()  -- DocumentHandle or nil
+local view = helix.workspace.focused_view()      -- ViewHandle or nil
+local mode = helix.workspace.mode()              -- "normal" | "insert" | "select"
+helix.workspace.set_mode("insert")               -- switch mode
+local docs = helix.workspace.documents()          -- [DocumentHandle]
+local views = helix.workspace.views()             -- [ViewHandle]
+local snap = helix.workspace.snapshot()           -- full workspace snapshot table
+local theme = helix.workspace.theme()             -- { name, bg?, fg? }
+local cfg = helix.workspace.editor_config()       -- { scrolloff, mouse, ... }
+```
 
-helix.on("buffer_save", function(event)
-    print("Saving buffer: " .. event.path)
+### DocumentHandle methods
+
+```lua
+local doc = helix.workspace.focused_document()
+
+-- Queries
+local snap = doc:snapshot()     -- { path, language, is_modified, line_count, selections, ... }
+local text = doc:text()         -- full text as string
+local line = doc:line(0)        -- 0-based line
+local diags = doc:diagnostics() -- { diagnostics = [...] }
+
+-- Mutations
+doc:edit({
+    { start = {line=0, column=0}, finish = {line=0, column=0}, text = "hello" },
+})
+doc:save()                          -- save (no-op if unmodified)
+doc:save({ force = true })          -- force save
+doc:set_selections({
+    { anchor = {line=0, column=0}, head = {line=0, column=5} },
+})
+doc:undo()                          -- returns true if undo succeeded
+doc:redo()                          -- returns true if redo succeeded
+doc:select_all()
+
+-- Per-plugin virtual text annotations
+doc:set_annotations({
+    { line = 0, column = 0, text = " <- generated", fg = "#6f8f3d" },
+    { line = 4, text = "Review this block", bg = { r = 40, g = 30, b = 20 }, is_line = true },
+})
+doc:clear_annotations()
+```
+
+### ViewHandle methods
+
+```lua
+local view = helix.workspace.focused_view()
+
+local snap = view:snapshot()    -- { handle, document, cursor, viewport }
+local pos = view:cursor()       -- { line, column }
+view:focus()                    -- focus this view
+view:close()                    -- close this view
+```
+
+### `helix.documents` — Document listing and opening
+
+```lua
+local docs = helix.documents.list()                     -- [DocumentHandle]
+local doc = helix.documents.open("path/to/file.rs")     -- open, don't focus
+local doc = helix.documents.open("file.rs", { focus = true })
+```
+
+### `helix.events` — Event subscription
+
+```lua
+local subscription = helix.events.subscribe("document_opened", function(event)
+    -- event.document (DocumentHandle), event.path, event.language
+end)
+
+helix.events.unsubscribe(subscription)
+
+-- Available event kinds (also as constants on helix.events.kind):
+-- document_opened, document_changed, document_pre_save, document_saved,
+-- document_closed, selection_changed, mode_changed, view_focused,
+-- diagnostics_updated, lsp_attached, key_pressed, split_created,
+-- split_closed, tab_opened, tab_closed, tab_focused, float_created,
+-- float_closed, panel_toggled, assistant_thread_created,
+-- assistant_thread_closed, assistant_run_started, assistant_run_completed,
+-- assistant_message_received, assistant_context_changed, host_ready
+```
+
+### `helix.commands` — Register and execute commands
+
+```lua
+-- Register a plugin command (handler runs as a coroutine)
+local command = helix.commands.register({
+    name = "my_command",
+    doc = "Does something useful",
+    handler = function()
+        -- Can use helix.ui.prompt(), helix.ui.confirm(), helix.ui.pick() here
+        helix.ui.info("Done!")
+    end,
+})
+
+-- Update/remove by typed CommandHandle
+command:update({ doc = "Does something more useful" })
+helix.commands.remove(command)
+
+-- Execute a built-in editor command
+helix.commands.execute("write")
+helix.commands.execute("open", { "path/to/file.rs" })
+```
+
+### `helix.registers` — Read/write editor registers
+
+```lua
+local values = helix.registers.get("a")       -- [string]
+helix.registers.set("a", { "hello", "world" })
+```
+
+### `helix.ui` — UI operations
+
+```lua
+-- Fire-and-forget notifications
+helix.ui.notify("message")
+helix.ui.notify("message", "error")   -- "info" | "warn" | "error"
+helix.ui.info("info message")
+helix.ui.warn("warning message")
+helix.ui.error("error message")
+helix.ui.set_status("status line text")
+
+-- Coroutine-yielding (must be called from command handler or helix.async)
+local answer = helix.ui.prompt("Enter name:", "default")  -- yields, returns string or nil
+local yes = helix.ui.confirm("Are you sure?")             -- yields, returns bool
+local item = helix.ui.pick({"a", "b", "c"}, "Choose:")   -- yields, returns string or nil
+
+-- Panels
+local panel = helix.ui.panel({
+    title = "My Panel",
+    side = "right",    -- "left" | "right"
+    width = 30,
+    render = function(surface, area)
+        surface:set_string(area.x, area.y, "Hello", "ui.text")
+    end,
+    on_event = function(event) end,  -- optional
+})
+panel:focus()
+panel:resize("fixed:40")    -- also "percent:30"
+panel:toggle()
+panel:close()
+
+for _, entry in ipairs(helix.ui.panels()) do
+    entry.handle:focus()    -- PanelHandle
+end
+
+-- Theme
+local name = helix.ui.get_theme()
+helix.ui.set_theme("gruvbox")
+
+-- Terminal
+local size = helix.ui.terminal_size()  -- { width, height }
+helix.ui.redraw()
+```
+
+### `helix.splits` - View topology
+
+```lua
+local view = helix.workspace.focused_view()
+local doc = helix.workspace.focused_document()
+
+local right = helix.splits.split("right", { view = view, document = doc })
+helix.splits.resize({ view = right, dimension = "width", amount = "grow:10" })
+helix.splits.transpose(right)
+helix.splits.focus_direction("left")
+
+local tree = helix.splits.tree()
+local views = helix.splits.list()
+```
+
+### `helix.tabs` - Per-view tab groups
+
+Tab indexes are 0-based.
+
+```lua
+local view = helix.workspace.focused_view()
+local doc = helix.workspace.focused_document()
+
+helix.tabs.open(doc, { view = view, focus = true })
+helix.tabs.focus(0, view)
+helix.tabs.next(view)
+helix.tabs.previous(view)
+
+local tabs = helix.tabs.list(view)  -- { tabs = [...], active = index }
+helix.tabs.close({ view = view, index = 0 })
+```
+
+### `helix.floats` - Floating windows
+
+```lua
+local float = helix.floats.create({
+    title = "Preview",
+    placement = { type = "centered", width = 60, height = 12 },
+    content = {
+        { text = "Hello from a float", style = "ui.text" },
+    },
+    focus = true,
+    dismissible = true,
+})
+
+float:update({
+    title = "Preview (updated)",
+    placement = { type = "absolute", x = 4, y = 2, width = 50, height = 10 },
+})
+float:close()
+
+for _, entry in ipairs(helix.floats.list()) do
+    entry.handle:close()    -- FloatHandle
+end
+```
+
+### `helix.assistant` - Assistant threads
+
+```lua
+local thread = helix.assistant.active_thread()  -- ThreadHandle or nil
+if thread then
+    local snap = helix.assistant.thread(thread)
+    local entries = helix.assistant.entries(thread)
+    local context = helix.assistant.context(thread)
+    helix.assistant.submit(thread, "Continue from here")
+else
+    helix.assistant.submit(nil, "Start a new assistant request")
+end
+
+helix.assistant.cancel(thread)  -- nil cancels the active thread
+```
+
+### `helix.async(fn, ...)` — Launch a coroutine
+
+```lua
+-- Use from event handlers (which are synchronous) to call yielding APIs
+helix.events.subscribe("document_opened", function(event)
+    helix.async(function()
+        local confirm = helix.ui.confirm("Format this file?")
+        if confirm then
+            helix.commands.execute("format")
+        end
+    end)
 end)
 ```
 
-### Buffer Operations (Planned)
+### `helix.config()` — Per-plugin configuration
 
 ```lua
--- Get current buffer
-local buffer = helix.get_buffer()
-
--- Read buffer content
-local text = buffer:get_text()
-local selection = buffer:get_selection()
-
--- Modify buffer
-buffer:insert(position, "text")
-buffer:delete(range)
-buffer:set_selection(selection)
-```
-
-### Editor Operations (Planned)
-
-```lua
--- Execute commands
-helix.editor.execute_command("open_file")
-
--- Mode operations
-helix.editor.insert_mode()
-helix.editor.normal_mode()
-
--- Cursor movement
-helix.editor.move_cursor("left")
-helix.editor.move_cursor("right")
-```
-
-### UI Components (Planned)
-
-```lua
--- Create a custom picker
-helix.ui.picker({
-    items = {"option1", "option2", "option3"},
-    on_select = function(item)
-        print("Selected: " .. item)
-    end,
-    prompt = "Choose an option:"
-})
-
--- Show a notification
-helix.ui.notify("Hello from plugin!", "info")
-```
-
-### LSP Integration (Planned)
-
-```lua
--- Format current buffer
-helix.lsp.format()
-
--- Get document symbols
-local symbols = helix.lsp.document_symbols()
-
--- Go to definition
-helix.lsp.goto_definition()
-```
-
-### Custom Commands (Planned)
-
-```lua
--- Register a custom command
-helix.register_command({
-    name = "my_command",
-    description = "Does something useful",
-    handler = function()
-        helix.ui.notify("Command executed!")
-    end
-})
-```
-
-## Plugin Structure
-
-### Basic Plugin
-
-Minimal plugin with just an `init.lua`:
-
-```
-my-plugin/
-└── init.lua
-```
-
-### Advanced Plugin
-
-Full-featured plugin with metadata and modules:
-
-```
-my-plugin/
-├── plugin.toml     # Metadata
-├── init.lua        # Entry point
-├── config.lua      # Configuration handling
-├── commands.lua    # Custom commands
-└── utils.lua       # Utility functions
-```
-
-### Module System
-
-Use Lua's module system to organize code:
-
-**init.lua**:
-```lua
-local commands = require("my-plugin.commands")
-local config = require("my-plugin.config")
-
-local M = {}
-
-function M.setup(user_config)
-    config.setup(user_config)
-    commands.register_all()
+local cfg = helix.config()  -- returns table from config.toml or nil
+if cfg then
+    local delay = cfg.delay or 1000
 end
+```
 
-M.setup()
-return M
+### `helix.log` — Logging
+
+```lua
+helix.log.info("message")
+helix.log.warn("message")
+helix.log.error("message")
+helix.log.debug("message")
+helix.log.trace("message")
+```
+
+### `helix.lsp` — LSP queries
+
+```lua
+local clients = helix.lsp.get_clients()  -- [{ name, id }]
+```
+
+### `helix.layout` — Layout combinators
+
+```lua
+local rects = helix.layout.split_vertical(area, { "fill", "fixed:30" })
+local rects = helix.layout.split_horizontal(area, { "percent:50", "fill" })
+local rect = helix.layout.center(area, 40, 10)
 ```
 
 ## Configuration
 
-### Global Plugin Configuration
-
-In `config.toml`:
+### Global
 
 ```toml
 [plugins]
 enabled = true
 plugin-dir = "~/.config/helix/plugins"
 
-# Configure individual plugins
 [[plugins.plugin]]
 name = "auto-save"
 enabled = true
@@ -219,119 +361,29 @@ delay = 1000
 auto_format = true
 ```
 
-### Accessing Configuration in Lua
+### Accessing in Lua
 
 ```lua
-local config = helix.get_plugin_config("my-plugin")
-if config then
-    local delay = config.delay or 1000
-    print("Delay: " .. delay)
+local cfg = helix.config()
+if cfg then
+    local delay = cfg.delay or 1000
 end
 ```
 
-## Example Plugins
-
-See `contrib/plugins/` for example plugins:
-
-- **auto-save**: Automatically save buffers
-- **git-blame**: Show git blame in statusline (planned)
-- **project-files**: Quick file navigation (planned)
-- **scratch-buffer**: Create temporary buffers (planned)
-
-## Best Practices
-
-1. **Error Handling**: Always use `pcall` for operations that might fail:
-   ```lua
-   helix.on("buffer_save", function(event)
-       local success, err = pcall(function()
-           -- Your code here
-       end)
-       if not success then
-           print("Error: " .. tostring(err))
-       end
-   end)
-   ```
-
-2. **Performance**: Minimize work in event handlers, especially for frequent events like `buffer_changed`
-
-3. **Naming**: Use descriptive names for your plugins and commands to avoid conflicts
-
-4. **Documentation**: Include a README.md in your plugin directory
-
-5. **Testing**: Test your plugin with different editor states and configurations
-
 ## Security
 
-Plugins run in a sandboxed Lua environment with restricted access:
+Plugins run in a sandboxed Lua environment:
 
-- **Disabled functions**: `os.execute`, `os.exit`, `io.*`, `loadfile`, `dofile`
-- **File system**: Only specific API calls can access files
-- **Network**: No network access (currently)
-
-## Troubleshooting
-
-### Plugin Not Loading
-
-1. Check that `plugins.enabled = true` in config.toml
-2. Verify plugin directory path is correct
-3. Ensure `init.lua` exists in the plugin directory
-4. Check Helix logs for error messages
-
-### Event Handlers Not Firing
-
-1. Verify event name is correct (see API Reference)
-2. Check that the event is being triggered (add debug prints)
-3. Ensure no errors in the handler callback
-
-### Performance Issues
-
-1. Profile your event handlers
-2. Avoid heavy computations in frequent events
-3. Use debouncing for expensive operations
+- **Disabled**: `os.execute`, `os.exit`, `io.*`, `loadfile`, `dofile`
+- **No network access** (currently)
 
 ## Development
 
-### Building
-
-The plugin system is integrated into Helix. Build with:
-
 ```bash
-cargo build --release --features lua-plugins
+cargo build --release          # Build
+cargo test -p helix-plugin     # Test
+RUST_LOG=helix_plugin=debug hx # Debug logging
 ```
-
-### Testing
-
-Run plugin system tests:
-
-```bash
-cargo test -p helix-plugin
-```
-
-### Debugging
-
-Enable debug logging:
-
-```bash
-RUST_LOG=helix_plugin=debug hx
-```
-
-## Roadmap
-
-- [x] Basic event system
-- [x] Plugin loading and discovery
-- [x] Sandboxed Lua environment
-- [ ] Buffer API
-- [ ] Editor API
-- [ ] UI components  
-- [ ] Custom commands
-- [ ] LSP integration
-- [ ] Hot reloading
-- [ ] Plugin marketplace
-- [ ] Debug adapter for Lua
-
-## Contributing
-
-Contributions are welcome! Please see the main [Helix contributing guide](../CONTRIBUTING.md).
 
 ## License
 

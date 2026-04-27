@@ -1,112 +1,29 @@
 use serde::{Deserialize, Serialize};
+use std::num::NonZeroU64;
 use std::path::PathBuf;
 
-/// Represents a plugin event type that can be subscribed to
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum EventType {
-    /// Plugin system initialized
-    OnInit,
-    /// Editor ready
-    OnReady,
-    /// Buffer opened
-    OnBufferOpen,
-    /// Buffer is about to be saved
-    OnBufferPreSave,
-    /// Buffer was saved
-    OnBufferPostSave,
-    /// Buffer closed
-    OnBufferClose,
-    /// Buffer content changed
-    OnBufferChanged,
-    /// Editor mode changed
-    OnModeChange,
-    /// Key was pressed
-    OnKeyPress,
-    /// LSP attached to buffer
-    OnLspAttach,
-    /// LSP diagnostics received
-    OnLspDiagnostic,
-    /// LSP server initialized
-    OnLspInitialized,
-    /// Selection changed
-    OnSelectionChange,
-    /// View/window changed
-    OnViewChange,
-}
-
-impl EventType {
-    /// Returns the event name as a string for Lua
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::OnInit => "init",
-            Self::OnReady => "ready",
-            Self::OnBufferOpen => "buffer_open",
-            Self::OnBufferPreSave => "buffer_pre_save",
-            Self::OnBufferPostSave => "buffer_post_save",
-            Self::OnBufferClose => "buffer_close",
-            Self::OnBufferChanged => "buffer_changed",
-            Self::OnModeChange => "mode_change",
-            Self::OnKeyPress => "key_press",
-            Self::OnLspAttach => "lsp_attach",
-            Self::OnLspDiagnostic => "lsp_diagnostic",
-            Self::OnLspInitialized => "lsp_initialized",
-            Self::OnSelectionChange => "selection_change",
-            Self::OnViewChange => "view_change",
-        }
-    }
-}
-
-impl std::str::FromStr for EventType {
-    type Err = ();
-
-    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        match s {
-            "init" => Ok(Self::OnInit),
-            "ready" => Ok(Self::OnReady),
-            "buffer_open" => Ok(Self::OnBufferOpen),
-            "buffer_pre_save" => Ok(Self::OnBufferPreSave),
-            "buffer_post_save" => Ok(Self::OnBufferPostSave),
-            "buffer_close" => Ok(Self::OnBufferClose),
-            "buffer_changed" => Ok(Self::OnBufferChanged),
-            "mode_change" => Ok(Self::OnModeChange),
-            "key_press" => Ok(Self::OnKeyPress),
-            "lsp_attach" => Ok(Self::OnLspAttach),
-            "lsp_diagnostic" => Ok(Self::OnLspDiagnostic),
-            "lsp_initialized" => Ok(Self::OnLspInitialized),
-            "selection_change" => Ok(Self::OnSelectionChange),
-            "view_change" => Ok(Self::OnViewChange),
-            _ => Err(()),
-        }
-    }
-}
-
-/// Plugin event data
+/// Lightweight notification signal for the plugin event channel.
+///
+/// Produced by editor hooks and sent through the async channel. The application
+/// event loop converts these to full [`crate::contract::events::PluginEvent`]
+/// payloads (with editor context) before dispatching to plugin handlers.
 #[derive(Debug, Clone)]
-pub struct PluginEvent {
-    pub event_type: EventType,
-    pub data: EventData,
-}
-
-/// Event data variants
-#[derive(Debug, Clone)]
-pub enum EventData {
-    /// No data
-    None,
-    /// Buffer-related data
-    Buffer {
+pub enum PluginNotification {
+    BufferOpen {
         document_id: helix_view::DocumentId,
         path: Option<PathBuf>,
     },
-    /// Mode change data
-    ModeChange { old_mode: String, new_mode: String },
-    /// Key press data
-    KeyPress { key: String },
-    /// LSP attach data
-    LspAttach {
+    SelectionChange {
         document_id: helix_view::DocumentId,
-        language_server_id: usize,
+        path: Option<PathBuf>,
     },
-    /// LSP diagnostic data
+    ModeChange {
+        old_mode: String,
+        new_mode: String,
+    },
+    KeyPress {
+        key: String,
+    },
     LspDiagnostic {
         document_id: helix_view::DocumentId,
         diagnostic_count: usize,
@@ -203,71 +120,60 @@ pub struct CommandMetadata {
     pub args: Option<String>,
 }
 
-/// Interface for executing builtin editor commands from plugins
-pub trait EditorCommandRegistry: Send + Sync {
-    fn execute(
-        &self,
-        editor: &mut helix_view::Editor,
-        name: &str,
-        args: &[String],
-    ) -> std::result::Result<(), anyhow::Error>;
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct UiCallbackId(NonZeroU64);
+
+impl UiCallbackId {
+    pub fn new(id: u64) -> Option<Self> {
+        NonZeroU64::new(id).map(Self)
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
 }
 
-/// Wrapper for EditorCommandRegistry to store in Lua app data
-pub struct CommandRegistryWrapper(pub std::sync::Arc<dyn EditorCommandRegistry>);
-
-/// Interface for handling UI elements (prompts, pickers, panels) that require compositor access.
-#[allow(clippy::too_many_arguments)]
-pub trait UiHandler: Send + Sync {
-    fn prompt(
-        &self,
-        editor: &mut helix_view::Editor,
-        message: String,
-        default: Option<String>,
-        plugin_name: String,
-        callback_id: u64,
-    );
-    fn confirm(
-        &self,
-        editor: &mut helix_view::Editor,
-        message: String,
-        plugin_name: String,
-        callback_id: u64,
-    );
-    fn picker(
-        &self,
-        editor: &mut helix_view::Editor,
-        items: Vec<String>,
-        prompt: String,
-        plugin_name: String,
-        callback_id: u64,
-    );
-    fn register_panel(
-        &self,
-        editor: &mut helix_view::Editor,
-        plugin_name: String,
-        panel_id: String,
-        title: String,
-        side: String,
-        width: u16,
-        render_callback_id: u64,
-        event_callback_id: Option<u64>,
-    );
-    fn remove_panel(&self, editor: &mut helix_view::Editor, plugin_name: String, panel_id: String);
+impl From<UiCallbackId> for u64 {
+    fn from(id: UiCallbackId) -> Self {
+        id.get()
+    }
 }
 
-/// Wrapper for UiHandler to store in Lua app data
-pub struct UiHandlerWrapper(pub std::sync::Arc<dyn UiHandler>);
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct PluginCallbackKey {
+    pub plugin_name: String,
+    pub callback_id: UiCallbackId,
+}
+
+impl PluginCallbackKey {
+    pub fn new(plugin_name: String, callback_id: UiCallbackId) -> Self {
+        Self {
+            plugin_name,
+            callback_id,
+        }
+    }
+}
 
 /// Wrapper for UI callbacks to store in Lua app data
 pub struct UiCallbackRegistry(
     pub  std::sync::Arc<
-        parking_lot::RwLock<std::collections::HashMap<(String, u64), mlua::RegistryKey>>,
+        parking_lot::RwLock<std::collections::HashMap<PluginCallbackKey, mlua::RegistryKey>>,
     >,
 );
 
 /// Wrapper for UI callback counter to store in Lua app data
 pub struct UiCallbackCounter(pub std::sync::Arc<std::sync::atomic::AtomicU64>);
+
+impl UiCallbackCounter {
+    pub fn next(&self) -> UiCallbackId {
+        loop {
+            let raw = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(id) = UiCallbackId::new(raw) {
+                return id;
+            }
+        }
+    }
+}
 
 #[allow(clippy::too_many_arguments)]
 /// Abstraction over a drawing surface for plugin rendering.

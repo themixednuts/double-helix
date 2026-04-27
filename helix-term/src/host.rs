@@ -68,8 +68,7 @@ impl UiHost for TermHost<'_> {
     fn request_timer(&mut self, id: TimerId, after: Duration) {
         let ingress = self.ingress.clone();
         let timer_task = self.runtime.clock().timer(after);
-        let _ = self
-            .runtime
+        self.runtime
             .work()
             .spawn(async move {
                 if timer_task.await.is_ok() {

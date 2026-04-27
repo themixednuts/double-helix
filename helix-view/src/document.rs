@@ -1,8 +1,6 @@
 use anyhow::{anyhow, bail, Error};
 use arc_swap::access::DynAccess;
 use arc_swap::ArcSwap;
-use futures_util::future::BoxFuture;
-use futures_util::FutureExt;
 use helix_core::auto_pairs::AutoPairs;
 use helix_core::chars::char_is_word;
 use helix_core::command_line::Token;
@@ -14,6 +12,7 @@ use helix_core::syntax::config::LanguageServerFeature;
 use helix_core::text_annotations::{InlineAnnotation, Overlay, TextAnnotations};
 use helix_core::text_folding::{EndFoldPoint, FoldContainer, RopeSliceFoldExt, StartFoldPoint};
 use helix_lsp::util::lsp_pos_to_pos;
+use helix_runtime::{Task, TaskError, Work};
 use helix_stdx::faccess::{copy_metadata, readonly};
 use helix_vcs::{DiffHandle, DiffProviderRegistry};
 
@@ -50,7 +49,7 @@ use helix_core::{
 use crate::{
     bench::{current_bench_command_context, log_command_phase},
     document_lsp::{DocumentColorSwatches, DocumentLspState},
-    editor::{Config, CursorShapeConfig},
+    editor::{Config, CursorShapeConfig, LifecycleBus},
     events::{DocumentDidChange, SelectionDidChange},
     expansion,
     file_bound::FileBoundState,
@@ -202,7 +201,8 @@ pub struct DocumentSavedEvent {
 }
 
 pub type DocumentSavedEventResult = Result<DocumentSavedEvent, anyhow::Error>;
-pub type DocumentSavedEventFuture = BoxFuture<'static, DocumentSavedEventResult>;
+pub type DocumentSavedTask = Task<DocumentSavedEventResult>;
+pub type DocumentFormatTask = Task<Result<Transaction, FormatterError>>;
 
 #[derive(Debug)]
 pub struct SavePoint {
@@ -256,6 +256,7 @@ pub struct Document {
     // of storing a copy on every doc. Then we can remove the surrounding `Arc` and use the
     // `ArcSwap` directly.
     syn_loader: Arc<ArcSwap<syntax::Loader>>,
+    lifecycle: Arc<LifecycleBus>,
 }
 
 /// Inlay hints for a single `(Document, View)` combo.
@@ -709,6 +710,10 @@ impl Document {
         self.vcs.bind_redraw(redraw);
     }
 
+    pub fn bind_lifecycle(&mut self, lifecycle: Arc<LifecycleBus>) {
+        self.lifecycle = lifecycle;
+    }
+
     pub fn from(
         text: Rope,
         encoding_with_bom_info: Option<(&'static Encoding, bool)>,
@@ -731,6 +736,7 @@ impl Document {
             config,
             lsp: DocumentLspState::default(),
             syn_loader,
+            lifecycle: Arc::new(LifecycleBus::default()),
         }
     }
 
@@ -808,10 +814,7 @@ impl Document {
 
     /// The same as [`format`], but only returns formatting changes if auto-formatting
     /// is configured.
-    pub fn auto_format(
-        &self,
-        editor: &Editor,
-    ) -> Option<BoxFuture<'static, Result<Transaction, FormatterError>>> {
+    pub fn auto_format(&self, editor: &Editor) -> Option<DocumentFormatTask> {
         if self.language_config()?.auto_format {
             self.format(editor)
         } else {
@@ -823,10 +826,7 @@ impl Document {
     /// to format it nicely.
     // We can't use anyhow::Result here since the output of the future has to be
     // clonable to be used as shared future. So use a custom error type.
-    pub fn format(
-        &self,
-        editor: &Editor,
-    ) -> Option<BoxFuture<'static, Result<Transaction, FormatterError>>> {
+    pub fn format(&self, editor: &Editor) -> Option<DocumentFormatTask> {
         if let Some((fmt_cmd, fmt_args)) = self
             .language_config()
             .and_then(|c| c.formatter.as_ref())
@@ -912,7 +912,7 @@ impl Document {
 
                 Ok(helix_core::diff::compare_ropes(&text, &Rope::from(str)))
             };
-            return Some(formatting_future.boxed());
+            return Some(editor.runtime().work().spawn(formatting_future));
         };
 
         let text = self.text().clone();
@@ -945,19 +945,18 @@ impl Document {
                 offset_encoding,
             ))
         };
-        Some(fut.boxed())
+        Some(editor.runtime().work().spawn(fut))
     }
 
     pub fn save<P: Into<PathBuf>>(
         &mut self,
+        work: &Work,
         path: Option<P>,
-        force: bool,
-    ) -> Result<
-        impl Future<Output = Result<DocumentSavedEvent, anyhow::Error>> + 'static + Send,
-        anyhow::Error,
-    > {
+        policy: crate::editor::SavePolicy,
+    ) -> Result<DocumentSavedTask, anyhow::Error> {
         let path = path.map(|path| path.into());
-        self.save_impl(path, force)
+        self.save_impl(path, policy)
+            .map(|future| work.spawn(future))
 
         // futures_util::future::Ready<_>,
     }
@@ -967,7 +966,7 @@ impl Document {
     fn save_impl(
         &mut self,
         path: Option<PathBuf>,
-        force: bool,
+        policy: crate::editor::SavePolicy,
     ) -> Result<
         impl Future<Output = Result<DocumentSavedEvent, anyhow::Error>> + 'static + Send,
         anyhow::Error,
@@ -1008,7 +1007,7 @@ impl Document {
             if let Some(parent) = path.parent() {
                 // TODO: display a prompt asking the user if the directories should be created
                 if !parent.exists() {
-                    if force {
+                    if policy.should_overwrite() {
                         std::fs::DirBuilder::new().recursive(true).create(parent)?;
                     } else {
                         bail!("can't save file, parent directory does not exist (use :w! to create it)");
@@ -1017,7 +1016,7 @@ impl Document {
             }
 
             // Protect against overwriting changes made externally
-            if !force {
+            if !policy.should_overwrite() {
                 if let Ok(metadata) = fs::metadata(&path).await {
                     if let Ok(mtime) = metadata.modified() {
                         if last_saved_time < mtime {
@@ -1331,10 +1330,12 @@ impl Document {
             container.remove_by_selection(text, selection)
         }
 
-        helix_event::dispatch(SelectionDidChange {
+        let lifecycle = self.lifecycle.clone();
+        let mut event = SelectionDidChange {
             doc: self,
             view: view_id,
-        })
+        };
+        lifecycle.dispatch_selection_change(&mut event)
     }
 
     /// Find the origin selection of the text in a document, i.e. where
@@ -1651,13 +1652,15 @@ impl Document {
         });
 
         let dispatch_start = Instant::now();
-        helix_event::dispatch(DocumentDidChange {
+        let lifecycle = self.lifecycle.clone();
+        let mut event = DocumentDidChange {
             doc: self,
             view: view_id,
             old_text: &old_doc,
             changes,
             ghost_transaction: !emit_lsp_notification,
-        });
+        };
+        lifecycle.dispatch_document_change(&mut event);
         let dispatch_dur = dispatch_start.elapsed();
         log_command_phase(
             "document_apply",
@@ -3265,21 +3268,35 @@ impl Document {
         self.presentation.fold_container(view_id)
     }
 
-    pub fn plugin_annotations(&self, view_id: ViewId) -> Option<&Vec<PluginAnnotation>> {
+    pub fn plugin_annotations(&self, view_id: ViewId) -> Option<Vec<PluginAnnotation>> {
         self.presentation.plugin_annotations(view_id)
     }
 
-    pub fn set_plugin_annotations(&mut self, view_id: ViewId, annotations: Vec<PluginAnnotation>) {
+    pub fn set_plugin_annotations(
+        &mut self,
+        view_id: ViewId,
+        plugin: String,
+        annotations: Vec<PluginAnnotation>,
+    ) {
         self.presentation
-            .set_plugin_annotations(view_id, annotations);
+            .set_plugin_annotations(view_id, plugin, annotations);
+    }
+
+    pub fn clear_plugin_annotations(&mut self, plugin: &str) {
+        self.presentation.clear_plugin_annotations(plugin);
     }
 
     pub fn presence_annotations(&self, view_id: ViewId) -> Option<&Vec<PluginAnnotation>> {
         self.presentation.presence_annotations(view_id)
     }
 
-    pub fn set_presence_annotations(&mut self, view_id: ViewId, annotations: Vec<PluginAnnotation>) {
-        self.presentation.set_presence_annotations(view_id, annotations);
+    pub fn set_presence_annotations(
+        &mut self,
+        view_id: ViewId,
+        annotations: Vec<PluginAnnotation>,
+    ) {
+        self.presentation
+            .set_presence_annotations(view_id, annotations);
     }
 
     pub fn visual_annotations(&self, view_id: ViewId) -> Option<Vec<PluginAnnotation>> {
@@ -3287,12 +3304,11 @@ impl Document {
         let presence = self.presence_annotations(view_id);
         match (plugin, presence) {
             (None, None) => None,
-            (Some(plugin), None) => Some(plugin.clone()),
+            (Some(plugin), None) => Some(plugin),
             (None, Some(presence)) => Some(presence.clone()),
-            (Some(plugin), Some(presence)) => {
-                let mut merged = plugin.clone();
-                merged.extend_from_slice(presence);
-                Some(merged)
+            (Some(mut plugin), Some(presence)) => {
+                plugin.extend_from_slice(presence);
+                Some(plugin)
             }
         }
     }
@@ -3348,6 +3364,7 @@ pub enum FormatterError {
         command: String,
         error: std::io::ErrorKind,
     },
+    TaskFailed(TaskError),
     BrokenStdin,
     WaitForOutputFailed,
     InvalidUtf8Output,
@@ -3362,6 +3379,7 @@ impl Display for FormatterError {
             Self::SpawningFailed { command, error } => {
                 write!(f, "Failed to spawn formatter {}: {:?}", command, error)
             }
+            Self::TaskFailed(error) => write!(f, "Formatter task failed: {error}"),
             Self::BrokenStdin => write!(f, "Could not write to formatter stdin"),
             Self::WaitForOutputFailed => write!(f, "Waiting for formatter output failed"),
             Self::InvalidUtf8Output => write!(f, "Invalid UTF-8 formatter output"),

@@ -22,7 +22,7 @@ pub struct AnnotationState {
     pub(crate) inlay_hints: HashMap<ViewId, DocumentInlayHints>,
     pub(crate) jump_labels: HashMap<ViewId, Box<[Overlay]>>,
     pub(crate) fold_containers: HashMap<ViewId, FoldContainer>,
-    pub(crate) plugin_annotations: HashMap<ViewId, Vec<PluginAnnotation>>,
+    pub(crate) plugin_annotations: HashMap<ViewId, HashMap<String, Vec<PluginAnnotation>>>,
     pub(crate) presence_annotations: HashMap<ViewId, Vec<PluginAnnotation>>,
     gen: u64,
 }
@@ -115,13 +115,52 @@ impl AnnotationState {
 
     // -- Plugin annotations -------------------------------------------------
 
-    pub fn plugin_annotations(&self, view_id: ViewId) -> Option<&Vec<PluginAnnotation>> {
-        self.plugin_annotations.get(&view_id)
+    /// All plugin annotations for a view, flattened across plugin scopes.
+    /// Returns `None` when no plugin has registered annotations for this view.
+    pub fn plugin_annotations(&self, view_id: ViewId) -> Option<Vec<PluginAnnotation>> {
+        let buckets = self.plugin_annotations.get(&view_id)?;
+        if buckets.is_empty() {
+            return None;
+        }
+        let mut merged = Vec::with_capacity(buckets.values().map(Vec::len).sum());
+        for bucket in buckets.values() {
+            merged.extend_from_slice(bucket);
+        }
+        Some(merged)
     }
 
-    pub fn set_plugin_annotations(&mut self, view_id: ViewId, annotations: Vec<PluginAnnotation>) {
-        self.plugin_annotations.insert(view_id, annotations);
+    /// Replace annotations for a specific `plugin` scope. Other plugins' entries
+    /// for the same view are left untouched. Empty `annotations` clears the scope.
+    pub fn set_plugin_annotations(
+        &mut self,
+        view_id: ViewId,
+        plugin: String,
+        annotations: Vec<PluginAnnotation>,
+    ) {
+        let buckets = self.plugin_annotations.entry(view_id).or_default();
+        if annotations.is_empty() {
+            buckets.remove(&plugin);
+            if buckets.is_empty() {
+                self.plugin_annotations.remove(&view_id);
+            }
+        } else {
+            buckets.insert(plugin, annotations);
+        }
         self.bump();
+    }
+
+    /// Remove all plugin annotations registered by `plugin` across every view.
+    pub fn clear_plugin_scope(&mut self, plugin: &str) {
+        let mut changed = false;
+        self.plugin_annotations.retain(|_, buckets| {
+            if buckets.remove(plugin).is_some() {
+                changed = true;
+            }
+            !buckets.is_empty()
+        });
+        if changed {
+            self.bump();
+        }
     }
 
     pub fn presence_annotations(&self, view_id: ViewId) -> Option<&Vec<PluginAnnotation>> {

@@ -6,7 +6,7 @@ use helix_runtime::{Runtime, Sender};
 use helix_view::graphics::Rect;
 
 use crate::compositor::Compositor;
-use crate::runtime::ingress::RuntimeEvent;
+use crate::runtime::{request_redraw, RuntimeEvent};
 
 /// Mark a region, or the whole surface, as needing redraw.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,13 +54,13 @@ impl UiHost for TermHost<'_> {
         match area {
             Invalidation::Full => {
                 self.compositor.need_full_redraw();
-                helix_runtime::send_blocking(&self.ingress, RuntimeEvent::Redraw);
+                request_redraw(&self.ingress);
             }
             Invalidation::Rect(_rect) => {
                 // Terminal backend redraws the whole screen; treat rect as full.
                 // A future GPU/partial-damage backend could use the rect.
                 self.compositor.need_full_redraw();
-                helix_runtime::send_blocking(&self.ingress, RuntimeEvent::Redraw);
+                request_redraw(&self.ingress);
             }
         }
     }

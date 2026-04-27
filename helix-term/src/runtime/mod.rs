@@ -14,7 +14,7 @@ pub use exit::{
     apply_exit_task, drain_exit_tasks_blocking, drain_exit_tasks_collect, schedule_exit_task,
 };
 pub use ingress::{
-    send_redraw_with, send_status_message_with, send_task_event_with, send_ui_command_with,
+    request_redraw, send_status_message_with, send_task_event_with, send_ui_command_with,
     status_error_reporter, IdleRender, PendingFormatWrite, RuntimeEvent, RuntimeTaskEvent,
 };
 pub use ui::{

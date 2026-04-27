@@ -6,6 +6,7 @@ use helix_view::handlers::{AutoReloadEvent, AutoSaveEvent};
 
 use crate::commands;
 use crate::handlers::completion::trigger_auto_completion;
+use crate::runtime::request_redraw;
 use crate::ui::lsp::signature_help::SignatureHelp;
 
 #[derive(Clone)]
@@ -28,7 +29,7 @@ impl Notifier {
             &self.plugin_events,
             helix_plugin::PluginNotification::ModeChange { old_mode, new_mode },
         );
-        send_blocking(&self.ingress, crate::runtime::RuntimeEvent::Redraw);
+        request_redraw(&self.ingress);
     }
 }
 

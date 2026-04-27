@@ -345,9 +345,13 @@ pub async fn send_ui_command_with(cmd: UiCommand, ingress: IngressSender<Runtime
     let _ = ingress.send(ev).await;
 }
 
-pub async fn send_redraw_with(ingress: IngressSender<RuntimeEvent>) {
-    let event = RuntimeEvent::Redraw;
-    let _ = ingress.send(event).await;
+/// Request a UI redraw without blocking the caller.
+///
+/// Redraw events are coalescable invalidation signals. Dropping a redraw when
+/// the ingress queue is full or closed is preferable to blocking, especially
+/// from plain worker threads that are not running inside Tokio.
+pub fn request_redraw(ingress: &IngressSender<RuntimeEvent>) {
+    let _ = ingress.try_send(RuntimeEvent::Redraw);
 }
 
 pub async fn send_status_message_with(
@@ -389,4 +393,31 @@ pub fn spawn_ui_command_with_future(
         }
     })
     .detach();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_redraw_is_lossy_when_ingress_is_full() {
+        let (tx, mut rx) = helix_runtime::channel(1);
+
+        request_redraw(&tx);
+        request_redraw(&tx);
+
+        assert!(matches!(rx.try_recv(), Ok(RuntimeEvent::Redraw)));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(helix_runtime::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn request_redraw_ignores_closed_ingress() {
+        let (tx, rx) = helix_runtime::channel(1);
+        drop(rx);
+
+        request_redraw(&tx);
+    }
 }

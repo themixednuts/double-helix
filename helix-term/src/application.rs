@@ -446,7 +446,7 @@ impl Application {
                     path: Some(event.path.clone()),
                 },
             );
-            helix_runtime::send_blocking(&redraw_ingress, RuntimeEvent::Redraw);
+            ingress::request_redraw(&redraw_ingress);
             Ok(())
         });
 

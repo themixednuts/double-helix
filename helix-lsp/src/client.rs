@@ -221,11 +221,7 @@ impl Client {
         id: LanguageServerId,
         name: String,
         req_timeout: u64,
-    ) -> Result<(
-        Self,
-        Receiver<(LanguageServerId, Call)>,
-        Arc<Notify>,
-    )> {
+    ) -> Result<(Self, Receiver<(LanguageServerId, Call)>, Arc<Notify>)> {
         // Resolve path to the binary
         let cmd = helix_stdx::env::which(cmd)?;
 
@@ -460,12 +456,14 @@ impl Client {
     {
         let server_tx = self.server_tx.clone();
         let id = self.next_request_id();
-        let request = serde_json::to_value(params).map_err(Error::from).map(|params| jsonrpc::MethodCall {
-            jsonrpc: Some(jsonrpc::Version::V2),
-            id: id.clone(),
-            method: R::METHOD.to_string(),
-            params: Self::value_into_params(params),
-        });
+        let request = serde_json::to_value(params)
+            .map_err(Error::from)
+            .map(|params| jsonrpc::MethodCall {
+                jsonrpc: Some(jsonrpc::Version::V2),
+                id: id.clone(),
+                method: R::METHOD.to_string(),
+                params: Self::value_into_params(params),
+            });
 
         async move {
             use std::time::Duration;

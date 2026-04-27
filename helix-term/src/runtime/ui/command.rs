@@ -101,7 +101,7 @@ pub enum CompletionCommand {
     },
     ReplaceResolvedItem {
         previous: Arc<LspCompletionItem>,
-        resolved: CompletionItem,
+        resolved: Box<CompletionItem>,
     },
     Show {
         request: CompletionRequestId,
@@ -285,38 +285,29 @@ pub enum FileExplorerCommand {
 #[derive(Debug, Clone)]
 pub enum PluginCommand {
     Prompt {
-        message: String,
-        default: Option<String>,
-        plugin_name: String,
-        callback_id: u64,
+        request: helix_plugin::contract::requests::PromptRequest,
+        callback: helix_plugin::contract::UiCallbackToken,
     },
     Confirm {
-        message: String,
-        plugin_name: String,
-        callback_id: u64,
+        request: helix_plugin::contract::requests::ConfirmRequest,
+        callback: helix_plugin::contract::UiCallbackToken,
     },
     Picker {
-        items: Vec<String>,
-        prompt: String,
-        plugin_name: String,
-        callback_id: u64,
+        request: helix_plugin::contract::requests::PickerRequest,
+        callback: helix_plugin::contract::UiCallbackToken,
     },
     PushPanel {
-        plugin_name: String,
-        panel_id: String,
-        model_panel_id: helix_view::model::PanelId,
-        render_callback_id: u64,
-        event_callback_id: Option<u64>,
+        panel: helix_plugin::contract::PanelHandle,
     },
     RemovePanel {
-        panel_id: String,
+        panel: helix_plugin::contract::PanelHandle,
     },
 }
 
 /// Top-level UI command delivered on the main thread via [`crate::runtime::ingress::RuntimeEvent::Ui`].
 pub enum UiCommand {
     Layer(LayerCommand),
-    Completion(CompletionCommand),
+    Completion(Box<CompletionCommand>),
     Picker(PickerCommand),
     /// LSP navigation / overlays.
     Lsp(LspCommand),

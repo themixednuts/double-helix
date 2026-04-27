@@ -4,8 +4,6 @@ use arc_swap::ArcSwap;
 use diagnostics::PullAllDocumentsDiagnosticHandler;
 
 use crate::config::Config;
-use crate::events;
-use helix_view::events::DocumentDidClose;
 use crate::handlers::auto_reload::AutoReloadHandler;
 use crate::handlers::auto_save::AutoSaveHandler;
 use crate::handlers::diagnostics::PullDiagnosticsHandler;
@@ -22,12 +20,13 @@ pub mod blame;
 pub mod completion;
 pub mod diagnostics;
 mod document_colors;
+pub mod local;
 mod prompt;
 mod signature_help;
 mod snippet;
 
-fn register_assistant_hooks() {
-    helix_event::register_hook!(move |event: &mut DocumentDidClose<'_>| {
+fn attach_assistant_hooks(editor: &helix_view::Editor) {
+    editor.lifecycle().on_document_close(move |event| {
         let effects = event.editor.untrack_assistant_doc(event.doc.id());
         event.editor.apply_assistant_effects(effects);
         Ok(())
@@ -39,15 +38,9 @@ pub fn setup(
     ingress: helix_runtime::Sender<RuntimeEvent>,
     runtime: helix_runtime::Runtime,
 ) -> Handlers {
-    #[cfg(feature = "integration")]
-    {
-        helix_event::reset();
-    }
-
-    events::register();
-
     let event_tx = completion::CompletionHandler::spawn(config, runtime.clone(), ingress.clone());
-    let signature_hints = signature_help::SignatureHelpHandler::spawn(runtime.clone(), ingress.clone());
+    let signature_hints =
+        signature_help::SignatureHelpHandler::spawn(runtime.clone(), ingress.clone());
     let auto_save = AutoSaveHandler::spawn(runtime.clone(), ingress.clone());
     let auto_reload = AutoReloadHandler::spawn(runtime.clone(), ingress.clone());
     let document_colors = DocumentColorsHandler::spawn(runtime.clone(), ingress.clone());
@@ -57,7 +50,7 @@ pub fn setup(
     let pull_all_documents_diagnostics =
         PullAllDocumentsDiagnosticHandler::spawn(runtime, ingress.clone());
 
-    let handlers = Handlers {
+    Handlers {
         completions: helix_view::handlers::completion::CompletionHandler::new(event_tx),
         signature_hints,
         auto_save,
@@ -67,19 +60,22 @@ pub fn setup(
         word_index,
         pull_diagnostics,
         pull_all_documents_diagnostics,
-    };
+    }
+}
 
-    helix_view::handlers::register_hooks(&handlers);
-    completion::register_hooks(&handlers);
-    signature_help::register_hooks(&handlers);
-    auto_save::register_hooks(&handlers);
-    auto_reload::register_hooks(&handlers);
-    diagnostics::register_hooks(&handlers, ingress.clone());
-    snippet::register_hooks(&handlers);
-    document_colors::register_hooks(&handlers, ingress.clone());
-    prompt::register_hooks(&handlers, ingress.clone());
-    blame::register_hooks(&handlers);
-    register_assistant_hooks();
-
-    handlers
+pub fn attach(
+    editor: &helix_view::Editor,
+    handlers: &Handlers,
+    ingress: helix_runtime::Sender<RuntimeEvent>,
+) {
+    helix_view::handlers::attach(editor, handlers);
+    signature_help::attach(editor, handlers);
+    auto_save::attach(editor, handlers);
+    auto_reload::attach(editor, handlers);
+    diagnostics::attach(editor, handlers, ingress.clone());
+    snippet::attach(editor, handlers);
+    document_colors::attach(editor, handlers, ingress.clone());
+    prompt::attach(editor, handlers, ingress.clone());
+    blame::attach(editor, handlers);
+    attach_assistant_hooks(editor);
 }

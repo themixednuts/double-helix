@@ -1,12 +1,14 @@
-use helix_event::register_hook;
 use helix_runtime::{send_blocking, Sender as IngressSender};
-use helix_view::events::DocumentFocusLost;
 use helix_view::handlers::Handlers;
 
 use crate::runtime::{LayerCommand, RuntimeEvent, UiCommand};
 
-pub(super) fn register_hooks(_handlers: &Handlers, ingress: IngressSender<RuntimeEvent>) {
-    register_hook!(move |_event: &mut DocumentFocusLost<'_>| {
+pub(super) fn attach(
+    editor: &helix_view::Editor,
+    _handlers: &Handlers,
+    ingress: IngressSender<RuntimeEvent>,
+) {
+    editor.lifecycle().on_document_focus_lost(move |_event| {
         send_blocking(
             &ingress,
             RuntimeEvent::Ui(UiCommand::Layer(LayerCommand::DismissPromptIfPresent)),

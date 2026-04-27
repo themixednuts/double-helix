@@ -7,8 +7,8 @@
 //! **Split:** [`RuntimeTaskEvent`] applies editor-side effects (often via [`crate::effect`]).
 //! [`UiCommand`] drives compositor / layers / widgets. Keep that boundary when adding variants.
 
-use std::collections::HashSet;
 use std::borrow::Cow;
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -21,7 +21,10 @@ use helix_runtime::{Sender as IngressSender, TimerId, Token};
 use helix_view::document::DocumentInlayHintsId;
 use helix_view::document::FormatterError;
 use helix_view::handlers::lsp::{SignatureHelpInvoked, SignatureHelpRequestId};
-use helix_view::{DocumentId, ViewId};
+use helix_view::{
+    editor::{Activation, FrameSelection, PanelBehavior, SavePolicy, ThreadSelectPolicy},
+    DocumentId, ViewId,
+};
 
 use super::ui::UiCommand;
 
@@ -32,6 +35,24 @@ pub const BOUND: usize = 1024;
 pub struct StatusMessage {
     pub severity: Severity,
     pub message: Cow<'static, str>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingFormatWrite {
+    pub path: Option<PathBuf>,
+    pub policy: SavePolicy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdleRender {
+    Defer,
+    Immediate,
+}
+
+impl IdleRender {
+    pub const fn should_render_immediately(self) -> bool {
+        matches!(self, Self::Immediate)
+    }
 }
 
 impl From<anyhow::Error> for StatusMessage {
@@ -119,7 +140,7 @@ pub enum RuntimeTaskEvent {
         view_id: ViewId,
         expected_version: i32,
         format_result: Result<Transaction, FormatterError>,
-        write: Option<(Option<PathBuf>, bool)>,
+        write: Option<PendingFormatWrite>,
     },
     /// Show an error on the editor after async work (e.g. external URL open failed).
     SetEditorError { message: String },
@@ -183,38 +204,23 @@ pub enum RuntimeTaskEvent {
     DapExceptionsConfigured,
     /// Restore a persisted assistant thread record into editor-owned state.
     RestoreAssistantHistoryThread {
-        record: helix_view::assistant::history::Record,
-        activate: bool,
-        open_panel: bool,
+        record: Box<helix_view::assistant::history::Record>,
+        activation: Activation,
+        panel: PanelBehavior,
     },
     /// Activate an existing assistant thread in editor-owned state.
     ActivateAssistantThread {
         thread: helix_view::assistant::thread::Id,
-        open_panel: bool,
+        panel: PanelBehavior,
     },
     /// Detach an assistant context item from the active thread.
     DetachAssistantContext {
         item: helix_view::assistant::context::Id,
     },
-    /// Register a plugin panel in editor-owned layout state.
-    RegisterPluginPanel {
-        plugin_name: String,
-        panel_id: String,
-        title: String,
-        side: String,
-        width: u16,
-        render_callback_id: u64,
-        event_callback_id: Option<u64>,
-    },
-    /// Remove a plugin panel from editor-owned layout state.
-    RemovePluginPanel {
-        panel_id: String,
-    },
     /// Deliver a plugin UI callback value to the plugin engine on the editor side.
     DeliverPluginUiCallback {
-        plugin_name: String,
-        callback_id: u64,
-        value: serde_json::Value,
+        callback: helix_plugin::contract::UiCallbackToken,
+        value: helix_plugin::contract::DynamicValue,
     },
     /// Remove the assistant panel model entry from editor-owned layout state.
     RemoveAssistantPanel,
@@ -222,12 +228,10 @@ pub enum RuntimeTaskEvent {
     ConnectAssistantBackend {
         command: String,
         args: Vec<String>,
-        open_panel: bool,
+        panel: PanelBehavior,
     },
     /// Cycle the active assistant thread and open the panel.
-    CycleAssistantThread {
-        delta: isize,
-    },
+    CycleAssistantThread { delta: isize },
     /// Close the active assistant thread and keep panel state in sync.
     CloseActiveAssistantThread,
     /// Create a new assistant thread from the active backend and open the panel.
@@ -240,9 +244,7 @@ pub enum RuntimeTaskEvent {
         status: &'static str,
     },
     /// Submit a prompt to the active assistant backend.
-    SubmitAssistantPrompt {
-        text: String,
-    },
+    SubmitAssistantPrompt { text: String },
     /// Cancel the active assistant thread if one exists.
     CancelActiveAssistantThread,
     /// Open the selected assistant entry in a scratch document.
@@ -259,8 +261,8 @@ pub enum RuntimeTaskEvent {
     /// Load an assistant history thread record for activation.
     LoadAssistantHistoryThread {
         thread: helix_view::assistant::thread::Id,
-        activate: bool,
-        open_panel: bool,
+        activation: Activation,
+        panel: PanelBehavior,
     },
     /// Bootstrap assistant history scope and persisted layout at application startup.
     BootstrapAssistantHistory {
@@ -269,12 +271,10 @@ pub enum RuntimeTaskEvent {
     /// Switch the active DAP thread and fetch its stack trace.
     SelectDebugThread {
         thread_id: DebugThreadId,
-        force: bool,
+        policy: ThreadSelectPolicy,
     },
     /// Pause a specific DAP thread.
-    PauseDebugThread {
-        thread_id: DebugThreadId,
-    },
+    PauseDebugThread { thread_id: DebugThreadId },
     /// Select a stack frame within the active debug thread.
     SelectStackFrame {
         thread_id: DebugThreadId,
@@ -284,7 +284,7 @@ pub enum RuntimeTaskEvent {
     ApplyStackFrames {
         thread_id: DebugThreadId,
         frames: Vec<helix_dap::StackFrame>,
-        auto_select_first_frame: bool,
+        selection: FrameSelection,
     },
     /// Execute an LSP command through the editor-owned main-thread path.
     ExecuteLspCommand {
@@ -311,25 +311,17 @@ pub enum RuntimeTaskEvent {
         log_message: Option<String>,
     },
     /// Toggle a DAP breakpoint at a line and notify the active debugger.
-    ToggleBreakpoint {
-        path: PathBuf,
-        line: usize,
-    },
+    ToggleBreakpoint { path: PathBuf, line: usize },
     /// Auto-save debounce finished (insert mode defers; else save).
     AutoSaveRun { save_pending: Arc<AtomicBool> },
     /// Auto-reload debounce finished (insert mode defers; else reload).
     AutoReloadRun { reload_pending: Arc<AtomicBool> },
 }
 
-// ---------------------------------------------------------------------------
-// Ingress sender wiring.
-// ---------------------------------------------------------------------------
-
-/// Wire hook-error reporting into the application-owned ingress sender.
-pub type StatusBridge = helix_event::ErrorReporterGuard;
-
-pub fn install_status_bridge(ingress_tx: IngressSender<RuntimeEvent>) -> StatusBridge {
-    helix_event::scoped_error_reporter(std::sync::Arc::new(move |err| {
+pub fn status_error_reporter(
+    ingress_tx: IngressSender<RuntimeEvent>,
+) -> std::sync::Arc<dyn Fn(anyhow::Error) + Send + Sync> {
+    std::sync::Arc::new(move |err| {
         let message = StatusMessage::from(err);
         helix_runtime::send_blocking(
             &ingress_tx,
@@ -338,7 +330,7 @@ pub fn install_status_bridge(ingress_tx: IngressSender<RuntimeEvent>) -> StatusB
                 severity: message.severity,
             },
         );
-    }))
+    })
 }
 
 /// Send a typed [`RuntimeTaskEvent`] on the ingress channel (same semantics as [`send_ui_command_with`]).
@@ -398,5 +390,3 @@ pub fn spawn_ui_command_with_future(
     })
     .detach();
 }
-
-

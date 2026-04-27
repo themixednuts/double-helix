@@ -9,13 +9,16 @@ pub fn show_notification_history(cx: &mut Context) {
     }
 
     let ingress = cx.ingress.clone();
-    cx.editor.runtime().work().clone().spawn(async move {
-        send_ui_command_with(
-            UiCommand::Layer(LayerCommand::PushNotificationHistory),
-            ingress,
-        )
-        .await;
-    }).detach();
+    cx.editor
+        .work()
+        .spawn(async move {
+            send_ui_command_with(
+                UiCommand::Layer(LayerCommand::PushNotificationHistory),
+                ingress,
+            )
+            .await;
+        })
+        .detach();
 }
 
 /// Clear notification history

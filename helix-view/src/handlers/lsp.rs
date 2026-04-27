@@ -4,13 +4,9 @@ use std::num::NonZeroU64;
 use std::time::Instant;
 
 use crate::bench::log_command_phase;
-use crate::events::{
-    DiagnosticsDidChange, DocumentDidChange, DocumentDidClose, LanguageServerInitialized,
-};
 use crate::{DocumentId, Editor};
 use helix_core::diagnostic::DiagnosticProvider;
 use helix_core::Uri;
-use helix_event::register_hook;
 use helix_lsp::{lsp, LanguageServerId};
 
 pub use super::workspace_edit::{ApplyEditError, ApplyEditErrorKind};
@@ -138,7 +134,7 @@ impl Editor {
             doc.replace_diagnostics(diagnostics, &unchanged_diag_sources, Some(provider));
 
             let doc = doc.id();
-            helix_event::dispatch(DiagnosticsDidChange { editor: self, doc });
+            self.dispatch_diagnostics_change(doc);
         }
         self.refresh_workspace_diagnostic_counts();
     }
@@ -168,28 +164,30 @@ pub fn request_execute_lsp_command(
     });
 }
 
-pub fn register_hooks(_handlers: &Handlers) {
-    register_hook!(move |event: &mut LanguageServerInitialized<'_>| {
-        let language_server = event.editor.language_server_by_id(event.server_id).unwrap();
+pub fn attach(editor: &Editor, _handlers: &Handlers) {
+    editor
+        .lifecycle()
+        .on_language_server_initialized(move |event| {
+            let language_server = event.editor.language_server_by_id(event.server_id).unwrap();
 
-        for doc in event
-            .editor
-            .documents()
-            .filter(|doc| doc.supports_language_server(event.server_id))
-        {
-            let Some(url) = doc.url() else {
-                continue;
-            };
+            for doc in event
+                .editor
+                .documents()
+                .filter(|doc| doc.supports_language_server(event.server_id))
+            {
+                let Some(url) = doc.url() else {
+                    continue;
+                };
 
-            let language_id = doc.language_id().map(ToOwned::to_owned).unwrap_or_default();
+                let language_id = doc.language_id().map(ToOwned::to_owned).unwrap_or_default();
 
-            language_server.text_document_did_open(url, doc.version(), doc.text(), language_id);
-        }
+                language_server.text_document_did_open(url, doc.version(), doc.text(), language_id);
+            }
 
-        Ok(())
-    });
+            Ok(())
+        });
 
-    register_hook!(move |event: &mut DocumentDidChange<'_>| {
+    editor.lifecycle().on_document_change(move |event| {
         let hook_start = Instant::now();
         // Send textDocument/didChange notifications.
         if !event.ghost_transaction {
@@ -221,7 +219,7 @@ pub fn register_hooks(_handlers: &Handlers) {
         Ok(())
     });
 
-    register_hook!(move |event: &mut DocumentDidClose<'_>| {
+    editor.lifecycle().on_document_close(move |event| {
         // Send textDocument/didClose notifications.
         for language_server in event.doc.language_servers() {
             language_server.text_document_did_close(event.doc.identifier());

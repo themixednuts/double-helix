@@ -225,7 +225,7 @@ impl Animation {
             AnimationDirection::Normal => false,
             AnimationDirection::Reverse => true,
             AnimationDirection::Alternate => cycle_index % 2 == 1,
-            AnimationDirection::AlternateReverse => cycle_index % 2 == 0,
+            AnimationDirection::AlternateReverse => cycle_index.is_multiple_of(2),
         };
 
         if reverse {
@@ -253,14 +253,14 @@ impl Animation {
                     AnimationDirection::Normal => 1.0,
                     AnimationDirection::Reverse => 0.0,
                     AnimationDirection::Alternate => {
-                        if last_cycle % 2 == 0 {
+                        if last_cycle.is_multiple_of(2) {
                             1.0
                         } else {
                             0.0
                         }
                     }
                     AnimationDirection::AlternateReverse => {
-                        if last_cycle % 2 == 0 {
+                        if last_cycle.is_multiple_of(2) {
                             0.0
                         } else {
                             1.0

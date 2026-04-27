@@ -122,7 +122,7 @@ pub(crate) fn goto_locations(
                 0,
                 locations,
                 cwdir,
-                editor.runtime().clone(),
+                crate::ui::PickerRuntime::new(editor.runtime()),
                 ingress,
                 |cx: &mut crate::compositor::Context, location, action| {
                     jump_to_location(cx.editor, location, action);

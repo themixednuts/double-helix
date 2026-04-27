@@ -106,7 +106,7 @@ impl Handlers {
     }
 }
 
-pub fn register_hooks(handlers: &Handlers) {
-    lsp::register_hooks(handlers);
-    word_index::register_hooks(handlers);
+pub fn attach(editor: &Editor, handlers: &Handlers) {
+    lsp::attach(editor, handlers);
+    word_index::attach(editor, handlers);
 }

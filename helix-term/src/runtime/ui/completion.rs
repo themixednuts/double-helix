@@ -27,7 +27,7 @@ pub(crate) fn apply_completion_command(
             crate::ui::completion_ingress::apply_resolved_completion_item(
                 compositor,
                 previous.as_ref(),
-                resolved,
+                *resolved,
             );
         }
         CompletionCommand::Show {

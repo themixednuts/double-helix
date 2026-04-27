@@ -6,7 +6,7 @@ impl Revision {
         self.0
     }
 
-    pub fn next(&mut self) -> Self {
+    pub fn advance(&mut self) -> Self {
         self.0 = self.0.wrapping_add(1);
         *self
     }

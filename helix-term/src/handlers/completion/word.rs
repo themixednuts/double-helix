@@ -35,7 +35,7 @@ pub(crate) fn completion(
 
     let (view_id, doc) = focused_ref!(editor);
     let rope = doc.text().clone();
-    let word_index = editor.handlers.word_index().clone();
+    let word_index = editor.word_index().clone();
     let text = doc.text().slice(..);
     let selection = doc.selection(view_id).clone();
     let pos = selection.primary().cursor(text);

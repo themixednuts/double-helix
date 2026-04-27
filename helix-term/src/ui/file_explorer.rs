@@ -3,21 +3,22 @@ use std::path::{Path, PathBuf};
 
 use helix_core::hashmap;
 use helix_view::{
-    Editor,
     editor::{Action, EditingEngineConfig},
     theme::Style,
+    Editor,
 };
 use tui::text::Span;
 
 use crate::{
     alt, key,
-    runtime::{LayerCommand, UiCommand, ui::command::FileExplorerCommand},
+    runtime::{ui::command::FileExplorerCommand, LayerCommand, UiCommand},
 };
 
 use super::prompt::Movement;
 use super::{
-    Picker, PickerColumn, directory_content,
+    directory_content,
     picker::{PickerKeyHandler, PickerKeyHandlers},
+    Picker, PickerColumn,
 };
 
 /// for each path: (path to item, is the path a directory?)

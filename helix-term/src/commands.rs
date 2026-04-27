@@ -5,7 +5,6 @@ pub(crate) mod syntax;
 pub(crate) mod typed;
 
 pub use dap::*;
-use futures_util::FutureExt;
 use helix_stdx::{
     path::{self, find_paths},
     rope::{self, RopeSliceExt},
@@ -44,7 +43,7 @@ use helix_core::{
 };
 pub use helix_view::engine::CharPendingBinding;
 use helix_view::{
-    document::{FormatterError, Mode, SCRATCH_BUFFER_NAME},
+    document::{DocumentFormatTask, FormatterError, Mode, SCRATCH_BUFFER_NAME},
     editor::Action,
     engine::CommandToken,
     expansion,
@@ -108,6 +107,7 @@ pub struct Context<'a> {
     pub count: Option<NonZeroUsize>,
     pub editor: &'a mut Editor,
     pub registry: std::sync::Arc<helix_modal::registry::CommandRegistry>,
+    pub notifier: crate::handlers::local::Notifier,
 
     pub callback: Vec<crate::compositor::PostAction>,
     pub on_next_key_callback: Option<(OnKeyCallback, OnKeyCallbackKind)>,
@@ -162,7 +162,7 @@ impl Context<'_> {
         future: impl Future<Output = anyhow::Result<UiCommand>> + Send + 'static,
     ) {
         crate::runtime::ingress::spawn_ui_command_with_future(
-            self.editor.runtime().work().clone(),
+            self.editor.work(),
             future,
             self.ingress.clone(),
         );
@@ -174,7 +174,7 @@ impl Context<'_> {
         future: impl Future<Output = anyhow::Result<RuntimeTaskEvent>> + Send + 'static,
     ) {
         crate::runtime::ingress::spawn_task_event_with_future(
-            self.editor.runtime().work().clone(),
+            self.editor.work(),
             future,
             self.ingress.clone(),
         );
@@ -189,7 +189,7 @@ impl Context<'_> {
         &mut self,
         future: impl Future<Output = anyhow::Result<RuntimeTaskEvent>> + Send + 'static,
     ) {
-        self.exit_tasks.push(self.exit_task_work.spawn(future));
+        crate::runtime::schedule_exit_task(self.exit_tasks, &self.exit_task_work, future);
     }
 
     /// Returns 1 if no explicit count was provided
@@ -206,7 +206,7 @@ impl Context<'_> {
         let register = self.register.take();
 
         // Resolve editing context from the focused view.
-        let focus = self.editor.tree.focus;
+        let focus = self.editor.focused_view_id();
         let focused_view = self.editor.tree.get(focus);
         let view_id = focused_view.id;
         let doc_id = focused_view.doc;
@@ -269,6 +269,7 @@ impl Context<'_> {
             exit_tasks: self.exit_tasks,
             exit_task_work: self.exit_task_work.clone(),
             scroll: None,
+            notifier: self.notifier.clone(),
             ingress: self.ingress.clone(),
             idle_reset_tx: self.idle_reset_tx.clone(),
             plugin_manager: self.plugin_manager.clone(),
@@ -338,6 +339,7 @@ impl MappableCommand {
                         exit_tasks: cx.exit_tasks,
                         exit_task_work: cx.exit_task_work.clone(),
                         scroll: None,
+                        notifier: cx.notifier.clone(),
                         ingress: cx.ingress.clone(),
                         idle_reset_tx: cx.idle_reset_tx.clone(),
                         plugin_manager: cx.plugin_manager.clone(),
@@ -804,7 +806,10 @@ fn assistant_focus_entries(cx: &mut Context) {
 }
 
 fn assistant_open_entry_scratch(cx: &mut Context) {
-    let Some(effects) = cx.editor.open_selected_assistant_entry_scratch(Action::Replace) else {
+    let Some(effects) = cx
+        .editor
+        .open_selected_assistant_entry_scratch(Action::Replace)
+    else {
         cx.editor.set_status("No assistant entry selected");
         return;
     };
@@ -998,11 +1003,7 @@ fn goto_file_impl(cx: &mut Context, action: Action) {
         let path = path::expand(&sel);
         let path = &rel_path.join(path);
         if path.is_dir() {
-            let picker = ui::file_picker(
-                cx.editor,
-                path.into(),
-                cx.ingress.clone(),
-            );
+            let picker = ui::file_picker(cx.editor, path.into(), cx.ingress.clone());
             cx.push_layer(Box::new(overlaid(picker)));
         } else if let Err(e) = cx.editor.open(path, action) {
             cx.editor.set_error(format!("Open file failed: {:?}", e));
@@ -1040,11 +1041,7 @@ fn open_url(cx: &mut Context, url: Url, action: Action) {
         Ok(_) | Err(_) => {
             let path = &rel_path.join(url.path());
             if path.is_dir() {
-                let picker = ui::file_picker(
-                    cx.editor,
-                    path.into(),
-                    cx.ingress.clone(),
-                );
+                let picker = ui::file_picker(cx.editor, path.into(), cx.ingress.clone());
                 cx.push_layer(Box::new(overlaid(picker)));
             } else if let Err(e) = cx.editor.open(path, action) {
                 cx.editor.set_error(format!("Open file failed: {:?}", e));
@@ -1574,15 +1571,16 @@ fn global_search(cx: &mut Context) {
     let get_files = |query: &str,
                      editor: &mut Editor,
                      config: std::sync::Arc<GlobalSearchConfig>,
-                     injector: &ui::picker::Injector<_, _>| {
+                     injector: &ui::picker::Injector<_, _>,
+                     work: helix_runtime::Work| {
         if query.is_empty() {
-            return async { Ok(()) }.boxed();
+            return work.spawn(async { Ok(()) });
         }
 
         let search_root = helix_stdx::env::current_working_dir();
         if !search_root.exists() {
-            return async { Err(anyhow::anyhow!("Current working directory does not exist")) }
-                .boxed();
+            return work
+                .spawn(async { Err(anyhow::anyhow!("Current working directory does not exist")) });
         }
 
         let documents: Vec<_> = editor
@@ -1601,7 +1599,7 @@ fn global_search(cx: &mut Context) {
             }
             Err(err) => {
                 log::info!("Failed to compile search pattern in global search: {}", err);
-                return async { Err(anyhow::anyhow!("Failed to compile regex")) }.boxed();
+                return work.spawn(async { Err(anyhow::anyhow!("Failed to compile regex")) });
             }
         };
 
@@ -1611,7 +1609,7 @@ fn global_search(cx: &mut Context) {
             .unwrap_or_else(|_| search_root.clone());
 
         let injector = injector.clone();
-        async move {
+        work.spawn(async move {
             let searcher = SearcherBuilder::new()
                 .binary_detection(BinaryDetection::quit(b'\x00'))
                 .build();
@@ -1690,8 +1688,7 @@ fn global_search(cx: &mut Context) {
                     })
                 });
             Ok(())
-        }
-        .boxed()
+        })
     };
 
     let reg = cx.register.unwrap_or('/');
@@ -1702,7 +1699,7 @@ fn global_search(cx: &mut Context) {
         1, // contents
         [],
         config,
-        cx.editor.runtime().clone(),
+        crate::ui::PickerRuntime::new(cx.editor.runtime()),
         cx.ingress.clone(),
         move |cx, FileResult { path, line_num, .. }, action| {
             let doc = match cx.editor.open(path, action) {
@@ -1798,15 +1795,16 @@ fn local_search_grep(cx: &mut Context) {
     let get_files = |query: &str,
                      editor: &mut Editor,
                      config: std::sync::Arc<LocalSearchConfig>,
-                     injector: &ui::picker::Injector<_, _>| {
+                     injector: &ui::picker::Injector<_, _>,
+                     work: helix_runtime::Work| {
         if query.is_empty() {
-            return async { Ok(()) }.boxed();
+            return work.spawn(async { Ok(()) });
         }
 
         let search_root = helix_stdx::env::current_working_dir();
         if !search_root.exists() {
-            return async { Err(anyhow::anyhow!("Current working directory does not exist")) }
-                .boxed();
+            return work
+                .spawn(async { Err(anyhow::anyhow!("Current working directory does not exist")) });
         }
 
         // Only read the current document (not other documents opened in the buffer)
@@ -1824,7 +1822,7 @@ fn local_search_grep(cx: &mut Context) {
             }
             Err(err) => {
                 log::info!("Failed to compile search pattern in global search: {}", err);
-                return async { Err(anyhow::anyhow!("Failed to compile regex")) }.boxed();
+                return work.spawn(async { Err(anyhow::anyhow!("Failed to compile regex")) });
             }
         };
 
@@ -1834,7 +1832,7 @@ fn local_search_grep(cx: &mut Context) {
             .unwrap_or_else(|_| search_root.clone());
 
         let injector = injector.clone();
-        async move {
+        work.spawn(async move {
             let searcher = SearcherBuilder::new()
                 .binary_detection(BinaryDetection::quit(b'\x00'))
                 .build();
@@ -1933,8 +1931,7 @@ fn local_search_grep(cx: &mut Context) {
                     })
                 });
             Ok(())
-        }
-        .boxed()
+        })
     };
 
     let reg = cx.register.unwrap_or('/');
@@ -1945,7 +1942,7 @@ fn local_search_grep(cx: &mut Context) {
         1, // contents
         [],
         config,
-        cx.editor.runtime().clone(),
+        crate::ui::PickerRuntime::new(cx.editor.runtime()),
         cx.ingress.clone(),
         move |cx, FileResult { path, line_num, .. }, action| {
             let doc = match cx.editor.open(path, action) {
@@ -2084,7 +2081,7 @@ fn local_search_fuzzy(cx: &mut Context) {
         1, // contents
         [],
         config,
-        cx.editor.runtime().clone(),
+        crate::ui::PickerRuntime::new(cx.editor.runtime()),
         cx.ingress.clone(),
         move |cx, FileResult { path, line_num, .. }, action| {
             let doc = match cx.editor.open(path, action) {
@@ -2194,11 +2191,7 @@ fn file_picker(cx: &mut Context) {
         cx.editor.set_error("Workspace directory does not exist");
         return;
     }
-    let picker = ui::file_picker(
-        cx.editor,
-        root,
-        cx.ingress.clone(),
-    );
+    let picker = ui::file_picker(cx.editor, root, cx.ingress.clone());
     if cx.editor.config().file_picker.hide_preview {
         let overlay = ui::overlay::Overlay {
             content: picker,
@@ -2235,11 +2228,7 @@ fn file_picker_in_current_buffer_directory(cx: &mut Context) {
         }
     };
 
-    let picker = ui::file_picker(
-        cx.editor,
-        path,
-        cx.ingress.clone(),
-    );
+    let picker = ui::file_picker(cx.editor, path, cx.ingress.clone());
     cx.push_layer(Box::new(overlaid(picker)));
 }
 
@@ -2250,11 +2239,7 @@ fn file_picker_in_current_directory(cx: &mut Context) {
             .set_error("Current working directory does not exist");
         return;
     }
-    let picker = ui::file_picker(
-        cx.editor,
-        cwd,
-        cx.ingress.clone(),
-    );
+    let picker = ui::file_picker(cx.editor, cwd, cx.ingress.clone());
     cx.push_layer(Box::new(overlaid(picker)));
 }
 
@@ -2265,12 +2250,7 @@ fn file_explorer(cx: &mut Context) {
         return;
     }
 
-    if let Ok(picker) = ui::file_explorer(
-        None,
-        root,
-        cx.editor,
-        cx.ingress.clone(),
-    ) {
+    if let Ok(picker) = ui::file_explorer(None, root, cx.editor, cx.ingress.clone()) {
         cx.push_layer(Box::new(overlaid(picker)));
     }
 }
@@ -2298,12 +2278,7 @@ fn file_explorer_in_current_buffer_directory(cx: &mut Context) {
         }
     };
 
-    if let Ok(picker) = ui::file_explorer(
-        None,
-        path,
-        cx.editor,
-        cx.ingress.clone(),
-    ) {
+    if let Ok(picker) = ui::file_explorer(None, path, cx.editor, cx.ingress.clone()) {
         cx.push_layer(Box::new(overlaid(picker)));
     }
 }
@@ -2316,12 +2291,7 @@ fn file_explorer_in_current_directory(cx: &mut Context) {
         return;
     }
 
-    if let Ok(picker) = ui::file_explorer(
-        None,
-        cwd,
-        cx.editor,
-        cx.ingress.clone(),
-    ) {
+    if let Ok(picker) = ui::file_explorer(None, cwd, cx.editor, cx.ingress.clone()) {
         cx.push_layer(Box::new(overlaid(picker)));
     }
 }
@@ -2414,9 +2384,17 @@ fn buffer_picker(cx: &mut Context) {
         0
     };
 
-    let picker = Picker::new(columns, 2, items, (), cx.editor.runtime().clone(), cx.ingress.clone(), |cx, meta, action| {
-        cx.editor.switch(meta.id, action);
-    })
+    let picker = Picker::new(
+        columns,
+        2,
+        items,
+        (),
+        crate::ui::PickerRuntime::new(cx.editor.runtime()),
+        cx.ingress.clone(),
+        |cx, meta, action| {
+            cx.editor.switch(meta.id, action);
+        },
+    )
     .with_cursor(initial_cursor)
     .with_preview(|editor, meta| {
         let doc = &editor.documents.get(&meta.id)?;
@@ -2531,7 +2509,7 @@ fn jumplist_picker(cx: &mut Context) {
                 .map(|(doc_id, selection)| new_meta(view, *doc_id, selection.clone()))
         }),
         (),
-        cx.editor.runtime().clone(),
+        crate::ui::PickerRuntime::new(cx.editor.runtime()),
         cx.ingress.clone(),
         |cx, meta, action| {
             cx.editor.switch(meta.id, action);
@@ -2633,7 +2611,7 @@ fn changed_file_picker(cx: &mut Context) {
             style_deleted: deleted,
             style_renamed: renamed,
         },
-        cx.editor.runtime().clone(),
+        crate::ui::PickerRuntime::new(cx.editor.runtime()),
         cx.ingress.clone(),
         |cx, meta: &FileChange, action| {
             let path_to_open = meta.path();
@@ -2674,15 +2652,14 @@ fn changed_file_picker(cx: &mut Context) {
 pub fn command_palette(cx: &mut Context) {
     let register = cx.register;
     let count = cx.count;
-    cx.callback.push(crate::compositor::PostAction::ShowCommandPalette {
-        register,
-        count,
-    });
+    cx.callback
+        .push(crate::compositor::PostAction::ShowCommandPalette { register, count });
 }
 
 fn last_picker(cx: &mut Context) {
     // TODO: last picker does not seem to work well with buffer_picker
-    cx.callback.push(crate::compositor::PostAction::RestoreLastPicker);
+    cx.callback
+        .push(crate::compositor::PostAction::RestoreLastPicker);
 }
 
 pub(crate) fn show_command_palette(
@@ -2691,21 +2668,30 @@ pub(crate) fn show_command_palette(
     register: Option<char>,
     count: Option<NonZeroUsize>,
 ) {
-    let keymap = compositor.find::<ui::EditorView>().unwrap().keymaps.map()[&cx.editor.mode].reverse_map();
+    let keymap =
+        compositor.find::<ui::EditorView>().unwrap().keymaps.map()[&cx.editor.mode].reverse_map();
 
     let mut commands: Vec<MappableCommand> = MappableCommand::builtin_commands().to_vec();
-    commands.extend(typed::TYPABLE_COMMAND_MAP.values().map(|cmd| MappableCommand::Typable {
-        name: cmd.name.to_owned(),
-        args: String::new(),
-        doc: cmd.doc.to_owned(),
-    }));
+    commands.extend(
+        typed::TYPABLE_COMMAND_MAP
+            .values()
+            .map(|cmd| MappableCommand::Typable {
+                name: cmd.name.to_owned(),
+                args: String::new(),
+                doc: cmd.doc.to_owned(),
+            }),
+    );
 
     if let Some(pm) = &cx.plugin_manager {
-        commands.extend(pm.get_commands().into_iter().map(|meta| MappableCommand::Typable {
-            name: meta.name,
-            args: String::new(),
-            doc: meta.doc,
-        }));
+        commands.extend(
+            pm.get_commands()
+                .into_iter()
+                .map(|meta| MappableCommand::Typable {
+                    name: meta.name,
+                    args: String::new(),
+                    doc: meta.doc,
+                }),
+        );
     }
 
     let columns = [
@@ -2740,38 +2726,51 @@ pub(crate) fn show_command_palette(
         ui::PickerColumn::new("doc", |item: &MappableCommand, _| item.doc().into()),
     ];
 
-    let registry = compositor.find::<ui::EditorView>().unwrap().registry.clone();
-    let picker = Picker::new(columns, 0, commands, keymap, cx.editor.runtime().clone(), cx.ingress.clone(), move |cx, command, _action| {
-        let mut ctx = Context {
-            register,
-            count,
-            editor: cx.editor,
-            registry: registry.clone(),
-            callback: Vec::new(),
-            on_next_key_callback: None,
-            exit_tasks: cx.exit_tasks,
-            exit_task_work: cx.exit_task_work.clone(),
-            ingress: cx.ingress.clone(),
-            idle_reset_tx: cx.idle_reset_tx.clone(),
-            plugin_manager: cx.plugin_manager.clone(),
-        };
-        let focus = view!(ctx.editor).id;
+    let registry = compositor
+        .find::<ui::EditorView>()
+        .unwrap()
+        .registry
+        .clone();
+    let picker = Picker::new(
+        columns,
+        0,
+        commands,
+        keymap,
+        crate::ui::PickerRuntime::new(cx.editor.runtime()),
+        cx.ingress.clone(),
+        move |cx, command, _action| {
+            let mut ctx = Context {
+                register,
+                count,
+                editor: cx.editor,
+                registry: registry.clone(),
+                notifier: cx.notifier.clone(),
+                callback: Vec::new(),
+                on_next_key_callback: None,
+                exit_tasks: cx.exit_tasks,
+                exit_task_work: cx.exit_task_work.clone(),
+                ingress: cx.ingress.clone(),
+                idle_reset_tx: cx.idle_reset_tx.clone(),
+                plugin_manager: cx.plugin_manager.clone(),
+            };
+            let focus = view!(ctx.editor).id;
 
-        command.execute(&mut ctx);
+            command.execute(&mut ctx);
 
-        if ctx.editor.tree.contains(focus) {
-            let config = ctx.editor.config();
-            let mode = ctx.editor.mode();
-            let view = view_mut!(ctx.editor, focus);
-            let doc = doc_mut!(ctx.editor, &view.doc);
+            if ctx.editor.contains_view(focus) {
+                let config = ctx.editor.config();
+                let mode = ctx.editor.mode();
+                let view = view_mut!(ctx.editor, focus);
+                let doc = doc_mut!(ctx.editor, &view.doc);
 
-            view.ensure_cursor_in_view(doc, config.scrolloff);
+                view.ensure_cursor_in_view(doc, config.scrolloff);
 
-            if mode != Mode::Insert {
-                doc.append_changes_to_history(view);
+                if mode != Mode::Insert {
+                    doc.append_changes_to_history(view);
+                }
             }
-        }
-    });
+        },
+    );
     compositor.push(Box::new(overlaid(picker)));
 }
 
@@ -2798,15 +2797,11 @@ pub(crate) fn blame_line_impl(editor: &mut Editor, doc_id: DocumentId, cursor_li
                 || matches!(result, Err(LineBlameError::NotReadyYet) if !inline_blame_config.auto_fetch) =>
         {
             if let Some(path) = doc.path() {
-                let tx = editor.handlers.blame.clone();
-                helix_runtime::send_blocking(
-                    &tx,
-                    helix_view::handlers::BlameEvent {
-                        path: path.to_path_buf(),
-                        doc_id: doc.id(),
-                        line: Some(cursor_line),
-                    },
-                );
+                editor.request_blame(helix_view::handlers::BlameEvent {
+                    path: path.to_path_buf(),
+                    doc_id: doc.id(),
+                    line: Some(cursor_line),
+                });
                 editor.set_status(format!("Requested blame for {}...", path.display()));
                 let doc = editor
                     .document_mut(doc_id)
@@ -2987,10 +2982,13 @@ pub(crate) async fn make_format_task_event(
     doc_id: DocumentId,
     doc_version: i32,
     view_id: ViewId,
-    format: impl Future<Output = Result<Transaction, FormatterError>> + Send + 'static,
-    write: Option<(Option<PathBuf>, bool)>,
+    format: DocumentFormatTask,
+    write: Option<crate::runtime::PendingFormatWrite>,
 ) -> anyhow::Result<RuntimeTaskEvent> {
-    let format_result = format.await;
+    let format_result = match format.await {
+        Ok(result) => result,
+        Err(err) => Err(FormatterError::TaskFailed(err)),
+    };
     Ok(RuntimeTaskEvent::ApplyFormattingResult {
         doc_id,
         view_id,
@@ -3430,7 +3428,7 @@ fn hunk_range(hunk: Hunk, text: RopeSlice) -> Range {
 }
 
 pub mod insert {
-    use crate::{events::PostInsertChar, key};
+    use crate::{handlers::local, key};
 
     use super::*;
     pub type Hook = fn(&Rope, &Selection, char) -> Option<Transaction>;
@@ -3446,7 +3444,7 @@ pub mod insert {
             let doc = doc_mut!(cx.editor, &doc_id);
             doc.apply(&t, view_id);
         }
-        helix_event::dispatch(PostInsertChar { c, cx });
+        local::post_insert_char(c, cx);
     }
 
     pub fn smart_tab(cx: &mut Context) {
@@ -3887,26 +3885,32 @@ fn format_selections(cx: &mut Context) {
     let doc_version = doc.version();
     let ingress = cx.ingress.clone();
 
-    cx.editor.runtime().work().clone().spawn(async move {
-        match future.await {
-            Ok(Some(res)) => {
-                let transaction =
-                    helix_lsp::util::generate_transaction_from_edits(&text, res, offset_encoding);
-                send_task_event_with(
-                    RuntimeTaskEvent::ApplyTransactionIfCurrent {
-                        doc_id,
-                        view_id,
-                        expected_version: doc_version,
-                        transaction,
-                    },
-                    ingress,
-                )
-                .await
+    cx.editor
+        .work()
+        .spawn(async move {
+            match future.await {
+                Ok(Some(res)) => {
+                    let transaction = helix_lsp::util::generate_transaction_from_edits(
+                        &text,
+                        res,
+                        offset_encoding,
+                    );
+                    send_task_event_with(
+                        RuntimeTaskEvent::ApplyTransactionIfCurrent {
+                            doc_id,
+                            view_id,
+                            expected_version: doc_version,
+                            transaction,
+                        },
+                        ingress,
+                    )
+                    .await
+                }
+                Err(err) => log::error!("format sections failed: {err}"),
+                Ok(None) => (),
             }
-            Err(err) => log::error!("format sections failed: {err}"),
-            Ok(None) => (),
-        }
-    }).detach();
+        })
+        .detach();
 }
 
 fn keep_or_remove_selections_impl(cx: &mut Context, remove: bool) {
@@ -4044,7 +4048,7 @@ fn vsplit_new(cx: &mut Context) {
 }
 
 fn wclose(cx: &mut Context) {
-    if cx.editor.tree.views().count() == 1 {
+    if cx.editor.has_single_view() {
         if let Err(err) = typed::buffers_remaining_impl(cx.editor) {
             cx.editor.set_error(err.to_string());
             return;

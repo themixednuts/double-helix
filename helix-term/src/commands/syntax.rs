@@ -6,7 +6,6 @@ use std::{
 };
 
 use dashmap::DashMap;
-use futures_util::FutureExt;
 use grep_regex::RegexMatcherBuilder;
 use grep_searcher::{sinks, BinaryDetection, SearcherBuilder};
 use helix_core::{
@@ -182,7 +181,7 @@ pub fn syntax_symbol_picker(cx: &mut Context) {
         1, // name
         tags,
         (),
-        cx.editor.runtime().clone(),
+        crate::ui::PickerRuntime::new(cx.editor.runtime()),
         cx.ingress.clone(),
         move |cx: &mut crate::compositor::Context, tag: &Tag, action| {
             cx.editor.switch(doc_id, action);
@@ -286,14 +285,15 @@ pub fn syntax_workspace_symbol_picker(cx: &mut Context) {
     let get_tags = |query: &str,
                     editor: &mut Editor,
                     state: Arc<SearchState>,
-                    injector: &Injector<_, _>| {
+                    injector: &Injector<_, _>,
+                    work: helix_runtime::Work| {
         if query.len() < 3 {
-            return async { Ok(()) }.boxed();
+            return work.spawn(async { Ok(()) });
         }
         // Attempt to find the tag in any open documents.
         let pattern = match state.rope_regex_builder.build(query) {
             Ok(pattern) => pattern,
-            Err(err) => return async { Err(anyhow::anyhow!(err)) }.boxed(),
+            Err(err) => return work.spawn(async move { Err(anyhow::anyhow!(err)) }),
         };
         let loader = editor.syn_loader.load();
         for doc in editor.documents() {
@@ -306,13 +306,13 @@ pub fn syntax_workspace_symbol_picker(cx: &mut Context) {
             };
             for tag in tags {
                 if injector.push(tag).is_err() {
-                    return async { Ok(()) }.boxed();
+                    return work.spawn(async { Ok(()) });
                 }
             }
         }
         if !state.search_root.exists() {
-            return async { Err(anyhow::anyhow!("Current working directory does not exist")) }
-                .boxed();
+            return work
+                .spawn(async { Err(anyhow::anyhow!("Current working directory does not exist")) });
         }
         let matcher = match state.regex_matcher_builder.build(query) {
             Ok(matcher) => {
@@ -325,7 +325,7 @@ pub fn syntax_workspace_symbol_picker(cx: &mut Context) {
                     "Failed to compile search pattern in workspace symbol search: {}",
                     err
                 );
-                return async { Err(anyhow::anyhow!("Failed to compile regex")) }.boxed();
+                return work.spawn(async { Err(anyhow::anyhow!("Failed to compile regex")) });
             }
         };
         let pattern = Arc::new(pattern);
@@ -336,7 +336,7 @@ pub fn syntax_workspace_symbol_picker(cx: &mut Context) {
             .filter_map(Document::path)
             .cloned()
             .collect();
-        async move {
+        work.spawn(async move {
             let searcher = state.searcher_builder.build();
             state.walk_builder.build_parallel().run(|| {
                 let mut searcher = searcher.clone();
@@ -402,19 +402,18 @@ pub fn syntax_workspace_symbol_picker(cx: &mut Context) {
                 })
             });
             Ok(())
-        }
-        .boxed()
+        })
     };
     let picker = Picker::new(
         columns,
         1, // name
         [],
         state,
-        cx.editor.runtime().clone(),
+        crate::ui::PickerRuntime::new(cx.editor.runtime()),
         cx.ingress.clone(),
         move |cx: &mut crate::compositor::Context, tag: &Tag, action| {
             let doc_id = match &tag.doc {
-                UriOrDocumentId::Id(id) => id.clone(),
+                UriOrDocumentId::Id(id) => *id,
                 UriOrDocumentId::Uri(uri) => match cx.editor.open(uri.as_path().expect(""), action) {
                     Ok(id) => id,
                     Err(e) => {

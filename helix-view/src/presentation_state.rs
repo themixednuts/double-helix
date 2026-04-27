@@ -205,13 +205,22 @@ impl DocumentPresentationState {
         self.annotations.fold_containers_mut()
     }
 
-    pub fn plugin_annotations(&self, view_id: ViewId) -> Option<&Vec<PluginAnnotation>> {
+    pub fn plugin_annotations(&self, view_id: ViewId) -> Option<Vec<PluginAnnotation>> {
         self.annotations.plugin_annotations(view_id)
     }
 
-    pub fn set_plugin_annotations(&mut self, view_id: ViewId, annotations: Vec<PluginAnnotation>) {
+    pub fn set_plugin_annotations(
+        &mut self,
+        view_id: ViewId,
+        plugin: String,
+        annotations: Vec<PluginAnnotation>,
+    ) {
         self.annotations
-            .set_plugin_annotations(view_id, annotations);
+            .set_plugin_annotations(view_id, plugin, annotations);
+    }
+
+    pub fn clear_plugin_annotations(&mut self, plugin: &str) {
+        self.annotations.clear_plugin_scope(plugin);
     }
 
     pub fn presence_annotations(&self, view_id: ViewId) -> Option<&Vec<PluginAnnotation>> {

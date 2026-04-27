@@ -2,7 +2,7 @@ use crate::handlers::completion::LspCompletionItem;
 use crate::ui::{menu, Markdown, Menu, Popup, PromptEvent};
 use crate::{
     compositor::{Component, Context, Event, EventResult, RenderContext},
-    handlers::completion::{CompletionItem, CompletionResponse, ResolveHandler},
+    handlers::completion::{CompletionItem, CompletionResponse, ResolveHandler, ResolveRuntime},
     ui::completion_ingress::trigger_auto_completion,
 };
 use helix_core::snippets::{RenderedSnippet, Snippet};
@@ -187,7 +187,7 @@ impl Completion {
         editor: &Editor,
         items: Vec<CompletionItem>,
         trigger_offset: usize,
-        runtime: helix_runtime::Runtime,
+        runtime: ResolveRuntime,
         ingress: helix_runtime::Sender<crate::runtime::RuntimeEvent>,
     ) -> Self {
         let preview_completion_insert = editor.config().preview_completion_insert;
@@ -204,6 +204,11 @@ impl Completion {
             items,
             format_completion_data,
             move |editor: &mut Editor, item, event| {
+                let completion_savepoint = item.and_then(|item| {
+                    editor
+                        .completion_context(item.provider())
+                        .map(|context| context.savepoint.clone())
+                });
                 let (view_id, doc) = focused!(editor);
                 let view = view_mut!(editor, view_id);
 
@@ -244,10 +249,9 @@ impl Completion {
                             })
                         }
                         let item = item.unwrap();
-                        let context =
-                            &editor.handlers.completions.active_completions[&item.provider()];
+                        let savepoint = completion_savepoint.unwrap();
                         // if more text was entered, remove it
-                        doc.restore(view, &context.savepoint, false);
+                        doc.restore(view, &savepoint, false);
                         // always present here
 
                         match item {
@@ -276,10 +280,9 @@ impl Completion {
                         }
 
                         let item = item.unwrap();
-                        let context =
-                            &editor.handlers.completions.active_completions[&item.provider()];
+                        let savepoint = completion_savepoint.unwrap();
                         // if more text was entered, remove it
-                        doc.restore(view, &context.savepoint, true);
+                        doc.restore(view, &savepoint, true);
                         // save an undo checkpoint before the completion
                         doc.append_changes_to_history(view);
 

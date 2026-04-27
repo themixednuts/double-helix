@@ -280,7 +280,8 @@ pub fn schedule_redraw_at(
     work.spawn(async move {
         tokio::time::sleep_until(tokio::time::Instant::from_std(when)).await;
         crate::runtime::send_redraw_with(ingress).await;
-    }).detach();
+    })
+    .detach();
 }
 
 #[cfg(test)]

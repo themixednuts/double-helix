@@ -51,7 +51,7 @@ pub(crate) fn apply_layer_command(
                 0,
                 commands,
                 (),
-                editor.runtime().clone(),
+                crate::ui::PickerRuntime::new(editor.runtime()),
                 ingress,
                 move |cx, (ls_id, command), _action| {
                     helix_runtime::send_blocking(

@@ -2,7 +2,6 @@ use crate::runtime::RuntimeEvent;
 use crate::{
     commands::{self, OnKeyCallback, OnKeyCallbackKind},
     compositor::{Component, Context, Event, EventResult, RenderContext},
-    events::{OnModeSwitch, PostCommand},
     handlers::completion::CompletionItem,
     key,
     keymap::Keymaps,
@@ -127,32 +126,6 @@ impl RenderPhase {
 }
 
 impl ViewFrame<'_> {
-    fn new<'a>(
-        editor: &'a Editor,
-        doc: &'a Document,
-        view: &'a View,
-        area: Rect,
-        selection: &'a Selection,
-        is_focused: bool,
-        frame_num: u64,
-        view_render_start: std::time::Instant,
-        render_start: std::time::Instant,
-    ) -> ViewFrame<'a> {
-        ViewFrame {
-            editor,
-            doc,
-            trace: ViewTrace {
-                view,
-                selection,
-                is_focused,
-                frame_num,
-                view_render_start,
-                render_start,
-            },
-            area,
-        }
-    }
-
     fn render_state<'a>(
         &self,
         cached: Option<RenderSnapshotsRef<'a>>,
@@ -483,11 +456,11 @@ impl EditorView {
             selected_register: cx.register,
         };
         self.set_engine_input_state(state);
-        cx.editor.focused_modal_input = state;
+        cx.editor.frontend_mut().focused_modal_input = state;
     }
 
     fn publish_focused_modal_input(&self, editor: &mut Editor) {
-        editor.focused_modal_input = self.engine_input_state();
+        editor.frontend_mut().focused_modal_input = self.engine_input_state();
     }
 
     fn prepare_statusline(
@@ -1653,7 +1626,7 @@ impl EditorView {
         let mode_before = cx.editor.mode();
 
         // Resolve the editing context from the focused view.
-        let focus = cx.editor.tree.focus;
+        let focus = cx.editor.focused_view_id();
         let focused_view = cx.editor.tree.get(focus);
         let view_id = focused_view.id;
         let doc_id = focused_view.doc;
@@ -1855,11 +1828,13 @@ impl EditorView {
             self.sync_engine_from_context(cx);
             let mode_after = cx.editor.mode();
             if mode_after != mode_before {
-                helix_event::dispatch(OnModeSwitch {
+                let mut event = crate::handlers::local::ModeSwitch {
                     old_mode: mode_before,
                     new_mode: mode_after,
                     cx,
-                });
+                };
+                crate::handlers::local::mode_switch(&mut event);
+                cx.notifier.mode_switch(mode_before, mode_after);
             }
         } else {
             log::warn!("replay_insert: unknown entry command '{}'", entry_command);
@@ -1891,10 +1866,7 @@ impl EditorView {
             .iter()
             .find(|candidate| candidate.name() == command.name())
         {
-            helix_event::dispatch(PostCommand {
-                command: static_command,
-                cx,
-            });
+            crate::handlers::local::post_command(static_command, cx);
         }
     }
 
@@ -1911,11 +1883,13 @@ impl EditorView {
     ) {
         let mode_after = cx.editor.mode();
         if mode_after != mode_before {
-            helix_event::dispatch(OnModeSwitch {
+            let mut event = crate::handlers::local::ModeSwitch {
                 old_mode: mode_before,
                 new_mode: mode_after,
                 cx,
-            });
+            };
+            crate::handlers::local::mode_switch(&mut event);
+            cx.notifier.mode_switch(mode_before, mode_after);
 
             let engine = self.engine.as_mut().expect("engine is always present");
 
@@ -1945,7 +1919,7 @@ impl EditorView {
             editor,
             items,
             trigger_offset,
-            editor.runtime().clone(),
+            crate::handlers::completion::ResolveRuntime::new(editor.runtime()),
             ingress,
         );
 
@@ -1968,8 +1942,7 @@ impl EditorView {
         }
         self.completion = None;
         let mut on_next_key: Option<OnKeyCallback> = None;
-        editor.handlers.completions.cancel_request();
-        editor.handlers.completions.active_completions.clear();
+        editor.clear_completion_requests();
         if let Some(last_completion) = editor.last_completion.take() {
             match last_completion {
                 CompleteAction::Triggered => (),
@@ -2072,7 +2045,7 @@ impl EditorView {
                 let bufferline_visible = match config.bufferline.render_mode {
                     helix_view::editor::BufferLineRenderMode::Always => true,
                     helix_view::editor::BufferLineRenderMode::Multiple => {
-                        editor.documents.len() > 1
+                        editor.has_multiple_documents()
                     }
                     _ => false,
                 };
@@ -2156,8 +2129,6 @@ impl EditorView {
             }
 
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
-                let previous_view = cxt.editor.tree.focus;
-
                 let direction = match event.kind {
                     MouseEventKind::ScrollUp => Direction::Backward,
                     MouseEventKind::ScrollDown => Direction::Forward,
@@ -2165,17 +2136,30 @@ impl EditorView {
                 };
 
                 let scrolled_view = match pos_and_view(cxt.editor, row, column, false) {
-                    Some((_, view_id)) => {
-                        cxt.editor.tree.focus = view_id;
-                        view_id
-                    }
+                    Some((_, view_id)) => view_id,
                     None => return EventResult::Ignored(None),
                 };
 
                 let offset = config.scroll_lines.unsigned_abs();
-                commands::scroll(cxt, offset, direction, false);
-
-                restore_focus_after_mouse_scroll(cxt.editor, previous_view, scrolled_view);
+                cxt.editor.with_temporary_focus(scrolled_view, |editor| {
+                    let mut scroll_cx = crate::commands::Context {
+                        register: cxt.register,
+                        count: cxt.count,
+                        editor,
+                        registry: cxt.registry.clone(),
+                        notifier: cxt.notifier.clone(),
+                        callback: std::mem::take(&mut cxt.callback),
+                        on_next_key_callback: cxt.on_next_key_callback.take(),
+                        exit_tasks: cxt.exit_tasks,
+                        exit_task_work: cxt.exit_task_work.clone(),
+                        ingress: cxt.ingress.clone(),
+                        idle_reset_tx: cxt.idle_reset_tx.clone(),
+                        plugin_manager: cxt.plugin_manager.clone(),
+                    };
+                    commands::scroll(&mut scroll_cx, offset, direction, false);
+                    cxt.callback = scroll_cx.callback;
+                    cxt.on_next_key_callback = scroll_cx.on_next_key_callback;
+                });
 
                 EventResult::Consumed(None)
             }
@@ -2304,6 +2288,7 @@ impl Component for EditorView {
         let mut cx = commands::Context {
             editor: context.editor,
             registry: self.registry.clone(),
+            notifier: context.notifier.clone(),
             count: self.engine_input_state().count,
             register: self.engine_input_state().selected_register,
             callback: Vec::new(),
@@ -2365,6 +2350,7 @@ impl Component for EditorView {
                                     exit_tasks: cx.exit_tasks,
                                     exit_task_work: cx.exit_task_work.clone(),
                                     scroll: None,
+                                    notifier: cx.notifier.clone(),
                                     ingress: cx.ingress.clone(),
                                     idle_reset_tx: cx.idle_reset_tx.clone(),
                                     plugin_manager: cx.plugin_manager.clone(),
@@ -2503,7 +2489,7 @@ impl Component for EditorView {
             Event::FocusLost => {
                 if context.editor.config().auto_save.focus_lost {
                     let options = commands::WriteAllOptions {
-                        force: false,
+                        policy: helix_view::editor::SavePolicy::Safe,
                         write_scratch: false,
                         auto_format: false,
                     };
@@ -2552,7 +2538,7 @@ impl Component for EditorView {
         use helix_view::editor::BufferLineRenderMode;
         let use_bufferline = match config.bufferline.render_mode {
             BufferLineRenderMode::Always => true,
-            BufferLineRenderMode::Multiple if cx.editor.documents.len() > 1 => true,
+            BufferLineRenderMode::Multiple if cx.editor.has_multiple_documents() => true,
             _ => false,
         };
 
@@ -2602,17 +2588,19 @@ impl Component for EditorView {
             let doc = cx.editor.document(view.doc).unwrap();
             let selection = doc.selection(view.id);
 
-            let frame = ViewFrame::new(
-                cx.editor,
+            let frame = ViewFrame {
+                editor: cx.editor,
                 doc,
-                view,
+                trace: ViewTrace {
+                    view,
+                    selection,
+                    is_focused,
+                    frame_num,
+                    view_render_start,
+                    render_start,
+                },
                 area,
-                selection,
-                is_focused,
-                frame_num,
-                view_render_start,
-                render_start,
-            );
+            };
             frame.trace.log_state();
 
             match frame.render_state(
@@ -2806,20 +2794,9 @@ struct BufferInfo {
 // Key canonicalization (SHIFT stripping from Char keys) is now done in
 // the compositor's handle_event, so all components receive canonical keys.
 
-fn restore_focus_after_mouse_scroll(
-    editor: &mut Editor,
-    previous_view: ViewId,
-    scrolled_view: ViewId,
-) {
-    editor.tree.focus = previous_view;
-    if previous_view != scrolled_view {
-        editor.ensure_cursor_in_view(previous_view);
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{restore_focus_after_mouse_scroll, EditorView, ViewRenderContext};
+    use super::{EditorView, ViewRenderContext};
     use crate::handlers::Handlers;
     use crate::keymap::Keymaps;
     use arc_swap::ArcSwap;
@@ -2882,7 +2859,7 @@ mod tests {
             editor.syn_loader.clone(),
         );
         let doc_id = editor.new_file_from_document(Action::VerticalSplit, doc);
-        let view_id = editor.tree.focus;
+        let view_id = editor.focused_view_id();
         (editor, view_id, doc_id)
     }
 
@@ -3063,7 +3040,7 @@ mod tests {
             .document(doc_id)
             .expect("document")
             .view_offset(view_id);
-        restore_focus_after_mouse_scroll(&mut editor, view_id, view_id);
+        editor.with_temporary_focus(view_id, |_| {});
         let after = editor
             .document(doc_id)
             .expect("document")

@@ -27,10 +27,17 @@ pub struct Group {
 
 #[derive(Default)]
 struct State {
-    open: bool,
+    lifecycle: Lifecycle,
     live: usize,
-    finalized: bool,
     parent: Option<Guard>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum Lifecycle {
+    #[default]
+    Open,
+    Closing,
+    Closed,
 }
 
 struct Inner {
@@ -40,8 +47,7 @@ struct Inner {
 }
 
 struct Guard {
-    inner: Arc<Inner>,
-    active: bool,
+    inner: Option<Arc<Inner>>,
 }
 
 impl Group {
@@ -54,9 +60,8 @@ impl Group {
             inner: Arc::new(Inner {
                 token,
                 state: Mutex::new(State {
-                    open: true,
+                    lifecycle: Lifecycle::Open,
                     live: 0,
-                    finalized: false,
                     parent,
                 }),
                 notify: Notify::new(),
@@ -152,13 +157,12 @@ impl Block {
 
 fn track(inner: &Arc<Inner>) -> Result<Guard, SpawnError> {
     let mut state = inner.state.lock();
-    if !state.open {
+    if !matches!(state.lifecycle, Lifecycle::Open) {
         return Err(SpawnError::Closed);
     }
     state.live += 1;
     Ok(Guard {
-        inner: inner.clone(),
-        active: true,
+        inner: Some(inner.clone()),
     })
 }
 
@@ -169,12 +173,12 @@ fn close(inner: &Arc<Inner>, cancel: bool) {
 
     let parent = {
         let mut state = inner.state.lock();
-        if state.finalized {
+        if matches!(state.lifecycle, Lifecycle::Closed) {
             return;
         }
-        state.open = false;
+        state.lifecycle = Lifecycle::Closing;
         if state.live == 0 {
-            state.finalized = true;
+            state.lifecycle = Lifecycle::Closed;
             state.parent.take()
         } else {
             None
@@ -186,25 +190,26 @@ fn close(inner: &Arc<Inner>, cancel: bool) {
 
 fn is_settled(inner: &Arc<Inner>) -> bool {
     let state = inner.state.lock();
-    state.finalized || (!state.open && state.live == 0)
+    matches!(state.lifecycle, Lifecycle::Closed)
+        || (matches!(state.lifecycle, Lifecycle::Closing) && state.live == 0)
 }
 
 impl Drop for Guard {
     fn drop(&mut self) {
-        if !self.active {
+        let Some(inner) = self.inner.take() else {
             return;
-        }
+        };
         let parent = {
-            let mut state = self.inner.state.lock();
+            let mut state = inner.state.lock();
             state.live = state.live.saturating_sub(1);
-            if state.live == 0 && !state.open && !state.finalized {
-                state.finalized = true;
+            if state.live == 0 && matches!(state.lifecycle, Lifecycle::Closing) {
+                state.lifecycle = Lifecycle::Closed;
                 state.parent.take()
             } else {
                 None
             }
         };
-        self.inner.notify.notify_waiters();
+        inner.notify.notify_waiters();
         drop(parent);
     }
 }

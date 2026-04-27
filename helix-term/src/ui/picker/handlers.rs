@@ -2,9 +2,7 @@ use std::{path::Path, sync::Arc, time::Duration};
 
 use helix_runtime::{channel, Clock, Debounce, Sender, Work};
 
-use crate::{
-    runtime::{ui::command::PickerCommand, RuntimeEvent, UiCommand},
-};
+use crate::runtime::{ui::command::PickerCommand, RuntimeEvent, UiCommand};
 
 use super::SharedIngress;
 
@@ -23,11 +21,7 @@ enum PreviewHighlightEvent {
 }
 
 impl PreviewHighlightHandler {
-    pub(super) fn spawn(
-        work: Work,
-        clock: Clock,
-        ingress: SharedIngress,
-    ) -> Sender<Arc<Path>> {
+    pub(super) fn spawn(work: Work, clock: Clock, ingress: SharedIngress) -> Sender<Arc<Path>> {
         let (tx, mut rx) = channel(128);
         let mut handler = Self {
             trigger: None,
@@ -126,7 +120,12 @@ pub(super) struct DynamicQueryHandler {
 }
 
 impl DynamicQueryHandler {
-    pub(super) fn new(duration_ms: Option<u64>, work: Work, clock: Clock, ingress: SharedIngress) -> Self {
+    pub(super) fn new(
+        duration_ms: Option<u64>,
+        work: Work,
+        clock: Clock,
+        ingress: SharedIngress,
+    ) -> Self {
         Self {
             debounce: Duration::from_millis(duration_ms.unwrap_or(100)),
             timer: Debounce::new(Duration::from_millis(duration_ms.unwrap_or(100))),

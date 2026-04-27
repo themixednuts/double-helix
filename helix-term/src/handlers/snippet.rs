@@ -1,10 +1,8 @@
-use helix_event::register_hook;
 use helix_view::bench::log_command_phase;
-use helix_view::events::{DocumentDidChange, DocumentFocusLost, SelectionDidChange};
 use helix_view::handlers::Handlers;
 
-pub(super) fn register_hooks(_handlers: &Handlers) {
-    register_hook!(move |event: &mut SelectionDidChange<'_>| {
+pub(super) fn attach(editor: &helix_view::Editor, _handlers: &Handlers) {
+    editor.lifecycle().on_selection_change(move |event| {
         if let Some(snippet) = event.doc.active_snippet() {
             if !snippet.is_valid(event.doc.selection(event.view)) {
                 event.doc.clear_active_snippet();
@@ -12,7 +10,7 @@ pub(super) fn register_hooks(_handlers: &Handlers) {
         }
         Ok(())
     });
-    register_hook!(move |event: &mut DocumentDidChange<'_>| {
+    editor.lifecycle().on_document_change(move |event| {
         let hook_start = std::time::Instant::now();
         if let Some(snippet) = event.doc.active_snippet_mut() {
             let invalid = snippet.map(event.changes);
@@ -32,9 +30,10 @@ pub(super) fn register_hooks(_handlers: &Handlers) {
         });
         Ok(())
     });
-    register_hook!(move |event: &mut DocumentFocusLost<'_>| {
-        let editor = &mut event.editor;
-        focused!(editor).1.clear_active_snippet();
+    editor.lifecycle().on_document_focus_lost(move |event| {
+        if let Some(doc) = event.editor.document_mut(event.doc) {
+            doc.clear_active_snippet();
+        }
         Ok(())
     });
 }

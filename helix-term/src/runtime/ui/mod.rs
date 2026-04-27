@@ -4,8 +4,8 @@
 //! Add `runtime/ui/<domain>.rs` when a concern grows enough to split (e.g. LSP UI helpers)
 //! without pulling `handlers` ↔ `runtime` cycles—keep compositor work here, editor-only effects in [`crate::effect`].
 
-pub(crate) mod assistant;
 pub mod apply;
+pub(crate) mod assistant;
 pub mod command;
 pub(crate) mod completion;
 pub(crate) mod dap;

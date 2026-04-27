@@ -62,7 +62,11 @@ impl Transport {
         agent_stderr: BufReader<ChildStderr>,
         id: AgentId,
         name: String,
-    ) -> (Receiver<(AgentId, jsonrpc::Call)>, Sender<Payload>, Arc<Notify>) {
+    ) -> (
+        Receiver<(AgentId, jsonrpc::Call)>,
+        Sender<Payload>,
+        Arc<Notify>,
+    ) {
         let (client_tx, rx) = channel(256);
         let (tx, client_rx) = channel(256);
         let notify = Arc::new(Notify::new());

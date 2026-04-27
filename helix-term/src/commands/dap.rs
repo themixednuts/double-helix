@@ -27,7 +27,10 @@ fn thread_picker(cx: &mut Context, action: DapThreadAction) {
         let json = future.await?;
         let response: dap::requests::ThreadsResponse = serde_json::from_value(json)?;
         let threads = response.threads;
-        Ok(UiCommand::Dap(DapCommand::ThreadsPicker { threads, action }))
+        Ok(UiCommand::Dap(DapCommand::ThreadsPicker {
+            threads,
+            action,
+        }))
     }));
 }
 
@@ -110,7 +113,7 @@ pub fn dap_start_impl(
                 Ok(UiCommand::Nop)
             });
             crate::runtime::ingress::spawn_ui_command_with_future(
-                cx.editor.runtime().work().clone(),
+                cx.editor.work(),
                 callback,
                 cx.ingress.clone(),
             );
@@ -123,7 +126,7 @@ pub fn dap_start_impl(
                 Ok(UiCommand::Nop)
             });
             crate::runtime::ingress::spawn_ui_command_with_future(
-                cx.editor.runtime().work().clone(),
+                cx.editor.work(),
                 callback,
                 cx.ingress.clone(),
             );
@@ -213,7 +216,7 @@ pub fn dap_launch(cx: &mut Context) {
         0,
         templates,
         (),
-        cx.editor.runtime().clone(),
+        ui::PickerRuntime::new(cx.editor.runtime()),
         cx.ingress.clone(),
         |cx: &mut crate::compositor::Context, template: &DebugTemplate, _action| {
             if template.completion.is_empty() {
@@ -261,7 +264,7 @@ pub fn dap_restart(cx: &mut Context) {
 
     dap_callback(
         debugger.restart(),
-        cx.editor.runtime().work().clone(),
+        cx.editor.work(),
         cx.ingress.clone(),
         |_resp: ()| RuntimeTaskEvent::DapRestarted,
     );
@@ -370,9 +373,11 @@ pub fn dap_continue(cx: &mut Context) {
 
         dap_callback(
             request,
-            cx.editor.runtime().work().clone(),
+            cx.editor.work(),
             cx.ingress.clone(),
-            |_response: dap::requests::ContinueResponse| RuntimeTaskEvent::ResumeDebuggerApplication,
+            |_response: dap::requests::ContinueResponse| {
+                RuntimeTaskEvent::ResumeDebuggerApplication
+            },
         );
     } else {
         cx.editor
@@ -392,7 +397,7 @@ pub fn dap_step_in(cx: &mut Context) {
 
         dap_callback(
             request,
-            cx.editor.runtime().work().clone(),
+            cx.editor.work(),
             cx.ingress.clone(),
             |_response: ()| RuntimeTaskEvent::ResumeDebuggerApplication,
         );
@@ -409,7 +414,7 @@ pub fn dap_step_out(cx: &mut Context) {
         let request = debugger.step_out(thread_id);
         dap_callback(
             request,
-            cx.editor.runtime().work().clone(),
+            cx.editor.work(),
             cx.ingress.clone(),
             |_response: ()| RuntimeTaskEvent::ResumeDebuggerApplication,
         );
@@ -426,7 +431,7 @@ pub fn dap_next(cx: &mut Context) {
         let request = debugger.next(thread_id);
         dap_callback(
             request,
-            cx.editor.runtime().work().clone(),
+            cx.editor.work(),
             cx.ingress.clone(),
             |_response: ()| RuntimeTaskEvent::ResumeDebuggerApplication,
         );
@@ -536,7 +541,7 @@ pub fn dap_terminate(cx: &mut Context) {
         let request = debugger.terminate(terminate_arguments);
         dap_callback(
             request,
-            cx.editor.runtime().work().clone(),
+            cx.editor.work(),
             cx.ingress.clone(),
             |_response: ()| RuntimeTaskEvent::UnsetActiveDebugClient,
         );
@@ -557,9 +562,11 @@ pub fn dap_enable_exceptions(cx: &mut Context) {
 
     dap_callback(
         request,
-        cx.editor.runtime().work().clone(),
+        cx.editor.work(),
         cx.ingress.clone(),
-        |_response: dap::requests::SetExceptionBreakpointsResponse| RuntimeTaskEvent::DapExceptionsConfigured,
+        |_response: dap::requests::SetExceptionBreakpointsResponse| {
+            RuntimeTaskEvent::DapExceptionsConfigured
+        },
     )
 }
 
@@ -570,9 +577,11 @@ pub fn dap_disable_exceptions(cx: &mut Context) {
 
     dap_callback(
         request,
-        cx.editor.runtime().work().clone(),
+        cx.editor.work(),
         cx.ingress.clone(),
-        |_response: dap::requests::SetExceptionBreakpointsResponse| RuntimeTaskEvent::DapExceptionsConfigured,
+        |_response: dap::requests::SetExceptionBreakpointsResponse| {
+            RuntimeTaskEvent::DapExceptionsConfigured
+        },
     )
 }
 
@@ -629,5 +638,10 @@ pub fn dap_switch_stack_frame(cx: &mut Context) {
 
     let frames = debugger.stack_frames[&thread_id].clone();
 
-    cx.spawn_ui(async move { Ok(UiCommand::Dap(DapCommand::StackFramesPicker { thread_id, frames })) });
+    cx.spawn_ui(async move {
+        Ok(UiCommand::Dap(DapCommand::StackFramesPicker {
+            thread_id,
+            frames,
+        }))
+    });
 }

@@ -18,22 +18,34 @@ pub enum TaskError {
 #[derive(Debug)]
 pub struct Task<T> {
     handle: Option<JoinHandle<T>>,
-    abort_on_drop: bool,
+    drop_policy: DropPolicy,
 }
 
 #[must_use = "local tasks should be stored, awaited, or detached explicitly"]
 #[derive(Debug)]
 pub struct Local<T> {
     handle: Option<JoinHandle<T>>,
-    abort_on_drop: bool,
+    drop_policy: DropPolicy,
     _not_send: PhantomData<Rc<()>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DropPolicy {
+    Abort,
+    Detach,
+}
+
+impl DropPolicy {
+    fn should_abort(self) -> bool {
+        matches!(self, Self::Abort)
+    }
 }
 
 impl<T> Task<T> {
     pub(crate) fn new(handle: JoinHandle<T>) -> Self {
         Self {
             handle: Some(handle),
-            abort_on_drop: true,
+            drop_policy: DropPolicy::Abort,
         }
     }
 
@@ -44,7 +56,7 @@ impl<T> Task<T> {
     }
 
     pub fn detach(mut self) {
-        self.abort_on_drop = false;
+        self.drop_policy = DropPolicy::Detach;
     }
 
     pub fn is_finished(&self) -> bool {
@@ -56,7 +68,7 @@ impl<T> Local<T> {
     pub(crate) fn new(handle: JoinHandle<T>) -> Self {
         Self {
             handle: Some(handle),
-            abort_on_drop: true,
+            drop_policy: DropPolicy::Abort,
             _not_send: PhantomData,
         }
     }
@@ -68,7 +80,7 @@ impl<T> Local<T> {
     }
 
     pub fn detach(mut self) {
-        self.abort_on_drop = false;
+        self.drop_policy = DropPolicy::Detach;
     }
 
     pub fn is_finished(&self) -> bool {
@@ -78,7 +90,7 @@ impl<T> Local<T> {
 
 impl<T> Drop for Task<T> {
     fn drop(&mut self) {
-        if self.abort_on_drop {
+        if self.drop_policy.should_abort() {
             if let Some(handle) = &self.handle {
                 handle.abort();
             }
@@ -88,7 +100,7 @@ impl<T> Drop for Task<T> {
 
 impl<T> Drop for Local<T> {
     fn drop(&mut self) {
-        if self.abort_on_drop {
+        if self.drop_policy.should_abort() {
             if let Some(handle) = &self.handle {
                 handle.abort();
             }
@@ -104,7 +116,7 @@ impl<T> Future for Task<T> {
         let handle = this.handle.as_mut().expect("task polled after detach");
         match Pin::new(handle).poll(cx) {
             Poll::Ready(result) => {
-                this.abort_on_drop = false;
+                this.drop_policy = DropPolicy::Detach;
                 this.handle.take();
                 Poll::Ready(map_join_result(result))
             }
@@ -124,7 +136,7 @@ impl<T> Future for Local<T> {
             .expect("local task polled after detach");
         match Pin::new(handle).poll(cx) {
             Poll::Ready(result) => {
-                this.abort_on_drop = false;
+                this.drop_policy = DropPolicy::Detach;
                 this.handle.take();
                 Poll::Ready(map_join_result(result))
             }
@@ -166,9 +178,9 @@ mod tests {
         rt.block_on(async {
             tokio::task::LocalSet::new()
                 .run_until(async {
-                let task = Local::new(tokio::task::spawn_local(async { 7 }));
-                assert_eq!(task.await, Ok(7));
-            })
+                    let task = Local::new(tokio::task::spawn_local(async { 7 }));
+                    assert_eq!(task.await, Ok(7));
+                })
                 .await;
         });
     }

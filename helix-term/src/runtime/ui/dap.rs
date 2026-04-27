@@ -94,7 +94,7 @@ pub(crate) fn apply_dap_command(
                 let event = match action {
                     DapThreadAction::Switch => RuntimeTaskEvent::SelectDebugThread {
                         thread_id,
-                        force: true,
+                        policy: helix_view::editor::ThreadSelectPolicy::ReplaceCurrent,
                     },
                     DapThreadAction::Pause => RuntimeTaskEvent::PauseDebugThread { thread_id },
                 };
@@ -121,13 +121,13 @@ pub(crate) fn apply_dap_command(
                 0,
                 threads,
                 thread_states,
-                editor.runtime().clone(),
+                crate::ui::PickerRuntime::new(editor.runtime()),
                 ingress.clone(),
                 move |cx: &mut crate::compositor::Context, thread: &Thread, _action| {
                     let event = match action {
                         DapThreadAction::Switch => RuntimeTaskEvent::SelectDebugThread {
                             thread_id: thread.id,
-                            force: true,
+                            policy: helix_view::editor::ThreadSelectPolicy::ReplaceCurrent,
                         },
                         DapThreadAction::Pause => RuntimeTaskEvent::PauseDebugThread {
                             thread_id: thread.id,
@@ -162,7 +162,7 @@ pub(crate) fn apply_dap_command(
                 0,
                 frames,
                 (),
-                editor.runtime().clone(),
+                crate::ui::PickerRuntime::new(editor.runtime()),
                 ingress.clone(),
                 move |cx: &mut crate::compositor::Context, frame: &StackFrame, _action| {
                     helix_runtime::send_blocking(

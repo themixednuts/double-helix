@@ -1,11 +1,7 @@
 use std::time::Duration;
 
-use helix_event::register_hook;
 use helix_runtime::{Clock, Debounce, Runtime, Work};
-use helix_view::{
-    events::{DocumentDidOpen, EditorConfigDidChange},
-    handlers::{BlameEvent, Handlers},
-};
+use helix_view::handlers::{BlameEvent, Handlers};
 
 use crate::runtime::{send_task_event_with, RuntimeEvent, RuntimeTaskEvent};
 
@@ -46,19 +42,21 @@ impl BlameHandler {
         let (tx, mut rx) = helix_runtime::channel(128);
         let work = runtime.work().clone();
         let clock = runtime.clock().clone();
-        work.clone().spawn(async move {
-            let mut handler = BlameHandler::new(work, clock, ingress);
-            while let Some(event) = rx.recv().await {
-                handler.event(event);
-            }
-        }).detach();
+        work.clone()
+            .spawn(async move {
+                let mut handler = BlameHandler::new(work, clock, ingress);
+                while let Some(event) = rx.recv().await {
+                    handler.event(event);
+                }
+            })
+            .detach();
         tx
     }
 }
 
-pub(super) fn register_hooks(handlers: &Handlers) {
+pub(super) fn attach(editor: &helix_view::Editor, handlers: &Handlers) {
     let tx = handlers.blame.clone();
-    register_hook!(move |event: &mut DocumentDidOpen<'_>| {
+    editor.lifecycle().on_document_open(move |event| {
         if event.editor.config().inline_blame.auto_fetch {
             helix_runtime::send_blocking(
                 &tx,
@@ -72,7 +70,7 @@ pub(super) fn register_hooks(handlers: &Handlers) {
         Ok(())
     });
     let tx = handlers.blame.clone();
-    register_hook!(move |event: &mut EditorConfigDidChange<'_>| {
+    editor.lifecycle().on_editor_config_change(move |event| {
         let has_enabled_inline_blame = !event.old_config.inline_blame.auto_fetch
             && event.editor.config().inline_blame.auto_fetch;
 

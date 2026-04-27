@@ -133,11 +133,17 @@ impl DiagnosticsHandler {
     }
 
     pub fn bind_runtime(&mut self, runtime: Runtime) {
-        *self.runtime.lock().expect("diagnostics runtime lock poisoned") = Some(runtime);
+        *self
+            .runtime
+            .lock()
+            .expect("diagnostics runtime lock poisoned") = Some(runtime);
     }
 
     pub fn bind_redraw(&mut self, redraw: FrameHandle) {
-        *self.redraw.lock().expect("diagnostics redraw lock poisoned") = Some(redraw);
+        *self
+            .redraw
+            .lock()
+            .expect("diagnostics redraw lock poisoned") = Some(redraw);
     }
 
     fn load_last_doc(&self) -> DocumentId {

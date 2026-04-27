@@ -21,11 +21,60 @@ use crate::{
     runtime::{ingress::RuntimeEvent, ExitTaskResult, RuntimeTaskEvent},
 };
 use helix_core::Transaction;
+use helix_plugin::contract::{adapt, events};
 use helix_plugin::PluginManager;
 use helix_runtime::{Sender as IngressSender, TaskError};
 use helix_vcs::FileBlame;
 use helix_view::document::{FormatterError, Mode};
 use helix_view::{Document, DocumentId, Editor, ViewId};
+
+/// Fire a plugin event, logging errors.
+fn fire_plugin_event(
+    editor: &mut Editor,
+    plugin_manager: &PluginManager,
+    event: events::PluginEvent,
+) {
+    if let Err(err) = plugin_manager.fire_event(editor, &event) {
+        log::error!("Failed to fire plugin event: {err}");
+    }
+}
+
+/// Emit `AssistantThreadCreated` for threads that exist now but weren't in `before`.
+fn emit_new_thread_events(
+    editor: &mut Editor,
+    plugin_manager: &PluginManager,
+    before: &[helix_view::assistant::thread::Id],
+) {
+    let new_threads: Vec<_> = editor
+        .assistant
+        .threads()
+        .filter(|t| !before.contains(&t.id))
+        .map(|t| events::AssistantThreadCreatedEvent {
+            thread: adapt::thread_handle(t.id),
+            title: t.title().map(|s| s.to_string()),
+            scope_cwd: t.scope().cwd.display().to_string(),
+        })
+        .collect();
+
+    for event in new_threads {
+        fire_plugin_event(
+            editor,
+            plugin_manager,
+            events::PluginEvent::AssistantThreadCreated(event),
+        );
+    }
+}
+
+/// Label for an assistant context kind (for plugin events).
+fn context_kind_label(kind: &helix_view::assistant::context::Kind) -> String {
+    match kind {
+        helix_view::assistant::context::Kind::Selection(_) => "selection".into(),
+        helix_view::assistant::context::Kind::Symbol(_) => "symbol".into(),
+        helix_view::assistant::context::Kind::File(_) => "file".into(),
+        helix_view::assistant::context::Kind::Diagnostics(_) => "diagnostics".into(),
+        helix_view::assistant::context::Kind::Diff(_) => "diff".into(),
+    }
+}
 
 pub(crate) fn apply_runtime_task_event(
     editor: &mut Editor,
@@ -75,7 +124,9 @@ pub(crate) fn apply_runtime_task_event(
             uri,
             provider,
             result,
-        } => language_server::apply_pull_diagnostics_response(editor, result, provider, uri, doc_id),
+        } => {
+            language_server::apply_pull_diagnostics_response(editor, result, provider, uri, doc_id)
+        }
         RuntimeTaskEvent::RetryPullDiagnostics {
             doc_id,
             language_servers,
@@ -96,7 +147,7 @@ pub(crate) fn apply_runtime_task_event(
             }
         }
         RuntimeTaskEvent::PullAllDocumentsDiagnosticsDebounced { language_servers } => {
-            let documents: Vec<_> = editor.documents.keys().copied().collect();
+            let documents: Vec<_> = editor.document_ids().collect();
             for document in documents {
                 language_server::request_document_diagnostics_for_language_servers(
                     editor,
@@ -126,78 +177,114 @@ pub(crate) fn apply_runtime_task_event(
             offset_encoding,
             id,
             hints,
-        } => language_server::apply_inlay_hints(editor, view_id, doc_id, offset_encoding, id, hints),
+        } => {
+            language_server::apply_inlay_hints(editor, view_id, doc_id, offset_encoding, id, hints)
+        }
         RuntimeTaskEvent::DapRestarted => dap::apply_dap_restarted(editor),
-        RuntimeTaskEvent::ResumeDebuggerApplication => dap::apply_resume_debugger_application(editor),
+        RuntimeTaskEvent::ResumeDebuggerApplication => {
+            dap::apply_resume_debugger_application(editor)
+        }
         RuntimeTaskEvent::UnsetActiveDebugClient => dap::apply_unset_active_debug_client(editor),
         RuntimeTaskEvent::DapExceptionsConfigured => {}
         RuntimeTaskEvent::RestoreAssistantHistoryThread {
             record,
-            activate,
-            open_panel,
-        } => assistant::apply_restore_assistant_history_thread(
-            editor,
-            ingress,
-            record,
-            activate,
-            open_panel,
-        ),
-        RuntimeTaskEvent::ActivateAssistantThread { thread, open_panel } => {
-            assistant::apply_activate_assistant_thread(editor, ingress, thread, open_panel)
+            activation,
+            panel,
+        } => {
+            let before: Vec<_> = editor.assistant.threads().map(|t| t.id).collect();
+            assistant::apply_restore_assistant_history_thread(
+                editor, ingress, *record, activation, panel,
+            );
+            emit_new_thread_events(editor, &plugin_manager, &before);
+        }
+        RuntimeTaskEvent::ActivateAssistantThread { thread, panel } => {
+            assistant::apply_activate_assistant_thread(editor, ingress, thread, panel)
         }
         RuntimeTaskEvent::DetachAssistantContext { item } => {
-            assistant::apply_detach_assistant_context(editor, item)
+            assistant::apply_detach_assistant_context(editor, item);
+            if let Some(thread) = editor.assistant.active().map(adapt::thread_handle) {
+                fire_plugin_event(
+                    editor,
+                    &plugin_manager,
+                    events::PluginEvent::AssistantContextChanged(
+                        events::AssistantContextChangedEvent {
+                            thread,
+                            attached: false,
+                            context_kind: "unknown".into(),
+                        },
+                    ),
+                );
+            }
         }
-        RuntimeTaskEvent::RegisterPluginPanel {
-            plugin_name,
-            panel_id,
-            title,
-            side,
-            width,
-            render_callback_id,
-            event_callback_id,
-        } => plugin::apply_register_plugin_panel(
-            editor,
-            ingress,
-            plugin_name,
-            panel_id,
-            title,
-            side,
-            width,
-            render_callback_id,
-            event_callback_id,
-        ),
-        RuntimeTaskEvent::RemovePluginPanel { panel_id } => {
-            plugin::apply_remove_plugin_panel(editor, ingress, panel_id)
+        RuntimeTaskEvent::DeliverPluginUiCallback { callback, value } => {
+            plugin::apply_plugin_ui_callback(editor, plugin_manager, callback, value)
         }
-        RuntimeTaskEvent::DeliverPluginUiCallback {
-            plugin_name,
-            callback_id,
-            value,
-        } => plugin::apply_plugin_ui_callback(editor, plugin_manager, plugin_name, callback_id, value),
         RuntimeTaskEvent::RemoveAssistantPanel => assistant::apply_remove_assistant_panel(editor),
         RuntimeTaskEvent::ConnectAssistantBackend {
             command,
             args,
-            open_panel,
-        } => assistant::apply_connect_assistant_backend(editor, ingress, command, args, open_panel),
+            panel,
+        } => {
+            let before: Vec<_> = editor.assistant.threads().map(|t| t.id).collect();
+            assistant::apply_connect_assistant_backend(editor, ingress, command, args, panel);
+            emit_new_thread_events(editor, &plugin_manager, &before);
+        }
         RuntimeTaskEvent::CycleAssistantThread { delta } => {
             assistant::apply_cycle_assistant_thread(editor, ingress, delta)
         }
         RuntimeTaskEvent::CloseActiveAssistantThread => {
-            assistant::apply_close_active_assistant_thread(editor, ingress)
+            let thread = editor.assistant.active().map(adapt::thread_handle);
+            assistant::apply_close_active_assistant_thread(editor, ingress);
+            if let Some(thread) = thread {
+                fire_plugin_event(
+                    editor,
+                    &plugin_manager,
+                    events::PluginEvent::AssistantThreadClosed(
+                        events::AssistantThreadClosedEvent { thread },
+                    ),
+                );
+            }
         }
         RuntimeTaskEvent::NewAssistantThreadFromActiveBackend => {
-            assistant::apply_new_assistant_thread_from_active_backend(editor, ingress)
+            let before: Vec<_> = editor.assistant.threads().map(|t| t.id).collect();
+            assistant::apply_new_assistant_thread_from_active_backend(editor, ingress);
+            emit_new_thread_events(editor, &plugin_manager, &before);
         }
         RuntimeTaskEvent::ToggleActiveAssistantFollow => {
             assistant::apply_toggle_active_assistant_follow(editor)
         }
         RuntimeTaskEvent::AttachAssistantContext { item, status } => {
-            assistant::apply_attach_assistant_context(editor, item, status)
+            let context_kind = context_kind_label(&item);
+            assistant::apply_attach_assistant_context(editor, item, status);
+            if let Some(thread) = editor.assistant.active().map(adapt::thread_handle) {
+                fire_plugin_event(
+                    editor,
+                    &plugin_manager,
+                    events::PluginEvent::AssistantContextChanged(
+                        events::AssistantContextChangedEvent {
+                            thread,
+                            attached: true,
+                            context_kind,
+                        },
+                    ),
+                );
+            }
         }
         RuntimeTaskEvent::SubmitAssistantPrompt { text } => {
-            assistant::apply_submit_assistant_prompt(editor, text)
+            assistant::apply_submit_assistant_prompt(editor, text);
+            if let Some(thread) = editor.assistant.active().map(adapt::thread_handle) {
+                fire_plugin_event(
+                    editor,
+                    &plugin_manager,
+                    events::PluginEvent::AssistantMessageReceived(
+                        events::AssistantMessageReceivedEvent {
+                            thread,
+                            entry_id: 0,
+                            kind: "user_prompt".into(),
+                        },
+                    ),
+                );
+            }
         }
         RuntimeTaskEvent::CancelActiveAssistantThread => {
             assistant::apply_cancel_active_assistant_thread(editor)
@@ -216,32 +303,29 @@ pub(crate) fn apply_runtime_task_event(
         }
         RuntimeTaskEvent::LoadAssistantHistoryThread {
             thread,
-            activate,
-            open_panel,
+            activation,
+            panel,
         } => assistant::request_load_assistant_history_thread(
-            editor,
-            ingress,
-            thread,
-            activate,
-            open_panel,
+            editor, ingress, thread, activation, panel,
         ),
         RuntimeTaskEvent::BootstrapAssistantHistory { scope } => {
             assistant::request_bootstrap_assistant_history(editor, ingress, scope)
         }
-        RuntimeTaskEvent::SelectDebugThread { thread_id, force } => {
-            dap::request_select_debug_thread(editor, ingress, thread_id, force)
+        RuntimeTaskEvent::SelectDebugThread { thread_id, policy } => {
+            dap::request_select_debug_thread(editor, ingress, thread_id, policy)
         }
         RuntimeTaskEvent::PauseDebugThread { thread_id } => {
             dap::request_pause_debug_thread(editor, ingress, thread_id)
         }
-        RuntimeTaskEvent::SelectStackFrame { thread_id, frame_id } => {
-            dap::apply_select_stack_frame(editor, thread_id, frame_id)
-        }
+        RuntimeTaskEvent::SelectStackFrame {
+            thread_id,
+            frame_id,
+        } => dap::apply_select_stack_frame(editor, thread_id, frame_id),
         RuntimeTaskEvent::ApplyStackFrames {
             thread_id,
             frames,
-            auto_select_first_frame,
-        } => dap::apply_stack_frames(editor, thread_id, frames, auto_select_first_frame),
+            selection,
+        } => dap::apply_stack_frames(editor, thread_id, frames, selection),
         RuntimeTaskEvent::ExecuteLspCommand { command, server_id } => {
             language_server::apply_execute_lsp_command(editor, command, server_id)
         }
@@ -327,7 +411,7 @@ pub(crate) fn apply_auto_save_debounce(editor: &mut Editor, save_pending: Arc<At
 
 fn request_auto_save(editor: &mut Editor) {
     let options = commands::WriteAllOptions {
-        force: false,
+        policy: helix_view::editor::SavePolicy::Safe,
         write_scratch: false,
         auto_format: false,
     };
@@ -382,9 +466,9 @@ pub(crate) fn apply_formatting_result(
     view_id: ViewId,
     doc_version: i32,
     format: Result<Transaction, FormatterError>,
-    write: Option<(Option<PathBuf>, bool)>,
+    write: Option<crate::runtime::PendingFormatWrite>,
 ) {
-    if !editor.documents.contains_key(&doc_id) || !editor.tree.contains(view_id) {
+    if !editor.contains_document(doc_id) || !editor.contains_view(view_id) {
         return;
     }
 
@@ -412,9 +496,9 @@ pub(crate) fn apply_formatting_result(
         }
     }
 
-    if let Some((path, force)) = write {
+    if let Some(write) = write {
         let id = doc.id();
-        if let Err(err) = editor.save(id, path, force) {
+        if let Err(err) = editor.save(id, write.path, write.policy) {
             editor.set_error(format!("Error saving: {}", err));
         }
     }

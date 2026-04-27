@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use crate::{
     compositor::Compositor,
-    runtime::{RuntimeEvent, UiCommand, ui::command::FileExplorerCommand},
+    runtime::{ui::command::FileExplorerCommand, RuntimeEvent, UiCommand},
     ui::{Prompt, PromptEvent},
 };
 use helix_view::Editor;

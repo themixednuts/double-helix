@@ -1,8 +1,8 @@
 use crate::compositor::{Component, Context, Event, EventResult, RenderContext};
 use crate::runtime::{RuntimeEvent, RuntimeTaskEvent};
 use crate::ui::gradient_border::GradientBorder;
-use helix_runtime::Sender as IngressSender;
 use helix_core::unicode::width::UnicodeWidthStr;
+use helix_runtime::Sender as IngressSender;
 use helix_view::theme::Modifier;
 use helix_view::{
     editor::{
@@ -108,14 +108,17 @@ impl NotificationPopup {
                     };
                     let ingress = ingress.clone();
 
-                    editor.runtime().work().clone().spawn(async move {
-                        tokio_sleep(remaining).await;
-                        crate::runtime::send_task_event_with(
-                            RuntimeTaskEvent::DismissNotification { id },
-                            ingress,
-                        )
-                        .await;
-                    }).detach();
+                    editor
+                        .work()
+                        .spawn(async move {
+                            tokio_sleep(remaining).await;
+                            crate::runtime::send_task_event_with(
+                                RuntimeTaskEvent::DismissNotification { id },
+                                ingress,
+                            )
+                            .await;
+                        })
+                        .detach();
                 }
             }
         }
@@ -129,10 +132,7 @@ impl NotificationPopup {
         area: Rect,
         cx: &RenderContext,
     ) -> Option<crate::render::PreparedRender> {
-        self.update(
-            cx.editor,
-            cx.ingress.clone(),
-        );
+        self.update(cx.editor, cx.ingress.clone());
 
         let editor = cx.editor;
 
@@ -252,10 +252,7 @@ impl Component for NotificationPopup {
     fn render(&mut self, area: Rect, surface: &mut Surface, cx: &RenderContext) {
         // Legacy eager path — kept for Component trait compliance.
         // EditorView now uses prepare_snapshot() directly.
-        self.update(
-            cx.editor,
-            cx.ingress.clone(),
-        );
+        self.update(cx.editor, cx.ingress.clone());
 
         self.layout_thickness = if cx.editor.config().gradient_borders.enable {
             cx.editor.config().gradient_borders.thickness as u16

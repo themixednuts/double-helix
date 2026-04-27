@@ -4,11 +4,9 @@ use std::{
     time::Duration,
 };
 
-use helix_event::register_hook;
 use helix_runtime::{Clock, Debounce, Runtime, Work};
 use helix_view::bench::log_command_phase;
 use helix_view::{
-    events::{DocumentDidChange, DocumentDidOpen, LanguageServerExited, LanguageServerInitialized},
     handlers::{lsp::DocumentColorsEvent, Handlers},
     DocumentId,
 };
@@ -70,20 +68,26 @@ impl DocumentColorsHandler {
         let (tx, mut rx) = helix_runtime::channel(128);
         let work = runtime.work().clone();
         let clock = runtime.clock().clone();
-        work.clone().spawn(async move {
-            let mut handler = DocumentColorsHandler::new(work, clock, ingress);
-            while let Some(event) = rx.recv().await {
-                handler.event(event);
-            }
-            handler.debounce.cancel();
-        }).detach();
+        work.clone()
+            .spawn(async move {
+                let mut handler = DocumentColorsHandler::new(work, clock, ingress);
+                while let Some(event) = rx.recv().await {
+                    handler.event(event);
+                }
+                handler.debounce.cancel();
+            })
+            .detach();
         tx
     }
 }
 
-pub(super) fn register_hooks(handlers: &Handlers, ingress: helix_runtime::Sender<RuntimeEvent>) {
+pub(super) fn attach(
+    editor: &helix_view::Editor,
+    handlers: &Handlers,
+    ingress: helix_runtime::Sender<RuntimeEvent>,
+) {
     let open_ingress = ingress.clone();
-    register_hook!(move |event: &mut DocumentDidOpen<'_>| {
+    editor.lifecycle().on_document_open(move |event| {
         // when a document is initially opened, request colors for it
         request_document_colors(event.editor, event.doc, open_ingress.clone());
 
@@ -91,7 +95,7 @@ pub(super) fn register_hooks(handlers: &Handlers, ingress: helix_runtime::Sender
     });
 
     let tx = handlers.document_colors.clone();
-    register_hook!(move |event: &mut DocumentDidChange<'_>| {
+    editor.lifecycle().on_document_change(move |event| {
         let hook_start = std::time::Instant::now();
         // Update the color swatch positions so they stay aligned with edits.
         event.doc.update_color_swatches(event.changes);
@@ -125,18 +129,20 @@ pub(super) fn register_hooks(handlers: &Handlers, ingress: helix_runtime::Sender
     });
 
     let init_ingress = ingress.clone();
-    register_hook!(move |event: &mut LanguageServerInitialized<'_>| {
-        let doc_ids: Vec<_> = event.editor.documents().map(|doc| doc.id()).collect();
+    editor
+        .lifecycle()
+        .on_language_server_initialized(move |event| {
+            let doc_ids: Vec<_> = event.editor.documents().map(|doc| doc.id()).collect();
 
-        for doc_id in doc_ids {
-            request_document_colors(event.editor, doc_id, init_ingress.clone());
-        }
+            for doc_id in doc_ids {
+                request_document_colors(event.editor, doc_id, init_ingress.clone());
+            }
 
-        Ok(())
-    });
+            Ok(())
+        });
 
     let exit_ingress = ingress;
-    register_hook!(move |event: &mut LanguageServerExited<'_>| {
+    editor.lifecycle().on_language_server_exited(move |event| {
         // Clear and re-request all color swatches when a server exits.
         for doc in event.editor.documents_mut() {
             if doc.supports_language_server(event.server_id) {

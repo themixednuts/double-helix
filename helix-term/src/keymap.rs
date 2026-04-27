@@ -681,10 +681,10 @@ mod tests {
             helix_runtime::test::runtime(),
             handlers,
         );
-        editor.modal_keymaps = Some(Arc::new(ArcSwap::from_pointee(to_component_modal_keymaps(
-            &default(),
-        ))));
-        editor.engine_factory = Some(Arc::new(TestModalEngineFactory {
+        editor.frontend_mut().modal_keymaps = Some(Arc::new(ArcSwap::from_pointee(
+            to_component_modal_keymaps(&default()),
+        )));
+        editor.frontend_mut().engine_factory = Some(Arc::new(TestModalEngineFactory {
             registry: Arc::new(helix_modal::populate::build_registry()),
         }));
         editor

@@ -7,7 +7,6 @@ pub mod commands;
 pub mod compositor;
 pub mod config;
 pub(crate) mod effect;
-pub mod events;
 pub mod health;
 pub mod host;
 pub mod keymap;

@@ -20,7 +20,7 @@ pub fn apply_ui_command(
             super::layer::apply_layer_command(editor, compositor, ingress.clone(), layer)
         }
         UiCommand::Completion(cmd) => {
-            super::completion::apply_completion_command(editor, compositor, ingress.clone(), cmd)
+            super::completion::apply_completion_command(editor, compositor, ingress.clone(), *cmd)
         }
         UiCommand::Picker(cmd) => {
             super::picker::apply_picker_command(editor, compositor, ingress.clone(), cmd)
@@ -63,5 +63,5 @@ pub fn apply_ui_command_opt(
     let Some(c) = compositor.as_mut() else {
         return;
     };
-    apply_ui_command(editor, *c, ingress, plugin_manager, cmd);
+    apply_ui_command(editor, c, ingress, plugin_manager, cmd);
 }

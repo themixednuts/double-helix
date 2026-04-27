@@ -18,12 +18,12 @@ use tokio::task::JoinSet;
 use tokio::time::{timeout_at, Instant};
 
 use crate::compositor::Compositor;
+use crate::handlers::completion::path_completion;
 use crate::handlers::completion::{
     handle_response, replace_completions, request_completions_from_language_server,
-    retain_valid_completions_for_trigger, word_completion, CompletionItem,
-    CompletionResponse, LspCompletionItem, Trigger, TriggerKind,
+    retain_valid_completions_for_trigger, word_completion, CompletionItem, CompletionResponse,
+    LspCompletionItem, Trigger, TriggerKind,
 };
-use crate::handlers::completion::path_completion;
 use crate::runtime::ui::{CompletionCommand, UiCommand};
 use crate::runtime::{send_ui_command_with, RuntimeEvent};
 use crate::ui::lsp::signature_help::SignatureHelp;
@@ -41,7 +41,7 @@ pub(crate) fn apply_provider_completion_response(
     let Some(completion) = &mut editor_view.completion else {
         return;
     };
-    if !editor.handlers.completions.is_current(request) {
+    if !editor.is_current_completion_request(request) {
         log::info!("dropping outdated completion response");
         return;
     }
@@ -51,11 +51,7 @@ pub(crate) fn apply_provider_completion_response(
         editor_view.clear_completion(editor);
         trigger_auto_completion(editor, false);
     } else {
-        editor
-            .handlers
-            .completions
-            .active_completions
-            .insert(response.provider, response.context);
+        editor.set_completion_context(response.provider, response.context);
     }
 }
 
@@ -80,7 +76,7 @@ pub(crate) fn show_completion_popup(
     context: HashMap<CompletionProvider, ResponseContext>,
     trigger: Trigger,
 ) {
-    if !editor.handlers.completions.is_current(request) {
+    if !editor.is_current_completion_request(request) {
         return;
     }
     let (view_id, doc) = focused_ref!(editor);
@@ -94,7 +90,7 @@ pub(crate) fn show_completion_popup(
         return;
     }
     retain_valid_completions_for_trigger(trigger, doc, view_id, &mut items);
-    editor.handlers.completions.active_completions = context;
+    editor.replace_completion_contexts(context);
 
     let completion_area = ui.set_completion(editor, items, trigger.pos, size, ingress);
     let signature_help_area = compositor
@@ -111,8 +107,6 @@ pub(crate) fn request_completions(
     compositor: &mut Compositor,
     ingress: helix_runtime::Sender<RuntimeEvent>,
 ) {
-    let (view_id, doc) = focused_ref!(editor);
-
     if compositor
         .find::<ui::EditorView>()
         .unwrap()
@@ -123,15 +117,19 @@ pub(crate) fn request_completions(
         return;
     }
 
-    let text = doc.text();
-    let cursor = doc.selection(view_id).primary().cursor(text.slice(..));
-    if trigger.view != view_id || trigger.doc != doc.id() || cursor < trigger.pos {
+    let (view_id, doc_id, cursor) = {
+        let (view_id, doc) = focused_ref!(editor);
+        let text = doc.text();
+        let cursor = doc.selection(view_id).primary().cursor(text.slice(..));
+        (view_id, doc.id(), cursor)
+    };
+    if trigger.view != view_id || trigger.doc != doc_id || cursor < trigger.pos {
         return;
     }
     trigger.pos = cursor;
-    let (request, cancel) = editor.handlers.completions.begin_request();
+    let (request, cancel) = editor.begin_completion_request();
     let view = view!(editor, view_id);
-    let doc = doc_mut!(editor, &doc.id());
+    let doc = doc_mut!(editor, &doc_id);
     let savepoint = doc.savepoint(view);
     let text = doc.text();
     let trigger_text = text.slice(..cursor);
@@ -149,17 +147,17 @@ pub(crate) fn request_completions(
                 trigger_character: None,
             }
         } else {
-            let trigger_char = ls
-                .capabilities()
-                .completion_provider
-                .as_ref()
-                .and_then(|provider| {
-                    provider
-                        .trigger_characters
-                        .as_deref()?
-                        .iter()
-                        .find(|&trigger_char| trigger_text.ends_with(trigger_char))
-                });
+            let trigger_char =
+                ls.capabilities()
+                    .completion_provider
+                    .as_ref()
+                    .and_then(|provider| {
+                        provider
+                            .trigger_characters
+                            .as_deref()?
+                            .iter()
+                            .find(|&trigger_char| trigger_text.ends_with(trigger_char))
+                    });
 
             if trigger_char.is_some() {
                 lsp::CompletionContext {
@@ -223,12 +221,12 @@ pub(crate) fn request_completions(
             context.insert(response.provider, response.context);
         }
         send_ui_command_with(
-            UiCommand::Completion(CompletionCommand::Show {
+            UiCommand::Completion(Box::new(CompletionCommand::Show {
                 request,
                 items,
                 context,
                 trigger,
-            }),
+            })),
             ingress.clone(),
         )
         .await;
@@ -237,45 +235,53 @@ pub(crate) fn request_completions(
         }
     };
     let wait_cancel = cancel.clone();
-    editor.runtime().work().clone().spawn(async move {
-        tokio::select! {
-            _ = wait_cancel.canceled() => {}
-            _ = request_completions => {}
-        }
-    }).detach();
+    editor
+        .work()
+        .spawn(async move {
+            tokio::select! {
+                _ = wait_cancel.canceled() => {}
+                _ = request_completions => {}
+            }
+        })
+        .detach();
 }
 
 pub(crate) fn request_incomplete_completion_list(
     editor: &mut Editor,
     ingress: helix_runtime::Sender<RuntimeEvent>,
 ) {
-    let handler = &mut editor.handlers.completions;
-    let (request, cancel) = handler.begin_request();
+    let (request, cancel) = editor.begin_completion_request();
     let mut requests = JoinSet::new();
     let mut savepoint: Option<Arc<SavePoint>> = None;
-    for (&provider, context) in &handler.active_completions {
-        if !context.is_incomplete {
-            continue;
-        }
-        let CompletionProvider::Lsp(ls_id) = provider else {
-            log::error!("non-lsp incomplete completion lists");
-            continue;
-        };
-        let Some(ls) = editor.language_servers.get_by_id(ls_id) else {
+    let incomplete_lsp_contexts: Vec<_> = editor
+        .active_completion_contexts()
+        .filter_map(|(provider, context)| {
+            if !context.is_incomplete {
+                return None;
+            }
+            let CompletionProvider::Lsp(ls_id) = *provider else {
+                log::error!("non-lsp incomplete completion lists");
+                return None;
+            };
+            Some((ls_id, context.priority))
+        })
+        .collect();
+    for (ls_id, priority) in incomplete_lsp_contexts {
+        let Some(ls) = editor.language_server_client(ls_id).cloned() else {
             continue;
         };
         let (view_id, doc) = focused!(editor);
         let view = view!(editor, view_id);
         let savepoint = savepoint.get_or_insert_with(|| doc.savepoint(view)).clone();
         let request = request_completions_from_language_server(
-            ls,
+            &ls,
             doc,
             view_id,
             CompletionContext {
                 trigger_kind: CompletionTriggerKind::TRIGGER_FOR_INCOMPLETE_COMPLETIONS,
                 trigger_character: None,
             },
-            context.priority,
+            priority,
             savepoint,
         );
         requests.spawn(request);
@@ -285,7 +291,9 @@ pub(crate) fn request_incomplete_completion_list(
             .runtime()
             .work()
             .clone()
-            .spawn(replace_completions(request, cancel, requests, true, ingress))
+            .spawn(replace_completions(
+                request, cancel, requests, true, ingress,
+            ))
             .detach();
     }
 }
@@ -319,9 +327,8 @@ pub fn trigger_auto_completion(editor: &Editor, trigger_char_only: bool) {
     #[cfg(not(windows))]
     let is_path_completion_trigger = matches!(cursor_char, Some(b'/'));
 
-    let handler = &editor.handlers.completions;
     if is_trigger_char || (is_path_completion_trigger && doc.path_completion_enabled()) {
-        handler.event(CompletionEvent::TriggerChar {
+        editor.send_completion_event(CompletionEvent::TriggerChar {
             cursor,
             doc: doc.id(),
             view: view_id,
@@ -338,7 +345,7 @@ pub fn trigger_auto_completion(editor: &Editor, trigger_char_only: bool) {
             .all(char_is_word);
 
     if is_auto_trigger {
-        handler.event(CompletionEvent::AutoTrigger {
+        editor.send_completion_event(CompletionEvent::AutoTrigger {
             cursor,
             doc: doc.id(),
             view: view_id,

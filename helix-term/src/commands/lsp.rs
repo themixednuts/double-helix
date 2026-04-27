@@ -1,4 +1,4 @@
-use futures_util::{stream::FuturesOrdered, FutureExt};
+use futures_util::stream::FuturesOrdered;
 use helix_lsp::{
     block_on,
     lsp::{
@@ -20,11 +20,8 @@ use helix_core::{
 };
 use helix_stdx::path;
 use helix_view::{
-    document::DocumentInlayHintsId,
-    handlers::lsp::SignatureHelpInvoked,
-    icons::ICONS,
-    theme::Style,
-    Document, View,
+    document::DocumentInlayHintsId, handlers::lsp::SignatureHelpInvoked, icons::ICONS,
+    theme::Style, Document, View,
 };
 
 use crate::{
@@ -191,7 +188,7 @@ fn diag_picker(
         primary_column,
         flat_diag,
         styles,
-        cx.editor.runtime().clone(),
+        crate::ui::PickerRuntime::new(cx.editor.runtime()),
         cx.ingress.clone(),
         move |cx: &mut crate::compositor::Context, diag: &PickerDiagnostic, action| {
             navigation::jump_to_location(cx.editor, &diag.location, action);
@@ -318,7 +315,11 @@ pub fn workspace_symbol_picker(cx: &mut Context) {
         return;
     }
 
-    let get_symbols = |pattern: &str, editor: &mut Editor, _data, injector: &Injector<_, _>| {
+    let get_symbols = |pattern: &str,
+                       editor: &mut Editor,
+                       _data,
+                       injector: &Injector<_, _>,
+                       work: helix_runtime::Work| {
         let (_, doc) = focused_ref!(editor);
         let mut seen_language_servers = HashSet::new();
         let mut futures: FuturesOrdered<_> = doc
@@ -369,7 +370,7 @@ pub fn workspace_symbol_picker(cx: &mut Context) {
         }
 
         let injector = injector.clone();
-        async move {
+        work.spawn(async move {
             while let Some(response) = futures.next().await {
                 match response {
                     Ok(items) => {
@@ -381,8 +382,7 @@ pub fn workspace_symbol_picker(cx: &mut Context) {
                 }
             }
             Ok(())
-        }
-        .boxed()
+        })
     };
     let columns = [
         ui::PickerColumn::new("kind", |item: &DocumentSymbolPickerItem, _| {
@@ -431,7 +431,7 @@ pub fn workspace_symbol_picker(cx: &mut Context) {
         1, // name column
         [],
         (),
-        cx.editor.runtime().clone(),
+        crate::ui::PickerRuntime::new(cx.editor.runtime()),
         cx.ingress.clone(),
         move |cx: &mut crate::compositor::Context, item: &DocumentSymbolPickerItem, action| {
             navigation::jump_to_location(cx.editor, &item.location, action);
@@ -447,7 +447,7 @@ pub fn workspace_symbol_picker(cx: &mut Context) {
 pub fn diagnostics_picker(cx: &mut Context) {
     let (_, doc) = focused_ref!(cx.editor);
     if let Some(uri) = doc.uri() {
-        let diagnostics = cx.editor.diagnostics.get(&uri).cloned().unwrap_or_default();
+        let diagnostics = cx.editor.document_diagnostics(&uri);
         let picker = diag_picker(cx, [(uri, diagnostics)], DiagnosticsFormat::HideSourcePath);
         cx.push_layer(Box::new(overlaid(picker)));
     }
@@ -455,7 +455,7 @@ pub fn diagnostics_picker(cx: &mut Context) {
 
 pub fn workspace_diagnostics_picker(cx: &mut Context) {
     // TODO not yet filtered by LanguageServerFeature, need to do something similar as Document::shown_diagnostics here for all open documents
-    let diagnostics = cx.editor.diagnostics.clone();
+    let diagnostics = cx.editor.diagnostics_snapshot();
     let picker = diag_picker(cx, diagnostics, DiagnosticsFormat::ShowSourcePath);
     cx.push_layer(Box::new(overlaid(picker)));
 }
@@ -900,10 +900,12 @@ fn get_prefill_from_lsp_response(
     response: Option<lsp::PrepareRenameResponse>,
 ) -> Result<String, &'static str> {
     match response {
-        Some(lsp::PrepareRenameResponse::Range(range)) => Ok(lsp_range_to_range(text, range, offset_encoding)
-        .ok_or("lsp sent invalid selection range for rename")?
-        .fragment(text.slice(..))
-        .into()),
+        Some(lsp::PrepareRenameResponse::Range(range)) => {
+            Ok(lsp_range_to_range(text, range, offset_encoding)
+                .ok_or("lsp sent invalid selection range for rename")?
+                .fragment(text.slice(..))
+                .into())
+        }
         Some(lsp::PrepareRenameResponse::RangeWithPlaceholder { placeholder, .. }) => {
             Ok(placeholder)
         }
@@ -947,11 +949,14 @@ pub(crate) fn create_rename_prompt(
 
                     match block_on(future) {
                         Ok(edits) => {
-                            if let Err(err) =
-                                cx.editor.apply_workspace_edit(offset_encoding, &edits.unwrap_or_default())
+                            if let Err(err) = cx
+                                .editor
+                                .apply_workspace_edit(offset_encoding, &edits.unwrap_or_default())
                             {
-                                cx.editor
-                                    .set_error(format!("Failed to apply rename edits: {}", err.kind));
+                                cx.editor.set_error(format!(
+                                    "Failed to apply rename edits: {}",
+                                    err.kind
+                                ));
                             }
                         }
                         Err(err) => cx.editor.set_error(err.to_string()),
@@ -991,11 +996,14 @@ pub(crate) fn create_rename_prompt(
 
                     match block_on(future) {
                         Ok(edits) => {
-                            if let Err(err) =
-                                cx.editor.apply_workspace_edit(offset_encoding, &edits.unwrap_or_default())
+                            if let Err(err) = cx
+                                .editor
+                                .apply_workspace_edit(offset_encoding, &edits.unwrap_or_default())
                             {
-                                cx.editor
-                                    .set_error(format!("Failed to apply rename edits: {}", err.kind));
+                                cx.editor.set_error(format!(
+                                    "Failed to apply rename edits: {}",
+                                    err.kind
+                                ));
                             }
                         }
                         Err(err) => cx.editor.set_error(err.to_string()),
@@ -1014,7 +1022,8 @@ pub fn rename_symbol(cx: &mut Context) {
 
     let (has_rename_support, prepare_rename) = {
         let (view_id, doc) = focused_ref!(cx.editor);
-        let mut language_servers = doc.language_servers_with_feature(LanguageServerFeature::RenameSymbol);
+        let mut language_servers =
+            doc.language_servers_with_feature(LanguageServerFeature::RenameSymbol);
         let has_rename_support = language_servers.next().is_some();
         let prepare_rename = doc
             .language_servers_with_feature(LanguageServerFeature::RenameSymbol)
@@ -1032,7 +1041,9 @@ pub fn rename_symbol(cx: &mut Context) {
                 let offset_encoding = language_server.offset_encoding();
                 let pos = doc.position(view_id, offset_encoding);
                 let text = doc.text().clone();
-                let future = language_server.prepare_rename(doc.identifier(), pos).unwrap();
+                let future = language_server
+                    .prepare_rename(doc.identifier(), pos)
+                    .unwrap();
                 (ls_id, offset_encoding, text, future)
             });
         (has_rename_support, prepare_rename)
@@ -1048,13 +1059,9 @@ pub fn rename_symbol(cx: &mut Context) {
         let fallback_prefill = get_prefill_from_word_boundary(cx.editor);
         cx.spawn_ui(async move {
             let response = future.await?;
-            let prefill = get_prefill_from_lsp_response(
-                &text,
-                &fallback_prefill,
-                offset_encoding,
-                response,
-            )
-            .map_err(anyhow::Error::msg)?;
+            let prefill =
+                get_prefill_from_lsp_response(&text, &fallback_prefill, offset_encoding, response)
+                    .map_err(anyhow::Error::msg)?;
             Ok(UiCommand::Lsp(LspCommand::PrepareRename {
                 prefill,
                 history_register,
@@ -1095,26 +1102,24 @@ pub fn compute_inlay_hints_for_all_views(
         return;
     }
 
-    for (view, _) in editor.tree.views() {
-        let doc = match editor.documents.get(&view.doc) {
-            Some(doc) => doc,
-            None => continue,
-        };
+    editor.for_each_view_document(|view, doc| {
         if let Some(callback) = compute_inlay_hints_for_view(view, doc) {
             crate::runtime::ingress::spawn_task_event_with_future(
-                editor.runtime().work().clone(),
+                editor.work(),
                 callback,
                 ingress.clone(),
             );
         }
-    }
+    });
 }
 
 fn compute_inlay_hints_for_view(
     view: &View,
     doc: &Document,
 ) -> Option<
-    std::pin::Pin<Box<impl Future<Output = Result<crate::runtime::RuntimeTaskEvent, anyhow::Error>>>>,
+    std::pin::Pin<
+        Box<impl Future<Output = Result<crate::runtime::RuntimeTaskEvent, anyhow::Error>>>,
+    >,
 > {
     let view_id = view.id;
     let doc_id = view.doc;

@@ -69,7 +69,9 @@ impl CompletionHandler {
                     return;
                 }
                 send_ui_command_with(
-                    UiCommand::Completion(CompletionCommand::RequestDebounced { trigger }),
+                    UiCommand::Completion(Box::new(CompletionCommand::RequestDebounced {
+                        trigger,
+                    })),
                     ingress,
                 )
                 .await;
@@ -131,12 +133,14 @@ impl CompletionHandler {
         let (tx, mut rx) = helix_runtime::channel(128);
         let work = runtime.work().clone();
         let clock = runtime.clock().clone();
-        work.clone().spawn(async move {
-            let mut handler = CompletionHandler::new(config, work, clock, ingress);
-            while let Some(event) = rx.recv().await {
-                handler.event(event);
-            }
-        }).detach();
+        work.clone()
+            .spawn(async move {
+                let mut handler = CompletionHandler::new(config, work, clock, ingress);
+                while let Some(event) = rx.recv().await {
+                    handler.event(event);
+                }
+            })
+            .detach();
         tx
     }
 }
@@ -189,4 +193,3 @@ pub(crate) fn request_completions_from_language_server(
         }
     }
 }
-

@@ -1,18 +1,14 @@
 use std::time::Duration;
 
 use helix_core::syntax::config::LanguageServerFeature;
-use helix_event::register_hook;
 use helix_lsp::lsp;
 use helix_runtime::{send_blocking, Clock, Debounce, Runtime, Token, Work};
 use helix_stdx::rope::RopeSliceExt;
 use helix_view::bench::log_command_phase;
-use helix_view::document::Mode;
-use helix_view::events::{DocumentDidChange, SelectionDidChange};
 use helix_view::handlers::lsp::{SignatureHelpEvent, SignatureHelpInvoked, SignatureHelpRequestId};
-use crate::events::{OnModeSwitch, PostInsertChar};
+
 use crate::handlers::Handlers;
 use crate::runtime::{send_task_event_with, RuntimeEvent, RuntimeTaskEvent};
-use crate::ui::lsp::signature_help::SignatureHelp;
 
 #[derive(Debug, PartialEq, Eq)]
 enum State {
@@ -141,19 +137,21 @@ impl SignatureHelpHandler {
         let (tx, mut rx) = helix_runtime::channel(128);
         let work = runtime.work().clone();
         let clock = runtime.clock().clone();
-        work.clone().spawn(async move {
-            let mut handler = SignatureHelpHandler::new(work, clock, ingress);
-            while let Some(event) = rx.recv().await {
-                handler.event(event);
-            }
-        }).detach();
+        work.clone()
+            .spawn(async move {
+                let mut handler = SignatureHelpHandler::new(work, clock, ingress);
+                while let Some(event) = rx.recv().await {
+                    handler.event(event);
+                }
+            })
+            .detach();
         tx
     }
 }
 
-fn signature_help_post_insert_char_hook(
+pub(crate) fn signature_help_post_insert_char_hook(
     tx: &helix_runtime::Sender<SignatureHelpEvent>,
-    PostInsertChar { cx, .. }: &mut PostInsertChar<'_, '_>,
+    cx: &mut crate::commands::Context,
 ) -> anyhow::Result<()> {
     if !cx.editor.config().lsp.auto_signature_help {
         return Ok(());
@@ -189,32 +187,9 @@ fn signature_help_post_insert_char_hook(
     Ok(())
 }
 
-pub(super) fn register_hooks(handlers: &Handlers) {
+pub(super) fn attach(editor: &helix_view::Editor, handlers: &Handlers) {
     let tx = handlers.signature_hints.clone();
-    register_hook!(move |event: &mut OnModeSwitch<'_, '_>| {
-        match (event.old_mode, event.new_mode) {
-            (Mode::Insert, _) => {
-                send_blocking(&tx, SignatureHelpEvent::Cancel);
-                event
-                    .cx
-                    .callback
-                    .push(crate::compositor::PostAction::RemoveById(SignatureHelp::ID));
-            }
-            (_, Mode::Insert) if event.cx.editor.config().lsp.auto_signature_help => {
-                send_blocking(&tx, SignatureHelpEvent::Trigger);
-            }
-            _ => (),
-        }
-        Ok(())
-    });
-
-    let tx = handlers.signature_hints.clone();
-    register_hook!(
-        move |event: &mut PostInsertChar<'_, '_>| signature_help_post_insert_char_hook(&tx, event)
-    );
-
-    let tx = handlers.signature_hints.clone();
-    register_hook!(move |event: &mut DocumentDidChange<'_>| {
+    editor.lifecycle().on_document_change(move |event| {
         let hook_start = std::time::Instant::now();
         if event.doc.config.load().lsp.auto_signature_help && !event.ghost_transaction {
             send_blocking(&tx, SignatureHelpEvent::ReTrigger);
@@ -239,7 +214,7 @@ pub(super) fn register_hooks(handlers: &Handlers) {
     });
 
     let tx = handlers.signature_hints.clone();
-    register_hook!(move |event: &mut SelectionDidChange<'_>| {
+    editor.lifecycle().on_selection_change(move |event| {
         if event.doc.config.load().lsp.auto_signature_help {
             send_blocking(&tx, SignatureHelpEvent::ReTrigger);
         }

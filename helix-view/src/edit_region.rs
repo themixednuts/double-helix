@@ -70,6 +70,7 @@ impl EditRegion {
             let id = editor.new_component_doc(doc);
             self.doc_id = Some(id);
             let factory = editor
+                .frontend()
                 .engine_factory
                 .as_ref()
                 .expect("engine_factory not initialized");
@@ -77,7 +78,11 @@ impl EditRegion {
             self.history = Some(ViewHistoryState::new(id));
         }
         if self.keymaps.is_none() {
-            self.keymaps = editor.modal_keymaps.clone().map(ModalKeymaps::from_shared);
+            self.keymaps = editor
+                .frontend()
+                .modal_keymaps
+                .clone()
+                .map(ModalKeymaps::from_shared);
         }
         if let Some(doc) = self
             .doc_id
@@ -171,7 +176,7 @@ impl EditRegion {
             self.mode = editor.mode;
             editor.mode = global_mode;
             if self.region.is_focused() {
-                editor.focused_modal_input = engine.input_state();
+                editor.frontend_mut().focused_modal_input = engine.input_state();
             }
             self.engine = Some(engine);
             return Some(result);
@@ -183,7 +188,7 @@ impl EditRegion {
         self.mode = editor.mode;
         editor.mode = global_mode;
         if self.region.is_focused() {
-            editor.focused_modal_input = engine.input_state();
+            editor.frontend_mut().focused_modal_input = engine.input_state();
         }
         if let Some(state) = editor.component_view(self.region.id()) {
             self.history = Some(state.history.clone());

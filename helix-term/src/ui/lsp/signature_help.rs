@@ -266,7 +266,7 @@ pub(crate) fn show_signature(
         Some(s) if !s.signatures.is_empty() => s,
         _ => {
             send_blocking(
-                &editor.handlers.signature_hints,
+                editor.signature_help_sender(),
                 SignatureHelpEvent::RequestComplete {
                     request,
                     open: false,
@@ -277,7 +277,7 @@ pub(crate) fn show_signature(
         }
     };
     send_blocking(
-        &editor.handlers.signature_hints,
+        editor.signature_help_sender(),
         SignatureHelpEvent::RequestComplete {
             request,
             open: true,

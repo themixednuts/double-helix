@@ -64,19 +64,25 @@ impl Handler {
         registration_id: String,
         options: lsp::DidChangeWatchedFilesRegistrationOptions,
     ) {
-        send_blocking(&self.tx, Event::Register {
-            client_id,
-            client,
-            registration_id,
-            options,
-        });
+        send_blocking(
+            &self.tx,
+            Event::Register {
+                client_id,
+                client,
+                registration_id,
+                options,
+            },
+        );
     }
 
     pub fn unregister(&self, client_id: LanguageServerId, registration_id: String) {
-        send_blocking(&self.tx, Event::Unregister {
-            client_id,
-            registration_id,
-        });
+        send_blocking(
+            &self.tx,
+            Event::Unregister {
+                client_id,
+                registration_id,
+            },
+        );
     }
 
     pub fn file_changed(&self, path: PathBuf) {

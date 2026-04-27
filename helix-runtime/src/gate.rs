@@ -6,29 +6,39 @@ pub enum Push<T> {
     Ready(T),
 }
 
-#[derive(Debug, Default)]
-pub struct Gate<T> {
-    open: bool,
-    items: VecDeque<T>,
+#[derive(Debug)]
+pub enum Gate<T> {
+    Closed(VecDeque<T>),
+    Open,
 }
 
 impl<T> Gate<T> {
     pub fn push(&mut self, item: T) -> Push<T> {
-        if self.open {
-            Push::Ready(item)
-        } else {
-            self.items.push_back(item);
-            Push::Buffered
+        match self {
+            Self::Open => Push::Ready(item),
+            Self::Closed(items) => {
+                items.push_back(item);
+                Push::Buffered
+            }
         }
     }
 
     pub fn open(&mut self) -> Vec<T> {
-        self.open = true;
-        self.items.drain(..).collect()
+        let items = match std::mem::replace(self, Self::Open) {
+            Self::Closed(items) => items,
+            Self::Open => VecDeque::new(),
+        };
+        items.into_iter().collect()
     }
 
     pub fn is_open(&self) -> bool {
-        self.open
+        matches!(self, Self::Open)
+    }
+}
+
+impl<T> Default for Gate<T> {
+    fn default() -> Self {
+        Self::Closed(VecDeque::new())
     }
 }
 

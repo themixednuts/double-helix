@@ -33,7 +33,7 @@ assets = [
 [features]
 default = ["git"]
 unicode-lines = ["helix-core/unicode-lines", "helix-view/unicode-lines"]
-integration = ["helix-event/integration_test"]
+integration = []
 git = ["helix-vcs/git"]
 bench = [
   "helix-core/bench",
@@ -53,7 +53,6 @@ required-features = ["integration", "bench"]
 [dependencies]
 helix-stdx = { path = "../helix-stdx" }
 helix-core = { path = "../helix-core" }
-helix-event = { path = "../helix-event" }
 helix-view = { path = "../helix-view" }
 helix-lsp = { path = "../helix-lsp" }
 helix-dap = { path = "../helix-dap" }

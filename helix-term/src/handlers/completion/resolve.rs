@@ -2,15 +2,30 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use helix_lsp::lsp;
-use helix_runtime::{send_blocking, Debounce, Runtime, Token, Work};
 use helix_runtime::Sender as IngressSender;
+use helix_runtime::{send_blocking, Debounce, Token, Work};
 
 use helix_view::Editor;
 
 use super::LspCompletionItem;
 use crate::handlers::completion::CompletionItem;
-use crate::runtime::{send_ui_command_with, RuntimeEvent};
 use crate::runtime::ui::{CompletionCommand, UiCommand};
+use crate::runtime::{send_ui_command_with, RuntimeEvent};
+
+#[derive(Clone)]
+pub struct ResolveRuntime {
+    work: Work,
+    clock: helix_runtime::Clock,
+}
+
+impl ResolveRuntime {
+    pub fn new(runtime: &helix_runtime::Runtime) -> Self {
+        Self {
+            work: runtime.work().clone(),
+            clock: runtime.clock().clone(),
+        }
+    }
+}
 
 /// A hook for resolving incomplete completion items.
 ///
@@ -29,10 +44,11 @@ pub struct ResolveHandler {
 }
 
 impl ResolveHandler {
-    pub fn new(runtime: Runtime, ingress: IngressSender<RuntimeEvent>) -> ResolveHandler {
+    pub fn new(runtime: ResolveRuntime, ingress: IngressSender<RuntimeEvent>) -> ResolveHandler {
+        let ResolveRuntime { work, clock } = runtime;
         ResolveHandler {
             last_request: None,
-            resolver: ResolveTimeout::spawn(runtime.work().clone(), runtime.clock().clone(), ingress),
+            resolver: ResolveTimeout::spawn(work, clock, ingress),
         }
     }
 
@@ -70,7 +86,7 @@ impl ResolveHandler {
         if self.last_request.as_deref().is_some_and(|it| it == item) {
             return;
         }
-        let Some(ls) = editor.language_servers.get_by_id(item.provider).cloned() else {
+        let Some(ls) = editor.language_server_client(item.provider).cloned() else {
             item.resolved = true;
             return;
         };
@@ -139,24 +155,26 @@ impl ResolveTimeout {
             tx: tx.clone(),
             ingress,
         };
-        timeout.work.clone().spawn(async move {
-            while let Some(request) = rx.recv().await {
-                timeout.event(request);
-            }
-            timeout.cancel();
-        }).detach();
+        timeout
+            .work
+            .clone()
+            .spawn(async move {
+                while let Some(request) = rx.recv().await {
+                    timeout.event(request);
+                }
+                timeout.cancel();
+            })
+            .detach();
         tx
     }
 
     fn event(&mut self, request: ResolveRequest) {
         match request {
-            ResolveRequest::Resolve { item, ls } => {
-                self.handle_resolve(PendingResolve {
-                    item,
-                    ls,
-                    ingress: self.ingress.clone(),
-                })
-            }
+            ResolveRequest::Resolve { item, ls } => self.handle_resolve(PendingResolve {
+                item,
+                ls,
+                ingress: self.ingress.clone(),
+            }),
             ResolveRequest::Start => self.start(),
             ResolveRequest::Cancel => self.cancel(),
         }
@@ -233,12 +251,13 @@ impl PendingResolve {
                 item
             }
         });
-        send_ui_command_with(UiCommand::Completion(
-            CompletionCommand::ReplaceResolvedItem {
+        send_ui_command_with(
+            UiCommand::Completion(Box::new(CompletionCommand::ReplaceResolvedItem {
                 previous,
-                resolved: resolved_item,
-            },
-        ), self.ingress)
+                resolved: Box::new(resolved_item),
+            })),
+            self.ingress,
+        )
         .await
     }
 }

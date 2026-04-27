@@ -90,7 +90,7 @@ pub fn show_document_symbol_picker(
         1,
         symbols,
         (),
-        editor.runtime().clone(),
+        crate::ui::PickerRuntime::new(editor.runtime()),
         ingress,
         move |cx: &mut crate::compositor::Context, item, action| {
             navigation::jump_to_location(cx.editor, &item.location, action);

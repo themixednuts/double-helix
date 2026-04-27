@@ -9,15 +9,10 @@ use std::{
 use anyhow::Ok;
 use arc_swap::access::Access;
 
-use crate::{events::OnModeSwitch, runtime::{send_task_event_with, RuntimeEvent, RuntimeTaskEvent}};
-use helix_event::register_hook;
+use crate::runtime::{send_task_event_with, RuntimeEvent, RuntimeTaskEvent};
 use helix_runtime::{send_blocking, Clock, Debounce, Runtime, Work};
 use helix_view::bench::log_command_phase;
-use helix_view::{
-    document::Mode,
-    events::DocumentDidChange,
-    handlers::{AutoSaveEvent, Handlers},
-};
+use helix_view::handlers::{AutoSaveEvent, Handlers};
 
 #[derive(Debug)]
 pub(super) struct AutoSaveHandler {
@@ -30,7 +25,11 @@ pub(super) struct AutoSaveHandler {
 }
 
 impl AutoSaveHandler {
-    fn new(work: Work, clock: Clock, ingress: helix_runtime::Sender<RuntimeEvent>) -> AutoSaveHandler {
+    fn new(
+        work: Work,
+        clock: Clock,
+        ingress: helix_runtime::Sender<RuntimeEvent>,
+    ) -> AutoSaveHandler {
         AutoSaveHandler {
             save_pending: Default::default(),
             armed: Default::default(),
@@ -63,7 +62,10 @@ impl AutoSaveHandler {
                     let ingress = self.ingress.clone();
                     self.work
                         .spawn(async move {
-                            send_task_event_with(RuntimeTaskEvent::AutoSaveRun { save_pending }, ingress)
+                            send_task_event_with(
+                                RuntimeTaskEvent::AutoSaveRun { save_pending },
+                                ingress,
+                            )
                             .await;
                         })
                         .detach();
@@ -79,19 +81,21 @@ impl AutoSaveHandler {
         let (tx, mut rx) = helix_runtime::channel(128);
         let work = runtime.work().clone();
         let clock = runtime.clock().clone();
-        work.clone().spawn(async move {
-            let mut handler = AutoSaveHandler::new(work, clock, ingress);
-            while let Some(event) = rx.recv().await {
-                handler.event(event);
-            }
-        }).detach();
+        work.clone()
+            .spawn(async move {
+                let mut handler = AutoSaveHandler::new(work, clock, ingress);
+                while let Some(event) = rx.recv().await {
+                    handler.event(event);
+                }
+            })
+            .detach();
         tx
     }
 }
 
-pub(super) fn register_hooks(handlers: &Handlers) {
+pub(super) fn attach(editor: &helix_view::Editor, handlers: &Handlers) {
     let tx = handlers.auto_save.clone();
-    register_hook!(move |event: &mut DocumentDidChange<'_>| {
+    editor.lifecycle().on_document_change(move |event| {
         let hook_start = std::time::Instant::now();
         let config = event.doc.config.load();
         if config.auto_save.after_delay.enable {
@@ -113,14 +117,6 @@ pub(super) fn register_hooks(handlers: &Handlers) {
                 event.doc.text().len_bytes()
             )
         });
-        Ok(())
-    });
-
-    let tx = handlers.auto_save.clone();
-    register_hook!(move |event: &mut OnModeSwitch<'_, '_>| {
-        if event.old_mode == Mode::Insert {
-            send_blocking(&tx, AutoSaveEvent::LeftInsertMode)
-        }
         Ok(())
     });
 }

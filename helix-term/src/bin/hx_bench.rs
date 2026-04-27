@@ -426,7 +426,7 @@ async fn main_impl(runtime: helix_runtime::Runtime) -> anyhow::Result<()> {
 
     // Insert the synthetic content into the initial document
     {
-        let view_id = app.editor.tree.focus;
+        let view_id = app.editor.focused_view_id();
         let view = app.editor.tree.get(view_id);
         let doc_id = view.doc;
         let doc = app.editor.documents.get_mut(&doc_id).unwrap();
@@ -446,7 +446,7 @@ async fn main_impl(runtime: helix_runtime::Runtime) -> anyhow::Result<()> {
     app.render_timed().await;
 
     // Activate the bench — same as `:bench` does
-    app.editor.bench = Some(BenchState::new(bench_args.seed, duration));
+    let _ = app.editor.start_bench(bench_args.seed, duration);
 
     eprintln!("  Running bench for {}s...", bench_args.duration_secs);
 
@@ -455,8 +455,7 @@ async fn main_impl(runtime: helix_runtime::Runtime) -> anyhow::Result<()> {
 
     // bench_run_loop prints the report to stderr when the bench expires.
     // If bench state is still around (shouldn't be), print report manually.
-    if let Some(mut bench) = app.editor.bench.take() {
-        let report = bench.report();
+    if let Some(report) = app.editor.cancel_bench() {
         eprintln!("{report}");
     }
 
@@ -485,7 +484,7 @@ fn install_fixture_document(
     content: &str,
     requested_lines: usize,
 ) -> (helix_view::ViewId, helix_view::DocumentId) {
-    let view_id = app.editor.tree.focus;
+    let view_id = app.editor.focused_view_id();
     let view = app.editor.tree.get(view_id);
     let doc_id = view.doc;
     let doc = app.editor.documents.get_mut(&doc_id).unwrap();

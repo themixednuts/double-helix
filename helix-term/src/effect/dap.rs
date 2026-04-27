@@ -4,11 +4,7 @@ use helix_dap::{StackFrame, ThreadId as DebugThreadId};
 use helix_runtime::Sender as IngressSender;
 use helix_view::Editor;
 
-use crate::runtime::{
-    ingress::RuntimeEvent,
-    send_task_event_with,
-    RuntimeTaskEvent,
-};
+use crate::runtime::{ingress::RuntimeEvent, send_task_event_with, RuntimeTaskEvent};
 
 pub(crate) fn apply_dap_restarted(editor: &mut Editor) {
     editor.set_status("Debugging session restarted");
@@ -26,15 +22,15 @@ pub(crate) fn request_select_debug_thread(
     editor: &mut Editor,
     ingress: IngressSender<RuntimeEvent>,
     thread_id: DebugThreadId,
-    force: bool,
+    policy: helix_view::editor::ThreadSelectPolicy,
 ) {
-    let work = editor.runtime().work().clone();
+    let work = editor.work();
     let Some(debugger) = editor.debug_adapters.get_active_client_mut() else {
         editor.set_error("Debugger is not running");
         return;
     };
 
-    if !force && debugger.thread_id.is_some() {
+    if !policy.should_replace_current() && debugger.thread_id.is_some() {
         return;
     }
 
@@ -49,7 +45,7 @@ pub(crate) fn request_select_debug_thread(
                     RuntimeTaskEvent::ApplyStackFrames {
                         thread_id,
                         frames,
-                        auto_select_first_frame: true,
+                        selection: helix_view::editor::FrameSelection::SelectFirst,
                     },
                     ingress,
                 )
@@ -74,7 +70,7 @@ pub(crate) fn request_pause_debug_thread(
     ingress: IngressSender<RuntimeEvent>,
     thread_id: DebugThreadId,
 ) {
-    let work = editor.runtime().work().clone();
+    let work = editor.work();
     let debugger = debugger!(editor);
     let request = debugger.pause(thread_id);
     work.spawn(async move {
@@ -102,7 +98,9 @@ pub(crate) fn apply_select_stack_frame(
         .position(|f| f.id == frame_id);
     debugger.active_frame = pos;
 
-    let frame = debugger.stack_frames[&thread_id].get(pos.unwrap_or(0)).cloned();
+    let frame = debugger.stack_frames[&thread_id]
+        .get(pos.unwrap_or(0))
+        .cloned();
     if let Some(frame) = &frame {
         helix_view::handlers::dap::jump_to_stack_frame(editor, frame);
     }
@@ -112,13 +110,13 @@ pub(crate) fn apply_stack_frames(
     editor: &mut Editor,
     thread_id: DebugThreadId,
     frames: Vec<StackFrame>,
-    auto_select_first_frame: bool,
+    selection: helix_view::editor::FrameSelection,
 ) {
     let debugger = debugger!(editor);
     debugger.stack_frames.insert(thread_id, frames);
-    debugger.active_frame = auto_select_first_frame.then_some(0);
+    debugger.active_frame = selection.should_select_first().then_some(0);
 
-    if auto_select_first_frame {
+    if selection.should_select_first() {
         let frame = debugger
             .stack_frames
             .get(&thread_id)

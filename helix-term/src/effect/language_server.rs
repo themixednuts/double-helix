@@ -5,10 +5,8 @@ use futures_util::{
     StreamExt,
 };
 use helix_core::{
-    diagnostic::DiagnosticProvider,
-    syntax::config::LanguageServerFeature,
-    text_annotations::InlineAnnotation,
-    Uri,
+    diagnostic::DiagnosticProvider, syntax::config::LanguageServerFeature,
+    text_annotations::InlineAnnotation, Uri,
 };
 use helix_lsp::{self, lsp, util::lsp_range_to_range, LanguageServerId};
 use helix_runtime::Sender as IngressSender;
@@ -20,12 +18,10 @@ use helix_view::{
     DocumentId, Editor, Theme, ViewId,
 };
 
-use crate::{
-    runtime::{
-        ingress::{send_task_event_with, send_ui_command_with, RuntimeEvent},
-        ui::command::LspCodeActionItem,
-        RuntimeTaskEvent, UiCommand,
-    },
+use crate::runtime::{
+    ingress::{send_task_event_with, send_ui_command_with, RuntimeEvent},
+    ui::command::LspCodeActionItem,
+    RuntimeTaskEvent, UiCommand,
 };
 
 pub(crate) fn request_document_diagnostics_for_language_servers(
@@ -42,7 +38,10 @@ pub(crate) fn request_document_diagnostics_for_language_servers(
 
     let mut futures: FuturesUnordered<_> = language_servers
         .iter()
-        .filter_map(|server_id| doc.language_servers().find(|server| &server.id() == server_id))
+        .filter_map(|server_id| {
+            doc.language_servers()
+                .find(|server| &server.id() == server_id)
+        })
         .filter_map(|language_server| {
             let future = language_server.text_document_diagnostic(
                 doc.identifier(),
@@ -337,7 +336,7 @@ pub(crate) fn request_apply_code_action(
             if code_action.edit.is_none() || code_action.command.is_none() {
                 if let Some(future) = language_server.resolve_code_action(&code_action) {
                     crate::runtime::ingress::spawn_task_event_with_future(
-                        editor.runtime().work().clone(),
+                        editor.work(),
                         async move {
                             let resolved = future.await.ok();
                             let code_action = resolved.as_ref().unwrap_or(&code_action);
@@ -446,11 +445,11 @@ pub(crate) fn apply_inlay_hints(
     let inlay_hints_length_limit = doc.config.load().lsp.inlay_hints_length_limit;
 
     for hint in hints {
-        let char_idx = match helix_lsp::util::lsp_pos_to_pos(doc_text, hint.position, offset_encoding)
-        {
-            Some(pos) => pos,
-            None => continue,
-        };
+        let char_idx =
+            match helix_lsp::util::lsp_pos_to_pos(doc_text, hint.position, offset_encoding) {
+                Some(pos) => pos,
+                None => continue,
+            };
 
         let mut label = match hint.label {
             lsp::InlayHintLabel::String(s) => s,

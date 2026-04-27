@@ -62,7 +62,7 @@ pub fn show_code_action_picker(
         0,
         items,
         (),
-        editor.runtime().clone(),
+        ui::PickerRuntime::new(editor.runtime()),
         ingress.clone(),
         move |cx: &mut crate::compositor::Context, lsp_item, _action| {
             apply_code_action_item(cx.editor, cx.ingress.clone(), lsp_item);

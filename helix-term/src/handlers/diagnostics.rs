@@ -3,26 +3,25 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use helix_core::syntax::config::LanguageServerFeature;
-use helix_event::register_hook;
 use helix_lsp::{lsp, LanguageServerId};
 use helix_runtime::{send_blocking, Clock, Debounce, Runtime, Work};
 use helix_view::bench::log_command_phase;
 use helix_view::document::Mode;
-use helix_view::events::{
-    DiagnosticsDidChange, DocumentDidChange, DocumentDidOpen, LanguageServerInitialized,
-};
 use helix_view::handlers::lsp::{PullAllDocumentsDiagnosticsEvent, PullDiagnosticsEvent};
 use helix_view::handlers::Handlers;
 use helix_view::DocumentId;
 
 use crate::{
     effect::language_server::request_document_diagnostics,
-    events::OnModeSwitch,
     runtime::{send_task_event_with, RuntimeEvent, RuntimeTaskEvent},
 };
 
-pub(super) fn register_hooks(handlers: &Handlers, ingress: helix_runtime::Sender<RuntimeEvent>) {
-    register_hook!(move |event: &mut DiagnosticsDidChange<'_>| {
+pub(super) fn attach(
+    editor: &helix_view::Editor,
+    handlers: &Handlers,
+    ingress: helix_runtime::Sender<RuntimeEvent>,
+) {
+    editor.lifecycle().on_diagnostics_change(move |event| {
         if event.editor.mode != Mode::Insert {
             for (view, _) in event.editor.tree.views_mut() {
                 view.diagnostics_handler.refresh()
@@ -30,16 +29,9 @@ pub(super) fn register_hooks(handlers: &Handlers, ingress: helix_runtime::Sender
         }
         Ok(())
     });
-    register_hook!(move |event: &mut OnModeSwitch<'_, '_>| {
-        for (view, _) in event.cx.editor.tree.views_mut() {
-            view.diagnostics_handler.active = event.new_mode != Mode::Insert;
-        }
-        Ok(())
-    });
-
     let tx = handlers.pull_diagnostics.clone();
     let tx_all_documents = handlers.pull_all_documents_diagnostics.clone();
-    register_hook!(move |event: &mut DocumentDidChange<'_>| {
+    editor.lifecycle().on_document_change(move |event| {
         let hook_start = std::time::Instant::now();
         if event
             .doc
@@ -98,22 +90,24 @@ pub(super) fn register_hooks(handlers: &Handlers, ingress: helix_runtime::Sender
     });
 
     let open_ingress = ingress.clone();
-    register_hook!(move |event: &mut DocumentDidOpen<'_>| {
+    editor.lifecycle().on_document_open(move |event| {
         request_document_diagnostics(event.editor, event.doc, open_ingress.clone());
 
         Ok(())
     });
 
     let init_ingress = ingress;
-    register_hook!(move |event: &mut LanguageServerInitialized<'_>| {
-        let doc_ids: Vec<_> = event.editor.documents.keys().copied().collect();
+    editor
+        .lifecycle()
+        .on_language_server_initialized(move |event| {
+            let doc_ids: Vec<_> = event.editor.document_ids().collect();
 
-        for doc_id in doc_ids {
-            request_document_diagnostics(event.editor, doc_id, init_ingress.clone());
-        }
+            for doc_id in doc_ids {
+                request_document_diagnostics(event.editor, doc_id, init_ingress.clone());
+            }
 
-        Ok(())
-    });
+            Ok(())
+        });
 }
 
 #[derive(Debug)]
@@ -165,13 +159,15 @@ impl PullDiagnosticsHandler {
         let (tx, mut rx) = helix_runtime::channel(128);
         let work = runtime.work().clone();
         let clock = runtime.clock().clone();
-        work.clone().spawn(async move {
-            let mut handler = PullDiagnosticsHandler::new(work, clock, ingress);
-            while let Some(event) = rx.recv().await {
-                handler.event(event);
-            }
-            handler.debounce.cancel();
-        }).detach();
+        work.clone()
+            .spawn(async move {
+                let mut handler = PullDiagnosticsHandler::new(work, clock, ingress);
+                while let Some(event) = rx.recv().await {
+                    handler.event(event);
+                }
+                handler.debounce.cancel();
+            })
+            .detach();
         tx
     }
 }
@@ -227,14 +223,15 @@ impl PullAllDocumentsDiagnosticHandler {
         let (tx, mut rx) = helix_runtime::channel(128);
         let work = runtime.work().clone();
         let clock = runtime.clock().clone();
-        work.clone().spawn(async move {
-            let mut handler = PullAllDocumentsDiagnosticHandler::new(work, clock, ingress);
-            while let Some(event) = rx.recv().await {
-                handler.event(event);
-            }
-            handler.debounce.cancel();
-        }).detach();
+        work.clone()
+            .spawn(async move {
+                let mut handler = PullAllDocumentsDiagnosticHandler::new(work, clock, ingress);
+                while let Some(event) = rx.recv().await {
+                    handler.event(event);
+                }
+                handler.debounce.cancel();
+            })
+            .detach();
         tx
     }
 }
-

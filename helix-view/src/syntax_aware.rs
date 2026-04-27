@@ -137,13 +137,13 @@ impl SyntaxSnapshotState {
         } else {
             SyntaxStatus::Disabled
         };
-        self.revision.next();
+        self.revision.advance();
     }
 
     fn mark_updated(&mut self) {
         if self.tree.is_some() {
             self.status = SyntaxStatus::Fresh;
-            self.revision.next();
+            self.revision.advance();
         } else {
             self.mark_disabled();
         }
@@ -152,7 +152,7 @@ impl SyntaxSnapshotState {
     fn mark_stale(&mut self) {
         if self.tree.is_some() && self.status != SyntaxStatus::StalePendingRefresh {
             self.status = SyntaxStatus::StalePendingRefresh;
-            self.revision.next();
+            self.revision.advance();
         }
     }
 
@@ -160,7 +160,7 @@ impl SyntaxSnapshotState {
         if self.tree.is_some() || self.status != SyntaxStatus::Disabled {
             self.tree = None;
             self.status = SyntaxStatus::Disabled;
-            self.revision.next();
+            self.revision.advance();
         }
     }
 }

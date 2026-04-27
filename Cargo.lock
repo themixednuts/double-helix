@@ -1532,20 +1532,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "helix-event"
-version = "25.7.1"
-dependencies = [
- "anyhow",
- "foldhash 0.2.0",
- "futures-executor",
- "hashbrown 0.16.1",
- "log",
- "once_cell",
- "parking_lot",
- "tokio",
-]
-
-[[package]]
 name = "helix-loader"
 version = "25.7.1"
 dependencies = [
@@ -1618,18 +1604,22 @@ name = "helix-plugin"
 version = "25.7.1"
 dependencies = [
  "anyhow",
+ "arc-swap",
+ "heck",
  "helix-core",
- "helix-event",
  "helix-loader",
  "helix-lsp",
+ "helix-runtime",
  "helix-stdx",
  "helix-view",
  "log",
  "mlua",
  "once_cell",
  "parking_lot",
+ "rmp-serde",
  "serde",
  "serde_json",
+ "slotmap",
  "tempfile",
  "thiserror",
  "tokio",
@@ -1683,7 +1673,6 @@ dependencies = [
  "helix-acp",
  "helix-core",
  "helix-dap",
- "helix-event",
  "helix-loader",
  "helix-lsp",
  "helix-modal",
@@ -1768,7 +1757,6 @@ dependencies = [
  "helix-acp",
  "helix-core",
  "helix-dap",
- "helix-event",
  "helix-loader",
  "helix-lsp",
  "helix-runtime",
@@ -2741,6 +2729,25 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "rmp"
+version = "0.8.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4ba8be72d372b2c9b35542551678538b562e7cf86c3315773cae48dfbfe7790c"
+dependencies = [
+ "num-traits",
+]
+
+[[package]]
+name = "rmp-serde"
+version = "1.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "72f81bee8c8ef9b577d1681a70ebbc962c232461e397b22c208c43c04b67a155"
+dependencies = [
+ "rmp",
+ "serde",
 ]
 
 [[package]]

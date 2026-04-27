@@ -10,15 +10,10 @@ use helix_core::{
     chars::char_is_word, fuzzy::fuzzy_match, movement, text_annotations::TextAnnotations,
     ChangeSet, Range, Rope, RopeSlice,
 };
-use helix_event::register_hook;
 use helix_runtime::{channel, send_blocking, Clock, Debounce, Runtime, Sender, Work};
 use helix_stdx::rope::RopeSliceExt as _;
 
-use crate::{
-    bench::log_command_phase,
-    events::{ConfigDidChange, DocumentDidChange, DocumentDidClose, DocumentDidOpen},
-    DocumentId,
-};
+use crate::{bench::log_command_phase, DocumentId};
 
 use super::Handlers;
 
@@ -419,9 +414,9 @@ fn is_changeset_significant(changes: &ChangeSet) -> bool {
     diff > 1_000
 }
 
-pub(crate) fn register_hooks(handlers: &Handlers) {
+pub(crate) fn attach(editor: &crate::Editor, handlers: &Handlers) {
     let coordinator = handlers.word_index.coordinator.clone();
-    register_hook!(move |event: &mut DocumentDidOpen<'_>| {
+    editor.lifecycle().on_document_open(move |event| {
         let doc = doc!(event.editor, &event.doc);
         if doc.word_completion_enabled() {
             send_blocking(&coordinator, Event::Insert(doc.text().clone()));
@@ -430,7 +425,7 @@ pub(crate) fn register_hooks(handlers: &Handlers) {
     });
 
     let tx = handlers.word_index.hook.clone();
-    register_hook!(move |event: &mut DocumentDidChange<'_>| {
+    editor.lifecycle().on_document_change(move |event| {
         let hook_start = std::time::Instant::now();
         if !event.ghost_transaction && event.doc.word_completion_enabled() {
             helix_runtime::send_blocking(
@@ -461,7 +456,7 @@ pub(crate) fn register_hooks(handlers: &Handlers) {
     });
 
     let tx = handlers.word_index.hook.clone();
-    register_hook!(move |event: &mut DocumentDidClose<'_>| {
+    editor.lifecycle().on_document_close(move |event| {
         if event.doc.word_completion_enabled() {
             helix_runtime::send_blocking(
                 &tx,
@@ -472,7 +467,7 @@ pub(crate) fn register_hooks(handlers: &Handlers) {
     });
 
     let coordinator = handlers.word_index.coordinator.clone();
-    register_hook!(move |event: &mut ConfigDidChange<'_>| {
+    editor.lifecycle().on_config_change(move |event| {
         // The feature has been turned off. Clear the index and reclaim any used memory.
         if event.old.word_completion.enable && !event.new.word_completion.enable {
             send_blocking(&coordinator, Event::Clear);

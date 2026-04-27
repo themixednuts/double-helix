@@ -84,10 +84,10 @@ impl StatuslineModel {
                 function_name,
             }
             .into_owned(),
-            bench_overlay: editor.bench.as_ref().map(|bench| BenchOverlay {
+            bench_overlay: editor.bench_overlay().map(|bench| BenchOverlay {
                 rolling_fps: bench.rolling_fps,
-                actions_executed: bench.actions_executed as usize,
-                remaining_seconds: bench.duration.saturating_sub(bench.elapsed()).as_secs_f64(),
+                actions_executed: bench.actions_executed,
+                remaining_seconds: bench.remaining_seconds,
             }),
         }
     }

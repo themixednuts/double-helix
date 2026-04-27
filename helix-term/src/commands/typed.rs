@@ -2,9 +2,7 @@ use std::fmt::Write;
 use std::io::BufReader;
 use std::ops::{self, Deref};
 
-use crate::runtime::{
-    AssistantCommand, LayerCommand, UiCommand,
-};
+use crate::runtime::{AssistantCommand, LayerCommand, PendingFormatWrite, UiCommand};
 
 use super::*;
 
@@ -17,7 +15,7 @@ use helix_core::{line_ending, SmartString};
 use helix_plugin::PluginManager;
 use helix_stdx::path::home_dir;
 use helix_view::document::{read_to_string, DEFAULT_LANGUAGE_NAME};
-use helix_view::editor::{CloseError, ConfigEvent};
+use helix_view::editor::{CloseError, ClosePolicy, ConfigEvent, PanelBehavior, SavePolicy};
 use helix_view::expansion;
 use helix_view::handlers::BlameEvent;
 use serde_json::Value;
@@ -85,7 +83,7 @@ fn exit(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow:
             cx,
             args.first(),
             WriteOptions {
-                force: false,
+                policy: SavePolicy::Safe,
                 auto_format: !args.has_flag(WRITE_NO_FORMAT_FLAG.name),
             },
         )?;
@@ -104,7 +102,7 @@ fn force_exit(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> a
             cx,
             args.first(),
             WriteOptions {
-                force: true,
+                policy: SavePolicy::Overwrite,
                 auto_format: !args.has_flag(WRITE_NO_FORMAT_FLAG.name),
             },
         )?;
@@ -121,7 +119,7 @@ fn quit(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> anyhow
     }
 
     // last view and we have unsaved changes
-    if cx.editor.tree.views().count() == 1 {
+    if cx.editor.has_single_view() {
         buffers_remaining_impl(cx.editor)?
     }
 
@@ -180,14 +178,15 @@ fn open_impl(cx: &mut compositor::Context, args: Args, action: Action) -> anyhow
 fn buffer_close_by_ids_impl(
     cx: &mut compositor::Context,
     doc_ids: &[DocumentId],
-    force: bool,
+    policy: ClosePolicy,
 ) -> anyhow::Result<()> {
     cx.block_try_flush_writes()?;
 
     let (modified_ids, modified_names): (Vec<_>, Vec<_>) = doc_ids
         .iter()
         .filter_map(|&doc_id| {
-            if let Err(CloseError::BufferModified(name)) = cx.editor.close_document(doc_id, force) {
+            if let Err(CloseError::BufferModified(name)) = cx.editor.close_document(doc_id, policy)
+            {
                 Some((doc_id, name))
             } else {
                 None
@@ -258,7 +257,7 @@ fn buffer_close(
     }
 
     let document_ids = buffer_gather_paths_impl(cx.editor, args);
-    buffer_close_by_ids_impl(cx, &document_ids, false)
+    buffer_close_by_ids_impl(cx, &document_ids, ClosePolicy::ProtectModified)
 }
 
 fn force_buffer_close(
@@ -271,7 +270,7 @@ fn force_buffer_close(
     }
 
     let document_ids = buffer_gather_paths_impl(cx.editor, args);
-    buffer_close_by_ids_impl(cx, &document_ids, true)
+    buffer_close_by_ids_impl(cx, &document_ids, ClosePolicy::DiscardModified)
 }
 
 fn buffer_gather_others_impl(editor: &mut Editor, skip_visible: bool) -> Vec<DocumentId> {
@@ -306,7 +305,7 @@ fn buffer_close_others(
     }
 
     let document_ids = buffer_gather_others_impl(cx.editor, args.has_flag("skip-visible"));
-    buffer_close_by_ids_impl(cx, &document_ids, false)
+    buffer_close_by_ids_impl(cx, &document_ids, ClosePolicy::ProtectModified)
 }
 
 fn force_buffer_close_others(
@@ -319,7 +318,7 @@ fn force_buffer_close_others(
     }
 
     let document_ids = buffer_gather_others_impl(cx.editor, args.has_flag("skip-visible"));
-    buffer_close_by_ids_impl(cx, &document_ids, true)
+    buffer_close_by_ids_impl(cx, &document_ids, ClosePolicy::DiscardModified)
 }
 
 fn buffer_gather_all_impl(editor: &mut Editor) -> Vec<DocumentId> {
@@ -336,7 +335,7 @@ fn buffer_close_all(
     }
 
     let document_ids = buffer_gather_all_impl(cx.editor);
-    buffer_close_by_ids_impl(cx, &document_ids, false)
+    buffer_close_by_ids_impl(cx, &document_ids, ClosePolicy::ProtectModified)
 }
 
 fn force_buffer_close_all(
@@ -349,7 +348,7 @@ fn force_buffer_close_all(
     }
 
     let document_ids = buffer_gather_all_impl(cx.editor);
-    buffer_close_by_ids_impl(cx, &document_ids, true)
+    buffer_close_by_ids_impl(cx, &document_ids, ClosePolicy::DiscardModified)
 }
 
 fn buffer_next(
@@ -409,7 +408,10 @@ fn write_impl(
                     doc.version(),
                     view_id,
                     fmt,
-                    Some((path.map(Into::into), options.force)),
+                    Some(PendingFormatWrite {
+                        path: path.map(Into::into),
+                        policy: options.policy,
+                    }),
                 )
             })
         } else {
@@ -421,7 +423,7 @@ fn write_impl(
     if let Some(task) = format_task {
         cx.exit_task_event(task);
     } else {
-        cx.editor.save(doc_id, path, options.force)?;
+        cx.editor.save(doc_id, path, options.policy)?;
     }
 
     Ok(())
@@ -488,7 +490,7 @@ fn insert_final_newline(doc: &mut Document, view_id: ViewId) {
 
 #[derive(Debug, Clone, Copy)]
 pub struct WriteOptions {
-    pub force: bool,
+    pub policy: SavePolicy,
     pub auto_format: bool,
 }
 
@@ -501,7 +503,7 @@ fn write(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow
         cx,
         args.first(),
         WriteOptions {
-            force: false,
+            policy: SavePolicy::Safe,
             auto_format: !args.has_flag(WRITE_NO_FORMAT_FLAG.name),
         },
     )
@@ -516,7 +518,7 @@ fn force_write(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> 
         cx,
         args.first(),
         WriteOptions {
-            force: true,
+            policy: SavePolicy::Overwrite,
             auto_format: !args.has_flag(WRITE_NO_FORMAT_FLAG.name),
         },
     )
@@ -535,13 +537,13 @@ fn write_buffer_close(
         cx,
         args.first(),
         WriteOptions {
-            force: false,
+            policy: SavePolicy::Safe,
             auto_format: !args.has_flag(WRITE_NO_FORMAT_FLAG.name),
         },
     )?;
 
     let document_ids = buffer_gather_paths_impl(cx.editor, args);
-    buffer_close_by_ids_impl(cx, &document_ids, false)
+    buffer_close_by_ids_impl(cx, &document_ids, ClosePolicy::ProtectModified)
 }
 
 fn force_write_buffer_close(
@@ -557,13 +559,13 @@ fn force_write_buffer_close(
         cx,
         args.first(),
         WriteOptions {
-            force: true,
+            policy: SavePolicy::Overwrite,
             auto_format: !args.has_flag(WRITE_NO_FORMAT_FLAG.name),
         },
     )?;
 
     let document_ids = buffer_gather_paths_impl(cx.editor, args);
-    buffer_close_by_ids_impl(cx, &document_ids, false)
+    buffer_close_by_ids_impl(cx, &document_ids, ClosePolicy::ProtectModified)
 }
 
 fn new_file(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> anyhow::Result<()> {
@@ -753,7 +755,7 @@ fn write_quit(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> a
         cx,
         args.first(),
         WriteOptions {
-            force: false,
+            policy: SavePolicy::Safe,
             auto_format: !args.has_flag(WRITE_NO_FORMAT_FLAG.name),
         },
     )?;
@@ -774,7 +776,7 @@ fn force_write_quit(
         cx,
         args.first(),
         WriteOptions {
-            force: true,
+            policy: SavePolicy::Overwrite,
             auto_format: !args.has_flag(WRITE_NO_FORMAT_FLAG.name),
         },
     )?;
@@ -817,7 +819,7 @@ pub(super) fn buffers_remaining_impl(editor: &mut Editor) -> anyhow::Result<()> 
 
 #[derive(Debug, Clone, Copy)]
 pub struct WriteAllOptions {
-    pub force: bool,
+    pub policy: SavePolicy,
     pub write_scratch: bool,
     pub auto_format: bool,
 }
@@ -826,7 +828,12 @@ pub fn write_all_impl(
     cx: &mut compositor::Context,
     options: WriteAllOptions,
 ) -> anyhow::Result<()> {
-    write_all_editor_impl(cx.editor, Some(cx.exit_tasks), Some(&cx.exit_task_work), options)
+    write_all_editor_impl(
+        cx.editor,
+        Some(cx.exit_tasks),
+        Some(&cx.exit_task_work),
+        options,
+    )
 }
 
 pub fn write_all_editor_impl(
@@ -886,17 +893,20 @@ pub fn write_all_editor_impl(
                     doc.version(),
                     target_view,
                     fmt,
-                    Some((None, options.force)),
+                    Some(PendingFormatWrite {
+                        path: None,
+                        policy: options.policy,
+                    }),
                 );
-                let exit_tasks = exit_tasks
-                    .as_deref_mut()
-                    .expect("write_all_editor_impl requires exit_tasks when auto_format is enabled");
-                exit_tasks.push(
-                    exit_task_work
-                        .expect(
-                            "write_all_editor_impl requires exit_task_work when auto_format is enabled",
-                        )
-                        .spawn(task),
+                let exit_tasks = exit_tasks.as_deref_mut().expect(
+                    "write_all_editor_impl requires exit_tasks when auto_format is enabled",
+                );
+                crate::runtime::schedule_exit_task(
+                    exit_tasks,
+                    exit_task_work.expect(
+                        "write_all_editor_impl requires exit_task_work when auto_format is enabled",
+                    ),
+                    task,
                 );
             })
         } else {
@@ -904,11 +914,11 @@ pub fn write_all_editor_impl(
         };
 
         if fmt.is_none() {
-            editor.save::<PathBuf>(doc_id, None, options.force)?;
+            editor.save::<PathBuf>(doc_id, None, options.policy)?;
         }
     }
 
-    if !errors.is_empty() && !options.force {
+    if !errors.is_empty() && !options.policy.should_overwrite() {
         bail!("{:?}", errors);
     }
 
@@ -923,7 +933,7 @@ fn write_all(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> an
     write_all_impl(
         cx,
         WriteAllOptions {
-            force: false,
+            policy: SavePolicy::Safe,
             write_scratch: true,
             auto_format: !args.has_flag(WRITE_NO_FORMAT_FLAG.name),
         },
@@ -942,7 +952,7 @@ fn force_write_all(
     write_all_impl(
         cx,
         WriteAllOptions {
-            force: true,
+            policy: SavePolicy::Overwrite,
             write_scratch: true,
             auto_format: !args.has_flag(WRITE_NO_FORMAT_FLAG.name),
         },
@@ -960,12 +970,12 @@ fn write_all_quit(
     write_all_impl(
         cx,
         WriteAllOptions {
-            force: false,
+            policy: SavePolicy::Safe,
             write_scratch: true,
             auto_format: !args.has_flag(WRITE_NO_FORMAT_FLAG.name),
         },
     )?;
-    quit_all_impl(cx, false)
+    quit_all_impl(cx, QuitPolicy::CheckBuffers)
 }
 
 fn force_write_all_quit(
@@ -979,17 +989,29 @@ fn force_write_all_quit(
     let _ = write_all_impl(
         cx,
         WriteAllOptions {
-            force: true,
+            policy: SavePolicy::Overwrite,
             write_scratch: true,
             auto_format: !args.has_flag(WRITE_NO_FORMAT_FLAG.name),
         },
     );
-    quit_all_impl(cx, true)
+    quit_all_impl(cx, QuitPolicy::DiscardBuffers)
 }
 
-fn quit_all_impl(cx: &mut compositor::Context, force: bool) -> anyhow::Result<()> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QuitPolicy {
+    CheckBuffers,
+    DiscardBuffers,
+}
+
+impl QuitPolicy {
+    fn should_check_buffers(self) -> bool {
+        matches!(self, Self::CheckBuffers)
+    }
+}
+
+fn quit_all_impl(cx: &mut compositor::Context, policy: QuitPolicy) -> anyhow::Result<()> {
     cx.block_try_flush_writes()?;
-    if !force {
+    if policy.should_check_buffers() {
         buffers_remaining_impl(cx.editor)?;
     }
 
@@ -1007,7 +1029,7 @@ fn quit_all(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> an
         return Ok(());
     }
 
-    quit_all_impl(cx, false)
+    quit_all_impl(cx, QuitPolicy::CheckBuffers)
 }
 
 fn force_quit_all(
@@ -1019,7 +1041,7 @@ fn force_quit_all(
         return Ok(());
     }
 
-    quit_all_impl(cx, true)
+    quit_all_impl(cx, QuitPolicy::DiscardBuffers)
 }
 
 fn cquit(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow::Result<()> {
@@ -1033,7 +1055,7 @@ fn cquit(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow
         .unwrap_or(1);
 
     cx.editor.exit_code = exit_code;
-    quit_all_impl(cx, false)
+    quit_all_impl(cx, QuitPolicy::CheckBuffers)
 }
 
 fn force_cquit(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow::Result<()> {
@@ -1047,7 +1069,7 @@ fn force_cquit(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> 
         .unwrap_or(1);
     cx.editor.exit_code = exit_code;
 
-    quit_all_impl(cx, true)
+    quit_all_impl(cx, QuitPolicy::DiscardBuffers)
 }
 
 fn theme(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow::Result<()> {
@@ -1114,6 +1136,7 @@ fn yank_joined(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> 
     let separator = args.first().unwrap_or(&default_sep);
     let register = cx
         .editor
+        .frontend()
         .focused_modal_input
         .selected_register
         .unwrap_or(cx.editor.config().default_yank_register);
@@ -1450,26 +1473,24 @@ fn reload(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> anyh
         view.ensure_cursor_in_view(doc, scrolloff);
     })?;
     let doc_id = doc.id();
-    if let Some(path) = doc.path() {
-        cx.editor
-            .language_servers
-            .file_event_handler
-            .file_changed(path.clone());
-    }
-
-    if doc.should_request_full_file_blame(auto_fetch) {
-        if let Some(path) = doc.path() {
-            helix_runtime::send_blocking(
-                &cx.editor.handlers.blame,
-                BlameEvent {
-                    path: path.to_path_buf(),
-                    doc_id,
-                    line: None,
-                },
-            );
-        }
-    }
+    let changed_path = doc.path().cloned();
+    let blame_request = doc.path().and_then(|path| {
+        doc.should_request_full_file_blame(auto_fetch)
+            .then(|| BlameEvent {
+                path: path.to_path_buf(),
+                doc_id,
+                line: None,
+            })
+    });
     doc.mark_blame_outdated();
+    let _ = doc;
+
+    if let Some(path) = changed_path {
+        cx.editor.notify_file_changed(path);
+    }
+    if let Some(event) = blame_request {
+        cx.editor.request_blame(event);
+    }
 
     Ok(())
 }
@@ -1520,12 +1541,7 @@ pub fn reload_all_impl(editor: &mut Editor) -> anyhow::Result<()> {
             continue;
         }
 
-        if let Some(path) = doc.path() {
-            editor
-                .language_servers
-                .file_event_handler
-                .file_changed(path.clone());
-        }
+        let changed_path = doc.path().cloned();
 
         for view_id in view_ids {
             let view = view_mut!(editor, view_id);
@@ -1534,19 +1550,23 @@ pub fn reload_all_impl(editor: &mut Editor) -> anyhow::Result<()> {
             }
         }
 
-        if doc.should_request_full_file_blame(blame_compute) {
-            if let Some(path) = doc.path() {
-                helix_runtime::send_blocking(
-                    &editor.handlers.blame,
-                    BlameEvent {
-                        path: path.to_path_buf(),
-                        doc_id,
-                        line: None,
-                    },
-                );
-            }
-        }
+        let blame_request = doc.path().and_then(|path| {
+            doc.should_request_full_file_blame(blame_compute)
+                .then(|| BlameEvent {
+                    path: path.to_path_buf(),
+                    doc_id,
+                    line: None,
+                })
+        });
         doc.mark_blame_outdated();
+        let _ = doc;
+
+        if let Some(path) = changed_path {
+            editor.notify_file_changed(path);
+        }
+        if let Some(event) = blame_request {
+            editor.request_blame(event);
+        }
     }
 
     Ok(())
@@ -1564,7 +1584,7 @@ fn update(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyho
             cx,
             None,
             WriteOptions {
-                force: false,
+                policy: SavePolicy::Safe,
                 auto_format: !args.has_flag(WRITE_NO_FORMAT_FLAG.name),
             },
         )
@@ -1770,7 +1790,7 @@ fn lsp_stop(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> any
     };
 
     for ls_name in &language_servers {
-        cx.editor.language_servers.stop(ls_name);
+        cx.editor.stop_language_server(ls_name);
 
         for doc in cx.editor.documents_mut() {
             if let Some(client) = doc.remove_language_server_by_name(ls_name) {
@@ -2705,7 +2725,19 @@ fn redraw(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> anyh
 
 #[derive(Debug, Clone, Copy)]
 pub struct MoveBufferOptions {
-    pub force: bool,
+    pub parent: ParentDirPolicy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParentDirPolicy {
+    RequireExisting,
+    CreateMissing,
+}
+
+impl ParentDirPolicy {
+    fn should_create_missing(self) -> bool {
+        matches!(self, Self::CreateMissing)
+    }
 }
 
 fn move_buffer(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow::Result<()> {
@@ -2714,7 +2746,13 @@ fn move_buffer(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> 
     }
 
     let new_path: PathBuf = args.first().unwrap().into();
-    move_buffer_impl(cx, new_path, MoveBufferOptions { force: false })
+    move_buffer_impl(
+        cx,
+        new_path,
+        MoveBufferOptions {
+            parent: ParentDirPolicy::RequireExisting,
+        },
+    )
 }
 
 fn force_move_buffer(
@@ -2727,7 +2765,13 @@ fn force_move_buffer(
     }
 
     let new_path: PathBuf = args.first().unwrap().into();
-    move_buffer_impl(cx, new_path, MoveBufferOptions { force: true })
+    move_buffer_impl(
+        cx,
+        new_path,
+        MoveBufferOptions {
+            parent: ParentDirPolicy::CreateMissing,
+        },
+    )
 }
 
 fn move_buffer_impl(
@@ -2752,7 +2796,7 @@ fn move_buffer_impl(
     if old_path.exists() {
         if let Some(parent) = new_path.parent() {
             if !parent.exists() {
-                if options.force {
+                if options.parent.should_create_missing() {
                     std::fs::DirBuilder::new().recursive(true).create(parent)?;
                 } else {
                     bail!(
@@ -3507,11 +3551,13 @@ pub(crate) fn do_assistant_connect(
 ) -> anyhow::Result<()> {
     helix_runtime::send_blocking(
         &ingress,
-        crate::runtime::RuntimeEvent::Task(crate::runtime::RuntimeTaskEvent::ConnectAssistantBackend {
-            command,
-            args: cmd_args,
-            open_panel: true,
-        }),
+        crate::runtime::RuntimeEvent::Task(
+            crate::runtime::RuntimeTaskEvent::ConnectAssistantBackend {
+                command,
+                args: cmd_args,
+                panel: PanelBehavior::Open,
+            },
+        ),
     );
 
     Ok(())
@@ -3593,7 +3639,7 @@ fn assistant_open(
         return Ok(());
     }
 
-    let has_agent = cx.editor.assistant_threads().next().is_some();
+    let has_agent = cx.editor.has_assistant_threads();
     let agents = cx.editor.config().agents.clone();
 
     if !has_agent && !agents.is_empty() {
@@ -3640,7 +3686,7 @@ fn assistant_open_history(
         return Ok(());
     }
 
-    let scope = cx.editor.active_thread_scope_or_layout();
+    let scope = cx.editor.active_assistant_scope_or_layout();
 
     if let Some(entries) = cx.editor.assistant_history_entries(&scope) {
         cx.spawn_ui(async move {
@@ -3753,9 +3799,11 @@ async fn resolve_context_provider(
     editor: &helix_view::Editor,
     key: &helix_view::assistant::context::Key,
 ) -> anyhow::Result<helix_view::assistant::context::Kind> {
-    let snapshot = editor.active_thread_snapshot().context("No active assistant thread")?;
+    let snapshot = editor
+        .active_assistant_snapshot()
+        .context("No active assistant thread")?;
     let provider = editor
-        .assistant_context
+        .assistant_context_registry()
         .provider(key)
         .cloned()
         .context("Assistant context provider missing")?;
@@ -3775,13 +3823,15 @@ fn assistant_attach_selection(
     }
     helix_runtime::send_blocking(
         &cx.ingress,
-        crate::runtime::RuntimeEvent::Task(crate::runtime::RuntimeTaskEvent::AttachAssistantContext {
-            item: cx
-                .editor
-                .capture_current_surface(helix_view::collab::surface::Capture::Selection)
-                .context("Selection context unavailable")?,
-            status: "Attached selection context",
-        }),
+        crate::runtime::RuntimeEvent::Task(
+            crate::runtime::RuntimeTaskEvent::AttachAssistantContext {
+                item: cx
+                    .editor
+                    .capture_current_surface(helix_view::collab::surface::Capture::Selection)
+                    .context("Selection context unavailable")?,
+                status: "Attached selection context",
+            },
+        ),
     );
     Ok(())
 }
@@ -3796,13 +3846,15 @@ fn assistant_attach_symbol(
     }
     helix_runtime::send_blocking(
         &cx.ingress,
-        crate::runtime::RuntimeEvent::Task(crate::runtime::RuntimeTaskEvent::AttachAssistantContext {
-            item: cx
-                .editor
-                .capture_current_surface(helix_view::collab::surface::Capture::Symbol)
-                .context("Symbol context unavailable")?,
-            status: "Attached symbol context",
-        }),
+        crate::runtime::RuntimeEvent::Task(
+            crate::runtime::RuntimeTaskEvent::AttachAssistantContext {
+                item: cx
+                    .editor
+                    .capture_current_surface(helix_view::collab::surface::Capture::Symbol)
+                    .context("Symbol context unavailable")?,
+                status: "Attached symbol context",
+            },
+        ),
     );
     Ok(())
 }
@@ -3821,10 +3873,12 @@ fn assistant_attach_file(
     ))?;
     helix_runtime::send_blocking(
         &cx.ingress,
-        crate::runtime::RuntimeEvent::Task(crate::runtime::RuntimeTaskEvent::AttachAssistantContext {
-            item,
-            status: "Attached file context",
-        }),
+        crate::runtime::RuntimeEvent::Task(
+            crate::runtime::RuntimeTaskEvent::AttachAssistantContext {
+                item,
+                status: "Attached file context",
+            },
+        ),
     );
     Ok(())
 }
@@ -3843,10 +3897,12 @@ fn assistant_attach_diagnostics(
     ))?;
     helix_runtime::send_blocking(
         &cx.ingress,
-        crate::runtime::RuntimeEvent::Task(crate::runtime::RuntimeTaskEvent::AttachAssistantContext {
-            item,
-            status: "Attached diagnostics context",
-        }),
+        crate::runtime::RuntimeEvent::Task(
+            crate::runtime::RuntimeTaskEvent::AttachAssistantContext {
+                item,
+                status: "Attached diagnostics context",
+            },
+        ),
     );
     Ok(())
 }
@@ -3865,10 +3921,12 @@ fn assistant_attach_diff(
     ))?;
     helix_runtime::send_blocking(
         &cx.ingress,
-        crate::runtime::RuntimeEvent::Task(crate::runtime::RuntimeTaskEvent::AttachAssistantContext {
-            item,
-            status: "Attached diff context",
-        }),
+        crate::runtime::RuntimeEvent::Task(
+            crate::runtime::RuntimeTaskEvent::AttachAssistantContext {
+                item,
+                status: "Attached diff context",
+            },
+        ),
     );
     Ok(())
 }
@@ -3882,7 +3940,10 @@ fn assistant_detach_context(
         return Ok(());
     }
 
-    let items = cx.editor.active_thread_context().context("No active assistant thread")?;
+    let items = cx
+        .editor
+        .active_assistant_context()
+        .context("No active assistant thread")?;
     if items.is_empty() {
         bail!("No attached assistant context")
     }
@@ -3933,8 +3994,11 @@ fn assistant_reveal_entry_location(
         return Ok(());
     }
 
-    let location = cx.editor
-        .selected_assistant_entry_locations()
+    let location = cx
+        .editor
+        .assistant
+        .panel(false)
+        .selected_entry_locations()
         .context("No assistant entry selected")?
         .into_iter()
         .next()
@@ -3998,10 +4062,9 @@ fn bench(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow
         .and_then(|a| a.as_ref().parse().ok())
         .unwrap_or(42);
 
-    if cx.editor.bench.is_some() {
+    if cx.editor.has_active_bench() {
         // Already running — cancel it
-        if let Some(mut bench) = cx.editor.bench.take() {
-            let report = bench.report();
+        if let Some(report) = cx.editor.cancel_bench() {
             eprintln!("{report}");
             cx.editor
                 .set_status("Bench cancelled. Report printed to stderr.");
@@ -4024,13 +4087,12 @@ fn bench(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow
     }
 
     let duration = std::time::Duration::from_secs(duration_secs);
-    let bench = BenchState::new(seed, duration);
-    let log_msg = bench
-        .log_path
+    let log_msg = cx
+        .editor
+        .start_bench(seed, duration)
         .as_ref()
         .map(|p| format!(" Log: {}", p.display()))
         .unwrap_or_default();
-    cx.editor.bench = Some(bench);
     cx.editor.set_status(format!(
         "Bench started: {duration_secs}s, seed={seed}. Ctrl+C or :bench to stop.{log_msg}"
     ));
@@ -5281,7 +5343,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "assistant-new-thread",
-        aliases: &[],
+        aliases: &["new-thread"],
         doc: "Create a new assistant thread on the active backend.",
         fun: assistant_new_thread,
         completer: CommandCompleter::none(),
@@ -5292,7 +5354,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "assistant-close-thread",
-        aliases: &[],
+        aliases: &["close-thread"],
         doc: "Close the active assistant thread.",
         fun: assistant_close_thread,
         completer: CommandCompleter::none(),
@@ -5303,7 +5365,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "assistant-next-thread",
-        aliases: &[],
+        aliases: &["next-thread"],
         doc: "Activate the next assistant thread tab.",
         fun: assistant_next_thread,
         completer: CommandCompleter::none(),
@@ -5314,7 +5376,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "assistant-prev-thread",
-        aliases: &[],
+        aliases: &["prev-thread"],
         doc: "Activate the previous assistant thread tab.",
         fun: assistant_prev_thread,
         completer: CommandCompleter::none(),
@@ -5325,7 +5387,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "assistant-toggle-follow",
-        aliases: &[],
+        aliases: &["follow"],
         doc: "Toggle following for the active assistant thread.",
         fun: assistant_toggle_follow,
         completer: CommandCompleter::none(),
@@ -5336,7 +5398,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "assistant-open-entry-scratch",
-        aliases: &[],
+        aliases: &["scratch"],
         doc: "Open the selected assistant entry in a scratch buffer.",
         fun: assistant_open_entry_scratch,
         completer: CommandCompleter::none(),
@@ -5369,7 +5431,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "assistant-attach-selection",
-        aliases: &[],
+        aliases: &["attach-sel"],
         doc: "Attach the current selection as assistant context.",
         fun: assistant_attach_selection,
         completer: CommandCompleter::none(),
@@ -5380,7 +5442,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "assistant-attach-symbol",
-        aliases: &[],
+        aliases: &["attach-sym"],
         doc: "Attach the current selection as symbol context.",
         fun: assistant_attach_symbol,
         completer: CommandCompleter::none(),
@@ -5391,7 +5453,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "assistant-attach-file",
-        aliases: &[],
+        aliases: &["attach-file"],
         doc: "Attach the current file as assistant context.",
         fun: assistant_attach_file,
         completer: CommandCompleter::none(),
@@ -5402,7 +5464,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "assistant-attach-diagnostics",
-        aliases: &[],
+        aliases: &["attach-diag"],
         doc: "Attach current-file diagnostics as assistant context.",
         fun: assistant_attach_diagnostics,
         completer: CommandCompleter::none(),
@@ -5413,7 +5475,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "assistant-attach-diff",
-        aliases: &[],
+        aliases: &["attach-diff"],
         doc: "Attach current-file diff summary as assistant context.",
         fun: assistant_attach_diff,
         completer: CommandCompleter::none(),
@@ -5424,7 +5486,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "assistant-detach-context",
-        aliases: &[],
+        aliases: &["detach"],
         doc: "Detach an attached assistant context item.",
         fun: assistant_detach_context,
         completer: CommandCompleter::none(),

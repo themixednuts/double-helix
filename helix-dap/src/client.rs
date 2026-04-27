@@ -5,8 +5,8 @@ use crate::{
     Error, Result,
 };
 use helix_core::syntax::config::{DebugAdapterConfig, DebuggerQuirks};
-use helix_runtime::{channel, Receiver, Sender};
 use helix_dap_types::*;
+use helix_runtime::{channel, Receiver, Sender};
 
 use serde_json::Value;
 

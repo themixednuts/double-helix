@@ -10,6 +10,7 @@ pub(crate) mod effect;
 pub mod health;
 pub mod host;
 pub mod keymap;
+pub mod migration;
 pub mod plugin_registry;
 pub mod render;
 pub mod runtime;

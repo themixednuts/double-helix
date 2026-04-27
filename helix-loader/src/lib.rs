@@ -7,6 +7,9 @@ use etcetera::base_strategy::{choose_base_strategy, BaseStrategy};
 use std::path::{Path, PathBuf};
 
 pub const VERSION_AND_GIT_HASH: &str = env!("VERSION_AND_GIT_HASH");
+pub const PRODUCT_CONFIG_DIR: &str = "double-helix";
+pub const LEGACY_CONFIG_DIR: &str = "helix";
+pub const WORKSPACE_CONFIG_DIR: &str = ".double-helix";
 
 static RUNTIME_DIRS: once_cell::sync::Lazy<Vec<PathBuf>> =
     once_cell::sync::Lazy::new(prioritize_runtime_dirs);
@@ -33,8 +36,8 @@ pub fn initialize_log_file(specified_file: Option<PathBuf>) {
 ///
 /// 1. sibling directory to `CARGO_MANIFEST_DIR` (if environment variable is set)
 /// 2. subdirectory of user config directory (always included)
-/// 3. `HELIX_RUNTIME` (if environment variable is set)
-/// 4. `HELIX_DEFAULT_RUNTIME` (if environment variable is set *at build time*)
+/// 3. `DOUBLE_HELIX_RUNTIME` (if environment variable is set)
+/// 4. `DOUBLE_HELIX_DEFAULT_RUNTIME` (if environment variable is set *at build time*)
 /// 5. subdirectory of path to helix executable (always included)
 ///
 /// Postcondition: returns at least two paths (they might not exist).
@@ -52,7 +55,7 @@ fn prioritize_runtime_dirs() -> Vec<PathBuf> {
     let conf_rt_dir = config_dir().join(RT_DIR);
     rt_dirs.push(conf_rt_dir);
 
-    if let Ok(dir) = std::env::var("HELIX_RUNTIME") {
+    if let Ok(dir) = std::env::var("DOUBLE_HELIX_RUNTIME") {
         let dir = path::expand_tilde(Path::new(&dir));
         rt_dirs.push(path::normalize(dir));
     }
@@ -61,7 +64,7 @@ fn prioritize_runtime_dirs() -> Vec<PathBuf> {
     // in the lookup list. This allows downstream packagers to set a fallback
     // directory to a location that is conventional on their distro so that they
     // need not resort to a wrapper script or a global environment variable.
-    if let Some(dir) = std::option_env!("HELIX_DEFAULT_RUNTIME") {
+    if let Some(dir) = std::option_env!("DOUBLE_HELIX_DEFAULT_RUNTIME") {
         rt_dirs.push(dir.into());
     }
 
@@ -117,18 +120,23 @@ pub fn runtime_file(rel_path: impl AsRef<Path>) -> PathBuf {
 }
 
 pub fn config_dir() -> PathBuf {
-    // TODO: allow env var override
     let strategy = choose_base_strategy().expect("Unable to find the config directory!");
     let mut path = strategy.config_dir();
-    path.push("helix");
+    path.push(PRODUCT_CONFIG_DIR);
+    path
+}
+
+pub fn legacy_config_dir() -> PathBuf {
+    let strategy = choose_base_strategy().expect("Unable to find the config directory!");
+    let mut path = strategy.config_dir();
+    path.push(LEGACY_CONFIG_DIR);
     path
 }
 
 pub fn cache_dir() -> PathBuf {
-    // TODO: allow env var override
     let strategy = choose_base_strategy().expect("Unable to find the cache directory!");
     let mut path = strategy.cache_dir();
-    path.push("helix");
+    path.push(PRODUCT_CONFIG_DIR);
     path
 }
 
@@ -141,7 +149,14 @@ pub fn log_file() -> PathBuf {
 }
 
 pub fn workspace_config_file() -> PathBuf {
-    find_workspace().0.join(".helix").join("config.toml")
+    find_workspace()
+        .0
+        .join(WORKSPACE_CONFIG_DIR)
+        .join("config.toml")
+}
+
+pub fn workspace_ignore_file_name() -> PathBuf {
+    PathBuf::from(WORKSPACE_CONFIG_DIR).join("ignore")
 }
 
 pub fn lang_config_file() -> PathBuf {
@@ -149,7 +164,7 @@ pub fn lang_config_file() -> PathBuf {
 }
 
 pub fn default_log_file() -> PathBuf {
-    cache_dir().join("helix.log")
+    cache_dir().join("double-helix.log")
 }
 
 /// Merge two TOML documents, merging values from `right` onto `left`
@@ -239,7 +254,7 @@ pub fn merge_toml_values(left: toml::Value, right: toml::Value, merge_depth: usi
 /// Used as a ceiling dir for LSP root resolution, the filepicker and potentially as a future filewatching root
 ///
 /// This function starts searching the FS upward from the CWD
-/// and returns the first directory that contains either `.git`, `.svn`, `.jj` or `.helix`.
+/// and returns the first directory that contains either `.git`, `.svn`, `.jj` or `.double-helix`.
 /// If no workspace was found returns (CWD, true).
 /// Otherwise (workspace, false) is returned
 pub fn find_workspace() -> (PathBuf, bool) {
@@ -253,7 +268,7 @@ pub fn find_workspace_in(dir: impl AsRef<Path>) -> (PathBuf, bool) {
         if ancestor.join(".git").exists()
             || ancestor.join(".svn").exists()
             || ancestor.join(".jj").exists()
-            || ancestor.join(".helix").exists()
+            || ancestor.join(WORKSPACE_CONFIG_DIR).exists()
         {
             return (ancestor.to_owned(), false);
         }

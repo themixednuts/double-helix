@@ -11,7 +11,7 @@ pub fn default_lang_config() -> toml::Value {
 pub fn user_lang_config() -> Result<toml::Value, toml::de::Error> {
     let config = [
         crate::config_dir(),
-        crate::find_workspace().0.join(".helix"),
+        crate::find_workspace().0.join(crate::WORKSPACE_CONFIG_DIR),
     ]
     .into_iter()
     .map(|path| path.join("languages.toml"))

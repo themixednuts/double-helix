@@ -46,4 +46,4 @@ below.
   grammars.
 - If a parser is causing a segfault, or you want to remove it, make sure to
   remove the compiled parser located at `runtime/grammars/<name>.so`.
-- If you are attempting to add queries and Helix is unable to locate them, ensure that the environment variable `HELIX_RUNTIME` is set to the location of the `runtime` folder you're developing in.
+- If you are attempting to add queries and Double Helix is unable to locate them, ensure that the environment variable `DOUBLE_HELIX_RUNTIME` is set to the location of the `runtime` folder you're developing in.

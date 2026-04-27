@@ -11,6 +11,7 @@ pub struct Args {
     pub health: bool,
     pub health_arg: Option<String>,
     pub load_tutor: bool,
+    pub migrate: bool,
     pub fetch_grammars: bool,
     pub build_grammars: bool,
     pub split: Option<Layout>,
@@ -47,6 +48,7 @@ impl Args {
                 "--version" => args.display_version = true,
                 "--help" => args.display_help = true,
                 "--tutor" => args.load_tutor = true,
+                "--migrate" => args.migrate = true,
                 "--vsplit" => match args.split {
                     Some(_) => anyhow::bail!("can only set a split once of a specific type"),
                     None => args.split = Some(Layout::Vertical),

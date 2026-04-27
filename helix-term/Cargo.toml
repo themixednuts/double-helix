@@ -16,12 +16,12 @@ homepage.workspace = true
 # generate a .deb in target/debian/ with the command: cargo deb --no-build
 name = "double-helix"
 assets = [
-  { source = "target/release/dhx", dest = "/usr/lib/helix/", mode = "755" },
+  { source = "target/release/dhx", dest = "/usr/lib/double-helix/", mode = "755" },
   { source = "../contrib/dhx_launcher.sh", dest = "/usr/bin/dhx", mode = "755" },
-  { source = "../runtime/*", dest = "/usr/lib/helix/runtime/", mode = "644" },
-  { source = "../runtime/grammars/*", dest = "/usr/lib/helix/runtime/grammars/", mode = "644" }, # to avoid sources/
-  { source = "../runtime/queries/**/*", dest = "/usr/lib/helix/runtime/queries/", mode = "644" },
-  { source = "../runtime/themes/**/*", dest = "/usr/lib/helix/runtime/themes/", mode = "644" },
+  { source = "../runtime/*", dest = "/usr/lib/double-helix/runtime/", mode = "644" },
+  { source = "../runtime/grammars/*", dest = "/usr/lib/double-helix/runtime/grammars/", mode = "644" }, # to avoid sources/
+  { source = "../runtime/queries/**/*", dest = "/usr/lib/double-helix/runtime/queries/", mode = "644" },
+  { source = "../runtime/themes/**/*", dest = "/usr/lib/double-helix/runtime/themes/", mode = "644" },
   { source = "../README.md", dest = "/usr/share/doc/double-helix/", mode = "644" },
   { source = "../contrib/completion/dhx.bash", dest = "/usr/share/bash-completion/completions/dhx", mode = "644" },
   { source = "../contrib/completion/dhx.fish", dest = "/usr/share/fish/vendor_completions.d/dhx.fish", mode = "644" },

@@ -3,6 +3,7 @@
 
 complete -c dhx -s h -l help -d "Prints help information"
 complete -c dhx -l tutor -d "Loads the tutorial"
+complete -c dhx -l migrate -d "Copies existing Helix config into Double Helix config paths"
 complete -c dhx -l health -xa "(__dhx_langs_ops)" -d "Checks for errors"
 complete -c dhx -l health -xka all -d "Prints all diagnostic informations"
 complete -c dhx -l health -xka all-languages -d "Lists all languages"

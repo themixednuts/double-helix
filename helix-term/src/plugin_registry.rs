@@ -424,6 +424,79 @@ impl TermCommandHost {
     }
 }
 
+pub struct TermEventHost {
+    next_subscription_handle: std::sync::atomic::AtomicU64,
+    subscriptions: HashMap<SubscriptionHandle, PluginId>,
+}
+
+impl PluginEventHost for TermEventHost {
+    fn subscribe(
+        &mut self,
+        plugin: PluginId,
+        _kind: helix_plugin::contract::events::EventKind,
+    ) -> ContractResult<helix_plugin::contract::SubscriptionHandle> {
+        let handle = helix_plugin::contract::SubscriptionHandle::from_raw(next_non_zero(
+            &self.next_subscription_handle,
+        ));
+        self.subscriptions.insert(handle, plugin);
+        Ok(handle)
+    }
+
+    fn unsubscribe(
+        &mut self,
+        plugin: PluginId,
+        handle: helix_plugin::contract::SubscriptionHandle,
+    ) -> ContractResult<()> {
+        match self.subscriptions.get(&handle) {
+            Some(owner) if *owner == plugin => {
+                self.subscriptions.remove(&handle);
+                Ok(())
+            }
+            Some(_) => Err(permission_denied(plugin, handle)),
+            None => Err(ContractError::stale_handle(handle.to_string())),
+        }
+    }
+
+    fn event_catalog(&self) -> Vec<EventKindInfo> {
+        ApiMetadata::default().event_catalog
+    }
+}
+
+pub fn get_ui_host(
+    ingress: crate::runtime::RuntimeEventSender,
+) -> Box<dyn PluginUiHost + Send + Sync> {
+    Box::new(TermUiHost {
+        sender: ingress,
+        next_callback_id: std::sync::atomic::AtomicU64::new(1),
+    })
+}
+
+pub fn get_panel_host(
+    ingress: crate::runtime::RuntimeEventSender,
+) -> Box<dyn PluginPanelHost + Send + Sync> {
+    Box::new(TermPanelHost {
+        sender: ingress,
+        panel_owners: HashMap::new(),
+    })
+}
+
+pub fn get_command_host(
+    ingress: crate::runtime::RuntimeEventSender,
+) -> Box<dyn PluginCommandHost + Send + Sync> {
+    Box::new(TermCommandHost {
+        ingress,
+        next_command_handle: std::sync::atomic::AtomicU64::new(1),
+        commands: HashMap::new(),
+    })
+}
+
+pub fn get_event_host() -> Box<dyn PluginEventHost + Send + Sync> {
+    Box::new(TermEventHost {
+        next_subscription_handle: std::sync::atomic::AtomicU64::new(1),
+        subscriptions: HashMap::new(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -690,77 +763,4 @@ mod tests {
         host.unsubscribe(plugin_id(), handle)
             .expect("owner can unsubscribe");
     }
-}
-
-pub struct TermEventHost {
-    next_subscription_handle: std::sync::atomic::AtomicU64,
-    subscriptions: HashMap<SubscriptionHandle, PluginId>,
-}
-
-impl PluginEventHost for TermEventHost {
-    fn subscribe(
-        &mut self,
-        plugin: PluginId,
-        _kind: helix_plugin::contract::events::EventKind,
-    ) -> ContractResult<helix_plugin::contract::SubscriptionHandle> {
-        let handle = helix_plugin::contract::SubscriptionHandle::from_raw(next_non_zero(
-            &self.next_subscription_handle,
-        ));
-        self.subscriptions.insert(handle, plugin);
-        Ok(handle)
-    }
-
-    fn unsubscribe(
-        &mut self,
-        plugin: PluginId,
-        handle: helix_plugin::contract::SubscriptionHandle,
-    ) -> ContractResult<()> {
-        match self.subscriptions.get(&handle) {
-            Some(owner) if *owner == plugin => {
-                self.subscriptions.remove(&handle);
-                Ok(())
-            }
-            Some(_) => Err(permission_denied(plugin, handle)),
-            None => Err(ContractError::stale_handle(handle.to_string())),
-        }
-    }
-
-    fn event_catalog(&self) -> Vec<EventKindInfo> {
-        ApiMetadata::default().event_catalog
-    }
-}
-
-pub fn get_ui_host(
-    ingress: crate::runtime::RuntimeEventSender,
-) -> Box<dyn PluginUiHost + Send + Sync> {
-    Box::new(TermUiHost {
-        sender: ingress,
-        next_callback_id: std::sync::atomic::AtomicU64::new(1),
-    })
-}
-
-pub fn get_panel_host(
-    ingress: crate::runtime::RuntimeEventSender,
-) -> Box<dyn PluginPanelHost + Send + Sync> {
-    Box::new(TermPanelHost {
-        sender: ingress,
-        panel_owners: HashMap::new(),
-    })
-}
-
-pub fn get_command_host(
-    ingress: crate::runtime::RuntimeEventSender,
-) -> Box<dyn PluginCommandHost + Send + Sync> {
-    Box::new(TermCommandHost {
-        ingress,
-        next_command_handle: std::sync::atomic::AtomicU64::new(1),
-        commands: HashMap::new(),
-    })
-}
-
-pub fn get_event_host() -> Box<dyn PluginEventHost + Send + Sync> {
-    Box::new(TermEventHost {
-        next_subscription_handle: std::sync::atomic::AtomicU64::new(1),
-        subscriptions: HashMap::new(),
-    })
 }

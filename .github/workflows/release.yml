@@ -174,17 +174,17 @@ jobs:
           export OUTPUT="double-helix-$VERSION-$ARCH.AppImage"
           export UPDATE_INFORMATION="gh-releases-zsync|$GITHUB_REPOSITORY_OWNER|double-helix|latest|$APP-*-$ARCH.AppImage.zsync"
 
-          mkdir -p "$APP.AppDir"/usr/{bin,lib/helix}
+          mkdir -p "$APP.AppDir"/usr/{bin,lib/double-helix}
 
           cp "target/${{ matrix.target }}/opt/dhx" "$APP.AppDir/usr/bin/dhx"
           rm -rf runtime/grammars/sources
-          cp -r runtime "$APP.AppDir/usr/lib/helix/runtime"
+          cp -r runtime "$APP.AppDir/usr/lib/double-helix/runtime"
 
           cat << 'EOF' > "$APP.AppDir/AppRun"
           #!/bin/sh
 
           APPDIR="$(dirname "$(readlink -f "${0}")")"
-          HELIX_RUNTIME="$APPDIR/usr/lib/helix/runtime" exec "$APPDIR/usr/bin/dhx" "$@"
+          DOUBLE_HELIX_RUNTIME="$APPDIR/usr/lib/double-helix/runtime" exec "$APPDIR/usr/bin/dhx" "$@"
           EOF
           chmod 755 "$APP.AppDir/AppRun"
 

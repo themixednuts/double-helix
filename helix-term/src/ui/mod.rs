@@ -328,7 +328,7 @@ pub fn file_picker(
         .filter_entry(move |entry| filter_picker_entry(entry, &absolute_root, dedup_symlinks));
 
     walk_builder.add_custom_ignore_filename(helix_loader::config_dir().join("ignore"));
-    walk_builder.add_custom_ignore_filename(".helix/ignore");
+    walk_builder.add_custom_ignore_filename(helix_loader::workspace_ignore_file_name());
 
     // We want to exclude files that the editor can't handle yet
     let mut type_builder = TypesBuilder::new();
@@ -467,7 +467,7 @@ pub fn directory_content(
         .git_exclude(config.file_explorer.git_exclude)
         .max_depth(Some(1))
         .add_custom_ignore_filename(helix_loader::config_dir().join("ignore"))
-        .add_custom_ignore_filename(".helix/ignore")
+        .add_custom_ignore_filename(helix_loader::workspace_ignore_file_name())
         .types(get_excluded_types())
         .build()
         .filter_map(|entry| {

@@ -57,7 +57,7 @@
 | `bufferline.separator` | Separator rendered between buffer names when using `[editor.bufferline]`. | `"│"` |
 | `color-modes` | Whether to color the mode indicator with different colors depending on the mode itself | `false` |
 | `text-width` | Maximum line length. Used for the `:reflow` command and soft-wrapping if `soft-wrap.wrap-at-text-width` is set | `80` |
-| `workspace-lsp-roots` | Directories relative to the workspace root that are treated as LSP roots. Should only be set in `.helix/config.toml` | `[]` |
+| `workspace-lsp-roots` | Directories relative to the workspace root that are treated as LSP roots. Should only be set in `.double-helix/config.toml` | `[]` |
 | `default-line-ending` | The line ending to use for new documents. Can be `native`, `lf`, `crlf`, `ff`, `cr` or `nel`. `native` uses the platform's native line ending (`crlf` on Windows, otherwise `lf`). | `"native"` |
 | `insert-final-newline` | Whether to automatically insert a trailing line-ending on write if missing | `true` |
 | `atomic-save` | Whether to use atomic operations to write documents to disk. This prevents data loss if the editor is interrupted while writing the file, but may confuse some file watching/hot reloading programs. | `true` |
@@ -219,9 +219,9 @@ All git related options are only enabled in a git repository.
 
 Ignore files can be placed locally as `.ignore` or put in your home directory as `~/.ignore`. They support the usual ignore and negative ignore (unignore) rules used in `.gitignore` files.
 
-Additionally, you can use Helix-specific ignore files by creating a local `.helix/ignore` file in the current workspace or a global `ignore` file located in your Helix config directory:
-- Linux and Mac: `~/.config/helix/ignore`
-- Windows: `%AppData%\helix\ignore`
+Additionally, you can use Double Helix-specific ignore files by creating a local `.double-helix/ignore` file in the current workspace or a global `ignore` file located in your Double Helix config directory:
+- Linux and Mac: `~/.config/double-helix/ignore`
+- Windows: `%AppData%\double-helix\ignore`
 
 Example:
 

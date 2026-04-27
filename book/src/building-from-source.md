@@ -1,6 +1,6 @@
 ## Building from source
 
-- [Configuring Helix's runtime files](#configuring-helixs-runtime-files)
+- [Configuring Double Helix's runtime files](#configuring-double-helixs-runtime-files)
   - [Linux and macOS](#linux-and-macos)
   - [Windows](#windows)
   - [Multiple runtime directories](#multiple-runtime-directories)
@@ -55,61 +55,61 @@ RUSTFLAGS="-C target-feature=-crt-static"
 > 💡 Tree-sitter grammars can be fetched and compiled if not pre-packaged. Fetch
 > grammars with `dhx --grammar fetch` and compile them with
 > `dhx --grammar build`. This will install them in
-> the `runtime` directory within the user's helix config directory (more
+> the `runtime` directory within the user's Double Helix config directory (more
 > [details below](#multiple-runtime-directories)).
 
-### Configuring Helix's runtime files
+### Configuring Double Helix's runtime files
 
 #### Linux and macOS
 
-The **runtime** directory is one below the Helix source, so either export a
-`HELIX_RUNTIME` environment variable to point to that directory and add it to
+The **runtime** directory is one below the Double Helix source, so either export a
+`DOUBLE_HELIX_RUNTIME` environment variable to point to that directory and add it to
 your `~/.bashrc` or equivalent:
 
 ```sh
-export HELIX_RUNTIME=~/src/helix/runtime
+export DOUBLE_HELIX_RUNTIME=~/src/double-helix/runtime
 ```
 
 Or, create a symbolic link:
 
 ```sh
-ln -Tsf $PWD/runtime ~/.config/helix/runtime
+ln -Tsf $PWD/runtime ~/.config/double-helix/runtime
 ```
 
 #### Windows
 
-Either set the `HELIX_RUNTIME` environment variable to point to the runtime files using the Windows setting (search for
+Either set the `DOUBLE_HELIX_RUNTIME` environment variable to point to the runtime files using the Windows setting (search for
 `Edit environment variables for your account`) or use the `setx` command in
 Cmd:
 
 ```sh
-setx HELIX_RUNTIME "%userprofile%\src\helix\runtime"
+setx DOUBLE_HELIX_RUNTIME "%userprofile%\src\double-helix\runtime"
 ```
 
 > 💡 `%userprofile%` resolves to your user directory like
 > `C:\Users\Your-Name\` for example.
 
-Or, create a symlink in `%appdata%\helix\` that links to the source code directory:
+Or, create a symlink in `%appdata%\double-helix\` that links to the source code directory:
 
-| Method     | Command                                                                                |
-| ---------- | -------------------------------------------------------------------------------------- |
-| PowerShell | `New-Item -ItemType Junction -Target "runtime" -Path "$Env:AppData\helix\runtime"`     |
-| Cmd        | `cd %appdata%\helix` <br/> `mklink /D runtime "%userprofile%\src\helix\runtime"`       |
+| Method     | Command                                                                                              |
+| ---------- | ---------------------------------------------------------------------------------------------------- |
+| PowerShell | `New-Item -ItemType Junction -Target "runtime" -Path "$Env:AppData\double-helix\runtime"`            |
+| Cmd        | `cd %appdata%\double-helix` <br/> `mklink /D runtime "%userprofile%\src\double-helix\runtime"`       |
 
 > 💡 On Windows, creating a symbolic link may require running PowerShell or
 > Cmd as an administrator.
 
 #### Multiple runtime directories
 
-When Helix finds multiple runtime directories it will search through them for files in the
+When Double Helix finds multiple runtime directories it will search through them for files in the
 following order:
 
 1. `runtime/` sibling directory to `$CARGO_MANIFEST_DIR` directory (this is intended for
   developing and testing helix only).
-2. `runtime/` subdirectory of OS-dependent helix user config directory.
-3. `$HELIX_RUNTIME`
+2. `runtime/` subdirectory of OS-dependent Double Helix user config directory.
+3. `$DOUBLE_HELIX_RUNTIME`
 4. Distribution-specific fallback directory (set at compile time—not run time—
-   with the `HELIX_DEFAULT_RUNTIME` environment variable)
+   with the `DOUBLE_HELIX_DEFAULT_RUNTIME` environment variable)
 5. `runtime/` subdirectory of path to Helix executable.
 
 This order also sets the priority for selecting which file will be used if multiple runtime
@@ -117,25 +117,25 @@ directories have files with the same name.
 
 #### Note to packagers
 
-If you are making a package of Helix for end users, to provide a good out of
-the box experience, you should set the `HELIX_DEFAULT_RUNTIME` environment
+If you are making a package of Double Helix for end users, to provide a good out of
+the box experience, you should set the `DOUBLE_HELIX_DEFAULT_RUNTIME` environment
 variable at build time (before invoking `cargo build`) to a directory which
 will store the final runtime files after installation. For example, say you want
-to package the runtime into `/usr/lib/helix/runtime`. The rough steps a build
+to package the runtime into `/usr/lib/double-helix/runtime`. The rough steps a build
 script could follow are:
 
-1. `export HELIX_DEFAULT_RUNTIME=/usr/lib/helix/runtime`
+1. `export DOUBLE_HELIX_DEFAULT_RUNTIME=/usr/lib/double-helix/runtime`
 1. `cargo build --profile opt --locked`
-1. `cp -r runtime $BUILD_DIR/usr/lib/helix/`
+1. `cp -r runtime $BUILD_DIR/usr/lib/double-helix/`
 1. `cp target/opt/dhx $BUILD_DIR/usr/bin/dhx`
 
 This way the resulting `dhx` binary will always look for its runtime directory in
-`/usr/lib/helix/runtime` if the user has no custom runtime in `~/.config/helix`
-or `HELIX_RUNTIME`.
+`/usr/lib/double-helix/runtime` if the user has no custom runtime in
+`~/.config/double-helix` or `DOUBLE_HELIX_RUNTIME`.
 
 ### Validating the installation
 
-To make sure everything is set up as expected you should run the Helix health
+To make sure everything is set up as expected you should run the Double Helix health
 check:
 
 ```sh
@@ -149,7 +149,7 @@ For more information on the health check results refer to
 
 If your desktop environment supports the
 [XDG desktop menu](https://specifications.freedesktop.org/menu-spec/menu-spec-latest.html)
-you can configure Helix to show up in the application menu by copying the
+you can configure Double Helix to show up in the application menu by copying the
 provided `.desktop` and icon files to their correct folders:
 
 ```sh

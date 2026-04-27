@@ -1,3 +1,3 @@
 #!/usr/bin/env sh
 
-HELIX_RUNTIME=/usr/lib/helix/runtime exec /usr/lib/helix/dhx "$@"
+DOUBLE_HELIX_RUNTIME=/usr/lib/double-helix/runtime exec /usr/lib/double-helix/dhx "$@"

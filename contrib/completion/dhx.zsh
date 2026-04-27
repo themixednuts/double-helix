@@ -11,6 +11,7 @@ _dhx() {
 		"-V[Prints version information]" \
 		"--version[Prints version information]" \
 		"--tutor[Loads the tutorial]" \
+		"--migrate[Copies existing Helix config into Double Helix config paths]" \
 		"--health[Checks for errors in editor setup]:language:->health" \
 		"-g[Fetches or builds tree-sitter grammars]:action:->grammar" \
 		"--grammar[Fetches or builds tree-sitter grammars]:action:->grammar" \

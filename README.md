@@ -68,7 +68,7 @@ Or if you have `just` installed, you can simply run `just` recipes in the folder
 
 THEN THE IMPORTANT PART that is missing from the docs page(this way you get all the default themes and gramars), [source](https://github.com/helix-editor/helix/discussions/7549#discussioncomment-6948696)
 ```bash
-cp -R runtime ~/.config/helix/
+cp -R runtime ~/.config/double-helix/
 dhx -g fetch
 dhx -g build
 ```

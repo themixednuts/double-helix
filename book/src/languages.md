@@ -16,7 +16,7 @@ There are three possible locations for a `languages.toml` file:
    auto-formatting for Rust:
 
    ```toml
-   # in <config_dir>/helix/languages.toml
+   # in <config_dir>/double-helix/languages.toml
 
    [language-server.mylang-lsp]
    command = "mylang-lsp"
@@ -26,9 +26,9 @@ There are three possible locations for a `languages.toml` file:
    auto-format = false
    ```
 
-3. In a `.helix` folder in your project. Language configuration may also be
+3. In a `.double-helix` folder in your project. Language configuration may also be
    overridden local to a project by creating a `languages.toml` file in a
-   `.helix` folder. Its settings will be merged with the language configuration
+   `.double-helix` folder. Its settings will be merged with the language configuration
    in the configuration directory and the built-in configuration.
 
 ## Language configuration
@@ -72,7 +72,7 @@ These configuration keys are available:
 | `rulers`              | Overrides the `editor.rulers` config key for the language. |
 | `path-completion`     | Overrides the `editor.path-completion` config key for the language. |
 | `word-completion`     | Overrides the [`editor.word-completion`](./editor.md#editorword-completion-section) configuration for the language. |
-| `workspace-lsp-roots`     | Directories relative to the workspace root that are treated as LSP roots. Should only be set in `.helix/config.toml`. Overwrites the setting of the same name in `config.toml` if set. |
+| `workspace-lsp-roots`     | Directories relative to the workspace root that are treated as LSP roots. Should only be set in `.double-helix/config.toml`. Overwrites the setting of the same name in `config.toml` if set. |
 | `persistent-diagnostic-sources` | An array of LSP diagnostic sources assumed unchanged when the language server resends the same set of diagnostics. Helix can track the position for these diagnostics internally instead. Useful for diagnostics that are recomputed on save.
 | `rainbow-brackets` | Overrides the `editor.rainbow-brackets` config key for the language |
 

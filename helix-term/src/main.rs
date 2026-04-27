@@ -45,6 +45,11 @@ fn main() -> Result<()> {
 async fn main_impl(runtime: helix_runtime::Runtime) -> Result<i32> {
     let args = Args::parse_args().context("could not parse arguments")?;
 
+    if args.migrate {
+        helix_term::migration::migrate_from_helix()?;
+        return Ok(0);
+    }
+
     helix_loader::initialize_config_file(args.config_file.clone());
     helix_loader::initialize_log_file(args.log_file.clone());
 
@@ -65,6 +70,7 @@ ARGS:
 FLAGS:
     -h, --help                     Print help information
     --tutor                        Load the tutorial
+    --migrate                      Copy existing Helix config into Double Helix config paths
     --health [CATEGORY]            Check for potential errors in editor setup
                                    CATEGORY can be a language or one of 'clipboard', 'languages',
                                    'all-languages' or 'all'. 'languages' is filtered according to

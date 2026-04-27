@@ -23,7 +23,7 @@ There are three kinds of commands that can be used in keymaps:
   like `"<A-o>"`, e.g. `"@miw<A-o>"`
 
 To remap keys, create a `config.toml` file in your `helix` configuration
-directory (default `~/.config/helix` on Linux systems) with a structure like
+directory (default `~/.config/double-helix` on Linux systems) with a structure like
 this:
 
 > 💡 To set a modifier + key as a keymap, type `A-X = ...` or  `C-X = ...` for Alt + X or Ctrl + X. Combine with Shift using a dash, e.g. `C-S-esc`. 
@@ -33,7 +33,7 @@ this:
 # At most one section each of 'keys.normal', 'keys.insert' and 'keys.select'
 [keys.normal]
 C-s = ":w" # Maps Ctrl-s to the typable command :w which is an alias for :write (save file)
-C-o = ":open ~/.config/helix/config.toml" # Maps Ctrl-o to opening of the helix config file
+C-o = ":open ~/.config/double-helix/config.toml" # Maps Ctrl-o to opening of the Double Helix config file
 a = "move_char_left" # Maps the 'a' key to the move_char_left command
 w = "move_line_up" # Maps the 'w' key move_line_up
 "C-S-esc" = "extend_line" # Maps Ctrl-Shift-Escape to extend_line

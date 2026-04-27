@@ -14,11 +14,11 @@ Note that:
 
 ## Pre-built binaries
 
-Download pre-built binaries from the [GitHub Releases page](https://github.com/helix-editor/helix/releases).
-The tarball contents include an `hx` binary and a `runtime` directory.
-To set up Helix:
+Download pre-built binaries from the [GitHub Releases page](https://github.com/themixednuts/double-helix/releases).
+The tarball contents include a `dhx` binary and a `runtime` directory.
+To set up Double Helix:
 
-1. Add the `hx` binary to your system's `$PATH` to allow it to be used from the command line.
-2. Copy the `runtime` directory to a location that `hx` searches for runtime files. A typical location on Linux/macOS is `~/.config/helix/runtime`.
+1. Add the `dhx` binary to your system's `$PATH` to allow it to be used from the command line.
+2. Copy the `runtime` directory to a location that `dhx` searches for runtime files. A typical location on Linux/macOS is `~/.config/double-helix/runtime`.
 
-To see the runtime directories that `hx` searches, run `hx --health`. If necessary, you can override the default runtime location by setting the `HELIX_RUNTIME` environment variable.
+To see the runtime directories that `dhx` searches, run `dhx --health`. If necessary, you can override the default runtime location by setting the `DOUBLE_HELIX_RUNTIME` environment variable.

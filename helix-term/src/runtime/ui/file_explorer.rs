@@ -1,23 +1,31 @@
-use std::{
-    fs,
-    path::PathBuf,
-};
+use std::path::PathBuf;
 
 use crate::{
     compositor::Compositor,
-    runtime::{ui::command::FileExplorerCommand, RuntimeEvent, UiCommand},
+    runtime::{RuntimeEvent, UiCommand, ui::command::FileExplorerCommand},
     ui::{Prompt, PromptEvent},
 };
 use helix_view::Editor;
+
+fn is_directory_input(input: &str) -> bool {
+    input.ends_with(std::path::MAIN_SEPARATOR) || input.ends_with('/')
+}
+
 fn refresh_file_explorer(cursor: u32, cx: &mut crate::compositor::Context, root: PathBuf) {
     let ingress = cx.ingress.clone();
-    cx.editor.runtime().work().clone().spawn(async move {
-        crate::runtime::send_ui_command_with(
-            UiCommand::Layer(crate::runtime::LayerCommand::RefreshFileExplorer { cursor, root }),
-            ingress,
-        )
-        .await;
-    }).detach();
+    cx.editor
+        .work()
+        .spawn(async move {
+            crate::runtime::send_ui_command_with(
+                UiCommand::Layer(crate::runtime::LayerCommand::RefreshFileExplorer {
+                    cursor,
+                    root,
+                }),
+                ingress,
+            )
+            .await;
+        })
+        .detach();
 }
 
 pub(crate) fn apply_file_explorer_command(
@@ -42,22 +50,26 @@ pub(crate) fn apply_file_explorer_command(
                     }
 
                     let to_create_string = input.to_owned();
-                    let to_create = helix_stdx::path::expand_tilde(PathBuf::from(&to_create_string));
+                    let to_create =
+                        helix_stdx::path::expand_tilde(PathBuf::from(&to_create_string));
                     if to_create.exists() {
                         let root = root.clone();
                         cx.spawn_ui(async move {
-                            Ok(UiCommand::FileExplorer(FileExplorerCommand::ConfirmCreate {
-                                root,
-                                cursor,
-                                input: to_create_string,
-                                target: to_create.to_path_buf(),
-                            }))
+                            Ok(UiCommand::FileExplorer(
+                                FileExplorerCommand::ConfirmCreate {
+                                    root,
+                                    cursor,
+                                    input: to_create_string,
+                                    target: to_create.to_path_buf(),
+                                },
+                            ))
                         });
                         return;
                     }
 
-                    let result = if to_create_string.ends_with(std::path::MAIN_SEPARATOR) {
-                        match fs::create_dir_all(&to_create).map_err(|err| {
+                    let is_dir = is_directory_input(&to_create_string);
+                    let result = if is_dir {
+                        match cx.editor.create_path(&to_create, true).map_err(|err| {
                             format!("Unable to create directory {}: {err}", to_create.display())
                         }) {
                             Ok(()) => {
@@ -67,25 +79,10 @@ pub(crate) fn apply_file_explorer_command(
                             Err(err) => Err(err),
                         }
                     } else {
-                        let Some(to_create_parent) = to_create.parent() else {
-                            cx.editor.set_result(Err(format!(
-                                "Failed to get parent directory of {}",
-                                to_create.display()
-                            )));
-                            return;
-                        };
-
-                        if let Err(err_create_parent) = fs::create_dir_all(to_create_parent) {
-                            cx.editor.set_result(Err(format!(
-                                "Could not create intermediate directories: {err_create_parent}"
-                            )));
-                            return;
-                        }
-
-                        match fs::File::create(&to_create).map_err(|err| {
+                        match cx.editor.create_path(&to_create, false).map_err(|err| {
                             format!("Unable to create file {}: {err}", to_create.display())
                         }) {
-                            Ok(_) => {
+                            Ok(()) => {
                                 refresh_file_explorer(cursor, cx, root.clone());
                                 Ok(format!("Created file: {}", to_create.display()))
                             }
@@ -136,7 +133,7 @@ pub(crate) fn apply_file_explorer_command(
                     match cx.editor.move_path(&source, &move_to).map_err(|err| {
                         format!(
                             "Unable to move {} {} -> {}: {err}",
-                            if move_to_string.ends_with(std::path::MAIN_SEPARATOR) {
+                            if is_directory_input(&move_to_string) {
                                 "directory"
                             } else {
                                 "file"
@@ -179,10 +176,8 @@ pub(crate) fn apply_file_explorer_command(
                         return;
                     }
 
-                    let result = if !target.exists() {
-                        Some(Err(format!("Path {} does not exist", target.display())))
-                    } else if target.is_dir() {
-                        match fs::remove_dir_all(&target).map_err(|err| {
+                    let result = if target.is_dir() {
+                        match cx.editor.delete_path(&target).map_err(|err| {
                             format!("Unable to delete directory {}: {err}", target.display())
                         }) {
                             Ok(()) => {
@@ -192,7 +187,7 @@ pub(crate) fn apply_file_explorer_command(
                             Err(err) => Some(Err(err)),
                         }
                     } else {
-                        match fs::remove_file(&target).map_err(|err| {
+                        match cx.editor.delete_path(&target).map_err(|err| {
                             format!("Unable to delete file {}: {err}", target.display())
                         }) {
                             Ok(()) => {
@@ -229,7 +224,7 @@ pub(crate) fn apply_file_explorer_command(
                     let copy_to_string = input.to_owned();
                     let copy_to = helix_stdx::path::expand_tilde(PathBuf::from(&copy_to_string));
 
-                    if source.is_dir() || copy_to_string.ends_with(std::path::MAIN_SEPARATOR) {
+                    if source.is_dir() || is_directory_input(&copy_to_string) {
                         cx.editor.set_result(Err(format!(
                             "Copying directories is not supported: {} is a directory",
                             source.display()
@@ -253,7 +248,7 @@ pub(crate) fn apply_file_explorer_command(
                         return;
                     }
 
-                    match std::fs::copy(&source, &copy_to).map_err(|err| {
+                    match cx.editor.copy_path(&source, &copy_to).map_err(|err| {
                         format!(
                             "Unable to copy from file {} to {}: {err}",
                             source.display(),
@@ -291,10 +286,10 @@ pub(crate) fn apply_file_explorer_command(
                         return;
                     }
 
-                    let result = if input.ends_with(std::path::MAIN_SEPARATOR) {
-                        match fs::create_dir_all(&target)
-                            .map_err(|err| format!("Unable to create directory {}: {err}", target.display()))
-                        {
+                    let result = if is_directory_input(&input) {
+                        match cx.editor.create_path(&target, true).map_err(|err| {
+                            format!("Unable to create directory {}: {err}", target.display())
+                        }) {
                             Ok(()) => {
                                 refresh_file_explorer(cursor, cx, root.clone());
                                 Ok(format!("Created directory: {}", target.display()))
@@ -302,23 +297,10 @@ pub(crate) fn apply_file_explorer_command(
                             Err(err) => Err(err),
                         }
                     } else {
-                        let Some(parent) = target.parent() else {
-                            cx.editor.set_result(Err(format!(
-                                "Failed to get parent directory of {}",
-                                target.display()
-                            )));
-                            return;
-                        };
-                        if let Err(err) = fs::create_dir_all(parent) {
-                            cx.editor.set_result(Err(format!(
-                                "Could not create intermediate directories: {err}"
-                            )));
-                            return;
-                        }
-                        match fs::File::create(&target)
-                            .map_err(|err| format!("Unable to create file {}: {err}", target.display()))
-                        {
-                            Ok(_) => {
+                        match cx.editor.create_path(&target, false).map_err(|err| {
+                            format!("Unable to create file {}: {err}", target.display())
+                        }) {
+                            Ok(()) => {
                                 refresh_file_explorer(cursor, cx, root.clone());
                                 Ok(format!("Created file: {}", target.display()))
                             }
@@ -338,7 +320,11 @@ pub(crate) fn apply_file_explorer_command(
             destination,
         } => {
             let prompt = Prompt::new(
-                format!("Path {} already exists. Ovewrite? (y/n):", destination.display()).into(),
+                format!(
+                    "Path {} already exists. Ovewrite? (y/n):",
+                    destination.display()
+                )
+                .into(),
                 None,
                 crate::ui::completers::none,
                 move |cx, answer: &str, event: PromptEvent| {
@@ -349,7 +335,7 @@ pub(crate) fn apply_file_explorer_command(
                     match cx.editor.move_path(&source, &destination).map_err(|err| {
                         format!(
                             "Unable to move {} {} -> {}: {err}",
-                            if input.ends_with(std::path::MAIN_SEPARATOR) {
+                            if is_directory_input(&input) {
                                 "directory"
                             } else {
                                 "file"
@@ -376,7 +362,11 @@ pub(crate) fn apply_file_explorer_command(
             destination,
         } => {
             let prompt = Prompt::new(
-                format!("Path {} already exists. Ovewrite? (y/n):", destination.display()).into(),
+                format!(
+                    "Path {} already exists. Ovewrite? (y/n):",
+                    destination.display()
+                )
+                .into(),
                 None,
                 crate::ui::completers::none,
                 move |cx, answer: &str, event: PromptEvent| {
@@ -384,7 +374,7 @@ pub(crate) fn apply_file_explorer_command(
                         return;
                     }
 
-                    match std::fs::copy(&source, &destination).map_err(|err| {
+                    match cx.editor.copy_path(&source, &destination).map_err(|err| {
                         format!(
                             "Unable to copy from file {} to {}: {err}",
                             source.display(),

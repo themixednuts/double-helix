@@ -13,7 +13,6 @@ use crate::{
         text_decorations::DecorationManager,
     },
 };
-use futures_util::future::BoxFuture;
 use helix_core::unicode::width::UnicodeWidthStr;
 use helix_runtime::Sender;
 use nucleo::pattern::{CaseMatching, Normalization};
@@ -49,6 +48,7 @@ use helix_view::{
     editor::Action,
     graphics::{CursorKind, Margin, Modifier, Rect},
     input::KeyEvent,
+    keyboard::{KeyCode, KeyModifiers},
     theme::Style,
     traits::{Bounded, Scrollable as ViewScrollable, Viewport},
     view::ViewPosition,
@@ -58,6 +58,23 @@ use helix_view::{
 use self::handlers::{DynamicQueryChange, DynamicQueryHandler, PreviewHighlightHandler};
 
 pub(super) type SharedIngress = Arc<helix_runtime::Sender<crate::runtime::RuntimeEvent>>;
+
+#[derive(Clone)]
+pub struct PickerRuntime {
+    work: helix_runtime::Work,
+    clock: helix_runtime::Clock,
+    block: helix_runtime::Block,
+}
+
+impl PickerRuntime {
+    pub fn new(runtime: &helix_runtime::Runtime) -> Self {
+        Self {
+            work: runtime.work().clone(),
+            clock: runtime.clock().clone(),
+            block: runtime.block().clone(),
+        }
+    }
+}
 
 pub const ID: &str = "picker";
 
@@ -255,8 +272,13 @@ impl<T, D> Column<T, D> {
 
 /// Returns a new list of options to replace the contents of the picker
 /// when called with the current picker query,
-type DynQueryCallback<T, D> =
-    fn(&str, &mut Editor, Arc<D>, &Injector<T, D>) -> BoxFuture<'static, anyhow::Result<()>>;
+type DynQueryCallback<T, D> = fn(
+    &str,
+    &mut Editor,
+    Arc<D>,
+    &Injector<T, D>,
+    helix_runtime::Work,
+) -> helix_runtime::Task<anyhow::Result<()>>;
 
 type PickerItemDataFn<T> = Box<dyn Fn(&T) -> helix_view::model::PickerItemData + Send + Sync>;
 
@@ -315,7 +337,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
     pub fn stream(
         columns: impl IntoIterator<Item = Column<T, D>>,
         editor_data: D,
-        _runtime: helix_runtime::Runtime,
+        _runtime: PickerRuntime,
         ingress: helix_runtime::Sender<crate::runtime::RuntimeEvent>,
     ) -> (Nucleo<T>, Injector<T, D>) {
         let columns: Arc<[_]> = columns.into_iter().collect();
@@ -348,7 +370,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
         primary_column: usize,
         options: O,
         editor_data: D,
-        runtime: helix_runtime::Runtime,
+        runtime: PickerRuntime,
         ingress: helix_runtime::Sender<crate::runtime::RuntimeEvent>,
         callback_fn: F,
     ) -> Self
@@ -374,47 +396,44 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
         for item in options {
             inject_nucleo_item(&injector, &columns, item, &editor_data);
         }
-        Self::with(
-            matcher,
-            columns,
-            primary_column,
-            Arc::new(editor_data),
-            Arc::new(AtomicUsize::new(0)),
-            runtime,
-            ingress,
-            callback_fn,
-        )
+        let injector = Injector {
+            dst: injector,
+            columns: columns.clone(),
+            editor_data: Arc::new(editor_data),
+            version: 0,
+            picker_version: Arc::new(AtomicUsize::new(0)),
+            ingress: ingress.clone(),
+            _redraw: RuntimeRedrawOnDrop {
+                ingress: ingress.clone(),
+            },
+        };
+        Self::with(matcher, primary_column, injector, runtime, callback_fn)
     }
 
     pub fn with_stream(
         matcher: Nucleo<T>,
         primary_column: usize,
         injector: Injector<T, D>,
-        runtime: helix_runtime::Runtime,
+        runtime: PickerRuntime,
         callback_fn: impl Fn(&mut Context, &T, Action) + Send + 'static,
     ) -> Self {
-        Self::with(
-            matcher,
-            injector.columns,
-            primary_column,
-            injector.editor_data,
-            injector.picker_version,
-            runtime,
-            injector.ingress,
-            callback_fn,
-        )
+        Self::with(matcher, primary_column, injector, runtime, callback_fn)
     }
 
     fn with(
         matcher: Nucleo<T>,
-        columns: Arc<[Column<T, D>]>,
         default_column: usize,
-        editor_data: Arc<D>,
-        version: Arc<AtomicUsize>,
-        runtime: helix_runtime::Runtime,
-        ingress: SharedIngress,
+        injector: Injector<T, D>,
+        runtime: PickerRuntime,
         callback_fn: impl Fn(&mut Context, &T, Action) + Send + 'static,
     ) -> Self {
+        let Injector {
+            columns,
+            editor_data,
+            picker_version: version,
+            ingress,
+            ..
+        } = injector;
         assert!(!columns.is_empty());
 
         let prompt = Prompt::new(
@@ -430,9 +449,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             .collect();
 
         let query = PickerQuery::new(columns.iter().map(|col| &col.name).cloned(), default_column);
-        let work = runtime.work().clone();
-        let clock = runtime.clock().clone();
-        let block = runtime.block().clone();
+        let PickerRuntime { work, clock, block } = runtime;
 
         Self {
             columns,
@@ -558,22 +575,28 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
         let ingress = (*self.ingress).clone();
         let path = path.to_path_buf();
 
-        self.block.clone().spawn(move || {
-            let syntax = match helix_core::Syntax::new(text.slice(..), language, &loader) {
-                Ok(syntax) => syntax,
-                Err(err) => {
-                    log::info!("highlighting picker preview failed: {err}");
-                    return;
-                }
-            };
+        self.block
+            .clone()
+            .spawn(move || {
+                let syntax = match helix_core::Syntax::new(text.slice(..), language, &loader) {
+                    Ok(syntax) => syntax,
+                    Err(err) => {
+                        log::info!("highlighting picker preview failed: {err}");
+                        return;
+                    }
+                };
 
-            helix_runtime::send_blocking(
-                &ingress,
-                crate::runtime::RuntimeEvent::Ui(crate::runtime::UiCommand::Picker(
-                    crate::runtime::ui::command::PickerCommand::ApplyPreviewSyntax { path, syntax },
-                )),
-            );
-        }).detach();
+                helix_runtime::send_blocking(
+                    &ingress,
+                    crate::runtime::RuntimeEvent::Ui(crate::runtime::UiCommand::Picker(
+                        crate::runtime::ui::command::PickerCommand::ApplyPreviewSyntax {
+                            path,
+                            syntax,
+                        },
+                    )),
+                );
+            })
+            .detach();
     }
 
     fn apply_preview_syntax(
@@ -586,11 +609,8 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
         let Some(CachedPreview::Document(ref mut doc)) = self.preview_cache.get_mut(&path) else {
             return;
         };
-        let diagnostics = helix_view::Editor::doc_diagnostics(
-            &editor.language_servers,
-            &editor.diagnostics,
-            doc,
-        );
+        let diagnostics =
+            helix_view::Editor::doc_diagnostics(&editor.language_servers, &editor.diagnostics, doc);
         doc.replace_diagnostics(diagnostics, &[], None);
         doc.set_syntax(Some(syntax));
     }
@@ -602,12 +622,20 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             return;
         };
         let injector = self.injector();
-        let future = (callback)(&query, editor, self.editor_data.clone(), &injector);
+        let task = (callback)(
+            &query,
+            editor,
+            self.editor_data.clone(),
+            &injector,
+            self.work.clone(),
+        );
         self.work
             .clone()
             .spawn(async move {
-                if let Err(err) = future.await {
-                    log::info!("Dynamic request failed: {err}");
+                match task.await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => log::info!("Dynamic request failed: {err}"),
+                    Err(err) => log::info!("Dynamic request task failed: {err}"),
                 }
             })
             .detach();
@@ -871,6 +899,22 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
     }
 
     fn custom_key_event_handler(&mut self, event: &KeyEvent, cx: &mut Context) -> EventResult {
+        if !self.prompt.line().is_empty()
+            && event.modifiers == KeyModifiers::NONE
+            && matches!(
+                event.code,
+                KeyCode::Char(_)
+                    | KeyCode::Backspace
+                    | KeyCode::Delete
+                    | KeyCode::Left
+                    | KeyCode::Right
+                    | KeyCode::Home
+                    | KeyCode::End
+            )
+        {
+            return EventResult::Ignored(None);
+        }
+
         if let (Some(callback), Some(selected)) =
             (self.custom_key_handlers.get(event), self.selection())
         {

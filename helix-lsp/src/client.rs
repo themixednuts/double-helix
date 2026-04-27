@@ -48,6 +48,15 @@ fn workspace_for_uri(uri: lsp::Url) -> WorkspaceFolder {
     }
 }
 
+fn file_operation_uri(path: &Path, is_dir: bool) -> Option<String> {
+    let url = if is_dir {
+        Url::from_directory_path(path)
+    } else {
+        Url::from_file_path(path)
+    };
+    Some(url.ok()?.to_string())
+}
+
 #[derive(Debug)]
 pub struct Client {
     id: LanguageServerId,
@@ -587,8 +596,12 @@ impl Client {
                         relative_pattern_support: Some(true),
                     }),
                     file_operations: Some(lsp::WorkspaceFileOperationsClientCapabilities {
+                        will_create: Some(true),
+                        did_create: Some(true),
                         will_rename: Some(true),
                         did_rename: Some(true),
+                        will_delete: Some(true),
+                        did_delete: Some(true),
                         ..Default::default()
                     }),
                     diagnostic: Some(lsp::DiagnosticWorkspaceClientCapabilities {
@@ -764,6 +777,36 @@ impl Client {
         })
     }
 
+    pub fn will_create(
+        &self,
+        path: &Path,
+        is_dir: bool,
+    ) -> Option<impl Future<Output = Result<Option<lsp::WorkspaceEdit>>>> {
+        let capabilities = self.file_operations_intests();
+        if !capabilities.will_create.has_interest(path, is_dir) {
+            return None;
+        }
+        let files = vec![lsp::FileCreate {
+            uri: file_operation_uri(path, is_dir)?,
+        }];
+        Some(self.call_with_timeout::<lsp::request::WillCreateFiles>(
+            &lsp::CreateFilesParams { files },
+            5,
+        ))
+    }
+
+    pub fn did_create(&self, path: &Path, is_dir: bool) -> Option<()> {
+        let capabilities = self.file_operations_intests();
+        if !capabilities.did_create.has_interest(path, is_dir) {
+            return None;
+        }
+        let files = vec![lsp::FileCreate {
+            uri: file_operation_uri(path, is_dir)?,
+        }];
+        self.notify::<lsp::notification::DidCreateFiles>(lsp::CreateFilesParams { files });
+        Some(())
+    }
+
     pub fn will_rename(
         &self,
         old_path: &Path,
@@ -774,17 +817,9 @@ impl Client {
         if !capabilities.will_rename.has_interest(old_path, is_dir) {
             return None;
         }
-        let url_from_path = |path| {
-            let url = if is_dir {
-                Url::from_directory_path(path)
-            } else {
-                Url::from_file_path(path)
-            };
-            Some(url.ok()?.to_string())
-        };
         let files = vec![lsp::FileRename {
-            old_uri: url_from_path(old_path)?,
-            new_uri: url_from_path(new_path)?,
+            old_uri: file_operation_uri(old_path, is_dir)?,
+            new_uri: file_operation_uri(new_path, is_dir)?,
         }];
         Some(self.call_with_timeout::<lsp::request::WillRenameFiles>(
             &lsp::RenameFilesParams { files },
@@ -797,20 +832,42 @@ impl Client {
         if !capabilities.did_rename.has_interest(new_path, is_dir) {
             return None;
         }
-        let url_from_path = |path| {
-            let url = if is_dir {
-                Url::from_directory_path(path)
-            } else {
-                Url::from_file_path(path)
-            };
-            Some(url.ok()?.to_string())
-        };
 
         let files = vec![lsp::FileRename {
-            old_uri: url_from_path(old_path)?,
-            new_uri: url_from_path(new_path)?,
+            old_uri: file_operation_uri(old_path, is_dir)?,
+            new_uri: file_operation_uri(new_path, is_dir)?,
         }];
         self.notify::<lsp::notification::DidRenameFiles>(lsp::RenameFilesParams { files });
+        Some(())
+    }
+
+    pub fn will_delete(
+        &self,
+        path: &Path,
+        is_dir: bool,
+    ) -> Option<impl Future<Output = Result<Option<lsp::WorkspaceEdit>>>> {
+        let capabilities = self.file_operations_intests();
+        if !capabilities.will_delete.has_interest(path, is_dir) {
+            return None;
+        }
+        let files = vec![lsp::FileDelete {
+            uri: file_operation_uri(path, is_dir)?,
+        }];
+        Some(self.call_with_timeout::<lsp::request::WillDeleteFiles>(
+            &lsp::DeleteFilesParams { files },
+            5,
+        ))
+    }
+
+    pub fn did_delete(&self, path: &Path, is_dir: bool) -> Option<()> {
+        let capabilities = self.file_operations_intests();
+        if !capabilities.did_delete.has_interest(path, is_dir) {
+            return None;
+        }
+        let files = vec![lsp::FileDelete {
+            uri: file_operation_uri(path, is_dir)?,
+        }];
+        self.notify::<lsp::notification::DidDeleteFiles>(lsp::DeleteFilesParams { files });
         Some(())
     }
 

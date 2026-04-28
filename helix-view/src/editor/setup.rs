@@ -53,7 +53,7 @@ impl Editor {
             language_servers,
             diagnostics: Diagnostics::new(),
             workspace_diagnostic_counts: WorkspaceDiagnosticCounts::default(),
-            diff_providers: DiffProviderRegistry::default(),
+            diff_providers: DiffProviderRegistry::new(conf.vcs.provider.into()),
             debug_adapters: dap::registry::Registry::new(),
             breakpoints: HashMap::new(),
             runtime,

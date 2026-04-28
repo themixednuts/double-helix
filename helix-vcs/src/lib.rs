@@ -1,6 +1,6 @@
 //! `helix_vcs` provides types for working with diffs from a Version Control System (VCS).
-//! Git provides full diff support. Changed-file status also checks Jujutsu before falling
-//! back to the diff providers.
+//! Git provides full diff support. Changed-file status can use Git, Jujutsu, or automatic
+//! detection that checks Jujutsu before falling back to Git.
 
 use anyhow::{anyhow, bail, Result};
 use arc_swap::ArcSwap;
@@ -28,13 +28,43 @@ pub use status::FileChange;
 /// need optional dependencies.
 #[derive(Clone, Debug)]
 pub struct DiffProviderRegistry {
+    provider: VcsProvider,
     providers: Vec<DiffProvider>,
 }
 
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum VcsProvider {
+    #[default]
+    Auto,
+    Git,
+    Jj,
+    None,
+}
+
 impl DiffProviderRegistry {
+    pub fn new(provider: VcsProvider) -> Self {
+        let providers = vec![
+            #[cfg(feature = "git")]
+            DiffProvider::Git,
+            DiffProvider::None,
+        ];
+        Self {
+            provider,
+            providers,
+        }
+    }
+
+    pub const fn provider(&self) -> VcsProvider {
+        self.provider
+    }
+
     /// Get the given file from the VCS. This provides the unedited document as a "base"
     /// for a diff to be created.
     pub fn get_diff_base(&self, file: &Path) -> Option<Vec<u8>> {
+        if !matches!(self.provider, VcsProvider::Auto | VcsProvider::Git) {
+            return None;
+        }
+
         self.providers
             .iter()
             .find_map(|provider| match provider.get_diff_base(file) {
@@ -49,6 +79,10 @@ impl DiffProviderRegistry {
 
     /// Get the current name of the current [HEAD](https://stackoverflow.com/questions/2304087/what-is-head-in-git).
     pub fn get_current_head_name(&self, file: &Path) -> Option<Arc<ArcSwap<Box<str>>>> {
+        if !matches!(self.provider, VcsProvider::Auto | VcsProvider::Git) {
+            return None;
+        }
+
         self.providers
             .iter()
             .find_map(|provider| match provider.get_current_head_name(file) {
@@ -98,10 +132,24 @@ impl DiffProviderRegistry {
         cwd: &Path,
         mut f: impl FnMut(Result<FileChange>) -> bool,
     ) -> Result<()> {
-        if jj::for_each_changed_file(cwd, &mut f).is_ok() {
-            return Ok(());
+        match self.provider {
+            VcsProvider::Auto => {
+                if jj::for_each_changed_file(cwd, &mut f).is_ok() {
+                    return Ok(());
+                }
+                self.for_each_diff_provider_changed_file(cwd, f)
+            }
+            VcsProvider::Git => self.for_each_diff_provider_changed_file(cwd, f),
+            VcsProvider::Jj => jj::for_each_changed_file(cwd, f),
+            VcsProvider::None => Ok(()),
         }
+    }
 
+    fn for_each_diff_provider_changed_file(
+        &self,
+        cwd: &Path,
+        mut f: impl FnMut(Result<FileChange>) -> bool,
+    ) -> Result<()> {
         self.providers
             .iter()
             .find_map(
@@ -120,12 +168,7 @@ impl DiffProviderRegistry {
 
 impl Default for DiffProviderRegistry {
     fn default() -> Self {
-        let providers = vec![
-            #[cfg(feature = "git")]
-            DiffProvider::Git,
-            DiffProvider::None,
-        ];
-        DiffProviderRegistry { providers }
+        Self::new(VcsProvider::Auto)
     }
 }
 
@@ -167,5 +210,28 @@ impl DiffProvider {
             Self::Git => git::for_each_changed_file(_cwd, _f),
             Self::None => bail!("No diff support compiled in"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DiffProviderRegistry, VcsProvider};
+
+    #[test]
+    fn default_provider_is_auto() {
+        assert_eq!(
+            DiffProviderRegistry::default().provider(),
+            VcsProvider::Auto
+        );
+    }
+
+    #[test]
+    fn explicit_none_provider_returns_no_changed_files() {
+        let registry = DiffProviderRegistry::new(VcsProvider::None);
+
+        assert_eq!(
+            registry.changed_files(std::path::Path::new(".")).unwrap(),
+            []
+        );
     }
 }

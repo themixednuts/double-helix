@@ -21,6 +21,8 @@ impl Application {
                 if let Err(err) = self.terminal.reconfigure((&app_config.editor).into()) {
                     self.editor.set_error(err.to_string());
                 };
+                self.editor.diff_providers =
+                    helix_vcs::DiffProviderRegistry::new(app_config.editor.vcs.provider.into());
                 self.config.store(Arc::new(app_config));
                 self.editor
                     .dispatch_editor_config_change(&old_editor_config);
@@ -51,6 +53,8 @@ impl Application {
             self.editor.refresh_document_languages();
 
             self.terminal.reconfigure((&default_config.editor).into())?;
+            self.editor.diff_providers =
+                helix_vcs::DiffProviderRegistry::new(default_config.editor.vcs.provider.into());
             self.config.store(Arc::new(default_config));
             self.editor
                 .set_modal_keymaps(crate::keymap::to_component_modal_keymaps(

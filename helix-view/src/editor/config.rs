@@ -288,6 +288,7 @@ pub struct Config {
     pub file_picker: FilePickerConfig,
     pub bufferline: BufferLineConfig,
     pub file_explorer: FileExplorerConfig,
+    pub vcs: VcsConfig,
     pub statusline: StatusLineConfig,
     pub cursor_shape: CursorShapeConfig,
     pub true_color: bool,
@@ -348,6 +349,41 @@ pub struct Config {
     pub acp: AcpConfig,
     #[serde(default)]
     pub editing_engine: EditingEngineConfig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", default, deny_unknown_fields)]
+pub struct VcsConfig {
+    pub provider: VcsProvider,
+}
+
+impl Default for VcsConfig {
+    fn default() -> Self {
+        Self {
+            provider: VcsProvider::Auto,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum VcsProvider {
+    #[default]
+    Auto,
+    Git,
+    Jj,
+    None,
+}
+
+impl From<VcsProvider> for helix_vcs::VcsProvider {
+    fn from(provider: VcsProvider) -> Self {
+        match provider {
+            VcsProvider::Auto => Self::Auto,
+            VcsProvider::Git => Self::Git,
+            VcsProvider::Jj => Self::Jj,
+            VcsProvider::None => Self::None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -1447,6 +1483,7 @@ impl Default for Config {
             file_picker: FilePickerConfig::default(),
             bufferline: BufferLineConfig::default(),
             file_explorer: FileExplorerConfig::default(),
+            vcs: VcsConfig::default(),
             statusline: StatusLineConfig::default(),
             cursor_shape: CursorShapeConfig::default(),
             true_color: false,
@@ -1501,7 +1538,7 @@ impl Default for Config {
 
 #[cfg(test)]
 mod tests {
-    use super::{BufferLineRenderMode, Config};
+    use super::{BufferLineRenderMode, Config, VcsProvider};
 
     #[test]
     fn bufferline_accepts_render_mode_string() {
@@ -1527,5 +1564,18 @@ mod tests {
 
         assert_eq!(config.bufferline.render_mode, BufferLineRenderMode::Always);
         assert_eq!(config.bufferline.separator, ">");
+    }
+
+    #[test]
+    fn vcs_provider_accepts_explicit_selection() {
+        let config: Config = toml::from_str(
+            r#"
+            [vcs]
+            provider = "jj"
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(config.vcs.provider, VcsProvider::Jj);
     }
 }

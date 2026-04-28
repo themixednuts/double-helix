@@ -203,12 +203,18 @@ impl Editor {
                 Editor::doc_diagnostics(&self.language_servers, &self.diagnostics, &doc);
             doc.replace_diagnostics(diagnostics, &[], None);
 
-            if let Some(diff_base) = self.diff_providers.get_diff_base(&path) {
-                doc.set_diff_base(diff_base);
-            }
-            doc.set_version_control_head(self.diff_providers.get_current_head_name(&path));
+            let diff_base = self.diff_providers.get_diff_base(&path);
+            let version_control_head = self.diff_providers.get_current_head_name(&path);
 
             let id = self.new_document(doc);
+            let doc = self
+                .documents
+                .get_mut(&id)
+                .expect("newly inserted document must exist");
+            if let Some(diff_base) = diff_base {
+                doc.set_diff_base(diff_base);
+            }
+            doc.set_version_control_head(version_control_head);
 
             self.launch_language_servers(id);
 
@@ -345,5 +351,94 @@ impl Editor {
         self.dispatch_document_close(doc);
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{path::Path, process::Command, sync::Arc};
+
+    use arc_swap::ArcSwap;
+    use helix_core::syntax;
+
+    use super::*;
+    use crate::{editor::Config, graphics::Rect, handlers::Handlers, theme, View};
+
+    fn exec_git(args: &[&str], repo: &Path) {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_ASKPASS")
+            .env_remove("SSH_ASKPASS")
+            .env("GIT_TERMINAL_PROMPT", "false")
+            .env("GIT_AUTHOR_DATE", "2000-01-01 00:00:00 +0000")
+            .env("GIT_AUTHOR_EMAIL", "author@example.com")
+            .env("GIT_AUTHOR_NAME", "author")
+            .env("GIT_COMMITTER_DATE", "2000-01-02 00:00:00 +0000")
+            .env("GIT_COMMITTER_EMAIL", "committer@example.com")
+            .env("GIT_COMMITTER_NAME", "committer")
+            .env("GIT_CONFIG_COUNT", "2")
+            .env("GIT_CONFIG_KEY_0", "commit.gpgsign")
+            .env("GIT_CONFIG_VALUE_0", "false")
+            .env("GIT_CONFIG_KEY_1", "init.defaultBranch")
+            .env("GIT_CONFIG_VALUE_1", "main")
+            .output()
+            .unwrap_or_else(|_| panic!("`git {args:?}` failed"));
+
+        if !output.status.success() {
+            println!("{}", String::from_utf8_lossy(&output.stdout));
+            eprintln!("{}", String::from_utf8_lossy(&output.stderr));
+            panic!("`git {args:?}` failed");
+        }
+    }
+
+    fn test_editor(runtime: helix_runtime::Runtime) -> Editor {
+        let theme_loader = Arc::new(theme::Loader::new(&[]));
+        let syn_loader = Arc::new(ArcSwap::from_pointee(syntax::Loader::default()));
+        let config = Arc::new(ArcSwap::from_pointee(Config::default()));
+        let handlers = Handlers::dummy();
+        let mut editor = Editor::new(
+            Rect::new(0, 0, 120, 40),
+            theme_loader,
+            syn_loader,
+            config,
+            runtime,
+            handlers,
+        );
+        let doc_id = editor.new_document(Document::default(
+            editor.config.clone(),
+            editor.syn_loader.clone(),
+        ));
+        let mut view = View::new(doc_id, editor.config().gutters.clone());
+        editor.bind_view_redraw(&mut view);
+        let view_id = editor.tree.insert(view);
+        let _ = editor.track_tree_surface(view_id);
+        let doc = crate::doc_mut!(editor, &doc_id);
+        doc.ensure_view_init(view_id);
+        doc.mark_as_focused();
+        editor
+    }
+
+    #[test]
+    fn open_git_document_binds_redraw_before_vcs_diff() {
+        let tokio = tokio::runtime::Runtime::new().expect("runtime");
+        let _guard = tokio.enter();
+        let runtime = helix_runtime::Runtime::new(tokio.handle().clone());
+        let repo = tempfile::tempdir().expect("create temp git repo");
+        exec_git(&["init"], repo.path());
+
+        let file = repo.path().join("tracked.txt");
+        std::fs::write(&file, "base\n").expect("write base file");
+        exec_git(&["add", "tracked.txt"], repo.path());
+        exec_git(&["commit", "-m", "initial"], repo.path());
+        std::fs::write(&file, "changed\n").expect("write changed file");
+
+        let mut editor = test_editor(runtime);
+        let doc_id = editor.open(&file, Action::Replace).expect("open file");
+        let doc = editor.document(doc_id).expect("document");
+
+        assert!(doc.diff_handle().is_some());
     }
 }

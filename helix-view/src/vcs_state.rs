@@ -19,31 +19,21 @@ pub enum LineBlameError<'a> {
 #[derive(Debug, Default)]
 pub struct VcsState {
     diff_handle: Option<DiffHandle>,
-    redraw: Option<FrameHandle>,
     version_control_head: Option<Arc<ArcSwap<Box<str>>>>,
     file_blame: Option<anyhow::Result<FileBlame>>,
     blame_outdated: bool,
 }
 
 impl VcsState {
-    pub fn bind_redraw(&mut self, redraw: FrameHandle) {
-        self.redraw = Some(redraw);
-    }
-
     pub fn diff_handle(&self) -> Option<&DiffHandle> {
         self.diff_handle.as_ref()
     }
 
-    pub fn set_diff_base(&mut self, diff_base: Rope, text: Rope) {
+    pub fn set_diff_base(&mut self, diff_base: Rope, text: Rope, redraw: FrameHandle) {
         if let Some(differ) = &self.diff_handle {
             differ.update_diff_base(diff_base);
             return;
         }
-        let redraw = self
-            .redraw
-            .as_ref()
-            .expect("document vcs state requires redraw sender")
-            .clone();
         self.diff_handle = Some(DiffHandle::new(diff_base, text, redraw));
     }
 

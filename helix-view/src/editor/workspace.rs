@@ -207,12 +207,13 @@ impl Editor {
             let version_control_head = self.diff_providers.get_current_head_name(&path);
 
             let id = self.new_document(doc);
+            let redraw = self.document_redraw_handle();
             let doc = self
                 .documents
                 .get_mut(&id)
                 .expect("newly inserted document must exist");
             if let Some(diff_base) = diff_base {
-                doc.set_diff_base(diff_base);
+                doc.set_diff_base(diff_base, &redraw);
             }
             doc.set_version_control_head(version_control_head);
 

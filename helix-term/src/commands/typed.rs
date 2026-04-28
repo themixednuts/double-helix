@@ -1467,9 +1467,11 @@ fn reload(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> anyh
 
     let scrolloff = cx.editor.config().scrolloff;
     let auto_fetch = cx.editor.config().inline_blame.auto_fetch;
+    let diff_providers = cx.editor.diff_providers.clone();
+    let redraw = cx.editor.document_redraw_handle();
     let (view_id, doc) = focused!(cx.editor);
     let view = view_mut!(cx.editor, view_id);
-    doc.reload(view, &cx.editor.diff_providers).map(|_| {
+    doc.reload(view, &diff_providers, &redraw).map(|_| {
         view.ensure_cursor_in_view(doc, scrolloff);
     })?;
     let doc_id = doc.id();
@@ -1526,6 +1528,8 @@ pub fn reload_all_impl(editor: &mut Editor) -> anyhow::Result<()> {
         .collect();
 
     let blame_compute = editor.config().inline_blame.auto_fetch;
+    let diff_providers = editor.diff_providers.clone();
+    let redraw = editor.document_redraw_handle();
 
     for (doc_id, view_ids) in docs_view_ids {
         let doc = doc_mut!(editor, &doc_id);
@@ -1536,7 +1540,7 @@ pub fn reload_all_impl(editor: &mut Editor) -> anyhow::Result<()> {
         // Ensure that the view is synced with the document's history.
         view.sync_changes(doc);
 
-        if let Err(error) = doc.reload(view, &editor.diff_providers) {
+        if let Err(error) = doc.reload(view, &diff_providers, &redraw) {
             editor.set_error(format!("{}", error));
             continue;
         }

@@ -2,7 +2,7 @@ use std::{num::NonZeroUsize, path::Path};
 
 use slotmap::Key;
 
-use crate::{Document, DocumentId, ViewId};
+use crate::{document::DocumentRedrawHandle, Document, DocumentId, ViewId};
 
 use super::Editor;
 
@@ -13,7 +13,6 @@ impl Editor {
             NonZeroUsize::new_unchecked(self.next_document_id.value().get() + 1)
         });
         doc.bind_lifecycle(self.lifecycle.clone());
-        doc.bind_redraw(self.frame_gate.handle());
         doc.id = id;
         self.documents.insert(id, doc);
 
@@ -29,10 +28,13 @@ impl Editor {
             NonZeroUsize::new_unchecked(self.next_document_id.value().get() + 1)
         });
         doc.bind_lifecycle(self.lifecycle.clone());
-        doc.bind_redraw(self.frame_gate.handle());
         doc.id = id;
         self.component_docs.insert(id, doc);
         id
+    }
+
+    pub fn document_redraw_handle(&self) -> DocumentRedrawHandle {
+        DocumentRedrawHandle::new(self.frame_gate.handle())
     }
 
     #[inline]

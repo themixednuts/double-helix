@@ -4,9 +4,8 @@ use super::{Editor, EditorEvent};
 
 impl Editor {
     pub(crate) fn bind_view_redraw(&self, view: &mut View) {
-        view.diagnostics_handler.bind_runtime(self.runtime.clone());
         view.diagnostics_handler
-            .bind_redraw(self.frame_gate.handle());
+            .bind_runtime(self.runtime.clone(), self.frame_gate.handle());
     }
 
     pub(crate) fn track_tree_surface(

@@ -12,7 +12,7 @@ use helix_core::syntax::config::LanguageServerFeature;
 use helix_core::text_annotations::{InlineAnnotation, Overlay, TextAnnotations};
 use helix_core::text_folding::{EndFoldPoint, FoldContainer, RopeSliceFoldExt, StartFoldPoint};
 use helix_lsp::util::lsp_pos_to_pos;
-use helix_runtime::{Task, TaskError, Work};
+use helix_runtime::{FrameHandle, Task, TaskError, Work};
 use helix_stdx::faccess::{copy_metadata, readonly};
 use helix_vcs::{DiffHandle, DiffProviderRegistry};
 
@@ -234,6 +234,19 @@ pub struct PluginAnnotation {
     /// Alternate text to use when this annotation is "dropped" to a virtual line
     /// (e.g., elbow symbol instead of arrow for diagnostics on narrow terminals)
     pub dropped_text: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct DocumentRedrawHandle(FrameHandle);
+
+impl DocumentRedrawHandle {
+    pub(crate) fn new(redraw: FrameHandle) -> Self {
+        Self(redraw)
+    }
+
+    fn frame_handle(&self) -> FrameHandle {
+        self.0.clone()
+    }
 }
 
 pub struct Document {
@@ -706,10 +719,6 @@ use helix_lsp::{lsp, Client, LanguageServerId, LanguageServerName};
 use url::Url;
 
 impl Document {
-    pub fn bind_redraw(&mut self, redraw: helix_runtime::FrameHandle) {
-        self.vcs.bind_redraw(redraw);
-    }
-
     pub fn bind_lifecycle(&mut self, lifecycle: Arc<LifecycleBus>) {
         self.lifecycle = lifecycle;
     }
@@ -1226,6 +1235,7 @@ impl Document {
         &mut self,
         view: &mut View,
         provider_registry: &DiffProviderRegistry,
+        redraw: &DocumentRedrawHandle,
     ) -> Result<(), Error> {
         let encoding = self.encoding();
         let path = match self.path() {
@@ -1253,7 +1263,7 @@ impl Document {
         self.detect_indent_and_line_ending();
 
         match provider_registry.get_diff_base(&path) {
-            Some(diff_base) => self.set_diff_base(diff_base),
+            Some(diff_base) => self.set_diff_base(diff_base, redraw),
             None => self.vcs.clear_diff_base(),
         }
 
@@ -2251,9 +2261,10 @@ impl Document {
     }
 
     /// Intialize/updates the differ for this document with a new base.
-    pub fn set_diff_base(&mut self, diff_base: Vec<u8>) {
+    pub fn set_diff_base(&mut self, diff_base: Vec<u8>, redraw: &DocumentRedrawHandle) {
         if let Ok((diff_base, ..)) = from_reader(&mut diff_base.as_slice(), Some(self.encoding())) {
-            self.vcs.set_diff_base(diff_base, self.text().clone())
+            self.vcs
+                .set_diff_base(diff_base, self.text().clone(), redraw.frame_handle())
         } else {
             self.vcs.clear_diff_base();
         }

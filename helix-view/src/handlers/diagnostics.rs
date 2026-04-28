@@ -102,8 +102,13 @@ pub struct DiagnosticsHandler {
     last_cursor_line: AtomicUsize,
     pub active: bool,
     events: Mutex<Option<Sender<DiagnosticEvent>>>,
-    redraw: Mutex<Option<FrameHandle>>,
-    runtime: Mutex<Option<Runtime>>,
+    runtime: Mutex<Option<DiagnosticRuntime>>,
+}
+
+#[derive(Clone)]
+struct DiagnosticRuntime {
+    runtime: Runtime,
+    redraw: FrameHandle,
 }
 
 // make sure we never share handlers across multiple views this is a stop
@@ -123,7 +128,6 @@ impl DiagnosticsHandler {
             active_generation: Arc::new(AtomicUsize::new(0)),
             generation: AtomicUsize::new(0),
             events: Mutex::new(None),
-            redraw: Mutex::new(None),
             runtime: Mutex::new(None),
             // usize::MAX encodes a "no document" sentinel.
             last_doc: AtomicUsize::new(usize::MAX),
@@ -132,18 +136,12 @@ impl DiagnosticsHandler {
         }
     }
 
-    pub fn bind_runtime(&mut self, runtime: Runtime) {
+    pub fn bind_runtime(&mut self, runtime: Runtime, redraw: FrameHandle) {
         *self
             .runtime
             .lock()
-            .expect("diagnostics runtime lock poisoned") = Some(runtime);
-    }
-
-    pub fn bind_redraw(&mut self, redraw: FrameHandle) {
-        *self
-            .redraw
-            .lock()
-            .expect("diagnostics redraw lock poisoned") = Some(redraw);
+            .expect("diagnostics runtime lock poisoned") =
+            Some(DiagnosticRuntime { runtime, redraw });
     }
 
     fn load_last_doc(&self) -> DocumentId {
@@ -171,18 +169,11 @@ impl DiagnosticsHandler {
             .expect("diagnostics runtime lock poisoned")
             .as_ref()?
             .clone();
-        let redraw = self
-            .redraw
-            .lock()
-            .expect("diagnostics redraw lock poisoned")
-            .as_ref()
-            .expect("editor-owned diagnostics handler requires redraw sender")
-            .clone();
         let tx = DiagnosticTimeout::spawn(
             self.active_generation.clone(),
-            runtime.work().clone(),
-            runtime.clock().clone(),
-            redraw,
+            runtime.runtime.work().clone(),
+            runtime.runtime.clock().clone(),
+            runtime.redraw,
         );
         *events = Some(tx.clone());
         Some(tx)

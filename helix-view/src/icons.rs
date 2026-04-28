@@ -57,6 +57,7 @@ pub struct Kind {
 
     file: Option<Icon>,
     folder: Option<Icon>,
+    folder_open: Option<Icon>,
     text: Option<Icon>,
     module: Option<Icon>,
     namespace: Option<Icon>,
@@ -113,6 +114,7 @@ impl Kind {
         let icon = match kind {
             "file" => self.file()?,
             "folder" => self.folder()?,
+            "folder_open" => self.folder_open()?,
             "module" => self.module()?,
             "namespace" => self.namespace()?,
             "package" => self.package()?,
@@ -173,6 +175,18 @@ impl Kind {
         }
         let folder = self.folder.clone().unwrap_or_else(|| Icon {
             glyph: String::from("󰉋"),
+            color: None,
+        });
+        Some(folder)
+    }
+
+    #[inline]
+    pub fn folder_open(&self) -> Option<Icon> {
+        if !self.enabled {
+            return None;
+        }
+        let folder = self.folder_open.clone().unwrap_or_else(|| Icon {
+            glyph: String::from("󰝰"),
             color: None,
         });
         Some(folder)
@@ -714,6 +728,7 @@ impl Vcs {
 pub struct Mime {
     enabled: bool,
     directory: Option<String>,
+    directory_open: Option<String>,
     #[serde(flatten)]
     mime: HashMap<String, Icon>,
 }
@@ -854,6 +869,20 @@ impl Mime {
     #[inline]
     pub fn directory_or_default(&self) -> &str {
         self.directory.as_ref().map_or("󰉋", |dir| dir.as_str())
+    }
+
+    #[inline]
+    pub fn directory_open(&self) -> Option<&str> {
+        if !self.enabled {
+            return None;
+        }
+
+        Some(self.directory_open_or_default())
+    }
+
+    #[inline]
+    pub fn directory_open_or_default(&self) -> &str {
+        self.directory_open.as_ref().map_or("󰝰", |dir| dir.as_str())
     }
 
     // Returns the icon that matches the name, if any, otherwise returns the name back.

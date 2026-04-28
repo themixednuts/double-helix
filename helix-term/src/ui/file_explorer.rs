@@ -36,9 +36,6 @@ const FALLBACK_FILE_ICON: &str = "󰈔";
 const TREE_GUIDE: &str = "│ ";
 const TREE_MIDDLE: &str = "├╴";
 const TREE_LAST: &str = "└╴";
-const DISCLOSURE_OPEN: &str = " ";
-const DISCLOSURE_CLOSED: &str = " ";
-const DISCLOSURE_EMPTY: &str = "  ";
 const VCS_ADDED_ICON: &str = "";
 const VCS_MODIFIED_ICON: &str = "○";
 const VCS_DELETED_ICON: &str = "";
@@ -834,38 +831,36 @@ impl FileExplorerPanel {
             spans.push(Span::styled(connector, guide_style));
         }
 
-        let disclosure = if row.is_dir {
-            if row.expanded {
-                DISCLOSURE_OPEN
-            } else {
-                DISCLOSURE_CLOSED
-            }
-        } else {
-            DISCLOSURE_EMPTY
-        };
-        spans.push(Span::styled(disclosure, guide_style));
-
         if show_icons {
             let icons = ICONS.load();
             if row.is_dir {
-                if let Some(icon) = icons.kind().folder() {
+                let kind_icon = if row.expanded {
+                    icons.kind().folder_open()
+                } else {
+                    icons.kind().folder()
+                };
+                if let Some(icon) = kind_icon {
                     let icon_style = icon
                         .color()
                         .map(|color| base_style.patch(Style::default().fg(color)))
                         .unwrap_or(directory_style);
                     spans.push(Span::styled(format!("{}  ", icon.glyph()), icon_style));
-                } else if row.expanded {
-                    spans.push(Span::styled(
-                        format!("{FALLBACK_FOLDER_OPEN_ICON}  "),
-                        directory_style,
-                    ));
-                } else if let Some(icon) = icons.mime().directory() {
-                    spans.push(Span::styled(format!("{icon}  "), directory_style));
                 } else {
-                    spans.push(Span::styled(
-                        format!("{FALLBACK_FOLDER_ICON}  "),
-                        directory_style,
-                    ));
+                    let mime_icon = if row.expanded {
+                        icons.mime().directory_open()
+                    } else {
+                        icons.mime().directory()
+                    };
+                    if let Some(icon) = mime_icon {
+                        spans.push(Span::styled(format!("{icon}  "), directory_style));
+                    } else {
+                        let fallback = if row.expanded {
+                            FALLBACK_FOLDER_OPEN_ICON
+                        } else {
+                            FALLBACK_FOLDER_ICON
+                        };
+                        spans.push(Span::styled(format!("{fallback}  "), directory_style));
+                    }
                 }
             } else if let Some(icon) = icons
                 .mime()
@@ -965,11 +960,7 @@ impl Component for FileExplorerPanel {
         let deleted_style = cx.editor.theme.get("diff.minus");
         let renamed_style = cx.editor.theme.get("diff.delta.moved");
         let conflict_style = cx.editor.theme.get("diff.delta.conflict");
-        let guide_style = cx
-            .editor
-            .theme
-            .get("ui.virtual.indent-guide")
-            .patch(inactive);
+        let guide_style = inactive;
         let header_style = if self.focused {
             cx.editor.theme.get("ui.statusline")
         } else {
@@ -1220,7 +1211,7 @@ mod tests {
     }
 
     #[test]
-    fn row_spans_use_subtle_tree_guides_and_disclosure_arrows() {
+    fn row_spans_use_tree_guides_without_disclosure_arrows() {
         let row = ExplorerRow {
             path: PathBuf::from("workspace").join("src"),
             label: "src".to_string(),
@@ -1256,7 +1247,62 @@ mod tests {
 
         assert!(rendered.contains(TREE_GUIDE));
         assert!(rendered.contains(TREE_LAST));
-        assert!(rendered.contains(DISCLOSURE_CLOSED));
+        assert!(!rendered.contains(''));
+        assert!(!rendered.contains(''));
+    }
+
+    #[test]
+    fn row_spans_use_distinct_folder_icons_for_open_and_closed_dirs() {
+        let panel = FileExplorerPanel {
+            root: PathBuf::from("workspace"),
+            rows: Vec::new(),
+            expanded_dirs: HashSet::new(),
+            selection: 0,
+            scroll: 0,
+            area: Rect::default(),
+            focused: true,
+            model_panel_id: None,
+        };
+        let open_row = ExplorerRow {
+            path: PathBuf::from("workspace").join("src"),
+            label: "src".to_string(),
+            is_dir: true,
+            depth: 1,
+            expanded: true,
+            is_last: true,
+            ancestor_last: Vec::new(),
+            vcs_status: None,
+        };
+        let closed_row = ExplorerRow {
+            expanded: false,
+            ..open_row.clone()
+        };
+
+        let open = panel
+            .row_spans(
+                &open_row,
+                Style::default(),
+                Style::default(),
+                Style::default(),
+                true,
+            )
+            .into_iter()
+            .map(|span| span.content.into_owned())
+            .collect::<String>();
+        let closed = panel
+            .row_spans(
+                &closed_row,
+                Style::default(),
+                Style::default(),
+                Style::default(),
+                true,
+            )
+            .into_iter()
+            .map(|span| span.content.into_owned())
+            .collect::<String>();
+
+        assert!(open.contains(FALLBACK_FOLDER_OPEN_ICON));
+        assert!(closed.contains(FALLBACK_FOLDER_ICON));
     }
 
     #[test]

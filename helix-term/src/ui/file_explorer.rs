@@ -27,16 +27,19 @@ use super::prompt::Movement;
 
 pub const ID: &str = "file-explorer-panel";
 
-const HEADER_ROWS: u16 = 2;
+const HEADER_ROWS: u16 = 3;
 const PANEL_WIDTH: u16 = 34;
 
 /// Explorer rows are the current visible tree, not the full filesystem.
 #[derive(Clone, Debug)]
 struct ExplorerRow {
     path: PathBuf,
+    label: String,
     is_dir: bool,
     depth: usize,
     expanded: bool,
+    is_last: bool,
+    ancestor_last: Vec<bool>,
 }
 
 pub struct FileExplorerPanel {
@@ -67,6 +70,14 @@ fn display_name(path: &Path) -> String {
         .and_then(|name| name.to_str())
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| path.display().to_string())
+}
+
+fn relative_display(base: &Path, path: &Path) -> String {
+    path.strip_prefix(base)
+        .ok()
+        .filter(|path| !path.as_os_str().is_empty())
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| display_name(path))
 }
 
 fn directory_children(
@@ -163,22 +174,81 @@ impl FileExplorerPanel {
             }
         }
 
+        let followed_file = self.followed_file(editor);
+        if let Some(path) = &followed_file {
+            self.expand_to_path(path);
+        }
+
         let mut rows = Vec::new();
         let mut seen = HashSet::new();
         if let Ok(canonical_root) = self.root.canonicalize() {
             seen.insert(canonical_root);
         }
-        self.collect_rows(editor, &self.root, 0, &mut seen, &mut rows)?;
+        let root_expanded = self.expanded_dirs.contains(&self.root);
+        rows.push(ExplorerRow {
+            path: self.root.clone(),
+            label: display_name(&self.root),
+            is_dir: true,
+            depth: 0,
+            expanded: root_expanded,
+            is_last: true,
+            ancestor_last: Vec::new(),
+        });
+        if root_expanded {
+            self.collect_rows(editor, &self.root, 1, &[], &mut seen, &mut rows)?;
+        }
         self.rows = rows;
 
         if self.rows.is_empty() {
             self.selection = 0;
             self.scroll = 0;
         } else {
-            self.selection = cursor.unwrap_or(self.selection).min(self.rows.len() - 1);
+            let followed_selection = followed_file
+                .as_deref()
+                .and_then(|path| self.selection_for_path(path));
+            self.selection = cursor
+                .or(followed_selection)
+                .unwrap_or(self.selection)
+                .min(self.rows.len() - 1);
             self.ensure_selection_visible();
         }
         Ok(())
+    }
+
+    fn followed_file(&self, editor: &Editor) -> Option<PathBuf> {
+        let view = editor.tree.try_get(editor.tree.focus)?;
+        let doc = editor.document(view.doc)?;
+        let path = doc.path()?;
+        let path = helix_stdx::path::normalize(path);
+        path.starts_with(&self.root).then_some(path)
+    }
+
+    fn expand_to_path(&mut self, path: &Path) {
+        let mut ancestor = path.parent();
+        while let Some(dir) = ancestor {
+            if !dir.starts_with(&self.root) {
+                break;
+            }
+            self.expanded_dirs.insert(dir.to_path_buf());
+            if dir == self.root {
+                break;
+            }
+            ancestor = dir.parent();
+        }
+    }
+
+    fn selection_for_path(&self, path: &Path) -> Option<usize> {
+        self.rows
+            .iter()
+            .position(|row| row.path == path)
+            .or_else(|| {
+                self.rows
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, row)| path.starts_with(&row.path))
+                    .max_by_key(|(_, row)| row.depth)
+                    .map(|(index, _)| index)
+            })
     }
 
     fn collect_rows(
@@ -186,16 +256,23 @@ impl FileExplorerPanel {
         editor: &Editor,
         root: &Path,
         depth: usize,
+        ancestor_last: &[bool],
         seen: &mut HashSet<PathBuf>,
         rows: &mut Vec<ExplorerRow>,
     ) -> Result<(), std::io::Error> {
-        for (path, is_dir) in directory_children(root, editor)? {
+        let children = directory_children(root, editor)?;
+        let last = children.len().saturating_sub(1);
+        for (index, (path, is_dir)) in children.into_iter().enumerate() {
             let expanded = is_dir && self.expanded_dirs.contains(&path);
+            let is_last = index == last;
             rows.push(ExplorerRow {
                 path: path.clone(),
+                label: relative_display(root, &path),
                 is_dir,
                 depth,
                 expanded,
+                is_last,
+                ancestor_last: ancestor_last.to_vec(),
             });
 
             if !expanded {
@@ -204,7 +281,9 @@ impl FileExplorerPanel {
 
             let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
             if seen.insert(canonical) {
-                self.collect_rows(editor, &path, depth + 1, seen, rows)?;
+                let mut child_ancestors = ancestor_last.to_vec();
+                child_ancestors.push(is_last);
+                self.collect_rows(editor, &path, depth + 1, &child_ancestors, seen, rows)?;
             }
         }
         Ok(())
@@ -261,12 +340,7 @@ impl FileExplorerPanel {
     }
 
     fn label_for(&self, row: &ExplorerRow) -> String {
-        row.path
-            .strip_prefix(&self.root)
-            .ok()
-            .filter(|path| !path.as_os_str().is_empty())
-            .map(|path| path.display().to_string())
-            .unwrap_or_else(|| display_name(&row.path))
+        row.label.clone()
     }
 
     fn visible_height(&self) -> usize {
@@ -569,9 +643,19 @@ impl FileExplorerPanel {
         row: &ExplorerRow,
         base_style: Style,
         directory_style: Style,
+        guide_style: Style,
     ) -> Vec<Span<'static>> {
-        let mut spans = Vec::with_capacity(5);
-        spans.push(Span::styled("  ".repeat(row.depth), base_style));
+        let mut spans = Vec::with_capacity(6 + row.ancestor_last.len());
+
+        for ancestor_last in &row.ancestor_last {
+            let guide = if *ancestor_last { "  " } else { "│ " };
+            spans.push(Span::styled(guide.to_string(), guide_style));
+        }
+
+        if row.depth > 0 {
+            let connector = if row.is_last { "└" } else { "├" };
+            spans.push(Span::styled(connector.to_string(), guide_style));
+        }
 
         let disclosure = if row.is_dir {
             if row.expanded {
@@ -582,7 +666,7 @@ impl FileExplorerPanel {
         } else {
             "  "
         };
-        spans.push(Span::styled(disclosure, base_style));
+        spans.push(Span::styled(disclosure, guide_style));
 
         let icons = ICONS.load();
         if row.is_dir {
@@ -679,6 +763,16 @@ impl Component for FileExplorerPanel {
         let inactive = cx.editor.theme.get("ui.text.inactive");
         let selected = cx.editor.theme.get("ui.menu.selected");
         let directory_style = cx.editor.theme.get("ui.text.directory");
+        let title_style = cx
+            .editor
+            .theme
+            .get("ui.text.info")
+            .add_modifier(Modifier::BOLD);
+        let guide_style = cx
+            .editor
+            .theme
+            .get("ui.virtual.indent-guide")
+            .patch(inactive);
         let border_style = if self.focused {
             cx.editor
                 .theme
@@ -699,17 +793,52 @@ impl Component for FileExplorerPanel {
         }
 
         let root_label = display_name(&self.root);
-        let title = format!("Files  {root_label}");
-        surface.set_stringn(inner.x, inner.y, title, inner.width as usize, text_style);
-
-        if inner.height > 1 {
+        if inner.width >= 2 {
+            surface.set_stringn(inner.x, inner.y, "╭", 1, border_style);
             surface.set_stringn(
-                inner.x,
-                inner.y + 1,
-                "─".repeat(inner.width as usize),
-                inner.width as usize,
-                inactive,
+                inner.x + 1,
+                inner.y,
+                "─".repeat(inner.width.saturating_sub(2) as usize),
+                inner.width.saturating_sub(2) as usize,
+                border_style,
             );
+            surface.set_stringn(inner.right() - 1, inner.y, "╮", 1, border_style);
+
+            let title = " Explorer ";
+            surface.set_stringn(inner.x + 2, inner.y, title, title.len(), title_style);
+            let count = format!(" {}/{} ", self.rows.len(), self.rows.len());
+            let count_width = count.chars().count() as u16;
+            let count_x = inner.right().saturating_sub(count_width + 1);
+            if count_x > inner.x + title.len() as u16 + 2 {
+                surface.set_stringn(count_x, inner.y, count, count_width as usize, inactive);
+            }
+
+            if inner.height > 1 {
+                let prompt = format!("› {root_label}");
+                surface.set_stringn(inner.x, inner.y + 1, "│", 1, border_style);
+                if inner.width > 2 {
+                    surface.set_stringn(
+                        inner.x + 1,
+                        inner.y + 1,
+                        prompt,
+                        inner.width.saturating_sub(2) as usize,
+                        text_style,
+                    );
+                }
+                surface.set_stringn(inner.right() - 1, inner.y + 1, "│", 1, border_style);
+            }
+
+            if inner.height > 2 {
+                surface.set_stringn(inner.x, inner.y + 2, "╰", 1, border_style);
+                surface.set_stringn(
+                    inner.x + 1,
+                    inner.y + 2,
+                    "─".repeat(inner.width.saturating_sub(2) as usize),
+                    inner.width.saturating_sub(2) as usize,
+                    border_style,
+                );
+                surface.set_stringn(inner.right() - 1, inner.y + 2, "╯", 1, border_style);
+            }
         }
 
         let list = inner.clip_top(HEADER_ROWS);
@@ -744,7 +873,12 @@ impl Component for FileExplorerPanel {
             } else {
                 directory_style
             };
-            let spans = self.row_spans(row, base_style, directory_style);
+            let guide_style = if is_selected {
+                selected.patch(guide_style)
+            } else {
+                guide_style
+            };
+            let spans = self.row_spans(row, base_style, directory_style, guide_style);
             draw_spans(surface, list.x, y, list.width, &spans);
         }
     }
@@ -776,7 +910,7 @@ mod tests {
         let config = helix_view::editor::Config::default();
         let config = Arc::new(ArcSwap::from_pointee(config));
         let handlers = helix_view::handlers::Handlers::dummy();
-        Editor::new(
+        let mut editor = Editor::new(
             Rect::new(0, 0, width, height),
             Arc::new(theme_loader),
             Arc::new(ArcSwap::from_pointee(syn_loader)),
@@ -786,7 +920,9 @@ mod tests {
             )),
             runtime,
             handlers,
-        )
+        );
+        editor.new_file(Action::VerticalSplit);
+        editor
     }
 
     #[test]
@@ -800,16 +936,44 @@ mod tests {
             let editor = test_editor(100, 30, rt.runtime());
 
             let mut panel = FileExplorerPanel::new(temp.path().to_path_buf(), &editor).unwrap();
-            assert_eq!(panel.rows.len(), 2);
-            assert_eq!(display_name(&panel.rows[0].path), "src");
+            assert_eq!(panel.rows.len(), 3);
+            assert_eq!(display_name(&panel.rows[0].path), display_name(temp.path()));
             assert!(panel.rows[0].is_dir);
-            assert_eq!(display_name(&panel.rows[1].path), "README.md");
+            assert!(panel.rows[0].expanded);
+            assert_eq!(display_name(&panel.rows[1].path), "src");
+            assert!(panel.rows[1].is_dir);
+            assert_eq!(display_name(&panel.rows[2].path), "README.md");
 
+            panel.selection = 1;
             panel.toggle_selected_dir(&editor);
             assert!(panel
                 .rows
                 .iter()
-                .any(|row| display_name(&row.path) == "main.rs" && row.depth == 1));
+                .any(|row| display_name(&row.path) == "main.rs" && row.depth == 2));
+        });
+    }
+
+    #[test]
+    fn panel_follows_current_file_on_open() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path().join("src").join("nested")).unwrap();
+        let current = temp.path().join("src").join("nested").join("main.rs");
+        fs::write(&current, "").unwrap();
+        let rt = helix_runtime::test::RuntimeTest::default();
+        rt.block_on(async {
+            let mut editor = test_editor(100, 30, rt.runtime());
+            editor.open(&current, Action::Replace).unwrap();
+
+            let panel = FileExplorerPanel::new(temp.path().to_path_buf(), &editor).unwrap();
+
+            assert!(panel
+                .rows
+                .iter()
+                .any(|row| display_name(&row.path) == "main.rs"));
+            assert_eq!(
+                panel.selected().map(|row| row.path.as_path()),
+                Some(current.as_path())
+            );
         });
     }
 

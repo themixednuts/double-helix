@@ -27,8 +27,10 @@ use super::prompt::Movement;
 
 pub const ID: &str = "file-explorer-panel";
 
-const HEADER_ROWS: u16 = 3;
+const HEADER_ROWS: u16 = 1;
 const PANEL_WIDTH: u16 = 34;
+const FALLBACK_FOLDER_ICON: &str = "";
+const FALLBACK_FILE_ICON: &str = "󰈔";
 
 /// Explorer rows are the current visible tree, not the full filesystem.
 #[derive(Clone, Debug)]
@@ -54,9 +56,9 @@ pub struct FileExplorerPanel {
 }
 
 fn path_prefill(path: &Path) -> String {
-    let mut path = path.display().to_string();
-    if !path.ends_with(std::path::MAIN_SEPARATOR) && !path.ends_with('/') {
-        path.push(std::path::MAIN_SEPARATOR);
+    let mut path = display_path(path);
+    if !path.ends_with('/') {
+        path.push('/');
     }
     path
 }
@@ -69,14 +71,18 @@ fn display_name(path: &Path) -> String {
     path.file_name()
         .and_then(|name| name.to_str())
         .map(ToOwned::to_owned)
-        .unwrap_or_else(|| path.display().to_string())
+        .unwrap_or_else(|| display_path(path))
+}
+
+fn display_path(path: &Path) -> String {
+    path.display().to_string().replace('\\', "/")
 }
 
 fn relative_display(base: &Path, path: &Path) -> String {
     path.strip_prefix(base)
         .ok()
         .filter(|path| !path.as_os_str().is_empty())
-        .map(|path| path.display().to_string())
+        .map(display_path)
         .unwrap_or_else(|| display_name(path))
 }
 
@@ -495,7 +501,7 @@ impl FileExplorerPanel {
             .selected_register
             .unwrap_or(cx.editor.config().default_yank_register);
         let path = helix_stdx::path::get_relative_path(&row.path);
-        let path = path.to_string_lossy().to_string();
+        let path = path.to_string_lossy().replace('\\', "/");
         let message = format!("Yanked path {} to register {register}", path);
 
         match cx.editor.registers.write(register, vec![path]) {
@@ -529,7 +535,7 @@ impl FileExplorerPanel {
         let source = row.path.clone();
         let root = self.root.clone();
         let cursor = selected_cursor(self.selection);
-        let prefill = row.path.display().to_string();
+        let prefill = display_path(&row.path);
         cx.spawn_ui(async move {
             Ok(UiCommand::FileExplorer(FileExplorerCommand::PromptMove {
                 source,
@@ -676,6 +682,13 @@ impl FileExplorerPanel {
                     .map(|color| base_style.patch(Style::default().fg(color)))
                     .unwrap_or(directory_style);
                 spans.push(Span::styled(format!("{}  ", icon.glyph()), icon_style));
+            } else if let Some(icon) = icons.mime().directory() {
+                spans.push(Span::styled(format!("{icon}  "), directory_style));
+            } else {
+                spans.push(Span::styled(
+                    format!("{FALLBACK_FOLDER_ICON}  "),
+                    directory_style,
+                ));
             }
         } else if let Some(icon) = icons.mime().get(Some(&row.path), None) {
             let icon_style = icon
@@ -683,6 +696,8 @@ impl FileExplorerPanel {
                 .map(|color| base_style.patch(Style::default().fg(color)))
                 .unwrap_or(base_style);
             spans.push(Span::styled(format!("{}  ", icon.glyph()), icon_style));
+        } else {
+            spans.push(Span::styled(format!("{FALLBACK_FILE_ICON}  "), base_style));
         }
 
         let label_style = if row.is_dir {
@@ -763,16 +778,16 @@ impl Component for FileExplorerPanel {
         let inactive = cx.editor.theme.get("ui.text.inactive");
         let selected = cx.editor.theme.get("ui.menu.selected");
         let directory_style = cx.editor.theme.get("ui.text.directory");
-        let title_style = cx
-            .editor
-            .theme
-            .get("ui.text.info")
-            .add_modifier(Modifier::BOLD);
         let guide_style = cx
             .editor
             .theme
             .get("ui.virtual.indent-guide")
             .patch(inactive);
+        let header_style = if self.focused {
+            cx.editor.theme.get("ui.statusline")
+        } else {
+            cx.editor.theme.get("ui.statusline.inactive")
+        };
         let border_style = if self.focused {
             cx.editor
                 .theme
@@ -783,65 +798,29 @@ impl Component for FileExplorerPanel {
         };
 
         surface.clear_with(area, background);
-        for y in area.y..area.bottom() {
-            surface.set_stringn(area.x, y, "│", 1, border_style);
-        }
+        let divider = Rect::new(area.right().saturating_sub(1), area.y, 1, area.height);
+        crate::widgets::vdivider(surface, divider, border_style);
 
-        let inner = area.clip_left(1);
+        let inner = area.clip_right(1);
         if inner.width == 0 {
             return;
         }
 
-        let root_label = display_name(&self.root);
-        if inner.width >= 2 {
-            surface.set_stringn(inner.x, inner.y, "╭", 1, border_style);
-            surface.set_stringn(
-                inner.x + 1,
-                inner.y,
-                "─".repeat(inner.width.saturating_sub(2) as usize),
-                inner.width.saturating_sub(2) as usize,
-                border_style,
-            );
-            surface.set_stringn(inner.right() - 1, inner.y, "╮", 1, border_style);
+        let current = if self.rows.is_empty() {
+            0
+        } else {
+            self.selection + 1
+        };
+        crate::widgets::header_with_counts(
+            surface,
+            inner,
+            " Files",
+            current,
+            self.rows.len(),
+            header_style,
+        );
 
-            let title = " Explorer ";
-            surface.set_stringn(inner.x + 2, inner.y, title, title.len(), title_style);
-            let count = format!(" {}/{} ", self.rows.len(), self.rows.len());
-            let count_width = count.chars().count() as u16;
-            let count_x = inner.right().saturating_sub(count_width + 1);
-            if count_x > inner.x + title.len() as u16 + 2 {
-                surface.set_stringn(count_x, inner.y, count, count_width as usize, inactive);
-            }
-
-            if inner.height > 1 {
-                let prompt = format!("› {root_label}");
-                surface.set_stringn(inner.x, inner.y + 1, "│", 1, border_style);
-                if inner.width > 2 {
-                    surface.set_stringn(
-                        inner.x + 1,
-                        inner.y + 1,
-                        prompt,
-                        inner.width.saturating_sub(2) as usize,
-                        text_style,
-                    );
-                }
-                surface.set_stringn(inner.right() - 1, inner.y + 1, "│", 1, border_style);
-            }
-
-            if inner.height > 2 {
-                surface.set_stringn(inner.x, inner.y + 2, "╰", 1, border_style);
-                surface.set_stringn(
-                    inner.x + 1,
-                    inner.y + 2,
-                    "─".repeat(inner.width.saturating_sub(2) as usize),
-                    inner.width.saturating_sub(2) as usize,
-                    border_style,
-                );
-                surface.set_stringn(inner.right() - 1, inner.y + 2, "╯", 1, border_style);
-            }
-        }
-
-        let list = inner.clip_top(HEADER_ROWS);
+        let list = inner.clip_top(HEADER_ROWS).clip_left(1);
         if list.height == 0 {
             return;
         }
@@ -975,6 +954,43 @@ mod tests {
                 Some(current.as_path())
             );
         });
+    }
+
+    #[test]
+    fn panel_labels_use_forward_slashes() {
+        let base = PathBuf::from("workspace");
+        let path = base.join("src").join("main").join("java");
+
+        assert_eq!(relative_display(&base, &path), "src/main/java");
+    }
+
+    #[test]
+    fn row_spans_include_fallback_icons() {
+        let row = ExplorerRow {
+            path: PathBuf::from("workspace").join("src"),
+            label: "src".to_string(),
+            is_dir: true,
+            depth: 1,
+            expanded: true,
+            is_last: true,
+            ancestor_last: Vec::new(),
+        };
+        let panel = FileExplorerPanel {
+            root: PathBuf::from("workspace"),
+            rows: Vec::new(),
+            expanded_dirs: HashSet::new(),
+            selection: 0,
+            scroll: 0,
+            area: Rect::default(),
+            focused: true,
+            model_panel_id: None,
+        };
+
+        let spans = panel.row_spans(&row, Style::default(), Style::default(), Style::default());
+
+        assert!(spans
+            .iter()
+            .any(|span| span.content.contains(FALLBACK_FOLDER_ICON)));
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! `helix_vcs` provides types for working with diffs from a Version Control System (VCS).
-//! Currently `git` is the only supported provider for diffs, but this architecture allows
-//! for other providers to be added in the future.
+//! Git provides full diff support. Changed-file status also checks Jujutsu before falling
+//! back to the diff providers.
 
 use anyhow::{anyhow, bail, Result};
 use arc_swap::ArcSwap;
@@ -14,6 +14,8 @@ mod git;
 #[cfg(feature = "git")]
 pub use git::blame::FileBlame;
 
+mod jj;
+
 mod diff;
 
 pub use diff::{DiffHandle, Hunk};
@@ -22,8 +24,8 @@ mod status;
 
 pub use status::FileChange;
 
-/// Contains all active diff providers. Diff providers are compiled in via features. Currently
-/// only `git` is supported.
+/// Contains all active diff providers. Diff providers are compiled in via features when they
+/// need optional dependencies.
 #[derive(Clone, Debug)]
 pub struct DiffProviderRegistry {
     providers: Vec<DiffProvider>,
@@ -64,25 +66,60 @@ impl DiffProviderRegistry {
     pub fn for_each_changed_file(
         self,
         cwd: PathBuf,
-        f: impl Fn(Result<FileChange>) -> bool + Send + 'static,
+        f: impl FnMut(Result<FileChange>) -> bool + Send + 'static,
     ) {
         tokio::task::spawn_blocking(move || {
-            if self
-                .providers
-                .iter()
-                .find_map(|provider| provider.for_each_changed_file(&cwd, &f).ok())
-                .is_none()
-            {
-                f(Err(anyhow!("no diff provider returns success")));
+            let mut f = f;
+            if let Err(err) = self.for_each_changed_file_sync(&cwd, &mut f) {
+                f(Err(err));
             }
         });
+    }
+
+    /// Collect changed files synchronously. UI components that render persistent state can use
+    /// this to build a snapshot without going through picker injectors.
+    pub fn changed_files(&self, cwd: &Path) -> Result<Vec<FileChange>> {
+        let mut changes = Vec::new();
+        self.for_each_changed_file_sync(cwd, |change| match change {
+            Ok(change) => {
+                changes.push(change);
+                true
+            }
+            Err(err) => {
+                log::debug!("failed to collect changed file: {err:#?}");
+                true
+            }
+        })?;
+        Ok(changes)
+    }
+
+    fn for_each_changed_file_sync(
+        &self,
+        cwd: &Path,
+        mut f: impl FnMut(Result<FileChange>) -> bool,
+    ) -> Result<()> {
+        if jj::for_each_changed_file(cwd, &mut f).is_ok() {
+            return Ok(());
+        }
+
+        self.providers
+            .iter()
+            .find_map(
+                |provider| match provider.for_each_changed_file(cwd, &mut f) {
+                    Ok(()) => Some(Ok(())),
+                    Err(err) => {
+                        log::debug!("{err:#?}");
+                        log::debug!("failed to collect changed files for {}", cwd.display());
+                        None
+                    }
+                },
+            )
+            .unwrap_or_else(|| Err(anyhow!("no diff provider returns success")))
     }
 }
 
 impl Default for DiffProviderRegistry {
     fn default() -> Self {
-        // currently only git is supported
-        // TODO make this configurable when more providers are added
         let providers = vec![
             #[cfg(feature = "git")]
             DiffProvider::Git,
@@ -123,7 +160,7 @@ impl DiffProvider {
     fn for_each_changed_file(
         &self,
         _cwd: &Path,
-        _f: impl Fn(Result<FileChange>) -> bool,
+        _f: impl FnMut(Result<FileChange>) -> bool,
     ) -> Result<()> {
         match self {
             #[cfg(feature = "git")]

@@ -172,7 +172,7 @@ async fn load_reflects_update_after_edit() {
         &differ,
         |hunks| {
             hunks
-                == &[Hunk {
+                == [Hunk {
                     before: 1..1,
                     after: 1..2,
                 }]
@@ -207,7 +207,7 @@ async fn load_reflects_rapid_successive_edits() {
         &differ,
         |hunks| {
             hunks
-                == &[Hunk {
+                == [Hunk {
                     before: 1..2,
                     after: 1..2,
                 }]
@@ -226,7 +226,7 @@ async fn load_reflects_rapid_successive_edits() {
         |hunks| {
             // lines 1-2 in base (just println) replaced by lines 1-3 in doc (two printlns)
             hunks
-                == &[Hunk {
+                == [Hunk {
                     before: 1..2,
                     after: 1..3,
                 }]
@@ -259,7 +259,7 @@ async fn load_reflects_base_change() {
         &differ,
         |hunks| {
             hunks
-                == &[Hunk {
+                == [Hunk {
                     before: 1..2,
                     after: 1..2,
                 }]
@@ -299,7 +299,7 @@ async fn load_reflects_delete_then_insert() {
         &differ,
         |hunks| {
             hunks
-                == &[Hunk {
+                == [Hunk {
                     before: 1..2,
                     after: 1..1,
                 }]
@@ -316,7 +316,7 @@ async fn load_reflects_delete_then_insert() {
         |hunks| {
             // beta replaced by epsilon = modification of line 1
             hunks
-                == &[Hunk {
+                == [Hunk {
                     before: 1..2,
                     after: 1..2,
                 }]
@@ -338,7 +338,7 @@ async fn load_coherent_after_simultaneous_base_and_doc_update() {
         &differ,
         |hunks| {
             hunks
-                == &[Hunk {
+                == [Hunk {
                     before: 1..1,
                     after: 1..2,
                 }]
@@ -355,7 +355,7 @@ async fn load_coherent_after_simultaneous_base_and_doc_update() {
         &differ,
         |hunks| {
             hunks
-                == &[Hunk {
+                == [Hunk {
                     before: 3..3,
                     after: 3..4,
                 }]

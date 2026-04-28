@@ -848,9 +848,12 @@ impl Mime {
             return None;
         }
 
-        let dir = self.directory.as_ref().map_or("󰉋", |dir| dir.as_str());
+        Some(self.directory_or_default())
+    }
 
-        Some(dir)
+    #[inline]
+    pub fn directory_or_default(&self) -> &str {
+        self.directory.as_ref().map_or("󰉋", |dir| dir.as_str())
     }
 
     // Returns the icon that matches the name, if any, otherwise returns the name back.
@@ -864,6 +867,15 @@ impl Mime {
             return None;
         }
 
+        self.get_or_default(path, name)
+    }
+
+    #[inline]
+    pub fn get_or_default<'b, 'a: 'b>(
+        &'a self,
+        path: Option<&'b PathBuf>,
+        name: Option<&'b str>,
+    ) -> Option<&'b Icon> {
         if let Some(path) = path {
             // Search for fully specified name first so that custom icons,
             // for example for `README.md` or `docker-compose.yaml`, can

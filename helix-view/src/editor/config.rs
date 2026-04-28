@@ -198,6 +198,8 @@ pub struct FileExplorerConfig {
     pub git_global: bool,
     pub git_exclude: bool,
     pub flatten_dirs: bool,
+    pub icons: bool,
+    pub vcs: bool,
 }
 
 impl Default for FileExplorerConfig {
@@ -211,6 +213,8 @@ impl Default for FileExplorerConfig {
             git_global: false,
             git_exclude: false,
             flatten_dirs: true,
+            icons: true,
+            vcs: true,
         }
     }
 }

@@ -81,7 +81,7 @@ pub fn get_current_head_name(file: &Path) -> Result<Arc<ArcSwap<Box<str>>>> {
     Ok(Arc::new(ArcSwap::from_pointee(name.into_boxed_str())))
 }
 
-pub fn for_each_changed_file(cwd: &Path, f: impl Fn(Result<FileChange>) -> bool) -> Result<()> {
+pub fn for_each_changed_file(cwd: &Path, f: impl FnMut(Result<FileChange>) -> bool) -> Result<()> {
     status(&open_repo(cwd)?.to_thread_local(), f)
 }
 
@@ -128,7 +128,7 @@ fn open_repo(path: &Path) -> Result<ThreadSafeRepository> {
 }
 
 /// Emulates the result of running `git status` from the command line.
-fn status(repo: &Repository, f: impl Fn(Result<FileChange>) -> bool) -> Result<()> {
+fn status(repo: &Repository, mut f: impl FnMut(Result<FileChange>) -> bool) -> Result<()> {
     let work_dir = repo
         .workdir()
         .ok_or_else(|| anyhow::anyhow!("working tree not found"))?
@@ -155,8 +155,14 @@ fn status(repo: &Repository, f: impl Fn(Result<FileChange>) -> bool) -> Result<(
     let status_iter = status_platform.into_index_worktree_iter(empty_patterns)?;
 
     for item in status_iter {
-        let Ok(item) = item.map_err(|err| f(Err(err.into()))) else {
-            continue;
+        let item = match item {
+            Ok(item) => item,
+            Err(err) => {
+                if !f(Err(err.into())) {
+                    break;
+                }
+                continue;
+            }
         };
         let change = match item {
             Item::Modification {

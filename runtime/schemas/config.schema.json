@@ -1,0 +1,742 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://double-helix.dev/schemas/config.schema.json",
+  "title": "Double Helix config.toml",
+  "description": "User or workspace configuration for Double Helix.",
+  "type": "object",
+  "x-tombi-toml-version": "v1.0.0",
+  "additionalProperties": false,
+  "properties": {
+    "theme": {
+      "oneOf": [
+        { "type": "string" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["dark", "light"],
+          "properties": {
+            "dark": { "type": "string" },
+            "light": { "type": "string" },
+            "fallback": { "type": "string" }
+          }
+        }
+      ]
+    },
+    "editor": { "$ref": "#/$defs/editor" },
+    "keys": { "$ref": "#/$defs/keymaps" },
+    "icons": { "$ref": "#/$defs/icons" }
+  },
+  "$defs": {
+    "arrayOfStrings": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "severity": {
+      "type": "string",
+      "enum": ["hint", "info", "warning", "error"]
+    },
+    "diagnosticFilter": {
+      "type": "string",
+      "enum": ["disable", "hint", "info", "warning", "error"]
+    },
+    "color": {
+      "type": "string",
+      "description": "Named palette color or #RGB/#RRGGBB color."
+    },
+    "style": {
+      "oneOf": [
+        { "$ref": "#/$defs/color" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "fg": { "$ref": "#/$defs/color" },
+            "bg": { "$ref": "#/$defs/color" },
+            "underline": {
+              "oneOf": [
+                { "$ref": "#/$defs/color" },
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "color": { "$ref": "#/$defs/color" },
+                    "style": {
+                      "type": "string",
+                      "enum": ["line", "curl", "dashed", "dotted", "double-line"]
+                    }
+                  }
+                }
+              ]
+            },
+            "modifiers": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "enum": [
+                  "bold",
+                  "dim",
+                  "italic",
+                  "underlined",
+                  "slow_blink",
+                  "rapid_blink",
+                  "reversed",
+                  "hidden",
+                  "crossed_out"
+                ]
+              }
+            }
+          }
+        }
+      ]
+    },
+    "editor": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "welcome-screen": { "type": "boolean" },
+        "scrolloff": { "type": "integer", "minimum": 0 },
+        "scroll-lines": { "type": "integer" },
+        "mouse": { "type": "boolean" },
+        "shell": { "$ref": "#/$defs/arrayOfStrings" },
+        "line-number": { "type": "string", "enum": ["absolute", "relative"] },
+        "picker-symbol": { "type": "string" },
+        "cursorline": { "type": "boolean" },
+        "cursorcolumn": { "type": "boolean" },
+        "gutters": {
+          "oneOf": [
+            { "$ref": "#/$defs/gutterLayout" },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "layout": { "$ref": "#/$defs/gutterLayout" },
+                "line-numbers": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "min-width": { "type": "integer", "minimum": 0 }
+                  }
+                }
+              }
+            }
+          ]
+        },
+        "middle-click-paste": { "type": "boolean" },
+        "auto-pairs": {
+          "oneOf": [
+            { "type": "boolean" },
+            {
+              "type": "object",
+              "additionalProperties": { "type": "string", "minLength": 1, "maxLength": 1 }
+            }
+          ]
+        },
+        "auto-completion": { "type": "boolean" },
+        "path-completion": { "type": "boolean" },
+        "word-completion": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enable": { "type": "boolean" },
+            "trigger-length": { "type": "integer", "minimum": 1, "maximum": 255 }
+          }
+        },
+        "auto-format": { "type": "boolean" },
+        "default-yank-register": { "type": "string", "minLength": 1, "maxLength": 1 },
+        "auto-save": {
+          "oneOf": [
+            { "type": "boolean" },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "focus-lost": { "type": "boolean" },
+                "after-delay": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "enable": { "type": "boolean" },
+                    "timeout": { "type": "integer", "minimum": 0 }
+                  }
+                }
+              }
+            }
+          ]
+        },
+        "auto-reload": { "type": "boolean" },
+        "text-width": { "type": "integer", "minimum": 0 },
+        "idle-timeout": { "type": "integer", "minimum": 0 },
+        "completion-timeout": { "type": "integer", "minimum": 0 },
+        "preview-completion-insert": { "type": "boolean" },
+        "completion-trigger-len": { "type": "integer", "minimum": 0, "maximum": 255 },
+        "completion-replace": { "type": "boolean" },
+        "continue-comments": { "type": "boolean" },
+        "auto-info": { "type": "boolean" },
+        "file-picker": { "$ref": "#/$defs/filePicker" },
+        "bufferline": {
+          "oneOf": [
+            { "type": "string", "enum": ["never", "always", "multiple"] },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "render-mode": { "type": "string", "enum": ["never", "always", "multiple"] },
+                "separator": { "type": "string" }
+              }
+            }
+          ]
+        },
+        "file-explorer": { "$ref": "#/$defs/fileExplorer" },
+        "vcs": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "provider": { "type": "string", "enum": ["auto", "git", "jj", "none"] }
+          }
+        },
+        "statusline": { "$ref": "#/$defs/statusline" },
+        "cursor-shape": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "normal": { "$ref": "#/$defs/cursorKind" },
+            "select": { "$ref": "#/$defs/cursorKind" },
+            "insert": { "$ref": "#/$defs/cursorKind" }
+          }
+        },
+        "true-color": { "type": "boolean" },
+        "undercurl": { "type": "boolean" },
+        "search": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "smart-case": { "type": "boolean" },
+            "wrap-around": { "type": "boolean" }
+          }
+        },
+        "lsp": { "$ref": "#/$defs/lsp" },
+        "terminal": { "$ref": "#/$defs/command" },
+        "rulers": {
+          "type": "array",
+          "items": { "type": "integer", "minimum": 0, "maximum": 65535 }
+        },
+        "ruler-char": { "type": "string" },
+        "whitespace": { "$ref": "#/$defs/whitespace" },
+        "indent-guides": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "render": { "type": "boolean" },
+            "character": { "type": "string", "minLength": 1, "maxLength": 1 },
+            "skip-levels": { "type": "integer", "minimum": 0, "maximum": 255 }
+          }
+        },
+        "color-modes": { "type": "boolean" },
+        "soft-wrap": { "$ref": "#/$defs/softWrap" },
+        "workspace-lsp-roots": { "$ref": "#/$defs/arrayOfStrings" },
+        "default-line-ending": {
+          "type": "string",
+          "enum": ["native", "lf", "crlf", "ff", "cr", "nel"]
+        },
+        "insert-final-newline": { "type": "boolean" },
+        "atomic-save": { "type": "boolean" },
+        "trim-final-newlines": { "type": "boolean" },
+        "trim-trailing-whitespace": { "type": "boolean" },
+        "smart-tab": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enable": { "type": "boolean" },
+            "supersede-menu": { "type": "boolean" }
+          }
+        },
+        "popup-border": { "type": "string", "enum": ["none", "all", "popup", "menu"] },
+        "rounded-corners": { "type": "boolean" },
+        "indent-heuristic": {
+          "type": "string",
+          "enum": ["simple", "tree-sitter", "hybrid"]
+        },
+        "jump-label-alphabet": { "type": "string" },
+        "inline-diagnostics": { "$ref": "#/$defs/inlineDiagnostics" },
+        "end-of-line-diagnostics": { "$ref": "#/$defs/diagnosticFilter" },
+        "clipboard-provider": {
+          "oneOf": [
+            {
+              "type": "string",
+              "enum": [
+                "pasteboard",
+                "wayland",
+                "x-clip",
+                "x-sel",
+                "win32-yank",
+                "termux",
+                "termcode",
+                "tmux",
+                "windows",
+                "none"
+              ]
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["custom"],
+              "properties": {
+                "custom": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["yank", "paste"],
+                  "properties": {
+                    "yank": { "$ref": "#/$defs/command" },
+                    "paste": { "$ref": "#/$defs/command" },
+                    "yank-primary": { "$ref": "#/$defs/command" },
+                    "paste-primary": { "$ref": "#/$defs/command" }
+                  }
+                }
+              }
+            }
+          ]
+        },
+        "editor-config": { "type": "boolean" },
+        "max-panel-width": { "type": "integer", "minimum": 0 },
+        "max-panel-height": { "type": "integer", "minimum": 0 },
+        "max-panel-width-percent": { "type": "number" },
+        "max-panel-height-percent": { "type": "number" },
+        "inline-blame": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "show": { "type": "string", "enum": ["never", "cursor-line", "all-lines"] },
+            "auto-fetch": { "type": "boolean" },
+            "format": { "type": "string" }
+          }
+        },
+        "rainbow-brackets": { "type": "boolean" },
+        "kitty-keyboard-protocol": { "type": "string", "enum": ["auto", "disabled", "enabled"] },
+        "cmdline": { "$ref": "#/$defs/cmdline" },
+        "gradient-borders": { "$ref": "#/$defs/gradientBorders" },
+        "notifications": { "$ref": "#/$defs/notifications" },
+        "completion-highlight": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "highlight-type": { "type": "string", "enum": ["default", "theme-colors", "vibrant"] }
+          }
+        },
+        "buffer-picker": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "start-position": { "type": "string", "enum": ["current", "previous"] }
+          }
+        },
+        "fold-textobjects": { "$ref": "#/$defs/arrayOfStrings" },
+        "agents": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "command"],
+            "properties": {
+              "name": { "type": "string" },
+              "command": { "type": "string" },
+              "args": { "$ref": "#/$defs/arrayOfStrings" },
+              "theme": { "type": "string" }
+            }
+          }
+        },
+        "acp": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "cycle-thinking": { "type": "string" },
+            "cycle-model": { "type": "string" },
+            "cycle-mode": { "type": "string" },
+            "bubble-corners": { "type": "string", "enum": ["rounded", "squared"] }
+          }
+        },
+        "editing-engine": { "type": "string", "enum": ["helix", "vim"] }
+      }
+    },
+    "gutterLayout": {
+      "type": "array",
+      "items": { "type": "string", "enum": ["diagnostics", "line-numbers", "spacer", "diff"] }
+    },
+    "filePicker": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "hidden": { "type": "boolean" },
+        "follow-symlinks": { "type": "boolean" },
+        "deduplicate-links": { "type": "boolean" },
+        "parents": { "type": "boolean" },
+        "ignore": { "type": "boolean" },
+        "git-ignore": { "type": "boolean" },
+        "git-global": { "type": "boolean" },
+        "git-exclude": { "type": "boolean" },
+        "max-depth": { "type": "integer", "minimum": 0 },
+        "hide-preview": { "type": "boolean" }
+      }
+    },
+    "fileExplorer": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "hidden": { "type": "boolean" },
+        "follow-symlinks": { "type": "boolean" },
+        "parents": { "type": "boolean" },
+        "ignore": { "type": "boolean" },
+        "git-ignore": { "type": "boolean" },
+        "git-global": { "type": "boolean" },
+        "git-exclude": { "type": "boolean" },
+        "flatten-dirs": { "type": "boolean" },
+        "icons": { "type": "boolean" },
+        "vcs": { "type": "boolean" }
+      }
+    },
+    "statusline": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "left": { "$ref": "#/$defs/statuslineElements" },
+        "center": { "$ref": "#/$defs/statuslineElements" },
+        "right": { "$ref": "#/$defs/statuslineElements" },
+        "separator": { "type": "string" },
+        "mode": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "normal": { "type": "string" },
+            "insert": { "type": "string" },
+            "select": { "type": "string" }
+          }
+        },
+        "diagnostics": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/severity" }
+        },
+        "workspace-diagnostics": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/severity" }
+        }
+      }
+    },
+    "statuslineElements": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "enum": [
+          "mode",
+          "spinner",
+          "file-base-name",
+          "file-name",
+          "file-absolute-path",
+          "file-modification-indicator",
+          "read-only-indicator",
+          "file-encoding",
+          "file-line-ending",
+          "file-indent-style",
+          "file-type",
+          "diagnostics",
+          "workspace-diagnostics",
+          "selections",
+          "primary-selection-length",
+          "position",
+          "separator",
+          "position-percentage",
+          "total-line-numbers",
+          "spacer",
+          "version-control",
+          "register",
+          "current-working-directory",
+          "function-name"
+        ]
+      }
+    },
+    "cursorKind": {
+      "type": "string",
+      "enum": ["block", "bar", "underline", "hidden"]
+    },
+    "lsp": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enable": { "type": "boolean" },
+        "display-progress-messages": { "type": "boolean" },
+        "display-messages": { "type": "boolean" },
+        "auto-signature-help": { "type": "boolean" },
+        "display-signature-help-docs": { "type": "boolean" },
+        "signature-help-position": { "type": "string", "enum": ["above", "below"] },
+        "display-inlay-hints": { "type": "boolean" },
+        "inlay-hints-length-limit": { "type": "integer", "minimum": 1, "maximum": 255 },
+        "display-color-swatches": { "type": "boolean" },
+        "color-swatches-string": { "type": "string" },
+        "snippets": { "type": "boolean" },
+        "goto-reference-include-declaration": { "type": "boolean" }
+      }
+    },
+    "command": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["command"],
+      "properties": {
+        "command": { "type": "string" },
+        "args": { "$ref": "#/$defs/arrayOfStrings" }
+      }
+    },
+    "softWrap": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enable": { "type": "boolean" },
+        "max-wrap": { "type": "integer", "minimum": 0, "maximum": 65535 },
+        "max-indent-retain": { "type": "integer", "minimum": 0, "maximum": 65535 },
+        "wrap-indicator": { "type": "string" },
+        "wrap-at-text-width": { "type": "boolean" }
+      }
+    },
+    "whitespace": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "render": {
+          "oneOf": [
+            { "type": "string", "enum": ["none", "all"] },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "default": { "type": "string", "enum": ["none", "all"] },
+                "space": { "type": "string", "enum": ["none", "all"] },
+                "nbsp": { "type": "string", "enum": ["none", "all"] },
+                "nnbsp": { "type": "string", "enum": ["none", "all"] },
+                "tab": { "type": "string", "enum": ["none", "all"] },
+                "newline": { "type": "string", "enum": ["none", "all"] }
+              }
+            }
+          ]
+        },
+        "characters": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "space": { "type": "string", "minLength": 1, "maxLength": 1 },
+            "nbsp": { "type": "string", "minLength": 1, "maxLength": 1 },
+            "nnbsp": { "type": "string", "minLength": 1, "maxLength": 1 },
+            "tab": { "type": "string", "minLength": 1, "maxLength": 1 },
+            "tabpad": { "type": "string", "minLength": 1, "maxLength": 1 },
+            "newline": { "type": "string", "minLength": 1, "maxLength": 1 }
+          }
+        }
+      }
+    },
+    "inlineDiagnostics": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "cursor-line": { "$ref": "#/$defs/diagnosticFilter" },
+        "other-lines": { "$ref": "#/$defs/diagnosticFilter" },
+        "min-diagnostic-width": { "type": "integer", "minimum": 0, "maximum": 65535 },
+        "prefix-len": { "type": "integer", "minimum": 0, "maximum": 65535 },
+        "max-wrap": { "type": "integer", "minimum": 0, "maximum": 65535 },
+        "max-diagnostics": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "cmdline": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "style": { "type": "string", "enum": ["bottom", "popup"] },
+        "show-icons": { "type": "boolean" },
+        "min-popup-width": { "type": "integer", "minimum": 0, "maximum": 65535 },
+        "max-popup-width": { "type": "integer", "minimum": 0, "maximum": 65535 },
+        "use-full-height": { "type": "boolean" },
+        "icons": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "search": { "type": "string" },
+            "command": { "type": "string" },
+            "shell": { "type": "string" },
+            "general": { "type": "string" }
+          }
+        }
+      }
+    },
+    "gradientBorders": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enable": { "type": "boolean" },
+        "thickness": { "type": "integer", "minimum": 0, "maximum": 255 },
+        "direction": { "type": "string", "enum": ["horizontal", "vertical", "diagonal", "radial"] },
+        "start-color": { "type": "string" },
+        "end-color": { "type": "string" },
+        "middle-color": { "type": "string" },
+        "animation-speed": { "type": "integer", "minimum": 0, "maximum": 255 }
+      }
+    },
+    "notifications": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enable": { "type": "boolean" },
+        "style": { "type": "string", "enum": ["popup", "statusline"] },
+        "max-history": { "type": "integer", "minimum": 0 },
+        "default-timeout": { "type": "integer", "minimum": 0 },
+        "position": {
+          "type": "string",
+          "enum": [
+            "top-left",
+            "top-center",
+            "top-right",
+            "bottom-left",
+            "bottom-center",
+            "bottom-right"
+          ]
+        },
+        "max-width": { "type": "integer", "minimum": 0, "maximum": 65535 },
+        "max-height": { "type": "integer", "minimum": 0, "maximum": 65535 },
+        "show-icons": { "type": "boolean" },
+        "icons": { "$ref": "#/$defs/notificationStrings" },
+        "padding": { "type": "integer", "minimum": 0, "maximum": 65535 },
+        "show-emojis": { "type": "boolean" },
+        "emojis": { "$ref": "#/$defs/notificationStrings" },
+        "enable-history": { "type": "boolean" },
+        "border": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enable": { "type": "boolean" },
+            "width": { "type": "integer", "minimum": 0, "maximum": 255 },
+            "radius": { "type": "integer", "minimum": 0, "maximum": 255 },
+            "gradient": { "type": "boolean" },
+            "gradient-start": { "type": "string" },
+            "gradient-end": { "type": "string" },
+            "style": { "type": "string", "enum": ["solid", "dashed", "dotted"] }
+          }
+        },
+        "shadow": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enable": { "type": "boolean" },
+            "offset-x": { "type": "integer", "minimum": 0, "maximum": 65535 },
+            "offset-y": { "type": "integer", "minimum": 0, "maximum": 65535 }
+          }
+        }
+      }
+    },
+    "notificationStrings": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "info": { "type": "string" },
+        "warning": { "type": "string" },
+        "error": { "type": "string" },
+        "success": { "type": "string" }
+      }
+    },
+    "icon": {
+      "oneOf": [
+        { "type": "string" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["glyph"],
+          "properties": {
+            "glyph": { "type": "string" },
+            "color": { "type": "string" }
+          }
+        }
+      ]
+    },
+    "icons": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "mime": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/icon" },
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "directory": { "type": "string" },
+            "directory-open": { "type": "string" }
+          }
+        },
+        "kind": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/icon" },
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "file": { "$ref": "#/$defs/icon" },
+            "folder": { "$ref": "#/$defs/icon" },
+            "folder-open": { "$ref": "#/$defs/icon" }
+          }
+        },
+        "diagnostic": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "hint": { "type": "string" },
+            "info": { "type": "string" },
+            "warning": { "type": "string" },
+            "error": { "type": "string" }
+          }
+        },
+        "vcs": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "branch": { "type": "string" },
+            "added": { "type": "string" },
+            "removed": { "type": "string" },
+            "ignored": { "type": "string" },
+            "modified": { "type": "string" },
+            "renamed": { "type": "string" },
+            "conflict": { "type": "string" }
+          }
+        },
+        "dap": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "verified": { "type": "string" },
+            "unverified": { "type": "string" }
+          }
+        },
+        "gutter": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "added": { "type": "string" },
+            "modified": { "type": "string" },
+            "deleted": { "type": "string" }
+          }
+        }
+      }
+    },
+    "keymaps": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "normal": { "$ref": "#/$defs/keymap" },
+        "insert": { "$ref": "#/$defs/keymap" },
+        "select": { "$ref": "#/$defs/keymap" }
+      }
+    },
+    "keymap": {
+      "type": "object",
+      "additionalProperties": {
+        "oneOf": [
+          { "type": "string" },
+          {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          { "$ref": "#/$defs/keymap" }
+        ]
+      }
+    }
+  }
+}

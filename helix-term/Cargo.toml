@@ -21,6 +21,7 @@ assets = [
   { source = "../runtime/*", dest = "/usr/lib/double-helix/runtime/", mode = "644" },
   { source = "../runtime/grammars/*", dest = "/usr/lib/double-helix/runtime/grammars/", mode = "644" }, # to avoid sources/
   { source = "../runtime/queries/**/*", dest = "/usr/lib/double-helix/runtime/queries/", mode = "644" },
+  { source = "../runtime/schemas/**/*", dest = "/usr/lib/double-helix/runtime/schemas/", mode = "644" },
   { source = "../runtime/themes/**/*", dest = "/usr/lib/double-helix/runtime/themes/", mode = "644" },
   { source = "../README.md", dest = "/usr/share/doc/double-helix/", mode = "644" },
   { source = "../contrib/completion/dhx.bash", dest = "/usr/share/bash-completion/completions/dhx", mode = "644" },

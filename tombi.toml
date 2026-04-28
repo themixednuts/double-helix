@@ -1,0 +1,15 @@
+[[schemas]]
+path = "runtime/schemas/config.schema.json"
+include = ["config.toml", ".double-helix/config.toml", "**/.double-helix/config.toml"]
+
+[[schemas]]
+path = "runtime/schemas/languages.schema.json"
+include = ["languages.toml", ".double-helix/languages.toml", "**/.double-helix/languages.toml"]
+
+[[schemas]]
+path = "runtime/schemas/theme.schema.json"
+include = ["theme.toml", "base16_theme.toml", "runtime/themes/*.toml", "themes/*.toml", "**/themes/*.toml"]
+
+[[schemas]]
+path = "runtime/schemas/plugin.schema.json"
+include = ["**/plugin.toml"]

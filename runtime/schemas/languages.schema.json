@@ -1,0 +1,337 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://double-helix.dev/schemas/languages.schema.json",
+  "title": "Double Helix languages.toml",
+  "description": "Language, language server, and tree-sitter grammar configuration for Double Helix.",
+  "type": "object",
+  "x-tombi-toml-version": "v1.0.0",
+  "additionalProperties": false,
+  "properties": {
+    "use-grammars": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["only"],
+          "properties": {
+            "only": {
+              "type": "array",
+              "items": { "type": "string" },
+              "uniqueItems": true
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["except"],
+          "properties": {
+            "except": {
+              "type": "array",
+              "items": { "type": "string" },
+              "uniqueItems": true
+            }
+          }
+        }
+      ]
+    },
+    "language-server": {
+      "type": "object",
+      "additionalProperties": { "$ref": "#/$defs/languageServer" },
+      "x-tombi-additional-key-label": "server_name"
+    },
+    "grammar": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/grammar" }
+    },
+    "language": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/language" }
+    }
+  },
+  "$defs": {
+    "strings": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "severity": {
+      "type": "string",
+      "enum": ["hint", "info", "warning", "error"]
+    },
+    "autoPairs": {
+      "oneOf": [
+        { "type": "boolean" },
+        {
+          "type": "object",
+          "additionalProperties": { "type": "string", "minLength": 1, "maxLength": 1 }
+        }
+      ]
+    },
+    "softWrap": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enable": { "type": "boolean" },
+        "max-wrap": { "type": "integer", "minimum": 0, "maximum": 65535 },
+        "max-indent-retain": { "type": "integer", "minimum": 0, "maximum": 65535 },
+        "wrap-indicator": { "type": "string" },
+        "wrap-at-text-width": { "type": "boolean" }
+      }
+    },
+    "wordCompletion": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enable": { "type": "boolean" },
+        "trigger-length": { "type": "integer", "minimum": 1, "maximum": 255 }
+      }
+    },
+    "fileType": {
+      "oneOf": [
+        { "type": "string" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["glob"],
+          "properties": {
+            "glob": { "type": "string" }
+          }
+        }
+      ]
+    },
+    "blockCommentToken": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["start", "end"],
+      "properties": {
+        "start": { "type": "string" },
+        "end": { "type": "string" }
+      }
+    },
+    "languageFeature": {
+      "type": "string",
+      "enum": [
+        "format",
+        "goto-declaration",
+        "goto-definition",
+        "goto-type-definition",
+        "goto-reference",
+        "goto-implementation",
+        "signature-help",
+        "hover",
+        "document-highlight",
+        "completion",
+        "code-action",
+        "workspace-command",
+        "document-symbols",
+        "workspace-symbols",
+        "diagnostics",
+        "pull-diagnostics",
+        "rename-symbol",
+        "inlay-hints",
+        "document-colors"
+      ]
+    },
+    "languageServerFeatureSet": {
+      "oneOf": [
+        { "type": "string" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["name"],
+          "properties": {
+            "name": { "type": "string" },
+            "only-features": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/languageFeature" },
+              "uniqueItems": true
+            },
+            "except-features": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/languageFeature" },
+              "uniqueItems": true
+            }
+          }
+        }
+      ]
+    },
+    "languageServer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["command"],
+      "properties": {
+        "command": { "type": "string" },
+        "args": { "$ref": "#/$defs/strings" },
+        "environment": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        },
+        "config": true,
+        "timeout": { "type": "integer", "minimum": 0 },
+        "required-root-patterns": { "$ref": "#/$defs/strings" }
+      }
+    },
+    "formatter": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["command"],
+      "properties": {
+        "command": { "type": "string" },
+        "args": { "$ref": "#/$defs/strings" }
+      }
+    },
+    "indent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tab-width", "unit"],
+      "properties": {
+        "tab-width": { "type": "integer", "minimum": 1, "maximum": 16 },
+        "unit": { "type": "string" }
+      }
+    },
+    "debugCompletion": {
+      "oneOf": [
+        { "type": "string" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "name": { "type": "string" },
+            "completion": { "type": "string" },
+            "default": { "type": "string" }
+          }
+        }
+      ]
+    },
+    "debugTemplate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "request", "args"],
+      "properties": {
+        "name": { "type": "string" },
+        "request": { "type": "string" },
+        "completion": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/debugCompletion" }
+        },
+        "args": {
+          "type": "object",
+          "additionalProperties": true
+        }
+      }
+    },
+    "debugger": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "transport", "templates"],
+      "properties": {
+        "name": { "type": "string" },
+        "transport": { "type": "string" },
+        "command": { "type": "string" },
+        "args": { "$ref": "#/$defs/strings" },
+        "port-arg": { "type": "string" },
+        "templates": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/debugTemplate" }
+        },
+        "quirks": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "absolute-paths": { "type": "boolean" }
+          }
+        }
+      }
+    },
+    "language": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name"],
+      "properties": {
+        "name": { "type": "string" },
+        "language-id": { "type": "string" },
+        "scope": { "type": "string" },
+        "file-types": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/fileType" }
+        },
+        "shebangs": { "$ref": "#/$defs/strings" },
+        "roots": { "$ref": "#/$defs/strings" },
+        "comment-token": {
+          "oneOf": [
+            { "type": "string" },
+            { "$ref": "#/$defs/strings" }
+          ]
+        },
+        "comment-tokens": {
+          "oneOf": [
+            { "type": "string" },
+            { "$ref": "#/$defs/strings" }
+          ]
+        },
+        "block-comment-tokens": {
+          "oneOf": [
+            { "$ref": "#/$defs/blockCommentToken" },
+            {
+              "type": "array",
+              "items": { "$ref": "#/$defs/blockCommentToken" }
+            }
+          ]
+        },
+        "text-width": { "type": "integer", "minimum": 0 },
+        "soft-wrap": { "$ref": "#/$defs/softWrap" },
+        "auto-format": { "type": "boolean" },
+        "formatter": { "$ref": "#/$defs/formatter" },
+        "path-completion": { "type": "boolean" },
+        "word-completion": { "$ref": "#/$defs/wordCompletion" },
+        "diagnostic-severity": { "$ref": "#/$defs/severity" },
+        "grammar": { "type": "string" },
+        "injection-regex": { "type": "string" },
+        "language-servers": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/languageServerFeatureSet" }
+        },
+        "indent": { "$ref": "#/$defs/indent" },
+        "debugger": { "$ref": "#/$defs/debugger" },
+        "auto-pairs": { "$ref": "#/$defs/autoPairs" },
+        "rulers": {
+          "type": "array",
+          "items": { "type": "integer", "minimum": 0, "maximum": 65535 }
+        },
+        "workspace-lsp-roots": { "$ref": "#/$defs/strings" },
+        "persistent-diagnostic-sources": { "$ref": "#/$defs/strings" },
+        "rainbow-brackets": { "type": "boolean" }
+      }
+    },
+    "grammar": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "source"],
+      "properties": {
+        "name": { "type": "string" },
+        "source": {
+          "oneOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["path"],
+              "properties": {
+                "path": { "type": "string" }
+              }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["git", "rev"],
+              "properties": {
+                "git": { "type": "string" },
+                "rev": { "type": "string" },
+                "subpath": { "type": "string" }
+              }
+            }
+          ]
+        }
+      }
+    }
+  }
+}

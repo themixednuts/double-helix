@@ -1,3 +1,5 @@
+#:schema ./runtime/schemas/theme.schema.json
+
 # Author: NNB <nnbnh@protonmail.com>
 
 "ui.menu" = { fg = "black", bg = "white" }

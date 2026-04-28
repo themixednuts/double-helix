@@ -1,0 +1,73 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://double-helix.dev/schemas/theme.schema.json",
+  "title": "Double Helix theme TOML",
+  "description": "Theme and palette configuration for Double Helix.",
+  "type": "object",
+  "x-tombi-toml-version": "v1.0.0",
+  "properties": {
+    "inherits": {
+      "type": "string",
+      "description": "Name of another theme to inherit before applying this theme."
+    },
+    "palette": {
+      "type": "object",
+      "additionalProperties": { "$ref": "#/$defs/color" },
+      "x-tombi-additional-key-label": "color_name"
+    }
+  },
+  "additionalProperties": {
+    "oneOf": [
+      { "$ref": "#/$defs/color" },
+      { "$ref": "#/$defs/style" }
+    ]
+  },
+  "$defs": {
+    "color": {
+      "type": "string",
+      "description": "Named palette color or #RGB/#RRGGBB color."
+    },
+    "style": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "fg": { "$ref": "#/$defs/color" },
+        "bg": { "$ref": "#/$defs/color" },
+        "underline": {
+          "oneOf": [
+            { "$ref": "#/$defs/color" },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "color": { "$ref": "#/$defs/color" },
+                "style": {
+                  "type": "string",
+                  "enum": ["line", "curl", "dashed", "dotted", "double-line"]
+                }
+              }
+            }
+          ]
+        },
+        "modifiers": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "bold",
+              "dim",
+              "italic",
+              "underlined",
+              "slow_blink",
+              "rapid_blink",
+              "reversed",
+              "hidden",
+              "crossed_out"
+            ]
+          },
+          "uniqueItems": true
+        }
+      }
+    }
+  }
+}

@@ -1,3 +1,5 @@
+#:schema ./runtime/schemas/theme.schema.json
+
 attribute = "lilac"
 keyword = "almond"
 "keyword.directive" = "lilac" # -- preprocessor comments (#if in C)

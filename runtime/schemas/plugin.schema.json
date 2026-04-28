@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://double-helix.dev/schemas/plugin.schema.json",
+  "title": "Double Helix plugin.toml",
+  "description": "Plugin metadata loaded from a plugin directory.",
+  "type": "object",
+  "x-tombi-toml-version": "v1.0.0",
+  "additionalProperties": false,
+  "properties": {
+    "name": {
+      "type": "string",
+      "description": "Plugin name."
+    },
+    "version": {
+      "type": "string",
+      "description": "Plugin version."
+    },
+    "description": {
+      "type": "string",
+      "description": "Human-readable plugin description."
+    },
+    "author": {
+      "type": "string",
+      "description": "Plugin author."
+    },
+    "entry": {
+      "type": "string",
+      "description": "Lua entry point relative to the plugin directory. Defaults to init.lua."
+    }
+  }
+}

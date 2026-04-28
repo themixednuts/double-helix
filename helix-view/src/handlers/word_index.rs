@@ -65,14 +65,7 @@ impl Handler {
         let (tx, rx) = channel(128);
         runtime.work().spawn(index.clone().run(rx)).detach();
         Self {
-            hook: Hook::spawn(Hook {
-                changes: HashMap::default(),
-                coordinator: tx.clone(),
-                debounce: Debounce::new(DEBOUNCE),
-                work: runtime.work().clone(),
-                clock: runtime.clock().clone(),
-                tx: None,
-            }),
+            hook: Hook::spawn(tx.clone(), runtime.work().clone(), runtime.clock().clone()),
             index,
             coordinator: tx,
         }
@@ -86,15 +79,22 @@ struct Hook {
     debounce: Debounce,
     work: Work,
     clock: Clock,
-    tx: Option<Sender<Event>>,
+    tx: Sender<Event>,
 }
 
 const DEBOUNCE: Duration = Duration::from_secs(1);
 
 impl Hook {
-    fn spawn(mut hook: Self) -> Sender<Event> {
+    fn spawn(coordinator: Sender<Event>, work: Work, clock: Clock) -> Sender<Event> {
         let (tx, mut rx) = helix_runtime::channel(128);
-        hook.tx = Some(tx.clone());
+        let mut hook = Self {
+            changes: HashMap::default(),
+            coordinator,
+            debounce: Debounce::new(DEBOUNCE),
+            work,
+            clock,
+            tx: tx.clone(),
+        };
         let work = hook.work.clone();
         work.spawn(async move {
             while let Some(event) = rx.recv().await {
@@ -148,11 +148,7 @@ impl Hook {
     }
 
     fn restart_debounce(&mut self) {
-        let tx = self
-            .tx
-            .as_ref()
-            .expect("word index hook sender initialized")
-            .clone();
+        let tx = self.tx.clone();
         self.debounce.restart(&self.work, &self.clock, async move {
             let _ = tx.send(Event::FlushDebounced).await;
         });

@@ -25,7 +25,7 @@ impl Application {
                 self.editor
                     .dispatch_editor_config_change(&old_editor_config);
                 self.editor
-                    .refresh_modal_keymaps(crate::keymap::to_component_modal_keymaps(
+                    .set_modal_keymaps(crate::keymap::to_component_modal_keymaps(
                         &self.config.load().keys,
                     ));
             }
@@ -53,7 +53,7 @@ impl Application {
             self.terminal.reconfigure((&default_config.editor).into())?;
             self.config.store(Arc::new(default_config));
             self.editor
-                .refresh_modal_keymaps(crate::keymap::to_component_modal_keymaps(
+                .set_modal_keymaps(crate::keymap::to_component_modal_keymaps(
                     &self.config.load().keys,
                 ));
             Ok(())

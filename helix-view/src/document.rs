@@ -2965,7 +2965,7 @@ impl Document {
     }
 
     #[inline]
-    pub fn selections(&self) -> &HashMap<ViewId, Selection> {
+    pub fn selections(&self) -> crate::selection_store::Selections<'_> {
         self.selection_store.selections()
     }
 

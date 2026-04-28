@@ -33,8 +33,8 @@ pub struct EditRegion {
     /// (count, pending operators, insert recording).
     engine: Option<Box<dyn EditingEngine>>,
     /// Per-region modal keymaps with independent pending/sticky state.
-    keymaps: Option<ModalKeymaps>,
-    history: Option<ViewHistoryState>,
+    keymaps: ModalKeymaps,
+    history: ViewHistoryState,
 }
 
 impl Default for EditRegion {
@@ -44,8 +44,8 @@ impl Default for EditRegion {
             doc_id: None,
             mode: Mode::Normal,
             engine: None,
-            keymaps: None,
-            history: None,
+            keymaps: ModalKeymaps::default(),
+            history: ViewHistoryState::new(DocumentId::default()),
         }
     }
 }
@@ -69,20 +69,10 @@ impl EditRegion {
             let doc = Document::default(editor.config.clone(), editor.syn_loader.clone());
             let id = editor.new_component_doc(doc);
             self.doc_id = Some(id);
-            let factory = editor
-                .frontend()
-                .engine_factory
-                .as_ref()
-                .expect("engine_factory not initialized");
+            let factory = editor.frontend().engine_factory.clone();
             self.engine = Some(factory.create(editor.config.load().editing_engine));
-            self.history = Some(ViewHistoryState::new(id));
-        }
-        if self.keymaps.is_none() {
-            self.keymaps = editor
-                .frontend()
-                .modal_keymaps
-                .clone()
-                .map(ModalKeymaps::from_shared);
+            self.keymaps = ModalKeymaps::from_shared(editor.frontend().modal_keymaps.clone());
+            self.history = ViewHistoryState::new(id);
         }
         if let Some(doc) = self
             .doc_id
@@ -93,9 +83,7 @@ impl EditRegion {
         if let Some(doc_id) = self.doc_id {
             let state = editor.ensure_component_view(self.region.id(), doc_id);
             state.area = self.area();
-            if let Some(history) = &self.history {
-                state.history = history.clone();
-            }
+            state.history = self.history.clone();
         }
     }
 
@@ -160,14 +148,12 @@ impl EditRegion {
         let doc_id = self.doc_id?;
         let area = self.area();
         let history = self.history.clone();
-        let keymaps = self.keymaps.as_mut()?;
+        let keymaps = &mut self.keymaps;
         let mut engine = self.engine.take()?;
         let state = editor.ensure_component_view(self.region.id(), doc_id);
         state.doc = doc_id;
         state.area = area;
-        if let Some(history) = history {
-            state.history = history;
-        }
+        state.history = history;
 
         let global_mode = editor.mode;
         editor.mode = self.mode;
@@ -191,7 +177,7 @@ impl EditRegion {
             editor.frontend_mut().focused_modal_input = engine.input_state();
         }
         if let Some(state) = editor.component_view(self.region.id()) {
-            self.history = Some(state.history.clone());
+            self.history = state.history.clone();
         }
         self.engine = Some(engine);
         Some(result)
@@ -271,17 +257,11 @@ impl HistoryViewport<Document> for EditRegion {
         transaction: &helix_core::Transaction,
         doc: &mut Document,
     ) {
-        self.history
-            .as_mut()
-            .expect("edit region history not initialized")
-            .apply(transaction, doc);
+        self.history.apply(transaction, doc);
     }
 
     fn sync_changes(&mut self, doc: &mut Document) {
-        self.history
-            .as_mut()
-            .expect("edit region history not initialized")
-            .sync_changes(doc);
+        self.history.sync_changes(doc);
     }
 }
 
@@ -290,8 +270,6 @@ impl Jumpable<Document> for EditRegion {
         let view_id = self.id();
         doc.append_changes_to_history(self);
         self.history
-            .as_mut()
-            .expect("edit region history not initialized")
             .jumps
             .push((doc.id(), doc.selection(view_id).clone()));
     }

@@ -278,21 +278,18 @@ impl Application {
         let keys = Box::new(Map::new(Arc::clone(&config), |config: &Config| {
             &config.keys
         }));
-        editor.frontend_mut().modal_keymaps = Some(Arc::new(arc_swap::ArcSwap::from_pointee(
+        editor.frontend_mut().modal_keymaps = Arc::new(arc_swap::ArcSwap::from_pointee(
             crate::keymap::to_component_modal_keymaps(&config.load().keys),
-        )));
+        ));
 
         // Build the editing engine based on config
         let registry = std::sync::Arc::new(helix_modal::populate::build_registry());
-        editor.frontend_mut().engine_factory = Some(Arc::new(ModalEngineFactory {
-            registry: registry.clone(),
-        }));
-        let engine = editor
-            .frontend()
-            .engine_factory
-            .as_ref()
-            .expect("engine_factory not set")
-            .create(config.load().editor.editing_engine);
+        let engine_factory: Arc<dyn helix_view::engine::EditingEngineFactory> =
+            Arc::new(ModalEngineFactory {
+                registry: registry.clone(),
+            });
+        editor.frontend_mut().engine_factory = engine_factory.clone();
+        let engine = engine_factory.create(config.load().editor.editing_engine);
         log::info!("Editing engine: {}", engine.name());
 
         let editor_view = Box::new(ui::EditorView::new(Keymaps::new(keys), engine, registry));

@@ -90,8 +90,10 @@ impl Editor {
             frontend: FrontendState {
                 focused_modal_input: crate::engine::ModalInputState::default(),
                 assistant_panel_theme: None,
-                engine_factory: None,
-                modal_keymaps: None,
+                engine_factory: std::sync::Arc::new(crate::engine::HeadlessEditingEngineFactory),
+                modal_keymaps: std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(
+                    std::collections::HashMap::new(),
+                )),
             },
             assistant_services: AssistantServices {
                 terminals: std::sync::Arc::new(helix_acp::TerminalManager::new()),

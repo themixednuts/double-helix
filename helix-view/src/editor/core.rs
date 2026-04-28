@@ -55,11 +55,9 @@ pub(crate) struct AssistantFollowState {
 pub struct FrontendState {
     pub focused_modal_input: crate::engine::ModalInputState,
     pub assistant_panel_theme: Option<Theme>,
-    pub engine_factory: Option<std::sync::Arc<dyn crate::engine::EditingEngineFactory>>,
-    pub modal_keymaps: Option<
-        std::sync::Arc<
-            arc_swap::ArcSwap<std::collections::HashMap<Mode, crate::keymap::ModalKeyTrie>>,
-        >,
+    pub engine_factory: std::sync::Arc<dyn crate::engine::EditingEngineFactory>,
+    pub modal_keymaps: std::sync::Arc<
+        arc_swap::ArcSwap<std::collections::HashMap<Mode, crate::keymap::ModalKeyTrie>>,
     >,
 }
 

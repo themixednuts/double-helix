@@ -280,6 +280,14 @@ type DynQueryCallback<T, D> = fn(
     helix_runtime::Work,
 ) -> helix_runtime::Task<anyhow::Result<()>>;
 
+enum DynamicQuery<T: 'static + Send + Sync, D: 'static> {
+    Disabled,
+    Enabled {
+        handler: Sender<DynamicQueryChange>,
+        callback: DynQueryCallback<T, D>,
+    },
+}
+
 type PickerItemDataFn<T> = Box<dyn Fn(&T) -> helix_view::model::PickerItemData + Send + Sync>;
 
 pub struct Picker<T: 'static + Send + Sync, D: 'static> {
@@ -316,8 +324,7 @@ pub struct Picker<T: 'static + Send + Sync, D: 'static> {
     preview_highlight_handler: Sender<Arc<Path>>,
     /// Read-only preview viewport state.
     preview_region: ContentRegion<()>,
-    dynamic_query_handler: Option<Sender<DynamicQueryChange>>,
-    dynamic_query_callback: Option<DynQueryCallback<T, D>>,
+    dynamic_query: DynamicQuery<T, D>,
     /// Cached gradient border for rendering when enabled in config
     gradient_border: Option<GradientBorder>,
 
@@ -476,8 +483,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
                 ingress.clone(),
             ),
             preview_region: ContentRegion::default(),
-            dynamic_query_handler: None,
-            dynamic_query_callback: None,
+            dynamic_query: DynamicQuery::Disabled,
             gradient_border: None,
             model_layer_id: None,
             item_data_fn: None,
@@ -538,21 +544,19 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
         callback: DynQueryCallback<T, D>,
         debounce_ms: Option<u64>,
     ) -> Self {
-        let handler = DynamicQueryHandler::new(
+        let handler = DynamicQueryHandler::spawn(
             debounce_ms,
             self.work.clone(),
             self.clock.clone(),
             self.ingress.clone(),
-        )
-        .spawn();
+        );
         let event = DynamicQueryChange {
             query: self.primary_query(),
             // Treat the initial query as a paste.
             is_paste: true,
         };
         helix_runtime::send_blocking(&handler, event);
-        self.dynamic_query_handler = Some(handler);
-        self.dynamic_query_callback = Some(callback);
+        self.dynamic_query = DynamicQuery::Enabled { handler, callback };
         self
     }
 
@@ -618,8 +622,9 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
     fn run_dynamic_query(&mut self, editor: &mut Editor, query: Arc<str>) {
         self.version.fetch_add(1, atomic::Ordering::Relaxed);
         self.matcher.restart(false);
-        let Some(callback) = self.dynamic_query_callback else {
-            return;
+        let callback = match &self.dynamic_query {
+            DynamicQuery::Disabled => return,
+            DynamicQuery::Enabled { callback, .. } => *callback,
         };
         let injector = self.injector();
         let task = (callback)(
@@ -972,7 +977,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
         }
         // If this is a dynamic picker, notify the query hook that the primary
         // query might have been updated.
-        if let Some(handler) = &self.dynamic_query_handler {
+        if let DynamicQuery::Enabled { handler, .. } = &self.dynamic_query {
             let event = DynamicQueryChange {
                 query: self.primary_query(),
                 is_paste,

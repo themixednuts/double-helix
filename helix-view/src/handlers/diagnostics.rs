@@ -101,14 +101,33 @@ pub struct DiagnosticsHandler {
     last_doc: AtomicUsize,
     last_cursor_line: AtomicUsize,
     pub active: bool,
-    events: Mutex<Option<Sender<DiagnosticEvent>>>,
-    runtime: Mutex<Option<DiagnosticRuntime>>,
+    event_source: Mutex<DiagnosticEventSource>,
 }
 
 #[derive(Clone)]
 struct DiagnosticRuntime {
     runtime: Runtime,
     redraw: FrameHandle,
+}
+
+enum DiagnosticEventSource {
+    Unbound,
+    Bound(DiagnosticRuntime),
+    Spawned(Sender<DiagnosticEvent>),
+}
+
+enum DiagnosticEventTarget {
+    Unbound,
+    Spawned(Sender<DiagnosticEvent>),
+}
+
+impl DiagnosticEventTarget {
+    fn send(self, event: DiagnosticEvent) {
+        let Self::Spawned(tx) = self else {
+            return;
+        };
+        send_blocking(&tx, event);
+    }
 }
 
 // make sure we never share handlers across multiple views this is a stop
@@ -127,8 +146,7 @@ impl DiagnosticsHandler {
         Self {
             active_generation: Arc::new(AtomicUsize::new(0)),
             generation: AtomicUsize::new(0),
-            events: Mutex::new(None),
-            runtime: Mutex::new(None),
+            event_source: Mutex::new(DiagnosticEventSource::Unbound),
             // usize::MAX encodes a "no document" sentinel.
             last_doc: AtomicUsize::new(usize::MAX),
             last_cursor_line: AtomicUsize::new(usize::MAX),
@@ -137,11 +155,14 @@ impl DiagnosticsHandler {
     }
 
     pub fn bind_runtime(&mut self, runtime: Runtime, redraw: FrameHandle) {
-        *self
-            .runtime
+        let mut source = self
+            .event_source
             .lock()
-            .expect("diagnostics runtime lock poisoned") =
-            Some(DiagnosticRuntime { runtime, redraw });
+            .expect("diagnostics event source lock poisoned");
+        if matches!(&*source, DiagnosticEventSource::Spawned(_)) {
+            return;
+        }
+        *source = DiagnosticEventSource::Bound(DiagnosticRuntime { runtime, redraw });
     }
 
     fn load_last_doc(&self) -> DocumentId {
@@ -155,36 +176,32 @@ impl DiagnosticsHandler {
         self.last_doc.store(id.value().get(), Ordering::Relaxed);
     }
 
-    fn events(&self) -> Option<Sender<DiagnosticEvent>> {
-        let mut events = self
-            .events
+    fn events(&self) -> DiagnosticEventTarget {
+        let mut source = self
+            .event_source
             .lock()
-            .expect("diagnostics handler lock poisoned");
-        if let Some(tx) = events.as_ref() {
-            return Some(tx.clone());
+            .expect("diagnostics event source lock poisoned");
+
+        match &*source {
+            DiagnosticEventSource::Unbound => DiagnosticEventTarget::Unbound,
+            DiagnosticEventSource::Spawned(tx) => DiagnosticEventTarget::Spawned(tx.clone()),
+            DiagnosticEventSource::Bound(runtime) => {
+                let tx = DiagnosticTimeout::spawn(
+                    self.active_generation.clone(),
+                    runtime.runtime.work().clone(),
+                    runtime.runtime.clock().clone(),
+                    runtime.redraw.clone(),
+                );
+                *source = DiagnosticEventSource::Spawned(tx.clone());
+                DiagnosticEventTarget::Spawned(tx)
+            }
         }
-        let runtime = self
-            .runtime
-            .lock()
-            .expect("diagnostics runtime lock poisoned")
-            .as_ref()?
-            .clone();
-        let tx = DiagnosticTimeout::spawn(
-            self.active_generation.clone(),
-            runtime.runtime.work().clone(),
-            runtime.runtime.clock().clone(),
-            runtime.redraw,
-        );
-        *events = Some(tx.clone());
-        Some(tx)
     }
 }
 
 impl DiagnosticsHandler {
     pub fn refresh(&self) {
-        if let Some(events) = self.events() {
-            send_blocking(&events, DiagnosticEvent::Refresh);
-        }
+        self.events().send(DiagnosticEvent::Refresh);
     }
 
     pub fn immediately_show_diagnostic(&self, doc: &Document, view: ViewId) {
@@ -215,14 +232,9 @@ impl DiagnosticsHandler {
             self.last_cursor_line.store(cursor_line, Ordering::Relaxed);
             let new_gen = self.generation.load(Ordering::Relaxed) + 1;
             self.generation.store(new_gen, Ordering::Relaxed);
-            if let Some(events) = self.events() {
-                send_blocking(
-                    &events,
-                    DiagnosticEvent::CursorLineChanged {
-                        generation: new_gen,
-                    },
-                );
-            }
+            self.events().send(DiagnosticEvent::CursorLineChanged {
+                generation: new_gen,
+            });
             false
         }
     }

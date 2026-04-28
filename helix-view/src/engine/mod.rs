@@ -375,3 +375,80 @@ pub trait EditingEngine: Send {
 pub trait EditingEngineFactory: Send + Sync {
     fn create(&self, config: crate::editor::EditingEngineConfig) -> Box<dyn EditingEngine>;
 }
+
+#[derive(Debug, Default)]
+pub struct HeadlessEditingEngineFactory;
+
+impl EditingEngineFactory for HeadlessEditingEngineFactory {
+    fn create(&self, _config: crate::editor::EditingEngineConfig) -> Box<dyn EditingEngine> {
+        Box::new(HeadlessEditingEngine)
+    }
+}
+
+#[derive(Debug)]
+struct HeadlessEditingEngine;
+
+impl EditingEngine for HeadlessEditingEngine {
+    fn pre_resolve(
+        &mut self,
+        _editor: &mut Editor,
+        _view_id: ViewId,
+        _doc_id: DocumentId,
+        _keymaps: &dyn KeymapQuery,
+        _key: KeyEvent,
+    ) -> Option<EngineResult> {
+        None
+    }
+
+    fn process_lookup(
+        &mut self,
+        _editor: &mut Editor,
+        _view_id: ViewId,
+        _doc_id: DocumentId,
+        _keymaps: &mut dyn KeymapQuery,
+        _key: KeyEvent,
+        _lookup: KeymapLookup,
+    ) -> EngineResult {
+        EngineResult::Unbound
+    }
+
+    fn mode_name(&self) -> &str {
+        "HEADLESS"
+    }
+
+    fn editor_mode(&self) -> Mode {
+        Mode::Normal
+    }
+
+    fn pending_display(&self) -> &str {
+        ""
+    }
+
+    fn is_pending(&self) -> bool {
+        false
+    }
+
+    fn reset(&mut self) {}
+
+    fn name(&self) -> &str {
+        "headless"
+    }
+
+    fn last_action(&self) -> Option<&RecordedAction> {
+        None
+    }
+
+    fn repeat_last(
+        &mut self,
+        _editor: &mut Editor,
+        _view_id: ViewId,
+        _doc_id: DocumentId,
+        _count: NonZeroUsize,
+    ) -> EngineResult {
+        EngineResult::Unbound
+    }
+
+    fn begin_insert_recording(&mut self, _entry_command: Cow<'static, str>) {}
+
+    fn end_insert_recording(&mut self) {}
+}

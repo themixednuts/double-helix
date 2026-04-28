@@ -53,14 +53,13 @@ impl Editor {
         self.lifecycle.clone()
     }
 
-    pub fn refresh_modal_keymaps(
+    pub fn set_modal_keymaps(
         &self,
         keymaps: std::collections::HashMap<crate::document::Mode, crate::keymap::ModalKeyTrie>,
     ) {
-        let Some(modal_keymaps) = &self.frontend.modal_keymaps else {
-            return;
-        };
-        modal_keymaps.store(std::sync::Arc::new(keymaps));
+        self.frontend
+            .modal_keymaps
+            .store(std::sync::Arc::new(keymaps));
     }
 
     pub fn assistant_context_registry(&self) -> &crate::assistant::context::Registry {

@@ -169,14 +169,19 @@ impl Editor {
                 current_view.sync_changes(doc);
             }
             current_view.id
-        } else if let Some(view_id) = doc.selections().keys().next() {
-            let view_id = *view_id;
-            let view = self.tree.get_mut(view_id);
-            view.sync_changes(doc);
-            view_id
         } else {
-            doc.ensure_view_init(current_view.id);
-            current_view.id
+            let existing_view_id = {
+                let selections = doc.selections();
+                selections.keys().next().copied()
+            };
+            if let Some(view_id) = existing_view_id {
+                let view = self.tree.get_mut(view_id);
+                view.sync_changes(doc);
+                view_id
+            } else {
+                doc.ensure_view_init(current_view.id);
+                current_view.id
+            }
         }
     }
 

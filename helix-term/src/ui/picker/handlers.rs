@@ -11,7 +11,7 @@ pub(super) struct PreviewHighlightHandler {
     debounce: Debounce,
     work: Work,
     clock: Clock,
-    tx: Option<Sender<PreviewHighlightEvent>>,
+    tx: Sender<PreviewHighlightEvent>,
     ingress: SharedIngress,
 }
 
@@ -28,10 +28,9 @@ impl PreviewHighlightHandler {
             debounce: Debounce::new(Duration::from_millis(150)),
             work: work.clone(),
             clock,
-            tx: None,
+            tx: tx.clone(),
             ingress,
         };
-        handler.tx = Some(tx.clone());
         handler
             .work
             .clone()
@@ -70,11 +69,7 @@ impl PreviewHighlightHandler {
     }
 
     fn restart(&mut self) {
-        let tx = self
-            .tx
-            .as_ref()
-            .expect("picker preview sender initialized")
-            .clone();
+        let tx = self.tx.clone();
         self.debounce.restart(&self.work, &self.clock, async move {
             let _ = tx.send(PreviewHighlightEvent::Flush).await;
         });
@@ -113,43 +108,39 @@ pub(super) struct DynamicQueryHandler {
     timer: Debounce,
     work: Work,
     clock: Clock,
-    tx: Option<Sender<DynamicQueryEvent>>,
+    tx: Sender<DynamicQueryEvent>,
     last_query: Arc<str>,
     query: Option<Arc<str>>,
     ingress: SharedIngress,
 }
 
 impl DynamicQueryHandler {
-    pub(super) fn new(
+    pub(super) fn spawn(
         duration_ms: Option<u64>,
         work: Work,
         clock: Clock,
         ingress: SharedIngress,
-    ) -> Self {
-        Self {
+    ) -> Sender<DynamicQueryChange> {
+        let (tx, mut rx) = channel(128);
+        let mut handler = Self {
             debounce: Duration::from_millis(duration_ms.unwrap_or(100)),
             timer: Debounce::new(Duration::from_millis(duration_ms.unwrap_or(100))),
-            work,
+            work: work.clone(),
             clock,
-            tx: None,
+            tx: tx.clone(),
             last_query: "".into(),
             query: None,
             ingress,
-        }
-    }
-
-    pub(super) fn spawn(mut self) -> Sender<DynamicQueryChange> {
-        let (tx, mut rx) = channel(128);
-        self.tx = Some(tx.clone());
+        };
         let internal_tx = tx.clone();
-        let work = self.work.clone();
-        self.work
+        handler
+            .work
             .clone()
             .spawn(async move {
                 while let Some(event) = rx.recv().await {
-                    self.handle_event(event);
+                    handler.handle_event(event);
                 }
-                self.timer.cancel();
+                handler.timer.cancel();
             })
             .detach();
         let (frontend_tx, mut frontend_rx) = channel(128);
@@ -184,11 +175,7 @@ impl DynamicQueryHandler {
     }
 
     fn restart(&mut self) {
-        let tx = self
-            .tx
-            .as_ref()
-            .expect("picker dynamic query sender initialized")
-            .clone();
+        let tx = self.tx.clone();
         self.timer = Debounce::new(self.debounce);
         self.timer.restart(&self.work, &self.clock, async move {
             let _ = tx.send(DynamicQueryEvent::Flush).await;

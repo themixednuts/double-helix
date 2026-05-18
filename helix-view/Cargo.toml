@@ -55,7 +55,7 @@ base64 = "0.22"
 parking_lot.workspace = true
 thiserror.workspace = true
 notify.workspace = true
-indexmap = "2.13"
+indexmap = "2.14"
 
 kstring = "2.0"
 [target.'cfg(windows)'.dependencies]

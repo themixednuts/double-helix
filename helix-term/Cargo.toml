@@ -47,6 +47,10 @@ name = "dhx"
 path = "src/main.rs"
 
 [[bin]]
+name = "dhx-ui-storybook"
+path = "src/bin/dhx_ui_storybook.rs"
+
+[[bin]]
 name = "hx-bench"
 path = "src/bin/hx_bench.rs"
 required-features = ["integration", "bench"]
@@ -68,7 +72,7 @@ anyhow = "1"
 once_cell = "1.21"
 
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "io-util", "io-std", "time", "process", "macros", "fs", "parking_lot"] }
-tui = { path = "../helix-tui", package = "helix-tui", default-features = false, features = ["termina", "crossterm"] }
+tui = { path = "../helix-tui", package = "helix-tui", default-features = false, features = ["termina", "crossterm", "ratatui"] }
 termina = { workspace = true, features = ["event-stream"] }
 signal-hook = "0.4"
 tokio-stream = "0.1"
@@ -106,6 +110,7 @@ serde = { version = "1.0", features = ["derive"] }
 
 dashmap = "6.0"
 rayon = "1.11"
+fff-search = "=0.6.4"
 
 [target.'cfg(windows)'.dependencies]
 crossterm = { version = "0.28", features = ["event-stream"] }
@@ -122,4 +127,6 @@ helix-loader = { path = "../helix-loader" }
 smallvec = "1.15"
 indoc = "2.0.6"
 tempfile.workspace = true
+assert_fs.workspace = true
+predicates.workspace = true
 same-file = "1.0.1"

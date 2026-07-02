@@ -18,12 +18,12 @@ use std::{
 
 use crate::{
     commands,
-    runtime::{ingress::RuntimeEvent, ExitTaskResult, RuntimeTaskEvent},
+    runtime::{ExitTaskResult, RuntimeTaskEvent},
 };
 use helix_core::Transaction;
 use helix_plugin::contract::{adapt, events};
 use helix_plugin::PluginManager;
-use helix_runtime::{Sender as IngressSender, TaskError};
+use helix_runtime::TaskError;
 use helix_vcs::FileBlame;
 use helix_view::document::{FormatterError, Mode};
 use helix_view::{Document, DocumentId, Editor, ViewId};
@@ -78,7 +78,7 @@ fn context_kind_label(kind: &helix_view::assistant::context::Kind) -> String {
 
 pub(crate) fn apply_runtime_task_event(
     editor: &mut Editor,
-    ingress: IngressSender<RuntimeEvent>,
+    ingress: crate::runtime::RuntimeIngress,
     plugin_manager: std::sync::Arc<PluginManager>,
     task: RuntimeTaskEvent,
 ) {
@@ -365,7 +365,7 @@ pub(crate) fn apply_runtime_task_event(
 
 pub(crate) fn apply_exit_task_result(
     editor: &mut Editor,
-    ingress: IngressSender<RuntimeEvent>,
+    ingress: crate::runtime::RuntimeIngress,
     plugin_manager: std::sync::Arc<PluginManager>,
     result: ExitTaskResult,
 ) -> anyhow::Result<()> {

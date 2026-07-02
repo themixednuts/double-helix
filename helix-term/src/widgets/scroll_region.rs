@@ -4,7 +4,6 @@
 //! preview panes, documentation popups, or any multi-line styled content.
 
 use helix_view::graphics::{Rect, Style};
-use tui::buffer::Buffer as Surface;
 use tui::text::Spans;
 
 /// Styles for the scroll region widget.
@@ -32,7 +31,7 @@ pub struct ScrollState {
 ///
 /// Returns `ScrollState` with max_scroll and visible line count.
 pub fn scroll_region(
-    surface: &mut Surface,
+    surface: &mut crate::render::CellSurface,
     area: Rect,
     lines: &[Spans],
     scroll: u16,
@@ -73,7 +72,13 @@ pub fn scroll_region(
             }
             let text: &str = &span.content;
             let width = text.len().min(remaining);
-            surface.set_stringn(x, y, text, width, span.style);
+            surface.set_stringn(
+                x,
+                y,
+                text,
+                width,
+                tui::ratatui::to_ratatui_style(span.style),
+            );
             x += width as u16;
         }
     }

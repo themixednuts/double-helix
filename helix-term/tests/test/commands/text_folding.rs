@@ -7,7 +7,7 @@ use helix_core::graphemes::prev_grapheme_boundary;
 use helix_core::{coords_at_pos, Position, Range};
 use helix_core::{Rope, RopeSlice};
 
-use helix_view::current_ref;
+use helix_view::focused_ref;
 
 const RUST_CODE: &str = "tests/test/commands/text_folding/rust-code.rs";
 const PYTHON_CODE: &str = "tests/test/commands/text_folding/python-code.py";

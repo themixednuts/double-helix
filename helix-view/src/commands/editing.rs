@@ -79,6 +79,47 @@ pub fn exit_select_mode(editor: &mut Editor, _view_id: ViewId, _doc_id: Document
     exit_select_mode_in(editor);
 }
 
+/// Enter insert mode at the start of each selection.
+pub fn insert_mode(editor: &mut Editor, view_id: ViewId, doc_id: DocumentId) {
+    editor.mode = Mode::Insert;
+    let doc = crate::doc_mut!(editor, &doc_id);
+    let selection = doc
+        .selection(view_id)
+        .clone()
+        .transform(|range| Range::new(range.to(), range.from()));
+    doc.set_selection(view_id, selection);
+}
+
+/// Enter insert mode at the end of each selection.
+pub fn append_mode(editor: &mut Editor, view_id: ViewId, doc_id: DocumentId) {
+    editor.mode = Mode::Insert;
+    let doc = crate::doc_mut!(editor, &doc_id);
+    doc.mark_restore_cursor();
+    let text = doc.text().slice(..);
+
+    let end = text.len_chars();
+    let last_range = doc
+        .selection(view_id)
+        .iter()
+        .last()
+        .expect("selection should always have at least one range");
+    if !last_range.is_empty() && last_range.to() == end {
+        let transaction = Transaction::change(
+            doc.text(),
+            [(end, end, Some(doc.line_ending().as_str().into()))].into_iter(),
+        );
+        doc.apply(&transaction, view_id);
+    }
+
+    let selection = doc.selection(view_id).clone().transform(|range| {
+        Range::new(
+            range.from(),
+            graphemes::next_grapheme_boundary(doc.text().slice(..), range.to()),
+        )
+    });
+    doc.set_selection(view_id, selection);
+}
+
 /// Rotate the primary selection index forward.
 pub fn rotate_selections_forward_in(
     target: &impl Identified,
@@ -2120,6 +2161,16 @@ pub fn insert_char_transaction(
         .as_ref()
         .and_then(|ap| auto_pairs::hook(text, selection, c, ap))
         .or_else(|| insert_single_char(text, selection, c))
+}
+
+/// Insert one character at every cursor. Returns whether a transaction was applied.
+pub fn insert_char(editor: &mut Editor, view_id: ViewId, doc_id: DocumentId, c: char) -> bool {
+    let Some(transaction) = insert_char_transaction(editor, view_id, doc_id, c) else {
+        return false;
+    };
+    let doc = crate::doc_mut!(editor, &doc_id);
+    doc.apply(&transaction, view_id);
+    true
 }
 
 /// Plain character insertion (no auto-pairs).

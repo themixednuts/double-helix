@@ -1,7 +1,7 @@
 use crate::compositor::Context;
 use crate::runtime::ui::command::PluginCommand;
 use crate::runtime::ExitTaskSet;
-use crate::runtime::{RuntimeEvent, UiCommand};
+use crate::runtime::UiCommand;
 use crate::ui::PromptEvent;
 use helix_core::command_line::Args;
 use helix_plugin::contract::host::{
@@ -16,7 +16,6 @@ use helix_plugin::contract::requests::{
 use helix_plugin::contract::{
     adapt, CommandHandle, ContractError, ContractResult, PanelHandle, PluginId, SubscriptionHandle,
 };
-use helix_runtime::{send_blocking, Sender};
 use helix_view::model::FocusTarget;
 use helix_view::Editor;
 use std::collections::HashMap;
@@ -27,14 +26,11 @@ fn internal_error(message: impl Into<String>) -> ContractError {
 }
 
 fn with_editor<T>(f: impl FnOnce(&Editor) -> ContractResult<T>) -> ContractResult<T> {
-    let editor = helix_plugin::lua::get_editor().map_err(|err| internal_error(err.to_string()))?;
-    f(editor)
+    helix_plugin::lua::with_current_editor(f).map_err(|err| internal_error(err.to_string()))?
 }
 
 fn with_editor_mut<T>(f: impl FnOnce(&mut Editor) -> ContractResult<T>) -> ContractResult<T> {
-    let editor =
-        helix_plugin::lua::get_editor_mut().map_err(|err| internal_error(err.to_string()))?;
-    f(editor)
+    helix_plugin::lua::with_current_editor_mut(f).map_err(|err| internal_error(err.to_string()))?
 }
 
 fn next_non_zero(counter: &std::sync::atomic::AtomicU64) -> NonZeroU64 {
@@ -51,7 +47,7 @@ fn permission_denied(plugin: PluginId, handle: impl std::fmt::Display) -> Contra
 }
 
 pub struct TermUiHost {
-    sender: Sender<RuntimeEvent>,
+    sender: crate::runtime::RuntimeIngress,
     next_callback_id: std::sync::atomic::AtomicU64,
 }
 
@@ -76,13 +72,10 @@ impl PluginUiHost for TermUiHost {
     ) -> ContractResult<UiCallbackToken> {
         let token = next_non_zero(&self.next_callback_id);
         let callback = UiCallbackToken::from_raw(token);
-        send_blocking(
-            &self.sender,
-            RuntimeEvent::Ui(UiCommand::Plugin(PluginCommand::Prompt {
-                request: req,
-                callback,
-            })),
-        );
+        self.sender.ui(UiCommand::Plugin(PluginCommand::Prompt {
+            request: req,
+            callback,
+        }));
         Ok(callback)
     }
 
@@ -93,13 +86,10 @@ impl PluginUiHost for TermUiHost {
     ) -> ContractResult<UiCallbackToken> {
         let token = next_non_zero(&self.next_callback_id);
         let callback = UiCallbackToken::from_raw(token);
-        send_blocking(
-            &self.sender,
-            RuntimeEvent::Ui(UiCommand::Plugin(PluginCommand::Confirm {
-                request: req,
-                callback,
-            })),
-        );
+        self.sender.ui(UiCommand::Plugin(PluginCommand::Confirm {
+            request: req,
+            callback,
+        }));
         Ok(callback)
     }
 
@@ -110,19 +100,16 @@ impl PluginUiHost for TermUiHost {
     ) -> ContractResult<UiCallbackToken> {
         let token = next_non_zero(&self.next_callback_id);
         let callback = UiCallbackToken::from_raw(token);
-        send_blocking(
-            &self.sender,
-            RuntimeEvent::Ui(UiCommand::Plugin(PluginCommand::Picker {
-                request: req,
-                callback,
-            })),
-        );
+        self.sender.ui(UiCommand::Plugin(PluginCommand::Picker {
+            request: req,
+            callback,
+        }));
         Ok(callback)
     }
 }
 
 pub struct TermPanelHost {
-    sender: Sender<RuntimeEvent>,
+    sender: crate::runtime::RuntimeIngress,
     panel_owners: HashMap<PanelHandle, PluginId>,
 }
 
@@ -169,10 +156,8 @@ impl PluginPanelHost for TermPanelHost {
         })?;
 
         self.panel_owners.insert(panel, plugin);
-        send_blocking(
-            &self.sender,
-            RuntimeEvent::Ui(UiCommand::Plugin(PluginCommand::PushPanel { panel })),
-        );
+        self.sender
+            .ui(UiCommand::Plugin(PluginCommand::PushPanel { panel }));
         Ok(panel)
     }
 
@@ -203,10 +188,8 @@ impl PluginPanelHost for TermPanelHost {
             Ok(())
         })?;
         self.panel_owners.remove(&panel);
-        send_blocking(
-            &self.sender,
-            RuntimeEvent::Ui(UiCommand::Plugin(PluginCommand::RemovePanel { panel })),
-        );
+        self.sender
+            .ui(UiCommand::Plugin(PluginCommand::RemovePanel { panel }));
         Ok(())
     }
 
@@ -293,7 +276,7 @@ struct RegisteredCommandDefinition {
 }
 
 pub struct TermCommandHost {
-    ingress: crate::runtime::RuntimeEventSender,
+    ingress: crate::runtime::RuntimeIngress,
     next_command_handle: std::sync::atomic::AtomicU64,
     commands: HashMap<CommandHandle, RegisteredCommandDefinition>,
 }
@@ -376,20 +359,20 @@ impl PluginCommandHost for TermCommandHost {
 
             let work = editor.work();
             let exit_task_work = work;
+            let redraw = editor.redraw_handle();
             let mut exit_tasks = ExitTaskSet::new();
-            let mut cx = Context {
+            let mut cx = Context::new(
                 editor,
-                scroll: None,
-                exit_tasks: &mut exit_tasks,
+                &mut exit_tasks,
                 exit_task_work,
-                notifier: crate::handlers::local::Notifier {
-                    ingress: self.ingress.clone(),
+                crate::handlers::local::Notifier {
+                    redraw: redraw.clone(),
                     plugin_events: helix_runtime::channel(1).0,
                 },
-                ingress: self.ingress.clone(),
-                idle_reset_tx: helix_runtime::channel(1).0,
-                plugin_manager: None,
-            };
+                self.ingress.clone(),
+                crate::runtime::IdleResetGate::new().handle(),
+                None,
+            );
 
             let line = req.args.join(" ");
             let args = Args::parse(&line, cmd.signature, true, |token| Ok(token.content))
@@ -462,9 +445,7 @@ impl PluginEventHost for TermEventHost {
     }
 }
 
-pub fn get_ui_host(
-    ingress: crate::runtime::RuntimeEventSender,
-) -> Box<dyn PluginUiHost + Send + Sync> {
+pub fn get_ui_host(ingress: crate::runtime::RuntimeIngress) -> Box<dyn PluginUiHost + Send + Sync> {
     Box::new(TermUiHost {
         sender: ingress,
         next_callback_id: std::sync::atomic::AtomicU64::new(1),
@@ -472,7 +453,7 @@ pub fn get_ui_host(
 }
 
 pub fn get_panel_host(
-    ingress: crate::runtime::RuntimeEventSender,
+    ingress: crate::runtime::RuntimeIngress,
 ) -> Box<dyn PluginPanelHost + Send + Sync> {
     Box::new(TermPanelHost {
         sender: ingress,
@@ -481,7 +462,7 @@ pub fn get_panel_host(
 }
 
 pub fn get_command_host(
-    ingress: crate::runtime::RuntimeEventSender,
+    ingress: crate::runtime::RuntimeIngress,
 ) -> Box<dyn PluginCommandHost + Send + Sync> {
     Box::new(TermCommandHost {
         ingress,
@@ -500,6 +481,7 @@ pub fn get_event_host() -> Box<dyn PluginEventHost + Send + Sync> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::RuntimeDelivery;
     use arc_swap::ArcSwap;
     use std::sync::Arc;
 
@@ -523,11 +505,20 @@ mod tests {
     }
 
     fn test_command_host() -> TermCommandHost {
+        let (ingress, _receiver) = test_runtime_ingress();
         TermCommandHost {
-            ingress: helix_runtime::channel(1).0,
+            ingress,
             next_command_handle: std::sync::atomic::AtomicU64::new(1),
             commands: HashMap::new(),
         }
+    }
+
+    fn test_runtime_ingress() -> (
+        crate::runtime::RuntimeIngress,
+        crate::runtime::RuntimeIngressReceiver,
+    ) {
+        let runtime = helix_runtime::test::runtime();
+        crate::runtime::RuntimeIngress::channel(runtime.work().clone())
     }
 
     fn plugin_id() -> PluginId {
@@ -548,7 +539,7 @@ mod tests {
 
     #[tokio::test]
     async fn panel_host_enqueues_typed_panel_handle() {
-        let (sender, mut receiver) = helix_runtime::channel(1);
+        let (sender, mut receiver) = test_runtime_ingress();
         let mut host = TermPanelHost {
             sender,
             panel_owners: HashMap::new(),
@@ -570,7 +561,7 @@ mod tests {
 
         assert!(adapt::resolve_panel(&editor.model, panel).is_ok());
         match receiver.try_recv().expect("push panel event") {
-            RuntimeEvent::Ui(UiCommand::Plugin(PluginCommand::PushPanel { panel: pushed })) => {
+            RuntimeDelivery::Ui(UiCommand::Plugin(PluginCommand::PushPanel { panel: pushed })) => {
                 assert_eq!(pushed, panel);
             }
             _ => panic!("expected typed push panel command"),
@@ -579,7 +570,7 @@ mod tests {
 
     #[tokio::test]
     async fn panel_host_rejects_foreign_panel_handles() {
-        let (sender, _receiver) = helix_runtime::channel(4);
+        let (sender, _receiver) = test_runtime_ingress();
         let mut host = TermPanelHost {
             sender,
             panel_owners: HashMap::new(),
@@ -621,7 +612,7 @@ mod tests {
 
     #[test]
     fn ui_host_enqueues_contract_ui_requests() {
-        let (sender, mut receiver) = helix_runtime::channel(3);
+        let (sender, mut receiver) = test_runtime_ingress();
         let mut host = TermUiHost {
             sender,
             next_callback_id: std::sync::atomic::AtomicU64::new(1),
@@ -637,7 +628,7 @@ mod tests {
             )
             .expect("enqueue prompt");
         match receiver.try_recv().expect("prompt event") {
-            RuntimeEvent::Ui(UiCommand::Plugin(PluginCommand::Prompt { request, callback })) => {
+            RuntimeDelivery::Ui(UiCommand::Plugin(PluginCommand::Prompt { request, callback })) => {
                 assert_eq!(callback, prompt);
                 assert_eq!(request.message, "Name?");
                 assert_eq!(request.default.as_deref(), Some("helix"));
@@ -654,7 +645,10 @@ mod tests {
             )
             .expect("enqueue confirm");
         match receiver.try_recv().expect("confirm event") {
-            RuntimeEvent::Ui(UiCommand::Plugin(PluginCommand::Confirm { request, callback })) => {
+            RuntimeDelivery::Ui(UiCommand::Plugin(PluginCommand::Confirm {
+                request,
+                callback,
+            })) => {
                 assert_eq!(callback, confirm);
                 assert_eq!(request.message, "Continue?");
             }
@@ -671,7 +665,7 @@ mod tests {
             )
             .expect("enqueue picker");
         match receiver.try_recv().expect("picker event") {
-            RuntimeEvent::Ui(UiCommand::Plugin(PluginCommand::Picker { request, callback })) => {
+            RuntimeDelivery::Ui(UiCommand::Plugin(PluginCommand::Picker { request, callback })) => {
                 assert_eq!(callback, picker);
                 assert_eq!(request.items, ["one", "two"]);
                 assert_eq!(request.prompt.as_deref(), Some("Pick:"));

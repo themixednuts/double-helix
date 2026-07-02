@@ -9,9 +9,10 @@ use super::Application;
 impl Application {
     pub(super) async fn service_idle_timeout(&mut self, render: crate::runtime::IdleRender) {
         let ingress = self.ingress().tx.clone();
-        let idle_reset = self.ingress().idle_reset_tx.clone();
+        let idle_reset = self.ingress().idle_reset.clone();
+        let redraw = self.editor.redraw_handle();
         let notifier = crate::handlers::local::Notifier {
-            ingress: ingress.clone(),
+            redraw: redraw.clone(),
             plugin_events: self.ingress().plugin_event_tx.clone(),
         };
         let mut cx = Self::make_compositor_context(
@@ -56,7 +57,8 @@ impl Application {
 
     pub fn handle_document_write(&mut self, doc_save_event: DocumentSavedEventResult) {
         let doc_save_event = match doc_save_event {
-            Ok(event) => event,
+            Ok(Some(event)) => event,
+            Ok(None) => return,
             Err(err) => {
                 self.editor.set_error(err.to_string());
                 return;

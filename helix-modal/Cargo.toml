@@ -21,4 +21,5 @@ log = "0.4"
 [dev-dependencies]
 arc-swap.workspace = true
 helix-loader = { path = "../helix-loader" }
+helix-runtime = { path = "../helix-runtime" }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }

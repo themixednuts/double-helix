@@ -194,13 +194,9 @@ impl Editor {
         log::debug!("editor error: {}", error);
 
         let config = self.config();
-        if config.notifications.enable && config.notifications.style == NotificationStyle::Popup {
+        self.status_msg = Some((error.clone(), Severity::Error));
+        if config.notifications.enable {
             self.notify_error(error);
-        } else {
-            self.status_msg = Some((error.clone(), Severity::Error));
-            if config.notifications.enable {
-                self.notify_error(error);
-            }
         }
     }
 

@@ -39,7 +39,7 @@ fn thread_picker(cx: &mut Context, action: DapThreadAction) {
 fn dap_callback<T>(
     call: impl Future<Output = helix_dap::Result<serde_json::Value>> + 'static + Send,
     work: helix_runtime::Work,
-    ingress: helix_runtime::Sender<crate::runtime::RuntimeEvent>,
+    ingress: crate::runtime::RuntimeIngress,
     task_event: impl FnOnce(T) -> RuntimeTaskEvent + Send + 'static,
 ) where
     T: for<'de> serde::Deserialize<'de> + Send + 'static,
@@ -216,7 +216,7 @@ pub fn dap_launch(cx: &mut Context) {
         0,
         templates,
         (),
-        ui::PickerRuntime::new(cx.editor.runtime()),
+        ui::PickerRuntime::new(cx.editor),
         cx.ingress.clone(),
         |cx: &mut crate::compositor::Context, template: &DebugTemplate, _action| {
             if template.completion.is_empty() {
@@ -356,13 +356,8 @@ pub fn dap_toggle_breakpoint(cx: &mut Context) {
 }
 
 pub fn dap_toggle_breakpoint_impl(cx: &mut Context, path: PathBuf, line: usize) {
-    helix_runtime::send_blocking(
-        &cx.ingress,
-        crate::runtime::RuntimeEvent::Task(crate::runtime::RuntimeTaskEvent::ToggleBreakpoint {
-            path,
-            line,
-        }),
-    );
+    cx.ingress
+        .task(crate::runtime::RuntimeTaskEvent::ToggleBreakpoint { path, line });
 }
 
 pub fn dap_continue(cx: &mut Context) {

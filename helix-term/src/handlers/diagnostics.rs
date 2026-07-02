@@ -4,22 +4,19 @@ use std::time::Duration;
 
 use helix_core::syntax::config::LanguageServerFeature;
 use helix_lsp::{lsp, LanguageServerId};
-use helix_runtime::{send_blocking, Clock, Debounce, Runtime, Work};
+use helix_runtime::{send_blocking, Runtime, Work};
 use helix_view::bench::log_command_phase;
 use helix_view::document::Mode;
 use helix_view::handlers::lsp::{PullAllDocumentsDiagnosticsEvent, PullDiagnosticsEvent};
 use helix_view::handlers::Handlers;
 use helix_view::DocumentId;
 
-use crate::{
-    effect::language_server::request_document_diagnostics,
-    runtime::{send_task_event_with, RuntimeEvent, RuntimeTaskEvent},
-};
+use crate::{effect::language_server::request_document_diagnostics, runtime::RuntimeTaskEvent};
 
 pub(super) fn attach(
     editor: &helix_view::Editor,
     handlers: &Handlers,
-    ingress: helix_runtime::Sender<RuntimeEvent>,
+    ingress: crate::runtime::RuntimeIngress,
 ) {
     editor.lifecycle().on_diagnostics_change(move |event| {
         if event.editor.mode != Mode::Insert {
@@ -113,20 +110,23 @@ pub(super) fn attach(
 #[derive(Debug)]
 pub(super) struct PullDiagnosticsHandler {
     document_ids: Arc<Mutex<HashSet<DocumentId>>>,
-    debounce: Debounce,
-    work: Work,
-    clock: Clock,
-    ingress: helix_runtime::Sender<RuntimeEvent>,
+    debouncer: crate::runtime::RuntimeTaskDebouncer,
 }
 
 impl PullDiagnosticsHandler {
-    fn new(work: Work, clock: Clock, ingress: helix_runtime::Sender<RuntimeEvent>) -> Self {
+    fn new(
+        work: Work,
+        clock: helix_runtime::Clock,
+        ingress: crate::runtime::RuntimeIngress,
+    ) -> Self {
         Self {
             document_ids: Default::default(),
-            debounce: Debounce::new(Duration::from_millis(250)),
-            work,
-            clock,
-            ingress,
+            debouncer: crate::runtime::RuntimeTaskDebouncer::new(
+                Duration::from_millis(250),
+                work,
+                clock,
+                ingress,
+            ),
         }
     }
 
@@ -136,25 +136,21 @@ impl PullDiagnosticsHandler {
             .expect("pull diagnostics lock poisoned")
             .insert(event.document_id);
         let document_ids = self.document_ids.clone();
-        let ingress = self.ingress.clone();
-        self.debounce.restart(&self.work, &self.clock, async move {
-            let document_ids = {
-                let mut document_ids = document_ids.lock().expect("pull diagnostics lock poisoned");
-                std::mem::take(&mut *document_ids)
-            };
-            if !document_ids.is_empty() {
-                send_task_event_with(
-                    RuntimeTaskEvent::PullDiagnosticsDebounced { document_ids },
-                    ingress,
-                )
-                .await;
-            }
-        });
+        self.debouncer
+            .send_after_with(Duration::from_millis(250), move || {
+                let document_ids = {
+                    let mut document_ids =
+                        document_ids.lock().expect("pull diagnostics lock poisoned");
+                    std::mem::take(&mut *document_ids)
+                };
+                (!document_ids.is_empty())
+                    .then(|| RuntimeTaskEvent::PullDiagnosticsDebounced { document_ids })
+            });
     }
 
     pub fn spawn(
         runtime: Runtime,
-        ingress: helix_runtime::Sender<RuntimeEvent>,
+        ingress: crate::runtime::RuntimeIngress,
     ) -> helix_runtime::Sender<PullDiagnosticsEvent> {
         let (tx, mut rx) = helix_runtime::channel(128);
         let work = runtime.work().clone();
@@ -165,7 +161,7 @@ impl PullDiagnosticsHandler {
                 while let Some(event) = rx.recv().await {
                     handler.event(event);
                 }
-                handler.debounce.cancel();
+                handler.debouncer.cancel();
             })
             .detach();
         tx
@@ -175,20 +171,23 @@ impl PullDiagnosticsHandler {
 #[derive(Debug)]
 pub(super) struct PullAllDocumentsDiagnosticHandler {
     language_servers: Arc<Mutex<HashSet<LanguageServerId>>>,
-    debounce: Debounce,
-    work: Work,
-    clock: Clock,
-    ingress: helix_runtime::Sender<RuntimeEvent>,
+    debouncer: crate::runtime::RuntimeTaskDebouncer,
 }
 
 impl PullAllDocumentsDiagnosticHandler {
-    fn new(work: Work, clock: Clock, ingress: helix_runtime::Sender<RuntimeEvent>) -> Self {
+    fn new(
+        work: Work,
+        clock: helix_runtime::Clock,
+        ingress: crate::runtime::RuntimeIngress,
+    ) -> Self {
         Self {
             language_servers: Default::default(),
-            debounce: Debounce::new(Duration::from_secs(1)),
-            work,
-            clock,
-            ingress,
+            debouncer: crate::runtime::RuntimeTaskDebouncer::new(
+                Duration::from_secs(1),
+                work,
+                clock,
+                ingress,
+            ),
         }
     }
 
@@ -198,27 +197,23 @@ impl PullAllDocumentsDiagnosticHandler {
             .expect("pull all diagnostics lock poisoned")
             .extend(event.language_servers);
         let language_servers = self.language_servers.clone();
-        let ingress = self.ingress.clone();
-        self.debounce.restart(&self.work, &self.clock, async move {
-            let language_servers = {
-                let mut language_servers = language_servers
-                    .lock()
-                    .expect("pull all diagnostics lock poisoned");
-                std::mem::take(&mut *language_servers)
-            };
-            if !language_servers.is_empty() {
-                send_task_event_with(
-                    RuntimeTaskEvent::PullAllDocumentsDiagnosticsDebounced { language_servers },
-                    ingress,
-                )
-                .await;
-            }
-        });
+        self.debouncer
+            .send_after_with(Duration::from_secs(1), move || {
+                let language_servers = {
+                    let mut language_servers = language_servers
+                        .lock()
+                        .expect("pull all diagnostics lock poisoned");
+                    std::mem::take(&mut *language_servers)
+                };
+                (!language_servers.is_empty()).then(|| {
+                    RuntimeTaskEvent::PullAllDocumentsDiagnosticsDebounced { language_servers }
+                })
+            });
     }
 
     pub fn spawn(
         runtime: Runtime,
-        ingress: helix_runtime::Sender<RuntimeEvent>,
+        ingress: crate::runtime::RuntimeIngress,
     ) -> helix_runtime::Sender<PullAllDocumentsDiagnosticsEvent> {
         let (tx, mut rx) = helix_runtime::channel(128);
         let work = runtime.work().clone();
@@ -229,7 +224,7 @@ impl PullAllDocumentsDiagnosticHandler {
                 while let Some(event) = rx.recv().await {
                     handler.event(event);
                 }
-                handler.debounce.cancel();
+                handler.debouncer.cancel();
             })
             .detach();
         tx

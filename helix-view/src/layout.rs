@@ -4,6 +4,7 @@
 //! frontends can use these to compute sub-areas for widget rendering.
 
 use crate::graphics::Rect;
+use helix_core::unicode::width::UnicodeWidthStr;
 use helix_core::Position;
 use std::num::NonZeroU16;
 
@@ -153,6 +154,103 @@ pub fn anchor_near(viewport: Rect, anchor: Position, size: (u16, u16), bias: Anc
     };
 
     Rect::new(x.max(viewport.x), y.max(viewport.y), w, h)
+}
+
+/// Frontend-agnostic layout state for a single-line text input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TextInputLayout {
+    /// Byte offset where visible text should begin.
+    pub anchor: usize,
+    /// Screen position of the cursor.
+    pub cursor_x: u16,
+    /// Screen position of the cursor.
+    pub cursor_y: u16,
+    /// Whether the cursor cell is inside the input area and can be styled.
+    pub cursor_in_area: bool,
+    /// Whether the text is clipped before `anchor`.
+    pub truncated_start: bool,
+    /// Whether the text extends past the visible area.
+    pub truncated_end: bool,
+}
+
+/// Compute the visible anchor and cursor position for a single-line text input.
+pub fn text_input_layout(area: Rect, text: &str, cursor: usize) -> TextInputLayout {
+    let cursor = clamp_to_char_boundary(text, cursor);
+
+    if area.width == 0 || area.height == 0 {
+        return TextInputLayout {
+            anchor: 0,
+            cursor_x: area.x,
+            cursor_y: area.y,
+            cursor_in_area: false,
+            truncated_start: false,
+            truncated_end: false,
+        };
+    }
+
+    let line_width = area.width as usize;
+
+    if text.width() <= line_width {
+        let cursor_col = text[..cursor].width() as u16;
+        let cursor_x = area.x.saturating_add(cursor_col);
+        return TextInputLayout {
+            anchor: 0,
+            cursor_x: cursor_x.min(area.right().saturating_sub(1)),
+            cursor_y: area.y,
+            cursor_in_area: cursor_x < area.right(),
+            truncated_start: false,
+            truncated_end: false,
+        };
+    }
+
+    let anchor = text_input_anchor(text, cursor, line_width);
+    let truncated_start = anchor > 0;
+    let truncated_end = text[anchor..].width() > line_width;
+    let cursor_col = if cursor >= anchor {
+        text[anchor..cursor].width() as u16
+    } else {
+        0
+    };
+    let cursor_x = area.x.saturating_add(cursor_col);
+
+    TextInputLayout {
+        anchor,
+        cursor_x: cursor_x.min(area.right().saturating_sub(1)),
+        cursor_y: area.y,
+        cursor_in_area: cursor_x < area.right(),
+        truncated_start,
+        truncated_end,
+    }
+}
+
+fn text_input_anchor(text: &str, cursor: usize, line_width: usize) -> usize {
+    use helix_core::unicode::segmentation::UnicodeSegmentation;
+
+    if text[..cursor].width() <= line_width {
+        return 0;
+    }
+
+    let mut width = 0;
+    text[..cursor]
+        .grapheme_indices(true)
+        .rev()
+        .find_map(|(idx, grapheme)| {
+            width += grapheme.width();
+            if width > line_width {
+                Some(idx + grapheme.len())
+            } else {
+                None
+            }
+        })
+        .unwrap_or(0)
+}
+
+fn clamp_to_char_boundary(text: &str, cursor: usize) -> usize {
+    let mut cursor = cursor.min(text.len());
+    while cursor > 0 && !text.is_char_boundary(cursor) {
+        cursor -= 1;
+    }
+    cursor
 }
 
 /// Internal: allocate sizes along a single axis, returning the resolved
@@ -374,6 +472,48 @@ mod tests {
             AnchorBias::Right,
         );
         assert!(r.right() <= 80);
+    }
+
+    // ─── text_input_layout ─────────────────────────────────────────
+
+    #[test]
+    fn text_input_layout_fits_text() {
+        let state = text_input_layout(Rect::new(2, 3, 10, 1), "hello", 3);
+
+        assert_eq!(state.anchor, 0);
+        assert_eq!(state.cursor_x, 5);
+        assert_eq!(state.cursor_y, 3);
+        assert!(state.cursor_in_area);
+        assert!(!state.truncated_start);
+        assert!(!state.truncated_end);
+    }
+
+    #[test]
+    fn text_input_layout_scrolls_to_cursor() {
+        let state = text_input_layout(Rect::new(0, 0, 4, 1), "abcdef", 6);
+
+        assert_eq!(state.anchor, 2);
+        assert_eq!(state.cursor_x, 3);
+        assert!(!state.cursor_in_area);
+        assert!(state.truncated_start);
+        assert!(!state.truncated_end);
+    }
+
+    #[test]
+    fn text_input_layout_clamps_invalid_cursor_boundary() {
+        let state = text_input_layout(Rect::new(0, 0, 5, 1), "aé", 2);
+
+        assert_eq!(state.anchor, 0);
+        assert_eq!(state.cursor_x, 1);
+        assert!(state.cursor_in_area);
+    }
+
+    #[test]
+    fn text_input_layout_reports_full_width_cursor_outside_area() {
+        let state = text_input_layout(Rect::new(0, 0, 4, 1), "abcd", 4);
+
+        assert_eq!(state.cursor_x, 3);
+        assert!(!state.cursor_in_area);
     }
 
     // ─── empty input ────────────────────────────────────────────────

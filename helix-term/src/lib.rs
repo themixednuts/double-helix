@@ -7,6 +7,8 @@ pub mod commands;
 pub mod compositor;
 pub mod config;
 pub(crate) mod effect;
+pub mod embed;
+pub(crate) mod fff;
 pub mod health;
 pub mod host;
 pub mod keymap;
@@ -16,6 +18,7 @@ pub mod render;
 pub mod runtime;
 pub use runtime::AppEvent;
 pub mod shutdown;
+pub mod storybook;
 pub mod ui;
 pub mod widgets;
 
@@ -26,6 +29,9 @@ use std::path::Path;
 
 use futures_util::Future;
 mod handlers;
+
+#[cfg(test)]
+pub(crate) mod test_support;
 
 use ignore::DirEntry;
 use url::Url;

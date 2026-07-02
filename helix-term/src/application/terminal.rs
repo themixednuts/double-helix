@@ -22,9 +22,10 @@ impl Application {
 
     fn handle_resize_event(&mut self, width: u16, height: u16) -> bool {
         let ingress = self.ingress().tx.clone();
-        let idle_reset = self.ingress().idle_reset_tx.clone();
+        let idle_reset = self.ingress().idle_reset.clone();
+        let redraw = self.editor.redraw_handle();
         let notifier = crate::handlers::local::Notifier {
-            ingress: ingress.clone(),
+            redraw: redraw.clone(),
             plugin_events: self.ingress().plugin_event_tx.clone(),
         };
         self.terminal
@@ -114,9 +115,10 @@ impl Application {
         }
 
         let ingress = self.ingress().tx.clone();
-        let idle_reset = self.ingress().idle_reset_tx.clone();
+        let idle_reset = self.ingress().idle_reset.clone();
+        let redraw = self.editor.redraw_handle();
         let notifier = crate::handlers::local::Notifier {
-            ingress: ingress.clone(),
+            redraw: redraw.clone(),
             plugin_events: self.ingress().plugin_event_tx.clone(),
         };
         let mut cx = Self::make_compositor_context(

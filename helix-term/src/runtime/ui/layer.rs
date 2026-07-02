@@ -1,14 +1,10 @@
-use crate::{
-    compositor::Compositor,
-    runtime::{ui::command::LayerCommand, RuntimeEvent},
-};
-use helix_runtime::Sender as IngressSender;
+use crate::{compositor::Compositor, runtime::ui::command::LayerCommand};
 use helix_view::editor::Severity;
 
 pub(crate) fn apply_layer_command(
     editor: &mut helix_view::Editor,
     compositor: &mut Compositor,
-    ingress: IngressSender<RuntimeEvent>,
+    ingress: crate::runtime::RuntimeIngress,
     cmd: LayerCommand,
 ) {
     match cmd {
@@ -38,16 +34,14 @@ pub(crate) fn apply_layer_command(
                 0,
                 commands,
                 (),
-                crate::ui::PickerRuntime::new(editor.runtime()),
+                crate::ui::PickerRuntime::new(editor),
                 ingress,
                 move |cx, (ls_id, command), _action| {
-                    helix_runtime::send_blocking(
-                        &cx.ingress,
-                        RuntimeEvent::Task(crate::runtime::RuntimeTaskEvent::ExecuteLspCommand {
+                    cx.ingress
+                        .task(crate::runtime::RuntimeTaskEvent::ExecuteLspCommand {
                             command: command.clone(),
                             server_id: *ls_id,
-                        }),
-                    );
+                        });
                 },
             );
             compositor.push(Box::new(crate::ui::overlay::overlaid(picker)));

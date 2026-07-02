@@ -1,27 +1,23 @@
 use crate::{
     compositor::Compositor,
-    runtime::{ui::command::PluginCommand, RuntimeEvent, RuntimeTaskEvent},
+    runtime::{ui::command::PluginCommand, RuntimeTaskEvent},
 };
 use helix_plugin::contract::DynamicValue;
 use helix_plugin::contract::UiCallbackToken;
 use helix_plugin::PluginManager;
-use helix_runtime::Sender as IngressSender;
 
 fn deliver_plugin_ui_callback(
-    ingress: &IngressSender<RuntimeEvent>,
+    ingress: &crate::runtime::RuntimeIngress,
     callback: UiCallbackToken,
     value: DynamicValue,
 ) {
-    helix_runtime::send_blocking(
-        ingress,
-        RuntimeEvent::Task(RuntimeTaskEvent::DeliverPluginUiCallback { callback, value }),
-    );
+    ingress.task(RuntimeTaskEvent::DeliverPluginUiCallback { callback, value });
 }
 
 pub(crate) fn apply_plugin_command(
     editor: &mut helix_view::Editor,
     compositor: &mut Compositor,
-    ingress: IngressSender<RuntimeEvent>,
+    ingress: crate::runtime::RuntimeIngress,
     _plugin_manager: std::sync::Arc<PluginManager>,
     cmd: PluginCommand,
 ) {
@@ -83,7 +79,7 @@ pub(crate) fn apply_plugin_command(
                 0,
                 request.items,
                 (),
-                crate::ui::PickerRuntime::new(editor.runtime()),
+                crate::ui::PickerRuntime::new(editor),
                 ingress,
                 move |cx: &mut crate::compositor::Context, item: &String, _action| {
                     deliver_plugin_ui_callback(

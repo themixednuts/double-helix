@@ -10,7 +10,7 @@ use helix_lsp::{
 };
 
 use tokio_stream::StreamExt;
-use tui::{text::Span, widgets::Row};
+use tui::text::Span;
 
 use super::{Context, Editor};
 
@@ -32,8 +32,8 @@ use crate::{
     },
     runtime::{RuntimeTaskEvent, UiCommand},
     ui::{
-        self, lsp::document_symbols::display_symbol_kind, lsp::navigation, overlay::overlaid,
-        Picker, PromptEvent,
+        self, lsp::document_symbols::display_symbol_kind, lsp::navigation, menu::Row,
+        overlay::overlaid, Picker, PromptEvent,
     },
 };
 
@@ -188,7 +188,7 @@ fn diag_picker(
         primary_column,
         flat_diag,
         styles,
-        crate::ui::PickerRuntime::new(cx.editor.runtime()),
+        crate::ui::PickerRuntime::new(cx.editor),
         cx.ingress.clone(),
         move |cx: &mut crate::compositor::Context, diag: &PickerDiagnostic, action| {
             navigation::jump_to_location(cx.editor, &diag.location, action);
@@ -431,7 +431,7 @@ pub fn workspace_symbol_picker(cx: &mut Context) {
         1, // name column
         [],
         (),
-        crate::ui::PickerRuntime::new(cx.editor.runtime()),
+        crate::ui::PickerRuntime::new(cx.editor),
         cx.ingress.clone(),
         move |cx: &mut crate::compositor::Context, item: &DocumentSymbolPickerItem, action| {
             navigation::jump_to_location(cx.editor, &item.location, action);
@@ -1096,7 +1096,7 @@ pub fn select_references_to_symbol_under_cursor(cx: &mut Context) {
 
 pub fn compute_inlay_hints_for_all_views(
     editor: &mut Editor,
-    ingress: helix_runtime::Sender<crate::runtime::RuntimeEvent>,
+    ingress: crate::runtime::RuntimeIngress,
 ) {
     if !editor.config().lsp.display_inlay_hints {
         return;

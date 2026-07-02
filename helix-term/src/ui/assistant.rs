@@ -20,8 +20,10 @@ use helix_view::theme::{Modifier, Style};
 use helix_view::traits::{Bounded, Focusable, Identified, Modal, Scrollable};
 use helix_view::Editor;
 use std::time::Duration;
-use tui::buffer::Buffer as Surface;
 use tui::text::{Span, Spans};
+
+mod markdown;
+use markdown::{fit_bubble_width, render_markdown_lines, wrap_text, MarkdownLineStyles};
 
 pub const ID: &str = "assistant-panel";
 pub const PERMISSION_ID: &str = "assistant-permission";
@@ -354,10 +356,9 @@ impl AssistantPanel {
 
     fn current_message_accent(
         &self,
-        editor: &Editor,
+        model: &helix_view::model::AssistantModel,
         theme: &helix_view::Theme,
     ) -> Option<(GraphicsStyle, f32)> {
-        let model = Self::assistant_model(editor);
         if model.focus() != helix_view::assistant::thread::Focus::Messages
             || model.selected_entry_id().is_none()
         {
@@ -600,7 +601,7 @@ impl AssistantPanel {
     /// Build renderable blocks from chat entries.
     fn build_blocks<'a>(
         &self,
-        editor: &Editor,
+        model: &helix_view::model::AssistantModel,
         theme: &helix_view::Theme,
         width: u16,
         corners: MessageCorners,
@@ -617,8 +618,7 @@ impl AssistantPanel {
         let code_style = theme.get("markup.raw.inline");
         let bold_style = agent_style.add_modifier(Modifier::BOLD);
         let italic_style = agent_style.add_modifier(Modifier::ITALIC);
-        let active_accent = self.current_message_accent(editor, theme);
-        let model = Self::assistant_model(editor);
+        let active_accent = self.current_message_accent(model, theme);
         let agent_name = model.agent_name.as_str();
 
         // Flex width: min 60%, max 90% of panel — but never panic on tiny sizes.
@@ -763,23 +763,556 @@ impl AssistantPanel {
     /// Render chat blocks directly to the surface with proper scroll.
     fn render_content(
         &mut self,
-        editor: &Editor,
+        model: &helix_view::model::AssistantModel,
         blocks: &[Message],
         area: Rect,
-        surface: &mut Surface,
+        surface: &mut crate::render::CellSurface,
     ) {
         if area.height == 0 || area.width == 0 {
             self.chat_layout = MessageListState::default();
             return;
         }
 
-        let cursor = self.navigation_cursor(editor);
+        let cursor = MessageCursor::new(self.selected_index_in(model), model.content_scroll());
         self.chat_layout = message_list(surface, area, blocks, cursor.scroll(), cursor.selected());
         let mut cursor = cursor;
         cursor.clamp_selection(&self.chat_layout);
         self.output.scroll_to(cursor.scroll());
         self.output
             .set_content_height(self.chat_layout.total_height);
+    }
+
+    fn render_surface(
+        &mut self,
+        area: Rect,
+        surface: &mut crate::render::CellSurface,
+        cx: &RenderContext,
+    ) {
+        log::warn!(
+            "[assistant_panel] render area=({},{} {}x{})",
+            area.x,
+            area.y,
+            area.width,
+            area.height,
+        );
+        if area.width < 20 || area.height < 6 {
+            return;
+        }
+
+        use helix_view::layout::{split_horizontal, split_vertical, Size};
+
+        // Layout: [1px border | content]
+        let h_areas = split_horizontal(area, &[Size::fixed(1), Size::Fill]);
+        let border_area = h_areas[0];
+        let inner = h_areas[1];
+
+        let error_rows = 1u16;
+        let input_rows = 5u16; // 1 top border + 3 content + 1 bottom border
+        let model = cx.assistant_model(false);
+        let plan = model.plan_section();
+        let context_items = &model.context_items;
+        let context_line = model.context_line();
+        let status_items = model.status_items();
+        let plan_rows = plan
+            .as_ref()
+            .map(|section| (section.rows.len() + 1).min(6) as u16)
+            .unwrap_or(0);
+        let context_rows = if context_items.is_empty() { 0 } else { 1 };
+
+        // Vertical layout: [header | chat | plan | context pills | input | status | error]
+        let v_areas = split_vertical(
+            inner,
+            &[
+                Size::fixed(1),         // header
+                Size::Fill,             // chat content
+                Size::fixed(plan_rows), // plan
+                Size::fixed(context_rows),
+                Size::fixed(input_rows), // input
+                Size::fixed(1),          // status bar
+                Size::fixed(error_rows), // error line
+            ],
+        );
+        let header_area = v_areas[0];
+        let content_area_raw = v_areas[1];
+        let plan_area = v_areas[2];
+        let context_area = v_areas[3];
+        let input_area_raw = v_areas[4];
+        let bar_area = v_areas[5];
+        let error_area = v_areas[6];
+
+        // Inset content/plan/input by 1px on each side for padding.
+        let content_area = Rect::new(
+            content_area_raw.x + 1,
+            content_area_raw.y,
+            content_area_raw.width.saturating_sub(2),
+            content_area_raw.height,
+        );
+        {
+            let theme = cx.assistant_theme();
+            let bg_style = theme.get("ui.background");
+            {
+                let area = tui::ratatui::to_ratatui_rect(inner);
+                tui::ratatui::widgets::Widget::render(tui::ratatui::widgets::Clear, area, surface);
+                surface.set_style(area, tui::ratatui::to_ratatui_style(bg_style));
+            };
+
+            // Left border
+            let border_style = theme.get("ui.window");
+            crate::widgets::vdivider(surface, border_area, border_style);
+
+            let header_style = if self.focused {
+                theme.get("ui.statusline")
+            } else {
+                theme.get("ui.statusline.inactive")
+            };
+            surface.set_style(
+                tui::ratatui::to_ratatui_rect(header_area),
+                tui::ratatui::to_ratatui_style(header_style),
+            );
+            let header = model.header();
+            let agent_busy = model.agent_busy;
+            // Agent status indicator: filled circle when the agent is doing
+            // work (gets attention), middle-dot when idle (quiet, harmonises
+            // with the chrome's separator language). The state change itself
+            // is the cue — the glyph swaps, not just the colour.
+            let (dot_glyph, dot_style) = if agent_busy {
+                ("\u{25cf}", theme.get("warning"))
+            } else {
+                ("\u{00b7}", theme.get("hint"))
+            };
+            surface.set_stringn(
+                header_area.x + 1,
+                header_area.y,
+                dot_glyph,
+                1,
+                tui::ratatui::to_ratatui_style(dot_style),
+            );
+            let trailing_width = header
+                .trailing
+                .iter()
+                .enumerate()
+                .map(|(index, item)| {
+                    UnicodeWidthStr::width(item.label.as_str()) + usize::from(index > 0) * 2
+                })
+                .sum::<usize>() as u16;
+            if !header.trailing.is_empty() {
+                let mut rx = header_area.x + header_area.width.saturating_sub(trailing_width);
+                for (index, item) in header.trailing.iter().enumerate() {
+                    if index > 0 {
+                        surface.set_stringn(
+                            rx,
+                            header_area.y,
+                            "  ",
+                            2,
+                            tui::ratatui::to_ratatui_style(header_style),
+                        );
+                        rx += 2;
+                    }
+                    let style = Self::header_item_style(theme, header_style, item.tone);
+                    let width = UnicodeWidthStr::width(item.label.as_str());
+                    surface.set_stringn(
+                        rx,
+                        header_area.y,
+                        &item.label,
+                        width,
+                        tui::ratatui::to_ratatui_style(style),
+                    );
+                    rx += width as u16;
+                }
+            }
+            let mut x = header_area.x + 3;
+            let right_edge = if header.trailing.is_empty() {
+                header_area.x + header_area.width
+            } else {
+                header_area.x + header_area.width - trailing_width - 1
+            };
+            for item in &header.leading {
+                if x >= right_edge {
+                    break;
+                }
+                let style = Self::header_item_style(theme, header_style, item.tone);
+                let width = UnicodeWidthStr::width(item.label.as_str()) as u16;
+                let budget = right_edge.saturating_sub(x) as usize;
+                surface.set_stringn(
+                    x,
+                    header_area.y,
+                    &item.label,
+                    budget,
+                    tui::ratatui::to_ratatui_style(style),
+                );
+                x = x.saturating_add(width.min(right_edge.saturating_sub(x)) + 1);
+            }
+            let bar_style = if self.focused {
+                theme.get("ui.statusline")
+            } else {
+                theme.get("ui.statusline.inactive")
+            };
+            surface.set_style(
+                tui::ratatui::to_ratatui_rect(bar_area),
+                tui::ratatui::to_ratatui_style(bar_style),
+            );
+            // Bottom status: mode  model (gap between, no separator)
+            let use_status_colors = cx.config().color_modes;
+            let theme = cx.assistant_theme();
+            let get_style = |assistant_scope: &str, statusline_fallback: &str| -> Style {
+                if use_status_colors {
+                    theme
+                        .try_get(assistant_scope)
+                        .unwrap_or_else(|| theme.get(statusline_fallback))
+                } else {
+                    bar_style
+                }
+            };
+            let muted_style = theme
+                .try_get("ui.text.inactive")
+                .or_else(|| theme.try_get("comment"))
+                .unwrap_or(bar_style);
+            let mut spans: Vec<Span> = Vec::new();
+            for (index, item) in status_items.iter().enumerate() {
+                if index > 0 {
+                    spans.push(Span::styled("  ".to_string(), bar_style));
+                }
+                match item.kind {
+                    helix_view::model::AssistantStatusItemKind::Mode => {
+                        let style = get_style("ui.assistant.mode", "ui.statusline.select");
+                        spans.push(Span::styled(
+                            format!(" {} ", item.label),
+                            bar_style.patch(style),
+                        ));
+                    }
+                    helix_view::model::AssistantStatusItemKind::Model => {
+                        let style = get_style("ui.assistant.model", "ui.statusline.normal");
+                        spans.push(Span::styled(
+                            format!(" {} ", item.label),
+                            bar_style.patch(style),
+                        ));
+                    }
+                    helix_view::model::AssistantStatusItemKind::Follow => {
+                        // Follow is metadata, not a state chip — render plain
+                        // with muted styling and the model's own `· follow X`
+                        // separator-prefixed label. No bg wrap.
+                        spans.push(Span::styled(
+                            item.label.clone(),
+                            bar_style.patch(muted_style),
+                        ));
+                    }
+                }
+            }
+            if !spans.is_empty() {
+                let combined = Spans::from(spans);
+                let line = tui::ratatui::to_ratatui_line(&combined);
+                surface.set_line(
+                    bar_area.x,
+                    bar_area.y,
+                    &line,
+                    combined.width().min(bar_area.width as usize) as u16,
+                );
+            }
+        }
+
+        // ── Error line ──
+        if self.error_marquee.has_text() {
+            let error_inset = Rect::new(
+                error_area.x + 1,
+                error_area.y,
+                error_area.width.saturating_sub(2),
+                error_area.height,
+            );
+            let error_style = cx.assistant_theme().get("error");
+            if let Some(when) = self.error_marquee.render(error_inset, surface, error_style) {
+                schedule_redraw_at(cx.work(), when, cx.redraw.clone());
+            }
+        }
+
+        // ── Plan area ──
+        if plan_rows > 0 && plan_area.height > 0 {
+            let theme = cx.assistant_theme();
+            let plan_done_style = theme.get("diff.plus");
+            let plan_progress_style = theme.get("warning");
+            let plan_pending_style = theme.get("ui.text.inactive");
+            let plan_failed_style = theme.get("error");
+            let tool_name_style = theme.get("ui.text.focus");
+            let section = plan.as_ref().unwrap();
+            let done = section.done;
+            let total = section.total;
+            let plan_inset = Rect::new(
+                plan_area.x + 1,
+                plan_area.y,
+                plan_area.width.saturating_sub(2),
+                plan_area.height,
+            );
+            let bar_width = (plan_inset.width as usize).saturating_sub(14).min(24);
+            let filled = (done * bar_width).checked_div(total).unwrap_or(0);
+            let empty = bar_width.saturating_sub(filled);
+            let line = Spans::from(vec![
+                Span::styled(format!("{} ", section.title), tool_name_style),
+                Span::styled(
+                    format!(
+                        "\u{2590}{}{}\u{258c} {done}/{total}",
+                        "\u{2588}".repeat(filled),
+                        "\u{2591}".repeat(empty)
+                    ),
+                    plan_progress_style,
+                ),
+            ]);
+            let line = tui::ratatui::to_ratatui_line(&line);
+            surface.set_line(plan_inset.x, plan_inset.y, &line, plan_inset.width);
+            for (i, item) in section.rows.iter().take(5).enumerate() {
+                let style = match item.tone {
+                    helix_view::model::AssistantPlanTone::Completed => plan_done_style,
+                    helix_view::model::AssistantPlanTone::InProgress => plan_progress_style,
+                    helix_view::model::AssistantPlanTone::Failed => plan_failed_style,
+                    helix_view::model::AssistantPlanTone::Pending => plan_pending_style,
+                };
+                let y = plan_inset.y + 1 + i as u16;
+                if y < plan_inset.bottom() {
+                    let line = Spans::from(vec![
+                        Span::styled(item.icon.to_string(), style),
+                        Span::styled(item.content.clone(), style),
+                    ]);
+                    let line = tui::ratatui::to_ratatui_line(&line);
+                    surface.set_line(plan_inset.x, y, &line, plan_inset.width);
+                }
+            }
+        }
+
+        if model.has_running_activity() {
+            schedule_redraw_at(cx.work(), self.spinner.next_redraw(), cx.redraw.clone());
+        }
+
+        if let Some((_, progress)) = self.current_message_accent(&model, cx.assistant_theme()) {
+            if progress < 1.0 {
+                if let Some(when) = self.message_focus_animation.sample().next_redraw {
+                    schedule_redraw_at(cx.work(), when, cx.redraw.clone());
+                }
+            }
+        }
+
+        if context_rows > 0 && context_area.height > 0 {
+            let style = cx.assistant_theme().get("ui.text.info");
+            surface.set_stringn(
+                context_area.x + 1,
+                context_area.y,
+                context_line.as_deref().unwrap_or_default(),
+                context_area.width.saturating_sub(2) as usize,
+                tui::ratatui::to_ratatui_style(style),
+            );
+        }
+
+        if input_area_raw.height > 0 {
+            let inset = Rect::new(
+                input_area_raw.x + 1,
+                input_area_raw.y,
+                input_area_raw.width.saturating_sub(2),
+                input_area_raw.height,
+            );
+            let theme = cx.assistant_theme();
+            let text_style = theme.get("ui.text");
+            let placeholder_style = theme.get("ui.text.inactive");
+            let input_border_style = theme
+                .try_get("ui.assistant.input.border")
+                .unwrap_or_else(|| theme.get("ui.window"));
+
+            // Draw border around input area.
+            if inset.width >= 4 && inset.height >= 3 {
+                let bw = inset.width as usize;
+                let rounded = cx.config().acp.bubble_corners_rounded();
+                let (tl, tr, bl, br) = if rounded {
+                    ("╭", "╮", "╰", "╯")
+                } else {
+                    ("┌", "┐", "└", "┘")
+                };
+                let top = format!("{tl}{}{tr}", "─".repeat(bw.saturating_sub(2)));
+                surface.set_stringn(
+                    inset.x,
+                    inset.y,
+                    &top,
+                    bw,
+                    tui::ratatui::to_ratatui_style(input_border_style),
+                );
+                for row in 1..inset.height.saturating_sub(1) {
+                    let y = inset.y + row;
+                    surface.set_stringn(
+                        inset.x,
+                        y,
+                        "│",
+                        1,
+                        tui::ratatui::to_ratatui_style(input_border_style),
+                    );
+                    surface.set_stringn(
+                        inset.right() - 1,
+                        y,
+                        "│",
+                        1,
+                        tui::ratatui::to_ratatui_style(input_border_style),
+                    );
+                }
+                let bot = format!("{bl}{}{br}", "─".repeat(bw.saturating_sub(2)));
+                surface.set_stringn(
+                    inset.x,
+                    inset.y + inset.height - 1,
+                    &bot,
+                    bw,
+                    tui::ratatui::to_ratatui_style(input_border_style),
+                );
+            }
+
+            // Inner text area inside the border (1px border + 1px padding each side).
+            let input_area = Rect::new(
+                inset.x + 2,
+                inset.y + 1,
+                inset.width.saturating_sub(4),
+                inset.height.saturating_sub(2),
+            );
+            self.input.set_area(input_area);
+
+            // Render component document content in the input area.
+            let view_id = self.input.id();
+            let is_empty = if input_area.width > 0 && input_area.height > 0 {
+                if let Some(doc) = self
+                    .input
+                    .doc_id()
+                    .and_then(|doc_id| cx.component_document(doc_id))
+                {
+                    let text = doc.text();
+                    let height = input_area.height as usize;
+                    let total_lines = text.len_lines();
+
+                    // Find cursor line to scroll around it.
+                    let cursor_line = doc
+                        .selections()
+                        .get(&view_id)
+                        .map(|sel| {
+                            let cursor = sel.primary().cursor(text.slice(..));
+                            text.char_to_line(cursor)
+                        })
+                        .unwrap_or(0);
+
+                    // Scroll so cursor is visible.
+                    let scroll = if cursor_line >= height {
+                        cursor_line + 1 - height
+                    } else {
+                        0
+                    };
+
+                    // Render visible lines.
+                    for row in 0..height {
+                        let line_idx = scroll + row;
+                        if line_idx >= total_lines {
+                            break;
+                        }
+                        let line = text.line(line_idx);
+                        let s: String = line
+                            .chars()
+                            .take_while(|c| *c != '\n')
+                            .take(input_area.width as usize)
+                            .collect();
+                        surface.set_stringn(
+                            input_area.x,
+                            input_area.y + row as u16,
+                            &s,
+                            input_area.width as usize,
+                            tui::ratatui::to_ratatui_style(text_style),
+                        );
+                    }
+
+                    // Cursor position relative to scroll.
+                    if let Some(sel) = doc.selections().get(&view_id) {
+                        let cursor = sel.primary().cursor(text.slice(..));
+                        let line_start = text.line_to_char(cursor_line);
+                        let col = cursor - line_start;
+                        let screen_row = cursor_line.saturating_sub(scroll);
+                        let cx_pos = input_area.x + col as u16;
+                        let cy_pos = input_area.y + screen_row as u16;
+                        if cy_pos < input_area.bottom() && cx_pos < input_area.right() {
+                            self.last_input_cursor = Some((cx_pos, cy_pos));
+                        }
+                    }
+                    // Empty = no content besides trailing line ending(s)
+                    !text.chars().any(|c| c != '\n' && c != '\r')
+                } else {
+                    true
+                }
+            } else {
+                true
+            };
+
+            if is_empty && input_area.width > 0 && input_area.height > 0 {
+                surface.set_stringn(
+                    input_area.x,
+                    input_area.y,
+                    "Ask anything...",
+                    input_area.width as usize,
+                    tui::ratatui::to_ratatui_style(placeholder_style),
+                );
+            }
+        }
+
+        // ── Content area (chat history) ──────────────────────
+
+        if content_area.height == 0 || content_area.width == 0 {
+            return;
+        }
+
+        self.output.set_area(content_area);
+
+        let theme = cx.assistant_theme();
+        // Empty state
+        if self.output.content().is_empty() {
+            let empty_style = theme.get("ui.text.inactive");
+            let center_y = content_area.y + content_area.height / 2;
+
+            let msg = "Space A for menu";
+            let mx = content_area.x
+                + content_area
+                    .width
+                    .saturating_sub(UnicodeWidthStr::width(msg) as u16)
+                    / 2;
+            if center_y >= content_area.y && center_y < content_area.y + content_area.height {
+                surface.set_stringn(
+                    mx,
+                    center_y,
+                    msg,
+                    content_area.width as usize,
+                    tui::ratatui::to_ratatui_style(empty_style),
+                );
+            }
+
+            return;
+        }
+
+        // Render chat content using message list primitives.
+        let corners = MessageCorners::Squared;
+        let blocks = self.build_blocks(&model, theme, content_area.width, corners);
+        self.render_content(&model, &blocks, content_area, surface);
+
+        // Scrollbar
+        let total_height = self.output.content_height();
+        let scroll_from_top = Scrollable::scroll(&self.output);
+        if total_height > content_area.height as usize {
+            let scroll_style = theme.get("ui.menu.scroll");
+            crate::widgets::Scrollbar::new(
+                total_height,
+                scroll_from_top,
+                content_area.height as usize,
+            )
+            .thumb_style(
+                Style::default().fg(scroll_style.fg.unwrap_or(helix_view::theme::Color::Reset)),
+            )
+            .track(
+                "▐",
+                Style::default().fg(scroll_style.bg.unwrap_or(helix_view::theme::Color::Reset)),
+            )
+            .render(
+                Rect::new(
+                    content_area_raw.right() - 1,
+                    content_area.y,
+                    1,
+                    content_area.height,
+                ),
+                surface,
+            );
+        }
     }
 
     pub fn selected_message(&self, editor: &Editor) -> Option<usize> {
@@ -1125,229 +1658,6 @@ impl AssistantPanel {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Simple markdown line renderer
-// ---------------------------------------------------------------------------
-
-struct MarkdownLineStyles {
-    heading: helix_view::graphics::Style,
-    code: helix_view::graphics::Style,
-    bold: helix_view::graphics::Style,
-    italic: helix_view::graphics::Style,
-    separator: helix_view::graphics::Style,
-}
-
-/// Compute the ideal bubble width for `text`: fit to the longest wrapped
-/// line, then clamp to [min_w, max_w].
-fn fit_bubble_width(text: &str, min_w: usize, max_w: usize) -> usize {
-    let max_w = max_w.max(4);
-    let min_w = min_w.min(max_w);
-    let inner_max = max_w.saturating_sub(4).max(1);
-    let wrapped = wrap_text(text, inner_max);
-    let longest = wrapped.iter().map(|l| l.len()).max().unwrap_or(0);
-    (longest + 4).clamp(min_w, max_w)
-}
-
-/// Render markdown-ish text into styled Spans lines.
-/// Handles: headings (#), bold (**), italic (*), inline code (`), code blocks (```), horizontal rules (---).
-/// Word-wrap text to fit within `max_width` columns.
-fn wrap_text(text: &str, max_width: usize) -> Vec<String> {
-    let mut result = Vec::new();
-    if max_width == 0 {
-        return result;
-    }
-    for line in text.lines() {
-        if line.is_empty() {
-            result.push(String::new());
-            continue;
-        }
-        let mut current = String::new();
-        let mut current_width = 0;
-        for word in line.split_whitespace() {
-            let word_width = word.len();
-            if current_width > 0 && current_width + 1 + word_width > max_width {
-                result.push(current);
-                current = String::new();
-                current_width = 0;
-            }
-            if current_width > 0 {
-                current.push(' ');
-                current_width += 1;
-            }
-            current.push_str(word);
-            current_width += word_width;
-        }
-        if !current.is_empty() || line.ends_with(' ') {
-            result.push(current);
-        }
-    }
-    if result.is_empty() {
-        result.push(String::new());
-    }
-    result
-}
-
-fn render_markdown_lines<'a>(
-    text: &str,
-    lines: &mut Vec<Spans<'a>>,
-    base_style: helix_view::graphics::Style,
-    styles: &MarkdownLineStyles,
-) {
-    let mut in_code_block = false;
-
-    for line in text.lines() {
-        // Code block toggle
-        if line.starts_with("```") {
-            in_code_block = !in_code_block;
-            if in_code_block {
-                // Start of code block — just show a dim line
-                lines.push(Spans::from(Span::styled(
-                    "────────".to_string(),
-                    styles.code,
-                )));
-            } else {
-                lines.push(Spans::from(Span::styled(
-                    "────────".to_string(),
-                    styles.code,
-                )));
-            }
-            continue;
-        }
-
-        if in_code_block {
-            lines.push(Spans::from(Span::styled(format!("  {line}"), styles.code)));
-            continue;
-        }
-
-        // Horizontal rules
-        let trimmed = line.trim();
-        if (trimmed.starts_with("---") || trimmed.starts_with("***") || trimmed.starts_with("___"))
-            && trimmed
-                .chars()
-                .all(|c| c == '-' || c == '*' || c == '_' || c == ' ')
-            && trimmed.len() >= 3
-        {
-            lines.push(Spans::from(Span::styled(
-                "───".to_string(),
-                styles.separator,
-            )));
-            continue;
-        }
-
-        // Headings
-        if let Some(stripped) = line.strip_prefix("# ") {
-            lines.push(Spans::from(Span::styled(
-                stripped.to_string(),
-                styles.heading,
-            )));
-            continue;
-        }
-        if let Some(stripped) = line.strip_prefix("## ") {
-            lines.push(Spans::from(Span::styled(
-                stripped.to_string(),
-                styles.heading,
-            )));
-            continue;
-        }
-        if let Some(stripped) = line.strip_prefix("### ") {
-            lines.push(Spans::from(Span::styled(
-                stripped.to_string(),
-                styles.heading,
-            )));
-            continue;
-        }
-
-        // Inline formatting: parse **bold**, *italic*, `code`
-        let spans =
-            parse_inline_markdown(line, base_style, styles.bold, styles.italic, styles.code);
-        lines.push(Spans::from(spans));
-    }
-}
-
-/// Parse a single line for inline markdown: **bold**, *italic*, `code`.
-fn parse_inline_markdown(
-    line: &str,
-    base: helix_view::graphics::Style,
-    bold: helix_view::graphics::Style,
-    italic: helix_view::graphics::Style,
-    code: helix_view::graphics::Style,
-) -> Vec<Span<'static>> {
-    let mut spans = Vec::new();
-    let mut current = String::new();
-    let chars: Vec<char> = line.chars().collect();
-    let len = chars.len();
-    let mut i = 0;
-
-    while i < len {
-        // Inline code
-        if chars[i] == '`' {
-            if !current.is_empty() {
-                spans.push(Span::styled(std::mem::take(&mut current), base));
-            }
-            i += 1;
-            let mut code_text = String::new();
-            while i < len && chars[i] != '`' {
-                code_text.push(chars[i]);
-                i += 1;
-            }
-            if i < len {
-                i += 1; // skip closing `
-            }
-            spans.push(Span::styled(code_text, code));
-            continue;
-        }
-
-        // Bold: **text**
-        if i + 1 < len && chars[i] == '*' && chars[i + 1] == '*' {
-            if !current.is_empty() {
-                spans.push(Span::styled(std::mem::take(&mut current), base));
-            }
-            i += 2;
-            let mut bold_text = String::new();
-            while i + 1 < len && !(chars[i] == '*' && chars[i + 1] == '*') {
-                bold_text.push(chars[i]);
-                i += 1;
-            }
-            if i + 1 < len {
-                i += 2; // skip closing **
-            }
-            spans.push(Span::styled(bold_text, bold));
-            continue;
-        }
-
-        // Italic: *text*
-        if chars[i] == '*' {
-            if !current.is_empty() {
-                spans.push(Span::styled(std::mem::take(&mut current), base));
-            }
-            i += 1;
-            let mut italic_text = String::new();
-            while i < len && chars[i] != '*' {
-                italic_text.push(chars[i]);
-                i += 1;
-            }
-            if i < len {
-                i += 1; // skip closing *
-            }
-            spans.push(Span::styled(italic_text, italic));
-            continue;
-        }
-
-        current.push(chars[i]);
-        i += 1;
-    }
-
-    if !current.is_empty() {
-        spans.push(Span::styled(current, base));
-    }
-
-    if spans.is_empty() {
-        spans.push(Span::styled(String::new(), base));
-    }
-
-    spans
-}
-
 impl Focusable for AssistantPanel {
     fn is_focused(&self) -> bool {
         self.focused
@@ -1401,461 +1711,8 @@ impl Component for AssistantPanel {
         self.sync_to_model(editor);
     }
 
-    fn render(&mut self, area: Rect, surface: &mut Surface, cx: &RenderContext) {
-        log::warn!(
-            "[assistant_panel] render area=({},{} {}x{})",
-            area.x,
-            area.y,
-            area.width,
-            area.height,
-        );
-        if area.width < 20 || area.height < 6 {
-            return;
-        }
-
-        use helix_view::layout::{split_horizontal, split_vertical, Size};
-
-        // Layout: [1px border | content]
-        let h_areas = split_horizontal(area, &[Size::fixed(1), Size::Fill]);
-        let border_area = h_areas[0];
-        let inner = h_areas[1];
-
-        let error_rows = 1u16;
-        let input_rows = 5u16; // 1 top border + 3 content + 1 bottom border
-        let model = Self::assistant_model(cx.editor);
-        let plan = model.plan_section();
-        let context_items = &model.context_items;
-        let context_line = model.context_line();
-        let status_items = model.status_items();
-        let plan_rows = plan
-            .as_ref()
-            .map(|section| (section.rows.len() + 1).min(6) as u16)
-            .unwrap_or(0);
-        let context_rows = if context_items.is_empty() { 0 } else { 1 };
-
-        // Vertical layout: [header | chat | plan | context pills | input | status | error]
-        let v_areas = split_vertical(
-            inner,
-            &[
-                Size::fixed(1),         // header
-                Size::Fill,             // chat content
-                Size::fixed(plan_rows), // plan
-                Size::fixed(context_rows),
-                Size::fixed(input_rows), // input
-                Size::fixed(1),          // status bar
-                Size::fixed(error_rows), // error line
-            ],
-        );
-        let header_area = v_areas[0];
-        let content_area_raw = v_areas[1];
-        let plan_area = v_areas[2];
-        let context_area = v_areas[3];
-        let input_area_raw = v_areas[4];
-        let bar_area = v_areas[5];
-        let error_area = v_areas[6];
-
-        // Inset content/plan/input by 1px on each side for padding.
-        let content_area = Rect::new(
-            content_area_raw.x + 1,
-            content_area_raw.y,
-            content_area_raw.width.saturating_sub(2),
-            content_area_raw.height,
-        );
-        {
-            let theme = cx.editor.assistant_theme();
-            let bg_style = theme.get("ui.background");
-            surface.clear_with(inner, bg_style);
-
-            // Left border
-            let border_style = theme.get("ui.window");
-            crate::widgets::vdivider(surface, border_area, border_style);
-
-            let header_style = if self.focused {
-                theme.get("ui.statusline")
-            } else {
-                theme.get("ui.statusline.inactive")
-            };
-            surface.set_style(header_area, header_style);
-            let header = model.header();
-            let agent_busy = model.agent_busy;
-            let dot_style = if agent_busy {
-                theme.get("warning")
-            } else {
-                theme.get("hint")
-            };
-            surface.set_stringn(header_area.x + 1, header_area.y, "\u{25cf}", 1, dot_style);
-            let trailing_width = header
-                .trailing
-                .iter()
-                .enumerate()
-                .map(|(index, item)| {
-                    UnicodeWidthStr::width(item.label.as_str()) + usize::from(index > 0) * 2
-                })
-                .sum::<usize>() as u16;
-            if !header.trailing.is_empty() {
-                let mut rx = header_area.x + header_area.width.saturating_sub(trailing_width);
-                for (index, item) in header.trailing.iter().enumerate() {
-                    if index > 0 {
-                        surface.set_stringn(rx, header_area.y, "  ", 2, header_style);
-                        rx += 2;
-                    }
-                    let style = Self::header_item_style(theme, header_style, item.tone);
-                    let width = UnicodeWidthStr::width(item.label.as_str());
-                    surface.set_stringn(rx, header_area.y, &item.label, width, style);
-                    rx += width as u16;
-                }
-            }
-            let mut x = header_area.x + 3;
-            let right_edge = if header.trailing.is_empty() {
-                header_area.x + header_area.width
-            } else {
-                header_area.x + header_area.width - trailing_width - 1
-            };
-            for item in &header.leading {
-                if x >= right_edge {
-                    break;
-                }
-                let style = Self::header_item_style(theme, header_style, item.tone);
-                let width = UnicodeWidthStr::width(item.label.as_str()) as u16;
-                let budget = right_edge.saturating_sub(x) as usize;
-                surface.set_stringn(x, header_area.y, &item.label, budget, style);
-                x = x.saturating_add(width.min(right_edge.saturating_sub(x)) + 1);
-            }
-            let bar_style = if self.focused {
-                theme.get("ui.statusline")
-            } else {
-                theme.get("ui.statusline.inactive")
-            };
-            surface.set_style(bar_area, bar_style);
-            // Bottom status: mode  model (gap between, no separator)
-            let use_status_colors = cx.editor.config().color_modes;
-            let theme = cx.editor.assistant_theme();
-            let get_style = |assistant_scope: &str, statusline_fallback: &str| -> Style {
-                if use_status_colors {
-                    theme
-                        .try_get(assistant_scope)
-                        .unwrap_or_else(|| theme.get(statusline_fallback))
-                } else {
-                    bar_style
-                }
-            };
-            let mut spans: Vec<Span> = Vec::new();
-            for (index, item) in status_items.iter().enumerate() {
-                if index > 0 {
-                    spans.push(Span::styled("  ".to_string(), bar_style));
-                }
-                let style = match item.kind {
-                    helix_view::model::AssistantStatusItemKind::Mode => {
-                        get_style("ui.assistant.mode", "ui.statusline.select")
-                    }
-                    helix_view::model::AssistantStatusItemKind::Model => {
-                        get_style("ui.assistant.model", "ui.statusline.normal")
-                    }
-                    helix_view::model::AssistantStatusItemKind::Follow => theme.get("ui.text.info"),
-                };
-                spans.push(Span::styled(
-                    format!(" {} ", item.label),
-                    bar_style.patch(style),
-                ));
-            }
-            if !spans.is_empty() {
-                let combined = Spans::from(spans);
-                surface.set_spans(
-                    bar_area.x,
-                    bar_area.y,
-                    &combined,
-                    combined.width().min(bar_area.width as usize) as u16,
-                );
-            }
-        }
-
-        // ── Error line ──
-        if self.error_marquee.has_text() {
-            let error_inset = Rect::new(
-                error_area.x + 1,
-                error_area.y,
-                error_area.width.saturating_sub(2),
-                error_area.height,
-            );
-            let error_style = cx.editor.assistant_theme().get("error");
-            if let Some(when) = self.error_marquee.render(error_inset, surface, error_style) {
-                schedule_redraw_at(cx.editor.work(), when, cx.ingress.clone());
-            }
-        }
-
-        // ── Plan area ──
-        if plan_rows > 0 && plan_area.height > 0 {
-            let theme = cx.editor.assistant_theme();
-            let plan_done_style = theme.get("diff.plus");
-            let plan_progress_style = theme.get("warning");
-            let plan_pending_style = theme.get("ui.text.inactive");
-            let plan_failed_style = theme.get("error");
-            let tool_name_style = theme.get("ui.text.focus");
-            let section = plan.as_ref().unwrap();
-            let done = section.done;
-            let total = section.total;
-            let plan_inset = Rect::new(
-                plan_area.x + 1,
-                plan_area.y,
-                plan_area.width.saturating_sub(2),
-                plan_area.height,
-            );
-            let bar_width = (plan_inset.width as usize).saturating_sub(14).min(24);
-            let filled = (done * bar_width).checked_div(total).unwrap_or(0);
-            let empty = bar_width.saturating_sub(filled);
-            surface.set_spans(
-                plan_inset.x,
-                plan_inset.y,
-                &Spans::from(vec![
-                    Span::styled(format!("{} ", section.title), tool_name_style),
-                    Span::styled(
-                        format!(
-                            "\u{2590}{}{}\u{258c} {done}/{total}",
-                            "\u{2588}".repeat(filled),
-                            "\u{2591}".repeat(empty)
-                        ),
-                        plan_progress_style,
-                    ),
-                ]),
-                plan_inset.width,
-            );
-            for (i, item) in section.rows.iter().take(5).enumerate() {
-                let style = match item.tone {
-                    helix_view::model::AssistantPlanTone::Completed => plan_done_style,
-                    helix_view::model::AssistantPlanTone::InProgress => plan_progress_style,
-                    helix_view::model::AssistantPlanTone::Failed => plan_failed_style,
-                    helix_view::model::AssistantPlanTone::Pending => plan_pending_style,
-                };
-                let y = plan_inset.y + 1 + i as u16;
-                if y < plan_inset.bottom() {
-                    surface.set_spans(
-                        plan_inset.x,
-                        y,
-                        &Spans::from(vec![
-                            Span::styled(item.icon.to_string(), style),
-                            Span::styled(item.content.clone(), style),
-                        ]),
-                        plan_inset.width,
-                    );
-                }
-            }
-        }
-
-        if model.has_running_activity() {
-            schedule_redraw_at(
-                cx.editor.work(),
-                self.spinner.next_redraw(),
-                cx.ingress.clone(),
-            );
-        }
-
-        if let Some((_, progress)) =
-            self.current_message_accent(cx.editor, cx.editor.assistant_theme())
-        {
-            if progress < 1.0 {
-                if let Some(when) = self.message_focus_animation.sample().next_redraw {
-                    schedule_redraw_at(cx.editor.work(), when, cx.ingress.clone());
-                }
-            }
-        }
-
-        if context_rows > 0 && context_area.height > 0 {
-            let style = cx.editor.assistant_theme().get("ui.text.info");
-            surface.set_stringn(
-                context_area.x + 1,
-                context_area.y,
-                context_line.as_deref().unwrap_or_default(),
-                context_area.width.saturating_sub(2) as usize,
-                style,
-            );
-        }
-
-        if input_area_raw.height > 0 {
-            let inset = Rect::new(
-                input_area_raw.x + 1,
-                input_area_raw.y,
-                input_area_raw.width.saturating_sub(2),
-                input_area_raw.height,
-            );
-            let theme = cx.editor.assistant_theme();
-            let text_style = theme.get("ui.text");
-            let placeholder_style = theme.get("ui.text.inactive");
-            let input_border_style = theme
-                .try_get("ui.assistant.input.border")
-                .unwrap_or_else(|| theme.get("ui.window"));
-
-            // Draw border around input area.
-            if inset.width >= 4 && inset.height >= 3 {
-                let bw = inset.width as usize;
-                let rounded = cx.editor.config().acp.bubble_corners_rounded();
-                let (tl, tr, bl, br) = if rounded {
-                    ("╭", "╮", "╰", "╯")
-                } else {
-                    ("┌", "┐", "└", "┘")
-                };
-                let top = format!("{tl}{}{tr}", "─".repeat(bw.saturating_sub(2)));
-                surface.set_stringn(inset.x, inset.y, &top, bw, input_border_style);
-                for row in 1..inset.height.saturating_sub(1) {
-                    let y = inset.y + row;
-                    surface.set_stringn(inset.x, y, "│", 1, input_border_style);
-                    surface.set_stringn(inset.right() - 1, y, "│", 1, input_border_style);
-                }
-                let bot = format!("{bl}{}{br}", "─".repeat(bw.saturating_sub(2)));
-                surface.set_stringn(
-                    inset.x,
-                    inset.y + inset.height - 1,
-                    &bot,
-                    bw,
-                    input_border_style,
-                );
-            }
-
-            // Inner text area inside the border (1px border + 1px padding each side).
-            let input_area = Rect::new(
-                inset.x + 2,
-                inset.y + 1,
-                inset.width.saturating_sub(4),
-                inset.height.saturating_sub(2),
-            );
-            self.input.set_area(input_area);
-
-            // Render component document content in the input area.
-            let view_id = self.input.id();
-            let is_empty = if input_area.width > 0 && input_area.height > 0 {
-                if let Some(doc) = self.input.document(cx.editor) {
-                    let text = doc.text();
-                    let height = input_area.height as usize;
-                    let total_lines = text.len_lines();
-
-                    // Find cursor line to scroll around it.
-                    let cursor_line = doc
-                        .selections()
-                        .get(&view_id)
-                        .map(|sel| {
-                            let cursor = sel.primary().cursor(text.slice(..));
-                            text.char_to_line(cursor)
-                        })
-                        .unwrap_or(0);
-
-                    // Scroll so cursor is visible.
-                    let scroll = if cursor_line >= height {
-                        cursor_line + 1 - height
-                    } else {
-                        0
-                    };
-
-                    // Render visible lines.
-                    for row in 0..height {
-                        let line_idx = scroll + row;
-                        if line_idx >= total_lines {
-                            break;
-                        }
-                        let line = text.line(line_idx);
-                        let s: String = line
-                            .chars()
-                            .take_while(|c| *c != '\n')
-                            .take(input_area.width as usize)
-                            .collect();
-                        surface.set_stringn(
-                            input_area.x,
-                            input_area.y + row as u16,
-                            &s,
-                            input_area.width as usize,
-                            text_style,
-                        );
-                    }
-
-                    // Cursor position relative to scroll.
-                    if let Some(sel) = doc.selections().get(&view_id) {
-                        let cursor = sel.primary().cursor(text.slice(..));
-                        let line_start = text.line_to_char(cursor_line);
-                        let col = cursor - line_start;
-                        let screen_row = cursor_line.saturating_sub(scroll);
-                        let cx_pos = input_area.x + col as u16;
-                        let cy_pos = input_area.y + screen_row as u16;
-                        if cy_pos < input_area.bottom() && cx_pos < input_area.right() {
-                            self.last_input_cursor = Some((cx_pos, cy_pos));
-                        }
-                    }
-                    // Empty = no content besides trailing line ending(s)
-                    !text.chars().any(|c| c != '\n' && c != '\r')
-                } else {
-                    true
-                }
-            } else {
-                true
-            };
-
-            if is_empty && input_area.width > 0 && input_area.height > 0 {
-                surface.set_stringn(
-                    input_area.x,
-                    input_area.y,
-                    "Ask anything...",
-                    input_area.width as usize,
-                    placeholder_style,
-                );
-            }
-        }
-
-        // ── Content area (chat history) ──────────────────────
-
-        if content_area.height == 0 || content_area.width == 0 {
-            return;
-        }
-
-        self.output.set_area(content_area);
-
-        let theme = cx.editor.assistant_theme();
-        // Empty state
-        if self.output.content().is_empty() {
-            let empty_style = theme.get("ui.text.inactive");
-            let center_y = content_area.y + content_area.height / 2;
-
-            let msg = "Space A for menu";
-            let mx = content_area.x
-                + content_area
-                    .width
-                    .saturating_sub(UnicodeWidthStr::width(msg) as u16)
-                    / 2;
-            if center_y >= content_area.y && center_y < content_area.y + content_area.height {
-                surface.set_stringn(mx, center_y, msg, content_area.width as usize, empty_style);
-            }
-
-            return;
-        }
-
-        // Render chat content using message list primitives.
-        let corners = MessageCorners::Squared;
-        let blocks = self.build_blocks(cx.editor, theme, content_area.width, corners);
-        self.render_content(cx.editor, &blocks, content_area, surface);
-
-        // Scrollbar
-        let total_height = self.output.content_height();
-        let scroll_from_top = Scrollable::scroll(&self.output);
-        if total_height > content_area.height as usize {
-            let scroll_style = theme.get("ui.menu.scroll");
-            crate::widgets::Scrollbar::new(
-                total_height,
-                scroll_from_top,
-                content_area.height as usize,
-            )
-            .thumb_style(
-                Style::default().fg(scroll_style.fg.unwrap_or(helix_view::theme::Color::Reset)),
-            )
-            .track(
-                "▐",
-                Style::default().fg(scroll_style.bg.unwrap_or(helix_view::theme::Color::Reset)),
-            )
-            .render(
-                Rect::new(
-                    content_area_raw.right() - 1,
-                    content_area.y,
-                    1,
-                    content_area.height,
-                ),
-                surface,
-            );
-        }
+    fn render(&mut self, area: Rect, surface: &mut crate::render::CellSurface, cx: &RenderContext) {
+        self.render_surface(area, surface, cx);
     }
 
     fn handle_event(&mut self, event: &Event, cx: &mut Context) -> EventResult {
@@ -2068,70 +1925,38 @@ impl Component for AssistantPanel {
                         self.send_current_prompt(cx);
                         return EventResult::Consumed(None);
                     }
-                    // i/a/I/A → enter insert mode.
+                    // i/a/I/A → enter insert mode with Helix-matching
+                    // cursor placement. The selection transforms used to
+                    // be hand-rolled here, one match arm per key — which
+                    // was both verbose and prone to drift from the editor.
+                    // `EditRegion::enter_insert_at` now owns the canonical
+                    // semantics; this site just names the entry.
                     KeyCode::Char('i') => {
-                        self.input.enter_insert_mode("insert_mode".into());
+                        self.input.enter_insert_at(
+                            cx.editor,
+                            helix_view::edit_region::InsertEntry::AtCurrent,
+                        );
                         return EventResult::Consumed(None);
                     }
                     KeyCode::Char('a') => {
-                        self.input.enter_insert_mode("append_mode".into());
-                        // Move cursor forward by one (append behavior).
-                        if let Some(doc_id) = self.input.doc_id() {
-                            if let Some(doc) = cx.editor.component_docs.get_mut(&doc_id) {
-                                let text = doc.text().slice(..);
-                                let selection = doc
-                                    .selection(self.input.view_id())
-                                    .clone()
-                                    .transform(|range| {
-                                        let pos = helix_core::graphemes::next_grapheme_boundary(
-                                            text,
-                                            range.cursor(text),
-                                        );
-                                        helix_core::Range::new(pos, pos)
-                                    });
-                                doc.set_selection(self.input.view_id(), selection);
-                            }
-                        }
+                        self.input.enter_insert_at(
+                            cx.editor,
+                            helix_view::edit_region::InsertEntry::Append,
+                        );
                         return EventResult::Consumed(None);
                     }
                     KeyCode::Char('I') => {
-                        self.input.enter_insert_mode("insert_mode".into());
-                        // Move cursor to start of line.
-                        if let Some(doc_id) = self.input.doc_id() {
-                            if let Some(doc) = cx.editor.component_docs.get_mut(&doc_id) {
-                                let text = doc.text().slice(..);
-                                let selection = doc
-                                    .selection(self.input.view_id())
-                                    .clone()
-                                    .transform(|range| {
-                                        let line = text.char_to_line(range.cursor(text));
-                                        let pos = text.line_to_char(line);
-                                        helix_core::Range::new(pos, pos)
-                                    });
-                                doc.set_selection(self.input.view_id(), selection);
-                            }
-                        }
+                        self.input.enter_insert_at(
+                            cx.editor,
+                            helix_view::edit_region::InsertEntry::AtLineStart,
+                        );
                         return EventResult::Consumed(None);
                     }
                     KeyCode::Char('A') => {
-                        self.input.enter_insert_mode("append_mode".into());
-                        // Move cursor to end of line.
-                        if let Some(doc_id) = self.input.doc_id() {
-                            if let Some(doc) = cx.editor.component_docs.get_mut(&doc_id) {
-                                let text = doc.text().slice(..);
-                                let selection = doc
-                                    .selection(self.input.view_id())
-                                    .clone()
-                                    .transform(|range| {
-                                        let line = text.char_to_line(range.cursor(text));
-                                        let pos = helix_core::line_ending::line_end_char_index(
-                                            &text, line,
-                                        );
-                                        helix_core::Range::new(pos, pos)
-                                    });
-                                doc.set_selection(self.input.view_id(), selection);
-                            }
-                        }
+                        self.input.enter_insert_at(
+                            cx.editor,
+                            helix_view::edit_region::InsertEntry::AtLineEnd,
+                        );
                         return EventResult::Consumed(None);
                     }
                     _ => {}
@@ -2172,7 +1997,7 @@ impl Component for AssistantPanel {
         (None, CursorKind::Hidden)
     }
 
-    fn id(&self) -> Option<&'static str> {
+    fn id(&self) -> Option<&str> {
         Some(ID)
     }
 
@@ -2233,10 +2058,17 @@ impl PermissionPopup {
             let _ = tx.send(response);
         }
     }
-}
 
-impl Component for PermissionPopup {
-    fn render(&mut self, area: Rect, surface: &mut Surface, cx: &RenderContext) {
+    fn render_surface(
+        &mut self,
+        area: Rect,
+        surface: &mut crate::render::CellSurface,
+        cx: &RenderContext,
+    ) {
+        if area.width < 6 || area.height < 4 {
+            return;
+        }
+
         let popup_width = 50u16.min(area.width.saturating_sub(4));
         let option_lines = self.options.len() as u16;
         let desc_lines = self
@@ -2257,46 +2089,72 @@ impl Component for PermissionPopup {
         };
 
         // Background
-        let bg = cx.editor.assistant_theme().get("ui.popup");
+        let theme = cx.assistant_theme();
+        let bg = theme.get("ui.popup");
         for py in popup_area.y..popup_area.y + popup_area.height {
             for px in popup_area.x..popup_area.x + popup_area.width {
-                surface[(px, py)].set_style(bg).set_symbol(" ");
+                {
+                    if let Some(cell) = surface.cell_mut((px, py)) {
+                        cell.set_symbol(" ");
+                        cell.set_style(tui::ratatui::to_ratatui_style(bg));
+                    }
+                };
             }
         }
 
         // Border top
-        let border_style = cx.editor.assistant_theme().get("ui.popup");
+        let border_style = theme.get("ui.popup");
         let top_border = format!("┌{}┐", "─".repeat(popup_width.saturating_sub(2) as usize));
-        surface.set_stringn(x, y, &top_border, popup_width as usize, border_style);
+        surface.set_stringn(
+            x,
+            y,
+            &top_border,
+            popup_width as usize,
+            tui::ratatui::to_ratatui_style(border_style),
+        );
 
         // Title
-        let title_style = cx
-            .editor
-            .assistant_theme()
-            .get("ui.text")
-            .add_modifier(Modifier::BOLD);
+        let title_style = theme.get("ui.text").add_modifier(Modifier::BOLD);
         let title_line = format!(
             "│ {:<width$}│",
             self.title,
             width = (popup_width - 4) as usize
         );
-        surface.set_stringn(x, y + 1, &title_line, popup_width as usize, title_style);
+        surface.set_stringn(
+            x,
+            y + 1,
+            &title_line,
+            popup_width as usize,
+            tui::ratatui::to_ratatui_style(title_style),
+        );
 
         let mut row = y + 2;
 
         // Description
         if let Some(ref desc) = self.description {
-            let desc_style = cx.editor.assistant_theme().get("ui.text.inactive");
+            let desc_style = theme.get("ui.text.inactive");
             for line in desc.lines() {
                 let padded = format!("│ {:<width$}│", line, width = (popup_width - 4) as usize);
-                surface.set_stringn(x, row, &padded, popup_width as usize, desc_style);
+                surface.set_stringn(
+                    x,
+                    row,
+                    &padded,
+                    popup_width as usize,
+                    tui::ratatui::to_ratatui_style(desc_style),
+                );
                 row += 1;
             }
         }
 
         // Separator
         let sep = format!("├{}┤", "─".repeat(popup_width.saturating_sub(2) as usize));
-        surface.set_stringn(x, row, &sep, popup_width as usize, border_style);
+        surface.set_stringn(
+            x,
+            row,
+            &sep,
+            popup_width as usize,
+            tui::ratatui::to_ratatui_style(border_style),
+        );
         row += 1;
 
         // Options
@@ -2304,24 +2162,42 @@ impl Component for PermissionPopup {
             let is_selected = i == self.selected;
             let marker = if is_selected { ">" } else { " " };
             let style = if is_selected {
-                cx.editor.assistant_theme().get("ui.menu.selected")
+                theme.get("ui.menu.selected")
             } else {
-                cx.editor.assistant_theme().get("ui.text")
+                theme.get("ui.text")
             };
             let opt_line = format!(
                 "│{marker} {:<width$}│",
                 opt.title,
                 width = (popup_width - 5) as usize
             );
-            surface.set_stringn(x, row, &opt_line, popup_width as usize, style);
+            surface.set_stringn(
+                x,
+                row,
+                &opt_line,
+                popup_width as usize,
+                tui::ratatui::to_ratatui_style(style),
+            );
             row += 1;
         }
 
         // Border bottom
         let bottom_border = format!("└{}┘", "─".repeat(popup_width.saturating_sub(2) as usize));
         if row < popup_area.y + popup_area.height {
-            surface.set_stringn(x, row, &bottom_border, popup_width as usize, border_style);
+            surface.set_stringn(
+                x,
+                row,
+                &bottom_border,
+                popup_width as usize,
+                tui::ratatui::to_ratatui_style(border_style),
+            );
         }
+    }
+}
+
+impl Component for PermissionPopup {
+    fn render(&mut self, area: Rect, surface: &mut crate::render::CellSurface, cx: &RenderContext) {
+        self.render_surface(area, surface, cx);
     }
 
     fn handle_event(&mut self, event: &Event, _cx: &mut Context) -> EventResult {
@@ -2370,7 +2246,7 @@ impl Component for PermissionPopup {
         }
     }
 
-    fn id(&self) -> Option<&'static str> {
+    fn id(&self) -> Option<&str> {
         Some(PERMISSION_ID)
     }
 }
@@ -2642,8 +2518,9 @@ mod tests {
             panel.sync_from_assistant(&mut editor);
             select_thread_entry(&mut editor, 0);
 
+            let model = editor.assistant_model(false);
             let expanded_blocks = panel.build_blocks(
-                &editor,
+                &model,
                 editor.assistant_theme(),
                 30,
                 MessageCorners::Squared,
@@ -2652,8 +2529,9 @@ mod tests {
 
             assert!(panel.toggle_selected_message_fold(&mut editor));
 
+            let model = editor.assistant_model(false);
             let collapsed_blocks = panel.build_blocks(
-                &editor,
+                &model,
                 editor.assistant_theme(),
                 30,
                 MessageCorners::Squared,

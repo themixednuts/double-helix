@@ -200,6 +200,7 @@ pub struct FileExplorerConfig {
     pub flatten_dirs: bool,
     pub icons: bool,
     pub vcs: bool,
+    pub diagnostics: bool,
 }
 
 impl Default for FileExplorerConfig {
@@ -215,6 +216,7 @@ impl Default for FileExplorerConfig {
             flatten_dirs: true,
             icons: true,
             vcs: true,
+            diagnostics: true,
         }
     }
 }
@@ -1082,6 +1084,14 @@ pub enum StatusLineElement {
     Register,
     CurrentWorkingDirectory,
     FunctionName,
+    /// Compact display of attached language servers, e.g.
+    /// ` rust-analyzer ` or ` rust-analyzer · ruff `. Renders
+    /// nothing when no LSP is attached, so the statusline doesn't
+    /// reserve dead space on non-LSP buffers (binary files, scratch
+    /// buffers, etc.). Opt-in via user config — the default
+    /// [`StatusLineConfig::default`] doesn't include it to preserve
+    /// existing user layouts.
+    LspStatus,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

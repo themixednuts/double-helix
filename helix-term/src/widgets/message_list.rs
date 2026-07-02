@@ -2,7 +2,6 @@
 
 use helix_core::unicode::width::UnicodeWidthStr;
 use helix_view::graphics::{Rect, Style};
-use tui::buffer::Buffer as Surface;
 use tui::text::Spans;
 
 use super::{message, MessageAlign, MessageStyle};
@@ -353,7 +352,12 @@ impl MessageCursor {
     }
 }
 
-fn render_text_lines(surface: &mut Surface, area: Rect, y_offset: isize, lines: &[Spans<'_>]) {
+fn render_text_lines(
+    surface: &mut crate::render::CellSurface,
+    area: Rect,
+    y_offset: isize,
+    lines: &[Spans<'_>],
+) {
     for (row, line) in lines.iter().enumerate() {
         let line_y = y_offset + row as isize;
         if line_y < area.y as isize {
@@ -363,25 +367,17 @@ fn render_text_lines(surface: &mut Surface, area: Rect, y_offset: isize, lines: 
             break;
         }
 
-        let mut x = area.x;
-        for span in &line.0 {
-            let remaining = area.right().saturating_sub(x) as usize;
-            if remaining == 0 {
-                break;
-            }
-            let width = span.content.len().min(remaining);
-            surface.set_stringn(x, line_y as u16, span.content.as_ref(), width, span.style);
-            x += width as u16;
-        }
+        surface.set_line(
+            area.x,
+            line_y as u16,
+            &tui::ratatui::to_ratatui_line(line),
+            area.width,
+        );
     }
 }
 
-fn spans_width(line: &Spans<'_>) -> usize {
-    line.0.iter().map(|span| span.content.len()).sum()
-}
-
 fn render_accessory_lines(
-    surface: &mut Surface,
+    surface: &mut crate::render::CellSurface,
     area: Rect,
     y_offset: isize,
     lines: &[Spans<'_>],
@@ -396,25 +392,26 @@ fn render_accessory_lines(
             break;
         }
 
-        let line_width = spans_width(line).min(area.width as usize) as u16;
-        let mut x = match align {
+        let line_width = line.width().min(area.width as usize) as u16;
+        let x = match align {
             MessageAccessoryAlign::Left => area.x,
             MessageAccessoryAlign::Right => area.right().saturating_sub(line_width),
         };
 
-        for span in &line.0 {
-            let remaining = area.right().saturating_sub(x) as usize;
-            if remaining == 0 {
-                break;
-            }
-            let width = span.content.len().min(remaining);
-            surface.set_stringn(x, line_y as u16, span.content.as_ref(), width, span.style);
-            x += width as u16;
-        }
+        surface.set_line(
+            x,
+            line_y as u16,
+            &tui::ratatui::to_ratatui_line(line),
+            line_width,
+        );
     }
 }
 
-fn render_selected_decoration(surface: &mut Surface, area: Rect, decoration: MessageDecoration) {
+fn render_selected_decoration(
+    surface: &mut crate::render::CellSurface,
+    area: Rect,
+    decoration: MessageDecoration,
+) {
     if area.width == 0 || area.height == 0 {
         return;
     }
@@ -422,14 +419,14 @@ fn render_selected_decoration(surface: &mut Surface, area: Rect, decoration: Mes
     match decoration {
         MessageDecoration::Bar { symbol, style } => {
             for y in area.top()..area.bottom() {
-                surface.set_stringn(area.x, y, symbol, 1, style);
+                surface.set_stringn(area.x, y, symbol, 1, tui::ratatui::to_ratatui_style(style));
             }
         }
     }
 }
 
 pub fn message_list(
-    surface: &mut Surface,
+    surface: &mut crate::render::CellSurface,
     area: Rect,
     items: &[Message<'_>],
     scroll: usize,
@@ -492,6 +489,12 @@ pub fn message_list(
             break;
         }
 
+        let content_area = if selected_area.is_some() && item.selected_decoration().is_some() {
+            area.clip_left(1)
+        } else {
+            area
+        };
+
         match &item.kind {
             MessageKind::Bubble {
                 label,
@@ -503,38 +506,38 @@ pub fn message_list(
                 let mut cur_y = y_offset;
 
                 if let Some((text, label_style)) = label {
-                    if cur_y >= area.y as isize && cur_y < area.bottom() as isize {
+                    if cur_y >= content_area.y as isize && cur_y < content_area.bottom() as isize {
                         let x = match align {
-                            MessageAlign::Right => area.x
-                                + area
+                            MessageAlign::Right => content_area.x
+                                + content_area
                                     .width
                                     .saturating_sub(UnicodeWidthStr::width(text.as_str()) as u16),
-                            MessageAlign::Left => area.x,
+                            MessageAlign::Left => content_area.x,
                         };
                         surface.set_stringn(
                             x,
                             cur_y as u16,
                             text,
-                            area.width as usize,
-                            *label_style,
+                            content_area.width as usize,
+                            tui::ratatui::to_ratatui_style(*label_style),
                         );
                     }
                     cur_y += 1;
                 }
 
-                if cur_y < area.bottom() as isize
-                    && cur_y + lines.len() as isize + 2 > area.y as isize
+                if cur_y < content_area.bottom() as isize
+                    && cur_y + lines.len() as isize + 2 > content_area.y as isize
                 {
-                    let bubble_y = cur_y.max(area.y as isize) as u16;
+                    let bubble_y = cur_y.max(content_area.y as isize) as u16;
                     let bubble_bottom =
-                        ((cur_y + lines.len() as isize + 2) as u16).min(area.bottom());
+                        ((cur_y + lines.len() as isize + 2) as u16).min(content_area.bottom());
                     let visible_height = bubble_bottom.saturating_sub(bubble_y);
 
                     if visible_height > 0 {
-                        let skip_top = (area.y as isize - cur_y).max(0) as usize;
+                        let skip_top = (content_area.y as isize - cur_y).max(0) as usize;
                         message(
                             surface,
-                            Rect::new(area.x, bubble_y, area.width, visible_height),
+                            Rect::new(content_area.x, bubble_y, content_area.width, visible_height),
                             lines,
                             *bubble_width,
                             *align,
@@ -546,14 +549,19 @@ pub fn message_list(
 
                 let details = item.details(selected == Some(layout.index));
                 if !details.is_empty() {
-                    render_text_lines(surface, area, cur_y + lines.len() as isize + 2, details);
+                    render_text_lines(
+                        surface,
+                        content_area,
+                        cur_y + lines.len() as isize + 2,
+                        details,
+                    );
                 }
 
                 let mut accessory_y = cur_y + lines.len() as isize + 2 + details.len() as isize;
                 for accessory in item.accessories(selected == Some(layout.index)) {
                     render_accessory_lines(
                         surface,
-                        area,
+                        content_area,
                         accessory_y,
                         &accessory.lines,
                         accessory.align,
@@ -562,17 +570,22 @@ pub fn message_list(
                 }
             }
             MessageKind::Plain(lines) => {
-                render_text_lines(surface, area, y_offset, lines);
+                render_text_lines(surface, content_area, y_offset, lines);
                 let details = item.details(selected == Some(layout.index));
                 if !details.is_empty() {
-                    render_text_lines(surface, area, y_offset + lines.len() as isize, details);
+                    render_text_lines(
+                        surface,
+                        content_area,
+                        y_offset + lines.len() as isize,
+                        details,
+                    );
                 }
 
                 let mut accessory_y = y_offset + lines.len() as isize + details.len() as isize;
                 for accessory in item.accessories(selected == Some(layout.index)) {
                     render_accessory_lines(
                         surface,
-                        area,
+                        content_area,
                         accessory_y,
                         &accessory.lines,
                         accessory.align,
@@ -602,10 +615,11 @@ pub fn message_list(
 mod tests {
     use super::*;
     use helix_view::graphics::Style;
+    use tui::ratatui::{buffer::Buffer as Surface, layout::Rect as SurfaceRect};
 
     #[test]
     fn message_list_tracks_item_layout() {
-        let mut surface = Surface::empty(Rect::new(0, 0, 40, 8));
+        let mut surface = Surface::empty(SurfaceRect::new(0, 0, 40, 8));
         let items = vec![
             Message::plain(vec![Spans::from("one")]),
             Message::bubble(
@@ -635,7 +649,7 @@ mod tests {
 
     #[test]
     fn message_list_navigation_primitives_work() {
-        let mut surface = Surface::empty(Rect::new(0, 0, 40, 8));
+        let mut surface = Surface::empty(SurfaceRect::new(0, 0, 40, 8));
         let items = vec![
             Message::plain(vec![Spans::from("one")]),
             Message::plain(vec![Spans::from("two")]),
@@ -654,7 +668,7 @@ mod tests {
 
     #[test]
     fn selected_details_expand_layout() {
-        let mut surface = Surface::empty(Rect::new(0, 0, 40, 8));
+        let mut surface = Surface::empty(SurfaceRect::new(0, 0, 40, 8));
         let items = vec![
             Message::plain(vec![Spans::from("one")])
                 .with_selected_details(vec![Spans::from("hint")]),
@@ -671,7 +685,7 @@ mod tests {
 
     #[test]
     fn cursor_moves_and_keeps_selection_visible() {
-        let mut surface = Surface::empty(Rect::new(0, 0, 40, 3));
+        let mut surface = Surface::empty(SurfaceRect::new(0, 0, 40, 3));
         let items = vec![
             Message::plain(vec![Spans::from("one")]),
             Message::plain(vec![Spans::from("two")]),
@@ -689,7 +703,7 @@ mod tests {
 
     #[test]
     fn cursor_moves_by_page() {
-        let mut surface = Surface::empty(Rect::new(0, 0, 40, 6));
+        let mut surface = Surface::empty(SurfaceRect::new(0, 0, 40, 6));
         let items = vec![
             Message::plain(vec![Spans::from("one")]),
             Message::plain(vec![Spans::from("two")]),
@@ -708,19 +722,20 @@ mod tests {
 
     #[test]
     fn selected_bar_renders_for_selected_message() {
-        let mut surface = Surface::empty(Rect::new(0, 0, 20, 4));
+        let mut surface = Surface::empty(SurfaceRect::new(0, 0, 20, 4));
         let items =
             vec![Message::plain(vec![Spans::from("one")]).with_selected_bar("|", Style::default())];
 
         let state = message_list(&mut surface, Rect::new(0, 0, 20, 4), &items, 0, Some(0));
 
         assert_eq!(state.selected_area, Some(Rect::new(0, 0, 20, 1)));
-        assert_eq!(surface[(0, 0)].symbol.as_ref(), "|");
+        assert_eq!(surface[(0, 0)].symbol(), "|");
+        assert_eq!(surface[(1, 0)].symbol(), "o");
     }
 
     #[test]
     fn selected_accessory_expands_layout() {
-        let mut surface = Surface::empty(Rect::new(0, 0, 20, 4));
+        let mut surface = Surface::empty(SurfaceRect::new(0, 0, 20, 4));
         let items = vec![Message::plain(vec![Spans::from("one")])
             .with_selected_accessory(vec![Spans::from("hint")], MessageAccessoryAlign::Right)];
 
@@ -733,7 +748,7 @@ mod tests {
 
     #[test]
     fn right_aligned_label_uses_display_width() {
-        let mut surface = Surface::empty(Rect::new(0, 0, 10, 4));
+        let mut surface = Surface::empty(SurfaceRect::new(0, 0, 10, 4));
         let items = vec![Message::bubble(
             Some(("é".into(), Style::default())),
             vec![Spans::from("one")],
@@ -749,6 +764,18 @@ mod tests {
 
         message_list(&mut surface, Rect::new(0, 0, 10, 4), &items, 0, None);
 
-        assert_eq!(surface[(9, 0)].symbol.as_ref(), "é");
+        assert_eq!(surface[(9, 0)].symbol(), "é");
+    }
+
+    #[test]
+    fn right_aligned_accessory_uses_display_width() {
+        let mut surface = Surface::empty(SurfaceRect::new(0, 0, 10, 3));
+        let items = vec![Message::plain(vec![Spans::from("body")])
+            .with_accessory(vec![Spans::from("é界")], MessageAccessoryAlign::Right)];
+
+        message_list(&mut surface, Rect::new(0, 0, 10, 3), &items, 0, None);
+
+        assert_eq!(surface[(7, 1)].symbol(), "é");
+        assert_eq!(surface[(8, 1)].symbol(), "界");
     }
 }

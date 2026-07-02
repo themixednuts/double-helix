@@ -1,9 +1,7 @@
 //! Apply [`super::command::UiCommand`] on the main thread (`Editor` + `Compositor`).
 
 use crate::compositor::Compositor;
-use crate::runtime::RuntimeEvent;
 use helix_plugin::PluginManager;
-use helix_runtime::Sender as IngressSender;
 use helix_view::Editor;
 
 use super::command::UiCommand;
@@ -11,7 +9,7 @@ use super::command::UiCommand;
 pub fn apply_ui_command(
     editor: &mut Editor,
     compositor: &mut Compositor,
-    ingress: IngressSender<RuntimeEvent>,
+    ingress: crate::runtime::RuntimeIngress,
     plugin_manager: std::sync::Arc<PluginManager>,
     cmd: UiCommand,
 ) {
@@ -24,6 +22,9 @@ pub fn apply_ui_command(
         }
         UiCommand::Picker(cmd) => {
             super::picker::apply_picker_command(editor, compositor, ingress.clone(), cmd)
+        }
+        UiCommand::Document(cmd) => {
+            super::document::apply_document_command(editor, cmd);
         }
         UiCommand::Nop => {}
         UiCommand::NeedFullRedraw => compositor.need_full_redraw(),
@@ -56,7 +57,7 @@ pub fn apply_ui_command(
 pub fn apply_ui_command_opt(
     editor: &mut Editor,
     compositor: &mut Option<&mut Compositor>,
-    ingress: IngressSender<RuntimeEvent>,
+    ingress: crate::runtime::RuntimeIngress,
     plugin_manager: std::sync::Arc<PluginManager>,
     cmd: UiCommand,
 ) {

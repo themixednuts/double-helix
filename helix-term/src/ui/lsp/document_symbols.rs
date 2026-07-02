@@ -46,7 +46,7 @@ pub fn display_symbol_kind(kind: lsp::SymbolKind) -> &'static str {
 pub fn show_document_symbol_picker(
     editor: &mut helix_view::Editor,
     compositor: &mut Compositor,
-    ingress: helix_runtime::Sender<crate::runtime::RuntimeEvent>,
+    ingress: crate::runtime::RuntimeIngress,
     symbols: Vec<DocumentSymbolPickerItem>,
 ) {
     if symbols.is_empty() {
@@ -90,7 +90,7 @@ pub fn show_document_symbol_picker(
         1,
         symbols,
         (),
-        crate::ui::PickerRuntime::new(editor.runtime()),
+        crate::ui::PickerRuntime::new(editor),
         ingress,
         move |cx: &mut crate::compositor::Context, item, action| {
             navigation::jump_to_location(cx.editor, &item.location, action);

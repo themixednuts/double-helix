@@ -1,10 +1,9 @@
 use std::path::PathBuf;
 
 use helix_dap::{StackFrame, ThreadId as DebugThreadId};
-use helix_runtime::Sender as IngressSender;
 use helix_view::Editor;
 
-use crate::runtime::{ingress::RuntimeEvent, send_task_event_with, RuntimeTaskEvent};
+use crate::runtime::{send_task_event_with, RuntimeTaskEvent};
 
 pub(crate) fn apply_dap_restarted(editor: &mut Editor) {
     editor.set_status("Debugging session restarted");
@@ -20,7 +19,7 @@ pub(crate) fn apply_unset_active_debug_client(editor: &mut Editor) {
 
 pub(crate) fn request_select_debug_thread(
     editor: &mut Editor,
-    ingress: IngressSender<RuntimeEvent>,
+    ingress: crate::runtime::RuntimeIngress,
     thread_id: DebugThreadId,
     policy: helix_view::editor::ThreadSelectPolicy,
 ) {
@@ -67,7 +66,7 @@ pub(crate) fn request_select_debug_thread(
 
 pub(crate) fn request_pause_debug_thread(
     editor: &mut Editor,
-    ingress: IngressSender<RuntimeEvent>,
+    ingress: crate::runtime::RuntimeIngress,
     thread_id: DebugThreadId,
 ) {
     let work = editor.work();

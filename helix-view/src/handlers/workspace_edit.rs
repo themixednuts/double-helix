@@ -134,7 +134,7 @@ impl Editor {
         let doc = crate::Document::open(
             path,
             None,
-            true,
+            crate::document::LanguageInitialization::Full,
             self.config.clone(),
             self.syn_loader.clone(),
         )

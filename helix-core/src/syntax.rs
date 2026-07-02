@@ -525,6 +525,7 @@ pub struct SyntaxComplexity {
 
 pub const INTERACTIVE_PARSE_TIMEOUT: Duration = Duration::from_millis(12);
 pub const IDLE_PARSE_TIMEOUT: Duration = Duration::from_millis(500);
+pub const BACKGROUND_PARSE_TIMEOUT: Duration = Duration::from_secs(2);
 
 impl Syntax {
     pub fn enter_trace(ctx: SyntaxTraceContext) -> SyntaxTraceGuard {
@@ -532,7 +533,16 @@ impl Syntax {
     }
 
     pub fn new(source: RopeSlice, language: Language, loader: &Loader) -> Result<Self, Error> {
-        let inner = tree_house::Syntax::new(source, language, IDLE_PARSE_TIMEOUT, loader)?;
+        Self::new_with_timeout(source, language, loader, IDLE_PARSE_TIMEOUT)
+    }
+
+    pub fn new_with_timeout(
+        source: RopeSlice,
+        language: Language,
+        loader: &Loader,
+        timeout: Duration,
+    ) -> Result<Self, Error> {
+        let inner = tree_house::Syntax::new(source, language, timeout, loader)?;
         Ok(Self { inner })
     }
 

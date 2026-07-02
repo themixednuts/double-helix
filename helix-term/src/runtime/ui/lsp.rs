@@ -1,16 +1,13 @@
 use crate::{
     compositor::Compositor,
-    runtime::{
-        ui::command::{LspCodeActionPresentation, LspCommand},
-        RuntimeEvent,
-    },
+    runtime::ui::command::{LspCodeActionPresentation, LspCommand},
 };
 use helix_view::Editor;
 
 pub(crate) fn apply_lsp_command(
     editor: &mut Editor,
     compositor: &mut Compositor,
-    ingress: helix_runtime::Sender<RuntimeEvent>,
+    ingress: crate::runtime::RuntimeIngress,
     cmd: LspCommand,
 ) {
     match cmd {

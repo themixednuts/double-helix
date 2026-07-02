@@ -24,7 +24,7 @@ pub enum Direction {
     Backward,
 }
 
-#[derive(Copy, Clone, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum Movement {
     Extend,
     Move,

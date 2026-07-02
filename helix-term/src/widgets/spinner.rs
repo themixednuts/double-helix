@@ -23,8 +23,11 @@ impl Spinner {
     }
 
     pub fn frame(&self) -> &'static str {
-        let step =
-            (self.started_at.elapsed().as_millis() / self.interval.as_millis().max(1)) as usize;
+        self.frame_for_elapsed(self.started_at.elapsed())
+    }
+
+    pub fn frame_for_elapsed(&self, elapsed: Duration) -> &'static str {
+        let step = (elapsed.as_millis() / self.interval.as_millis().max(1)) as usize;
         self.frames[step % self.frames.len()]
     }
 
@@ -41,5 +44,14 @@ mod tests {
     fn spinner_uses_configured_frames() {
         let spinner = Spinner::new(&["a", "b"], Duration::from_millis(1));
         assert!(["a", "b"].contains(&spinner.frame()));
+    }
+
+    #[test]
+    fn spinner_can_render_deterministic_elapsed_frames() {
+        let spinner = Spinner::new(&["a", "b"], Duration::from_millis(10));
+
+        assert_eq!(spinner.frame_for_elapsed(Duration::from_millis(0)), "a");
+        assert_eq!(spinner.frame_for_elapsed(Duration::from_millis(10)), "b");
+        assert_eq!(spinner.frame_for_elapsed(Duration::from_millis(20)), "a");
     }
 }

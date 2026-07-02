@@ -93,7 +93,7 @@ fn jump_to_position(
 pub(crate) fn goto_locations(
     editor: &mut Editor,
     compositor: &mut Compositor,
-    ingress: helix_runtime::Sender<crate::runtime::RuntimeEvent>,
+    ingress: crate::runtime::RuntimeIngress,
     locations: Vec<LspLocation>,
 ) {
     let cwdir = env::current_working_dir();
@@ -122,7 +122,7 @@ pub(crate) fn goto_locations(
                 0,
                 locations,
                 cwdir,
-                crate::ui::PickerRuntime::new(editor.runtime()),
+                crate::ui::PickerRuntime::new(editor),
                 ingress,
                 |cx: &mut crate::compositor::Context, location, action| {
                     jump_to_location(cx.editor, location, action);

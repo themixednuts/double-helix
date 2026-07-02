@@ -5,12 +5,11 @@ use helix_view::Editor;
 
 use crate::compositor::Compositor;
 use crate::runtime::ui::command::LspCodeActionItem;
-use crate::runtime::RuntimeEvent;
 use crate::ui::{self, overlay::overlaid, Popup, PromptEvent};
 
 pub fn apply_code_action_item(
     editor: &mut Editor,
-    ingress: helix_runtime::Sender<RuntimeEvent>,
+    ingress: crate::runtime::RuntimeIngress,
     item: &LspCodeActionItem,
 ) {
     crate::effect::language_server::request_apply_code_action(editor, item.clone(), ingress);
@@ -19,7 +18,7 @@ pub fn apply_code_action_item(
 pub fn show_code_action_menu(
     editor: &mut Editor,
     compositor: &mut Compositor,
-    ingress: helix_runtime::Sender<RuntimeEvent>,
+    ingress: crate::runtime::RuntimeIngress,
     items: Vec<LspCodeActionItem>,
 ) {
     if items.is_empty() {
@@ -42,7 +41,7 @@ pub fn show_code_action_menu(
 pub fn show_code_action_picker(
     editor: &mut Editor,
     compositor: &mut Compositor,
-    ingress: helix_runtime::Sender<crate::runtime::RuntimeEvent>,
+    ingress: crate::runtime::RuntimeIngress,
     items: Vec<LspCodeActionItem>,
 ) {
     if items.is_empty() {
@@ -62,7 +61,7 @@ pub fn show_code_action_picker(
         0,
         items,
         (),
-        ui::PickerRuntime::new(editor.runtime()),
+        ui::PickerRuntime::new(editor),
         ingress.clone(),
         move |cx: &mut crate::compositor::Context, lsp_item, _action| {
             apply_code_action_item(cx.editor, cx.ingress.clone(), lsp_item);

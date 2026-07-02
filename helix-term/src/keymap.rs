@@ -12,7 +12,10 @@ use helix_view::{
     engine::{CharPendingBinding, KeymapLookup},
     info::Info,
     input::KeyEvent,
-    keymap::{ModalCommandBinding, ModalKeyTrie, ModalKeyTrieNode},
+    keymap::{
+        FrontendIntentId, ModalCommandBinding, ModalIntent, ModalIntentBinding, ModalIntentTrie,
+        ModalIntentTrieNode, ModalKeyTrie, ModalKeyTrieNode,
+    },
 };
 use serde::Deserialize;
 use std::{
@@ -465,7 +468,7 @@ fn to_component_modal_trie(trie: &KeyTrie) -> Option<ModalKeyTrie> {
         KeyTrie::MappableCommand(cmd @ MappableCommand::Engine { spec })
             if cmd.supports_component_region() =>
         {
-            Some(ModalKeyTrie::Command(ModalCommandBinding::new(
+            Some(ModalKeyTrie::Binding(ModalCommandBinding::new(
                 spec.token(),
                 spec.doc(),
             )))
@@ -512,6 +515,57 @@ fn to_component_modal_trie(trie: &KeyTrie) -> Option<ModalKeyTrie> {
     }
 }
 
+pub fn to_semantic_modal_keymaps(map: &HashMap<Mode, KeyTrie>) -> HashMap<Mode, ModalIntentTrie> {
+    map.iter()
+        .filter_map(|(&mode, trie)| to_semantic_modal_trie(trie).map(|trie| (mode, trie)))
+        .collect()
+}
+
+fn to_semantic_modal_trie(trie: &KeyTrie) -> Option<ModalIntentTrie> {
+    match trie {
+        KeyTrie::MappableCommand(cmd) => semantic_modal_binding(cmd).map(ModalIntentTrie::Binding),
+        KeyTrie::Sequence(cmds) => {
+            let commands = cmds
+                .iter()
+                .filter_map(semantic_modal_binding)
+                .collect::<Vec<_>>();
+            if commands.is_empty() {
+                None
+            } else {
+                Some(ModalIntentTrie::Sequence(commands.into_boxed_slice()))
+            }
+        }
+        KeyTrie::Node(node) => {
+            let map = node
+                .iter()
+                .filter_map(|(&key, trie)| to_semantic_modal_trie(trie).map(|trie| (key, trie)))
+                .collect::<HashMap<_, _>>();
+            if map.is_empty() && node.fallback.is_none() {
+                return None;
+            }
+
+            let mut modal = ModalIntentTrieNode::new(&node.name, map, node.order.clone());
+            modal.is_sticky = node.is_sticky;
+            modal.fallback = node.fallback;
+            Some(ModalIntentTrie::Node(modal))
+        }
+    }
+}
+
+fn semantic_modal_binding(cmd: &MappableCommand) -> Option<ModalIntentBinding> {
+    match cmd {
+        MappableCommand::Engine { spec } => Some(ModalIntentBinding::new(
+            ModalIntent::engine(spec.token()),
+            spec.doc(),
+        )),
+        MappableCommand::Frontend { spec } => Some(ModalIntentBinding::new(
+            ModalIntent::frontend(FrontendIntentId::new(spec.name())),
+            spec.doc(),
+        )),
+        MappableCommand::Typable { .. } | MappableCommand::Macro { .. } => None,
+    }
+}
+
 pub fn to_modal_keymaps(map: &HashMap<Mode, KeyTrie>) -> HashMap<Mode, ModalKeyTrie> {
     map.iter()
         .filter_map(|(&mode, trie)| to_modal_trie(trie).map(|trie| (mode, trie)))
@@ -520,7 +574,7 @@ pub fn to_modal_keymaps(map: &HashMap<Mode, KeyTrie>) -> HashMap<Mode, ModalKeyT
 
 fn to_modal_trie(trie: &KeyTrie) -> Option<ModalKeyTrie> {
     match trie {
-        KeyTrie::MappableCommand(MappableCommand::Engine { spec }) => Some(ModalKeyTrie::Command(
+        KeyTrie::MappableCommand(MappableCommand::Engine { spec }) => Some(ModalKeyTrie::Binding(
             ModalCommandBinding::new(spec.token(), spec.doc()),
         )),
         KeyTrie::MappableCommand(
@@ -631,7 +685,7 @@ mod tests {
     use helix_view::{
         document::Mode,
         edit_region::EditRegion,
-        engine::{EditingEngine, EditingEngineFactory, EngineResult},
+        engine::EngineResult,
         graphics::Rect,
         handlers::Handlers,
         theme,
@@ -642,26 +696,6 @@ mod tests {
 
     fn named_command(name: &str) -> MappableCommand {
         MappableCommand::named(name).expect("named command must exist")
-    }
-
-    struct TestModalEngineFactory {
-        registry: Arc<helix_modal::registry::CommandRegistry>,
-    }
-
-    impl EditingEngineFactory for TestModalEngineFactory {
-        fn create(
-            &self,
-            config: helix_view::editor::EditingEngineConfig,
-        ) -> Box<dyn EditingEngine> {
-            match config {
-                helix_view::editor::EditingEngineConfig::Helix => {
-                    Box::new(helix_modal::helix::HelixEngine::new(self.registry.clone()))
-                }
-                helix_view::editor::EditingEngineConfig::Vim => {
-                    Box::new(helix_modal::vim::VimEngine::new(self.registry.clone()))
-                }
-            }
-        }
     }
 
     fn test_editor() -> Editor {
@@ -684,9 +718,7 @@ mod tests {
         editor.frontend_mut().modal_keymaps = Arc::new(ArcSwap::from_pointee(
             to_component_modal_keymaps(&default()),
         ));
-        editor.frontend_mut().engine_factory = Arc::new(TestModalEngineFactory {
-            registry: Arc::new(helix_modal::populate::build_registry()),
-        });
+        Arc::new(helix_modal::ModalEngineFactory::default()).install(&mut editor);
         editor
     }
 
@@ -1015,6 +1047,29 @@ mod tests {
                 .is_some(),
             "component modal keymaps should keep viewport-backed cursor motions"
         );
+    }
+
+    #[test]
+    fn semantic_modal_keymaps_keep_frontend_command_intent() {
+        let modal = to_semantic_modal_keymaps(&default());
+        let normal = modal.get(&Mode::Normal).expect("normal mode modal keymap");
+        let Some(ModalIntentTrie::Binding(binding)) = normal.search(&[key!(']'), key!('d')]) else {
+            panic!("semantic modal keymaps should keep diagnostic navigation");
+        };
+        assert_eq!(
+            binding.intent(),
+            ModalIntent::frontend(FrontendIntentId::new("goto_next_diag"))
+        );
+    }
+
+    #[test]
+    fn semantic_modal_keymaps_keep_engine_command_intent() {
+        let modal = to_semantic_modal_keymaps(&default());
+        let normal = modal.get(&Mode::Normal).expect("normal mode modal keymap");
+        let Some(ModalIntentTrie::Binding(binding)) = normal.search(&[key!('w')]) else {
+            panic!("semantic modal keymaps should keep word motion");
+        };
+        assert!(matches!(binding.intent(), ModalIntent::Engine(_)));
     }
 
     #[tokio::test]

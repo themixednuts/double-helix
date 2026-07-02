@@ -30,6 +30,10 @@ impl Application {
                     .set_modal_keymaps(crate::keymap::to_component_modal_keymaps(
                         &self.config.load().keys,
                     ));
+                self.editor
+                    .set_semantic_modal_keymaps(crate::keymap::to_semantic_modal_keymaps(
+                        &self.config.load().keys,
+                    ));
             }
         }
 
@@ -58,6 +62,10 @@ impl Application {
             self.config.store(Arc::new(default_config));
             self.editor
                 .set_modal_keymaps(crate::keymap::to_component_modal_keymaps(
+                    &self.config.load().keys,
+                ));
+            self.editor
+                .set_semantic_modal_keymaps(crate::keymap::to_semantic_modal_keymaps(
                     &self.config.load().keys,
                 ));
             Ok(())

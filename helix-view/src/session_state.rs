@@ -8,12 +8,26 @@ use helix_core::Transaction;
 
 use crate::{document::SavePoint, ViewId};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DocumentOpenState {
+    #[default]
+    Interactive,
+    Preview,
+}
+
+impl DocumentOpenState {
+    pub const fn is_preview(self) -> bool {
+        matches!(self, Self::Preview)
+    }
+}
+
 #[derive(Debug)]
 pub struct DocumentSessionState {
     savepoints: Vec<Weak<SavePoint>>,
     version: i32,
     modified_since_accessed: bool,
     focused_at: Instant,
+    open_state: DocumentOpenState,
 }
 
 impl Default for DocumentSessionState {
@@ -23,6 +37,7 @@ impl Default for DocumentSessionState {
             version: 0,
             modified_since_accessed: false,
             focused_at: Instant::now(),
+            open_state: DocumentOpenState::Interactive,
         }
     }
 }
@@ -43,6 +58,14 @@ impl DocumentSessionState {
 
     pub fn mark_as_focused(&mut self) {
         self.focused_at = Instant::now();
+    }
+
+    pub const fn open_state(&self) -> DocumentOpenState {
+        self.open_state
+    }
+
+    pub fn set_open_state(&mut self, open_state: DocumentOpenState) {
+        self.open_state = open_state;
     }
 
     pub fn take_modified_since_accessed(&mut self) -> bool {

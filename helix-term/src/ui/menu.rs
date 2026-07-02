@@ -2,12 +2,32 @@ use crate::{
     compositor::{Component, Context, Event, EventResult, PostAction, RenderContext},
     ctrl, key, shift,
 };
-use tui::{buffer::Buffer as Surface, widgets::Table};
+use tui::text::Spans;
 
-pub use tui::widgets::{Cell, Row};
+use helix_view::{
+    editor::SmartTabConfig,
+    graphics::{Rect, Style},
+    Editor,
+};
+use tui::ratatui::layout::Constraint;
 
-use helix_view::{editor::SmartTabConfig, graphics::Rect, Editor};
-use tui::layout::Constraint;
+pub use crate::widgets::{TableCell as Cell, TableRow as Row};
+
+fn constrained_width(constraint: Constraint, length: u16) -> u16 {
+    match constraint {
+        Constraint::Percentage(percent) => {
+            let width = f32::from(percent) / 100.0 * f32::from(length);
+            width.min(f32::from(length)) as u16
+        }
+        Constraint::Ratio(numerator, denominator) => {
+            let width = numerator as f32 / denominator.max(1) as f32 * f32::from(length);
+            width.min(f32::from(length)) as u16
+        }
+        Constraint::Length(width) | Constraint::Fill(width) => length.min(width),
+        Constraint::Max(width) => length.min(width),
+        Constraint::Min(width) => length.max(width),
+    }
+}
 
 pub trait Item: Sync + Send + 'static {
     /// Additional editor state that is used for label calculation.
@@ -22,7 +42,22 @@ pub struct Menu<T: Item> {
     options: Vec<T>,
     editor_data: T::Data,
 
-    cursor: Option<usize>,
+    /// Selection cursor — owns the wrap-around arithmetic for
+    /// `move_up` / `move_down` / `move_half_page_*`. Shared with the
+    /// file explorer and any future list-shaped UI. The `selection()`
+    /// is *always* a valid index into `matches` (or 0 on an empty
+    /// list); the menu uses [`has_user_navigated`] to gate whether
+    /// that selection is "real" (user has acted on this menu).
+    ///
+    /// [`has_user_navigated`]: Self::has_user_navigated
+    nav: helix_view::list_nav::ListNav,
+    /// True once the user has pressed Up / Down / PageUp / PageDown
+    /// against this menu. Until then, [`Self::selection`] returns
+    /// `None` and pressing Enter is a no-op — so the autocompletion
+    /// popup doesn't auto-confirm its first entry on the next Enter
+    /// the user types as a newline. Cleared by [`Self::reset_cursor`]
+    /// / [`Self::clear`] / [`Self::ensure_cursor_in_bounds`]-on-empty.
+    has_user_navigated: bool,
 
     /// (index, score)
     matches: Vec<(u32, u32)>,
@@ -48,12 +83,15 @@ impl<T: Item> Menu<T> {
         editor_data: <T as Item>::Data,
         callback_fn: impl Fn(&mut Editor, Option<&T>, MenuEvent) + Send + 'static,
     ) -> Self {
-        let matches = (0..options.len() as u32).map(|i| (i, 0)).collect();
+        let matches: Vec<(u32, u32)> = (0..options.len() as u32).map(|i| (i, 0)).collect();
+        let mut nav = helix_view::list_nav::ListNav::new();
+        nav.set_item_count(matches.len());
         Self {
             options,
             editor_data,
             matches,
-            cursor: None,
+            nav,
+            has_user_navigated: false,
             widths: Vec::new(),
             callback_fn: Box::new(callback_fn),
             scroll: 0,
@@ -65,7 +103,7 @@ impl<T: Item> Menu<T> {
     }
 
     pub fn reset_cursor(&mut self) {
-        self.cursor = None;
+        self.has_user_navigated = false;
         self.scroll = 0;
         self.recalculate = true;
     }
@@ -76,56 +114,101 @@ impl<T: Item> Menu<T> {
     }
 
     pub fn ensure_cursor_in_bounds(&mut self) {
+        // Push the latest match count into nav so it clamps any
+        // out-of-range selection automatically. Empty match list
+        // clears the user-navigated flag — there's nothing to be
+        // pointed at.
+        self.nav.set_item_count(self.matches.len());
+        self.scroll = 0;
         if self.matches.is_empty() {
-            self.cursor = None;
-            self.scroll = 0;
+            self.has_user_navigated = false;
         } else {
-            self.scroll = 0;
             self.recalculate = true;
-            if let Some(cursor) = &mut self.cursor {
-                *cursor = (*cursor).min(self.matches.len() - 1)
-            }
         }
     }
 
     pub fn clear(&mut self) {
         self.matches.clear();
-
+        self.nav.set_item_count(0);
         // reset cursor position
-        self.cursor = None;
+        self.has_user_navigated = false;
         self.scroll = 0;
     }
 
     pub fn move_up(&mut self) {
-        let len = self.matches.len();
-        let max_index = len.saturating_sub(1);
-        let pos = self.cursor.map_or(max_index, |i| (i + max_index) % len) % len;
-        self.cursor = Some(pos);
+        if self.matches.is_empty() {
+            return;
+        }
+        self.nav.set_item_count(self.matches.len());
+        // First navigation lands on the last item — that's the
+        // "press Up on a fresh popup, see the last completion"
+        // behavior `cursor: Option<usize>` used to encode.
+        if !self.has_user_navigated {
+            self.nav.to_last();
+        } else {
+            self.nav
+                .move_by(-1, helix_view::list_nav::WrapBehavior::Wrap);
+        }
+        self.has_user_navigated = true;
         self.adjust_scroll();
     }
 
     pub fn move_half_page_up(&mut self) {
-        let len = self.matches.len();
-        let max_index = len.saturating_sub((self.size.1 as usize / 2).max(1));
-        let pos = self.cursor.map_or(max_index, |i| (i + max_index) % len) % len;
-        self.cursor = Some(pos);
+        if self.matches.is_empty() {
+            return;
+        }
+        let half = (self.size.1 as usize / 2).max(1);
+        self.nav.set_item_count(self.matches.len());
+        if !self.has_user_navigated {
+            // From a fresh popup, lands at `len - half` (modulo).
+            // Express that as "selection is implicitly at 0; move
+            // back by `half` with wrap" — same result, no special
+            // case in arithmetic.
+            self.nav.set_selection(0);
+            self.nav
+                .move_by(-(half as isize), helix_view::list_nav::WrapBehavior::Wrap);
+        } else {
+            self.nav
+                .move_by(-(half as isize), helix_view::list_nav::WrapBehavior::Wrap);
+        }
+        self.has_user_navigated = true;
         self.adjust_scroll();
     }
 
     pub fn move_down(&mut self) {
-        let len = self.matches.len();
-        let pos = self.cursor.map_or(0, |i| i + 1) % len;
-        self.cursor = Some(pos);
+        if self.matches.is_empty() {
+            return;
+        }
+        self.nav.set_item_count(self.matches.len());
+        if !self.has_user_navigated {
+            // First nav lands on the first item (selection stays at 0).
+            self.nav.set_selection(0);
+        } else {
+            self.nav
+                .move_by(1, helix_view::list_nav::WrapBehavior::Wrap);
+        }
+        self.has_user_navigated = true;
         self.adjust_scroll();
     }
 
     pub fn move_half_page_down(&mut self) {
-        let len = self.matches.len();
-        let pos = self
-            .cursor
-            .map_or(0, |i| i + (self.size.1 as usize / 2).max(1))
-            % len;
-        self.cursor = Some(pos);
+        if self.matches.is_empty() {
+            return;
+        }
+        let half = (self.size.1 as usize / 2).max(1);
+        self.nav.set_item_count(self.matches.len());
+        if !self.has_user_navigated {
+            // From a fresh popup, lands at index `half` (wrap if
+            // half >= len). Same arithmetic as ListNav, but starting
+            // implicitly at 0.
+            self.nav.set_selection(0);
+            self.nav
+                .move_by(half as isize, helix_view::list_nav::WrapBehavior::Wrap);
+        } else {
+            self.nav
+                .move_by(half as isize, helix_view::list_nav::WrapBehavior::Wrap);
+        }
+        self.has_user_navigated = true;
         self.adjust_scroll();
     }
 
@@ -178,23 +261,33 @@ impl<T: Item> Menu<T> {
         self.recalculate = false;
     }
 
+    /// The effective cursor — `Some(index)` only if the user has
+    /// navigated this menu and the index is in range. This is the
+    /// single source of truth for the menu's "is anything selected
+    /// right now?" question; `selection()`, `selection_mut()`,
+    /// `cursor_index()`, and the renderer all funnel through it so
+    /// the `has_user_navigated` gating stays consistent.
+    fn effective_cursor(&self) -> Option<usize> {
+        if !self.has_user_navigated || self.matches.is_empty() {
+            return None;
+        }
+        let cursor = self.nav.selection();
+        (cursor < self.matches.len()).then_some(cursor)
+    }
+
     fn adjust_scroll(&mut self) {
         let win_height = self.size.1 as usize;
-        if let Some(cursor) = self.cursor {
-            let mut scroll = self.scroll;
-            if cursor > (win_height + scroll).saturating_sub(1) {
-                // scroll down
-                scroll += cursor - (win_height + scroll).saturating_sub(1)
-            } else if cursor < scroll {
-                // scroll up
-                scroll = cursor
-            }
-            self.scroll = scroll;
-        }
+        self.scroll = crate::widgets::SelectionViewport::new(
+            self.matches.len(),
+            self.effective_cursor(),
+            win_height,
+            self.scroll,
+        )
+        .scroll_to_selected();
     }
 
     pub fn selection(&self) -> Option<&T> {
-        self.cursor.and_then(|cursor| {
+        self.effective_cursor().and_then(|cursor| {
             self.matches
                 .get(cursor)
                 .map(|(index, _score)| &self.options[*index as usize])
@@ -202,7 +295,7 @@ impl<T: Item> Menu<T> {
     }
 
     pub fn selection_mut(&mut self) -> Option<&mut T> {
-        self.cursor.and_then(|cursor| {
+        self.effective_cursor().and_then(|cursor| {
             self.matches
                 .get(cursor)
                 .map(|(index, _score)| &mut self.options[*index as usize])
@@ -227,7 +320,115 @@ impl<T: Item> Menu<T> {
 
     /// Current selection index (into matched items), if any.
     pub fn cursor_index(&self) -> Option<usize> {
-        self.cursor
+        self.effective_cursor()
+    }
+
+    fn render_surface(
+        &mut self,
+        area: Rect,
+        surface: &mut crate::render::CellSurface,
+        cx: &RenderContext,
+    ) {
+        let theme = cx.theme();
+        let styles = crate::ui::design::MenuStyles::from_theme(theme);
+        let style = styles.background;
+        let selected = styles.selected;
+        // Thin accent rail at the left of the selected row — visible even when
+        // the selection background is subtle, and consistent with the picker's
+        // chevron affordance. Reuses ui.text.focus so the accent is the same
+        // colour across every menu surface (completion, select, etc.).
+        let accent_rail_color = theme.try_get("ui.text.focus").and_then(|s| s.fg);
+
+        {
+            let area = tui::ratatui::to_ratatui_rect(area);
+            tui::ratatui::widgets::Widget::render(tui::ratatui::widgets::Clear, area, surface);
+            surface.set_style(area, tui::ratatui::to_ratatui_style(style));
+        };
+
+        let scroll = self.scroll;
+        let options: Vec<_> = self
+            .matches
+            .iter()
+            .map(|(index, _score)| &self.options[*index as usize])
+            .collect();
+        let len = options.len();
+        let win_height = area.height as usize;
+        if len == 0 || win_height == 0 {
+            return;
+        }
+
+        let table_area = area.clip_left(Self::LEFT_PADDING as u16).clip_right(1);
+        let render_borders = cx.menu_border();
+
+        for (visible_row, option) in options.iter().skip(scroll).take(win_height).enumerate() {
+            let y = table_area.y + visible_row as u16;
+            if y >= table_area.bottom() {
+                break;
+            }
+
+            let option_index = scroll + visible_row;
+            let is_selected = self
+                .effective_cursor()
+                .map(|cursor| cursor == option_index)
+                .unwrap_or(false);
+            let row_area = Rect::new(area.x, y, area.width, 1);
+            if is_selected {
+                surface.set_style(
+                    tui::ratatui::to_ratatui_rect(row_area),
+                    tui::ratatui::to_ratatui_style(selected),
+                );
+            }
+
+            let row = option.format(&self.editor_data);
+            let mut x = table_area.x;
+            for (constraint, cell) in self.widths.iter().zip(row.cells.iter()) {
+                if x >= table_area.right() {
+                    break;
+                }
+                let width = constrained_width(*constraint, table_area.width);
+                let width = width.min(table_area.right().saturating_sub(x));
+                render_menu_cell(
+                    surface,
+                    cell,
+                    Rect::new(x, y, width, 1),
+                    is_selected.then_some(selected),
+                );
+                x = x.saturating_add(width).saturating_add(1);
+            }
+
+            if is_selected && !render_borders {
+                // Left edge: accent rail glyph if the theme has a focus colour,
+                // otherwise just the selection background extending to the edge.
+                if let Some(cell) = surface.cell_mut((area.left(), y)) {
+                    let mut cell_style = tui::ratatui::to_ratatui_style(selected);
+                    if let Some(fg) = accent_rail_color {
+                        cell.set_symbol("▎");
+                        cell_style = cell_style.fg(tui::ratatui::to_ratatui_color(fg));
+                    }
+                    cell.set_style(cell_style);
+                };
+                if let Some(cell) = surface.cell_mut((area.right().saturating_sub(1), y)) {
+                    cell.set_style(tui::ratatui::to_ratatui_style(selected));
+                };
+            }
+        }
+
+        let fits = len <= win_height;
+        if !fits {
+            let scroll_style = styles.scroll;
+            let thumb_fg = scroll_style.fg.unwrap_or(helix_view::theme::Color::Reset);
+            let mut sb = crate::widgets::Scrollbar::new(len, scroll, win_height)
+                .symbol(if render_borders { "▌" } else { "▐" })
+                .thumb_style(helix_view::graphics::Style::default().fg(thumb_fg));
+            if !render_borders {
+                let track_fg = scroll_style.bg.unwrap_or(helix_view::theme::Color::Reset);
+                sb = sb.track("▐", helix_view::graphics::Style::default().fg(track_fg));
+            }
+            sb.render(
+                Rect::new(area.right() - 1, area.top(), 1, area.height),
+                surface,
+            );
+        }
     }
 }
 
@@ -341,81 +542,44 @@ impl<T: Item + 'static> Component for Menu<T> {
         Some(self.size)
     }
 
-    fn render(&mut self, area: Rect, surface: &mut Surface, cx: &RenderContext) {
-        let theme = &cx.editor.theme;
-        let style = theme
-            .try_get("ui.menu")
-            .unwrap_or_else(|| theme.get("ui.text"));
-        let selected = theme.get("ui.menu.selected");
+    fn render(&mut self, area: Rect, surface: &mut crate::render::CellSurface, cx: &RenderContext) {
+        self.render_surface(area, surface, cx);
+    }
+}
 
-        surface.clear_with(area, style);
+fn render_menu_cell(
+    surface: &mut crate::render::CellSurface,
+    cell: &Cell<'_>,
+    area: Rect,
+    selected: Option<Style>,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
 
-        let scroll = self.scroll;
-
-        let options: Vec<_> = self
-            .matches
-            .iter()
-            .map(|(index, _score)| {
-                // (index, self.options.get(*index).unwrap()) // get_unchecked
-                &self.options[*index as usize] // get_unchecked
-            })
-            .collect();
-
-        let len = options.len();
-
-        let win_height = area.height as usize;
-
-        let rows = options
-            .iter()
-            .map(|option| option.format(&self.editor_data));
-        let table = Table::new(rows)
-            .style(style)
-            .highlight_style(selected)
-            .column_spacing(1)
-            .widths(&self.widths);
-
-        use tui::widgets::TableState;
-
-        table.render_table(
-            area.clip_left(Self::LEFT_PADDING as u16).clip_right(1),
-            surface,
-            &mut TableState {
-                offset: scroll,
-                selected: self.cursor,
-            },
-            false,
-        );
-
-        let render_borders = cx.editor.menu_border();
-
-        if !render_borders {
-            if let Some(cursor) = self.cursor {
-                let offset_from_top = cursor - scroll;
-                let left = &mut surface[(area.left(), area.y + offset_from_top as u16)];
-                left.set_style(selected);
-                let right = &mut surface[(
-                    area.right().saturating_sub(1),
-                    area.y + offset_from_top as u16,
-                )];
-                right.set_style(selected);
-            }
+    for (row, spans) in cell.content.lines.iter().enumerate() {
+        if row as u16 >= area.height {
+            break;
         }
 
-        let fits = len <= win_height;
-
-        if !fits {
-            let scroll_style = theme.get("ui.menu.scroll");
-            let thumb_fg = scroll_style.fg.unwrap_or(helix_view::theme::Color::Reset);
-            let mut sb = crate::widgets::Scrollbar::new(len, scroll, win_height)
-                .symbol(if render_borders { "▌" } else { "▐" })
-                .thumb_style(helix_view::graphics::Style::default().fg(thumb_fg));
-            if !render_borders {
-                let track_fg = scroll_style.bg.unwrap_or(helix_view::theme::Color::Reset);
-                sb = sb.track("▐", helix_view::graphics::Style::default().fg(track_fg));
-            }
-            sb.render(
-                Rect::new(area.right() - 1, area.top(), 1, area.height),
-                surface,
+        if let Some(selected) = selected {
+            let patched = Spans(
+                spans
+                    .0
+                    .iter()
+                    .map(|span| {
+                        tui::text::Span::styled(span.content.clone(), span.style.patch(selected))
+                    })
+                    .collect(),
+            );
+            let line = tui::ratatui::to_ratatui_line(&patched);
+            surface.set_line(area.x, area.y + row as u16, &line, area.width);
+        } else {
+            surface.set_line(
+                area.x,
+                area.y + row as u16,
+                &tui::ratatui::to_ratatui_line(spans),
+                area.width,
             );
         }
     }

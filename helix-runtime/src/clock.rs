@@ -31,6 +31,11 @@ impl Clock {
         Instant::now()
     }
 
+    pub(crate) fn deadline_after(&self, after: Duration) -> tokio::time::Instant {
+        let _guard = self.handle.enter();
+        tokio::time::Instant::now() + after
+    }
+
     pub fn next_id(&self) -> TimerId {
         TimerId(self.ids.fetch_add(1, Ordering::Relaxed))
     }
@@ -38,6 +43,12 @@ impl Clock {
     pub fn timer(&self, after: Duration) -> Task<()> {
         Task::new(self.handle.spawn(async move {
             tokio::time::sleep(after).await;
+        }))
+    }
+
+    pub(crate) fn timer_at(&self, deadline: tokio::time::Instant) -> Task<()> {
+        Task::new(self.handle.spawn(async move {
+            tokio::time::sleep_until(deadline).await;
         }))
     }
 }

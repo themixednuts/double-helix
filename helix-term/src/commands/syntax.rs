@@ -181,7 +181,7 @@ pub fn syntax_symbol_picker(cx: &mut Context) {
         1, // name
         tags,
         (),
-        crate::ui::PickerRuntime::new(cx.editor.runtime()),
+        crate::ui::PickerRuntime::new(cx.editor),
         cx.ingress.clone(),
         move |cx: &mut crate::compositor::Context, tag: &Tag, action| {
             cx.editor.switch(doc_id, action);
@@ -409,7 +409,7 @@ pub fn syntax_workspace_symbol_picker(cx: &mut Context) {
         1, // name
         [],
         state,
-        crate::ui::PickerRuntime::new(cx.editor.runtime()),
+        crate::ui::PickerRuntime::new(cx.editor),
         cx.ingress.clone(),
         move |cx: &mut crate::compositor::Context, tag: &Tag, action| {
             let doc_id = match &tag.doc {

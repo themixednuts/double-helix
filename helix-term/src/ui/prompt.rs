@@ -7,9 +7,7 @@ use helix_view::input::KeyEvent;
 use helix_view::keyboard::KeyCode;
 use std::sync::Arc;
 use std::{borrow::Cow, ops::RangeFrom};
-use tui::buffer::Buffer as Surface;
 use tui::text::Span;
-use tui::widgets::{Block, BorderType, Widget};
 
 use helix_core::{
     unicode::segmentation::{GraphemeCursor, UnicodeSegmentation},
@@ -18,7 +16,7 @@ use helix_core::{
 };
 use helix_view::{
     editor::CmdlineStyle,
-    graphics::{CursorKind, Margin, Rect},
+    graphics::{CursorKind, Rect},
     Editor,
 };
 
@@ -534,9 +532,22 @@ impl Prompt {
 const BASE_WIDTH: u16 = 30;
 
 impl Prompt {
-    pub fn render_prompt(&mut self, area: Rect, surface: &mut Surface, cx: &RenderContext) {
-        let theme = &cx.editor.theme;
+    fn render_prompt_surface<F>(
+        &mut self,
+        area: Rect,
+        surface: &mut crate::render::CellSurface,
+        cx: &RenderContext,
+        mut render_text: F,
+    ) where
+        F: FnMut(&mut ui::Text, Rect, &mut crate::render::CellSurface, &RenderContext),
+    {
+        let theme = cx.theme();
+        let editor_config = cx.config();
         let prompt_color = theme.get("ui.text");
+        // Accent the prompt label (`:` / `/` / custom prefix) so it reads as
+        // a distinct affordance, not as part of the typed query. Falls back
+        // to the regular text colour for themes without a focus accent.
+        let prompt_label_color = theme.try_get("ui.text.focus").unwrap_or(prompt_color);
         let completion_color = theme.get("ui.menu");
         let selected_color = theme.get("ui.menu.selected");
         let suggestion_color = theme.get("ui.text.inactive");
@@ -561,7 +572,7 @@ impl Prompt {
 
         let completion_area = Rect::new(
             area.x,
-            (area.height - height).saturating_sub(1),
+            area.y + (area.height - height).saturating_sub(1),
             area.width,
             height,
         );
@@ -577,7 +588,11 @@ impl Prompt {
                 .map(|selection| selection / items * items)
                 .unwrap_or_default();
 
-            surface.clear_with(area, background);
+            {
+                let area = tui::ratatui::to_ratatui_rect(area);
+                tui::ratatui::widgets::Widget::render(tui::ratatui::widgets::Clear, area, surface);
+                surface.set_style(area, tui::ratatui::to_ratatui_style(background));
+            };
 
             let mut row = 0;
             let mut col = 0;
@@ -598,7 +613,7 @@ impl Prompt {
                     area.y + row,
                     &completion.content,
                     col_width.saturating_sub(1) as usize,
-                    completion_item_style,
+                    tui::ratatui::to_ratatui_style(completion_item_style),
                 );
 
                 row += 1;
@@ -627,25 +642,29 @@ impl Prompt {
             ));
 
             let background = theme.get("ui.help");
-            surface.clear_with(area, background);
-
-            let border_type = BorderType::new(cx.editor.config().rounded_corners);
-            let block = Block::bordered()
-                // .title(self.title.as_str())
-                .border_style(background)
-                .border_type(border_type);
-
-            let inner = block.inner(area).inner(Margin::horizontal(1));
-
-            block.render(area, surface);
-            text.render(inner, surface, cx);
+            let inner = crate::widgets::Panel::framed(
+                crate::widgets::PanelStyle::plain(background),
+                editor_config.rounded_corners,
+            )
+            .render(surface, area);
+            let inner = Rect::new(
+                inner.x.saturating_add(1),
+                inner.y,
+                inner.width.saturating_sub(2),
+                inner.height,
+            );
+            render_text(&mut text, inner, surface, cx);
         }
 
         let line = area.height - 1;
-        surface.clear_with(area.clip_top(line), background);
+        {
+            let area = tui::ratatui::to_ratatui_rect(area.clip_top(line));
+            tui::ratatui::widgets::Widget::render(tui::ratatui::widgets::Clear, area, surface);
+            surface.set_style(area, tui::ratatui::to_ratatui_style(background));
+        };
         // render buffer text
         // Map generic labels to traditional bottom-style symbols
-        let label = if cx.editor.config().cmdline.style == CmdlineStyle::Bottom {
+        let label = if editor_config.cmdline.style == CmdlineStyle::Bottom {
             if self.prompt == "Cmdline" {
                 ":"
             } else if self.prompt == "Search" {
@@ -656,7 +675,12 @@ impl Prompt {
         } else {
             &self.prompt
         };
-        surface.set_string(area.x, area.y + line, label, prompt_color);
+        surface.set_string(
+            area.x,
+            area.y + line,
+            label,
+            tui::ratatui::to_ratatui_style(prompt_label_color),
+        );
 
         let label_len = UnicodeWidthStr::width(label) as u16;
         self.line_area = area.clip_left(label_len).clip_top(line).clip_right(2);
@@ -664,12 +688,12 @@ impl Prompt {
         if self.line.is_empty() {
             self.anchor = 0;
             // Show the most recently entered value as a suggestion.
-            if let Some(suggestion) = self.first_history_completion(cx.editor) {
+            if let Some(suggestion) = cx.first_register_value(self.history_register) {
                 surface.set_string(
                     self.line_area.x,
                     self.line_area.y,
-                    suggestion,
-                    suggestion_color,
+                    suggestion.as_ref(),
+                    tui::ratatui::to_ratatui_style(suggestion_color),
                 );
             }
             self.truncate_start = false;
@@ -679,12 +703,12 @@ impl Prompt {
             let mut text: ui::text::Text = crate::ui::markdown::highlighted_code_block(
                 &self.line,
                 language,
-                Some(&cx.editor.theme),
+                Some(theme),
                 &loader.load(),
                 None,
             )
             .into();
-            text.render(self.line_area, surface, cx);
+            render_text(&mut text, self.line_area, surface, cx);
             let cursor_col = self.line[..self.cursor.min(self.line.len())].width() as u16;
             self.truncate_start = false;
             self.truncate_end = false;
@@ -870,8 +894,10 @@ impl Component for Prompt {
         self.sync_to_model(editor);
     }
 
-    fn render(&mut self, area: Rect, surface: &mut Surface, cx: &RenderContext) {
-        self.render_prompt(area, surface, cx)
+    fn render(&mut self, area: Rect, surface: &mut crate::render::CellSurface, cx: &RenderContext) {
+        self.render_prompt_surface(area, surface, cx, |text, area, surface, cx| {
+            text.render(area, surface, cx);
+        });
     }
 
     fn cursor(&self, _area: Rect, editor: &Editor) -> (Option<Position>, CursorKind) {

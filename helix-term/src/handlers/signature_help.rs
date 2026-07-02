@@ -2,13 +2,13 @@ use std::time::Duration;
 
 use helix_core::syntax::config::LanguageServerFeature;
 use helix_lsp::lsp;
-use helix_runtime::{send_blocking, Clock, Debounce, Runtime, Token, Work};
+use helix_runtime::{send_blocking, Runtime, Token, Work};
 use helix_stdx::rope::RopeSliceExt;
 use helix_view::bench::log_command_phase;
 use helix_view::handlers::lsp::{SignatureHelpEvent, SignatureHelpInvoked, SignatureHelpRequestId};
 
 use crate::handlers::Handlers;
-use crate::runtime::{send_task_event_with, RuntimeEvent, RuntimeTaskEvent};
+use crate::runtime::RuntimeTaskEvent;
 
 #[derive(Debug, PartialEq, Eq)]
 enum State {
@@ -28,17 +28,14 @@ pub(super) struct SignatureHelpHandler {
     request: Option<SignatureHelpRequestId>,
     cancel: Option<Token>,
     next_request: u64,
-    debounce: Debounce,
-    work: Work,
-    clock: Clock,
-    ingress: helix_runtime::Sender<RuntimeEvent>,
+    debouncer: crate::runtime::RuntimeTaskDebouncer,
 }
 
 impl SignatureHelpHandler {
     pub fn new(
         work: Work,
-        clock: Clock,
-        ingress: helix_runtime::Sender<RuntimeEvent>,
+        clock: helix_runtime::Clock,
+        ingress: crate::runtime::RuntimeIngress,
     ) -> SignatureHelpHandler {
         SignatureHelpHandler {
             trigger: None,
@@ -46,10 +43,12 @@ impl SignatureHelpHandler {
             request: None,
             cancel: None,
             next_request: 1,
-            debounce: Debounce::new(Duration::from_millis(TIMEOUT)),
-            work,
-            clock,
-            ingress,
+            debouncer: crate::runtime::RuntimeTaskDebouncer::new(
+                Duration::from_millis(TIMEOUT),
+                work,
+                clock,
+                ingress,
+            ),
         }
     }
 
@@ -67,25 +66,16 @@ impl SignatureHelpHandler {
         }
         self.request = Some(request);
         self.state = State::Pending;
-        let ingress = self.ingress.clone();
-
-        let send = async move {
-            send_task_event_with(
-                RuntimeTaskEvent::RequestSignatureDebounced {
-                    invoked: invocation,
-                    request,
-                    cancel,
-                },
-                ingress,
-            )
-            .await;
+        let event = RuntimeTaskEvent::RequestSignatureDebounced {
+            invoked: invocation,
+            request,
+            cancel,
         };
 
         if delay {
-            self.debounce.restart(&self.work, &self.clock, send);
+            self.debouncer.send(event);
         } else {
-            self.debounce.cancel();
-            self.work.spawn(send).detach();
+            self.debouncer.send_now(event);
         }
     }
 
@@ -106,7 +96,7 @@ impl SignatureHelpHandler {
             }
             SignatureHelpEvent::Cancel => {
                 self.state = State::Closed;
-                self.debounce.cancel();
+                self.debouncer.cancel();
                 if let Some(cancel) = self.cancel.take() {
                     cancel.cancel();
                 }
@@ -132,7 +122,7 @@ impl SignatureHelpHandler {
 
     pub fn spawn(
         runtime: Runtime,
-        ingress: helix_runtime::Sender<RuntimeEvent>,
+        ingress: crate::runtime::RuntimeIngress,
     ) -> helix_runtime::Sender<SignatureHelpEvent> {
         let (tx, mut rx) = helix_runtime::channel(128);
         let work = runtime.work().clone();
@@ -143,6 +133,7 @@ impl SignatureHelpHandler {
                 while let Some(event) = rx.recv().await {
                     handler.event(event);
                 }
+                handler.debouncer.cancel();
             })
             .detach();
         tx

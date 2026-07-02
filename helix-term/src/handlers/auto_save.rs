@@ -9,8 +9,8 @@ use std::{
 use anyhow::Ok;
 use arc_swap::access::Access;
 
-use crate::runtime::{send_task_event_with, RuntimeEvent, RuntimeTaskEvent};
-use helix_runtime::{send_blocking, Clock, Debounce, Runtime, Work};
+use crate::runtime::RuntimeTaskEvent;
+use helix_runtime::{send_blocking, Runtime, Work};
 use helix_view::bench::log_command_phase;
 use helix_view::handlers::{AutoSaveEvent, Handlers};
 
@@ -18,25 +18,24 @@ use helix_view::handlers::{AutoSaveEvent, Handlers};
 pub(super) struct AutoSaveHandler {
     save_pending: Arc<AtomicBool>,
     armed: Arc<AtomicBool>,
-    debounce: Debounce,
-    work: Work,
-    clock: Clock,
-    ingress: helix_runtime::Sender<RuntimeEvent>,
+    debouncer: crate::runtime::RuntimeTaskDebouncer,
 }
 
 impl AutoSaveHandler {
     fn new(
         work: Work,
-        clock: Clock,
-        ingress: helix_runtime::Sender<RuntimeEvent>,
+        clock: helix_runtime::Clock,
+        ingress: crate::runtime::RuntimeIngress,
     ) -> AutoSaveHandler {
         AutoSaveHandler {
             save_pending: Default::default(),
             armed: Default::default(),
-            debounce: Debounce::new(Duration::from_millis(1)),
-            work,
-            clock,
-            ingress,
+            debouncer: crate::runtime::RuntimeTaskDebouncer::new(
+                Duration::from_millis(1),
+                work,
+                clock,
+                ingress,
+            ),
         }
     }
 
@@ -46,29 +45,19 @@ impl AutoSaveHandler {
                 self.armed.store(true, atomic::Ordering::Relaxed);
                 let save_pending = self.save_pending.clone();
                 let armed = self.armed.clone();
-                let ingress = self.ingress.clone();
-                self.debounce = Debounce::new(Duration::from_millis(save_after));
-                self.debounce.restart(&self.work, &self.clock, async move {
-                    armed.store(false, atomic::Ordering::Relaxed);
-                    send_task_event_with(RuntimeTaskEvent::AutoSaveRun { save_pending }, ingress)
-                        .await;
-                });
+                self.debouncer
+                    .send_after_with(Duration::from_millis(save_after), move || {
+                        armed.store(false, atomic::Ordering::Relaxed);
+                        Some(RuntimeTaskEvent::AutoSaveRun { save_pending })
+                    });
             }
             AutoSaveEvent::LeftInsertMode => {
                 if !self.armed.load(atomic::Ordering::Relaxed)
                     && self.save_pending.load(atomic::Ordering::Relaxed)
                 {
-                    let save_pending = self.save_pending.clone();
-                    let ingress = self.ingress.clone();
-                    self.work
-                        .spawn(async move {
-                            send_task_event_with(
-                                RuntimeTaskEvent::AutoSaveRun { save_pending },
-                                ingress,
-                            )
-                            .await;
-                        })
-                        .detach();
+                    self.debouncer.send_now(RuntimeTaskEvent::AutoSaveRun {
+                        save_pending: self.save_pending.clone(),
+                    });
                 }
             }
         }
@@ -76,7 +65,7 @@ impl AutoSaveHandler {
 
     pub fn spawn(
         runtime: Runtime,
-        ingress: helix_runtime::Sender<RuntimeEvent>,
+        ingress: crate::runtime::RuntimeIngress,
     ) -> helix_runtime::Sender<AutoSaveEvent> {
         let (tx, mut rx) = helix_runtime::channel(128);
         let work = runtime.work().clone();
@@ -87,6 +76,7 @@ impl AutoSaveHandler {
                 while let Some(event) = rx.recv().await {
                     handler.event(event);
                 }
+                handler.debouncer.cancel();
             })
             .detach();
         tx

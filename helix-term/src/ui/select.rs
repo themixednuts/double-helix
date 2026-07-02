@@ -1,10 +1,6 @@
 use std::borrow::Cow;
 
 use helix_view::{graphics::Rect, Editor};
-use tui::{
-    buffer::Buffer as Surface,
-    widgets::{Block, Widget as _},
-};
 
 use crate::compositor::{Component, Context, Event, EventResult, RenderContext};
 
@@ -40,6 +36,55 @@ impl<T: Item> Select<T> {
             options: menu,
         }
     }
+
+    fn render_surface<FM, FO>(
+        &mut self,
+        area: Rect,
+        surface: &mut crate::render::CellSurface,
+        cx: &RenderContext,
+        render_message: FM,
+        render_options: FO,
+    ) where
+        FM: FnOnce(&mut Text, Rect, &mut crate::render::CellSurface, &RenderContext),
+        FO: FnOnce(&mut Menu<T>, Rect, &mut crate::render::CellSurface, &RenderContext),
+    {
+        let max_width = 80.min(((area.width as u32) * 80u32 / 100) as u16);
+        let (message_width, message_height) =
+            super::text::required_size(&self.message.contents, max_width);
+        let (_, menu_height) = self
+            .options
+            .required_size((max_width, area.height))
+            .unwrap();
+        let width = message_width + 4;
+        let height = message_height + 2 + menu_height;
+        let area = Rect {
+            x: (area.width / 2).saturating_sub(width / 2),
+            y: (area.height / 2).saturating_sub(height / 2),
+            width,
+            height,
+        };
+
+        let background = cx.theme().get("ui.background");
+        let text = cx.theme().get("ui.text");
+        let message_style = background.patch(text);
+        let message_box = area.with_height(message_height + 2);
+        let message_inner = crate::widgets::Panel::framed(
+            crate::widgets::PanelStyle::plain(message_style),
+            cx.config().rounded_corners,
+        )
+        .render(surface, message_box);
+
+        let message_area = Rect::new(
+            message_inner.x.saturating_add(1),
+            message_inner.y,
+            message_inner.width.saturating_sub(2),
+            message_inner.height,
+        );
+        render_message(&mut self.message, message_area, surface, cx);
+
+        let menu_area = area.clip_top(message_height + 2);
+        render_options(&mut self.options, menu_area, surface, cx);
+    }
 }
 
 impl<T: Item> Component for Select<T> {
@@ -56,47 +101,13 @@ impl<T: Item> Component for Select<T> {
         ))
     }
 
-    fn render(&mut self, area: Rect, surface: &mut Surface, cx: &RenderContext) {
-        const BLOCK: Block<'_> = Block::bordered();
-
-        // +---------------------+
-        // | message             |
-        // +---------------------+
-        //   options menu
-        //
-        //
-
-        // Limit the text width to 80% of the screen or 80 columns, whichever is
-        // smaller.
-        let max_width = 80.min(((area.width as u32) * 80u32 / 100) as u16);
-        let (message_width, message_height) =
-            super::text::required_size(&self.message.contents, max_width);
-        let (_, menu_height) = self
-            .options
-            .required_size((max_width, area.height))
-            .unwrap();
-        // + 2 for borders and another + 2 for horizontal padding
-        let width = message_width + 4;
-        let height = message_height + 2 + menu_height;
-        let area = Rect {
-            x: (area.width / 2) - width / 2,
-            y: (area.height / 2) - height / 2,
-            width,
-            height,
-        };
-
-        // Message
-        let background = cx.editor.theme.get("ui.background");
-        let text = cx.editor.theme.get("ui.text");
-        let message_box = area.with_height(message_height + 2);
-        surface.clear_with(message_box, background.patch(text));
-        BLOCK.render(message_box, surface);
-        // Add horizontal padding so the message isn't too close to the border.
-        let message_area = BLOCK.inner(message_box).clip_left(1).clip_right(1);
-        self.message.render(message_area, surface, cx);
-
-        // Options menu
-        let menu_area = area.clip_top(message_height + 2);
-        self.options.render(menu_area, surface, cx);
+    fn render(&mut self, area: Rect, surface: &mut crate::render::CellSurface, cx: &RenderContext) {
+        self.render_surface(
+            area,
+            surface,
+            cx,
+            |message, area, surface, cx| message.render(area, surface, cx),
+            |options, area, surface, cx| options.render(area, surface, cx),
+        );
     }
 }

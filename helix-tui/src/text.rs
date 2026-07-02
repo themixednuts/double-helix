@@ -15,33 +15,29 @@
 //! that you can start by using simple `String` or `&str` and then promote them to the previous
 //! primitives when you need additional styling capabilities.
 //!
-//! For example, for the [`crate::widgets::Block`] widget, all the following calls are valid to set
-//! its `title` property (which is a [`Spans`] under the hood):
+//! For example, all the following calls are valid ways to build styled text:
 //!
 //! ```rust
-//! # use helix_tui::widgets::Block;
 //! # use helix_tui::text::{Span, Spans};
 //! # use helix_view::graphics::{Color, Style};
 //! // A simple string with no styling.
 //! // Converted to Spans(vec![
 //! //   Span { content: Cow::Borrowed("My title"), style: Style { .. } }
 //! // ])
-//! let block = Block::default().title("My title");
+//! let title = Spans::from("My title");
 //!
 //! // A simple string with a unique style.
 //! // Converted to Spans(vec![
 //! //   Span { content: Cow::Borrowed("My title"), style: Style { fg: Some(Color::Yellow), .. }
 //! // ])
-//! let block = Block::default().title(
-//!     Span::styled("My title", Style::default().fg(Color::Yellow))
-//! );
+//! let title = Spans::from(Span::styled("My title", Style::default().fg(Color::Yellow)));
 //!
 //! // A string with multiple styles.
 //! // Converted to Spans(vec![
 //! //   Span { content: Cow::Borrowed("My"), style: Style { fg: Some(Color::Yellow), .. } },
 //! //   Span { content: Cow::Borrowed(" title"), .. }
 //! // ])
-//! let block = Block::default().title(vec![
+//! let title = Spans::from(vec![
 //!     Span::styled("My", Style::default().fg(Color::Yellow)),
 //!     Span::raw(" title"),
 //! ]);

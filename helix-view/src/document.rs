@@ -27,7 +27,10 @@ use std::io;
 use std::ops;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 use std::time::{Instant, SystemTime};
 
 use helix_core::{
@@ -56,7 +59,7 @@ use crate::{
     graphics::CursorKind,
     presentation_state::DocumentPresentationState,
     selection_store::SelectionStore,
-    session_state::DocumentSessionState,
+    session_state::{DocumentOpenState, DocumentSessionState},
     snippet_state::DocumentSnippetState,
     syntax_aware::{SyntaxAwareState, SyntaxSnapshot},
     text_buffer::TextBuffer,
@@ -64,6 +67,14 @@ use crate::{
     view::ViewPosition,
     DocumentId, Editor, Theme, View, ViewId,
 };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LanguageInitialization {
+    Disabled,
+    MetadataOnly,
+    #[default]
+    Full,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GutterSnapshot {
@@ -200,9 +211,52 @@ pub struct DocumentSavedEvent {
     pub text: Rope,
 }
 
-pub type DocumentSavedEventResult = Result<DocumentSavedEvent, anyhow::Error>;
+pub type DocumentSavedEventResult = Result<Option<DocumentSavedEvent>, anyhow::Error>;
 pub type DocumentSavedTask = Task<DocumentSavedEventResult>;
 pub type DocumentFormatTask = Task<Result<Transaction, FormatterError>>;
+
+#[derive(Clone, Default)]
+pub struct DocumentSaveLock {
+    inner: Arc<tokio::sync::Mutex<()>>,
+    latest_coalescible_generation: Arc<AtomicUsize>,
+}
+
+#[derive(Clone)]
+pub(crate) struct DocumentSaveTicket {
+    lock: DocumentSaveLock,
+    coalescible_generation: Option<usize>,
+}
+
+impl DocumentSaveLock {
+    pub(crate) fn ticket(&self, coalescible: bool) -> DocumentSaveTicket {
+        let coalescible_generation = coalescible.then(|| {
+            self.latest_coalescible_generation
+                .fetch_add(1, Ordering::AcqRel)
+                + 1
+        });
+
+        DocumentSaveTicket {
+            lock: self.clone(),
+            coalescible_generation,
+        }
+    }
+}
+
+impl DocumentSaveTicket {
+    pub(crate) fn is_superseded(&self) -> bool {
+        self.coalescible_generation.is_some_and(|generation| {
+            self.lock
+                .latest_coalescible_generation
+                .load(Ordering::Acquire)
+                != generation
+        })
+    }
+
+    pub(crate) async fn run<T>(&self, future: impl Future<Output = T>) -> T {
+        let _guard = self.lock.inner.lock().await;
+        future.await
+    }
+}
 
 #[derive(Debug)]
 pub struct SavePoint {
@@ -778,7 +832,7 @@ impl Document {
     pub fn open(
         path: &Path,
         mut encoding: Option<&'static Encoding>,
-        detect_language: bool,
+        language_initialization: LanguageInitialization,
         config: Arc<dyn DynAccess<Config> + Send + Sync>,
         syn_loader: Arc<ArcSwap<syntax::Loader>>,
     ) -> Result<Self, DocumentOpenError> {
@@ -811,8 +865,13 @@ impl Document {
 
         // set the path and try detecting the language
         doc.set_path(Some(path));
-        if detect_language {
-            doc.detect_language(&loader);
+        match language_initialization {
+            LanguageInitialization::Full => doc.detect_language(&loader),
+            LanguageInitialization::MetadataOnly => {
+                let language_config = doc.detect_language_config(&loader);
+                doc.set_language_configuration(language_config);
+            }
+            LanguageInitialization::Disabled => {}
         }
 
         doc.presentation.set_editor_config(editor_config);
@@ -957,17 +1016,17 @@ impl Document {
         Some(editor.runtime().work().spawn(fut))
     }
 
-    pub fn save<P: Into<PathBuf>>(
+    pub(crate) fn save_serialized<P: Into<PathBuf>>(
         &mut self,
         work: &Work,
         path: Option<P>,
         policy: crate::editor::SavePolicy,
+        save_lock: DocumentSaveLock,
     ) -> Result<DocumentSavedTask, anyhow::Error> {
         let path = path.map(|path| path.into());
-        self.save_impl(path, policy)
-            .map(|future| work.spawn(future))
-
-        // futures_util::future::Ready<_>,
+        let ticket = save_lock.ticket(path.is_none());
+        self.save_impl(path, policy, Some(ticket.clone()))
+            .map(|future| work.spawn(async move { ticket.run(future).await }))
     }
 
     /// The `Document`'s text is encoded according to its encoding and written to the file located
@@ -976,8 +1035,9 @@ impl Document {
         &mut self,
         path: Option<PathBuf>,
         policy: crate::editor::SavePolicy,
+        save_ticket: Option<DocumentSaveTicket>,
     ) -> Result<
-        impl Future<Output = Result<DocumentSavedEvent, anyhow::Error>> + 'static + Send,
+        impl Future<Output = Result<Option<DocumentSavedEvent>, anyhow::Error>> + 'static + Send,
         anyhow::Error,
     > {
         log::debug!(
@@ -1013,6 +1073,13 @@ impl Document {
         // We encode the file according to the `Document`'s encoding.
         let future = async move {
             use tokio::fs;
+            if save_ticket
+                .as_ref()
+                .is_some_and(DocumentSaveTicket::is_superseded)
+            {
+                return Ok(None);
+            }
+
             if let Some(parent) = path.parent() {
                 // TODO: display a prompt asking the user if the directories should be created
                 if !parent.exists() {
@@ -1159,7 +1226,7 @@ impl Document {
                 }
             }
 
-            Ok(event)
+            Ok(Some(event))
         };
 
         Ok(future)
@@ -2168,6 +2235,18 @@ impl Document {
 
     pub fn is_persistent_scratch(&self) -> bool {
         self.presentation.is_persistent_scratch()
+    }
+
+    pub fn is_preview(&self) -> bool {
+        self.session.open_state().is_preview()
+    }
+
+    pub fn mark_preview(&mut self) {
+        self.session.set_open_state(DocumentOpenState::Preview);
+    }
+
+    pub fn promote_from_preview(&mut self) {
+        self.session.set_open_state(DocumentOpenState::Interactive);
     }
 
     pub fn set_persistent_scratch(&mut self, persistent_scratch: bool) {

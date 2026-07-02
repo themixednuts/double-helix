@@ -3,7 +3,7 @@ use std::sync::atomic::{self, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use helix_runtime::{send_blocking, Clock, Debounce, FrameHandle, Runtime, Sender, Work};
+use helix_runtime::{send_blocking, Clock, DebouncedSender, FrameHandle, Runtime, Sender, Work};
 
 use crate::{Document, DocumentId, ViewId};
 
@@ -17,10 +17,7 @@ pub enum DiagnosticEvent {
 struct DiagnosticTimeout {
     active_generation: Arc<AtomicUsize>,
     pending_generation: Option<usize>,
-    debounce: Debounce,
-    work: Work,
-    clock: Clock,
-    tx: Sender<DiagnosticEvent>,
+    debouncer: DebouncedSender<DiagnosticEvent>,
     redraw: FrameHandle,
 }
 
@@ -37,22 +34,16 @@ impl DiagnosticTimeout {
         let mut timeout = Self {
             active_generation,
             pending_generation: None,
-            debounce: Debounce::new(TIMEOUT),
-            work,
-            clock,
-            tx: tx.clone(),
+            debouncer: DebouncedSender::new(TIMEOUT, work.clone(), clock, tx.clone()),
             redraw,
         };
-        timeout
-            .work
-            .clone()
-            .spawn(async move {
-                while let Some(event) = rx.recv().await {
-                    timeout.handle_event(event);
-                }
-                timeout.debounce.cancel();
-            })
-            .detach();
+        work.spawn(async move {
+            while let Some(event) = rx.recv().await {
+                timeout.handle_event(event);
+            }
+            timeout.debouncer.cancel();
+        })
+        .detach();
         tx
     }
 
@@ -77,10 +68,7 @@ impl DiagnosticTimeout {
     }
 
     fn restart(&mut self) {
-        let tx = self.tx.clone();
-        self.debounce.restart(&self.work, &self.clock, async move {
-            let _ = tx.send(DiagnosticEvent::FlushDebounced).await;
-        });
+        self.debouncer.send(DiagnosticEvent::FlushDebounced);
     }
 
     fn commit_pending_generation(&mut self) {

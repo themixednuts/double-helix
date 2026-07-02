@@ -1,6 +1,6 @@
 use arc_swap::{access::Map, ArcSwap};
 use futures_util::Stream;
-use helix_core::{pos_at_coords, syntax, Range};
+use helix_core::{find_workspace, pos_at_coords, syntax, Range};
 use helix_lsp::{
     lsp::{self as lsp_types},
     Call, LanguageServerId, LspProgressMap,
@@ -9,7 +9,7 @@ use helix_view::{
     align_view,
     bench::log_run_phase,
     document::DocumentOpenError,
-    editor::{ConfigEvent, EditorEvent},
+    editor::{ConfigEvent, EditorBuilder, EditorEvent},
     theme,
     tree::Layout,
     Align, Editor,
@@ -27,10 +27,10 @@ use crate::{
 };
 use futures_util::stream::select_all::SelectAll;
 use helix_dap::{self as dap, registry::DebugAdapterId};
-use helix_runtime::{channel, Receiver, Runtime, Sender, Work};
+use helix_runtime::{FrameReceiver, Runtime, Work};
 use tokio::time::{sleep, Instant, Sleep};
 
-use crate::runtime::ingress::{self, RuntimeEvent};
+use crate::runtime::{RuntimeDelivery, RuntimeIngressReceiver};
 
 use std::{
     borrow::Cow,
@@ -71,22 +71,23 @@ type TerminalEvent = termina::Event;
 #[cfg(windows)]
 type TerminalEvent = crossterm::event::Event;
 
-type Terminal = tui::terminal::Terminal<TerminalBackend>;
+type Terminal = ratatui_terminal::AppTerminal<TerminalBackend>;
 
 mod bench;
 mod config;
 mod lifecycle;
 mod lsp;
+mod ratatui_terminal;
 mod terminal;
 
 struct IngressState {
-    tx: Sender<RuntimeEvent>,
-    rx: Receiver<RuntimeEvent>,
+    tx: crate::runtime::RuntimeIngress,
+    rx: RuntimeIngressReceiver,
     config_rx: helix_runtime::Receiver<ConfigEvent>,
     assistant_updates_rx: helix_runtime::Receiver<helix_view::assistant::backend::Update>,
-    redraw_rx: helix_runtime::Receiver<()>,
-    idle_reset_rx: helix_runtime::Receiver<()>,
-    idle_reset_tx: helix_runtime::Sender<()>,
+    redraw_rx: FrameReceiver,
+    idle_reset_rx: crate::runtime::IdleResetReceiver,
+    idle_reset: crate::runtime::IdleResetHandle,
     plugin_event_rx: helix_runtime::Receiver<PluginNotification>,
     plugin_event_tx: helix_runtime::Sender<PluginNotification>,
 }
@@ -115,26 +116,6 @@ struct TerminalState {
 
 struct LanguageState {
     progress: LspProgressMap,
-}
-
-struct ModalEngineFactory {
-    registry: Arc<helix_modal::registry::CommandRegistry>,
-}
-
-impl helix_view::engine::EditingEngineFactory for ModalEngineFactory {
-    fn create(
-        &self,
-        config: helix_view::editor::EditingEngineConfig,
-    ) -> Box<dyn helix_view::engine::EditingEngine> {
-        match config {
-            helix_view::editor::EditingEngineConfig::Helix => {
-                Box::new(helix_modal::helix::HelixEngine::new(self.registry.clone()))
-            }
-            helix_view::editor::EditingEngineConfig::Vim => {
-                Box::new(helix_modal::vim::VimEngine::new(self.registry.clone()))
-            }
-        }
-    }
 }
 
 pub struct Application {
@@ -184,20 +165,19 @@ impl Application {
         exit_tasks: &'a mut ExitTaskSet,
         exit_task_work: Work,
         notifier: crate::handlers::local::Notifier,
-        ingress: Sender<RuntimeEvent>,
-        idle_reset_tx: helix_runtime::Sender<()>,
+        ingress: crate::runtime::RuntimeIngress,
+        idle_reset: crate::runtime::IdleResetHandle,
         plugin_manager: Arc<PluginManager>,
     ) -> crate::compositor::Context<'a> {
-        crate::compositor::Context {
+        crate::compositor::Context::new(
             editor,
             exit_tasks,
             exit_task_work,
-            scroll: None,
             notifier,
             ingress,
-            idle_reset_tx,
-            plugin_manager: Some(plugin_manager),
-        }
+            idle_reset,
+            Some(plugin_manager),
+        )
     }
 
     pub fn new(
@@ -229,40 +209,47 @@ impl Application {
         let area = terminal.size();
         let mut compositor = Compositor::new(area);
         let config = Arc::new(ArcSwap::from_pointee(config));
-        let (ingress_tx, ingress_rx) = channel(ingress::BOUND);
+        let (ingress_tx, ingress_rx) =
+            crate::runtime::RuntimeIngress::channel(runtime.work().clone());
         let handlers = handlers::setup(config.clone(), ingress_tx.clone(), runtime.clone());
-        let mut editor = Editor::new(
-            area,
-            Arc::new(theme_loader),
-            Arc::new(ArcSwap::from_pointee(lang_loader)),
-            Arc::new(Map::new(Arc::clone(&config), |config: &Config| {
-                &config.editor
-            })),
-            runtime.clone(),
-            handlers,
-        );
+        let mut editor = EditorBuilder::new(area, runtime.clone())
+            .theme_loader(Arc::new(theme_loader))
+            .language_loader(lang_loader)
+            .config_access(Arc::new(Map::new(
+                Arc::clone(&config),
+                |config: &Config| &config.editor,
+            )))
+            .handlers(handlers)
+            .build();
         editor
             .lifecycle()
             .set_error_reporter(crate::runtime::status_error_reporter(ingress_tx.clone()));
         crate::handlers::attach(&editor, &editor.handlers, ingress_tx.clone());
         editor.set_assistant_history_backend(helix_view::assistant::history::local_backend());
         editor.set_assistant_context_registry(helix_view::assistant::context::core_registry());
+        let fff_root = find_workspace().0;
+        if fff_root.exists() {
+            let fff_config = editor.config().file_picker.clone();
+            runtime
+                .block()
+                .spawn(move || crate::fff::prewarm(&fff_root, &fff_config))
+                .detach();
+        }
         let lsp_incoming = editor.take_lsp_incoming();
         let debugger_incoming = editor.take_debugger_incoming();
         let config_rx = editor.take_config_rx();
         let assistant_updates_rx = editor.take_assistant_updates_rx();
         let redraw_rx = editor.take_redraw_rx();
-        let (idle_reset_tx, idle_reset_rx) = helix_runtime::channel(64);
+        let mut idle_reset_gate = crate::runtime::IdleResetGate::new();
+        let idle_reset = idle_reset_gate.handle();
+        let idle_reset_rx = idle_reset_gate.take_receiver();
         let (plugin_event_tx, plugin_event_rx) = helix_runtime::channel(256);
         let idle_timeout = editor.config().idle_timeout;
         if editor.assistant_history_backend().is_some() {
-            helix_runtime::send_blocking(
-                &ingress_tx,
-                crate::runtime::RuntimeEvent::Task(
-                    crate::runtime::RuntimeTaskEvent::BootstrapAssistantHistory {
-                        scope: helix_view::assistant::layout::current_scope(),
-                    },
-                ),
+            ingress_tx.task(
+                crate::runtime::RuntimeTaskEvent::BootstrapAssistantHistory {
+                    scope: helix_view::assistant::layout::current_scope(),
+                },
             );
         }
         // Initialize OS-native file watcher for auto-reload
@@ -281,18 +268,18 @@ impl Application {
         editor.frontend_mut().modal_keymaps = Arc::new(arc_swap::ArcSwap::from_pointee(
             crate::keymap::to_component_modal_keymaps(&config.load().keys),
         ));
+        editor.frontend_mut().semantic_modal_keymaps = Arc::new(arc_swap::ArcSwap::from_pointee(
+            crate::keymap::to_semantic_modal_keymaps(&config.load().keys),
+        ));
 
-        // Build the editing engine based on config
-        let registry = std::sync::Arc::new(helix_modal::populate::build_registry());
-        let engine_factory: Arc<dyn helix_view::engine::EditingEngineFactory> =
-            Arc::new(ModalEngineFactory {
-                registry: registry.clone(),
-            });
-        editor.frontend_mut().engine_factory = engine_factory.clone();
-        let engine = engine_factory.create(config.load().editor.editing_engine);
-        log::info!("Editing engine: {}", engine.name());
-
-        let editor_view = Box::new(ui::EditorView::new(Keymaps::new(keys), engine, registry));
+        let modal_engines = Arc::new(helix_modal::ModalEngineFactory::with_builtins());
+        modal_engines.install(&mut editor);
+        let engine_config = config.load().editor.editing_engine;
+        let editor_view = Box::new(ui::EditorView::from_modal_factory(
+            Keymaps::new(keys),
+            &modal_engines,
+            engine_config,
+        ));
         compositor.push(editor_view);
 
         let exit_task_work = runtime.work().clone();
@@ -422,7 +409,7 @@ impl Application {
             if let Err(e) = plugin_manager.initialize(&mut editor) {
                 log::error!("Failed to initialize plugin manager: {}", e);
             } else {
-                log::warn!("Plugin system initialized");
+                log::info!("Plugin system initialized");
                 editor.set_status("Plugin system initialized");
             }
         }
@@ -433,7 +420,7 @@ impl Application {
         #[cfg(not(windows))]
         let shutdown_rx = None;
 
-        let redraw_ingress = ingress_tx.clone();
+        let redraw = editor.redraw_handle();
         let plugin_events = plugin_event_tx.clone();
         editor.lifecycle().on_document_open(move |event| {
             helix_runtime::send_blocking(
@@ -443,7 +430,7 @@ impl Application {
                     path: Some(event.path.clone()),
                 },
             );
-            ingress::request_redraw(&redraw_ingress);
+            redraw.request_redraw();
             Ok(())
         });
 
@@ -513,7 +500,7 @@ impl Application {
                 assistant_updates_rx,
                 redraw_rx,
                 idle_reset_rx,
-                idle_reset_tx,
+                idle_reset,
                 plugin_event_rx,
                 plugin_event_tx,
             },
@@ -545,14 +532,22 @@ impl Application {
         &self.runtime
     }
 
-    /// Clone of the sender for [`RuntimeEvent`] delivery into the main loop.
-    pub fn ingress_sender(&self) -> Sender<RuntimeEvent> {
+    /// Clone of the typed ingress for deliveries into the main loop.
+    pub fn ingress_sender(&self) -> crate::runtime::RuntimeIngress {
         self.ingress.tx.clone()
     }
 
     #[inline]
-    fn queue_redraw(&self) {
-        self.editor.request_redraw();
+    fn queue_redraw(&mut self) {
+        if self.editor.is_redraw_pending() {
+            return;
+        }
+
+        self.editor.mark_redraw_pending();
+        let timeout = Instant::now() + std::time::Duration::from_millis(33);
+        if timeout < self.timers.idle.deadline() && timeout < self.timers.redraw.deadline() {
+            self.timers.redraw.as_mut().reset(timeout);
+        }
     }
 
     fn handle_runtime_status(&mut self, message: String, severity: helix_view::editor::Severity) {
@@ -600,28 +595,31 @@ impl Application {
         self.render().await;
     }
 
-    async fn handle_runtime_event(&mut self, event: RuntimeEvent) {
-        match event {
-            RuntimeEvent::Redraw => {
-                self.queue_redraw();
-            }
-            RuntimeEvent::Status { message, severity } => {
+    async fn handle_runtime_delivery(&mut self, delivery: RuntimeDelivery) {
+        if let RuntimeDelivery::Ui(crate::runtime::UiCommand::Picker(cmd)) = &delivery {
+            log::info!(
+                target: crate::ui::picker::PICKER_TRACE_TARGET,
+                "phase=runtime_event event=Ui::Picker command={cmd:?}",
+            );
+        }
+        match delivery {
+            RuntimeDelivery::Status { message, severity } => {
                 self.handle_runtime_status(message, severity);
             }
-            RuntimeEvent::Timer(id) => {
+            RuntimeDelivery::Timer(id) => {
                 self.handle_runtime_timer(id);
             }
-            RuntimeEvent::Task(task) => {
+            RuntimeDelivery::Task(task) => {
                 self.handle_runtime_task(task).await;
             }
-            RuntimeEvent::AssistantPermissionResolved {
+            RuntimeDelivery::AssistantPermissionResolved {
                 thread,
                 request,
                 decision,
             } => {
                 self.handle_runtime_assistant_permission(thread, request, decision);
             }
-            RuntimeEvent::Ui(cmd) => {
+            RuntimeDelivery::Ui(cmd) => {
                 self.handle_runtime_ui_command(cmd).await;
             }
         }
@@ -641,7 +639,7 @@ impl Application {
             let timer_task = clock.timer(after);
             work.spawn(async move {
                 if timer_task.await.is_ok() {
-                    let _ = ingress.send(RuntimeEvent::Timer(id)).await;
+                    ingress.send_timer(id).await;
                 }
             })
             .detach();
@@ -650,8 +648,26 @@ impl Application {
 
     async fn render(&mut self) {
         let t0 = std::time::Instant::now();
+        let focused_doc_id = self.editor.focused_document_id();
+        let focused_doc_path = self
+            .editor
+            .focused_document()
+            .and_then(|doc| doc.path())
+            .map(|path| path.display().to_string().replace('\\', "/"))
+            .unwrap_or_else(|| String::from("<scratch>"));
+        log::info!(
+            target: crate::ui::picker::PICKER_TRACE_TARGET,
+            "phase=app_render_start redraw_pending={} full_redraw={} focused_view={:?} focused_doc={:?} focused_path={} documents={} component_documents={}",
+            self.editor.is_redraw_pending(),
+            self.compositor.full_redraw,
+            self.editor.focused_view_id(),
+            focused_doc_id,
+            focused_doc_path,
+            self.editor.document_count(),
+            self.editor.component_docs.len(),
+        );
         let ingress = self.ingress().tx.clone();
-        let idle_reset = self.ingress().idle_reset_tx.clone();
+        let idle_reset = self.ingress().idle_reset.clone();
 
         self.editor.pause_assistant_follow_if_local_change();
 
@@ -667,8 +683,9 @@ impl Application {
         });
 
         let frame_setup_start = std::time::Instant::now();
+        let redraw = self.editor.redraw_handle();
         let notifier = crate::handlers::local::Notifier {
-            ingress: ingress.clone(),
+            redraw: redraw.clone(),
             plugin_events: self.ingress().plugin_event_tx.clone(),
         };
         let mut cx = Self::make_compositor_context(
@@ -729,8 +746,16 @@ impl Application {
         let (pos, kind) = self.compositor.cursor(area, &self.editor);
         let cursor_elapsed = cursor_start.elapsed();
         log_run_phase("render", "cursor_total", cursor_elapsed, || {
-            format!("cursor_visible={}", pos.is_some())
+            format!("cursor_pos_present={} cursor_kind={kind:?}", pos.is_some())
         });
+        log::info!(
+            target: crate::ui::picker::PICKER_TRACE_TARGET,
+            "phase=app_cursor_resolved pos={} kind={:?} elapsed_us={}",
+            pos.map(|pos| format!("{},{}", pos.col, pos.row))
+                .unwrap_or_else(|| String::from("<none>")),
+            kind,
+            cursor_elapsed.as_micros(),
+        );
         self.editor.cursor_cache.reset();
 
         let t2 = std::time::Instant::now(); // compositor done
@@ -743,8 +768,17 @@ impl Application {
 
         let t3 = std::time::Instant::now(); // terminal flush done
         log_run_phase("render", "flush_total", t3 - t2, || {
-            format!("cursor_visible={}", pos.is_some())
+            format!("cursor_pos_present={} cursor_kind={kind:?}", pos.is_some())
         });
+        log::info!(
+            target: crate::ui::picker::PICKER_TRACE_TARGET,
+            "phase=app_render_done total_us={} compositor_us={} flush_us={} cursor_pos_present={} cursor_kind={:?}",
+            (t3 - t0).as_micros(),
+            (t2 - t1).as_micros(),
+            (t3 - t2).as_micros(),
+            pos.is_some(),
+            kind,
+        );
 
         // Record render sub-phases when bench is active
         self.editor
@@ -791,8 +825,8 @@ impl Application {
                 Some(event) = input_stream.next() => {
                     self.handle_terminal_events(event).await;
                 }
-                Some(evt) = self.ingress.rx.recv() => {
-                    self.handle_runtime_event(evt).await;
+                Some(delivery) = self.ingress.rx.recv() => {
+                    self.handle_runtime_delivery(delivery).await;
                 }
                 Some(result) = self.editor.recv_save_result() => {
                     self.handle_document_write(result);
@@ -823,16 +857,10 @@ impl Application {
                         }
                     }
                 }
-                Some(()) = self.ingress.redraw_rx.recv() => {
-                    if !self.editor.is_redraw_pending() {
-                        self.editor.request_redraw();
-                        let timeout = Instant::now() + std::time::Duration::from_millis(33);
-                        if timeout < self.timers.idle.deadline() && timeout < self.timers.redraw.deadline() {
-                            self.timers.redraw.as_mut().reset(timeout);
-                        }
-                    }
+                Some(_request) = self.ingress.redraw_rx.recv() => {
+                    self.queue_redraw();
                 }
-                Some(()) = self.ingress.idle_reset_rx.recv() => {
+                Some(_request) = self.ingress.idle_reset_rx.recv() => {
                     let timeout = self.editor.config().idle_timeout;
                     self.timers.idle.as_mut().reset(Instant::now() + timeout);
                 }
@@ -844,7 +872,9 @@ impl Application {
 
                     #[cfg(feature = "integration")]
                     {
-                        return true;
+                        if self.exit.tasks.is_empty() && !self.editor.has_pending_writes() {
+                            return true;
+                        }
                     }
                 }
                 _ = &mut self.timers.redraw => {
@@ -938,7 +968,7 @@ impl Application {
 
 impl ui::menu::Item for lsp_types::MessageActionItem {
     type Data = ();
-    fn format(&self, _data: &Self::Data) -> tui::widgets::Row<'_> {
+    fn format(&self, _data: &Self::Data) -> ui::menu::Row<'_> {
         self.title.as_str().into()
     }
 }

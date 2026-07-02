@@ -58,6 +58,8 @@ notify.workspace = true
 indexmap = "2.13"
 
 kstring = "2.0"
+trash = "5.2.5"
+zstd = "0.13.3"
 [target.'cfg(windows)'.dependencies]
 clipboard-win = { version = "5.4", features = ["std"] }
 crossterm = { version = "0.28", optional = true }

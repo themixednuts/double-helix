@@ -1,11 +1,10 @@
-use crate::runtime::RuntimeEvent;
 use crate::{
     commands::{self, OnKeyCallback, OnKeyCallbackKind},
-    compositor::{Component, Context, Event, EventResult, RenderContext},
+    compositor::{Component, Event, EventResult, RenderContext},
     handlers::completion::CompletionItem,
     key,
     keymap::Keymaps,
-    render::{CacheStore, PreparedRender},
+    render::{blit_cells, CacheStore, CellSurface, PreparedRender},
     ui::{
         document::{render_document, HighlighterInput, LinePos, RenderOutput, TextRenderer},
         statusline,
@@ -25,8 +24,9 @@ use helix_loader::VERSION_AND_GIT_HASH;
 use helix_view::{
     // annotations::diagnostics::DiagnosticFilter,
     document::Mode,
-    editor::{CompleteAction, InlineBlameConfig, InlineBlameShow},
+    editor::{CompleteAction, Config, CursorCache, InlineBlameConfig, InlineBlameShow},
     graphics::{Color, CursorKind, Modifier, Rect, Style},
+    gutter::{DebugExecutionPosition, GutterContext},
     icons::ICONS,
     input::{KeyEvent, MouseButton, MouseEvent, MouseEventKind},
     keyboard::{KeyCode, KeyModifiers},
@@ -38,16 +38,14 @@ use helix_view::{
     ViewId,
 };
 use std::{
-    collections::{HashMap, HashSet},
+    borrow::Cow,
+    collections::{HashMap, HashSet, VecDeque},
     mem::take,
     rc::Rc,
     sync::{Arc, LazyLock},
 };
 
-use tui::{
-    buffer::Buffer as Surface,
-    text::{Span, Spans},
-};
+use tui::text::{Span, Spans};
 
 use super::text_decorations::blame::InlineBlame;
 
@@ -62,11 +60,18 @@ const MAX_SEED_LINE_MAP_GAP: usize = 4_096;
 
 /// View render context grouping parameters for `render_view`.
 pub(crate) struct ViewRenderContext<'a> {
-    pub editor: &'a Editor,
     pub doc: &'a Document,
     pub view: &'a View,
     pub viewport: Rect,
     pub is_focused: bool,
+    pub config: &'a Config,
+    pub config_gen: u64,
+    pub theme: &'a Theme,
+    pub mode: Mode,
+    pub syntax_loader: &'a Arc<arc_swap::ArcSwap<helix_core::syntax::Loader>>,
+    pub cursor_cache: &'a CursorCache,
+    pub gutter_context: GutterContext<'a>,
+    pub debug_execution: Option<DebugExecutionPosition<'a>>,
     /// Cached syntax styles to replay instead of running tree-sitter.
     pub cached_syntax: Option<&'a SyntaxStyleCache>,
     /// Set of dirty visual rows. Only these rows will be re-rendered.
@@ -78,14 +83,51 @@ pub(crate) struct ViewRenderContext<'a> {
 struct ViewRenderCacheEntry {
     snapshots: RenderSnapshots,
     /// The rendered cells for the view's area.
-    cells: tui::buffer::Buffer,
+    cells: CellSurface,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct ViewRenderCacheKey {
+    view: ViewId,
+    doc: DocumentId,
+}
+
+fn copy_cell_region(src: &CellSurface, area: Rect) -> CellSurface {
+    let mut buf = CellSurface::empty(tui::ratatui::to_ratatui_rect(area));
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            if let (Some(src_cell), Some(dst_cell)) = (src.cell((x, y)), buf.cell_mut((x, y))) {
+                *dst_cell = src_cell.clone();
+            }
+        }
+    }
+    buf
+}
+
+impl ViewRenderCacheKey {
+    const fn new(view: ViewId, doc: DocumentId) -> Self {
+        Self { view, doc }
+    }
 }
 
 struct ViewFrame<'a> {
-    editor: &'a Editor,
+    snapshot: ViewFrameSnapshot<'a>,
     doc: &'a Document,
     trace: ViewTrace<'a>,
     area: Rect,
+}
+
+struct ViewFrameSnapshot<'a> {
+    config: arc_swap::access::DynGuard<Config>,
+    config_gen: u64,
+    theme: &'a Theme,
+    theme_name: &'a str,
+    mode: Mode,
+    syntax_loader: &'a Arc<arc_swap::ArcSwap<helix_core::syntax::Loader>>,
+    cursor_cache: &'a CursorCache,
+    focused_view_id: ViewId,
+    breakpoints: Option<&'a [helix_view::editor::Breakpoint]>,
+    debug_execution: Option<DebugExecutionPosition<'a>>,
 }
 
 struct ViewTrace<'a> {
@@ -133,8 +175,8 @@ impl ViewFrame<'_> {
     ) -> RenderState {
         self.view().resolve_render_state(
             self.doc,
-            self.editor.config_gen,
-            Arc::from(self.editor.theme.name()),
+            self.snapshot.config_gen,
+            Arc::from(self.snapshot.theme_name),
             cached,
             self.render_scope(terminal_focused),
         )
@@ -143,7 +185,7 @@ impl ViewFrame<'_> {
     fn render_scope(&self, terminal_focused: bool) -> RenderScope<'_> {
         RenderScope::new(
             self.trace.selection,
-            self.editor.mode,
+            self.snapshot.mode,
             self.trace.is_focused,
             terminal_focused,
         )
@@ -157,16 +199,28 @@ impl ViewFrame<'_> {
         self.view().id
     }
 
-    fn update_cursor_cache(&self, layout: &LayoutSnapshot) {
-        layout.update_cursor_cache(self.editor, self.doc, self.view());
+    fn cache_key(&self) -> ViewRenderCacheKey {
+        ViewRenderCacheKey::new(self.view_id(), self.doc.id())
     }
 
-    fn clear_dirty_rows(&self, dirty_rows: &HashSet<u16>, surface: &mut Surface) {
+    fn update_cursor_cache(&self, layout: &LayoutSnapshot) {
+        if self.snapshot.focused_view_id == self.view_id() {
+            self.snapshot
+                .cursor_cache
+                .set(layout.cursor_position(self.doc, self.view()));
+        }
+    }
+
+    fn clear_dirty_rows(&self, dirty_rows: &HashSet<u16>, surface: &mut CellSurface) {
         let inner = self.view().inner_area(self.doc);
         for &row in dirty_rows {
             if row < inner.height {
                 let y = inner.y + row;
-                surface.clear(Rect::new(inner.x, y, inner.width, 1));
+                tui::ratatui::widgets::Widget::render(
+                    tui::ratatui::widgets::Clear,
+                    tui::ratatui::to_ratatui_rect(Rect::new(inner.x, y, inner.width, 1)),
+                    surface,
+                );
             }
         }
     }
@@ -177,12 +231,32 @@ impl ViewFrame<'_> {
         dirty_rows: Option<&'a HashSet<u16>>,
         seed_line_map: Option<&'a LineMap>,
     ) -> ViewRenderContext<'a> {
+        let wrap_indicator = self
+            .snapshot
+            .config
+            .soft_wrap
+            .wrap_indicator
+            .as_deref()
+            .map_or(Cow::Borrowed("↪"), Cow::Borrowed);
         ViewRenderContext {
-            editor: self.editor,
             doc: self.doc,
             view: self.view(),
             viewport: self.area,
             is_focused: self.trace.is_focused,
+            config: &self.snapshot.config,
+            config_gen: self.snapshot.config_gen,
+            theme: self.snapshot.theme,
+            mode: self.snapshot.mode,
+            syntax_loader: self.snapshot.syntax_loader,
+            cursor_cache: self.snapshot.cursor_cache,
+            gutter_context: GutterContext {
+                mode: self.snapshot.mode,
+                line_number: self.snapshot.config.line_number,
+                wrap_indicator,
+                breakpoints: self.snapshot.breakpoints,
+                debug_execution: self.snapshot.debug_execution,
+            },
+            debug_execution: self.snapshot.debug_execution,
             cached_syntax,
             dirty_rows,
             seed_line_map,
@@ -192,7 +266,7 @@ impl ViewFrame<'_> {
 
 impl ViewTrace<'_> {
     fn log_state(&self) {
-        log::warn!(
+        log::debug!(
             "[view] id={:?} focused={} area=({},{} {}x{}) inner_height={} statusline_row={}",
             self.view.id,
             self.is_focused,
@@ -240,12 +314,20 @@ impl ViewTrace<'_> {
 
     fn log_dirty_reuse(&self, reuse: &ReuseState, output: &RenderOutput) {
         log::info!(
-            "F{} CACHE DIRTY_RERENDER view={:?} dirty_rows={:?} new_syntax={} new_linemap={} elapsed={:?}",
+            concat!(
+                "F{} CACHE DIRTY_RERENDER view={:?} dirty_rows={:?}",
+                " new_syntax={} new_linemap={}",
+                " syntax_advances={} skip_right_syntax_advances={} skip_right_eof_fast_paths={}",
+                " elapsed={:?}"
+            ),
             self.frame_num,
             self.view.id,
             reuse.dirty_rows(),
             output.syntax_styles.len(),
             output.line_map.lines.len(),
+            output.metrics.syntax_advances,
+            output.metrics.skip_right_syntax_advances,
+            output.metrics.skip_right_eof_fast_paths,
             self.render_start.elapsed(),
         );
     }
@@ -253,7 +335,11 @@ impl ViewTrace<'_> {
     fn log_refresh(&self, refresh: &RefreshState, output: &RenderOutput) {
         let view_position = refresh.view_position();
         log::info!(
-            "F{} CACHE MISS view={:?} anchor={} voff={} area={}x{} syntax={} lines={} elapsed={:?}",
+            concat!(
+                "F{} CACHE MISS view={:?} anchor={} voff={} area={}x{} syntax={} lines={}",
+                " syntax_advances={} skip_right_syntax_advances={} skip_right_eof_fast_paths={}",
+                " elapsed={:?}"
+            ),
             self.frame_num,
             self.view.id,
             view_position.anchor,
@@ -262,6 +348,9 @@ impl ViewTrace<'_> {
             self.view.area.height,
             output.syntax_styles.len(),
             output.line_map.lines.len(),
+            output.metrics.syntax_advances,
+            output.metrics.skip_right_syntax_advances,
+            output.metrics.skip_right_eof_fast_paths,
             self.render_start.elapsed(),
         );
     }
@@ -327,9 +416,12 @@ impl ViewTrace<'_> {
 ///    lines from overlay fingerprints, re-render only dirty lines. When 0 lines
 ///    are dirty (nothing changed at all), this is a pure blit — zero extra work.
 /// 2. **Content miss** — content changed → full re-render + record syntax styles + line map
+const VIEW_RENDER_CACHE_DOCS_PER_VIEW: usize = 8;
+
 #[derive(Default)]
 struct ViewRenderCache {
-    entries: HashMap<ViewId, ViewRenderCacheEntry>,
+    entries: HashMap<ViewRenderCacheKey, ViewRenderCacheEntry>,
+    order: VecDeque<ViewRenderCacheKey>,
     #[cfg(debug_assertions)]
     hits: u64,
     #[cfg(debug_assertions)]
@@ -343,15 +435,45 @@ struct ViewRenderCache {
 }
 
 impl ViewRenderCache {
-    fn update_overlay_fingerprints(&mut self, view_id: ViewId, overlay_fingerprints: Arc<[u64]>) {
-        if let Some(entry) = self.entries.get_mut(&view_id) {
+    fn update_overlay_fingerprints(
+        &mut self,
+        key: ViewRenderCacheKey,
+        overlay_fingerprints: Arc<[u64]>,
+    ) {
+        if let Some(entry) = self.entries.get_mut(&key) {
             entry.snapshots.paint.overlay_fingerprints = overlay_fingerprints;
         }
     }
 
-    fn store(&mut self, view_id: ViewId, snapshots: RenderSnapshots, cells: tui::buffer::Buffer) {
+    fn store(&mut self, key: ViewRenderCacheKey, snapshots: RenderSnapshots, cells: CellSurface) {
+        self.order.retain(|cached| *cached != key);
+        self.order.push_back(key);
         self.entries
-            .insert(view_id, ViewRenderCacheEntry { snapshots, cells });
+            .insert(key, ViewRenderCacheEntry { snapshots, cells });
+        self.evict_view(key.view);
+    }
+
+    fn retain_active_views(&mut self, active: &HashSet<ViewId>) {
+        self.entries.retain(|key, _| active.contains(&key.view));
+        self.order.retain(|key| active.contains(&key.view));
+    }
+
+    fn evict_view(&mut self, view: ViewId) {
+        while self.order.iter().filter(|key| key.view == view).count()
+            > VIEW_RENDER_CACHE_DOCS_PER_VIEW
+        {
+            let Some(position) = self.order.iter().position(|key| key.view == view) else {
+                return;
+            };
+            if let Some(key) = self.order.remove(position) {
+                self.entries.remove(&key);
+            }
+        }
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.order.clear();
     }
 
     #[cfg(debug_assertions)]
@@ -403,6 +525,41 @@ impl ViewRenderCache {
     fn log_and_reset_stats(&mut self) {}
 }
 
+struct BufferlineModel<'a> {
+    theme: &'a Theme,
+    separator: String,
+    current_doc: DocumentId,
+    documents: Vec<BufferlineDocument<'a>>,
+}
+
+struct BufferlineDocument<'a> {
+    id: DocumentId,
+    label: String,
+    path: Option<&'a std::path::PathBuf>,
+    language_name: Option<&'a str>,
+    is_modified: bool,
+}
+
+impl<'a> BufferlineModel<'a> {
+    fn from_render_context(cx: &RenderContext<'a>, separator: &str) -> Self {
+        Self {
+            theme: cx.theme(),
+            separator: separator.to_owned(),
+            current_doc: cx.focused_document_id(),
+            documents: cx
+                .documents()
+                .map(|doc| BufferlineDocument {
+                    id: doc.id(),
+                    label: cx.buffer_label(doc),
+                    path: doc.path(),
+                    language_name: doc.language_name(),
+                    is_modified: doc.is_modified(),
+                })
+                .collect(),
+        }
+    }
+}
+
 pub struct EditorView {
     pub keymaps: Keymaps,
     /// The editing engine. Always `Some` during normal operation; temporarily
@@ -423,7 +580,7 @@ pub struct EditorView {
     pub prompt_active: bool,
     notification_popup: NotificationPopup,
     /// Per-view render cache for skipping re-render of unchanged views.
-    render_cache: ViewRenderCache,
+    view_cache: ViewRenderCache,
     chrome_cache: CacheStore,
 }
 
@@ -465,27 +622,33 @@ impl EditorView {
 
     fn prepare_statusline(
         &self,
-        editor: &Editor,
+        cx: &RenderContext,
         doc: &Document,
         view: &View,
         is_focused: bool,
     ) -> PreparedRender {
         let statusline_area = view.area.clip_top(view.area.height.saturating_sub(1));
-        let statusline_mode = editor.mode();
-        let statusline_register = self.engine_input_state().selected_register;
+        let config = cx.config();
         let statusline_model = statusline::StatuslineModel::collect(
-            editor,
+            statusline::StatuslineContext {
+                config: &config.statusline,
+                theme: cx.theme(),
+                theme_name: cx.theme_name(),
+                color_modes: config.color_modes,
+                workspace_diagnostics: cx.workspace_diagnostic_counts(),
+                bench_overlay: cx.bench_overlay(),
+                mode: cx.mode(),
+                selected_register: self.engine_input_state().selected_register,
+                spinners: &self.spinners,
+            },
             doc,
             view,
             is_focused,
-            statusline_mode,
-            statusline_register,
-            &self.spinners,
         );
         statusline::Statusline::prepare(statusline_model, statusline_area)
     }
 
-    pub fn new(
+    fn new(
         keymaps: Keymaps,
         engine: Box<dyn helix_view::engine::EditingEngine>,
         registry: std::sync::Arc<helix_modal::registry::CommandRegistry>,
@@ -503,55 +666,50 @@ impl EditorView {
             bufferline_positions: Vec::new(),
             prompt_active: false,
             notification_popup: NotificationPopup::new(),
-            render_cache: ViewRenderCache::default(),
+            view_cache: ViewRenderCache::default(),
             chrome_cache: CacheStore::default(),
         }
     }
 
-    /// Blit cached cells onto the main surface.
-    fn blit(src: &tui::buffer::Buffer, dst: &mut Surface) {
-        let a = src.area;
-        for y in a.top()..a.bottom() {
-            for x in a.left()..a.right() {
-                dst[(x, y)] = src[(x, y)].clone();
-            }
-        }
+    pub fn from_modal_factory(
+        keymaps: Keymaps,
+        factory: &helix_modal::ModalEngineFactory,
+        engine_config: helix_view::editor::EditingEngineConfig,
+    ) -> Self {
+        Self::new(
+            keymaps,
+            factory.create_engine(engine_config),
+            factory.registry(),
+        )
     }
 
-    /// Copy a rectangular region from the surface into a standalone buffer.
-    fn copy_region(src: &Surface, area: Rect) -> tui::buffer::Buffer {
-        let mut buf = tui::buffer::Buffer::empty(area);
-        for y in area.top()..area.bottom() {
-            for x in area.left()..area.right() {
-                buf[(x, y)] = src[(x, y)].clone();
-            }
-        }
-        buf
-    }
-
-    fn blit_cached_view(&self, view_id: ViewId, surface: &mut Surface) {
-        if let Some(cached) = self.render_cache.entries.get(&view_id) {
-            Self::blit(&cached.cells, surface);
+    fn blit_cached_view(
+        cache: &ViewRenderCache,
+        key: ViewRenderCacheKey,
+        surface: &mut CellSurface,
+    ) {
+        if let Some(cached) = cache.entries.get(&key) {
+            blit_cells(&cached.cells, surface);
         }
     }
 
     fn store_view_render(
-        &mut self,
+        cache: &mut ViewRenderCache,
         frame: &ViewFrame<'_>,
         snapshots: RenderSnapshots,
-        surface: &Surface,
+        surface: &CellSurface,
     ) {
         frame.update_cursor_cache(&snapshots.layout);
         let copy_start = std::time::Instant::now();
-        let cells = Self::copy_region(surface, Self::content_area(frame.view()));
+        let cells = copy_cell_region(surface, Self::content_area(frame.view()));
         frame.trace.log_copy_region(copy_start);
-        self.render_cache.store(frame.view_id(), snapshots, cells);
+        cache.store(frame.cache_key(), snapshots, cells);
     }
 
     fn render_pass(
-        &mut self,
+        &self,
         frame: &ViewFrame<'_>,
-        surface: &mut Surface,
+        surface: &mut CellSurface,
         request: RenderRequest<'_>,
         phase: RenderPhase,
     ) -> RenderOutput {
@@ -566,25 +724,24 @@ impl EditorView {
     }
 
     fn render_reuse_plan(
-        &mut self,
+        &self,
+        cache: &mut ViewRenderCache,
         frame: ViewFrame<'_>,
-        surface: &mut Surface,
+        surface: &mut CellSurface,
         reuse: ReuseState,
     ) {
         let blit_start = std::time::Instant::now();
-        self.blit_cached_view(frame.view_id(), surface);
+        Self::blit_cached_view(cache, frame.cache_key(), surface);
         frame.trace.log_blit(blit_start);
 
         frame.update_cursor_cache(&reuse.layout_snapshot());
         frame.trace.log_reuse(&reuse);
 
-        self.render_cache
-            .record_hit(reuse.dirty_count(), reuse.line_count());
+        cache.record_hit(reuse.dirty_count(), reuse.line_count());
 
         if reuse.is_clean() {
             frame.trace.log_pure_reuse();
-            self.render_cache
-                .update_overlay_fingerprints(frame.view_id(), reuse.overlay_fingerprints());
+            cache.update_overlay_fingerprints(frame.cache_key(), reuse.overlay_fingerprints());
             return;
         }
 
@@ -607,17 +764,18 @@ impl EditorView {
         frame.trace.log_dirty_reuse(&reuse, &render_output);
 
         let snapshots = reuse.into_snapshots(render_output.line_map, render_output.syntax_styles);
-        self.store_view_render(&frame, snapshots, surface);
+        Self::store_view_render(cache, &frame, snapshots, surface);
         frame.trace.log_render_total(phase);
     }
 
     fn render_refresh_plan(
-        &mut self,
+        &self,
+        cache: &mut ViewRenderCache,
         frame: ViewFrame<'_>,
-        surface: &mut Surface,
+        surface: &mut CellSurface,
         refresh: RefreshState,
     ) {
-        self.render_cache.record_miss();
+        cache.record_miss();
 
         let render_output = self.render_pass(
             &frame,
@@ -646,15 +804,80 @@ impl EditorView {
             render_output.syntax_styles,
             overlay_fingerprints,
         );
-        self.store_view_render(&frame, snapshots, surface);
+        Self::store_view_render(cache, &frame, snapshots, surface);
         frame.trace.log_render_total(RenderPhase::Full);
+    }
+
+    fn render_views(
+        &self,
+        area: Rect,
+        surface: &mut CellSurface,
+        cx: &RenderContext,
+        cache: &mut ViewRenderCache,
+        frame_num: u64,
+        render_start: std::time::Instant,
+    ) {
+        cache.record_frame();
+
+        log::debug!(
+            "[editor_render] area=({},{} {}x{}) views={}",
+            area.x,
+            area.y,
+            area.width,
+            area.height,
+            cx.views().count(),
+        );
+        for (view, is_focused) in cx.views() {
+            let view_render_start = std::time::Instant::now();
+            let doc = cx.document(view.doc).unwrap();
+            let selection = doc.selection(view.id);
+
+            let frame = ViewFrame {
+                snapshot: ViewFrameSnapshot {
+                    config: cx.config(),
+                    config_gen: cx.config_gen(),
+                    theme: cx.theme(),
+                    theme_name: cx.theme_name(),
+                    mode: cx.mode(),
+                    syntax_loader: cx.syntax_loader(),
+                    cursor_cache: cx.cursor_cache(),
+                    focused_view_id: cx.focused_view_id(),
+                    breakpoints: cx.breakpoints_for_document(doc),
+                    debug_execution: cx.debug_execution_position(),
+                },
+                doc,
+                trace: ViewTrace {
+                    view,
+                    selection,
+                    is_focused,
+                    frame_num,
+                    view_render_start,
+                    render_start,
+                },
+                area,
+            };
+            frame.trace.log_state();
+
+            match frame.render_state(
+                cache
+                    .entries
+                    .get(&ViewRenderCacheKey::new(view.id, view.doc))
+                    .map(|entry| entry.snapshots.as_ref()),
+                self.terminal_focused,
+            ) {
+                RenderState::Reuse(reuse) => self.render_reuse_plan(cache, frame, surface, reuse),
+                RenderState::Refresh(refresh) => {
+                    self.render_refresh_plan(cache, frame, surface, refresh)
+                }
+            }
+        }
     }
 
     pub fn spinners_mut(&mut self) -> &mut ProgressSpinners {
         &mut self.spinners
     }
 
-    pub fn draw_welcome(theme: &Theme, view: &View, surface: &mut Surface, is_colorful: bool) {
+    pub fn draw_welcome(theme: &Theme, view: &View, surface: &mut CellSurface, is_colorful: bool) {
         /// Logo for Helix
         const LOGO_STR: &str = "\
 **             
@@ -895,14 +1118,19 @@ impl EditorView {
             let y = start_drawing_at_y + lines_drawn as u16;
 
             // Draw a single line of the help text
-            surface.set_spans(x_start_help, y, line, line.width() as u16);
+            surface.set_line(
+                x_start_help,
+                y,
+                &tui::ratatui::to_ratatui_line(line),
+                line.width() as u16,
+            );
 
             if show_logo {
                 // Draw a single line of the logo
-                surface.set_spans(
+                surface.set_line(
                     x_start_left_help - LOGO_LEFT_PADDING - *LOGO_WIDTH,
                     y,
-                    &logo[lines_drawn],
+                    &tui::ratatui::to_ratatui_line(&logo[lines_drawn]),
                     *LOGO_WIDTH,
                 );
             }
@@ -910,26 +1138,32 @@ impl EditorView {
     }
 
     pub(crate) fn render_view(
-        &mut self,
+        &self,
         vctx: &ViewRenderContext<'_>,
-        surface: &mut Surface,
+        surface: &mut CellSurface,
     ) -> RenderOutput {
         let ViewRenderContext {
-            editor,
             doc,
             view,
             viewport,
             is_focused,
+            config,
+            config_gen,
+            theme,
+            mode,
+            syntax_loader,
+            cursor_cache,
+            gutter_context,
+            debug_execution,
             cached_syntax,
             dirty_rows,
             seed_line_map,
+            ..
         } = vctx;
         let is_focused = *is_focused;
         let inner = view.inner_area(doc);
         let area = view.area;
-        let theme = &editor.theme;
-        let config = editor.config();
-        let loader = editor.syn_loader.load();
+        let loader = syntax_loader.load();
 
         let view_offset = doc.view_offset(view.id);
 
@@ -945,7 +1179,10 @@ impl EditorView {
         let mut decorations = DecorationManager::default();
 
         if !(is_focused && self.terminal_focused) {
-            surface.set_style(area, theme.get("ui.background.inactive"))
+            surface.set_style(
+                tui::ratatui::to_ratatui_rect(area),
+                tui::ratatui::to_ratatui_style(theme.get("ui.background.inactive")),
+            )
         }
 
         if is_focused && config.cursorline {
@@ -966,8 +1203,8 @@ impl EditorView {
         }
 
         // Set DAP highlights, if needed.
-        if let Some(frame) = editor.current_stack_frame() {
-            let dap_line = frame.line.saturating_sub(1);
+        if let Some(position) = debug_execution {
+            let dap_line = position.line;
             let style = theme.get("ui.highlight.frameline");
             let line_decoration = move |renderer: &mut TextRenderer, pos: LinePos| {
                 if pos.doc_line != dap_line {
@@ -1030,7 +1267,7 @@ impl EditorView {
             }
             overlays.push(doc.selection_highlights(
                 view.id,
-                editor.mode(),
+                *mode,
                 theme,
                 &config.cursor_shape,
                 self.terminal_focused,
@@ -1051,7 +1288,7 @@ impl EditorView {
         if !gutter_overflow {
             let gutter_start = std::time::Instant::now();
             Self::render_gutter(
-                editor,
+                gutter_context,
                 doc,
                 view,
                 view.area,
@@ -1091,7 +1328,7 @@ impl EditorView {
             .cursor(doc.text().slice(..));
         if is_focused {
             decorations.add_decoration(text_decorations::Cursor {
-                cache: &editor.cursor_cache,
+                cache: cursor_cache,
                 primary_cursor,
             });
         }
@@ -1114,7 +1351,7 @@ impl EditorView {
         let top_doc_line = doc
             .text()
             .char_to_line(view_offset.anchor.min(doc.text().len_chars()));
-        let layout_inputs = view.layout_inputs(doc, editor.config_gen);
+        let layout_inputs = view.layout_inputs(doc, *config_gen);
         let render_seed = seed_line_map.and_then(|line_map| {
             layout_inputs.render_seed(line_map, top_doc_line, MAX_SEED_LINE_MAP_GAP)
         });
@@ -1142,7 +1379,15 @@ impl EditorView {
 
         // Draw rulers after document. Skip cells that already have content.
         let rulers_start = std::time::Instant::now();
-        Self::draw_rulers(editor, doc, view, inner, surface, theme);
+        Self::draw_rulers(
+            &config.rulers,
+            &config.ruler_char,
+            doc,
+            view,
+            inner,
+            surface,
+            theme,
+        );
         helix_view::bench::log_run_phase("render_view", "rulers", rulers_start.elapsed(), || {
             format!("view_id={:?}", view.id)
         });
@@ -1153,10 +1398,12 @@ impl EditorView {
             let x = area.right();
             let border_style = theme.get("ui.window");
             for y in area.top()..area.bottom() {
-                surface[(x, y)]
-                    .set_symbol(tui::symbols::line::VERTICAL)
-                    //.set_symbol(" ")
-                    .set_style(border_style);
+                {
+                    if let Some(cell) = surface.cell_mut((x, y)) {
+                        cell.set_symbol(tui::symbols::line::VERTICAL);
+                        cell.set_style(tui::ratatui::to_ratatui_style(border_style));
+                    }
+                };
             }
             helix_view::bench::log_run_phase(
                 "render_view",
@@ -1190,13 +1437,25 @@ impl EditorView {
         theme: &Theme,
     ) {
         const INLINE_BLAME_SCOPE: &str = "ui.virtual.inline-blame";
+        // Blame is metadata — it should never compete with the
+        // actual code for the reader's attention. Fall back through
+        // `comment` and `ui.text.inactive` so themes that haven't
+        // defined the scope still get a dim presentation. Without
+        // this fallback, the default style is `ui.text` which
+        // makes the blame look like code, which is the opposite of
+        // what we want.
+        let blame_style = theme
+            .try_get(INLINE_BLAME_SCOPE)
+            .or_else(|| theme.try_get("comment"))
+            .or_else(|| theme.try_get("ui.text.inactive"))
+            .unwrap_or_else(|| theme.get("ui.text"));
         let text = doc.text();
         match inline_blame.show {
             InlineBlameShow::Never => (),
             InlineBlameShow::CursorLine => {
                 if let Some(line_blame) = doc.line_blame_at_cursor(view.id, &inline_blame.format) {
                     decorations.add_decoration(InlineBlame::new(
-                        theme.get(INLINE_BLAME_SCOPE),
+                        blame_style,
                         text_decorations::blame::LineBlame::OneLine(line_blame),
                     ));
                 }
@@ -1209,7 +1468,7 @@ impl EditorView {
                 }
 
                 decorations.add_decoration(InlineBlame::new(
-                    theme.get(INLINE_BLAME_SCOPE),
+                    blame_style,
                     text_decorations::blame::LineBlame::ManyLines(blame_lines),
                 ));
             }
@@ -1217,15 +1476,14 @@ impl EditorView {
     }
 
     pub fn draw_rulers(
-        editor: &Editor,
+        editor_rulers: &[u16],
+        ruler_char: &str,
         doc: &Document,
         view: &View,
         viewport: Rect,
-        surface: &mut Surface,
+        surface: &mut CellSurface,
         theme: &Theme,
     ) {
-        let editor_rulers = &editor.config().rulers;
-        let ruler_char = &editor.config().ruler_char;
         // Base style from theme for rulers
         let base_style = theme.try_get("ui.virtual.ruler").unwrap_or_default();
         // Background style is used only for background-style rulers. If theme lacks a bg, reuse fg.
@@ -1247,10 +1505,16 @@ impl EditorView {
                 if ruler_char.is_empty() {
                     // Background-style ruler: only apply to cells without content
                     for y in area.top()..area.bottom() {
-                        let cell = &surface[(area.x, y)];
                         // Skip cells that have non-whitespace content (like diagnostic bubbles)
-                        if &*cell.symbol == " " || cell.symbol.is_empty() {
-                            surface[(area.x, y)].set_style(bg_style);
+                        if surface
+                            .cell((area.x, y))
+                            .is_some_and(|cell| cell.symbol() == " " || cell.symbol().is_empty())
+                        {
+                            {
+                                if let Some(cell) = surface.cell_mut((area.x, y)) {
+                                    cell.set_style(tui::ratatui::to_ratatui_style(bg_style));
+                                }
+                            };
                         }
                     }
                 } else {
@@ -1261,40 +1525,43 @@ impl EditorView {
                         glyph_style = glyph_style.fg(Color::Gray);
                     }
                     for y in area.top()..area.bottom() {
-                        let cell = &surface[(area.x, y)];
                         // Only draw ruler glyph on empty/space cells to avoid overwriting content
-                        if &*cell.symbol == " " || cell.symbol.is_empty() {
-                            surface[(area.x, y)]
-                                .set_symbol(ruler_char)
-                                .set_style(glyph_style);
+                        if surface
+                            .cell((area.x, y))
+                            .is_some_and(|cell| cell.symbol() == " " || cell.symbol().is_empty())
+                        {
+                            {
+                                if let Some(cell) = surface.cell_mut((area.x, y)) {
+                                    cell.set_symbol(ruler_char);
+                                    cell.set_style(tui::ratatui::to_ratatui_style(glyph_style));
+                                }
+                            };
                         }
                     }
                 }
             })
     }
 
-    /// Render bufferline at the top
-    pub fn draw_bufferline(&mut self, editor: &Editor, viewport: Rect, surface: &mut Surface) {
+    /// Render bufferline at the top from an explicit render model.
+    fn draw_bufferline_model(
+        &mut self,
+        model: &BufferlineModel<'_>,
+        viewport: Rect,
+        surface: &mut CellSurface,
+    ) {
+        let bufferline_styles = crate::ui::design::BufferlineStyles::from_theme(model.theme);
         self.bufferline_positions.clear();
-        surface.clear_with(
-            viewport,
-            editor
-                .theme
-                .try_get("ui.bufferline.background")
-                .unwrap_or_else(|| editor.theme.get("ui.statusline")),
-        );
+        {
+            let area = tui::ratatui::to_ratatui_rect(viewport);
+            tui::ratatui::widgets::Widget::render(tui::ratatui::widgets::Clear, area, surface);
+            surface.set_style(
+                area,
+                tui::ratatui::to_ratatui_style(bufferline_styles.background),
+            );
+        };
 
-        let bufferline_active = editor
-            .theme
-            .try_get("ui.bufferline.active")
-            .unwrap_or_else(|| editor.theme.get("ui.statusline.active"));
-
-        let bufferline_inactive = editor
-            .theme
-            .try_get("ui.bufferline")
-            .unwrap_or_else(|| editor.theme.get("ui.statusline.inactive"));
-
-        let current_doc = view!(editor).doc;
+        let bufferline_active = bufferline_styles.active;
+        let bufferline_inactive = bufferline_styles.inactive;
 
         self.bufferline_info.clear();
 
@@ -1303,31 +1570,32 @@ impl EditorView {
         let mut buffer_texts = Vec::new();
         let mut buffer_widths = Vec::new();
 
-        for (idx, doc) in editor.documents().enumerate() {
-            let fname = editor.buffer_label(doc);
-
+        for (idx, doc) in model.documents.iter().enumerate() {
             // Add separator width if not the first document
             if idx > 0 {
-                let sep = &editor.config().bufferline.separator;
-                total_width += UnicodeWidthStr::width(sep.as_str()) as u16;
+                let sep = model.separator.as_str();
+                total_width += UnicodeWidthStr::width(sep) as u16;
             }
 
             let icons = ICONS.load();
 
-            let text = if doc.path().is_some() {
-                if let Some(icon) = icons.mime().get(doc.path(), doc.language_name()) {
-                    format!(
-                        "{} {}{}",
-                        icon.glyph(),
-                        fname,
-                        if doc.is_modified() { " [+]" } else { "" }
-                    )
+            // Modified state shown as a single `●` (1 cell) instead
+            // of the older `[+]` (3 cells) text marker. The dot is
+            // a known visual idiom for "unsaved" across many editors,
+            // takes less bufferline real estate, and we accent it
+            // separately at paint time so it stands out against the
+            // tab label even on themes that don't style modifiers.
+            let modified_suffix = if doc.is_modified { " ●" } else { "" };
+            let label = if doc.path.is_some() {
+                if let Some(icon) = icons.mime().get(doc.path, doc.language_name) {
+                    format!("{} {}{}", icon.glyph(), doc.label, modified_suffix)
                 } else {
-                    format!("{}{}", fname, if doc.is_modified() { " [+]" } else { "" })
+                    format!("{}{}", doc.label, modified_suffix)
                 }
             } else {
-                format!("{}{}", fname, if doc.is_modified() { " [+]" } else { "" })
+                format!("{}{}", doc.label, modified_suffix)
             };
+            let text = format!(" {label} ");
 
             self.bufferline_positions.push(total_width);
             let text_width = UnicodeWidthStr::width(text.as_str()) as u16;
@@ -1337,33 +1605,36 @@ impl EditorView {
         }
 
         // Determine scroll offset
-        let scroll_offset =
-            if let Some(current_idx) = editor.documents().position(|d| d.id() == current_doc) {
-                if let Some(&target_x) = self.bufferline_positions.get(current_idx) {
-                    if target_x >= viewport.width / 2 {
-                        target_x
-                            .saturating_sub(viewport.width / 2)
-                            .min(total_width.saturating_sub(viewport.width))
-                    } else {
-                        0
-                    }
+        let scroll_offset = if let Some(current_idx) = model
+            .documents
+            .iter()
+            .position(|doc| doc.id == model.current_doc)
+        {
+            if let Some(&target_x) = self.bufferline_positions.get(current_idx) {
+                if target_x >= viewport.width / 2 {
+                    target_x
+                        .saturating_sub(viewport.width / 2)
+                        .min(total_width.saturating_sub(viewport.width))
                 } else {
                     0
                 }
             } else {
                 0
-            };
+            }
+        } else {
+            0
+        };
 
         // Second pass: render with the calculated offset
-        for (idx, doc) in editor.documents().enumerate() {
+        for (idx, doc) in model.documents.iter().enumerate() {
             let buffer_x = self.bufferline_positions[idx];
             let text = &buffer_texts[idx];
 
             // Render separator if not first document
             if idx > 0 {
-                let sep = &editor.config().bufferline.separator;
+                let sep = model.separator.as_str();
                 let sep_x = buffer_x
-                    .saturating_sub(UnicodeWidthStr::width(sep.as_str()) as u16)
+                    .saturating_sub(UnicodeWidthStr::width(sep) as u16)
                     .saturating_sub(scroll_offset);
                 if sep_x < viewport.width {
                     let render_x = viewport.x + sep_x;
@@ -1372,7 +1643,7 @@ impl EditorView {
                         viewport.y,
                         sep,
                         (viewport.width - sep_x) as usize,
-                        bufferline_inactive,
+                        tui::ratatui::to_ratatui_style(bufferline_inactive),
                     );
                 }
             }
@@ -1388,7 +1659,7 @@ impl EditorView {
                 continue;
             }
 
-            let style = if current_doc == doc.id() {
+            let style = if model.current_doc == doc.id {
                 bufferline_active
             } else {
                 bufferline_inactive
@@ -1412,20 +1683,84 @@ impl EditorView {
                 viewport.y,
                 &visible_text,
                 available_width as usize,
-                style,
+                tui::ratatui::to_ratatui_style(style),
             );
+
+            // Accent the modified-dot when present so it reads at a
+            // glance against the tab label. Falls back through
+            // `ui.statusline.modified` → `warning` → the base tab
+            // style so any theme yields a sensible color without a
+            // dedicated scope. We compute the dot's screen column by
+            // measuring the visible text (which may have been clipped
+            // from the left during horizontal scroll); if the dot
+            // itself was clipped out, the lookup returns out-of-bounds
+            // and we skip the overpaint.
+            if doc.is_modified {
+                let visible_width = UnicodeWidthStr::width(visible_text.as_str()) as u16;
+                // text is ` ... ● ` — the `●` sits at width-2 from
+                // the start (one cell of trailing space after it).
+                if visible_width >= 2 && visible_text.ends_with("● ") {
+                    let dot_x = actual_render_x + visible_width - 2;
+                    if dot_x < viewport.x + viewport.width {
+                        let accent = model
+                            .theme
+                            .try_get("ui.statusline.modified")
+                            .or_else(|| model.theme.try_get("warning"))
+                            .unwrap_or(style);
+                        surface.set_stringn(
+                            dot_x,
+                            viewport.y,
+                            "●",
+                            1,
+                            tui::ratatui::to_ratatui_style(style.patch(accent)),
+                        );
+                    }
+                }
+            }
 
             // Track buffer info for mouse clicks (adjust for scroll offset)
             let start_x = actual_render_x;
             let end_x = (actual_render_x + UnicodeWidthStr::width(visible_text.as_str()) as u16)
                 .min(viewport.x + viewport.width);
-            self.bufferline_info
-                .add_buffer_info(doc.id(), start_x..end_x);
+            self.bufferline_info.add_buffer_info(doc.id, start_x..end_x);
+        }
+
+        // Overflow chevrons — when the bufferline is wider than the
+        // viewport, paint `‹` and `›` at the edges so users notice
+        // there are more tabs to scroll to. Otherwise the only cue
+        // is the inactive label color trailing off, which is easy to
+        // miss with many buffers open. Chevrons sit in the muted
+        // chrome color so they read as affordances, not labels —
+        // and they overpaint the first/last cell of whatever tab
+        // text was there, which loses one character but gains the
+        // visibility cue (tabs are 5+ cells already).
+        let has_left_overflow = scroll_offset > 0;
+        let has_right_overflow = total_width.saturating_sub(scroll_offset) > viewport.width;
+        let chevron_style = bufferline_styles
+            .inactive
+            .patch(model.theme.try_get("ui.text.inactive").unwrap_or_default());
+        if has_left_overflow && viewport.width > 0 {
+            surface.set_stringn(
+                viewport.x,
+                viewport.y,
+                "‹",
+                1,
+                tui::ratatui::to_ratatui_style(chevron_style),
+            );
+        }
+        if has_right_overflow && viewport.width > 0 {
+            surface.set_stringn(
+                viewport.x + viewport.width - 1,
+                viewport.y,
+                "›",
+                1,
+                tui::ratatui::to_ratatui_style(chevron_style),
+            );
         }
     }
 
     pub fn render_gutter<'d>(
-        editor: &'d Editor,
+        gutter_context: &'d GutterContext<'d>,
         doc: &'d Document,
         view: &View,
         viewport: Rect,
@@ -1438,13 +1773,10 @@ impl EditorView {
 
         let mut offset = 0;
 
-        let gutter_style = theme.get("ui.gutter");
-        let gutter_selected_style = theme.get("ui.gutter.selected");
-        let gutter_style_virtual = theme.get("ui.gutter.virtual");
-        let gutter_selected_style_virtual = theme.get("ui.gutter.selected.virtual");
+        let gutter_styles = crate::ui::design::GutterStyles::from_theme(theme);
 
         for gutter_type in view.gutters() {
-            let mut gutter = gutter_type.style(editor, doc, view, theme, is_focused);
+            let mut gutter = gutter_type.style(gutter_context, doc, view, theme, is_focused);
             let width = gutter_type.width(view, doc);
             // avoid lots of small allocations by reusing a text buffer for each line
             let mut text = String::with_capacity(width);
@@ -1456,10 +1788,10 @@ impl EditorView {
                 let y = pos.visual_line;
 
                 let gutter_style = match (selected, pos.first_visual_line) {
-                    (false, true) => gutter_style,
-                    (true, true) => gutter_selected_style,
-                    (false, false) => gutter_style_virtual,
-                    (true, false) => gutter_selected_style_virtual,
+                    (false, true) => gutter_styles.base,
+                    (true, true) => gutter_styles.selected,
+                    (false, false) => gutter_styles.virtual_line,
+                    (true, false) => gutter_styles.selected_virtual,
                 };
 
                 if let Some(style) =
@@ -1489,15 +1821,15 @@ impl EditorView {
         doc: &Document,
         view: &View,
         viewport: Rect,
-        surface: &mut Surface,
+        surface: &mut CellSurface,
         theme: &Theme,
     ) {
         use helix_core::diagnostic::Severity;
-        use tui::{
+        use tui::ratatui::{
             layout::Alignment,
-            text::Text,
             widgets::{Paragraph, Widget, Wrap},
         };
+        use tui::text::Text;
 
         let diagnostics = doc.diagnostics_at_cursor(view.id);
 
@@ -1530,13 +1862,18 @@ impl EditorView {
         }
 
         let text = Text::from(lines);
-        let paragraph = Paragraph::new(&text)
+        let paragraph = Paragraph::new(tui::ratatui::to_ratatui_text(&text))
             .alignment(Alignment::Right)
             .wrap(Wrap { trim: true });
         let width = 100.min(viewport.width);
         let height = 15.min(viewport.height);
         paragraph.render(
-            Rect::new(viewport.right() - width, viewport.y + 1, width, height),
+            tui::ratatui::to_ratatui_rect(Rect::new(
+                viewport.right() - width,
+                viewport.y + 1,
+                width,
+                height,
+            )),
             surface,
         );
     }
@@ -1545,16 +1882,15 @@ impl EditorView {
     pub fn cursor_line_decoration(doc: &Document, view: &View, theme: &Theme) -> impl Decoration {
         let (primary_line, secondary_lines) = doc.cursor_lines(view.id);
 
-        let primary_style = theme.get("ui.cursorline.primary");
-        let secondary_style = theme.get("ui.cursorline.secondary");
+        let cursorline_styles = crate::ui::design::CursorLineStyles::from_theme(theme);
         let viewport = view.area;
 
         move |renderer: &mut TextRenderer, pos: LinePos| {
             let area = Rect::new(viewport.x, pos.visual_line, viewport.width, 1);
             if primary_line == pos.doc_line {
-                renderer.set_style(area, primary_style);
+                renderer.set_style(area, cursorline_styles.primary);
             } else if secondary_lines.binary_search(&pos.doc_line).is_ok() {
-                renderer.set_style(area, secondary_style);
+                renderer.set_style(area, cursorline_styles.secondary);
             }
         }
     }
@@ -1563,23 +1899,16 @@ impl EditorView {
     pub fn draw_cursor_column(
         doc: &Document,
         view: &View,
-        surface: &mut Surface,
+        surface: &mut CellSurface,
         theme: &Theme,
         viewport: Rect,
         text_annotations: &TextAnnotations,
     ) {
         let text = doc.text().slice(..);
 
-        // Manual fallback behaviour:
-        // ui.cursorcolumn.{p/s} -> ui.cursorcolumn -> ui.cursorline.{p/s}
-        let primary_style = theme
-            .try_get_exact("ui.cursorcolumn.primary")
-            .or_else(|| theme.try_get_exact("ui.cursorcolumn"))
-            .unwrap_or_else(|| theme.get("ui.cursorline.primary"));
-        let secondary_style = theme
-            .try_get_exact("ui.cursorcolumn.secondary")
-            .or_else(|| theme.try_get_exact("ui.cursorcolumn"))
-            .unwrap_or_else(|| theme.get("ui.cursorline.secondary"));
+        let cursorline_styles = crate::ui::design::CursorLineStyles::from_theme(theme);
+        let primary_style = cursorline_styles.column_primary;
+        let secondary_style = cursorline_styles.column_secondary;
 
         let inner_area = view.inner_area(doc);
 
@@ -1605,9 +1934,15 @@ impl EditorView {
                     view.area.height,
                 );
                 if is_primary {
-                    surface.set_style(area, primary_style)
+                    surface.set_style(
+                        tui::ratatui::to_ratatui_rect(area),
+                        tui::ratatui::to_ratatui_style(primary_style),
+                    )
                 } else {
-                    surface.set_style(area, secondary_style)
+                    surface.set_style(
+                        tui::ratatui::to_ratatui_rect(area),
+                        tui::ratatui::to_ratatui_style(secondary_style),
+                    )
                 }
             }
         }
@@ -1913,7 +2248,7 @@ impl EditorView {
         items: Vec<CompletionItem>,
         trigger_offset: usize,
         size: Rect,
-        ingress: helix_runtime::Sender<RuntimeEvent>,
+        ingress: crate::runtime::RuntimeIngress,
     ) -> Option<Rect> {
         let mut completion = Completion::new(
             editor,
@@ -2153,7 +2488,8 @@ impl EditorView {
                         exit_tasks: cxt.exit_tasks,
                         exit_task_work: cxt.exit_task_work.clone(),
                         ingress: cxt.ingress.clone(),
-                        idle_reset_tx: cxt.idle_reset_tx.clone(),
+                        redraw: cxt.redraw.clone(),
+                        idle_reset: cxt.idle_reset.clone(),
                         plugin_manager: cxt.plugin_manager.clone(),
                     };
                     commands::scroll(&mut scroll_cx, offset, direction, false);
@@ -2296,7 +2632,8 @@ impl Component for EditorView {
             exit_tasks: context.exit_tasks,
             exit_task_work: context.exit_task_work.clone(),
             ingress: context.ingress.clone(),
-            idle_reset_tx: context.idle_reset_tx.clone(),
+            redraw: context.redraw.clone(),
+            idle_reset: context.idle_reset.clone(),
             plugin_manager: context.plugin_manager.clone(),
         };
 
@@ -2324,7 +2661,7 @@ impl Component for EditorView {
             Event::Resize(_width, _height) => {
                 // Ignore this event, we handle resizing just before rendering to screen.
                 // Handling it here but not re-rendering will cause flashing
-                self.render_cache.entries.clear();
+                self.view_cache.clear();
                 EventResult::Consumed(None)
             }
             Event::Key(key) => {
@@ -2345,23 +2682,14 @@ impl Component for EditorView {
                         let mut consumed = false;
                         if let Some(completion) = &mut self.completion {
                             let res = {
-                                let mut cx = Context {
-                                    editor: cx.editor,
-                                    exit_tasks: cx.exit_tasks,
-                                    exit_task_work: cx.exit_task_work.clone(),
-                                    scroll: None,
-                                    notifier: cx.notifier.clone(),
-                                    ingress: cx.ingress.clone(),
-                                    idle_reset_tx: cx.idle_reset_tx.clone(),
-                                    plugin_manager: cx.plugin_manager.clone(),
-                                };
+                                let mut completion_cx = cx.compositor_context();
                                 if let EventResult::Consumed(callback) =
-                                    completion.handle_event(event, &mut cx)
+                                    completion.handle_event(event, &mut completion_cx)
                                 {
                                     consumed = true;
                                     Some(callback)
-                                } else if let EventResult::Consumed(callback) =
-                                    completion.handle_event(&Event::Key(key!(Enter)), &mut cx)
+                                } else if let EventResult::Consumed(callback) = completion
+                                    .handle_event(&Event::Key(key!(Enter)), &mut completion_cx)
                                 {
                                     Some(callback)
                                 } else {
@@ -2483,7 +2811,7 @@ impl Component for EditorView {
             Event::IdleTimeout => self.handle_idle_timeout(&mut cx),
             Event::FocusGained => {
                 self.terminal_focused = true;
-                self.render_cache.entries.clear();
+                self.view_cache.clear();
                 EventResult::Consumed(None)
             }
             Event::FocusLost => {
@@ -2498,7 +2826,7 @@ impl Component for EditorView {
                     }
                 }
                 self.terminal_focused = false;
-                self.render_cache.entries.clear();
+                self.view_cache.clear();
                 EventResult::Consumed(None)
             }
         }
@@ -2519,53 +2847,50 @@ impl Component for EditorView {
         crate::compositor::LayoutRole::Fill
     }
 
-    fn render(&mut self, area: Rect, surface: &mut Surface, cx: &RenderContext) {
-        // clear with background color
+    fn render(&mut self, area: Rect, surface: &mut CellSurface, cx: &RenderContext) {
         static FRAME_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let frame_num = FRAME_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let render_start = std::time::Instant::now();
         let clear_start = std::time::Instant::now();
-        surface.set_style(area, cx.editor.theme.get("ui.background"));
+        surface.set_style(
+            tui::ratatui::to_ratatui_rect(area),
+            tui::ratatui::to_ratatui_style(cx.style("ui.background")),
+        );
         helix_view::bench::log_run_phase(
             "editor_render",
-            "clear_background",
+            "clear_background_ratatui",
             clear_start.elapsed(),
             || format!("area={}x{}", area.width, area.height),
         );
-        let config = cx.editor.config();
+        let config = cx.config();
 
-        // check if bufferline should be rendered
         use helix_view::editor::BufferLineRenderMode;
         let use_bufferline = match config.bufferline.render_mode {
             BufferLineRenderMode::Always => true,
-            BufferLineRenderMode::Multiple if cx.editor.has_multiple_documents() => true,
+            BufferLineRenderMode::Multiple if cx.has_multiple_documents() => true,
             _ => false,
         };
-
-        // NOTE: editor.resize(editor_area) is now done in compositor pre-render.
 
         if use_bufferline {
             let bufferline_start = std::time::Instant::now();
             let bufferline_area = area.with_height(1);
             let mut output = crate::render::RenderOutput::new(bufferline_area);
-            self.draw_bufferline(cx.editor, bufferline_area, &mut output.surface);
+            let model =
+                BufferlineModel::from_render_context(cx, config.bufferline.separator.as_str());
+            self.draw_bufferline_model(&model, bufferline_area, output.surface_mut());
             let prepared = PreparedRender::ready(output);
             self.chrome_cache.compose(prepared, surface);
             helix_view::bench::log_run_phase(
                 "editor_render",
-                "bufferline",
+                "bufferline_ratatui",
                 bufferline_start.elapsed(),
                 || format!("area={}x{}", area.width, 1),
             );
         }
 
-        // Evict cache entries for views that no longer exist.
         {
-            let active: std::collections::HashSet<ViewId> =
-                cx.editor.tree.views().map(|(v, _)| v.id).collect();
-            self.render_cache
-                .entries
-                .retain(|id, _| active.contains(id));
+            let active: std::collections::HashSet<ViewId> = cx.views().map(|(v, _)| v.id).collect();
+            self.view_cache.retain_active_views(&active);
             self.chrome_cache.retain(|id| {
                 active
                     .iter()
@@ -2573,99 +2898,36 @@ impl Component for EditorView {
             });
         }
 
-        self.render_cache.record_frame();
+        let mut view_cache = std::mem::take(&mut self.view_cache);
+        self.render_views(area, surface, cx, &mut view_cache, frame_num, render_start);
+        self.view_cache = view_cache;
 
-        log::warn!(
-            "[editor_render] area=({},{} {}x{}) views={}",
-            area.x,
-            area.y,
-            area.width,
-            area.height,
-            cx.editor.tree.views().count(),
-        );
-        for (view, is_focused) in cx.editor.tree.views() {
-            let view_render_start = std::time::Instant::now();
-            let doc = cx.editor.document(view.doc).unwrap();
-            let selection = doc.selection(view.id);
-
-            let frame = ViewFrame {
-                editor: cx.editor,
-                doc,
-                trace: ViewTrace {
-                    view,
-                    selection,
-                    is_focused,
-                    frame_num,
-                    view_render_start,
-                    render_start,
-                },
-                area,
-            };
-            frame.trace.log_state();
-
-            match frame.render_state(
-                self.render_cache
-                    .entries
-                    .get(&view.id)
-                    .map(|entry| entry.snapshots.as_ref()),
-                self.terminal_focused,
-            ) {
-                RenderState::Reuse(reuse) => self.render_reuse_plan(frame, surface, reuse),
-                RenderState::Refresh(refresh) => self.render_refresh_plan(frame, surface, refresh),
-            }
-        }
-
-        // Batch all statusline renders and execute deferred work in parallel.
         {
             let statusline_start = std::time::Instant::now();
             let batch: Vec<PreparedRender> = cx
-                .editor
-                .tree
                 .views()
                 .map(|(view, is_focused)| {
-                    let doc = cx.editor.document(view.doc).unwrap();
-                    self.prepare_statusline(cx.editor, doc, view, is_focused)
+                    let doc = cx.document(view.doc).unwrap();
+                    self.prepare_statusline(cx, doc, view, is_focused)
                 })
                 .collect();
             let count = batch.len();
             self.chrome_cache.compose_batch(batch, surface);
             helix_view::bench::log_run_phase(
                 "editor_render",
-                "statusline_batch",
+                "statusline_batch_ratatui",
                 statusline_start.elapsed(),
                 || format!("count={}", count),
             );
         }
 
-        self.render_cache.log_and_reset_stats();
+        self.view_cache.log_and_reset_stats();
 
-        let key_width = 15u16; // for showing pending keys
-        let mut status_msg_width = 0;
-
-        // render status msg
-        if let Some((status_msg, severity)) = &cx.editor.status_msg {
-            let status_start = std::time::Instant::now();
-            status_msg_width = status_msg.width();
-            use helix_view::editor::Severity;
-            let style = if *severity == Severity::Error {
-                cx.editor.theme.get("error")
-            } else {
-                cx.editor.theme.get("ui.text")
-            };
-
-            surface.set_string(
-                area.x,
-                area.y + area.height.saturating_sub(1),
-                status_msg,
-                style,
-            );
-            helix_view::bench::log_run_phase(
-                "editor_render",
-                "status_msg",
-                status_start.elapsed(),
-                || format!("width={}", status_msg_width),
-            );
-        }
+        let key_width = 15u16;
+        // status_msg is now rendered by the compositor in the reserved
+        // global status row (full terminal width, below all chrome), so
+        // EditorView no longer paints it inside its own area.
+        let status_msg_width = 0u16;
 
         if area.width.saturating_sub(status_msg_width as u16) > key_width {
             let pending_start = std::time::Instant::now();
@@ -2679,15 +2941,14 @@ impl Component for EditorView {
                     disp.push_str(pending);
                 }
             }
-            // Also show raw pending keys from the keymaps (engine may not surface all)
             for key in self.keymaps.pending() {
                 disp.push_str(&key.key_sequence_format());
             }
             for key in &self.pseudo_pending {
                 disp.push_str(&key.key_sequence_format());
             }
-            let style = cx.editor.theme.get("ui.text");
-            let macro_width = if cx.editor.macro_recording.is_some() {
+            let style = cx.style("ui.text");
+            let macro_width = if cx.macro_recording_register().is_some() {
                 3
             } else {
                 0
@@ -2697,9 +2958,9 @@ impl Component for EditorView {
                 area.y + area.height.saturating_sub(1),
                 disp.get(disp.len().saturating_sub(key_width as usize)..)
                     .unwrap_or(&disp),
-                style,
+                tui::ratatui::to_ratatui_style(style),
             );
-            if let Some((reg, _)) = cx.editor.macro_recording {
+            if let Some(reg) = cx.macro_recording_register() {
                 let disp = format!("[{}]", reg);
                 let style = style
                     .fg(helix_view::graphics::Color::Yellow)
@@ -2708,48 +2969,47 @@ impl Component for EditorView {
                     area.x + area.width.saturating_sub(3),
                     area.y + area.height.saturating_sub(1),
                     &disp,
-                    style,
+                    tui::ratatui::to_ratatui_style(style),
                 );
             }
             helix_view::bench::log_run_phase(
                 "editor_render",
-                "pending_keys",
+                "pending_keys_ratatui",
                 pending_start.elapsed(),
                 || format!("display_width={}", disp.len()),
             );
         }
 
-        // Batch completion + notification renders for parallel deferred execution.
-        // NOTE: cleanup_notifications() is now done in compositor pre-render.
         {
             let chrome_start = std::time::Instant::now();
 
-            let mut chrome_batch = Vec::with_capacity(2);
             if let Some(completion) = self.completion.as_mut() {
-                chrome_batch.push(completion.prepare_render(area, cx));
+                let prepared = completion.prepare_render(area, cx);
+                self.chrome_cache.compose(prepared, surface);
             }
             if let Some(prepared) = self.notification_popup.prepare_snapshot(area, cx) {
-                chrome_batch.push(prepared);
-            }
-            if !chrome_batch.is_empty() {
-                self.chrome_cache.compose_batch(chrome_batch, surface);
+                self.chrome_cache.compose(prepared, surface);
             }
             helix_view::bench::log_run_phase(
                 "editor_render",
-                "chrome_batch",
+                "chrome_batch_ratatui",
                 chrome_start.elapsed(),
                 || format!("area={}x{}", area.width, area.height),
             );
         }
         helix_view::bench::log_run_phase(
             "editor_render",
-            "final_total",
+            "final_total_ratatui",
             render_start.elapsed(),
             || format!("area={}x{} frame={}", area.width, area.height, frame_num),
         );
     }
 
     fn cursor(&self, _area: Rect, editor: &Editor) -> (Option<Position>, CursorKind) {
+        if editor.model.focus != FocusTarget::Editor {
+            return (None, CursorKind::Hidden);
+        }
+
         let (pos, kind) = editor.cursor();
         if self.terminal_focused {
             (pos, kind)
@@ -2796,14 +3056,18 @@ struct BufferInfo {
 
 #[cfg(test)]
 mod tests {
-    use super::{EditorView, ViewRenderContext};
+    use super::{BufferlineDocument, BufferlineModel, EditorView, ViewRenderContext};
+    use crate::compositor::Component;
     use crate::handlers::Handlers;
     use crate::keymap::Keymaps;
+    use crate::render::CellSurface;
     use arc_swap::ArcSwap;
     use helix_core::Rope;
     use helix_loader::runtime_dirs;
-    use helix_modal::{helix::HelixEngine, populate::build_registry};
-    use helix_view::graphics::Rect;
+    use helix_modal::{helix::HelixEngine, CommandRegistry};
+    use helix_view::graphics::{CursorKind, Rect};
+    use helix_view::gutter::GutterContext;
+    use helix_view::model::{FocusTarget, PanelSide, PanelSize, TreePanelModel};
     use helix_view::theme;
     use helix_view::view::{
         LayoutSnapshot, LineMap, ViewLayoutInputs, ViewPosition, VisualLineInfo,
@@ -2812,6 +3076,7 @@ mod tests {
         editor::{Action, Config, Editor},
         Document, DocumentId, View,
     };
+    use std::borrow::Cow;
     use std::path::Path;
     use std::sync::Arc;
 
@@ -2864,12 +3129,33 @@ mod tests {
     }
 
     fn test_editor_view() -> EditorView {
-        let registry = Arc::new(build_registry());
+        let registry = Arc::new(CommandRegistry::builtins());
         EditorView::new(
             Keymaps::default(),
             Box::new(HelixEngine::new(registry.clone())),
             registry,
         )
+    }
+
+    #[test]
+    fn editor_view_cursor_is_hidden_when_model_focus_is_not_editor() {
+        let rt = helix_runtime::test::RuntimeTest::default();
+        rt.block_on(async {
+            let (mut editor, _, _) = test_editor_with_text("alpha\n");
+            let view = test_editor_view();
+            let panel_id = editor.model.insert_panel(
+                "Files",
+                Box::new(TreePanelModel::default()),
+                PanelSide::Left,
+                PanelSize::fixed(34),
+            );
+            editor.model.focus = FocusTarget::Panel(panel_id);
+
+            let (pos, kind) = view.cursor(Rect::new(0, 0, 80, 24), &editor);
+
+            assert_eq!(pos, None);
+            assert_eq!(kind, CursorKind::Hidden);
+        });
     }
 
     fn giant_multiline_fixture(lines: usize, bytes_per_line: usize) -> String {
@@ -2981,6 +3267,57 @@ mod tests {
     }
 
     #[test]
+    fn render_view_can_target_ratatui_surface() {
+        let rt = helix_runtime::test::RuntimeTest::default();
+        rt.block_on(async {
+            let (mut editor, view_id, doc_id) = test_editor_with_text("alpha\nbeta\n");
+            let area = Rect::new(0, 0, 80, 24);
+            editor.resize(area);
+
+            let editor_view = test_editor_view();
+            let doc = editor.document(doc_id).expect("document");
+            let view = view!(editor, view_id);
+            let config = editor.config();
+            let vctx = ViewRenderContext {
+                doc,
+                view,
+                viewport: area,
+                is_focused: true,
+                config: &config,
+                config_gen: editor.config_gen,
+                theme: &editor.theme,
+                mode: editor.mode(),
+                syntax_loader: &editor.syn_loader,
+                cursor_cache: &editor.cursor_cache,
+                gutter_context: GutterContext {
+                    mode: editor.mode(),
+                    line_number: config.line_number,
+                    wrap_indicator: config
+                        .soft_wrap
+                        .wrap_indicator
+                        .as_deref()
+                        .map_or(Cow::Borrowed("↪"), Cow::Borrowed),
+                    breakpoints: doc
+                        .path()
+                        .and_then(|path| editor.breakpoints.get(path))
+                        .map(Vec::as_slice),
+                    debug_execution: None,
+                },
+                debug_execution: None,
+                cached_syntax: None,
+                dirty_rows: None,
+                seed_line_map: None,
+            };
+            let mut surface = CellSurface::empty(tui::ratatui::layout::Rect::new(0, 0, 80, 24));
+
+            let output = editor_view.render_view(&vctx, &mut surface);
+
+            assert!(!output.line_map.lines.is_empty());
+            assert!(surface.content.iter().any(|cell| cell.symbol() == "a"));
+        });
+    }
+
+    #[test]
     fn seed_line_map_reuse_requires_stable_text_layout_inputs() {
         let previous = layout_inputs(
             5,
@@ -3058,7 +3395,7 @@ mod tests {
     }
 
     #[test]
-    fn bufferline_renders_scratch_labels_without_leading_gap() {
+    fn bufferline_renders_buffer_labels_with_native_padding() {
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
         let _guard = runtime.enter();
         let (mut editor, _view_id, doc_id) = test_editor_with_text("fn main() {}\n");
@@ -3090,35 +3427,63 @@ mod tests {
 
         let mut editor_view = test_editor_view();
         let area = Rect::new(0, 0, 80, 1);
-        let mut surface = tui::buffer::Buffer::empty(area);
-        editor_view.draw_bufferline(&editor, area, &mut surface);
+        let mut surface = CellSurface::empty(tui::ratatui::to_ratatui_rect(area));
+        let config = editor.config();
+        let model = BufferlineModel {
+            theme: &editor.theme,
+            separator: config.bufferline.separator.clone(),
+            current_doc: editor.focused_document_id(),
+            documents: editor
+                .documents()
+                .map(|doc| BufferlineDocument {
+                    id: doc.id(),
+                    label: editor.buffer_label(doc),
+                    path: doc.path(),
+                    language_name: doc.language_name(),
+                    is_modified: doc.is_modified(),
+                })
+                .collect(),
+        };
+        editor_view.draw_bufferline_model(&model, area, &mut surface);
 
         let second_x = editor_view.bufferline_positions[1];
         let third_x = editor_view.bufferline_positions[2];
         let row: String = (0..area.width)
-            .map(|x| surface[(area.x + x, area.y)].symbol.as_ref())
+            .map(|x| surface[(area.x + x, area.y)].symbol())
             .collect();
 
         assert_eq!(
-            surface[(second_x - 1, 0)].symbol.as_ref(),
+            surface[(second_x - 1, 0)].symbol(),
             "│",
             "row={row:?} positions={:?}",
             editor_view.bufferline_positions
         );
         assert_eq!(
-            surface[(second_x, 0)].symbol.as_ref(),
+            surface[(second_x, 0)].symbol(),
+            " ",
+            "row={row:?} positions={:?}",
+            editor_view.bufferline_positions
+        );
+        assert_eq!(
+            surface[(second_x + 1, 0)].symbol(),
             "[",
             "row={row:?} positions={:?}",
             editor_view.bufferline_positions
         );
         assert_eq!(
-            surface[(third_x - 1, 0)].symbol.as_ref(),
+            surface[(third_x - 1, 0)].symbol(),
             "│",
             "row={row:?} positions={:?}",
             editor_view.bufferline_positions
         );
         assert_eq!(
-            surface[(third_x, 0)].symbol.as_ref(),
+            surface[(third_x, 0)].symbol(),
+            " ",
+            "row={row:?} positions={:?}",
+            editor_view.bufferline_positions
+        );
+        assert_eq!(
+            surface[(third_x + 1, 0)].symbol(),
             "[",
             "row={row:?} positions={:?}",
             editor_view.bufferline_positions
@@ -3161,18 +3526,39 @@ mod tests {
                 );
             }
 
-            let mut editor_view = test_editor_view();
+            let editor_view = test_editor_view();
             let area = Rect::new(0, 0, 160, 61);
-            let mut surface = tui::buffer::Buffer::empty(area);
+            let mut surface = CellSurface::empty(tui::ratatui::to_ratatui_rect(area));
             let start = std::time::Instant::now();
             let doc = editor.document(doc_id).expect("document");
             let view = view!(editor, view_id);
+            let config = editor.config();
             let vctx = ViewRenderContext {
-                editor: &editor,
                 doc,
                 view,
                 viewport: area,
                 is_focused: true,
+                config: &config,
+                config_gen: editor.config_gen,
+                theme: &editor.theme,
+                mode: editor.mode(),
+                syntax_loader: &editor.syn_loader,
+                cursor_cache: &editor.cursor_cache,
+                gutter_context: GutterContext {
+                    mode: editor.mode(),
+                    line_number: config.line_number,
+                    wrap_indicator: config
+                        .soft_wrap
+                        .wrap_indicator
+                        .as_deref()
+                        .map_or(Cow::Borrowed("↪"), Cow::Borrowed),
+                    breakpoints: doc
+                        .path()
+                        .and_then(|path| editor.breakpoints.get(path))
+                        .map(Vec::as_slice),
+                    debug_execution: None,
+                },
+                debug_execution: None,
                 cached_syntax: None,
                 dirty_rows: None,
                 seed_line_map: None,

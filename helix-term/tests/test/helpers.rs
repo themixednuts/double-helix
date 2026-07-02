@@ -9,7 +9,7 @@ use anyhow::bail;
 use helix_core::{diagnostic::Severity, test, Selection, Transaction};
 use helix_runtime::test::runtime as test_runtime;
 use helix_term::{application::Application, args::Args, config::Config, keymap::merge_keys};
-use helix_view::{current_ref, doc, input::parse_macro, Editor};
+use helix_view::{focused_ref, input::parse_macro, Editor};
 use tempfile::NamedTempFile;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
@@ -268,7 +268,7 @@ pub async fn test_with_config<T: Into<TestCase>>(
         Some(app),
         test_case.clone(),
         &|app| {
-            let doc = doc!(app.editor);
+            let doc = helix_view::focused_ref!(app.editor).1;
             assert_eq!(&test_case.out_text, doc.text());
 
             let mut selections: Vec<_> = doc.selections().values().cloned().collect();

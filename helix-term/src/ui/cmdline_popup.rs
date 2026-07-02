@@ -1,6 +1,7 @@
 use crate::compositor::{Component, Context, Event, EventResult, RenderContext};
 use crate::ui::gradient_border::GradientBorder;
 use crate::ui::prompt::{Completion, Prompt, PromptEvent};
+use crate::widgets::{draw_string_anchored, AnchoredText};
 use helix_core::{unicode::width::UnicodeWidthStr, Position};
 use helix_view::{
     editor::CmdlineStyle,
@@ -8,10 +9,6 @@ use helix_view::{
     Editor,
 };
 use std::borrow::Cow;
-use tui::{
-    buffer::Buffer as Surface,
-    widgets::{Block, BorderType, Widget},
-};
 
 pub struct CmdlinePopup {
     prompt: Prompt,
@@ -93,38 +90,48 @@ impl CmdlinePopup {
     }
 
     /// Render popup-style cmdline
-    fn render_popup(&mut self, area: Rect, surface: &mut Surface, cx: &RenderContext) {
+    fn render_popup(
+        &mut self,
+        area: Rect,
+        surface: &mut crate::render::CellSurface,
+        cx: &RenderContext,
+    ) {
         let popup_area = self.calculate_popup_area(area);
         self.popup_area = popup_area;
 
-        let theme = &cx.editor.theme;
-        let config = &cx.editor.config().gradient_borders;
+        let theme = cx.theme();
+        let editor_config = cx.config();
+        let gradient_config = &editor_config.gradient_borders;
+        let rounded_corners = editor_config.rounded_corners;
 
         // Clear the area
-        surface.clear_with(popup_area, theme.get("ui.popup"));
+        {
+            let area = tui::ratatui::to_ratatui_rect(popup_area);
+            tui::ratatui::widgets::Widget::render(tui::ratatui::widgets::Clear, area, surface);
+            surface.set_style(area, tui::ratatui::to_ratatui_style(theme.get("ui.popup")));
+        };
 
         // Use gradient border if enabled, otherwise use default border
-        let inner_area = if config.enable && self.style == CmdlineStyle::Popup {
+        let inner_area = if gradient_config.enable && self.style == CmdlineStyle::Popup {
             // Initialize gradient border if needed
             if self.gradient_border.is_none() {
-                self.gradient_border = Some(GradientBorder::from_theme(theme, config));
+                self.gradient_border = Some(GradientBorder::from_theme(theme, gradient_config));
             }
 
             // Render gradient border with title
             if let Some(ref mut gradient_border) = self.gradient_border {
-                let rounded = cx.editor.config().rounded_corners;
                 gradient_border.render_with_title(
                     popup_area,
                     surface,
                     theme,
                     Some(self.prompt.prompt()),
-                    rounded,
+                    rounded_corners,
                 );
             }
 
             // Calculate inner area manually using configured gradient thickness
             {
-                let t: u16 = config.thickness as u16;
+                let t: u16 = gradient_config.thickness as u16;
                 Rect {
                     x: popup_area.x + t,
                     y: popup_area.y + t,
@@ -137,23 +144,27 @@ impl CmdlinePopup {
             let border_style = theme.get("ui.popup.border");
             let background_style = theme.get("ui.popup");
 
-            let border_type = BorderType::new(cx.editor.config().rounded_corners);
-            let block = Block::default()
-                .borders(tui::widgets::Borders::ALL)
-                .border_type(border_type)
-                .border_style(border_style)
-                .style(background_style)
-                .title(self.prompt.prompt());
-
-            let inner_area = block.inner(popup_area);
-            block.render(popup_area, surface);
-            inner_area
+            let inner = crate::widgets::Panel::framed(
+                crate::widgets::PanelStyle::new(background_style, border_style, border_style),
+                rounded_corners,
+            )
+            .render(surface, popup_area);
+            let title = self.prompt.prompt();
+            if !title.is_empty() && popup_area.width > title.width() as u16 + 2 {
+                surface.set_stringn(
+                    popup_area.x + 1,
+                    popup_area.y,
+                    title,
+                    popup_area.width.saturating_sub(2) as usize,
+                    tui::ratatui::to_ratatui_style(border_style),
+                );
+            }
+            inner
         };
 
         // Render command icon (if enabled) but not the prompt text since it's now on the border
-        let config = cx.editor.config();
-        let icon = if config.cmdline.show_icons {
-            self.get_command_icon(&config.cmdline.icons)
+        let icon = if editor_config.cmdline.show_icons {
+            self.get_command_icon(&editor_config.cmdline.icons)
         } else {
             ""
         };
@@ -168,7 +179,12 @@ impl CmdlinePopup {
             let prompt_color = theme.get("ui.text.focus");
             // Make the icon more prominent with bold styling
             let icon_style = prompt_color.add_modifier(helix_view::theme::Modifier::BOLD);
-            surface.set_string(inner_area.x, inner_area.y, &prefix_text, icon_style);
+            surface.set_string(
+                inner_area.x,
+                inner_area.y,
+                &prefix_text,
+                tui::ratatui::to_ratatui_style(icon_style),
+            );
         }
 
         // Calculate input area
@@ -189,8 +205,13 @@ impl CmdlinePopup {
     }
 
     /// Render the input text with horizontal scrolling support
-    fn render_input_text(&mut self, area: Rect, surface: &mut Surface, cx: &RenderContext) {
-        let theme = &cx.editor.theme;
+    fn render_input_text(
+        &mut self,
+        area: Rect,
+        surface: &mut crate::render::CellSurface,
+        cx: &RenderContext,
+    ) {
+        let theme = cx.theme();
         let text_style = theme.get("ui.text");
         let line_width = area.width as usize;
 
@@ -201,15 +222,13 @@ impl CmdlinePopup {
         let line = self.prompt.line();
         let visible_text = &line[anchor..];
 
-        // Use set_string_anchored to handle truncation indicators
-        surface.set_string_anchored(
-            area.x,
-            area.y,
-            self.prompt.truncate_start(),
-            self.prompt.truncate_end(),
-            visible_text,
-            line_width,
-            |_| text_style,
+        let mut style_for_offset = |_| tui::ratatui::to_ratatui_style(text_style);
+        draw_string_anchored(
+            surface,
+            AnchoredText::new(area.x, area.y, visible_text, line_width)
+                .truncate_start(self.prompt.truncate_start())
+                .truncate_end(self.prompt.truncate_end()),
+            &mut style_for_offset,
         );
     }
 
@@ -217,10 +236,10 @@ impl CmdlinePopup {
     fn render_completion_popup(
         &mut self,
         base_area: Rect,
-        surface: &mut Surface,
+        surface: &mut crate::render::CellSurface,
         cx: &RenderContext,
     ) {
-        let theme = &cx.editor.theme;
+        let theme = cx.theme();
         // Match global autocomplete/picker colors
         let completion_bg = theme.get("ui.menu");
         let selected_row_bg = theme.get("ui.menu.selected");
@@ -239,21 +258,26 @@ impl CmdlinePopup {
         );
 
         // Clear and render completion background (match global autocomplete)
-        surface.clear_with(comp_area, completion_bg);
+        {
+            let area = tui::ratatui::to_ratatui_rect(comp_area);
+            tui::ratatui::widgets::Widget::render(tui::ratatui::widgets::Clear, area, surface);
+            surface.set_style(area, tui::ratatui::to_ratatui_style(completion_bg));
+        };
 
-        let config = &cx.editor.config().gradient_borders;
+        let editor_config = cx.config();
+        let gradient_config = &editor_config.gradient_borders;
+        let rounded_corners = editor_config.rounded_corners;
 
         // Use gradient border for completion if enabled
-        let inner_area = if config.enable && self.style == CmdlineStyle::Popup {
+        let inner_area = if gradient_config.enable && self.style == CmdlineStyle::Popup {
             // Reuse the gradient border for completion popup
             if let Some(ref mut gradient_border) = self.gradient_border {
-                let rounded = cx.editor.config().rounded_corners;
-                gradient_border.render(comp_area, surface, &cx.editor.theme, rounded);
+                gradient_border.render(comp_area, surface, theme, rounded_corners);
             }
 
             // Calculate inner area manually using configured gradient thickness
             {
-                let t: u16 = config.thickness as u16;
+                let t: u16 = gradient_config.thickness as u16;
                 Rect {
                     x: comp_area.x + t,
                     y: comp_area.y + t,
@@ -263,21 +287,19 @@ impl CmdlinePopup {
             }
         } else {
             // Use traditional border, matching popup card styling
-            let border_type = BorderType::new(cx.editor.config().rounded_corners);
-            let block = Block::default()
-                .borders(tui::widgets::Borders::ALL)
-                .border_type(border_type)
-                .border_style(theme.get("ui.popup.border"))
-                .style(completion_bg);
-
-            let inner_area = block.inner(comp_area);
-            block.render(comp_area, surface);
-            inner_area
+            crate::widgets::Panel::framed(
+                crate::widgets::PanelStyle::new(
+                    theme.get("ui.popup"),
+                    theme.get("ui.popup.border"),
+                    theme.get("ui.popup.border"),
+                ),
+                rounded_corners,
+            )
+            .render(surface, comp_area)
         };
 
         // Render completion items with scrolling support
-        let config = cx.editor.config();
-        let picker_symbol = config.picker_symbol.as_str();
+        let picker_symbol = editor_config.picker_symbol.as_str();
         let symbol_width = picker_symbol.width();
 
         let completions = self.prompt.completions();
@@ -308,7 +330,7 @@ impl CmdlinePopup {
                     y,
                     &spaces,
                     inner_area.width as usize,
-                    selected_row_bg,
+                    tui::ratatui::to_ratatui_style(selected_row_bg),
                 );
                 // Use the theme's selected style for text (fg+bg from ui.menu.selected)
                 selected_row_bg
@@ -327,7 +349,7 @@ impl CmdlinePopup {
                 y,
                 &text,
                 inner_area.width as usize,
-                item_style,
+                tui::ratatui::to_ratatui_style(item_style),
             );
         }
 
@@ -341,7 +363,7 @@ impl CmdlinePopup {
                     inner_area.x + inner_area.width.saturating_sub(1),
                     inner_area.y,
                     "↑",
-                    scroll_indicator_style,
+                    tui::ratatui::to_ratatui_style(scroll_indicator_style),
                 );
             }
 
@@ -351,16 +373,10 @@ impl CmdlinePopup {
                     inner_area.x + inner_area.width.saturating_sub(1),
                     inner_area.y + inner_area.height.saturating_sub(1),
                     "↓",
-                    scroll_indicator_style,
+                    tui::ratatui::to_ratatui_style(scroll_indicator_style),
                 );
             }
         }
-    }
-
-    /// Render traditional bottom cmdline
-    fn render_bottom(&mut self, area: Rect, surface: &mut Surface, cx: &RenderContext) {
-        // Delegate to the original prompt rendering
-        self.prompt.render_prompt(area, surface, cx);
     }
 }
 
@@ -370,10 +386,10 @@ impl Component for CmdlinePopup {
         self.prompt.handle_event(event, cx)
     }
 
-    fn render(&mut self, area: Rect, surface: &mut Surface, cx: &RenderContext) {
+    fn render(&mut self, area: Rect, surface: &mut crate::render::CellSurface, cx: &RenderContext) {
         match self.style {
             CmdlineStyle::Popup => self.render_popup(area, surface, cx),
-            CmdlineStyle::Bottom => self.render_bottom(area, surface, cx),
+            CmdlineStyle::Bottom => self.prompt.render(area, surface, cx),
         }
     }
 
@@ -399,9 +415,12 @@ impl Component for CmdlinePopup {
                         height: self.popup_area.height.saturating_sub(t * 2),
                     }
                 } else {
-                    Block::default()
-                        .borders(tui::widgets::Borders::ALL)
-                        .inner(self.popup_area)
+                    Rect::new(
+                        self.popup_area.x + 1,
+                        self.popup_area.y + 1,
+                        self.popup_area.width.saturating_sub(2),
+                        self.popup_area.height.saturating_sub(2),
+                    )
                 };
 
                 // Build the same input area used in render_popup

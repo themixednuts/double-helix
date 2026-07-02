@@ -295,7 +295,9 @@ impl AssistantModel {
         if let Some(follow_label) = self.follow_label() {
             items.push(AssistantStatusItem {
                 kind: AssistantStatusItemKind::Follow,
-                label: format!("follow:{follow_label}"),
+                // Editorial format: dot-prefixed separator, lowercase, no
+                // colon — reads as quiet metadata, not as a config dump.
+                label: format!("· follow {follow_label}"),
             });
         }
         items

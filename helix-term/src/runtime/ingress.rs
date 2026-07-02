@@ -1,8 +1,8 @@
 //! Typed events delivered from async/runtime work into the main application loop.
 //!
-//! Background and UI tasks send through [`helix_runtime::Sender`] owned by
-//! [`crate::application::Application`]; the receiving side is drained in
-//! `Application::event_loop_until_idle`.
+//! Background and UI tasks send through [`RuntimeIngress`] typed methods. The raw
+//! mailbox event is private so producer code cannot enqueue arbitrary variants or
+//! bypass the non-blocking/full-queue handoff policy.
 //!
 //! **Split:** [`RuntimeTaskEvent`] applies editor-side effects (often via [`crate::effect`]).
 //! [`UiCommand`] drives compositor / layers / widgets. Keep that boundary when adding variants.
@@ -17,7 +17,8 @@ use helix_core::diagnostic::{DiagnosticProvider, Severity};
 use helix_core::{Transaction, Uri};
 use helix_dap::ThreadId as DebugThreadId;
 use helix_lsp::{lsp, LanguageServerId};
-use helix_runtime::{Sender as IngressSender, TimerId, Token};
+use helix_runtime::DebouncedSender;
+use helix_runtime::{Receiver as IngressReceiver, Sender as IngressSender, TimerId, Token, Work};
 use helix_view::document::DocumentInlayHintsId;
 use helix_view::document::FormatterError;
 use helix_view::handlers::lsp::{SignatureHelpInvoked, SignatureHelpRequestId};
@@ -73,10 +74,9 @@ impl From<&'static str> for StatusMessage {
     }
 }
 
-/// Application-level ingress from the `helix-runtime` stack (timers, tasks, redraw, status).
-pub enum RuntimeEvent {
-    /// Request a UI refresh (replaces ad hoc redraw hooks over time).
-    Redraw,
+/// Application-level delivery from the `helix-runtime` stack (timers, tasks, status).
+#[derive(Debug)]
+pub enum RuntimeDelivery {
     /// Show a transient status line message.
     Status { message: String, severity: Severity },
     /// A [`Clock`] timer fired.
@@ -93,18 +93,21 @@ pub enum RuntimeEvent {
     Ui(UiCommand),
 }
 
+/// Private mailbox payload. Only [`RuntimeIngress`] can construct and queue this
+/// type, which prevents callers from bypassing the typed ingress API.
+struct RuntimeEvent(RuntimeDelivery);
+
 impl std::fmt::Debug for RuntimeEvent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Redraw => f.write_str("Redraw"),
-            Self::Status { message, severity } => f
+        match &self.0 {
+            RuntimeDelivery::Status { message, severity } => f
                 .debug_struct("Status")
                 .field("message", message)
                 .field("severity", severity)
                 .finish(),
-            Self::Timer(id) => f.debug_tuple("Timer").field(id).finish(),
-            Self::Task(t) => f.debug_tuple("Task").field(t).finish(),
-            Self::AssistantPermissionResolved {
+            RuntimeDelivery::Timer(id) => f.debug_tuple("Timer").field(id).finish(),
+            RuntimeDelivery::Task(t) => f.debug_tuple("Task").field(t).finish(),
+            RuntimeDelivery::AssistantPermissionResolved {
                 thread,
                 request,
                 decision,
@@ -114,8 +117,243 @@ impl std::fmt::Debug for RuntimeEvent {
                 .field("request", request)
                 .field("decision", decision)
                 .finish(),
-            Self::Ui(cmd) => f.debug_tuple("Ui").field(cmd).finish(),
+            RuntimeDelivery::Ui(cmd) => f.debug_tuple("Ui").field(cmd).finish(),
         }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct RuntimeIngress {
+    tx: IngressSender<RuntimeEvent>,
+    work: Work,
+}
+
+#[derive(Debug)]
+pub struct RuntimeIngressReceiver {
+    rx: IngressReceiver<RuntimeEvent>,
+}
+
+#[derive(Clone, Debug)]
+pub struct RuntimeTaskDebouncer {
+    inner: DebouncedSender<RuntimeEvent>,
+}
+
+#[derive(Clone, Debug)]
+pub struct RuntimeUiDebouncer {
+    inner: DebouncedSender<RuntimeEvent>,
+}
+
+impl RuntimeIngress {
+    pub(crate) fn channel(work: Work) -> (Self, RuntimeIngressReceiver) {
+        let (tx, rx) = helix_runtime::channel(BOUND);
+        (Self { tx, work }, RuntimeIngressReceiver { rx })
+    }
+
+    fn enqueue(&self, event: RuntimeEvent) {
+        match self.tx.try_send(event) {
+            Ok(()) | Err(helix_runtime::TrySend::Closed(_)) => {}
+            Err(helix_runtime::TrySend::Full(event)) => {
+                let tx = self.tx.clone();
+                self.work
+                    .spawn(async move {
+                        let _ = tx.send(event).await;
+                    })
+                    .detach();
+            }
+        }
+    }
+
+    async fn send(&self, event: RuntimeEvent) {
+        let _ = self.tx.send(event).await;
+    }
+
+    pub fn status(&self, message: impl Into<StatusMessage>) {
+        let message = message.into();
+        self.enqueue(RuntimeEvent(RuntimeDelivery::Status {
+            message: message.message.into_owned(),
+            severity: message.severity,
+        }));
+    }
+
+    pub async fn send_status(&self, message: impl Into<StatusMessage>) {
+        let message = message.into();
+        self.send(RuntimeEvent(RuntimeDelivery::Status {
+            message: message.message.into_owned(),
+            severity: message.severity,
+        }))
+        .await;
+    }
+
+    pub fn task(&self, task: RuntimeTaskEvent) {
+        self.enqueue(RuntimeEvent(RuntimeDelivery::Task(task)));
+    }
+
+    pub async fn send_task(&self, task: RuntimeTaskEvent) {
+        self.send(RuntimeEvent(RuntimeDelivery::Task(task))).await;
+    }
+
+    pub fn ui(&self, cmd: UiCommand) {
+        self.enqueue(RuntimeEvent(RuntimeDelivery::Ui(cmd)));
+    }
+
+    pub async fn send_ui(&self, cmd: UiCommand) {
+        self.send(RuntimeEvent(RuntimeDelivery::Ui(cmd))).await;
+    }
+
+    pub fn timer(&self, id: TimerId) {
+        self.enqueue(RuntimeEvent(RuntimeDelivery::Timer(id)));
+    }
+
+    pub async fn send_timer(&self, id: TimerId) {
+        self.send(RuntimeEvent(RuntimeDelivery::Timer(id))).await;
+    }
+
+    pub fn assistant_permission_resolved(
+        &self,
+        thread: helix_view::assistant::thread::Id,
+        request: helix_view::assistant::permission::RequestId,
+        decision: helix_view::assistant::permission::Decision,
+    ) {
+        self.enqueue(RuntimeEvent(RuntimeDelivery::AssistantPermissionResolved {
+            thread,
+            request,
+            decision,
+        }));
+    }
+
+    pub async fn send_assistant_permission_resolved(
+        &self,
+        thread: helix_view::assistant::thread::Id,
+        request: helix_view::assistant::permission::RequestId,
+        decision: helix_view::assistant::permission::Decision,
+    ) {
+        self.send(RuntimeEvent(RuntimeDelivery::AssistantPermissionResolved {
+            thread,
+            request,
+            decision,
+        }))
+        .await;
+    }
+
+    pub fn task_debouncer(
+        &self,
+        delay: std::time::Duration,
+        runtime: &helix_runtime::Runtime,
+    ) -> RuntimeTaskDebouncer {
+        RuntimeTaskDebouncer {
+            inner: DebouncedSender::new(
+                delay,
+                runtime.work().clone(),
+                runtime.clock().clone(),
+                self.tx.clone(),
+            ),
+        }
+    }
+
+    pub fn ui_debouncer(
+        &self,
+        delay: std::time::Duration,
+        runtime: &helix_runtime::Runtime,
+    ) -> RuntimeUiDebouncer {
+        RuntimeUiDebouncer {
+            inner: DebouncedSender::new(
+                delay,
+                runtime.work().clone(),
+                runtime.clock().clone(),
+                self.tx.clone(),
+            ),
+        }
+    }
+}
+
+impl RuntimeIngressReceiver {
+    pub async fn recv(&mut self) -> Option<RuntimeDelivery> {
+        self.rx.recv().await.map(|event| event.0)
+    }
+
+    pub fn try_recv(&mut self) -> Result<RuntimeDelivery, helix_runtime::TryRecvError> {
+        self.rx.try_recv().map(|event| event.0)
+    }
+}
+
+impl RuntimeTaskDebouncer {
+    pub fn new(
+        delay: std::time::Duration,
+        work: Work,
+        clock: helix_runtime::Clock,
+        ingress: RuntimeIngress,
+    ) -> Self {
+        Self {
+            inner: DebouncedSender::new(delay, work, clock, ingress.tx),
+        }
+    }
+
+    pub fn send(&self, task: RuntimeTaskEvent) {
+        self.inner.send(RuntimeEvent(RuntimeDelivery::Task(task)));
+    }
+
+    pub fn send_now(&self, task: RuntimeTaskEvent) {
+        self.inner
+            .send_now(RuntimeEvent(RuntimeDelivery::Task(task)));
+    }
+
+    pub fn send_after(&self, task: RuntimeTaskEvent, delay: std::time::Duration) {
+        self.inner
+            .send_after(RuntimeEvent(RuntimeDelivery::Task(task)), delay);
+    }
+
+    pub fn send_after_with(
+        &self,
+        delay: std::time::Duration,
+        build: impl FnOnce() -> Option<RuntimeTaskEvent> + Send + 'static,
+    ) {
+        self.inner.send_after_with(delay, move || {
+            build().map(RuntimeDelivery::Task).map(RuntimeEvent)
+        });
+    }
+
+    pub fn cancel(&self) {
+        self.inner.cancel();
+    }
+}
+
+impl RuntimeUiDebouncer {
+    pub fn new(
+        delay: std::time::Duration,
+        work: Work,
+        clock: helix_runtime::Clock,
+        ingress: RuntimeIngress,
+    ) -> Self {
+        Self {
+            inner: DebouncedSender::new(delay, work, clock, ingress.tx),
+        }
+    }
+
+    pub fn send_after(&self, cmd: UiCommand, delay: std::time::Duration) {
+        self.inner
+            .send_after(RuntimeEvent(RuntimeDelivery::Ui(cmd)), delay);
+    }
+
+    pub fn send(&self, cmd: UiCommand) {
+        self.inner.send(RuntimeEvent(RuntimeDelivery::Ui(cmd)));
+    }
+
+    pub fn send_now(&self, cmd: UiCommand) {
+        self.inner.send_now(RuntimeEvent(RuntimeDelivery::Ui(cmd)));
+    }
+
+    pub fn send_after_with(
+        &self,
+        delay: std::time::Duration,
+        build: impl FnOnce() -> Option<UiCommand> + Send + 'static,
+    ) {
+        self.inner.send_after_with(delay, move || {
+            build().map(RuntimeDelivery::Ui).map(RuntimeEvent)
+        });
+    }
+
+    pub fn cancel(&self) {
+        self.inner.cancel();
     }
 }
 
@@ -319,58 +557,32 @@ pub enum RuntimeTaskEvent {
 }
 
 pub fn status_error_reporter(
-    ingress_tx: IngressSender<RuntimeEvent>,
+    ingress: RuntimeIngress,
 ) -> std::sync::Arc<dyn Fn(anyhow::Error) + Send + Sync> {
     std::sync::Arc::new(move |err| {
         let message = StatusMessage::from(err);
-        helix_runtime::send_blocking(
-            &ingress_tx,
-            RuntimeEvent::Status {
-                message: message.message.into_owned(),
-                severity: message.severity,
-            },
-        );
+        ingress.status(message);
     })
 }
 
 /// Send a typed [`RuntimeTaskEvent`] on the ingress channel (same semantics as [`send_ui_command_with`]).
-pub async fn send_task_event_with(task: RuntimeTaskEvent, ingress: IngressSender<RuntimeEvent>) {
-    let ev = RuntimeEvent::Task(task);
-    let _ = ingress.send(ev).await;
+pub async fn send_task_event_with(task: RuntimeTaskEvent, ingress: RuntimeIngress) {
+    ingress.send_task(task).await;
 }
 
 /// Send a typed [`UiCommand`] on the ingress channel.
-pub async fn send_ui_command_with(cmd: UiCommand, ingress: IngressSender<RuntimeEvent>) {
-    let ev = RuntimeEvent::Ui(cmd);
-    let _ = ingress.send(ev).await;
+pub async fn send_ui_command_with(cmd: UiCommand, ingress: RuntimeIngress) {
+    ingress.send_ui(cmd).await;
 }
 
-/// Request a UI redraw without blocking the caller.
-///
-/// Redraw events are coalescable invalidation signals. Dropping a redraw when
-/// the ingress queue is full or closed is preferable to blocking, especially
-/// from plain worker threads that are not running inside Tokio.
-pub fn request_redraw(ingress: &IngressSender<RuntimeEvent>) {
-    let _ = ingress.try_send(RuntimeEvent::Redraw);
-}
-
-pub async fn send_status_message_with(
-    message: impl Into<StatusMessage>,
-    ingress: IngressSender<RuntimeEvent>,
-) {
-    let message = message.into();
-    let event = RuntimeEvent::Status {
-        message: message.message.into_owned(),
-        severity: message.severity,
-    };
-
-    let _ = ingress.send(event).await;
+pub async fn send_status_message_with(message: impl Into<StatusMessage>, ingress: RuntimeIngress) {
+    ingress.send_status(message).await;
 }
 
 pub fn spawn_task_event_with_future(
     work: helix_runtime::Work,
     future: impl std::future::Future<Output = anyhow::Result<RuntimeTaskEvent>> + Send + 'static,
-    ingress: IngressSender<RuntimeEvent>,
+    ingress: RuntimeIngress,
 ) {
     work.spawn(async move {
         match future.await {
@@ -384,7 +596,7 @@ pub fn spawn_task_event_with_future(
 pub fn spawn_ui_command_with_future(
     work: helix_runtime::Work,
     future: impl std::future::Future<Output = anyhow::Result<UiCommand>> + Send + 'static,
-    ingress: IngressSender<RuntimeEvent>,
+    ingress: RuntimeIngress,
 ) {
     work.spawn(async move {
         match future.await {
@@ -393,31 +605,4 @@ pub fn spawn_ui_command_with_future(
         }
     })
     .detach();
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn request_redraw_is_lossy_when_ingress_is_full() {
-        let (tx, mut rx) = helix_runtime::channel(1);
-
-        request_redraw(&tx);
-        request_redraw(&tx);
-
-        assert!(matches!(rx.try_recv(), Ok(RuntimeEvent::Redraw)));
-        assert!(matches!(
-            rx.try_recv(),
-            Err(helix_runtime::TryRecvError::Empty)
-        ));
-    }
-
-    #[test]
-    fn request_redraw_ignores_closed_ingress() {
-        let (tx, rx) = helix_runtime::channel(1);
-        drop(rx);
-
-        request_redraw(&tx);
-    }
 }

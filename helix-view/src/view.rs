@@ -8,7 +8,7 @@ use crate::{
     graphics::Rect,
     handlers::diagnostics::DiagnosticsHandler,
     history_state::ViewHistoryState,
-    Align, Document, DocumentId, Editor, Theme, ViewId,
+    Align, Document, DocumentId, Theme, ViewId,
 };
 
 use helix_core::{
@@ -621,13 +621,6 @@ impl LayoutSnapshot {
                 visual_col - doc.view_offset(view.id).horizontal_offset,
             ))
         })
-    }
-
-    pub fn update_cursor_cache(&self, editor: &Editor, doc: &Document, view: &View) {
-        if editor.tree.focus != view.id {
-            return;
-        }
-        editor.cursor_cache.set(self.cursor_position(doc, view));
     }
 
     pub fn render_seed(&self, top_doc_line: usize, max_gap: usize) -> Option<RenderSeed> {

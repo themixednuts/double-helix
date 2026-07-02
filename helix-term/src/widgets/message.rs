@@ -5,7 +5,6 @@
 //! width and subtle animated border accents.
 
 use helix_view::graphics::{Rect, Style};
-use tui::buffer::Buffer as Surface;
 use tui::text::Spans;
 
 /// Alignment of the bubble within the available width.
@@ -38,7 +37,7 @@ pub struct MessageState {
 }
 
 pub fn message(
-    surface: &mut Surface,
+    surface: &mut crate::render::CellSurface,
     area: Rect,
     lines: &[Spans],
     bubble_width: u16,
@@ -64,7 +63,7 @@ pub fn message(
     };
 
     let bw = bubble_w as u16;
-    let surf_area = surface.area();
+    let surf_area = tui::ratatui::to_helix_rect(*surface.area());
     let surf_right = surf_area.right();
     let surf_bottom = surf_area.bottom();
     let mut y = area.y;
@@ -98,28 +97,36 @@ pub fn message(
             if x >= surf_right {
                 continue;
             }
-            surface[(x, fy)].set_symbol(" ");
+            if let Some(cell) = surface.cell_mut((x, fy)) {
+                cell.set_symbol(" ");
+            }
         }
 
         if border_cells.left_vertical != " " {
-            surface[(x_offset, fy)]
-                .set_symbol(border_cells.left_vertical)
-                .set_style(border_style_for_edge(
-                    BorderEdge::Left,
-                    row as usize,
-                    accent,
-                ));
+            {
+                if let Some(cell) = surface.cell_mut((x_offset, fy)) {
+                    cell.set_symbol(border_cells.left_vertical);
+                    cell.set_style(tui::ratatui::to_ratatui_style(border_style_for_edge(
+                        BorderEdge::Left,
+                        row as usize,
+                        accent,
+                    )));
+                }
+            };
         }
 
         let right_x = x_offset + bw.saturating_sub(1);
         if right_x < surf_right && border_cells.right_vertical != " " {
-            surface[(right_x, fy)]
-                .set_symbol(border_cells.right_vertical)
-                .set_style(border_style_for_edge(
-                    BorderEdge::Right,
-                    row as usize,
-                    accent,
-                ));
+            {
+                if let Some(cell) = surface.cell_mut((right_x, fy)) {
+                    cell.set_symbol(border_cells.right_vertical);
+                    cell.set_style(tui::ratatui::to_ratatui_style(border_style_for_edge(
+                        BorderEdge::Right,
+                        row as usize,
+                        accent,
+                    )));
+                }
+            };
         }
     }
 
@@ -130,18 +137,9 @@ pub fn message(
             break;
         }
 
-        let mut x = x_offset + 1;
-        let right_limit = x_offset + bw - 1;
-        for span in &line.0 {
-            let remaining = right_limit.saturating_sub(x) as usize;
-            if remaining == 0 {
-                break;
-            }
-            let text: &str = &span.content;
-            let width = text.len().min(remaining);
-            surface.set_stringn(x, y, text, width, span.style);
-            x += width as u16;
-        }
+        let x = x_offset + 1;
+        let width = x_offset.saturating_add(bw).saturating_sub(1 + x);
+        surface.set_line(x, y, &tui::ratatui::to_ratatui_line(line), width);
 
         y += 1;
     }
@@ -152,9 +150,16 @@ pub fn message(
             if x >= surf_right || y >= surf_bottom {
                 continue;
             }
-            surface[(x, y)]
-                .set_symbol(border_cells.bottom(dx, bubble_w, align))
-                .set_style(border_style_for_edge(BorderEdge::Bottom, dx, accent));
+            {
+                if let Some(cell) = surface.cell_mut((x, y)) {
+                    cell.set_symbol(border_cells.bottom(dx, bubble_w, align));
+                    cell.set_style(tui::ratatui::to_ratatui_style(border_style_for_edge(
+                        BorderEdge::Bottom,
+                        dx,
+                        accent,
+                    )));
+                }
+            };
         }
     }
 
@@ -300,6 +305,7 @@ fn perimeter_position(
 mod tests {
     use super::*;
     use helix_view::graphics::Color;
+    use tui::ratatui::{buffer::Buffer as Surface, layout::Rect as SurfaceRect};
 
     #[test]
     fn corners_stay_normal_for_left_messages() {
@@ -343,7 +349,7 @@ mod tests {
 
     #[test]
     fn left_message_renders_open_frame() {
-        let mut surface = Surface::empty(Rect::new(0, 0, 12, 4));
+        let mut surface = Surface::empty(SurfaceRect::new(0, 0, 12, 4));
         let _ = message(
             &mut surface,
             Rect::new(0, 0, 12, 4),
@@ -359,19 +365,19 @@ mod tests {
             0,
         );
 
-        assert_eq!(surface[(0, 0)].symbol.as_ref(), "│");
-        assert_eq!(surface[(7, 0)].symbol.as_ref(), " ");
-        assert_eq!(surface[(1, 0)].symbol.as_ref(), "h");
-        assert_eq!(surface[(2, 0)].symbol.as_ref(), "i");
-        assert_eq!(surface[(0, 1)].symbol.as_ref(), "└");
-        assert_eq!(surface[(1, 1)].symbol.as_ref(), "─");
-        assert_eq!(surface[(2, 1)].symbol.as_ref(), "─");
-        assert_eq!(surface[(7, 1)].symbol.as_ref(), "╴");
+        assert_eq!(surface[(0, 0)].symbol(), "│");
+        assert_eq!(surface[(7, 0)].symbol(), " ");
+        assert_eq!(surface[(1, 0)].symbol(), "h");
+        assert_eq!(surface[(2, 0)].symbol(), "i");
+        assert_eq!(surface[(0, 1)].symbol(), "└");
+        assert_eq!(surface[(1, 1)].symbol(), "─");
+        assert_eq!(surface[(2, 1)].symbol(), "─");
+        assert_eq!(surface[(7, 1)].symbol(), "╴");
     }
 
     #[test]
     fn right_message_renders_open_frame() {
-        let mut surface = Surface::empty(Rect::new(0, 0, 12, 4));
+        let mut surface = Surface::empty(SurfaceRect::new(0, 0, 12, 4));
         let _ = message(
             &mut surface,
             Rect::new(0, 0, 12, 4),
@@ -387,11 +393,35 @@ mod tests {
             0,
         );
 
-        assert_eq!(surface[(5, 0)].symbol.as_ref(), "h");
-        assert_eq!(surface[(6, 0)].symbol.as_ref(), "i");
-        assert_eq!(surface[(11, 0)].symbol.as_ref(), "│");
-        assert_eq!(surface[(4, 1)].symbol.as_ref(), "╶");
-        assert_eq!(surface[(10, 1)].symbol.as_ref(), "─");
-        assert_eq!(surface[(11, 1)].symbol.as_ref(), "┘");
+        assert_eq!(surface[(5, 0)].symbol(), "h");
+        assert_eq!(surface[(6, 0)].symbol(), "i");
+        assert_eq!(surface[(11, 0)].symbol(), "│");
+        assert_eq!(surface[(4, 1)].symbol(), "╶");
+        assert_eq!(surface[(10, 1)].symbol(), "─");
+        assert_eq!(surface[(11, 1)].symbol(), "┘");
+    }
+
+    #[test]
+    fn message_content_uses_display_width_not_byte_length() {
+        let mut surface = Surface::empty(SurfaceRect::new(0, 0, 12, 4));
+        let _ = message(
+            &mut surface,
+            Rect::new(0, 0, 12, 4),
+            &[Spans::from("é界")],
+            8,
+            MessageAlign::Left,
+            MessageStyle {
+                border: Style::default(),
+                corners: MessageCorners::Squared,
+                accent: None,
+                accent_progress: 0.0,
+            },
+            0,
+        );
+
+        assert_eq!(surface[(1, 0)].symbol(), "é");
+        assert_eq!(surface[(2, 0)].symbol(), "界");
+        assert_eq!(surface[(3, 0)].symbol(), " ");
+        assert_eq!(surface[(4, 0)].symbol(), " ");
     }
 }

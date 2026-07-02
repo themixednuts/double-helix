@@ -537,7 +537,8 @@ fn build_tree_sitter_library(
                     ));
                 }
                 command.arg(&object_file);
-                _path_guard = TempPath::from_path(object_file);
+                _path_guard = TempPath::try_from_path(object_file)
+                    .context("failed to guard temporary scanner object file")?;
             }
         }
 
@@ -594,7 +595,8 @@ fn build_tree_sitter_library(
                 }
 
                 command.arg(&object_file);
-                _path_guard = TempPath::from_path(object_file);
+                _path_guard = TempPath::try_from_path(object_file)
+                    .context("failed to guard temporary scanner object file")?;
             }
         }
         command.arg("-xc").arg("-std=c11").arg(parser_path);

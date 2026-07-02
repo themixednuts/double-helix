@@ -382,6 +382,7 @@ fn write_impl(
     path: Option<&str>,
     options: WriteOptions,
 ) -> anyhow::Result<()> {
+    let path = path.filter(|path| !path.is_empty());
     let config = cx.editor.config();
     let (view_id, doc) = focused!(cx.editor);
 
@@ -398,6 +399,10 @@ fn write_impl(
     // Save an undo checkpoint for any outstanding changes.
     let view = view_mut!(cx.editor, view_id);
     doc.append_changes_to_history(view);
+
+    if path.is_none() && focused_ref!(cx.editor).1.path().is_none() {
+        bail!("Can't save with no path set!");
+    }
 
     let (format_task, doc_id) = {
         let (view_id, doc) = focused_ref!(cx.editor);
@@ -424,6 +429,9 @@ fn write_impl(
         cx.exit_task_event(task);
     } else {
         cx.editor.save(doc_id, path, options.policy)?;
+        if path.is_some() {
+            cx.block_try_flush_writes()?;
+        }
     }
 
     Ok(())
@@ -1655,19 +1663,15 @@ fn lsp_workspace_command(
                     .transpose()?
                     .filter(|args| !args.is_empty());
 
-                helix_runtime::send_blocking(
-                    &cx.ingress,
-                    crate::runtime::RuntimeEvent::Task(
-                        crate::runtime::RuntimeTaskEvent::ExecuteLspCommand {
-                            command: helix_lsp::lsp::Command {
-                                title: command.clone(),
-                                arguments,
-                                command,
-                            },
-                            server_id: *ls_id,
+                cx.ingress
+                    .task(crate::runtime::RuntimeTaskEvent::ExecuteLspCommand {
+                        command: helix_lsp::lsp::Command {
+                            title: command.clone(),
+                            arguments,
+                            command,
                         },
-                    ),
-                );
+                        server_id: *ls_id,
+                    });
             }
             [] => {
                 cx.editor.set_status(format!(
@@ -3549,20 +3553,15 @@ pub(crate) fn do_assistant_connect(
     _editor: &mut helix_view::Editor,
     command: String,
     cmd_args: Vec<String>,
-    ingress: helix_runtime::Sender<crate::runtime::RuntimeEvent>,
+    ingress: crate::runtime::RuntimeIngress,
     _agent_index: Option<usize>,
     _activate_input: bool,
 ) -> anyhow::Result<()> {
-    helix_runtime::send_blocking(
-        &ingress,
-        crate::runtime::RuntimeEvent::Task(
-            crate::runtime::RuntimeTaskEvent::ConnectAssistantBackend {
-                command,
-                args: cmd_args,
-                panel: PanelBehavior::Open,
-            },
-        ),
-    );
+    ingress.task(crate::runtime::RuntimeTaskEvent::ConnectAssistantBackend {
+        command,
+        args: cmd_args,
+        panel: PanelBehavior::Open,
+    });
 
     Ok(())
 }
@@ -3624,12 +3623,8 @@ fn assistant_prompt(
         bail!("Usage: assistant-prompt <message>");
     }
 
-    helix_runtime::send_blocking(
-        &cx.ingress,
-        crate::runtime::RuntimeEvent::Task(
-            crate::runtime::RuntimeTaskEvent::SubmitAssistantPrompt { text: prompt_text },
-        ),
-    );
+    cx.ingress
+        .task(crate::runtime::RuntimeTaskEvent::SubmitAssistantPrompt { text: prompt_text });
 
     Ok(())
 }
@@ -3672,12 +3667,8 @@ fn assistant_cancel(
         return Ok(());
     }
 
-    helix_runtime::send_blocking(
-        &cx.ingress,
-        crate::runtime::RuntimeEvent::Task(
-            crate::runtime::RuntimeTaskEvent::CancelActiveAssistantThread,
-        ),
-    );
+    cx.ingress
+        .task(crate::runtime::RuntimeTaskEvent::CancelActiveAssistantThread);
     Ok(())
 }
 
@@ -3701,12 +3692,8 @@ fn assistant_open_history(
         return Ok(());
     }
 
-    helix_runtime::send_blocking(
-        &cx.ingress,
-        crate::runtime::RuntimeEvent::Task(
-            crate::runtime::RuntimeTaskEvent::BootstrapAssistantHistory { scope },
-        ),
-    );
+    cx.ingress
+        .task(crate::runtime::RuntimeTaskEvent::BootstrapAssistantHistory { scope });
 
     cx.editor.set_status("Loading assistant history...");
 
@@ -3714,12 +3701,8 @@ fn assistant_open_history(
 }
 
 fn cycle_assistant_thread(cx: &mut compositor::Context, delta: isize) -> anyhow::Result<()> {
-    helix_runtime::send_blocking(
-        &cx.ingress,
-        crate::runtime::RuntimeEvent::Task(
-            crate::runtime::RuntimeTaskEvent::CycleAssistantThread { delta },
-        ),
-    );
+    cx.ingress
+        .task(crate::runtime::RuntimeTaskEvent::CycleAssistantThread { delta });
     Ok(())
 }
 
@@ -3754,12 +3737,8 @@ fn assistant_close_thread(
         return Ok(());
     }
 
-    helix_runtime::send_blocking(
-        &cx.ingress,
-        crate::runtime::RuntimeEvent::Task(
-            crate::runtime::RuntimeTaskEvent::CloseActiveAssistantThread,
-        ),
-    );
+    cx.ingress
+        .task(crate::runtime::RuntimeTaskEvent::CloseActiveAssistantThread);
     Ok(())
 }
 
@@ -3772,12 +3751,8 @@ fn assistant_new_thread(
         return Ok(());
     }
 
-    helix_runtime::send_blocking(
-        &cx.ingress,
-        crate::runtime::RuntimeEvent::Task(
-            crate::runtime::RuntimeTaskEvent::NewAssistantThreadFromActiveBackend,
-        ),
-    );
+    cx.ingress
+        .task(crate::runtime::RuntimeTaskEvent::NewAssistantThreadFromActiveBackend);
     Ok(())
 }
 
@@ -3790,12 +3765,8 @@ fn assistant_toggle_follow(
         return Ok(());
     }
 
-    helix_runtime::send_blocking(
-        &cx.ingress,
-        crate::runtime::RuntimeEvent::Task(
-            crate::runtime::RuntimeTaskEvent::ToggleActiveAssistantFollow,
-        ),
-    );
+    cx.ingress
+        .task(crate::runtime::RuntimeTaskEvent::ToggleActiveAssistantFollow);
     Ok(())
 }
 
@@ -3825,18 +3796,14 @@ fn assistant_attach_selection(
     if event != PromptEvent::Validate {
         return Ok(());
     }
-    helix_runtime::send_blocking(
-        &cx.ingress,
-        crate::runtime::RuntimeEvent::Task(
-            crate::runtime::RuntimeTaskEvent::AttachAssistantContext {
-                item: cx
-                    .editor
-                    .capture_current_surface(helix_view::collab::surface::Capture::Selection)
-                    .context("Selection context unavailable")?,
-                status: "Attached selection context",
-            },
-        ),
-    );
+    cx.ingress
+        .task(crate::runtime::RuntimeTaskEvent::AttachAssistantContext {
+            item: cx
+                .editor
+                .capture_current_surface(helix_view::collab::surface::Capture::Selection)
+                .context("Selection context unavailable")?,
+            status: "Attached selection context",
+        });
     Ok(())
 }
 
@@ -3848,18 +3815,14 @@ fn assistant_attach_symbol(
     if event != PromptEvent::Validate {
         return Ok(());
     }
-    helix_runtime::send_blocking(
-        &cx.ingress,
-        crate::runtime::RuntimeEvent::Task(
-            crate::runtime::RuntimeTaskEvent::AttachAssistantContext {
-                item: cx
-                    .editor
-                    .capture_current_surface(helix_view::collab::surface::Capture::Symbol)
-                    .context("Symbol context unavailable")?,
-                status: "Attached symbol context",
-            },
-        ),
-    );
+    cx.ingress
+        .task(crate::runtime::RuntimeTaskEvent::AttachAssistantContext {
+            item: cx
+                .editor
+                .capture_current_surface(helix_view::collab::surface::Capture::Symbol)
+                .context("Symbol context unavailable")?,
+            status: "Attached symbol context",
+        });
     Ok(())
 }
 
@@ -3875,15 +3838,11 @@ fn assistant_attach_file(
         cx.editor,
         &helix_view::assistant::context::Key::core("file"),
     ))?;
-    helix_runtime::send_blocking(
-        &cx.ingress,
-        crate::runtime::RuntimeEvent::Task(
-            crate::runtime::RuntimeTaskEvent::AttachAssistantContext {
-                item,
-                status: "Attached file context",
-            },
-        ),
-    );
+    cx.ingress
+        .task(crate::runtime::RuntimeTaskEvent::AttachAssistantContext {
+            item,
+            status: "Attached file context",
+        });
     Ok(())
 }
 
@@ -3899,15 +3858,11 @@ fn assistant_attach_diagnostics(
         cx.editor,
         &helix_view::assistant::context::Key::core("diagnostics"),
     ))?;
-    helix_runtime::send_blocking(
-        &cx.ingress,
-        crate::runtime::RuntimeEvent::Task(
-            crate::runtime::RuntimeTaskEvent::AttachAssistantContext {
-                item,
-                status: "Attached diagnostics context",
-            },
-        ),
-    );
+    cx.ingress
+        .task(crate::runtime::RuntimeTaskEvent::AttachAssistantContext {
+            item,
+            status: "Attached diagnostics context",
+        });
     Ok(())
 }
 
@@ -3923,15 +3878,11 @@ fn assistant_attach_diff(
         cx.editor,
         &helix_view::assistant::context::Key::core("diff"),
     ))?;
-    helix_runtime::send_blocking(
-        &cx.ingress,
-        crate::runtime::RuntimeEvent::Task(
-            crate::runtime::RuntimeTaskEvent::AttachAssistantContext {
-                item,
-                status: "Attached diff context",
-            },
-        ),
-    );
+    cx.ingress
+        .task(crate::runtime::RuntimeTaskEvent::AttachAssistantContext {
+            item,
+            status: "Attached diff context",
+        });
     Ok(())
 }
 
@@ -3952,14 +3903,10 @@ fn assistant_detach_context(
         bail!("No attached assistant context")
     }
     if items.len() == 1 {
-        helix_runtime::send_blocking(
-            &cx.ingress,
-            crate::runtime::RuntimeEvent::Task(
-                crate::runtime::RuntimeTaskEvent::DetachAssistantContext {
-                    item: items[0].id.clone(),
-                },
-            ),
-        );
+        cx.ingress
+            .task(crate::runtime::RuntimeTaskEvent::DetachAssistantContext {
+                item: items[0].id.clone(),
+            });
         return Ok(());
     }
 
@@ -3980,12 +3927,8 @@ fn assistant_open_entry_scratch(
         return Ok(());
     }
 
-    helix_runtime::send_blocking(
-        &cx.ingress,
-        crate::runtime::RuntimeEvent::Task(
-            crate::runtime::RuntimeTaskEvent::OpenSelectedAssistantEntryScratch,
-        ),
-    );
+    cx.ingress
+        .task(crate::runtime::RuntimeTaskEvent::OpenSelectedAssistantEntryScratch);
     Ok(())
 }
 
@@ -4020,12 +3963,8 @@ fn assistant_open_turn_changes(
         return Ok(());
     }
 
-    helix_runtime::send_blocking(
-        &cx.ingress,
-        crate::runtime::RuntimeEvent::Task(
-            crate::runtime::RuntimeTaskEvent::OpenSelectedAssistantTurnChanges,
-        ),
-    );
+    cx.ingress
+        .task(crate::runtime::RuntimeTaskEvent::OpenSelectedAssistantTurnChanges);
     Ok(())
 }
 
@@ -4038,12 +3977,8 @@ fn assistant_open_thread_changes(
         return Ok(());
     }
 
-    helix_runtime::send_blocking(
-        &cx.ingress,
-        crate::runtime::RuntimeEvent::Task(
-            crate::runtime::RuntimeTaskEvent::OpenActiveAssistantThreadChanges,
-        ),
-    );
+    cx.ingress
+        .task(crate::runtime::RuntimeTaskEvent::OpenActiveAssistantThreadChanges);
     Ok(())
 }
 

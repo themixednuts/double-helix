@@ -140,6 +140,14 @@ impl SyntaxSnapshotState {
         self.revision.advance();
     }
 
+    fn mark_pending_initial_parse(&mut self) {
+        self.tree = None;
+        if self.status != SyntaxStatus::StalePendingRefresh {
+            self.status = SyntaxStatus::StalePendingRefresh;
+            self.revision.advance();
+        }
+    }
+
     fn mark_updated(&mut self) {
         if self.tree.is_some() {
             self.status = SyntaxStatus::Fresh;
@@ -189,6 +197,14 @@ fn syntax_budget(
     SyntaxBudget::Idle
 }
 
+fn initial_syntax_budget(shape: DocumentShape) -> SyntaxBudget {
+    if shape.has_giant_lines() {
+        SyntaxBudget::Interactive(InteractiveSyntaxReason::GiantLines)
+    } else {
+        SyntaxBudget::Idle
+    }
+}
+
 impl SyntaxAwareState {
     pub fn set_language(
         &mut self,
@@ -198,16 +214,59 @@ impl SyntaxAwareState {
         display_name: &str,
     ) {
         self.language = language_config;
-        let syntax = self.language.as_ref().and_then(|config| {
-            Syntax::new(text, config.language(), loader)
-                .map_err(|err| {
-                    if err != syntax::HighlighterError::NoRootConfig {
-                        log::warn!("Error building syntax for '{}': {err}", display_name);
-                    }
-                })
-                .ok()
-        });
-        self.syntax_snapshot.set_tree(syntax);
+        let Some(config) = self.language.as_ref() else {
+            self.syntax_snapshot.set_tree(None);
+            return;
+        };
+
+        let shape = DocumentShape::from_text(text);
+        let budget = initial_syntax_budget(shape);
+        let timeout = match budget {
+            SyntaxBudget::Idle => syntax::IDLE_PARSE_TIMEOUT,
+            SyntaxBudget::Interactive(_) => syntax::INTERACTIVE_PARSE_TIMEOUT,
+        };
+
+        match Syntax::new_with_timeout(text, config.language(), loader, timeout) {
+            Ok(syntax) => {
+                self.syntax_snapshot.set_tree(Some(syntax));
+                log_run_event("syntax_initial_parse_ok", || {
+                    format!(
+                        "display_name={} lines={} bytes={} use_interactive_budget={} reason={}",
+                        display_name,
+                        shape.line_count,
+                        shape.byte_count,
+                        matches!(budget, SyntaxBudget::Interactive(_)),
+                        match budget {
+                            SyntaxBudget::Idle => "idle",
+                            SyntaxBudget::Interactive(reason) => reason.label(),
+                        }
+                    )
+                });
+            }
+            Err(syntax::HighlighterError::Timeout) => {
+                self.syntax_snapshot.mark_pending_initial_parse();
+                log_run_event("syntax_initial_parse_timeout", || {
+                    format!(
+                        "display_name={} lines={} bytes={} avg_bytes_per_line={} use_interactive_budget={} reason={}",
+                        display_name,
+                        shape.line_count,
+                        shape.byte_count,
+                        shape.average_bytes_per_line(),
+                        matches!(budget, SyntaxBudget::Interactive(_)),
+                        match budget {
+                            SyntaxBudget::Idle => "idle",
+                            SyntaxBudget::Interactive(reason) => reason.label(),
+                        }
+                    )
+                });
+            }
+            Err(err) => {
+                if err != syntax::HighlighterError::NoRootConfig {
+                    log::warn!("Error building syntax for '{}': {err}", display_name);
+                }
+                self.syntax_snapshot.set_tree(None);
+            }
+        }
     }
 
     pub fn set_language_configuration(
@@ -485,8 +544,39 @@ impl SyntaxAwareState {
         }
 
         if self.syntax_snapshot.syntax().is_none() {
-            self.syntax_snapshot.mark_disabled();
-            return true;
+            let Some(language) = self.language.as_ref() else {
+                self.syntax_snapshot.mark_disabled();
+                return true;
+            };
+            let shape = DocumentShape::from_text(current_doc);
+            return match Syntax::new(current_doc, language.language(), loader) {
+                Ok(syntax) => {
+                    self.syntax_snapshot.set_tree(Some(syntax));
+                    log_run_event("syntax_initial_idle_parse_ok", || {
+                        format!("lines={} bytes={}", shape.line_count, shape.byte_count)
+                    });
+                    true
+                }
+                Err(syntax::HighlighterError::Timeout) => {
+                    log_run_event("syntax_initial_idle_parse_timeout", || {
+                        format!("lines={} bytes={}", shape.line_count, shape.byte_count)
+                    });
+                    false
+                }
+                Err(err) => {
+                    log::error!(
+                        "TS parser failed during initial idle parse, disabling TS for the current buffer: {err}"
+                    );
+                    log_run_event("syntax_disabled", || {
+                        format!(
+                            "phase=initial_idle_parse lines={} bytes={} error={err}",
+                            shape.line_count, shape.byte_count
+                        )
+                    });
+                    self.syntax_snapshot.mark_disabled();
+                    true
+                }
+            };
         }
 
         let result = {
@@ -548,7 +638,8 @@ impl SyntaxAwareState {
 #[cfg(test)]
 mod tests {
     use super::{
-        syntax_budget, DocumentShape, InteractiveSyntaxReason, SyntaxBudget, SyntaxStatus,
+        initial_syntax_budget, syntax_budget, DocumentShape, InteractiveSyntaxReason, SyntaxBudget,
+        SyntaxStatus,
     };
     use helix_core::syntax::SyntaxComplexity;
 
@@ -599,6 +690,19 @@ mod tests {
 
         assert_eq!(
             syntax_budget(SyntaxStatus::Fresh, shape, complexity),
+            SyntaxBudget::Interactive(InteractiveSyntaxReason::GiantLines)
+        );
+    }
+
+    #[test]
+    fn initial_syntax_budget_uses_interactive_for_giant_lines() {
+        let shape = DocumentShape {
+            line_count: 2,
+            byte_count: 512 * 1024,
+        };
+
+        assert_eq!(
+            initial_syntax_budget(shape),
             SyntaxBudget::Interactive(InteractiveSyntaxReason::GiantLines)
         );
     }

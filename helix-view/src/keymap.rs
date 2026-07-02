@@ -3,49 +3,50 @@ use arc_swap::{
     ArcSwap,
 };
 use std::{
-    borrow::Cow,
     collections::HashMap,
     ops::{Deref, DerefMut},
     sync::Arc,
 };
 
 use crate::document::Mode;
-use crate::engine::{CharPendingBinding, CommandToken, KeymapLookup, KeymapQuery};
+use crate::engine::{CharPendingBinding, CharPendingId, CommandToken, KeymapLookup, KeymapQuery};
 use crate::info::Info;
 use crate::input::{KeyCode, KeyEvent};
 use crate::keyboard::KeyModifiers;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ModalCommandBinding {
-    token: CommandToken,
+pub struct ModalBinding<T> {
+    target: T,
     doc: &'static str,
 }
 
-impl ModalCommandBinding {
-    pub const fn new(token: CommandToken, doc: &'static str) -> Self {
-        Self { token, doc }
+impl<T> ModalBinding<T> {
+    pub const fn new(target: T, doc: &'static str) -> Self {
+        Self { target, doc }
     }
 
-    pub const fn token(self) -> CommandToken {
-        self.token
-    }
-
-    pub const fn doc(self) -> &'static str {
+    pub const fn doc(&self) -> &'static str {
         self.doc
     }
 }
 
+impl<T: Copy> ModalBinding<T> {
+    pub const fn target(&self) -> T {
+        self.target
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ModalKeyTrieNode {
+pub struct ModalTrieNode<T> {
     pub name: String,
-    pub map: HashMap<KeyEvent, ModalKeyTrie>,
+    pub map: HashMap<KeyEvent, ModalTrie<T>>,
     pub order: Vec<KeyEvent>,
     pub is_sticky: bool,
     pub fallback: Option<CharPendingBinding>,
 }
 
-impl ModalKeyTrieNode {
-    pub fn new(name: &str, map: HashMap<KeyEvent, ModalKeyTrie>, order: Vec<KeyEvent>) -> Self {
+impl<T> ModalTrieNode<T> {
+    pub fn new(name: &str, map: HashMap<KeyEvent, ModalTrie<T>>, order: Vec<KeyEvent>) -> Self {
         Self {
             name: name.to_string(),
             map,
@@ -62,9 +63,9 @@ impl ModalKeyTrieNode {
                 continue;
             };
             let desc = match trie {
-                ModalKeyTrie::Command(cmd) => cmd.doc(),
-                ModalKeyTrie::Node(node) => node.name.as_str(),
-                ModalKeyTrie::Sequence(_) => "[Multiple commands]",
+                ModalTrie::Binding(binding) => binding.doc(),
+                ModalTrie::Node(node) => node.name.as_str(),
+                ModalTrie::Sequence(_) => "[Multiple commands]",
             };
             body.push((key.to_string(), desc));
         }
@@ -75,41 +76,41 @@ impl ModalKeyTrieNode {
     }
 }
 
-impl Deref for ModalKeyTrieNode {
-    type Target = HashMap<KeyEvent, ModalKeyTrie>;
+impl<T> Deref for ModalTrieNode<T> {
+    type Target = HashMap<KeyEvent, ModalTrie<T>>;
 
     fn deref(&self) -> &Self::Target {
         &self.map
     }
 }
 
-impl DerefMut for ModalKeyTrieNode {
+impl<T> DerefMut for ModalTrieNode<T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.map
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ModalKeyTrie {
-    Command(ModalCommandBinding),
-    Sequence(Box<[ModalCommandBinding]>),
-    Node(ModalKeyTrieNode),
+pub enum ModalTrie<T> {
+    Binding(ModalBinding<T>),
+    Sequence(Box<[ModalBinding<T>]>),
+    Node(ModalTrieNode<T>),
 }
 
-impl ModalKeyTrie {
-    pub fn node(&self) -> Option<&ModalKeyTrieNode> {
+impl<T> ModalTrie<T> {
+    pub fn node(&self) -> Option<&ModalTrieNode<T>> {
         match self {
             Self::Node(node) => Some(node),
-            Self::Command(_) | Self::Sequence(_) => None,
+            Self::Binding(_) | Self::Sequence(_) => None,
         }
     }
 
-    pub fn search(&self, keys: &[KeyEvent]) -> Option<&ModalKeyTrie> {
+    pub fn search(&self, keys: &[KeyEvent]) -> Option<&Self> {
         let mut trie = self;
         for key in keys {
             trie = match trie {
                 Self::Node(map) => map.get(key),
-                Self::Command(_) | Self::Sequence(_) => None,
+                Self::Binding(_) | Self::Sequence(_) => None,
             }?;
         }
         Some(trie)
@@ -129,21 +130,31 @@ impl ModalKeyTrie {
                         None
                     }
                 },
-                Self::Command(_) | Self::Sequence(_) => None,
+                Self::Binding(_) | Self::Sequence(_) => None,
             }?;
         }
         None
     }
 }
 
-pub struct ModalKeymaps {
-    map: Box<dyn DynAccess<HashMap<Mode, ModalKeyTrie>> + Send + Sync>,
-    state: Vec<KeyEvent>,
-    sticky: Option<ModalKeyTrieNode>,
+#[derive(Debug, Clone)]
+pub enum ModalLookup<T> {
+    Matched(T),
+    MatchedSequence(Box<[T]>),
+    Pending(Option<Info>),
+    NotFound,
+    Cancelled(Box<[KeyEvent]>),
+    Fallback(CharPendingId, char),
 }
 
-impl ModalKeymaps {
-    pub fn new(map: Box<dyn DynAccess<HashMap<Mode, ModalKeyTrie>> + Send + Sync>) -> Self {
+pub struct ModalKeymapState<T> {
+    map: Box<dyn DynAccess<HashMap<Mode, ModalTrie<T>>> + Send + Sync>,
+    state: Vec<KeyEvent>,
+    sticky: Option<ModalTrieNode<T>>,
+}
+
+impl<T: Copy + Send + Sync + 'static> ModalKeymapState<T> {
+    pub fn new(map: Box<dyn DynAccess<HashMap<Mode, ModalTrie<T>>> + Send + Sync>) -> Self {
         Self {
             map,
             state: Vec::new(),
@@ -151,11 +162,11 @@ impl ModalKeymaps {
         }
     }
 
-    pub fn from_shared(map: Arc<ArcSwap<HashMap<Mode, ModalKeyTrie>>>) -> Self {
+    pub fn from_shared(map: Arc<ArcSwap<HashMap<Mode, ModalTrie<T>>>>) -> Self {
         Self::new(Box::new(map))
     }
 
-    pub fn map(&self) -> DynGuard<HashMap<Mode, ModalKeyTrie>> {
+    pub fn map(&self) -> DynGuard<HashMap<Mode, ModalTrie<T>>> {
         self.map.load()
     }
 
@@ -170,22 +181,125 @@ impl ModalKeymaps {
         };
         keymap
             .search(self.pending())
-            .and_then(ModalKeyTrie::node)
+            .and_then(ModalTrie::node)
             .is_some_and(|node| node.contains_key(&key))
     }
+}
 
+impl<T: Copy + Send + Sync + 'static> Default for ModalKeymapState<T> {
+    fn default() -> Self {
+        Self::new(Box::new(ArcSwap::new(Arc::new(HashMap::new()))))
+    }
+}
+
+fn lookup_keymap<T: Copy>(
+    keymap: &ModalTrie<T>,
+    state: &mut Vec<KeyEvent>,
+    sticky: &mut Option<ModalTrieNode<T>>,
+    key: KeyEvent,
+) -> ModalLookup<T> {
+    if key
+        == (KeyEvent {
+            code: KeyCode::Esc,
+            modifiers: KeyModifiers::empty(),
+        })
+    {
+        if !state.is_empty() {
+            return ModalLookup::Cancelled(std::mem::take(state).into_boxed_slice());
+        }
+        *sticky = None;
+    }
+
+    let first = state.first().unwrap_or(&key);
+    let trie = match sticky.as_ref() {
+        Some(node) => node.map.get(first),
+        None => keymap.search(&[*first]),
+    };
+    let trie = match trie {
+        Some(ModalTrie::Binding(binding)) => return ModalLookup::Matched(binding.target()),
+        Some(ModalTrie::Sequence(bindings)) => {
+            let targets = bindings
+                .iter()
+                .map(ModalBinding::target)
+                .collect::<Vec<_>>();
+            return ModalLookup::MatchedSequence(targets.into_boxed_slice());
+        }
+        None => return ModalLookup::NotFound,
+        Some(trie) => trie,
+    };
+
+    state.push(key);
+    match trie.search(&state[1..]) {
+        Some(ModalTrie::Node(map)) => {
+            let next_sticky = map.is_sticky.then(|| map.clone());
+            let info = map.infobox();
+            if map.is_sticky {
+                state.clear();
+            }
+            if let Some(next_sticky) = next_sticky {
+                *sticky = Some(next_sticky);
+            }
+            ModalLookup::Pending(Some(info))
+        }
+        Some(ModalTrie::Binding(binding)) => {
+            state.clear();
+            ModalLookup::Matched(binding.target())
+        }
+        Some(ModalTrie::Sequence(bindings)) => {
+            state.clear();
+            let targets = bindings
+                .iter()
+                .map(ModalBinding::target)
+                .collect::<Vec<_>>();
+            ModalLookup::MatchedSequence(targets.into_boxed_slice())
+        }
+        None => {
+            if let Some(ch) = key.char() {
+                if let Some(fallback) = trie.search_fallback(&state[1..]) {
+                    state.clear();
+                    return ModalLookup::Fallback(fallback.id(), ch);
+                }
+            }
+            ModalLookup::Cancelled(std::mem::take(state).into_boxed_slice())
+        }
+    }
+}
+
+/// Modal bindings that can be executed directly by the editing engine.
+///
+/// Use this keymap shape for normal editor input and for component-owned edit
+/// regions that intentionally expose only engine commands.
+pub type ModalCommandBinding = ModalBinding<CommandToken>;
+pub type ModalKeyTrieNode = ModalTrieNode<CommandToken>;
+pub type ModalKeyTrie = ModalTrie<CommandToken>;
+pub type ModalKeymaps = ModalKeymapState<CommandToken>;
+
+impl ModalCommandBinding {
+    pub const fn token(&self) -> CommandToken {
+        self.target()
+    }
+}
+
+impl ModalKeymaps {
     pub fn get(&mut self, mode: Mode, key: KeyEvent) -> KeymapLookup {
         let keymaps = &*self.map();
         let Some(keymap) = keymaps.get(&mode) else {
             return KeymapLookup::NotFound;
         };
-        lookup_keymap(keymap, &mut self.state, &mut self.sticky, key)
+        lookup_keymap(keymap, &mut self.state, &mut self.sticky, key).into()
     }
 }
 
-impl Default for ModalKeymaps {
-    fn default() -> Self {
-        Self::new(Box::new(ArcSwap::new(Arc::new(HashMap::new()))))
+impl From<ModalLookup<CommandToken>> for KeymapLookup {
+    fn from(lookup: ModalLookup<CommandToken>) -> Self {
+        match lookup {
+            ModalLookup::Matched(token) => Self::Matched(token),
+            ModalLookup::MatchedSequence(tokens) => Self::MatchedSequence(tokens),
+            ModalLookup::Pending(info) => Self::Pending(info),
+            ModalLookup::NotFound => Self::NotFound,
+            ModalLookup::Cancelled(keys) => Self::Cancelled(keys),
+            ModalLookup::Fallback(fallback, ch) => Self::Fallback(fallback, ch),
+        }
     }
 }
 
@@ -203,7 +317,7 @@ impl KeymapQuery for ModalKeymaps {
     }
 
     fn sticky_infobox(&self) -> Option<Info> {
-        self.sticky.as_ref().map(ModalKeyTrieNode::infobox)
+        self.sticky.as_ref().map(ModalTrieNode::infobox)
     }
 
     fn clear_sticky(&mut self) {
@@ -211,66 +325,70 @@ impl KeymapQuery for ModalKeymaps {
     }
 }
 
-fn lookup_keymap(
-    keymap: &ModalKeyTrie,
-    state: &mut Vec<KeyEvent>,
-    sticky: &mut Option<ModalKeyTrieNode>,
-    key: KeyEvent,
-) -> KeymapLookup {
-    if key
-        == (KeyEvent {
-            code: KeyCode::Esc,
-            modifiers: KeyModifiers::empty(),
-        })
-    {
-        if !state.is_empty() {
-            return KeymapLookup::Cancelled(std::mem::take(state).into_boxed_slice());
-        }
-        *sticky = None;
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FrontendIntentKind {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ComponentIntentKind {}
+
+pub type FrontendIntentId = crate::id::Id<FrontendIntentKind, &'static str>;
+pub type ComponentIntentId = crate::id::Id<ComponentIntentKind, &'static str>;
+
+/// Modal binding intent for components that need editor-like keymaps without
+/// pretending every configured command is executable by the editing engine.
+///
+/// Choose the variant by execution boundary:
+///
+/// - `Engine`: the target is a `CommandToken` and can be sent directly to an
+///   editing engine or component-owned edit region.
+/// - `Frontend`: the target is a named frontend/editor command from user
+///   config. Components must explicitly whitelist and reinterpret these.
+/// - `Component`: the target is local to the receiving component/panel and has
+///   no editor-global meaning.
+///
+/// This type is intentionally separate from `ModalKeymaps`: only
+/// `ModalKeymaps` implements `KeymapQuery`, so code that needs to dispatch into
+/// the core modal engine cannot accidentally receive frontend or component
+/// actions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ModalIntent {
+    Engine(CommandToken),
+    Frontend(FrontendIntentId),
+    Component(ComponentIntentId),
+}
+
+impl ModalIntent {
+    pub const fn engine(token: CommandToken) -> Self {
+        Self::Engine(token)
     }
 
-    let first = state.first().unwrap_or(&key);
-    let trie_node = match sticky.as_ref() {
-        Some(trie) => Cow::Owned(ModalKeyTrie::Node(trie.clone())),
-        None => Cow::Borrowed(keymap),
-    };
+    pub const fn frontend(id: FrontendIntentId) -> Self {
+        Self::Frontend(id)
+    }
 
-    let trie = match trie_node.search(&[*first]) {
-        Some(ModalKeyTrie::Command(cmd)) => return KeymapLookup::Matched(cmd.token()),
-        Some(ModalKeyTrie::Sequence(cmds)) => {
-            let tokens = cmds.iter().map(|cmd| cmd.token()).collect::<Vec<_>>();
-            return KeymapLookup::MatchedSequence(tokens.into_boxed_slice());
-        }
-        None => return KeymapLookup::NotFound,
-        Some(trie) => trie,
-    };
+    pub const fn component(id: ComponentIntentId) -> Self {
+        Self::Component(id)
+    }
+}
 
-    state.push(key);
-    match trie.search(&state[1..]) {
-        Some(ModalKeyTrie::Node(map)) => {
-            if map.is_sticky {
-                state.clear();
-                *sticky = Some(map.clone());
-            }
-            KeymapLookup::Pending(Some(map.infobox()))
-        }
-        Some(ModalKeyTrie::Command(cmd)) => {
-            state.clear();
-            KeymapLookup::Matched(cmd.token())
-        }
-        Some(ModalKeyTrie::Sequence(cmds)) => {
-            state.clear();
-            let tokens = cmds.iter().map(|cmd| cmd.token()).collect::<Vec<_>>();
-            KeymapLookup::MatchedSequence(tokens.into_boxed_slice())
-        }
-        None => {
-            if let Some(ch) = key.char() {
-                if let Some(fallback) = trie.search_fallback(&state[1..]) {
-                    state.clear();
-                    return KeymapLookup::Fallback(fallback.id(), ch);
-                }
-            }
-            KeymapLookup::Cancelled(std::mem::take(state).into_boxed_slice())
-        }
+pub type ModalIntentBinding = ModalBinding<ModalIntent>;
+pub type ModalIntentTrieNode = ModalTrieNode<ModalIntent>;
+pub type ModalIntentTrie = ModalTrie<ModalIntent>;
+pub type ModalIntentLookup = ModalLookup<ModalIntent>;
+pub type ModalIntentKeymaps = ModalKeymapState<ModalIntent>;
+
+impl ModalIntentBinding {
+    pub const fn intent(&self) -> ModalIntent {
+        self.target()
+    }
+}
+
+impl ModalIntentKeymaps {
+    pub fn get(&mut self, mode: Mode, key: KeyEvent) -> ModalIntentLookup {
+        let keymaps = &*self.map();
+        let Some(keymap) = keymaps.get(&mode) else {
+            return ModalLookup::NotFound;
+        };
+        lookup_keymap(keymap, &mut self.state, &mut self.sticky, key)
     }
 }

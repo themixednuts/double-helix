@@ -25,9 +25,12 @@ pub mod icons;
 pub mod id;
 pub mod info;
 pub mod input;
+pub mod jump_labels;
 pub mod keyboard;
 pub mod keymap;
 pub mod layout;
+pub mod list_nav;
+pub mod modal_text;
 pub mod model;
 pub mod presentation_state;
 pub mod register;
@@ -36,6 +39,7 @@ pub mod selection_store;
 pub mod session_state;
 pub mod snippet_state;
 pub mod statusline;
+pub mod statusline_mode;
 pub mod syntax_aware;
 pub mod text_buffer;
 pub mod theme;
@@ -106,7 +110,7 @@ pub fn align_view(doc: &mut Document, view: &View, align: Align) {
     align_view_in(doc, view, align);
 }
 
-pub use document::Document;
+pub use document::{Document, LanguageInitialization};
 pub use editor::Editor;
 use helix_core::char_idx_at_visual_offset;
 pub use revision::Revision;

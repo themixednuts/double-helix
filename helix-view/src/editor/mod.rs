@@ -5,6 +5,8 @@ mod component;
 mod config;
 mod core;
 mod document;
+mod embed;
+mod file_operation;
 mod focus;
 mod hooks;
 mod jump;
@@ -41,11 +43,16 @@ pub use config::{
     WhitespaceRender, WhitespaceRenderValue, WordCompletion,
 };
 pub use core::Editor;
+pub use embed::{
+    DocumentSnapshot, EditorSession, EditorSessionBuilder, EditorSessionEvent, EditorSnapshot,
+    FocusedSnapshot, InsertPlacement, StatusSnapshot, ViewSnapshot,
+};
 pub use helix_core::diagnostic::Severity;
 pub use hooks::LifecycleBus;
 pub use navigation::{Action, CloseError};
 pub use runtime::DocumentSaveReport;
 pub use session::BenchOverlay;
+pub use setup::EditorBuilder;
 pub use state::CursorCache;
 pub use status::{Notification, NotificationManager, WorkspaceDiagnosticCounts};
 pub use types::{
@@ -53,6 +60,7 @@ pub use types::{
     ClosePolicy, CompleteAction, ConfigEvent, EditTarget, EditorEvent, FrameSelection,
     PanelBehavior, SavePolicy, ShowDocumentRequest, ThreadSelectPolicy,
 };
+pub use workspace::DetachedPreviewDocument;
 impl crate::traits::Modal for Editor {
     fn mode(&self) -> Mode {
         Editor::mode(self)

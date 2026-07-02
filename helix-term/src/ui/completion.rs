@@ -22,11 +22,7 @@ use nucleo::{
     pattern::{Atom, AtomKind, CaseMatching, Normalization},
     Config, Utf32Str,
 };
-use tui::{
-    buffer::Buffer as Surface,
-    text::{Span, Spans},
-    widgets::BorderType,
-};
+use tui::text::{Span, Spans};
 
 use std::cmp::Reverse;
 
@@ -188,7 +184,7 @@ impl Completion {
         items: Vec<CompletionItem>,
         trigger_offset: usize,
         runtime: ResolveRuntime,
-        ingress: helix_runtime::Sender<crate::runtime::RuntimeEvent>,
+        ingress: crate::runtime::RuntimeIngress,
     ) -> Self {
         let preview_completion_insert = editor.config().preview_completion_insert;
         let replace_mode = editor.config().completion_replace;
@@ -522,6 +518,18 @@ impl Completion {
         self.popup.contents().is_empty()
     }
 
+    /// Advance the menu selection by one row. Useful for headless setup
+    /// (tests, storybook fixtures) — at runtime the user drives this via key
+    /// events that the compositor forwards to `handle_event`.
+    pub fn move_down(&mut self) {
+        self.popup.contents_mut().move_down();
+    }
+
+    /// Reverse of [`Self::move_down`].
+    pub fn move_up(&mut self) {
+        self.popup.contents_mut().move_up();
+    }
+
     pub fn replace_item(
         &mut self,
         old_item: &impl PartialEq<CompletionItem>,
@@ -621,6 +629,155 @@ impl Completion {
         model.doc = doc_text;
     }
 
+    fn cache_tag(&self, area: Rect, ctx: &RenderContext) -> crate::render::CacheTag {
+        use crate::render::{CacheId, CacheKey, CacheTag};
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let mut h = DefaultHasher::new();
+        self.filter.hash(&mut h);
+        let menu = self.popup.contents();
+        menu.cursor_index().hash(&mut h);
+        menu.len().hash(&mut h);
+        self.popup.scroll_half_pages.hash(&mut h);
+        self.popup.area.hash(&mut h);
+        if let Some(pos) = ctx.cursor_position() {
+            pos.row.hash(&mut h);
+            pos.col.hash(&mut h);
+        }
+
+        CacheTag {
+            id: CacheId::hashed(&"completion"),
+            key: CacheKey::hashed(&h.finish()),
+            area,
+        }
+    }
+
+    fn render_surface<FP, FM>(
+        &mut self,
+        area: Rect,
+        surface: &mut crate::render::CellSurface,
+        cx: &RenderContext,
+        render_popup: FP,
+        render_markdown: FM,
+    ) where
+        FP: FnOnce(
+            &mut Popup<Menu<CompletionItem>>,
+            Rect,
+            &mut crate::render::CellSurface,
+            &RenderContext,
+        ),
+        FM: FnOnce(&mut Markdown, Rect, &mut crate::render::CellSurface, &RenderContext),
+    {
+        render_popup(&mut self.popup, area, surface, cx);
+
+        let option = match self.popup.contents_mut().selection_mut() {
+            Some(option) => option,
+            None => return,
+        };
+
+        let Some(coords) = cx.cursor_position() else {
+            return;
+        };
+        let cursor_pos = coords.row as u16;
+        let Some(doc) = cx.focused_document() else {
+            return;
+        };
+        let language = doc.language_name().unwrap_or("");
+        let syn_loader = cx.syntax_loader().clone();
+
+        let markdowned = |lang: &str, detail: Option<&str>, doc: Option<&str>| {
+            let md = match (detail, doc) {
+                (Some(detail), Some(doc)) => format!("```{lang}\n{detail}\n```\n{doc}"),
+                (Some(detail), None) => format!("```{lang}\n{detail}\n```"),
+                (None, Some(doc)) => doc.to_string(),
+                (None, None) => String::new(),
+            };
+            Markdown::new(md, syn_loader.clone())
+        };
+
+        let mut markdown_doc = match option {
+            CompletionItem::Lsp(option) => match &option.item.documentation {
+                Some(lsp::Documentation::String(contents))
+                | Some(lsp::Documentation::MarkupContent(lsp::MarkupContent {
+                    kind: lsp::MarkupKind::PlainText,
+                    value: contents,
+                })) => markdowned(language, option.item.detail.as_deref(), Some(contents)),
+                Some(lsp::Documentation::MarkupContent(lsp::MarkupContent {
+                    kind: lsp::MarkupKind::Markdown,
+                    value: contents,
+                })) => markdowned(language, option.item.detail.as_deref(), Some(contents)),
+                None if option.item.detail.is_some() => {
+                    markdowned(language, option.item.detail.as_deref(), None)
+                }
+                None => return,
+            },
+            CompletionItem::Other(option) => {
+                let Some(doc) = option.documentation.as_deref() else {
+                    return;
+                };
+                markdowned(language, None, Some(doc))
+            }
+        };
+
+        let popup_area = self.popup.area_at(
+            area,
+            cx.cursor_position(),
+            cx.popup_border(),
+            cx.menu_border(),
+        );
+        let doc_width_available = area.right().saturating_sub(popup_area.right());
+        let doc_area = if doc_width_available > 30 {
+            let mut doc_width = doc_width_available;
+            let mut doc_height = area.bottom().saturating_sub(popup_area.top());
+            let x = popup_area.right();
+            let y = popup_area.top();
+
+            if let Some((rel_width, rel_height)) =
+                markdown_doc.required_size((doc_width, doc_height))
+            {
+                doc_width = rel_width.min(doc_width);
+                doc_height = rel_height.min(doc_height);
+            }
+            Rect::new(x, y, doc_width, doc_height)
+        } else {
+            let avail_height_above = cursor_pos.min(popup_area.top()).saturating_sub(area.y + 1);
+            let avail_height_below = area
+                .bottom()
+                .saturating_sub(cursor_pos.max(popup_area.bottom()) + 1);
+            let (y, avail_height) = if avail_height_below >= avail_height_above {
+                (
+                    area.bottom().saturating_sub(avail_height_below),
+                    avail_height_below,
+                )
+            } else {
+                (area.y, avail_height_above)
+            };
+            if avail_height <= 1 {
+                return;
+            }
+
+            Rect::new(area.x, y, area.width, avail_height.min(15))
+        };
+
+        let background = cx.theme().get("ui.popup");
+        if cx.popup_border() {
+            crate::widgets::Panel::framed(
+                crate::widgets::PanelStyle::plain(background),
+                cx.config().rounded_corners,
+            )
+            .render(surface, doc_area);
+        } else {
+            {
+                let area = tui::ratatui::to_ratatui_rect(doc_area);
+                tui::ratatui::widgets::Widget::render(tui::ratatui::widgets::Clear, area, surface);
+                surface.set_style(area, tui::ratatui::to_ratatui_style(background));
+            };
+        }
+
+        render_markdown(&mut markdown_doc, doc_area, surface, cx);
+    }
+
     /// Pre-resolve the currently selected LSP completion item so the render
     /// phase doesn't need `&mut Editor`. Called from `EditorView::sync`.
     pub fn resolve_selected_item(&mut self, editor: &mut Editor) {
@@ -643,147 +800,23 @@ impl Component for Completion {
         self.sync_to_model(editor);
     }
 
-    fn prepare_render(&mut self, area: Rect, ctx: &RenderContext) -> crate::render::PreparedRender {
-        use crate::render::{CacheId, CacheKey, CacheTag, PreparedRender, RenderOutput};
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-
-        let mut h = DefaultHasher::new();
-        self.filter.hash(&mut h);
-        let menu = self.popup.contents();
-        menu.cursor_index().hash(&mut h);
-        menu.len().hash(&mut h);
-        self.popup.scroll_half_pages.hash(&mut h);
-        self.popup.area.hash(&mut h);
-        if let Some(pos) = ctx.editor.cursor().0 {
-            pos.row.hash(&mut h);
-            pos.col.hash(&mut h);
-        }
-
-        let tag = CacheTag {
-            id: CacheId::hashed(&"completion"),
-            key: CacheKey::hashed(&h.finish()),
+    fn render(&mut self, area: Rect, surface: &mut crate::render::CellSurface, cx: &RenderContext) {
+        self.render_surface(
             area,
-        };
-        let mut output = RenderOutput::new(area);
-        self.render(area, &mut output.surface, ctx);
-        PreparedRender::cached(tag, output)
+            surface,
+            cx,
+            |popup, area, surface, cx| popup.render(area, surface, cx),
+            |markdown, area, surface, cx| markdown.render(area, surface, cx),
+        );
     }
 
-    fn render(&mut self, area: Rect, surface: &mut Surface, cx: &RenderContext) {
-        self.popup.render(area, surface, cx);
+    fn prepare_render(&mut self, area: Rect, ctx: &RenderContext) -> crate::render::PreparedRender {
+        use crate::render::{PreparedRender, RenderOutput};
 
-        // if we have a selection, render a markdown popup on top/below with info
-        // NOTE: ensure_item_resolved is now called in EditorView::sync.
-        let option = match self.popup.contents_mut().selection_mut() {
-            Some(option) => option,
-            None => return,
-        };
-        // need to render:
-        // option.detail
-        // ---
-        // option.documentation
-
-        let Some(coords) = cx.editor.cursor().0 else {
-            return;
-        };
-        let cursor_pos = coords.row as u16;
-        let (_, doc) = focused_ref!(cx.editor);
-        let language = doc.language_name().unwrap_or("");
-
-        let markdowned = |lang: &str, detail: Option<&str>, doc: Option<&str>| {
-            let md = match (detail, doc) {
-                (Some(detail), Some(doc)) => format!("```{lang}\n{detail}\n```\n{doc}"),
-                (Some(detail), None) => format!("```{lang}\n{detail}\n```"),
-                (None, Some(doc)) => doc.to_string(),
-                (None, None) => String::new(),
-            };
-            Markdown::new(md, cx.editor.syn_loader.clone())
-        };
-
-        let mut markdown_doc = match option {
-            CompletionItem::Lsp(option) => match &option.item.documentation {
-                Some(lsp::Documentation::String(contents))
-                | Some(lsp::Documentation::MarkupContent(lsp::MarkupContent {
-                    kind: lsp::MarkupKind::PlainText,
-                    value: contents,
-                })) => {
-                    // TODO: convert to wrapped text
-                    markdowned(language, option.item.detail.as_deref(), Some(contents))
-                }
-                Some(lsp::Documentation::MarkupContent(lsp::MarkupContent {
-                    kind: lsp::MarkupKind::Markdown,
-                    value: contents,
-                })) => {
-                    // TODO: set language based on doc scope
-                    markdowned(language, option.item.detail.as_deref(), Some(contents))
-                }
-                None if option.item.detail.is_some() => {
-                    // TODO: set language based on doc scope
-                    markdowned(language, option.item.detail.as_deref(), None)
-                }
-                None => return,
-            },
-            CompletionItem::Other(option) => {
-                let Some(doc) = option.documentation.as_deref() else {
-                    return;
-                };
-                markdowned(language, None, Some(doc))
-            }
-        };
-
-        let popup_area = self.popup.area(area, cx.editor);
-        let doc_width_available = area.width.saturating_sub(popup_area.right());
-        let doc_area = if doc_width_available > 30 {
-            let mut doc_width = doc_width_available;
-            let mut doc_height = area.height.saturating_sub(popup_area.top());
-            let x = popup_area.right();
-            let y = popup_area.top();
-
-            if let Some((rel_width, rel_height)) =
-                markdown_doc.required_size((doc_width, doc_height))
-            {
-                doc_width = rel_width.min(doc_width);
-                doc_height = rel_height.min(doc_height);
-            }
-            Rect::new(x, y, doc_width, doc_height)
-        } else {
-            // Documentation should not cover the cursor or the completion popup
-            // Completion popup could be above or below the current line
-            let avail_height_above = cursor_pos.min(popup_area.top()).saturating_sub(1);
-            let avail_height_below = area
-                .height
-                .saturating_sub(cursor_pos.max(popup_area.bottom()) + 1 /* padding */);
-            let (y, avail_height) = if avail_height_below >= avail_height_above {
-                (
-                    area.height.saturating_sub(avail_height_below),
-                    avail_height_below,
-                )
-            } else {
-                (0, avail_height_above)
-            };
-            if avail_height <= 1 {
-                return;
-            }
-
-            Rect::new(0, y, area.width, avail_height.min(15))
-        };
-
-        // clear area
-        let background = cx.editor.theme.get("ui.popup");
-        surface.clear_with(doc_area, background);
-
-        if cx.editor.popup_border() {
-            use tui::widgets::{Block, Widget};
-            let border_type = BorderType::new(cx.editor.config().rounded_corners);
-            Widget::render(
-                Block::bordered().border_type(border_type),
-                doc_area,
-                surface,
-            );
-        }
-
-        markdown_doc.render(doc_area, surface, cx);
+        let tag = self.cache_tag(area, ctx);
+        let mut output = RenderOutput::new(area);
+        self.render(area, output.surface_mut(), ctx);
+        PreparedRender::cached(tag, output)
     }
 }
 fn lsp_item_to_transaction(

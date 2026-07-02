@@ -4,21 +4,12 @@
 //! when text is wider than the area, showing ellipsis indicators.
 
 use helix_view::graphics::Rect;
-use tui::buffer::Buffer as Surface;
 
-use helix_core::unicode::width::UnicodeWidthStr;
 use helix_view::graphics::Style;
 
-/// Computed state returned by `text_input` for cursor positioning.
-pub struct TextInputState {
-    /// Screen position of the cursor (absolute x, y).
-    pub cursor_x: u16,
-    pub cursor_y: u16,
-    /// Whether the text was truncated on the left.
-    pub truncated_start: bool,
-    /// Whether the text was truncated on the right.
-    pub truncated_end: bool,
-}
+use super::{draw_string_anchored, AnchoredText};
+
+pub use helix_view::layout::TextInputLayout as TextInputState;
 
 /// Render a single-line text input with cursor.
 ///
@@ -28,102 +19,102 @@ pub struct TextInputState {
 ///
 /// Returns `TextInputState` with the computed cursor screen position.
 pub fn text_input(
-    surface: &mut Surface,
+    surface: &mut crate::render::CellSurface,
     area: Rect,
     text: &str,
     cursor: usize,
     style: Style,
     cursor_style: Style,
 ) -> TextInputState {
-    if area.width == 0 || area.height == 0 {
-        return TextInputState {
-            cursor_x: area.x,
-            cursor_y: area.y,
-            truncated_start: false,
-            truncated_end: false,
-        };
-    }
+    let state = helix_view::layout::text_input_layout(area, text, cursor);
 
-    let line_width = area.width as usize;
+    if area.width == 0 || area.height == 0 {
+        return state;
+    }
 
     // Simple case: text fits entirely.
-    if text.width() <= line_width {
-        surface.set_string(area.x, area.y, text, style);
-
-        // Compute cursor screen position.
-        let cursor_col = text[..cursor.min(text.len())].width() as u16;
-        let cx = area.x + cursor_col;
+    if !state.truncated_start && !state.truncated_end {
+        surface.set_string(area.x, area.y, text, tui::ratatui::to_ratatui_style(style));
 
         // Draw cursor cell.
-        if cx < area.right() {
-            let cell = &mut surface[(cx, area.y)];
-            cell.set_style(cursor_style);
+        if state.cursor_in_area {
+            {
+                if let Some(cell) = surface.cell_mut((state.cursor_x, area.y)) {
+                    cell.set_style(tui::ratatui::to_ratatui_style(cursor_style));
+                }
+            };
         }
 
-        return TextInputState {
-            cursor_x: cx.min(area.right().saturating_sub(1)),
-            cursor_y: area.y,
-            truncated_start: false,
-            truncated_end: false,
+        return state;
+    }
+
+    // Render with truncation indicators.
+    let mut style_for_offset = |_| tui::ratatui::to_ratatui_style(style);
+    draw_string_anchored(
+        surface,
+        AnchoredText::new(area.x, area.y, &text[state.anchor..], area.width as usize)
+            .truncate_start(state.truncated_start)
+            .truncate_end(state.truncated_end),
+        &mut style_for_offset,
+    );
+
+    // Draw cursor cell.
+    if state.cursor_in_area {
+        {
+            if let Some(cell) = surface.cell_mut((state.cursor_x, area.y)) {
+                cell.set_style(tui::ratatui::to_ratatui_style(cursor_style));
+            }
         };
     }
 
-    // Text is wider than area — need to scroll.
-    // Find an anchor (byte offset) such that the cursor is visible.
-    let anchor = compute_anchor(text, cursor, line_width);
-    let truncated_start = anchor > 0;
-    let truncated_end = text[anchor..].width() > line_width;
-
-    // Render with truncation indicators.
-    surface.set_string_anchored(
-        area.x,
-        area.y,
-        truncated_start,
-        truncated_end,
-        &text[anchor..],
-        line_width,
-        |_| style,
-    );
-
-    // Compute cursor screen position relative to anchor.
-    let cursor_col = text[anchor..cursor.min(text.len())].width() as u16;
-    let cx = area.x + cursor_col;
-
-    // Draw cursor cell.
-    if cx < area.right() {
-        let cell = &mut surface[(cx, area.y)];
-        cell.set_style(cursor_style);
-    }
-
-    TextInputState {
-        cursor_x: cx.min(area.right().saturating_sub(1)),
-        cursor_y: area.y,
-        truncated_start,
-        truncated_end,
-    }
+    state
 }
 
-/// Compute the byte offset anchor so that the cursor is visible within
-/// `line_width` characters.
-fn compute_anchor(text: &str, cursor: usize, line_width: usize) -> usize {
-    use helix_core::unicode::segmentation::UnicodeSegmentation;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tui::ratatui::{buffer::Buffer as Surface, layout::Rect as SurfaceRect};
 
-    if text[..cursor].width() <= line_width {
-        return 0;
+    #[test]
+    fn truncated_input_keeps_first_visible_grapheme() {
+        let mut surface = Surface::empty(SurfaceRect::new(0, 0, 4, 1));
+
+        let state = text_input(
+            &mut surface,
+            Rect::new(0, 0, 4, 1),
+            "abcdef",
+            6,
+            Style::default(),
+            Style::default(),
+        );
+
+        assert!(state.truncated_start);
+        assert!(!state.truncated_end);
+        assert_eq!(surface[(0, 0)].symbol(), "…");
+        assert_eq!(surface[(1, 0)].symbol(), "c");
+        assert_eq!(surface[(2, 0)].symbol(), "d");
+        assert_eq!(surface[(3, 0)].symbol(), "e");
     }
 
-    // Walk backwards from cursor to find an anchor that fits.
-    let mut width = 0;
-    text[..cursor]
-        .grapheme_indices(true)
-        .rev()
-        .find_map(|(idx, g)| {
-            width += g.width();
-            if width > line_width {
-                Some(idx + g.len())
-            } else {
-                None
-            }
-        })
-        .unwrap_or(0)
+    #[test]
+    fn ratatui_surface_renders_same_truncated_input() {
+        let mut surface =
+            crate::render::CellSurface::empty(tui::ratatui::layout::Rect::new(0, 0, 4, 1));
+
+        let state = text_input(
+            &mut surface,
+            Rect::new(0, 0, 4, 1),
+            "abcdef",
+            6,
+            Style::default(),
+            Style::default(),
+        );
+
+        assert!(state.truncated_start);
+        assert!(!state.truncated_end);
+        assert_eq!(surface[(0, 0)].symbol(), "…");
+        assert_eq!(surface[(1, 0)].symbol(), "c");
+        assert_eq!(surface[(2, 0)].symbol(), "d");
+        assert_eq!(surface[(3, 0)].symbol(), "e");
+    }
 }

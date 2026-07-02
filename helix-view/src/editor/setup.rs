@@ -17,6 +17,79 @@ use super::{
     Config, CursorCache, Editor, NotificationManager, WorkspaceDiagnosticCounts,
 };
 
+pub struct EditorBuilder {
+    area: Rect,
+    theme_loader: Arc<theme::Loader>,
+    language_loader: Arc<ArcSwap<syntax::Loader>>,
+    config: Arc<dyn DynAccess<Config> + Send + Sync>,
+    runtime: Runtime,
+    handlers: Handlers,
+}
+
+impl EditorBuilder {
+    #[must_use]
+    pub fn new(area: Rect, runtime: Runtime) -> Self {
+        Self {
+            area,
+            theme_loader: Arc::new(theme::Loader::new(helix_loader::runtime_dirs())),
+            language_loader: Arc::new(ArcSwap::from_pointee(
+                helix_core::config::default_lang_loader(),
+            )),
+            config: Arc::new(ArcSwap::from_pointee(Config::default())),
+            runtime,
+            handlers: Handlers::dummy(),
+        }
+    }
+
+    #[must_use]
+    pub fn theme_loader(mut self, theme_loader: Arc<theme::Loader>) -> Self {
+        self.theme_loader = theme_loader;
+        self
+    }
+
+    #[must_use]
+    pub fn language_loader(mut self, language_loader: syntax::Loader) -> Self {
+        self.language_loader = Arc::new(ArcSwap::from_pointee(language_loader));
+        self
+    }
+
+    #[must_use]
+    pub fn language_loader_store(mut self, language_loader: Arc<ArcSwap<syntax::Loader>>) -> Self {
+        self.language_loader = language_loader;
+        self
+    }
+
+    #[must_use]
+    pub fn config(mut self, config: Config) -> Self {
+        self.config = Arc::new(ArcSwap::from_pointee(config));
+        self
+    }
+
+    #[must_use]
+    pub fn config_access(mut self, config: Arc<dyn DynAccess<Config> + Send + Sync>) -> Self {
+        self.config = config;
+        self
+    }
+
+    #[must_use]
+    pub fn handlers(mut self, handlers: Handlers) -> Self {
+        self.handlers = handlers;
+        self
+    }
+
+    #[must_use]
+    pub fn build(self) -> Editor {
+        Editor::new(
+            self.area,
+            self.theme_loader,
+            self.language_loader,
+            self.config,
+            self.runtime,
+            self.handlers,
+        )
+    }
+}
+
 impl Editor {
     pub fn new(
         mut area: Rect,
@@ -31,9 +104,7 @@ impl Editor {
         let auto_pairs = (&conf.auto_pairs).into();
         let (assistant_updates_tx, assistant_updates_rx) = helix_runtime::channel(128);
 
-        area.height -= 1;
-
-        let (save_tx, save_queue) = helix_runtime::channel(64);
+        area.height = area.height.saturating_sub(1);
 
         Self {
             mode: Mode::Normal,
@@ -43,9 +114,8 @@ impl Editor {
             component_docs: std::collections::BTreeMap::new(),
             next_virtual_view_idx: 0,
             component_views: std::collections::BTreeMap::new(),
-            saves: HashMap::new(),
-            save_tx,
-            save_queue,
+            save_locks: HashMap::new(),
+            save_queue: std::collections::VecDeque::new(),
             write_count: 0,
             macro_recording: None,
             macro_replaying: Vec::new(),
@@ -81,6 +151,7 @@ impl Editor {
             handlers,
             lifecycle: std::sync::Arc::new(super::hooks::LifecycleBus::default()),
             file_watcher: None,
+            file_operations: super::file_operation::FileOperationJournal::default(),
             mouse_down_range: None,
             cursor_cache: CursorCache::default(),
             model: crate::model::Model::default(),
@@ -92,6 +163,9 @@ impl Editor {
                 assistant_panel_theme: None,
                 engine_factory: std::sync::Arc::new(crate::engine::HeadlessEditingEngineFactory),
                 modal_keymaps: std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(
+                    std::collections::HashMap::new(),
+                )),
+                semantic_modal_keymaps: std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(
                     std::collections::HashMap::new(),
                 )),
             },
@@ -115,5 +189,35 @@ impl Editor {
             },
             bench: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn editor_builder_creates_headless_editor() {
+        let area = Rect::new(0, 0, 40, 12);
+        let runtime = helix_runtime::test::RuntimeTest::default();
+        runtime.block_on(async {
+            let editor = EditorBuilder::new(area, runtime.runtime()).build();
+
+            assert_eq!(editor.tree.area().width, area.width);
+            assert_eq!(editor.tree.area().height, area.height.saturating_sub(1));
+            assert_eq!(editor.document_count(), 0);
+        });
+    }
+
+    #[test]
+    fn editor_builder_handles_zero_height_area() {
+        let area = Rect::new(0, 0, 40, 0);
+        let runtime = helix_runtime::test::RuntimeTest::default();
+        runtime.block_on(async {
+            let editor = EditorBuilder::new(area, runtime.runtime()).build();
+
+            assert_eq!(editor.tree.area().width, area.width);
+            assert_eq!(editor.tree.area().height, 0);
+        });
     }
 }

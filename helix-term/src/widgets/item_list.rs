@@ -4,7 +4,8 @@
 //! and draws a proportional scrollbar when items exceed the visible area.
 
 use helix_view::graphics::{Rect, Style};
-use tui::buffer::Buffer as Surface;
+
+use super::SelectionViewport;
 
 /// Styles for the item list widget.
 #[derive(Default)]
@@ -35,15 +36,18 @@ pub struct ListState {
 /// selection, scrolling, and the scrollbar.
 ///
 /// Returns `ListState` with the computed scroll and visible range.
-pub fn item_list(
-    surface: &mut Surface,
+pub fn item_list<F>(
+    surface: &mut crate::render::CellSurface,
     area: Rect,
     item_count: usize,
     selected: Option<usize>,
     scroll: usize,
     styles: &ListStyles,
-    render_item: impl Fn(usize, Rect, &mut Surface, bool),
-) -> ListState {
+    render_item: F,
+) -> ListState
+where
+    F: Fn(usize, Rect, &mut crate::render::CellSurface, bool),
+{
     if area.height == 0 || area.width == 0 {
         return ListState {
             scroll: 0,
@@ -53,10 +57,16 @@ pub fn item_list(
     }
 
     let win_height = area.height as usize;
-    let scroll = scroll.min(item_count.saturating_sub(win_height));
-    let visible_end = (scroll + win_height).min(item_count);
+    let viewport = SelectionViewport::new(item_count, selected, win_height, scroll);
+    let visible_range = viewport.visible_range();
+    let scroll = visible_range.start;
+    let visible_end = visible_range.end;
 
-    surface.clear_with(area, styles.normal);
+    {
+        let area = tui::ratatui::to_ratatui_rect(area);
+        tui::ratatui::widgets::Widget::render(tui::ratatui::widgets::Clear, area, surface);
+        surface.set_style(area, tui::ratatui::to_ratatui_style(styles.normal));
+    };
 
     let needs_scrollbar = item_count > win_height;
     let content_area = if needs_scrollbar {
@@ -75,7 +85,11 @@ pub fn item_list(
         );
 
         if is_selected {
-            surface.clear_with(item_area, styles.selected);
+            {
+                let area = tui::ratatui::to_ratatui_rect(item_area);
+                tui::ratatui::widgets::Widget::render(tui::ratatui::widgets::Clear, area, surface);
+                surface.set_style(area, tui::ratatui::to_ratatui_style(styles.selected));
+            };
         }
 
         render_item(item_idx, item_area, surface, is_selected);

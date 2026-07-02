@@ -6,25 +6,33 @@
 //! widget functions with the right data.
 //!
 //! Layout combinators live in `helix_view::layout` (shared across frontends).
-//! These widgets are terminal-specific — they render to `tui::buffer::Buffer`.
+//! These widgets are terminal-specific — they render to Ratatui buffers.
 //!
 //! Trait-based capabilities (Focusable, Scrollable, Bounded, etc.) live in
 //! `helix_view::traits` — the single canonical source for all frontends.
 
 mod box_shadow;
+mod chip_strip;
 mod divider;
 mod header;
 mod item_list;
 mod message;
 mod message_list;
+mod panel;
+mod picker_table;
 mod scroll_region;
 mod scrollbar;
+mod selection_viewport;
 mod spinner;
 mod style;
+mod surface;
+mod table;
 mod text_input;
+mod tree_list;
 
 pub use box_shadow::BoxShadow;
-pub use divider::{hdivider, vdivider};
+pub use chip_strip::{chip_strip_left, chip_strip_right, Chip};
+pub use divider::{border, hdivider, vdivider};
 pub use header::{header, header_with_counts};
 pub use item_list::{item_list, ListState, ListStyles};
 pub use message::{message, MessageAlign, MessageCorners, MessageState, MessageStyle};
@@ -33,8 +41,16 @@ pub use message_list::{
     MessageCursor, MessageDecoration, MessageDetailsVisibility, MessageKind, MessageLayout,
     MessageListState,
 };
+pub use panel::{inset, Panel, PanelEdge, PanelStyle, PanelVariant};
+pub use picker_table::PickerTable;
 pub use scroll_region::{scroll_region, ScrollState, ScrollStyles};
 pub use scrollbar::Scrollbar;
+pub use selection_viewport::SelectionViewport;
 pub use spinner::Spinner;
 pub use style::WidgetStyle;
+pub use surface::{draw_string_anchored, AnchoredText};
+pub use table::{TableCell, TableRow};
 pub use text_input::{text_input, TextInputState};
+pub use tree_list::{
+    tree_list, tree_list_label_offset, TreeListIcon, TreeListItem, TreeListStatus, TreeListStyles,
+};

@@ -1,9 +1,11 @@
+pub(crate) mod context;
 pub(crate) mod dap;
 pub(crate) mod lsp;
 pub(crate) mod notification;
 pub(crate) mod syntax;
 pub(crate) mod typed;
 
+pub use context::*;
 pub use dap::*;
 use helix_stdx::{
     path::{self, find_paths},
@@ -14,10 +16,7 @@ use helix_view::vcs_state::LineBlameError;
 pub use lsp::*;
 pub use notification::*;
 pub use syntax::*;
-use tui::{
-    text::{Span, Spans},
-    widgets::Cell,
-};
+use tui::text::{Span, Spans};
 pub use typed::*;
 
 use helix_core::{
@@ -63,18 +62,15 @@ use insert::*;
 use movement::Movement;
 
 use crate::{
-    compositor::{self, Component, Compositor},
+    compositor::{self, Compositor},
     filter_picker_entry,
-    runtime::ingress::{RuntimeEvent, RuntimeTaskEvent},
-    runtime::{send_task_event_with, AssistantCommand, ExitTaskSet, UiCommand},
-    ui::{self, overlay::overlaid, Picker, PickerColumn, Prompt, PromptEvent},
+    runtime::{send_task_event_with, AssistantCommand, RuntimeTaskEvent, UiCommand},
+    ui::{self, menu::Cell, overlay::overlaid, Picker, PickerColumn, Prompt, PromptEvent},
 };
-use helix_runtime::Sender as IngressSender;
 use std::{
     collections::{HashMap, HashSet},
     error::Error,
     fmt,
-    future::Future,
     io::Read,
     num::NonZeroUsize,
     sync::OnceLock,
@@ -92,191 +88,6 @@ use url::Url;
 use grep_regex::RegexMatcherBuilder;
 use grep_searcher::{sinks, BinaryDetection, SearcherBuilder};
 use ignore::{DirEntry, WalkBuilder, WalkState};
-
-use helix_plugin::PluginManager;
-
-pub type OnKeyCallback = Box<dyn FnOnce(&mut Context, KeyEvent) + Send>;
-#[derive(PartialEq, Eq, Clone, Copy, Debug)]
-pub enum OnKeyCallbackKind {
-    PseudoPending,
-    Fallback,
-}
-
-pub struct Context<'a> {
-    pub register: Option<char>,
-    pub count: Option<NonZeroUsize>,
-    pub editor: &'a mut Editor,
-    pub registry: std::sync::Arc<helix_modal::registry::CommandRegistry>,
-    pub notifier: crate::handlers::local::Notifier,
-
-    pub callback: Vec<crate::compositor::PostAction>,
-    pub on_next_key_callback: Option<(OnKeyCallback, OnKeyCallbackKind)>,
-    /// Exit-bound task sink for commands that must complete typed task work before shutdown.
-    pub exit_tasks: &'a mut ExitTaskSet,
-    pub exit_task_work: helix_runtime::Work,
-    /// Mirrors [`compositor::Context::ingress`] when built from the live app (Phase 3).
-    pub ingress: IngressSender<RuntimeEvent>,
-    pub idle_reset_tx: helix_runtime::Sender<()>,
-    pub plugin_manager: Option<std::sync::Arc<PluginManager>>,
-}
-
-impl Context<'_> {
-    /// Push a new component onto the compositor.
-    pub fn push_layer(&mut self, component: Box<dyn Component>) {
-        self.callback
-            .push(crate::compositor::PostAction::PushLayer(component));
-    }
-
-    /// Call `replace_or_push` on the Compositor
-    pub fn replace_or_push_layer<T: Component>(&mut self, id: &'static str, component: T) {
-        self.callback
-            .push(crate::compositor::PostAction::ReplaceOrPushLayer {
-                id,
-                layer: Box::new(component),
-            });
-    }
-
-    #[inline]
-    pub fn on_next_key(
-        &mut self,
-        on_next_key_callback: impl FnOnce(&mut Context, KeyEvent) + Send + 'static,
-    ) {
-        self.on_next_key_callback = Some((
-            Box::new(on_next_key_callback),
-            OnKeyCallbackKind::PseudoPending,
-        ));
-    }
-
-    #[inline]
-    pub fn on_next_key_fallback(
-        &mut self,
-        on_next_key_callback: impl FnOnce(&mut Context, KeyEvent) + Send + 'static,
-    ) {
-        self.on_next_key_callback =
-            Some((Box::new(on_next_key_callback), OnKeyCallbackKind::Fallback));
-    }
-
-    #[inline]
-    pub fn spawn_ui(
-        &mut self,
-        future: impl Future<Output = anyhow::Result<UiCommand>> + Send + 'static,
-    ) {
-        crate::runtime::ingress::spawn_ui_command_with_future(
-            self.editor.work(),
-            future,
-            self.ingress.clone(),
-        );
-    }
-
-    #[inline]
-    pub fn spawn_task_event(
-        &mut self,
-        future: impl Future<Output = anyhow::Result<RuntimeTaskEvent>> + Send + 'static,
-    ) {
-        crate::runtime::ingress::spawn_task_event_with_future(
-            self.editor.work(),
-            future,
-            self.ingress.clone(),
-        );
-    }
-
-    pub fn reset_idle_timer(&self) {
-        helix_runtime::send_blocking(&self.idle_reset_tx, ());
-    }
-
-    #[inline]
-    pub fn exit_task_event(
-        &mut self,
-        future: impl Future<Output = anyhow::Result<RuntimeTaskEvent>> + Send + 'static,
-    ) {
-        crate::runtime::schedule_exit_task(self.exit_tasks, &self.exit_task_work, future);
-    }
-
-    /// Returns 1 if no explicit count was provided
-    #[inline]
-    pub fn count(&self) -> usize {
-        self.count.map_or(1, |v| v.get())
-    }
-
-    /// Execute an engine command through the registry.
-    fn execute_engine_command(&mut self, token: CommandToken) {
-        use helix_modal::registry::CommandRef;
-
-        let count = self.count();
-        let register = self.register.take();
-
-        // Resolve editing context from the focused view.
-        let focus = self.editor.focused_view_id();
-        let focused_view = self.editor.tree.get(focus);
-        let view_id = focused_view.id;
-        let doc_id = focused_view.doc;
-
-        let Some(kind) = self.registry.resolve(token) else {
-            log::warn!("engine command missing from registry: {}", token.as_str());
-            return;
-        };
-
-        match kind {
-            CommandRef::Motion(m) => {
-                let movement = if self.editor.mode() == Mode::Select {
-                    Movement::Extend
-                } else {
-                    Movement::Move
-                };
-                let motion = m
-                    .make
-                    .make(Some(NonZeroUsize::new(count).unwrap_or(NonZeroUsize::MIN)));
-                motion(self.editor, view_id, doc_id, movement);
-            }
-            CommandRef::Operator(op) => {
-                (op.execute)(self.editor, view_id, doc_id, register);
-            }
-            CommandRef::Action(a) => {
-                (a.execute)(self.editor, view_id, doc_id, count, register);
-            }
-            CommandRef::TextObject(to) => {
-                let obj_fn = (to.make)(count);
-                obj_fn(
-                    self.editor,
-                    view_id,
-                    doc_id,
-                    helix_core::textobject::TextObject::Around,
-                );
-            }
-            CommandRef::CharPending(cp) => {
-                let resolve = cp.resolve;
-                let movement = if self.editor.mode() == Mode::Select {
-                    Movement::Extend
-                } else {
-                    Movement::Move
-                };
-                self.on_next_key(move |cx, event| {
-                    if let Some(ch) = event.char() {
-                        let motion = resolve(ch, count);
-                        cx.editor
-                            .apply_motion(move |ed| motion(ed, view_id, doc_id, movement));
-                    }
-                });
-            }
-        }
-    }
-
-    /// Waits on all pending async UI work, then tries to flush all pending write
-    /// operations for all documents.
-    pub fn block_try_flush_writes(&mut self) -> anyhow::Result<()> {
-        compositor::Context {
-            editor: self.editor,
-            exit_tasks: self.exit_tasks,
-            exit_task_work: self.exit_task_work.clone(),
-            scroll: None,
-            notifier: self.notifier.clone(),
-            ingress: self.ingress.clone(),
-            idle_reset_tx: self.idle_reset_tx.clone(),
-            plugin_manager: self.plugin_manager.clone(),
-        }
-        .block_try_flush_writes()
-    }
-}
 
 use helix_view::{align_view, Align};
 
@@ -334,20 +145,14 @@ impl MappableCommand {
         match &self {
             Self::Typable { name, args, doc: _ } => {
                 if let Some(command) = typed::TYPABLE_COMMAND_MAP.get(name.as_str()) {
-                    let mut cx = compositor::Context {
-                        editor: cx.editor,
-                        exit_tasks: cx.exit_tasks,
-                        exit_task_work: cx.exit_task_work.clone(),
-                        scroll: None,
-                        notifier: cx.notifier.clone(),
-                        ingress: cx.ingress.clone(),
-                        idle_reset_tx: cx.idle_reset_tx.clone(),
-                        plugin_manager: cx.plugin_manager.clone(),
-                    };
-                    if let Err(e) =
-                        typed::execute_command(&mut cx, command, args, PromptEvent::Validate)
-                    {
-                        cx.editor.set_error(format!("{}", e));
+                    let mut compositor_cx = cx.compositor_context();
+                    if let Err(e) = typed::execute_command(
+                        &mut compositor_cx,
+                        command,
+                        args,
+                        PromptEvent::Validate,
+                    ) {
+                        compositor_cx.editor.set_error(format!("{}", e));
                     }
                 } else if let Some(plugin_manager) = &cx.plugin_manager {
                     let args: Vec<String> =
@@ -1583,110 +1388,54 @@ fn global_search(cx: &mut Context) {
                 .spawn(async { Err(anyhow::anyhow!("Current working directory does not exist")) });
         }
 
-        let documents: Vec<_> = editor
+        let content_overlays: Vec<_> = editor
             .documents()
-            .map(|doc| (doc.path().cloned(), doc.text().to_owned()))
+            .filter(|doc| doc.is_modified())
+            .filter_map(|doc| {
+                let path = doc.path()?;
+                Some(fff_search::ContentOverlay {
+                    path: helix_stdx::path::normalize(path),
+                    bytes: std::sync::Arc::from(
+                        doc.text().to_string().into_bytes().into_boxed_slice(),
+                    ),
+                    revision: doc.version() as u64,
+                })
+            })
             .collect();
 
-        let matcher = match RegexMatcherBuilder::new()
+        match RegexMatcherBuilder::new()
             .case_smart(config.smart_case)
             .build(query)
         {
             Ok(matcher) => {
                 // Clear any "Failed to compile regex" errors out of the statusline.
                 editor.clear_status();
-                matcher
+                drop(matcher);
             }
             Err(err) => {
                 log::info!("Failed to compile search pattern in global search: {}", err);
                 return work.spawn(async { Err(anyhow::anyhow!("Failed to compile regex")) });
             }
-        };
-
-        let dedup_symlinks = config.file_picker_config.deduplicate_links;
-        let absolute_root = search_root
-            .canonicalize()
-            .unwrap_or_else(|_| search_root.clone());
+        }
 
         let injector = injector.clone();
+        let query = query.to_owned();
         work.spawn(async move {
-            let searcher = SearcherBuilder::new()
-                .binary_detection(BinaryDetection::quit(b'\x00'))
-                .build();
-            WalkBuilder::new(search_root)
-                .hidden(config.file_picker_config.hidden)
-                .parents(config.file_picker_config.parents)
-                .ignore(config.file_picker_config.ignore)
-                .follow_links(config.file_picker_config.follow_symlinks)
-                .git_ignore(config.file_picker_config.git_ignore)
-                .git_global(config.file_picker_config.git_global)
-                .git_exclude(config.file_picker_config.git_exclude)
-                .max_depth(config.file_picker_config.max_depth)
-                .filter_entry(move |entry| {
-                    filter_picker_entry(entry, &absolute_root, dedup_symlinks)
-                })
-                .add_custom_ignore_filename(helix_loader::config_dir().join("ignore"))
-                .add_custom_ignore_filename(helix_loader::workspace_ignore_file_name())
-                .build_parallel()
-                .run(|| {
-                    let mut searcher = searcher.clone();
-                    let matcher = matcher.clone();
-                    let injector = injector.clone();
-                    let documents = &documents;
-                    Box::new(move |entry: Result<DirEntry, ignore::Error>| -> WalkState {
-                        let entry = match entry {
-                            Ok(entry) => entry,
-                            Err(_) => return WalkState::Continue,
-                        };
-
-                        if !entry.path().is_file() {
-                            return WalkState::Continue;
-                        }
-
-                        let mut stop = false;
-                        let sink = sinks::UTF8(|line_num, _line_content| {
-                            stop = injector
-                                .push(FileResult::new(entry.path(), line_num as usize - 1))
-                                .is_err();
-
-                            Ok(!stop)
-                        });
-                        let doc = documents.iter().find(|&(doc_path, _)| {
-                            doc_path
-                                .as_ref()
-                                .is_some_and(|doc_path| doc_path == entry.path())
-                        });
-
-                        let result = if let Some((_, doc)) = doc {
-                            // there is already a buffer for this file
-                            // search the buffer instead of the file because it's faster
-                            // and captures new edits without requiring a save
-                            if searcher.multi_line_with_matcher(&matcher) {
-                                // in this case a continuous buffer is required
-                                // convert the rope to a string
-                                let text = doc.to_string();
-                                searcher.search_slice(&matcher, text.as_bytes(), sink)
-                            } else {
-                                searcher.search_reader(
-                                    &matcher,
-                                    RopeReader::new(doc.slice(..)),
-                                    sink,
-                                )
-                            }
-                        } else {
-                            searcher.search_path(&matcher, entry.path(), sink)
-                        };
-
-                        if let Err(err) = result {
-                            log::error!("Global search error: {}, {}", entry.path().display(), err);
-                        }
-                        if stop {
-                            WalkState::Quit
-                        } else {
-                            WalkState::Continue
-                        }
-                    })
-                });
+            let matches = crate::fff::grep_files(
+                &search_root,
+                &query,
+                config.smart_case,
+                &config.file_picker_config,
+                &content_overlays,
+            )?;
+            for item in matches {
+                if injector
+                    .push(FileResult::new(&item.path, item.line_num))
+                    .is_err()
+                {
+                    break;
+                }
+            }
             Ok(())
         })
     };
@@ -1699,7 +1448,7 @@ fn global_search(cx: &mut Context) {
         1, // contents
         [],
         config,
-        crate::ui::PickerRuntime::new(cx.editor.runtime()),
+        crate::ui::PickerRuntime::new(cx.editor),
         cx.ingress.clone(),
         move |cx, FileResult { path, line_num, .. }, action| {
             let doc = match cx.editor.open(path, action) {
@@ -1942,7 +1691,7 @@ fn local_search_grep(cx: &mut Context) {
         1, // contents
         [],
         config,
-        crate::ui::PickerRuntime::new(cx.editor.runtime()),
+        crate::ui::PickerRuntime::new(cx.editor),
         cx.ingress.clone(),
         move |cx, FileResult { path, line_num, .. }, action| {
             let doc = match cx.editor.open(path, action) {
@@ -2081,7 +1830,7 @@ fn local_search_fuzzy(cx: &mut Context) {
         1, // contents
         [],
         config,
-        crate::ui::PickerRuntime::new(cx.editor.runtime()),
+        crate::ui::PickerRuntime::new(cx.editor),
         cx.ingress.clone(),
         move |cx, FileResult { path, line_num, .. }, action| {
             let doc = match cx.editor.open(path, action) {
@@ -2136,62 +1885,30 @@ fn enter_insert_mode(cx: &mut Context) {
 
 // inserts at the start of each selection
 fn insert_mode(cx: &mut Context) {
-    enter_insert_mode(cx);
-    let (view_id, doc) = focused!(cx.editor);
-
-    log::trace!(
-        "entering insert mode with sel: {:?}, text: {:?}",
-        doc.selection(view_id),
-        doc.text().to_string()
-    );
-
-    let selection = doc
-        .selection(view_id)
-        .clone()
-        .transform(|range| Range::new(range.to(), range.from()));
-
-    doc.set_selection(view_id, selection);
+    let view_id = cx.editor.focused_view_id();
+    let doc_id = cx.editor.focused_document_id();
+    helix_view::commands::editing::insert_mode(cx.editor, view_id, doc_id);
 }
 
 // inserts at the end of each selection
 fn append_mode(cx: &mut Context) {
-    enter_insert_mode(cx);
-    let (view_id, doc) = focused!(cx.editor);
-    doc.mark_restore_cursor();
-    let text = doc.text().slice(..);
-
-    // Make sure there's room at the end of the document if the last
-    // selection butts up against it.
-    let end = text.len_chars();
-    let last_range = doc
-        .selection(view_id)
-        .iter()
-        .last()
-        .expect("selection should always have at least one range");
-    if !last_range.is_empty() && last_range.to() == end {
-        let transaction = Transaction::change(
-            doc.text(),
-            [(end, end, Some(doc.line_ending().as_str().into()))].into_iter(),
-        );
-        doc.apply(&transaction, view_id);
-    }
-
-    let selection = doc.selection(view_id).clone().transform(|range| {
-        Range::new(
-            range.from(),
-            graphemes::next_grapheme_boundary(doc.text().slice(..), range.to()),
-        )
-    });
-    doc.set_selection(view_id, selection);
+    let view_id = cx.editor.focused_view_id();
+    let doc_id = cx.editor.focused_document_id();
+    helix_view::commands::editing::append_mode(cx.editor, view_id, doc_id);
 }
 
 fn file_picker(cx: &mut Context) {
     let root = find_workspace().0;
+    log::info!(
+        target: ui::picker::PICKER_TRACE_TARGET,
+        "phase=command_start command=file_picker root={}",
+        root.display(),
+    );
     if !root.exists() {
         cx.editor.set_error("Workspace directory does not exist");
         return;
     }
-    let picker = ui::file_picker(cx.editor, root, cx.ingress.clone());
+    let picker = ui::file_picker(cx.editor, root.clone(), cx.ingress.clone());
     if cx.editor.config().file_picker.hide_preview {
         let overlay = ui::overlay::Overlay {
             content: picker,
@@ -2203,6 +1920,11 @@ fn file_picker(cx: &mut Context) {
     } else {
         cx.push_layer(Box::new(overlaid(picker)));
     }
+    log::info!(
+        target: ui::picker::PICKER_TRACE_TARGET,
+        "phase=command_done command=file_picker root={}",
+        root.display(),
+    );
 }
 
 fn file_picker_in_current_buffer_directory(cx: &mut Context) {
@@ -2228,12 +1950,26 @@ fn file_picker_in_current_buffer_directory(cx: &mut Context) {
         }
     };
 
+    log::info!(
+        target: ui::picker::PICKER_TRACE_TARGET,
+        "phase=command_start command=file_picker_in_current_buffer_directory root={}",
+        path.display(),
+    );
     let picker = ui::file_picker(cx.editor, path, cx.ingress.clone());
     cx.push_layer(Box::new(overlaid(picker)));
+    log::info!(
+        target: ui::picker::PICKER_TRACE_TARGET,
+        "phase=command_done command=file_picker_in_current_buffer_directory",
+    );
 }
 
 fn file_picker_in_current_directory(cx: &mut Context) {
     let cwd = helix_stdx::env::current_working_dir();
+    log::info!(
+        target: ui::picker::PICKER_TRACE_TARGET,
+        "phase=command_start command=file_picker_in_current_directory root={}",
+        cwd.display(),
+    );
     if !cwd.exists() {
         cx.editor
             .set_error("Current working directory does not exist");
@@ -2241,6 +1977,10 @@ fn file_picker_in_current_directory(cx: &mut Context) {
     }
     let picker = ui::file_picker(cx.editor, cwd, cx.ingress.clone());
     cx.push_layer(Box::new(overlaid(picker)));
+    log::info!(
+        target: ui::picker::PICKER_TRACE_TARGET,
+        "phase=command_done command=file_picker_in_current_directory",
+    );
 }
 
 fn file_explorer(cx: &mut Context) {
@@ -2291,8 +2031,17 @@ fn file_explorer_in_current_directory(cx: &mut Context) {
 }
 
 fn open_file_explorer_panel(cx: &mut Context, root: PathBuf) {
-    match ui::FileExplorerPanel::new(root, cx.editor) {
-        Ok(panel) => cx.replace_or_push_layer(ui::FILE_EXPLORER_ID, panel),
+    let root = helix_stdx::path::normalize(root);
+    match ui::FileExplorerPanel::new(root.clone(), cx.editor) {
+        Ok(mut panel) => {
+            panel.queue_selected_preview(cx.editor, cx.ingress.clone());
+            cx.replace_or_push_layer(ui::FILE_EXPLORER_ID, panel);
+            crate::runtime::ui::file_explorer::queue_file_explorer_vcs_snapshot(
+                cx.editor,
+                cx.ingress.clone(),
+                root,
+            );
+        }
         Err(err) => cx.editor.set_error(format!("{err}")),
     }
 }
@@ -2390,7 +2139,7 @@ fn buffer_picker(cx: &mut Context) {
         2,
         items,
         (),
-        crate::ui::PickerRuntime::new(cx.editor.runtime()),
+        crate::ui::PickerRuntime::new(cx.editor),
         cx.ingress.clone(),
         |cx, meta, action| {
             cx.editor.switch(meta.id, action);
@@ -2510,7 +2259,7 @@ fn jumplist_picker(cx: &mut Context) {
                 .map(|(doc_id, selection)| new_meta(view, *doc_id, selection.clone()))
         }),
         (),
-        crate::ui::PickerRuntime::new(cx.editor.runtime()),
+        crate::ui::PickerRuntime::new(cx.editor),
         cx.ingress.clone(),
         |cx, meta, action| {
             cx.editor.switch(meta.id, action);
@@ -2612,7 +2361,7 @@ fn changed_file_picker(cx: &mut Context) {
             style_deleted: deleted,
             style_renamed: renamed,
         },
-        crate::ui::PickerRuntime::new(cx.editor.runtime()),
+        crate::ui::PickerRuntime::new(cx.editor),
         cx.ingress.clone(),
         |cx, meta: &FileChange, action| {
             let path_to_open = meta.path();
@@ -2636,14 +2385,7 @@ fn changed_file_picker(cx: &mut Context) {
         .for_each_changed_file(cwd, move |change| match change {
             Ok(change) => injector.push(change).is_ok(),
             Err(err) => {
-                let message = crate::runtime::ingress::StatusMessage::from(err);
-                helix_runtime::send_blocking(
-                    &ingress,
-                    RuntimeEvent::Status {
-                        message: message.message.into_owned(),
-                        severity: message.severity,
-                    },
-                );
+                ingress.status(err);
                 true
             }
         });
@@ -2737,23 +2479,10 @@ pub(crate) fn show_command_palette(
         0,
         commands,
         keymap,
-        crate::ui::PickerRuntime::new(cx.editor.runtime()),
+        crate::ui::PickerRuntime::new(cx.editor),
         cx.ingress.clone(),
         move |cx, command, _action| {
-            let mut ctx = Context {
-                register,
-                count,
-                editor: cx.editor,
-                registry: registry.clone(),
-                notifier: cx.notifier.clone(),
-                callback: Vec::new(),
-                on_next_key_callback: None,
-                exit_tasks: cx.exit_tasks,
-                exit_task_work: cx.exit_task_work.clone(),
-                ingress: cx.ingress.clone(),
-                idle_reset_tx: cx.idle_reset_tx.clone(),
-                plugin_manager: cx.plugin_manager.clone(),
-            };
+            let mut ctx = cx.command_context(registry.clone(), register, count);
             let focus = view!(ctx.editor).id;
 
             command.execute(&mut ctx);
@@ -2835,11 +2564,11 @@ fn blame_line(cx: &mut Context) {
 #[cfg(test)]
 mod tests {
     use super::{CommandScope, MappableCommand};
-    use helix_modal::populate::build_registry;
+    use helix_modal::CommandRegistry;
 
     #[test]
     fn engine_commands_are_registered_in_modal_registry() {
-        let registry = build_registry();
+        let registry = CommandRegistry::builtins();
 
         for command in MappableCommand::builtin_commands() {
             match command {
@@ -2863,7 +2592,7 @@ mod tests {
 
     #[test]
     fn modal_registry_does_not_contain_undeclared_engine_commands() {
-        let registry = build_registry();
+        let registry = CommandRegistry::builtins();
 
         let mut declared = MappableCommand::builtin_commands()
             .iter()
@@ -3437,14 +3166,9 @@ pub mod insert {
     use helix_view::editor::SmartTabConfig;
 
     pub fn insert_char(cx: &mut Context, c: char) {
-        let (view_id, doc) = focused!(cx.editor);
-        let doc_id = doc.id();
-        if let Some(t) =
-            helix_view::commands::editing::insert_char_transaction(cx.editor, view_id, doc_id, c)
-        {
-            let doc = doc_mut!(cx.editor, &doc_id);
-            doc.apply(&t, view_id);
-        }
+        let view_id = cx.editor.focused_view_id();
+        let doc_id = cx.editor.focused_document_id();
+        helix_view::commands::editing::insert_char(cx.editor, view_id, doc_id, c);
         local::post_insert_char(c, cx);
     }
 
@@ -4849,93 +4573,69 @@ fn extend_to_word(cx: &mut Context) {
 }
 
 fn jump_to_label(cx: &mut Context, labels: Vec<Range>, behaviour: Movement) {
+    use helix_view::jump_labels::{JumpSession, JumpSignal};
+
     let (_, doc) = focused_ref!(cx.editor);
-    let alphabet = &cx.editor.config().jump_label_alphabet;
     if labels.is_empty() {
         return;
     }
-    let alphabet_char = |i| {
-        let mut res = Tendril::new();
-        res.push(alphabet[i]);
-        res
-    };
+
+    // The label-allocation algorithm (square-spiral pattern, two-letter
+    // label per target) and the state machine that resolves the user's
+    // next two keystrokes live in [`helix_view::jump_labels::JumpSession`]
+    // — the same shared type the file explorer uses for its `gw`.
+    // Keeping the implementation in one place is what guarantees the
+    // editor's `gw` labels its first N words identically to the
+    // explorer's `gw` labeling its first N rows: there is only one
+    // algorithm and one set of contract tests.
+    let alphabet = cx.editor.config().jump_label_alphabet.clone();
+    let mut session = JumpSession::new(labels.len() as u32, alphabet);
 
     // Add label for each jump candidate to the View as virtual text.
+    // The Overlay-based rendering is editor-specific (uses
+    // `Document::set_jump_labels` to push virtual text into the rope's
+    // rendered view) — only the *label characters* come from the
+    // shared session.
     let text = doc.text().slice(..);
     let mut overlays: Vec<_> = labels
         .iter()
         .enumerate()
-        .flat_map(|(i, range)| {
-            // Prefer "lower" chars of the given alphabeth.
-            // Use all possible combinations of lower chars before extending
-            // the used subset upwards.
-            // E.g., "abc..." will lead to label sequence
-            // "aa", "ba", "ab", "bb", "ca", "cb", "ac", "bc", "cc", ...
-            // Labels are generated in a square manner as illustrated by the
-            // schematic below.
-            //    a  b  c  d
-            // a  0  1  4  9
-            // b  2  3  5 10
-            // c  6  7  8 11
-            // d 12 13 14 15
-            // The column index determines the leading (outer) char,
-            // the row index determines the trailing (inner) char.
-            let base = (i as f64).sqrt() as usize;
-            let offset = i - base * base;
-
-            let outer = if offset < base { base } else { offset - base };
-            let inner = if offset < base { offset } else { base };
-            [
-                Overlay::new(range.from(), alphabet_char(outer)),
+        .filter_map(|(i, range)| {
+            let label = session.label_at(i as u32)?;
+            let mut first = Tendril::new();
+            first.push(label.first);
+            let mut second = Tendril::new();
+            second.push(label.second);
+            Some([
+                Overlay::new(range.from(), first),
                 Overlay::new(
                     graphemes::next_grapheme_boundary(text, range.from()),
-                    alphabet_char(inner),
+                    second,
                 ),
-            ]
+            ])
         })
+        .flatten()
         .collect();
     overlays.sort_unstable_by_key(|overlay| overlay.char_idx);
     let (view_id, doc) = focused!(cx.editor);
     doc.set_jump_labels(view_id, overlays);
 
-    // Accept two characters matching a visible label. Jump to the candidate
-    // for that label if it exists.
+    // Accept up to two characters via the session's state machine.
+    // The closure tree mirrors the previous hand-rolled flow but the
+    // decision of "what did the user select" is now centralized.
     let primary_selection = doc.selection(view_id).primary();
     let view = view_id;
     let doc = doc.id();
-    cx.on_next_key(move |cx, event| {
-        let alphabet = &cx.editor.config().jump_label_alphabet;
-        let Some(outer) = event
-            .char()
-            .filter(|_| event.modifiers.is_empty())
-            .and_then(|ch| alphabet.iter().position(|&it| it == ch))
-        else {
-            doc_mut!(cx.editor, &doc).remove_jump_labels(view);
-            return;
-        };
-
-        cx.on_next_key(move |cx, event| {
-            doc_mut!(cx.editor, &doc).remove_jump_labels(view);
-            let alphabet = &cx.editor.config().jump_label_alphabet;
-            let Some(inner) = event
-                .char()
-                .filter(|_| event.modifiers.is_empty())
-                .and_then(|ch| alphabet.iter().position(|&it| it == ch))
-            else {
-                return;
-            };
-            // Mapping back a label to an index requires to distinguish 2 cases
-            // (see label generation above for illustration):
-            // 1. We are in the new column
-            //    => size of inner square + pos in column.
-            // 2. We are in the new row (including corner)
-            //    => size of extended inner square + pos in row.
-            let index = if outer > inner {
-                outer * outer + inner
-            } else {
-                inner * (inner + 1) + outer
-            };
-            if let Some(mut range) = labels.get(index).copied() {
+    cx.on_next_key(move |cx, event| match session.feed_key(event) {
+        JumpSignal::Pending => {
+            cx.on_next_key(move |cx, event| {
+                doc_mut!(cx.editor, &doc).remove_jump_labels(view);
+                let JumpSignal::Selected(target_id) = session.feed_key(event) else {
+                    return;
+                };
+                let Some(mut range) = labels.get(target_id as usize).copied() else {
+                    return;
+                };
                 range = if behaviour == Movement::Extend {
                     let anchor = if range.anchor < range.head {
                         let from = primary_selection.from();
@@ -4958,8 +4658,13 @@ fn jump_to_label(cx: &mut Context, labels: Vec<Range>, behaviour: Movement) {
                 };
                 save_selection(cx);
                 doc_mut!(cx.editor, &doc).set_selection(view, range.into());
-            }
-        });
+            });
+        }
+        _ => {
+            // Cancelled (or any unexpected pre-resolved signal) —
+            // remove labels and bail.
+            doc_mut!(cx.editor, &doc).remove_jump_labels(view);
+        }
     });
 }
 

@@ -4,7 +4,7 @@ use anyhow::bail;
 use futures_util::stream::SelectAll;
 use helix_dap as dap;
 use helix_lsp::{Call, LanguageServerId};
-use helix_runtime::{Receiver as RuntimeReceiver, Runtime, Work};
+use helix_runtime::{FrameHandle, FrameReceiver, Receiver as RuntimeReceiver, Runtime, Work};
 
 use crate::document::{DocumentSavedEvent, DocumentSavedEventResult};
 use crate::DocumentId;
@@ -24,8 +24,12 @@ impl Editor {
         std::mem::replace(&mut self.config_events.1, helix_runtime::channel(1).1)
     }
 
-    pub fn take_redraw_rx(&mut self) -> RuntimeReceiver<()> {
+    pub fn take_redraw_rx(&mut self) -> FrameReceiver {
         self.frame_gate.take_receiver()
+    }
+
+    pub fn redraw_handle(&self) -> FrameHandle {
+        self.frame_gate.handle()
     }
 
     pub fn take_assistant_updates_rx(
@@ -68,9 +72,14 @@ impl Editor {
         policy: super::SavePolicy,
     ) -> anyhow::Result<()> {
         let path = path.map(|path| path.into());
+        let save_lock = self
+            .save_locks
+            .get(&doc_id)
+            .cloned()
+            .ok_or_else(|| anyhow::format_err!("save lock is closed for this document!"))?;
         let work = self.work();
         let doc = doc_mut!(self, &doc_id);
-        let doc_save_task = doc.save(&work, path, policy)?;
+        let doc_save_task = doc.save_serialized(&work, path, policy, save_lock)?;
 
         let handler = self.language_servers.file_event_handler.clone();
         let task = work.spawn(async move {
@@ -78,19 +87,13 @@ impl Editor {
                 Ok(res) => res,
                 Err(err) => return Err(anyhow::anyhow!("document save task failed: {err}")),
             };
-            if let Ok(event) = &res {
+            if let Ok(Some(event)) = &res {
                 handler.file_changed(event.path.clone());
             }
             res
         });
 
-        helix_runtime::send_blocking(
-            self.saves
-                .get(&doc_id)
-                .ok_or_else(|| anyhow::format_err!("saves are closed for this document!"))?,
-            task,
-        );
-
+        self.save_queue.push_back(task);
         self.write_count += 1;
 
         Ok(())
@@ -137,12 +140,16 @@ impl Editor {
     }
 
     pub async fn recv_save_result(&mut self) -> Option<DocumentSavedEventResult> {
-        let save_task = self.save_queue.recv().await?;
+        let save_task = self.save_queue.pop_front()?;
         self.write_count = self.write_count.saturating_sub(1);
         Some(match save_task.await {
             Ok(result) => result,
             Err(err) => Err(anyhow::anyhow!("document save task failed: {err}")),
         })
+    }
+
+    pub fn has_pending_writes(&self) -> bool {
+        self.write_count > 0
     }
 
     pub async fn flush_writes(&mut self) -> anyhow::Result<()> {
@@ -151,12 +158,14 @@ impl Editor {
                 break;
             };
 
-            let save_event = match save_result {
+            let Some(save_event) = (match save_result {
                 Ok(event) => event,
                 Err(err) => {
                     self.set_error(err.to_string());
                     bail!(err);
                 }
+            }) else {
+                continue;
             };
 
             let _ = self.apply_document_saved_event(save_event);

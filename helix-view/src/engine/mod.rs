@@ -14,8 +14,8 @@ use crate::input::KeyEvent;
 use crate::{DocumentId, Editor, ViewId};
 
 use helix_core::movement::Movement;
-use std::borrow::Cow;
 use std::num::NonZeroUsize;
+use std::{borrow::Cow, sync::Arc};
 
 // ─── Keymap abstraction ─────────────────────────────────────────────
 
@@ -240,7 +240,7 @@ pub enum EngineResult {
     /// 3. Exit insert mode (the last key should be Esc)
     ReplayInsert {
         entry_command: Cow<'static, str>,
-        keys: Box<[KeyEvent]>,
+        keys: Arc<[KeyEvent]>,
     },
 }
 
@@ -261,7 +261,7 @@ pub enum RecordedAction {
     /// `entry_command` is the frontend command name (e.g., "insert_mode", "append_mode").
     InsertSequence {
         entry_command: Cow<'static, str>,
-        keys: Box<[KeyEvent]>,
+        keys: Arc<[KeyEvent]>,
     },
     /// A simple action with count (e.g., `3x`, `5J`).
     CountedAction {

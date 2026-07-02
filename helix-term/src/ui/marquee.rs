@@ -11,7 +11,6 @@ use helix_core::unicode::width::UnicodeWidthChar;
 use helix_view::graphics::{Rect, Style};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tui::buffer::Buffer as Surface;
 
 /// Default inactivity duration after which the marquee pauses (held at start).
 pub const DEFAULT_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -77,7 +76,7 @@ impl TextLayout {
         &self,
         char_offset: usize,
         area: Rect,
-        surface: &mut Surface,
+        surface: &mut crate::render::CellSurface,
         style: Style,
     ) {
         let byte_start = self
@@ -90,7 +89,7 @@ impl TextLayout {
             area.y,
             &self.text[byte_start..],
             area.width as usize,
-            style,
+            tui::ratatui::to_ratatui_style(style),
         );
     }
 }
@@ -196,7 +195,12 @@ impl Marquee {
     /// Returns `Some(instant)` if the marquee is animating and needs another
     /// render at that time. Returns `None` if static (text fits, inactive, or
     /// no text).
-    pub fn render(&self, area: Rect, surface: &mut Surface, style: Style) -> Option<Instant> {
+    pub fn render(
+        &self,
+        area: Rect,
+        surface: &mut crate::render::CellSurface,
+        style: Style,
+    ) -> Option<Instant> {
         let layout = self.layout.as_ref()?;
         let viewport = area.width as usize;
         if viewport == 0 {
@@ -275,11 +279,11 @@ impl Marquee {
 pub fn schedule_redraw_at(
     work: helix_runtime::Work,
     when: Instant,
-    ingress: helix_runtime::Sender<crate::runtime::RuntimeEvent>,
+    redraw: helix_runtime::FrameHandle,
 ) {
     work.spawn(async move {
         tokio::time::sleep_until(tokio::time::Instant::from_std(when)).await;
-        crate::runtime::request_redraw(&ingress);
+        redraw.request_redraw();
     })
     .detach();
 }
@@ -322,7 +326,8 @@ mod tests {
         let mut marquee = Marquee::new();
         marquee.set_text(Some("hi"));
         let area = Rect::new(0, 0, 10, 1);
-        let mut surface = Surface::empty(Rect::new(0, 0, 10, 1));
+        let mut surface =
+            crate::render::CellSurface::empty(tui::ratatui::layout::Rect::new(0, 0, 10, 1));
         let next = marquee.render(area, &mut surface, Style::default());
         assert!(next.is_none());
     }
@@ -332,7 +337,8 @@ mod tests {
         let mut marquee = Marquee::new();
         marquee.set_text(Some("this is a long string that overflows"));
         let area = Rect::new(0, 0, 10, 1);
-        let mut surface = Surface::empty(Rect::new(0, 0, 10, 1));
+        let mut surface =
+            crate::render::CellSurface::empty(tui::ratatui::layout::Rect::new(0, 0, 10, 1));
         let next = marquee.render(area, &mut surface, Style::default());
         assert!(next.is_some());
     }
@@ -341,7 +347,8 @@ mod tests {
     fn no_text_returns_none() {
         let marquee = Marquee::new();
         let area = Rect::new(0, 0, 10, 1);
-        let mut surface = Surface::empty(Rect::new(0, 0, 10, 1));
+        let mut surface =
+            crate::render::CellSurface::empty(tui::ratatui::layout::Rect::new(0, 0, 10, 1));
         assert!(marquee
             .render(area, &mut surface, Style::default())
             .is_none());

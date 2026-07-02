@@ -1,9 +1,6 @@
 use crate::compositor::{Component, RenderContext};
 use arc_swap::ArcSwap;
-use tui::{
-    buffer::Buffer as Surface,
-    text::{Span, Spans, Text},
-};
+use tui::text::{Span, Spans, Text};
 
 use std::sync::Arc;
 
@@ -366,17 +363,17 @@ impl Markdown {
 }
 
 impl Component for Markdown {
-    fn render(&mut self, area: Rect, surface: &mut Surface, cx: &RenderContext) {
-        use tui::widgets::{Paragraph, Widget, Wrap};
+    fn render(&mut self, area: Rect, surface: &mut crate::render::CellSurface, cx: &RenderContext) {
+        use tui::ratatui::widgets::{Paragraph, Widget, Wrap};
 
-        let text = self.parse(Some(&cx.editor.theme));
-
-        let par = Paragraph::new(&text)
+        let text = self.parse(Some(cx.theme()));
+        let text = tui::ratatui::to_ratatui_text(&text);
+        let par = Paragraph::new(text)
             .wrap(Wrap { trim: false })
             .scroll((cx.scroll().unwrap_or_default() as u16, 0));
 
         let margin = Margin::all(1);
-        par.render(area.inner(margin), surface);
+        par.render(tui::ratatui::to_ratatui_rect(area.inner(margin)), surface);
     }
 
     fn required_size(&mut self, viewport: (u16, u16)) -> Option<(u16, u16)> {

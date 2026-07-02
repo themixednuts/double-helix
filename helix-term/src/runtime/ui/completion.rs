@@ -1,12 +1,9 @@
-use crate::{
-    compositor::Compositor,
-    runtime::{ui::command::CompletionCommand, RuntimeEvent},
-};
+use crate::{compositor::Compositor, runtime::ui::command::CompletionCommand};
 
 pub(crate) fn apply_completion_command(
     editor: &mut helix_view::Editor,
     compositor: &mut Compositor,
-    ingress: helix_runtime::Sender<RuntimeEvent>,
+    ingress: crate::runtime::RuntimeIngress,
     cmd: CompletionCommand,
 ) {
     match cmd {

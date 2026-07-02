@@ -2,8 +2,10 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 
-use helix_view::graphics::Rect;
-use tui::buffer::Buffer as Surface;
+use helix_view::graphics::{Rect, Style};
+
+/// Terminal-style cell grid used by the current render pipeline.
+pub type CellSurface = tui::ratatui::buffer::Buffer;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CacheId(u64);
@@ -37,8 +39,58 @@ pub struct CacheTag {
 
 #[derive(Debug)]
 pub struct RenderOutput {
-    pub area: Rect,
-    pub surface: Surface,
+    area: Rect,
+    surface: CellSurface,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RenderCell<'a> {
+    pub x: u16,
+    pub y: u16,
+    pub symbol: &'a str,
+    pub style: Style,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct RenderCellRun<'a> {
+    pub x: u16,
+    pub y: u16,
+    pub width: u16,
+    pub style: Style,
+    cells: &'a [tui::ratatui::buffer::Cell],
+}
+
+pub struct RenderCellRuns<'a> {
+    output: &'a RenderOutput,
+    x: u16,
+    y: u16,
+}
+
+/// Owned display-list representation of a rendered frame.
+///
+/// This is convenient for hosts that want self-contained styled text runs, but
+/// it allocates row/run vectors and owned run text. Use [`RenderOutput::cells`]
+/// or [`RenderOutput::cell_runs`] on hot paths that can consume the borrowed
+/// cell buffer directly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderScene {
+    area: Rect,
+    rows: Vec<RenderRow>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderRow {
+    y: u16,
+    runs: Vec<RenderRun>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderRun {
+    pub x: u16,
+    pub y: u16,
+    pub width: u16,
+    pub text: String,
+    pub style: Style,
 }
 
 impl RenderOutput {
@@ -46,8 +98,198 @@ impl RenderOutput {
     pub fn new(area: Rect) -> Self {
         Self {
             area,
-            surface: Surface::empty(area),
+            surface: CellSurface::empty(tui::ratatui::to_ratatui_rect(area)),
         }
+    }
+
+    #[must_use]
+    pub fn area(&self) -> Rect {
+        self.area
+    }
+
+    pub fn surface(&self) -> &CellSurface {
+        &self.surface
+    }
+
+    pub fn surface_mut(&mut self) -> &mut CellSurface {
+        &mut self.surface
+    }
+
+    pub fn into_surface(self) -> CellSurface {
+        self.surface
+    }
+
+    pub fn cells(&self) -> impl Iterator<Item = RenderCell<'_>> {
+        let area = *self.surface.area();
+        self.surface
+            .content
+            .iter()
+            .enumerate()
+            .filter_map(move |(index, cell)| {
+                if area.width == 0 {
+                    return None;
+                }
+                let width = area.width as usize;
+                let x = area.x + (index % width) as u16;
+                let y = area.y + (index / width) as u16;
+                Some(RenderCell {
+                    x,
+                    y,
+                    symbol: cell.symbol(),
+                    style: tui::ratatui::to_helix_style(cell.style()),
+                })
+            })
+    }
+
+    /// Iterate same-style cell runs without allocating owned run text.
+    pub fn cell_runs(&self) -> RenderCellRuns<'_> {
+        RenderCellRuns {
+            output: self,
+            x: self.area.left(),
+            y: self.area.top(),
+        }
+    }
+
+    /// Convert this frame to an owned display list.
+    ///
+    /// This allocates `RenderScene` row/run vectors and owned `String` text for
+    /// each run. Prefer [`Self::cells`] or [`Self::cell_runs`] when the host can
+    /// render directly from borrowed cell data.
+    #[must_use]
+    pub fn to_scene(&self) -> RenderScene {
+        let mut rows = Vec::with_capacity(self.area.height as usize);
+        for y in self.area.top()..self.area.bottom() {
+            let mut row = RenderRow {
+                y,
+                runs: Vec::new(),
+            };
+            for x in self.area.left()..self.area.right() {
+                let Some(cell) = self.surface.cell((x, y)) else {
+                    continue;
+                };
+                let style = tui::ratatui::to_helix_style(cell.style());
+                let symbol = cell.symbol();
+                match row.runs.last_mut() {
+                    Some(run) if run.style == style && run.x.saturating_add(run.width) == x => {
+                        run.text.push_str(symbol);
+                        run.width = run.width.saturating_add(1);
+                    }
+                    _ => row.runs.push(RenderRun {
+                        x,
+                        y,
+                        width: 1,
+                        text: symbol.to_owned(),
+                        style,
+                    }),
+                }
+            }
+            rows.push(row);
+        }
+        RenderScene {
+            area: self.area,
+            rows,
+        }
+    }
+}
+
+impl<'a> RenderCellRun<'a> {
+    pub fn cells(&self) -> &'a [tui::ratatui::buffer::Cell] {
+        self.cells
+    }
+
+    pub fn symbols(&self) -> impl Iterator<Item = &str> {
+        self.cells.iter().map(tui::ratatui::buffer::Cell::symbol)
+    }
+
+    pub fn write_text(&self, output: &mut String) {
+        for symbol in self.symbols() {
+            output.push_str(symbol);
+        }
+    }
+}
+
+impl<'a> Iterator for RenderCellRuns<'a> {
+    type Item = RenderCellRun<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let area = self.output.area;
+        let surface_area = *self.output.surface.area();
+        if area.width == 0 || surface_area.width == 0 {
+            return None;
+        }
+
+        while self.y < area.bottom() {
+            if self.x >= area.right() {
+                self.x = area.left();
+                self.y = self.y.saturating_add(1);
+                continue;
+            }
+
+            let start_x = self.x;
+            let y = self.y;
+            let start = cell_index(surface_area, start_x, y)?;
+            let first = self.output.surface.cell((start_x, y))?;
+            let style = tui::ratatui::to_helix_style(first.style());
+            let mut end_x = start_x.saturating_add(1);
+
+            while end_x < area.right() {
+                let Some(cell) = self.output.surface.cell((end_x, y)) else {
+                    break;
+                };
+                if tui::ratatui::to_helix_style(cell.style()) != style {
+                    break;
+                }
+                end_x = end_x.saturating_add(1);
+            }
+
+            self.x = end_x;
+            let width = end_x.saturating_sub(start_x);
+            let end = start + width as usize;
+            return Some(RenderCellRun {
+                x: start_x,
+                y,
+                width,
+                style,
+                cells: &self.output.surface.content[start..end],
+            });
+        }
+
+        None
+    }
+}
+
+fn cell_index(area: tui::ratatui::layout::Rect, x: u16, y: u16) -> Option<usize> {
+    if x < area.x || y < area.y || x >= area.right() || y >= area.bottom() {
+        return None;
+    }
+    let row = y.saturating_sub(area.y) as usize;
+    let col = x.saturating_sub(area.x) as usize;
+    Some(row * area.width as usize + col)
+}
+
+impl RenderScene {
+    #[must_use]
+    pub fn area(&self) -> Rect {
+        self.area
+    }
+
+    pub fn rows(&self) -> &[RenderRow] {
+        &self.rows
+    }
+
+    pub fn runs(&self) -> impl Iterator<Item = &RenderRun> {
+        self.rows.iter().flat_map(RenderRow::runs)
+    }
+}
+
+impl RenderRow {
+    #[must_use]
+    pub fn y(&self) -> u16 {
+        self.y
+    }
+
+    pub fn runs(&self) -> &[RenderRun] {
+        &self.runs
     }
 }
 
@@ -65,13 +307,7 @@ impl RenderWork {
     }
 }
 
-/// Common render interface. "I can produce pixels for a given area."
-pub trait Renderable {
-    fn render(&mut self, area: Rect, surface: &mut Surface);
-}
-
-/// A render artifact ready for composition. The universal output type
-/// that all rendering paths produce and `CacheStore` consumes.
+/// A cell-grid render artifact ready for composition.
 pub struct PreparedRender {
     tag: Option<CacheTag>,
     work: RenderWork,
@@ -107,10 +343,10 @@ impl PreparedRender {
     /// Captures an owned `Send + 'static` snapshot and a render closure.
     /// The closure executes later — potentially on a rayon thread — with
     /// only the snapshot (no `&Editor` needed).
-    pub fn snapshot<S, F>(tag: CacheTag, snapshot: S, render: F) -> Self
+    pub fn snapshot<T, F>(tag: CacheTag, snapshot: T, render: F) -> Self
     where
-        S: Send + 'static,
-        F: FnOnce(S) -> RenderOutput + Send + 'static,
+        T: Send + 'static,
+        F: FnOnce(T) -> RenderOutput + Send + 'static,
     {
         Self {
             tag: Some(tag),
@@ -142,7 +378,7 @@ struct CacheMeta {
 pub struct CacheStore {
     index: HashMap<CacheId, u32>,
     meta: Vec<CacheMeta>,
-    surfaces: Vec<Surface>,
+    surfaces: Vec<CellSurface>,
 }
 
 impl CacheStore {
@@ -163,22 +399,22 @@ impl CacheStore {
         }
     }
 
-    pub fn compose(&mut self, prepared: PreparedRender, surface: &mut Surface) -> CacheState {
+    pub fn compose(&mut self, prepared: PreparedRender, surface: &mut CellSurface) -> CacheState {
         let PreparedRender { tag, work } = prepared;
         let Some(tag) = tag else {
             let output = work.run();
-            blit(&output.surface, surface);
+            blit_cells(output.surface(), surface);
             return CacheState::Uncached;
         };
 
         if let Some(cached) = self.lookup(tag.id, tag.key, tag.area) {
-            blit(cached, surface);
+            blit_cells(cached, surface);
             return CacheState::Hit;
         }
 
         let output = work.run();
-        blit(&output.surface, surface);
-        self.store(tag, output.surface);
+        blit_cells(output.surface(), surface);
+        self.store(tag, output.into_surface());
         CacheState::Miss
     }
 
@@ -186,7 +422,11 @@ impl CacheStore {
     /// parallel via rayon. Cache hits are resolved first; remaining work
     /// items execute on the rayon thread pool; results are blitted onto
     /// `surface` in the original submission order (preserving z-order).
-    pub fn compose_batch(&mut self, batch: Vec<PreparedRender>, surface: &mut Surface) {
+    pub fn compose_batch(
+        &mut self,
+        batch: impl IntoIterator<Item = PreparedRender>,
+        surface: &mut CellSurface,
+    ) {
         use rayon::prelude::*;
 
         struct Pending {
@@ -194,13 +434,14 @@ impl CacheStore {
             work: RenderWork,
         }
 
-        let mut pending: Vec<Pending> = Vec::with_capacity(batch.len());
+        let batch = batch.into_iter();
+        let mut pending: Vec<Pending> = Vec::with_capacity(batch.size_hint().0);
 
         for prepared in batch {
             let PreparedRender { tag, work } = prepared;
             if let Some(tag) = tag {
                 if let Some(cached) = self.lookup(tag.id, tag.key, tag.area) {
-                    blit(cached, surface);
+                    blit_cells(cached, surface);
                     continue;
                 }
                 pending.push(Pending {
@@ -225,20 +466,20 @@ impl CacheStore {
             .collect();
 
         for (tag, output) in outputs {
-            blit(&output.surface, surface);
+            blit_cells(output.surface(), surface);
             if let Some(tag) = tag {
-                self.store(tag, output.surface);
+                self.store(tag, output.into_surface());
             }
         }
     }
 
-    fn lookup(&self, id: CacheId, key: CacheKey, area: Rect) -> Option<&Surface> {
+    fn lookup(&self, id: CacheId, key: CacheKey, area: Rect) -> Option<&CellSurface> {
         let &idx = self.index.get(&id)?;
         let m = &self.meta[idx as usize];
         (m.key == key && m.area == area).then(|| &self.surfaces[idx as usize])
     }
 
-    fn store(&mut self, tag: CacheTag, surface: Surface) {
+    fn store(&mut self, tag: CacheTag, surface: CellSurface) {
         if let Some(&idx) = self.index.get(&tag.id) {
             let i = idx as usize;
             self.meta[i] = CacheMeta {
@@ -261,41 +502,44 @@ impl CacheStore {
     }
 }
 
-/// Blit `src` onto `dst`, row-at-a-time for cache-friendly copying.
-pub fn blit(src: &Surface, dst: &mut Surface) {
-    let area = src.area;
-    let src_w = area.width as usize;
-    if src_w == 0 || area.height == 0 {
+/// Blit one cell surface onto another without style conversion.
+pub fn blit_cells(src: &CellSurface, dst: &mut CellSurface) {
+    let src_area = tui::ratatui::to_helix_rect(*src.area());
+    let dst_area = tui::ratatui::to_helix_rect(*dst.area());
+    let area = src_area.intersection(dst_area);
+    if area.width == 0 || area.height == 0 {
         return;
     }
-    let dst_w = dst.area.width as usize;
-    let dst_ox = (area.x - dst.area.x) as usize;
-    let dst_oy = (area.y - dst.area.y) as usize;
+
+    let src_w = src.area().width as usize;
+    let dst_w = dst.area().width as usize;
+    let src_x = (area.x - src_area.x) as usize;
+    let src_y = (area.y - src_area.y) as usize;
+    let dst_x = (area.x - dst_area.x) as usize;
+    let dst_y = (area.y - dst_area.y) as usize;
+    let width = area.width as usize;
 
     for row in 0..area.height as usize {
-        let src_start = row * src_w;
-        let dst_start = (dst_oy + row) * dst_w + dst_ox;
-        dst.content[dst_start..dst_start + src_w]
-            .clone_from_slice(&src.content[src_start..src_start + src_w]);
+        let src_start = (src_y + row) * src_w + src_x;
+        let dst_start = (dst_y + row) * dst_w + dst_x;
+        dst.content[dst_start..dst_start + width]
+            .clone_from_slice(&src.content[src_start..src_start + width]);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tui::buffer::Cell;
 
     fn render_char(ch: char, area: Rect) -> RenderOutput {
-        let mut surface = Surface::empty(area);
-        let mut symbol = [0; 4];
+        let mut output = RenderOutput::new(area);
+        let symbol = ch.to_string();
         for y in area.top()..area.bottom() {
             for x in area.left()..area.right() {
-                let mut cell = Cell::default();
-                cell.set_symbol(ch.encode_utf8(&mut symbol));
-                surface[(x, y)] = cell;
+                output.surface_mut()[(x, y)].set_symbol(&symbol);
             }
         }
-        RenderOutput { area, surface }
+        output
     }
 
     fn test_tag(slot: &str, ver: u8) -> CacheTag {
@@ -310,7 +554,7 @@ mod tests {
     fn cache_store_reuses_matching_entry() {
         let area = Rect::new(0, 0, 4, 1);
         let mut store = CacheStore::default();
-        let mut surface = Surface::empty(area);
+        let mut surface = CellSurface::empty(tui::ratatui::to_ratatui_rect(area));
 
         let tag = test_tag("slot", 1);
         let prepared = PreparedRender::cached(tag, render_char('a', area));
@@ -319,14 +563,14 @@ mod tests {
         // Same tag → hit, surface still has 'a' (not re-rendered).
         let prepared = PreparedRender::cached(tag, render_char('b', area));
         assert_eq!(store.compose(prepared, &mut surface), CacheState::Hit);
-        assert_eq!(surface[(0, 0)].symbol.as_ref(), "a");
+        assert_eq!(surface[(0, 0)].symbol(), "a");
     }
 
     #[test]
     fn cache_store_composes_deferred_render_work() {
         let area = Rect::new(0, 0, 2, 1);
         let mut store = CacheStore::default();
-        let mut surface = Surface::empty(area);
+        let mut surface = CellSurface::empty(tui::ratatui::to_ratatui_rect(area));
         let tag = CacheTag {
             id: CacheId::hashed(&"slot"),
             key: CacheKey::hashed(&1_u8),
@@ -335,22 +579,20 @@ mod tests {
 
         let prepared = PreparedRender::snapshot(tag, 'z', move |ch| {
             let mut output = RenderOutput::new(area);
-            let mut cell = Cell::default();
-            let mut symbol = [0; 4];
-            cell.set_symbol(ch.encode_utf8(&mut symbol));
-            output.surface[(0, 0)] = cell;
+            let symbol = ch.to_string();
+            output.surface_mut()[(0, 0)].set_symbol(&symbol);
             output
         });
 
         assert_eq!(store.compose(prepared, &mut surface), CacheState::Miss);
-        assert_eq!(surface[(0, 0)].symbol.as_ref(), "z");
+        assert_eq!(surface[(0, 0)].symbol(), "z");
     }
 
     #[test]
     fn snapshot_builds_cached_deferred_work() {
         let area = Rect::new(0, 0, 1, 1);
         let mut store = CacheStore::default();
-        let mut surface = Surface::empty(area);
+        let mut surface = CellSurface::empty(tui::ratatui::to_ratatui_rect(area));
         let tag = CacheTag {
             id: CacheId::hashed(&"slot"),
             key: CacheKey::hashed(&2_u8),
@@ -359,14 +601,160 @@ mod tests {
 
         let prepared = PreparedRender::snapshot(tag, 'q', move |ch| {
             let mut output = RenderOutput::new(area);
-            let mut symbol = [0; 4];
-            let mut cell = Cell::default();
-            cell.set_symbol(ch.encode_utf8(&mut symbol));
-            output.surface[(0, 0)] = cell;
+            let symbol = ch.to_string();
+            output.surface_mut()[(0, 0)].set_symbol(&symbol);
             output
         });
 
         assert_eq!(store.compose(prepared, &mut surface), CacheState::Miss);
-        assert_eq!(surface[(0, 0)].symbol.as_ref(), "q");
+        assert_eq!(surface[(0, 0)].symbol(), "q");
+    }
+
+    #[test]
+    fn ratatui_cache_store_reuses_matching_entry() {
+        let area = Rect::new(0, 0, 4, 1);
+        let mut store = CacheStore::default();
+        let mut surface = CellSurface::empty(tui::ratatui::to_ratatui_rect(area));
+        let tag = CacheTag {
+            id: CacheId::hashed(&"ratatui-slot"),
+            key: CacheKey::hashed(&1_u8),
+            area,
+        };
+
+        let mut first = RenderOutput::new(area);
+        first
+            .surface_mut()
+            .set_string(0, 0, "aaaa", tui::ratatui::style::Style::default());
+        assert_eq!(
+            store.compose(PreparedRender::cached(tag, first), &mut surface),
+            CacheState::Miss
+        );
+
+        let mut second = RenderOutput::new(area);
+        second
+            .surface_mut()
+            .set_string(0, 0, "bbbb", tui::ratatui::style::Style::default());
+        assert_eq!(
+            store.compose(PreparedRender::cached(tag, second), &mut surface),
+            CacheState::Hit
+        );
+        assert_eq!(surface[(0, 0)].symbol(), "a");
+    }
+
+    #[test]
+    fn blit_cells_preserves_symbol_and_style() {
+        let area = Rect::new(0, 0, 2, 1);
+        let mut src = CellSurface::empty(tui::ratatui::to_ratatui_rect(area));
+        src[(1, 0)]
+            .set_symbol("x")
+            .set_fg(tui::ratatui::style::Color::LightGreen);
+        let mut dst = CellSurface::empty(tui::ratatui::to_ratatui_rect(area));
+
+        blit_cells(&src, &mut dst);
+
+        assert_eq!(dst[(1, 0)].symbol(), "x");
+        assert_eq!(dst[(1, 0)].fg, tui::ratatui::style::Color::LightGreen);
+    }
+
+    #[test]
+    fn render_output_cells_expose_helix_cell_records() {
+        let area = Rect::new(2, 3, 2, 1);
+        let mut output = RenderOutput::new(area);
+        output.surface_mut()[(2, 3)].set_symbol("x").set_style(
+            tui::ratatui::style::Style::default()
+                .fg(tui::ratatui::style::Color::LightGreen)
+                .add_modifier(tui::ratatui::style::Modifier::BOLD),
+        );
+
+        let cells = output.cells().collect::<Vec<_>>();
+
+        assert_eq!(cells.len(), 2);
+        assert_eq!(cells[0].x, 2);
+        assert_eq!(cells[0].y, 3);
+        assert_eq!(cells[0].symbol, "x");
+        assert_eq!(
+            cells[0].style.fg,
+            Some(helix_view::graphics::Color::LightGreen)
+        );
+        assert!(cells[0]
+            .style
+            .add_modifier
+            .contains(helix_view::graphics::Modifier::BOLD));
+    }
+
+    #[test]
+    fn render_output_cells_handles_empty_width() {
+        let output = RenderOutput::new(Rect::new(0, 0, 0, 1));
+
+        assert_eq!(output.cells().count(), 0);
+    }
+
+    #[test]
+    fn render_output_scene_groups_adjacent_cells_by_style() {
+        let area = Rect::new(0, 0, 4, 1);
+        let mut output = RenderOutput::new(area);
+        let red = tui::ratatui::style::Style::default().fg(tui::ratatui::style::Color::Red);
+        let blue = tui::ratatui::style::Style::default().fg(tui::ratatui::style::Color::Blue);
+        output.surface_mut()[(0, 0)].set_symbol("a").set_style(red);
+        output.surface_mut()[(1, 0)].set_symbol("b").set_style(red);
+        output.surface_mut()[(2, 0)].set_symbol("c").set_style(blue);
+        output.surface_mut()[(3, 0)].set_symbol("d").set_style(blue);
+
+        let scene = output.to_scene();
+        let row = &scene.rows()[0];
+
+        assert_eq!(scene.area(), area);
+        assert_eq!(row.y(), 0);
+        assert_eq!(row.runs().len(), 2);
+        assert_eq!(row.runs()[0].x, 0);
+        assert_eq!(row.runs()[0].width, 2);
+        assert_eq!(row.runs()[0].text, "ab");
+        assert_eq!(
+            row.runs()[0].style.fg,
+            Some(helix_view::graphics::Color::Red)
+        );
+        assert_eq!(row.runs()[1].x, 2);
+        assert_eq!(row.runs()[1].width, 2);
+        assert_eq!(row.runs()[1].text, "cd");
+        assert_eq!(
+            row.runs()[1].style.fg,
+            Some(helix_view::graphics::Color::Blue)
+        );
+    }
+
+    #[test]
+    fn render_output_cell_runs_group_adjacent_cells_without_owned_text() {
+        let area = Rect::new(0, 0, 4, 1);
+        let mut output = RenderOutput::new(area);
+        let red = tui::ratatui::style::Style::default().fg(tui::ratatui::style::Color::Red);
+        let blue = tui::ratatui::style::Style::default().fg(tui::ratatui::style::Color::Blue);
+        output.surface_mut()[(0, 0)].set_symbol("a").set_style(red);
+        output.surface_mut()[(1, 0)].set_symbol("b").set_style(red);
+        output.surface_mut()[(2, 0)].set_symbol("c").set_style(blue);
+        output.surface_mut()[(3, 0)].set_symbol("d").set_style(blue);
+
+        let runs = output.cell_runs().collect::<Vec<_>>();
+
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].x, 0);
+        assert_eq!(runs[0].width, 2);
+        assert_eq!(runs[0].symbols().collect::<Vec<_>>(), ["a", "b"]);
+        assert_eq!(runs[1].x, 2);
+        assert_eq!(runs[1].width, 2);
+        assert_eq!(runs[1].symbols().collect::<Vec<_>>(), ["c", "d"]);
+    }
+
+    #[test]
+    fn render_cell_run_writes_into_caller_owned_buffer() {
+        let area = Rect::new(0, 0, 2, 1);
+        let mut output = RenderOutput::new(area);
+        output.surface_mut()[(0, 0)].set_symbol("a");
+        output.surface_mut()[(1, 0)].set_symbol("b");
+        let run = output.cell_runs().next().unwrap();
+        let mut text = String::with_capacity(run.width as usize);
+
+        run.write_text(&mut text);
+
+        assert_eq!(text, "ab");
     }
 }

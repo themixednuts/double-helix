@@ -1,4 +1,5 @@
 use std::io::{self, Write as _};
+use std::ops::Range;
 
 use helix_view::{
     editor::KittyKeyboardProtocolConfig,
@@ -14,9 +15,15 @@ use termina::{
     Event, OneBased, PlatformTerminal, Terminal as _, WindowSize,
 };
 
-use crate::{buffer::Cell, terminal::Config};
+use crate::terminal::Config;
 
-use super::Backend;
+use super::{cell::TerminalCell, Backend};
+
+use ratatui::{
+    backend::{ClearType as RatatuiClearType, WindowSize as RatatuiWindowSize},
+    buffer::Cell,
+    layout::{Position, Size},
+};
 
 // These macros are helpers to set/unset modes like bracketed paste or enter/exit the alternate
 // screen.
@@ -76,6 +83,7 @@ pub struct TerminaBackend {
     capabilities: Capabilities,
     reset_cursor_command: String,
     is_synchronized_output_set: bool,
+    cursor_position: (u16, u16),
 }
 
 impl TerminaBackend {
@@ -112,6 +120,7 @@ impl TerminaBackend {
             capabilities,
             reset_cursor_command,
             is_synchronized_output_set: false,
+            cursor_position: (0, 0),
         })
     }
 
@@ -373,6 +382,144 @@ impl TerminaBackend {
         }
         Ok(())
     }
+
+    fn draw_cells<'a, I, C>(&mut self, content: I) -> io::Result<()>
+    where
+        I: Iterator<Item = (u16, u16, &'a C)>,
+        C: TerminalCell + 'a,
+    {
+        self.start_synchronized_render()?;
+
+        let mut fg = Color::Reset;
+        let mut bg = Color::Reset;
+        let mut underline_color = Color::Reset;
+        let mut underline_style = UnderlineStyle::Reset;
+        let mut modifier = Modifier::empty();
+        let mut last_pos: Option<(u16, u16)> = None;
+        for (x, y, cell) in content {
+            // Move the cursor if the previous location was not (x - 1, y)
+            if !matches!(last_pos, Some(p) if x == p.0 + 1 && y == p.1) {
+                write!(
+                    self.terminal,
+                    "{}",
+                    Csi::Cursor(csi::Cursor::Position {
+                        col: OneBased::from_zero_based(x),
+                        line: OneBased::from_zero_based(y),
+                    })
+                )?;
+            }
+            last_pos = Some((x, y));
+
+            let mut attributes = SgrAttributes::default();
+            let next_fg = cell.fg();
+            if next_fg != fg {
+                attributes.foreground = Some(next_fg.into());
+                fg = next_fg;
+            }
+            let next_bg = cell.bg();
+            if next_bg != bg {
+                attributes.background = Some(next_bg.into());
+                bg = next_bg;
+            }
+            let next_modifier = cell.modifier();
+            if next_modifier != modifier {
+                attributes.modifiers = diff_modifiers(modifier, next_modifier);
+                modifier = next_modifier;
+            }
+
+            // Set underline style and color separately from SgrAttributes. Some terminals seem
+            // to not like underline colors and styles being intermixed with other SGRs.
+            let mut new_underline_style = cell.underline_style();
+            if self.capabilities.extended_underlines {
+                let next_underline_color = cell.underline_color();
+                if next_underline_color != underline_color {
+                    write!(
+                        self.terminal,
+                        "{}",
+                        Csi::Sgr(csi::Sgr::UnderlineColor(next_underline_color.into()))
+                    )?;
+                    underline_color = next_underline_color;
+                }
+            } else {
+                match new_underline_style {
+                    UnderlineStyle::Reset | UnderlineStyle::Line => (),
+                    _ => new_underline_style = UnderlineStyle::Line,
+                }
+            }
+            if new_underline_style != underline_style {
+                write!(
+                    self.terminal,
+                    "{}",
+                    Csi::Sgr(csi::Sgr::Underline(new_underline_style.into()))
+                )?;
+                underline_style = new_underline_style;
+            }
+
+            // `attributes` will be empty if nothing changed between two cells. Empty
+            // `SgrAttributes` behave the same as a `Sgr::Reset` rather than a 'no-op' though so
+            // we should avoid writing them if they're empty.
+            if !attributes.is_empty() {
+                write!(
+                    self.terminal,
+                    "{}",
+                    Csi::Sgr(csi::Sgr::Attributes(attributes))
+                )?;
+            }
+
+            write!(self.terminal, "{}", cell.symbol())?;
+        }
+
+        write!(self.terminal, "{}", Csi::Sgr(csi::Sgr::Reset))?;
+
+        self.end_sychronized_render()?;
+
+        Ok(())
+    }
+
+    fn scroll_region(
+        &mut self,
+        region: Range<u16>,
+        direction: ScrollDirection,
+        line_count: u16,
+    ) -> io::Result<()> {
+        if line_count == 0 || region.is_empty() {
+            return Ok(());
+        }
+
+        write!(
+            self.terminal,
+            "\x1b[{};{}r",
+            region.start.saturating_add(1),
+            region.end
+        )?;
+        match direction {
+            ScrollDirection::Up => write!(
+                self.terminal,
+                "{}{}",
+                Csi::Cursor(csi::Cursor::Position {
+                    col: OneBased::from_zero_based(0),
+                    line: OneBased::from_zero_based(region.end - 1),
+                }),
+                Csi::Edit(csi::Edit::ScrollUp(u32::from(line_count))),
+            )?,
+            ScrollDirection::Down => write!(
+                self.terminal,
+                "{}{}",
+                Csi::Cursor(csi::Cursor::Position {
+                    col: OneBased::from_zero_based(0),
+                    line: OneBased::from_zero_based(region.start),
+                }),
+                Csi::Edit(csi::Edit::ScrollDown(u32::from(line_count))),
+            )?,
+        }
+        write!(self.terminal, "\x1b[r")
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScrollDirection {
+    Up,
+    Down,
 }
 
 impl Backend for TerminaBackend {
@@ -434,88 +581,7 @@ impl Backend for TerminaBackend {
     where
         I: Iterator<Item = (u16, u16, &'a Cell)>,
     {
-        self.start_synchronized_render()?;
-
-        let mut fg = Color::Reset;
-        let mut bg = Color::Reset;
-        let mut underline_color = Color::Reset;
-        let mut underline_style = UnderlineStyle::Reset;
-        let mut modifier = Modifier::empty();
-        let mut last_pos: Option<(u16, u16)> = None;
-        for (x, y, cell) in content {
-            // Move the cursor if the previous location was not (x - 1, y)
-            if !matches!(last_pos, Some(p) if x == p.0 + 1 && y == p.1) {
-                write!(
-                    self.terminal,
-                    "{}",
-                    Csi::Cursor(csi::Cursor::Position {
-                        col: OneBased::from_zero_based(x),
-                        line: OneBased::from_zero_based(y),
-                    })
-                )?;
-            }
-            last_pos = Some((x, y));
-
-            let mut attributes = SgrAttributes::default();
-            if cell.fg != fg {
-                attributes.foreground = Some(cell.fg.into());
-                fg = cell.fg;
-            }
-            if cell.bg != bg {
-                attributes.background = Some(cell.bg.into());
-                bg = cell.bg;
-            }
-            if cell.modifier != modifier {
-                attributes.modifiers = diff_modifiers(modifier, cell.modifier);
-                modifier = cell.modifier;
-            }
-
-            // Set underline style and color separately from SgrAttributes. Some terminals seem
-            // to not like underline colors and styles being intermixed with other SGRs.
-            let mut new_underline_style = cell.underline_style;
-            if self.capabilities.extended_underlines {
-                if cell.underline_color != underline_color {
-                    write!(
-                        self.terminal,
-                        "{}",
-                        Csi::Sgr(csi::Sgr::UnderlineColor(cell.underline_color.into()))
-                    )?;
-                    underline_color = cell.underline_color;
-                }
-            } else {
-                match new_underline_style {
-                    UnderlineStyle::Reset | UnderlineStyle::Line => (),
-                    _ => new_underline_style = UnderlineStyle::Line,
-                }
-            }
-            if new_underline_style != underline_style {
-                write!(
-                    self.terminal,
-                    "{}",
-                    Csi::Sgr(csi::Sgr::Underline(new_underline_style.into()))
-                )?;
-                underline_style = new_underline_style;
-            }
-
-            // `attributes` will be empty if nothing changed between two cells. Empty
-            // `SgrAttributes` behave the same as a `Sgr::Reset` rather than a 'no-op' though so
-            // we should avoid writing them if they're empty.
-            if !attributes.is_empty() {
-                write!(
-                    self.terminal,
-                    "{}",
-                    Csi::Sgr(csi::Sgr::Attributes(attributes))
-                )?;
-            }
-
-            write!(self.terminal, "{}", &cell.symbol)?;
-        }
-
-        write!(self.terminal, "{}", Csi::Sgr(csi::Sgr::Reset))?;
-
-        self.end_sychronized_render()?;
-
-        Ok(())
+        self.draw_cells(content)
     }
 
     fn hide_cursor(&mut self) -> io::Result<()> {
@@ -542,6 +608,7 @@ impl Backend for TerminaBackend {
     fn set_cursor(&mut self, x: u16, y: u16) -> io::Result<()> {
         let col = OneBased::from_zero_based(x);
         let line = OneBased::from_zero_based(y);
+        self.cursor_position = (x, y);
         write!(
             self.terminal,
             "{}",
@@ -575,6 +642,102 @@ impl Backend for TerminaBackend {
 
     fn get_theme_mode(&self) -> Option<theme::Mode> {
         self.capabilities.theme_mode
+    }
+}
+
+impl ratatui::backend::Backend for TerminaBackend {
+    type Error = io::Error;
+
+    fn draw<'a, I>(&mut self, content: I) -> Result<(), Self::Error>
+    where
+        I: Iterator<Item = (u16, u16, &'a ratatui::buffer::Cell)>,
+    {
+        self.draw_cells(content)
+    }
+
+    fn append_lines(&mut self, n: u16) -> Result<(), Self::Error> {
+        for _ in 0..n {
+            self.terminal.write_all(b"\n")?;
+        }
+        Ok(())
+    }
+
+    fn hide_cursor(&mut self) -> Result<(), Self::Error> {
+        <Self as Backend>::hide_cursor(self)
+    }
+
+    fn show_cursor(&mut self) -> Result<(), Self::Error> {
+        <Self as Backend>::show_cursor(self, CursorKind::Block)
+    }
+
+    fn get_cursor_position(&mut self) -> Result<Position, Self::Error> {
+        Ok(Position::new(
+            self.cursor_position.0,
+            self.cursor_position.1,
+        ))
+    }
+
+    fn set_cursor_position<P>(&mut self, position: P) -> Result<(), Self::Error>
+    where
+        P: Into<Position>,
+    {
+        let position = position.into();
+        <Self as Backend>::set_cursor(self, position.x, position.y)
+    }
+
+    fn clear(&mut self) -> Result<(), Self::Error> {
+        <Self as Backend>::clear(self)
+    }
+
+    fn clear_region(&mut self, clear_type: RatatuiClearType) -> Result<(), Self::Error> {
+        let edit = match clear_type {
+            RatatuiClearType::All => csi::Edit::EraseInDisplay(csi::EraseInDisplay::EraseDisplay),
+            RatatuiClearType::AfterCursor => {
+                csi::Edit::EraseInDisplay(csi::EraseInDisplay::EraseToEndOfDisplay)
+            }
+            RatatuiClearType::BeforeCursor => {
+                csi::Edit::EraseInDisplay(csi::EraseInDisplay::EraseToStartOfDisplay)
+            }
+            RatatuiClearType::CurrentLine => csi::Edit::EraseInLine(csi::EraseInLine::EraseLine),
+            RatatuiClearType::UntilNewLine => {
+                csi::Edit::EraseInLine(csi::EraseInLine::EraseToEndOfLine)
+            }
+        };
+        write!(self.terminal, "{}", Csi::Edit(edit))
+    }
+
+    fn size(&self) -> Result<Size, Self::Error> {
+        let Rect { width, height, .. } = <Self as Backend>::size(self)?;
+        Ok(Size::new(width, height))
+    }
+
+    fn window_size(&mut self) -> Result<RatatuiWindowSize, Self::Error> {
+        let WindowSize {
+            rows,
+            cols,
+            pixel_width,
+            pixel_height,
+        } = self.terminal.get_dimensions()?;
+        Ok(RatatuiWindowSize {
+            columns_rows: Size::new(cols, rows),
+            pixels: Size::new(pixel_width.unwrap_or(0), pixel_height.unwrap_or(0)),
+        })
+    }
+
+    fn flush(&mut self) -> Result<(), Self::Error> {
+        self.terminal.flush()
+    }
+
+    fn scroll_region_up(&mut self, region: Range<u16>, line_count: u16) -> Result<(), Self::Error> {
+        self.scroll_region(region, ScrollDirection::Up, line_count)
+    }
+
+    fn scroll_region_down(
+        &mut self,
+        region: Range<u16>,
+        line_count: u16,
+    ) -> Result<(), Self::Error> {
+        self.scroll_region(region, ScrollDirection::Down, line_count)
     }
 }
 

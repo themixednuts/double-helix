@@ -1,40 +1,71 @@
-use crate::compositor::{Component, RenderContext};
+use crate::{
+    compositor::{Component, RenderContext},
+    ui::design::{self, InfoPopupStyles},
+    widgets::{Panel, PanelStyle},
+};
 use helix_view::graphics::{Margin, Rect};
 use helix_view::info::Info;
-use tui::buffer::Buffer as Surface;
-use tui::text::Text;
-use tui::widgets::{Block, BorderType, Paragraph, Widget};
+use tui::ratatui::widgets::{Paragraph, Widget};
 
 impl Component for Info {
-    fn render(&mut self, viewport: Rect, surface: &mut Surface, cx: &RenderContext) {
-        let text_style = cx.editor.theme.get("ui.text.info");
-        let popup_style = cx.editor.theme.get("ui.popup.info");
+    fn render(
+        &mut self,
+        viewport: Rect,
+        surface: &mut crate::render::CellSurface,
+        cx: &RenderContext,
+    ) {
+        let styles = design::InfoPopupStyles::from_theme(cx.theme());
+        let rounded = cx.config().rounded_corners;
 
-        // Calculate the area of the terminal to modify. Because we want to
-        // render at the bottom right, we use the viewport's width and height
-        // which evaluate to the most bottom right coordinate.
-        let width = self.width + 2 + 2; // +2 for border, +2 for margin
-        let height = self.height + 2; // +2 for border
-        let area = viewport.intersection(Rect::new(
-            viewport.width.saturating_sub(width),
-            viewport.height.saturating_sub(height + 2), // +2 for statusline
-            width,
-            height,
-        ));
-        surface.clear_with(area, popup_style);
-
-        let border_type = BorderType::new(cx.editor.config().rounded_corners);
-        let block = Block::bordered()
-            .title(self.title.as_ref())
-            .border_style(popup_style)
-            .border_type(border_type);
-
-        let margin = Margin::horizontal(1);
-        let inner = block.inner(area).inner(margin);
-        block.render(area, surface);
-
-        Paragraph::new(&Text::from(self.text.as_str()))
-            .style(text_style)
-            .render(inner, surface);
+        render_info_popup(surface, viewport, self, styles, rounded);
     }
+}
+
+pub(crate) fn render_info_popup(
+    surface: &mut crate::render::CellSurface,
+    viewport: Rect,
+    info: &Info,
+    styles: InfoPopupStyles,
+    rounded_corners: bool,
+) -> Rect {
+    let area = design::info_popup_area(viewport, info);
+    if area.width == 0 || area.height == 0 {
+        return area;
+    }
+
+    // Use the shared `Panel::framed` widget — same chrome as every
+    // other framed surface in the editor (plugin floats, debug
+    // overlays). It fills the background, draws the border (with
+    // configurable rounded corners), and returns the inner content
+    // area. Centralizing here means a future change to border
+    // semantics (style key, glyph set, padding) propagates to every
+    // popup that draws a frame.
+    let panel_style = PanelStyle::new(styles.popup, styles.popup, styles.popup);
+    let panel = Panel::framed(panel_style, rounded_corners).title(info.title.as_ref());
+    let inner = panel.render(surface, area).inner(Margin::horizontal(1));
+
+    let needs_scrollbar = info.height > inner.height;
+    let body = if needs_scrollbar {
+        inner.clip_right(1)
+    } else {
+        inner
+    };
+    let scroll = info.visible_scroll(body.height);
+
+    Paragraph::new(info.text.as_str())
+        .style(tui::ratatui::to_ratatui_style(styles.text))
+        .scroll((scroll as u16, 0))
+        .render(tui::ratatui::to_ratatui_rect(body), surface);
+
+    if needs_scrollbar && inner.width > 0 {
+        crate::widgets::Scrollbar::new(info.height as usize, scroll, inner.height as usize)
+            .symbol("▌")
+            .thumb_style(styles.scrollbar)
+            .render(
+                Rect::new(inner.right().saturating_sub(1), inner.y, 1, inner.height),
+                surface,
+            );
+    }
+
+    area
 }

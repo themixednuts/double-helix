@@ -24,8 +24,8 @@ use crate::handlers::completion::{
     retain_valid_completions_for_trigger, word_completion, CompletionItem, CompletionResponse,
     LspCompletionItem, Trigger, TriggerKind,
 };
+use crate::runtime::send_ui_command_with;
 use crate::runtime::ui::{CompletionCommand, UiCommand};
-use crate::runtime::{send_ui_command_with, RuntimeEvent};
 use crate::ui::lsp::signature_help::SignatureHelp;
 use crate::ui::{self, Popup};
 
@@ -70,7 +70,7 @@ pub(crate) fn apply_resolved_completion_item(
 pub(crate) fn show_completion_popup(
     editor: &mut Editor,
     compositor: &mut Compositor,
-    ingress: helix_runtime::Sender<crate::runtime::RuntimeEvent>,
+    ingress: crate::runtime::RuntimeIngress,
     request: RequestId,
     mut items: Vec<CompletionItem>,
     context: HashMap<CompletionProvider, ResponseContext>,
@@ -105,7 +105,7 @@ pub(crate) fn request_completions(
     mut trigger: Trigger,
     editor: &mut Editor,
     compositor: &mut Compositor,
-    ingress: helix_runtime::Sender<RuntimeEvent>,
+    ingress: crate::runtime::RuntimeIngress,
 ) {
     if compositor
         .find::<ui::EditorView>()
@@ -248,7 +248,7 @@ pub(crate) fn request_completions(
 
 pub(crate) fn request_incomplete_completion_list(
     editor: &mut Editor,
-    ingress: helix_runtime::Sender<RuntimeEvent>,
+    ingress: crate::runtime::RuntimeIngress,
 ) {
     let (request, cancel) = editor.begin_completion_request();
     let mut requests = JoinSet::new();

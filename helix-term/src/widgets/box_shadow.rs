@@ -24,7 +24,7 @@
 //! ```
 
 use helix_view::graphics::{Color, Rect};
-use tui::buffer::Buffer as Surface;
+use tui::ratatui::{buffer::Buffer as Surface, style::Color as RatatuiColor};
 
 /// A box shadow definition, analogous to CSS `box-shadow`.
 #[derive(Debug, Clone, Copy)]
@@ -115,7 +115,7 @@ impl BoxShadow {
             return;
         }
 
-        let bounds = *surface.area();
+        let bounds = tui::ratatui::to_helix_rect(*surface.area());
 
         if self.inset {
             self.render_inset(surface, content_area, bounds);
@@ -295,7 +295,7 @@ fn blend_cell(surface: &mut Surface, x: u16, y: u16, sr: u8, sg: u8, sb: u8, alp
 
     // Blend background.
     let (br, bg_color, bb) = cell_bg_rgb(cell.bg);
-    cell.bg = Color::Rgb(
+    cell.bg = RatatuiColor::Rgb(
         lerp_u8(br, sr, alpha),
         lerp_u8(bg_color, sg, alpha),
         lerp_u8(bb, sb, alpha),
@@ -303,7 +303,7 @@ fn blend_cell(surface: &mut Surface, x: u16, y: u16, sr: u8, sg: u8, sb: u8, alp
 
     // Dim foreground toward shadow color so text fades naturally.
     let (fr, fg_color, fb) = cell_fg_rgb(cell.fg);
-    cell.fg = Color::Rgb(
+    cell.fg = RatatuiColor::Rgb(
         lerp_u8(fr, sr, alpha * 0.6),
         lerp_u8(fg_color, sg, alpha * 0.6),
         lerp_u8(fb, sb, alpha * 0.6),
@@ -316,20 +316,20 @@ fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
 }
 
 /// Extract RGB from a cell's background color, defaulting to a dark base.
-fn cell_bg_rgb(color: Color) -> (u8, u8, u8) {
+fn cell_bg_rgb(color: RatatuiColor) -> (u8, u8, u8) {
     match color {
-        Color::Rgb(r, g, b) => (r, g, b),
-        Color::Reset => (30, 30, 30), // assume dark terminal background
-        _ => color_rgb(color),
+        RatatuiColor::Rgb(r, g, b) => (r, g, b),
+        RatatuiColor::Reset => (30, 30, 30), // assume dark terminal background
+        _ => color_rgb(tui::ratatui::to_helix_color(color)),
     }
 }
 
 /// Extract RGB from a cell's foreground color, defaulting to light text.
-fn cell_fg_rgb(color: Color) -> (u8, u8, u8) {
+fn cell_fg_rgb(color: RatatuiColor) -> (u8, u8, u8) {
     match color {
-        Color::Rgb(r, g, b) => (r, g, b),
-        Color::Reset => (200, 200, 200), // assume light terminal foreground
-        _ => color_rgb(color),
+        RatatuiColor::Rgb(r, g, b) => (r, g, b),
+        RatatuiColor::Reset => (200, 200, 200), // assume light terminal foreground
+        _ => color_rgb(tui::ratatui::to_helix_color(color)),
     }
 }
 
@@ -407,21 +407,21 @@ mod tests {
 
     #[test]
     fn render_does_not_panic_on_empty() {
-        let mut surface = Surface::empty(Rect::new(0, 0, 80, 24));
+        let mut surface = Surface::empty(tui::ratatui::layout::Rect::new(0, 0, 80, 24));
         let shadow = BoxShadow::new();
         shadow.render(&mut surface, Rect::new(5, 5, 10, 5));
     }
 
     #[test]
     fn render_inset_does_not_panic() {
-        let mut surface = Surface::empty(Rect::new(0, 0, 80, 24));
+        let mut surface = Surface::empty(tui::ratatui::layout::Rect::new(0, 0, 80, 24));
         let shadow = BoxShadow::new().inset(true).blur(2);
         shadow.render(&mut surface, Rect::new(5, 5, 10, 5));
     }
 
     #[test]
     fn zero_opacity_is_noop() {
-        let mut surface = Surface::empty(Rect::new(0, 0, 80, 24));
+        let mut surface = Surface::empty(tui::ratatui::layout::Rect::new(0, 0, 80, 24));
         let before = surface[(6, 6)].clone();
         BoxShadow::new()
             .opacity(0.0)

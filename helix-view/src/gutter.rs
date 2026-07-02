@@ -1,13 +1,13 @@
-use std::fmt::Write;
+use std::{borrow::Cow, fmt::Write, path::Path};
 
 use helix_core::syntax::config::LanguageServerFeature;
 use helix_core::text_folding::Fold;
 
 use crate::{
-    editor::GutterType,
+    editor::{Breakpoint, GutterType, LineNumber},
     graphics::{Style, UnderlineStyle},
     icons::ICONS,
-    Document, Editor, Theme, View,
+    Document, Theme, View,
 };
 
 fn count_digits(n: usize) -> usize {
@@ -15,13 +15,33 @@ fn count_digits(n: usize) -> usize {
 }
 
 pub type GutterFn<'doc> = Box<dyn FnMut(usize, bool, bool, &mut String) -> Option<Style> + 'doc>;
-pub type Gutter =
-    for<'doc> fn(&'doc Editor, &'doc Document, &View, &Theme, bool, usize) -> GutterFn<'doc>;
+pub type Gutter = for<'doc> fn(
+    &'doc GutterContext<'doc>,
+    &'doc Document,
+    &View,
+    &Theme,
+    bool,
+    usize,
+) -> GutterFn<'doc>;
+
+#[derive(Clone, Copy)]
+pub struct DebugExecutionPosition<'a> {
+    pub line: usize,
+    pub path: Option<&'a Path>,
+}
+
+pub struct GutterContext<'a> {
+    pub mode: crate::document::Mode,
+    pub line_number: LineNumber,
+    pub wrap_indicator: Cow<'a, str>,
+    pub breakpoints: Option<&'a [Breakpoint]>,
+    pub debug_execution: Option<DebugExecutionPosition<'a>>,
+}
 
 impl GutterType {
     pub fn style<'doc>(
         self,
-        editor: &'doc Editor,
+        context: &'doc GutterContext<'doc>,
         doc: &'doc Document,
         view: &View,
         theme: &Theme,
@@ -29,11 +49,11 @@ impl GutterType {
     ) -> GutterFn<'doc> {
         match self {
             GutterType::Diagnostics => {
-                diagnostics_or_breakpoints(editor, doc, view, theme, is_focused)
+                diagnostics_or_breakpoints(context, doc, view, theme, is_focused)
             }
-            GutterType::LineNumbers => line_numbers(editor, doc, view, theme, is_focused),
-            GutterType::Spacer => padding(editor, doc, view, theme, is_focused),
-            GutterType::Diff => diff(editor, doc, view, theme, is_focused),
+            GutterType::LineNumbers => line_numbers(context, doc, view, theme, is_focused),
+            GutterType::Spacer => padding(context, doc, view, theme, is_focused),
+            GutterType::Diff => diff(context, doc, view, theme, is_focused),
         }
     }
 
@@ -94,15 +114,31 @@ pub fn diagnostic<'doc>(
 }
 
 pub fn diff<'doc>(
-    _editor: &'doc Editor,
+    _context: &'doc GutterContext<'doc>,
     doc: &'doc Document,
     _view: &View,
     theme: &Theme,
     _is_focused: bool,
 ) -> GutterFn<'doc> {
-    let added = theme.get("diff.plus.gutter");
-    let deleted = theme.get("diff.minus.gutter");
-    let modified = theme.get("diff.delta.gutter");
+    // Fall back to the non-gutter diff scopes so themes that define
+    // `diff.plus` / `diff.minus` / `diff.delta` (for inline diff
+    // markers) get visible gutter markers automatically without
+    // needing to define a `.gutter` variant explicitly. Without
+    // this fallback, themes that style only the inline diffs leave
+    // gutter markers colorless and indistinguishable from the
+    // rest of the gutter.
+    let added = theme
+        .try_get("diff.plus.gutter")
+        .or_else(|| theme.try_get("diff.plus"))
+        .unwrap_or_default();
+    let deleted = theme
+        .try_get("diff.minus.gutter")
+        .or_else(|| theme.try_get("diff.minus"))
+        .unwrap_or_default();
+    let modified = theme
+        .try_get("diff.delta.gutter")
+        .or_else(|| theme.try_get("diff.delta"))
+        .unwrap_or_default();
     if let Some(diff_handle) = doc.diff_handle() {
         let hunks = diff_handle.load();
         let mut hunk_i = 0;
@@ -148,7 +184,7 @@ pub fn diff<'doc>(
 }
 
 pub fn line_numbers<'doc>(
-    editor: &'doc Editor,
+    context: &'doc GutterContext<'doc>,
     doc: &'doc Document,
     view: &View,
     theme: &Theme,
@@ -171,17 +207,13 @@ pub fn line_numbers<'doc>(
         .text()
         .char_to_line(doc.selection(view.id).primary().cursor(text));
 
-    let line_number = editor.config().line_number;
-    let wrap_indicator = editor
-        .config()
-        .soft_wrap
+    let line_number = context.line_number;
+    let wrap_indicator = context
         .wrap_indicator
-        .as_ref()
-        .map_or_else(
-            || "↪".into(),
-            |indicator| indicator.clone().chars().take(width).collect::<String>(),
-        );
-    let mode = editor.mode;
+        .chars()
+        .take(width)
+        .collect::<String>();
+    let mode = context.mode;
 
     // folded lines between `line` and `current_line`
     let mut folded_lines = None;
@@ -296,7 +328,7 @@ fn line_numbers_width(view: &View, doc: &Document) -> usize {
 }
 
 pub fn padding<'doc>(
-    _editor: &'doc Editor,
+    _context: &'doc GutterContext<'doc>,
     _doc: &'doc Document,
     _view: &View,
     _theme: &Theme,
@@ -306,7 +338,7 @@ pub fn padding<'doc>(
 }
 
 pub fn breakpoints<'doc>(
-    editor: &'doc Editor,
+    context: &'doc GutterContext<'doc>,
     doc: &'doc Document,
     _view: &View,
     theme: &Theme,
@@ -316,7 +348,7 @@ pub fn breakpoints<'doc>(
     let info = theme.get("info");
     let breakpoint_style = theme.get("ui.debug.breakpoint");
 
-    let breakpoints = doc.path().and_then(|path| editor.breakpoints.get(path));
+    let breakpoints = context.breakpoints.filter(|_| doc.path().is_some());
 
     let breakpoints = match breakpoints {
         Some(breakpoints) => breakpoints,
@@ -356,22 +388,16 @@ pub fn breakpoints<'doc>(
 }
 
 fn execution_pause_indicator<'doc>(
-    editor: &'doc Editor,
+    context: &'doc GutterContext<'doc>,
     doc: &'doc Document,
     theme: &Theme,
     is_focused: bool,
 ) -> GutterFn<'doc> {
     let style = theme.get("ui.debug.active");
-    let current_stack_frame = editor.current_stack_frame();
-    let frame_line = current_stack_frame.map(|frame| frame.line.saturating_sub(1));
-    let frame_source_path = current_stack_frame.map(|frame| {
-        frame
-            .source
-            .as_ref()
-            .and_then(|source| source.path.as_ref())
-    });
+    let frame_line = context.debug_execution.map(|position| position.line);
+    let frame_source_path = context.debug_execution.and_then(|position| position.path);
     let should_display_for_current_doc =
-        doc.path().is_some() && frame_source_path.unwrap_or(None) == doc.path();
+        doc.path().is_some() && frame_source_path == doc.path().map(|path| path.as_path());
 
     Box::new(
         move |line: usize, _selected: bool, first_visual_line: bool, out: &mut String| {
@@ -391,15 +417,15 @@ fn execution_pause_indicator<'doc>(
 }
 
 pub fn diagnostics_or_breakpoints<'doc>(
-    editor: &'doc Editor,
+    context: &'doc GutterContext<'doc>,
     doc: &'doc Document,
     view: &View,
     theme: &Theme,
     is_focused: bool,
 ) -> GutterFn<'doc> {
     let mut diagnostics = diagnostic(doc, view, theme, is_focused);
-    let mut breakpoints = breakpoints(editor, doc, view, theme, is_focused);
-    let mut execution_pause_indicator = execution_pause_indicator(editor, doc, theme, is_focused);
+    let mut breakpoints = breakpoints(context, doc, view, theme, is_focused);
+    let mut execution_pause_indicator = execution_pause_indicator(context, doc, theme, is_focused);
 
     Box::new(move |line, selected, first_visual_line: bool, out| {
         execution_pause_indicator(line, selected, first_visual_line, out)

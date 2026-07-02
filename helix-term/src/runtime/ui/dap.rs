@@ -1,6 +1,6 @@
 use crate::{
     compositor::Compositor,
-    runtime::{ui::command::DapThreadAction, DapCommand, RuntimeEvent, RuntimeTaskEvent},
+    runtime::{ui::command::DapThreadAction, DapCommand, RuntimeTaskEvent},
     ui::{self, Picker, Prompt, PromptEvent},
 };
 use helix_dap::{StackFrame, Thread, ThreadStates};
@@ -9,7 +9,7 @@ use helix_view::editor::Breakpoint;
 pub(crate) fn apply_dap_command(
     editor: &mut helix_view::Editor,
     compositor: &mut Compositor,
-    ingress: helix_runtime::Sender<RuntimeEvent>,
+    ingress: crate::runtime::RuntimeIngress,
     cmd: DapCommand,
 ) {
     match cmd {
@@ -35,19 +35,15 @@ pub(crate) fn apply_dap_command(
                     if event != PromptEvent::Validate {
                         return;
                     }
-                    helix_runtime::send_blocking(
-                        &cx.ingress,
-                        RuntimeEvent::Task(
-                            crate::runtime::RuntimeTaskEvent::SetBreakpointCondition {
-                                path: path.clone(),
-                                index,
-                                condition: match input {
-                                    "" => None,
-                                    input => Some(input.to_owned()),
-                                },
+                    cx.ingress
+                        .task(crate::runtime::RuntimeTaskEvent::SetBreakpointCondition {
+                            path: path.clone(),
+                            index,
+                            condition: match input {
+                                "" => None,
+                                input => Some(input.to_owned()),
                             },
-                        ),
-                    );
+                        });
                 },
             );
             if let Some(condition) = initial {
@@ -68,19 +64,15 @@ pub(crate) fn apply_dap_command(
                     if event != PromptEvent::Validate {
                         return;
                     }
-                    helix_runtime::send_blocking(
-                        &cx.ingress,
-                        RuntimeEvent::Task(
-                            crate::runtime::RuntimeTaskEvent::SetBreakpointLogMessage {
-                                path: path.clone(),
-                                index,
-                                log_message: match input {
-                                    "" => None,
-                                    input => Some(input.to_owned()),
-                                },
+                    cx.ingress
+                        .task(crate::runtime::RuntimeTaskEvent::SetBreakpointLogMessage {
+                            path: path.clone(),
+                            index,
+                            log_message: match input {
+                                "" => None,
+                                input => Some(input.to_owned()),
                             },
-                        ),
-                    );
+                        });
                 },
             );
             if let Some(log_message) = initial {
@@ -98,7 +90,7 @@ pub(crate) fn apply_dap_command(
                     },
                     DapThreadAction::Pause => RuntimeTaskEvent::PauseDebugThread { thread_id },
                 };
-                helix_runtime::send_blocking(&ingress, RuntimeEvent::Task(event));
+                ingress.task(event);
                 return;
             }
             let Some(debugger) = editor.debug_adapters.get_active_client_mut() else {
@@ -121,7 +113,7 @@ pub(crate) fn apply_dap_command(
                 0,
                 threads,
                 thread_states,
-                crate::ui::PickerRuntime::new(editor.runtime()),
+                crate::ui::PickerRuntime::new(editor),
                 ingress.clone(),
                 move |cx: &mut crate::compositor::Context, thread: &Thread, _action| {
                     let event = match action {
@@ -133,7 +125,7 @@ pub(crate) fn apply_dap_command(
                             thread_id: thread.id,
                         },
                     };
-                    helix_runtime::send_blocking(&cx.ingress, RuntimeEvent::Task(event));
+                    cx.ingress.task(event);
                 },
             )
             .with_preview(move |editor, thread| {
@@ -162,16 +154,13 @@ pub(crate) fn apply_dap_command(
                 0,
                 frames,
                 (),
-                crate::ui::PickerRuntime::new(editor.runtime()),
+                crate::ui::PickerRuntime::new(editor),
                 ingress.clone(),
                 move |cx: &mut crate::compositor::Context, frame: &StackFrame, _action| {
-                    helix_runtime::send_blocking(
-                        &cx.ingress,
-                        RuntimeEvent::Task(RuntimeTaskEvent::SelectStackFrame {
-                            thread_id,
-                            frame_id: frame.id,
-                        }),
-                    );
+                    cx.ingress.task(RuntimeTaskEvent::SelectStackFrame {
+                        thread_id,
+                        frame_id: frame.id,
+                    });
                 },
             )
             .with_preview(move |_editor, frame| {

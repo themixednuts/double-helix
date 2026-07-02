@@ -4,7 +4,6 @@ use helix_view::{
     graphics::{Color, Rect, Style},
     theme::{Modifier, Theme},
 };
-use tui::buffer::Buffer as Surface;
 
 type Rgb = (u8, u8, u8);
 
@@ -161,16 +160,32 @@ impl GradientBorder {
 
     /// Render the gradient border without requiring a theme reference.
     /// (The theme parameter on [`render`] is unused; this avoids the borrow.)
-    pub fn render_no_theme(&mut self, area: Rect, surface: &mut Surface, rounded: bool) {
+    pub fn render_no_theme(
+        &mut self,
+        area: Rect,
+        surface: &mut crate::render::CellSurface,
+        rounded: bool,
+    ) {
         self.render_inner(area, surface, rounded);
     }
 
     /// Render the gradient border around the given area
-    pub fn render(&mut self, area: Rect, surface: &mut Surface, _theme: &Theme, rounded: bool) {
+    pub fn render(
+        &mut self,
+        area: Rect,
+        surface: &mut crate::render::CellSurface,
+        _theme: &Theme,
+        rounded: bool,
+    ) {
         self.render_inner(area, surface, rounded);
     }
 
-    fn render_inner(&mut self, area: Rect, surface: &mut Surface, rounded: bool) {
+    fn render_inner(
+        &mut self,
+        area: Rect,
+        surface: &mut crate::render::CellSurface,
+        rounded: bool,
+    ) {
         if !self.config.enable || area.width < 2 || area.height < 2 {
             return;
         }
@@ -197,9 +212,12 @@ impl GradientBorder {
                 horizontal
             };
 
-            if let Some(cell) = surface.get_mut(x, area.top()) {
-                cell.set_symbol(symbol).set_style(style);
-            }
+            {
+                if let Some(cell) = surface.cell_mut((x, area.top())) {
+                    cell.set_symbol(symbol);
+                    cell.set_style(tui::ratatui::to_ratatui_style(style));
+                }
+            };
         }
 
         // Render bottom border
@@ -215,9 +233,12 @@ impl GradientBorder {
                 horizontal
             };
 
-            if let Some(cell) = surface.get_mut(x, bottom_y) {
-                cell.set_symbol(symbol).set_style(style);
-            }
+            {
+                if let Some(cell) = surface.cell_mut((x, bottom_y)) {
+                    cell.set_symbol(symbol);
+                    cell.set_style(tui::ratatui::to_ratatui_style(style));
+                }
+            };
         }
 
         // Render left and right borders (skip corners)
@@ -225,17 +246,23 @@ impl GradientBorder {
             // Left border
             let color = self.get_gradient_color(area.left(), y, area);
             let style = Style::default().fg(color);
-            if let Some(cell) = surface.get_mut(area.left(), y) {
-                cell.set_symbol(vertical).set_style(style);
-            }
+            {
+                if let Some(cell) = surface.cell_mut((area.left(), y)) {
+                    cell.set_symbol(vertical);
+                    cell.set_style(tui::ratatui::to_ratatui_style(style));
+                }
+            };
 
             // Right border
             let right_x = area.right() - 1;
             let color = self.get_gradient_color(right_x, y, area);
             let style = Style::default().fg(color);
-            if let Some(cell) = surface.get_mut(right_x, y) {
-                cell.set_symbol(vertical).set_style(style);
-            }
+            {
+                if let Some(cell) = surface.cell_mut((right_x, y)) {
+                    cell.set_symbol(vertical);
+                    cell.set_style(tui::ratatui::to_ratatui_style(style));
+                }
+            };
         }
 
         // Update animation frame
@@ -246,7 +273,7 @@ impl GradientBorder {
     pub fn render_with_title(
         &mut self,
         area: Rect,
-        surface: &mut Surface,
+        surface: &mut crate::render::CellSurface,
         theme: &Theme,
         title: Option<&str>,
         rounded: bool,
@@ -266,9 +293,13 @@ impl GradientBorder {
 
                 // Clear the area for the title and render it
                 for (i, ch) in title.chars().enumerate() {
-                    if let Some(cell) = surface.get_mut(title_start + i as u16, area.top()) {
-                        cell.set_char(ch).set_style(title_style);
-                    }
+                    let mut buf = [0; 4];
+                    {
+                        if let Some(cell) = surface.cell_mut((title_start + i as u16, area.top())) {
+                            cell.set_symbol(ch.encode_utf8(&mut buf));
+                            cell.set_style(tui::ratatui::to_ratatui_style(title_style));
+                        }
+                    };
                 }
             }
         }

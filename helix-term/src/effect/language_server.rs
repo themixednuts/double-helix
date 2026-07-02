@@ -9,7 +9,6 @@ use helix_core::{
     text_annotations::InlineAnnotation, Uri,
 };
 use helix_lsp::{self, lsp, util::lsp_range_to_range, LanguageServerId};
-use helix_runtime::Sender as IngressSender;
 use helix_runtime::Token;
 use helix_view::{
     document::{DocumentInlayHints, DocumentInlayHintsId},
@@ -19,7 +18,7 @@ use helix_view::{
 };
 
 use crate::runtime::{
-    ingress::{send_task_event_with, send_ui_command_with, RuntimeEvent},
+    ingress::{send_task_event_with, send_ui_command_with},
     ui::command::LspCodeActionItem,
     RuntimeTaskEvent, UiCommand,
 };
@@ -28,7 +27,7 @@ pub(crate) fn request_document_diagnostics_for_language_servers(
     editor: &mut Editor,
     doc_id: DocumentId,
     language_servers: HashSet<LanguageServerId>,
-    ingress: IngressSender<RuntimeEvent>,
+    ingress: crate::runtime::RuntimeIngress,
 ) {
     let Some(doc) = editor.document_mut(doc_id) else {
         return;
@@ -144,7 +143,7 @@ pub(crate) fn request_document_diagnostics_for_language_servers(
 pub(crate) fn request_document_diagnostics(
     editor: &mut Editor,
     doc_id: DocumentId,
-    ingress: IngressSender<RuntimeEvent>,
+    ingress: crate::runtime::RuntimeIngress,
 ) {
     let Some(doc) = editor.document(doc_id) else {
         return;
@@ -161,7 +160,7 @@ pub(crate) fn request_document_diagnostics(
 pub(crate) fn request_document_colors(
     editor: &mut Editor,
     doc_id: DocumentId,
-    ingress: IngressSender<RuntimeEvent>,
+    ingress: crate::runtime::RuntimeIngress,
 ) {
     if !editor.config().lsp.display_color_swatches {
         return;
@@ -240,7 +239,7 @@ pub(crate) fn request_signature_help(
     invoked: SignatureHelpInvoked,
     request: SignatureHelpRequestId,
     cancel: Token,
-    ingress: IngressSender<RuntimeEvent>,
+    ingress: crate::runtime::RuntimeIngress,
 ) {
     let (view_id, doc) = focused!(editor);
 
@@ -312,7 +311,7 @@ pub(crate) fn apply_execute_lsp_command(
 pub(crate) fn request_apply_code_action(
     editor: &mut Editor,
     item: LspCodeActionItem,
-    ingress: IngressSender<RuntimeEvent>,
+    ingress: crate::runtime::RuntimeIngress,
 ) {
     let Some(language_server) = editor.language_server_by_id(item.language_server_id) else {
         editor.set_error("Language Server disappeared");
@@ -322,13 +321,10 @@ pub(crate) fn request_apply_code_action(
 
     match item.lsp_item {
         lsp::CodeActionOrCommand::Command(command) => {
-            helix_runtime::send_blocking(
-                &ingress,
-                RuntimeEvent::Task(RuntimeTaskEvent::ExecuteLspCommand {
-                    command,
-                    server_id: item.language_server_id,
-                }),
-            );
+            ingress.task(RuntimeTaskEvent::ExecuteLspCommand {
+                command,
+                server_id: item.language_server_id,
+            });
         }
         lsp::CodeActionOrCommand::CodeAction(code_action) => {
             let server_id = item.language_server_id;
@@ -353,15 +349,12 @@ pub(crate) fn request_apply_code_action(
                 }
             }
 
-            helix_runtime::send_blocking(
-                &ingress,
-                RuntimeEvent::Task(RuntimeTaskEvent::ApplyCodeAction {
-                    offset_encoding,
-                    workspace_edit: code_action.edit,
-                    command: code_action.command,
-                    server_id,
-                }),
-            );
+            ingress.task(RuntimeTaskEvent::ApplyCodeAction {
+                offset_encoding,
+                workspace_edit: code_action.edit,
+                command: code_action.command,
+                server_id,
+            });
         }
     }
 }

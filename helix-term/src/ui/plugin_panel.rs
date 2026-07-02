@@ -1,16 +1,16 @@
 //! Plugin panel — a Component that delegates rendering to a Lua callback.
 //!
-//! When `render()` is called, it wraps the real `Surface` in a `TermDrawSurface`
-//! (implementing `helix_plugin::types::DrawSurface`), sets up the thread-local
-//! render context, and invokes the plugin's Lua render callback.
+//! Lua render callbacks emit typed render operations. The terminal frontend
+//! applies those operations to the active Ratatui buffer after Lua returns.
 
 use crate::compositor::{Component, Context, Event, EventResult, RenderContext};
+use crate::ui::plugin_render::apply_plugin_render_ops;
 use helix_plugin::contract::{adapt, PanelHandle};
 use helix_plugin::mlua;
-use helix_view::graphics::{Rect, Style};
+use helix_plugin::types::SurfaceRenderOps;
+use helix_view::graphics::Rect;
 use helix_view::model::{FocusTarget, PanelId};
 use helix_view::traits::Focusable;
-use tui::buffer::Buffer as Surface;
 
 pub(crate) fn component_id(panel: PanelHandle) -> String {
     format!("plugin_panel:{}", panel.raw().get())
@@ -21,24 +21,97 @@ pub struct PluginPanel {
     panel: PanelHandle,
     model_panel_id: PanelId,
     focused: bool,
-    // Leaked string for Component::id() - bounded by panel count.
-    component_id: &'static str,
+    component_id: String,
 }
 
 impl PluginPanel {
     pub fn new(panel: PanelHandle, model_panel_id: PanelId) -> Self {
-        let component_id: &'static str = Box::leak(component_id(panel).into_boxed_str());
         Self {
             panel,
             model_panel_id,
             focused: false,
-            component_id,
+            component_id: component_id(panel),
         }
     }
 
     pub fn from_editor(editor: &helix_view::Editor, panel: PanelHandle) -> Option<Self> {
         let model_panel_id = adapt::resolve_panel(&editor.model, panel).ok()?;
         Some(Self::new(panel, model_panel_id))
+    }
+
+    fn render_surface(
+        &mut self,
+        area: Rect,
+        surface: &mut crate::render::CellSurface,
+        cx: &RenderContext,
+    ) {
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        let Some(ref pm) = cx.plugin_manager else {
+            return;
+        };
+
+        let engine = pm.engine();
+        let engine = engine.read();
+        let lua = engine.lua();
+
+        let panel_callbacks = engine.panel_callbacks();
+        let panel_callbacks = panel_callbacks.read();
+        let Some(callbacks) = panel_callbacks.get(&self.panel) else {
+            let style = cx.theme().get("error");
+            surface.set_stringn(
+                area.x,
+                area.y,
+                "Plugin render error",
+                area.width as usize,
+                tui::ratatui::to_ratatui_style(style),
+            );
+            return;
+        };
+
+        let ui_callbacks = engine.ui_callbacks();
+        let ui_callbacks = ui_callbacks.read();
+        let key = helix_plugin::types::PluginCallbackKey::new(
+            callbacks.plugin_name.clone(),
+            callbacks.render_callback_id,
+        );
+        let Some(callback_ref) = ui_callbacks.get(&key) else {
+            let style = cx.theme().get("error");
+            surface.set_stringn(
+                area.x,
+                area.y,
+                "Plugin render error",
+                area.width as usize,
+                tui::ratatui::to_ratatui_style(style),
+            );
+            return;
+        };
+
+        let Ok(callback) = lua.registry_value::<mlua::Function>(callback_ref) else {
+            return;
+        };
+
+        let Ok(area_table) = helix_plugin::lua::api::facade::rect_to_table(lua, area) else {
+            return;
+        };
+        let Ok(lua_surface) = lua.create_userdata(helix_plugin::lua::api::facade::LuaSurface)
+        else {
+            return;
+        };
+
+        let theme = cx.theme();
+        let mut render_ops = SurfaceRenderOps::default();
+        helix_plugin::lua::with_render_context(&mut render_ops, theme, || {
+            if let Err(e) =
+                helix_plugin::lua::with_current_plugin_name(lua, &callbacks.plugin_name, || {
+                    callback.call::<()>((area_table, lua_surface))
+                })
+            {
+                log::error!("Plugin panel render error ({}): {}", self.panel, e);
+            }
+        });
+        apply_plugin_render_ops(surface, render_ops);
     }
 }
 
@@ -75,79 +148,8 @@ impl Component for PluginPanel {
         }
     }
 
-    fn render(&mut self, area: Rect, surface: &mut Surface, cx: &RenderContext) {
-        if area.width == 0 || area.height == 0 {
-            return;
-        }
-        let Some(ref pm) = cx.plugin_manager else {
-            return;
-        };
-
-        let engine = pm.engine();
-        let engine = engine.read();
-        let lua = engine.lua();
-
-        let panel_callbacks = engine.panel_callbacks();
-        let panel_callbacks = panel_callbacks.read();
-        let Some(callbacks) = panel_callbacks.get(&self.panel) else {
-            let style = cx.editor.theme.get("error");
-            surface.set_stringn(
-                area.x,
-                area.y,
-                "Plugin render error",
-                area.width as usize,
-                style,
-            );
-            return;
-        };
-
-        let ui_callbacks = engine.ui_callbacks();
-        let ui_callbacks = ui_callbacks.read();
-        let key = helix_plugin::types::PluginCallbackKey::new(
-            callbacks.plugin_name.clone(),
-            callbacks.render_callback_id,
-        );
-        let Some(callback_ref) = ui_callbacks.get(&key) else {
-            let style = cx.editor.theme.get("error");
-            surface.set_stringn(
-                area.x,
-                area.y,
-                "Plugin render error",
-                area.width as usize,
-                style,
-            );
-            return;
-        };
-
-        let Ok(callback) = lua.registry_value::<mlua::Function>(callback_ref) else {
-            return;
-        };
-
-        let Ok(area_table) = helix_plugin::lua::api::facade::rect_to_table(lua, area) else {
-            return;
-        };
-        let Ok(lua_surface) = lua.create_userdata(helix_plugin::lua::api::facade::LuaSurface)
-        else {
-            return;
-        };
-
-        // Wrap the real surface in DrawSurface and call the Lua function.
-        // Use a raw pointer for the theme to avoid borrow conflict with cx.editor.
-        // Safety: theme lives as long as editor, and we're single-threaded during render.
-        let theme_ptr = &cx.editor.theme as *const helix_view::Theme;
-        let theme = unsafe { &*theme_ptr };
-        let mut wrapper = TermDrawSurface { surface };
-        helix_plugin::lua::with_render_context(&mut wrapper, theme, || {
-            helix_plugin::lua::with_editor_context_ref(cx.editor, || {
-                if let Err(e) =
-                    helix_plugin::lua::with_current_plugin_name(lua, &callbacks.plugin_name, || {
-                        callback.call::<()>((area_table, lua_surface))
-                    })
-                {
-                    log::error!("Plugin panel render error ({}): {}", self.panel, e);
-                }
-            });
-        });
+    fn render(&mut self, area: Rect, surface: &mut crate::render::CellSurface, cx: &RenderContext) {
+        self.render_surface(area, surface, cx);
     }
 
     fn handle_event(&mut self, event: &Event, cx: &mut Context) -> EventResult {
@@ -216,8 +218,8 @@ impl Component for PluginPanel {
         }
     }
 
-    fn id(&self) -> Option<&'static str> {
-        Some(self.component_id)
+    fn id(&self) -> Option<&str> {
+        Some(&self.component_id)
     }
 
     fn layout_role(&self) -> crate::compositor::LayoutRole {
@@ -229,87 +231,6 @@ impl Component for PluginPanel {
     }
 
     crate::component_traits!(focusable);
-}
-
-// ─── TermDrawSurface ─────────────────────────────────────────────────
-
-/// Concrete implementation of `DrawSurface` wrapping a `tui::buffer::Buffer`.
-pub(crate) struct TermDrawSurface<'a> {
-    pub(crate) surface: &'a mut Surface,
-}
-
-impl helix_plugin::types::DrawSurface for TermDrawSurface<'_> {
-    fn set_string(&mut self, x: u16, y: u16, text: &str, style: Style) {
-        self.surface.set_string(x, y, text, style);
-    }
-
-    fn set_stringn(&mut self, x: u16, y: u16, text: &str, max_width: usize, style: Style) {
-        self.surface.set_stringn(x, y, text, max_width, style);
-    }
-
-    fn clear_with(&mut self, area: Rect, style: Style) {
-        self.surface.clear_with(area, style);
-    }
-
-    fn set_style(&mut self, area: Rect, style: Style) {
-        self.surface.set_style(area, style);
-    }
-
-    fn header(&mut self, area: Rect, title: &str, style: Style) {
-        crate::widgets::header(self.surface, area, title, style);
-    }
-
-    fn header_with_counts(
-        &mut self,
-        area: Rect,
-        title: &str,
-        current: usize,
-        total: usize,
-        style: Style,
-    ) {
-        crate::widgets::header_with_counts(self.surface, area, title, current, total, style);
-    }
-
-    fn hdivider(&mut self, area: Rect, style: Style) {
-        crate::widgets::hdivider(self.surface, area, style);
-    }
-
-    fn vdivider(&mut self, area: Rect, style: Style) {
-        crate::widgets::vdivider(self.surface, area, style);
-    }
-
-    fn text_input(
-        &mut self,
-        area: Rect,
-        text: &str,
-        cursor: usize,
-        style: Style,
-        cursor_style: Style,
-    ) -> (u16, u16) {
-        let state =
-            crate::widgets::text_input(self.surface, area, text, cursor, style, cursor_style);
-        (state.cursor_x, state.cursor_y)
-    }
-
-    fn scrollbar(
-        &mut self,
-        area: Rect,
-        total: usize,
-        offset: usize,
-        visible: usize,
-        thumb_style: Style,
-        track_symbol: Option<&str>,
-        track_style: Style,
-    ) {
-        let mut sb =
-            crate::widgets::Scrollbar::new(total, offset, visible).thumb_style(thumb_style);
-        if let Some(sym) = track_symbol {
-            sb = sb.track(Box::leak(sym.to_owned().into_boxed_str()), track_style);
-        } else {
-            sb = sb.track(" ", track_style);
-        }
-        sb.render(area, self.surface);
-    }
 }
 
 #[cfg(test)]

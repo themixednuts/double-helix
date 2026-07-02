@@ -12,19 +12,25 @@ repository.workspace = true
 homepage.workspace = true
 
 [features]
-default = ["termina", "crossterm"]
+default = ["termina", "crossterm", "ratatui"]
+ratatui = []
 
 [dependencies]
 helix-view = { path = "../helix-view", features = ["term"] }
 helix-core = { path = "../helix-core" }
 
 bitflags.workspace = true
-cassowary = "0.3"
 unicode-segmentation.workspace = true
 termina = { workspace = true, optional = true }
 termini = "1.0"
 once_cell = "1.21"
 log = "~0.4"
+ratatui = { version = "0.30", default-features = false, features = [
+  "std",
+  "layout-cache",
+  "underline-color",
+  "scrolling-regions",
+] }
 
 [target.'cfg(windows)'.dependencies]
 crossterm = { version = "0.28", optional = true }

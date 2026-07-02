@@ -1,4 +1,5 @@
 mod docgen;
+mod fff_upstream;
 mod helpers;
 mod path;
 
@@ -148,6 +149,10 @@ pub mod tasks {
         Ok(())
     }
 
+    pub fn fff_upstream(args: impl Iterator<Item = String>) -> Result<(), DynError> {
+        crate::fff_upstream::check(args)
+    }
+
     pub fn print_help() {
         println!(
             "
@@ -161,6 +166,8 @@ Usage: Run with `cargo xtask <task>`, eg. `cargo xtask docgen`.
                                    given themes, or all themes if none are specified.
         arch-check                 Verify layering: helix-core has no frontend deps; helix-view
                                    has no terminal deps when built without term feature.
+        fff-upstream [--ref REF]   Compare vendored FFF core against upstream fff.nvim.
+                     [--fail-on-drift]
 "
         );
     }
@@ -176,6 +183,7 @@ fn main() -> Result<(), DynError> {
             "query-check" => tasks::querycheck(args)?,
             "theme-check" => tasks::themecheck(args)?,
             "arch-check" => tasks::arch_check()?,
+            "fff-upstream" => tasks::fff_upstream(args)?,
             invalid => return Err(format!("Invalid task name: {}", invalid).into()),
         },
     };

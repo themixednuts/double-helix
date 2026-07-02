@@ -6,7 +6,7 @@ use futures_util::Future;
 use helix_core::completion::CompletionProvider;
 use helix_lsp::lsp;
 use helix_lsp::util::pos_to_lsp_pos;
-use helix_runtime::{Clock, Latest, Runtime, Work};
+use helix_runtime::{Runtime, Work};
 use helix_view::document::SavePoint;
 use helix_view::handlers::completion::{CompletionEvent, ResponseContext};
 use helix_view::{Document, DocumentId, ViewId};
@@ -15,7 +15,6 @@ use crate::config::Config;
 use crate::handlers::completion::item::CompletionResponse;
 use crate::handlers::completion::CompletionItems;
 use crate::runtime::ui::{CompletionCommand, UiCommand};
-use crate::runtime::{send_ui_command_with, RuntimeEvent};
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum TriggerKind {
@@ -36,46 +35,33 @@ pub struct Trigger {
 pub struct CompletionHandler {
     trigger: Option<Trigger>,
     config: Arc<ArcSwap<Config>>,
-    latest: Latest,
-    work: Work,
-    clock: Clock,
-    ingress: helix_runtime::Sender<RuntimeEvent>,
+    debouncer: crate::runtime::RuntimeUiDebouncer,
 }
 
 impl CompletionHandler {
     fn new(
         config: Arc<ArcSwap<Config>>,
         work: Work,
-        clock: Clock,
-        ingress: helix_runtime::Sender<RuntimeEvent>,
+        clock: helix_runtime::Clock,
+        ingress: crate::runtime::RuntimeIngress,
     ) -> CompletionHandler {
         Self {
             config,
             trigger: None,
-            latest: Latest::default(),
-            work,
-            clock,
-            ingress,
+            debouncer: crate::runtime::RuntimeUiDebouncer::new(
+                Duration::ZERO,
+                work,
+                clock,
+                ingress,
+            ),
         }
     }
 
     fn schedule(&mut self, trigger: Trigger, delay: Duration) {
-        let clock = self.clock.clone();
-        let ingress = self.ingress.clone();
-        self.latest
-            .restart_with(&self.work, move |token| async move {
-                let _ = clock.timer(delay).await;
-                if token.is_canceled() {
-                    return;
-                }
-                send_ui_command_with(
-                    UiCommand::Completion(Box::new(CompletionCommand::RequestDebounced {
-                        trigger,
-                    })),
-                    ingress,
-                )
-                .await;
-            });
+        self.debouncer.send_after(
+            UiCommand::Completion(Box::new(CompletionCommand::RequestDebounced { trigger })),
+            delay,
+        );
     }
 
     fn event(&mut self, event: CompletionEvent) {
@@ -114,12 +100,12 @@ impl CompletionHandler {
             }
             CompletionEvent::Cancel => {
                 self.trigger = None;
-                self.latest.cancel();
+                self.debouncer.cancel();
             }
             CompletionEvent::DeleteText { cursor } => {
                 if matches!(self.trigger, Some(Trigger{ pos, .. }) if cursor < pos) {
                     self.trigger = None;
-                    self.latest.cancel();
+                    self.debouncer.cancel();
                 }
             }
         }
@@ -128,7 +114,7 @@ impl CompletionHandler {
     pub fn spawn(
         config: Arc<ArcSwap<Config>>,
         runtime: Runtime,
-        ingress: helix_runtime::Sender<RuntimeEvent>,
+        ingress: crate::runtime::RuntimeIngress,
     ) -> helix_runtime::Sender<CompletionEvent> {
         let (tx, mut rx) = helix_runtime::channel(128);
         let work = runtime.work().clone();

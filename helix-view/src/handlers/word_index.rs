@@ -10,7 +10,7 @@ use helix_core::{
     chars::char_is_word, fuzzy::fuzzy_match, movement, text_annotations::TextAnnotations,
     ChangeSet, Range, Rope, RopeSlice,
 };
-use helix_runtime::{channel, send_blocking, Clock, Debounce, Runtime, Sender, Work};
+use helix_runtime::{channel, send_blocking, Clock, DebouncedSender, Runtime, Sender, Work};
 use helix_stdx::rope::RopeSliceExt as _;
 
 use crate::{bench::log_command_phase, DocumentId};
@@ -76,10 +76,7 @@ impl Handler {
 struct Hook {
     changes: HashMap<DocumentId, Change>,
     coordinator: Sender<Event>,
-    debounce: Debounce,
-    work: Work,
-    clock: Clock,
-    tx: Sender<Event>,
+    debouncer: DebouncedSender<Event>,
 }
 
 const DEBOUNCE: Duration = Duration::from_secs(1);
@@ -90,17 +87,13 @@ impl Hook {
         let mut hook = Self {
             changes: HashMap::default(),
             coordinator,
-            debounce: Debounce::new(DEBOUNCE),
-            work,
-            clock,
-            tx: tx.clone(),
+            debouncer: DebouncedSender::new(DEBOUNCE, work.clone(), clock, tx.clone()),
         };
-        let work = hook.work.clone();
         work.spawn(async move {
             while let Some(event) = rx.recv().await {
                 hook.handle_event(event);
             }
-            hook.debounce.cancel();
+            hook.debouncer.cancel();
         })
         .detach();
         tx
@@ -148,10 +141,7 @@ impl Hook {
     }
 
     fn restart_debounce(&mut self) {
-        let tx = self.tx.clone();
-        self.debounce.restart(&self.work, &self.clock, async move {
-            let _ = tx.send(Event::FlushDebounced).await;
-        });
+        self.debouncer.send(Event::FlushDebounced);
     }
 
     fn flush(&mut self) {

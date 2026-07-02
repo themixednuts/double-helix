@@ -1,6 +1,6 @@
 use crate::{
     compositor::Compositor,
-    runtime::{AssistantCommand, RuntimeEvent, RuntimeTaskEvent},
+    runtime::{AssistantCommand, RuntimeTaskEvent},
 };
 
 fn context_label(item: &helix_view::assistant::context::Item) -> String {
@@ -21,24 +21,21 @@ fn context_label(item: &helix_view::assistant::context::Item) -> String {
 }
 
 fn connect_assistant_backend(
-    ingress: &helix_runtime::Sender<RuntimeEvent>,
+    ingress: &crate::runtime::RuntimeIngress,
     command: String,
     args: Vec<String>,
 ) {
-    helix_runtime::send_blocking(
-        ingress,
-        RuntimeEvent::Task(RuntimeTaskEvent::ConnectAssistantBackend {
-            command,
-            args,
-            panel: helix_view::editor::PanelBehavior::Open,
-        }),
-    );
+    ingress.task(RuntimeTaskEvent::ConnectAssistantBackend {
+        command,
+        args,
+        panel: helix_view::editor::PanelBehavior::Open,
+    });
 }
 
 pub(crate) fn apply_assistant_command(
     editor: &mut helix_view::Editor,
     compositor: &mut Compositor,
-    ingress: helix_runtime::Sender<RuntimeEvent>,
+    ingress: crate::runtime::RuntimeIngress,
     cmd: AssistantCommand,
 ) {
     match cmd {
@@ -59,10 +56,7 @@ pub(crate) fn apply_assistant_command(
         AssistantCommand::ClosePanel => {
             use crate::ui::assistant::ID as ASSISTANT_PANEL_ID;
 
-            helix_runtime::send_blocking(
-                &ingress,
-                RuntimeEvent::Task(RuntimeTaskEvent::RemoveAssistantPanel),
-            );
+            ingress.task(RuntimeTaskEvent::RemoveAssistantPanel);
             compositor.remove(ASSISTANT_PANEL_ID);
         }
         AssistantCommand::FocusPanelInput => {
@@ -142,12 +136,8 @@ pub(crate) fn apply_assistant_command(
                         }
                         _ => helix_view::assistant::permission::Decision::Dismiss,
                     };
-                    let _ = ingress
-                        .send(RuntimeEvent::AssistantPermissionResolved {
-                            thread,
-                            request: request_id,
-                            decision,
-                        })
+                    ingress
+                        .send_assistant_permission_resolved(thread, request_id, decision)
                         .await;
                 })
                 .detach();
@@ -192,30 +182,25 @@ pub(crate) fn apply_assistant_command(
                 0,
                 entries,
                 (),
-                crate::ui::PickerRuntime::new(editor.runtime()),
+                crate::ui::PickerRuntime::new(editor),
                 ingress.clone(),
                 move |cx: &mut crate::compositor::Context,
                       item: &helix_view::assistant::history::Stub,
                       _action| {
                     if cx.editor.assistant_thread_exists(item.id) {
-                        helix_runtime::send_blocking(
-                            &cx.ingress,
-                            RuntimeEvent::Task(RuntimeTaskEvent::ActivateAssistantThread {
-                                thread: item.id,
-                                panel: helix_view::editor::PanelBehavior::Open,
-                            }),
-                        );
+                        cx.ingress.task(RuntimeTaskEvent::ActivateAssistantThread {
+                            thread: item.id,
+                            panel: helix_view::editor::PanelBehavior::Open,
+                        });
                         return;
                     }
 
-                    helix_runtime::send_blocking(
-                        &cx.ingress,
-                        RuntimeEvent::Task(RuntimeTaskEvent::LoadAssistantHistoryThread {
+                    cx.ingress
+                        .task(RuntimeTaskEvent::LoadAssistantHistoryThread {
                             thread: item.id,
                             activation: helix_view::editor::Activation::Activate,
                             panel: helix_view::editor::PanelBehavior::Open,
-                        }),
-                    );
+                        });
                 },
             );
 
@@ -232,17 +217,14 @@ pub(crate) fn apply_assistant_command(
                 0,
                 items,
                 (),
-                crate::ui::PickerRuntime::new(editor.runtime()),
+                crate::ui::PickerRuntime::new(editor),
                 ingress,
                 move |cx: &mut crate::compositor::Context,
                       item: &helix_view::assistant::context::Item,
                       _action| {
-                    helix_runtime::send_blocking(
-                        &cx.ingress,
-                        RuntimeEvent::Task(RuntimeTaskEvent::DetachAssistantContext {
-                            item: item.id.clone(),
-                        }),
-                    );
+                    cx.ingress.task(RuntimeTaskEvent::DetachAssistantContext {
+                        item: item.id.clone(),
+                    });
                 },
             );
 
@@ -273,7 +255,7 @@ pub(crate) fn apply_assistant_command(
                 0,
                 agents,
                 (),
-                crate::ui::PickerRuntime::new(editor.runtime()),
+                crate::ui::PickerRuntime::new(editor),
                 ingress.clone(),
                 move |cx: &mut crate::compositor::Context,
                       item: &helix_view::editor::AgentConfig,

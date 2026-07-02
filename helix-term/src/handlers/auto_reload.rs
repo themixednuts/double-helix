@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use crate::runtime::{send_task_event_with, RuntimeEvent, RuntimeTaskEvent};
+use crate::runtime::{send_task_event_with, RuntimeTaskEvent};
 use helix_runtime::{send_blocking, Runtime, Work};
 use helix_view::file_watcher::FileWatcher;
 use helix_view::handlers::{AutoReloadEvent, Handlers};
@@ -11,11 +11,11 @@ use helix_view::Editor;
 pub(super) struct AutoReloadHandler {
     reload_pending: Arc<AtomicBool>,
     work: Work,
-    ingress: helix_runtime::Sender<RuntimeEvent>,
+    ingress: crate::runtime::RuntimeIngress,
 }
 
 impl AutoReloadHandler {
-    fn new(work: Work, ingress: helix_runtime::Sender<RuntimeEvent>) -> AutoReloadHandler {
+    fn new(work: Work, ingress: crate::runtime::RuntimeIngress) -> AutoReloadHandler {
         AutoReloadHandler {
             reload_pending: Default::default(),
             work,
@@ -58,7 +58,7 @@ impl AutoReloadHandler {
 
     pub fn spawn(
         runtime: Runtime,
-        ingress: helix_runtime::Sender<RuntimeEvent>,
+        ingress: crate::runtime::RuntimeIngress,
     ) -> helix_runtime::Sender<AutoReloadEvent> {
         let (tx, mut rx) = helix_runtime::channel(128);
         let work = runtime.work().clone();

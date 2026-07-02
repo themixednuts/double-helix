@@ -390,7 +390,8 @@
         "git-exclude": { "type": "boolean" },
         "flatten-dirs": { "type": "boolean" },
         "icons": { "type": "boolean" },
-        "vcs": { "type": "boolean" }
+        "vcs": { "type": "boolean" },
+        "diagnostics": { "type": "boolean" }
       }
     },
     "statusline": {

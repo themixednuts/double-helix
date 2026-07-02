@@ -16,8 +16,21 @@ impl Editor {
         doc.id = id;
         self.documents.insert(id, doc);
 
-        let save_sender = self.save_tx.clone();
-        self.saves.insert(id, save_sender);
+        self.save_locks.insert(id, Default::default());
+
+        id
+    }
+
+    pub(crate) fn restore_document(&mut self, mut doc: Document) -> DocumentId {
+        let id = doc.id;
+        debug_assert!(
+            !self.documents.contains_key(&id) && !self.component_docs.contains_key(&id),
+            "restored document id must not already be live"
+        );
+        doc.bind_lifecycle(self.lifecycle.clone());
+        self.documents.insert(id, doc);
+
+        self.save_locks.insert(id, Default::default());
 
         id
     }

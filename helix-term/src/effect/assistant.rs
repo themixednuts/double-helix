@@ -1,11 +1,9 @@
-use helix_runtime::{send_blocking, Sender as IngressSender};
-
-use crate::runtime::{ingress::RuntimeEvent, send_task_event_with, RuntimeTaskEvent, UiCommand};
+use crate::runtime::{send_task_event_with, RuntimeTaskEvent, UiCommand};
 use helix_view::{editor::Action, Editor};
 
 pub(crate) fn apply_restore_assistant_history_thread(
     editor: &mut Editor,
-    ingress: IngressSender<RuntimeEvent>,
+    ingress: crate::runtime::RuntimeIngress,
     record: helix_view::assistant::history::Record,
     activation: helix_view::editor::Activation,
     panel: helix_view::editor::PanelBehavior,
@@ -15,18 +13,15 @@ pub(crate) fn apply_restore_assistant_history_thread(
     editor.persist_assistant_layout();
 
     if panel.should_open() {
-        send_blocking(
-            &ingress,
-            RuntimeEvent::Ui(UiCommand::Assistant(
-                crate::runtime::ui::command::AssistantCommand::OpenPanel,
-            )),
-        );
+        ingress.ui(UiCommand::Assistant(
+            crate::runtime::ui::command::AssistantCommand::OpenPanel,
+        ));
     }
 }
 
 pub(crate) fn apply_activate_assistant_thread(
     editor: &mut Editor,
-    ingress: IngressSender<RuntimeEvent>,
+    ingress: crate::runtime::RuntimeIngress,
     thread: helix_view::assistant::thread::Id,
     panel: helix_view::editor::PanelBehavior,
 ) {
@@ -35,12 +30,9 @@ pub(crate) fn apply_activate_assistant_thread(
     editor.persist_assistant_layout();
 
     if panel.should_open() {
-        send_blocking(
-            &ingress,
-            RuntimeEvent::Ui(UiCommand::Assistant(
-                crate::runtime::ui::command::AssistantCommand::OpenPanel,
-            )),
-        );
+        ingress.ui(UiCommand::Assistant(
+            crate::runtime::ui::command::AssistantCommand::OpenPanel,
+        ));
     }
 
     editor.set_status("Activated assistant history thread");
@@ -81,7 +73,7 @@ pub(crate) fn apply_remove_assistant_panel(editor: &mut Editor) {
 
 pub(crate) fn apply_connect_assistant_backend(
     editor: &mut Editor,
-    ingress: IngressSender<RuntimeEvent>,
+    ingress: crate::runtime::RuntimeIngress,
     command: String,
     args: Vec<String>,
     panel: helix_view::editor::PanelBehavior,
@@ -97,12 +89,9 @@ pub(crate) fn apply_connect_assistant_backend(
     editor.persist_assistant_layout();
 
     if panel.should_open() {
-        send_blocking(
-            &ingress,
-            RuntimeEvent::Ui(UiCommand::Assistant(
-                crate::runtime::ui::command::AssistantCommand::OpenPanel,
-            )),
-        );
+        ingress.ui(UiCommand::Assistant(
+            crate::runtime::ui::command::AssistantCommand::OpenPanel,
+        ));
     }
 
     editor.set_status(format!("Connecting assistant backend: {command}..."));
@@ -110,7 +99,7 @@ pub(crate) fn apply_connect_assistant_backend(
 
 pub(crate) fn apply_cycle_assistant_thread(
     editor: &mut Editor,
-    ingress: IngressSender<RuntimeEvent>,
+    ingress: crate::runtime::RuntimeIngress,
     delta: isize,
 ) {
     let effects = match editor.cycle_active_assistant_thread(delta) {
@@ -122,17 +111,14 @@ pub(crate) fn apply_cycle_assistant_thread(
     };
     editor.apply_assistant_effects(effects);
     editor.persist_assistant_layout();
-    send_blocking(
-        &ingress,
-        RuntimeEvent::Ui(UiCommand::Assistant(
-            crate::runtime::ui::command::AssistantCommand::OpenPanel,
-        )),
-    );
+    ingress.ui(UiCommand::Assistant(
+        crate::runtime::ui::command::AssistantCommand::OpenPanel,
+    ));
 }
 
 pub(crate) fn apply_close_active_assistant_thread(
     editor: &mut Editor,
-    ingress: IngressSender<RuntimeEvent>,
+    ingress: crate::runtime::RuntimeIngress,
 ) {
     let effects = match editor.close_active_assistant_thread() {
         Ok(effects) => effects,
@@ -143,17 +129,14 @@ pub(crate) fn apply_close_active_assistant_thread(
     };
     editor.apply_assistant_effects(effects);
     editor.persist_assistant_layout();
-    send_blocking(
-        &ingress,
-        RuntimeEvent::Ui(UiCommand::Assistant(
-            crate::runtime::ui::command::AssistantCommand::OpenPanel,
-        )),
-    );
+    ingress.ui(UiCommand::Assistant(
+        crate::runtime::ui::command::AssistantCommand::OpenPanel,
+    ));
 }
 
 pub(crate) fn apply_new_assistant_thread_from_active_backend(
     editor: &mut Editor,
-    ingress: IngressSender<RuntimeEvent>,
+    ingress: crate::runtime::RuntimeIngress,
 ) {
     let effects = match editor.new_assistant_thread_from_active_backend() {
         Ok(effects) => effects,
@@ -165,12 +148,9 @@ pub(crate) fn apply_new_assistant_thread_from_active_backend(
     editor.apply_assistant_effects(effects);
     editor.request_redraw();
     editor.persist_assistant_layout();
-    send_blocking(
-        &ingress,
-        RuntimeEvent::Ui(UiCommand::Assistant(
-            crate::runtime::ui::command::AssistantCommand::OpenPanel,
-        )),
-    );
+    ingress.ui(UiCommand::Assistant(
+        crate::runtime::ui::command::AssistantCommand::OpenPanel,
+    ));
 }
 
 pub(crate) fn apply_toggle_active_assistant_follow(editor: &mut Editor) {
@@ -255,7 +235,7 @@ pub(crate) fn apply_assistant_history_entries(
 
 pub(crate) fn request_load_assistant_history_thread(
     editor: &mut Editor,
-    ingress: IngressSender<RuntimeEvent>,
+    ingress: crate::runtime::RuntimeIngress,
     thread: helix_view::assistant::thread::Id,
     activation: helix_view::editor::Activation,
     panel: helix_view::editor::PanelBehavior,
@@ -305,7 +285,7 @@ pub(crate) fn request_load_assistant_history_thread(
 
 pub(crate) fn request_bootstrap_assistant_history(
     editor: &mut Editor,
-    ingress: IngressSender<RuntimeEvent>,
+    ingress: crate::runtime::RuntimeIngress,
     scope: helix_view::assistant::thread::Scope,
 ) {
     let Some(history) = editor.assistant_history_backend() else {

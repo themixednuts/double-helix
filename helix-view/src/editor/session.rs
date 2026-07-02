@@ -45,6 +45,10 @@ impl Editor {
         self.needs_redraw
     }
 
+    pub fn mark_redraw_pending(&mut self) {
+        self.needs_redraw = true;
+    }
+
     pub fn clear_redraw_request(&mut self) {
         self.needs_redraw = false;
     }
@@ -59,6 +63,15 @@ impl Editor {
     ) {
         self.frontend
             .modal_keymaps
+            .store(std::sync::Arc::new(keymaps));
+    }
+
+    pub fn set_semantic_modal_keymaps(
+        &self,
+        keymaps: std::collections::HashMap<crate::document::Mode, crate::keymap::ModalIntentTrie>,
+    ) {
+        self.frontend
+            .semantic_modal_keymaps
             .store(std::sync::Arc::new(keymaps));
     }
 

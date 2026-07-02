@@ -3,11 +3,12 @@ pub mod assistant;
 mod cmdline_popup;
 mod completion;
 pub(crate) mod completion_ingress;
+pub(crate) mod design;
 mod document;
 pub(crate) mod editor;
 mod file_explorer;
 pub mod gradient_border;
-mod info;
+pub(crate) mod info;
 pub mod lsp;
 mod markdown;
 pub mod marquee;
@@ -17,6 +18,7 @@ pub mod overlay;
 pub mod picker;
 pub(crate) mod plugin_float;
 pub mod plugin_panel;
+pub(crate) mod plugin_render;
 pub mod popup;
 pub mod prompt;
 mod select;
@@ -25,11 +27,11 @@ mod statusline;
 mod text;
 mod text_decorations;
 
-use crate::filter_picker_entry;
 use crate::runtime::{send_ui_command_with, LayerCommand, UiCommand};
 pub use cmdline_popup::CmdlinePopup;
 pub use completion::Completion;
 pub use editor::EditorView;
+pub(crate) use file_explorer::PANEL_WIDTH as FILE_EXPLORER_PANEL_WIDTH;
 pub use file_explorer::{FileExplorerPanel, ID as FILE_EXPLORER_ID};
 use helix_stdx::rope;
 use helix_view::theme::Style;
@@ -43,11 +45,15 @@ pub use select::Select;
 pub use spinner::{ProgressSpinners, Spinner};
 pub use text::Text;
 
-use helix_view::editor::CmdlineStyle;
+use helix_view::editor::{CmdlineStyle, FileExplorerConfig};
 use helix_view::Editor;
 use tui::text::{Span, Spans};
 
 use std::path::Path;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, Mutex,
+};
 use std::{error::Error, path::PathBuf};
 
 struct Utf8PathBuf {
@@ -291,71 +297,67 @@ pub fn raw_regex_prompt(
 #[derive(Debug)]
 pub struct FilePickerData {
     root: PathBuf,
+    file_picker_config: helix_view::editor::FilePickerConfig,
+    current_file: Option<PathBuf>,
     directory_style: Style,
+    search_epoch: AtomicU64,
+    search_lock: Mutex<()>,
+    trace: picker::PickerTrace,
 }
-type FilePicker = Picker<PathBuf, FilePickerData>;
+
+#[derive(Debug)]
+pub struct FilePickerItem {
+    path: PathBuf,
+    query: std::sync::Arc<str>,
+    track_fff: bool,
+}
+
+pub type FilePicker = Picker<FilePickerItem, FilePickerData>;
 
 pub fn file_picker(
     editor: &Editor,
     root: PathBuf,
-    ingress: helix_runtime::Sender<crate::runtime::RuntimeEvent>,
+    ingress: crate::runtime::RuntimeIngress,
 ) -> FilePicker {
-    use ignore::{types::TypesBuilder, WalkBuilder};
-    use std::time::Instant;
-
+    let open_start = std::time::Instant::now();
+    let trace = picker::PickerTrace::new("file_picker", open_start);
     let config = editor.config();
+    let file_picker_config = config.file_picker.clone();
+    let current_file = editor
+        .tree
+        .try_get(editor.tree.focus)
+        .and_then(|view| editor.document(view.doc))
+        .and_then(|doc| doc.path().cloned());
     let data = FilePickerData {
         root: root.clone(),
+        file_picker_config: file_picker_config.clone(),
+        current_file: current_file.clone(),
         directory_style: editor.theme.get("ui.text.directory"),
+        search_epoch: AtomicU64::new(0),
+        search_lock: Mutex::new(()),
+        trace,
     };
-
-    let now = Instant::now();
-
-    let dedup_symlinks = config.file_picker.deduplicate_links;
-    let absolute_root = root.canonicalize().unwrap_or_else(|_| root.clone());
-
-    let mut walk_builder = WalkBuilder::new(&root);
-    walk_builder
-        .hidden(config.file_picker.hidden)
-        .parents(config.file_picker.parents)
-        .ignore(config.file_picker.ignore)
-        .follow_links(config.file_picker.follow_symlinks)
-        .git_ignore(config.file_picker.git_ignore)
-        .git_global(config.file_picker.git_global)
-        .git_exclude(config.file_picker.git_exclude)
-        .sort_by_file_name(|name1, name2| name1.cmp(name2))
-        .max_depth(config.file_picker.max_depth)
-        .filter_entry(move |entry| filter_picker_entry(entry, &absolute_root, dedup_symlinks));
-
-    walk_builder.add_custom_ignore_filename(helix_loader::config_dir().join("ignore"));
-    walk_builder.add_custom_ignore_filename(helix_loader::workspace_ignore_file_name());
-
-    // We want to exclude files that the editor can't handle yet
-    let mut type_builder = TypesBuilder::new();
-    type_builder
-        .add(
-            "compressed",
-            "*.{zip,gz,bz2,zst,lzo,sz,tgz,tbz2,lz,lz4,lzma,lzo,z,Z,xz,7z,rar,cab}",
-        )
-        .expect("Invalid type definition");
-    type_builder.negate("all");
-    let excluded_types = type_builder
-        .build()
-        .expect("failed to build excluded_types");
-    walk_builder.types(excluded_types);
-    let mut files = walk_builder.build().filter_map(|entry| {
-        let entry = entry.ok()?;
-        if !entry.path().is_file() {
-            return None;
-        }
-        Some(entry.into_path())
-    });
-    log::debug!("file_picker init {:?}", Instant::now().duration_since(now));
+    trace.log(
+        "open_start",
+        format_args!(
+            "root={} current_file={} hide_preview={} hidden={} ignore={} git_ignore={} max_depth={:?}",
+            root.display(),
+            current_file
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            file_picker_config.hide_preview,
+            file_picker_config.hidden,
+            file_picker_config.ignore,
+            file_picker_config.git_ignore,
+            file_picker_config.max_depth,
+        ),
+    );
 
     let columns = [PickerColumn::new(
         "path",
-        |item: &PathBuf, data: &FilePickerData| {
-            let path = item.strip_prefix(&data.root).unwrap_or(item);
+        |item: &FilePickerItem, data: &FilePickerData| {
+            let path = item.path.strip_prefix(&data.root).unwrap_or(&item.path);
             let mut spans = Vec::with_capacity(3);
             if let Some(dirs) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
                 spans.extend([
@@ -371,64 +373,243 @@ pub fn file_picker(
             Spans::from(spans).into()
         },
     )];
+
+    let open_root = root.clone();
+    let open_file_picker_config = file_picker_config.clone();
+    let open_item = move |cx: &mut crate::compositor::Context, item: &FilePickerItem, action| {
+        let path = helix_stdx::path::canonicalize(&item.path);
+        let old_id = cx.editor.document_id_by_path(&path);
+
+        match cx.editor.open(&path, action) {
+            Ok(doc_id) => {
+                if item.track_fff {
+                    crate::fff::record_file_open(
+                        &open_root,
+                        &open_file_picker_config,
+                        &item.query,
+                        &path,
+                    );
+                }
+                if old_id != Some(doc_id) {
+                    default_folding(cx.editor);
+                }
+            }
+            Err(e) => {
+                let err = if let Some(err) = e.source() {
+                    format!("{}", err)
+                } else {
+                    format!("unable to open \"{}\"", path.display())
+                };
+                cx.editor.set_error(err);
+            }
+        }
+    };
+
+    let get_files = |query: &str,
+                     _editor: &mut Editor,
+                     data: Arc<FilePickerData>,
+                     injector: &picker::Injector<FilePickerItem, FilePickerData>,
+                     work: helix_runtime::Work| {
+        let query = query.to_owned();
+        let injector = injector.clone();
+        let epoch = data.search_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+        data.trace.log(
+            "dynamic_query_callback_queued",
+            format_args!("epoch={epoch} query={query:?}"),
+        );
+        work.spawn(async move {
+            tokio::task::spawn_blocking(move || {
+                let task_start = std::time::Instant::now();
+                let _search = data
+                    .search_lock
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("FFF file picker search lock was poisoned"))?;
+                if data.search_epoch.load(Ordering::Acquire) != epoch {
+                    data.trace.log(
+                        "dynamic_query_stale_before_search",
+                        format_args!(
+                            "epoch={epoch} query={query:?} elapsed_us={}",
+                            task_start.elapsed().as_micros(),
+                        ),
+                    );
+                    return Ok(());
+                }
+
+                let search_start = std::time::Instant::now();
+                data.trace.log(
+                    "fff_search_start",
+                    format_args!(
+                        "epoch={epoch} query={query:?} root={}",
+                        data.root.display(),
+                    ),
+                );
+                let matches = crate::fff::search_files(
+                    &data.root,
+                    &query,
+                    data.current_file.as_deref(),
+                    &data.file_picker_config,
+                )?;
+                if data.search_epoch.load(Ordering::Acquire) != epoch {
+                    data.trace.log(
+                        "dynamic_query_stale_after_search",
+                        format_args!(
+                            "epoch={epoch} query={query:?} search_us={} elapsed_us={}",
+                            search_start.elapsed().as_micros(),
+                            task_start.elapsed().as_micros(),
+                        ),
+                    );
+                    return Ok(());
+                }
+
+                let result_count = matches.len();
+                let inject_start = std::time::Instant::now();
+                let mut injected = 0usize;
+                for item in matches {
+                    if data.search_epoch.load(Ordering::Acquire) != epoch {
+                        break;
+                    }
+                    if injector
+                        .push(FilePickerItem {
+                            path: item.path,
+                            query: item.query,
+                            track_fff: true,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                    injected += 1;
+                }
+                data.trace.log(
+                    "dynamic_query_inject_done",
+                    format_args!(
+                        "epoch={epoch} query={query:?} search_us={} inject_us={} elapsed_us={} results={result_count} injected={injected}",
+                        search_start.elapsed().as_micros(),
+                        inject_start.elapsed().as_micros(),
+                        task_start.elapsed().as_micros(),
+                    ),
+                );
+
+                Ok(())
+            })
+            .await
+            .map_err(|err| anyhow::anyhow!("FFF file picker search task failed: {err}"))?
+        })
+    };
+    let refresh_root = root.clone();
+    let refresh_config = file_picker_config.clone();
+    let refresh_ingress = ingress.clone();
+    editor
+        .runtime()
+        .block()
+        .spawn(move || {
+            trace.log(
+                "initial_refresh_wait_start",
+                format_args!("root={}", refresh_root.display()),
+            );
+            let send_refresh = || {
+                trace.log("initial_refresh_send", format_args!("query=\"\""));
+                refresh_ingress.ui(crate::runtime::UiCommand::Picker(
+                    crate::runtime::ui::command::PickerCommand::RunDynamicQuery {
+                        query: "".into(),
+                    },
+                ));
+            };
+            match crate::fff::wait_for_initial_file_results(&refresh_root, &refresh_config) {
+                Ok(true) => {
+                    trace.log(
+                        "initial_results_ready",
+                        format_args!("root={}", refresh_root.display()),
+                    );
+                    send_refresh();
+                }
+                Ok(false) => trace.log(
+                    "initial_results_timeout",
+                    format_args!("root={}", refresh_root.display()),
+                ),
+                Err(err) => log::error!("FFF file picker first-results wait failed: {err:#}"),
+            }
+            match crate::fff::wait_for_initial_file_scan(&refresh_root, &refresh_config) {
+                Ok(true) => {
+                    trace.log(
+                        "initial_scan_ready",
+                        format_args!("root={}", refresh_root.display()),
+                    );
+                    send_refresh();
+                }
+                Ok(false) => trace.log(
+                    "initial_scan_timeout",
+                    format_args!("root={}", refresh_root.display()),
+                ),
+                Err(err) => log::error!("FFF file picker scan readiness failed: {err:#}"),
+            }
+        })
+        .detach();
+
+    let initial_search_start = std::time::Instant::now();
+    let initial_options = match crate::fff::search_files_available(
+        &root,
+        "",
+        current_file.as_deref(),
+        &file_picker_config,
+    ) {
+        Ok(matches) => matches
+            .into_iter()
+            .map(|item| FilePickerItem {
+                path: item.path,
+                query: item.query,
+                track_fff: true,
+            })
+            .collect::<Vec<_>>(),
+        Err(err) => {
+            trace.log(
+                "initial_search_failed",
+                format_args!(
+                    "elapsed_us={} error={err:#}",
+                    initial_search_start.elapsed().as_micros(),
+                ),
+            );
+            Vec::new()
+        }
+    };
+    trace.log(
+        "initial_search_done",
+        format_args!(
+            "elapsed_us={} results={}",
+            initial_search_start.elapsed().as_micros(),
+            initial_options.len(),
+        ),
+    );
+
     let picker = Picker::new(
         columns,
         0,
-        [],
+        initial_options,
         data,
-        PickerRuntime::new(editor.runtime()),
+        PickerRuntime::new(editor),
         ingress.clone(),
-        move |cx, path: &PathBuf, action| {
-            let path = helix_stdx::path::canonicalize(path);
-            let old_id = cx.editor.document_id_by_path(&path);
-
-            match cx.editor.open(&path, action) {
-                Ok(doc_id) => {
-                    if old_id != Some(doc_id) {
-                        default_folding(cx.editor);
-                    }
-                }
-                Err(e) => {
-                    let err = if let Some(err) = e.source() {
-                        format!("{}", err)
-                    } else {
-                        format!("unable to open \"{}\"", path.display())
-                    };
-                    cx.editor.set_error(err);
-                }
-            }
-        },
+        open_item,
     )
-    .with_preview(|_editor, path| Some((path.as_path().into(), None)))
-    .show_preview(!config.file_picker.hide_preview)
+    .with_trace(trace)
+    .with_preview(|_editor, item| Some((item.path.as_path().into(), None)))
+    .show_preview(!file_picker_config.hide_preview)
     .with_item_data(
-        |path: &PathBuf| helix_view::model::PickerItemData::FilePath {
-            path: path.clone(),
+        |item: &FilePickerItem| helix_view::model::PickerItemData::FilePath {
+            path: item.path.clone(),
             is_dir: false,
         },
+    )
+    .with_dynamic_query(get_files, Some(40))
+    .with_initial_dynamic_query()
+    .with_external_filtering();
+    trace.log(
+        "open_return",
+        format_args!(
+            "root={} elapsed_us={}",
+            root.display(),
+            open_start.elapsed().as_micros(),
+        ),
     );
-    let injector = picker.injector();
-    let timeout = std::time::Instant::now() + std::time::Duration::from_millis(30);
-
-    let mut hit_timeout = false;
-    for file in &mut files {
-        if injector.push(file).is_err() {
-            break;
-        }
-        if std::time::Instant::now() >= timeout {
-            hit_timeout = true;
-            break;
-        }
-    }
-    if hit_timeout {
-        std::thread::spawn(move || {
-            for file in files {
-                if injector.push(file).is_err() {
-                    break;
-                }
-            }
-        });
-    }
     picker
 }
 
@@ -451,20 +632,26 @@ pub fn directory_content(
     root: &Path,
     editor: &Editor,
 ) -> Result<Vec<(PathBuf, bool)>, std::io::Error> {
-    use ignore::WalkBuilder;
-
     let config = editor.config();
+    directory_content_with_config(root, &config.file_explorer)
+}
+
+pub fn directory_content_with_config(
+    root: &Path,
+    config: &FileExplorerConfig,
+) -> Result<Vec<(PathBuf, bool)>, std::io::Error> {
+    use ignore::WalkBuilder;
 
     let mut walk_builder = WalkBuilder::new(root);
 
     let mut content: Vec<(PathBuf, bool)> = walk_builder
-        .hidden(config.file_explorer.hidden)
-        .parents(config.file_explorer.parents)
-        .ignore(config.file_explorer.ignore)
-        .follow_links(config.file_explorer.follow_symlinks)
-        .git_ignore(config.file_explorer.git_ignore)
-        .git_global(config.file_explorer.git_global)
-        .git_exclude(config.file_explorer.git_exclude)
+        .hidden(config.hidden)
+        .parents(config.parents)
+        .ignore(config.ignore)
+        .follow_links(config.follow_symlinks)
+        .git_ignore(config.git_ignore)
+        .git_global(config.git_global)
+        .git_exclude(config.git_exclude)
         .max_depth(Some(1))
         .add_custom_ignore_filename(helix_loader::config_dir().join("ignore"))
         .add_custom_ignore_filename(helix_loader::workspace_ignore_file_name())
@@ -476,7 +663,7 @@ pub fn directory_content(
                     let path = entry.path();
                     let is_dir = path.is_dir();
                     let mut path = path.to_path_buf();
-                    if is_dir && path != root && config.file_explorer.flatten_dirs {
+                    if is_dir && path != root && config.flatten_dirs {
                         while let Some(single_child_directory) = get_child_if_single_dir(&path) {
                             path = single_child_directory;
                         }
@@ -728,6 +915,10 @@ pub mod completers {
 
         let is_tilde = input == "~";
         let path = helix_stdx::path::expand_tilde(Path::new(input));
+        #[cfg(windows)]
+        if path.is_absolute() {
+            return Vec::new();
+        }
 
         let (dir, file_name) = if input.ends_with(std::path::MAIN_SEPARATOR) {
             (path, None)
@@ -761,6 +952,7 @@ pub mod completers {
             .hidden(false)
             .follow_links(false) // We're scanning over depth 1
             .git_ignore(git_ignore)
+            .parents(false)
             .max_depth(Some(1))
             .build()
             .filter_map(|file| {

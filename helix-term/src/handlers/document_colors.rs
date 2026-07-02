@@ -4,36 +4,36 @@ use std::{
     time::Duration,
 };
 
-use helix_runtime::{Clock, Debounce, Runtime, Work};
+use helix_runtime::{Runtime, Work};
 use helix_view::bench::log_command_phase;
 use helix_view::{
     handlers::{lsp::DocumentColorsEvent, Handlers},
     DocumentId,
 };
 
-use crate::{
-    effect::language_server::request_document_colors,
-    runtime::{send_task_event_with, RuntimeEvent, RuntimeTaskEvent},
-};
+use crate::{effect::language_server::request_document_colors, runtime::RuntimeTaskEvent};
 
 pub(super) struct DocumentColorsHandler {
     docs: Arc<Mutex<HashSet<DocumentId>>>,
-    debounce: Debounce,
-    work: Work,
-    clock: Clock,
-    ingress: helix_runtime::Sender<RuntimeEvent>,
+    debouncer: crate::runtime::RuntimeTaskDebouncer,
 }
 
 const DOCUMENT_CHANGE_DEBOUNCE: Duration = Duration::from_millis(250);
 
 impl DocumentColorsHandler {
-    fn new(work: Work, clock: Clock, ingress: helix_runtime::Sender<RuntimeEvent>) -> Self {
+    fn new(
+        work: Work,
+        clock: helix_runtime::Clock,
+        ingress: crate::runtime::RuntimeIngress,
+    ) -> Self {
         Self {
             docs: Default::default(),
-            debounce: Debounce::new(DOCUMENT_CHANGE_DEBOUNCE),
-            work,
-            clock,
-            ingress,
+            debouncer: crate::runtime::RuntimeTaskDebouncer::new(
+                DOCUMENT_CHANGE_DEBOUNCE,
+                work,
+                clock,
+                ingress,
+            ),
         }
     }
 
@@ -45,25 +45,20 @@ impl DocumentColorsHandler {
             .insert(doc_id);
 
         let docs = self.docs.clone();
-        let ingress = self.ingress.clone();
-        self.debounce.restart(&self.work, &self.clock, async move {
-            let doc_ids = {
-                let mut docs = docs.lock().expect("document colors lock poisoned");
-                std::mem::take(&mut *docs)
-            };
-            if !doc_ids.is_empty() {
-                send_task_event_with(
-                    RuntimeTaskEvent::RequestDocumentColorsDebounced { doc_ids },
-                    ingress,
-                )
-                .await;
-            }
-        });
+        self.debouncer
+            .send_after_with(DOCUMENT_CHANGE_DEBOUNCE, move || {
+                let doc_ids = {
+                    let mut docs = docs.lock().expect("document colors lock poisoned");
+                    std::mem::take(&mut *docs)
+                };
+                (!doc_ids.is_empty())
+                    .then(|| RuntimeTaskEvent::RequestDocumentColorsDebounced { doc_ids })
+            });
     }
 
     pub fn spawn(
         runtime: Runtime,
-        ingress: helix_runtime::Sender<RuntimeEvent>,
+        ingress: crate::runtime::RuntimeIngress,
     ) -> helix_runtime::Sender<DocumentColorsEvent> {
         let (tx, mut rx) = helix_runtime::channel(128);
         let work = runtime.work().clone();
@@ -74,7 +69,7 @@ impl DocumentColorsHandler {
                 while let Some(event) = rx.recv().await {
                     handler.event(event);
                 }
-                handler.debounce.cancel();
+                handler.debouncer.cancel();
             })
             .detach();
         tx
@@ -84,7 +79,7 @@ impl DocumentColorsHandler {
 pub(super) fn attach(
     editor: &helix_view::Editor,
     handlers: &Handlers,
-    ingress: helix_runtime::Sender<RuntimeEvent>,
+    ingress: crate::runtime::RuntimeIngress,
 ) {
     let open_ingress = ingress.clone();
     editor.lifecycle().on_document_open(move |event| {

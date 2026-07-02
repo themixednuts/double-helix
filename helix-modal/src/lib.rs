@@ -5,15 +5,19 @@
 //! Both engines share the same command atoms from `helix_view::commands`
 //! but implement different composition rules.
 
+pub mod factory;
 pub mod helix;
 pub mod populate;
 pub mod registry;
 pub mod vim;
 
-use std::borrow::Cow;
+use std::{borrow::Cow, sync::Arc};
 
 use helix_view::engine::{EngineResult, RecordedAction};
 use helix_view::input::KeyEvent;
+
+pub use factory::ModalEngineFactory;
+pub use registry::CommandRegistry;
 
 // ─── Shared utilities ───────────────────────────────────────────────
 
@@ -67,12 +71,12 @@ pub(crate) fn record_insert_key(
 
 /// Finalize an insert recording into a `RecordedAction::InsertSequence`.
 ///
-/// Converts the mutable `Vec` into an immutable `Box<[KeyEvent]>`.
+/// Converts the mutable `Vec` into an immutable shared slice.
 pub(crate) fn finalize_insert_recording(
     recording: Option<InsertRecording>,
 ) -> Option<RecordedAction> {
     recording.map(|rec| RecordedAction::InsertSequence {
         entry_command: rec.entry_command,
-        keys: rec.keys.into_boxed_slice(),
+        keys: Arc::from(rec.keys.into_boxed_slice()),
     })
 }

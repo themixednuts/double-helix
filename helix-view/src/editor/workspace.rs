@@ -1,12 +1,65 @@
-use std::{io::stdin, path::Path};
+use std::{
+    io::stdin,
+    path::{Path, PathBuf},
+    time::Instant,
+};
 
 use anyhow::Error;
 use helix_core::Selection;
 use helix_lsp::{self};
 
-use crate::{document::DocumentOpenError, Align, Document, DocumentId, View, ViewId};
+use crate::{
+    document::{DocumentOpenError, LanguageInitialization},
+    Align, Document, DocumentId, View, ViewId,
+};
 
 use super::{Action, CloseError, Editor};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DocumentOpenRole {
+    Interactive,
+    Preview,
+}
+
+#[derive(Debug)]
+pub struct DetachedPreviewDocument {
+    document: Document,
+    restore_language_servers: bool,
+}
+
+impl DetachedPreviewDocument {
+    fn new(document: Document, restore_language_servers: bool) -> Self {
+        Self {
+            document,
+            restore_language_servers,
+        }
+    }
+
+    pub fn path(&self) -> Option<&Path> {
+        self.document.path().map(PathBuf::as_path)
+    }
+
+    pub const fn restore_language_servers(&self) -> bool {
+        self.restore_language_servers
+    }
+
+    fn into_document(self) -> Document {
+        self.document
+    }
+}
+
+impl DocumentOpenRole {
+    const fn language_initialization(self) -> LanguageInitialization {
+        match self {
+            Self::Interactive => LanguageInitialization::Full,
+            Self::Preview => LanguageInitialization::Full,
+        }
+    }
+
+    const fn is_preview(self) -> bool {
+        matches!(self, Self::Preview)
+    }
+}
 
 impl Editor {
     pub fn switch(&mut self, id: DocumentId, action: Action) {
@@ -184,42 +237,149 @@ impl Editor {
         self.document_by_path(path).map(|doc| doc.id)
     }
 
-    pub fn open(&mut self, path: &Path, action: Action) -> Result<DocumentId, DocumentOpenError> {
+    fn initialize_visual_document(&mut self, id: DocumentId, path: &Path) {
+        let start = Instant::now();
+        let diagnostics_start = Instant::now();
+        let diagnostics = {
+            let doc = self
+                .documents
+                .get(&id)
+                .expect("document must exist before visual initialization");
+            Editor::doc_diagnostics(&self.language_servers, &self.diagnostics, doc)
+        };
+        let diagnostics_us = diagnostics_start.elapsed().as_micros();
+        let diff_start = Instant::now();
+        let diff_base = self.diff_providers.get_diff_base(path);
+        let diff_base_us = diff_start.elapsed().as_micros();
+        let head_start = Instant::now();
+        let version_control_head = self.diff_providers.get_current_head_name(path);
+        let head_us = head_start.elapsed().as_micros();
+        let redraw = self.document_redraw_handle();
+
+        let doc = self
+            .documents
+            .get_mut(&id)
+            .expect("document must exist before visual initialization");
+        doc.replace_diagnostics(diagnostics, &[], None);
+        if let Some(diff_base) = diff_base {
+            doc.set_diff_base(diff_base, &redraw);
+        }
+        doc.set_version_control_head(version_control_head);
+        log::info!(
+            "[document_open] visual_init doc={:?} path={} diagnostics={} diff_base={} diagnostics_us={} diff_base_us={} head_us={} total_us={}",
+            id,
+            path.display(),
+            doc.diagnostics().len(),
+            doc.diff_handle().is_some(),
+            diagnostics_us,
+            diff_base_us,
+            head_us,
+            start.elapsed().as_micros()
+        );
+    }
+
+    fn initialize_interactive_document(&mut self, id: DocumentId, path: &std::path::PathBuf) {
+        self.initialize_visual_document(id, path);
+        let doc = self
+            .documents
+            .get_mut(&id)
+            .expect("document must exist before interactive initialization");
+        doc.promote_from_preview();
+
+        self.launch_language_servers(id);
+        self.dispatch_document_open(id, path);
+    }
+
+    fn initialize_preview_document(&mut self, id: DocumentId, path: &Path) {
+        self.initialize_visual_document(id, path);
+        self.launch_language_servers(id);
+        let language_servers = self
+            .documents
+            .get(&id)
+            .map(|doc| doc.language_servers().count())
+            .unwrap_or(0);
+        log::info!(
+            "[document_open] preview_lsp doc={:?} path={} language_servers={}",
+            id,
+            path.display(),
+            language_servers,
+        );
+    }
+
+    fn close_preview_language_servers(doc: &mut Document) -> usize {
+        let language_servers = doc.language_servers().count();
+        for language_server in doc.language_servers() {
+            language_server.text_document_did_close(doc.identifier());
+        }
+        doc.clear_language_servers();
+        language_servers
+    }
+
+    pub fn promote_preview_document(&mut self, id: DocumentId) {
+        let Some(path) = self
+            .documents
+            .get(&id)
+            .filter(|doc| doc.is_preview())
+            .and_then(|doc| doc.path().cloned())
+        else {
+            return;
+        };
+
+        let doc = self
+            .documents
+            .get_mut(&id)
+            .expect("document must exist while promoting preview");
+        doc.promote_from_preview();
+
+        self.launch_language_servers(id);
+        self.dispatch_document_open(id, &path);
+        let language_servers = self
+            .documents
+            .get(&id)
+            .map(|doc| doc.language_servers().count())
+            .unwrap_or(0);
+        log::info!(
+            "[document_open] preview_promote doc={:?} path={} language_servers={} documents={}",
+            id,
+            path.display(),
+            language_servers,
+            self.document_count(),
+        );
+    }
+
+    fn open_with_role(
+        &mut self,
+        path: &Path,
+        action: Action,
+        role: DocumentOpenRole,
+    ) -> Result<DocumentId, DocumentOpenError> {
         let path = helix_stdx::path::canonicalize(path);
         let id = self.document_id_by_path(&path);
 
         let id = if let Some(id) = id {
+            if !role.is_preview() {
+                self.promote_preview_document(id);
+            }
             id
         } else {
             let mut doc = Document::open(
                 &path,
                 None,
-                true,
+                role.language_initialization(),
                 self.config.clone(),
                 self.syn_loader.clone(),
             )?;
 
-            let diagnostics =
-                Editor::doc_diagnostics(&self.language_servers, &self.diagnostics, &doc);
-            doc.replace_diagnostics(diagnostics, &[], None);
-
-            let diff_base = self.diff_providers.get_diff_base(&path);
-            let version_control_head = self.diff_providers.get_current_head_name(&path);
+            if role.is_preview() {
+                doc.mark_preview();
+            }
 
             let id = self.new_document(doc);
-            let redraw = self.document_redraw_handle();
-            let doc = self
-                .documents
-                .get_mut(&id)
-                .expect("newly inserted document must exist");
-            if let Some(diff_base) = diff_base {
-                doc.set_diff_base(diff_base, &redraw);
+            if role.is_preview() {
+                self.initialize_preview_document(id, &path);
+            } else {
+                self.initialize_interactive_document(id, &path);
             }
-            doc.set_version_control_head(version_control_head);
-
-            self.launch_language_servers(id);
-
-            self.dispatch_document_open(id, &path);
 
             id
         };
@@ -227,6 +387,108 @@ impl Editor {
         self.switch(id, action);
 
         Ok(id)
+    }
+
+    pub fn open(&mut self, path: &Path, action: Action) -> Result<DocumentId, DocumentOpenError> {
+        self.open_with_role(path, action, DocumentOpenRole::Interactive)
+    }
+
+    pub fn open_preview(
+        &mut self,
+        path: &Path,
+        action: Action,
+    ) -> Result<DocumentId, DocumentOpenError> {
+        self.open_with_role(path, action, DocumentOpenRole::Preview)
+    }
+
+    pub fn restore_preview_document(
+        &mut self,
+        detached: DetachedPreviewDocument,
+        action: Action,
+    ) -> DocumentId {
+        let restore_start = Instant::now();
+        let restore_language_servers = detached.restore_language_servers();
+        let doc = detached.into_document();
+        debug_assert!(doc.is_preview());
+        let path = doc.path().cloned();
+        let id = self.restore_document(doc);
+        let restore_us = restore_start.elapsed().as_micros();
+        let lsp_start = Instant::now();
+        if restore_language_servers {
+            self.launch_language_servers(id);
+        }
+        let lsp_us = lsp_start.elapsed().as_micros();
+        let switch_start = Instant::now();
+        self.switch(id, action);
+        let switch_us = switch_start.elapsed().as_micros();
+        let language_servers = self
+            .documents
+            .get(&id)
+            .map(|doc| doc.language_servers().count())
+            .unwrap_or(0);
+        log::info!(
+            "[document_open] preview_restore doc={:?} path={} restore_language_servers={} language_servers={} documents={} restore_us={} lsp_us={} switch_us={} total_us={}",
+            id,
+            path.as_deref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| String::from("<scratch>")),
+            restore_language_servers,
+            language_servers,
+            self.document_count(),
+            restore_us,
+            lsp_us,
+            switch_us,
+            restore_start.elapsed().as_micros(),
+        );
+        id
+    }
+
+    pub fn take_preview_document(&mut self, id: DocumentId) -> Option<DetachedPreviewDocument> {
+        let doc = self.documents.get(&id)?;
+        if !doc.is_preview() {
+            return None;
+        }
+        if doc.is_modified() {
+            return None;
+        }
+        if self.tree.traverse().any(|(_, view)| view.doc == id) {
+            return None;
+        }
+
+        let language_servers = self
+            .documents
+            .get_mut(&id)
+            .map(Self::close_preview_language_servers)
+            .unwrap_or(0);
+        let restore_language_servers = language_servers > 0;
+        self.save_locks.remove(&id);
+        let view_ids: Vec<_> = self
+            .tree
+            .views_mut()
+            .map(|(view, _)| {
+                let view_id = view.id;
+                view.remove_document(&id);
+                view_id
+            })
+            .collect();
+        if let Some(doc) = self.documents.get_mut(&id) {
+            for view_id in view_ids {
+                doc.remove_view(view_id);
+            }
+        }
+        let doc = self.documents.remove(&id)?;
+        self._refresh();
+        log::info!(
+            "[document_open] preview_take doc={:?} path={} closed_language_servers={} restore_language_servers={} documents={}",
+            id,
+            doc.path()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| String::from("<scratch>")),
+            language_servers,
+            restore_language_servers,
+            self.document_count(),
+        );
+        Some(DetachedPreviewDocument::new(doc, restore_language_servers))
     }
 
     pub fn open_uri_path(
@@ -290,7 +552,7 @@ impl Editor {
             return Err(CloseError::BufferModified(doc.display_name().into_owned()));
         }
 
-        self.saves.remove(&doc_id);
+        self.save_locks.remove(&doc_id);
 
         enum CloseAction {
             Close(ViewId),
@@ -440,6 +702,54 @@ mod tests {
         let doc_id = editor.open(&file, Action::Replace).expect("open file");
         let doc = editor.document(doc_id).expect("document");
 
+        assert!(doc.diff_handle().is_some());
+    }
+
+    #[test]
+    fn open_promotes_existing_preview_document() {
+        let tokio = tokio::runtime::Runtime::new().expect("runtime");
+        let _guard = tokio.enter();
+        let runtime = helix_runtime::Runtime::new(tokio.handle().clone());
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let file = temp.path().join("preview.txt");
+        std::fs::write(&file, "preview\n").expect("write preview file");
+
+        let mut editor = test_editor(runtime);
+        let preview_id = editor
+            .open_preview(&file, Action::Replace)
+            .expect("open preview");
+        assert!(editor
+            .document(preview_id)
+            .is_some_and(|doc| doc.is_preview()));
+
+        let opened_id = editor.open(&file, Action::Replace).expect("open file");
+        assert_eq!(opened_id, preview_id);
+        assert!(editor
+            .document(opened_id)
+            .is_some_and(|doc| !doc.is_preview()));
+    }
+
+    #[test]
+    fn open_preview_initializes_vcs_diff_without_promoting() {
+        let tokio = tokio::runtime::Runtime::new().expect("runtime");
+        let _guard = tokio.enter();
+        let runtime = helix_runtime::Runtime::new(tokio.handle().clone());
+        let repo = tempfile::tempdir().expect("create temp git repo");
+        exec_git(&["init"], repo.path());
+
+        let file = repo.path().join("tracked.txt");
+        std::fs::write(&file, "base\n").expect("write base file");
+        exec_git(&["add", "tracked.txt"], repo.path());
+        exec_git(&["commit", "-m", "initial"], repo.path());
+        std::fs::write(&file, "changed\n").expect("write changed file");
+
+        let mut editor = test_editor(runtime);
+        let doc_id = editor
+            .open_preview(&file, Action::Replace)
+            .expect("open preview");
+        let doc = editor.document(doc_id).expect("preview document");
+
+        assert!(doc.is_preview());
         assert!(doc.diff_handle().is_some());
     }
 }

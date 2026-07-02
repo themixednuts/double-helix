@@ -38,6 +38,46 @@ use crate::contract::host::{
 use crate::contract::requests;
 use crate::contract::snapshots;
 use crate::error::Result;
+use crate::types::SurfaceRenderOp;
+
+mod documents;
+mod host;
+mod layout;
+mod logging;
+mod lsp;
+mod views;
+mod workspace;
+pub use documents::register as register_documents_module;
+pub use host::register as register_host_module;
+pub use layout::register as register_layout_module;
+pub use logging::register as register_log_module;
+pub use lsp::register as register_lsp_module;
+pub use views::register as register_views_module;
+pub use workspace::register as register_workspace_module;
+
+fn with_editor<T>(f: impl FnOnce(&helix_view::Editor) -> LuaResult<T>) -> LuaResult<T> {
+    crate::lua::with_current_editor(f)?
+}
+
+fn with_editor_mut<T>(f: impl FnOnce(&mut helix_view::Editor) -> LuaResult<T>) -> LuaResult<T> {
+    crate::lua::with_current_editor_mut(f)?
+}
+
+fn with_query_bridge<T>(f: impl FnOnce(EditorQueryBridge<'_>) -> LuaResult<T>) -> LuaResult<T> {
+    with_editor(|editor| f(EditorQueryBridge::new(editor)))
+}
+
+fn with_mutation_bridge<T>(
+    f: impl FnOnce(EditorMutationBridge<'_>) -> LuaResult<T>,
+) -> LuaResult<T> {
+    with_editor_mut(|editor| f(EditorMutationBridge::new(editor)))
+}
+
+fn with_surface<T>(
+    f: impl FnOnce(&mut crate::types::SurfaceRenderOps, &helix_view::Theme) -> LuaResult<T>,
+) -> LuaResult<T> {
+    crate::lua::with_current_render_context(f)?
+}
 
 // ---------------------------------------------------------------------------
 // Handle userdata — opaque handles exposed to Lua as light userdata
@@ -69,36 +109,36 @@ impl LuaUserData for LuaDocumentHandle {
         // -- Query methods --
 
         methods.add_method("snapshot", |lua, this, ()| {
-            let editor = crate::lua::get_editor()?;
-            let bridge = EditorQueryBridge::new(editor);
-            let snap = bridge
-                .document_snapshot(this.0)
-                .map_err(|e| LuaError::RuntimeError(e.to_string()))?;
+            let snap = with_query_bridge(|bridge| {
+                bridge
+                    .document_snapshot(this.0)
+                    .map_err(|e| LuaError::RuntimeError(e.to_string()))
+            })?;
             snapshot_to_table(lua, &snap)
         });
 
         methods.add_method("text", |_lua, this, ()| {
-            let editor = crate::lua::get_editor()?;
-            let bridge = EditorQueryBridge::new(editor);
-            bridge
-                .document_text(this.0)
-                .map_err(|e| LuaError::RuntimeError(e.to_string()))
+            with_query_bridge(|bridge| {
+                bridge
+                    .document_text(this.0)
+                    .map_err(|e| LuaError::RuntimeError(e.to_string()))
+            })
         });
 
         methods.add_method("line", |_lua, this, line: usize| {
-            let editor = crate::lua::get_editor()?;
-            let bridge = EditorQueryBridge::new(editor);
-            bridge
-                .document_line(this.0, line)
-                .map_err(|e| LuaError::RuntimeError(e.to_string()))
+            with_query_bridge(|bridge| {
+                bridge
+                    .document_line(this.0, line)
+                    .map_err(|e| LuaError::RuntimeError(e.to_string()))
+            })
         });
 
         methods.add_method("diagnostics", |lua, this, ()| {
-            let editor = crate::lua::get_editor()?;
-            let bridge = EditorQueryBridge::new(editor);
-            let snap = bridge
-                .diagnostics(this.0)
-                .map_err(|e| LuaError::RuntimeError(e.to_string()))?;
+            let snap = with_query_bridge(|bridge| {
+                bridge
+                    .diagnostics(this.0)
+                    .map_err(|e| LuaError::RuntimeError(e.to_string()))
+            })?;
             diagnostics_to_table(lua, &snap)
         });
 
@@ -111,15 +151,14 @@ impl LuaUserData for LuaDocumentHandle {
                 .iter()
                 .map(parse_text_edit)
                 .collect::<LuaResult<Vec<_>>>()?;
-            let editor = crate::lua::get_editor_mut()?;
-            let mut bridge = EditorMutationBridge::new(editor);
-            bridge
-                .apply_edit(requests::ApplyEditRequest {
-                    document: this.0,
-                    edits,
-                })
-                .map_err(|e| LuaError::RuntimeError(e.to_string()))?;
-            Ok(())
+            with_mutation_bridge(|mut bridge| {
+                bridge
+                    .apply_edit(requests::ApplyEditRequest {
+                        document: this.0,
+                        edits,
+                    })
+                    .map_err(|e| LuaError::RuntimeError(e.to_string()))
+            })
         });
 
         // doc:save(opts?) — save the document
@@ -127,15 +166,14 @@ impl LuaUserData for LuaDocumentHandle {
             let force = opts
                 .and_then(|t| t.get::<Option<bool>>("force").ok().flatten())
                 .unwrap_or(false);
-            let editor = crate::lua::get_editor_mut()?;
-            let mut bridge = EditorMutationBridge::new(editor);
-            bridge
-                .save_document(requests::SaveDocumentRequest {
-                    document: this.0,
-                    force,
-                })
-                .map_err(|e| LuaError::RuntimeError(e.to_string()))?;
-            Ok(())
+            with_mutation_bridge(|mut bridge| {
+                bridge
+                    .save_document(requests::SaveDocumentRequest {
+                        document: this.0,
+                        force,
+                    })
+                    .map_err(|e| LuaError::RuntimeError(e.to_string()))
+            })
         });
 
         // doc:set_selections(selections, view?) — set selections on the document
@@ -146,69 +184,70 @@ impl LuaUserData for LuaDocumentHandle {
                     .iter()
                     .map(parse_selection_range)
                     .collect::<LuaResult<Vec<_>>>()?;
-                let editor = crate::lua::get_editor_mut()?;
-                let mut bridge = EditorMutationBridge::new(editor);
-                bridge
-                    .set_selection(requests::SetSelectionRequest {
-                        document: this.0,
-                        view: view.map(|v| v.0),
-                        selections,
-                    })
-                    .map_err(|e| LuaError::RuntimeError(e.to_string()))?;
-                Ok(())
+                with_mutation_bridge(|mut bridge| {
+                    bridge
+                        .set_selection(requests::SetSelectionRequest {
+                            document: this.0,
+                            view: view.map(|v| v.0),
+                            selections,
+                        })
+                        .map_err(|e| LuaError::RuntimeError(e.to_string()))
+                })
             },
         );
 
         // doc:undo() — undo the last change, returns true if successful
         methods.add_method("undo", |_lua, this, ()| {
-            let editor = crate::lua::get_editor_mut()?;
-            let mut bridge = EditorMutationBridge::new(editor);
-            bridge
-                .undo(requests::UndoRequest { document: this.0 })
-                .map_err(|e| LuaError::RuntimeError(e.to_string()))
+            with_mutation_bridge(|mut bridge| {
+                bridge
+                    .undo(requests::UndoRequest { document: this.0 })
+                    .map_err(|e| LuaError::RuntimeError(e.to_string()))
+            })
         });
 
         // doc:redo() — redo the last undone change, returns true if successful
         methods.add_method("redo", |_lua, this, ()| {
-            let editor = crate::lua::get_editor_mut()?;
-            let mut bridge = EditorMutationBridge::new(editor);
-            bridge
-                .redo(requests::RedoRequest { document: this.0 })
-                .map_err(|e| LuaError::RuntimeError(e.to_string()))
+            with_mutation_bridge(|mut bridge| {
+                bridge
+                    .redo(requests::RedoRequest { document: this.0 })
+                    .map_err(|e| LuaError::RuntimeError(e.to_string()))
+            })
         });
 
         // doc:select_all() — select all text in the document
         methods.add_method("select_all", |_lua, this, ()| {
-            let editor = crate::lua::get_editor_mut()?;
-            let doc_id = crate::contract::adapt::resolve_document(editor, this.0)
-                .map_err(|e| LuaError::RuntimeError(e.to_string()))?;
-            let view_id = editor
-                .tree
-                .try_get(editor.tree.focus)
-                .filter(|view| view.doc == doc_id)
-                .map(|view| view.id)
-                .or_else(|| {
-                    editor
-                        .tree
-                        .views()
-                        .find_map(|(view, _)| (view.doc == doc_id).then_some(view.id))
-                })
-                .or_else(|| editor.tree.views().next().map(|(view, _)| view.id))
-                .ok_or_else(|| LuaError::RuntimeError("view not found".into()))?;
-            let doc = editor
-                .documents
-                .get(&doc_id)
-                .ok_or_else(|| LuaError::RuntimeError("document not found".into()))?;
-            let text = doc.text();
-            let len = text.len_chars();
-            if len == 0 {
-                return Ok(());
-            }
-            let selection = helix_core::Selection::single(0, len);
-            let doc = editor.documents.get_mut(&doc_id).unwrap();
-            doc.ensure_view_init(view_id);
-            doc.set_selection(view_id, selection);
-            Ok(())
+            with_editor_mut(|editor| {
+                let doc_id = crate::contract::adapt::resolve_document(editor, this.0)
+                    .map_err(|e| LuaError::RuntimeError(e.to_string()))?;
+                let view_id = editor
+                    .tree
+                    .try_get(editor.tree.focus)
+                    .filter(|view| view.doc == doc_id)
+                    .map(|view| view.id)
+                    .or_else(|| {
+                        editor
+                            .tree
+                            .views()
+                            .find_map(|(view, _)| (view.doc == doc_id).then_some(view.id))
+                    })
+                    .or_else(|| editor.tree.views().next().map(|(view, _)| view.id))
+                    .ok_or_else(|| LuaError::RuntimeError("view not found".into()))?;
+                let doc = editor
+                    .documents
+                    .get(&doc_id)
+                    .ok_or_else(|| LuaError::RuntimeError("document not found".into()))?;
+                let text = doc.text();
+                let len = text.len_chars();
+                if len == 0 {
+                    Ok(())
+                } else {
+                    let selection = helix_core::Selection::single(0, len);
+                    let doc = editor.documents.get_mut(&doc_id).unwrap();
+                    doc.ensure_view_init(view_id);
+                    doc.set_selection(view_id, selection);
+                    Ok(())
+                }
+            })
         });
 
         // doc:set_annotations(annotations) — replace virtual text annotations
@@ -225,43 +264,44 @@ impl LuaUserData for LuaDocumentHandle {
                     .map(parse_annotation)
                     .collect::<LuaResult<_>>()?;
 
-                let editor = crate::lua::get_editor_mut()?;
-                let doc_id = crate::contract::adapt::resolve_document(editor, this.0)
-                    .map_err(|e| LuaError::RuntimeError(e.to_string()))?;
+                with_editor_mut(|editor| {
+                    let doc_id = crate::contract::adapt::resolve_document(editor, this.0)
+                        .map_err(|e| LuaError::RuntimeError(e.to_string()))?;
 
-                // Resolve positions against the document text.
-                let doc = editor
-                    .documents
-                    .get(&doc_id)
-                    .ok_or_else(|| LuaError::RuntimeError("document not found".into()))?;
-                let text = doc.text();
-                let converted: Vec<helix_view::document::PluginAnnotation> = parsed
-                    .into_iter()
-                    .map(|p| helix_view::document::PluginAnnotation {
-                        char_idx: crate::contract::adapt::position_to_char(text, p.position),
-                        ..p.annot
-                    })
-                    .collect();
+                    // Resolve positions against the document text.
+                    let doc = editor
+                        .documents
+                        .get(&doc_id)
+                        .ok_or_else(|| LuaError::RuntimeError("document not found".into()))?;
+                    let text = doc.text();
+                    let converted: Vec<helix_view::document::PluginAnnotation> = parsed
+                        .into_iter()
+                        .map(|p| helix_view::document::PluginAnnotation {
+                            char_idx: crate::contract::adapt::position_to_char(text, p.position),
+                            ..p.annot
+                        })
+                        .collect();
 
-                // Find all views showing this document.
-                let view_ids: Vec<helix_view::ViewId> = editor
-                    .tree
-                    .views()
-                    .filter_map(|(view, _)| (view.doc == doc_id).then_some(view.id))
-                    .collect();
+                    // Find all views showing this document.
+                    let view_ids: Vec<helix_view::ViewId> = editor
+                        .tree
+                        .views()
+                        .filter_map(|(view, _)| (view.doc == doc_id).then_some(view.id))
+                        .collect();
 
-                if view_ids.is_empty() {
-                    return Ok(());
-                }
+                    if view_ids.is_empty() {
+                        return Ok(());
+                    }
 
-                let doc = editor.documents.get_mut(&doc_id).unwrap();
-                let mut iter = view_ids.into_iter();
-                let first = iter.next().expect("non-empty view_ids");
-                for view_id in iter {
-                    doc.set_plugin_annotations(view_id, plugin_name.clone(), converted.clone());
-                }
-                doc.set_plugin_annotations(first, plugin_name, converted);
-                Ok(())
+                    let doc = editor.documents.get_mut(&doc_id).unwrap();
+                    let mut iter = view_ids.into_iter();
+                    let first = iter.next().expect("non-empty view_ids");
+                    for view_id in iter {
+                        doc.set_plugin_annotations(view_id, plugin_name.clone(), converted.clone());
+                    }
+                    doc.set_plugin_annotations(first, plugin_name, converted);
+                    Ok(())
+                })
             },
         );
 
@@ -269,15 +309,16 @@ impl LuaUserData for LuaDocumentHandle {
         // calling plugin on this document.
         methods.add_method("clear_annotations", |lua, this, ()| {
             let plugin_name = current_plugin_name(lua)?;
-            let editor = crate::lua::get_editor_mut()?;
-            let doc_id = crate::contract::adapt::resolve_document(editor, this.0)
-                .map_err(|e| LuaError::RuntimeError(e.to_string()))?;
-            let doc = editor
-                .documents
-                .get_mut(&doc_id)
-                .ok_or_else(|| LuaError::RuntimeError("document not found".into()))?;
-            doc.clear_plugin_annotations(&plugin_name);
-            Ok(())
+            with_editor_mut(|editor| {
+                let doc_id = crate::contract::adapt::resolve_document(editor, this.0)
+                    .map_err(|e| LuaError::RuntimeError(e.to_string()))?;
+                let doc = editor
+                    .documents
+                    .get_mut(&doc_id)
+                    .ok_or_else(|| LuaError::RuntimeError("document not found".into()))?;
+                doc.clear_plugin_annotations(&plugin_name);
+                Ok(())
+            })
         });
     }
 
@@ -308,21 +349,21 @@ impl LuaUserData for LuaViewHandle {
         methods.add_method("id", |_lua, this, ()| Ok(this.0.raw().get()));
 
         methods.add_method("snapshot", |lua, this, ()| {
-            let editor = crate::lua::get_editor()?;
-            let bridge = EditorQueryBridge::new(editor);
-            let snap = bridge
-                .view_snapshot(this.0)
-                .map_err(|e| LuaError::RuntimeError(e.to_string()))?;
+            let snap = with_query_bridge(|bridge| {
+                bridge
+                    .view_snapshot(this.0)
+                    .map_err(|e| LuaError::RuntimeError(e.to_string()))
+            })?;
             view_snapshot_to_table(lua, &snap)
         });
 
         // view:cursor() — get cursor position as {line=, column=}
         methods.add_method("cursor", |lua, this, ()| {
-            let editor = crate::lua::get_editor()?;
-            let bridge = EditorQueryBridge::new(editor);
-            let snap = bridge
-                .view_snapshot(this.0)
-                .map_err(|e| LuaError::RuntimeError(e.to_string()))?;
+            let snap = with_query_bridge(|bridge| {
+                bridge
+                    .view_snapshot(this.0)
+                    .map_err(|e| LuaError::RuntimeError(e.to_string()))
+            })?;
             let t = lua.create_table()?;
             t.set("line", snap.cursor.line)?;
             t.set("column", snap.cursor.column)?;
@@ -331,22 +372,20 @@ impl LuaUserData for LuaViewHandle {
 
         // view:focus() — focus this view
         methods.add_method("focus", |_lua, this, ()| {
-            let editor = crate::lua::get_editor_mut()?;
-            let mut bridge = EditorMutationBridge::new(editor);
-            bridge
-                .focus_view(requests::FocusViewRequest { view: this.0 })
-                .map_err(|e| LuaError::RuntimeError(e.to_string()))?;
-            Ok(())
+            with_mutation_bridge(|mut bridge| {
+                bridge
+                    .focus_view(requests::FocusViewRequest { view: this.0 })
+                    .map_err(|e| LuaError::RuntimeError(e.to_string()))
+            })
         });
 
         // view:close() — close this view
         methods.add_method("close", |_lua, this, ()| {
-            let editor = crate::lua::get_editor_mut()?;
-            let mut bridge = EditorMutationBridge::new(editor);
-            bridge
-                .close_view(requests::CloseViewRequest { view: this.0 })
-                .map_err(|e| LuaError::RuntimeError(e.to_string()))?;
-            Ok(())
+            with_mutation_bridge(|mut bridge| {
+                bridge
+                    .close_view(requests::CloseViewRequest { view: this.0 })
+                    .map_err(|e| LuaError::RuntimeError(e.to_string()))
+            })
         });
     }
 
@@ -523,283 +562,6 @@ impl LuaUserData for LuaThreadHandle {
 }
 
 // ---------------------------------------------------------------------------
-// helix.workspace — workspace queries + mode + config
-// ---------------------------------------------------------------------------
-
-pub fn register_workspace_module(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
-    let m = lua.create_table()?;
-
-    // helix.workspace.focused_document() -> DocumentHandle?
-    m.set(
-        "focused_document",
-        lua.create_function(|_lua, ()| {
-            let editor = crate::lua::get_editor()?;
-            let bridge = EditorQueryBridge::new(editor);
-            Ok(bridge.focused_document().map(LuaDocumentHandle))
-        })?,
-    )?;
-
-    // helix.workspace.focused_view() -> ViewHandle?
-    m.set(
-        "focused_view",
-        lua.create_function(|_lua, ()| {
-            let editor = crate::lua::get_editor()?;
-            let bridge = EditorQueryBridge::new(editor);
-            Ok(bridge.focused_view().map(LuaViewHandle))
-        })?,
-    )?;
-
-    // helix.workspace.mode() -> string
-    m.set(
-        "mode",
-        lua.create_function(|_lua, ()| {
-            let editor = crate::lua::get_editor()?;
-            let bridge = EditorQueryBridge::new(editor);
-            let snap = bridge.workspace_snapshot();
-            Ok(mode_to_string(snap.mode))
-        })?,
-    )?;
-
-    // helix.workspace.set_mode(mode_str) — "normal", "insert", "select"
-    m.set(
-        "set_mode",
-        lua.create_function(|_lua, mode_str: String| {
-            let mode = parse_edit_mode(&mode_str)?;
-            let editor = crate::lua::get_editor_mut()?;
-            let mut bridge = EditorMutationBridge::new(editor);
-            bridge
-                .set_mode(requests::SetModeRequest { mode })
-                .map_err(|e| LuaError::RuntimeError(e.to_string()))?;
-            Ok(())
-        })?,
-    )?;
-
-    // helix.workspace.snapshot() -> table
-    m.set(
-        "snapshot",
-        lua.create_function(|lua, ()| {
-            let editor = crate::lua::get_editor()?;
-            let bridge = EditorQueryBridge::new(editor);
-            let snap = bridge.workspace_snapshot();
-            let table = lua.create_table()?;
-            table.set(
-                "focused_document",
-                snap.focused_document.map(LuaDocumentHandle),
-            )?;
-            table.set("focused_view", snap.focused_view.map(LuaViewHandle))?;
-            table.set("mode", mode_to_string(snap.mode))?;
-            let docs = lua.create_table()?;
-            for (i, h) in snap.documents.iter().enumerate() {
-                docs.set(i + 1, LuaDocumentHandle(*h))?;
-            }
-            table.set("documents", docs)?;
-            let views = lua.create_table()?;
-            for (i, h) in snap.views.iter().enumerate() {
-                views.set(i + 1, LuaViewHandle(*h))?;
-            }
-            table.set("views", views)?;
-            Ok(table)
-        })?,
-    )?;
-
-    // helix.workspace.theme() -> table
-    m.set(
-        "theme",
-        lua.create_function(|lua, ()| {
-            let editor = crate::lua::get_editor()?;
-            let bridge = EditorQueryBridge::new(editor);
-            let snap = bridge.theme_snapshot();
-            let table = lua.create_table()?;
-            table.set("name", snap.name)?;
-            if let Some(c) = snap.bg {
-                table.set("bg", format!("#{:02x}{:02x}{:02x}", c.r, c.g, c.b))?;
-            }
-            if let Some(c) = snap.fg {
-                table.set("fg", format!("#{:02x}{:02x}{:02x}", c.r, c.g, c.b))?;
-            }
-            Ok(table)
-        })?,
-    )?;
-
-    // helix.workspace.documents() -> [DocumentHandle]
-    m.set(
-        "documents",
-        lua.create_function(|_lua, ()| {
-            let editor = crate::lua::get_editor()?;
-            let bridge = EditorQueryBridge::new(editor);
-            Ok(bridge
-                .list_documents()
-                .into_iter()
-                .map(LuaDocumentHandle)
-                .collect::<Vec<_>>())
-        })?,
-    )?;
-
-    // helix.workspace.views() -> [ViewHandle]
-    m.set(
-        "views",
-        lua.create_function(|_lua, ()| {
-            let editor = crate::lua::get_editor()?;
-            let bridge = EditorQueryBridge::new(editor);
-            Ok(bridge
-                .list_views()
-                .into_iter()
-                .map(LuaViewHandle)
-                .collect::<Vec<_>>())
-        })?,
-    )?;
-
-    // helix.workspace.config() -> table (editor config)
-    m.set(
-        "editor_config",
-        lua.create_function(|lua, ()| {
-            let editor = crate::lua::get_editor()?;
-            let config = editor.config();
-            let table = lua.create_table()?;
-            table.set("scrolloff", config.scrolloff)?;
-            table.set("mouse", config.mouse)?;
-            table.set("cursorline", config.cursorline)?;
-            table.set("cursorcolumn", config.cursorcolumn)?;
-            table.set("auto_format", config.auto_format)?;
-            table.set("auto_completion", config.auto_completion)?;
-            table.set("auto_info", config.auto_info)?;
-            table.set(
-                "line_number",
-                match config.line_number {
-                    helix_view::editor::LineNumber::Absolute => "absolute",
-                    helix_view::editor::LineNumber::Relative => "relative",
-                },
-            )?;
-            Ok(table)
-        })?,
-    )?;
-
-    helix_table.set("workspace", m)?;
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// helix.documents — document listing + open
-// ---------------------------------------------------------------------------
-
-pub fn register_documents_module(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
-    let m = lua.create_table()?;
-
-    // helix.documents.list() -> [DocumentHandle]
-    m.set(
-        "list",
-        lua.create_function(|_lua, ()| {
-            let editor = crate::lua::get_editor()?;
-            let bridge = EditorQueryBridge::new(editor);
-            Ok(bridge
-                .list_documents()
-                .into_iter()
-                .map(LuaDocumentHandle)
-                .collect::<Vec<_>>())
-        })?,
-    )?;
-
-    // helix.documents.open(path, opts?) -> DocumentHandle
-    m.set(
-        "open",
-        lua.create_function(|_lua, (path, opts): (String, Option<LuaTable>)| {
-            let focus = opts
-                .and_then(|t| t.get::<Option<bool>>("focus").ok().flatten())
-                .unwrap_or(false);
-            let editor = crate::lua::get_editor_mut()?;
-            let mut bridge = EditorMutationBridge::new(editor);
-            let handle = bridge
-                .open_document(requests::OpenDocumentRequest { path, focus })
-                .map_err(|e| LuaError::RuntimeError(e.to_string()))?;
-            Ok(LuaDocumentHandle(handle))
-        })?,
-    )?;
-
-    helix_table.set("documents", m)?;
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// helix.views — view listing
-// ---------------------------------------------------------------------------
-
-pub fn register_views_module(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
-    let m = lua.create_table()?;
-
-    // helix.views.list() -> [ViewHandle]
-    m.set(
-        "list",
-        lua.create_function(|_lua, ()| {
-            let editor = crate::lua::get_editor()?;
-            let bridge = EditorQueryBridge::new(editor);
-            Ok(bridge
-                .list_views()
-                .into_iter()
-                .map(LuaViewHandle)
-                .collect::<Vec<_>>())
-        })?,
-    )?;
-
-    helix_table.set("views", m)?;
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// helix.host — API metadata / capability discovery
-// ---------------------------------------------------------------------------
-
-pub fn register_host_module(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
-    let m = lua.create_table()?;
-
-    // helix.host.api_metadata() -> table
-    m.set(
-        "api_metadata",
-        lua.create_function(|lua, ()| {
-            let editor = crate::lua::get_editor()?;
-            let bridge = EditorQueryBridge::new(editor);
-            let meta = bridge.api_metadata();
-
-            let table = lua.create_table()?;
-            table.set("version", meta.version)?;
-            table.set("min_compatible_version", meta.min_compatible_version)?;
-
-            let caps = lua.create_table()?;
-            for (i, cap) in meta.capabilities.iter().enumerate() {
-                caps.set(i + 1, format!("{cap:?}").to_lowercase())?;
-            }
-            table.set("capabilities", caps)?;
-
-            let caps_clone: Vec<String> = meta
-                .capabilities
-                .iter()
-                .map(|c| format!("{c:?}").to_lowercase())
-                .collect();
-            table.set(
-                "has_capability",
-                lua.create_function(move |_lua, (_self_table, name): (LuaTable, String)| {
-                    Ok(caps_clone.contains(&name.to_lowercase()))
-                })?,
-            )?;
-
-            let catalog = lua.create_table()?;
-            for (i, info) in meta.event_catalog.iter().enumerate() {
-                let entry = lua.create_table()?;
-                entry.set("kind", info.kind.as_str())?;
-                entry.set("description", info.description.as_str())?;
-                entry.set("since_version", info.since_version)?;
-                catalog.set(i + 1, entry)?;
-            }
-            table.set("event_catalog", catalog)?;
-
-            Ok(table)
-        })?,
-    )?;
-
-    helix_table.set("host", m)?;
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
 // helix.events - event subscription
 // ---------------------------------------------------------------------------
 
@@ -939,20 +701,13 @@ fn clear_panel_callbacks(lua: &Lua, panel: PanelHandle) -> LuaResult<()> {
     Ok(())
 }
 
-fn resolve_lua_float(float: FloatHandle) -> LuaResult<helix_view::model::FloatId> {
-    let editor = crate::lua::get_editor()?;
-    crate::contract::adapt::resolve_float(&editor.model, float)
-        .map_err(|e| LuaError::RuntimeError(e.to_string()))
-}
-
 fn float_render_callback(
     float: FloatHandle,
 ) -> LuaResult<Option<(String, crate::types::UiCallbackId)>> {
-    Ok({
-        let editor = crate::lua::get_editor()?;
+    with_editor(|editor| {
         let float_id = crate::contract::adapt::resolve_float(&editor.model, float)
             .map_err(|e| LuaError::RuntimeError(e.to_string()))?;
-        editor.model.float(float_id).and_then(|entry| {
+        Ok(editor.model.float(float_id).and_then(|entry| {
             entry
                 .content
                 .downcast_ref::<helix_view::model::PluginFloatModel>()
@@ -960,7 +715,7 @@ fn float_render_callback(
                     crate::types::UiCallbackId::new(model.render_callback_id)
                         .map(|id| (model.plugin_name.clone(), id))
                 })
-        })
+        }))
     })
 }
 
@@ -972,33 +727,34 @@ fn remove_float_render_callback(lua: &Lua, float: FloatHandle) -> LuaResult<()> 
 }
 
 fn set_lua_float_owner(float: FloatHandle, plugin_name: &str) -> LuaResult<()> {
-    let float_id = resolve_lua_float(float)?;
-    let editor = crate::lua::get_editor_mut()?;
-    let entry = editor
-        .model
-        .float_mut(float_id)
-        .ok_or_else(|| stale_handle_error(float))?;
-    entry.owner = Some(plugin_name.to_string());
-    if let Some(model) = entry
-        .content
-        .downcast_mut::<helix_view::model::PluginFloatModel>()
-    {
-        model.plugin_name = plugin_name.to_string();
-    }
-    Ok(())
+    with_editor_mut(|editor| {
+        let float_id = crate::contract::adapt::resolve_float(&editor.model, float)
+            .map_err(|e| LuaError::RuntimeError(e.to_string()))?;
+        let entry = editor
+            .model
+            .float_mut(float_id)
+            .ok_or_else(|| stale_handle_error(float))?;
+        entry.owner = Some(plugin_name.to_string());
+        if let Some(model) = entry
+            .content
+            .downcast_mut::<helix_view::model::PluginFloatModel>()
+        {
+            model.plugin_name = plugin_name.to_string();
+        }
+        Ok(())
+    })
 }
 
 fn ensure_float_owner(lua: &Lua, float: FloatHandle) -> LuaResult<()> {
     let plugin_name = current_plugin_name(lua)?;
-    let owner = {
-        let editor = crate::lua::get_editor()?;
+    let owner = with_editor(|editor| {
         let float_id = crate::contract::adapt::resolve_float(&editor.model, float)
             .map_err(|e| LuaError::RuntimeError(e.to_string()))?;
-        editor
+        Ok(editor
             .model
             .float(float_id)
-            .map(|entry| entry.owner.clone())
-    };
+            .map(|entry| entry.owner.clone()))
+    })?;
 
     match owner {
         Some(Some(owner)) if owner == plugin_name => Ok(()),
@@ -1490,14 +1246,15 @@ fn register_registers_module(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
             let name = name_str.chars().next().ok_or_else(|| {
                 LuaError::RuntimeError("Register name must be a single character".into())
             })?;
-            let editor = crate::lua::get_editor()?;
             let table = lua.create_table()?;
-            if let Some(values) = editor.read_register(name) {
-                for (i, val) in values.enumerate() {
-                    table.set(i + 1, val.to_string())?;
+            with_editor(|editor| {
+                if let Some(values) = editor.read_register(name) {
+                    for (i, val) in values.enumerate() {
+                        table.set(i + 1, val.to_string())?;
+                    }
                 }
-            }
-            Ok(table)
+                Ok(table)
+            })
         })?,
     )?;
 
@@ -1508,9 +1265,10 @@ fn register_registers_module(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
             let name = name_str.chars().next().ok_or_else(|| {
                 LuaError::RuntimeError("Register name must be a single character".into())
             })?;
-            let editor = crate::lua::get_editor_mut()?;
-            editor.write_register(name, values).map_err(|e| {
-                LuaError::RuntimeError(format!("Failed to write to register {name}: {e}"))
+            with_editor_mut(|editor| {
+                editor.write_register(name, values).map_err(|e| {
+                    LuaError::RuntimeError(format!("Failed to write to register {name}: {e}"))
+                })
             })
         })?,
     )?;
@@ -1871,17 +1629,13 @@ pub fn register_ui_module(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
 
     m.set(
         "get_theme",
-        lua.create_function(|_lua, ()| {
-            let editor = crate::lua::get_editor()?;
-            Ok(editor.theme.name().to_string())
-        })?,
+        lua.create_function(|_lua, ()| with_editor(|editor| Ok(editor.theme.name().to_string())))?,
     )?;
 
     m.set(
         "set_theme",
         lua.create_function(|_lua, name: String| {
-            let editor = crate::lua::get_editor_mut()?;
-            match editor.theme_loader.load(&name) {
+            with_editor_mut(|editor| match editor.theme_loader.load(&name) {
                 Ok(theme) => {
                     editor.set_theme(theme);
                     Ok(())
@@ -1889,7 +1643,7 @@ pub fn register_ui_module(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
                 Err(e) => Err(LuaError::RuntimeError(format!(
                     "Failed to load theme {name}: {e}"
                 ))),
-            }
+            })
         })?,
     )?;
 
@@ -1898,12 +1652,13 @@ pub fn register_ui_module(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
     m.set(
         "terminal_size",
         lua.create_function(|lua, ()| {
-            let editor = crate::lua::get_editor()?;
-            let area = editor.tree.area();
             let size = lua.create_table()?;
-            size.set("width", area.width)?;
-            size.set("height", area.height)?;
-            Ok(size)
+            with_editor(|editor| {
+                let area = editor.tree.area();
+                size.set("width", area.width)?;
+                size.set("height", area.height)?;
+                Ok(size)
+            })
         })?,
     )?;
 
@@ -1912,43 +1667,14 @@ pub fn register_ui_module(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
     m.set(
         "redraw",
         lua.create_function(|_lua, ()| {
-            let editor = crate::lua::get_editor_mut()?;
-            editor.request_redraw();
-            Ok(())
+            with_editor_mut(|editor| {
+                editor.request_redraw();
+                Ok(())
+            })
         })?,
     )?;
 
     helix_table.set("ui", m)?;
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// helix.lsp — LSP operations
-// ---------------------------------------------------------------------------
-
-pub fn register_lsp_module(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
-    let m = lua.create_table()?;
-
-    m.set(
-        "get_clients",
-        lua.create_function(|lua, ()| {
-            let editor = crate::lua::get_editor()?;
-            let clients = lua.create_table()?;
-            for (i, (name, id)) in editor
-                .language_server_client_names()
-                .zip(editor.language_server_client_ids())
-                .enumerate()
-            {
-                let c = lua.create_table()?;
-                c.set("name", name)?;
-                c.set("id", id)?;
-                clients.set(i + 1, c)?;
-            }
-            Ok(clients)
-        })?,
-    )?;
-
-    helix_table.set("lsp", m)?;
     Ok(())
 }
 
@@ -1983,94 +1709,6 @@ fn parse_panel_size_spec(s: &str) -> LuaResult<requests::PanelSizeSpec> {
     )))
 }
 
-fn parse_size(s: &str) -> LuaResult<helix_view::layout::Size> {
-    use helix_view::layout::Size;
-    if s == "fill" {
-        return Ok(Size::Fill);
-    }
-    if let Some(n) = s.strip_prefix("fixed:") {
-        let v: u16 = n
-            .parse()
-            .map_err(|_| LuaError::RuntimeError(format!("invalid fixed size: {s}")))?;
-        return Ok(Size::fixed(v));
-    }
-    if let Some(n) = s.strip_prefix("percent:") {
-        let v: u8 = n
-            .parse()
-            .map_err(|_| LuaError::RuntimeError(format!("invalid percent size: {s}")))?;
-        return Ok(Size::Percent(v));
-    }
-    if let Some(rest) = s.strip_prefix("constrained:") {
-        let parts: Vec<&str> = rest.split(':').collect();
-        if parts.len() != 2 {
-            return Err(LuaError::RuntimeError(format!(
-                "constrained size needs min:max, got: {s}"
-            )));
-        }
-        let min: u16 = parts[0]
-            .parse()
-            .map_err(|_| LuaError::RuntimeError(format!("invalid constrained min: {s}")))?;
-        let max: u16 = parts[1]
-            .parse()
-            .map_err(|_| LuaError::RuntimeError(format!("invalid constrained max: {s}")))?;
-        return Ok(Size::constrained(min, max));
-    }
-    if let Ok(v) = s.parse::<u16>() {
-        return Ok(Size::fixed(v));
-    }
-    Err(LuaError::RuntimeError(format!(
-        "unknown size format: {s}. Expected: \"fill\", \"fixed:N\", \"percent:N\", \"constrained:MIN:MAX\", or a number"
-    )))
-}
-
-fn parse_sizes(list: &[String]) -> LuaResult<Vec<helix_view::layout::Size>> {
-    list.iter().map(|s| parse_size(s)).collect()
-}
-
-pub fn register_layout_module(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
-    let m = lua.create_table()?;
-
-    m.set(
-        "split_vertical",
-        lua.create_function(|lua, (area_table, sizes_list): (LuaTable, Vec<String>)| {
-            let area = table_to_rect(&area_table)?;
-            let sizes = parse_sizes(&sizes_list)?;
-            let rects = helix_view::layout::split_vertical(area, &sizes);
-            let result = lua.create_table()?;
-            for (i, r) in rects.iter().enumerate() {
-                result.set(i + 1, rect_to_table(lua, *r)?)?;
-            }
-            Ok(result)
-        })?,
-    )?;
-
-    m.set(
-        "split_horizontal",
-        lua.create_function(|lua, (area_table, sizes_list): (LuaTable, Vec<String>)| {
-            let area = table_to_rect(&area_table)?;
-            let sizes = parse_sizes(&sizes_list)?;
-            let rects = helix_view::layout::split_horizontal(area, &sizes);
-            let result = lua.create_table()?;
-            for (i, r) in rects.iter().enumerate() {
-                result.set(i + 1, rect_to_table(lua, *r)?)?;
-            }
-            Ok(result)
-        })?,
-    )?;
-
-    m.set(
-        "center",
-        lua.create_function(|lua, (area_table, width, height): (LuaTable, u16, u16)| {
-            let area = table_to_rect(&area_table)?;
-            let r = helix_view::layout::center(area, width, height);
-            rect_to_table(lua, r)
-        })?,
-    )?;
-
-    helix_table.set("layout", m)?;
-    Ok(())
-}
-
 // ---------------------------------------------------------------------------
 // helix.surface — render surface userdata
 // ---------------------------------------------------------------------------
@@ -2083,39 +1721,49 @@ impl LuaUserData for LuaSurface {
         methods.add_method(
             "set_string",
             |_lua, _this, (x, y, text, scope): (u16, u16, String, String)| {
-                let mut context = crate::lua::render_context()?;
-                let style = context.theme().get(&scope);
-                context.surface().set_string(x, y, &text, style);
-                Ok(())
+                with_surface(|ops, theme| {
+                    let style = theme.get(&scope);
+                    ops.push(SurfaceRenderOp::SetString { x, y, text, style });
+                    Ok(())
+                })
             },
         );
 
         methods.add_method(
             "set_stringn",
             |_lua, _this, (x, y, text, max_width, scope): (u16, u16, String, usize, String)| {
-                let mut context = crate::lua::render_context()?;
-                let style = context.theme().get(&scope);
-                context.surface().set_stringn(x, y, &text, max_width, style);
-                Ok(())
+                with_surface(|ops, theme| {
+                    let style = theme.get(&scope);
+                    ops.push(SurfaceRenderOp::SetStringN {
+                        x,
+                        y,
+                        text,
+                        max_width,
+                        style,
+                    });
+                    Ok(())
+                })
             },
         );
 
         methods.add_method("clear", |_lua, _this, (area, scope): (LuaTable, String)| {
             let area = table_to_rect(&area)?;
-            let mut context = crate::lua::render_context()?;
-            let style = context.theme().get(&scope);
-            context.surface().clear_with(area, style);
-            Ok(())
+            with_surface(|ops, theme| {
+                let style = theme.get(&scope);
+                ops.push(SurfaceRenderOp::Clear { area, style });
+                Ok(())
+            })
         });
 
         methods.add_method(
             "set_style",
             |_lua, _this, (area, scope): (LuaTable, String)| {
                 let area = table_to_rect(&area)?;
-                let mut context = crate::lua::render_context()?;
-                let style = context.theme().get(&scope);
-                context.surface().set_style(area, style);
-                Ok(())
+                with_surface(|ops, theme| {
+                    let style = theme.get(&scope);
+                    ops.push(SurfaceRenderOp::SetStyle { area, style });
+                    Ok(())
+                })
             },
         );
 
@@ -2123,10 +1771,11 @@ impl LuaUserData for LuaSurface {
             "header",
             |_lua, _this, (area, title, scope): (LuaTable, String, String)| {
                 let area = table_to_rect(&area)?;
-                let mut context = crate::lua::render_context()?;
-                let style = context.theme().get(&scope);
-                context.surface().header(area, &title, style);
-                Ok(())
+                with_surface(|ops, theme| {
+                    let style = theme.get(&scope);
+                    ops.push(SurfaceRenderOp::Header { area, title, style });
+                    Ok(())
+                })
             },
         );
 
@@ -2136,12 +1785,17 @@ impl LuaUserData for LuaSurface {
              _this,
              (area, title, current, total, scope): (LuaTable, String, usize, usize, String)| {
                 let area = table_to_rect(&area)?;
-                let mut context = crate::lua::render_context()?;
-                let style = context.theme().get(&scope);
-                context
-                    .surface()
-                    .header_with_counts(area, &title, current, total, style);
-                Ok(())
+                with_surface(|ops, theme| {
+                    let style = theme.get(&scope);
+                    ops.push(SurfaceRenderOp::HeaderWithCounts {
+                        area,
+                        title,
+                        current,
+                        total,
+                        style,
+                    });
+                    Ok(())
+                })
             },
         );
 
@@ -2149,10 +1803,11 @@ impl LuaUserData for LuaSurface {
             "hdivider",
             |_lua, _this, (area, scope): (LuaTable, String)| {
                 let area = table_to_rect(&area)?;
-                let mut context = crate::lua::render_context()?;
-                let style = context.theme().get(&scope);
-                context.surface().hdivider(area, style);
-                Ok(())
+                with_surface(|ops, theme| {
+                    let style = theme.get(&scope);
+                    ops.push(SurfaceRenderOp::HDivider { area, style });
+                    Ok(())
+                })
             },
         );
 
@@ -2160,10 +1815,11 @@ impl LuaUserData for LuaSurface {
             "vdivider",
             |_lua, _this, (area, scope): (LuaTable, String)| {
                 let area = table_to_rect(&area)?;
-                let mut context = crate::lua::render_context()?;
-                let style = context.theme().get(&scope);
-                context.surface().vdivider(area, style);
-                Ok(())
+                with_surface(|ops, theme| {
+                    let style = theme.get(&scope);
+                    ops.push(SurfaceRenderOp::VDivider { area, style });
+                    Ok(())
+                })
             },
         );
 
@@ -2179,17 +1835,22 @@ impl LuaUserData for LuaSurface {
                 String,
             )| {
                 let area = table_to_rect(&area)?;
-                let mut context = crate::lua::render_context()?;
-                let style = context.theme().get(&scope);
-                let cursor_style = context.theme().get(&cursor_scope);
-                let (cx, cy) =
-                    context
-                        .surface()
-                        .text_input(area, &text, cursor, style, cursor_style);
-                let result = lua.create_table()?;
-                result.set("cursor_x", cx)?;
-                result.set("cursor_y", cy)?;
-                Ok(result)
+                let state = helix_view::layout::text_input_layout(area, &text, cursor);
+                with_surface(|ops, theme| {
+                    let style = theme.get(&scope);
+                    let cursor_style = theme.get(&cursor_scope);
+                    ops.push(SurfaceRenderOp::TextInput {
+                        area,
+                        text,
+                        cursor,
+                        style,
+                        cursor_style,
+                    });
+                    let result = lua.create_table()?;
+                    result.set("cursor_x", state.cursor_x)?;
+                    result.set("cursor_y", state.cursor_y)?;
+                    Ok(result)
+                })
             },
         );
 
@@ -2202,72 +1863,27 @@ impl LuaUserData for LuaSurface {
                 let visible: usize = opts.get("visible")?;
                 let thumb_scope: String = opts.get("thumb_style")?;
                 let track_scope: Option<String> = opts.get("track_style").ok();
-                let mut context = crate::lua::render_context()?;
-                let thumb_style = context.theme().get(&thumb_scope);
-                let track_style = track_scope
-                    .as_deref()
-                    .map(|scope| context.theme().get(scope))
-                    .unwrap_or_default();
-                context.surface().scrollbar(
-                    area,
-                    total,
-                    offset,
-                    visible,
-                    thumb_style,
-                    None,
-                    track_style,
-                );
-                Ok(())
+                let track_symbol: Option<String> = opts.get("track_symbol").ok();
+                with_surface(|ops, theme| {
+                    let thumb_style = theme.get(&thumb_scope);
+                    let track_style = track_scope
+                        .as_deref()
+                        .map(|scope| theme.get(scope))
+                        .unwrap_or_default();
+                    ops.push(SurfaceRenderOp::Scrollbar {
+                        area,
+                        total,
+                        offset,
+                        visible,
+                        thumb_style,
+                        track_symbol,
+                        track_style,
+                    });
+                    Ok(())
+                })
             },
         );
     }
-}
-
-// ---------------------------------------------------------------------------
-// helix.log — logging
-// ---------------------------------------------------------------------------
-
-pub fn register_log_module(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
-    let m = lua.create_table()?;
-
-    m.set(
-        "info",
-        lua.create_function(|_lua, message: String| {
-            log::info!("[plugin] {}", message);
-            Ok(())
-        })?,
-    )?;
-    m.set(
-        "warn",
-        lua.create_function(|_lua, message: String| {
-            log::warn!("[plugin] {}", message);
-            Ok(())
-        })?,
-    )?;
-    m.set(
-        "error",
-        lua.create_function(|_lua, message: String| {
-            log::error!("[plugin] {}", message);
-            Ok(())
-        })?,
-    )?;
-    m.set(
-        "debug",
-        lua.create_function(|_lua, message: String| {
-            log::debug!("[plugin] {}", message);
-            Ok(())
-        })?,
-    )?;
-    m.set(
-        "trace",
-        lua.create_function(|_lua, message: String| {
-            log::trace!("[plugin] {}", message);
-            Ok(())
-        })?,
-    )?;
-
-    helix_table.set("log", m)?;
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -2299,7 +1915,6 @@ pub fn rect_to_table(lua: &Lua, r: helix_view::graphics::Rect) -> LuaResult<LuaT
 // ---------------------------------------------------------------------------
 
 fn register_splits_module(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
-    use crate::contract::bridge::EditorMutationBridge;
     use crate::contract::host::PluginSplitHost;
 
     let m = lua.create_table()?;
@@ -2321,15 +1936,15 @@ fn register_splits_module(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
                 .as_ref()
                 .and_then(|t| t.get::<Option<LuaViewHandle>>("view").ok().flatten())
                 .map(|v| v.0);
-            let editor = crate::lua::get_editor_mut()?;
-            let mut bridge = EditorMutationBridge::new(editor);
-            let view_handle = bridge
-                .split_view(requests::SplitViewRequest {
-                    view,
-                    direction: dir,
-                    document,
-                })
-                .map_err(|e| LuaError::RuntimeError(e.to_string()))?;
+            let view_handle = with_mutation_bridge(|mut bridge| {
+                bridge
+                    .split_view(requests::SplitViewRequest {
+                        view,
+                        direction: dir,
+                        document,
+                    })
+                    .map_err(|e| LuaError::RuntimeError(e.to_string()))
+            })?;
             Ok(LuaViewHandle(view_handle))
         })?,
     )?;
@@ -2339,12 +1954,12 @@ fn register_splits_module(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
         "focus_direction",
         lua.create_function(|_lua, direction: String| {
             let dir = parse_split_direction(&direction)?;
-            let editor = crate::lua::get_editor_mut()?;
-            let mut bridge = EditorMutationBridge::new(editor);
-            bridge
-                .focus_direction(requests::FocusDirectionRequest { direction: dir })
-                .map_err(|e| LuaError::RuntimeError(e.to_string()))?;
-            Ok(())
+            with_mutation_bridge(|mut bridge| {
+                bridge
+                    .focus_direction(requests::FocusDirectionRequest { direction: dir })
+                    .map_err(|e| LuaError::RuntimeError(e.to_string()))?;
+                Ok(())
+            })
         })?,
     )?;
 
@@ -2353,12 +1968,12 @@ fn register_splits_module(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
         "swap",
         lua.create_function(|_lua, direction: String| {
             let dir = parse_split_direction(&direction)?;
-            let editor = crate::lua::get_editor_mut()?;
-            let mut bridge = EditorMutationBridge::new(editor);
-            bridge
-                .swap_split(requests::SwapSplitRequest { direction: dir })
-                .map_err(|e| LuaError::RuntimeError(e.to_string()))?;
-            Ok(())
+            with_mutation_bridge(|mut bridge| {
+                bridge
+                    .swap_split(requests::SwapSplitRequest { direction: dir })
+                    .map_err(|e| LuaError::RuntimeError(e.to_string()))?;
+                Ok(())
+            })
         })?,
     )?;
 
@@ -2366,14 +1981,14 @@ fn register_splits_module(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
     m.set(
         "transpose",
         lua.create_function(|_lua, view: Option<LuaViewHandle>| {
-            let editor = crate::lua::get_editor_mut()?;
-            let mut bridge = EditorMutationBridge::new(editor);
-            bridge
-                .transpose(requests::TransposeSplitRequest {
-                    view: view.map(|v| v.0),
-                })
-                .map_err(|e| LuaError::RuntimeError(e.to_string()))?;
-            Ok(())
+            with_mutation_bridge(|mut bridge| {
+                bridge
+                    .transpose(requests::TransposeSplitRequest {
+                        view: view.map(|v| v.0),
+                    })
+                    .map_err(|e| LuaError::RuntimeError(e.to_string()))?;
+                Ok(())
+            })
         })?,
     )?;
 
@@ -2394,16 +2009,16 @@ fn register_splits_module(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
                 }
             };
             let amount = parse_resize_amount(&amount_str)?;
-            let editor = crate::lua::get_editor_mut()?;
-            let mut bridge = EditorMutationBridge::new(editor);
-            bridge
-                .resize_split(requests::ResizeSplitRequest {
-                    view,
-                    dimension,
-                    amount,
-                })
-                .map_err(|e| LuaError::RuntimeError(e.to_string()))?;
-            Ok(())
+            with_mutation_bridge(|mut bridge| {
+                bridge
+                    .resize_split(requests::ResizeSplitRequest {
+                        view,
+                        dimension,
+                        amount,
+                    })
+                    .map_err(|e| LuaError::RuntimeError(e.to_string()))?;
+                Ok(())
+            })
         })?,
     )?;
 
@@ -2411,9 +2026,7 @@ fn register_splits_module(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
     m.set(
         "tree",
         lua.create_function(|lua, ()| {
-            let editor = crate::lua::get_editor()?;
-            let bridge = EditorQueryBridge::new(editor);
-            let snap = bridge.split_tree();
+            let snap = with_query_bridge(|bridge| Ok(bridge.split_tree()))?;
             split_node_to_table(lua, &snap.root)
         })?,
     )?;
@@ -2422,11 +2035,13 @@ fn register_splits_module(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
     m.set(
         "list",
         lua.create_function(|_lua, ()| {
-            let editor = crate::lua::get_editor()?;
-            let bridge = crate::contract::bridge::EditorQueryBridge::new(editor);
-            let views: Vec<LuaViewHandle> =
-                bridge.list_views().into_iter().map(LuaViewHandle).collect();
-            Ok(views)
+            with_query_bridge(|bridge| {
+                Ok(bridge
+                    .list_views()
+                    .into_iter()
+                    .map(LuaViewHandle)
+                    .collect::<Vec<_>>())
+            })
         })?,
     )?;
 
@@ -2520,7 +2135,6 @@ fn parse_tab_close_arg(arg: LuaValue) -> LuaResult<(Option<ViewHandle>, Option<u
 // ---------------------------------------------------------------------------
 
 fn register_tabs_module(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
-    use crate::contract::bridge::EditorMutationBridge;
     use crate::contract::host::PluginTabHost;
 
     let m = lua.create_table()?;
@@ -2537,16 +2151,16 @@ fn register_tabs_module(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
                 .as_ref()
                 .and_then(|t| t.get::<Option<LuaViewHandle>>("view").ok().flatten())
                 .map(|v| v.0);
-            let editor = crate::lua::get_editor_mut()?;
-            let mut bridge = EditorMutationBridge::new(editor);
-            bridge
-                .open_tab(requests::OpenTabRequest {
-                    view,
-                    document: doc.0,
-                    focus,
-                })
-                .map_err(|e| LuaError::RuntimeError(e.to_string()))?;
-            Ok(())
+            with_mutation_bridge(|mut bridge| {
+                bridge
+                    .open_tab(requests::OpenTabRequest {
+                        view,
+                        document: doc.0,
+                        focus,
+                    })
+                    .map_err(|e| LuaError::RuntimeError(e.to_string()))?;
+                Ok(())
+            })
         })?,
     )?;
 
@@ -2555,12 +2169,12 @@ fn register_tabs_module(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
         "close",
         lua.create_function(|_lua, arg: LuaValue| {
             let (view, index) = parse_tab_close_arg(arg)?;
-            let editor = crate::lua::get_editor_mut()?;
-            let mut bridge = EditorMutationBridge::new(editor);
-            bridge
-                .close_tab(requests::CloseTabRequest { view, index })
-                .map_err(|e| LuaError::RuntimeError(e.to_string()))?;
-            Ok(())
+            with_mutation_bridge(|mut bridge| {
+                bridge
+                    .close_tab(requests::CloseTabRequest { view, index })
+                    .map_err(|e| LuaError::RuntimeError(e.to_string()))?;
+                Ok(())
+            })
         })?,
     )?;
 
@@ -2568,15 +2182,15 @@ fn register_tabs_module(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
     m.set(
         "focus",
         lua.create_function(|_lua, (index, view): (usize, Option<LuaViewHandle>)| {
-            let editor = crate::lua::get_editor_mut()?;
-            let mut bridge = EditorMutationBridge::new(editor);
-            bridge
-                .focus_tab(requests::FocusTabRequest {
-                    view: view.map(|v| v.0),
-                    index,
-                })
-                .map_err(|e| LuaError::RuntimeError(e.to_string()))?;
-            Ok(())
+            with_mutation_bridge(|mut bridge| {
+                bridge
+                    .focus_tab(requests::FocusTabRequest {
+                        view: view.map(|v| v.0),
+                        index,
+                    })
+                    .map_err(|e| LuaError::RuntimeError(e.to_string()))?;
+                Ok(())
+            })
         })?,
     )?;
 
@@ -2584,15 +2198,15 @@ fn register_tabs_module(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
     m.set(
         "next",
         lua.create_function(|_lua, view: Option<LuaViewHandle>| {
-            let editor = crate::lua::get_editor_mut()?;
-            let mut bridge = EditorMutationBridge::new(editor);
-            bridge
-                .cycle_tab(requests::CycleTabRequest {
-                    view: view.map(|v| v.0),
-                    direction: requests::TabCycleDirection::Next,
-                })
-                .map_err(|e| LuaError::RuntimeError(e.to_string()))?;
-            Ok(())
+            with_mutation_bridge(|mut bridge| {
+                bridge
+                    .cycle_tab(requests::CycleTabRequest {
+                        view: view.map(|v| v.0),
+                        direction: requests::TabCycleDirection::Next,
+                    })
+                    .map_err(|e| LuaError::RuntimeError(e.to_string()))?;
+                Ok(())
+            })
         })?,
     )?;
 
@@ -2600,15 +2214,15 @@ fn register_tabs_module(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
     m.set(
         "previous",
         lua.create_function(|_lua, view: Option<LuaViewHandle>| {
-            let editor = crate::lua::get_editor_mut()?;
-            let mut bridge = EditorMutationBridge::new(editor);
-            bridge
-                .cycle_tab(requests::CycleTabRequest {
-                    view: view.map(|v| v.0),
-                    direction: requests::TabCycleDirection::Previous,
-                })
-                .map_err(|e| LuaError::RuntimeError(e.to_string()))?;
-            Ok(())
+            with_mutation_bridge(|mut bridge| {
+                bridge
+                    .cycle_tab(requests::CycleTabRequest {
+                        view: view.map(|v| v.0),
+                        direction: requests::TabCycleDirection::Previous,
+                    })
+                    .map_err(|e| LuaError::RuntimeError(e.to_string()))?;
+                Ok(())
+            })
         })?,
     )?;
 
@@ -2616,11 +2230,11 @@ fn register_tabs_module(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
     m.set(
         "list",
         lua.create_function(|lua, view: Option<LuaViewHandle>| {
-            let editor = crate::lua::get_editor()?;
-            let bridge = EditorQueryBridge::new(editor);
-            let snap = bridge
-                .list_tabs(view.map(|v| v.0))
-                .map_err(|e| LuaError::RuntimeError(e.to_string()))?;
+            let snap = with_query_bridge(|bridge| {
+                bridge
+                    .list_tabs(view.map(|v| v.0))
+                    .map_err(|e| LuaError::RuntimeError(e.to_string()))
+            })?;
             let t = lua.create_table()?;
             let tabs = lua.create_table()?;
             for (i, tab) in snap.tabs.iter().enumerate() {
@@ -2657,27 +2271,28 @@ fn register_floats_module(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
             let plugin_name = current_plugin_name(lua)?;
             let plugin_id = current_plugin_id(lua)?;
 
-            let _ = crate::lua::get_editor_mut()?;
             let placement = parse_float_placement(&opts.get::<LuaTable>("placement")?)?;
             let (content, render_callback) = parse_float_content(lua, &opts, &plugin_name)?;
-            let editor = crate::lua::get_editor_mut()?;
-            let mut bridge = EditorMutationBridge::new(editor);
-            let float = match bridge.create_float(
-                plugin_id,
-                requests::CreateFloatRequest {
-                    title,
-                    placement,
-                    content,
-                    focus,
-                    dismissible,
-                },
-            ) {
+            let float = match with_mutation_bridge(|mut bridge| {
+                bridge
+                    .create_float(
+                        plugin_id,
+                        requests::CreateFloatRequest {
+                            title,
+                            placement,
+                            content,
+                            focus,
+                            dismissible,
+                        },
+                    )
+                    .map_err(|err| LuaError::RuntimeError(err.to_string()))
+            }) {
                 Ok(float) => float,
                 Err(err) => {
                     if let Some(callback_id) = render_callback {
                         remove_ui_callback(lua, plugin_name, callback_id)?;
                     }
-                    return Err(LuaError::RuntimeError(err.to_string()));
+                    return Err(err);
                 }
             };
 
@@ -2685,9 +2300,12 @@ fn register_floats_module(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
                 if let Some(callback_id) = render_callback {
                     remove_ui_callback(lua, plugin_name, callback_id)?;
                 }
-                let editor = crate::lua::get_editor_mut()?;
-                let mut bridge = EditorMutationBridge::new(editor);
-                let _ = bridge.close_float(requests::CloseFloatRequest { float });
+                let _ = with_mutation_bridge(|mut bridge| {
+                    bridge
+                        .close_float(requests::CloseFloatRequest { float })
+                        .map_err(|e| LuaError::RuntimeError(e.to_string()))?;
+                    Ok(())
+                });
                 return Err(err);
             }
 
@@ -2701,12 +2319,12 @@ fn register_floats_module(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
         lua.create_function(|lua, float: LuaFloatHandle| {
             ensure_float_owner(lua, float.0)?;
             remove_float_render_callback(lua, float.0)?;
-            let editor = crate::lua::get_editor_mut()?;
-            let mut bridge = EditorMutationBridge::new(editor);
-            bridge
-                .close_float(requests::CloseFloatRequest { float: float.0 })
-                .map_err(|e| LuaError::RuntimeError(e.to_string()))?;
-            Ok(())
+            with_mutation_bridge(|mut bridge| {
+                bridge
+                    .close_float(requests::CloseFloatRequest { float: float.0 })
+                    .map_err(|e| LuaError::RuntimeError(e.to_string()))?;
+                Ok(())
+            })
         })?,
     )?;
 
@@ -2715,26 +2333,27 @@ fn register_floats_module(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
         "list",
         lua.create_function(|lua, ()| {
             let plugin_name = current_plugin_name(lua)?;
-            let editor = crate::lua::get_editor()?;
             let result = lua.create_table()?;
-            for (i, (id, entry)) in editor
-                .model
-                .floats
-                .iter()
-                .filter(|(_, entry)| entry.owner.as_deref() == Some(plugin_name.as_str()))
-                .enumerate()
-            {
-                let t = lua.create_table()?;
-                let handle = crate::contract::adapt::float_handle(id);
-                t.set("handle", LuaFloatHandle(handle))?;
-                t.set("title", entry.title.clone())?;
-                t.set(
-                    "is_focused",
-                    editor.model.focus == helix_view::model::FocusTarget::Float(id),
-                )?;
-                result.set(i + 1, t)?;
-            }
-            Ok(result)
+            with_editor(|editor| {
+                for (i, (id, entry)) in editor
+                    .model
+                    .floats
+                    .iter()
+                    .filter(|(_, entry)| entry.owner.as_deref() == Some(plugin_name.as_str()))
+                    .enumerate()
+                {
+                    let t = lua.create_table()?;
+                    let handle = crate::contract::adapt::float_handle(id);
+                    t.set("handle", LuaFloatHandle(handle))?;
+                    t.set("title", entry.title.clone())?;
+                    t.set(
+                        "is_focused",
+                        editor.model.focus == helix_view::model::FocusTarget::Float(id),
+                    )?;
+                    result.set(i + 1, t)?;
+                }
+                Ok(result)
+            })
         })?,
     )?;
 
@@ -2767,12 +2386,12 @@ impl LuaUserData for LuaFloatHandle {
         methods.add_method("close", |lua, this, ()| {
             ensure_float_owner(lua, this.0)?;
             remove_float_render_callback(lua, this.0)?;
-            let editor = crate::lua::get_editor_mut()?;
-            let mut bridge = EditorMutationBridge::new(editor);
-            bridge
-                .close_float(requests::CloseFloatRequest { float: this.0 })
-                .map_err(|e| LuaError::RuntimeError(e.to_string()))?;
-            Ok(())
+            with_mutation_bridge(|mut bridge| {
+                bridge
+                    .close_float(requests::CloseFloatRequest { float: this.0 })
+                    .map_err(|e| LuaError::RuntimeError(e.to_string()))?;
+                Ok(())
+            })
         });
 
         // float:update(opts) — update title, placement
@@ -2802,18 +2421,20 @@ impl LuaUserData for LuaFloatHandle {
                 None
             };
 
-            let editor = crate::lua::get_editor_mut()?;
-            let mut bridge = EditorMutationBridge::new(editor);
-            if let Err(err) = bridge.update_float(requests::UpdateFloatRequest {
-                float: this.0,
-                title,
-                placement,
-                content,
+            if let Err(err) = with_mutation_bridge(|mut bridge| {
+                bridge
+                    .update_float(requests::UpdateFloatRequest {
+                        float: this.0,
+                        title,
+                        placement,
+                        content,
+                    })
+                    .map_err(|err| LuaError::RuntimeError(err.to_string()))
             }) {
                 if let Some(callback_id) = new_render_callback {
                     remove_ui_callback(lua, plugin_name, callback_id)?;
                 }
-                return Err(LuaError::RuntimeError(err.to_string()));
+                return Err(err);
             }
 
             if let Some((plugin_name, callback_id)) = old_render_callback {
@@ -2940,9 +2561,7 @@ fn register_assistant_module(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
     m.set(
         "snapshot",
         lua.create_function(|lua, ()| {
-            let editor = crate::lua::get_editor()?;
-            let bridge = EditorQueryBridge::new(editor);
-            let snap = bridge.assistant_snapshot();
+            let snap = with_query_bridge(|bridge| Ok(bridge.assistant_snapshot()))?;
             let table = lua.create_table()?;
             table.set("active_thread", snap.active_thread.map(LuaThreadHandle))?;
             table.set("is_ready", snap.is_ready)?;
@@ -2968,11 +2587,11 @@ fn register_assistant_module(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
     m.set(
         "thread",
         lua.create_function(|lua, thread: LuaThreadHandle| {
-            let editor = crate::lua::get_editor()?;
-            let bridge = EditorQueryBridge::new(editor);
-            let snap = bridge
-                .thread_snapshot(thread.0)
-                .map_err(|e| LuaError::RuntimeError(e.to_string()))?;
+            let snap = with_query_bridge(|bridge| {
+                bridge
+                    .thread_snapshot(thread.0)
+                    .map_err(|e| LuaError::RuntimeError(e.to_string()))
+            })?;
             let table = lua.create_table()?;
             table.set("handle", LuaThreadHandle(snap.handle))?;
             table.set("title", snap.title.as_deref())?;
@@ -2990,11 +2609,11 @@ fn register_assistant_module(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
     m.set(
         "entries",
         lua.create_function(|lua, thread: LuaThreadHandle| {
-            let editor = crate::lua::get_editor()?;
-            let bridge = EditorQueryBridge::new(editor);
-            let entries = bridge
-                .thread_entries(thread.0)
-                .map_err(|e| LuaError::RuntimeError(e.to_string()))?;
+            let entries = with_query_bridge(|bridge| {
+                bridge
+                    .thread_entries(thread.0)
+                    .map_err(|e| LuaError::RuntimeError(e.to_string()))
+            })?;
             let result = lua.create_table()?;
             for (i, entry) in entries.iter().enumerate() {
                 let t = lua.create_table()?;
@@ -3012,11 +2631,11 @@ fn register_assistant_module(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
     m.set(
         "context",
         lua.create_function(|lua, thread: LuaThreadHandle| {
-            let editor = crate::lua::get_editor()?;
-            let bridge = EditorQueryBridge::new(editor);
-            let items = bridge
-                .thread_context(thread.0)
-                .map_err(|e| LuaError::RuntimeError(e.to_string()))?;
+            let items = with_query_bridge(|bridge| {
+                bridge
+                    .thread_context(thread.0)
+                    .map_err(|e| LuaError::RuntimeError(e.to_string()))
+            })?;
             let result = lua.create_table()?;
             for (i, item) in items.iter().enumerate() {
                 let t = lua.create_table()?;
@@ -3032,22 +2651,20 @@ fn register_assistant_module(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
     // helix.assistant.is_ready() -> bool
     m.set(
         "is_ready",
-        lua.create_function(|_lua, ()| {
-            let editor = crate::lua::get_editor()?;
-            Ok(!editor.assistant.is_empty())
-        })?,
+        lua.create_function(|_lua, ()| with_editor(|editor| Ok(!editor.assistant.is_empty())))?,
     )?;
 
     // helix.assistant.active_thread() -> ThreadHandle?
     m.set(
         "active_thread",
         lua.create_function(|_lua, ()| {
-            let editor = crate::lua::get_editor()?;
-            Ok(editor
-                .assistant
-                .active()
-                .map(crate::contract::adapt::thread_handle)
-                .map(LuaThreadHandle))
+            with_editor(|editor| {
+                Ok(editor
+                    .assistant
+                    .active()
+                    .map(crate::contract::adapt::thread_handle)
+                    .map(LuaThreadHandle))
+            })
         })?,
     )?;
 
@@ -3055,9 +2672,7 @@ fn register_assistant_module(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
     m.set(
         "thread_count",
         lua.create_function(|_lua, ()| {
-            let editor = crate::lua::get_editor()?;
-            let count = editor.assistant.threads().count();
-            Ok(count)
+            with_editor(|editor| Ok(editor.assistant.threads().count()))
         })?,
     )?;
 
@@ -3065,11 +2680,11 @@ fn register_assistant_module(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
     m.set(
         "submit",
         lua.create_function(|_lua, (thread, text): (Option<LuaThreadHandle>, String)| {
-            let editor = crate::lua::get_editor_mut()?;
-            let mut bridge = EditorMutationBridge::new(editor);
-            bridge
-                .submit_prompt(thread.map(|thread| thread.0), text)
-                .map_err(|e| LuaError::RuntimeError(e.to_string()))
+            with_mutation_bridge(|mut bridge| {
+                bridge
+                    .submit_prompt(thread.map(|thread| thread.0), text)
+                    .map_err(|e| LuaError::RuntimeError(e.to_string()))
+            })
         })?,
     )?;
 
@@ -3077,11 +2692,11 @@ fn register_assistant_module(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
     m.set(
         "cancel",
         lua.create_function(|_lua, thread: Option<LuaThreadHandle>| {
-            let editor = crate::lua::get_editor_mut()?;
-            let mut bridge = EditorMutationBridge::new(editor);
-            bridge
-                .cancel_thread(thread.map(|thread| thread.0))
-                .map_err(|e| LuaError::RuntimeError(e.to_string()))
+            with_mutation_bridge(|mut bridge| {
+                bridge
+                    .cancel_thread(thread.map(|thread| thread.0))
+                    .map_err(|e| LuaError::RuntimeError(e.to_string()))
+            })
         })?,
     )?;
 

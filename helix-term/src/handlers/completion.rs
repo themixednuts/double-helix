@@ -37,7 +37,7 @@ pub(crate) async fn replace_completions(
     cancel: Token,
     mut requests: JoinSet<CompletionResponse>,
     is_incomplete: bool,
-    ingress: helix_runtime::Sender<crate::runtime::RuntimeEvent>,
+    ingress: crate::runtime::RuntimeIngress,
 ) {
     while let Some(response) = handle_response(&mut requests, is_incomplete).await {
         if cancel.is_canceled() {

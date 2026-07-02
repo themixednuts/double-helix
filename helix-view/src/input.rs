@@ -69,6 +69,18 @@ pub struct KeyEvent {
 }
 
 impl KeyEvent {
+    /// Return this key in the canonical form used for editor dispatch.
+    ///
+    /// Character keys already carry their shifted character in [`KeyCode::Char`],
+    /// so a separate `SHIFT` modifier would make bindings such as `J` and
+    /// `<S-j>` appear different to modal keymaps.
+    pub fn canonicalize(mut self) -> Self {
+        if let KeyCode::Char(_) = self.code {
+            self.modifiers.remove(KeyModifiers::SHIFT);
+        }
+        self
+    }
+
     /// If a character was pressed, return it.
     pub fn char(&self) -> Option<char> {
         match self.code {

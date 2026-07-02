@@ -1,4 +1,5 @@
-use crate::{backend::Backend, buffer::Cell, terminal::Config};
+use super::cell::TerminalCell;
+use crate::{backend::Backend, terminal::Config};
 use crossterm::{
     cursor::{Hide, MoveTo, SetCursorStyle, Show},
     event::{
@@ -16,11 +17,22 @@ use crossterm::{
 };
 use helix_view::graphics::{Color, CursorKind, Modifier, Rect, UnderlineStyle};
 use once_cell::sync::OnceCell;
+use ratatui::buffer::Cell;
 use std::{
     fmt,
     io::{self, Write},
 };
 use termini::TermInfo;
+
+use crossterm::{
+    cursor,
+    terminal::{ScrollDown, ScrollUp},
+};
+use ratatui::{
+    backend::{ClearType as RatatuiClearType, WindowSize},
+    layout::{Position, Size},
+};
+use std::ops::Range;
 
 fn term_program() -> Option<String> {
     // Some terminals don't set $TERM_PROGRAM
@@ -139,6 +151,84 @@ where
                 supported
             })
     }
+
+    fn draw_cells<'a, I, C>(&mut self, content: I) -> io::Result<()>
+    where
+        I: Iterator<Item = (u16, u16, &'a C)>,
+        C: TerminalCell + 'a,
+    {
+        // Begin synchronized update — terminal holds display
+        // until the matching end sequence, preventing partial-frame flicker.
+        write!(self.buffer, "\x1b[?2026h")?;
+
+        let mut fg = Color::Reset;
+        let mut bg = Color::Reset;
+        let mut underline_color = Color::Reset;
+        let mut underline_style = UnderlineStyle::Reset;
+        let mut modifier = Modifier::empty();
+        let mut last_pos: Option<(u16, u16)> = None;
+        for (x, y, cell) in content {
+            // Move the cursor if the previous location was not (x - 1, y)
+            if !matches!(last_pos, Some(p) if x == p.0 + 1 && y == p.1) {
+                queue!(self.buffer, MoveTo(x, y))?;
+            }
+            last_pos = Some((x, y));
+            let next_modifier = cell.modifier();
+            if next_modifier != modifier {
+                let diff = ModifierDiff {
+                    from: modifier,
+                    to: next_modifier,
+                };
+                diff.queue(&mut self.buffer)?;
+                modifier = next_modifier;
+            }
+
+            let next_fg = cell.fg();
+            let next_bg = cell.bg();
+            if next_fg != fg || next_bg != bg {
+                queue!(
+                    self.buffer,
+                    SetColors(Colors::new(next_fg.into(), next_bg.into()))
+                )?;
+                fg = next_fg;
+                bg = next_bg;
+            }
+
+            let mut new_underline_style = cell.underline_style();
+            if self.capabilities.has_extended_underlines {
+                let next_underline_color = cell.underline_color();
+                if next_underline_color != underline_color {
+                    let color = CColor::from(next_underline_color);
+                    queue!(self.buffer, SetUnderlineColor(color))?;
+                    underline_color = next_underline_color;
+                }
+            } else {
+                match new_underline_style {
+                    UnderlineStyle::Reset | UnderlineStyle::Line => (),
+                    _ => new_underline_style = UnderlineStyle::Line,
+                }
+            }
+
+            if new_underline_style != underline_style {
+                let attr = CAttribute::from(new_underline_style);
+                queue!(self.buffer, SetAttribute(attr))?;
+                underline_style = new_underline_style;
+            }
+
+            queue!(self.buffer, Print(cell.symbol()))?;
+        }
+
+        queue!(
+            self.buffer,
+            SetUnderlineColor(CColor::Reset),
+            SetForegroundColor(CColor::Reset),
+            SetBackgroundColor(CColor::Reset),
+            SetAttribute(CAttribute::Reset)
+        )?;
+
+        // End synchronized update — terminal renders the complete frame.
+        write!(self.buffer, "\x1b[?2026l")
+    }
 }
 
 impl<W> Write for CrosstermBackend<W>
@@ -229,72 +319,7 @@ where
     where
         I: Iterator<Item = (u16, u16, &'a Cell)>,
     {
-        // Begin synchronized update — terminal holds display
-        // until the matching end sequence, preventing partial-frame flicker.
-        write!(self.buffer, "\x1b[?2026h")?;
-
-        let mut fg = Color::Reset;
-        let mut bg = Color::Reset;
-        let mut underline_color = Color::Reset;
-        let mut underline_style = UnderlineStyle::Reset;
-        let mut modifier = Modifier::empty();
-        let mut last_pos: Option<(u16, u16)> = None;
-        for (x, y, cell) in content {
-            // Move the cursor if the previous location was not (x - 1, y)
-            if !matches!(last_pos, Some(p) if x == p.0 + 1 && y == p.1) {
-                queue!(self.buffer, MoveTo(x, y))?;
-            }
-            last_pos = Some((x, y));
-            if cell.modifier != modifier {
-                let diff = ModifierDiff {
-                    from: modifier,
-                    to: cell.modifier,
-                };
-                diff.queue(&mut self.buffer)?;
-                modifier = cell.modifier;
-            }
-            if cell.fg != fg || cell.bg != bg {
-                queue!(
-                    self.buffer,
-                    SetColors(Colors::new(cell.fg.into(), cell.bg.into()))
-                )?;
-                fg = cell.fg;
-                bg = cell.bg;
-            }
-
-            let mut new_underline_style = cell.underline_style;
-            if self.capabilities.has_extended_underlines {
-                if cell.underline_color != underline_color {
-                    let color = CColor::from(cell.underline_color);
-                    queue!(self.buffer, SetUnderlineColor(color))?;
-                    underline_color = cell.underline_color;
-                }
-            } else {
-                match new_underline_style {
-                    UnderlineStyle::Reset | UnderlineStyle::Line => (),
-                    _ => new_underline_style = UnderlineStyle::Line,
-                }
-            }
-
-            if new_underline_style != underline_style {
-                let attr = CAttribute::from(new_underline_style);
-                queue!(self.buffer, SetAttribute(attr))?;
-                underline_style = new_underline_style;
-            }
-
-            queue!(self.buffer, Print(&cell.symbol))?;
-        }
-
-        queue!(
-            self.buffer,
-            SetUnderlineColor(CColor::Reset),
-            SetForegroundColor(CColor::Reset),
-            SetBackgroundColor(CColor::Reset),
-            SetAttribute(CAttribute::Reset)
-        )?;
-
-        // End synchronized update — terminal renders the complete frame.
-        write!(self.buffer, "\x1b[?2026l")
+        self.draw_cells(content)
     }
 
     fn hide_cursor(&mut self) -> io::Result<()> {
@@ -335,6 +360,91 @@ where
 
     fn get_theme_mode(&self) -> Option<helix_view::theme::Mode> {
         None
+    }
+}
+
+impl<W> ratatui::backend::Backend for CrosstermBackend<W>
+where
+    W: Write,
+{
+    type Error = io::Error;
+
+    fn draw<'a, I>(&mut self, content: I) -> Result<(), Self::Error>
+    where
+        I: Iterator<Item = (u16, u16, &'a ratatui::buffer::Cell)>,
+    {
+        self.draw_cells(content)
+    }
+
+    fn append_lines(&mut self, n: u16) -> Result<(), Self::Error> {
+        for _ in 0..n {
+            self.buffer.write_all(b"\n")?;
+        }
+        Ok(())
+    }
+
+    fn hide_cursor(&mut self) -> Result<(), Self::Error> {
+        <Self as Backend>::hide_cursor(self)
+    }
+
+    fn show_cursor(&mut self) -> Result<(), Self::Error> {
+        <Self as Backend>::show_cursor(self, CursorKind::Block)
+    }
+
+    fn get_cursor_position(&mut self) -> Result<Position, Self::Error> {
+        let (x, y) = cursor::position()?;
+        Ok(Position::new(x, y))
+    }
+
+    fn set_cursor_position<P>(&mut self, position: P) -> Result<(), Self::Error>
+    where
+        P: Into<Position>,
+    {
+        let position = position.into();
+        <Self as Backend>::set_cursor(self, position.x, position.y)
+    }
+
+    fn clear(&mut self) -> Result<(), Self::Error> {
+        <Self as Backend>::clear(self)
+    }
+
+    fn clear_region(&mut self, clear_type: RatatuiClearType) -> Result<(), Self::Error> {
+        let clear_type = match clear_type {
+            RatatuiClearType::All => ClearType::All,
+            RatatuiClearType::AfterCursor => ClearType::FromCursorDown,
+            RatatuiClearType::BeforeCursor => ClearType::FromCursorUp,
+            RatatuiClearType::CurrentLine => ClearType::CurrentLine,
+            RatatuiClearType::UntilNewLine => ClearType::UntilNewLine,
+        };
+        queue!(self.buffer, Clear(clear_type))
+    }
+
+    fn size(&self) -> Result<Size, Self::Error> {
+        let area = <Self as Backend>::size(self)?;
+        Ok(Size::new(area.width, area.height))
+    }
+
+    fn window_size(&mut self) -> Result<WindowSize, Self::Error> {
+        Ok(WindowSize {
+            columns_rows: ratatui::backend::Backend::size(self)?,
+            pixels: Size::new(0, 0),
+        })
+    }
+
+    fn flush(&mut self) -> Result<(), Self::Error> {
+        self.buffer.flush()
+    }
+
+    fn scroll_region_up(&mut self, region: Range<u16>, line_count: u16) -> Result<(), Self::Error> {
+        scroll_region(&mut self.buffer, region, ScrollDirection::Up, line_count)
+    }
+
+    fn scroll_region_down(
+        &mut self,
+        region: Range<u16>,
+        line_count: u16,
+    ) -> Result<(), Self::Error> {
+        scroll_region(&mut self.buffer, region, ScrollDirection::Down, line_count)
     }
 }
 
@@ -406,6 +516,71 @@ impl ModifierDiff {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScrollDirection {
+    Up,
+    Down,
+}
+
+fn scroll_region<W>(
+    buffer: &mut W,
+    region: Range<u16>,
+    direction: ScrollDirection,
+    line_count: u16,
+) -> io::Result<()>
+where
+    W: Write,
+{
+    if line_count == 0 || region.is_empty() {
+        return Ok(());
+    }
+
+    queue!(buffer, SetScrollRegion::from_half_open(region.clone()))?;
+    match direction {
+        ScrollDirection::Up => queue!(buffer, MoveTo(0, region.end - 1), ScrollUp(line_count))?,
+        ScrollDirection::Down => queue!(buffer, MoveTo(0, region.start), ScrollDown(line_count))?,
+    }
+    queue!(buffer, SetScrollRegion::reset())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SetScrollRegion {
+    top: Option<u16>,
+    bottom: Option<u16>,
+}
+
+impl SetScrollRegion {
+    fn from_half_open(region: Range<u16>) -> Self {
+        Self {
+            top: Some(region.start.saturating_add(1)),
+            bottom: Some(region.end),
+        }
+    }
+
+    fn reset() -> Self {
+        Self {
+            top: None,
+            bottom: None,
+        }
+    }
+}
+
+impl Command for SetScrollRegion {
+    fn write_ansi(&self, f: &mut impl fmt::Write) -> fmt::Result {
+        match (self.top, self.bottom) {
+            (Some(top), Some(bottom)) => write!(f, "\x1b[{top};{bottom}r"),
+            _ => f.write_str("\x1b[r"),
+        }
+    }
+
+    #[cfg(windows)]
+    fn execute_winapi(&self) -> io::Result<()> {
+        Err(std::io::Error::other(
+            "SetScrollRegion is only supported through ANSI output.",
+        ))
+    }
+}
+
 /// Crossterm uses semicolon as a separator for colors
 /// this is actually not spec compliant (although commonly supported)
 /// However the correct approach is to use colons as a separator.
@@ -457,5 +632,52 @@ impl Command for SetUnderlineColor {
         Err(std::io::Error::other(
             "SetUnderlineColor not supported by winapi.",
         ))
+    }
+}
+
+#[cfg(all(test, feature = "ratatui"))]
+mod tests {
+    use super::*;
+    use ratatui::backend::Backend as RatatuiBackend;
+
+    fn backend() -> CrosstermBackend<Vec<u8>> {
+        CrosstermBackend::new(
+            Vec::new(),
+            Config {
+                enable_mouse_capture: false,
+                force_enable_extended_underlines: true,
+                kitty_keyboard_protocol: Default::default(),
+            },
+        )
+    }
+
+    #[test]
+    fn ratatui_draw_uses_direct_backend_without_helix_cell_conversion() {
+        let mut backend = backend();
+        let mut cell = ratatui::buffer::Cell::new("x");
+        cell.set_fg(ratatui::style::Color::LightBlue);
+        cell.set_bg(ratatui::style::Color::Rgb(1, 2, 3));
+        cell.underline_color = ratatui::style::Color::Indexed(4);
+        cell.modifier = ratatui::style::Modifier::BOLD | ratatui::style::Modifier::UNDERLINED;
+
+        RatatuiBackend::draw(&mut backend, [(3, 2, &cell)].into_iter()).unwrap();
+
+        let output = String::from_utf8(backend.buffer).unwrap();
+        assert!(output.contains("\x1b[?2026h"));
+        assert!(output.contains("\x1b[3;4H"));
+        assert!(output.contains("x"));
+        assert!(output.contains("\x1b[?2026l"));
+    }
+
+    #[test]
+    fn ratatui_scroll_region_uses_half_open_rows() {
+        let mut backend = backend();
+
+        RatatuiBackend::scroll_region_up(&mut backend, 1..3, 2).unwrap();
+
+        let output = String::from_utf8(backend.buffer).unwrap();
+        assert!(output.contains("\x1b[2;3r"));
+        assert!(output.contains("\x1b[2S"));
+        assert!(output.ends_with("\x1b[r"));
     }
 }

@@ -1,10 +1,10 @@
 use std::{future::Future, sync::Arc};
 
 use helix_plugin::PluginManager;
-use helix_runtime::{Sender as IngressSender, Work};
+use helix_runtime::Work;
 use helix_view::Editor;
 
-use super::{ingress::RuntimeEvent, ExitTaskResult, ExitTaskSet, RuntimeTaskEvent};
+use super::{ExitTaskResult, ExitTaskSet, RuntimeTaskEvent};
 
 pub fn schedule_exit_task(
     exit_tasks: &mut ExitTaskSet,
@@ -16,7 +16,7 @@ pub fn schedule_exit_task(
 
 pub fn apply_exit_task(
     editor: &mut Editor,
-    ingress: IngressSender<RuntimeEvent>,
+    ingress: crate::runtime::RuntimeIngress,
     plugin_manager: Arc<PluginManager>,
     result: ExitTaskResult,
 ) -> anyhow::Result<()> {
@@ -26,7 +26,7 @@ pub fn apply_exit_task(
 pub fn drain_exit_tasks_blocking(
     editor: &mut Editor,
     exit_tasks: &mut ExitTaskSet,
-    ingress: IngressSender<RuntimeEvent>,
+    ingress: crate::runtime::RuntimeIngress,
     plugin_manager: Arc<PluginManager>,
 ) -> anyhow::Result<()> {
     log::debug!("waiting on pending exit-bound task work...");
@@ -41,7 +41,7 @@ pub fn drain_exit_tasks_blocking(
 pub async fn drain_exit_tasks_collect(
     editor: &mut Editor,
     exit_tasks: &mut ExitTaskSet,
-    ingress: IngressSender<RuntimeEvent>,
+    ingress: crate::runtime::RuntimeIngress,
     plugin_manager: Arc<PluginManager>,
 ) -> Vec<anyhow::Error> {
     let mut errs = Vec::new();

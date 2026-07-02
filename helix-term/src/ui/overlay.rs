@@ -3,7 +3,6 @@ use helix_view::{
     graphics::{CursorKind, Rect},
     Editor,
 };
-use tui::buffer::Buffer;
 
 use crate::compositor::{Component, Context, Event, EventResult, PickerComponent, RenderContext};
 
@@ -47,7 +46,7 @@ impl<T: Component + 'static> Component for Overlay<T> {
         self.content.sync(editor);
     }
 
-    fn render(&mut self, area: Rect, frame: &mut Buffer, ctx: &RenderContext) {
+    fn render(&mut self, area: Rect, frame: &mut crate::render::CellSurface, ctx: &RenderContext) {
         let dimensions = (self.calc_child_size)(area);
         self.content.render(dimensions, frame, ctx)
     }
@@ -74,7 +73,7 @@ impl<T: Component + 'static> Component for Overlay<T> {
         self.content.cursor(dimensions, ctx)
     }
 
-    fn id(&self) -> Option<&'static str> {
+    fn id(&self) -> Option<&str> {
         self.content.id()
     }
 

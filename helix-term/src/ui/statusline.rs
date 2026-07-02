@@ -2,20 +2,24 @@ use helix_core::diagnostic::Severity;
 use helix_core::indent::IndentStyle;
 use helix_core::unicode::width::UnicodeWidthStr;
 use helix_view::document::Mode;
-use helix_view::editor::{StatusLineConfig, StatusLineElement as StatusLineElementId};
+use helix_view::editor::{
+    StatusLineConfig, StatusLineElement as StatusLineElementId, WorkspaceDiagnosticCounts,
+};
 use helix_view::icons::ICONS;
 use helix_view::statusline::{
     CursorStatusProvider, DiagnosticCounts, DiagnosticStatusProvider, DocumentStatusProvider,
     SelectionStatusProvider, StatuslineSnapshot,
 };
-use helix_view::theme::{Style, Theme};
-use helix_view::{Document, DocumentId, Editor, View, ViewId};
+use helix_view::theme::{Style as ThemeStyle, Theme};
+use helix_view::{Document, DocumentId, View, ViewId};
 use std::borrow::Cow;
 use std::sync::{LazyLock, Mutex};
-use tui::buffer::Buffer as Surface;
-use tui::text::{Span, Spans};
+use tui::ratatui::{
+    style::Style as RatatuiStyle,
+    text::{Line, Span},
+};
 
-use crate::ui::ProgressSpinners;
+use crate::ui::{design::StatuslineStyles, ProgressSpinners};
 
 #[derive(Debug, Clone, Copy)]
 pub struct BenchOverlay {
@@ -37,13 +41,10 @@ pub struct StatuslineModel {
 
 impl StatuslineModel {
     pub fn collect(
-        editor: &Editor,
+        context: StatuslineContext<'_>,
         doc: &Document,
         view: &View,
         focused: bool,
-        mode: Mode,
-        selected_register: Option<char>,
-        spinners: &ProgressSpinners,
     ) -> Self {
         let cursor = doc.cursor_status(view.id);
         let selection = doc.selection_status(view.id);
@@ -51,11 +52,21 @@ impl StatuslineModel {
             .language_servers()
             .next()
             .and_then(|server| {
-                spinners
+                context
+                    .spinners
                     .get(server.id())
                     .and_then(|spinner| spinner.frame())
             })
             .unwrap_or(" ");
+        // Pre-collect language-server names so the LspStatus
+        // element doesn't have to thread the live editor through
+        // the render path. Iteration order is attach order — for
+        // most buffers this is one server; rare languages have two
+        // or three (e.g. typescript-language-server + eslint).
+        let lsp_server_names: Vec<String> = doc
+            .language_servers()
+            .map(|server| server.name().to_string())
+            .collect();
         let current_working_directory = helix_stdx::env::current_working_dir()
             .file_name()
             .map(|name| Cow::Owned(name.to_string_lossy().into_owned()))
@@ -64,27 +75,28 @@ impl StatuslineModel {
 
         Self {
             view_id: view.id,
-            config: editor.config().statusline.clone(),
-            theme: editor.theme.clone(),
-            theme_name: editor.theme.name().to_string(),
-            color_modes: editor.config().color_modes,
+            config: context.config.clone(),
+            theme: context.theme.clone(),
+            theme_name: context.theme_name.to_string(),
+            color_modes: context.color_modes,
             snapshot: StatuslineSnapshot {
                 modal: helix_view::statusline::ModalStatus {
                     focused,
-                    mode,
-                    selected_register,
+                    mode: context.mode,
+                    selected_register: context.selected_register,
                 },
                 cursor,
                 selection,
                 document: doc.document_status(),
                 diagnostics: doc.diagnostic_counts(),
-                workspace_diagnostics: editor.workspace_diagnostic_counts(),
+                workspace_diagnostics: context.workspace_diagnostics,
                 spinner_frame: Cow::Borrowed(spinner_frame),
                 current_working_directory,
                 function_name,
+                lsp_server_names,
             }
             .into_owned(),
-            bench_overlay: editor.bench_overlay().map(|bench| BenchOverlay {
+            bench_overlay: context.bench_overlay.map(|bench| BenchOverlay {
                 rolling_fps: bench.rolling_fps,
                 actions_executed: bench.actions_executed,
                 remaining_seconds: bench.remaining_seconds,
@@ -93,15 +105,27 @@ impl StatuslineModel {
     }
 }
 
+pub struct StatuslineContext<'a> {
+    pub config: &'a StatusLineConfig,
+    pub theme: &'a Theme,
+    pub theme_name: &'a str,
+    pub color_modes: bool,
+    pub workspace_diagnostics: WorkspaceDiagnosticCounts,
+    pub bench_overlay: Option<helix_view::editor::BenchOverlay>,
+    pub mode: Mode,
+    pub selected_register: Option<char>,
+    pub spinners: &'a ProgressSpinners,
+}
+
 pub(crate) fn cache_id(view_id: ViewId) -> crate::render::CacheId {
     crate::render::CacheId::hashed(&("statusline", view_id))
 }
 
 #[derive(Default)]
 pub struct RenderBuffer<'a> {
-    pub left: Spans<'a>,
-    pub center: Spans<'a>,
-    pub right: Spans<'a>,
+    pub left: Line<'a>,
+    pub center: Line<'a>,
+    pub right: Line<'a>,
 }
 
 pub struct Statusline<'a> {
@@ -142,20 +166,28 @@ impl<'a> Statusline<'a> {
         };
         PreparedRender::snapshot(tag, model, move |model| {
             let mut component = Statusline::new(model);
-            let mut surface = Surface::empty(area);
-            component.render(area, &mut surface);
-            RenderOutput { area, surface }
+            let mut output = RenderOutput::new(area);
+            component.render_surface(area, output.surface_mut());
+            output
         })
     }
 
-    pub fn render(&mut self, viewport: helix_view::graphics::Rect, surface: &mut Surface) {
+    pub fn render_surface(
+        &mut self,
+        viewport: helix_view::graphics::Rect,
+        surface: &mut crate::render::CellSurface,
+    ) {
+        let statusline_styles = StatuslineStyles::from_theme(&self.model.theme);
         let base_style = if self.model.snapshot.modal.focused {
-            self.model.theme.get("ui.statusline")
+            rat_style(statusline_styles.base)
         } else {
-            self.model.theme.get("ui.statusline.inactive")
+            rat_style(statusline_styles.inactive)
         };
 
-        surface.set_style(viewport.with_height(1), base_style);
+        surface.set_style(
+            tui::ratatui::to_ratatui_rect(viewport.with_height(1)),
+            base_style,
+        );
 
         for element_id in self.model.config.left.clone() {
             let element_start = std::time::Instant::now();
@@ -171,7 +203,7 @@ impl<'a> Statusline<'a> {
             );
         }
 
-        surface.set_spans(
+        surface.set_line(
             viewport.x,
             viewport.y,
             &self.parts.left,
@@ -205,12 +237,12 @@ impl<'a> Statusline<'a> {
                 .bg(helix_view::graphics::Color::Yellow);
             append(
                 &mut self.parts.right,
-                Span::styled(fps_text, bench_style),
+                themed_span(fps_text, bench_style),
                 base_style,
             );
         }
 
-        surface.set_spans(
+        surface.set_line(
             viewport.x
                 + viewport
                     .width
@@ -239,7 +271,7 @@ impl<'a> Statusline<'a> {
         let center_max_width = viewport.width.saturating_sub(2 * edge_width + 2 * spacing);
         let center_width = center_max_width.min(self.parts.center.width() as u16);
 
-        surface.set_spans(
+        surface.set_line(
             viewport.x + viewport.width / 2 - center_width / 2,
             viewport.y,
             &self.parts.center,
@@ -248,9 +280,28 @@ impl<'a> Statusline<'a> {
     }
 }
 
-fn append<'a>(buffer: &mut Spans<'a>, mut span: Span<'a>, base_style: Style) {
+fn rat_style(style: ThemeStyle) -> RatatuiStyle {
+    tui::ratatui::to_ratatui_style(style)
+}
+
+fn themed_span<'a>(content: impl Into<Cow<'a, str>>, style: ThemeStyle) -> Span<'a> {
+    Span::styled(content, rat_style(style))
+}
+
+/// Resolve the "secondary" statusline text style — a muted variant for
+/// less-important elements like position, selection counts, and encoding.
+/// Falls back through several theme keys so any theme produces a sensible
+/// dimmed colour without needing a custom statusline.muted scope.
+fn statusline_muted(theme: &Theme) -> ThemeStyle {
+    theme
+        .try_get("ui.text.inactive")
+        .or_else(|| theme.try_get("comment"))
+        .unwrap_or_else(|| theme.get("ui.statusline"))
+}
+
+fn append<'a>(buffer: &mut Line<'a>, mut span: Span<'a>, base_style: RatatuiStyle) {
     span.style = base_style.patch(span.style);
-    buffer.0.push(span);
+    buffer.spans.push(span);
 }
 
 fn get_render_function<'a, F>(element_id: StatusLineElementId) -> impl Fn(&mut Statusline<'a>, F)
@@ -260,6 +311,7 @@ where
     match element_id {
         StatusLineElementId::Mode => render_mode,
         StatusLineElementId::Spinner => render_lsp_spinner,
+        StatusLineElementId::LspStatus => render_lsp_status,
         StatusLineElementId::FileBaseName => render_file_base_name,
         StatusLineElementId::FileName => render_file_name,
         StatusLineElementId::FileAbsolutePath => render_file_absolute_path,
@@ -291,26 +343,28 @@ where
 {
     let visible = statusline.model.snapshot.modal.focused;
     let modenames = &statusline.model.config.mode;
-    let mode_str = match statusline.model.snapshot.modal.mode {
-        Mode::Insert => &modenames.insert,
-        Mode::Select => &modenames.select,
-        Mode::Normal => &modenames.normal,
-    };
+    let mode = statusline.model.snapshot.modal.mode;
+    // Shared lookup with the file explorer / future surfaces.
+    // `mode_name` returns the user-configured label; on
+    // unfocused statuslines we pad to the same width so the
+    // chrome doesn't shift when focus changes.
+    let mode_str = helix_view::statusline_mode::mode_name(mode, modenames);
     let content = if visible {
         format!(" {mode_str} ")
     } else {
         " ".repeat(mode_str.width() + 2)
     };
     let style = if visible && statusline.model.color_modes {
-        match statusline.model.snapshot.modal.mode {
-            Mode::Insert => statusline.model.theme.get("ui.statusline.insert"),
-            Mode::Select => statusline.model.theme.get("ui.statusline.select"),
-            Mode::Normal => statusline.model.theme.get("ui.statusline.normal"),
+        let styles = StatuslineStyles::from_theme(&statusline.model.theme);
+        match mode {
+            Mode::Insert => styles.insert,
+            Mode::Select => styles.select,
+            Mode::Normal => styles.normal,
         }
     } else {
-        Style::default()
+        ThemeStyle::default()
     };
-    write(statusline, Span::styled(content, style));
+    write(statusline, themed_span(content, style));
 }
 
 fn render_lsp_spinner<'a, F>(statusline: &mut Statusline<'a>, write: F)
@@ -327,6 +381,38 @@ where
             .to_string()
             .into(),
     );
+}
+
+/// `LspStatus` element: a compact list of attached language server
+/// names, e.g. ` rust-analyzer ` or ` rust-analyzer · ruff `. Renders
+/// nothing when no LSP is attached so the statusline doesn't reserve
+/// dead space for non-LSP buffers (binary files, scratch buffers,
+/// languages with no configured server).
+///
+/// Pairs naturally with the `Spinner` element: place `LspStatus` next
+/// to `Spinner` and you get "is anything attached" + "is it busy
+/// right now" in two compact columns. Style uses `ui.text.inactive`
+/// (chrome-like, never demands attention) — falls back through
+/// `comment` and finally the statusline base.
+fn render_lsp_status<'a, F>(statusline: &mut Statusline<'a>, write: F)
+where
+    F: Fn(&mut Statusline<'a>, Span<'a>) + Copy,
+{
+    let names = &statusline.model.snapshot.lsp_server_names;
+    if names.is_empty() {
+        return;
+    }
+    let style = statusline
+        .model
+        .theme
+        .try_get("ui.text.inactive")
+        .or_else(|| statusline.model.theme.try_get("comment"))
+        .unwrap_or_else(|| statusline.model.theme.get("ui.statusline"));
+    // ` name1 · name2 ` — the `·` separator is the same idiom the
+    // rest of the chrome uses (count cluster, follow indicator, etc.)
+    // so the typography stays consistent.
+    let body = names.join(" · ");
+    write(statusline, themed_span(format!(" {body} "), style));
 }
 
 fn render_diagnostics<'a, F>(statusline: &mut Statusline<'a>, write: F)
@@ -364,11 +450,8 @@ where
     let icons = ICONS.load();
     let icon = icons.kind().workspace();
     if !icon.glyph().is_empty() {
-        if let Some(style) = icon.color().map(|color| Style::default().fg(color)) {
-            write(
-                statusline,
-                Span::styled(format!("{} ", icon.glyph()), style),
-            );
+        if let Some(style) = icon.color().map(|color| ThemeStyle::default().fg(color)) {
+            write(statusline, themed_span(format!("{} ", icon.glyph()), style));
         } else {
             write(statusline, format!("{} ", icon.glyph()).into());
         }
@@ -391,7 +474,7 @@ fn render_diagnostic_counts<'a, F>(
             Severity::Hint if counts.hints > 0 => {
                 write(
                     statusline,
-                    Span::styled(
+                    themed_span(
                         icons.diagnostic().hint().to_string(),
                         statusline.model.theme.get("hint"),
                     ),
@@ -401,7 +484,7 @@ fn render_diagnostic_counts<'a, F>(
             Severity::Info if counts.info > 0 => {
                 write(
                     statusline,
-                    Span::styled(
+                    themed_span(
                         icons.diagnostic().info().to_string(),
                         statusline.model.theme.get("info"),
                     ),
@@ -411,7 +494,7 @@ fn render_diagnostic_counts<'a, F>(
             Severity::Warning if counts.warnings > 0 => {
                 write(
                     statusline,
-                    Span::styled(
+                    themed_span(
                         icons.diagnostic().warning().to_string(),
                         statusline.model.theme.get("warning"),
                     ),
@@ -421,7 +504,7 @@ fn render_diagnostic_counts<'a, F>(
             Severity::Error if counts.errors > 0 => {
                 write(
                     statusline,
-                    Span::styled(
+                    themed_span(
                         icons.diagnostic().error().to_string(),
                         statusline.model.theme.get("error"),
                     ),
@@ -438,14 +521,13 @@ where
     F: Fn(&mut Statusline<'a>, Span<'a>) + Copy,
 {
     let selection = statusline.model.snapshot.selection;
-    write(
-        statusline,
-        if selection.count == 1 {
-            " 1 sel ".into()
-        } else {
-            format!(" {}/{} sels ", selection.primary_index + 1, selection.count).into()
-        },
-    );
+    let muted = statusline_muted(&statusline.model.theme);
+    let text = if selection.count == 1 {
+        " 1 sel ".to_string()
+    } else {
+        format!(" {}/{} sels ", selection.primary_index + 1, selection.count)
+    };
+    write(statusline, themed_span(text, muted));
 }
 
 fn render_primary_selection_length<'a, F>(statusline: &mut Statusline<'a>, write: F)
@@ -453,10 +535,9 @@ where
     F: Fn(&mut Statusline<'a>, Span<'a>) + Copy,
 {
     let length = statusline.model.snapshot.selection.primary_length;
-    write(
-        statusline,
-        format!(" {} char{} ", length, if length == 1 { "" } else { "s" }).into(),
-    );
+    let muted = statusline_muted(&statusline.model.theme);
+    let text = format!(" {} char{} ", length, if length == 1 { "" } else { "s" });
+    write(statusline, themed_span(text, muted));
 }
 
 fn render_position<'a, F>(statusline: &mut Statusline<'a>, write: F)
@@ -464,20 +545,18 @@ where
     F: Fn(&mut Statusline<'a>, Span<'a>) + Copy,
 {
     let position = statusline.model.snapshot.cursor.position;
-    write(
-        statusline,
-        format!(" {}:{} ", position.row + 1, position.col + 1).into(),
-    );
+    let muted = statusline_muted(&statusline.model.theme);
+    let text = format!(" {}:{} ", position.row + 1, position.col + 1);
+    write(statusline, themed_span(text, muted));
 }
 
 fn render_total_line_numbers<'a, F>(statusline: &mut Statusline<'a>, write: F)
 where
     F: Fn(&mut Statusline<'a>, Span<'a>) + Copy,
 {
-    write(
-        statusline,
-        format!(" {} ", statusline.model.snapshot.cursor.total_lines).into(),
-    );
+    let muted = statusline_muted(&statusline.model.theme);
+    let text = format!(" {} ", statusline.model.snapshot.cursor.total_lines);
+    write(statusline, themed_span(text, muted));
 }
 
 fn render_position_percentage<'a, F>(statusline: &mut Statusline<'a>, write: F)
@@ -486,10 +565,9 @@ where
 {
     let position = statusline.model.snapshot.cursor.position;
     let max_rows = statusline.model.snapshot.cursor.total_lines.max(1);
-    write(
-        statusline,
-        format!("{}%", (position.row + 1) * 100 / max_rows).into(),
-    );
+    let muted = statusline_muted(&statusline.model.theme);
+    let text = format!("{}%", (position.row + 1) * 100 / max_rows);
+    write(statusline, themed_span(text, muted));
 }
 
 fn render_file_encoding<'a, F>(statusline: &mut Statusline<'a>, write: F)
@@ -537,10 +615,10 @@ where
         statusline.model.snapshot.document.file_path.as_ref(),
         Some(file_type),
     ) {
-        if let Some(style) = icon.color().map(|color| Style::default().fg(color)) {
+        if let Some(style) = icon.color().map(|color| ThemeStyle::default().fg(color)) {
             write(
                 statusline,
-                Span::styled(format!(" {} ", icon.glyph()), style),
+                themed_span(format!(" {} ", icon.glyph()), style),
             );
         } else {
             write(statusline, format!(" {} ", icon.glyph()).into());
@@ -578,14 +656,20 @@ fn render_file_modification_indicator<'a, F>(statusline: &mut Statusline<'a>, wr
 where
     F: Fn(&mut Statusline<'a>, Span<'a>) + Copy,
 {
-    write(
-        statusline,
-        if statusline.model.snapshot.document.modified {
-            "[+]".into()
-        } else {
-            "   ".into()
-        },
-    );
+    if statusline.model.snapshot.document.modified {
+        // Accent the unsaved marker so it stands out against the filename —
+        // unsaved state is the one thing the eye should catch immediately.
+        let accent = statusline
+            .model
+            .theme
+            .try_get("ui.text.focus")
+            .or_else(|| statusline.model.theme.try_get("warning"))
+            .unwrap_or_else(|| statusline.model.theme.get("ui.statusline"));
+        write(statusline, themed_span("[+]", accent));
+    } else {
+        // Preserve layout width when the file is clean.
+        write(statusline, "   ".into());
+    }
 }
 
 fn render_read_only_indicator<'a, F>(statusline: &mut Statusline<'a>, write: F)
@@ -618,9 +702,9 @@ where
 {
     write(
         statusline,
-        Span::styled(
+        themed_span(
             statusline.model.config.separator.to_string(),
-            statusline.model.theme.get("ui.statusline.separator"),
+            StatuslineStyles::from_theme(&statusline.model.theme).separator,
         ),
     );
 }
@@ -703,10 +787,10 @@ where
         let icons = ICONS.load();
         if let Some(icon) = icons.kind().get("function") {
             let glyph = icon.glyph();
-            if let Some(style) = icon.color().map(|color| Style::default().fg(color)) {
+            if let Some(style) = icon.color().map(|color| ThemeStyle::default().fg(color)) {
                 write(
                     statusline,
-                    Span::styled(format!(" {} {}", glyph, name), style),
+                    themed_span(format!(" {} {}", glyph, name), style),
                 );
             } else {
                 write(statusline, format!(" {} {} ", glyph, name).into());

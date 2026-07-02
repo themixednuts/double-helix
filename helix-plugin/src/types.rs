@@ -175,57 +175,100 @@ impl UiCallbackCounter {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-/// Abstraction over a drawing surface for plugin rendering.
+/// A typed rendering command emitted by the plugin ABI.
 ///
-/// helix-plugin defines this trait; helix-term provides the implementation
-/// wrapping `tui::buffer::Buffer`. This avoids helix-plugin depending on helix-tui.
-pub trait DrawSurface {
-    fn set_string(&mut self, x: u16, y: u16, text: &str, style: helix_view::graphics::Style);
-    fn set_stringn(
-        &mut self,
+/// Plugins record commands during Lua render callbacks. The terminal frontend
+/// owns the actual Ratatui buffer and applies these commands after Lua returns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SurfaceRenderOp {
+    SetString {
         x: u16,
         y: u16,
-        text: &str,
+        text: String,
+        style: helix_view::graphics::Style,
+    },
+    SetStringN {
+        x: u16,
+        y: u16,
+        text: String,
         max_width: usize,
         style: helix_view::graphics::Style,
-    );
-    fn clear_with(&mut self, area: helix_view::graphics::Rect, style: helix_view::graphics::Style);
-    fn set_style(&mut self, area: helix_view::graphics::Rect, style: helix_view::graphics::Style);
-
-    // Widget-level operations — delegate to the real widget functions.
-    fn header(
-        &mut self,
+    },
+    Clear {
         area: helix_view::graphics::Rect,
-        title: &str,
         style: helix_view::graphics::Style,
-    );
-    fn header_with_counts(
-        &mut self,
+    },
+    SetStyle {
         area: helix_view::graphics::Rect,
-        title: &str,
+        style: helix_view::graphics::Style,
+    },
+    Header {
+        area: helix_view::graphics::Rect,
+        title: String,
+        style: helix_view::graphics::Style,
+    },
+    HeaderWithCounts {
+        area: helix_view::graphics::Rect,
+        title: String,
         current: usize,
         total: usize,
         style: helix_view::graphics::Style,
-    );
-    fn hdivider(&mut self, area: helix_view::graphics::Rect, style: helix_view::graphics::Style);
-    fn vdivider(&mut self, area: helix_view::graphics::Rect, style: helix_view::graphics::Style);
-    fn text_input(
-        &mut self,
+    },
+    HDivider {
         area: helix_view::graphics::Rect,
-        text: &str,
+        style: helix_view::graphics::Style,
+    },
+    VDivider {
+        area: helix_view::graphics::Rect,
+        style: helix_view::graphics::Style,
+    },
+    TextInput {
+        area: helix_view::graphics::Rect,
+        text: String,
         cursor: usize,
         style: helix_view::graphics::Style,
         cursor_style: helix_view::graphics::Style,
-    ) -> (u16, u16);
-    fn scrollbar(
-        &mut self,
+    },
+    Scrollbar {
         area: helix_view::graphics::Rect,
         total: usize,
         offset: usize,
         visible: usize,
         thumb_style: helix_view::graphics::Style,
-        track_symbol: Option<&str>,
+        track_symbol: Option<String>,
         track_style: helix_view::graphics::Style,
-    );
+    },
+}
+
+/// Ordered render commands emitted by one plugin render callback.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SurfaceRenderOps {
+    ops: Vec<SurfaceRenderOp>,
+}
+
+impl SurfaceRenderOps {
+    pub fn push(&mut self, op: SurfaceRenderOp) {
+        self.ops.push(op);
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ops.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.ops.len()
+    }
+
+    pub fn as_slice(&self) -> &[SurfaceRenderOp] {
+        &self.ops
+    }
+}
+
+impl IntoIterator for SurfaceRenderOps {
+    type Item = SurfaceRenderOp;
+    type IntoIter = std::vec::IntoIter<SurfaceRenderOp>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.ops.into_iter()
+    }
 }

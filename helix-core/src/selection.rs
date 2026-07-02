@@ -63,7 +63,7 @@ pub struct Range {
 }
 
 impl Range {
-    pub fn new(anchor: usize, head: usize) -> Self {
+    pub const fn new(anchor: usize, head: usize) -> Self {
         Self {
             anchor,
             head,
@@ -71,7 +71,7 @@ impl Range {
         }
     }
 
-    pub fn point(head: usize) -> Self {
+    pub const fn point(head: usize) -> Self {
         Self::new(head, head)
     }
 
@@ -84,21 +84,29 @@ impl Range {
     /// Start of the range.
     #[inline]
     #[must_use]
-    pub fn from(&self) -> usize {
-        std::cmp::min(self.anchor, self.head)
+    pub const fn from(&self) -> usize {
+        if self.anchor < self.head {
+            self.anchor
+        } else {
+            self.head
+        }
     }
 
     /// End of the range.
     #[inline]
     #[must_use]
-    pub fn to(&self) -> usize {
-        std::cmp::max(self.anchor, self.head)
+    pub const fn to(&self) -> usize {
+        if self.anchor > self.head {
+            self.anchor
+        } else {
+            self.head
+        }
     }
 
     /// Total length of the range.
     #[inline]
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.to() - self.from()
     }
 
@@ -118,7 +126,7 @@ impl Range {
 
     /// `true` when head and anchor are at the same position.
     #[inline]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.anchor == self.head
     }
 
@@ -126,7 +134,7 @@ impl Range {
     /// `Direction::Forward` otherwise.
     #[inline]
     #[must_use]
-    pub fn direction(&self) -> Direction {
+    pub const fn direction(&self) -> Direction {
         if self.head < self.anchor {
             Direction::Backward
         } else {
@@ -135,7 +143,7 @@ impl Range {
     }
 
     /// Flips the direction of the selection
-    pub fn flip(&self) -> Self {
+    pub const fn flip(&self) -> Self {
         Self {
             anchor: self.head,
             head: self.anchor,
@@ -145,17 +153,17 @@ impl Range {
 
     /// Returns the selection if it goes in the direction of `direction`,
     /// flipping the selection otherwise.
-    pub fn with_direction(self, direction: Direction) -> Self {
-        if self.direction() == direction {
-            self
-        } else {
-            self.flip()
+    pub const fn with_direction(self, direction: Direction) -> Self {
+        match (self.direction(), direction) {
+            (Direction::Forward, Direction::Forward)
+            | (Direction::Backward, Direction::Backward) => self,
+            _ => self.flip(),
         }
     }
 
     /// Check two ranges for overlap.
     #[must_use]
-    pub fn overlaps(&self, other: &Self) -> bool {
+    pub const fn overlaps(&self, other: &Self) -> bool {
         // To my eye, it's non-obvious why this works, but I arrived
         // at it after transforming the slower version that explicitly
         // enumerated more cases.  The unit tests are thorough.
@@ -163,11 +171,11 @@ impl Range {
     }
 
     #[inline]
-    pub fn contains_range(&self, other: &Self) -> bool {
+    pub const fn contains_range(&self, other: &Self) -> bool {
         self.from() <= other.from() && self.to() >= other.to()
     }
 
-    pub fn contains(&self, pos: usize) -> bool {
+    pub const fn contains(&self, pos: usize) -> bool {
         self.from() <= pos && pos < self.to()
     }
 

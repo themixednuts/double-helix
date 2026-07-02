@@ -1,13 +1,35 @@
 use std::{
     io::{Read, Seek, Write},
     ops::RangeInclusive,
+    path::Path,
 };
 
 use helix_core::diagnostic::Severity;
 use helix_stdx::path;
-use helix_view::doc;
 
 use super::*;
+
+#[cfg(unix)]
+fn create_file_symlink(original: &Path, link: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(original, link)
+}
+
+#[cfg(windows)]
+fn create_file_symlink(original: &Path, link: &Path) -> std::io::Result<()> {
+    std::os::windows::fs::symlink_file(original, link)
+}
+
+fn is_missing_symlink_privilege(err: &std::io::Error) -> bool {
+    cfg!(windows) && err.raw_os_error() == Some(1314)
+}
+
+fn try_create_file_symlink(original: &Path, link: &Path) -> anyhow::Result<bool> {
+    match create_file_symlink(original, link) {
+        Ok(()) => Ok(true),
+        Err(err) if is_missing_symlink_privilege(&err) => Ok(false),
+        Err(err) => Err(err.into()),
+    }
+}
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_exit_w_buffer_w_path() -> anyhow::Result<()> {
@@ -165,7 +187,7 @@ async fn test_buffer_close_concurrent() -> anyhow::Result<()> {
     const RANGE: RangeInclusive<i32> = 1..=1000;
 
     for i in RANGE {
-        let cmd = format!("%c{}<esc>:w!<ret>", i);
+        let cmd = format!("i{}<esc>:w!<ret>", i);
         command.push_str(&cmd);
     }
 
@@ -188,9 +210,10 @@ async fn test_buffer_close_concurrent() -> anyhow::Result<()> {
     )
     .await?;
 
+    let expected = RANGE.map(|i| i.to_string()).collect::<Vec<_>>().join("\n");
     helpers::assert_file_has_content(
         &mut file,
-        &LineFeedHandling::Native.apply(&RANGE.end().to_string()),
+        &LineFeedHandling::Native.apply(&format!("{expected}\n")),
     )?;
 
     Ok(())
@@ -217,6 +240,33 @@ async fn test_write() -> anyhow::Result<()> {
 
     assert_eq!(
         LineFeedHandling::Native.apply("the gostak distims the doshes"),
+        file_content
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_write_while_file_explorer_focused() -> anyhow::Result<()> {
+    let mut file = tempfile::NamedTempFile::new()?;
+    let mut app = helpers::AppBuilder::new()
+        .with_file(file.path(), None)
+        .build()?;
+
+    test_key_sequence(
+        &mut app,
+        Some("ifile explorer write reaches disk<esc><space>e:w<ret>"),
+        None,
+        false,
+    )
+    .await?;
+
+    reload_file(&mut file).unwrap();
+    let mut file_content = String::new();
+    file.as_file_mut().read_to_string(&mut file_content)?;
+
+    assert_eq!(
+        LineFeedHandling::Native.apply("file explorer write reaches disk"),
         file_content
     );
 
@@ -287,7 +337,7 @@ async fn test_write_concurrent() -> anyhow::Result<()> {
         .build()?;
 
     for i in RANGE {
-        let cmd = format!("%c{}<esc>:w!<ret>", i);
+        let cmd = format!("i{}<esc>:w!<ret>", i);
         command.push_str(&cmd);
     }
 
@@ -296,8 +346,9 @@ async fn test_write_concurrent() -> anyhow::Result<()> {
     reload_file(&mut file).unwrap();
     let mut file_content = String::new();
     file.read_to_string(&mut file_content)?;
+    let expected = RANGE.map(|i| i.to_string()).collect::<Vec<_>>().join("\n");
     assert_eq!(
-        LineFeedHandling::Native.apply(&RANGE.end().to_string()),
+        LineFeedHandling::Native.apply(&format!("{expected}\n")),
         file_content
     );
 
@@ -317,14 +368,14 @@ async fn test_write_fail_mod_flag() -> anyhow::Result<()> {
             (
                 None,
                 Some(&|app| {
-                    let doc = doc!(app.editor);
+                    let doc = helix_view::focused_ref!(app.editor).1;
                     assert!(!doc.is_modified());
                 }),
             ),
             (
                 Some("ihello<esc>"),
                 Some(&|app| {
-                    let doc = doc!(app.editor);
+                    let doc = helix_view::focused_ref!(app.editor).1;
                     assert!(doc.is_modified());
                 }),
             ),
@@ -333,7 +384,7 @@ async fn test_write_fail_mod_flag() -> anyhow::Result<()> {
                 Some(&|app| {
                     assert_eq!(&Severity::Error, app.editor.get_status().unwrap().1);
 
-                    let doc = doc!(app.editor);
+                    let doc = helix_view::focused_ref!(app.editor).1;
                     assert!(doc.is_modified());
                 }),
             ),
@@ -456,7 +507,7 @@ async fn test_write_new_path() -> anyhow::Result<()> {
             (
                 Some("ii can eat glass, it will not hurt me<ret><esc>:w<ret>"),
                 Some(&|app| {
-                    let doc = doc!(app.editor);
+                    let doc = helix_view::focused_ref!(app.editor).1;
                     assert!(!app.editor.is_err());
                     assert_eq!(&path::normalize(file1.path()), doc.path().unwrap());
                 }),
@@ -464,7 +515,7 @@ async fn test_write_new_path() -> anyhow::Result<()> {
             (
                 Some(&format!(":w {}<ret>", file2.path().to_string_lossy())),
                 Some(&|app| {
-                    let doc = doc!(app.editor);
+                    let doc = helix_view::focused_ref!(app.editor).1;
                     assert!(!app.editor.is_err());
                     assert_eq!(&path::normalize(file2.path()), doc.path().unwrap());
                     assert!(app.editor.document_by_path(file1.path()).is_none());
@@ -498,7 +549,7 @@ async fn test_write_fail_new_path() -> anyhow::Result<()> {
             (
                 None,
                 Some(&|app| {
-                    let doc = doc!(app.editor);
+                    let doc = helix_view::focused_ref!(app.editor).1;
                     assert_ne!(
                         Some(&Severity::Error),
                         app.editor.get_status().map(|status| status.1)
@@ -509,7 +560,7 @@ async fn test_write_fail_new_path() -> anyhow::Result<()> {
             (
                 Some(&format!(":w {}<ret>", file.path().to_string_lossy())),
                 Some(&|app| {
-                    let doc = doc!(app.editor);
+                    let doc = helix_view::focused_ref!(app.editor).1;
                     assert_eq!(
                         Some(&Severity::Error),
                         app.editor.get_status().map(|status| status.1)
@@ -711,16 +762,13 @@ async fn test_write_all_insert_final_newline_do_not_add_if_unmodified() -> anyho
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_symlink_write() -> anyhow::Result<()> {
-    #[cfg(unix)]
-    use std::os::unix::fs::symlink;
-    #[cfg(not(unix))]
-    use std::os::windows::fs::symlink_file as symlink;
-
     let dir = tempfile::tempdir()?;
 
     let mut file = tempfile::NamedTempFile::new_in(&dir)?;
     let symlink_path = dir.path().join("linked");
-    symlink(file.path(), &symlink_path)?;
+    if !try_create_file_symlink(file.path(), &symlink_path)? {
+        return Ok(());
+    }
 
     let mut app = helpers::AppBuilder::new()
         .with_file(&symlink_path, None)
@@ -749,16 +797,13 @@ async fn test_symlink_write() -> anyhow::Result<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_symlink_write_fail() -> anyhow::Result<()> {
-    #[cfg(unix)]
-    use std::os::unix::fs::symlink;
-    #[cfg(not(unix))]
-    use std::os::windows::fs::symlink_file as symlink;
-
     let dir = tempfile::tempdir()?;
 
     let file = helpers::new_readonly_tempfile_in_dir(&dir)?;
     let symlink_path = dir.path().join("linked");
-    symlink(file.path(), &symlink_path)?;
+    if !try_create_file_symlink(file.path(), &symlink_path)? {
+        return Ok(());
+    }
 
     let mut app = helpers::AppBuilder::new()
         .with_file(&symlink_path, None)
@@ -786,11 +831,6 @@ async fn test_symlink_write_fail() -> anyhow::Result<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_symlink_write_relative() -> anyhow::Result<()> {
-    #[cfg(unix)]
-    use std::os::unix::fs::symlink;
-    #[cfg(not(unix))]
-    use std::os::windows::fs::symlink_file as symlink;
-
     // tempdir
     // |- - b
     // |  |- file
@@ -802,7 +842,9 @@ async fn test_symlink_write_relative() -> anyhow::Result<()> {
     let mut file = tempfile::NamedTempFile::new_in(&inner_dir)?;
     let symlink_path = dir.path().join("linked");
     let relative_path = std::path::PathBuf::from("b").join(file.path().file_name().unwrap());
-    symlink(relative_path, &symlink_path)?;
+    if !try_create_file_symlink(&relative_path, &symlink_path)? {
+        return Ok(());
+    }
 
     let mut app = helpers::AppBuilder::new()
         .with_file(&symlink_path, None)

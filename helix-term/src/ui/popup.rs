@@ -3,14 +3,10 @@ use crate::{
     compositor::{Component, Context, Event, EventResult, PostAction, RenderContext},
     ctrl, key,
 };
-use tui::{
-    buffer::Buffer as Surface,
-    widgets::{Block, BorderType, Widget},
-};
 
 use helix_core::Position;
 use helix_view::{
-    graphics::{Margin, Rect},
+    graphics::Rect,
     input::{MouseEvent, MouseEventKind},
     Editor,
 };
@@ -123,8 +119,34 @@ impl<T: Component> Popup<T> {
         self.render_info(viewport, editor).area
     }
 
+    pub fn area_at(
+        &mut self,
+        viewport: Rect,
+        cursor_position: Option<Position>,
+        popup_border: bool,
+        menu_border: bool,
+    ) -> Rect {
+        self.render_info_at(viewport, cursor_position, popup_border, menu_border)
+            .area
+    }
+
     fn render_info(&mut self, viewport: Rect, editor: &Editor) -> RenderInfo {
-        let mut position = editor.cursor().0.unwrap_or_default();
+        self.render_info_at(
+            viewport,
+            editor.cursor().0,
+            editor.popup_border(),
+            editor.menu_border(),
+        )
+    }
+
+    fn render_info_at(
+        &mut self,
+        viewport: Rect,
+        cursor_position: Option<Position>,
+        popup_border: bool,
+        menu_border: bool,
+    ) -> RenderInfo {
+        let mut position = cursor_position.unwrap_or_default();
         if let Some(old_position) = self
             .position
             .filter(|old_position| old_position.row == position.row)
@@ -139,11 +161,7 @@ impl<T: Component> Popup<T> {
             .type_name()
             .starts_with("helix_term::ui::menu::Menu");
 
-        let mut render_borders = if is_menu {
-            editor.menu_border()
-        } else {
-            editor.popup_border()
-        };
+        let mut render_borders = if is_menu { menu_border } else { popup_border };
 
         // -- make sure frame doesn't stick out of bounds
         let mut rel_x = position.col as u16;
@@ -214,6 +232,87 @@ impl<T: Component> Popup<T> {
             child_height,
             render_borders,
             is_menu,
+        }
+    }
+
+    fn render_surface<F>(
+        &mut self,
+        viewport: Rect,
+        surface: &mut crate::render::CellSurface,
+        cx: &RenderContext,
+        render_child: F,
+    ) where
+        F: FnOnce(&mut T, Rect, &mut crate::render::CellSurface, &RenderContext),
+    {
+        let RenderInfo {
+            area,
+            child_height,
+            render_borders,
+            is_menu,
+        } = self.render_info_at(
+            viewport,
+            cx.cursor_position(),
+            cx.popup_border(),
+            cx.menu_border(),
+        );
+        self.area = area;
+
+        let menu_styles = crate::ui::design::MenuStyles::from_theme(cx.theme());
+        let popup_styles = crate::ui::design::PopupStyles::from_theme(cx.theme());
+        let background = if is_menu {
+            menu_styles.background
+        } else {
+            popup_styles.background
+        };
+        let inner = if render_borders {
+            crate::widgets::Panel::framed(
+                crate::widgets::PanelStyle::plain(background),
+                cx.config().rounded_corners,
+            )
+            .render(surface, area)
+        } else {
+            {
+                let area = tui::ratatui::to_ratatui_rect(area);
+                tui::ratatui::widgets::Widget::render(tui::ratatui::widgets::Clear, area, surface);
+                surface.set_style(area, tui::ratatui::to_ratatui_style(background));
+            };
+            area
+        };
+        let border = usize::from(render_borders);
+
+        let max_offset = child_height.saturating_sub(inner.height) as usize;
+        let half_page_size = (inner.height / 2) as usize;
+        let scroll = max_offset.min(self.scroll_half_pages * half_page_size);
+        if let Some(div) = scroll.checked_div(half_page_size) {
+            self.scroll_half_pages = div;
+        }
+        cx.set_scroll(Some(scroll));
+        render_child(&mut self.contents, inner, surface, cx);
+
+        if self.has_scrollbar {
+            let win_height = inner.height as usize;
+            let len = child_height as usize;
+
+            if len > win_height {
+                let scroll_style = menu_styles.scroll;
+                let thumb_fg = scroll_style.fg.unwrap_or(helix_view::theme::Color::Reset);
+                let mut sb = crate::widgets::Scrollbar::new(len, scroll, win_height)
+                    .symbol(if render_borders { "▌" } else { "▐" })
+                    .thumb_style(helix_view::graphics::Style::default().fg(thumb_fg));
+                if !render_borders {
+                    let track_fg = scroll_style.bg.unwrap_or(helix_view::theme::Color::Reset);
+                    sb = sb.track("▐", helix_view::graphics::Style::default().fg(track_fg));
+                }
+                sb.render(
+                    Rect::new(
+                        inner.right() - 1 + border as u16,
+                        inner.top(),
+                        1,
+                        inner.height,
+                    ),
+                    surface,
+                );
+            }
         }
     }
 
@@ -308,73 +407,18 @@ impl<T: Component> Component for Popup<T> {
         }
     }
 
-    fn render(&mut self, viewport: Rect, surface: &mut Surface, cx: &RenderContext) {
-        let RenderInfo {
-            area,
-            child_height,
-            render_borders,
-            is_menu,
-        } = self.render_info(viewport, cx.editor);
-        self.area = area;
-
-        // clear area
-        let background = if is_menu {
-            // TODO: consistently style menu
-            cx.editor
-                .theme
-                .try_get("ui.menu")
-                .unwrap_or_else(|| cx.editor.theme.get("ui.text"))
-        } else {
-            cx.editor.theme.get("ui.popup")
-        };
-        surface.clear_with(area, background);
-
-        let mut inner = area;
-        if render_borders {
-            let border_type = BorderType::new(cx.editor.config().rounded_corners);
-            inner = area.inner(Margin::all(1));
-            Widget::render(Block::bordered().border_type(border_type), area, surface);
-        }
-        let border = usize::from(render_borders);
-
-        let max_offset = child_height.saturating_sub(inner.height) as usize;
-        let half_page_size = (inner.height / 2) as usize;
-        let scroll = max_offset.min(self.scroll_half_pages * half_page_size);
-        if let Some(div) = scroll.checked_div(half_page_size) {
-            self.scroll_half_pages = div;
-        }
-        cx.set_scroll(Some(scroll));
-        self.contents.render(inner, surface, cx);
-
-        // render scrollbar if contents do not fit
-        if self.has_scrollbar {
-            let win_height = inner.height as usize;
-            let len = child_height as usize;
-
-            if len > win_height {
-                let scroll_style = cx.editor.theme.get("ui.menu.scroll");
-                let thumb_fg = scroll_style.fg.unwrap_or(helix_view::theme::Color::Reset);
-                let mut sb = crate::widgets::Scrollbar::new(len, scroll, win_height)
-                    .symbol(if render_borders { "▌" } else { "▐" })
-                    .thumb_style(helix_view::graphics::Style::default().fg(thumb_fg));
-                if !render_borders {
-                    let track_fg = scroll_style.bg.unwrap_or(helix_view::theme::Color::Reset);
-                    sb = sb.track("▐", helix_view::graphics::Style::default().fg(track_fg));
-                }
-                sb.render(
-                    Rect::new(
-                        inner.right() - 1 + border as u16,
-                        inner.top(),
-                        1,
-                        inner.height,
-                    ),
-                    surface,
-                );
-            }
-        }
+    fn render(
+        &mut self,
+        viewport: Rect,
+        surface: &mut crate::render::CellSurface,
+        cx: &RenderContext,
+    ) {
+        self.render_surface(viewport, surface, cx, |contents, inner, surface, cx| {
+            contents.render(inner, surface, cx);
+        });
     }
 
-    fn id(&self) -> Option<&'static str> {
+    fn id(&self) -> Option<&str> {
         Some(self.id)
     }
 }

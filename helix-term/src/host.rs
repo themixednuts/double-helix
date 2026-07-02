@@ -2,11 +2,10 @@
 
 use std::time::Duration;
 
-use helix_runtime::{Runtime, Sender};
+use helix_runtime::{FrameHandle, Runtime};
 use helix_view::graphics::Rect;
 
 use crate::compositor::Compositor;
-use crate::runtime::{request_redraw, RuntimeEvent};
 
 /// Mark a region, or the whole surface, as needing redraw.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,23 +27,26 @@ pub trait UiHost {
 ///
 /// Invalidation triggers a compositor full-redraw + async redraw request so the
 /// application's render loop picks it up. Timers use [`helix_runtime::Clock`]
-/// and deliver expiry through the application ingress ([`RuntimeEvent::Timer`]).
+/// and deliver expiry through the typed application ingress.
 pub struct TermHost<'a> {
     pub compositor: &'a mut Compositor,
     runtime: &'a Runtime,
-    ingress: Sender<RuntimeEvent>,
+    ingress: crate::runtime::RuntimeIngress,
+    redraw: FrameHandle,
 }
 
 impl<'a> TermHost<'a> {
     pub fn new(
         compositor: &'a mut Compositor,
         runtime: &'a Runtime,
-        ingress: Sender<RuntimeEvent>,
+        ingress: crate::runtime::RuntimeIngress,
+        redraw: FrameHandle,
     ) -> Self {
         Self {
             compositor,
             runtime,
             ingress,
+            redraw,
         }
     }
 }
@@ -54,13 +56,13 @@ impl UiHost for TermHost<'_> {
         match area {
             Invalidation::Full => {
                 self.compositor.need_full_redraw();
-                request_redraw(&self.ingress);
+                self.redraw.request_redraw();
             }
             Invalidation::Rect(_rect) => {
                 // Terminal backend redraws the whole screen; treat rect as full.
                 // A future GPU/partial-damage backend could use the rect.
                 self.compositor.need_full_redraw();
-                request_redraw(&self.ingress);
+                self.redraw.request_redraw();
             }
         }
     }
@@ -72,7 +74,7 @@ impl UiHost for TermHost<'_> {
             .work()
             .spawn(async move {
                 if timer_task.await.is_ok() {
-                    let _ = ingress.send(RuntimeEvent::Timer(id)).await;
+                    ingress.send_timer(id).await;
                 }
             })
             .detach();

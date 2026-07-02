@@ -2,9 +2,12 @@
 
 use std::io;
 
-use crate::{buffer::Cell, terminal::Config};
+use crate::terminal::Config;
+use ratatui::buffer::Cell;
 
 use helix_view::graphics::{CursorKind, Rect};
+
+mod cell;
 
 #[cfg(all(feature = "termina", not(windows)))]
 mod termina;

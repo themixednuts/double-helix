@@ -2,15 +2,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use helix_lsp::lsp;
-use helix_runtime::Sender as IngressSender;
-use helix_runtime::{send_blocking, Debounce, Token, Work};
+use helix_runtime::{send_blocking, DebouncedSender, Token, Work};
 
 use helix_view::Editor;
 
 use super::LspCompletionItem;
 use crate::handlers::completion::CompletionItem;
+use crate::runtime::send_ui_command_with;
 use crate::runtime::ui::{CompletionCommand, UiCommand};
-use crate::runtime::{send_ui_command_with, RuntimeEvent};
 
 #[derive(Clone)]
 pub struct ResolveRuntime {
@@ -44,7 +43,7 @@ pub struct ResolveHandler {
 }
 
 impl ResolveHandler {
-    pub fn new(runtime: ResolveRuntime, ingress: IngressSender<RuntimeEvent>) -> ResolveHandler {
+    pub fn new(runtime: ResolveRuntime, ingress: crate::runtime::RuntimeIngress) -> ResolveHandler {
         let ResolveRuntime { work, clock } = runtime;
         ResolveHandler {
             last_request: None,
@@ -124,35 +123,36 @@ enum ResolveRequest {
 struct PendingResolve {
     item: Arc<LspCompletionItem>,
     ls: Arc<helix_lsp::Client>,
-    ingress: IngressSender<RuntimeEvent>,
+    ingress: crate::runtime::RuntimeIngress,
 }
 
 struct ResolveTimeout {
     next_request: Option<PendingResolve>,
     in_flight: Option<Arc<LspCompletionItem>>,
     cancel: Option<Token>,
-    debounce: Debounce,
+    debouncer: DebouncedSender<ResolveRequest>,
     work: Work,
-    clock: helix_runtime::Clock,
-    tx: helix_runtime::Sender<ResolveRequest>,
-    ingress: IngressSender<RuntimeEvent>,
+    ingress: crate::runtime::RuntimeIngress,
 }
 
 impl ResolveTimeout {
     fn spawn(
         work: Work,
         clock: helix_runtime::Clock,
-        ingress: IngressSender<RuntimeEvent>,
+        ingress: crate::runtime::RuntimeIngress,
     ) -> helix_runtime::Sender<ResolveRequest> {
         let (tx, mut rx) = helix_runtime::channel(128);
         let mut timeout = Self {
             next_request: None,
             in_flight: None,
             cancel: None,
-            debounce: Debounce::new(Duration::from_millis(150)),
+            debouncer: DebouncedSender::new(
+                Duration::from_millis(150),
+                work.clone(),
+                clock,
+                tx.clone(),
+            ),
             work,
-            clock,
-            tx: tx.clone(),
             ingress,
         };
         timeout
@@ -194,15 +194,12 @@ impl ResolveTimeout {
             .is_some_and(|old_request| old_request == &request.item)
         {
             self.next_request = None;
-            self.debounce.cancel();
+            self.debouncer.cancel();
             return;
         }
 
         self.next_request = Some(request);
-        let tx = self.tx.clone();
-        self.debounce.restart(&self.work, &self.clock, async move {
-            let _ = tx.send(ResolveRequest::Start).await;
-        });
+        self.debouncer.send(ResolveRequest::Start);
     }
 
     fn start(&mut self) {
@@ -220,7 +217,7 @@ impl ResolveTimeout {
 
     fn cancel(&mut self) {
         self.next_request = None;
-        self.debounce.cancel();
+        self.debouncer.cancel();
         if let Some(cancel) = self.cancel.take() {
             cancel.cancel();
         }

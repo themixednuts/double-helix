@@ -6,10 +6,10 @@
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-use helix_view::editor::Config;
+use helix_view::editor::{Config, EditorSessionBuilder, EditorSessionEvent, InsertPlacement};
 use helix_view::engine::{
-    ActionId, CommandToken, EditingEngine, EngineResult, KeymapLookup, KeymapQuery, MotionId,
-    OperatorId,
+    ActionId, CommandToken, EditingEngine, EditingEngineFactory, EngineResult, KeymapLookup,
+    KeymapQuery, MotionId, OperatorId,
 };
 use helix_view::graphics::Rect;
 use helix_view::input::KeyEvent;
@@ -17,8 +17,8 @@ use helix_view::keyboard::{KeyCode, KeyModifiers};
 use helix_view::Editor;
 
 use helix_modal::helix::HelixEngine;
-use helix_modal::populate::build_registry;
 use helix_modal::vim::VimEngine;
+use helix_modal::{CommandRegistry, ModalEngineFactory};
 
 // ─── Test helpers ────────────────────────────────────────────────────
 
@@ -186,12 +186,12 @@ fn test_editor() -> Editor {
 }
 
 fn build_helix_engine() -> Box<dyn EditingEngine> {
-    let registry = Arc::new(build_registry());
+    let registry = Arc::new(CommandRegistry::builtins());
     Box::new(HelixEngine::new(registry))
 }
 
 fn build_vim_engine() -> Box<dyn EditingEngine> {
-    let registry = Arc::new(build_registry());
+    let registry = Arc::new(CommandRegistry::builtins());
     Box::new(VimEngine::new(registry))
 }
 
@@ -222,6 +222,38 @@ fn doc_text(editor: &Editor) -> String {
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn editor_session_embeds_modal_engine_without_terminal_ui() {
+    let area = Rect::new(0, 0, 40, 12);
+    let factory: Arc<dyn EditingEngineFactory> = Arc::new(ModalEngineFactory::with_builtins());
+    let mut session = EditorSessionBuilder::new(area, helix_runtime::test::runtime())
+        .engine_factory(factory)
+        .build();
+    let doc_id = session
+        .editor_mut()
+        .new_file(helix_view::editor::Action::VerticalSplit);
+
+    assert_eq!(
+        session.enter_insert_mode(InsertPlacement::BeforeSelection),
+        EditorSessionEvent::Executed
+    );
+    assert_eq!(
+        session.dispatch_key(char_key('x')),
+        EditorSessionEvent::Inserted('x')
+    );
+    assert_eq!(
+        session.dispatch_key(char_key('y')),
+        EditorSessionEvent::Inserted('y')
+    );
+
+    let doc = session.editor().document(doc_id).unwrap();
+    assert_eq!(
+        doc.text().to_string(),
+        format!("xy{}", doc.line_ending().as_str())
+    );
+    assert_eq!(session.mode(), helix_view::document::Mode::Insert);
+}
 
 #[tokio::test]
 async fn helix_engine_motion_moves_cursor() {
@@ -324,7 +356,7 @@ async fn engine_mode_names() {
 
 #[tokio::test]
 async fn registry_has_commands() {
-    let registry = build_registry();
+    let registry = CommandRegistry::builtins();
     assert!(
         registry.len() > 100,
         "registry should have 100+ commands, got {}",

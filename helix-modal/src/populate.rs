@@ -255,11 +255,14 @@ pub fn engine_command_specs() -> &'static [EngineCommandSpec] {
     })
 }
 
-/// Build a fully populated registry with all known commands.
-pub fn build_registry() -> CommandRegistry {
-    let mut catalog = RegistryCatalogBuilder::default();
-    register_commands(&mut catalog);
-    catalog.freeze()
+impl CommandRegistry {
+    /// Build the registry for Helix's built-in modal commands.
+    #[must_use]
+    pub fn builtins() -> Self {
+        let mut catalog = RegistryCatalogBuilder::default();
+        register_commands(&mut catalog);
+        catalog.freeze()
+    }
 }
 
 // ─── Motions ─────────────────────────────────────────────────────────

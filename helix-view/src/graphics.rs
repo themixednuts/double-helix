@@ -532,32 +532,30 @@ impl FromStr for Modifier {
 ///     .add_modifier(Modifier::ITALIC | Modifier::BOLD);
 /// ```
 ///
-/// It represents an incremental change. If you apply the styles S1, S2, S3 to a cell of the
-/// terminal buffer, the style of this cell will be the result of the merge of S1, S2 and S3, not
-/// just S3.
+/// It represents an incremental change. If you apply the styles S1, S2, S3 to a style
+/// accumulator, the result will be the merge of S1, S2 and S3, not just S3.
 ///
 /// ```rust
-/// # use helix_view::graphics::{Rect, Color, UnderlineStyle, Modifier, Style};
-/// # use helix_tui::buffer::Buffer;
+/// # use helix_view::graphics::{Color, Modifier, Style};
 /// let styles = [
 ///     Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD | Modifier::ITALIC),
 ///     Style::default().bg(Color::Red),
 ///     Style::default().fg(Color::Yellow).remove_modifier(Modifier::ITALIC),
 /// ];
-/// let mut buffer = Buffer::empty(Rect::new(0, 0, 1, 1));
-/// for style in &styles {
-///   buffer[(0, 0)].set_style(*style);
+/// let mut style = Style::default();
+/// for diff in &styles {
+///   style = style.patch(*diff);
 /// }
 /// assert_eq!(
 ///     Style {
 ///         fg: Some(Color::Yellow),
 ///         bg: Some(Color::Red),
 ///         add_modifier: Modifier::BOLD,
-///         underline_color: Some(Color::Reset),
-///         underline_style: Some(UnderlineStyle::Reset),
-///         sub_modifier: Modifier::empty(),
+///         underline_color: None,
+///         underline_style: None,
+///         sub_modifier: Modifier::ITALIC,
 ///     },
-///     buffer[(0, 0)].style(),
+///     style,
 /// );
 /// ```
 ///
@@ -565,26 +563,25 @@ impl FromStr for Modifier {
 /// reset all properties until that point use [`Style::reset`].
 ///
 /// ```
-/// # use helix_view::graphics::{Rect, Color, UnderlineStyle, Modifier, Style};
-/// # use helix_tui::buffer::Buffer;
+/// # use helix_view::graphics::{Color, Modifier, Style};
 /// let styles = [
 ///     Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD | Modifier::ITALIC),
 ///     Style::reset().fg(Color::Yellow),
 /// ];
-/// let mut buffer = Buffer::empty(Rect::new(0, 0, 1, 1));
-/// for style in &styles {
-///   buffer[(0, 0)].set_style(*style);
+/// let mut style = Style::default();
+/// for diff in &styles {
+///   style = style.patch(*diff);
 /// }
 /// assert_eq!(
 ///     Style {
 ///         fg: Some(Color::Yellow),
 ///         bg: Some(Color::Reset),
-///         underline_color: Some(Color::Reset),
-///         underline_style: Some(UnderlineStyle::Reset),
+///         underline_color: None,
+///         underline_style: None,
 ///         add_modifier: Modifier::empty(),
-///         sub_modifier: Modifier::empty(),
+///         sub_modifier: Modifier::all(),
 ///     },
-///     buffer[(0, 0)].style(),
+///     style,
 /// );
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

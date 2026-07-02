@@ -20,9 +20,9 @@ use helix_view::graphics::Rect;
 use helix_view::theme::Style;
 use helix_view::view::{RenderSeed, ViewPosition};
 use helix_view::{Document, Theme};
-use tui::buffer::Buffer as Surface;
 
 use crate::ui::text_decorations::DecorationManager;
+use crate::widgets::AnchoredText;
 
 /// Input to the document renderer: either a live tree-sitter highlighter
 /// or cached syntax styles from a previous frame.
@@ -50,11 +50,19 @@ pub struct LinePos {
 pub struct RenderOutput {
     pub syntax_styles: Vec<helix_view::view::SyntaxStyleEntry>,
     pub line_map: helix_view::view::LineMap,
+    pub metrics: RenderMetrics,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RenderMetrics {
+    pub syntax_advances: usize,
+    pub skip_right_syntax_advances: usize,
+    pub skip_right_eof_fast_paths: usize,
 }
 
 #[allow(clippy::too_many_arguments)]
 pub fn render_document(
-    surface: &mut Surface,
+    surface: &mut crate::render::CellSurface,
     viewport: Rect,
     doc: &Document,
     offset: ViewPosition,
@@ -254,6 +262,7 @@ pub fn render_text(
     let mut drawn = 0usize;
     let mut dirty_offscreen = 0usize;
     let mut syntax_advances = 0usize;
+    let mut skip_right_syntax_advances = 0usize;
     let mut overlay_advances = 0usize;
     let mut virtual_drawn = 0usize;
     let mut zero_width_drawn = 0usize;
@@ -275,6 +284,7 @@ pub fn render_text(
     let mut skip_right_syntax_us = 0u64;
     let mut skip_right_overlay_us = 0u64;
     let mut skip_right_decor_us = 0u64;
+    let mut skip_right_eof_fast_paths = 0usize;
     let mut line_finalize_us = 0u64;
     let mut skipped_offscreen_left_lines = 0usize;
     let viewport_right = renderer.offset.col + renderer.viewport.width as usize;
@@ -485,11 +495,8 @@ pub fn render_text(
                         && seed.char_idx > grapheme.char_idx
                     {
                         let current_line = grapheme.line_idx;
-                        let next_line_char =
-                            formatter.skip_to_next_line().unwrap_or(text.len_chars());
-                        syntax_highlighter.advance_to(next_line_char);
-                        overlay_highlighter.advance_to(next_line_char);
-                        decorations.fast_forward_to_char(next_line_char, current_line);
+                        let next_line = formatter.skip_to_next_line();
+                        let next_line_char = next_line.unwrap_or_else(|| text.len_chars());
                         last_line_end = seed.visual_col;
                         if let Some(last_entry) = line_map_lines.last_mut() {
                             last_entry.char_range_end = next_line_char;
@@ -498,6 +505,14 @@ pub fn render_text(
                             dirty_offscreen += 1;
                         }
                         skipped_offscreen_left_lines += 1;
+                        if next_line.is_none() {
+                            skip_right_eof_fast_paths += 1;
+                            break 'render;
+                        }
+                        skip_right_syntax_advances +=
+                            syntax_highlighter.advance_to(next_line_char);
+                        overlay_highlighter.advance_to(next_line_char);
+                        decorations.fast_forward_to_char(next_line_char, current_line);
                         continue;
                     }
 
@@ -581,11 +596,21 @@ pub fn render_text(
         if !text_fmt.soft_wrap && !visible_right_edge {
             let skip_right_start = Instant::now();
             let current_line = grapheme.line_idx;
-            let next_line_char = formatter.skip_to_next_line().unwrap_or(text.len_chars());
+            let next_line = formatter.skip_to_next_line();
+            let next_line_char = next_line.unwrap_or_else(|| text.len_chars());
             let skipped_tail = next_line_char.saturating_sub(grapheme.char_idx);
             skipped_right += skipped_tail;
+            last_line_end = viewport_right;
+            if let Some(last_entry) = line_map_lines.last_mut() {
+                last_entry.char_range_end = next_line_char;
+            }
+            skip_right_us += skip_right_start.elapsed().as_micros() as u64;
+            if next_line.is_none() {
+                skip_right_eof_fast_paths += 1;
+                break 'render;
+            }
             let skip_right_syntax_start = Instant::now();
-            syntax_highlighter.advance_to(next_line_char);
+            skip_right_syntax_advances += syntax_highlighter.advance_to(next_line_char);
             skip_right_syntax_us += skip_right_syntax_start.elapsed().as_micros() as u64;
             let skip_right_overlay_start = Instant::now();
             overlay_highlighter.advance_to(next_line_char);
@@ -593,11 +618,6 @@ pub fn render_text(
             let skip_right_decor_start = Instant::now();
             decorations.fast_forward_to_char(next_line_char, current_line);
             skip_right_decor_us += skip_right_decor_start.elapsed().as_micros() as u64;
-            last_line_end = viewport_right;
-            if let Some(last_entry) = line_map_lines.last_mut() {
-                last_entry.char_range_end = next_line_char;
-            }
-            skip_right_us += skip_right_start.elapsed().as_micros() as u64;
             continue;
         }
 
@@ -751,14 +771,14 @@ pub fn render_text(
                 "anchor={} row_off={} soft_wrap={} viewport={}x{} h_offset={} v_offset={}",
                 " skipped_before_top={} skipped_left={} skipped_right={}",
                 " dirty_offscreen={} drawn={} line_map_rows={}",
-                " syntax_advances={} overlay_advances={} virtual_drawn={} zero_width_drawn={}",
+                " syntax_advances={} skip_right_syntax_advances={} overlay_advances={} virtual_drawn={} zero_width_drawn={}",
                 " first_visible_char={:?} last_visible_char={:?}",
                 " first_drawn_char={:?} last_drawn_char={:?} max_drawn_col={}",
                 " skipped_offscreen_left_lines={}",
                 " formatter_next_us={} advance_loop_us={} decoration_us={} draw_us={} bookkeeping_us={} skip_right_us={}",
                 " skip_left_syntax_us={} skip_left_overlay_us={} skip_left_decor_us={}",
                 " skip_right_syntax_us={} skip_right_overlay_us={} skip_right_decor_us={}",
-                " line_finalize_us={}",
+                " skip_right_eof_fast_paths={} line_finalize_us={}",
                 " formatter_next_calls={} formatter_advance_grapheme_calls={} formatter_inline_annotation_hits={}",
                 " formatter_overlay_hits={} formatter_fold_skip_count={} formatter_folded_chars_skipped={}",
                 " formatter_word_refills={} formatter_skip_to_next_line_calls={}",
@@ -778,6 +798,7 @@ pub fn render_text(
             drawn,
             line_map_lines.len(),
             syntax_advances,
+            skip_right_syntax_advances,
             overlay_advances,
             virtual_drawn,
             zero_width_drawn,
@@ -799,6 +820,7 @@ pub fn render_text(
             skip_right_syntax_us,
             skip_right_overlay_us,
             skip_right_decor_us,
+            skip_right_eof_fast_paths,
             line_finalize_us,
             formatter_stats.next_calls,
             formatter_stats.advance_grapheme_calls,
@@ -820,12 +842,16 @@ pub fn render_text(
         line_map: LineMap {
             lines: Arc::from(line_map_lines),
         },
+        metrics: RenderMetrics {
+            syntax_advances,
+            skip_right_syntax_advances,
+            skip_right_eof_fast_paths,
+        },
     }
 }
 
-#[derive(Debug)]
 pub struct TextRenderer<'a> {
-    surface: &'a mut Surface,
+    surface: &'a mut crate::render::CellSurface,
     pub text_style: Style,
     pub whitespace_style: Style,
     pub indent_guide_char: String,
@@ -850,7 +876,7 @@ pub struct GraphemeStyle {
 
 impl<'a> TextRenderer<'a> {
     pub fn new(
-        surface: &'a mut Surface,
+        surface: &'a mut crate::render::CellSurface,
         doc: &Document,
         theme: &Theme,
         offset: Position,
@@ -952,7 +978,7 @@ impl<'a> TextRenderer<'a> {
             self.viewport.x + col,
             self.viewport.y + row,
             grapheme,
-            style,
+            tui::ratatui::to_ratatui_style(style),
         );
         true
     }
@@ -1010,7 +1036,7 @@ impl<'a> TextRenderer<'a> {
                 self.viewport.x + (position.col - self.offset.col) as u16,
                 self.viewport.y + position.row as u16,
                 grapheme,
-                style,
+                tui::ratatui::to_ratatui_style(style),
             );
         } else if cut_off_start != 0 && cut_off_start < width {
             // partially on screen
@@ -1020,7 +1046,10 @@ impl<'a> TextRenderer<'a> {
                 (width - cut_off_start) as u16,
                 1,
             );
-            self.surface.set_style(rect, style);
+            self.surface.set_style(
+                tui::ratatui::to_ratatui_rect(rect),
+                tui::ratatui::to_ratatui_style(style),
+            );
         }
         if *is_in_indent_area && !is_whitespace {
             *last_indent_level = position.col;
@@ -1055,9 +1084,16 @@ impl<'a> TextRenderer<'a> {
             let x = (self.viewport.x as usize + (i * self.indent_width as usize) - self.offset.col)
                 as u16;
             let y = self.viewport.y + row;
-            debug_assert!(self.surface.in_bounds(x, y));
-            self.surface
-                .set_string(x, y, &self.indent_guide_char, self.indent_guide_style);
+            debug_assert!(self
+                .surface
+                .area()
+                .contains(tui::ratatui::layout::Position::new(x, y)));
+            self.surface.set_string(
+                x,
+                y,
+                &self.indent_guide_char,
+                tui::ratatui::to_ratatui_style(self.indent_guide_style),
+            );
         }
     }
 
@@ -1065,8 +1101,12 @@ impl<'a> TextRenderer<'a> {
         if (y as usize) < self.offset.row {
             return;
         }
-        self.surface
-            .set_string(x, y + self.viewport.y, string, style)
+        self.surface.set_string(
+            x,
+            y + self.viewport.y,
+            string.as_ref(),
+            tui::ratatui::to_ratatui_style(style),
+        )
     }
 
     pub fn set_stringn(
@@ -1080,8 +1120,13 @@ impl<'a> TextRenderer<'a> {
         if (y as usize) < self.offset.row {
             return;
         }
-        self.surface
-            .set_stringn(x, y + self.viewport.y, string, width, style);
+        self.surface.set_stringn(
+            x,
+            y + self.viewport.y,
+            string.as_ref(),
+            width,
+            tui::ratatui::to_ratatui_style(style),
+        );
     }
 
     /// Sets the style of an area **within the text viewport* this accounts
@@ -1089,7 +1134,10 @@ impl<'a> TextRenderer<'a> {
     pub fn set_style(&mut self, mut area: Rect, style: Style) {
         area = area.clip_top(self.offset.row as u16);
         area.y += self.viewport.y;
-        self.surface.set_style(area, style);
+        self.surface.set_style(
+            tui::ratatui::to_ratatui_rect(area),
+            tui::ratatui::to_ratatui_style(style),
+        );
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1106,14 +1154,13 @@ impl<'a> TextRenderer<'a> {
         if (y as usize) < self.offset.row {
             return (x, y);
         }
-        self.surface.set_string_truncated(
-            x,
-            y + self.viewport.y,
-            string,
-            width,
-            style,
-            ellipsis,
-            truncate_start,
+        let mut style_for_offset = |offset| tui::ratatui::to_ratatui_style(style(offset));
+        crate::widgets::draw_string_anchored(
+            self.surface,
+            AnchoredText::new(x, y + self.viewport.y, string, width)
+                .truncate_end(ellipsis)
+                .truncate_start(truncate_start),
+            &mut style_for_offset,
         )
     }
 }
@@ -1239,10 +1286,13 @@ impl<'h, 'r, 't> SyntaxHighlighter<'h, 'r, 't> {
         std::mem::take(&mut self.recorded_styles)
     }
 
-    fn advance_to(&mut self, char_idx: usize) {
+    fn advance_to(&mut self, char_idx: usize) -> usize {
+        let mut advances = 0;
         while self.pos < char_idx {
             self.advance();
+            advances += 1;
         }
+        advances
     }
 }
 
@@ -1294,10 +1344,15 @@ impl<'t> OverlayHighlighter<'t> {
 mod tests {
     use std::sync::Arc;
 
+    use crate::render::CellSurface as Surface;
     use arc_swap::ArcSwap;
     use helix_core::syntax;
-    use helix_view::{editor::Config, graphics::Rect, theme::Theme, view::ViewPosition};
-    use tui::buffer::Buffer as Surface;
+    use helix_view::{
+        editor::Config,
+        graphics::Rect,
+        theme::Theme,
+        view::{SyntaxStyleEntry, ViewPosition},
+    };
 
     use super::*;
 
@@ -1322,7 +1377,7 @@ mod tests {
     fn render_document_handles_post_join_giant_lines() {
         let doc = test_doc(&giant_two_line_fixture(32 * 1024));
         let viewport = Rect::new(0, 0, 160, 61);
-        let mut surface = Surface::empty(viewport);
+        let mut surface = Surface::empty(tui::ratatui::to_ratatui_rect(viewport));
 
         let output = render_document(
             &mut surface,
@@ -1344,6 +1399,43 @@ mod tests {
     }
 
     #[test]
+    fn render_document_does_not_replay_offscreen_syntax_to_eof() {
+        let text = "a".repeat(200_000);
+        let doc = test_doc(&text);
+        let syntax_entries = (0..text.len())
+            .map(|char_idx| SyntaxStyleEntry {
+                char_idx,
+                style: Style::default(),
+            })
+            .collect::<Vec<_>>();
+        let viewport = Rect::new(0, 0, 80, 10);
+        let mut surface = Surface::empty(tui::ratatui::to_ratatui_rect(viewport));
+
+        let output = render_document(
+            &mut surface,
+            viewport,
+            &doc,
+            ViewPosition::default(),
+            &TextAnnotations::default(),
+            HighlighterInput::Cached(&syntax_entries),
+            Vec::new(),
+            &Theme::default(),
+            DecorationManager::default(),
+            None,
+            None,
+            None,
+        );
+
+        assert_eq!(output.metrics.skip_right_eof_fast_paths, 1);
+        assert_eq!(output.metrics.skip_right_syntax_advances, 0);
+        assert!(output.metrics.syntax_advances <= viewport.width as usize + 1);
+        assert_eq!(
+            output.line_map.lines[0].char_range_end,
+            doc.text().len_chars()
+        );
+    }
+
+    #[test]
     #[ignore = "targeted local repro for post-xJ giant-line render"]
     fn render_document_post_join_giant_line_repro() {
         let event_log_path = std::env::temp_dir().join(format!(
@@ -1357,7 +1449,7 @@ mod tests {
         });
         let doc = test_doc(&giant_two_line_fixture(900_000));
         let viewport = Rect::new(0, 0, 160, 61);
-        let mut surface = Surface::empty(viewport);
+        let mut surface = Surface::empty(tui::ratatui::to_ratatui_rect(viewport));
         let start = std::time::Instant::now();
 
         let output = render_document(
@@ -1418,7 +1510,7 @@ mod tests {
         ];
 
         for offset in offsets {
-            let mut surface = Surface::empty(viewport);
+            let mut surface = Surface::empty(tui::ratatui::to_ratatui_rect(viewport));
             let start = std::time::Instant::now();
             let output = render_document(
                 &mut surface,

@@ -4,11 +4,9 @@ use arc_swap::ArcSwap;
 use helix_core::{syntax, Rope};
 use helix_lsp::lsp;
 use helix_view::editor::Action;
-use helix_view::graphics::{Margin, Rect, Style};
+use helix_view::graphics::{Margin, Rect};
 use helix_view::input::Event;
 use helix_view::{Document, Editor};
-use tui::buffer::Buffer;
-use tui::widgets::{BorderType, Paragraph, Widget, Wrap};
 
 use crate::compositor::{Component, Compositor, Context, EventResult, RenderContext};
 use crate::runtime::ui::command::LspHoverDisplay;
@@ -90,40 +88,93 @@ const HEADER_HEIGHT: u16 = 1;
 const SEPARATOR_HEIGHT: u16 = 1;
 
 impl Component for Hover {
-    fn render(&mut self, area: Rect, surface: &mut Buffer, cx: &RenderContext) {
+    fn render(&mut self, area: Rect, surface: &mut crate::render::CellSurface, cx: &RenderContext) {
+        use tui::ratatui::widgets::{Paragraph, Widget, Wrap};
+
         let margin = Margin::all(1);
         let area = area.inner(margin);
 
         let (header, contents) = self.content_markdown();
+        let theme = cx.theme();
 
-        // show header and border only when more than one results
         if let Some(header) = header {
-            // header LSP Name
-            let header = header.parse(Some(&cx.editor.theme));
-            let header = Paragraph::new(&header);
-            header.render(area.with_height(HEADER_HEIGHT), surface);
+            let header = header.parse(Some(theme));
+            let header = tui::ratatui::to_ratatui_text(&header);
+            let header = Paragraph::new(header);
+            header.render(
+                tui::ratatui::to_ratatui_rect(area.with_height(HEADER_HEIGHT)),
+                surface,
+            );
 
-            // border
-            let sep_style = Style::default();
-            let borders = BorderType::line_symbols(BorderType::Plain);
+            // Theme the divider between the LSP-name header (e.g.
+            // "[1/3] rust-analyzer") and the hover body. `Style::default()`
+            // was uncolored, making the line look like a stray character
+            // when the popup background was tinted. `comment` (or
+            // `ui.window`) gives a subtle visual separator that matches
+            // the rest of the chrome.
+            let divider_style = theme
+                .try_get("ui.window")
+                .or_else(|| theme.try_get("comment"))
+                .unwrap_or_default();
             for x in area.left()..area.right() {
-                if let Some(cell) = surface.get_mut(x, area.top() + HEADER_HEIGHT) {
-                    cell.set_symbol(borders.horizontal).set_style(sep_style);
+                if let Some(cell) = surface.cell_mut((x, area.top() + HEADER_HEIGHT)) {
+                    cell.set_symbol("─");
+                    cell.set_style(tui::ratatui::to_ratatui_style(divider_style));
                 }
             }
         }
 
-        // hover content
-        let contents = contents.parse(Some(&cx.editor.theme));
+        let contents_parsed = contents.parse(Some(theme));
+        // Re-measure the content height so we can decide whether to
+        // draw a scrollbar. The `Paragraph` widget itself doesn't
+        // expose this — we use the same `required_size` helper the
+        // hover's `required_size()` uses to lay out the popup. The
+        // popup's actual area may be smaller than the requested
+        // size (clamped to viewport), so a scrollbar appears when
+        // the content was clipped.
         let contents_area = area.clip_top(if self.has_header() {
             HEADER_HEIGHT + SEPARATOR_HEIGHT
         } else {
             0
         });
-        let contents_para = Paragraph::new(&contents)
+        let (_, content_height) =
+            crate::ui::text::required_size(&contents_parsed, contents_area.width as u16);
+        let scroll_pos = cx.scroll().unwrap_or_default();
+        let needs_scrollbar = content_height > contents_area.height;
+        // Reserve the rightmost column for the scrollbar when needed
+        // so content doesn't render under it.
+        let body_area = if needs_scrollbar {
+            contents_area.clip_right(1)
+        } else {
+            contents_area
+        };
+
+        let contents_text = tui::ratatui::to_ratatui_text(&contents_parsed);
+        let contents_para = Paragraph::new(contents_text)
             .wrap(Wrap { trim: false })
-            .scroll((cx.scroll().unwrap_or_default() as u16, 0));
-        contents_para.render(contents_area, surface);
+            .scroll((scroll_pos as u16, 0));
+        contents_para.render(tui::ratatui::to_ratatui_rect(body_area), surface);
+
+        // Render the scrollbar. Uses `ui.menu.scroll` (the same scope
+        // the picker uses) so the visual language stays consistent.
+        // Falls back through `ui.text.inactive` → default style so
+        // even an unconfigured theme yields something visible.
+        if needs_scrollbar && contents_area.height > 0 {
+            let thumb_style = theme
+                .try_get("ui.menu.scroll")
+                .or_else(|| theme.try_get("ui.text.inactive"))
+                .unwrap_or_default();
+            let scrollbar_x = contents_area.right().saturating_sub(1);
+            let scrollbar_area = Rect::new(scrollbar_x, contents_area.y, 1, contents_area.height);
+            crate::widgets::Scrollbar::new(
+                content_height as usize,
+                scroll_pos,
+                contents_area.height as usize,
+            )
+            .symbol("▌")
+            .thumb_style(thumb_style)
+            .render(scrollbar_area, surface);
+        }
     }
 
     fn required_size(&mut self, viewport: (u16, u16)) -> Option<(u16, u16)> {

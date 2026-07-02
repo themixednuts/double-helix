@@ -1,21 +1,20 @@
 use crate::compositor::{Component, Context, Event, EventResult, RenderContext};
-use crate::runtime::{RuntimeEvent, RuntimeTaskEvent};
+use crate::runtime::RuntimeTaskEvent;
 use crate::ui::gradient_border::GradientBorder;
 use helix_core::unicode::width::UnicodeWidthStr;
-use helix_runtime::Sender as IngressSender;
 use helix_view::theme::Modifier;
 use helix_view::{
     editor::{
-        CmdlineStyle, Notification, NotificationConfig, NotificationEmojis, NotificationIcons,
-        NotificationPosition, NotificationShadowConfig, NotificationStyle, Severity,
+        CmdlineStyle, Config, Notification, NotificationConfig, NotificationEmojis,
+        NotificationIcons, NotificationPosition, NotificationShadowConfig, NotificationStyle,
+        Severity,
     },
     graphics::{Color, Rect, Style},
-    Editor,
+    Theme,
 };
 use std::hash::{Hash, Hasher};
 use std::time::Instant;
 use tokio::time::sleep as tokio_sleep;
-use tui::buffer::Buffer as Surface;
 
 // ---------------------------------------------------------------------------
 // Stateful popup — tracks notification lifecycle (add / expire / dismiss)
@@ -66,28 +65,38 @@ impl NotificationPopup {
         }
     }
 
-    pub fn update(&mut self, editor: &Editor, ingress: IngressSender<RuntimeEvent>) {
-        let config = &editor.config().notifications;
+    pub fn update(
+        &mut self,
+        config: &Config,
+        notifications: &[Notification],
+        work: helix_runtime::Work,
+        ingress: crate::runtime::RuntimeIngress,
+    ) {
+        let notifications_config = &config.notifications;
 
-        if !config.enable
-            || config.style != NotificationStyle::Popup
-            || editor.config().cmdline.style != CmdlineStyle::Popup
+        if !notifications_config.enable
+            || notifications_config.style != NotificationStyle::Popup
+            || config.cmdline.style != CmdlineStyle::Popup
         {
             self.notifications.clear();
             return;
         }
 
-        let active_notifications = editor.get_active_notifications();
+        let is_active =
+            |notification: &Notification| !notification.dismissed && !notification.is_expired();
 
         self.notifications.retain_mut(|item| {
-            let still_active = active_notifications
+            let still_active = notifications
                 .iter()
-                .any(|n| n.id == item.notification.id);
+                .any(|n| n.id == item.notification.id && is_active(n));
             let is_expired = item.notification.is_expired();
             still_active && !is_expired
         });
 
-        for notification in active_notifications {
+        for notification in notifications
+            .iter()
+            .filter(|notification| is_active(notification))
+        {
             if !self
                 .notifications
                 .iter()
@@ -108,51 +117,52 @@ impl NotificationPopup {
                     };
                     let ingress = ingress.clone();
 
-                    editor
-                        .work()
-                        .spawn(async move {
-                            tokio_sleep(remaining).await;
-                            crate::runtime::send_task_event_with(
-                                RuntimeTaskEvent::DismissNotification { id },
-                                ingress,
-                            )
-                            .await;
-                        })
-                        .detach();
+                    work.spawn(async move {
+                        tokio_sleep(remaining).await;
+                        crate::runtime::send_task_event_with(
+                            RuntimeTaskEvent::DismissNotification { id },
+                            ingress,
+                        )
+                        .await;
+                    })
+                    .detach();
                 }
             }
         }
     }
 
-    /// Sync state from editor and produce a [`crate::render::PreparedRender`]
-    /// via owned snapshot.  Returns `None` when there are no notifications to
-    /// draw — the caller should skip composition entirely.
+    /// Sync state from editor and produce a native Ratatui render snapshot.
+    /// Returns `None` when there are no notifications to draw.
     pub fn prepare_snapshot(
         &mut self,
         area: Rect,
         cx: &RenderContext,
     ) -> Option<crate::render::PreparedRender> {
-        self.update(cx.editor, cx.ingress.clone());
+        let config = cx.config();
+        let config = &*config;
+        self.update(
+            config,
+            cx.notification_history(),
+            cx.work(),
+            cx.ingress.clone(),
+        );
+        let notifications_config = &config.notifications;
 
-        let editor = cx.editor;
-
-        self.layout_thickness = if editor.config().gradient_borders.enable {
-            editor.config().gradient_borders.thickness as u16
+        self.layout_thickness = if config.gradient_borders.enable {
+            config.gradient_borders.thickness as u16
         } else {
-            editor.config().notifications.border.width as u16
+            notifications_config.border.width as u16
         };
-        self.layout_rounded =
-            editor.config().rounded_corners || editor.config().notifications.border.radius > 0;
-        self.layout_padding = editor.config().notifications.padding;
+        self.layout_rounded = config.rounded_corners || notifications_config.border.radius > 0;
+        self.layout_padding = notifications_config.padding;
 
         if self.notifications.is_empty() {
             return None;
         }
 
-        let config = &editor.config().notifications;
-        self.calculate_notification_areas(area, config);
+        self.calculate_notification_areas(area, notifications_config);
 
-        let model = NotificationModel::collect(self, editor);
+        let model = NotificationModel::collect(self, config, cx.theme());
         Some(prepare_notification_render(model, area))
     }
 
@@ -242,6 +252,43 @@ impl NotificationPopup {
             item.area = *area;
         }
     }
+
+    fn render_surface(
+        &mut self,
+        area: Rect,
+        surface: &mut crate::render::CellSurface,
+        cx: &RenderContext,
+    ) {
+        let config = cx.config();
+        let config = &*config;
+        self.update(
+            config,
+            cx.notification_history(),
+            cx.work(),
+            cx.ingress.clone(),
+        );
+        let notifications_config = &config.notifications;
+
+        self.layout_thickness = if config.gradient_borders.enable {
+            config.gradient_borders.thickness as u16
+        } else {
+            notifications_config.border.width as u16
+        };
+        self.layout_rounded = config.rounded_corners || notifications_config.border.radius > 0;
+        self.layout_padding = notifications_config.padding;
+
+        if self.notifications.is_empty() {
+            return;
+        }
+
+        self.calculate_notification_areas(area, notifications_config);
+
+        let mut model = NotificationModel::collect(self, config, cx.theme());
+        let items: Vec<NotificationRenderItem> = model.items.clone();
+        for item in items.iter().rev() {
+            render_notification(&mut model, item, surface);
+        }
+    }
 }
 
 impl Component for NotificationPopup {
@@ -249,32 +296,8 @@ impl Component for NotificationPopup {
         EventResult::Ignored(None)
     }
 
-    fn render(&mut self, area: Rect, surface: &mut Surface, cx: &RenderContext) {
-        // Legacy eager path — kept for Component trait compliance.
-        // EditorView now uses prepare_snapshot() directly.
-        self.update(cx.editor, cx.ingress.clone());
-
-        self.layout_thickness = if cx.editor.config().gradient_borders.enable {
-            cx.editor.config().gradient_borders.thickness as u16
-        } else {
-            cx.editor.config().notifications.border.width as u16
-        };
-        self.layout_rounded = cx.editor.config().rounded_corners
-            || cx.editor.config().notifications.border.radius > 0;
-        self.layout_padding = cx.editor.config().notifications.padding;
-
-        if self.notifications.is_empty() {
-            return;
-        }
-
-        let config = &cx.editor.config().notifications;
-        self.calculate_notification_areas(area, config);
-
-        let mut model = NotificationModel::collect(self, cx.editor);
-        let items: Vec<NotificationRenderItem> = model.items.clone();
-        for item in items.iter().rev() {
-            render_notification(&mut model, item, surface);
-        }
+    fn render(&mut self, area: Rect, surface: &mut crate::render::CellSurface, cx: &RenderContext) {
+        self.render_surface(area, surface, cx);
     }
 }
 
@@ -297,6 +320,13 @@ struct NotificationRenderItem {
     area: Rect,
     fade_progress: f32,
     corner_radius: u8,
+    /// Fraction of the notification's auto-dismiss window still
+    /// remaining: `1.0` immediately after the notification appears,
+    /// trending to `0.0` as the timeout approaches, `None` when the
+    /// notification has no timeout (sticky / user-dismiss only).
+    /// Renderer draws this as a thin progress bar at the bottom of
+    /// the popup so users see when the popup will disappear.
+    dismiss_remaining: Option<f32>,
 }
 
 #[derive(Clone, Copy)]
@@ -345,23 +375,42 @@ pub struct NotificationModel {
 }
 
 impl NotificationModel {
-    fn collect(popup: &NotificationPopup, editor: &Editor) -> Self {
-        let config = &editor.config().notifications;
-        let theme = &editor.theme;
+    fn collect(popup: &NotificationPopup, config: &Config, theme: &Theme) -> Self {
+        let notifications_config = &config.notifications;
 
         let items: Vec<NotificationRenderItem> = popup
             .notifications
             .iter()
-            .map(|item| NotificationRenderItem {
-                message: item.notification.message.to_string(),
-                severity: item.notification.severity,
-                id: item.notification.id,
-                area: item.area,
-                fade_progress: item.fade_progress(),
-                corner_radius: item
-                    .notification
-                    .corner_radius
-                    .unwrap_or(config.border.radius),
+            .map(|item| {
+                // Compute the remaining-time fraction so the renderer
+                // can draw a thin progress bar at the bottom edge —
+                // visible cue for "how long until this disappears".
+                // None when the notification doesn't auto-dismiss.
+                let dismiss_remaining = item.notification.timeout.map(|timeout| {
+                    let elapsed = item.notification.timestamp.elapsed();
+                    if elapsed >= timeout {
+                        0.0
+                    } else {
+                        let total_ms = timeout.as_millis() as f32;
+                        let remaining_ms = (timeout - elapsed).as_millis() as f32;
+                        // Clamp defensively — `Duration::saturating_sub` can
+                        // give a non-negative result that still rounds out of
+                        // range under unusual clock conditions.
+                        (remaining_ms / total_ms).clamp(0.0, 1.0)
+                    }
+                });
+                NotificationRenderItem {
+                    message: item.notification.message.to_string(),
+                    severity: item.notification.severity,
+                    id: item.notification.id,
+                    area: item.area,
+                    fade_progress: item.fade_progress(),
+                    corner_radius: item
+                        .notification
+                        .corner_radius
+                        .unwrap_or(notifications_config.border.radius),
+                    dismiss_remaining,
+                }
             })
             .collect();
 
@@ -374,30 +423,32 @@ impl NotificationModel {
             hint: theme.get("hint"),
         };
 
-        let gradient_border = if config.border.enable && editor.config().gradient_borders.enable {
-            let mut gb = popup.gradient_border.clone().unwrap_or_else(|| {
-                GradientBorder::from_theme(theme, &editor.config().gradient_borders)
-            });
-            gb.disable_animation();
-            Some(gb)
-        } else {
-            None
-        };
+        let gradient_border =
+            if notifications_config.border.enable && config.gradient_borders.enable {
+                let mut gb = popup
+                    .gradient_border
+                    .clone()
+                    .unwrap_or_else(|| GradientBorder::from_theme(theme, &config.gradient_borders));
+                gb.disable_animation();
+                Some(gb)
+            } else {
+                None
+            };
 
         Self {
             items,
             styles,
-            show_emojis: config.show_emojis,
-            show_icons: config.show_icons,
-            emojis: config.emojis.clone(),
-            icons: config.icons.clone(),
-            padding: config.padding,
-            shadow: config.shadow.clone(),
-            border_enable: config.border.enable,
-            border_width: config.border.width,
-            gradient_enable: editor.config().gradient_borders.enable,
-            gradient_thickness: editor.config().gradient_borders.thickness as u16,
-            rounded_corners: editor.config().rounded_corners,
+            show_emojis: notifications_config.show_emojis,
+            show_icons: notifications_config.show_icons,
+            emojis: notifications_config.emojis.clone(),
+            icons: notifications_config.icons.clone(),
+            padding: notifications_config.padding,
+            shadow: notifications_config.shadow.clone(),
+            border_enable: notifications_config.border.enable,
+            border_width: notifications_config.border.width,
+            gradient_enable: config.gradient_borders.enable,
+            gradient_thickness: config.gradient_borders.thickness as u16,
+            rounded_corners: config.rounded_corners,
             gradient_border,
         }
     }
@@ -417,6 +468,14 @@ impl NotificationModel {
             std::mem::discriminant(&item.severity).hash(&mut h);
             item.fade_progress.to_bits().hash(&mut h);
             item.corner_radius.hash(&mut h);
+            // Quantize the dismiss-remaining fraction to 32 buckets
+            // so the cache invalidates a couple of dozen times across
+            // a typical dismiss window — frequent enough that the
+            // progress bar visibly moves, infrequent enough that we
+            // don't redraw every frame for an idle popup.
+            item.dismiss_remaining
+                .map(|f| (f * 32.0) as u8)
+                .hash(&mut h);
         }
         self.show_emojis.hash(&mut h);
         self.show_icons.hash(&mut h);
@@ -447,12 +506,12 @@ fn prepare_notification_render(
         area,
     };
     PreparedRender::snapshot(tag, model, move |mut model| {
-        let mut surface = Surface::empty(area);
+        let mut output = RenderOutput::new(area);
         let items: Vec<NotificationRenderItem> = model.items.clone();
         for item in items.iter().rev() {
-            render_notification(&mut model, item, &mut surface);
+            render_notification(&mut model, item, output.surface_mut());
         }
-        RenderOutput { area, surface }
+        output
     })
 }
 
@@ -461,7 +520,7 @@ fn prepare_notification_render(
 fn render_notification(
     model: &mut NotificationModel,
     item: &NotificationRenderItem,
-    surface: &mut Surface,
+    surface: &mut crate::render::CellSurface,
 ) {
     if item.area.width < 4 || item.area.height < 3 {
         return;
@@ -480,7 +539,11 @@ fn render_notification(
             .popup
             .bg(Color::Rgb(0, 0, 0))
             .add_modifier(Modifier::DIM);
-        surface.clear_with(shadow_area, shadow);
+        {
+            let area = tui::ratatui::to_ratatui_rect(shadow_area);
+            tui::ratatui::widgets::Widget::render(tui::ratatui::widgets::Clear, area, surface);
+            surface.set_style(area, tui::ratatui::to_ratatui_style(shadow));
+        };
     }
 
     let notification_style = model
@@ -541,7 +604,11 @@ fn render_notification(
 
     // Fill background
     if inner_area.width > 0 && inner_area.height > 0 {
-        surface.clear_with(inner_area, model.styles.popup);
+        {
+            let area = tui::ratatui::to_ratatui_rect(inner_area);
+            tui::ratatui::widgets::Widget::render(tui::ratatui::widgets::Clear, area, surface);
+            surface.set_style(area, tui::ratatui::to_ratatui_style(model.styles.popup));
+        };
     }
 
     // Render text content
@@ -565,7 +632,12 @@ fn render_notification(
         }
 
         if i == 0 && show_prefix {
-            surface.set_string(content_area.x, y_pos, &prefix, notification_style);
+            surface.set_string(
+                content_area.x,
+                y_pos,
+                &prefix,
+                tui::ratatui::to_ratatui_style(notification_style),
+            );
         }
 
         let x_offset = if i == 0 && show_prefix {
@@ -579,8 +651,64 @@ fn render_notification(
             y_pos,
             line,
             available,
-            notification_style,
+            tui::ratatui::to_ratatui_style(notification_style),
         );
+    }
+
+    // Auto-dismiss countdown bar — a single row of fractional block
+    // glyphs along the *bottom edge* of the inner area, draining
+    // from full to empty as the dismiss deadline approaches. We
+    // skip the bar entirely when the notification doesn't auto-
+    // dismiss (`dismiss_remaining` is None) so sticky notifications
+    // don't get a permanently-full progress bar that misleads about
+    // their state. Severity color drives the bar tint so error bars
+    // read red, warnings yellow, etc. — same visual language as the
+    // text content.
+    if let Some(remaining) = item.dismiss_remaining {
+        // Bar lives on the bottom-most row inside the border. Skip
+        // when the inner area is too short to spare a row for it.
+        if inner_area.height >= 2 && inner_area.width >= 2 {
+            let bar_y = inner_area.y + inner_area.height.saturating_sub(1);
+            let bar_x = inner_area.x;
+            // Inset 1 cell on each side so the bar doesn't bleed into
+            // the rounded border glyphs at the corners.
+            let bar_width = inner_area.width.saturating_sub(2);
+            if bar_width > 0 {
+                let total_cells = bar_width as f32;
+                let full_cells = (remaining * total_cells).floor();
+                let partial_eighth = ((remaining * total_cells - full_cells) * 8.0).round() as u8;
+                let full = full_cells as u16;
+                let bar_style = notification_style;
+                for i in 0..bar_width {
+                    let glyph = if i < full {
+                        "█"
+                    } else if i == full && partial_eighth > 0 {
+                        // Eighth-block fractional glyphs (▏▎▍▌▋▊▉) for
+                        // sub-cell smoothness — the eye reads movement
+                        // even on slow countdowns.
+                        match partial_eighth {
+                            1 => "▏",
+                            2 => "▎",
+                            3 => "▍",
+                            4 => "▌",
+                            5 => "▋",
+                            6 => "▊",
+                            7 => "▉",
+                            _ => "█",
+                        }
+                    } else {
+                        " "
+                    };
+                    surface.set_stringn(
+                        bar_x + 1 + i,
+                        bar_y,
+                        glyph,
+                        1,
+                        tui::ratatui::to_ratatui_style(bar_style),
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -656,7 +784,13 @@ fn wrap_text(text: &str, max_width: u16) -> Vec<String> {
     lines
 }
 
-fn render_simple_border(area: Rect, surface: &mut Surface, style: Style, rounded: bool, width: u8) {
+fn render_simple_border(
+    area: Rect,
+    surface: &mut crate::render::CellSurface,
+    style: Style,
+    rounded: bool,
+    width: u8,
+) {
     let (h, v, tl, tr, bl, br) = if rounded {
         ("─", "│", "╭", "╮", "╰", "╯")
     } else {
@@ -689,20 +823,32 @@ fn render_simple_border(area: Rect, surface: &mut Surface, style: Style, rounded
             } else {
                 h
             };
-            if let Some(cell) = surface.get_mut(x, y0) {
-                cell.set_symbol(ch_top).set_style(style);
-            }
-            if let Some(cell) = surface.get_mut(x, y1) {
-                cell.set_symbol(ch_bot).set_style(style);
-            }
+            {
+                if let Some(cell) = surface.cell_mut((x, y0)) {
+                    cell.set_symbol(ch_top);
+                    cell.set_style(tui::ratatui::to_ratatui_style(style));
+                }
+            };
+            {
+                if let Some(cell) = surface.cell_mut((x, y1)) {
+                    cell.set_symbol(ch_bot);
+                    cell.set_style(tui::ratatui::to_ratatui_style(style));
+                }
+            };
         }
         for y in (y0 + 1)..y1 {
-            if let Some(cell) = surface.get_mut(x0, y) {
-                cell.set_symbol(v).set_style(style);
-            }
-            if let Some(cell) = surface.get_mut(x1, y) {
-                cell.set_symbol(v).set_style(style);
-            }
+            {
+                if let Some(cell) = surface.cell_mut((x0, y)) {
+                    cell.set_symbol(v);
+                    cell.set_style(tui::ratatui::to_ratatui_style(style));
+                }
+            };
+            {
+                if let Some(cell) = surface.cell_mut((x1, y)) {
+                    cell.set_symbol(v);
+                    cell.set_style(tui::ratatui::to_ratatui_style(style));
+                }
+            };
         }
     }
 }

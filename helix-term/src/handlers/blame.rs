@@ -1,43 +1,40 @@
 use std::time::Duration;
 
-use helix_runtime::{Clock, Debounce, Runtime, Work};
+use helix_runtime::{Runtime, Work};
 use helix_view::handlers::{BlameEvent, Handlers};
 
-use crate::runtime::{send_task_event_with, RuntimeEvent, RuntimeTaskEvent};
+use crate::runtime::RuntimeTaskEvent;
 
 #[derive(Debug)]
 pub struct BlameHandler {
-    debounce: Debounce,
-    work: Work,
-    clock: Clock,
-    ingress: helix_runtime::Sender<RuntimeEvent>,
+    debouncer: crate::runtime::RuntimeTaskDebouncer,
 }
 
 impl BlameHandler {
-    fn new(work: Work, clock: Clock, ingress: helix_runtime::Sender<RuntimeEvent>) -> Self {
+    fn new(
+        work: Work,
+        clock: helix_runtime::Clock,
+        ingress: crate::runtime::RuntimeIngress,
+    ) -> Self {
         Self {
-            debounce: Debounce::new(Duration::from_millis(50)),
-            work,
-            clock,
-            ingress,
+            debouncer: crate::runtime::RuntimeTaskDebouncer::new(
+                Duration::from_millis(50),
+                work,
+                clock,
+                ingress,
+            ),
         }
     }
 
     fn event(&mut self, event: BlameEvent) {
         let BlameEvent { path, doc_id, line } = event;
-        let ingress = self.ingress.clone();
-        self.debounce.restart(&self.work, &self.clock, async move {
-            send_task_event_with(
-                RuntimeTaskEvent::BlameFetchDebounced { doc_id, path, line },
-                ingress,
-            )
-            .await;
-        });
+        self.debouncer
+            .send(RuntimeTaskEvent::BlameFetchDebounced { doc_id, path, line });
     }
 
     pub fn spawn(
         runtime: Runtime,
-        ingress: helix_runtime::Sender<RuntimeEvent>,
+        ingress: crate::runtime::RuntimeIngress,
     ) -> helix_runtime::Sender<BlameEvent> {
         let (tx, mut rx) = helix_runtime::channel(128);
         let work = runtime.work().clone();

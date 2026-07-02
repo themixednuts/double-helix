@@ -82,6 +82,11 @@ pub struct StatuslineSnapshot<'a> {
     pub spinner_frame: Cow<'a, str>,
     pub current_working_directory: Cow<'a, str>,
     pub function_name: Option<String>,
+    /// Names of the language servers attached to the focused
+    /// document, in attach order. Empty when the buffer has no LSP
+    /// (binary, scratch, unsupported language) so renderers can
+    /// skip the element entirely without reserving dead space.
+    pub lsp_server_names: Vec<String>,
 }
 
 /// Produces cursor-oriented statusline data.
@@ -216,6 +221,7 @@ impl StatuslineSnapshot<'_> {
             spinner_frame: Cow::Owned(self.spinner_frame.into_owned()),
             current_working_directory: Cow::Owned(self.current_working_directory.into_owned()),
             function_name: self.function_name,
+            lsp_server_names: self.lsp_server_names,
         }
     }
 }

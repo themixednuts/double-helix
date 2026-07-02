@@ -1,12 +1,12 @@
 use std::{
     borrow::Cow,
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, VecDeque},
     path::PathBuf,
     sync::Arc,
 };
 
 use crate::{
-    document::{DocumentSavedTask, Mode},
+    document::{DocumentSaveLock, DocumentSavedTask, Mode},
     handlers::Handlers,
     info::Info,
     input::KeyEvent,
@@ -59,6 +59,9 @@ pub struct FrontendState {
     pub modal_keymaps: std::sync::Arc<
         arc_swap::ArcSwap<std::collections::HashMap<Mode, crate::keymap::ModalKeyTrie>>,
     >,
+    pub semantic_modal_keymaps: std::sync::Arc<
+        arc_swap::ArcSwap<std::collections::HashMap<Mode, crate::keymap::ModalIntentTrie>>,
+    >,
 }
 
 pub struct Editor {
@@ -70,10 +73,9 @@ pub struct Editor {
     pub(super) next_virtual_view_idx: u32,
     pub component_views: BTreeMap<ViewId, ComponentViewState>,
 
-    pub saves: HashMap<DocumentId, RuntimeSender<DocumentSavedTask>>,
-    pub(super) save_tx: RuntimeSender<DocumentSavedTask>,
-    pub save_queue: RuntimeReceiver<DocumentSavedTask>,
-    pub write_count: usize,
+    pub(crate) save_locks: HashMap<DocumentId, DocumentSaveLock>,
+    pub(crate) save_queue: VecDeque<DocumentSavedTask>,
+    pub(crate) write_count: usize,
 
     pub registers: Registers,
     pub macro_recording: Option<(char, Vec<KeyEvent>)>,
@@ -116,6 +118,7 @@ pub struct Editor {
     pub(crate) lifecycle: std::sync::Arc<super::hooks::LifecycleBus>,
 
     pub file_watcher: Option<crate::file_watcher::FileWatcher>,
+    pub(crate) file_operations: super::file_operation::FileOperationJournal,
 
     pub mouse_down_range: Option<Range>,
     pub cursor_cache: CursorCache,

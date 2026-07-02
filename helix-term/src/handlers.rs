@@ -7,7 +7,6 @@ use crate::config::Config;
 use crate::handlers::auto_reload::AutoReloadHandler;
 use crate::handlers::auto_save::AutoSaveHandler;
 use crate::handlers::diagnostics::PullDiagnosticsHandler;
-use crate::runtime::RuntimeEvent;
 
 pub use helix_view::handlers::{word_index, Handlers};
 
@@ -35,7 +34,7 @@ fn attach_assistant_hooks(editor: &helix_view::Editor) {
 
 pub fn setup(
     config: Arc<ArcSwap<Config>>,
-    ingress: helix_runtime::Sender<RuntimeEvent>,
+    ingress: crate::runtime::RuntimeIngress,
     runtime: helix_runtime::Runtime,
 ) -> Handlers {
     let event_tx = completion::CompletionHandler::spawn(config, runtime.clone(), ingress.clone());
@@ -66,7 +65,7 @@ pub fn setup(
 pub fn attach(
     editor: &helix_view::Editor,
     handlers: &Handlers,
-    ingress: helix_runtime::Sender<RuntimeEvent>,
+    ingress: crate::runtime::RuntimeIngress,
 ) {
     helix_view::handlers::attach(editor, handlers);
     signature_help::attach(editor, handlers);

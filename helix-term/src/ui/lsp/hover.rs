@@ -94,11 +94,13 @@ impl Component for Hover {
         let margin = Margin::all(1);
         let area = area.inner(margin);
 
-        let (header, contents) = self.content_markdown();
         let theme = cx.theme();
+        let has_header = self.has_header();
+        let active_index = self.active_index;
+        let (header, contents) = &mut self.contents[active_index];
 
         if let Some(header) = header {
-            let header = header.parse(Some(theme));
+            let header = header.layout(area.width as usize, Some(theme));
             let header = tui::ratatui::to_ratatui_text(&header);
             let header = Paragraph::new(header);
             header.render(
@@ -124,7 +126,12 @@ impl Component for Hover {
             }
         }
 
-        let contents_parsed = contents.parse(Some(theme));
+        let contents_area = area.clip_top(if has_header {
+            HEADER_HEIGHT + SEPARATOR_HEIGHT
+        } else {
+            0
+        });
+        let contents_parsed = contents.layout(contents_area.width as usize, Some(theme));
         // Re-measure the content height so we can decide whether to
         // draw a scrollbar. The `Paragraph` widget itself doesn't
         // expose this — we use the same `required_size` helper the
@@ -132,11 +139,6 @@ impl Component for Hover {
         // popup's actual area may be smaller than the requested
         // size (clamped to viewport), so a scrollbar appears when
         // the content was clipped.
-        let contents_area = area.clip_top(if self.has_header() {
-            HEADER_HEIGHT + SEPARATOR_HEIGHT
-        } else {
-            0
-        });
         let (_, content_height) =
             crate::ui::text::required_size(&contents_parsed, contents_area.width);
         let scroll_pos = cx.scroll().unwrap_or_default();
@@ -180,23 +182,25 @@ impl Component for Hover {
     fn required_size(&mut self, viewport: (u16, u16)) -> Option<(u16, u16)> {
         let max_text_width = viewport.0.saturating_sub(PADDING_HORIZONTAL).clamp(10, 120);
 
-        let (header, contents) = self.content_markdown();
+        let has_header = self.has_header();
+        let active_index = self.active_index;
+        let (header, contents) = &mut self.contents[active_index];
 
         let header_width = header
-            .as_ref()
+            .as_mut()
             .map(|header| {
-                let header = header.parse(None);
+                let header = header.layout(max_text_width as usize, None);
                 let (width, _height) = crate::ui::text::required_size(&header, max_text_width);
                 width
             })
             .unwrap_or_default();
 
-        let contents = contents.parse(None);
+        let contents = contents.layout(max_text_width as usize, None);
         let (content_width, content_height) =
             crate::ui::text::required_size(&contents, max_text_width);
 
         let width = PADDING_HORIZONTAL + header_width.max(content_width);
-        let height = if self.has_header() {
+        let height = if has_header {
             PADDING_TOP + HEADER_HEIGHT + SEPARATOR_HEIGHT + content_height + PADDING_BOTTOM
         } else {
             PADDING_TOP + content_height + PADDING_BOTTOM

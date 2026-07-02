@@ -26,7 +26,7 @@ use tui::{
 
 use std::{
     borrow::Cow,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fmt,
     io::Read,
     path::{Path, PathBuf},
@@ -430,6 +430,7 @@ pub struct Picker<T: 'static + Send + Sync, D: 'static> {
     /// Optional callback to convert a picker item `T` into `PickerItemData` for the UI model.
     /// If `None`, items are stored as `PickerItemData::Plain`.
     item_data_fn: Option<PickerItemDataFn<T>>,
+    marked: Option<HashSet<u32>>,
     ingress: SharedIngress,
     redraw: SharedRedraw,
     work: helix_runtime::Work,
@@ -604,6 +605,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             instance_id,
             model_layer_id: None,
             item_data_fn: None,
+            marked: None,
             ingress,
             redraw,
             work,
@@ -1115,7 +1117,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             return;
         }
 
-        let next_scroll = crate::widgets::SelectionViewport::new(
+        let next_scroll = helix_view::list_nav::ListViewport::new(
             matched_count as usize,
             Some(self.cursor.min(matched_count.saturating_sub(1)) as usize),
             area.height as usize,
@@ -1134,6 +1136,29 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
     ) -> Self {
         self.item_data_fn = Some(Box::new(f));
         self
+    }
+
+    pub fn with_multi_select(mut self) -> Self {
+        self.marked = Some(HashSet::new());
+        self
+    }
+
+    pub fn toggle_mark(&mut self) {
+        let Some(marked) = self.marked.as_mut() else {
+            return;
+        };
+        if !marked.insert(self.cursor) {
+            marked.remove(&self.cursor);
+        }
+    }
+
+    pub fn marked_indices(&self) -> Vec<u32> {
+        let Some(marked) = self.marked.as_ref() else {
+            return Vec::new();
+        };
+        let mut marked_indices: Vec<_> = marked.iter().copied().collect();
+        marked_indices.sort_unstable();
+        marked_indices
     }
 
     /// Write a render-ready snapshot to `editor.model`.
@@ -1668,11 +1693,13 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
 
         let options: Vec<_> = snapshot
             .matched_items(offset..end)
-            .map(|item| {
+            .enumerate()
+            .map(|(visible_index, item)| {
+                let item_index = offset.saturating_add(visible_index as u32);
                 let mut widths = self.widths.iter_mut();
                 let mut matcher_index = 0;
 
-                Row::new(self.columns.iter().map(|column| {
+                let row = Row::new(self.columns.iter().map(|column| {
                     if column.hidden {
                         return Cell::default();
                     }
@@ -1742,7 +1769,20 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
                     }
 
                     cell
-                }))
+                }));
+
+                if self.marked.is_some() {
+                    let marked = self
+                        .marked
+                        .as_ref()
+                        .is_some_and(|marked| marked.contains(&item_index));
+                    let mut cells = Vec::with_capacity(row.cells.len() + 1);
+                    cells.push(Cell::from(if marked { "✓" } else { " " }));
+                    cells.extend(row.cells);
+                    Row::new(cells)
+                } else {
+                    row
+                }
             })
             .collect();
 
@@ -1756,29 +1796,44 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             header_style = theme.get("ui.picker.header");
             let header_column_style = theme.get("ui.picker.header.column");
 
-            header = Some(
-                Row::new(self.columns.iter().map(|column| {
-                    if column.hidden {
-                        Cell::default()
+            let row = Row::new(self.columns.iter().map(|column| {
+                if column.hidden {
+                    Cell::default()
+                } else {
+                    let style = if active_column.is_some_and(|name| Arc::ptr_eq(name, &column.name))
+                    {
+                        theme.get("ui.picker.header.column.active")
                     } else {
-                        let style =
-                            if active_column.is_some_and(|name| Arc::ptr_eq(name, &column.name)) {
-                                theme.get("ui.picker.header.column.active")
-                            } else {
-                                header_column_style
-                            };
+                        header_column_style
+                    };
 
-                        Cell::from(Span::styled(Cow::from(&*column.name), style))
-                    }
-                }))
-                .style(header_style),
-            );
+                    Cell::from(Span::styled(Cow::from(&*column.name), style))
+                }
+            }))
+            .style(header_style);
+            header = Some(if self.marked.is_some() {
+                let mut cells = Vec::with_capacity(row.cells.len() + 1);
+                cells.push(Cell::default());
+                cells.extend(row.cells);
+                Row::new(cells).style(header_style)
+            } else {
+                row
+            });
         }
+
+        let mut table_widths = Vec::new();
+        let table_widths = if self.marked.is_some() {
+            table_widths.push(Constraint::Length(1));
+            table_widths.extend(self.widths.iter().copied());
+            table_widths.as_slice()
+        } else {
+            self.widths.as_slice()
+        };
 
         PickerTable {
             rows: options,
             header,
-            widths: &self.widths,
+            widths: table_widths,
             text_style,
             placeholder_style: theme.get("ui.text.inactive"),
             selected_style: selected,
@@ -2161,6 +2216,9 @@ impl<I: 'static + Send + Sync, D: 'static + Send + Sync> Component for Picker<I,
             }
             key!(End) => {
                 self.to_end();
+            }
+            key!(' ') if self.marked.is_some() => {
+                self.toggle_mark();
             }
             key!(Esc) | ctrl!('c') => return close_fn(self),
             alt!(Enter) => {

@@ -26,6 +26,7 @@ mod spinner;
 mod statusline;
 mod text;
 mod text_decorations;
+pub(crate) mod text_layout;
 
 use crate::runtime::{send_ui_command_with, LayerCommand, UiCommand};
 pub use cmdline_popup::CmdlinePopup;

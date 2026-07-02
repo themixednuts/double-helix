@@ -3,7 +3,7 @@
 //! Stories are deterministic Ratatui renders. They give us a place to standardize
 //! Helix's terminal UI while keeping Lua plugins on the typed render-op ABI.
 
-use std::{path::PathBuf, sync::OnceLock, time::Duration};
+use std::{cell::Cell as StdCell, path::PathBuf, sync::OnceLock, time::Duration};
 
 use anyhow::{bail, Result};
 use helix_plugin::types::{SurfaceRenderOp, SurfaceRenderOps};
@@ -257,6 +257,121 @@ static STORIES: &[Story] = &[
         ],
         canvas: StoryCanvas::Padded { x: 1, y: 1 },
         render: StoryRenderer::Styled(render_spinner_shadow_story),
+    },
+    Story {
+        id: "widgets/list-state",
+        title: "List State",
+        category: "Widgets",
+        component: "Widgets/List State",
+        variant: "Viewport Math",
+        summary: "Canonical ListNav viewport projection with selection-following scroll.",
+        kind: StoryKind::Component,
+        args: &[StoryArg::new("selection", "27", "Selected row index")],
+        canvas: StoryCanvas::Padded { x: 1, y: 1 },
+        render: StoryRenderer::Styled(render_list_state_story),
+    },
+    Story {
+        id: "widgets/marquee",
+        title: "Marquee",
+        category: "Widgets",
+        component: "Widgets/Marquee",
+        variant: "Overflow",
+        summary: "Scroll-hold-reset single-line overflow text.",
+        kind: StoryKind::Component,
+        args: &[StoryArg::new(
+            "tick",
+            "wall-clock",
+            "Animation frame source",
+        )],
+        canvas: StoryCanvas::Centered {
+            width: 72,
+            height: 5,
+        },
+        render: StoryRenderer::Styled(render_marquee_story),
+    },
+    Story {
+        id: "widgets/tabs",
+        title: "Tabs",
+        category: "Widgets",
+        component: "Widgets/Tabs",
+        variant: "Overflow",
+        summary: "Horizontal tab strip with badges and overflow indicators.",
+        kind: StoryKind::Component,
+        args: &[StoryArg::new("active", "diagnostics", "Selected tab")],
+        canvas: StoryCanvas::Centered {
+            width: 64,
+            height: 5,
+        },
+        render: StoryRenderer::Styled(render_tabs_story),
+    },
+    Story {
+        id: "widgets/hint-bar",
+        title: "Hint Bar",
+        category: "Widgets",
+        component: "Widgets/Hint Bar",
+        variant: "Priority Elision",
+        summary: "Key/action footer chips that drop low-priority hints when narrow.",
+        kind: StoryKind::Component,
+        args: &[StoryArg::new("width", "narrow", "Elides by priority")],
+        canvas: StoryCanvas::Centered {
+            width: 52,
+            height: 5,
+        },
+        render: StoryRenderer::Styled(render_hint_bar_story),
+    },
+    Story {
+        id: "widgets/multi-select",
+        title: "Multi Select",
+        category: "Widgets",
+        component: "Widgets/Item List",
+        variant: "Marked Rows",
+        summary: "Item-list marked-set plumbing for opt-in multi-select pickers.",
+        kind: StoryKind::Component,
+        args: &[StoryArg::new("marks", "3", "Marked fixture rows")],
+        canvas: StoryCanvas::Padded { x: 1, y: 1 },
+        render: StoryRenderer::Styled(render_multi_select_story),
+    },
+    Story {
+        id: "widgets/toast-queue",
+        title: "Toast Queue",
+        category: "Widgets",
+        component: "Widgets/Toast Queue",
+        variant: "Stacked",
+        summary: "Bounded toast visibility with newest-first ordering and overflow count.",
+        kind: StoryKind::Component,
+        args: &[StoryArg::new("visible", "3", "Maximum visible toasts")],
+        canvas: StoryCanvas::Centered {
+            width: 54,
+            height: 8,
+        },
+        render: StoryRenderer::Styled(render_toast_queue_story),
+    },
+    Story {
+        id: "widgets/progress",
+        title: "Progress",
+        category: "Widgets",
+        component: "Widgets/Progress",
+        variant: "Determinate",
+        summary: "Determinate progress bars with partial-block sub-cell fill.",
+        kind: StoryKind::Component,
+        args: &[StoryArg::new("ratio", "0.0..1.0", "Progress fill ratio")],
+        canvas: StoryCanvas::Centered {
+            width: 64,
+            height: 7,
+        },
+        render: StoryRenderer::Styled(render_progress_story),
+    },
+    Story {
+        id: "widgets/item-list/100k",
+        title: "100k Item List",
+        category: "Widgets",
+        component: "Widgets/Item List",
+        variant: "Virtualized Stress",
+        summary: "Synthetic 100k-row fixture that renders only the visible item window.",
+        kind: StoryKind::Component,
+        args: &[StoryArg::new("items", "100000", "Synthetic item count")],
+        canvas: StoryCanvas::Padded { x: 1, y: 1 },
+        render: StoryRenderer::Styled(render_item_list_100k_story),
     },
     Story {
         id: "ui/editor-shell",
@@ -1533,6 +1648,284 @@ fn render_spinner_shadow_story(surface: &mut Buffer, area: Rect, styles: UiStyle
         .render(surface, inset_card);
     crate::widgets::border(surface, inset_card, styles.border, false);
     set_clipped(surface, inset(inset_card, 1, 1), 1, "inset", styles.text);
+}
+
+fn render_list_state_story(surface: &mut Buffer, area: Rect, styles: UiStyleGuide) {
+    fill_rect(surface, area, styles.surface);
+    let list = render_panel(surface, area, "ListNav viewport", styles);
+    let mut nav = helix_view::list_nav::ListNav::new();
+    nav.set_item_count(100);
+    nav.set_viewport_height(list.height as usize);
+    nav.set_selection(27);
+    let range = nav.visible_range();
+    for (row, index) in range.clone().enumerate() {
+        let selected = index == nav.selection();
+        let style = if selected {
+            styles.selected
+        } else {
+            styles.text
+        };
+        set_clipped(
+            surface,
+            list,
+            row as u16,
+            &format!(
+                "{} row {index:03} scroll={} visible={}..{}",
+                if selected { ">" } else { " " },
+                nav.scroll(),
+                range.start,
+                range.end
+            ),
+            style,
+        );
+    }
+}
+
+fn render_marquee_story(surface: &mut Buffer, area: Rect, styles: UiStyleGuide) {
+    fill_rect(surface, area, styles.surface);
+    let panel = render_panel(surface, area, "marquee", styles);
+    let mut marquee = crate::widgets::Marquee::new()
+        .with_scroll_duration(Duration::from_millis(STORYBOOK_TICK_MS * 12))
+        .with_hold_times(Duration::from_millis(400), Duration::from_millis(300));
+    marquee.set_text(Some(
+        "assistant error: request exceeded context budget while rendering the latest tool result",
+    ));
+    marquee.touch();
+    let row = Rect::new(panel.x, panel.y + panel.height / 2, panel.width, 1);
+    marquee.render(row, surface, styles.warning);
+}
+
+fn render_tabs_story(surface: &mut Buffer, area: Rect, styles: UiStyleGuide) {
+    fill_rect(surface, area, styles.surface);
+    let panel = render_panel(surface, area, "tabs", styles);
+    let tabs = [
+        crate::widgets::Tab::new("buffers").badge("4"),
+        crate::widgets::Tab::new("diagnostics").badge("12"),
+        crate::widgets::Tab::new("symbols"),
+        crate::widgets::Tab::new("references").badge("8"),
+        crate::widgets::Tab::new("outline"),
+    ];
+    let state = crate::widgets::tabs(
+        surface,
+        Rect::new(panel.x, panel.y + 1, panel.width, 1),
+        &tabs,
+        3,
+        0,
+        crate::widgets::TabsStyle {
+            background: styles.panel,
+            active: styles.selected,
+            inactive: styles.text,
+            hover: styles.info,
+            badge: styles.warning,
+            overflow: styles.accent,
+        },
+    );
+    set_clipped(
+        surface,
+        panel,
+        3,
+        &format!(
+            "scroll={} visible={}..{} overflow=({}, {})",
+            state.scroll,
+            state.visible_start,
+            state.visible_end,
+            state.left_overflow,
+            state.right_overflow
+        ),
+        styles.muted,
+    );
+}
+
+fn render_hint_bar_story(surface: &mut Buffer, area: Rect, styles: UiStyleGuide) {
+    fill_rect(surface, area, styles.surface);
+    let panel = render_panel(surface, area, "hint_bar", styles);
+    let hints = [
+        crate::widgets::Hint::new("enter", "open").priority(220),
+        crate::widgets::Hint::new("space", "mark").priority(210),
+        crate::widgets::Hint::new("ctrl-s", "split").priority(90),
+        crate::widgets::Hint::new("esc", "close").priority(200),
+        crate::widgets::Hint::new("ctrl-t", "preview").priority(80),
+    ];
+    let state = crate::widgets::hint_bar(
+        surface,
+        Rect::new(panel.x, panel.y + 1, panel.width, 1),
+        &hints,
+        crate::widgets::HintBarStyle {
+            background: styles.panel,
+            key: styles.accent,
+            label: styles.text,
+            separator: styles.muted,
+        },
+    );
+    set_clipped(
+        surface,
+        panel,
+        3,
+        &format!(
+            "visible={:?} hidden={}",
+            state.visible_indices, state.hidden_count
+        ),
+        styles.muted,
+    );
+}
+
+fn render_multi_select_story(surface: &mut Buffer, area: Rect, styles: UiStyleGuide) {
+    fill_rect(surface, area, styles.surface);
+    let panel = render_panel(surface, area, "multi-select item_list", styles);
+    let items = [
+        "README.md",
+        "helix-term/src/ui/picker.rs",
+        "helix-term/src/widgets/item_list.rs",
+        "helix-term/src/widgets/hint_bar.rs",
+        "helix-term/src/widgets/progress.rs",
+        "helix-view/src/list_nav.rs",
+    ];
+    let marks = [1, 2, 4];
+    let list_styles = crate::widgets::ListStyles {
+        normal: styles.menu,
+        selected: styles.menu_selected,
+        scrollbar_thumb: styles.menu_scroll,
+        scrollbar_track: styles.popup_border,
+    };
+    crate::widgets::item_list_with_marks(
+        surface,
+        panel,
+        items.len(),
+        Some(2),
+        0,
+        Some(crate::widgets::MarkedItems::new(&marks, "✓")),
+        &list_styles,
+        |idx, row, surface, selected, marked| {
+            let style = if selected {
+                styles.text
+            } else if marked {
+                styles.accent
+            } else {
+                styles.muted
+            };
+            surface.set_stringn(
+                row.x,
+                row.y,
+                items[idx],
+                row.width as usize,
+                tui::ratatui::to_ratatui_style(style),
+            );
+        },
+    );
+}
+
+fn render_toast_queue_story(surface: &mut Buffer, area: Rect, styles: UiStyleGuide) {
+    fill_rect(surface, area, styles.surface);
+    let panel = render_panel(surface, area, "toast_queue", styles);
+    let toasts = [
+        crate::widgets::Toast::new(
+            1,
+            "workspace symbols indexed",
+            crate::widgets::ToastSeverity::Info,
+        ),
+        crate::widgets::Toast::new(2, "format completed", crate::widgets::ToastSeverity::Hint),
+        crate::widgets::Toast::new(
+            3,
+            "rust-analyzer is still loading",
+            crate::widgets::ToastSeverity::Warning,
+        ),
+        crate::widgets::Toast::new(
+            4,
+            "failed to fetch remote branch",
+            crate::widgets::ToastSeverity::Error,
+        ),
+    ];
+    let mut queue = crate::widgets::ToastQueue::default();
+    queue.sync(toasts.iter());
+    crate::widgets::toast_queue(
+        surface,
+        panel,
+        &queue,
+        &toasts,
+        3,
+        None,
+        crate::widgets::ToastStyle {
+            background: styles.panel,
+            error: styles.error,
+            warning: styles.warning,
+            info: styles.info,
+            hint: styles.success,
+            overflow: styles.muted,
+        },
+    );
+}
+
+fn render_progress_story(surface: &mut Buffer, area: Rect, styles: UiStyleGuide) {
+    fill_rect(surface, area, styles.surface);
+    let panel = render_panel(surface, area, "progress", styles);
+    for (row, ratio) in [0.0, 0.25, 0.625, 1.0].into_iter().enumerate() {
+        let y = panel.y.saturating_add(row as u16 + 1);
+        if y >= panel.bottom() {
+            break;
+        }
+        crate::widgets::progress_bar(
+            surface,
+            Rect::new(panel.x, y, panel.width, 1),
+            ratio,
+            Some(&format!("{:.0}%", ratio * 100.0)),
+            crate::widgets::ProgressStyle {
+                track: styles.border,
+                fill: styles.accent,
+                label: styles.text,
+            },
+        );
+    }
+}
+
+fn render_item_list_100k_story(surface: &mut Buffer, area: Rect, styles: UiStyleGuide) {
+    fill_rect(surface, area, styles.surface);
+    let panel = render_panel(surface, area, "100k item_list", styles);
+    let selected = 54_321usize;
+    let scroll = selected.saturating_sub(panel.height as usize / 2);
+    let list_styles = crate::widgets::ListStyles {
+        normal: styles.menu,
+        selected: styles.menu_selected,
+        scrollbar_thumb: styles.menu_scroll,
+        scrollbar_track: styles.popup_border,
+    };
+    let rendered = StdCell::new(0usize);
+    let state = crate::widgets::item_list(
+        surface,
+        panel,
+        100_000,
+        Some(selected),
+        scroll,
+        &list_styles,
+        |idx, row, surface, is_selected| {
+            rendered.set(rendered.get() + 1);
+            let style = if is_selected {
+                styles.text
+            } else {
+                styles.muted
+            };
+            surface.set_stringn(
+                row.x,
+                row.y,
+                format!("row {idx:06}  rendered from visible callback"),
+                row.width as usize,
+                tui::ratatui::to_ratatui_style(style),
+            );
+        },
+    );
+    let footer = Rect::new(panel.x, panel.bottom().saturating_sub(1), panel.width, 1);
+    fill_rect(surface, footer, styles.panel);
+    set_clipped(
+        surface,
+        footer,
+        0,
+        &format!(
+            "visible={}..{} callbacks={} total=100000",
+            state.visible_start,
+            state.visible_end,
+            rendered.get()
+        ),
+        styles.accent,
+    );
 }
 
 fn render_editor_shell_story(surface: &mut Buffer, area: Rect, context: StoryContext<'_>) {

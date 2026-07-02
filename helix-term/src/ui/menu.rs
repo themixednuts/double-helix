@@ -277,7 +277,7 @@ impl<T: Item> Menu<T> {
 
     fn adjust_scroll(&mut self) {
         let win_height = self.size.1 as usize;
-        self.scroll = crate::widgets::SelectionViewport::new(
+        self.scroll = helix_view::list_nav::ListViewport::new(
             self.matches.len(),
             self.effective_cursor(),
             win_height,

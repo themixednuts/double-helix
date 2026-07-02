@@ -172,11 +172,12 @@ impl Component for SignatureHelp {
             None => return,
             Some(doc) => Markdown::new(doc.clone(), Arc::clone(&self.config_loader)),
         };
-        let sig_doc = sig_doc.parse(Some(theme));
-        let sig_doc = tui::ratatui::to_ratatui_text(&sig_doc);
+        let mut sig_doc = sig_doc;
         let sig_doc_area = area
             .clip_top(sig_text_area.height + 2)
             .clip_bottom(u16::from(cx.popup_border()));
+        let sig_doc = sig_doc.layout(sig_doc_area.width as usize, Some(theme));
+        let sig_doc = tui::ratatui::to_ratatui_text(&sig_doc);
         let sig_doc_para = Paragraph::new(sig_doc)
             .wrap(Wrap { trim: false })
             .scroll((cx.scroll().unwrap_or_default() as u16, 0));
@@ -206,8 +207,8 @@ impl Component for SignatureHelp {
 
         let (width, height) = match signature.signature_doc {
             Some(ref doc) => {
-                let doc_md = Markdown::new(doc.clone(), Arc::clone(&self.config_loader));
-                let doc_text = doc_md.parse(None);
+                let mut doc_md = Markdown::new(doc.clone(), Arc::clone(&self.config_loader));
+                let doc_text = doc_md.layout(max_text_width as usize, None);
                 let (doc_width, doc_height) =
                     crate::ui::text::required_size(&doc_text, max_text_width);
                 (

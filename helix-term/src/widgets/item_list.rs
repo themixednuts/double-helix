@@ -5,7 +5,7 @@
 
 use helix_view::graphics::{Rect, Style};
 
-use super::SelectionViewport;
+use helix_view::list_nav::ListViewport;
 
 /// Styles for the item list widget.
 #[derive(Default)]
@@ -29,6 +29,22 @@ pub struct ListState {
     pub visible_end: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MarkedItems<'a> {
+    marked: &'a [usize],
+    glyph: &'a str,
+}
+
+impl<'a> MarkedItems<'a> {
+    pub const fn new(marked: &'a [usize], glyph: &'a str) -> Self {
+        Self { marked, glyph }
+    }
+
+    pub fn is_marked(self, index: usize) -> bool {
+        self.marked.contains(&index)
+    }
+}
+
 /// Render a scrollable item list with selection highlight.
 ///
 /// `render_item` is called for each visible item with `(index, area, surface, is_selected)`.
@@ -48,6 +64,33 @@ pub fn item_list<F>(
 where
     F: Fn(usize, Rect, &mut crate::render::CellSurface, bool),
 {
+    item_list_with_marks(
+        surface,
+        area,
+        item_count,
+        selected,
+        scroll,
+        None,
+        styles,
+        |index, area, surface, is_selected, _is_marked| {
+            render_item(index, area, surface, is_selected);
+        },
+    )
+}
+
+pub fn item_list_with_marks<F>(
+    surface: &mut crate::render::CellSurface,
+    area: Rect,
+    item_count: usize,
+    selected: Option<usize>,
+    scroll: usize,
+    marks: Option<MarkedItems<'_>>,
+    styles: &ListStyles,
+    render_item: F,
+) -> ListState
+where
+    F: Fn(usize, Rect, &mut crate::render::CellSurface, bool, bool),
+{
     if area.height == 0 || area.width == 0 {
         return ListState {
             scroll: 0,
@@ -57,7 +100,7 @@ where
     }
 
     let win_height = area.height as usize;
-    let viewport = SelectionViewport::new(item_count, selected, win_height, scroll);
+    let viewport = ListViewport::new(item_count, selected, win_height, scroll);
     let visible_range = viewport.visible_range();
     let scroll = visible_range.start;
     let visible_end = visible_range.end;
@@ -92,7 +135,26 @@ where
             };
         }
 
-        render_item(item_idx, item_area, surface, is_selected);
+        let is_marked = marks.is_some_and(|marks| marks.is_marked(item_idx));
+        let item_area = if let Some(marks) = marks.filter(|_| content_area.width > 1) {
+            let glyph_style = if is_selected {
+                styles.selected
+            } else {
+                styles.normal
+            };
+            surface.set_stringn(
+                item_area.x,
+                item_area.y,
+                if is_marked { marks.glyph } else { " " },
+                1,
+                tui::ratatui::to_ratatui_style(glyph_style),
+            );
+            item_area.clip_left(1)
+        } else {
+            item_area
+        };
+
+        render_item(item_idx, item_area, surface, is_selected, is_marked);
     }
 
     if needs_scrollbar {
@@ -106,5 +168,17 @@ where
         scroll,
         visible_start: scroll,
         visible_end,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn marked_items_reports_marked_indices() {
+        let marks = MarkedItems::new(&[1, 3], "✓");
+        assert!(marks.is_marked(1));
+        assert!(!marks.is_marked(2));
     }
 }

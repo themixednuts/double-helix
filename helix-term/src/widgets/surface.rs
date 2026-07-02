@@ -1,6 +1,5 @@
 //! Anchored text drawing that Ratatui does not provide directly.
 
-use helix_core::unicode::{segmentation::UnicodeSegmentation, width::UnicodeWidthStr};
 use tui::ratatui::{buffer::Buffer, style::Style};
 
 /// Request object for drawing horizontally anchored text.
@@ -79,28 +78,18 @@ pub fn draw_string_anchored(
 
     let reserve_end = usize::from(truncate_end && used < available);
     let content_limit = available.saturating_sub(used + reserve_end);
-    let mut rendered = 0usize;
-    for (byte_offset, grapheme) in text.grapheme_indices(true) {
-        let grapheme_width = grapheme.width();
-        if grapheme_width == 0 {
-            continue;
-        }
-        if rendered + grapheme_width > content_limit {
-            break;
-        }
-
+    for grapheme in crate::ui::text_layout::visible_graphemes(text, content_limit) {
         if let Some(cell) = surface.cell_mut((next_x, y)) {
-            cell.set_symbol(grapheme);
-            cell.set_style(style(byte_offset));
+            cell.set_symbol(grapheme.text);
+            cell.set_style(style(grapheme.byte));
         }
-        for dx in 1..grapheme_width {
+        for dx in 1..grapheme.width {
             if let Some(cell) = surface.cell_mut((next_x.saturating_add(dx as u16), y)) {
                 cell.reset();
             }
         }
-        next_x = next_x.saturating_add(grapheme_width as u16);
-        used += grapheme_width;
-        rendered += grapheme_width;
+        next_x = next_x.saturating_add(grapheme.width as u16);
+        used += grapheme.width;
     }
 
     if truncate_end && used < available {

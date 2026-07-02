@@ -42,6 +42,69 @@
 //! denominator. State + helpers keeps each host in control of its
 //! keymap while sharing the actual cursor math.
 
+use std::ops::Range;
+
+/// Pure viewport math for list-shaped UI surfaces.
+///
+/// `ListNav` owns mutable navigation state. This helper is the canonical
+/// stateless projection used by widgets that are handed selection and scroll
+/// values directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ListViewport {
+    total: usize,
+    selected: Option<usize>,
+    visible: usize,
+    scroll: usize,
+}
+
+impl ListViewport {
+    pub const fn new(total: usize, selected: Option<usize>, visible: usize, scroll: usize) -> Self {
+        Self {
+            total,
+            selected,
+            visible,
+            scroll,
+        }
+    }
+
+    pub fn max_scroll(self) -> usize {
+        self.total.saturating_sub(self.visible)
+    }
+
+    pub fn clamped_scroll(self) -> usize {
+        self.scroll.min(self.max_scroll())
+    }
+
+    pub fn scroll_to_selected(self) -> usize {
+        let Some(selected) = self.selected else {
+            return self.clamped_scroll();
+        };
+        if self.visible == 0 || self.total == 0 {
+            return 0;
+        }
+
+        let selected = selected.min(self.total.saturating_sub(1));
+        let scroll = self.clamped_scroll();
+        if selected < scroll {
+            selected
+        } else if selected >= scroll.saturating_add(self.visible) {
+            selected.saturating_add(1).saturating_sub(self.visible)
+        } else {
+            scroll
+        }
+    }
+
+    pub fn visible_range(self) -> Range<usize> {
+        let start = self.clamped_scroll();
+        start..start.saturating_add(self.visible).min(self.total)
+    }
+
+    pub fn selected_visible_range(self) -> Range<usize> {
+        let start = self.scroll_to_selected();
+        start..start.saturating_add(self.visible).min(self.total)
+    }
+}
+
 /// What the host should do after a navigation call.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NavOutcome {
@@ -262,28 +325,26 @@ impl ListNav {
             self.scroll = 0;
             return;
         }
-        if self.selection < self.scroll {
-            self.scroll = self.selection;
-        } else {
-            let bottom = self
-                .scroll
-                .saturating_add(self.viewport_height)
-                .saturating_sub(1);
-            if self.selection > bottom {
-                self.scroll = self
-                    .selection
-                    .saturating_sub(self.viewport_height.saturating_sub(1));
-            }
-        }
-        // Clamp scroll so we never show empty rows past the end when
-        // we could be showing real rows by scrolling up.
-        let max_scroll = self
-            .item_count
-            .saturating_sub(self.viewport_height)
-            .min(self.selection);
-        if self.scroll > max_scroll {
-            self.scroll = max_scroll;
-        }
+        self.scroll = ListViewport::new(
+            self.item_count,
+            Some(self.selection),
+            self.viewport_height,
+            self.scroll,
+        )
+        .scroll_to_selected();
+    }
+
+    pub fn viewport(&self) -> ListViewport {
+        ListViewport::new(
+            self.item_count,
+            (!self.is_empty()).then_some(self.selection),
+            self.viewport_height,
+            self.scroll,
+        )
+    }
+
+    pub fn visible_range(&self) -> Range<usize> {
+        self.viewport().visible_range()
     }
 }
 
@@ -467,6 +528,22 @@ mod tests {
         // 3 items, viewport 5 → can show everything starting at scroll 0.
         assert_eq!(n.scroll(), 0);
         assert_eq!(n.selection(), 2);
+    }
+
+    #[test]
+    fn list_viewport_scrolls_down_to_keep_selection_visible() {
+        let viewport = ListViewport::new(20, Some(9), 5, 0);
+
+        assert_eq!(viewport.scroll_to_selected(), 5);
+        assert_eq!(viewport.selected_visible_range(), 5..10);
+    }
+
+    #[test]
+    fn list_viewport_clamps_overscroll_to_last_page() {
+        let viewport = ListViewport::new(8, None, 3, 99);
+
+        assert_eq!(viewport.clamped_scroll(), 5);
+        assert_eq!(viewport.visible_range(), 5..8);
     }
 
     // ---------- to_first / to_last ---------------------------------

@@ -20,15 +20,13 @@ use helix_view::theme::{Modifier, Style};
 use helix_view::traits::{Bounded, Focusable, Identified, Modal, Scrollable};
 use helix_view::Editor;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tui::text::{Span, Spans};
 
-mod markdown;
-use markdown::{
-    complete_markdown_prefix_len, fit_bubble_width, render_markdown_lines, wrap_text,
-    MarkdownCacheKey, MarkdownLineStyles,
+use crate::ui::markdown::{
+    fit_bubble_width, wrap_text, Doc as MarkdownDoc, MarkdownCache, MarkdownLineStyles,
 };
 
 pub const ID: &str = "assistant-panel";
@@ -67,16 +65,8 @@ pub struct AssistantPanel {
     /// Selection animation that replays when message focus moves back onto a row.
     message_focus_animation: Animation,
     pending_message_g: bool,
-    markdown_cache: RefCell<HashMap<helix_view::assistant::thread::EntryId, CachedMarkdown>>,
+    markdown_cache: RefCell<HashMap<helix_view::assistant::thread::EntryId, MarkdownCache>>,
     mention: MentionPopup,
-}
-
-#[derive(Clone)]
-struct CachedMarkdown {
-    text: String,
-    key: MarkdownCacheKey,
-    complete_lines: Vec<Spans<'static>>,
-    lines: Vec<Spans<'static>>,
 }
 
 #[derive(Clone, Copy)]
@@ -611,10 +601,7 @@ impl AssistantPanel {
         let title_style = theme.get("ui.text.focus").add_modifier(Modifier::BOLD);
         let muted_style = theme.get("ui.text.inactive");
         let pending_style = theme.get("warning");
-        let plus = theme.get("diff.plus");
-        let minus = theme.get("diff.minus");
-        let delta = theme.get("diff.delta");
-        let text = theme.get("ui.text");
+        let diff_styles = crate::widgets::DiffStyles::from_theme(theme);
         let pending = files
             .iter()
             .filter(|(_, status, _)| status.is_pending())
@@ -633,17 +620,19 @@ impl AssistantPanel {
                 Span::styled(format!("  {}", status.label()), muted_style),
             ]));
             if expanded {
-                for line in diff.lines() {
-                    let style = if line.starts_with('+') && !line.starts_with("+++") {
-                        plus
-                    } else if line.starts_with('-') && !line.starts_with("---") {
-                        minus
-                    } else if line.starts_with("@@") {
-                        delta
-                    } else {
-                        text
-                    };
-                    lines.push(Spans::from(Span::styled(format!("     {line}"), style)));
+                let doc = crate::widgets::DiffDocument::from_unified_diff(diff);
+                let diff_lines = doc.layout_lines(
+                    &diff_styles,
+                    crate::widgets::DiffOptions {
+                        context: 3,
+                        line_numbers: false,
+                    },
+                    &BTreeSet::new(),
+                );
+                for line in diff_lines {
+                    let mut spans = vec![Span::styled("     ".to_string(), muted_style)];
+                    spans.extend(line.0);
+                    lines.push(Spans::from(spans));
                 }
             }
         }
@@ -711,73 +700,24 @@ impl AssistantPanel {
         &self,
         entry: helix_view::assistant::thread::EntryId,
         text: &str,
+        width: usize,
         base_style: Style,
         styles: &MarkdownLineStyles,
         theme: &helix_view::Theme,
         loader: &helix_core::syntax::Loader,
     ) -> Vec<Spans<'static>> {
-        let key = MarkdownCacheKey::new(text);
-        let cached = self.markdown_cache.borrow().get(&entry).cloned();
-        if let Some(cached) = cached {
-            if cached.key == key && cached.text == text {
-                return cached.lines.clone();
-            }
-            if text.starts_with(&cached.text) && cached.key.complete_len > 0 {
-                let prefix_len = cached.key.complete_len.min(text.len());
-                let tail = &text[prefix_len..];
-                let mut tail_lines = Vec::new();
-                render_markdown_lines(
-                    tail,
-                    &mut tail_lines,
-                    base_style,
-                    styles,
-                    Some(theme),
-                    loader,
-                );
-                let mut lines = cached.complete_lines.clone();
-                lines.extend(tail_lines);
-                self.markdown_cache.borrow_mut().insert(
-                    entry,
-                    CachedMarkdown {
-                        text: text.to_string(),
-                        key,
-                        complete_lines: cached.complete_lines.clone(),
-                        lines: lines.clone(),
-                    },
-                );
-                return lines;
-            }
-        }
-
-        let complete_len = complete_markdown_prefix_len(text);
-        let mut lines = Vec::new();
-        render_markdown_lines(text, &mut lines, base_style, styles, Some(theme), loader);
-        let complete_lines = if complete_len == text.len() {
-            lines.clone()
-        } else if complete_len > 0 {
-            let mut prefix = Vec::new();
-            render_markdown_lines(
-                &text[..complete_len],
-                &mut prefix,
+        self.markdown_cache
+            .borrow_mut()
+            .entry(entry)
+            .or_default()
+            .layout(
+                &MarkdownDoc::new(text),
+                width,
                 base_style,
                 styles,
                 Some(theme),
                 loader,
-            );
-            prefix
-        } else {
-            Vec::new()
-        };
-        self.markdown_cache.borrow_mut().insert(
-            entry,
-            CachedMarkdown {
-                text: text.to_string(),
-                key,
-                complete_lines,
-                lines: lines.clone(),
-            },
-        );
-        lines
+            )
     }
 
     fn apply_assistant_effects(
@@ -1346,6 +1286,7 @@ impl AssistantPanel {
                                 md_lines = self.render_markdown_cached(
                                     entry.id,
                                     &display.text,
+                                    inner_w,
                                     agent_style,
                                     &MarkdownLineStyles {
                                         heading: heading_style,
@@ -1362,23 +1303,7 @@ impl AssistantPanel {
                                     loader,
                                 );
                             }
-
-                            let mut lines: Vec<Spans> = Vec::new();
-                            for md_line in md_lines {
-                                let line_text: String =
-                                    md_line.0.iter().map(|s| s.content.as_ref()).collect();
-                                if line_text.len() <= inner_w {
-                                    lines.push(md_line);
-                                } else {
-                                    let wrapped = wrap_text(&line_text, inner_w);
-                                    let style =
-                                        md_line.0.first().map(|s| s.style).unwrap_or(agent_style);
-                                    for wl in &wrapped {
-                                        lines.push(Spans::from(Span::styled(wl.clone(), style)));
-                                    }
-                                }
-                            }
-                            (agent_label_style, lines)
+                            (agent_label_style, md_lines)
                         }
                     };
                     let mut message = Message::bubble(

@@ -15,11 +15,20 @@ impl Default for Spinner {
 
 impl Spinner {
     pub fn new(frames: &'static [&'static str], interval: Duration) -> Self {
+        assert!(!frames.is_empty());
         Self {
             frames,
             interval,
             started_at: Instant::now(),
         }
+    }
+
+    pub fn dots(interval: Duration) -> Self {
+        Self::new(&["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"], interval)
+    }
+
+    pub fn restart(&mut self) {
+        self.started_at = Instant::now();
     }
 
     pub fn frame(&self) -> &'static str {

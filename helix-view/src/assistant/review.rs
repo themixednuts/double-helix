@@ -108,7 +108,6 @@ pub struct Summary {
 }
 
 impl Summary {
-    #[must_use]
     pub fn pending_files(&self) -> impl Iterator<Item = &File> {
         self.files.iter().filter(|file| file.status.is_pending())
     }

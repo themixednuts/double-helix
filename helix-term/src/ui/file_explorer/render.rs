@@ -100,6 +100,10 @@ impl FileExplorerPanel {
         }
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "tree rows need separate rendering state for selection, filtering, and VCS styling"
+    )]
     pub(super) fn tree_item<'a>(
         &'a self,
         row: &'a ExplorerRow,

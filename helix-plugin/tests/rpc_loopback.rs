@@ -1,12 +1,12 @@
 use helix_plugin::contract::{events, ContractError, DocumentHandle, SubscriptionHandle};
-use helix_plugin::rpc::{FrameCodec, HostRequest, HostResponse, PluginRequest, Rpc};
+use helix_plugin::rpc::{Frame, FrameCodec, HostRequest, HostResponse, PluginRequest};
 use helix_plugin::PluginConfig;
 use std::io::{BufReader, BufWriter};
 use std::num::NonZeroU64;
 use std::process::{Command, Stdio};
 
-type ToChild = Rpc<HostRequest, HostResponse>;
-type FromChild = Rpc<PluginRequest, HostResponse>;
+type ToChild = Frame<HostRequest, HostResponse>;
+type FromChild = Frame<PluginRequest, HostResponse>;
 
 fn document(raw: u64) -> DocumentHandle {
     DocumentHandle::from_raw(NonZeroU64::new(raw).unwrap())
@@ -70,7 +70,7 @@ end)
     let mut subscribed = false;
     while !subscribed {
         match codec.read_sync::<FromChild, _>(&mut input).unwrap() {
-            Rpc::Request {
+            Frame::Request {
                 id,
                 body: PluginRequest::Subscribe { kind, .. },
             } => {
@@ -86,7 +86,7 @@ end)
                     .unwrap();
                 subscribed = true;
             }
-            Rpc::Request {
+            Frame::Request {
                 id,
                 body: PluginRequest::ApiMetadata,
             } => {
@@ -120,7 +120,7 @@ end)
     let mut saw_error_table = false;
     while !(saw_query && saw_mutation && saw_error_table) {
         match codec.read_sync::<FromChild, _>(&mut input).unwrap() {
-            Rpc::Request {
+            Frame::Request {
                 id,
                 body: PluginRequest::FocusedDocument,
             } => {
@@ -135,7 +135,7 @@ end)
                     )
                     .unwrap();
             }
-            Rpc::Request {
+            Frame::Request {
                 id,
                 body: PluginRequest::OpenDocument(req),
             } => {
@@ -151,7 +151,7 @@ end)
                     )
                     .unwrap();
             }
-            Rpc::Request {
+            Frame::Request {
                 id,
                 body: PluginRequest::Notify(req),
             } => {

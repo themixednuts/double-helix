@@ -66,11 +66,11 @@ mod tests {
 
         let hits2 = hits.clone();
         rt.block_on(async {
-            latest.restart(&runtime.work(), async {
+            latest.restart(runtime.work(), async {
                 tokio::time::sleep(Duration::from_secs(10)).await;
             });
 
-            latest.restart(&runtime.work(), async move {
+            latest.restart(runtime.work(), async move {
                 hits2.fetch_add(1, Ordering::Relaxed);
             });
 

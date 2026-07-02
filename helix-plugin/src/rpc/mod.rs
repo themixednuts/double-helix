@@ -144,7 +144,7 @@ mod tests {
 
     #[test]
     fn round_trip_sync_frame() {
-        let value: Rpc<HostRequest, PluginResponse> = Rpc::Request {
+        let value: Frame<HostRequest, PluginResponse> = Frame::Request {
             id: 7,
             body: HostRequest::Init {
                 metadata: ApiMetadata::default(),
@@ -156,10 +156,10 @@ mod tests {
         codec.write_sync(&mut bytes, &value).unwrap();
 
         let mut input = Cursor::new(bytes);
-        let decoded: Rpc<HostRequest, PluginResponse> = codec.read_sync(&mut input).unwrap();
+        let decoded: Frame<HostRequest, PluginResponse> = codec.read_sync(&mut input).unwrap();
         assert!(matches!(
             decoded,
-            Rpc::Request {
+            Frame::Request {
                 id: 7,
                 body: HostRequest::Init { .. }
             }
@@ -177,18 +177,18 @@ mod tests {
             }
         }
 
-        let value: Rpc<HostRequest, PluginResponse> = Rpc::Notify {
+        let value: Frame<HostRequest, PluginResponse> = Frame::Notify {
             body: HostRequest::Shutdown,
         };
         let mut codec = FrameCodec::with_floor(16);
         let mut bytes = Vec::new();
         codec.write_sync(&mut bytes, &value).unwrap();
 
-        let decoded: Rpc<HostRequest, PluginResponse> =
+        let decoded: Frame<HostRequest, PluginResponse> =
             codec.read_sync(&mut Slow(Cursor::new(bytes))).unwrap();
         assert!(matches!(
             decoded,
-            Rpc::Notify {
+            Frame::Notify {
                 body: HostRequest::Shutdown
             }
         ));
@@ -197,7 +197,7 @@ mod tests {
     #[test]
     fn huge_frame_round_trip() {
         let msg = "x".repeat(256 * 1024);
-        let value: Rpc<PluginRequest, HostResponse> = Rpc::Notify {
+        let value: Frame<PluginRequest, HostResponse> = Frame::Notify {
             body: PluginRequest::Log {
                 level: LogLevel::Info,
                 plugin: "fixture".into(),
@@ -208,9 +208,9 @@ mod tests {
         let mut bytes = Vec::new();
         codec.write_sync(&mut bytes, &value).unwrap();
 
-        let decoded: Rpc<PluginRequest, HostResponse> =
+        let decoded: Frame<PluginRequest, HostResponse> =
             codec.read_sync(&mut Cursor::new(bytes)).unwrap();
-        let Rpc::Notify {
+        let Frame::Notify {
             body: PluginRequest::Log { msg, .. },
         } = decoded
         else {
@@ -221,14 +221,14 @@ mod tests {
 
     #[test]
     fn buffers_reuse_capacity_after_warmup() {
-        let value: Rpc<HostRequest, PluginResponse> = Rpc::Notify {
+        let value: Frame<HostRequest, PluginResponse> = Frame::Notify {
             body: HostRequest::Shutdown,
         };
         let mut codec = FrameCodec::with_floor(32);
         let mut bytes = Vec::new();
         codec.write_sync(&mut bytes, &value).unwrap();
         let encode_cap = codec.encode_capacity();
-        let _: Rpc<HostRequest, PluginResponse> =
+        let _: Frame<HostRequest, PluginResponse> =
             codec.read_sync(&mut Cursor::new(bytes.clone())).unwrap();
         let decode_cap = codec.decode_capacity();
 
@@ -237,7 +237,7 @@ mod tests {
             let start_decode = codec.decode_capacity();
             let mut out = Vec::new();
             codec.write_sync(&mut out, &value).unwrap();
-            let _: Rpc<HostRequest, PluginResponse> =
+            let _: Frame<HostRequest, PluginResponse> =
                 codec.read_sync(&mut Cursor::new(bytes.clone())).unwrap();
             assert_eq!(codec.encode_capacity(), start_encode);
             assert_eq!(codec.decode_capacity(), start_decode);

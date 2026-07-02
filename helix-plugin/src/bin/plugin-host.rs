@@ -9,8 +9,8 @@ use std::num::NonZeroU64;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-type In = Rpc<HostRequest, HostResponse>;
-type Out = Rpc<PluginRequest, HostResponse>;
+type In = Frame<HostRequest, HostResponse>;
+type Out = Frame<PluginRequest, HostResponse>;
 
 fn internal(message: impl Into<String>) -> ContractError {
     ContractError::internal(message)
@@ -47,15 +47,13 @@ impl Peer {
         self.codec
             .write_sync(&mut self.stdout, &Out::Request { id, body })
             .map_err(|err| internal(err.to_string()))?;
-        loop {
-            match self.codec.read_sync::<In, _>(&mut self.stdin) {
-                Ok(Rpc::Response { id: res_id, result }) if res_id == id => return result,
-                Ok(Rpc::Notify {
-                    body: HostRequest::Shutdown,
-                }) => return Err(internal("plugin host shut down while waiting for response")),
-                Ok(_) => return Err(internal("unexpected rpc frame while waiting for response")),
-                Err(err) => return Err(internal(err.to_string())),
-            }
+        match self.codec.read_sync::<In, _>(&mut self.stdin) {
+            Ok(Frame::Response { id: res_id, result }) if res_id == id => result,
+            Ok(Frame::Notify {
+                body: HostRequest::Shutdown,
+            }) => Err(internal("plugin host shut down while waiting for response")),
+            Ok(_) => Err(internal("unexpected rpc frame while waiting for response")),
+            Err(err) => Err(internal(err.to_string())),
         }
     }
 
@@ -66,7 +64,7 @@ impl Peer {
     ) -> Result<(), FrameError> {
         self.codec.write_sync(
             &mut self.stdout,
-            &Rpc::<PluginRequest, PluginResponse>::Response { id, result },
+            &Frame::<PluginRequest, PluginResponse>::Response { id, result },
         )
     }
 }
@@ -653,11 +651,11 @@ fn main() {
     let mut host = RpcHost::new(Arc::clone(&peer));
 
     let init = match peer.lock().read() {
-        Ok(Rpc::Request {
+        Ok(Frame::Request {
             body: HostRequest::Init { mut config, .. },
             ..
         })
-        | Ok(Rpc::Notify {
+        | Ok(Frame::Notify {
             body: HostRequest::Init { mut config, .. },
         }) => {
             parse_args(&mut config);
@@ -701,17 +699,17 @@ fn main() {
         };
 
         match frame {
-            Rpc::Notify {
+            Frame::Notify {
                 body: HostRequest::Event(event),
             } => {
                 if let Err(err) = engine.call_event_handlers_remote(&mut host, &event) {
                     eprintln!("helix-plugin-host: event dispatch failed: {err}");
                 }
             }
-            Rpc::Notify {
+            Frame::Notify {
                 body: HostRequest::Shutdown,
             } => break,
-            Rpc::Request { id, body } => {
+            Frame::Request { id, body } => {
                 let result = match body {
                     HostRequest::Event(event) => engine
                         .call_event_handlers_remote(&mut host, &event)
@@ -733,20 +731,20 @@ fn main() {
                     break;
                 }
             }
-            Rpc::Response { .. } => {
+            Frame::Response { .. } => {
                 eprintln!("helix-plugin-host: unexpected response frame");
             }
-            Rpc::Notify {
+            Frame::Notify {
                 body: HostRequest::CommandInvoke { name, args },
             } => {
                 if let Err(err) = engine.execute_command_remote(&mut host, &name, args) {
                     eprintln!("helix-plugin-host: command failed: {err}");
                 }
             }
-            Rpc::Notify {
+            Frame::Notify {
                 body: HostRequest::UiCallback { .. },
             }
-            | Rpc::Notify {
+            | Frame::Notify {
                 body: HostRequest::Init { .. },
             } => {}
         }

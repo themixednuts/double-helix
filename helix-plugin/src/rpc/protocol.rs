@@ -9,18 +9,17 @@ use crate::types::PluginConfig;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum Rpc<Req, Res> {
-    Request {
-        id: u64,
-        body: Req,
-    },
+/// A length-prefixed RPC frame exchanged between the editor and a plugin host.
+pub enum Frame<Req, Res> {
+    /// A request that expects a matching response with the same id.
+    Request { id: u64, body: Req },
+    /// A response to a request with the same id.
     Response {
         id: u64,
         result: Result<Res, ContractError>,
     },
-    Notify {
-        body: Req,
-    },
+    /// A fire-and-forget request.
+    Notify { body: Req },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

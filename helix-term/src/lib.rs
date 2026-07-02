@@ -1,3 +1,8 @@
+#![allow(
+    clippy::unnecessary_operation,
+    reason = "rendering code scopes CellSurface cell borrows before subsequent buffer writes"
+)]
+
 #[macro_use]
 extern crate helix_view;
 

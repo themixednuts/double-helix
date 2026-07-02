@@ -4017,7 +4017,7 @@ fn bench(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow
         return Ok(());
     }
 
-    use helix_view::bench::{generate_bench_content, BenchState};
+    use helix_view::bench::generate_bench_content;
 
     // Parse optional arguments: :bench [duration_secs] [seed]
     let mut args_iter = args.iter();

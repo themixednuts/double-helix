@@ -166,7 +166,7 @@ mod tests {
             DynamicValue::Nil,
             DynamicValue::Bool(true),
             DynamicValue::Int(42),
-            DynamicValue::Float(3.14),
+            DynamicValue::Float(1.5),
             DynamicValue::String("hello".into()),
         ] {
             let bytes = encode(&val).unwrap();

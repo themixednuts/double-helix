@@ -44,7 +44,7 @@ The table fields are `code`, `message`, and optional `entity`. Treat `code` as s
 
 ## Remote Hosts
 
-Plugins can run out of process in `helix-plugin-host`. The editor and child process communicate over stdout/stdin using the same msgpack contract as the in-process Lua facade. The child process discovers plugins on its own filesystem.
+Plugins can run out of process in `helix-plugin-host`. The editor and child process communicate over stdout/stdin using length-prefixed msgpack `helix_plugin::rpc::Frame` messages that carry the same contract as the in-process Lua facade. The child process discovers plugins on its own filesystem.
 
 ```toml
 [[plugins.hosts]]

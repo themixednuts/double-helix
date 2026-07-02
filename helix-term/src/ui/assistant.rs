@@ -527,6 +527,10 @@ impl AssistantPanel {
         message
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "message styling helper keeps independent visual attributes explicit at call sites"
+    )]
     fn tool_call_message(
         &self,
         name: &str,
@@ -1123,7 +1127,7 @@ impl AssistantPanel {
             surface.set_stringn(
                 area.x,
                 y,
-                &" ".repeat(area.width as usize),
+                " ".repeat(area.width as usize),
                 area.width as usize,
                 tui::ratatui::to_ratatui_style(row_style),
             );

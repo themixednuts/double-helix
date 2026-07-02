@@ -138,7 +138,7 @@ impl Component for Hover {
             0
         });
         let (_, content_height) =
-            crate::ui::text::required_size(&contents_parsed, contents_area.width as u16);
+            crate::ui::text::required_size(&contents_parsed, contents_area.width);
         let scroll_pos = cx.scroll().unwrap_or_default();
         let needs_scrollbar = content_height > contents_area.height;
         // Reserve the rightmost column for the scrollbar when needed

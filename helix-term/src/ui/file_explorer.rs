@@ -532,7 +532,7 @@ impl FileExplorerPanel {
     /// row-entry edge so the user's next keystroke continues naturally.
     /// Used by [`Self::move_label_selection`] when a word motion would
     /// otherwise stall at the current label's boundary.
-    fn wrap_to_adjacent_row(&mut self, direction: i32, movement: CoreMovement) {
+    fn wrap_to_adjacent_row(&mut self, direction: i32, _movement: CoreMovement) {
         if self.rows.is_empty() {
             return;
         }
@@ -549,23 +549,8 @@ impl FileExplorerPanel {
         }
         self.seek_to(next_index);
 
-        // Land the label cursor at the row-entry edge:
-        // - forward wrap (`w` / `e`): col 0 of the new row's label
-        // - backward wrap (`b`): col 0 of the new row's label too, so
-        //   the next `b` (or any motion) starts cleanly
-        // For Select movement (visual extension), we keep the anchor
-        // so the new selection extends across the row boundary. With
-        // a plain Move, both anchor and head reset to col 0.
-        let new_selection = match movement {
-            CoreMovement::Extend => self.label_selection.collapse_to_cursor(""), // anchor stays
-            _ => LabelSelection::point(0),
-        };
-        // collapse_to_cursor needs the OLD label for grapheme-aligned
-        // semantics, but we just want point(0) of the new row's label;
-        // the `match` above keeps things simple — for Extend, treat
-        // the wrap as a hard reset for now (full extend-across-rows
-        // would require redesigning `label_selection` to span rows).
-        let _ = new_selection; // suppress unused warning while we keep the simple form below
+        // Land the label cursor at the row-entry edge. Cross-row label
+        // selection is not represented, so wrapping resets to the new label.
         self.label_selection = LabelSelection::point(0);
     }
 
@@ -3442,7 +3427,7 @@ mod tests {
 
             let mut panel = FileExplorerPanel::new(temp.path().to_path_buf(), &editor).unwrap();
             panel.area = Rect::new(0, 0, 40, 10);
-            assert!(panel.rows.len() >= 1);
+            assert!(!panel.rows.is_empty());
 
             press_key(&mut panel, &mut editor, &rt, key!('g'));
             press_key(&mut panel, &mut editor, &rt, key!('w'));
@@ -4515,7 +4500,7 @@ mod tests {
             let mut panel = FileExplorerPanel::new(temp.path().to_path_buf(), &editor).unwrap();
             panel.selection = row_index_by_name(&panel, "nested");
             // Expand the dir.
-            panel.toggle_selected_dir(&mut editor);
+            panel.toggle_selected_dir(&editor);
             assert!(panel.selected().unwrap().expanded);
 
             press_key(&mut panel, &mut editor, &rt, key!('o'));
@@ -4544,7 +4529,7 @@ mod tests {
             let mut editor = test_editor(100, 30, rt.runtime());
             let mut panel = FileExplorerPanel::new(temp.path().to_path_buf(), &editor).unwrap();
             panel.selection = row_index_by_name(&panel, "nested");
-            panel.toggle_selected_dir(&mut editor); // expand to reveal inner.rs
+            panel.toggle_selected_dir(&editor); // expand to reveal inner.rs
             panel.selection = row_index_by_name(&panel, "inner.rs");
 
             press_key(&mut panel, &mut editor, &rt, key!('o'));

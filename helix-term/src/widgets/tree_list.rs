@@ -293,6 +293,10 @@ fn draw_item(
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "tree label drawing keeps cursor, widths, icons, and selection styling independent"
+)]
 fn draw_label(
     surface: &mut crate::render::CellSurface,
     x: &mut u16,

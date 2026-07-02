@@ -1696,6 +1696,10 @@ fn story_picker(
         .with_cursor(cursor)
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "storybook helper mirrors picker rendering inputs for compact visual fixtures"
+)]
 fn render_story_picker_component(
     surface: &mut Buffer,
     area: Rect,

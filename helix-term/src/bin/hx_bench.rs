@@ -13,16 +13,110 @@
 //!   --width <u16>      Terminal width (default: 120)
 //!   --height <u16>     Terminal height (default: 50)
 
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use anyhow::Context;
 use helix_core::{syntax, Selection};
 use helix_term::{application::Application, args::Args, config::Config};
 use helix_view::bench::{
-    enter_bench_command, generate_bench_content, log_run_event, BenchCommandContext, BenchState,
+    enter_bench_command, generate_bench_content, log_run_event, BenchCommandContext,
 };
 use helix_view::commands::editing;
 use tokio_stream::wrappers::UnboundedReceiverStream;
+
+#[global_allocator]
+static ALLOCATOR: CountingAllocator = CountingAllocator;
+
+static ALLOC_CALLS: AtomicUsize = AtomicUsize::new(0);
+static ALLOC_BYTES: AtomicUsize = AtomicUsize::new(0);
+static REALLOC_CALLS: AtomicUsize = AtomicUsize::new(0);
+static REALLOC_BYTES: AtomicUsize = AtomicUsize::new(0);
+static DEALLOC_CALLS: AtomicUsize = AtomicUsize::new(0);
+static DEALLOC_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+struct CountingAllocator;
+
+unsafe impl GlobalAlloc for CountingAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        ALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
+        ALLOC_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
+        unsafe { System.alloc(layout) }
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        ALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
+        ALLOC_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
+        unsafe { System.alloc_zeroed(layout) }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        DEALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
+        DEALLOC_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
+        unsafe { System.dealloc(ptr, layout) }
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        REALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
+        REALLOC_BYTES.fetch_add(new_size, Ordering::Relaxed);
+        DEALLOC_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
+        unsafe { System.realloc(ptr, layout, new_size) }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AllocationSnapshot {
+    alloc_calls: usize,
+    alloc_bytes: usize,
+    realloc_calls: usize,
+    realloc_bytes: usize,
+    dealloc_calls: usize,
+    dealloc_bytes: usize,
+}
+
+impl AllocationSnapshot {
+    fn capture() -> Self {
+        Self {
+            alloc_calls: ALLOC_CALLS.load(Ordering::Relaxed),
+            alloc_bytes: ALLOC_BYTES.load(Ordering::Relaxed),
+            realloc_calls: REALLOC_CALLS.load(Ordering::Relaxed),
+            realloc_bytes: REALLOC_BYTES.load(Ordering::Relaxed),
+            dealloc_calls: DEALLOC_CALLS.load(Ordering::Relaxed),
+            dealloc_bytes: DEALLOC_BYTES.load(Ordering::Relaxed),
+        }
+    }
+
+    fn delta_since(self, before: Self) -> Self {
+        Self {
+            alloc_calls: self.alloc_calls - before.alloc_calls,
+            alloc_bytes: self.alloc_bytes - before.alloc_bytes,
+            realloc_calls: self.realloc_calls - before.realloc_calls,
+            realloc_bytes: self.realloc_bytes - before.realloc_bytes,
+            dealloc_calls: self.dealloc_calls - before.dealloc_calls,
+            dealloc_bytes: self.dealloc_bytes - before.dealloc_bytes,
+        }
+    }
+}
+
+impl std::fmt::Display for AllocationSnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "alloc_calls={} alloc_bytes={} realloc_calls={} realloc_bytes={} dealloc_calls={} dealloc_bytes={}",
+            self.alloc_calls,
+            self.alloc_bytes,
+            self.realloc_calls,
+            self.realloc_bytes,
+            self.dealloc_calls,
+            self.dealloc_bytes
+        )
+    }
+}
+
+fn allocation_delta_since(before: AllocationSnapshot) -> AllocationSnapshot {
+    AllocationSnapshot::capture().delta_since(before)
+}
 
 // ---------------------------------------------------------------------------
 // CLI argument parsing (minimal, no extra deps)
@@ -202,7 +296,9 @@ async fn main_impl(runtime: helix_runtime::Runtime) -> anyhow::Result<()> {
                 let (view_id, doc_id) =
                     install_fixture_document(&mut app, &content, scenario_requested_lines);
 
+                let alloc_before = AllocationSnapshot::capture();
                 let pre = app.render_timed().await;
+                let pre_alloc = allocation_delta_since(alloc_before);
                 let snippet = generate_bench_content(
                     bench_args.seed.wrapping_add(scenario_lines as u64 + 1),
                     120,
@@ -218,6 +314,7 @@ async fn main_impl(runtime: helix_runtime::Runtime) -> anyhow::Result<()> {
                     force_insert: false,
                 };
                 let _mutation_guard = enter_bench_command(mutation_context);
+                let alloc_before = AllocationSnapshot::capture();
                 let mutation_start = std::time::Instant::now();
                 {
                     let doc = app.editor.documents.get_mut(&doc_id).unwrap();
@@ -232,14 +329,20 @@ async fn main_impl(runtime: helix_runtime::Runtime) -> anyhow::Result<()> {
                     });
                 }
                 let mutation_elapsed = mutation_start.elapsed();
+                let mutation_alloc = allocation_delta_since(alloc_before);
+                let alloc_before = AllocationSnapshot::capture();
                 let post = app.render_timed().await;
+                let post_alloc = allocation_delta_since(alloc_before);
                 let doc = app.editor.documents.get(&doc_id).unwrap();
                 eprintln!(
-                    "matrix {}: pre_render_us={} mutation_us={} post_render_us={} inserted_chars={} lines={} bytes={}",
+                    "matrix {}: pre_render_us={} pre_{} mutation_us={} mutation_{} post_render_us={} post_{} inserted_chars={} lines={} bytes={}",
                     label,
                     pre.as_micros(),
+                    pre_alloc,
                     mutation_elapsed.as_micros(),
+                    mutation_alloc,
                     post.as_micros(),
+                    post_alloc,
                     snippet_chars,
                     doc.text().len_lines(),
                     doc.text().len_bytes()
@@ -247,12 +350,15 @@ async fn main_impl(runtime: helix_runtime::Runtime) -> anyhow::Result<()> {
             }
         } else if fixture_name == "document-change-fanout" {
             for render_idx in 0..bench_args.renders {
+                let alloc_before = AllocationSnapshot::capture();
                 let elapsed = app.render_timed().await;
+                let alloc_delta = allocation_delta_since(alloc_before);
                 let doc = app.editor.documents.get(&doc_id).unwrap();
                 eprintln!(
-                    "pre-mutation render {}: elapsed_us={} lines={} bytes={}",
+                    "pre-mutation render {}: elapsed_us={} {} lines={} bytes={}",
                     render_idx + 1,
                     elapsed.as_micros(),
+                    alloc_delta,
                     doc.text().len_lines(),
                     doc.text().len_bytes()
                 );
@@ -279,6 +385,7 @@ async fn main_impl(runtime: helix_runtime::Runtime) -> anyhow::Result<()> {
                 force_insert: false,
             };
             let _mutation_guard = enter_bench_command(mutation_context);
+            let alloc_before = AllocationSnapshot::capture();
             let mutation_start = std::time::Instant::now();
             {
                 let doc = app.editor.documents.get_mut(&doc_id).unwrap();
@@ -293,10 +400,12 @@ async fn main_impl(runtime: helix_runtime::Runtime) -> anyhow::Result<()> {
                 });
             }
             let mutation_elapsed = mutation_start.elapsed();
+            let mutation_alloc = allocation_delta_since(alloc_before);
             let doc = app.editor.documents.get(&doc_id).unwrap();
             eprintln!(
-                "mutation: elapsed_us={} inserted_chars={} lines={} bytes={}",
+                "mutation: elapsed_us={} {} inserted_chars={} lines={} bytes={}",
                 mutation_elapsed.as_micros(),
+                mutation_alloc,
                 snippet_chars,
                 doc.text().len_lines(),
                 doc.text().len_bytes()
@@ -312,24 +421,30 @@ async fn main_impl(runtime: helix_runtime::Runtime) -> anyhow::Result<()> {
             });
 
             for render_idx in 0..bench_args.renders {
+                let alloc_before = AllocationSnapshot::capture();
                 let elapsed = app.render_timed().await;
+                let alloc_delta = allocation_delta_since(alloc_before);
                 let doc = app.editor.documents.get(&doc_id).unwrap();
                 eprintln!(
-                    "post-mutation render {}: elapsed_us={} lines={} bytes={}",
+                    "post-mutation render {}: elapsed_us={} {} lines={} bytes={}",
                     render_idx + 1,
                     elapsed.as_micros(),
+                    alloc_delta,
                     doc.text().len_lines(),
                     doc.text().len_bytes()
                 );
             }
         } else if fixture_name == "giant-lines-collapse-render" {
             for render_idx in 0..bench_args.renders {
+                let alloc_before = AllocationSnapshot::capture();
                 let elapsed = app.render_timed().await;
+                let alloc_delta = allocation_delta_since(alloc_before);
                 let doc = app.editor.documents.get(&doc_id).unwrap();
                 eprintln!(
-                    "pre-collapse render {}: elapsed_us={} lines={} bytes={}",
+                    "pre-collapse render {}: elapsed_us={} {} lines={} bytes={}",
                     render_idx + 1,
                     elapsed.as_micros(),
+                    alloc_delta,
                     doc.text().len_lines(),
                     doc.text().len_bytes()
                 );
@@ -363,13 +478,16 @@ async fn main_impl(runtime: helix_runtime::Runtime) -> anyhow::Result<()> {
                 force_insert: false,
             };
             let _collapse_guard = enter_bench_command(collapse_context);
+            let alloc_before = AllocationSnapshot::capture();
             let collapse_start = std::time::Instant::now();
             editing::join_selections(&mut app.editor, view_id, doc_id);
             let collapse_elapsed = collapse_start.elapsed();
+            let collapse_alloc = allocation_delta_since(alloc_before);
             let doc = app.editor.documents.get(&doc_id).unwrap();
             eprintln!(
-                "collapse: elapsed_us={} lines={} bytes={}",
+                "collapse: elapsed_us={} {} lines={} bytes={}",
                 collapse_elapsed.as_micros(),
+                collapse_alloc,
                 doc.text().len_lines(),
                 doc.text().len_bytes()
             );
@@ -383,24 +501,30 @@ async fn main_impl(runtime: helix_runtime::Runtime) -> anyhow::Result<()> {
             });
 
             for render_idx in 0..bench_args.renders {
+                let alloc_before = AllocationSnapshot::capture();
                 let elapsed = app.render_timed().await;
+                let alloc_delta = allocation_delta_since(alloc_before);
                 let doc = app.editor.documents.get(&doc_id).unwrap();
                 eprintln!(
-                    "post-collapse render {}: elapsed_us={} lines={} bytes={}",
+                    "post-collapse render {}: elapsed_us={} {} lines={} bytes={}",
                     render_idx + 1,
                     elapsed.as_micros(),
+                    alloc_delta,
                     doc.text().len_lines(),
                     doc.text().len_bytes()
                 );
             }
         } else {
             for render_idx in 0..bench_args.renders {
+                let alloc_before = AllocationSnapshot::capture();
                 let elapsed = app.render_timed().await;
+                let alloc_delta = allocation_delta_since(alloc_before);
                 let doc = app.editor.documents.get(&doc_id).unwrap();
                 eprintln!(
-                    "render {}: elapsed_us={} lines={} bytes={}",
+                    "render {}: elapsed_us={} {} lines={} bytes={}",
                     render_idx + 1,
                     elapsed.as_micros(),
+                    alloc_delta,
                     doc.text().len_lines(),
                     doc.text().len_bytes()
                 );

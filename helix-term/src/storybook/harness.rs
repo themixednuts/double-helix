@@ -50,8 +50,10 @@ impl Stage {
         let runtime_handle = story_tokio_runtime().handle().clone();
         let _guard = runtime_handle.enter();
         let runtime = helix_runtime::Runtime::new(runtime_handle);
-        let mut config = crate::config::Config::default();
-        config.editor = context.editor_config.clone();
+        let config = crate::config::Config {
+            editor: context.editor_config.clone(),
+            ..Default::default()
+        };
         let mut embedded = EmbeddedEditorBuilder::new(area, runtime)
             .config(config)
             .theme_loader(Arc::new(super::theme_loader()))

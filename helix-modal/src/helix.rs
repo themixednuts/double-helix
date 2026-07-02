@@ -267,6 +267,10 @@ impl HelixEngine {
     }
 
     /// Execute a char-pending command (find_char, surround, etc.).
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "modal command dispatch carries editor, view, document, key, count, and register context"
+    )]
     fn execute_char_pending(
         &self,
         editor: &mut Editor,

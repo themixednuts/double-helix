@@ -2929,7 +2929,7 @@ impl Component for EditorView {
         // EditorView no longer paints it inside its own area.
         let status_msg_width = 0u16;
 
-        if area.width.saturating_sub(status_msg_width as u16) > key_width {
+        if area.width.saturating_sub(status_msg_width) > key_width {
             let pending_start = std::time::Instant::now();
             let mut disp = String::new();
             if let Some(count) = self.engine_input_state().count {
@@ -3181,7 +3181,7 @@ mod tests {
                 visible_col_start: 10,
                 visible_char_last: 90,
                 visible_col_last: 90,
-                horizontal_checkpoints: Vec::new(),
+                horizontal_checkpoints: Default::default(),
             }]),
         };
         let layout = layout_snapshot(line_map, 100);
@@ -3209,7 +3209,7 @@ mod tests {
                     visible_col_start: 10,
                     visible_char_last: 20,
                     visible_col_last: 20,
-                    horizontal_checkpoints: Vec::new(),
+                    horizontal_checkpoints: Default::default(),
                 },
                 VisualLineInfo {
                     visual_row: 0,
@@ -3220,7 +3220,7 @@ mod tests {
                     visible_col_start: 60,
                     visible_char_last: 80,
                     visible_col_last: 120,
-                    horizontal_checkpoints: Vec::new(),
+                    horizontal_checkpoints: Default::default(),
                 },
             ]),
         };
@@ -3249,7 +3249,7 @@ mod tests {
                 visible_col_start: 143_200,
                 visible_char_last: 143_237,
                 visible_col_last: 143_237,
-                horizontal_checkpoints: Vec::new(),
+                horizontal_checkpoints: Default::default(),
             }]),
         };
         let far_layout = layout_snapshot(line_map.clone(), 290_989);

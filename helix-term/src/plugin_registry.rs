@@ -16,7 +16,7 @@ use helix_plugin::contract::requests::{
 use helix_plugin::contract::{
     adapt, CommandHandle, ContractError, ContractResult, PanelHandle, PluginId, SubscriptionHandle,
 };
-use helix_plugin::rpc::{FrameCodec, HostRequest, HostResponse, PluginRequest, Rpc};
+use helix_plugin::rpc::{Frame, FrameCodec, HostRequest, HostResponse, PluginRequest};
 use helix_plugin::{PluginConfig, PluginHostConfig};
 use helix_view::model::FocusTarget;
 use helix_view::Editor;
@@ -596,7 +596,7 @@ async fn write_remote_host(
                 codec
                     .write::<_, _>(
                         &mut stdin,
-                        &Rpc::<HostRequest, HostResponse>::Notify { body },
+                        &Frame::<HostRequest, HostResponse>::Notify { body },
                     )
                     .await
             }
@@ -604,7 +604,7 @@ async fn write_remote_host(
                 codec
                     .write::<_, _>(
                         &mut stdin,
-                        &Rpc::<HostRequest, HostResponse>::Response { id, result },
+                        &Frame::<HostRequest, HostResponse>::Response { id, result },
                     )
                     .await
             }
@@ -627,7 +627,7 @@ async fn read_remote_host(
     let mut codec = FrameCodec::new();
     loop {
         let frame = match codec
-            .read::<Rpc<PluginRequest, HostResponse>, _>(&mut stdout)
+            .read::<Frame<PluginRequest, HostResponse>, _>(&mut stdout)
             .await
         {
             Ok(frame) => frame,
@@ -638,7 +638,7 @@ async fn read_remote_host(
         };
 
         match frame {
-            Rpc::Request { id, body } => {
+            Frame::Request { id, body } => {
                 let (respond_to, response) = tokio::sync::oneshot::channel();
                 ingress.task(crate::runtime::RuntimeTaskEvent::PluginHostRequest {
                     state: state.clone(),
@@ -652,7 +652,7 @@ async fn read_remote_host(
                     break;
                 }
             }
-            Rpc::Notify { body } => {
+            Frame::Notify { body } => {
                 let (respond_to, response) = tokio::sync::oneshot::channel();
                 ingress.task(crate::runtime::RuntimeTaskEvent::PluginHostRequest {
                     state: state.clone(),
@@ -661,7 +661,7 @@ async fn read_remote_host(
                 });
                 let _ = response.await;
             }
-            Rpc::Response { .. } => {
+            Frame::Response { .. } => {
                 log::warn!("remote plugin host '{name}' sent an unexpected response frame");
             }
         }

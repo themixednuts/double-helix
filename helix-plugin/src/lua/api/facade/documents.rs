@@ -5,8 +5,8 @@ pub fn register(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
 
     m.set(
         "list",
-        lua.create_function(|_lua, ()| {
-            with_query_bridge(|bridge| {
+        lua.create_function(|lua, ()| {
+            with_query_bridge(lua, |bridge| {
                 Ok(bridge
                     .list_documents()
                     .into_iter()
@@ -18,14 +18,14 @@ pub fn register(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
 
     m.set(
         "open",
-        lua.create_function(|_lua, (path, opts): (String, Option<LuaTable>)| {
+        lua.create_function(|lua, (path, opts): (String, Option<LuaTable>)| {
             let focus = opts
                 .and_then(|t| t.get::<Option<bool>>("focus").ok().flatten())
                 .unwrap_or(false);
-            let handle = with_mutation_bridge(|mut bridge| {
+            let handle = with_mutation_bridge(lua, |bridge| {
                 bridge
                     .open_document(requests::OpenDocumentRequest { path, focus })
-                    .map_err(|e| LuaError::RuntimeError(e.to_string()))
+                    .map_err(contract_error)
             })?;
             Ok(LuaDocumentHandle(handle))
         })?,

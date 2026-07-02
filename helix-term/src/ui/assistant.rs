@@ -21,6 +21,7 @@ use helix_view::traits::{Bounded, Focusable, Identified, Modal, Scrollable};
 use helix_view::Editor;
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tui::text::{Span, Spans};
 
@@ -66,6 +67,7 @@ pub struct AssistantPanel {
     /// Selection animation that replays when message focus moves back onto a row.
     message_focus_animation: Animation,
     markdown_cache: RefCell<HashMap<helix_view::assistant::thread::EntryId, CachedMarkdown>>,
+    mention: MentionPopup,
 }
 
 #[derive(Clone)]
@@ -80,6 +82,58 @@ struct CachedMarkdown {
 struct MessageNavigationState {
     selected: Option<usize>,
     scroll: usize,
+}
+
+#[derive(Default)]
+struct MentionPopup {
+    active: bool,
+    query: String,
+    token_start: usize,
+    token_end: usize,
+    selected: usize,
+    candidates: Vec<MentionCandidate>,
+    context_keys: Vec<String>,
+}
+
+#[derive(Clone)]
+struct MentionCandidate {
+    label: String,
+    detail: String,
+    replacement: String,
+    kind: MentionCandidateKind,
+}
+
+#[derive(Clone)]
+enum MentionCandidateKind {
+    File(PathBuf),
+    Selection,
+    Diagnostics,
+    Diff,
+}
+
+fn byte_index_at_char(text: &str, char_index: usize) -> usize {
+    text.char_indices()
+        .nth(char_index)
+        .map(|(idx, _)| idx)
+        .unwrap_or(text.len())
+}
+
+fn char_index_at_byte(text: &str, byte_index: usize) -> usize {
+    text[..byte_index.min(text.len())].chars().count()
+}
+
+fn mention_matches(label: &str, query: &str) -> bool {
+    query.is_empty()
+        || label
+            .to_ascii_lowercase()
+            .contains(&query.to_ascii_lowercase())
+}
+
+fn relative_mention_path(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
 }
 
 impl Default for AssistantPanel {
@@ -110,7 +164,9 @@ impl AssistantPanel {
 
         self.sync_input_from_assistant(editor, &model.input);
         self.output.set_content(model.entries);
-        self.output.scroll_to(model.content_scroll);
+        if !self.output.is_following_end() {
+            self.output.scroll_to(model.content_scroll);
+        }
     }
 
     fn entry_id_at(
@@ -318,6 +374,7 @@ impl AssistantPanel {
                 spec
             }),
             markdown_cache: RefCell::new(HashMap::new()),
+            mention: MentionPopup::default(),
         }
     }
 
@@ -532,6 +589,74 @@ impl AssistantPanel {
         message
     }
 
+    fn review_message(
+        &self,
+        mode: helix_view::assistant::review::Mode,
+        files: &[(
+            &std::path::Path,
+            helix_view::assistant::review::Status,
+            &str,
+        )],
+        expanded: bool,
+        selected: bool,
+        theme: &helix_view::Theme,
+        accent: Option<(GraphicsStyle, f32)>,
+    ) -> Message<'static> {
+        let title_style = theme.get("ui.text.focus").add_modifier(Modifier::BOLD);
+        let muted_style = theme.get("ui.text.inactive");
+        let pending_style = theme.get("warning");
+        let plus = theme.get("diff.plus");
+        let minus = theme.get("diff.minus");
+        let delta = theme.get("diff.delta");
+        let text = theme.get("ui.text");
+        let pending = files
+            .iter()
+            .filter(|(_, status, _)| status.is_pending())
+            .count();
+        let mut lines = vec![Spans::from(vec![
+            Span::styled(" review ", title_style),
+            Span::styled(mode.label().to_string(), muted_style),
+            Span::styled(format!("  {} files", files.len()), muted_style),
+            Span::styled(format!("  {pending} pending"), pending_style),
+        ])];
+
+        for (path, status, diff) in files {
+            lines.push(Spans::from(vec![
+                Span::styled("   ", muted_style),
+                Span::styled(path.display().to_string(), title_style),
+                Span::styled(format!("  {}", status.label()), muted_style),
+            ]));
+            if expanded {
+                for line in diff.lines() {
+                    let style = if line.starts_with('+') && !line.starts_with("+++") {
+                        plus
+                    } else if line.starts_with('-') && !line.starts_with("---") {
+                        minus
+                    } else if line.starts_with("@@") {
+                        delta
+                    } else {
+                        text
+                    };
+                    lines.push(Spans::from(Span::styled(format!("     {line}"), style)));
+                }
+            }
+        }
+
+        let mut message = Message::plain(lines);
+        if let Some((style, _)) = accent {
+            message = message.with_selected_bar("▌", style);
+        }
+        if selected {
+            message = Self::decorate_selected_message(
+                message,
+                true,
+                theme,
+                Self::plain_accessory_align(),
+            );
+        }
+        message
+    }
+
     fn yank_selected_message(&mut self, editor: &mut Editor) -> bool {
         let Some(text) = self.selected_entry_ref(editor).map(ChatEntry::plain_text) else {
             return false;
@@ -668,7 +793,360 @@ impl AssistantPanel {
             .document(editor)
             .map(|doc| doc.text().to_string())
             .unwrap_or_default();
+        self.sync_mention_context(editor, &text);
         self.set_draft(editor, text);
+    }
+
+    fn sync_mention_context(&mut self, editor: &mut Editor, text: &str) {
+        let Some(thread) = Self::assistant_model(editor).active_thread else {
+            return;
+        };
+        let items = self.context_items_for_mentions(editor, text);
+        let keys = items
+            .iter()
+            .map(helix_view::assistant::mention::key_for_kind)
+            .collect::<Vec<_>>();
+        if self.mention.context_keys == keys {
+            return;
+        }
+        self.mention.context_keys = keys;
+        Self::apply(
+            editor,
+            helix_view::assistant::Action::SetMentionContext { thread, items },
+        );
+    }
+
+    fn context_items_for_mentions(
+        &self,
+        editor: &Editor,
+        text: &str,
+    ) -> Vec<helix_view::assistant::context::Kind> {
+        let mut items = Vec::new();
+        let scope = editor.active_assistant_scope_or_layout();
+        for token in helix_view::assistant::mention::tokens(text) {
+            match token.text.as_str() {
+                "selection" => {
+                    if let Some(item) = editor
+                        .capture_current_surface(helix_view::collab::surface::Capture::Selection)
+                    {
+                        items.push(item);
+                    }
+                }
+                "diagnostics" => {
+                    if let Some(item) = Self::diagnostics_context(editor) {
+                        items.push(item);
+                    }
+                }
+                "diff" | "git-diff" => {
+                    if let Some(item) = Self::diff_context(editor) {
+                        items.push(item);
+                    }
+                }
+                path => {
+                    items.push(helix_view::assistant::context::Kind::File(
+                        helix_view::assistant::context::File {
+                            path: scope.cwd.join(path),
+                        },
+                    ));
+                }
+            }
+        }
+        items
+    }
+
+    fn diagnostics_context(editor: &Editor) -> Option<helix_view::assistant::context::Kind> {
+        let doc = editor.focused_document()?;
+        let path = doc.path()?.to_path_buf();
+        let items = doc
+            .diagnostics()
+            .iter()
+            .map(|diagnostic| diagnostic.message.clone())
+            .collect::<Vec<_>>();
+        (!items.is_empty()).then_some(helix_view::assistant::context::Kind::Diagnostics(
+            helix_view::assistant::context::Diagnostics { path, items },
+        ))
+    }
+
+    fn diff_context(editor: &Editor) -> Option<helix_view::assistant::context::Kind> {
+        let doc = editor.focused_document()?;
+        let path = doc.path()?.to_path_buf();
+        let handle = doc.diff_handle()?;
+        let diff = handle.load();
+        if diff.is_empty() {
+            return None;
+        }
+        let mut summary = String::new();
+        for index in 0..diff.len() {
+            let hunk = diff.nth_hunk(index);
+            use std::fmt::Write as _;
+            let _ = writeln!(
+                summary,
+                "hunk {}: base {}..{} -> current {}..{}",
+                index + 1,
+                hunk.before.start + 1,
+                hunk.before.end + 1,
+                hunk.after.start + 1,
+                hunk.after.end + 1
+            );
+        }
+        Some(helix_view::assistant::context::Kind::Diff(
+            helix_view::assistant::context::Diff {
+                path,
+                summary: summary.trim_end().to_string(),
+            },
+        ))
+    }
+
+    fn refresh_mention_popup(&mut self, editor: &Editor) {
+        let Some((input, cursor)) = self.input_text_and_cursor(editor) else {
+            self.mention.active = false;
+            return;
+        };
+        let Some(active) = helix_view::assistant::mention::active_query(&input, cursor) else {
+            self.mention.active = false;
+            return;
+        };
+        let token_end = helix_view::assistant::mention::active_token(&input, cursor)
+            .map(|token| token.end)
+            .unwrap_or(active.end);
+        self.mention.active = true;
+        self.mention.query = active.query;
+        self.mention.token_start = active.start;
+        self.mention.token_end = token_end;
+        self.mention.candidates = self.mention_candidates(editor, &self.mention.query);
+        if self.mention.selected >= self.mention.candidates.len() {
+            self.mention.selected = self.mention.candidates.len().saturating_sub(1);
+        }
+    }
+
+    fn input_text_and_cursor(&self, editor: &Editor) -> Option<(String, usize)> {
+        let doc = self.input.document(editor)?;
+        let text = doc.text().to_string();
+        let cursor = doc
+            .selection(self.input.view_id())
+            .primary()
+            .cursor(doc.text().slice(..));
+        Some((text.clone(), byte_index_at_char(&text, cursor)))
+    }
+
+    fn mention_candidates(&self, editor: &Editor, query: &str) -> Vec<MentionCandidate> {
+        const LIMIT: usize = 40;
+        let scope = editor.active_assistant_scope_or_layout();
+        let root = scope.cwd;
+        let mut candidates = Vec::new();
+        candidates.extend(Self::fixed_mention_candidates(query));
+        candidates.extend(Self::open_buffer_mention_candidates(editor, &root, query));
+        candidates.extend(Self::workspace_file_mention_candidates(
+            editor, &root, query,
+        ));
+        let mut seen = std::collections::HashSet::new();
+        candidates
+            .into_iter()
+            .filter(|candidate| seen.insert(candidate.replacement.clone()))
+            .take(LIMIT)
+            .collect()
+    }
+
+    fn fixed_mention_candidates(query: &str) -> Vec<MentionCandidate> {
+        [
+            (
+                "selection",
+                "current selection",
+                MentionCandidateKind::Selection,
+            ),
+            (
+                "diagnostics",
+                "current diagnostics",
+                MentionCandidateKind::Diagnostics,
+            ),
+            ("diff", "current git diff", MentionCandidateKind::Diff),
+        ]
+        .into_iter()
+        .filter(|(label, _, _)| mention_matches(label, query))
+        .map(|(label, detail, kind)| MentionCandidate {
+            label: format!("@{label}"),
+            detail: detail.to_string(),
+            replacement: label.to_string(),
+            kind,
+        })
+        .collect()
+    }
+
+    fn open_buffer_mention_candidates(
+        editor: &Editor,
+        root: &Path,
+        query: &str,
+    ) -> Vec<MentionCandidate> {
+        editor
+            .documents()
+            .filter_map(|doc| doc.path())
+            .filter_map(|path| {
+                let replacement = relative_mention_path(root, path);
+                mention_matches(&replacement, query).then(|| MentionCandidate {
+                    label: format!("@{replacement}"),
+                    detail: "open buffer".to_string(),
+                    replacement,
+                    kind: MentionCandidateKind::File(path.to_path_buf()),
+                })
+            })
+            .collect()
+    }
+
+    fn workspace_file_mention_candidates(
+        editor: &Editor,
+        root: &Path,
+        query: &str,
+    ) -> Vec<MentionCandidate> {
+        let config = editor.config().file_picker.clone();
+        let current_file = editor
+            .focused_document()
+            .and_then(|doc| doc.path().cloned());
+        let Ok(matches) =
+            crate::fff::search_files_available(root, query, current_file.as_deref(), &config)
+        else {
+            return Vec::new();
+        };
+        matches
+            .into_iter()
+            .map(|item| {
+                let replacement = relative_mention_path(root, &item.path);
+                MentionCandidate {
+                    label: format!("@{replacement}"),
+                    detail: "workspace file".to_string(),
+                    replacement,
+                    kind: MentionCandidateKind::File(item.path),
+                }
+            })
+            .collect()
+    }
+
+    fn accept_selected_mention(&mut self, editor: &mut Editor) -> bool {
+        if !self.mention.active || self.mention.candidates.is_empty() {
+            return false;
+        }
+        let Some(candidate) = self.mention.candidates.get(self.mention.selected).cloned() else {
+            return false;
+        };
+        let Some(doc_id) = self.input.doc_id() else {
+            return false;
+        };
+        let Some(doc) = editor.component_docs.get_mut(&doc_id) else {
+            return false;
+        };
+        let start = char_index_at_byte(&doc.text().to_string(), self.mention.token_start);
+        let end = char_index_at_byte(&doc.text().to_string(), self.mention.token_end);
+        let replacement = helix_core::Tendril::from(format!("@{}", candidate.replacement));
+        let transaction = helix_core::Transaction::change(
+            doc.text(),
+            [(start, end, Some(replacement))].into_iter(),
+        );
+        doc.apply(&transaction, self.input.view_id());
+
+        let item = match candidate.kind {
+            MentionCandidateKind::File(path) => Some(helix_view::assistant::context::Kind::File(
+                helix_view::assistant::context::File { path },
+            )),
+            MentionCandidateKind::Selection => {
+                editor.capture_current_surface(helix_view::collab::surface::Capture::Selection)
+            }
+            MentionCandidateKind::Diagnostics => Self::diagnostics_context(editor),
+            MentionCandidateKind::Diff => Self::diff_context(editor),
+        };
+        if let (Some(thread), Some(item)) = (Self::assistant_model(editor).active_thread, item) {
+            Self::apply(
+                editor,
+                helix_view::assistant::Action::SetMentionContext {
+                    thread,
+                    items: vec![item],
+                },
+            );
+        }
+        self.mention.active = false;
+        self.mention.context_keys.clear();
+        self.sync_draft_to_assistant(editor);
+        true
+    }
+
+    fn render_mention_popup(&self, surface: &mut crate::render::CellSurface, cx: &RenderContext) {
+        if !self.mention.active || self.mention.candidates.is_empty() {
+            return;
+        }
+
+        let Some((cursor_x, cursor_y)) = self.last_input_cursor else {
+            return;
+        };
+
+        let input_area = self.input.area();
+        if input_area.width == 0 || input_area.height == 0 {
+            return;
+        }
+
+        let visible_len = self.mention.candidates.len().min(6);
+        let width = self
+            .mention
+            .candidates
+            .iter()
+            .take(visible_len)
+            .map(|candidate| {
+                UnicodeWidthStr::width(candidate.label.as_str())
+                    + 2
+                    + UnicodeWidthStr::width(candidate.detail.as_str())
+            })
+            .max()
+            .unwrap_or(18)
+            .clamp(18, 56) as u16;
+        let width = width.min(input_area.width.max(1));
+        let height = visible_len as u16;
+        let x = cursor_x.min(input_area.right().saturating_sub(width));
+        let y = if cursor_y >= height {
+            cursor_y.saturating_sub(height)
+        } else {
+            input_area.bottom()
+        };
+        let area = Rect::new(x, y, width, height);
+        let rat_area = tui::ratatui::to_ratatui_rect(area);
+        tui::ratatui::widgets::Widget::render(tui::ratatui::widgets::Clear, rat_area, surface);
+
+        let theme = cx.assistant_theme();
+        let background = theme.get("ui.popup");
+        let selected = theme.get("ui.menu.selected");
+        let text = theme.get("ui.text");
+        let inactive = theme.get("ui.text.inactive");
+        surface.set_style(rat_area, tui::ratatui::to_ratatui_style(background));
+
+        for (row, candidate) in self.mention.candidates.iter().take(visible_len).enumerate() {
+            let y = area.y + row as u16;
+            let is_selected = row == self.mention.selected;
+            let row_style = if is_selected { selected } else { background };
+            surface.set_stringn(
+                area.x,
+                y,
+                &" ".repeat(area.width as usize),
+                area.width as usize,
+                tui::ratatui::to_ratatui_style(row_style),
+            );
+
+            let label_style = if is_selected { selected } else { text };
+            let label_width = UnicodeWidthStr::width(candidate.label.as_str()) as u16;
+            surface.set_stringn(
+                area.x,
+                y,
+                &candidate.label,
+                area.width as usize,
+                tui::ratatui::to_ratatui_style(label_style),
+            );
+
+            let detail_x = area.x + label_width.saturating_add(2);
+            if detail_x < area.right() {
+                surface.set_stringn(
+                    detail_x,
+                    y,
+                    &candidate.detail,
+                    area.right().saturating_sub(detail_x) as usize,
+                    tui::ratatui::to_ratatui_style(if is_selected { selected } else { inactive }),
+                );
+            }
+        }
     }
 
     fn sync_input_from_assistant(&mut self, editor: &mut Editor, draft: &str) {
@@ -807,6 +1285,23 @@ impl AssistantPanel {
                     status,
                     output,
                     expanded,
+                    selected,
+                    theme,
+                    message_accent,
+                ));
+                continue;
+            }
+            if let helix_view::model::AssistantEntryKind::ReviewSummary { mode, files } =
+                &entry.kind
+            {
+                let files = files
+                    .iter()
+                    .map(|(path, diff, status)| (path.as_path(), *status, diff.as_str()))
+                    .collect::<Vec<_>>();
+                blocks.push(self.review_message(
+                    *mode,
+                    &files,
+                    collapsed,
                     selected,
                     theme,
                     message_accent,
@@ -1179,6 +1674,12 @@ impl AssistantPanel {
                             bar_style.patch(muted_style),
                         ));
                     }
+                    helix_view::model::AssistantStatusItemKind::Review => {
+                        spans.push(Span::styled(
+                            item.label.clone(),
+                            bar_style.patch(muted_style),
+                        ));
+                    }
                 }
             }
             if !spans.is_empty() {
@@ -1430,6 +1931,7 @@ impl AssistantPanel {
                 );
             }
         }
+        self.render_mention_popup(surface, cx);
 
         // ── Content area (chat history) ──────────────────────
 
@@ -1735,6 +2237,7 @@ impl AssistantPanel {
         let handled = self.handle_engine_result(result, cx);
         if handled {
             self.sync_draft_to_assistant(cx.editor);
+            self.refresh_mention_popup(cx.editor);
         }
         handled
     }
@@ -2006,6 +2509,64 @@ impl Component for AssistantPanel {
                     self.yank_selected_message(cx.editor);
                     true
                 }
+                (KeyCode::Char('a'), KeyModifiers::NONE) => {
+                    match cx.editor.resolve_selected_assistant_review(
+                        helix_view::assistant::review::Decision::Accept,
+                    ) {
+                        Ok(effects) => {
+                            Self::apply_assistant_effects(cx.editor, effects);
+                            cx.editor.set_status("Accepted assistant change");
+                        }
+                        Err(err) => cx.editor.set_status(err.to_string()),
+                    }
+                    true
+                }
+                (KeyCode::Char('A'), KeyModifiers::NONE) => {
+                    match cx.editor.resolve_all_active_assistant_review(
+                        helix_view::assistant::review::Decision::Accept,
+                    ) {
+                        Ok(effects) => {
+                            Self::apply_assistant_effects(cx.editor, effects);
+                            cx.editor.set_status("Accepted all assistant changes");
+                        }
+                        Err(err) => cx.editor.set_status(err.to_string()),
+                    }
+                    true
+                }
+                (KeyCode::Char('x'), KeyModifiers::NONE) => {
+                    match cx.editor.resolve_selected_assistant_review(
+                        helix_view::assistant::review::Decision::Reject,
+                    ) {
+                        Ok(effects) => {
+                            Self::apply_assistant_effects(cx.editor, effects);
+                            cx.editor.set_status("Rejected assistant change");
+                        }
+                        Err(err) => cx.editor.set_status(err.to_string()),
+                    }
+                    true
+                }
+                (KeyCode::Char('X'), KeyModifiers::NONE) => {
+                    match cx.editor.resolve_all_active_assistant_review(
+                        helix_view::assistant::review::Decision::Reject,
+                    ) {
+                        Ok(effects) => {
+                            Self::apply_assistant_effects(cx.editor, effects);
+                            cx.editor.set_status("Rejected all assistant changes");
+                        }
+                        Err(err) => cx.editor.set_status(err.to_string()),
+                    }
+                    true
+                }
+                (KeyCode::Char('R'), KeyModifiers::NONE) => {
+                    match cx.editor.toggle_active_assistant_review_mode() {
+                        Ok((status, effects)) => {
+                            Self::apply_assistant_effects(cx.editor, effects);
+                            cx.editor.set_status(status);
+                        }
+                        Err(err) => cx.editor.set_status(err.to_string()),
+                    }
+                    true
+                }
                 (KeyCode::Char('t'), KeyModifiers::NONE) => {
                     if let Ok((status, effects)) = cx.editor.toggle_active_assistant_follow() {
                         Self::apply_assistant_effects(cx.editor, effects);
@@ -2025,8 +2586,10 @@ impl Component for AssistantPanel {
                     self.select_first_message(cx.editor);
                     true
                 }
-                (KeyCode::End, KeyModifiers::NONE) => {
+                (KeyCode::End, KeyModifiers::NONE) | (KeyCode::Char('G'), KeyModifiers::NONE) => {
                     self.select_last_message(cx.editor);
+                    self.output.scroll_to_end();
+                    self.set_content_scroll(cx.editor, self.output.max_scroll());
                     true
                 }
                 (KeyCode::PageUp, KeyModifiers::NONE)
@@ -2064,6 +2627,64 @@ impl Component for AssistantPanel {
         // The component modal keymaps filter out Frontend commands (insert_mode,
         // command_mode, etc.), so we handle mode switching explicitly here.
         if self.input.mode() == Mode::Insert {
+            if self.mention.active {
+                match key {
+                    KeyEvent {
+                        code: KeyCode::Esc,
+                        modifiers,
+                        ..
+                    } if modifiers.is_empty() => {
+                        self.mention.active = false;
+                        return EventResult::Consumed(None);
+                    }
+                    KeyEvent {
+                        code: KeyCode::Up,
+                        modifiers,
+                        ..
+                    } if modifiers.is_empty() => {
+                        self.mention.selected = self.mention.selected.saturating_sub(1);
+                        return EventResult::Consumed(None);
+                    }
+                    KeyEvent {
+                        code: KeyCode::Char('p'),
+                        modifiers,
+                        ..
+                    } if modifiers == KeyModifiers::CONTROL => {
+                        self.mention.selected = self.mention.selected.saturating_sub(1);
+                        return EventResult::Consumed(None);
+                    }
+                    KeyEvent {
+                        code: KeyCode::Down,
+                        modifiers,
+                        ..
+                    } if modifiers.is_empty() => {
+                        if self.mention.selected + 1 < self.mention.candidates.len() {
+                            self.mention.selected += 1;
+                        }
+                        return EventResult::Consumed(None);
+                    }
+                    KeyEvent {
+                        code: KeyCode::Char('n'),
+                        modifiers,
+                        ..
+                    } if modifiers == KeyModifiers::CONTROL => {
+                        if self.mention.selected + 1 < self.mention.candidates.len() {
+                            self.mention.selected += 1;
+                        }
+                        return EventResult::Consumed(None);
+                    }
+                    KeyEvent {
+                        code: KeyCode::Enter | KeyCode::Tab,
+                        modifiers,
+                        ..
+                    } if modifiers.is_empty() => {
+                        if self.accept_selected_mention(cx.editor) {
+                            return EventResult::Consumed(None);
+                        }
+                    }
+                    _ => {}
+                }
+            }
             // Escape in insert mode → back to normal.
             if matches!(key.code, KeyCode::Esc) && key.modifiers.is_empty() {
                 self.input.exit_insert_mode();
@@ -2072,6 +2693,8 @@ impl Component for AssistantPanel {
             // Tab → insert tab character (not bound in component keymaps).
             if matches!(key.code, KeyCode::Tab) && key.modifiers.is_empty() {
                 self.insert_char_into_input('\t', cx.editor);
+                self.sync_draft_to_assistant(cx.editor);
+                self.refresh_mention_popup(cx.editor);
                 return EventResult::Consumed(None);
             }
             // Shift+Tab → dedent (remove leading whitespace on current line).
@@ -2105,6 +2728,8 @@ impl Component for AssistantPanel {
                         }
                     }
                 }
+                self.sync_draft_to_assistant(cx.editor);
+                self.refresh_mention_popup(cx.editor);
                 return EventResult::Consumed(None);
             }
         } else {
@@ -2560,9 +3185,30 @@ mod tests {
                                 helix_view::assistant::change::File {
                                     path: std::path::PathBuf::from("change.txt"),
                                     hunks: Vec::new(),
+                                    review: None,
                                 };
                                 files
                             ],
+                        },
+                    )
+                }
+                ChatEntryKind::ReviewSummary { files, .. } => {
+                    helix_view::assistant::thread::EntryKind::ChangeSummary(
+                        helix_view::assistant::change::Summary {
+                            files: files
+                                .into_iter()
+                                .map(|(path, diff, status)| helix_view::assistant::change::File {
+                                    path: path.clone(),
+                                    hunks: Vec::new(),
+                                    review: Some(helix_view::assistant::review::File {
+                                        path,
+                                        before: String::new(),
+                                        after: String::new(),
+                                        diff,
+                                        status,
+                                    }),
+                                })
+                                .collect(),
                         },
                     )
                 }

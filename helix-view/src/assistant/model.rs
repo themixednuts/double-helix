@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use super::{context, history, mode, plan, terminal, thread, Store};
+use super::{context, history, mode, plan, review, terminal, thread, Store};
 use crate::collab::Location;
 use crate::DocumentId;
 
@@ -36,6 +36,7 @@ pub struct ThreadView {
     pub draft: String,
     pub context: Vec<Pill>,
     pub run: thread::Run,
+    pub review_mode: review::Mode,
     pub unread: bool,
     pub focus: thread::Focus,
     pub follow: Follow,
@@ -76,6 +77,17 @@ pub enum EntryKind {
     ChangeSummary {
         files: usize,
     },
+    ReviewSummary {
+        mode: review::Mode,
+        files: Vec<ReviewFile>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewFile {
+    pub path: std::path::PathBuf,
+    pub diff: String,
+    pub status: review::Status,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -145,6 +157,15 @@ impl EntryView {
                 EntryKind::Status { text } => crate::model::AssistantEntryKind::Status(text),
                 EntryKind::ChangeSummary { files } => {
                     crate::model::AssistantEntryKind::ChangeSummary { files }
+                }
+                EntryKind::ReviewSummary { mode, files } => {
+                    crate::model::AssistantEntryKind::ReviewSummary {
+                        mode,
+                        files: files
+                            .into_iter()
+                            .map(|file| (file.path, file.diff, file.status))
+                            .collect(),
+                    }
                 }
             },
         }
@@ -348,6 +369,7 @@ impl Store {
                 mode_name: active.mode_name,
                 model_label: active.model_label,
                 follow: Some(active.follow.to_model()),
+                review_mode: active.review_mode,
                 agent_name: active.title.unwrap_or_else(|| "Agent".to_string()),
                 agent_version: String::new(),
                 focused,
@@ -378,6 +400,7 @@ impl Store {
                 mode_name: None,
                 model_label: None,
                 follow: None,
+                review_mode: review::Mode::Write,
                 agent_name: fallback_agent_name,
                 agent_version: String::new(),
                 agent_busy: false,
@@ -440,6 +463,7 @@ impl Store {
                 id: thread.id,
                 title: thread.title().map(ToOwned::to_owned),
                 is_remote: matches!(thread.origin(), thread::Origin::Backend { .. }),
+                review_mode: thread.review_mode(),
                 entries: thread
                     .entries()
                     .iter()
@@ -479,6 +503,23 @@ impl Store {
                             },
                             thread::EntryKind::Status { text } => {
                                 EntryKind::Status { text: text.clone() }
+                            }
+                            thread::EntryKind::ChangeSummary(summary)
+                                if summary.files.iter().any(|file| file.review.is_some()) =>
+                            {
+                                EntryKind::ReviewSummary {
+                                    mode: thread.review_mode(),
+                                    files: summary
+                                        .files
+                                        .iter()
+                                        .filter_map(|file| file.review.as_ref())
+                                        .map(|file| ReviewFile {
+                                            path: file.path.clone(),
+                                            diff: file.diff.clone(),
+                                            status: file.status,
+                                        })
+                                        .collect(),
+                                }
                             }
                             thread::EntryKind::ChangeSummary(summary) => EntryKind::ChangeSummary {
                                 files: summary.files.len(),

@@ -460,6 +460,12 @@ pub enum RuntimeTaskEvent {
         callback: helix_plugin::contract::UiCallbackToken,
         value: helix_plugin::contract::DynamicValue,
     },
+    /// Service an out-of-process plugin host request on the editor main thread.
+    PluginHostRequest {
+        state: crate::plugin_registry::RemoteHostState,
+        request: helix_plugin::rpc::PluginRequest,
+        respond_to: crate::plugin_registry::PluginHostResponder,
+    },
     /// Remove the assistant panel model entry from editor-owned layout state.
     RemoveAssistantPanel,
     /// Connect an assistant backend and apply resulting editor-owned state.

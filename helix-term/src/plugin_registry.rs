@@ -16,10 +16,14 @@ use helix_plugin::contract::requests::{
 use helix_plugin::contract::{
     adapt, CommandHandle, ContractError, ContractResult, PanelHandle, PluginId, SubscriptionHandle,
 };
+use helix_plugin::rpc::{FrameCodec, HostRequest, HostResponse, PluginRequest, Rpc};
+use helix_plugin::{PluginConfig, PluginHostConfig};
 use helix_view::model::FocusTarget;
 use helix_view::Editor;
 use std::collections::HashMap;
 use std::num::NonZeroU64;
+use std::process::Stdio;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 fn internal_error(message: impl Into<String>) -> ContractError {
     ContractError::internal(message)
@@ -476,6 +480,297 @@ pub fn get_event_host() -> Box<dyn PluginEventHost + Send + Sync> {
         next_subscription_handle: std::sync::atomic::AtomicU64::new(1),
         subscriptions: HashMap::new(),
     })
+}
+
+pub(crate) struct RemoteHostStateInner {
+    pub(crate) ui: TermUiHost,
+    pub(crate) panel: TermPanelHost,
+    pub(crate) command: TermCommandHost,
+    pub(crate) event: TermEventHost,
+}
+
+#[derive(Clone)]
+pub struct RemoteHostState {
+    name: Arc<str>,
+    inner: Arc<Mutex<RemoteHostStateInner>>,
+}
+
+impl std::fmt::Debug for RemoteHostState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RemoteHostState")
+            .field("name", &self.name)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RemoteHostState {
+    fn new(name: String, ingress: crate::runtime::RuntimeIngress) -> Self {
+        Self {
+            name: Arc::from(name),
+            inner: Arc::new(Mutex::new(RemoteHostStateInner {
+                ui: TermUiHost {
+                    sender: ingress.clone(),
+                    next_callback_id: std::sync::atomic::AtomicU64::new(1),
+                },
+                panel: TermPanelHost {
+                    sender: ingress.clone(),
+                    panel_owners: HashMap::new(),
+                },
+                command: TermCommandHost {
+                    ingress,
+                    next_command_handle: std::sync::atomic::AtomicU64::new(1),
+                    commands: HashMap::new(),
+                },
+                event: TermEventHost {
+                    next_subscription_handle: std::sync::atomic::AtomicU64::new(1),
+                    subscriptions: HashMap::new(),
+                },
+            })),
+        }
+    }
+
+    pub(crate) fn lock(&self) -> MutexGuard<'_, RemoteHostStateInner> {
+        self.inner.lock().expect("remote host state poisoned")
+    }
+}
+
+enum HostOutbound {
+    Notify(HostRequest),
+    Response {
+        id: u64,
+        result: ContractResult<HostResponse>,
+    },
+}
+
+pub struct PluginHostResponder(tokio::sync::oneshot::Sender<ContractResult<HostResponse>>);
+
+impl std::fmt::Debug for PluginHostResponder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("PluginHostResponder").finish()
+    }
+}
+
+impl PluginHostResponder {
+    pub(crate) fn new(sender: tokio::sync::oneshot::Sender<ContractResult<HostResponse>>) -> Self {
+        Self(sender)
+    }
+
+    pub(crate) fn send(self, result: ContractResult<HostResponse>) {
+        let _ = self.0.send(result);
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct RemotePluginHosts {
+    hosts: Vec<RemotePluginHost>,
+}
+
+struct RemotePluginHost {
+    name: String,
+    tx: tokio::sync::mpsc::UnboundedSender<HostOutbound>,
+}
+
+impl RemotePluginHosts {
+    pub(crate) fn notify_event(&self, event: helix_plugin::contract::events::PluginEvent) {
+        for host in &self.hosts {
+            if host
+                .tx
+                .send(HostOutbound::Notify(HostRequest::Event(event.clone())))
+                .is_err()
+            {
+                log::debug!("remote plugin host '{}' is not accepting events", host.name);
+            }
+        }
+    }
+
+    pub(crate) fn shutdown(&self) {
+        for host in &self.hosts {
+            let _ = host.tx.send(HostOutbound::Notify(HostRequest::Shutdown));
+        }
+    }
+}
+
+fn remote_config(base: &PluginConfig, host: &PluginHostConfig) -> PluginConfig {
+    let mut config = base.clone();
+    if !host.plugin_dirs.is_empty() {
+        config.plugin_dirs = host.plugin_dirs.clone();
+    }
+    config.hosts.clear();
+    config
+}
+
+async fn write_remote_host(
+    name: String,
+    mut stdin: tokio::process::ChildStdin,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<HostOutbound>,
+) {
+    let mut codec = FrameCodec::new();
+    while let Some(outbound) = rx.recv().await {
+        let result = match outbound {
+            HostOutbound::Notify(body) => {
+                codec
+                    .write::<_, _>(
+                        &mut stdin,
+                        &Rpc::<HostRequest, HostResponse>::Notify { body },
+                    )
+                    .await
+            }
+            HostOutbound::Response { id, result } => {
+                codec
+                    .write::<_, _>(
+                        &mut stdin,
+                        &Rpc::<HostRequest, HostResponse>::Response { id, result },
+                    )
+                    .await
+            }
+        };
+
+        if let Err(err) = result {
+            log::error!("remote plugin host '{name}' write failed: {err}");
+            break;
+        }
+    }
+}
+
+async fn read_remote_host(
+    name: String,
+    mut stdout: tokio::process::ChildStdout,
+    ingress: crate::runtime::RuntimeIngress,
+    state: RemoteHostState,
+    tx: tokio::sync::mpsc::UnboundedSender<HostOutbound>,
+) {
+    let mut codec = FrameCodec::new();
+    loop {
+        let frame = match codec
+            .read::<Rpc<PluginRequest, HostResponse>, _>(&mut stdout)
+            .await
+        {
+            Ok(frame) => frame,
+            Err(err) => {
+                log::error!("remote plugin host '{name}' read failed: {err}");
+                break;
+            }
+        };
+
+        match frame {
+            Rpc::Request { id, body } => {
+                let (respond_to, response) = tokio::sync::oneshot::channel();
+                ingress.task(crate::runtime::RuntimeTaskEvent::PluginHostRequest {
+                    state: state.clone(),
+                    request: body,
+                    respond_to: PluginHostResponder::new(respond_to),
+                });
+                let result = response
+                    .await
+                    .unwrap_or_else(|_| Err(internal_error("plugin host request canceled")));
+                if tx.send(HostOutbound::Response { id, result }).is_err() {
+                    break;
+                }
+            }
+            Rpc::Notify { body } => {
+                let (respond_to, response) = tokio::sync::oneshot::channel();
+                ingress.task(crate::runtime::RuntimeTaskEvent::PluginHostRequest {
+                    state: state.clone(),
+                    request: body,
+                    respond_to: PluginHostResponder::new(respond_to),
+                });
+                let _ = response.await;
+            }
+            Rpc::Response { .. } => {
+                log::warn!("remote plugin host '{name}' sent an unexpected response frame");
+            }
+        }
+    }
+}
+
+async fn log_remote_stderr(name: String, stderr: tokio::process::ChildStderr) {
+    use tokio::io::AsyncBufReadExt;
+
+    let mut lines = tokio::io::BufReader::new(stderr).lines();
+    while let Ok(Some(line)) = lines.next_line().await {
+        log::warn!("remote plugin host '{name}' stderr: {line}");
+    }
+}
+
+pub(crate) fn spawn_remote_hosts(
+    config: &PluginConfig,
+    ingress: crate::runtime::RuntimeIngress,
+) -> RemotePluginHosts {
+    let mut hosts = Vec::new();
+    for host in &config.hosts {
+        let mut command = tokio::process::Command::new(&host.command);
+        command
+            .args(&host.args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(err) => {
+                log::error!(
+                    "failed to spawn remote plugin host '{}': {}",
+                    host.name,
+                    err
+                );
+                continue;
+            }
+        };
+
+        let Some(stdin) = child.stdin.take() else {
+            log::error!("remote plugin host '{}' has no stdin pipe", host.name);
+            continue;
+        };
+        let Some(stdout) = child.stdout.take() else {
+            log::error!("remote plugin host '{}' has no stdout pipe", host.name);
+            continue;
+        };
+        if let Some(stderr) = child.stderr.take() {
+            tokio::spawn(log_remote_stderr(host.name.clone(), stderr));
+        }
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let state = RemoteHostState::new(host.name.clone(), ingress.clone());
+        tokio::spawn(write_remote_host(host.name.clone(), stdin, rx));
+        tokio::spawn(read_remote_host(
+            host.name.clone(),
+            stdout,
+            ingress.clone(),
+            state,
+            tx.clone(),
+        ));
+
+        let name = host.name.clone();
+        tokio::spawn(async move {
+            match child.wait().await {
+                Ok(status) if status.success() => {
+                    log::info!("remote plugin host '{name}' exited");
+                }
+                Ok(status) => {
+                    log::error!("remote plugin host '{name}' exited with {status}");
+                }
+                Err(err) => {
+                    log::error!("remote plugin host '{name}' wait failed: {err}");
+                }
+            }
+        });
+
+        let init = HostRequest::Init {
+            metadata: ApiMetadata::default(),
+            config: remote_config(config, host),
+        };
+        if tx.send(HostOutbound::Notify(init)).is_err() {
+            log::error!("remote plugin host '{}' closed before init", host.name);
+            continue;
+        }
+
+        hosts.push(RemotePluginHost {
+            name: host.name.clone(),
+            tx,
+        });
+    }
+
+    RemotePluginHosts { hosts }
 }
 
 #[cfg(test)]

@@ -14,8 +14,8 @@ use super::adapt;
 use super::errors::{ContractError, ContractResult};
 use super::handles::{DocumentHandle, ViewHandle};
 use super::host::{
-    PluginFloatHost, PluginMutationHost, PluginQueryHost, PluginSplitHost, PluginTabHost,
-    PluginWorkspaceQueryHost,
+    PluginFacadeMutationHost, PluginFacadeQueryHost, PluginFloatHost, PluginMutationHost,
+    PluginQueryHost, PluginSplitHost, PluginTabHost, PluginWorkspaceQueryHost,
 };
 use super::metadata::ApiMetadata;
 use super::requests::*;
@@ -149,6 +149,16 @@ impl PluginQueryHost for EditorQueryBridge<'_> {
             )));
         }
         Ok(text.line(line).to_string())
+    }
+}
+
+impl PluginFacadeQueryHost for EditorQueryBridge<'_> {
+    fn split_tree(&self) -> SplitTreeSnapshot {
+        EditorQueryBridge::split_tree(self)
+    }
+
+    fn list_tabs(&self, view: Option<ViewHandle>) -> ContractResult<TabGroupSnapshot> {
+        EditorQueryBridge::list_tabs(self, view)
     }
 }
 
@@ -439,6 +449,8 @@ impl PluginMutationHost for EditorMutationBridge<'_> {
         Ok(())
     }
 }
+
+impl PluginFacadeMutationHost for EditorMutationBridge<'_> {}
 
 // ---------------------------------------------------------------------------
 // Split bridge

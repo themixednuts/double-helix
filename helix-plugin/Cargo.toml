@@ -21,7 +21,7 @@ mlua = { version = "0.10", features = ["lua54", "async", "send", "serialize", "v
 anyhow = "1"
 heck = "0.5"
 thiserror.workspace = true
-tokio = { version = "1", features = ["sync", "rt"] }
+tokio = { version = "1", features = ["io-util", "macros", "process", "rt", "rt-multi-thread", "sync"] }
 serde = { version = "1.0", features = ["derive"] }
 slotmap.workspace = true
 serde_json = "1.0"
@@ -35,3 +35,7 @@ toml.workspace = true
 arc-swap.workspace = true
 helix-runtime = { path = "../helix-runtime" }
 tempfile.workspace = true
+
+[[bin]]
+name = "helix-plugin-host"
+path = "src/bin/plugin-host.rs"

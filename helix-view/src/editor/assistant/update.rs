@@ -67,6 +67,14 @@ impl Editor {
                 effects: Vec::new(),
                 permission_request: Some((thread, request)),
             },
+            backend::Update::ReviewAcceptedFile { thread, path, text } => {
+                AssistantUpdateOutcome {
+                    effects: self.assistant.apply(
+                        crate::assistant::event::Event::ReviewAcceptedFile { thread, path, text },
+                    ),
+                    permission_request: None,
+                }
+            }
             backend::Update::Backend { backend, event } => AssistantUpdateOutcome {
                 effects: self.apply_assistant_backend_event(backend, event),
                 permission_request: None,

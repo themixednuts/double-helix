@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use super::{backend, context, permission, thread};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -13,6 +15,11 @@ pub enum Event {
     ContextResolveFailed {
         thread: thread::Id,
         error: String,
+    },
+    ReviewAcceptedFile {
+        thread: thread::Id,
+        path: PathBuf,
+        text: String,
     },
     Permission {
         thread: thread::Id,

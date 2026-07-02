@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use super::{Backend, Record, Stub, View};
-use crate::assistant::{change, config, context, mode, plan, terminal, thread, tool};
+use crate::assistant::{change, config, context, mode, plan, review, terminal, thread, tool};
 use crate::collab::{self, location};
 
 pub fn local_backend() -> Backend {
@@ -159,6 +159,8 @@ struct PersistedRecord {
     unread: bool,
     mode: Option<PersistedModeSet>,
     config: PersistedConfigState,
+    #[serde(default)]
+    review_mode: review::Mode,
     scope: PersistedScope,
     view: PersistedView,
     terminals: Vec<PersistedTerminal>,
@@ -196,6 +198,7 @@ impl PersistedRecord {
             unread: record.unread,
             mode: record.mode.as_ref().map(PersistedModeSet::from_domain),
             config: PersistedConfigState::from_domain(&record.config),
+            review_mode: record.review_mode,
             scope: PersistedScope::from(&record.scope),
             view: PersistedView::from_domain(&record.view),
             terminals: record
@@ -237,6 +240,7 @@ impl PersistedRecord {
             unread: self.unread,
             mode: self.mode.map(PersistedModeSet::into_domain).transpose()?,
             config: self.config.into_domain()?,
+            review_mode: self.review_mode,
             scope: self.scope.into_domain(),
             view: self.view.into_domain(),
             terminals: self
@@ -596,6 +600,8 @@ impl PersistedToolState {
 struct PersistedChangeFile {
     path: PathBuf,
     hunks: Vec<PersistedHunk>,
+    #[serde(default)]
+    review: Option<PersistedReviewFile>,
 }
 
 impl From<&change::File> for PersistedChangeFile {
@@ -603,6 +609,7 @@ impl From<&change::File> for PersistedChangeFile {
         Self {
             path: file.path.clone(),
             hunks: file.hunks.iter().map(PersistedHunk::from).collect(),
+            review: file.review.as_ref().map(PersistedReviewFile::from),
         }
     }
 }
@@ -616,6 +623,40 @@ impl PersistedChangeFile {
                 .into_iter()
                 .map(PersistedHunk::into_domain)
                 .collect(),
+            review: self.review.map(PersistedReviewFile::into_domain),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct PersistedReviewFile {
+    path: PathBuf,
+    before: String,
+    after: String,
+    diff: String,
+    status: review::Status,
+}
+
+impl From<&review::File> for PersistedReviewFile {
+    fn from(file: &review::File) -> Self {
+        Self {
+            path: file.path.clone(),
+            before: file.before.clone(),
+            after: file.after.clone(),
+            diff: file.diff.clone(),
+            status: file.status,
+        }
+    }
+}
+
+impl PersistedReviewFile {
+    fn into_domain(self) -> review::File {
+        review::File {
+            path: self.path,
+            before: self.before,
+            after: self.after,
+            diff: self.diff,
+            status: self.status,
         }
     }
 }
@@ -1230,6 +1271,7 @@ mod tests {
             unread: false,
             mode: None,
             config: config::State::new(Vec::new()),
+            review_mode: review::Mode::Write,
             scope: thread::Scope::new(PathBuf::from(".")),
             view: View {
                 focus: thread::Focus::Messages,

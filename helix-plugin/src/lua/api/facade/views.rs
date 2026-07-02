@@ -5,8 +5,8 @@ pub fn register(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
 
     m.set(
         "list",
-        lua.create_function(|_lua, ()| {
-            with_query_bridge(|bridge| {
+        lua.create_function(|lua, ()| {
+            with_query_bridge(lua, |bridge| {
                 Ok(bridge
                     .list_views()
                     .into_iter()

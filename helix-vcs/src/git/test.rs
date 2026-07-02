@@ -123,7 +123,14 @@ fn symlink() {
     File::create(&file).unwrap().write_all(&contents).unwrap();
     let file_link = temp_git.path().join("file_link.txt");
 
-    symlink("file.txt", &file_link).unwrap();
+    // Symlink creation requires Developer Mode or admin on Windows (error 1314).
+    if let Err(err) = symlink("file.txt", &file_link) {
+        if err.raw_os_error() == Some(1314) {
+            eprintln!("skipping: symlink privilege not held");
+            return;
+        }
+        panic!("symlink failed: {err}");
+    }
     create_commit(temp_git.path(), true);
 
     assert_eq!(git::get_diff_base(&file_link).unwrap(), contents);
@@ -149,7 +156,14 @@ fn symlink_to_git_repo() {
     create_commit(temp_git.path(), true);
 
     let file_link = temp_dir.path().join("file_link.txt");
-    symlink(&file, &file_link).unwrap();
+    // Symlink creation requires Developer Mode or admin on Windows (error 1314).
+    if let Err(err) = symlink(&file, &file_link) {
+        if err.raw_os_error() == Some(1314) {
+            eprintln!("skipping: symlink privilege not held");
+            return;
+        }
+        panic!("symlink failed: {err}");
+    }
 
     assert_eq!(git::get_diff_base(&file_link).unwrap(), contents);
     assert_eq!(git::get_diff_base(&file).unwrap(), contents);

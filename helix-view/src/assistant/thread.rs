@@ -6,7 +6,7 @@ use crate::collab::{FollowState, Location};
 use crate::id::Id as StableId;
 use crate::DocumentId;
 
-use super::{backend, change, config, context, mode, plan, terminal, tool};
+use super::{backend, change, config, context, mode, plan, review, terminal, tool};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ThreadKind {}
@@ -78,6 +78,7 @@ pub struct PersistedState {
     pub mode: Option<mode::Set>,
     pub config: config::State,
     pub terminals: Vec<terminal::Terminal>,
+    pub review_mode: review::Mode,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,6 +92,7 @@ pub struct Thread {
     draft: String,
     context: Vec<context::Item>,
     terminals: Vec<terminal::Terminal>,
+    review_mode: review::Mode,
     pub follow: FollowState,
     mode: Option<mode::Set>,
     config: config::State,
@@ -166,6 +168,7 @@ pub enum Event {
     Terminal(terminal::Event),
     Run(Run),
     Follow(Location),
+    Review(review::Event),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -193,6 +196,7 @@ impl Thread {
             draft: String::new(),
             context: Vec::new(),
             terminals: Vec::new(),
+            review_mode: review::Mode::Write,
             follow: FollowState::Off,
             mode: None,
             config: config::State::new(Vec::new()),
@@ -383,6 +387,16 @@ impl Thread {
         self.mode = state.mode;
         self.config = state.config;
         self.terminals = state.terminals;
+        self.review_mode = state.review_mode;
+    }
+
+    #[must_use]
+    pub fn review_mode(&self) -> review::Mode {
+        self.review_mode
+    }
+
+    pub fn set_review_mode(&mut self, mode: review::Mode) {
+        self.review_mode = mode;
     }
 
     #[must_use]
@@ -504,6 +518,7 @@ impl Thread {
             Event::Config(config) => self.set_config(config),
             Event::Terminal(event) => self.apply_terminal(event),
             Event::Run(run) => self.set_run(run),
+            Event::Review(event) => self.apply_review(event),
             Event::Follow(location) => match &mut self.follow {
                 FollowState::Off => {}
                 FollowState::On { last, .. } | FollowState::Paused { last, .. } => {
@@ -557,6 +572,27 @@ impl Thread {
                         });
                     }
                 }
+                EntryKind::ChangeSummary(summary) if summary.files.iter().any(|file| file.review.is_some()) => {
+                    if let Some(existing) = self.entries.iter_mut().rev().find(|entry| {
+                        matches!(
+                            &entry.kind,
+                            EntryKind::ChangeSummary(current)
+                                if same_review_files(current, &summary)
+                        )
+                    }) {
+                        existing.turn = entry.turn;
+                        existing.kind = EntryKind::ChangeSummary(summary);
+                        existing.locations = normalize_locations(existing.id, entry.locations);
+                    } else {
+                        let id = self.next_entry_id();
+                        self.entries.push(Entry {
+                            id,
+                            turn: entry.turn,
+                            kind: EntryKind::ChangeSummary(summary),
+                            locations: normalize_locations(id, entry.locations),
+                        });
+                    }
+                }
                 kind => {
                     let id = self.next_entry_id();
                     self.entries.push(Entry {
@@ -580,6 +616,49 @@ impl Thread {
                 self.view.opened_docs.remove(&id);
                 if self.view.selected == Some(id) {
                     self.view.selected = self.entries.last().map(|entry| entry.id);
+                }
+            }
+        }
+    }
+
+    fn apply_review(&mut self, event: review::Event) {
+        match event {
+            review::Event::Mode(mode) => self.set_review_mode(mode),
+            review::Event::Stage { file, mode } => {
+                self.set_review_mode(mode);
+                let locations = vec![Location::new(
+                    file.path.clone(),
+                    crate::collab::location::Source::Write,
+                )];
+                self.apply_content(Content::Append(NewEntry {
+                    turn: None,
+                    kind: EntryKind::ChangeSummary(change::Summary {
+                        files: vec![change::File {
+                            path: file.path.clone(),
+                            hunks: Vec::new(),
+                            review: Some(file),
+                        }],
+                    }),
+                    locations,
+                }));
+            }
+            review::Event::Resolve { target, decision } => {
+                for entry in &mut self.entries {
+                    let EntryKind::ChangeSummary(summary) = &mut entry.kind else {
+                        continue;
+                    };
+                    for file in &mut summary.files {
+                        let Some(review) = &mut file.review else {
+                            continue;
+                        };
+                        let matches_target = match &target {
+                            review::Target::All => true,
+                            review::Target::File(path) => &review.path == path,
+                        };
+                        if matches_target && review.status.is_pending() {
+                            review.resolve(decision);
+                        }
+                    }
                 }
             }
         }
@@ -688,6 +767,15 @@ fn normalize_locations(entry: EntryId, locations: Vec<Location>) -> Vec<Location
         .into_iter()
         .map(|location| location.for_entry(entry))
         .collect()
+}
+
+fn same_review_files(current: &change::Summary, next: &change::Summary) -> bool {
+    current.files.len() == next.files.len()
+        && current
+            .files
+            .iter()
+            .zip(&next.files)
+            .all(|(current, next)| current.path == next.path)
 }
 
 fn collect_change_summaries(

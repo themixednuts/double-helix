@@ -28,7 +28,44 @@ capabilities = ["query", "mutation", "ui", "events"]
 
 ## Errors
 
-Host contract failures use stable machine codes: `not_found`, `stale_handle`, `invalid_request`, `permission_denied`, `unsupported_capability`, `busy`, and `internal_error`. Error messages remain human-readable and include the code. Plugins should treat the code as stable and the message text as diagnostic.
+Host contract failures use stable machine codes: `not_found`, `stale_handle`, `invalid_request`, `permission_denied`, `unsupported_capability`, `busy`, and `internal_error`. When caught with `pcall`, wrapped Helix API functions return a table:
+
+```lua
+local ok, err = pcall(function()
+  helix.tabs.list(stale_view)
+end)
+
+if not ok and type(err) == "table" then
+  helix.log.warn(err.code .. ": " .. err.message)
+end
+```
+
+The table fields are `code`, `message`, and optional `entity`. Treat `code` as stable and `message` as diagnostic.
+
+## Remote Hosts
+
+Plugins can run out of process in `helix-plugin-host`. The editor and child process communicate over stdout/stdin using the same msgpack contract as the in-process Lua facade. The child process discovers plugins on its own filesystem.
+
+```toml
+[[plugins.hosts]]
+name = "local"
+command = "helix-plugin-host"
+plugin_dirs = ["/home/me/.config/helix/plugins"]
+```
+
+Remote execution over SSH uses the same host binary and needs no SSH-specific Helix code:
+
+```toml
+[[plugins.hosts]]
+name = "remote-box"
+command = "ssh"
+args = ["box", "helix-plugin-host"]
+plugin_dirs = ["/srv/helix/plugins"]
+```
+
+Remote mode supports contract calls that can be represented as synchronous query/mutation requests. Capabilities that depend on editor-local rendering or callbacks may be reported as unsupported by a remote host until that transport path is implemented. Plugins should check `helix.host.api_metadata().has_capability(name)` before using optional capability families.
+
+Security follows the configured command. `command = "ssh"` grants the plugin host whatever access that SSH account has on the remote machine. Editor-side contract bridges still enforce the same handle ownership, permissions, and capability checks as local plugins.
 
 ## Sandbox
 

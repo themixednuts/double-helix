@@ -25,6 +25,10 @@ In message focus:
 | `Tab` | Expand or collapse the selected entry; tool calls are collapsed by default |
 | `y` | Yank the selected entry |
 | `t` | Toggle follow mode |
+| `R` | Toggle write/review mode for the active thread |
+| `a` / `A` | Accept the selected/all pending review changes |
+| `x` / `X` | Reject the selected/all pending review changes |
+| `G` / `End` | Jump back to the live tail |
 | `Esc` | Interrupt a running agent; otherwise return to input |
 | `Ctrl-c` | Interrupt a running agent |
 
@@ -42,7 +46,34 @@ Choices such as allow always or reject always are stored in the assistant permis
 
 Future matching requests for the same agent and tool are answered automatically, and the thread shows a transient status such as `auto-allowed shell (always)` or `auto-rejected shell (always)`.
 
-Remove that file to clear stored rules.
+Use `:assistant-permissions-reset` to clear stored rules.
+
+## Review Mode
+
+Assistant writes have two modes:
+
+| Mode | Behavior |
+| --- | --- |
+| `write` | Writes land immediately. The panel shows an informational per-file diff card. |
+| `review` | Writes are staged in an overlay. The agent's later reads see staged content, and you accept or reject the files from the panel. |
+
+Toggle the active thread with `R` in message focus or `:assistant-toggle-review-mode`.
+
+Review cards use unified diff coloring and expand/collapse with `Tab`. In review mode, use `a` to accept the selected file, `A` to accept all, `x` to reject the selected file, and `X` to reject all.
+
+When an accepted file is open in a buffer, Helix applies the accepted text as a normal document transaction so undo history and language-server state stay in sync. Clean buffers are saved after the transaction. Dirty buffers receive the transaction but remain unsaved, and the status line notes that the accepted edit was not saved. Files that are not open fall back to direct filesystem writes.
+
+## Scrolling
+
+The assistant output follows new output only while the viewport is already at the bottom. Scrolling up pauses live follow. `G` or `End` returns to the newest output.
+
+## Context
+
+Attached context appears as chips above the input. Context can be attached with `:assistant-attach-file`, `:assistant-attach-diagnostics`, `:assistant-attach-diff`, and removed with `:assistant-detach-context`.
+
+Type `@` in the assistant input to open inline context completion. The popup lists workspace files, open buffers, and fixed entries for `@selection`, `@diagnostics`, and `@diff`.
+
+Filter by typing after `@`. Use `C-n`/`C-p` or `Up`/`Down` to move, `Enter` or `Tab` to insert the selected mention, and `Esc` to dismiss. Accepted mentions insert `@relative/path` or the fixed token and attach the matching context as a chip. Removing the mention token from the draft detaches that mention-owned context.
 
 ## Markdown
 

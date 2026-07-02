@@ -2,7 +2,9 @@ use std::num::NonZeroU64;
 
 use indexmap::IndexMap;
 
-use super::{action, backend, config, context, effect, event, history, mode, thread};
+use super::{
+    action, backend, config, context, effect, event, history, mention, mode, review, thread,
+};
 
 #[derive(Debug, Clone)]
 pub enum Store {
@@ -138,6 +140,20 @@ impl Store {
     pub fn selected_change_summary(&self) -> Option<super::change::Summary> {
         let (_, thread) = self.active_thread()?;
         thread.selected_change_summary()
+    }
+
+    pub fn selected_review_target(&self) -> Option<(thread::Id, review::Target)> {
+        let (thread_id, thread) = self.active_thread()?;
+        let entry = thread.selected()?;
+        let thread::EntryKind::ChangeSummary(summary) = &entry.kind else {
+            return None;
+        };
+        let file = summary
+            .files
+            .iter()
+            .filter_map(|file| file.review.as_ref())
+            .find(|file| file.status.is_pending())?;
+        Some((thread_id, review::Target::File(file.path.clone())))
     }
 
     pub fn active_backend_id(&self) -> Option<backend::Id> {
@@ -338,6 +354,13 @@ impl Store {
             }
             event::Event::ContextResolveFailed { .. } | event::Event::Permission { .. } => {
                 Vec::new()
+            }
+            event::Event::ReviewAcceptedFile { thread, path, text } => {
+                if self.thread(thread).is_some() {
+                    vec![effect::Effect::ApplyReviewAcceptedFile { thread, path, text }]
+                } else {
+                    Vec::new()
+                }
             }
             event::Event::Backend { backend, event } => match event {
                 super::backend::Event::Ready { .. } | super::backend::Event::Stopped => Vec::new(),
@@ -631,6 +654,24 @@ impl Store {
                     Vec::new()
                 }
             }
+            action::Action::SetMentionContext { thread, items } => {
+                if let Some(state) = self.thread_mut(thread) {
+                    state.retain_context_items(|ctx| !mention::is_context_id(&ctx.id));
+                    let mut seen = std::collections::BTreeSet::new();
+                    for item in items {
+                        let key = mention::key_for_kind(&item);
+                        if seen.insert(key.clone()) {
+                            state.push_context_item(context::Item {
+                                id: mention::context_id(&key),
+                                kind: item,
+                            });
+                        }
+                    }
+                    vec![effect::Effect::Save { thread }, effect::Effect::SyncModel]
+                } else {
+                    Vec::new()
+                }
+            }
             action::Action::Submit { thread, text } => {
                 if let Some(state) = self.thread_mut(thread) {
                     let thread::Origin::Backend { backend, .. } = state.origin() else {
@@ -713,6 +754,51 @@ impl Store {
                     thread::Origin::Local => None,
                 })
                 .unwrap_or_default(),
+            action::Action::SetReviewMode { thread, mode } => {
+                let Some(state) = self.thread_mut(thread) else {
+                    return Vec::new();
+                };
+                state.apply(thread::Event::Review(review::Event::Mode(mode)));
+                let mut effects = Vec::new();
+                if let thread::Origin::Backend { backend, .. } = state.origin() {
+                    effects.push(effect::Effect::SendBackendCommand {
+                        backend: backend.clone(),
+                        command: backend::Command::Review {
+                            thread,
+                            command: review::Command::SetMode(mode),
+                        },
+                    });
+                }
+                effects.push(effect::Effect::Save { thread });
+                effects.push(effect::Effect::SyncModel);
+                effects
+            }
+            action::Action::ResolveReview {
+                thread,
+                target,
+                decision,
+            } => {
+                let Some(state) = self.thread_mut(thread) else {
+                    return Vec::new();
+                };
+                state.apply(thread::Event::Review(review::Event::Resolve {
+                    target: target.clone(),
+                    decision,
+                }));
+                let mut effects = Vec::new();
+                if let thread::Origin::Backend { backend, .. } = state.origin() {
+                    effects.push(effect::Effect::SendBackendCommand {
+                        backend: backend.clone(),
+                        command: backend::Command::Review {
+                            thread,
+                            command: review::Command::Resolve { target, decision },
+                        },
+                    });
+                }
+                effects.push(effect::Effect::Save { thread });
+                effects.push(effect::Effect::SyncModel);
+                effects
+            }
             action::Action::NewThread { backend, scope } => {
                 let thread = self.create(thread::Origin::Local, scope.clone());
                 let _ = self.activate(thread);
@@ -913,6 +999,24 @@ mod tests {
             thread::Origin::Local,
             thread::Scope::new(std::path::PathBuf::from(".")),
         )
+    }
+
+    #[test]
+    fn review_accepted_file_emits_apply_effect_for_live_thread() {
+        let (mut store, thread) = store();
+        let path = std::path::PathBuf::from("src/lib.rs");
+        let text = "accepted\n".to_string();
+
+        let effects = store.apply(event::Event::ReviewAcceptedFile {
+            thread,
+            path: path.clone(),
+            text: text.clone(),
+        });
+
+        assert_eq!(
+            effects,
+            vec![effect::Effect::ApplyReviewAcceptedFile { thread, path, text }]
+        );
     }
 
     #[test]
@@ -1121,6 +1225,64 @@ mod tests {
                     && current_decision == &decision
             )
         }));
+    }
+
+    #[test]
+    fn set_review_mode_updates_thread_and_emits_backend_command() {
+        let (mut store, thread, backend) = backend_store();
+
+        let effects = store.act(action::Action::SetReviewMode {
+            thread,
+            mode: super::super::review::Mode::Review,
+        });
+
+        assert_eq!(
+            store.thread(thread).map(|thread| thread.review_mode()),
+            Some(super::super::review::Mode::Review)
+        );
+        assert!(effects.iter().any(|effect| {
+            matches!(
+                effect,
+                effect::Effect::SendBackendCommand {
+                    backend: current,
+                    command: backend::Command::Review {
+                        thread: current_thread,
+                        command: super::super::review::Command::SetMode(super::super::review::Mode::Review),
+                    },
+                } if current == &backend && *current_thread == thread
+            )
+        }));
+    }
+
+    #[test]
+    fn resolve_review_marks_pending_file() {
+        let (mut store, thread, _backend) = backend_store();
+        let path = std::path::PathBuf::from("file.rs");
+        let _ = store.apply(event::Event::Thread {
+            thread,
+            event: thread::Event::Review(super::super::review::Event::Stage {
+                mode: super::super::review::Mode::Review,
+                file: super::super::review::File::staged(path.clone(), "old".into(), "new".into()),
+            }),
+        });
+
+        let _ = store.act(action::Action::ResolveReview {
+            thread,
+            target: super::super::review::Target::File(path),
+            decision: super::super::review::Decision::Accept,
+        });
+
+        let entry = store
+            .thread(thread)
+            .and_then(|thread| thread.entries().last())
+            .expect("review entry");
+        let thread::EntryKind::ChangeSummary(summary) = &entry.kind else {
+            panic!("expected change summary");
+        };
+        assert_eq!(
+            summary.files[0].review.as_ref().map(|file| file.status),
+            Some(super::super::review::Status::Accepted)
+        );
     }
 
     #[test]

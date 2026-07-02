@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use url::Url;
 
-use super::{config, history, host, mode, permission, prompt, terminal, thread};
+use super::{config, history, host, mode, permission, prompt, review, terminal, thread};
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Id(Arc<str>);
@@ -191,6 +191,10 @@ pub enum Command {
         request: permission::RequestId,
         decision: permission::Decision,
     },
+    Review {
+        thread: thread::Id,
+        command: review::Command,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -226,6 +230,11 @@ pub enum Update {
     Permission {
         thread: thread::Id,
         request: permission::Request,
+    },
+    ReviewAcceptedFile {
+        thread: thread::Id,
+        path: std::path::PathBuf,
+        text: String,
     },
     Error {
         at: Target,

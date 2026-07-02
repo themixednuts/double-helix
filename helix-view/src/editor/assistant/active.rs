@@ -184,4 +184,40 @@ impl Editor {
             .context("No active assistant thread")?;
         Ok(self.select_assistant_entry(thread, entry))
     }
+
+    pub fn toggle_active_assistant_review_mode(
+        &mut self,
+    ) -> anyhow::Result<(String, Vec<crate::assistant::effect::Effect>)> {
+        let (thread, state) = self
+            .assistant
+            .active_thread_owned()
+            .context("No active assistant thread")?;
+        let mode = state.review_mode().toggled();
+        Ok((
+            format!("Assistant review mode: {}", mode.label()),
+            self.set_assistant_review_mode(thread, mode),
+        ))
+    }
+
+    pub fn resolve_selected_assistant_review(
+        &mut self,
+        decision: crate::assistant::review::Decision,
+    ) -> anyhow::Result<Vec<crate::assistant::effect::Effect>> {
+        let (thread, target) = self
+            .assistant
+            .selected_review_target()
+            .context("No pending review file selected")?;
+        Ok(self.resolve_assistant_review(thread, target, decision))
+    }
+
+    pub fn resolve_all_active_assistant_review(
+        &mut self,
+        decision: crate::assistant::review::Decision,
+    ) -> anyhow::Result<Vec<crate::assistant::effect::Effect>> {
+        let thread = self
+            .assistant
+            .active_id()
+            .context("No active assistant thread")?;
+        Ok(self.resolve_assistant_review(thread, crate::assistant::review::Target::All, decision))
+    }
 }

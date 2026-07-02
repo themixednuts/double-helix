@@ -1,5 +1,7 @@
 use crate::collab::{location, Location};
 
+use super::review;
+
 slotmap::new_key_type! {
     pub struct Id;
 }
@@ -14,6 +16,7 @@ pub struct Hunk {
 pub struct File {
     pub path: std::path::PathBuf,
     pub hunks: Vec<Hunk>,
+    pub review: Option<review::File>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

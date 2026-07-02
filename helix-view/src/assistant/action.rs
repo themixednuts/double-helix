@@ -1,4 +1,4 @@
-use super::{config, context, history, mode, permission, thread};
+use super::{config, context, history, mode, permission, review, thread};
 use crate::DocumentId;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,6 +70,10 @@ pub enum Action {
         thread: thread::Id,
         item: context::Id,
     },
+    SetMentionContext {
+        thread: thread::Id,
+        items: Vec<context::Kind>,
+    },
     Follow {
         thread: thread::Id,
     },
@@ -93,5 +97,14 @@ pub enum Action {
         thread: thread::Id,
         request: permission::RequestId,
         decision: permission::Decision,
+    },
+    SetReviewMode {
+        thread: thread::Id,
+        mode: review::Mode,
+    },
+    ResolveReview {
+        thread: thread::Id,
+        target: review::Target,
+        decision: review::Decision,
     },
 }

@@ -70,7 +70,14 @@ fn test_normalize_path() -> Result<(), Box<dyn Error>> {
         .to_owned();
 
     use std::os::windows;
-    windows::fs::symlink_dir(&dir1, &dir_link)?;
+    // Symlink creation requires Developer Mode or admin on Windows (error 1314).
+    if let Err(err) = windows::fs::symlink_dir(&dir1, &dir_link) {
+        if err.raw_os_error() == Some(1314) {
+            eprintln!("skipping: symlink privilege not held");
+            return Ok(());
+        }
+        return Err(err.into());
+    }
     windows::fs::symlink_file(&orig_file, &link)?;
 
     // root/link

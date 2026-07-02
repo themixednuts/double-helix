@@ -5,22 +5,24 @@ pub fn register(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
 
     m.set(
         "focused_document",
-        lua.create_function(|_lua, ()| {
-            with_query_bridge(|bridge| Ok(bridge.focused_document().map(LuaDocumentHandle)))
+        lua.create_function(|lua, ()| {
+            with_query_bridge(lua, |bridge| {
+                Ok(bridge.focused_document().map(LuaDocumentHandle))
+            })
         })?,
     )?;
 
     m.set(
         "focused_view",
-        lua.create_function(|_lua, ()| {
-            with_query_bridge(|bridge| Ok(bridge.focused_view().map(LuaViewHandle)))
+        lua.create_function(|lua, ()| {
+            with_query_bridge(lua, |bridge| Ok(bridge.focused_view().map(LuaViewHandle)))
         })?,
     )?;
 
     m.set(
         "mode",
-        lua.create_function(|_lua, ()| {
-            with_query_bridge(|bridge| {
+        lua.create_function(|lua, ()| {
+            with_query_bridge(lua, |bridge| {
                 let snap = bridge.workspace_snapshot();
                 Ok(mode_to_string(snap.mode))
             })
@@ -29,12 +31,12 @@ pub fn register(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
 
     m.set(
         "set_mode",
-        lua.create_function(|_lua, mode_str: String| {
+        lua.create_function(|lua, mode_str: String| {
             let mode = parse_edit_mode(&mode_str)?;
-            with_mutation_bridge(|mut bridge| {
+            with_mutation_bridge(lua, |bridge| {
                 bridge
                     .set_mode(requests::SetModeRequest { mode })
-                    .map_err(|e| LuaError::RuntimeError(e.to_string()))
+                    .map_err(contract_error)
             })
         })?,
     )?;
@@ -42,7 +44,7 @@ pub fn register(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
     m.set(
         "snapshot",
         lua.create_function(|lua, ()| {
-            let snap = with_query_bridge(|bridge| Ok(bridge.workspace_snapshot()))?;
+            let snap = with_query_bridge(lua, |bridge| Ok(bridge.workspace_snapshot()))?;
             let table = lua.create_table()?;
             table.set(
                 "focused_document",
@@ -67,7 +69,7 @@ pub fn register(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
     m.set(
         "theme",
         lua.create_function(|lua, ()| {
-            let snap = with_query_bridge(|bridge| Ok(bridge.theme_snapshot()))?;
+            let snap = with_query_bridge(lua, |bridge| Ok(bridge.theme_snapshot()))?;
             let table = lua.create_table()?;
             table.set("name", snap.name)?;
             if let Some(c) = snap.bg {
@@ -82,8 +84,8 @@ pub fn register(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
 
     m.set(
         "documents",
-        lua.create_function(|_lua, ()| {
-            with_query_bridge(|bridge| {
+        lua.create_function(|lua, ()| {
+            with_query_bridge(lua, |bridge| {
                 Ok(bridge
                     .list_documents()
                     .into_iter()
@@ -95,8 +97,8 @@ pub fn register(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
 
     m.set(
         "views",
-        lua.create_function(|_lua, ()| {
-            with_query_bridge(|bridge| {
+        lua.create_function(|lua, ()| {
+            with_query_bridge(lua, |bridge| {
                 Ok(bridge
                     .list_views()
                     .into_iter()

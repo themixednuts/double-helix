@@ -6,7 +6,7 @@ use helix_acp::client::{AgentConfig, IncomingReceiver};
 use helix_acp::types as acp;
 use helix_acp::AcpAgent;
 
-use super::super::{backend, host, permission, thread};
+use super::super::{backend, host, permission, review, thread};
 use super::{translate, Session};
 
 pub struct Driver {
@@ -89,6 +89,8 @@ struct State {
     sessions: HashMap<thread::Id, Session>,
     terminals: HashMap<String, (thread::Id, host::TerminalId)>,
     permissions: HashMap<permission::RequestId, PendingPermission>,
+    review_modes: HashMap<thread::Id, review::Mode>,
+    staged: HashMap<thread::Id, HashMap<PathBuf, review::File>>,
     rules: permission::Rules,
 }
 
@@ -105,8 +107,60 @@ impl State {
             sessions: HashMap::new(),
             terminals: HashMap::new(),
             permissions: HashMap::new(),
+            review_modes: HashMap::new(),
+            staged: HashMap::new(),
             rules: permission::Rules::load(),
         }
+    }
+
+    fn review_mode(&self, thread: thread::Id) -> review::Mode {
+        self.review_modes.get(&thread).copied().unwrap_or_default()
+    }
+
+    fn staged_text(&self, thread: thread::Id, path: &std::path::Path) -> Option<String> {
+        self.staged
+            .get(&thread)
+            .and_then(|files| files.get(path))
+            .filter(|file| file.status.is_pending())
+            .map(|file| file.after.clone())
+    }
+
+    fn stage(&mut self, thread: thread::Id, file: review::File) {
+        self.staged
+            .entry(thread)
+            .or_default()
+            .insert(file.path.clone(), file);
+    }
+
+    fn resolve(
+        &mut self,
+        thread: thread::Id,
+        target: &review::Target,
+        decision: review::Decision,
+    ) -> Vec<review::File> {
+        let Some(files) = self.staged.get_mut(&thread) else {
+            return Vec::new();
+        };
+        let mut resolved = Vec::new();
+        let paths: Vec<_> = files
+            .keys()
+            .filter(|path| match target {
+                review::Target::All => true,
+                review::Target::File(target) => *path == target,
+            })
+            .cloned()
+            .collect();
+
+        for path in paths {
+            let Some(mut file) = files.remove(&path) else {
+                continue;
+            };
+            if file.status.is_pending() {
+                file.resolve(decision);
+                resolved.push(file);
+            }
+        }
+        resolved
     }
 }
 
@@ -378,15 +432,13 @@ async fn handle_command(
                 let _ = tx
                     .send(backend::Update::Thread {
                         thread,
-                        event: thread::Event::Content(thread::Content::Append(
-                            thread::NewEntry {
-                                turn: None,
-                                kind: thread::EntryKind::Status {
-                                    text: "Assistant run canceled".to_string(),
-                                },
-                                locations: Vec::new(),
+                        event: thread::Event::Content(thread::Content::Append(thread::NewEntry {
+                            turn: None,
+                            kind: thread::EntryKind::Status {
+                                text: "Assistant run canceled".to_string(),
                             },
-                        )),
+                            locations: Vec::new(),
+                        })),
                     })
                     .await;
                 let _ = tx
@@ -476,6 +528,37 @@ async fn handle_command(
                 );
             }
         }
+        backend::Command::Review { thread, command } => match command {
+            review::Command::SetMode(mode) => {
+                state.review_modes.insert(thread, mode);
+                let _ = tx
+                    .send(backend::Update::Thread {
+                        thread,
+                        event: thread::Event::Review(review::Event::Mode(mode)),
+                    })
+                    .await;
+            }
+            review::Command::Resolve { target, decision } => {
+                let resolved = state.resolve(thread, &target, decision);
+                for file in &resolved {
+                    if decision == review::Decision::Accept {
+                        let _ = tx
+                            .send(backend::Update::ReviewAcceptedFile {
+                                thread,
+                                path: file.path.clone(),
+                                text: file.after.clone(),
+                            })
+                            .await;
+                    }
+                }
+                let _ = tx
+                    .send(backend::Update::Thread {
+                        thread,
+                        event: thread::Event::Review(review::Event::Resolve { target, decision }),
+                    })
+                    .await;
+            }
+        },
         backend::Command::ListThreads { scope, cursor } => {
             let _ = cursor;
             let entries = state
@@ -501,6 +584,8 @@ async fn handle_command(
         backend::Command::CloseThread { thread } => {
             state.sessions.remove(&thread);
             state.terminals.retain(|_, (owner, _)| *owner != thread);
+            state.review_modes.remove(&thread);
+            state.staged.remove(&thread);
         }
     }
 }
@@ -545,7 +630,13 @@ async fn handle_call(
         }) => match AgentMethodCall::parse(&method, params) {
             Ok(AgentMethodCall::ReadTextFile(req)) => {
                 let thread = thread_for_session(state, &req.session_id);
-                match host.fs.read_text(std::path::Path::new(&req.path)).await {
+                let staged = thread
+                    .and_then(|thread| state.staged_text(thread, std::path::Path::new(&req.path)));
+                match if let Some(content) = staged {
+                    Ok(content)
+                } else {
+                    host.fs.read_text(std::path::Path::new(&req.path)).await
+                } {
                     Ok(content) => {
                         if let Some(thread) = thread {
                             let _ = tx
@@ -572,8 +663,33 @@ async fn handle_call(
             Ok(AgentMethodCall::WriteTextFile(req)) => {
                 let thread = thread_for_session(state, &req.session_id);
                 let path = PathBuf::from(req.path.clone());
-                let previous = host.fs.read_text(&path).await.ok();
+                let previous = match thread.and_then(|thread| state.staged_text(thread, &path)) {
+                    Some(content) => Some(content),
+                    None => host.fs.read_text(&path).await.ok(),
+                };
                 let content = req.content;
+                if let Some(thread) = thread {
+                    let mode = state.review_mode(thread);
+                    if mode == review::Mode::Review {
+                        let file = review::File::staged(
+                            path.clone(),
+                            previous.clone().unwrap_or_default(),
+                            content.clone(),
+                        );
+                        state.stage(thread, file.clone());
+                        let _ = tx
+                            .send(backend::Update::Thread {
+                                thread,
+                                event: thread::Event::Review(review::Event::Stage { file, mode }),
+                            })
+                            .await;
+                        agent.reply(
+                            id,
+                            serde_json::to_value(acp::WriteTextFileResponse {}).unwrap(),
+                        );
+                        return;
+                    }
+                }
                 match host
                     .fs
                     .write_text(host::Write {
@@ -584,6 +700,20 @@ async fn handle_call(
                 {
                     Ok(()) => {
                         if let Some(thread) = thread {
+                            let file = review::File::written(
+                                path.clone(),
+                                previous.clone().unwrap_or_default(),
+                                content.clone(),
+                            );
+                            let _ = tx
+                                .send(backend::Update::Thread {
+                                    thread,
+                                    event: thread::Event::Review(review::Event::Stage {
+                                        file,
+                                        mode: review::Mode::Write,
+                                    }),
+                                })
+                                .await;
                             let _ = tx
                                 .send(backend::Update::Location {
                                     thread,
@@ -958,7 +1088,9 @@ fn changed_range(before: &str, after: &str) -> Option<crate::collab::RangeAnchor
 
 #[cfg(test)]
 mod tests {
-    use super::{changed_range, write_location};
+    use super::{changed_range, write_location, State};
+    use crate::assistant::{review, thread};
+    use std::num::NonZeroU64;
 
     #[test]
     fn changed_range_tracks_insertions() {
@@ -980,5 +1112,28 @@ mod tests {
         let range = location.range.expect("range");
         assert_eq!(range.anchor, 0);
         assert_eq!(range.head, 3);
+    }
+
+    #[test]
+    fn staged_overlay_reads_through_until_resolved() {
+        let mut state = State::new();
+        let thread = thread::Id::new(NonZeroU64::new(1).unwrap());
+        let path = std::path::PathBuf::from("file.rs");
+        state.stage(
+            thread,
+            review::File::staged(path.clone(), "old".into(), "new".into()),
+        );
+
+        assert_eq!(state.staged_text(thread, &path).as_deref(), Some("new"));
+
+        let resolved = state.resolve(
+            thread,
+            &review::Target::File(path.clone()),
+            review::Decision::Reject,
+        );
+
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].status, review::Status::Rejected);
+        assert_eq!(state.staged_text(thread, &path), None);
     }
 }

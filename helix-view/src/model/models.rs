@@ -167,6 +167,8 @@ pub struct AssistantModel {
     pub model_label: Option<String>,
     /// Active assistant follow status.
     pub follow: Option<AssistantFollow>,
+    /// Active assistant write/review mode.
+    pub review_mode: crate::assistant::review::Mode,
 
     /// Agent display name (e.g. "Claude Code", "No agent").
     pub agent_name: String,
@@ -302,6 +304,10 @@ impl AssistantModel {
                 label: format!("· follow {follow_label}"),
             });
         }
+        items.push(AssistantStatusItem {
+            kind: AssistantStatusItemKind::Review,
+            label: format!("· {}", self.review_mode.label()),
+        });
         items
     }
 
@@ -417,6 +423,7 @@ pub enum AssistantStatusItemKind {
     Mode,
     Model,
     Follow,
+    Review,
 }
 
 #[derive(Debug, Clone)]
@@ -591,6 +598,10 @@ pub enum AssistantEntryKind {
     ChangeSummary {
         files: usize,
     },
+    ReviewSummary {
+        mode: crate::assistant::review::Mode,
+        files: Vec<(std::path::PathBuf, String, crate::assistant::review::Status)>,
+    },
 }
 
 impl AssistantEntry {
@@ -598,7 +609,9 @@ impl AssistantEntry {
     pub const fn is_foldable(&self) -> bool {
         matches!(
             self.kind,
-            AssistantEntryKind::UserMessage(_) | AssistantEntryKind::AgentText(_)
+            AssistantEntryKind::UserMessage(_)
+                | AssistantEntryKind::AgentText(_)
+                | AssistantEntryKind::ReviewSummary { .. }
         )
     }
 
@@ -609,7 +622,9 @@ impl AssistantEntry {
             AssistantEntryKind::AgentText(_) => AssistantEntryRole::Agent,
             AssistantEntryKind::ToolCall { .. } => AssistantEntryRole::Tool,
             AssistantEntryKind::Status(_) => AssistantEntryRole::Status,
-            AssistantEntryKind::ChangeSummary { .. } => AssistantEntryRole::Change,
+            AssistantEntryKind::ChangeSummary { .. } | AssistantEntryKind::ReviewSummary { .. } => {
+                AssistantEntryRole::Change
+            }
         }
     }
 
@@ -640,6 +655,13 @@ impl AssistantEntry {
                 lines.join(helix_core::NATIVE_LINE_ENDING.as_str())
             }
             AssistantEntryKind::ChangeSummary { files } => format!("{files} changed files"),
+            AssistantEntryKind::ReviewSummary { files, .. } => files
+                .iter()
+                .map(|(path, diff, status)| {
+                    format!("{} ({})\n{}", path.display(), status.label(), diff)
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
         }
     }
 
@@ -692,6 +714,24 @@ impl AssistantEntry {
             AssistantEntryKind::ChangeSummary { files } => AssistantEntryDetails {
                 heading: "changes".to_string(),
                 body: Some(format!("{files} changed files")),
+                lines: Vec::new(),
+            },
+            AssistantEntryKind::ReviewSummary { mode, files } => AssistantEntryDetails {
+                heading: format!("{} review", mode.label()),
+                body: Some(
+                    files
+                        .iter()
+                        .map(|(path, diff, status)| {
+                            format!(
+                                "## {} ({})\n\n```diff\n{}```",
+                                path.display(),
+                                status.label(),
+                                diff
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n\n"),
+                ),
                 lines: Vec::new(),
             },
         }
@@ -758,6 +798,29 @@ impl AssistantEntry {
                 accessory: None,
                 accessory_tone: AssistantEntryTone::Default,
             }),
+            AssistantEntryKind::ReviewSummary { files, .. } => {
+                let pending = files
+                    .iter()
+                    .filter(|(_, _, status)| status.is_pending())
+                    .count();
+                Some(AssistantEntryRow {
+                    leading: String::new(),
+                    leading_tone: AssistantEntryTone::Inactive,
+                    animate_leading: false,
+                    body: if files.len() == 1 {
+                        format!(" review: {} ({})", files[0].0.display(), files[0].2.label())
+                    } else {
+                        format!(" review: {} files ({pending} pending)", files.len())
+                    },
+                    body_tone: if pending > 0 {
+                        AssistantEntryTone::Warning
+                    } else {
+                        AssistantEntryTone::Inactive
+                    },
+                    accessory: Some(" a accept  x reject ".to_string()).filter(|_| pending > 0),
+                    accessory_tone: AssistantEntryTone::Inactive,
+                })
+            }
             AssistantEntryKind::UserMessage(_) | AssistantEntryKind::AgentText(_) => None,
         }
     }
@@ -798,7 +861,8 @@ impl AssistantEntry {
             }
             AssistantEntryKind::ToolCall { .. }
             | AssistantEntryKind::Status(_)
-            | AssistantEntryKind::ChangeSummary { .. } => {
+            | AssistantEntryKind::ChangeSummary { .. }
+            | AssistantEntryKind::ReviewSummary { .. } => {
                 AssistantEntryDisplay::Plain(self.plain_row().expect("plain row display"))
             }
         }

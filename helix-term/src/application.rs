@@ -135,6 +135,7 @@ pub struct Application {
     terminal_state: TerminalState,
     language: LanguageState,
     plugin_manager: Arc<PluginManager>,
+    remote_plugin_hosts: crate::plugin_registry::RemotePluginHosts,
 }
 
 #[cfg(feature = "integration")]
@@ -393,8 +394,9 @@ impl Application {
         ])
         .context("build signal handler")?;
 
+        let plugin_config = PluginConfig::default();
         let plugin_manager =
-            PluginManager::new(PluginConfig::default()).expect("Failed to create plugin manager");
+            PluginManager::new(plugin_config.clone()).expect("Failed to create plugin manager");
 
         {
             let engine_arc = plugin_manager.engine();
@@ -414,6 +416,8 @@ impl Application {
             }
         }
         let plugin_manager = Arc::new(plugin_manager);
+        let remote_plugin_hosts =
+            crate::plugin_registry::spawn_remote_hosts(&plugin_config, ingress_tx.clone());
 
         #[cfg(windows)]
         let shutdown_rx = crate::shutdown::setup();
@@ -484,6 +488,7 @@ impl Application {
                 if let Err(e) = plugin_manager.fire_event(&mut editor, &event) {
                     log::error!("Failed to fire plugin event for startup doc: {}", e);
                 }
+                remote_plugin_hosts.notify_event(event);
             }
         }
 
@@ -523,6 +528,7 @@ impl Application {
                 progress: LspProgressMap::new(),
             },
             plugin_manager,
+            remote_plugin_hosts,
         };
 
         Ok(app)
@@ -855,6 +861,7 @@ impl Application {
                         if let Err(err) = self.plugin_manager.fire_event(&mut self.editor, &event) {
                             log::error!("Failed to fire plugin event: {}", err);
                         }
+                        self.remote_plugin_hosts.notify_event(event);
                     }
                 }
                 Some(_request) = self.ingress.redraw_rx.recv() => {
@@ -947,6 +954,7 @@ impl Application {
 
         self.event_loop(input_stream).await;
 
+        self.remote_plugin_hosts.shutdown();
         let close_errs = self.close().await;
 
         self.restore_term()?;

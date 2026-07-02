@@ -1,5 +1,7 @@
 use crate::collab::Location;
 
+use std::path::PathBuf;
+
 use super::{backend, history, thread};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,6 +27,11 @@ pub enum Effect {
         thread: thread::Id,
         entry: thread::EntryId,
         action: crate::editor::Action,
+    },
+    ApplyReviewAcceptedFile {
+        thread: thread::Id,
+        path: PathBuf,
+        text: String,
     },
     SetStatus {
         message: String,

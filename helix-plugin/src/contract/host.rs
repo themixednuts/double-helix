@@ -366,3 +366,20 @@ pub trait PluginWorkspaceQueryHost {
     /// Full workspace snapshot with split tree, panels, floats, and focus state.
     fn workspace_detail(&self) -> WorkspaceDetailSnapshot;
 }
+
+/// Read-only facade surface used by language runtimes.
+///
+/// This groups query-like operations that are implemented by different local
+/// bridge traits but are one synchronous RPC round-trip in a remote host.
+pub trait PluginFacadeQueryHost:
+    PluginQueryHost + PluginAssistantQueryHost + PluginWorkspaceQueryHost
+{
+    fn split_tree(&self) -> SplitTreeSnapshot;
+    fn list_tabs(&self, view: Option<ViewHandle>) -> ContractResult<TabGroupSnapshot>;
+}
+
+/// Mutable facade surface used by language runtimes.
+pub trait PluginFacadeMutationHost:
+    PluginMutationHost + PluginSplitHost + PluginTabHost + PluginFloatHost + PluginAssistantMutationHost
+{
+}

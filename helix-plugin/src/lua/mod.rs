@@ -384,6 +384,30 @@ pub(crate) struct EventHostWrapper(
     pub Arc<Mutex<Box<dyn crate::contract::host::PluginEventHost + Send + Sync>>>,
 );
 
+pub(crate) trait RemoteFacadeHost: Send + Sync {
+    fn query(&self) -> &dyn crate::contract::host::PluginFacadeQueryHost;
+    fn mutation(&mut self) -> &mut dyn crate::contract::host::PluginFacadeMutationHost;
+}
+
+impl<T> RemoteFacadeHost for T
+where
+    T: crate::contract::host::PluginFacadeQueryHost
+        + crate::contract::host::PluginFacadeMutationHost
+        + Send
+        + Sync
+        + 'static,
+{
+    fn query(&self) -> &dyn crate::contract::host::PluginFacadeQueryHost {
+        self
+    }
+
+    fn mutation(&mut self) -> &mut dyn crate::contract::host::PluginFacadeMutationHost {
+        self
+    }
+}
+
+pub(crate) struct RemoteFacadeHostWrapper(pub Arc<Mutex<Box<dyn RemoteFacadeHost>>>);
+
 pub(crate) struct CommandRegistryWrapper(pub Arc<RwLock<CommandRegistry>>);
 
 pub(crate) struct LoadedPluginRegistryWrapper(pub Arc<RwLock<LoadedPluginRegistry>>);
@@ -655,6 +679,44 @@ impl LuaEngine {
             })
     }
 
+    fn with_remote_facade_host<H, T>(&self, host: &H, f: impl FnOnce() -> Result<T>) -> Result<T>
+    where
+        H: crate::contract::host::PluginFacadeQueryHost
+            + crate::contract::host::PluginFacadeMutationHost
+            + Clone
+            + Send
+            + Sync
+            + 'static,
+    {
+        struct Guard<'lua> {
+            lua: &'lua Lua,
+            previous: Option<RemoteFacadeHostWrapper>,
+        }
+
+        impl Drop for Guard<'_> {
+            fn drop(&mut self) {
+                match self.previous.take() {
+                    Some(previous) => {
+                        self.lua.set_app_data(previous);
+                    }
+                    None => {
+                        self.lua.remove_app_data::<RemoteFacadeHostWrapper>();
+                    }
+                }
+            }
+        }
+
+        let wrapper = RemoteFacadeHostWrapper(Arc::new(Mutex::new(
+            Box::new(host.clone()) as Box<dyn RemoteFacadeHost>
+        )));
+        let previous = self.lua.set_app_data(wrapper);
+        let _guard = Guard {
+            lua: &self.lua,
+            previous,
+        };
+        f()
+    }
+
     fn with_watchdog<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> {
         let max_instructions = self
             .lua
@@ -848,6 +910,57 @@ impl LuaEngine {
         Ok(())
     }
 
+    pub fn execute_command_remote<H>(
+        &self,
+        host: &mut H,
+        name: &str,
+        args: Vec<String>,
+    ) -> Result<()>
+    where
+        H: crate::contract::host::PluginFacadeQueryHost
+            + crate::contract::host::PluginFacadeMutationHost
+            + Clone
+            + Send
+            + Sync
+            + 'static,
+    {
+        let (plugin_name, callback) = {
+            let commands = self.commands.read();
+            let command = commands.get_by_name(name).ok_or_else(|| {
+                PluginError::CommandExecutionFailed(format!("Command not found: {name}"))
+            })?;
+            let callback = self
+                .lua
+                .registry_value(&command.callback_ref)
+                .map_err(|e| {
+                    PluginError::CommandExecutionFailed(format!("Failed to retrieve callback: {e}"))
+                })?;
+            (command.plugin_name.clone(), callback)
+        };
+
+        let thread = self.lua.create_thread(callback).map_err(|e| {
+            PluginError::CommandExecutionFailed(format!("Failed to create coroutine: {}", e))
+        })?;
+
+        let lua_args = self
+            .lua
+            .create_sequence_from(args)
+            .map_err(PluginError::LuaError)?;
+
+        self.with_remote_facade_host(host, || {
+            with_current_plugin_name(&self.lua, &plugin_name, || {
+                self.with_watchdog(|| {
+                    let result: LuaMultiValue = thread.resume(lua_args).map_err(|e| {
+                        PluginError::CommandExecutionFailed(format!("Execution failed: {}", e))
+                    })?;
+                    self.handle_coroutine_yield(&thread, &plugin_name, result)
+                })
+            })
+        })?;
+
+        Ok(())
+    }
+
     /// If a coroutine yielded a callback token, store it for later resumption.
     /// If it returned normally (finished), do nothing.
     fn handle_coroutine_yield(
@@ -998,6 +1111,54 @@ impl LuaEngine {
         Ok(())
     }
 
+    /// Load a plugin while running in an out-of-process host.
+    pub fn load_plugin_remote<H>(
+        &mut self,
+        host: &mut H,
+        plugin: crate::types::Plugin,
+    ) -> Result<()>
+    where
+        H: crate::contract::host::PluginFacadeQueryHost
+            + crate::contract::host::PluginFacadeMutationHost
+            + Clone
+            + Send
+            + Sync
+            + 'static,
+    {
+        let entry_file = plugin
+            .path
+            .join(plugin.metadata.entry.as_deref().unwrap_or("init.lua"));
+
+        if !entry_file.exists() {
+            return Err(PluginError::InvalidPluginStructure(format!(
+                "Entry file not found: {:?}",
+                entry_file
+            )));
+        }
+
+        let code = std::fs::read_to_string(&entry_file)?;
+        self.ensure_plugin_id(&plugin.metadata.name);
+        let root = canonical_root(&plugin.path)?;
+        self.plugin_roots
+            .write()
+            .insert(plugin.metadata.name.clone(), root);
+        self.with_remote_facade_host(host, || {
+            with_current_plugin_name(&self.lua, &plugin.metadata.name, || {
+                self.with_watchdog(|| {
+                    self.lua
+                        .load(&code)
+                        .set_name(&plugin.metadata.name)
+                        .exec()
+                        .map_err(PluginError::LuaError)
+                })
+            })
+        })?;
+
+        self.plugins.insert(plugin.metadata.name.clone(), plugin);
+
+        Ok(())
+    }
+
     /// Dispatch a contract event to all subscribed plugin handlers.
     pub fn call_event_handlers(
         &self,
@@ -1045,6 +1206,86 @@ impl LuaEngine {
 
             let result = match callback {
                 Ok(callback) => with_editor_context(editor, || {
+                    with_current_plugin_name(&self.lua, &plugin_name, || {
+                        self.with_watchdog(|| {
+                            callback
+                                .call::<()>(event_data.clone())
+                                .map_err(PluginError::LuaError)
+                        })
+                    })
+                }),
+                Err(err) => Err(err),
+            };
+
+            match result {
+                Ok(()) => self.reset_event_failure(kind, handle),
+                Err(err) => {
+                    error!(
+                        "Plugin event handler failed: plugin='{}' event='{}' handle='{}': {}",
+                        plugin_name, kind, handle, err
+                    );
+                    self.record_event_failure(kind, handle, &plugin_name);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Dispatch a contract event while running in an out-of-process host.
+    pub fn call_event_handlers_remote<H>(
+        &self,
+        host: &mut H,
+        event: &crate::contract::events::PluginEvent,
+    ) -> Result<()>
+    where
+        H: crate::contract::host::PluginFacadeQueryHost
+            + crate::contract::host::PluginFacadeMutationHost
+            + Clone
+            + Send
+            + Sync
+            + 'static,
+    {
+        let kind = event.kind();
+
+        let targets: Vec<_> = self
+            .contract_event_handlers
+            .read()
+            .get(&kind)
+            .map(|callbacks| {
+                callbacks
+                    .iter()
+                    .map(|entry| (entry.handle, entry.plugin_name.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        if targets.is_empty() {
+            return Ok(());
+        }
+
+        let event_data = api::facade::contract_event_to_table(&self.lua, event)
+            .map_err(PluginError::LuaError)?;
+
+        for (handle, plugin_name) in targets {
+            let callback = {
+                let handlers = self.contract_event_handlers.read();
+                let Some(entry) = handlers
+                    .get(&kind)
+                    .and_then(|entries| entries.iter().find(|entry| entry.handle == handle))
+                else {
+                    continue;
+                };
+                self.lua
+                    .registry_value::<LuaFunction>(&entry.callback_ref)
+                    .map_err(|e| PluginError::EventHandlerError {
+                        plugin: entry.plugin_name.clone(),
+                        error: format!("Failed to retrieve callback: {e}"),
+                    })
+            };
+
+            let result = match callback {
+                Ok(callback) => self.with_remote_facade_host(host, || {
                     with_current_plugin_name(&self.lua, &plugin_name, || {
                         self.with_watchdog(|| {
                             callback
@@ -1980,16 +2221,28 @@ mod tests {
         )
         .unwrap();
 
-        let result = exec_as(
+        exec_as(
             &engine,
             "caller-plugin",
             r#"
-            helix.events.unsubscribe(subscription)
+            local ok, err = pcall(function()
+                helix.events.unsubscribe(subscription)
+            end)
+            assert(not ok)
+            assert(type(err) == "table", type(err) .. ":" .. tostring(err))
+            unsubscribe_err_code = err.code
             "#,
-        );
+        )
+        .unwrap();
 
-        let err = result.expect_err("foreign subscription should be rejected");
-        assert!(err.to_string().contains("permission denied"));
+        assert_eq!(
+            engine
+                .lua
+                .globals()
+                .get::<String>("unsubscribe_err_code")
+                .unwrap(),
+            "permission_denied"
+        );
         let handlers = engine.contract_event_handlers.read();
         let entries = handlers
             .get(&crate::contract::events::EventKind::DocumentOpened)
@@ -2229,17 +2482,55 @@ mod tests {
         )
         .unwrap();
 
-        let update_result = exec_as(
+        exec_as(
             &engine,
             "caller-plugin",
-            "command:update({ doc = 'stolen' })",
+            r#"
+            local ok, err = pcall(function()
+                command:update({ doc = 'stolen' })
+            end)
+            assert(not ok)
+            if type(err) == "table" then
+                update_err_code = err.code
+            else
+                update_err_code = tostring(err):match("code=([%w_]+)")
+            end
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            engine
+                .lua
+                .globals()
+                .get::<String>("update_err_code")
+                .unwrap(),
+            "permission_denied"
         );
-        let update_err = update_result.expect_err("foreign command update should be rejected");
-        assert!(update_err.to_string().contains("permission denied"));
 
-        let remove_result = exec_as(&engine, "caller-plugin", "helix.commands.remove(command)");
-        let remove_err = remove_result.expect_err("foreign command remove should be rejected");
-        assert!(remove_err.to_string().contains("permission denied"));
+        exec_as(
+            &engine,
+            "caller-plugin",
+            r#"
+            local ok, err = pcall(function()
+                helix.commands.remove(command)
+            end)
+            assert(not ok)
+            if type(err) == "table" then
+                remove_err_code = err.code
+            else
+                remove_err_code = tostring(err):match("code=([%w_]+)")
+            end
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            engine
+                .lua
+                .globals()
+                .get::<String>("remove_err_code")
+                .unwrap(),
+            "permission_denied"
+        );
 
         assert!(updated.lock().is_empty());
         assert!(removed.lock().is_empty());
@@ -2369,30 +2660,31 @@ mod tests {
     }
 
     #[test]
-    fn stale_document_handle_returns_contract_code() {
+    fn stale_document_handle_returns_contract_error_table() {
         let engine = LuaEngine::new().unwrap();
         engine
             .register_api(crate::types::PluginConfig::default())
             .unwrap();
         let mut editor = test_editor();
-        let stale = crate::contract::DocumentHandle::from_raw(NonZeroU64::new(999).unwrap());
+        let stale = crate::contract::ViewHandle::from_raw(NonZeroU64::new(999).unwrap());
 
-        let message: String = with_editor_context(&mut editor, || {
+        let (code, entity): (String, String) = with_editor_context(&mut editor, || {
             engine.lua.globals().set(
-                "doc",
+                "view",
                 engine
                     .lua
-                    .create_userdata(api::facade::LuaDocumentHandle(stale))?,
+                    .create_userdata(api::facade::LuaViewHandle(stale))?,
             )?;
             engine
                 .lua
                 .load(
                     r#"
                     local ok, err = pcall(function()
-                        return doc:text()
+                        return helix.tabs.list(view)
                     end)
                     assert(not ok)
-                    return tostring(err)
+                    assert(type(err) == "table", type(err) .. ":" .. tostring(err))
+                    return err.code, err.entity
                     "#,
                 )
                 .eval()
@@ -2400,7 +2692,8 @@ mod tests {
         })
         .unwrap();
 
-        assert!(message.contains("code=stale_handle"));
+        assert_eq!(code, "stale_handle");
+        assert!(entity.contains("ViewHandle"));
     }
 
     #[test]

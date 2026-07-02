@@ -3770,6 +3770,35 @@ fn assistant_toggle_follow(
     Ok(())
 }
 
+fn assistant_toggle_review_mode(
+    cx: &mut compositor::Context,
+    _args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+
+    let (status, effects) = cx.editor.toggle_active_assistant_review_mode()?;
+    cx.editor.apply_assistant_effects(effects);
+    cx.editor.set_status(status);
+    Ok(())
+}
+
+fn assistant_permissions_reset(
+    cx: &mut compositor::Context,
+    _args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+
+    helix_view::assistant::permission::Rules::reset()?;
+    cx.editor.set_status("Assistant permission rules reset");
+    Ok(())
+}
+
 async fn resolve_context_provider(
     editor: &helix_view::Editor,
     key: &helix_view::assistant::context::Key,
@@ -5329,6 +5358,28 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         aliases: &["follow"],
         doc: "Toggle following for the active assistant thread.",
         fun: assistant_toggle_follow,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "assistant-toggle-review-mode",
+        aliases: &["review-mode"],
+        doc: "Toggle the active assistant thread between write and review mode.",
+        fun: assistant_toggle_review_mode,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "assistant-permissions-reset",
+        aliases: &[],
+        doc: "Clear persisted assistant permission rules.",
+        fun: assistant_permissions_reset,
         completer: CommandCompleter::none(),
         signature: Signature {
             positionals: (0, Some(0)),

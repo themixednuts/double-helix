@@ -2,7 +2,7 @@ mod local;
 
 use std::sync::Arc;
 
-use super::{config, context, mode, plan, terminal, thread};
+use super::{config, context, mode, plan, review, terminal, thread};
 use crate::collab::FollowState;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -47,6 +47,7 @@ pub struct Record {
     pub unread: bool,
     pub mode: Option<mode::Set>,
     pub config: config::State,
+    pub review_mode: review::Mode,
     pub scope: thread::Scope,
     pub view: View,
     pub terminals: Vec<terminal::Terminal>,
@@ -161,6 +162,7 @@ impl Record {
             unread: thread.unread(),
             mode: thread.mode().cloned(),
             config: thread.config().clone(),
+            review_mode: thread.review_mode(),
             scope: thread.clone_scope(),
             view: View {
                 focus: thread.focus(),
@@ -187,6 +189,7 @@ impl Record {
             unread: self.unread,
             mode: self.mode,
             config: self.config,
+            review_mode: self.review_mode,
             terminals: self.terminals,
         });
         thread.restore_transient_view(

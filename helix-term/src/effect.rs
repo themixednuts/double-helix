@@ -219,6 +219,11 @@ pub(crate) fn apply_runtime_task_event(
         RuntimeTaskEvent::DeliverPluginUiCallback { callback, value } => {
             plugin::apply_plugin_ui_callback(editor, plugin_manager, callback, value)
         }
+        RuntimeTaskEvent::PluginHostRequest {
+            state,
+            request,
+            respond_to,
+        } => plugin::apply_plugin_host_request(editor, state, request, respond_to),
         RuntimeTaskEvent::RemoveAssistantPanel => assistant::apply_remove_assistant_panel(editor),
         RuntimeTaskEvent::ConnectAssistantBackend {
             command,

@@ -6,7 +6,7 @@ pub fn register(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
     m.set(
         "api_metadata",
         lua.create_function(|lua, ()| {
-            let meta = with_query_bridge(|bridge| Ok(bridge.api_metadata()))?;
+            let meta = with_query_bridge(lua, |bridge| Ok(bridge.api_metadata()))?;
 
             let table = lua.create_table()?;
             table.set("version", meta.version)?;

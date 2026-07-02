@@ -130,4 +130,25 @@ impl Editor {
     ) -> Vec<crate::assistant::effect::Effect> {
         self.assistant_act(crate::assistant::Action::Submit { thread, text })
     }
+
+    pub fn set_assistant_review_mode(
+        &mut self,
+        thread: crate::assistant::thread::Id,
+        mode: crate::assistant::review::Mode,
+    ) -> Vec<crate::assistant::effect::Effect> {
+        self.assistant_act(crate::assistant::Action::SetReviewMode { thread, mode })
+    }
+
+    pub fn resolve_assistant_review(
+        &mut self,
+        thread: crate::assistant::thread::Id,
+        target: crate::assistant::review::Target,
+        decision: crate::assistant::review::Decision,
+    ) -> Vec<crate::assistant::effect::Effect> {
+        self.assistant_act(crate::assistant::Action::ResolveReview {
+            thread,
+            target,
+            decision,
+        })
+    }
 }

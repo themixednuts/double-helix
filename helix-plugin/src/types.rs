@@ -87,6 +87,9 @@ pub struct PluginConfig {
     /// Individual plugin configurations
     #[serde(default)]
     pub plugins: Vec<IndividualPluginConfig>,
+    /// Out-of-process plugin hosts to spawn.
+    #[serde(default)]
+    pub hosts: Vec<PluginHostConfig>,
     /// Maximum Lua heap in bytes. Use 0 to disable the limit.
     #[serde(default = "default_max_memory")]
     pub max_memory: usize,
@@ -113,10 +116,26 @@ impl Default for PluginConfig {
             enabled: true,
             plugin_dirs: vec![],
             plugins: vec![],
+            hosts: vec![],
             max_memory: default_max_memory(),
             max_instructions: default_max_instructions(),
         }
     }
+}
+
+/// Configuration for an out-of-process plugin runtime.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginHostConfig {
+    /// Stable name used in logs and diagnostics.
+    pub name: String,
+    /// Executable to spawn, e.g. `helix-plugin-host` or `ssh`.
+    pub command: String,
+    /// Command-line arguments passed as-is.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Plugin directories interpreted on the child host's filesystem.
+    #[serde(default)]
+    pub plugin_dirs: Vec<PathBuf>,
 }
 
 /// Configuration for an individual plugin

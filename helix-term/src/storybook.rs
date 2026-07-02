@@ -362,6 +362,40 @@ static STORIES: &[Story] = &[
         render: StoryRenderer::Styled(render_progress_story),
     },
     Story {
+        id: "widgets/diff-view",
+        title: "Diff View",
+        category: "Widgets",
+        component: "Widgets/Diff View",
+        variant: "Folded Hunk",
+        summary: "Unified diff rendering with intraline emphasis and folded hunk state.",
+        kind: StoryKind::Component,
+        args: &[StoryArg::new("hunks", "2", "Second hunk folded")],
+        canvas: StoryCanvas::Centered {
+            width: 78,
+            height: 14,
+        },
+        render: StoryRenderer::Styled(render_diff_view_story),
+    },
+    Story {
+        id: "widgets/markdown",
+        title: "Markdown",
+        category: "Widgets",
+        component: "Widgets/Markdown",
+        variant: "Two Widths",
+        summary: "Unified markdown layout for tables, tasks, code fences, and footnotes.",
+        kind: StoryKind::Component,
+        args: &[StoryArg::new(
+            "widths",
+            "34/56",
+            "Two independent layout widths",
+        )],
+        canvas: StoryCanvas::Centered {
+            width: 94,
+            height: 20,
+        },
+        render: StoryRenderer::Styled(render_markdown_story),
+    },
+    Story {
         id: "widgets/item-list/100k",
         title: "100k Item List",
         category: "Widgets",
@@ -1702,21 +1736,30 @@ fn render_tabs_story(surface: &mut Buffer, area: Rect, styles: UiStyleGuide) {
         crate::widgets::Tab::new("buffers").badge("4"),
         crate::widgets::Tab::new("diagnostics").badge("12"),
         crate::widgets::Tab::new("symbols"),
-        crate::widgets::Tab::new("references").badge("8"),
+        crate::widgets::Tab::cells([
+            crate::widgets::TabCell::new(" references "),
+            crate::widgets::TabCell::styled("●", styles.warning),
+            crate::widgets::TabCell::new(" "),
+        ]),
         crate::widgets::Tab::new("outline"),
+        crate::widgets::Tab::new("preview").badge("2"),
+        crate::widgets::Tab::new("search"),
     ];
-    let state = crate::widgets::tabs(
+    let tab_area = Rect::new(panel.x, panel.y + 1, panel.width.min(34), 1);
+    let state = crate::widgets::tabs_with_options(
         surface,
-        Rect::new(panel.x, panel.y + 1, panel.width, 1),
+        tab_area,
         &tabs,
-        3,
-        0,
+        crate::widgets::TabsOptions::new(5)
+            .separator("│")
+            .scroll_policy(crate::widgets::TabsScrollPolicy::CenterActive),
         crate::widgets::TabsStyle {
             background: styles.panel,
             active: styles.selected,
             inactive: styles.text,
             hover: styles.info,
             badge: styles.warning,
+            separator: styles.muted,
             overflow: styles.accent,
         },
     );
@@ -1725,10 +1768,11 @@ fn render_tabs_story(surface: &mut Buffer, area: Rect, styles: UiStyleGuide) {
         panel,
         3,
         &format!(
-            "scroll={} visible={}..{} overflow=({}, {})",
+            "scroll={} visible={}..{} ranges={} overflow=({}, {})",
             state.scroll,
             state.visible_start,
             state.visible_end,
+            state.tab_ranges.len(),
             state.left_overflow,
             state.right_overflow
         ),
@@ -1873,6 +1917,139 @@ fn render_progress_story(surface: &mut Buffer, area: Rect, styles: UiStyleGuide)
                 fill: styles.accent,
                 label: styles.text,
             },
+        );
+    }
+}
+
+fn render_diff_view_story(surface: &mut Buffer, area: Rect, styles: UiStyleGuide) {
+    fill_rect(surface, area, styles.surface);
+    let panel = render_panel(surface, area, "diff_view", styles);
+    let diff = "\
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,5 +1,5 @@
+ pub fn greet(name: &str) -> String {
+-    format!(\"hello, {name}\")
++    format!(\"hello there, {name}\")
+ }
+ 
+ pub fn unchanged() {}
+@@ -18,6 +18,7 @@
+ fn render() {
+-    draw_old();
++    draw_new();
++    flush_surface();
+ }
+";
+    let doc = crate::widgets::DiffDocument::from_unified_diff(diff);
+    let mut folded = std::collections::BTreeSet::new();
+    folded.insert(1);
+    let diff_styles = crate::widgets::DiffStyles {
+        text: styles.text,
+        header: styles.muted,
+        plus: styles.success,
+        minus: styles.error,
+        delta: styles.info,
+        plus_emphasis: styles.success,
+        minus_emphasis: styles.error,
+    };
+    crate::widgets::diff_view(
+        surface,
+        panel,
+        &doc,
+        0,
+        &folded,
+        crate::widgets::DiffOptions {
+            context: 1,
+            line_numbers: true,
+        },
+        &diff_styles,
+    );
+}
+
+fn render_markdown_story(surface: &mut Buffer, area: Rect, styles: UiStyleGuide) {
+    fill_rect(surface, area, styles.surface);
+    let fixture = "\
+# Release Notes
+
+| area | status |
+| --- | ---: |
+| markdown tables | done |
+| picker truncation | validating |
+
+- [x] task lists
+- [ ] narrow wrapping
+
+```rust
+fn main() {
+    println!(\"hello markdown\");
+}
+```
+
+Footnote callout[^one].
+
+[^one]: Rendered through the unified markdown engine.
+";
+    let loader = helix_core::config::default_lang_loader();
+    let line_styles = crate::ui::markdown::MarkdownLineStyles {
+        heading: styles.accent,
+        code: styles.info,
+        bold: styles.text,
+        italic: styles.muted,
+        strike: styles.error,
+        link: styles.info,
+        quote: styles.muted,
+        list: styles.success,
+        separator: styles.border,
+    };
+    let left_width = area.width.saturating_sub(4).min(34);
+    let columns = split_horizontal(area, left_width);
+    let doc = crate::ui::Markdown::doc(fixture);
+    let mut cache = crate::ui::markdown::MarkdownCache::default();
+    for (index, column) in columns.into_iter().enumerate().take(2) {
+        if column.width < 8 {
+            continue;
+        }
+        let panel = render_panel(
+            surface,
+            column,
+            if index == 0 { "width 34" } else { "width 56" },
+            styles,
+        );
+        let mut lines = cache.layout(
+            &doc,
+            panel.width as usize,
+            styles.text,
+            &line_styles,
+            None,
+            &loader,
+        );
+        if index == 1 {
+            let mut extra = Vec::new();
+            crate::ui::markdown::render_markdown_lines(
+                "Middle truncation sample: `src/components/picker_table.rs`",
+                &mut extra,
+                styles.text,
+                &line_styles,
+                None,
+                &loader,
+            );
+            lines.extend(extra);
+        }
+        crate::ui::markdown::render_to_surface(surface, panel, &lines, 0);
+    }
+    let stats = cache.stats();
+    let label = crate::ui::text_layout::truncate(
+        &format!("markdown cache hits={} misses={}", stats.hits, stats.misses),
+        area.width as usize,
+        crate::ui::text_layout::TruncateAt::Middle,
+    );
+    if area.height > 0 {
+        set_right_clipped(
+            surface,
+            Rect::new(area.x, area.bottom().saturating_sub(1), area.width, 1),
+            &label,
+            styles.muted,
         );
     }
 }

@@ -160,6 +160,11 @@ impl Application {
                             }
                         }
 
+                        editor_view
+                            .spinners_mut()
+                            .get_or_create(server_id)
+                            .set_progress(percentage.map(|percentage| percentage.min(100) as u8));
+
                         match work {
                             lsp::WorkDoneProgress::Begin(begin_status) => {
                                 self.language.progress.begin(

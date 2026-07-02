@@ -80,6 +80,7 @@ pub struct StatuslineSnapshot<'a> {
     pub diagnostics: DiagnosticCounts,
     pub workspace_diagnostics: WorkspaceDiagnosticCounts,
     pub spinner_frame: Cow<'a, str>,
+    pub lsp_progress: Option<u8>,
     pub current_working_directory: Cow<'a, str>,
     pub function_name: Option<String>,
     /// Names of the language servers attached to the focused
@@ -219,6 +220,7 @@ impl StatuslineSnapshot<'_> {
             diagnostics: self.diagnostics,
             workspace_diagnostics: self.workspace_diagnostics,
             spinner_frame: Cow::Owned(self.spinner_frame.into_owned()),
+            lsp_progress: self.lsp_progress,
             current_working_directory: Cow::Owned(self.current_working_directory.into_owned()),
             function_name: self.function_name,
             lsp_server_names: self.lsp_server_names,

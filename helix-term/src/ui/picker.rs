@@ -1614,7 +1614,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             .render(surface, area)
         };
 
-        // -- Layout: [prompt(1) | separator(1) | content(fill)]
+        // -- Layout: [prompt(1) | separator(1) | content(fill) | hints(1)]
         use helix_view::layout::{split_vertical, Size};
         let v_areas = split_vertical(
             inner,
@@ -1622,11 +1622,13 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
                 Size::fixed(1), // prompt
                 Size::fixed(1), // separator
                 Size::Fill,     // content
+                Size::fixed(1), // hints
             ],
         );
         let prompt_row = v_areas[0];
         let separator_row = v_areas[1];
         let inner = v_areas[2]; // content area (reuse name for minimal diff below)
+        let hint_row = v_areas[3];
 
         let list_area = inner.clip_top(self.header_height());
         self.sync_list_region_view(list_area, matched_count);
@@ -1843,6 +1845,29 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             truncate_start: self.truncate_start,
         }
         .render(inner, surface);
+
+        // The picker render path does not currently receive resolved active-keymap
+        // labels, so this footer uses the canonical default bindings handled below.
+        let hints = [
+            crate::widgets::Hint::new("Enter", "open").priority(220),
+            crate::widgets::Hint::new("Esc", "close").priority(210),
+            crate::widgets::Hint::new("Tab", "next").priority(200),
+            crate::widgets::Hint::new("S-Tab", "prev").priority(190),
+            crate::widgets::Hint::new("C-s", "split").priority(120),
+            crate::widgets::Hint::new("C-v", "vsplit").priority(110),
+            crate::widgets::Hint::new("C-t", "preview").priority(100),
+        ];
+        crate::widgets::hint_bar(
+            surface,
+            hint_row,
+            &hints,
+            crate::widgets::HintBarStyle {
+                background,
+                key: selected,
+                label: muted_style,
+                separator: muted_style,
+            },
+        );
 
         if let Some(trace) = self.trace {
             trace.log(

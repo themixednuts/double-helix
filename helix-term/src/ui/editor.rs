@@ -14,11 +14,12 @@ use crate::{
         },
         Completion, NotificationPopup, ProgressSpinners,
     },
+    widgets::{tabs_with_options, Tab, TabCell, TabsOptions, TabsScrollPolicy, TabsStyle},
 };
 
 use helix_core::{
     diagnostic::NumberOrString, movement::Direction, text_annotations::TextAnnotations,
-    unicode::width::UnicodeWidthStr, visual_offset_from_block, Position, Range, Selection,
+    visual_offset_from_block, Position, Range, Selection,
 };
 use helix_loader::VERSION_AND_GIT_HASH;
 use helix_view::{
@@ -575,7 +576,6 @@ pub struct EditorView {
     bufferline_info: BufferLineInfo,
     /// Tracks if the terminal window is focused by reaction to terminal focus events
     terminal_focused: bool,
-    bufferline_positions: Vec<u16>,
     /// Tracks if there are prompt layers active (updated by compositor)
     pub prompt_active: bool,
     notification_popup: NotificationPopup,
@@ -663,7 +663,6 @@ impl EditorView {
             spinners: ProgressSpinners::default(),
             bufferline_info: BufferLineInfo::default(),
             terminal_focused: true,
-            bufferline_positions: Vec::new(),
             prompt_active: false,
             notification_popup: NotificationPopup::new(),
             view_cache: ViewRenderCache::default(),
@@ -1550,14 +1549,9 @@ impl EditorView {
         surface: &mut CellSurface,
     ) {
         let bufferline_styles = crate::ui::design::BufferlineStyles::from_theme(model.theme);
-        self.bufferline_positions.clear();
         {
             let area = tui::ratatui::to_ratatui_rect(viewport);
             tui::ratatui::widgets::Widget::render(tui::ratatui::widgets::Clear, area, surface);
-            surface.set_style(
-                area,
-                tui::ratatui::to_ratatui_style(bufferline_styles.background),
-            );
         };
 
         let bufferline_active = bufferline_styles.active;
@@ -1565,197 +1559,77 @@ impl EditorView {
 
         self.bufferline_info.clear();
 
-        // First pass: calculate all buffer positions and determine if scrolling is needed
-        let mut total_width = 0u16;
-        let mut buffer_texts = Vec::new();
-        let mut buffer_widths = Vec::new();
+        let icons = ICONS.load();
+        let modified_accent = model
+            .theme
+            .try_get("ui.statusline.modified")
+            .or_else(|| model.theme.try_get("warning"));
 
-        for (idx, doc) in model.documents.iter().enumerate() {
-            // Add separator width if not the first document
-            if idx > 0 {
-                let sep = model.separator.as_str();
-                total_width += UnicodeWidthStr::width(sep) as u16;
-            }
-
-            let icons = ICONS.load();
-
-            // Modified state shown as a single `●` (1 cell) instead
-            // of the older `[+]` (3 cells) text marker. The dot is
-            // a known visual idiom for "unsaved" across many editors,
-            // takes less bufferline real estate, and we accent it
-            // separately at paint time so it stands out against the
-            // tab label even on themes that don't style modifiers.
-            let modified_suffix = if doc.is_modified { " ●" } else { "" };
-            let label = if doc.path.is_some() {
-                if let Some(icon) = icons.mime().get(doc.path, doc.language_name) {
-                    format!("{} {}{}", icon.glyph(), doc.label, modified_suffix)
+        let tabs: Vec<_> = model
+            .documents
+            .iter()
+            .map(|doc| {
+                let label = if doc.path.is_some() {
+                    if let Some(icon) = icons.mime().get(doc.path, doc.language_name) {
+                        format!("{} {}", icon.glyph(), doc.label)
+                    } else {
+                        doc.label.clone()
+                    }
                 } else {
-                    format!("{}{}", doc.label, modified_suffix)
+                    doc.label.clone()
+                };
+                let base_style = if model.current_doc == doc.id {
+                    bufferline_active
+                } else {
+                    bufferline_inactive
+                };
+                if doc.is_modified {
+                    let dot_style = base_style.patch(modified_accent.unwrap_or(base_style));
+                    Tab::cells([
+                        TabCell::new(format!(" {label} ")),
+                        TabCell::styled("●", dot_style),
+                        TabCell::new(" "),
+                    ])
+                    .style(base_style)
+                } else {
+                    Tab::new(label).style(base_style)
                 }
-            } else {
-                format!("{}{}", doc.label, modified_suffix)
-            };
-            let text = format!(" {label} ");
+            })
+            .collect();
 
-            self.bufferline_positions.push(total_width);
-            let text_width = UnicodeWidthStr::width(text.as_str()) as u16;
-            buffer_texts.push(text);
-            buffer_widths.push(text_width);
-            total_width += text_width;
-        }
-
-        // Determine scroll offset
-        let scroll_offset = if let Some(current_idx) = model
+        let active = model
             .documents
             .iter()
             .position(|doc| doc.id == model.current_doc)
-        {
-            if let Some(&target_x) = self.bufferline_positions.get(current_idx) {
-                if target_x >= viewport.width / 2 {
-                    target_x
-                        .saturating_sub(viewport.width / 2)
-                        .min(total_width.saturating_sub(viewport.width))
-                } else {
-                    0
-                }
-            } else {
-                0
-            }
-        } else {
-            0
-        };
-
-        // Second pass: render with the calculated offset
-        for (idx, doc) in model.documents.iter().enumerate() {
-            let buffer_x = self.bufferline_positions[idx];
-            let text = &buffer_texts[idx];
-
-            // Render separator if not first document
-            if idx > 0 {
-                let sep = model.separator.as_str();
-                let sep_x = buffer_x
-                    .saturating_sub(UnicodeWidthStr::width(sep) as u16)
-                    .saturating_sub(scroll_offset);
-                if sep_x < viewport.width {
-                    let render_x = viewport.x + sep_x;
-                    surface.set_stringn(
-                        render_x,
-                        viewport.y,
-                        sep,
-                        (viewport.width - sep_x) as usize,
-                        tui::ratatui::to_ratatui_style(bufferline_inactive),
-                    );
-                }
-            }
-
-            // Skip buffers that are completely outside the visible area
-            let render_x = buffer_x.saturating_sub(scroll_offset);
-            if render_x >= viewport.width {
-                break;
-            }
-
-            // Skip buffers that end before the visible area
-            if buffer_x + buffer_widths[idx] < scroll_offset {
-                continue;
-            }
-
-            let style = if model.current_doc == doc.id {
-                bufferline_active
-            } else {
-                bufferline_inactive
-            };
-
-            let mut visible_text = text.clone();
-            let mut text_start_x = render_x;
-
-            // Clip text if it starts before the visible area
-            if buffer_x < scroll_offset {
-                let chars_to_skip = (scroll_offset - buffer_x) as usize;
-                visible_text = text.chars().skip(chars_to_skip).collect();
-                text_start_x = viewport.x;
-            }
-
-            let actual_render_x = viewport.x + text_start_x;
-            let available_width = viewport.width.saturating_sub(text_start_x);
-
-            surface.set_stringn(
-                actual_render_x,
-                viewport.y,
-                &visible_text,
-                available_width as usize,
-                tui::ratatui::to_ratatui_style(style),
-            );
-
-            // Accent the modified-dot when present so it reads at a
-            // glance against the tab label. Falls back through
-            // `ui.statusline.modified` → `warning` → the base tab
-            // style so any theme yields a sensible color without a
-            // dedicated scope. We compute the dot's screen column by
-            // measuring the visible text (which may have been clipped
-            // from the left during horizontal scroll); if the dot
-            // itself was clipped out, the lookup returns out-of-bounds
-            // and we skip the overpaint.
-            if doc.is_modified {
-                let visible_width = UnicodeWidthStr::width(visible_text.as_str()) as u16;
-                // text is ` ... ● ` — the `●` sits at width-2 from
-                // the start (one cell of trailing space after it).
-                if visible_width >= 2 && visible_text.ends_with("● ") {
-                    let dot_x = actual_render_x + visible_width - 2;
-                    if dot_x < viewport.x + viewport.width {
-                        let accent = model
-                            .theme
-                            .try_get("ui.statusline.modified")
-                            .or_else(|| model.theme.try_get("warning"))
-                            .unwrap_or(style);
-                        surface.set_stringn(
-                            dot_x,
-                            viewport.y,
-                            "●",
-                            1,
-                            tui::ratatui::to_ratatui_style(style.patch(accent)),
-                        );
-                    }
-                }
-            }
-
-            // Track buffer info for mouse clicks (adjust for scroll offset)
-            let start_x = actual_render_x;
-            let end_x = (actual_render_x + UnicodeWidthStr::width(visible_text.as_str()) as u16)
-                .min(viewport.x + viewport.width);
-            self.bufferline_info.add_buffer_info(doc.id, start_x..end_x);
-        }
-
-        // Overflow chevrons — when the bufferline is wider than the
-        // viewport, paint `‹` and `›` at the edges so users notice
-        // there are more tabs to scroll to. Otherwise the only cue
-        // is the inactive label color trailing off, which is easy to
-        // miss with many buffers open. Chevrons sit in the muted
-        // chrome color so they read as affordances, not labels —
-        // and they overpaint the first/last cell of whatever tab
-        // text was there, which loses one character but gains the
-        // visibility cue (tabs are 5+ cells already).
-        let has_left_overflow = scroll_offset > 0;
-        let has_right_overflow = total_width.saturating_sub(scroll_offset) > viewport.width;
+            .unwrap_or(0);
         let chevron_style = bufferline_styles
             .inactive
             .patch(model.theme.try_get("ui.text.inactive").unwrap_or_default());
-        if has_left_overflow && viewport.width > 0 {
-            surface.set_stringn(
-                viewport.x,
-                viewport.y,
-                "‹",
-                1,
-                tui::ratatui::to_ratatui_style(chevron_style),
-            );
-        }
-        if has_right_overflow && viewport.width > 0 {
-            surface.set_stringn(
-                viewport.x + viewport.width - 1,
-                viewport.y,
-                "›",
-                1,
-                tui::ratatui::to_ratatui_style(chevron_style),
-            );
+        let state = tabs_with_options(
+            surface,
+            viewport,
+            &tabs,
+            TabsOptions::new(active)
+                .separator(model.separator.as_str())
+                .scroll_policy(TabsScrollPolicy::CenterActive),
+            TabsStyle {
+                background: bufferline_styles.background,
+                active: bufferline_active,
+                inactive: bufferline_inactive,
+                hover: Style::default(),
+                badge: bufferline_inactive,
+                separator: bufferline_inactive,
+                overflow: chevron_style,
+            },
+        );
+
+        for range in &state.tab_ranges {
+            if let Some(doc) = model.documents.get(range.index) {
+                self.bufferline_info.add_buffer_info(
+                    doc.id,
+                    viewport.x + range.visible.start..viewport.x + range.visible.end,
+                );
+            };
         }
     }
 
@@ -3446,8 +3320,8 @@ mod tests {
         };
         editor_view.draw_bufferline_model(&model, area, &mut surface);
 
-        let second_x = editor_view.bufferline_positions[1];
-        let third_x = editor_view.bufferline_positions[2];
+        let second_x = editor_view.bufferline_info.visible_buffers[1].columns.start;
+        let third_x = editor_view.bufferline_info.visible_buffers[2].columns.start;
         let row: String = (0..area.width)
             .map(|x| surface[(area.x + x, area.y)].symbol())
             .collect();
@@ -3455,38 +3329,38 @@ mod tests {
         assert_eq!(
             surface[(second_x - 1, 0)].symbol(),
             "│",
-            "row={row:?} positions={:?}",
-            editor_view.bufferline_positions
+            "row={row:?} ranges={:?}",
+            editor_view.bufferline_info.visible_buffers
         );
         assert_eq!(
             surface[(second_x, 0)].symbol(),
             " ",
-            "row={row:?} positions={:?}",
-            editor_view.bufferline_positions
+            "row={row:?} ranges={:?}",
+            editor_view.bufferline_info.visible_buffers
         );
         assert_eq!(
             surface[(second_x + 1, 0)].symbol(),
             "[",
-            "row={row:?} positions={:?}",
-            editor_view.bufferline_positions
+            "row={row:?} ranges={:?}",
+            editor_view.bufferline_info.visible_buffers
         );
         assert_eq!(
             surface[(third_x - 1, 0)].symbol(),
             "│",
-            "row={row:?} positions={:?}",
-            editor_view.bufferline_positions
+            "row={row:?} ranges={:?}",
+            editor_view.bufferline_info.visible_buffers
         );
         assert_eq!(
             surface[(third_x, 0)].symbol(),
             " ",
-            "row={row:?} positions={:?}",
-            editor_view.bufferline_positions
+            "row={row:?} ranges={:?}",
+            editor_view.bufferline_info.visible_buffers
         );
         assert_eq!(
             surface[(third_x + 1, 0)].symbol(),
             "[",
-            "row={row:?} positions={:?}",
-            editor_view.bufferline_positions
+            "row={row:?} ranges={:?}",
+            editor_view.bufferline_info.visible_buffers
         );
     }
 

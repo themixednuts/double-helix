@@ -1,7 +1,5 @@
 use helix_core::unicode::{segmentation::UnicodeSegmentation, width::UnicodeWidthStr};
 
-// Later migration candidate: widgets/picker_table.rs still has local cell truncation.
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TruncateAt {
     Start,

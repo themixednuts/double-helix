@@ -1,6 +1,7 @@
 use crate::compositor::{Component, Context, Event, EventResult, RenderContext};
 use crate::runtime::RuntimeTaskEvent;
 use crate::ui::gradient_border::GradientBorder;
+use crate::widgets::{Toast, ToastId, ToastQueue, ToastSeverity};
 use helix_core::unicode::width::UnicodeWidthStr;
 use helix_view::theme::Modifier;
 use helix_view::{
@@ -12,8 +13,11 @@ use helix_view::{
     graphics::{Color, Rect, Style},
     Theme,
 };
-use std::hash::{Hash, Hasher};
 use std::time::Instant;
+use std::{
+    collections::HashSet,
+    hash::{Hash, Hasher},
+};
 use tokio::time::sleep as tokio_sleep;
 
 // ---------------------------------------------------------------------------
@@ -22,6 +26,8 @@ use tokio::time::sleep as tokio_sleep;
 
 pub struct NotificationPopup {
     notifications: Vec<NotificationItem>,
+    queue: ToastQueue,
+    timeout_tasks: HashSet<usize>,
     gradient_border: Option<GradientBorder>,
     layout_thickness: u16,
     layout_rounded: bool,
@@ -58,6 +64,8 @@ impl NotificationPopup {
     pub fn new() -> Self {
         Self {
             notifications: Vec::new(),
+            queue: ToastQueue::default(),
+            timeout_tasks: HashSet::new(),
             gradient_border: None,
             layout_thickness: 1,
             layout_rounded: false,
@@ -79,6 +87,8 @@ impl NotificationPopup {
             || config.cmdline.style != CmdlineStyle::Popup
         {
             self.notifications.clear();
+            self.queue.dismiss_all();
+            self.timeout_tasks.clear();
             return;
         }
 
@@ -91,6 +101,11 @@ impl NotificationPopup {
                 .any(|n| n.id == item.notification.id && is_active(n));
             let is_expired = item.notification.is_expired();
             still_active && !is_expired
+        });
+        self.timeout_tasks.retain(|id| {
+            notifications
+                .iter()
+                .any(|notification| notification.id == *id)
         });
 
         for notification in notifications
@@ -107,7 +122,7 @@ impl NotificationPopup {
                 self.notifications
                     .push(NotificationItem::new(notification.clone()));
 
-                if let Some(timeout) = timeout_opt {
+                if let Some(timeout) = timeout_opt.filter(|_| self.timeout_tasks.insert(id)) {
                     let started = notification.timestamp;
                     let elapsed = started.elapsed();
                     let remaining = if timeout > elapsed {
@@ -129,6 +144,8 @@ impl NotificationPopup {
                 }
             }
         }
+        let toasts = self.toasts();
+        self.queue.sync(toasts.iter());
     }
 
     /// Sync state from editor and produce a native Ratatui render snapshot.
@@ -160,6 +177,7 @@ impl NotificationPopup {
             return None;
         }
 
+        self.apply_queue_layout(notifications_config);
         self.calculate_notification_areas(area, notifications_config);
 
         let model = NotificationModel::collect(self, config, cx.theme());
@@ -281,12 +299,45 @@ impl NotificationPopup {
             return;
         }
 
+        self.apply_queue_layout(notifications_config);
         self.calculate_notification_areas(area, notifications_config);
 
         let mut model = NotificationModel::collect(self, config, cx.theme());
         let items: Vec<NotificationRenderItem> = model.items.clone();
         for item in items.iter().rev() {
             render_notification(&mut model, item, surface);
+        }
+    }
+
+    fn toasts(&self) -> Vec<Toast<'static>> {
+        self.notifications
+            .iter()
+            .map(|item| {
+                Toast::new(
+                    item.notification.id,
+                    item.notification.message.clone(),
+                    toast_severity(item.notification.severity),
+                )
+            })
+            .collect()
+    }
+
+    fn max_visible(config: &NotificationConfig) -> usize {
+        (config.max_height / 3).max(1) as usize
+    }
+
+    fn apply_queue_layout(&mut self, config: &NotificationConfig) {
+        let toasts = self.toasts();
+        self.queue.sync(toasts.iter());
+        let state = self.queue.layout(&toasts, Self::max_visible(config));
+        self.notifications
+            .retain(|item| state.visible_ids.contains(&ToastId(item.notification.id)));
+        if state.overflow_count > 0 {
+            self.notifications
+                .push(NotificationItem::new(Notification::new(
+                    format!("+{} more notifications", state.overflow_count),
+                    Severity::Info,
+                )));
         }
     }
 }
@@ -729,6 +780,15 @@ fn notification_emoji<'a>(severity: &Severity, config: &'a NotificationEmojis) -
         Severity::Error => &config.error,
         Severity::Warning => &config.warning,
         Severity::Info | Severity::Hint => &config.info,
+    }
+}
+
+fn toast_severity(severity: Severity) -> ToastSeverity {
+    match severity {
+        Severity::Error => ToastSeverity::Error,
+        Severity::Warning => ToastSeverity::Warning,
+        Severity::Info => ToastSeverity::Info,
+        Severity::Hint => ToastSeverity::Hint,
     }
 }
 

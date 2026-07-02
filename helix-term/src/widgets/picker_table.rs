@@ -1,14 +1,16 @@
 //! Runtime picker table rendering.
 //!
 //! The picker controller builds rows and headers; this widget owns the terminal
-//! rendering details for column sizing, selection symbols, and start truncation.
+//! rendering details for column sizing, selection symbols, and truncation.
 
-use helix_core::unicode::{segmentation::UnicodeSegmentation, width::UnicodeWidthStr};
+use helix_core::unicode::width::UnicodeWidthStr;
 use helix_view::graphics::{Rect, Style};
 use tui::{
     ratatui::layout::{Constraint, Direction as TuiDirection, Layout as TuiLayout},
-    text::Spans,
+    text::{Span, Spans},
 };
+
+use crate::ui::text_layout::{self, TruncateAt};
 
 use super::{TableCell, TableRow};
 
@@ -72,55 +74,39 @@ fn set_spans_truncated_start(
         return surface.set_line(x, y, &tui::ratatui::to_ratatui_line(spans), available);
     }
 
-    {
-        if let Some(cell) = surface.cell_mut((x, y)) {
-            cell.set_symbol("…");
-            cell.set_style(tui::ratatui::to_ratatui_style(ellipsis_style));
-        }
-    };
-    let mut remaining = available.saturating_sub(1) as usize;
-    if remaining == 0 {
-        return (x.saturating_add(1), y);
-    }
-
-    let mut graphemes = Vec::new();
-    'spans: for span in spans.0.iter().rev() {
-        for grapheme in span.content.graphemes(true).rev() {
-            let grapheme_width = grapheme.width();
-            if grapheme_width == 0 {
-                continue;
-            }
-            if grapheme_width > remaining {
-                break 'spans;
-            }
-            graphemes.push((grapheme, span.style));
-            remaining -= grapheme_width;
-            if remaining == 0 {
-                break 'spans;
-            }
-        }
-    }
-
-    let mut next_x = x.saturating_add(1);
-    for (grapheme, style) in graphemes.into_iter().rev() {
-        let grapheme_width = grapheme.width();
-        {
-            if let Some(cell) = surface.cell_mut((next_x, y)) {
-                cell.set_symbol(grapheme);
-                cell.set_style(tui::ratatui::to_ratatui_style(style));
-            }
-        };
-        for dx in 1..grapheme_width {
-            {
-                if let Some(cell) = surface.cell_mut((next_x.saturating_add(dx as u16), y)) {
-                    cell.reset();
+    let plain = spans
+        .0
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect::<String>();
+    let truncated = text_layout::truncate(&plain, available as usize, TruncateAt::Start);
+    let mut styled = Vec::new();
+    if let Some(rest) = truncated.strip_prefix('…') {
+        styled.push(Span::styled("…".to_string(), ellipsis_style));
+        let mut remaining = rest;
+        for span in spans.0.iter().rev() {
+            let content = span.content.as_ref();
+            if remaining.ends_with(content) {
+                styled.push(Span::styled(content.to_string(), span.style));
+                remaining = &remaining[..remaining.len().saturating_sub(content.len())];
+                if remaining.is_empty() {
+                    break;
                 }
-            };
+            } else if let Some(start) = content.rfind(remaining) {
+                styled.push(Span::styled(content[start..].to_string(), span.style));
+                break;
+            }
         }
-        next_x = next_x.saturating_add(grapheme_width as u16);
+        styled[1..].reverse();
+    } else {
+        styled.push(Span::styled(truncated, ellipsis_style));
     }
-
-    (next_x, y)
+    surface.set_line(
+        x,
+        y,
+        &tui::ratatui::to_ratatui_line(&Spans::from(styled)),
+        available,
+    )
 }
 
 fn render_picker_cell(
@@ -354,5 +340,40 @@ mod tests {
         .render(Rect::new(0, 0, 20, 3), &mut surface);
 
         assert_eq!(surface[(5, 0)].symbol(), "N");
+    }
+
+    #[test]
+    fn start_truncation_matches_text_layout_for_cjk() {
+        let mut surface = Buffer::empty(RatatuiRect::new(0, 0, 8, 1));
+        let widths = [Constraint::Length(8)];
+
+        PickerTable {
+            rows: vec![TableRow::new(["src/界面/文件.rs"])],
+            header: None,
+            widths: &widths,
+            text_style: Style::default(),
+            placeholder_style: Style::default(),
+            selected_style: Style::default(),
+            header_style: Style::default(),
+            highlight_symbol: "",
+            selected_row: None,
+            truncate_start: true,
+        }
+        .render(Rect::new(0, 0, 8, 1), &mut surface);
+
+        let expected = text_layout::truncate("src/界面/文件.rs", 8, TruncateAt::Start);
+        let mut rendered = String::new();
+        let mut previous_wide = false;
+        for x in 0..8 {
+            let symbol = surface[(x, 0)].symbol();
+            if symbol == " " && previous_wide {
+                previous_wide = false;
+                continue;
+            }
+            previous_wide = symbol.width() > 1;
+            rendered.push_str(symbol);
+        }
+        let rendered = rendered.trim_end().to_string();
+        assert_eq!(rendered, expected);
     }
 }

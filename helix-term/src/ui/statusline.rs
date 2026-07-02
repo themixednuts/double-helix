@@ -48,16 +48,18 @@ impl StatuslineModel {
     ) -> Self {
         let cursor = doc.cursor_status(view.id);
         let selection = doc.selection_status(view.id);
-        let spinner_frame = doc
-            .language_servers()
-            .next()
+        let first_server = doc.language_servers().next().map(|server| server.id());
+        let spinner_frame = first_server
             .and_then(|server| {
                 context
                     .spinners
-                    .get(server.id())
+                    .get(server)
                     .and_then(|spinner| spinner.frame())
             })
             .unwrap_or(" ");
+        let lsp_progress = first_server
+            .and_then(|server| context.spinners.get(server))
+            .and_then(|spinner| spinner.progress());
         // Pre-collect language-server names so the LspStatus
         // element doesn't have to thread the live editor through
         // the render path. Iteration order is attach order — for
@@ -91,6 +93,7 @@ impl StatuslineModel {
                 diagnostics: doc.diagnostic_counts(),
                 workspace_diagnostics: context.workspace_diagnostics,
                 spinner_frame: Cow::Borrowed(spinner_frame),
+                lsp_progress,
                 current_working_directory,
                 function_name,
                 lsp_server_names,
@@ -371,6 +374,42 @@ fn render_lsp_spinner<'a, F>(statusline: &mut Statusline<'a>, write: F)
 where
     F: Fn(&mut Statusline<'a>, Span<'a>) + Copy,
 {
+    if let Some(progress) = statusline.model.snapshot.lsp_progress {
+        let width = 6;
+        let state = crate::widgets::progress_fill(width, progress as f32 / 100.0);
+        let mut bar = String::with_capacity(width as usize);
+        for i in 0..width {
+            let glyph = if i < state.filled_cells {
+                "█"
+            } else if i == state.filled_cells && state.partial_eighths > 0 {
+                match state.partial_eighths {
+                    1 => "▏",
+                    2 => "▎",
+                    3 => "▍",
+                    4 => "▌",
+                    5 => "▋",
+                    6 => "▊",
+                    7 => "▉",
+                    _ => "█",
+                }
+            } else {
+                " "
+            };
+            bar.push_str(glyph);
+        }
+        let style = statusline
+            .model
+            .theme
+            .try_get("ui.statusline.progress")
+            .or_else(|| statusline.model.theme.try_get("info"))
+            .unwrap_or_else(|| statusline.model.theme.get("ui.statusline"));
+        write(
+            statusline,
+            themed_span(format!(" {bar} {progress:>3}% "), style),
+        );
+        return;
+    }
+
     write(
         statusline,
         statusline

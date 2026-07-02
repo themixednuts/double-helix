@@ -399,7 +399,6 @@ impl Markdown {
     const BLOCK_STYLE: &'static str = "markup.raw.inline";
     const RULE_STYLE: &'static str = "punctuation.special";
     const UNNUMBERED_LIST_STYLE: &'static str = "markup.list.unnumbered";
-    const NUMBERED_LIST_STYLE: &'static str = "markup.list.numbered";
     const HEADING_STYLES: [&'static str; 6] = [
         "markup.heading.1",
         "markup.heading.2",

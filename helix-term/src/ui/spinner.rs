@@ -21,6 +21,7 @@ impl ProgressSpinners {
 pub struct Spinner {
     inner: crate::widgets::Spinner,
     running: bool,
+    progress: Option<u8>,
 }
 
 impl Spinner {
@@ -28,6 +29,7 @@ impl Spinner {
         Self {
             inner: crate::widgets::Spinner::dots(Duration::from_millis(interval)),
             running: false,
+            progress: None,
         }
     }
 
@@ -35,6 +37,7 @@ impl Spinner {
         Self {
             inner: crate::widgets::Spinner::new(frames, Duration::from_millis(interval)),
             running: false,
+            progress: None,
         }
     }
 }
@@ -55,8 +58,17 @@ impl Spinner {
         self.running.then(|| self.inner.frame())
     }
 
+    pub fn set_progress(&mut self, progress: Option<u8>) {
+        self.progress = progress.map(|progress| progress.min(100));
+    }
+
+    pub fn progress(&self) -> Option<u8> {
+        self.running.then_some(self.progress).flatten()
+    }
+
     pub fn stop(&mut self) {
         self.running = false;
+        self.progress = None;
     }
 
     pub fn is_stopped(&self) -> bool {

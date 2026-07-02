@@ -55,10 +55,6 @@ impl Hover {
         self.contents.len() > 1
     }
 
-    fn content_markdown(&self) -> &(Option<Markdown>, Markdown) {
-        &self.contents[self.active_index]
-    }
-
     pub fn content_string(&self) -> String {
         self.contents
             .iter()

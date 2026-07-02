@@ -66,7 +66,10 @@ pub use spinner::Spinner;
 pub use style::WidgetStyle;
 pub use surface::{draw_string_anchored, AnchoredText};
 pub use table::{TableCell, TableRow};
-pub use tabs::{tabs, tabs_layout, Tab, TabsState, TabsStyle};
+pub use tabs::{
+    tabs, tabs_layout, tabs_layout_with_options, tabs_with_options, Tab, TabCell, TabRange,
+    TabsOptions, TabsScrollPolicy, TabsState, TabsStyle,
+};
 pub use text_input::{text_input, TextInputState};
 pub use toast::{
     toast_queue, Toast, ToastId, ToastQueue, ToastQueueState, ToastSeverity, ToastStyle,

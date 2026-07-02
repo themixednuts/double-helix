@@ -2,9 +2,11 @@ use crate::{
     compositor::Compositor,
     runtime::{ui::command::PluginCommand, RuntimeTaskEvent},
 };
-use helix_plugin::contract::DynamicValue;
+use helix_plugin::contract::requests::{NotifyLevel, PanelSizeSpec};
 use helix_plugin::contract::UiCallbackToken;
+use helix_plugin::contract::{adapt, DynamicValue, PanelHandle};
 use helix_plugin::PluginManager;
+use helix_view::model::PanelSize;
 
 fn deliver_plugin_ui_callback(
     ingress: &crate::runtime::RuntimeIngress,
@@ -12,6 +14,19 @@ fn deliver_plugin_ui_callback(
     value: DynamicValue,
 ) {
     ingress.task(RuntimeTaskEvent::DeliverPluginUiCallback { callback, value });
+}
+
+fn plugin_panel_id(
+    editor: &helix_view::Editor,
+    panel: PanelHandle,
+) -> Option<helix_view::model::PanelId> {
+    match adapt::resolve_panel(&editor.model, panel) {
+        Ok(id) => Some(id),
+        Err(err) => {
+            log::warn!("dropping stale plugin panel UI command for {panel}: {err}");
+            None
+        }
+    }
 }
 
 pub(crate) fn apply_plugin_command(
@@ -22,6 +37,11 @@ pub(crate) fn apply_plugin_command(
     cmd: PluginCommand,
 ) {
     match cmd {
+        PluginCommand::Notify { level, message } => match level {
+            NotifyLevel::Info => editor.set_status(message),
+            NotifyLevel::Warn => editor.set_status(format!("Warning: {message}")),
+            NotifyLevel::Error => editor.set_error(message),
+        },
         PluginCommand::Prompt { request, callback } => {
             let prompt = crate::ui::Prompt::new(
                 request.message.into(),
@@ -101,6 +121,39 @@ pub(crate) fn apply_plugin_command(
         PluginCommand::RemovePanel { panel } => {
             let target_id = crate::ui::plugin_panel::component_id(panel);
             compositor.remove_by_id(&target_id);
+        }
+        PluginCommand::UpdatePanel { panel, title } => {
+            let Some(panel_id) = plugin_panel_id(editor, panel) else {
+                return;
+            };
+            if let Some(panel) = editor.model.panels.get_mut(panel_id) {
+                if let Some(title) = title {
+                    panel.title = title;
+                }
+            }
+        }
+        PluginCommand::TogglePanel { panel } => {
+            let Some(panel_id) = plugin_panel_id(editor, panel) else {
+                return;
+            };
+            let _ = editor.model.toggle_panel(panel_id);
+        }
+        PluginCommand::FocusPanel { panel } => {
+            let Some(panel_id) = plugin_panel_id(editor, panel) else {
+                return;
+            };
+            editor.model.focus_panel(panel_id);
+        }
+        PluginCommand::ResizePanel { panel, size } => {
+            let Some(panel_id) = plugin_panel_id(editor, panel) else {
+                return;
+            };
+            if let Some(panel) = editor.model.panels.get_mut(panel_id) {
+                panel.size = match size {
+                    PanelSizeSpec::Fixed(cells) => PanelSize::fixed(cells),
+                    PanelSizeSpec::Percent(percent) => PanelSize::Percent(percent),
+                };
+            }
         }
     }
 }

@@ -57,16 +57,11 @@ pub struct TermUiHost {
 
 impl PluginUiHost for TermUiHost {
     fn notify(&mut self, req: NotifyRequest) -> ContractResult<()> {
-        with_editor_mut(|editor| {
-            match req.level {
-                contract_requests::NotifyLevel::Info => editor.set_status(req.message),
-                contract_requests::NotifyLevel::Warn => {
-                    editor.set_status(format!("Warning: {}", req.message));
-                }
-                contract_requests::NotifyLevel::Error => editor.set_error(req.message),
-            }
-            Ok(())
-        })
+        self.sender.ui(UiCommand::Plugin(PluginCommand::Notify {
+            level: req.level,
+            message: req.message,
+        }));
+        Ok(())
     }
 
     fn prompt(
@@ -167,18 +162,13 @@ impl PluginPanelHost for TermPanelHost {
 
     fn update_panel(&mut self, plugin: PluginId, req: PanelUpdateRequest) -> ContractResult<()> {
         self.ensure_panel_owner(plugin, req.panel)?;
-        with_editor_mut(|editor| {
-            let panel_id = adapt::resolve_panel(&editor.model, req.panel)?;
-            let panel = editor
-                .model
-                .panels
-                .get_mut(panel_id)
-                .ok_or_else(|| ContractError::stale_handle(req.panel.to_string()))?;
-            if let Some(title) = req.title {
-                panel.title = title;
-            }
-            Ok(())
-        })
+        self.ensure_panel_exists(req.panel)?;
+        self.sender
+            .ui(UiCommand::Plugin(PluginCommand::UpdatePanel {
+                panel: req.panel,
+                title: req.title,
+            }));
+        Ok(())
     }
 
     fn close_panel(&mut self, plugin: PluginId, req: PanelCloseRequest) -> ContractResult<()> {
@@ -199,14 +189,12 @@ impl PluginPanelHost for TermPanelHost {
 
     fn toggle_panel(&mut self, plugin: PluginId, req: TogglePanelRequest) -> ContractResult<()> {
         self.ensure_panel_owner(plugin, req.panel)?;
-        with_editor_mut(|editor| {
-            let panel_id = adapt::resolve_panel(&editor.model, req.panel)?;
-            editor
-                .model
-                .toggle_panel(panel_id)
-                .ok_or_else(|| ContractError::stale_handle(req.panel.to_string()))?;
-            Ok(())
-        })
+        self.ensure_panel_exists(req.panel)?;
+        self.sender
+            .ui(UiCommand::Plugin(PluginCommand::TogglePanel {
+                panel: req.panel,
+            }));
+        Ok(())
     }
 
     fn focus_panel(
@@ -215,32 +203,22 @@ impl PluginPanelHost for TermPanelHost {
         req: contract_requests::FocusPanelRequest,
     ) -> ContractResult<()> {
         self.ensure_panel_owner(plugin, req.panel)?;
-        with_editor_mut(|editor| {
-            let panel_id = adapt::resolve_panel(&editor.model, req.panel)?;
-            editor.model.focus_panel(panel_id);
-            Ok(())
-        })
+        self.ensure_panel_exists(req.panel)?;
+        self.sender.ui(UiCommand::Plugin(PluginCommand::FocusPanel {
+            panel: req.panel,
+        }));
+        Ok(())
     }
 
     fn resize_panel(&mut self, plugin: PluginId, req: ResizePanelRequest) -> ContractResult<()> {
         self.ensure_panel_owner(plugin, req.panel)?;
-        with_editor_mut(|editor| {
-            let panel_id = adapt::resolve_panel(&editor.model, req.panel)?;
-            let panel = editor
-                .model
-                .panels
-                .get_mut(panel_id)
-                .ok_or_else(|| ContractError::stale_handle(req.panel.to_string()))?;
-            panel.size = match req.size {
-                contract_requests::PanelSizeSpec::Fixed(cells) => {
-                    helix_view::model::PanelSize::fixed(cells)
-                }
-                contract_requests::PanelSizeSpec::Percent(percent) => {
-                    helix_view::model::PanelSize::Percent(percent)
-                }
-            };
-            Ok(())
-        })
+        self.ensure_panel_exists(req.panel)?;
+        self.sender
+            .ui(UiCommand::Plugin(PluginCommand::ResizePanel {
+                panel: req.panel,
+                size: req.size,
+            }));
+        Ok(())
     }
 
     fn list_panels(&self) -> Vec<helix_plugin::contract::snapshots::PanelSnapshot> {
@@ -271,6 +249,13 @@ impl TermPanelHost {
             Some(_) => Err(permission_denied(plugin, panel)),
             None => Err(ContractError::stale_handle(panel.to_string())),
         }
+    }
+
+    fn ensure_panel_exists(&self, panel: PanelHandle) -> ContractResult<()> {
+        with_editor(|editor| {
+            adapt::resolve_panel(&editor.model, panel)?;
+            Ok(())
+        })
     }
 }
 
@@ -905,6 +890,98 @@ mod tests {
         assert!(adapt::resolve_panel(&editor.model, panel).is_ok());
     }
 
+    #[tokio::test]
+    async fn panel_host_enqueues_typed_panel_mutations() {
+        let (sender, mut receiver) = test_runtime_ingress();
+        let mut host = TermPanelHost {
+            sender,
+            panel_owners: HashMap::new(),
+        };
+        let mut editor = test_editor();
+
+        let panel = helix_plugin::lua::with_editor_context(&mut editor, || {
+            host.register_panel(
+                plugin_id(),
+                contract_requests::PanelRegistration {
+                    title: "Plugin".into(),
+                    side: contract_requests::PanelSide::Right,
+                    size: Some(contract_requests::PanelSizeSpec::Fixed(30)),
+                    hidden: false,
+                },
+            )
+        })
+        .expect("register panel");
+        let _ = receiver.try_recv().expect("push panel event");
+
+        helix_plugin::lua::with_editor_context(&mut editor, || {
+            host.update_panel(
+                plugin_id(),
+                PanelUpdateRequest {
+                    panel,
+                    title: Some("Renamed".into()),
+                },
+            )
+        })
+        .expect("update panel");
+        match receiver.try_recv().expect("update panel event") {
+            RuntimeDelivery::Ui(UiCommand::Plugin(PluginCommand::UpdatePanel {
+                panel: updated,
+                title,
+            })) => {
+                assert_eq!(updated, panel);
+                assert_eq!(title.as_deref(), Some("Renamed"));
+            }
+            _ => panic!("expected typed update panel command"),
+        }
+
+        helix_plugin::lua::with_editor_context(&mut editor, || {
+            host.toggle_panel(plugin_id(), TogglePanelRequest { panel })
+        })
+        .expect("toggle panel");
+        match receiver.try_recv().expect("toggle panel event") {
+            RuntimeDelivery::Ui(UiCommand::Plugin(PluginCommand::TogglePanel {
+                panel: toggled,
+            })) => {
+                assert_eq!(toggled, panel);
+            }
+            _ => panic!("expected typed toggle panel command"),
+        }
+
+        helix_plugin::lua::with_editor_context(&mut editor, || {
+            host.focus_panel(plugin_id(), contract_requests::FocusPanelRequest { panel })
+        })
+        .expect("focus panel");
+        match receiver.try_recv().expect("focus panel event") {
+            RuntimeDelivery::Ui(UiCommand::Plugin(PluginCommand::FocusPanel {
+                panel: focused,
+            })) => {
+                assert_eq!(focused, panel);
+            }
+            _ => panic!("expected typed focus panel command"),
+        }
+
+        helix_plugin::lua::with_editor_context(&mut editor, || {
+            host.resize_panel(
+                plugin_id(),
+                ResizePanelRequest {
+                    panel,
+                    size: contract_requests::PanelSizeSpec::Percent(40),
+                },
+            )
+        })
+        .expect("resize panel");
+        match receiver.try_recv().expect("resize panel event") {
+            RuntimeDelivery::Ui(UiCommand::Plugin(PluginCommand::ResizePanel {
+                panel: resized,
+                size,
+            })) => {
+                assert_eq!(resized, panel);
+                assert_eq!(size, contract_requests::PanelSizeSpec::Percent(40));
+            }
+            _ => panic!("expected typed resize panel command"),
+        }
+    }
+
     #[test]
     fn ui_host_enqueues_contract_ui_requests() {
         let (sender, mut receiver) = test_runtime_ingress();
@@ -912,6 +989,19 @@ mod tests {
             sender,
             next_callback_id: std::sync::atomic::AtomicU64::new(1),
         };
+
+        host.notify(NotifyRequest {
+            level: contract_requests::NotifyLevel::Warn,
+            message: "Careful".into(),
+        })
+        .expect("enqueue notification");
+        match receiver.try_recv().expect("notify event") {
+            RuntimeDelivery::Ui(UiCommand::Plugin(PluginCommand::Notify { level, message })) => {
+                assert_eq!(level, contract_requests::NotifyLevel::Warn);
+                assert_eq!(message, "Careful");
+            }
+            _ => panic!("expected plugin notify command"),
+        }
 
         let prompt = host
             .prompt(

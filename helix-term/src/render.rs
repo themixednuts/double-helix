@@ -212,10 +212,19 @@ impl<'a> Iterator for RenderCellRuns<'a> {
     type Item = RenderCellRun<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let area = self.output.area;
+        let area = self
+            .output
+            .area
+            .intersection(tui::ratatui::to_helix_rect(*self.output.surface.area()));
         let surface_area = *self.output.surface.area();
         if area.width == 0 || surface_area.width == 0 {
             return None;
+        }
+        if self.y < area.top() {
+            self.y = area.top();
+        }
+        if self.x < area.left() {
+            self.x = area.left();
         }
 
         while self.y < area.bottom() {
@@ -756,5 +765,20 @@ mod tests {
         run.write_text(&mut text);
 
         assert_eq!(text, "ab");
+    }
+
+    #[test]
+    fn render_output_cell_runs_clamps_to_surface_area() {
+        let mut output = RenderOutput::new(Rect::new(0, 0, 4, 1));
+        *output.surface_mut() = CellSurface::empty(tui::ratatui::layout::Rect::new(0, 0, 2, 1));
+        output.surface_mut()[(0, 0)].set_symbol("a");
+        output.surface_mut()[(1, 0)].set_symbol("b");
+
+        let runs = output.cell_runs().collect::<Vec<_>>();
+
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].x, 0);
+        assert_eq!(runs[0].width, 2);
+        assert_eq!(runs[0].symbols().collect::<Vec<_>>(), ["a", "b"]);
     }
 }

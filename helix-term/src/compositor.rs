@@ -49,6 +49,7 @@ use std::sync::Arc;
 mod render_frame;
 pub use render_frame::{RenderContext, RenderSnapshot};
 
+/// Typed requests emitted by components after handling an event.
 pub enum PostAction {
     PopLayer {
         model_layer: Option<helix_view::model::LayerId>,
@@ -73,6 +74,54 @@ pub enum PostAction {
         pop_macro_replaying: bool,
     },
     Batch(Vec<PostAction>),
+}
+
+impl std::fmt::Debug for PostAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PopLayer {
+                model_layer,
+                remember_picker,
+            } => f
+                .debug_struct("PopLayer")
+                .field("model_layer", model_layer)
+                .field("remember_picker", remember_picker)
+                .finish(),
+            Self::RemoveById(id) => f.debug_tuple("RemoveById").field(id).finish(),
+            Self::PushLayer(layer) => f
+                .debug_struct("PushLayer")
+                .field("id", &layer.id())
+                .field("type", &layer.type_name())
+                .finish(),
+            Self::ReplaceOrPushLayer { id, layer } => f
+                .debug_struct("ReplaceOrPushLayer")
+                .field("id", id)
+                .field("layer_id", &layer.id())
+                .field("layer_type", &layer.type_name())
+                .finish(),
+            Self::UpdateCompletionFilter(c) => {
+                f.debug_tuple("UpdateCompletionFilter").field(c).finish()
+            }
+            Self::ClearCompletion => f.write_str("ClearCompletion"),
+            Self::ShowCommandPalette { register, count } => f
+                .debug_struct("ShowCommandPalette")
+                .field("register", register)
+                .field("count", count)
+                .finish(),
+            Self::RestoreLastPicker => f.write_str("RestoreLastPicker"),
+            Self::ReplayKeys {
+                keys,
+                count,
+                pop_macro_replaying,
+            } => f
+                .debug_struct("ReplayKeys")
+                .field("keys", keys)
+                .field("count", count)
+                .field("pop_macro_replaying", pop_macro_replaying)
+                .finish(),
+            Self::Batch(actions) => f.debug_tuple("Batch").field(actions).finish(),
+        }
+    }
 }
 
 // Cursive-inspired
@@ -403,11 +452,6 @@ pub trait Component: Any + Send {
     }
     // , args: ()
 
-    /// Should redraw? Useful for saving redraw cycles if we know component didn't change.
-    fn should_update(&self) -> bool {
-        true
-    }
-
     /// Sync component state to `editor.model`. Called by the compositor
     /// before layout computation and rendering, so Model is always up-to-date
     /// when layout and render functions read it.
@@ -704,7 +748,7 @@ impl Compositor {
         }
 
         for action in post_actions {
-            self.apply_post_action(cx, action);
+            apply_post_action(self, cx, action);
         }
 
         consumed
@@ -766,84 +810,6 @@ impl Compositor {
                             was,
                         );
                     }
-                }
-            }
-        }
-    }
-
-    fn apply_post_action(&mut self, cx: &mut Context, action: PostAction) {
-        match action {
-            PostAction::PopLayer {
-                model_layer,
-                remember_picker,
-            } => {
-                if remember_picker {
-                    self.last_picker = self.pop();
-                } else {
-                    self.pop();
-                }
-                if let Some(id) = model_layer {
-                    cx.editor.model.remove_layer(id);
-                }
-            }
-            PostAction::RemoveById(id) => {
-                self.remove(id);
-            }
-            PostAction::PushLayer(layer) => self.push(layer),
-            PostAction::ReplaceOrPushLayer { id, layer } => {
-                self.remove(id);
-                self.push(layer);
-            }
-            PostAction::UpdateCompletionFilter(c) => {
-                let editor_view = self.find::<crate::ui::EditorView>().unwrap();
-                if let Some(completion) = &mut editor_view.completion {
-                    completion.update_filter(c);
-                    if completion.is_empty()
-                        || c.is_some_and(|c| !helix_core::chars::char_is_word(c))
-                    {
-                        editor_view.clear_completion(cx.editor);
-                        if c.is_some() {
-                            crate::handlers::completion::trigger_auto_completion(cx.editor, false);
-                        }
-                    } else {
-                        crate::ui::completion_ingress::request_incomplete_completion_list(
-                            cx.editor,
-                            cx.ingress.clone(),
-                        );
-                    }
-                }
-            }
-            PostAction::ClearCompletion => {
-                let editor_view = self.find::<crate::ui::EditorView>().unwrap();
-                editor_view.clear_completion(cx.editor);
-            }
-            PostAction::ShowCommandPalette { register, count } => {
-                crate::commands::show_command_palette(self, cx, register, count);
-            }
-            PostAction::RestoreLastPicker => {
-                if let Some(picker) = self.last_picker.take() {
-                    self.push(picker);
-                } else {
-                    cx.editor.set_error("no last picker")
-                }
-            }
-            PostAction::ReplayKeys {
-                keys,
-                count,
-                pop_macro_replaying,
-            } => {
-                for _ in 0..count {
-                    for key in &keys {
-                        self.handle_event(&Event::Key(*key), cx);
-                    }
-                }
-                if pop_macro_replaying {
-                    cx.editor.macro_replaying.pop();
-                }
-            }
-            PostAction::Batch(actions) => {
-                for action in actions {
-                    self.apply_post_action(cx, action);
                 }
             }
         }
@@ -1244,6 +1210,82 @@ impl crate::host::UiHost for Compositor {
     }
 }
 
+pub(crate) fn apply_post_action(compositor: &mut Compositor, cx: &mut Context, action: PostAction) {
+    match action {
+        PostAction::PopLayer {
+            model_layer,
+            remember_picker,
+        } => {
+            if remember_picker {
+                compositor.last_picker = compositor.pop();
+            } else {
+                compositor.pop();
+            }
+            if let Some(id) = model_layer {
+                cx.editor.model.remove_layer(id);
+            }
+        }
+        PostAction::RemoveById(id) => {
+            compositor.remove(id);
+        }
+        PostAction::PushLayer(layer) => compositor.push(layer),
+        PostAction::ReplaceOrPushLayer { id, layer } => {
+            compositor.remove(id);
+            compositor.push(layer);
+        }
+        PostAction::UpdateCompletionFilter(c) => {
+            let editor_view = compositor.find::<crate::ui::EditorView>().unwrap();
+            if let Some(completion) = &mut editor_view.completion {
+                completion.update_filter(c);
+                if completion.is_empty() || c.is_some_and(|c| !helix_core::chars::char_is_word(c)) {
+                    editor_view.clear_completion(cx.editor);
+                    if c.is_some() {
+                        crate::handlers::completion::trigger_auto_completion(cx.editor, false);
+                    }
+                } else {
+                    crate::ui::completion_ingress::request_incomplete_completion_list(
+                        cx.editor,
+                        cx.ingress.clone(),
+                    );
+                }
+            }
+        }
+        PostAction::ClearCompletion => {
+            let editor_view = compositor.find::<crate::ui::EditorView>().unwrap();
+            editor_view.clear_completion(cx.editor);
+        }
+        PostAction::ShowCommandPalette { register, count } => {
+            crate::commands::show_command_palette(compositor, cx, register, count);
+        }
+        PostAction::RestoreLastPicker => {
+            if let Some(picker) = compositor.last_picker.take() {
+                compositor.push(picker);
+            } else {
+                cx.editor.set_error("no last picker")
+            }
+        }
+        PostAction::ReplayKeys {
+            keys,
+            count,
+            pop_macro_replaying,
+        } => {
+            for _ in 0..count {
+                for key in &keys {
+                    compositor.handle_event(&Event::Key(*key), cx);
+                }
+            }
+            if pop_macro_replaying {
+                cx.editor.macro_replaying.pop();
+            }
+        }
+        PostAction::Batch(actions) => {
+            for action in actions {
+                apply_post_action(compositor, cx, action);
+            }
+        }
+    }
+}
+
 // Downcasting via trait upcasting (stable since Rust 1.76).
 // `Component: Any` allows `&dyn Component` → `&dyn Any` coercion,
 // eliminating the need for a separate `AnyComponent` trait.
@@ -1268,7 +1310,10 @@ impl dyn Component {
     /// ```rust
     /// use helix_term::{ui::Text, compositor::Component};
     /// let boxed: Box<dyn Component> = Box::new(Text::new("text".to_string()));
-    /// let text: Box<Text> = boxed.downcast().unwrap();
+    /// let text: Box<Text> = match boxed.downcast() {
+    ///     Ok(text) => text,
+    ///     Err(_) => unreachable!("boxed component is Text"),
+    /// };
     /// ```
     pub fn downcast<T: Any>(self: Box<Self>) -> Result<Box<T>, Box<Self>> {
         if (self.as_ref() as &dyn Any).is::<T>() {
@@ -1450,6 +1495,86 @@ mod tests {
 
         assert_eq!(output.area(), area);
         assert_eq!(output.surface()[(0, 0)].symbol(), "f");
+    }
+
+    #[tokio::test]
+    async fn apply_post_action_dispatches_layer_requests() {
+        struct Probe(&'static str);
+
+        impl Component for Probe {
+            fn id(&self) -> Option<&str> {
+                Some(self.0)
+            }
+
+            fn render(
+                &mut self,
+                _area: Rect,
+                _surface: &mut crate::render::CellSurface,
+                _cx: &RenderContext,
+            ) {
+            }
+        }
+
+        let mut editor = test_editor(20, 10);
+        editor.macro_replaying.push('@');
+        let runtime = helix_runtime::test::runtime();
+        let (ingress, _rx) = crate::runtime::RuntimeIngress::channel(runtime.work().clone());
+        let (plugin_events, _plugin_events_rx) = helix_runtime::channel(1);
+        let idle_reset = crate::runtime::IdleResetGate::new().handle();
+        let redraw = editor.redraw_handle();
+        let notifier = crate::handlers::local::Notifier {
+            redraw: redraw.clone(),
+            plugin_events,
+        };
+        let mut exit_tasks = crate::runtime::ExitTaskSet::default();
+        let exit_task_work = editor.work();
+        let area = Rect::new(0, 0, 20, 10);
+        let mut compositor = Compositor::new(area);
+        let mut cx = Context::new(
+            &mut editor,
+            &mut exit_tasks,
+            exit_task_work,
+            notifier,
+            ingress,
+            idle_reset,
+            None,
+        );
+
+        apply_post_action(
+            &mut compositor,
+            &mut cx,
+            PostAction::Batch(vec![
+                PostAction::PushLayer(Box::new(Probe("old"))),
+                PostAction::ReplaceOrPushLayer {
+                    id: "old",
+                    layer: Box::new(Probe("new")),
+                },
+                PostAction::RemoveById("missing"),
+                PostAction::ReplayKeys {
+                    keys: Vec::new(),
+                    count: 2,
+                    pop_macro_replaying: true,
+                },
+            ]),
+        );
+
+        assert!(compositor.find_id::<Probe>("old").is_none());
+        assert!(compositor.find_id::<Probe>("new").is_some());
+        assert!(cx.editor.macro_replaying.is_empty());
+
+        apply_post_action(
+            &mut compositor,
+            &mut cx,
+            PostAction::PopLayer {
+                model_layer: None,
+                remember_picker: true,
+            },
+        );
+        assert_eq!(compositor.layer_count(), 0);
+        assert!(compositor.last_picker.is_some());
+
+        apply_post_action(&mut compositor, &mut cx, PostAction::RestoreLastPicker);
+        assert!(compositor.find_id::<Probe>("new").is_some());
     }
 
     #[tokio::test]

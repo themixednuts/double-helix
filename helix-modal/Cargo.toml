@@ -10,13 +10,18 @@ categories.workspace = true
 repository.workspace = true
 
 [features]
-default = []
-bench = ["helix-core/bench", "helix-view/bench"]
+default = ["helix"]
+helix = ["dep:helix-core", "dep:helix-view", "dep:log"]
+bench = ["helix", "helix-core/bench", "helix-view/bench"]
 
 [dependencies]
-helix-core = { path = "../helix-core" }
-helix-view = { path = "../helix-view" }
-log = "0.4"
+helix-core = { path = "../helix-core", optional = true }
+helix-view = { path = "../helix-view", optional = true }
+log = { version = "0.4", optional = true }
+
+[[example]]
+name = "standalone"
+required-features = []
 
 [dev-dependencies]
 arc-swap.workspace = true

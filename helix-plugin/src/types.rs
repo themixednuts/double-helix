@@ -43,6 +43,11 @@ pub struct PluginMetadata {
     pub author: Option<String>,
     /// Plugin entry point (default: init.lua)
     pub entry: Option<String>,
+    /// Minimum host API version required by this plugin.
+    pub min_api_version: Option<u32>,
+    /// Required host capability names.
+    #[serde(default)]
+    pub capabilities: Vec<String>,
 }
 
 impl Default for PluginMetadata {
@@ -53,6 +58,8 @@ impl Default for PluginMetadata {
             description: None,
             author: None,
             entry: Some("init.lua".to_string()),
+            min_api_version: None,
+            capabilities: Vec::new(),
         }
     }
 }
@@ -80,10 +87,24 @@ pub struct PluginConfig {
     /// Individual plugin configurations
     #[serde(default)]
     pub plugins: Vec<IndividualPluginConfig>,
+    /// Maximum Lua heap in bytes. Use 0 to disable the limit.
+    #[serde(default = "default_max_memory")]
+    pub max_memory: usize,
+    /// Maximum VM instructions per plugin dispatch. Use 0 to disable the watchdog.
+    #[serde(default = "default_max_instructions")]
+    pub max_instructions: u64,
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn default_max_memory() -> usize {
+    256 * 1024 * 1024
+}
+
+fn default_max_instructions() -> u64 {
+    5_000_000
 }
 
 impl Default for PluginConfig {
@@ -92,6 +113,8 @@ impl Default for PluginConfig {
             enabled: true,
             plugin_dirs: vec![],
             plugins: vec![],
+            max_memory: default_max_memory(),
+            max_instructions: default_max_instructions(),
         }
     }
 }

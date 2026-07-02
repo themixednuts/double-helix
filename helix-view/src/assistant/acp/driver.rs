@@ -88,7 +88,15 @@ impl backend::Driver for Driver {
 struct State {
     sessions: HashMap<thread::Id, Session>,
     terminals: HashMap<String, (thread::Id, host::TerminalId)>,
-    permissions: HashMap<permission::RequestId, helix_acp::jsonrpc::Id>,
+    permissions: HashMap<permission::RequestId, PendingPermission>,
+    rules: permission::Rules,
+}
+
+struct PendingPermission {
+    rpc: helix_acp::jsonrpc::Id,
+    agent: String,
+    tool: String,
+    choices: Vec<permission::Choice>,
 }
 
 impl State {
@@ -97,6 +105,7 @@ impl State {
             sessions: HashMap::new(),
             terminals: HashMap::new(),
             permissions: HashMap::new(),
+            rules: permission::Rules::load(),
         }
     }
 }
@@ -366,6 +375,26 @@ async fn handle_command(
         backend::Command::Cancel { thread } => {
             if let Some(session) = state.sessions.get(&thread) {
                 agent.cancel(session.to_string());
+                let _ = tx
+                    .send(backend::Update::Thread {
+                        thread,
+                        event: thread::Event::Content(thread::Content::Append(
+                            thread::NewEntry {
+                                turn: None,
+                                kind: thread::EntryKind::Status {
+                                    text: "Assistant run canceled".to_string(),
+                                },
+                                locations: Vec::new(),
+                            },
+                        )),
+                    })
+                    .await;
+                let _ = tx
+                    .send(backend::Update::Thread {
+                        thread,
+                        event: thread::Event::Run(thread::Run::Idle),
+                    })
+                    .await;
             }
         }
         backend::Command::SetMode { thread, mode } => {
@@ -421,9 +450,20 @@ async fn handle_command(
         backend::Command::ResolvePermission {
             request, decision, ..
         } => {
-            if let Some(id) = state.permissions.remove(&request) {
+            if let Some(pending) = state.permissions.remove(&request) {
                 let outcome = match decision {
                     permission::Decision::Choose(choice) => {
+                        if let Some(selected) =
+                            pending.choices.iter().find(|item| item.id == choice)
+                        {
+                            if let Err(err) =
+                                state
+                                    .rules
+                                    .remember(&pending.agent, &pending.tool, selected)
+                            {
+                                log::warn!("assistant permission rule save failed: {err}");
+                            }
+                        }
                         acp::RequestPermissionOutcome::Selected {
                             id: choice.to_string(),
                         }
@@ -431,7 +471,7 @@ async fn handle_command(
                     permission::Decision::Dismiss => acp::RequestPermissionOutcome::Dismissed,
                 };
                 agent.reply(
-                    id,
+                    pending.rpc,
                     serde_json::to_value(acp::RequestPermissionResponse { outcome }).unwrap(),
                 );
             }
@@ -798,26 +838,68 @@ async fn handle_call(
                     return;
                 };
                 let request_id = permission::RequestId::new(format!("perm:{:?}", &id));
+                let tool = req.title;
                 let mut builder = permission::Request::builder(
                     request_id.clone(),
                     thread,
-                    req.title,
+                    tool.clone(),
                     req.description.unwrap_or_default(),
                 )
-                .choice(permission::Choice::new(
-                    permission::ChoiceId::new(first.id),
-                    first.title,
-                    permission::Kind::Custom(std::borrow::Cow::Borrowed("choice")),
-                ));
+                .choice(permission_choice(first));
                 for option in options {
-                    builder = builder.choice(permission::Choice::new(
-                        permission::ChoiceId::new(option.id),
-                        option.title,
-                        permission::Kind::Custom(std::borrow::Cow::Borrowed("choice")),
-                    ));
+                    builder = builder.choice(permission_choice(option));
                 }
                 let request = builder.build();
-                state.permissions.insert(request_id, id);
+                if let Some(choice) =
+                    state
+                        .rules
+                        .choice(backend_id.as_str(), &tool, request.choices())
+                {
+                    let verb = request
+                        .choices()
+                        .iter()
+                        .find(|item| item.id == choice)
+                        .map(|item| match item.kind {
+                            permission::Kind::RejectAlways | permission::Kind::RejectOnce => {
+                                "auto-rejected"
+                            }
+                            _ => "auto-allowed",
+                        })
+                        .unwrap_or("auto-allowed");
+                    agent.reply(
+                        id,
+                        serde_json::to_value(acp::RequestPermissionResponse {
+                            outcome: acp::RequestPermissionOutcome::Selected {
+                                id: choice.to_string(),
+                            },
+                        })
+                        .unwrap(),
+                    );
+                    let _ = tx
+                        .send(backend::Update::Thread {
+                            thread,
+                            event: thread::Event::Content(thread::Content::Append(
+                                thread::NewEntry {
+                                    turn: None,
+                                    kind: thread::EntryKind::Status {
+                                        text: format!("{verb} {tool} (always)"),
+                                    },
+                                    locations: Vec::new(),
+                                },
+                            )),
+                        })
+                        .await;
+                    return;
+                }
+                state.permissions.insert(
+                    request_id,
+                    PendingPermission {
+                        rpc: id,
+                        agent: backend_id.as_str().to_string(),
+                        tool,
+                        choices: request.choices().to_vec(),
+                    },
+                );
                 let _ = tx
                     .send(backend::Update::Permission { thread, request })
                     .await;
@@ -833,6 +915,11 @@ async fn handle_call(
         },
         _ => {}
     }
+}
+
+fn permission_choice(option: acp::PermissionOption) -> permission::Choice {
+    let kind = permission::Kind::from_label(&option.id, &option.title);
+    permission::Choice::new(permission::ChoiceId::new(option.id), option.title, kind)
 }
 
 fn write_location(path: PathBuf, previous: Option<&str>, current: &str) -> crate::collab::Location {

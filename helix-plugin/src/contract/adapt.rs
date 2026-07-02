@@ -420,12 +420,14 @@ pub fn assistant_thread_snapshot(
 }
 
 /// Convert a `thread::Run` to a contract `AssistantRunState`.
+#[allow(unreachable_patterns)]
 pub fn run_to_contract(run: &helix_view::assistant::thread::Run) -> snapshots::AssistantRunState {
     match run {
         helix_view::assistant::thread::Run::Idle => snapshots::AssistantRunState::Idle,
         helix_view::assistant::thread::Run::Running => snapshots::AssistantRunState::Running,
         helix_view::assistant::thread::Run::Waiting => snapshots::AssistantRunState::Waiting,
         helix_view::assistant::thread::Run::Failed { .. } => snapshots::AssistantRunState::Failed,
+        _ => snapshots::AssistantRunState::Running,
     }
 }
 

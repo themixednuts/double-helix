@@ -68,6 +68,7 @@ pub enum EntryKind {
         id: String,
         name: String,
         state: String,
+        output: String,
     },
     Status {
         text: String,
@@ -130,13 +131,17 @@ impl EntryView {
                 EntryKind::AssistantText { text } => {
                     crate::model::AssistantEntryKind::AgentText(text)
                 }
-                EntryKind::ToolCall { id, name, state } => {
-                    crate::model::AssistantEntryKind::ToolCall {
-                        id,
-                        name,
-                        status: state,
-                    }
-                }
+                EntryKind::ToolCall {
+                    id,
+                    name,
+                    state,
+                    output,
+                } => crate::model::AssistantEntryKind::ToolCall {
+                    id,
+                    name,
+                    status: state,
+                    output,
+                },
                 EntryKind::Status { text } => crate::model::AssistantEntryKind::Status(text),
                 EntryKind::ChangeSummary { files } => {
                     crate::model::AssistantEntryKind::ChangeSummary { files }
@@ -298,7 +303,13 @@ impl Store {
                     .into_iter()
                     .map(EntryView::to_model)
                     .collect(),
-                agent_busy: matches!(active.run, thread::Run::Running),
+                agent_busy: matches!(active.run, thread::Run::Running | thread::Run::Waiting),
+                agent_status: match &active.run {
+                    thread::Run::Running => Some("working".to_string()),
+                    thread::Run::Waiting => Some("canceling".to_string()),
+                    thread::Run::Failed { message } => Some(format!("failed: {message}")),
+                    thread::Run::Idle => None,
+                },
                 input: active.draft,
                 context_items: active
                     .context
@@ -370,6 +381,7 @@ impl Store {
                 agent_name: fallback_agent_name,
                 agent_version: String::new(),
                 agent_busy: false,
+                agent_status: None,
                 focused,
                 insert_mode: false,
                 error: None,
@@ -455,7 +467,15 @@ impl Store {
                             thread::EntryKind::ToolCall(call) => EntryKind::ToolCall {
                                 id: call.id.to_string(),
                                 name: call.name.clone(),
-                                state: format!("{:?}", call.state),
+                                state: match &call.state {
+                                    super::tool::State::Pending => "pending".to_string(),
+                                    super::tool::State::Running => "running".to_string(),
+                                    super::tool::State::Completed => "completed".to_string(),
+                                    super::tool::State::Failed { .. } => "failed".to_string(),
+                                    super::tool::State::Canceled => "cancelled".to_string(),
+                                    super::tool::State::Unknown(value) => value.to_string(),
+                                },
+                                output: call.output.clone(),
                             },
                             thread::EntryKind::Status { text } => {
                                 EntryKind::Status { text: text.clone() }

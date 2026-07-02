@@ -3,6 +3,8 @@
 //! These tests construct an Editor + Engine without any terminal, compositor,
 //! or async UI handlers — proving the engine is frontend-independent.
 
+#![cfg(feature = "helix")]
+
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;

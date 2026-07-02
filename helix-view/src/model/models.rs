@@ -174,6 +174,8 @@ pub struct AssistantModel {
     pub agent_version: String,
     /// Whether the agent is currently processing a request.
     pub agent_busy: bool,
+    /// Current active run status label, if any.
+    pub agent_status: Option<String>,
 
     /// Whether the panel has keyboard focus.
     pub focused: bool,
@@ -363,7 +365,12 @@ impl AssistantModel {
             },
             tone: AssistantHeaderTone::Active,
         });
-        if self.agent_busy {
+        if let Some(status) = &self.agent_status {
+            trailing.push(AssistantHeaderItem {
+                label: status.clone(),
+                tone: AssistantHeaderTone::Warning,
+            });
+        } else if self.agent_busy {
             trailing.push(AssistantHeaderItem {
                 label: "working".to_string(),
                 tone: AssistantHeaderTone::Warning,
@@ -577,6 +584,7 @@ pub enum AssistantEntryKind {
         id: String,
         name: String,
         status: String,
+        output: String,
     },
     /// Status separator (e.g. "Session started", "Connected").
     Status(String),
@@ -611,7 +619,12 @@ impl AssistantEntry {
             AssistantEntryKind::UserMessage(message)
             | AssistantEntryKind::AgentText(message)
             | AssistantEntryKind::Status(message) => message.clone(),
-            AssistantEntryKind::ToolCall { id, name, status } => {
+            AssistantEntryKind::ToolCall {
+                id,
+                name,
+                status,
+                output,
+            } => {
                 let mut lines = vec![
                     format!("id: {id}"),
                     format!("name: {name}"),
@@ -619,6 +632,10 @@ impl AssistantEntry {
                 ];
                 if self.locations > 0 {
                     lines.push(format!("locations: {}", self.locations));
+                }
+                if !output.is_empty() {
+                    lines.push(String::new());
+                    lines.push(output.clone());
                 }
                 lines.join(helix_core::NATIVE_LINE_ENDING.as_str())
             }
@@ -639,7 +656,12 @@ impl AssistantEntry {
                 body: Some(message.clone()),
                 lines: Vec::new(),
             },
-            AssistantEntryKind::ToolCall { id, name, status } => {
+            AssistantEntryKind::ToolCall {
+                id,
+                name,
+                status,
+                output,
+            } => {
                 let mut lines = vec![
                     AssistantEntryDetailLine {
                         label: "id".to_string(),
@@ -658,7 +680,7 @@ impl AssistantEntry {
                 }
                 AssistantEntryDetails {
                     heading: format!("tool {name}"),
-                    body: None,
+                    body: (!output.is_empty()).then(|| output.clone()),
                     lines,
                 }
             }
@@ -700,11 +722,20 @@ impl AssistantEntry {
     #[must_use]
     pub fn plain_row(&self) -> Option<AssistantEntryRow> {
         match &self.kind {
-            AssistantEntryKind::ToolCall { name, status, .. } => Some(AssistantEntryRow {
+            AssistantEntryKind::ToolCall {
+                name,
+                status,
+                output,
+                ..
+            } => Some(AssistantEntryRow {
                 leading: format!(" {} ", Self::status_icon(status)),
                 leading_tone: Self::status_tone(status),
                 animate_leading: status == "running",
-                body: name.clone(),
+                body: if output.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{name} - {}", Self::summary(output, 72))
+                },
                 body_tone: AssistantEntryTone::Focus,
                 accessory: Some(format!(" {status}")),
                 accessory_tone: Self::status_tone(status),
@@ -792,6 +823,18 @@ impl AssistantEntry {
             "cancelled" => "–",
             _ => "○",
         }
+    }
+
+    fn summary(text: &str, max: usize) -> String {
+        let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        if compact.chars().count() <= max {
+            return compact;
+        }
+        compact
+            .chars()
+            .take(max.saturating_sub(1))
+            .chain(std::iter::once('…'))
+            .collect()
     }
 }
 

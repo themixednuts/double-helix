@@ -39,6 +39,8 @@ name = "my-plugin"
 version = "0.1.0"
 description = "My first Helix plugin"
 author = "Your Name"
+min_api_version = 2
+capabilities = ["query", "mutation", "ui", "events"]
 ```
 
 **init.lua**:
@@ -374,8 +376,16 @@ end
 
 Plugins run in a sandboxed Lua environment:
 
-- **Disabled**: `os.execute`, `os.exit`, `io.*`, `loadfile`, `dofile`
+- **Disabled**: `os.execute`, `os.exit`, `io`, `package`, `load`, `loadstring`, `loadfile`, `dofile`
+- **Scoped modules**: `require("name")` resolves only to `name.lua` inside the current plugin directory. Absolute paths, path separators, `:`, and `..` are rejected.
+- **Limits**: `max_memory` defaults to 256 MiB and `max_instructions` defaults to 5,000,000 VM instructions per plugin dispatch. Set either to `0` to disable that limit.
 - **No network access** (currently)
+
+## Versioning and errors
+
+`plugin.toml` may set `min_api_version` and `capabilities`. Loading is refused when `min_api_version` is greater than the host API version or a capability name is unknown. Capability names are `query`, `mutation`, `ui`, `panels`, `commands`, `events`, `render`, `splits`, `tabs`, and `floats`.
+
+Host contract failures carry stable codes: `not_found`, `stale_handle`, `invalid_request`, `permission_denied`, `unsupported_capability`, `busy`, and `internal_error`. Error text remains human-readable and includes the code for plugin-side handling.
 
 ## Development
 

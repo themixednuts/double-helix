@@ -71,23 +71,60 @@ impl ApiMetadata {
     }
 }
 
+impl Capability {
+    pub const ALL: &[Capability] = &[
+        Capability::Query,
+        Capability::Mutation,
+        Capability::Ui,
+        Capability::Panels,
+        Capability::Commands,
+        Capability::Events,
+        Capability::Render,
+        Capability::Splits,
+        Capability::Tabs,
+        Capability::Floats,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Capability::Query => "query",
+            Capability::Mutation => "mutation",
+            Capability::Ui => "ui",
+            Capability::Panels => "panels",
+            Capability::Commands => "commands",
+            Capability::Events => "events",
+            Capability::Render => "render",
+            Capability::Splits => "splits",
+            Capability::Tabs => "tabs",
+            Capability::Floats => "floats",
+        }
+    }
+}
+
+impl std::fmt::Display for Capability {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for Capability {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Capability::ALL
+            .iter()
+            .copied()
+            .find(|cap| cap.as_str() == value)
+            .ok_or_else(|| format!("unknown capability: {value}"))
+    }
+}
+
 impl Default for ApiMetadata {
     fn default() -> Self {
         Self {
             version: API_VERSION,
             min_compatible_version: MIN_COMPATIBLE_VERSION,
-            capabilities: vec![
-                Capability::Query,
-                Capability::Mutation,
-                Capability::Ui,
-                Capability::Panels,
-                Capability::Commands,
-                Capability::Events,
-                Capability::Render,
-                Capability::Splits,
-                Capability::Tabs,
-                Capability::Floats,
-            ],
+            capabilities: Capability::ALL.to_vec(),
             event_catalog: default_event_catalog(),
         }
     }

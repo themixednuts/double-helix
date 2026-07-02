@@ -112,7 +112,23 @@ pub(crate) fn apply_assistant_command(
                 .map(|choice| PermissionChoice {
                     id: choice.id.as_str().to_string(),
                     title: choice.label.clone(),
-                    description: None,
+                    description: match &choice.kind {
+                        helix_view::assistant::permission::Kind::Custom(kind) => {
+                            Some(kind.to_string())
+                        }
+                        _ => None,
+                    },
+                    key: match &choice.kind {
+                        helix_view::assistant::permission::Kind::AllowOnce => Some('y'),
+                        helix_view::assistant::permission::Kind::AllowAlways => Some('a'),
+                        helix_view::assistant::permission::Kind::RejectOnce => Some('n'),
+                        helix_view::assistant::permission::Kind::RejectAlways => Some('r'),
+                        helix_view::assistant::permission::Kind::Custom(_) => choice
+                            .label
+                            .chars()
+                            .find(|ch| ch.is_ascii_alphanumeric())
+                            .map(|ch| ch.to_ascii_lowercase()),
+                    },
                 })
                 .collect();
 
@@ -120,6 +136,7 @@ pub(crate) fn apply_assistant_command(
                 request.title().to_string(),
                 Some(request.body().to_string()),
                 choices,
+                request.default().map(|id| id.as_str().to_string()),
                 tx,
             );
             compositor.replace_or_push(PERMISSION_ID, popup);

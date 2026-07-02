@@ -43,4 +43,5 @@ pub struct Call {
     pub id: Id,
     pub name: String,
     pub state: State,
+    pub output: String,
 }

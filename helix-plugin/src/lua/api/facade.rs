@@ -73,6 +73,16 @@ fn with_mutation_bridge<T>(
     with_editor_mut(|editor| f(EditorMutationBridge::new(editor)))
 }
 
+fn contract_error(err: crate::contract::ContractError) -> LuaError {
+    let entity = err.entity().unwrap_or("");
+    LuaError::RuntimeError(format!(
+        "__helix_contract_error__\ncode={}\nmessage={}\nentity={}",
+        err.code(),
+        err,
+        entity
+    ))
+}
+
 fn with_surface<T>(
     f: impl FnOnce(&mut crate::types::SurfaceRenderOps, &helix_view::Theme) -> LuaResult<T>,
 ) -> LuaResult<T> {
@@ -87,7 +97,7 @@ fn with_surface<T>(
 ///
 /// Query methods read through the bridge; mutations are handle methods.
 #[derive(Debug, Clone, Copy)]
-struct LuaDocumentHandle(DocumentHandle);
+pub(crate) struct LuaDocumentHandle(pub(crate) DocumentHandle);
 
 impl FromLua for LuaDocumentHandle {
     fn from_lua(value: LuaValue, _lua: &Lua) -> LuaResult<Self> {
@@ -110,35 +120,22 @@ impl LuaUserData for LuaDocumentHandle {
 
         methods.add_method("snapshot", |lua, this, ()| {
             let snap = with_query_bridge(|bridge| {
-                bridge
-                    .document_snapshot(this.0)
-                    .map_err(|e| LuaError::RuntimeError(e.to_string()))
+                bridge.document_snapshot(this.0).map_err(contract_error)
             })?;
             snapshot_to_table(lua, &snap)
         });
 
         methods.add_method("text", |_lua, this, ()| {
-            with_query_bridge(|bridge| {
-                bridge
-                    .document_text(this.0)
-                    .map_err(|e| LuaError::RuntimeError(e.to_string()))
-            })
+            with_query_bridge(|bridge| bridge.document_text(this.0).map_err(contract_error))
         });
 
         methods.add_method("line", |_lua, this, line: usize| {
-            with_query_bridge(|bridge| {
-                bridge
-                    .document_line(this.0, line)
-                    .map_err(|e| LuaError::RuntimeError(e.to_string()))
-            })
+            with_query_bridge(|bridge| bridge.document_line(this.0, line).map_err(contract_error))
         });
 
         methods.add_method("diagnostics", |lua, this, ()| {
-            let snap = with_query_bridge(|bridge| {
-                bridge
-                    .diagnostics(this.0)
-                    .map_err(|e| LuaError::RuntimeError(e.to_string()))
-            })?;
+            let snap =
+                with_query_bridge(|bridge| bridge.diagnostics(this.0).map_err(contract_error))?;
             diagnostics_to_table(lua, &snap)
         });
 
@@ -157,7 +154,7 @@ impl LuaUserData for LuaDocumentHandle {
                         document: this.0,
                         edits,
                     })
-                    .map_err(|e| LuaError::RuntimeError(e.to_string()))
+                    .map_err(contract_error)
             })
         });
 
@@ -172,7 +169,7 @@ impl LuaUserData for LuaDocumentHandle {
                         document: this.0,
                         force,
                     })
-                    .map_err(|e| LuaError::RuntimeError(e.to_string()))
+                    .map_err(contract_error)
             })
         });
 
@@ -191,7 +188,7 @@ impl LuaUserData for LuaDocumentHandle {
                             view: view.map(|v| v.0),
                             selections,
                         })
-                        .map_err(|e| LuaError::RuntimeError(e.to_string()))
+                        .map_err(contract_error)
                 })
             },
         );
@@ -201,7 +198,7 @@ impl LuaUserData for LuaDocumentHandle {
             with_mutation_bridge(|mut bridge| {
                 bridge
                     .undo(requests::UndoRequest { document: this.0 })
-                    .map_err(|e| LuaError::RuntimeError(e.to_string()))
+                    .map_err(contract_error)
             })
         });
 
@@ -210,7 +207,7 @@ impl LuaUserData for LuaDocumentHandle {
             with_mutation_bridge(|mut bridge| {
                 bridge
                     .redo(requests::RedoRequest { document: this.0 })
-                    .map_err(|e| LuaError::RuntimeError(e.to_string()))
+                    .map_err(contract_error)
             })
         });
 
@@ -218,7 +215,7 @@ impl LuaUserData for LuaDocumentHandle {
         methods.add_method("select_all", |_lua, this, ()| {
             with_editor_mut(|editor| {
                 let doc_id = crate::contract::adapt::resolve_document(editor, this.0)
-                    .map_err(|e| LuaError::RuntimeError(e.to_string()))?;
+                    .map_err(contract_error)?;
                 let view_id = editor
                     .tree
                     .try_get(editor.tree.focus)
@@ -242,7 +239,11 @@ impl LuaUserData for LuaDocumentHandle {
                     Ok(())
                 } else {
                     let selection = helix_core::Selection::single(0, len);
-                    let doc = editor.documents.get_mut(&doc_id).unwrap();
+                    let doc = editor.documents.get_mut(&doc_id).ok_or_else(|| {
+                        contract_error(crate::contract::ContractError::stale_handle(
+                            this.0.to_string(),
+                        ))
+                    })?;
                     doc.ensure_view_init(view_id);
                     doc.set_selection(view_id, selection);
                     Ok(())
@@ -266,13 +267,14 @@ impl LuaUserData for LuaDocumentHandle {
 
                 with_editor_mut(|editor| {
                     let doc_id = crate::contract::adapt::resolve_document(editor, this.0)
-                        .map_err(|e| LuaError::RuntimeError(e.to_string()))?;
+                        .map_err(contract_error)?;
 
                     // Resolve positions against the document text.
-                    let doc = editor
-                        .documents
-                        .get(&doc_id)
-                        .ok_or_else(|| LuaError::RuntimeError("document not found".into()))?;
+                    let doc = editor.documents.get(&doc_id).ok_or_else(|| {
+                        contract_error(crate::contract::ContractError::stale_handle(
+                            this.0.to_string(),
+                        ))
+                    })?;
                     let text = doc.text();
                     let converted: Vec<helix_view::document::PluginAnnotation> = parsed
                         .into_iter()
@@ -293,9 +295,15 @@ impl LuaUserData for LuaDocumentHandle {
                         return Ok(());
                     }
 
-                    let doc = editor.documents.get_mut(&doc_id).unwrap();
+                    let doc = editor.documents.get_mut(&doc_id).ok_or_else(|| {
+                        contract_error(crate::contract::ContractError::stale_handle(
+                            this.0.to_string(),
+                        ))
+                    })?;
                     let mut iter = view_ids.into_iter();
-                    let first = iter.next().expect("non-empty view_ids");
+                    let Some(first) = iter.next() else {
+                        return Ok(());
+                    };
                     for view_id in iter {
                         doc.set_plugin_annotations(view_id, plugin_name.clone(), converted.clone());
                     }
@@ -311,11 +319,12 @@ impl LuaUserData for LuaDocumentHandle {
             let plugin_name = current_plugin_name(lua)?;
             with_editor_mut(|editor| {
                 let doc_id = crate::contract::adapt::resolve_document(editor, this.0)
-                    .map_err(|e| LuaError::RuntimeError(e.to_string()))?;
-                let doc = editor
-                    .documents
-                    .get_mut(&doc_id)
-                    .ok_or_else(|| LuaError::RuntimeError("document not found".into()))?;
+                    .map_err(contract_error)?;
+                let doc = editor.documents.get_mut(&doc_id).ok_or_else(|| {
+                    contract_error(crate::contract::ContractError::stale_handle(
+                        this.0.to_string(),
+                    ))
+                })?;
                 doc.clear_plugin_annotations(&plugin_name);
                 Ok(())
             })
@@ -605,13 +614,13 @@ fn command_registry(
 }
 
 fn stale_handle_error(handle: impl std::fmt::Display) -> LuaError {
-    LuaError::RuntimeError(
-        crate::contract::ContractError::stale_handle(handle.to_string()).to_string(),
-    )
+    contract_error(crate::contract::ContractError::stale_handle(
+        handle.to_string(),
+    ))
 }
 
 fn permission_denied_error(reason: impl Into<String>) -> LuaError {
-    LuaError::RuntimeError(crate::contract::ContractError::permission_denied(reason).to_string())
+    contract_error(crate::contract::ContractError::permission_denied(reason))
 }
 
 fn event_host(lua: &Lua) -> LuaResult<mlua::AppDataRef<'_, crate::lua::EventHostWrapper>> {
@@ -861,6 +870,7 @@ pub fn register_events_module(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
                     handle,
                     plugin_name,
                     callback_ref,
+                    failures: 0,
                 },
             );
 

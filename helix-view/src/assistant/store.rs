@@ -666,18 +666,33 @@ impl Store {
                     Vec::new()
                 }
             }
-            action::Action::Cancel { thread } => self
-                .thread(thread)
-                .and_then(|state| match state.origin() {
-                    thread::Origin::Backend { backend, .. } => {
-                        Some(vec![effect::Effect::SendBackendCommand {
-                            backend: backend.clone(),
-                            command: backend::Command::Cancel { thread },
-                        }])
-                    }
-                    thread::Origin::Local => None,
-                })
-                .unwrap_or_default(),
+            action::Action::Cancel { thread } => {
+                let Some(state) = self.thread_mut(thread) else {
+                    return Vec::new();
+                };
+                let thread::Origin::Backend { backend, .. } = state.origin() else {
+                    return Vec::new();
+                };
+                let backend = backend.clone();
+                state.apply(thread::Event::Run(thread::Run::Canceling));
+                state.apply(thread::Event::Content(thread::Content::Append(
+                    thread::NewEntry {
+                        turn: None,
+                        kind: thread::EntryKind::Status {
+                            text: "Canceling assistant run...".to_string(),
+                        },
+                        locations: Vec::new(),
+                    },
+                )));
+                vec![
+                    effect::Effect::SendBackendCommand {
+                        backend,
+                        command: backend::Command::Cancel { thread },
+                    },
+                    effect::Effect::Save { thread },
+                    effect::Effect::SyncModel,
+                ]
+            }
             action::Action::ResolvePermission {
                 thread,
                 request,
@@ -1104,6 +1119,50 @@ mod tests {
                     && *current_thread == thread
                     && current_request == &request
                     && current_decision == &decision
+            )
+        }));
+    }
+
+    #[test]
+    fn cancel_marks_thread_canceling_and_preserves_entries() {
+        let (mut store, thread, backend) = backend_store();
+        let effects = store.apply(event::Event::Thread {
+            thread,
+            event: thread::Event::Content(thread::Content::Append(thread::NewEntry {
+                turn: None,
+                kind: thread::EntryKind::AssistantText {
+                    text: "partial".to_string(),
+                },
+                locations: Vec::new(),
+            })),
+        });
+        assert!(!effects.is_empty());
+
+        let effects = store.act(action::Action::Cancel { thread });
+
+        let state = store.thread(thread).expect("thread");
+        assert_eq!(state.run(), &thread::Run::Canceling);
+        assert!(matches!(
+            state.entries().first(),
+            Some(thread::Entry {
+                kind: thread::EntryKind::AssistantText { text },
+                ..
+            }) if text == "partial"
+        ));
+        assert!(matches!(
+            state.entries().last(),
+            Some(thread::Entry {
+                kind: thread::EntryKind::Status { text },
+                ..
+            }) if text.contains("Canceling")
+        ));
+        assert!(effects.iter().any(|effect| {
+            matches!(
+                effect,
+                effect::Effect::SendBackendCommand {
+                    backend: current,
+                    command: backend::Command::Cancel { thread: current_thread },
+                } if current == &backend && *current_thread == thread
             )
         }));
     }

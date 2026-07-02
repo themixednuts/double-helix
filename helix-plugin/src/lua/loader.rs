@@ -1,7 +1,9 @@
+use crate::contract::metadata::{Capability, API_VERSION};
 use crate::error::{PluginError, Result};
 use crate::types::{Plugin, PluginMetadata};
 use log::{debug, info, warn};
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 /// Plugin loader responsible for discovering and loading plugins
 pub struct PluginLoader {
@@ -88,6 +90,18 @@ impl PluginLoader {
                 "Entry point '{}' not found in {:?}",
                 entry, path
             )));
+        }
+
+        if let Some(min_api_version) = metadata.min_api_version {
+            if min_api_version > API_VERSION {
+                return Err(PluginError::InvalidPluginStructure(format!(
+                    "plugin requires API version {min_api_version}, host supports {API_VERSION}"
+                )));
+            }
+        }
+
+        for capability in &metadata.capabilities {
+            Capability::from_str(capability).map_err(PluginError::ConfigError)?;
         }
 
         Ok(Plugin {
@@ -197,5 +211,25 @@ mod tests {
 
         // Should skip the broken plugin
         assert_eq!(plugins.len(), 0);
+    }
+
+    #[test]
+    fn test_min_api_version_too_high_refuses_plugin() {
+        let temp_dir = TempDir::new().unwrap();
+        let plugin_dir = temp_dir.path().join("future-plugin");
+        std::fs::create_dir(&plugin_dir).unwrap();
+
+        let metadata = r#"
+            name = "future-plugin"
+            version = "1.0.0"
+            min_api_version = 999
+        "#;
+        std::fs::write(plugin_dir.join("plugin.toml"), metadata).unwrap();
+        std::fs::write(plugin_dir.join("init.lua"), "-- future plugin").unwrap();
+
+        let loader = PluginLoader::new(vec![temp_dir.path().to_path_buf()]);
+        let plugins = loader.discover_plugins().unwrap();
+
+        assert!(plugins.is_empty());
     }
 }

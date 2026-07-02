@@ -233,7 +233,11 @@ impl PluginMutationHost for EditorMutationBridge<'_> {
 
         let view_id = resolve_operation_view_for_document(self.editor, doc_id)?;
 
-        let doc = self.editor.documents.get_mut(&doc_id).unwrap();
+        let doc = self
+            .editor
+            .documents
+            .get_mut(&doc_id)
+            .ok_or_else(|| ContractError::stale_handle(req.document.to_string()))?;
         let success = doc.apply(&transaction, view_id);
         if success {
             Ok(())
@@ -285,7 +289,11 @@ impl PluginMutationHost for EditorMutationBridge<'_> {
 
         let selection = helix_core::Selection::new(ranges.into(), 0);
 
-        let doc = self.editor.documents.get_mut(&doc_id).unwrap();
+        let doc = self
+            .editor
+            .documents
+            .get_mut(&doc_id)
+            .ok_or_else(|| ContractError::stale_handle(req.document.to_string()))?;
         doc.set_selection(view_id, selection);
         Ok(())
     }
@@ -378,7 +386,9 @@ impl PluginMutationHost for EditorMutationBridge<'_> {
         // additional view (if any) to avoid unnecessary work in the common
         // single-view case.
         let mut views = view_ids.into_iter();
-        let first = views.next().expect("non-empty view_ids");
+        let Some(first) = views.next() else {
+            return Ok(());
+        };
         for view_id in views {
             doc.set_plugin_annotations(view_id, plugin_id.clone(), converted.clone());
         }

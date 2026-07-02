@@ -18,7 +18,7 @@ use helix_view::engine::{
 use helix_view::input::KeyEvent;
 use helix_view::{DocumentId, Editor, ViewId};
 
-use crate::registry::{CommandRef, CommandRegistry};
+use crate::registry::{CharPendingResolution, CommandRef, CommandRegistry};
 use crate::{
     finalize_insert_recording, is_char_key, key_to_digit, record_insert_key, InsertRecording,
 };
@@ -138,8 +138,9 @@ impl HelixEngine {
                 EngineResult::Executed
             }
             KeymapLookup::Fallback(command, ch) => {
-                let result =
-                    self.execute_char_pending(editor, view_id, doc_id, command, ch, count_val);
+                let result = self.execute_char_pending(
+                    editor, view_id, doc_id, command, ch, count_val, register,
+                );
                 if keymaps.pending().is_empty() {
                     self.count = None;
                     self.register = None;
@@ -183,7 +184,7 @@ impl HelixEngine {
             },
             KeymapLookup::Cancelled(pending_keys) => EngineResult::CancelledInsert(pending_keys),
             KeymapLookup::Fallback(command, ch) => {
-                self.execute_char_pending(editor, view_id, doc_id, command, ch, 1)
+                self.execute_char_pending(editor, view_id, doc_id, command, ch, 1, None)
             }
         };
 
@@ -274,15 +275,22 @@ impl HelixEngine {
         command: CharPendingId,
         ch: char,
         count: usize,
+        register: Option<char>,
     ) -> EngineResult {
         let Some(cp) = self.registry.char_pending(command) else {
             log::warn!("char-pending command missing from registry: {command}");
             return EngineResult::Unbound;
         };
 
-        let movement = movement_from_mode(editor);
-        let motion = (cp.resolve)(ch, count);
-        motion(editor, view_id, doc_id, movement);
+        match (cp.resolve)(ch, count) {
+            CharPendingResolution::Motion(motion) => {
+                let movement = movement_from_mode(editor);
+                motion(editor, view_id, doc_id, movement);
+            }
+            CharPendingResolution::Action(action) => {
+                action(editor, view_id, doc_id, register);
+            }
+        }
         EngineResult::Executed
     }
 }
@@ -483,8 +491,9 @@ impl EditingEngine for HelixEngine {
                     }
                     OperatorTargetId::CharPending(command, ch) => {
                         if let Some(cp) = self.registry.char_pending(command) {
-                            let motion = (cp.resolve)(ch, total);
-                            motion(editor, view_id, doc_id, Movement::Extend);
+                            if let CharPendingResolution::Motion(motion) = (cp.resolve)(ch, total) {
+                                motion(editor, view_id, doc_id, Movement::Extend);
+                            }
                         }
                     }
                     OperatorTargetId::Linewise => {}

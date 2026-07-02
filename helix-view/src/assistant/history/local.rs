@@ -528,6 +528,8 @@ struct PersistedToolCall {
     id: String,
     name: String,
     state: PersistedToolState,
+    #[serde(default)]
+    output: String,
 }
 
 impl From<&tool::Call> for PersistedToolCall {
@@ -536,6 +538,7 @@ impl From<&tool::Call> for PersistedToolCall {
             id: call.id.to_string(),
             name: call.name.clone(),
             state: PersistedToolState::from(&call.state),
+            output: call.output.clone(),
         }
     }
 }
@@ -546,6 +549,7 @@ impl PersistedToolCall {
             id: tool::Id::new(self.id),
             name: self.name,
             state: self.state.into_domain(),
+            output: self.output,
         }
     }
 }

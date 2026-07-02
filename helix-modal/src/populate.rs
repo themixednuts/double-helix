@@ -15,8 +15,9 @@ use std::num::NonZeroUsize;
 use std::sync::OnceLock;
 
 use crate::registry::{
-    ActionEntry, CharPendingEntry, CommandKind, CommandRegistry, CommandRegistryBuilder,
-    CommandScope, EngineCommandSpec, MotionEntry, MotionFactory, OperatorEntry, TextObjectEntry,
+    ActionEntry, CharPendingEntry, CharPendingResolution, CommandKind, CommandRegistry,
+    CommandRegistryBuilder, CommandScope, EngineCommandSpec, MotionEntry, MotionFactory,
+    OperatorEntry, TextObjectEntry,
 };
 
 trait EngineCommandCatalog {
@@ -233,7 +234,9 @@ impl EngineCommandCatalog for RegistryCatalogBuilder {
         self.registry
             .register(CommandKind::CharPending(CharPendingEntry {
                 id: CharPendingId::new(name),
-                resolve,
+                resolve: Box::new(move |ch, count| {
+                    CharPendingResolution::Motion(resolve(ch, count))
+                }),
             }));
     }
 }

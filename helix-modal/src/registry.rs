@@ -183,12 +183,18 @@ pub struct ActionEntry {
     ),
 }
 
-// TODO: When adding action-like char-pending commands (e.g., replace_char),
-// widen `resolve` to return an enum { Motion(MotionFn), Action(...) }.
+pub type CharPendingActionFn =
+    Box<dyn Fn(&mut Editor, ViewId, DocumentId, Option<char>) + Send + Sync>;
+
+pub enum CharPendingResolution {
+    Motion(MotionFn),
+    Action(CharPendingActionFn),
+}
+
 pub struct CharPendingEntry {
     pub id: CharPendingId,
-    /// After receiving the character, produces a motion.
-    pub resolve: fn(ch: char, count: usize) -> MotionFn,
+    /// After receiving the character, produces a motion or direct action.
+    pub resolve: Box<dyn Fn(char, usize) -> CharPendingResolution + Send + Sync>,
 }
 
 /// Mutable builder for assembling a command registry at startup.

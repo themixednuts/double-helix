@@ -2,11 +2,13 @@ use crate::contract::{CommandHandle, PanelHandle, PluginId, SubscriptionHandle, 
 use crate::error::{PluginError, Result};
 use crate::types::{PluginCallbackKey, UiCallbackId};
 use helix_view::Editor;
+use log::{error, warn};
 use mlua::prelude::*;
-use mlua::RegistryKey;
+use mlua::{HookTriggers, RegistryKey, VmState};
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::num::NonZeroU64;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 mod context;
@@ -16,6 +18,8 @@ pub use context::{
 };
 
 pub(crate) struct CurrentPluginName(pub Arc<RwLock<Option<String>>>);
+
+pub(crate) struct PluginRoots(pub Arc<RwLock<HashMap<String, PathBuf>>>);
 
 pub(crate) fn current_plugin_name(lua: &Lua) -> std::result::Result<String, mlua::Error> {
     let state = lua
@@ -355,6 +359,7 @@ pub(crate) struct RegisteredEventHandler {
     pub(crate) handle: SubscriptionHandle,
     pub(crate) plugin_name: String,
     pub(crate) callback_ref: RegistryKey,
+    pub(crate) failures: u32,
 }
 
 type ContractEventHandlers =
@@ -387,6 +392,93 @@ pub(crate) struct PanelCallbackRegistry(
     pub Arc<RwLock<HashMap<PanelHandle, RegisteredPanelCallbacks>>>,
 );
 
+const WATCHDOG_STEP: u32 = 10_000;
+const EVENT_FAILURE_LIMIT: u32 = 10;
+
+fn setup_sandbox(
+    lua: &Lua,
+    config: &crate::types::PluginConfig,
+    plugin_roots: Arc<RwLock<HashMap<String, PathBuf>>>,
+) -> Result<()> {
+    lua.set_memory_limit(config.max_memory).map_err(|e| {
+        PluginError::InitializationFailed(format!("Failed to set memory limit: {e}"))
+    })?;
+    lua.set_app_data(PluginRoots(plugin_roots));
+
+    lua.load(
+        r#"
+        os.execute = nil
+        os.exit = nil
+        io = nil
+        package = nil
+        load = nil
+        loadstring = nil
+        loadfile = nil
+        dofile = nil
+        "#,
+    )
+    .exec()
+    .map_err(|e| PluginError::InitializationFailed(format!("Failed to setup sandbox: {e}")))?;
+
+    let require = lua.create_function(scoped_require).map_err(|e| {
+        PluginError::InitializationFailed(format!("Failed to install require: {e}"))
+    })?;
+    lua.globals().set("require", require).map_err(|e| {
+        PluginError::InitializationFailed(format!("Failed to install require: {e}"))
+    })?;
+    Ok(())
+}
+
+fn scoped_require(lua: &Lua, module: String) -> LuaResult<LuaValue> {
+    if module.is_empty()
+        || module.contains("..")
+        || module.contains('/')
+        || module.contains('\\')
+        || module.contains(':')
+    {
+        return Err(LuaError::RuntimeError(format!(
+            "module '{module}' is outside the plugin directory"
+        )));
+    }
+
+    let plugin_name = current_plugin_name(lua)?;
+    let root = {
+        let roots = lua
+            .app_data_ref::<PluginRoots>()
+            .ok_or_else(|| LuaError::RuntimeError("plugin roots unavailable".into()))?;
+        let root = roots.0.read().get(&plugin_name).cloned().ok_or_else(|| {
+            LuaError::RuntimeError(format!("plugin root not found: {plugin_name}"))
+        })?;
+        root
+    };
+
+    let relative = module.replace('.', std::path::MAIN_SEPARATOR_STR);
+    let candidate = root.join(relative).with_extension("lua");
+    let canonical = candidate
+        .canonicalize()
+        .map_err(|_| LuaError::RuntimeError(format!("module '{module}' not found")))?;
+    if !canonical.starts_with(&root) {
+        return Err(LuaError::RuntimeError(format!(
+            "module '{module}' is outside the plugin directory"
+        )));
+    }
+
+    let code = std::fs::read_to_string(&canonical).map_err(LuaError::external)?;
+    let name = canonical
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(module.as_str());
+    let value: LuaValue = lua.load(&code).set_name(name).eval()?;
+    Ok(match value {
+        LuaValue::Nil => LuaValue::Boolean(true),
+        value => value,
+    })
+}
+
+fn canonical_root(path: &Path) -> Result<PathBuf> {
+    path.canonicalize().map_err(PluginError::IoError)
+}
+
 /// Lua scripting engine for Helix plugins
 pub struct LuaEngine {
     /// The Lua runtime
@@ -403,6 +495,8 @@ pub struct LuaEngine {
     next_plugin_handle: Arc<std::sync::atomic::AtomicU64>,
     /// Rust-owned current plugin context for callbacks and API ownership checks.
     current_plugin_name: Arc<RwLock<Option<String>>>,
+    /// Canonical plugin root directories keyed by plugin name.
+    plugin_roots: Arc<RwLock<HashMap<String, PathBuf>>>,
     /// UI callbacks: (plugin_name, callback_id) -> callback_ref
     ui_callbacks: Arc<RwLock<HashMap<PluginCallbackKey, RegistryKey>>>,
     /// Panel render/event callback metadata keyed by panel handle.
@@ -429,28 +523,18 @@ impl LuaEngine {
     pub fn new() -> Result<Self> {
         let lua = Lua::new();
 
-        // Set up sandboxing - remove dangerous functions
-        lua.load(
-            r#"
-            -- Remove dangerous functions
-            os.execute = nil
-            os.exit = nil
-            io = nil
-            loadfile = nil
-            dofile = nil
-            "#,
-        )
-        .exec()
-        .map_err(|e| {
-            PluginError::InitializationFailed(format!("Failed to setup sandbox: {}", e))
-        })?;
-
         let contract_event_handlers = Arc::new(RwLock::new(HashMap::new()));
         let commands = Arc::new(RwLock::new(CommandRegistry::default()));
         let plugin_registry = Arc::new(RwLock::new(LoadedPluginRegistry::default()));
         let next_plugin_handle = Arc::new(std::sync::atomic::AtomicU64::new(1));
         let current_plugin_name = Arc::new(RwLock::new(None));
+        let plugin_roots = Arc::new(RwLock::new(HashMap::new()));
         lua.set_app_data(CurrentPluginName(Arc::clone(&current_plugin_name)));
+        setup_sandbox(
+            &lua,
+            &crate::types::PluginConfig::default(),
+            Arc::clone(&plugin_roots),
+        )?;
         let ui_callbacks = Arc::new(RwLock::new(HashMap::new()));
         let panel_callbacks = Arc::new(RwLock::new(HashMap::new()));
         let next_ui_callback_id = Arc::new(std::sync::atomic::AtomicU64::new(1));
@@ -466,6 +550,7 @@ impl LuaEngine {
             plugin_registry,
             next_plugin_handle,
             current_plugin_name,
+            plugin_roots,
             ui_callbacks,
             panel_callbacks,
             next_ui_callback_id,
@@ -482,22 +567,6 @@ impl LuaEngine {
     pub fn reset(&mut self) -> Result<()> {
         let lua = Lua::new();
 
-        // Set up sandboxing - remove dangerous functions
-        lua.load(
-            r#"
-            -- Remove dangerous functions
-            os.execute = nil
-            os.exit = nil
-            io = nil
-            loadfile = nil
-            dofile = nil
-            "#,
-        )
-        .exec()
-        .map_err(|e| {
-            PluginError::InitializationFailed(format!("Failed to setup sandbox: {}", e))
-        })?;
-
         self.clear_event_subscriptions()?;
         self.clear_command_registrations()?;
         self.ui_callbacks.write().clear();
@@ -508,11 +577,17 @@ impl LuaEngine {
         self.lua = lua;
         self.lua
             .set_app_data(CurrentPluginName(Arc::clone(&self.current_plugin_name)));
+        setup_sandbox(
+            &self.lua,
+            &crate::types::PluginConfig::default(),
+            Arc::clone(&self.plugin_roots),
+        )?;
         self.lua.set_app_data(PendingUiCallbackRegistry(Arc::clone(
             &self.pending_ui_callbacks,
         )));
         self.plugins.clear();
         self.plugin_registry.write().clear();
+        self.plugin_roots.write().clear();
 
         Ok(())
     }
@@ -580,6 +655,40 @@ impl LuaEngine {
             })
     }
 
+    fn with_watchdog<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> {
+        let max_instructions = self
+            .lua
+            .app_data_ref::<crate::types::PluginConfig>()
+            .map(|config| config.max_instructions)
+            .unwrap_or_else(|| crate::types::PluginConfig::default().max_instructions);
+
+        if max_instructions == 0 {
+            return f();
+        }
+
+        let count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let hook_count = Arc::clone(&count);
+        self.lua.set_hook(
+            HookTriggers::new().every_nth_instruction(WATCHDOG_STEP),
+            move |_lua, _debug| {
+                let executed = hook_count.fetch_add(
+                    u64::from(WATCHDOG_STEP),
+                    std::sync::atomic::Ordering::Relaxed,
+                ) + u64::from(WATCHDOG_STEP);
+                if executed > max_instructions {
+                    return Err(LuaError::RuntimeError(format!(
+                        "instruction watchdog exceeded {max_instructions} instructions"
+                    )));
+                }
+                Ok(VmState::Continue)
+            },
+        );
+
+        let result = f();
+        self.lua.remove_hook();
+        result
+    }
+
     pub fn set_ui_host(
         &mut self,
         host: Box<dyn crate::contract::host::PluginUiHost + Send + Sync>,
@@ -619,6 +728,9 @@ impl LuaEngine {
     /// Register the Helix API with Lua
     pub fn register_api(&self, config: crate::types::PluginConfig) -> Result<()> {
         let globals = self.lua.globals();
+        self.lua.set_memory_limit(config.max_memory).map_err(|e| {
+            PluginError::InitializationFailed(format!("Failed to set memory limit: {e}"))
+        })?;
 
         if let Some(ref host) = self.ui_host {
             self.lua.set_app_data(UiHostWrapper(Arc::clone(host)));
@@ -650,6 +762,8 @@ impl LuaEngine {
             .set_app_data(PluginHandleCounter(Arc::clone(&self.next_plugin_handle)));
         self.lua
             .set_app_data(CurrentPluginName(Arc::clone(&self.current_plugin_name)));
+        self.lua
+            .set_app_data(PluginRoots(Arc::clone(&self.plugin_roots)));
         self.lua
             .set_app_data(LoadedPluginRegistryWrapper(Arc::clone(
                 &self.plugin_registry,
@@ -722,10 +836,12 @@ impl LuaEngine {
 
         with_editor_context(editor, || {
             with_current_plugin_name(&self.lua, &plugin_name, || {
-                let result: LuaMultiValue = thread.resume(lua_args).map_err(|e| {
-                    PluginError::CommandExecutionFailed(format!("Execution failed: {}", e))
-                })?;
-                self.handle_coroutine_yield(&thread, &plugin_name, result)
+                self.with_watchdog(|| {
+                    let result: LuaMultiValue = thread.resume(lua_args).map_err(|e| {
+                        PluginError::CommandExecutionFailed(format!("Execution failed: {}", e))
+                    })?;
+                    self.handle_coroutine_yield(&thread, &plugin_name, result)
+                })
             })
         })?;
 
@@ -815,14 +931,16 @@ impl LuaEngine {
 
             with_editor_context(editor, || {
                 with_current_plugin_name(&self.lua, &entry.plugin_name, || {
-                    let result: LuaMultiValue = thread.resume(lua_value).map_err(|e| {
-                        PluginError::CommandExecutionFailed(format!(
-                            "coroutine resume failed (plugin: {}): {}",
-                            entry.plugin_name, e
-                        ))
-                    })?;
-                    // Handle re-yield for chained operations.
-                    self.handle_coroutine_yield(&thread, &entry.plugin_name, result)
+                    self.with_watchdog(|| {
+                        let result: LuaMultiValue = thread.resume(lua_value).map_err(|e| {
+                            PluginError::CommandExecutionFailed(format!(
+                                "coroutine resume failed (plugin: {}): {}",
+                                entry.plugin_name, e
+                            ))
+                        })?;
+                        // Handle re-yield for chained operations.
+                        self.handle_coroutine_yield(&thread, &entry.plugin_name, result)
+                    })
                 })
             })?;
 
@@ -859,13 +977,19 @@ impl LuaEngine {
         // Load and execute the plugin
         let code = std::fs::read_to_string(&entry_file)?;
         self.ensure_plugin_id(&plugin.metadata.name);
+        let root = canonical_root(&plugin.path)?;
+        self.plugin_roots
+            .write()
+            .insert(plugin.metadata.name.clone(), root);
         with_editor_context(editor, || {
             with_current_plugin_name(&self.lua, &plugin.metadata.name, || {
-                self.lua
-                    .load(&code)
-                    .set_name(&plugin.metadata.name)
-                    .exec()
-                    .map_err(PluginError::LuaError)
+                self.with_watchdog(|| {
+                    self.lua
+                        .load(&code)
+                        .set_name(&plugin.metadata.name)
+                        .exec()
+                        .map_err(PluginError::LuaError)
+                })
             })
         })?;
 
@@ -880,38 +1004,142 @@ impl LuaEngine {
         editor: &mut Editor,
         event: &crate::contract::events::PluginEvent,
     ) -> Result<()> {
-        let handlers = self.contract_event_handlers.read();
         let kind = event.kind();
 
-        if let Some(callbacks) = handlers.get(&kind) {
-            let event_data = with_editor_context_ref(editor, || {
-                api::facade::contract_event_to_table(&self.lua, event)
-                    .map_err(PluginError::LuaError)
-            })?;
+        let targets: Vec<_> = self
+            .contract_event_handlers
+            .read()
+            .get(&kind)
+            .map(|callbacks| {
+                callbacks
+                    .iter()
+                    .map(|entry| (entry.handle, entry.plugin_name.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
 
-            for entry in callbacks {
-                let callback: LuaFunction =
-                    self.lua.registry_value(&entry.callback_ref).map_err(|e| {
-                        PluginError::EventHandlerError {
-                            plugin: entry.plugin_name.clone(),
-                            error: format!("Failed to retrieve callback: {}", e),
-                        }
-                    })?;
+        if targets.is_empty() {
+            return Ok(());
+        }
 
-                let plugin_name_captured = entry.plugin_name.clone();
-                with_editor_context(editor, || {
-                    with_current_plugin_name(&self.lua, &entry.plugin_name, || {
-                        callback.call::<()>(event_data.clone())
-                    })
+        let event_data = with_editor_context_ref(editor, || {
+            api::facade::contract_event_to_table(&self.lua, event).map_err(PluginError::LuaError)
+        })?;
+
+        for (handle, plugin_name) in targets {
+            let callback = {
+                let handlers = self.contract_event_handlers.read();
+                let Some(entry) = handlers
+                    .get(&kind)
+                    .and_then(|entries| entries.iter().find(|entry| entry.handle == handle))
+                else {
+                    continue;
+                };
+                self.lua
+                    .registry_value::<LuaFunction>(&entry.callback_ref)
                     .map_err(|e| PluginError::EventHandlerError {
-                        plugin: plugin_name_captured,
-                        error: format!("Handler execution failed: {}", e),
+                        plugin: entry.plugin_name.clone(),
+                        error: format!("Failed to retrieve callback: {e}"),
                     })
-                })?;
+            };
+
+            let result = match callback {
+                Ok(callback) => with_editor_context(editor, || {
+                    with_current_plugin_name(&self.lua, &plugin_name, || {
+                        self.with_watchdog(|| {
+                            callback
+                                .call::<()>(event_data.clone())
+                                .map_err(PluginError::LuaError)
+                        })
+                    })
+                }),
+                Err(err) => Err(err),
+            };
+
+            match result {
+                Ok(()) => self.reset_event_failure(kind, handle),
+                Err(err) => {
+                    error!(
+                        "Plugin event handler failed: plugin='{}' event='{}' handle='{}': {}",
+                        plugin_name, kind, handle, err
+                    );
+                    self.record_event_failure(kind, handle, &plugin_name);
+                }
             }
         }
 
         Ok(())
+    }
+
+    fn reset_event_failure(
+        &self,
+        kind: crate::contract::events::EventKind,
+        handle: SubscriptionHandle,
+    ) {
+        if let Some(entry) = self
+            .contract_event_handlers
+            .write()
+            .get_mut(&kind)
+            .and_then(|entries| entries.iter_mut().find(|entry| entry.handle == handle))
+        {
+            entry.failures = 0;
+        }
+    }
+
+    fn record_event_failure(
+        &self,
+        kind: crate::contract::events::EventKind,
+        handle: SubscriptionHandle,
+        plugin_name: &str,
+    ) {
+        let removed = {
+            let mut handlers = self.contract_event_handlers.write();
+            let Some(entries) = handlers.get_mut(&kind) else {
+                return;
+            };
+            let Some(entry) = entries.iter_mut().find(|entry| entry.handle == handle) else {
+                return;
+            };
+            entry.failures += 1;
+            if entry.failures < EVENT_FAILURE_LIMIT {
+                return;
+            }
+
+            warn!(
+                "Unsubscribing plugin event handler after {} consecutive failures: plugin='{}' event='{}' handle='{}'",
+                EVENT_FAILURE_LIMIT,
+                plugin_name,
+                kind,
+                handle
+            );
+
+            let Some(index) = entries.iter().position(|entry| entry.handle == handle) else {
+                return;
+            };
+            let removed = entries.remove(index);
+            if entries.is_empty() {
+                handlers.remove(&kind);
+            }
+            removed
+        };
+
+        if let Some(host) = &self.event_host {
+            match self.plugin_id_for_name(plugin_name).and_then(|plugin| {
+                host.lock().unsubscribe(plugin, handle).map_err(|err| {
+                    PluginError::EventHandlerError {
+                        plugin: plugin_name.to_string(),
+                        error: err.to_string(),
+                    }
+                })
+            }) {
+                Ok(()) | Err(PluginError::EventHandlerError { .. }) => {}
+                Err(err) => warn!("Failed to notify host about event unsubscribe: {err}"),
+            }
+        }
+
+        if let Err(err) = self.lua.remove_registry_value(removed.callback_ref) {
+            warn!("Failed to remove event handler registry value: {err}");
+        }
     }
 
     /// Get the Lua runtime (for advanced operations)
@@ -1112,10 +1340,7 @@ mod tests {
         let plugin = crate::types::Plugin {
             metadata: crate::types::PluginMetadata {
                 name: "load-context".into(),
-                version: "0.1.0".into(),
-                description: None,
-                author: None,
-                entry: Some("init.lua".into()),
+                ..Default::default()
             },
             path: dir.path().to_path_buf(),
             enabled: true,
@@ -2141,6 +2366,206 @@ mod tests {
             .unwrap();
 
         assert!(engine.ui_callbacks.read().contains_key(&callback_key));
+    }
+
+    #[test]
+    fn stale_document_handle_returns_contract_code() {
+        let engine = LuaEngine::new().unwrap();
+        engine
+            .register_api(crate::types::PluginConfig::default())
+            .unwrap();
+        let mut editor = test_editor();
+        let stale = crate::contract::DocumentHandle::from_raw(NonZeroU64::new(999).unwrap());
+
+        let message: String = with_editor_context(&mut editor, || {
+            engine.lua.globals().set(
+                "doc",
+                engine
+                    .lua
+                    .create_userdata(api::facade::LuaDocumentHandle(stale))?,
+            )?;
+            engine
+                .lua
+                .load(
+                    r#"
+                    local ok, err = pcall(function()
+                        return doc:text()
+                    end)
+                    assert(not ok)
+                    return tostring(err)
+                    "#,
+                )
+                .eval()
+                .map_err(PluginError::LuaError)
+        })
+        .unwrap();
+
+        assert!(message.contains("code=stale_handle"));
+    }
+
+    #[test]
+    fn event_handler_failure_isolated_and_unsubscribed_after_threshold() {
+        #[derive(Clone)]
+        struct TestEventHost {
+            next: Arc<Mutex<u64>>,
+            unsubscribed: Arc<Mutex<Vec<crate::contract::SubscriptionHandle>>>,
+        }
+
+        impl crate::contract::host::PluginEventHost for TestEventHost {
+            fn subscribe(
+                &mut self,
+                _plugin: crate::contract::PluginId,
+                _kind: crate::contract::events::EventKind,
+            ) -> crate::contract::ContractResult<crate::contract::SubscriptionHandle> {
+                let mut next = self.next.lock();
+                let handle =
+                    crate::contract::SubscriptionHandle::from_raw(NonZeroU64::new(*next).unwrap());
+                *next += 1;
+                Ok(handle)
+            }
+
+            fn unsubscribe(
+                &mut self,
+                _plugin: crate::contract::PluginId,
+                handle: crate::contract::SubscriptionHandle,
+            ) -> crate::contract::ContractResult<()> {
+                self.unsubscribed.lock().push(handle);
+                Ok(())
+            }
+
+            fn event_catalog(&self) -> Vec<crate::contract::metadata::EventKindInfo> {
+                vec![]
+            }
+        }
+
+        let mut engine = LuaEngine::new().unwrap();
+        register_loaded_plugin(&engine, "test-plugin", 1);
+        set_current_plugin(&engine, "test-plugin");
+        let unsubscribed = Arc::new(Mutex::new(Vec::new()));
+        engine.set_event_host(Box::new(TestEventHost {
+            next: Arc::new(Mutex::new(1)),
+            unsubscribed: Arc::clone(&unsubscribed),
+        }));
+        engine
+            .register_api(crate::types::PluginConfig::default())
+            .unwrap();
+
+        exec_as(
+            &engine,
+            "test-plugin",
+            r#"
+            helix.events.subscribe("host_ready", function(event)
+                error("boom")
+            end)
+            helix.events.subscribe("host_ready", function(event)
+                _G.second_handler_runs = (_G.second_handler_runs or 0) + 1
+            end)
+            "#,
+        )
+        .unwrap();
+
+        let mut editor = test_editor();
+        let event = crate::contract::events::PluginEvent::HostReady(
+            crate::contract::events::HostReadyEvent {
+                api_version: crate::contract::metadata::API_VERSION,
+            },
+        );
+        for _ in 0..EVENT_FAILURE_LIMIT {
+            engine.call_event_handlers(&mut editor, &event).unwrap();
+        }
+
+        let second_runs: u32 = engine.lua.globals().get("second_handler_runs").unwrap();
+        assert_eq!(second_runs, EVENT_FAILURE_LIMIT);
+        assert_eq!(unsubscribed.lock().len(), 1);
+        assert_eq!(
+            engine
+                .contract_event_handlers
+                .read()
+                .get(&crate::contract::events::EventKind::HostReady)
+                .map(Vec::len),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn sandbox_scopes_require_to_plugin_directory() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let plugin_dir = temp_dir.path().join("scoped");
+        std::fs::create_dir(&plugin_dir).unwrap();
+        std::fs::write(plugin_dir.join("helper.lua"), "return { value = 42 }").unwrap();
+        std::fs::write(
+            plugin_dir.join("init.lua"),
+            r#"
+            local helper = require("helper")
+            _G.helper_value = helper.value
+            local ok = pcall(function()
+                require("io")
+            end)
+            _G.system_require_failed = not ok
+            _G.package_removed = package == nil
+            "#,
+        )
+        .unwrap();
+
+        let mut engine = LuaEngine::new().unwrap();
+        engine
+            .register_api(crate::types::PluginConfig::default())
+            .unwrap();
+        let mut editor = test_editor();
+        engine
+            .load_plugin(
+                &mut editor,
+                crate::types::Plugin {
+                    metadata: crate::types::PluginMetadata {
+                        name: "scoped".into(),
+                        ..Default::default()
+                    },
+                    path: plugin_dir,
+                    enabled: true,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(engine.lua.globals().get::<u32>("helper_value").unwrap(), 42);
+        assert!(engine
+            .lua
+            .globals()
+            .get::<bool>("system_require_failed")
+            .unwrap());
+        assert!(engine.lua.globals().get::<bool>("package_removed").unwrap());
+    }
+
+    #[test]
+    fn instruction_watchdog_aborts_runaway_plugin() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let plugin_dir = temp_dir.path().join("runaway");
+        std::fs::create_dir(&plugin_dir).unwrap();
+        std::fs::write(plugin_dir.join("init.lua"), "while true do end").unwrap();
+
+        let mut engine = LuaEngine::new().unwrap();
+        engine
+            .register_api(crate::types::PluginConfig {
+                max_instructions: 20_000,
+                ..Default::default()
+            })
+            .unwrap();
+        let mut editor = test_editor();
+        let result = engine.load_plugin(
+            &mut editor,
+            crate::types::Plugin {
+                metadata: crate::types::PluginMetadata {
+                    name: "runaway".into(),
+                    ..Default::default()
+                },
+                path: plugin_dir,
+                enabled: true,
+            },
+        );
+
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("instruction watchdog exceeded"));
     }
 
     #[test]

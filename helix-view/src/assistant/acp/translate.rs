@@ -206,10 +206,21 @@ fn tool_call(info: acp::ToolCallInfo) -> tool::Call {
         id: tool::Id::new(info.tool_call_id),
         name: info.title.unwrap_or_else(|| "tool".to_string()),
         state: tool_state(info.status),
+        output: String::new(),
     }
 }
 
 fn tool_update(update: acp::ToolCallUpdate) -> tool::Call {
+    let output = update
+        .content
+        .map(|blocks| {
+            blocks
+                .into_iter()
+                .map(content_text)
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default();
     tool::Call {
         id: tool::Id::new(update.tool_call_id),
         name: "tool".to_string(),
@@ -217,6 +228,7 @@ fn tool_update(update: acp::ToolCallUpdate) -> tool::Call {
             .status
             .map(tool_state)
             .unwrap_or(tool::State::Pending),
+        output,
     }
 }
 
@@ -360,5 +372,29 @@ mod tests {
             entry.locations[0].source,
             crate::collab::location::Source::Tool
         );
+    }
+
+    #[test]
+    fn thread_event_synthesizes_out_of_order_tool_update() {
+        let update = acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate {
+            tool_call_id: "tool-1".to_string(),
+            status: Some(acp::ToolCallStatus::Running),
+            content: Some(vec![acp::ContentBlock::Text(acp::TextContent {
+                text: "partial output".to_string(),
+            })]),
+        });
+
+        let Some(thread::Event::Content(thread::Content::Append(entry))) = thread_event(update)
+        else {
+            panic!("expected content append event");
+        };
+
+        let thread::EntryKind::ToolCall(call) = entry.kind else {
+            panic!("expected synthesized tool call");
+        };
+        assert_eq!(call.id.as_str(), "tool-1");
+        assert_eq!(call.name, "tool");
+        assert_eq!(call.state, tool::State::Running);
+        assert_eq!(call.output, "partial output");
     }
 }

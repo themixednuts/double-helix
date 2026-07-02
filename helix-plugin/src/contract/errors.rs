@@ -49,6 +49,25 @@ pub type ContractResult<T> = Result<T, ContractError>;
 // ---- Construction helpers ----
 
 impl ContractError {
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::NotFound { .. } => "not_found",
+            Self::StaleHandle { .. } => "stale_handle",
+            Self::InvalidRequest { .. } => "invalid_request",
+            Self::PermissionDenied { .. } => "permission_denied",
+            Self::UnsupportedCapability { .. } => "unsupported_capability",
+            Self::Busy { .. } => "busy",
+            Self::InternalError { .. } => "internal_error",
+        }
+    }
+
+    pub fn entity(&self) -> Option<&str> {
+        match self {
+            Self::NotFound { entity } | Self::StaleHandle { entity } => Some(entity),
+            _ => None,
+        }
+    }
+
     pub fn not_found(entity: impl Into<String>) -> Self {
         Self::NotFound {
             entity: entity.into(),
@@ -97,6 +116,8 @@ mod tests {
             e.to_string(),
             "stale handle: DocumentHandle(42) no longer exists"
         );
+        assert_eq!(e.code(), "stale_handle");
+        assert_eq!(e.entity(), Some("DocumentHandle(42)"));
     }
 
     #[test]

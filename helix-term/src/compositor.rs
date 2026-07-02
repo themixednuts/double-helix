@@ -160,7 +160,8 @@ pub(crate) fn compute_panel_layout(area: Rect, editor: &Editor) -> PanelLayout {
 
         match panel.side {
             PanelSide::Right => {
-                if editor_area.width <= 60 {
+                // Both the panel minimum (30) and the editor reserve (40) must fit.
+                if editor_area.width < 70 {
                     continue; // too narrow to split
                 }
                 let w = panel_size.max(30).min(editor_area.width.saturating_sub(40));

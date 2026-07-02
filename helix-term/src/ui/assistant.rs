@@ -19,11 +19,16 @@ use helix_view::input::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent
 use helix_view::theme::{Modifier, Style};
 use helix_view::traits::{Bounded, Focusable, Identified, Modal, Scrollable};
 use helix_view::Editor;
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::time::Duration;
 use tui::text::{Span, Spans};
 
 mod markdown;
-use markdown::{fit_bubble_width, render_markdown_lines, wrap_text, MarkdownLineStyles};
+use markdown::{
+    complete_markdown_prefix_len, fit_bubble_width, render_markdown_lines, wrap_text,
+    MarkdownCacheKey, MarkdownLineStyles,
+};
 
 pub const ID: &str = "assistant-panel";
 pub const PERMISSION_ID: &str = "assistant-permission";
@@ -60,6 +65,15 @@ pub struct AssistantPanel {
     spinner: Spinner,
     /// Selection animation that replays when message focus moves back onto a row.
     message_focus_animation: Animation,
+    markdown_cache: RefCell<HashMap<helix_view::assistant::thread::EntryId, CachedMarkdown>>,
+}
+
+#[derive(Clone)]
+struct CachedMarkdown {
+    text: String,
+    key: MarkdownCacheKey,
+    complete_lines: Vec<Spans<'static>>,
+    lines: Vec<Spans<'static>>,
 }
 
 #[derive(Clone, Copy)]
@@ -303,6 +317,7 @@ impl AssistantPanel {
                 spec.frame_interval = Duration::from_millis(16);
                 spec
             }),
+            markdown_cache: RefCell::new(HashMap::new()),
         }
     }
 
@@ -453,6 +468,70 @@ impl AssistantPanel {
         message
     }
 
+    fn tool_call_message(
+        &self,
+        name: &str,
+        status: &str,
+        output: &str,
+        expanded: bool,
+        selected: bool,
+        theme: &helix_view::Theme,
+        accent: Option<(GraphicsStyle, f32)>,
+    ) -> Message<'static> {
+        let icon = if status == "running" {
+            self.spinner.frame().to_string()
+        } else {
+            helix_view::model::AssistantEntry::status_icon(status).to_string()
+        };
+        let tone = helix_view::model::AssistantEntry::status_tone(status);
+        let icon_style = Self::entry_tone_style(theme, tone);
+        let title_style = theme.get("ui.text.focus").add_modifier(Modifier::BOLD);
+        let muted_style = theme.get("ui.text.inactive");
+        let summary = if output.is_empty() {
+            status.to_string()
+        } else {
+            Self::collapse_preview(output, 96)
+        };
+        let mut lines = vec![Spans::from(vec![
+            Span::styled(format!(" {icon} "), icon_style),
+            Span::styled(name.to_string(), title_style),
+            Span::styled(format!("  {summary}"), muted_style),
+        ])];
+
+        if expanded && !output.is_empty() {
+            let plus = theme.get("diff.plus");
+            let minus = theme.get("diff.minus");
+            let delta = theme.get("diff.delta");
+            let text = theme.get("ui.text");
+            for line in output.lines() {
+                let style = if line.starts_with('+') && !line.starts_with("+++") {
+                    plus
+                } else if line.starts_with('-') && !line.starts_with("---") {
+                    minus
+                } else if line.starts_with("@@") {
+                    delta
+                } else {
+                    text
+                };
+                lines.push(Spans::from(Span::styled(format!("   {line}"), style)));
+            }
+        }
+
+        let mut message = Message::plain(lines);
+        if let Some((style, _)) = accent {
+            message = message.with_selected_bar("▌", style);
+        }
+        if selected {
+            message = Self::decorate_selected_message(
+                message,
+                true,
+                theme,
+                Self::plain_accessory_align(),
+            );
+        }
+        message
+    }
+
     fn yank_selected_message(&mut self, editor: &mut Editor) -> bool {
         let Some(text) = self.selected_entry_ref(editor).map(ChatEntry::plain_text) else {
             return false;
@@ -495,6 +574,79 @@ impl AssistantPanel {
         }
         preview.push('…');
         preview
+    }
+
+    fn render_markdown_cached(
+        &self,
+        entry: helix_view::assistant::thread::EntryId,
+        text: &str,
+        base_style: Style,
+        styles: &MarkdownLineStyles,
+        theme: &helix_view::Theme,
+        loader: &helix_core::syntax::Loader,
+    ) -> Vec<Spans<'static>> {
+        let key = MarkdownCacheKey::new(text);
+        let cached = self.markdown_cache.borrow().get(&entry).cloned();
+        if let Some(cached) = cached {
+            if cached.key == key && cached.text == text {
+                return cached.lines.clone();
+            }
+            if text.starts_with(&cached.text) && cached.key.complete_len > 0 {
+                let prefix_len = cached.key.complete_len.min(text.len());
+                let tail = &text[prefix_len..];
+                let mut tail_lines = Vec::new();
+                render_markdown_lines(
+                    tail,
+                    &mut tail_lines,
+                    base_style,
+                    styles,
+                    Some(theme),
+                    loader,
+                );
+                let mut lines = cached.complete_lines.clone();
+                lines.extend(tail_lines);
+                self.markdown_cache.borrow_mut().insert(
+                    entry,
+                    CachedMarkdown {
+                        text: text.to_string(),
+                        key,
+                        complete_lines: cached.complete_lines.clone(),
+                        lines: lines.clone(),
+                    },
+                );
+                return lines;
+            }
+        }
+
+        let complete_len = complete_markdown_prefix_len(text);
+        let mut lines = Vec::new();
+        render_markdown_lines(text, &mut lines, base_style, styles, Some(theme), loader);
+        let complete_lines = if complete_len == text.len() {
+            lines.clone()
+        } else if complete_len > 0 {
+            let mut prefix = Vec::new();
+            render_markdown_lines(
+                &text[..complete_len],
+                &mut prefix,
+                base_style,
+                styles,
+                Some(theme),
+                loader,
+            );
+            prefix
+        } else {
+            Vec::new()
+        };
+        self.markdown_cache.borrow_mut().insert(
+            entry,
+            CachedMarkdown {
+                text: text.to_string(),
+                key,
+                complete_lines,
+                lines: lines.clone(),
+            },
+        );
+        lines
     }
 
     fn apply_assistant_effects(
@@ -603,6 +755,7 @@ impl AssistantPanel {
         &self,
         model: &helix_view::model::AssistantModel,
         theme: &helix_view::Theme,
+        loader: &helix_core::syntax::Loader,
         width: u16,
         corners: MessageCorners,
     ) -> Vec<Message<'a>> {
@@ -618,6 +771,10 @@ impl AssistantPanel {
         let code_style = theme.get("markup.raw.inline");
         let bold_style = agent_style.add_modifier(Modifier::BOLD);
         let italic_style = agent_style.add_modifier(Modifier::ITALIC);
+        let strike_style = agent_style.add_modifier(Modifier::CROSSED_OUT);
+        let link_style = theme.get("markup.link.url");
+        let quote_style = theme.get("markup.quote");
+        let list_style = theme.get("markup.list.unnumbered");
         let active_accent = self.current_message_accent(model, theme);
         let agent_name = model.agent_name.as_str();
 
@@ -630,7 +787,6 @@ impl AssistantPanel {
 
         for entry in self.output.content().iter() {
             let entry_id = Some(entry.id);
-            let display = entry.display(agent_name);
             let message_accent = if entry_id == selected {
                 active_accent
             } else {
@@ -638,6 +794,27 @@ impl AssistantPanel {
             };
             let selected = entry_id == selected;
             let collapsed = model.is_folded(entry.id);
+            if let helix_view::model::AssistantEntryKind::ToolCall {
+                name,
+                status,
+                output,
+                ..
+            } = &entry.kind
+            {
+                let expanded = status == "failed" || collapsed;
+                blocks.push(self.tool_call_message(
+                    name,
+                    status,
+                    output,
+                    expanded,
+                    selected,
+                    theme,
+                    message_accent,
+                ));
+                continue;
+            }
+
+            let display = entry.display(agent_name);
             match &display {
                 helix_view::model::AssistantEntryDisplay::Bubble(display) => {
                     let bubble_w =
@@ -665,17 +842,23 @@ impl AssistantPanel {
                                     agent_style,
                                 )));
                             } else {
-                                render_markdown_lines(
+                                md_lines = self.render_markdown_cached(
+                                    entry.id,
                                     &display.text,
-                                    &mut md_lines,
                                     agent_style,
                                     &MarkdownLineStyles {
                                         heading: heading_style,
                                         code: code_style,
                                         bold: bold_style,
                                         italic: italic_style,
+                                        strike: strike_style,
+                                        link: link_style,
+                                        quote: quote_style,
+                                        list: list_style,
                                         separator: separator_style,
                                     },
+                                    theme,
+                                    loader,
                                 );
                             }
 
@@ -1283,7 +1466,8 @@ impl AssistantPanel {
 
         // Render chat content using message list primitives.
         let corners = MessageCorners::Squared;
-        let blocks = self.build_blocks(&model, theme, content_area.width, corners);
+        let loader = cx.syntax_loader().load();
+        let blocks = self.build_blocks(&model, theme, &loader, content_area.width, corners);
         self.render_content(&model, &blocks, content_area, surface);
 
         // Scrollbar
@@ -1741,7 +1925,7 @@ impl Component for AssistantPanel {
             if let Some(effects) = cx.editor.cancel_active_assistant_thread() {
                 Self::apply_assistant_effects(cx.editor, effects);
             }
-            cx.editor.set_status("Cancelling agent...");
+            cx.editor.set_status("Canceling agent...");
             return EventResult::Consumed(None);
         }
 
@@ -1788,7 +1972,14 @@ impl Component for AssistantPanel {
             let viewport_height = self.output.area().height as usize;
             let handled = match (key.code, key.modifiers) {
                 (KeyCode::Esc, KeyModifiers::NONE) => {
-                    self.focus_input_region(cx.editor);
+                    if model.agent_busy {
+                        if let Some(effects) = cx.editor.cancel_active_assistant_thread() {
+                            Self::apply_assistant_effects(cx.editor, effects);
+                        }
+                        cx.editor.set_status("Canceling agent...");
+                    } else {
+                        self.focus_input_region(cx.editor);
+                    }
                     true
                 }
                 (KeyCode::Char('i'), KeyModifiers::NONE) => {
@@ -2022,6 +2213,7 @@ pub struct PermissionPopup {
     description: Option<String>,
     options: Vec<PermissionChoice>,
     selected: usize,
+    default: Option<String>,
     /// Channel to send the response back to the handler.
     response_tx: Option<tokio::sync::oneshot::Sender<PermissionResponse>>,
 }
@@ -2030,6 +2222,7 @@ pub struct PermissionChoice {
     pub id: String,
     pub title: String,
     pub description: Option<String>,
+    pub key: Option<char>,
 }
 
 pub enum PermissionResponse {
@@ -2042,6 +2235,7 @@ impl PermissionPopup {
         title: String,
         description: Option<String>,
         options: Vec<PermissionChoice>,
+        default: Option<String>,
         response_tx: tokio::sync::oneshot::Sender<PermissionResponse>,
     ) -> Self {
         Self {
@@ -2049,6 +2243,7 @@ impl PermissionPopup {
             description,
             options,
             selected: 0,
+            default,
             response_tx: Some(response_tx),
         }
     }
@@ -2161,6 +2356,12 @@ impl PermissionPopup {
         for (i, opt) in self.options.iter().enumerate() {
             let is_selected = i == self.selected;
             let marker = if is_selected { ">" } else { " " };
+            let key = opt.key.map(|key| format!(" [{key}]")).unwrap_or_default();
+            let default = if self.default.as_deref() == Some(opt.id.as_str()) {
+                " default"
+            } else {
+                ""
+            };
             let style = if is_selected {
                 theme.get("ui.menu.selected")
             } else {
@@ -2168,7 +2369,7 @@ impl PermissionPopup {
             };
             let opt_line = format!(
                 "│{marker} {:<width$}│",
-                opt.title,
+                format!("{}{}{}", opt.title, key, default),
                 width = (popup_width - 5) as usize
             );
             surface.set_stringn(
@@ -2217,7 +2418,12 @@ impl Component for PermissionPopup {
                 EventResult::Consumed(None)
             }
             KeyCode::Enter => {
-                if let Some(opt) = self.options.get(self.selected) {
+                let selected = self
+                    .default
+                    .as_ref()
+                    .and_then(|default| self.options.iter().find(|opt| &opt.id == default))
+                    .or_else(|| self.options.get(self.selected));
+                if let Some(opt) = selected {
                     self.send_response(PermissionResponse::Selected(opt.id.clone()));
                 }
                 EventResult::Consumed(Some(crate::compositor::PostAction::RemoveById(
@@ -2235,6 +2441,21 @@ impl Component for PermissionPopup {
                 let idx = (c as usize) - ('1' as usize);
                 if idx < self.options.len() {
                     self.send_response(PermissionResponse::Selected(self.options[idx].id.clone()));
+                    EventResult::Consumed(Some(crate::compositor::PostAction::RemoveById(
+                        PERMISSION_ID,
+                    )))
+                } else {
+                    EventResult::Consumed(None)
+                }
+            }
+            KeyCode::Char(c) => {
+                let c = c.to_ascii_lowercase();
+                if let Some(opt) = self
+                    .options
+                    .iter()
+                    .find(|opt| opt.key.is_some_and(|key| key == c))
+                {
+                    self.send_response(PermissionResponse::Selected(opt.id.clone()));
                     EventResult::Consumed(Some(crate::compositor::PostAction::RemoveById(
                         PERMISSION_ID,
                     )))
@@ -2311,25 +2532,24 @@ mod tests {
                 ChatEntryKind::AgentText(text) => {
                     helix_view::assistant::thread::EntryKind::AssistantText { text }
                 }
-                ChatEntryKind::ToolCall { id, name, status } => {
-                    helix_view::assistant::thread::EntryKind::ToolCall(
-                        helix_view::assistant::tool::Call {
-                            id: helix_view::assistant::tool::Id::new(id),
-                            name,
-                            state: match status.as_str() {
-                                "running" => helix_view::assistant::tool::State::Running,
-                                "completed" | "done" => {
-                                    helix_view::assistant::tool::State::Completed
-                                }
-                                "failed" => {
-                                    helix_view::assistant::tool::State::Failed { message: None }
-                                }
-                                "cancelled" => helix_view::assistant::tool::State::Canceled,
-                                _ => helix_view::assistant::tool::State::Pending,
-                            },
+                ChatEntryKind::ToolCall {
+                    id, name, status, ..
+                } => helix_view::assistant::thread::EntryKind::ToolCall(
+                    helix_view::assistant::tool::Call {
+                        id: helix_view::assistant::tool::Id::new(id),
+                        name,
+                        state: match status.as_str() {
+                            "running" => helix_view::assistant::tool::State::Running,
+                            "completed" | "done" => helix_view::assistant::tool::State::Completed,
+                            "failed" => {
+                                helix_view::assistant::tool::State::Failed { message: None }
+                            }
+                            "cancelled" => helix_view::assistant::tool::State::Canceled,
+                            _ => helix_view::assistant::tool::State::Pending,
                         },
-                    )
-                }
+                        output: String::new(),
+                    },
+                ),
                 ChatEntryKind::Status(text) => {
                     helix_view::assistant::thread::EntryKind::Status { text }
                 }
@@ -2519,9 +2739,11 @@ mod tests {
             select_thread_entry(&mut editor, 0);
 
             let model = editor.assistant_model(false);
+            let loader = editor.syn_loader.load();
             let expanded_blocks = panel.build_blocks(
                 &model,
                 editor.assistant_theme(),
+                &loader,
                 30,
                 MessageCorners::Squared,
             );
@@ -2533,6 +2755,7 @@ mod tests {
             let collapsed_blocks = panel.build_blocks(
                 &model,
                 editor.assistant_theme(),
+                &loader,
                 30,
                 MessageCorners::Squared,
             );

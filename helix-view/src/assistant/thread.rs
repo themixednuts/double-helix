@@ -59,6 +59,11 @@ pub enum Run {
     Failed { message: String },
 }
 
+impl Run {
+    #[allow(non_upper_case_globals)]
+    pub const Canceling: Self = Self::Waiting;
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PersistedState {
     pub title: Option<String>,
@@ -535,6 +540,10 @@ impl Thread {
                     if let Some(existing) = self.entries.iter_mut().rev().find(|entry| {
                         matches!(&entry.kind, EntryKind::ToolCall(current) if current.id == call.id)
                     }) {
+                        let call = match &existing.kind {
+                            EntryKind::ToolCall(current) => merge_tool_call(current, call),
+                            _ => call,
+                        };
                         existing.turn = entry.turn;
                         existing.kind = EntryKind::ToolCall(call);
                         existing.locations = normalize_locations(existing.id, entry.locations);
@@ -655,6 +664,23 @@ impl Entry {
             _ => None,
         }
     }
+}
+
+fn merge_tool_call(current: &tool::Call, mut next: tool::Call) -> tool::Call {
+    if next.name == "tool" && current.name != "tool" {
+        next.name.clone_from(&current.name);
+    }
+    if next.output.is_empty() {
+        next.output.clone_from(&current.output);
+    } else if !current.output.is_empty() {
+        let mut output = current.output.clone();
+        if !output.ends_with('\n') {
+            output.push('\n');
+        }
+        output.push_str(&next.output);
+        next.output = output;
+    }
+    next
 }
 
 fn normalize_locations(entry: EntryId, locations: Vec<Location>) -> Vec<Location> {

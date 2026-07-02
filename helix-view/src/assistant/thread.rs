@@ -79,6 +79,10 @@ pub struct PersistedState {
     pub config: config::State,
     pub terminals: Vec<terminal::Terminal>,
     pub review_mode: review::Mode,
+    pub usage: Usage,
+    pub commands: Vec<Command>,
+    pub pending_elicitations: Vec<Elicitation>,
+    pub caps: Option<helix_acp::AgentCaps>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,6 +97,10 @@ pub struct Thread {
     context: Vec<context::Item>,
     terminals: Vec<terminal::Terminal>,
     review_mode: review::Mode,
+    usage: Usage,
+    commands: Vec<Command>,
+    pending_elicitations: Vec<Elicitation>,
+    caps: Option<helix_acp::AgentCaps>,
     pub follow: FollowState,
     mode: Option<mode::Set>,
     config: config::State,
@@ -145,6 +153,7 @@ pub struct NewEntry {
 pub enum EntryKind {
     UserPrompt { text: String },
     AssistantText { text: String },
+    Thought { text: String },
     ToolCall(tool::Call),
     Status { text: String },
     ChangeSummary(change::Summary),
@@ -169,6 +178,107 @@ pub enum Event {
     Run(Run),
     Follow(Location),
     Review(review::Event),
+    Usage(UsageUpdate),
+    Commands(Vec<Command>),
+    Elicitation(ElicitationEvent),
+    Caps(helix_acp::AgentCaps),
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Usage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub total_input_tokens: u64,
+    pub total_output_tokens: u64,
+    pub cache_creation_input_tokens: u64,
+    pub cache_read_input_tokens: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UsageUpdate {
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub total_input_tokens: Option<u64>,
+    pub total_output_tokens: Option<u64>,
+    pub cache_creation_input_tokens: Option<u64>,
+    pub cache_read_input_tokens: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Command {
+    pub name: String,
+    pub description: Option<String>,
+    pub category: CommandCategory,
+    pub arguments: Vec<CommandArgument>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandCategory {
+    Native,
+    Mcp,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandArgument {
+    pub name: String,
+    pub description: Option<String>,
+    pub required: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Elicitation {
+    pub id: String,
+    pub status: ElicitationStatus,
+    pub mode: ElicitationMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ElicitationStatus {
+    Pending,
+    Completed,
+    Declined,
+    Canceled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ElicitationMode {
+    Form {
+        message: String,
+        fields: Vec<ElicitationField>,
+    },
+    Url {
+        message: String,
+        url: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ElicitationField {
+    pub name: String,
+    pub field_type: ElicitationFieldType,
+    pub label: Option<String>,
+    pub required: bool,
+    pub options: Vec<ElicitationOption>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ElicitationFieldType {
+    Text,
+    Select,
+    Bool,
+    Textarea,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ElicitationOption {
+    pub value: String,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ElicitationEvent {
+    Request(Elicitation),
+    Complete { id: String, status: ElicitationStatus },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -197,6 +307,10 @@ impl Thread {
             context: Vec::new(),
             terminals: Vec::new(),
             review_mode: review::Mode::Write,
+            usage: Usage::default(),
+            commands: Vec::new(),
+            pending_elicitations: Vec::new(),
+            caps: None,
             follow: FollowState::Off,
             mode: None,
             config: config::State::new(Vec::new()),
@@ -283,6 +397,22 @@ impl Thread {
 
     pub fn terminals(&self) -> &[terminal::Terminal] {
         &self.terminals
+    }
+
+    pub fn usage(&self) -> &Usage {
+        &self.usage
+    }
+
+    pub fn commands(&self) -> &[Command] {
+        &self.commands
+    }
+
+    pub fn pending_elicitations(&self) -> &[Elicitation] {
+        &self.pending_elicitations
+    }
+
+    pub fn caps(&self) -> Option<&helix_acp::AgentCaps> {
+        self.caps.as_ref()
     }
 
     pub fn set_terminals(&mut self, terminals: Vec<terminal::Terminal>) {
@@ -388,6 +518,10 @@ impl Thread {
         self.config = state.config;
         self.terminals = state.terminals;
         self.review_mode = state.review_mode;
+        self.usage = state.usage;
+        self.commands = state.commands;
+        self.pending_elicitations = state.pending_elicitations;
+        self.caps = state.caps;
     }
 
     #[must_use]
@@ -519,6 +653,10 @@ impl Thread {
             Event::Terminal(event) => self.apply_terminal(event),
             Event::Run(run) => self.set_run(run),
             Event::Review(event) => self.apply_review(event),
+            Event::Usage(update) => self.apply_usage(update),
+            Event::Commands(commands) => self.commands = commands,
+            Event::Elicitation(event) => self.apply_elicitation(event),
+            Event::Caps(caps) => self.caps = Some(caps),
             Event::Follow(location) => match &mut self.follow {
                 FollowState::Off => {}
                 FollowState::On { last, .. } | FollowState::Paused { last, .. } => {
@@ -549,6 +687,27 @@ impl Thread {
                             kind: EntryKind::AssistantText { text },
                             locations: normalize_locations(id, entry.locations),
                         });
+                    }
+                }
+                EntryKind::Thought { text } => {
+                    if let Some(Entry {
+                        id,
+                        kind: EntryKind::Thought { text: existing },
+                        locations,
+                        ..
+                    }) = self.entries.last_mut()
+                    {
+                        existing.push_str(&text);
+                        locations.extend(normalize_locations(*id, entry.locations));
+                    } else {
+                        let id = self.next_entry_id();
+                        self.entries.push(Entry {
+                            id,
+                            turn: entry.turn,
+                            kind: EntryKind::Thought { text },
+                            locations: normalize_locations(id, entry.locations),
+                        });
+                        self.view.folded.insert(id);
                     }
                 }
                 EntryKind::ToolCall(call) => {
@@ -664,6 +823,54 @@ impl Thread {
         }
     }
 
+    fn apply_usage(&mut self, update: UsageUpdate) {
+        if let Some(value) = update.input_tokens {
+            self.usage.input_tokens = value;
+            self.usage.total_input_tokens = self.usage.total_input_tokens.saturating_add(value);
+        }
+        if let Some(value) = update.output_tokens {
+            self.usage.output_tokens = value;
+            self.usage.total_output_tokens = self.usage.total_output_tokens.saturating_add(value);
+        }
+        if let Some(value) = update.total_input_tokens {
+            self.usage.total_input_tokens = value;
+        }
+        if let Some(value) = update.total_output_tokens {
+            self.usage.total_output_tokens = value;
+        }
+        if let Some(value) = update.cache_creation_input_tokens {
+            self.usage.cache_creation_input_tokens = value;
+        }
+        if let Some(value) = update.cache_read_input_tokens {
+            self.usage.cache_read_input_tokens = value;
+        }
+    }
+
+    fn apply_elicitation(&mut self, event: ElicitationEvent) {
+        match event {
+            ElicitationEvent::Request(elicitation) => {
+                if let Some(existing) = self
+                    .pending_elicitations
+                    .iter_mut()
+                    .find(|existing| existing.id == elicitation.id)
+                {
+                    *existing = elicitation;
+                } else {
+                    self.pending_elicitations.push(elicitation);
+                }
+            }
+            ElicitationEvent::Complete { id, status } => {
+                if let Some(existing) = self
+                    .pending_elicitations
+                    .iter_mut()
+                    .find(|existing| existing.id == id)
+                {
+                    existing.status = status;
+                }
+            }
+        }
+    }
+
     fn apply_terminal(&mut self, event: terminal::Event) {
         match event {
             terminal::Event::Open(terminal) => {
@@ -758,6 +965,12 @@ fn merge_tool_call(current: &tool::Call, mut next: tool::Call) -> tool::Call {
         }
         output.push_str(&next.output);
         next.output = output;
+    }
+    if next.subagent.is_none() {
+        next.subagent.clone_from(&current.subagent);
+    }
+    if next.sandbox.is_none() {
+        next.sandbox.clone_from(&current.sandbox);
     }
     next
 }

@@ -39,6 +39,8 @@ pub struct AgentConfig {
     pub env: Vec<(String, String)>,
     /// Working directory for the agent process.
     pub cwd: PathBuf,
+    /// MCP servers to connect to for each session.
+    pub mcp_servers: Vec<McpServer>,
     /// Request timeout in seconds.
     pub timeout_secs: u64,
 }
@@ -50,6 +52,7 @@ impl Default for AgentConfig {
             args: Vec::new(),
             env: Vec::new(),
             cwd: PathBuf::from("."),
+            mcp_servers: Vec::new(),
             timeout_secs: 120,
         }
     }
@@ -323,6 +326,7 @@ impl AcpAgent {
         let params = NewSessionRequest {
             mcp_servers: Vec::new(),
             cwd,
+            additional_directories: Vec::new(),
         };
         let resp: NewSessionResponse = self
             .call(methods::SESSION_NEW, params, self.timeout_secs)
@@ -335,12 +339,69 @@ impl AcpAgent {
     pub async fn load_session(&self, session_id: SessionId) -> Result<LoadSessionResponse> {
         let params = LoadSessionRequest {
             session_id: session_id.clone(),
+            mcp_servers: Vec::new(),
+            cwd: None,
+            additional_directories: Vec::new(),
         };
         let resp: LoadSessionResponse = self
             .call(methods::SESSION_LOAD, params, self.timeout_secs)
             .await?;
         *self.session_id.lock().await = Some(resp.session_id.clone());
         Ok(resp)
+    }
+
+    pub fn list_sessions(
+        &self,
+        cursor: Option<String>,
+    ) -> impl Future<Output = Result<ListSessionsResponse>> {
+        self.call(
+            methods::SESSION_LIST,
+            ListSessionsRequest { cursor },
+            self.timeout_secs,
+        )
+    }
+
+    pub fn resume_session(
+        &self,
+        session_id: SessionId,
+        cwd: PathBuf,
+    ) -> impl Future<Output = Result<ResumeSessionResponse>> {
+        self.call(
+            methods::SESSION_RESUME,
+            ResumeSessionRequest {
+                session_id,
+                cwd,
+                mcp_servers: Vec::new(),
+                additional_directories: Vec::new(),
+            },
+            self.timeout_secs,
+        )
+    }
+
+    pub fn delete_session(
+        &self,
+        session_id: SessionId,
+    ) -> impl Future<Output = Result<DeleteSessionResponse>> {
+        self.call(
+            methods::SESSION_DELETE,
+            DeleteSessionRequest { session_id },
+            self.timeout_secs,
+        )
+    }
+
+    pub fn authenticate(
+        &self,
+        method_id: String,
+    ) -> impl Future<Output = Result<AuthenticateResponse>> {
+        self.call(
+            methods::AUTHENTICATE,
+            AuthenticateRequest { method_id },
+            self.timeout_secs,
+        )
+    }
+
+    pub fn logout(&self) -> impl Future<Output = Result<LogoutResponse>> {
+        self.call(methods::LOGOUT, LogoutRequest {}, self.timeout_secs)
     }
 
     /// Send a prompt to the agent within a session.
@@ -386,8 +447,15 @@ impl AcpAgent {
         let params = SetSessionConfigOptionRequest {
             session_id,
             config_id,
-            value_id,
+            value: ConfigValue::Legacy(value_id),
         };
         self.call(methods::SESSION_SET_CONFIG, params, self.timeout_secs)
+    }
+
+    pub fn complete_elicitation(&self, elicitation_id: String) {
+        self.notify(
+            methods::ELICITATION_COMPLETE,
+            CompleteElicitationNotification { elicitation_id },
+        );
     }
 }

@@ -2,10 +2,21 @@
 //!
 //! Stories are deterministic Ratatui renders. They give us a place to standardize
 //! Helix's terminal UI while keeping Lua plugins on the typed render-op ABI.
+//!
+//! Interactive stories use `StoryRenderer::Interactive { init, update, render }`:
+//! keep all mutable state in the boxed `init` value, mutate it from terminal key
+//! events in `update`, and render from that state without touching global editor
+//! state. Static dumps render the same story from its initial state.
 
-use std::{cell::Cell as StdCell, path::PathBuf, sync::OnceLock, time::Duration};
+use std::{
+    any::Any, cell::Cell as StdCell, collections::BTreeSet, path::PathBuf, sync::OnceLock,
+    time::Duration,
+};
 
 use anyhow::{bail, Result};
+#[cfg(test)]
+use crossterm::event::KeyModifiers as CrosstermKeyModifiers;
+use crossterm::event::{KeyCode as CrosstermKeyCode, KeyEvent as CrosstermKeyEvent};
 use helix_plugin::types::{SurfaceRenderOp, SurfaceRenderOps};
 use helix_view::{document::Mode, graphics::Rect, info::Info, theme as helix_theme, Editor};
 use tui::ratatui::{
@@ -25,9 +36,11 @@ mod theme;
 mod timing;
 mod util;
 use harness::Stage;
-use model::{LoadedTheme, StoryArg, StoryCanvas, StoryContext, StoryKind, StoryRenderer};
+use model::{
+    InteractiveStory, LoadedTheme, StoryArg, StoryCanvas, StoryContext, StoryKind, StoryRenderer,
+};
 pub use model::{Story, UiStyleGuide};
-use shell::render_storybook;
+use shell::{render_storybook, render_storybook_with_state};
 use theme::{
     available_theme_names, load_named_storybook_theme, load_storybook_theme, parse_theme_mode,
     theme_loader, ThemeChoice,
@@ -179,7 +192,11 @@ static STORIES: &[Story] = &[
             StoryArg::new("scroll", "0", "Top of list"),
         ],
         canvas: StoryCanvas::Padded { x: 1, y: 1 },
-        render: StoryRenderer::Styled(render_item_list_story),
+        render: StoryRenderer::Interactive(InteractiveStory {
+            init: init_item_list_story,
+            update: update_item_list_story,
+            render: render_item_list_story,
+        }),
     },
     Story {
         id: "widgets/scrolling",
@@ -302,7 +319,11 @@ static STORIES: &[Story] = &[
             width: 64,
             height: 5,
         },
-        render: StoryRenderer::Styled(render_tabs_story),
+        render: StoryRenderer::Interactive(InteractiveStory {
+            init: init_tabs_story,
+            update: update_tabs_story,
+            render: render_tabs_story,
+        }),
     },
     Story {
         id: "widgets/hint-bar",
@@ -329,7 +350,11 @@ static STORIES: &[Story] = &[
         kind: StoryKind::Component,
         args: &[StoryArg::new("marks", "3", "Marked fixture rows")],
         canvas: StoryCanvas::Padded { x: 1, y: 1 },
-        render: StoryRenderer::Styled(render_multi_select_story),
+        render: StoryRenderer::Interactive(InteractiveStory {
+            init: init_multi_select_story,
+            update: update_multi_select_story,
+            render: render_multi_select_story,
+        }),
     },
     Story {
         id: "widgets/toast-queue",
@@ -344,7 +369,11 @@ static STORIES: &[Story] = &[
             width: 54,
             height: 8,
         },
-        render: StoryRenderer::Styled(render_toast_queue_story),
+        render: StoryRenderer::Interactive(InteractiveStory {
+            init: init_toast_queue_story,
+            update: update_toast_queue_story,
+            render: render_toast_queue_story,
+        }),
     },
     Story {
         id: "widgets/progress",
@@ -728,6 +757,7 @@ pub fn stories() -> &'static [Story] {
 pub fn run_cli(args: impl IntoIterator<Item = String>) -> Result<i32> {
     let mut command = Command::Interactive {
         story_id: STORIES[0].id.to_string(),
+        focused: false,
     };
     let mut theme_choice = ThemeChoice::Configured;
     let mut theme_mode = None;
@@ -735,7 +765,7 @@ pub fn run_cli(args: impl IntoIterator<Item = String>) -> Result<i32> {
 
     let mut args = args.into_iter().peekable();
     if args.peek().is_none() {
-        run_interactive(STORIES[0].id, theme_choice, theme_mode)?;
+        run_interactive(STORIES[0].id, theme_choice, theme_mode, false)?;
         return Ok(0);
     }
 
@@ -768,10 +798,11 @@ pub fn run_cli(args: impl IntoIterator<Item = String>) -> Result<i32> {
                     .map_err(|_| anyhow::anyhow!("--tick must be an integer"))?;
             }
             "--interactive" => {
-                let story_id = args
-                    .next_if(|arg| !arg.starts_with('-'))
-                    .unwrap_or_else(|| STORIES[0].id.to_string());
-                command = Command::Interactive { story_id };
+                let story_id = args.next_if(|arg| !arg.starts_with('-'));
+                command = Command::Interactive {
+                    focused: story_id.is_some(),
+                    story_id: story_id.unwrap_or_else(|| STORIES[0].id.to_string()),
+                };
             }
             "--dump" => {
                 let story_id = args.next().unwrap_or_else(|| STORIES[0].id.to_string());
@@ -790,6 +821,12 @@ pub fn run_cli(args: impl IntoIterator<Item = String>) -> Result<i32> {
                 let height = parse_dimension("--height", args.next())?;
                 command.set_height(height);
             }
+            other if !other.starts_with('-') && story_index(other).is_ok() => {
+                command = Command::Interactive {
+                    story_id: other.to_string(),
+                    focused: true,
+                };
+            }
             other => bail!("unexpected argument: {other}"),
         }
     }
@@ -797,7 +834,9 @@ pub fn run_cli(args: impl IntoIterator<Item = String>) -> Result<i32> {
     match command {
         Command::List => print_story_list(),
         Command::Themes => print_theme_list()?,
-        Command::Interactive { story_id } => run_interactive(&story_id, theme_choice, theme_mode)?,
+        Command::Interactive { story_id, focused } => {
+            run_interactive(&story_id, theme_choice, theme_mode, focused)?
+        }
         Command::Dump {
             story_id,
             width,
@@ -829,6 +868,7 @@ fn run_interactive(
     story_id: &str,
     theme_choice: ThemeChoice,
     theme_mode: Option<helix_theme::Mode>,
+    story_focused: bool,
 ) -> Result<()> {
     use crossterm::event::{self, Event, KeyCode, KeyEventKind};
     use tui::{backend::CrosstermBackend, ratatui::TerminalSession};
@@ -845,18 +885,24 @@ fn run_interactive(
     let mut session = TerminalSession::new(backend)?.claim()?;
 
     let mut selected = initial_index;
+    let mut story_states: Vec<Option<Box<dyn Any>>> = std::iter::repeat_with(|| None)
+        .take(STORIES.len())
+        .collect();
     let animation_started = std::time::Instant::now();
     let result: Result<()> = (|| loop {
         let tick = storybook_tick(animation_started.elapsed());
         session.draw(|frame| {
             let area = frame.area();
             let frame_theme = active_theme.with_tick(tick);
-            render_storybook(
+            let state = story_states[selected].as_deref();
+            render_storybook_with_state(
                 frame.buffer_mut(),
                 area.width,
                 area.height,
                 STORIES[selected].id,
                 &frame_theme,
+                state,
+                story_focused,
             );
         })?;
 
@@ -864,6 +910,13 @@ fn run_interactive(
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
                     KeyCode::Esc | KeyCode::Char('q') => break Ok(()),
+                    _ if story_focused => {
+                        if let Some(interactive) = STORIES[selected].interactive() {
+                            let state =
+                                story_states[selected].get_or_insert_with(|| (interactive.init)());
+                            (interactive.update)(state.as_mut(), key);
+                        }
+                    }
                     KeyCode::Down | KeyCode::Char('j') => {
                         selected = (selected + 1).min(STORIES.len().saturating_sub(1));
                     }
@@ -903,6 +956,7 @@ fn run_interactive(
     _story_id: &str,
     _theme_choice: ThemeChoice,
     _theme_mode: Option<helix_theme::Mode>,
+    _story_focused: bool,
 ) -> Result<()> {
     bail!("interactive storybook currently requires the crossterm terminal backend")
 }
@@ -1295,7 +1349,68 @@ fn render_text_input_empty_story(surface: &mut Buffer, area: Rect, styles: UiSty
     crate::widgets::text_input(surface, area, "", 0, styles.text, styles.selected);
 }
 
-fn render_item_list_story(surface: &mut Buffer, area: Rect, styles: UiStyleGuide) {
+fn story_state<T: 'static>(state: &dyn Any) -> &T {
+    state
+        .downcast_ref::<T>()
+        .expect("interactive story state type must match renderer")
+}
+
+fn story_state_mut<T: 'static>(state: &mut dyn Any) -> &mut T {
+    state
+        .downcast_mut::<T>()
+        .expect("interactive story state type must match updater")
+}
+
+#[derive(Debug, Clone)]
+struct ItemListStoryState {
+    selected: usize,
+    scroll: usize,
+}
+
+const ITEM_LIST_STORY_ITEMS: &[&str] = &[
+    "helix-term/src/ui/editor.rs",
+    "helix-term/src/ui/picker.rs",
+    "helix-term/src/ui/prompt.rs",
+    "helix-term/src/ui/menu.rs",
+    "helix-term/src/ui/popup.rs",
+    "helix-term/src/ui/assistant.rs",
+    "helix-term/src/ui/file_explorer.rs",
+    "helix-term/src/widgets/item_list.rs",
+    "helix-term/src/widgets/message.rs",
+    "helix-term/src/widgets/surface.rs",
+    "helix-plugin/src/lua/api/facade.rs",
+];
+
+fn init_item_list_story() -> Box<dyn Any> {
+    Box::new(ItemListStoryState {
+        selected: 5,
+        scroll: 2,
+    })
+}
+
+fn update_item_list_story(state: &mut dyn Any, key: CrosstermKeyEvent) {
+    let state = story_state_mut::<ItemListStoryState>(state);
+    match key.code {
+        CrosstermKeyCode::Char('j') | CrosstermKeyCode::Down => {
+            state.selected = (state.selected + 1).min(ITEM_LIST_STORY_ITEMS.len() - 1);
+        }
+        CrosstermKeyCode::Char('k') | CrosstermKeyCode::Up => {
+            state.selected = state.selected.saturating_sub(1);
+        }
+        CrosstermKeyCode::Home => state.selected = 0,
+        CrosstermKeyCode::End => state.selected = ITEM_LIST_STORY_ITEMS.len() - 1,
+        _ => {}
+    }
+}
+
+fn render_item_list_story(
+    state: &dyn Any,
+    surface: &mut Buffer,
+    area: Rect,
+    context: StoryContext<'_>,
+) {
+    let story_state = story_state::<ItemListStoryState>(state);
+    let styles = context.styles;
     fill_rect(surface, area, styles.surface);
     let root = tui::ratatui::to_ratatui_rect(area);
     let [list, details] = Layout::default()
@@ -1315,19 +1430,6 @@ fn render_item_list_story(surface: &mut Buffer, area: Rect, styles: UiStyleGuide
         styles,
     );
 
-    let items = [
-        "helix-term/src/ui/editor.rs",
-        "helix-term/src/ui/picker.rs",
-        "helix-term/src/ui/prompt.rs",
-        "helix-term/src/ui/menu.rs",
-        "helix-term/src/ui/popup.rs",
-        "helix-term/src/ui/assistant.rs",
-        "helix-term/src/ui/file_explorer.rs",
-        "helix-term/src/widgets/item_list.rs",
-        "helix-term/src/widgets/message.rs",
-        "helix-term/src/widgets/surface.rs",
-        "helix-plugin/src/lua/api/facade.rs",
-    ];
     let list_styles = crate::widgets::ListStyles {
         normal: styles.menu,
         selected: styles.menu_selected,
@@ -1337,9 +1439,9 @@ fn render_item_list_story(surface: &mut Buffer, area: Rect, styles: UiStyleGuide
     let state = crate::widgets::item_list(
         surface,
         list,
-        items.len(),
-        Some(5),
-        2,
+        ITEM_LIST_STORY_ITEMS.len(),
+        Some(story_state.selected),
+        story_state.scroll,
         &list_styles,
         |idx, row, surface, selected| {
             let marker = if selected { "> " } else { "  " };
@@ -1347,7 +1449,7 @@ fn render_item_list_story(surface: &mut Buffer, area: Rect, styles: UiStyleGuide
             surface.set_stringn(
                 row.x,
                 row.y,
-                format!("{marker}{}", items[idx]),
+                format!("{marker}{}", ITEM_LIST_STORY_ITEMS[idx]),
                 row.width as usize,
                 tui::ratatui::to_ratatui_style(style),
             );
@@ -1356,9 +1458,9 @@ fn render_item_list_story(surface: &mut Buffer, area: Rect, styles: UiStyleGuide
 
     for (row, text) in [
         format!("scroll: {}", state.scroll),
+        format!("selected: {}", story_state.selected),
         format!("visible: {}..{}", state.visible_start, state.visible_end),
         "row renderer is caller-owned".to_string(),
-        "widget owns selection bg and scrollbar".to_string(),
     ]
     .into_iter()
     .enumerate()
@@ -1729,7 +1831,43 @@ fn render_marquee_story(surface: &mut Buffer, area: Rect, styles: UiStyleGuide) 
     marquee.render(row, surface, styles.warning);
 }
 
-fn render_tabs_story(surface: &mut Buffer, area: Rect, styles: UiStyleGuide) {
+#[derive(Debug, Clone)]
+struct TabsStoryState {
+    active: usize,
+    scroll: u16,
+}
+
+const TABS_STORY_COUNT: usize = 7;
+
+fn init_tabs_story() -> Box<dyn Any> {
+    Box::new(TabsStoryState {
+        active: 5,
+        scroll: 0,
+    })
+}
+
+fn update_tabs_story(state: &mut dyn Any, key: CrosstermKeyEvent) {
+    let state = story_state_mut::<TabsStoryState>(state);
+    match key.code {
+        CrosstermKeyCode::Tab | CrosstermKeyCode::Right | CrosstermKeyCode::Char('l') => {
+            state.active = (state.active + 1) % TABS_STORY_COUNT;
+        }
+        CrosstermKeyCode::BackTab | CrosstermKeyCode::Left | CrosstermKeyCode::Char('h') => {
+            state.active = (state.active + TABS_STORY_COUNT - 1) % TABS_STORY_COUNT;
+        }
+        CrosstermKeyCode::Char(']') => {
+            state.scroll = state.scroll.saturating_add(4);
+        }
+        CrosstermKeyCode::Char('[') => {
+            state.scroll = state.scroll.saturating_sub(4);
+        }
+        _ => {}
+    }
+}
+
+fn render_tabs_story(state: &dyn Any, surface: &mut Buffer, area: Rect, context: StoryContext<'_>) {
+    let story_state = story_state::<TabsStoryState>(state);
+    let styles = context.styles;
     fill_rect(surface, area, styles.surface);
     let panel = render_panel(surface, area, "tabs", styles);
     let tabs = [
@@ -1750,9 +1888,10 @@ fn render_tabs_story(surface: &mut Buffer, area: Rect, styles: UiStyleGuide) {
         surface,
         tab_area,
         &tabs,
-        crate::widgets::TabsOptions::new(5)
+        crate::widgets::TabsOptions::new(story_state.active)
+            .scroll(story_state.scroll)
             .separator("│")
-            .scroll_policy(crate::widgets::TabsScrollPolicy::CenterActive),
+            .scroll_policy(crate::widgets::TabsScrollPolicy::EnsureActiveVisible),
         crate::widgets::TabsStyle {
             background: styles.panel,
             active: styles.selected,
@@ -1768,7 +1907,8 @@ fn render_tabs_story(surface: &mut Buffer, area: Rect, styles: UiStyleGuide) {
         panel,
         3,
         &format!(
-            "scroll={} visible={}..{} ranges={} overflow=({}, {})",
+            "active={} scroll={} visible={}..{} ranges={} overflow=({}, {})",
+            story_state.active,
             state.scroll,
             state.visible_start,
             state.visible_end,
@@ -1813,18 +1953,57 @@ fn render_hint_bar_story(surface: &mut Buffer, area: Rect, styles: UiStyleGuide)
     );
 }
 
-fn render_multi_select_story(surface: &mut Buffer, area: Rect, styles: UiStyleGuide) {
+#[derive(Debug, Clone)]
+struct MultiSelectStoryState {
+    selected: usize,
+    marks: BTreeSet<usize>,
+}
+
+const MULTI_SELECT_STORY_ITEMS: &[&str] = &[
+    "README.md",
+    "helix-term/src/ui/picker.rs",
+    "helix-term/src/widgets/item_list.rs",
+    "helix-term/src/widgets/hint_bar.rs",
+    "helix-term/src/widgets/progress.rs",
+    "helix-view/src/list_nav.rs",
+];
+
+fn init_multi_select_story() -> Box<dyn Any> {
+    Box::new(MultiSelectStoryState {
+        selected: 2,
+        marks: [1, 2, 4].into_iter().collect(),
+    })
+}
+
+fn update_multi_select_story(state: &mut dyn Any, key: CrosstermKeyEvent) {
+    let state = story_state_mut::<MultiSelectStoryState>(state);
+    match key.code {
+        CrosstermKeyCode::Char('j') | CrosstermKeyCode::Down => {
+            state.selected = (state.selected + 1).min(MULTI_SELECT_STORY_ITEMS.len() - 1);
+        }
+        CrosstermKeyCode::Char('k') | CrosstermKeyCode::Up => {
+            state.selected = state.selected.saturating_sub(1);
+        }
+        CrosstermKeyCode::Char(' ') => {
+            if !state.marks.remove(&state.selected) {
+                state.marks.insert(state.selected);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn render_multi_select_story(
+    state: &dyn Any,
+    surface: &mut Buffer,
+    area: Rect,
+    context: StoryContext<'_>,
+) {
+    let story_state = story_state::<MultiSelectStoryState>(state);
+    let styles = context.styles;
     fill_rect(surface, area, styles.surface);
     let panel = render_panel(surface, area, "multi-select item_list", styles);
-    let items = [
-        "README.md",
-        "helix-term/src/ui/picker.rs",
-        "helix-term/src/widgets/item_list.rs",
-        "helix-term/src/widgets/hint_bar.rs",
-        "helix-term/src/widgets/progress.rs",
-        "helix-view/src/list_nav.rs",
-    ];
-    let marks = [1, 2, 4];
+    let marks: Vec<_> = story_state.marks.iter().copied().collect();
     let list_styles = crate::widgets::ListStyles {
         normal: styles.menu,
         selected: styles.menu_selected,
@@ -1834,10 +2013,10 @@ fn render_multi_select_story(surface: &mut Buffer, area: Rect, styles: UiStyleGu
     crate::widgets::item_list_with_marks(
         surface,
         panel,
-        items.len(),
-        Some(2),
+        MULTI_SELECT_STORY_ITEMS.len(),
+        Some(story_state.selected),
         0,
-        Some(crate::widgets::MarkedItems::new(&marks, "✓")),
+        Some(crate::widgets::MarkedItems::new(marks.as_slice(), "✓")),
         &list_styles,
         |idx, row, surface, selected, marked| {
             let style = if selected {
@@ -1850,7 +2029,7 @@ fn render_multi_select_story(surface: &mut Buffer, area: Rect, styles: UiStyleGu
             surface.set_stringn(
                 row.x,
                 row.y,
-                items[idx],
+                MULTI_SELECT_STORY_ITEMS[idx],
                 row.width as usize,
                 tui::ratatui::to_ratatui_style(style),
             );
@@ -1858,10 +2037,15 @@ fn render_multi_select_story(surface: &mut Buffer, area: Rect, styles: UiStyleGu
     );
 }
 
-fn render_toast_queue_story(surface: &mut Buffer, area: Rect, styles: UiStyleGuide) {
-    fill_rect(surface, area, styles.surface);
-    let panel = render_panel(surface, area, "toast_queue", styles);
-    let toasts = [
+#[derive(Debug)]
+struct ToastQueueStoryState {
+    next_id: usize,
+    toasts: Vec<crate::widgets::Toast<'static>>,
+    queue: crate::widgets::ToastQueue,
+}
+
+fn init_toast_queue_story() -> Box<dyn Any> {
+    let toasts = vec![
         crate::widgets::Toast::new(
             1,
             "workspace symbols indexed",
@@ -1881,11 +2065,60 @@ fn render_toast_queue_story(surface: &mut Buffer, area: Rect, styles: UiStyleGui
     ];
     let mut queue = crate::widgets::ToastQueue::default();
     queue.sync(toasts.iter());
+    Box::new(ToastQueueStoryState {
+        next_id: 5,
+        toasts,
+        queue,
+    })
+}
+
+fn update_toast_queue_story(state: &mut dyn Any, key: CrosstermKeyEvent) {
+    let state = story_state_mut::<ToastQueueStoryState>(state);
+    match key.code {
+        CrosstermKeyCode::Char('p') => {
+            let messages = [
+                (
+                    "background format completed",
+                    crate::widgets::ToastSeverity::Hint,
+                ),
+                ("diagnostics refreshed", crate::widgets::ToastSeverity::Info),
+                (
+                    "language server still indexing",
+                    crate::widgets::ToastSeverity::Warning,
+                ),
+            ];
+            let (message, severity) = messages[state.next_id % messages.len()];
+            state
+                .toasts
+                .push(crate::widgets::Toast::new(state.next_id, message, severity));
+            state.next_id += 1;
+            state.queue.sync(state.toasts.iter());
+        }
+        CrosstermKeyCode::Char('d') => {
+            if let Some(id) = state.queue.layout(&state.toasts, 3).visible_ids.first() {
+                state.queue.dismiss_one(*id);
+            }
+        }
+        CrosstermKeyCode::Char('x') => state.queue.dismiss_all(),
+        _ => {}
+    }
+}
+
+fn render_toast_queue_story(
+    state: &dyn Any,
+    surface: &mut Buffer,
+    area: Rect,
+    context: StoryContext<'_>,
+) {
+    let state = story_state::<ToastQueueStoryState>(state);
+    let styles = context.styles;
+    fill_rect(surface, area, styles.surface);
+    let panel = render_panel(surface, area, "toast_queue", styles);
     crate::widgets::toast_queue(
         surface,
         panel,
-        &queue,
-        &toasts,
+        &state.queue,
+        &state.toasts,
         3,
         None,
         crate::widgets::ToastStyle {
@@ -2845,12 +3078,14 @@ dhx-ui-storybook
 
 USAGE:
     dhx-ui-storybook
+    dhx-ui-storybook <story-id>
     dhx-ui-storybook --interactive [story-id] [--theme <name|config>] [--theme-mode <dark|light>]
     dhx-ui-storybook --list
     dhx-ui-storybook --themes
     dhx-ui-storybook --dump <story-id|all> [--theme <name|config>] [--theme-mode <dark|light>] [--tick N] [--width N] [--height N]
 
 Interactive keys: Up/Down or k/j select stories, Tab/Shift+Tab or [/ ] switch themes, q exits.
+Focused story keys: pass through to interactive stories; q/Esc exits.
 
 Default story: {}
 Dump defaults: --width {} --height {}
@@ -2893,6 +3128,7 @@ enum Command {
     Themes,
     Interactive {
         story_id: String,
+        focused: bool,
     },
     Dump {
         story_id: String,
@@ -3118,6 +3354,27 @@ mod tests {
             storybook_tick(Duration::from_millis(STORYBOOK_TICK_MS * 2 + 1)),
             2
         );
+    }
+
+    #[test]
+    fn interactive_item_list_story_updates_headlessly() {
+        let story = STORIES
+            .iter()
+            .find(|story| story.id == "widgets/item-list")
+            .expect("interactive item-list story exists");
+        let interactive = story.interactive().expect("item-list story is interactive");
+        let mut state = (interactive.init)();
+        for key in [
+            CrosstermKeyEvent::new(CrosstermKeyCode::Char('j'), CrosstermKeyModifiers::NONE),
+            CrosstermKeyEvent::new(CrosstermKeyCode::Char('j'), CrosstermKeyModifiers::NONE),
+            CrosstermKeyEvent::new(CrosstermKeyCode::Char('k'), CrosstermKeyModifiers::NONE),
+        ] {
+            (interactive.update)(state.as_mut(), key);
+        }
+        let state = state
+            .downcast_ref::<ItemListStoryState>()
+            .expect("item-list state type");
+        assert_eq!(state.selected, 6);
     }
 
     #[test]

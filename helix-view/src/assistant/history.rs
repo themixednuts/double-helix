@@ -48,6 +48,10 @@ pub struct Record {
     pub mode: Option<mode::Set>,
     pub config: config::State,
     pub review_mode: review::Mode,
+    pub usage: thread::Usage,
+    pub commands: Vec<thread::Command>,
+    pub pending_elicitations: Vec<thread::Elicitation>,
+    pub caps: Option<helix_acp::AgentCaps>,
     pub scope: thread::Scope,
     pub view: View,
     pub terminals: Vec<terminal::Terminal>,
@@ -163,6 +167,10 @@ impl Record {
             mode: thread.mode().cloned(),
             config: thread.config().clone(),
             review_mode: thread.review_mode(),
+            usage: thread.usage().clone(),
+            commands: thread.commands().to_vec(),
+            pending_elicitations: thread.pending_elicitations().to_vec(),
+            caps: thread.caps().cloned(),
             scope: thread.clone_scope(),
             view: View {
                 focus: thread.focus(),
@@ -191,6 +199,10 @@ impl Record {
             config: self.config,
             review_mode: self.review_mode,
             terminals: self.terminals,
+            usage: thread::Usage::default(),
+            commands: Vec::new(),
+            pending_elicitations: Vec::new(),
+            caps: None,
         });
         thread.restore_transient_view(
             self.view.focus,

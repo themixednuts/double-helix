@@ -257,6 +257,8 @@ fn client_caps(host: &host::Set) -> acp::ClientCapabilities {
             write_text_file: Some(true),
         }),
         terminal: Some(host.terminal.is_some()),
+        session: None,
+        elicitation: None,
     }
 }
 
@@ -1033,6 +1035,37 @@ async fn handle_call(
                 let _ = tx
                     .send(backend::Update::Permission { thread, request })
                     .await;
+            }
+            Ok(AgentMethodCall::CreateElicitation(req)) => {
+                let Some(session_id) = req.session_id.as_deref() else {
+                    agent.reply_error(
+                        id,
+                        helix_acp::jsonrpc::Error::invalid_params("missing session_id"),
+                    );
+                    return;
+                };
+                let Some(thread) = thread_for_session(state, session_id) else {
+                    agent.reply_error(
+                        id,
+                        helix_acp::jsonrpc::Error::invalid_params("unknown session"),
+                    );
+                    return;
+                };
+                let _ = tx
+                    .send(backend::Update::Thread {
+                        thread,
+                        event: thread::Event::Elicitation(thread::ElicitationEvent::Request(
+                            translate::elicitation(req),
+                        )),
+                    })
+                    .await;
+                agent.reply(
+                    id,
+                    serde_json::to_value(acp::CreateElicitationResponse {
+                        action: acp::ElicitationAction::Cancel,
+                    })
+                    .unwrap(),
+                );
             }
             Err(err) => {
                 let _ = tx

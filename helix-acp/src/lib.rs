@@ -24,6 +24,12 @@ pub mod methods {
     // Client -> Agent requests
     pub const INITIALIZE: &str = "initialize";
     pub const AUTHENTICATE: &str = "authenticate";
+    pub const LOGOUT: &str = "logout";
+    pub const SESSION_LIST: &str = "session/list";
+    pub const SESSION_RESUME: &str = "session/resume";
+    pub const SESSION_DELETE: &str = "session/delete";
+    pub const ELICITATION_CREATE: &str = "elicitation/create";
+    pub const ELICITATION_COMPLETE: &str = "elicitation/complete";
     pub const SESSION_NEW: &str = "session/new";
     pub const SESSION_LOAD: &str = "session/load";
     pub const SESSION_PROMPT: &str = "session/prompt";

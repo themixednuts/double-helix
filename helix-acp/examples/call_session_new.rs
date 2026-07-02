@@ -24,6 +24,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         args,
         env: vec![],
         cwd: PathBuf::from("."),
+        mcp_servers: vec![],
         timeout_secs: 120,
     };
 

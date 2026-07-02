@@ -5,11 +5,13 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 pub type SessionId = String;
 pub type ToolCallId = String;
 pub type TerminalId = String;
+pub type Meta = serde_json::Map<String, Value>;
 
 // ---------------------------------------------------------------------------
 // Common types
@@ -41,6 +43,10 @@ pub struct ClientCapabilities {
     pub fs: Option<FileSystemCapabilities>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub terminal: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session: Option<ClientSessionCapabilities>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub elicitation: Option<ElicitationCapabilities>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -61,6 +67,78 @@ pub struct AgentCapabilities {
     pub prompt_capabilities: Option<PromptCapabilities>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mcp: Option<McpCapabilities>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session: Option<AgentSessionCapabilities>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientSessionCapabilities {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config_options: Option<SessionConfigOptionsCapabilities>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionConfigOptionsCapabilities {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub boolean: Option<BooleanConfigOptionCapabilities>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BooleanConfigOptionCapabilities {}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ElicitationCapabilities {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub form: Option<ElicitationFormCapabilities>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<ElicitationUrlCapabilities>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ElicitationFormCapabilities {}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ElicitationUrlCapabilities {}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentSessionCapabilities {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub list: Option<SessionListCapabilities>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delete: Option<SessionDeleteCapabilities>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resume: Option<SessionResumeCapabilities>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionListCapabilities {}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionDeleteCapabilities {}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionResumeCapabilities {}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentCaps {
+    pub load_session: bool,
+    pub list_sessions: bool,
+    pub resume_session: bool,
+    pub delete_session: bool,
+    pub mcp: bool,
+    pub auth: bool,
+    pub config_options: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -104,7 +182,37 @@ pub struct InitializeResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_info: Option<Implementation>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub auth_methods: Option<Vec<Value>>,
+    pub auth_methods: Option<Vec<AuthMethod>>,
+}
+
+impl InitializeResponse {
+    #[must_use]
+    pub fn caps(&self) -> AgentCaps {
+        AgentCaps {
+            load_session: self.agent_capabilities.load_session.unwrap_or(false),
+            list_sessions: self
+                .agent_capabilities
+                .session
+                .as_ref()
+                .and_then(|session| session.list.as_ref())
+                .is_some(),
+            resume_session: self
+                .agent_capabilities
+                .session
+                .as_ref()
+                .and_then(|session| session.resume.as_ref())
+                .is_some(),
+            delete_session: self
+                .agent_capabilities
+                .session
+                .as_ref()
+                .and_then(|session| session.delete.as_ref())
+                .is_some(),
+            mcp: self.agent_capabilities.mcp.is_some(),
+            auth: self.auth_methods.as_ref().is_some_and(|items| !items.is_empty()),
+            config_options: true,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -115,8 +223,10 @@ pub struct InitializeResponse {
 #[serde(rename_all = "camelCase")]
 pub struct NewSessionRequest {
     #[serde(default)]
-    pub mcp_servers: Vec<Value>,
+    pub mcp_servers: Vec<McpServer>,
     pub cwd: PathBuf,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub additional_directories: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -128,13 +238,19 @@ pub struct NewSessionResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub config_options: Option<Vec<ConfigOption>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub available_commands: Option<Vec<Value>>,
+    pub available_commands: Option<Vec<AvailableCommand>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LoadSessionRequest {
     pub session_id: SessionId,
+    #[serde(default)]
+    pub mcp_servers: Vec<McpServer>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub additional_directories: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -145,6 +261,67 @@ pub struct LoadSessionResponse {
     pub session_modes: Option<Vec<SessionMode>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub config_options: Option<Vec<ConfigOption>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResumeSessionRequest {
+    pub session_id: SessionId,
+    pub cwd: PathBuf,
+    #[serde(default)]
+    pub mcp_servers: Vec<McpServer>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub additional_directories: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ResumeSessionResponse {}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ListSessionsRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListSessionsResponse {
+    pub sessions: Vec<SessionInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteSessionRequest {
+    pub session_id: SessionId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteSessionResponse {}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionInfo {
+    pub session_id: SessionId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct McpServer {
+    pub id: String,
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: Vec<EnvVariable>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -171,6 +348,10 @@ pub struct ConfigOption {
     pub current_value: String,
     #[serde(default)]
     pub options: Vec<ConfigOptionValue>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<ConfigOptionKind>,
+    #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Meta>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -183,9 +364,98 @@ pub struct ConfigOptionValue {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "type")]
+pub enum ConfigOptionKind {
+    Select {
+        current_value: ConfigOptionValueId,
+        options: Vec<ConfigOptionValue>,
+    },
+    Boolean {
+        current_value: bool,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ConfigOptionValueId {
+    String(String),
+    Object { value: String },
+}
+
+impl ConfigOptionValueId {
+    #[must_use]
+    pub fn into_string(self) -> String {
+        match self {
+            Self::String(value) | Self::Object { value } => value,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConfigOptionUpdateData {
     pub config_options: Vec<ConfigOption>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageUpdateData {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_input_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_output_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_creation_input_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_read_input_tokens: Option<u64>,
+    #[serde(default)]
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AvailableCommandsUpdateData {
+    pub available_commands: Vec<AvailableCommand>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AvailableCommand {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input: Option<AvailableCommandInput>,
+    #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Meta>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AvailableCommandInput {
+    Unstructured {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        hint: Option<String>,
+    },
+    Structured {
+        #[serde(default)]
+        arguments: Vec<AvailableCommandArgument>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AvailableCommandArgument {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub required: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -321,6 +591,8 @@ pub enum SessionUpdate {
     Plan(Plan),
     #[serde(rename = "agent_message_chunk")]
     AgentMessageChunk(ContentChunk),
+    #[serde(rename = "agent_thought_chunk")]
+    AgentThoughtChunk(ContentChunk),
     #[serde(rename = "tool_call")]
     ToolCall(ToolCallInfo),
     #[serde(rename = "tool_call_update")]
@@ -330,7 +602,9 @@ pub enum SessionUpdate {
     #[serde(rename = "current_mode_update")]
     CurrentModeUpdate(CurrentModeUpdateData),
     #[serde(rename = "available_commands_update")]
-    AvailableCommandsUpdate(Value),
+    AvailableCommandsUpdate(AvailableCommandsUpdateData),
+    #[serde(rename = "usage_update")]
+    UsageUpdate(UsageUpdateData),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -386,6 +660,8 @@ pub struct ToolCallInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kind: Option<ToolKind>,
     pub status: ToolCallStatus,
+    #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Meta>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -396,6 +672,8 @@ pub struct ToolCallUpdate {
     pub status: Option<ToolCallStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<Vec<ContentBlock>>,
+    #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Meta>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -471,7 +749,7 @@ pub struct CreateTerminalResponse {
     pub terminal_id: TerminalId,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EnvVariable {
     pub name: String,
     pub value: String,
@@ -542,19 +820,43 @@ pub struct ReleaseTerminalResponse {}
 #[serde(rename_all = "camelCase")]
 pub struct RequestPermissionRequest {
     pub session_id: SessionId,
+    #[serde(default)]
     pub title: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    #[serde(default, alias = "options")]
     pub permissions: Vec<PermissionOption>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call: Option<ToolCallUpdate>,
+    #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Meta>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PermissionOption {
+    #[serde(default, alias = "optionId")]
     pub id: String,
+    #[serde(default, alias = "name")]
     pub title: String,
+    #[serde(default)]
+    pub kind: PermissionOptionKind,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Meta>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionOptionKind {
+    AllowOnce,
+    AllowAlways,
+    AllowThread,
+    RejectOnce,
+    RejectAlways,
+    #[default]
+    Other,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -592,11 +894,159 @@ pub struct SetSessionConfigOptionRequest {
     pub session_id: SessionId,
     pub config_id: String,
     #[serde(rename = "value")]
-    pub value_id: String,
+    pub value: ConfigValue,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SetSessionConfigOptionResponse {}
+#[serde(untagged)]
+pub enum ConfigValue {
+    ValueId { value: String },
+    Boolean { value: bool },
+    Legacy(String),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetSessionConfigOptionResponse {
+    #[serde(default)]
+    pub config_options: Vec<ConfigOption>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthenticateRequest {
+    pub method_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthenticateResponse {
+    #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Meta>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct LogoutRequest {}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct LogoutResponse {}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AuthMethod {
+    Agent(AuthMethodData),
+    Terminal(AuthMethodData),
+    EnvVar(AuthMethodData),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthMethodData {
+    pub id: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: Vec<EnvVariable>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub variable: Option<String>,
+    #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Meta>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateElicitationRequest {
+    pub elicitation_id: String,
+    pub session_id: Option<SessionId>,
+    pub mode: ElicitationMode,
+    #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Meta>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ElicitationMode {
+    Form(ElicitationFormMode),
+    Url(ElicitationUrlMode),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ElicitationFormMode {
+    pub message: String,
+    pub schema: ElicitationSchema,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ElicitationUrlMode {
+    pub message: String,
+    pub url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ElicitationSchema {
+    #[serde(default)]
+    pub fields: Vec<ElicitationField>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ElicitationField {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub field_type: ElicitationFieldType,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub required: Option<bool>,
+    #[serde(default)]
+    pub options: Vec<ElicitationOption>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ElicitationFieldType {
+    Text,
+    Select,
+    Bool,
+    Textarea,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ElicitationOption {
+    pub value: String,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateElicitationResponse {
+    pub action: ElicitationAction,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ElicitationAction {
+    Accept { content: Value },
+    Decline,
+    Cancel,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompleteElicitationNotification {
+    pub elicitation_id: String,
+}
 
 // ---------------------------------------------------------------------------
 // Parsed incoming messages from the agent
@@ -633,6 +1083,7 @@ pub enum AgentMethodCall {
     KillTerminal(KillTerminalRequest),
     ReleaseTerminal(ReleaseTerminalRequest),
     RequestPermission(RequestPermissionRequest),
+    CreateElicitation(CreateElicitationRequest),
 }
 
 impl AgentMethodCall {
@@ -663,6 +1114,9 @@ impl AgentMethodCall {
                 params.parse().map_err(crate::Error::AgentError)?,
             )),
             crate::methods::REQUEST_PERMISSION => Ok(AgentMethodCall::RequestPermission(
+                params.parse().map_err(crate::Error::AgentError)?,
+            )),
+            crate::methods::ELICITATION_CREATE => Ok(AgentMethodCall::CreateElicitation(
                 params.parse().map_err(crate::Error::AgentError)?,
             )),
             _ => Err(crate::Error::Unhandled(method.to_string())),

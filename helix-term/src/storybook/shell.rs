@@ -1,4 +1,5 @@
 use super::*;
+use std::any::Any;
 use tui::ratatui::widgets::{Clear, Widget};
 
 /// Horizontal gutter applied to header, nav, content, args, and footer. One
@@ -18,6 +19,18 @@ pub(super) fn render_storybook(
     height: u16,
     selected_id: &str,
     theme: &LoadedTheme,
+) {
+    render_storybook_with_state(surface, width, height, selected_id, theme, None, false);
+}
+
+pub(super) fn render_storybook_with_state(
+    surface: &mut Buffer,
+    width: u16,
+    height: u16,
+    selected_id: &str,
+    theme: &LoadedTheme,
+    interactive_state: Option<&dyn Any>,
+    story_focused: bool,
 ) {
     let styles = theme.styles;
     let area = Rect::new(0, 0, width, height);
@@ -61,12 +74,19 @@ pub(super) fn render_storybook(
         selected_id,
         styles,
     );
-    render_story_panel(surface, tui::ratatui::to_helix_rect(content), story, theme);
+    render_story_panel(
+        surface,
+        tui::ratatui::to_helix_rect(content),
+        story,
+        theme,
+        interactive_state,
+    );
     render_storybook_footer(
         surface,
         tui::ratatui::to_helix_rect(footer),
         selected_index,
         styles,
+        story_focused,
     );
 }
 
@@ -246,7 +266,13 @@ enum NavEntry {
     Story(usize),
 }
 
-fn render_story_panel(surface: &mut Buffer, area: Rect, story: Story, theme: &LoadedTheme) {
+fn render_story_panel(
+    surface: &mut Buffer,
+    area: Rect,
+    story: Story,
+    theme: &LoadedTheme,
+    interactive_state: Option<&dyn Any>,
+) {
     let styles = theme.styles;
     fill_rect(surface, area, styles.surface);
     if area.width == 0 || area.height == 0 {
@@ -270,7 +296,11 @@ fn render_story_panel(surface: &mut Buffer, area: Rect, story: Story, theme: &Lo
         area.width.saturating_sub(GUTTER * 2).max(1),
         canvas_height,
     );
-    story.render(surface, canvas, theme.context());
+    if let Some(state) = interactive_state {
+        story.render_with_state(surface, canvas, theme.context(), Some(state));
+    } else {
+        story.render(surface, canvas, theme.context());
+    }
 
     if args_visible {
         let args = Rect::new(
@@ -333,6 +363,7 @@ fn render_storybook_footer(
     area: Rect,
     selected_index: usize,
     styles: UiStyleGuide,
+    story_focused: bool,
 ) {
     fill_rect(surface, area, styles.surface);
     if area.width == 0 || area.height == 0 {
@@ -345,7 +376,11 @@ fn render_storybook_footer(
 
     // Three actions, generous spacing — reads as a single keyboard hint row,
     // not a wall of CLI flags.
-    let right = "↑↓ story    ⇥ theme    q quit";
+    let right = if story_focused {
+        "story keys active    q quit"
+    } else {
+        "↑↓ story    ⇥ theme    q quit"
+    };
     set_right_clipped(surface, gutter_row(area, 0), right, styles.muted);
 }
 

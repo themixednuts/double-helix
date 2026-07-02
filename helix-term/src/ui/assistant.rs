@@ -3134,6 +3134,8 @@ mod tests {
                             _ => helix_view::assistant::tool::State::Pending,
                         },
                         output: String::new(),
+                        sandbox: None,
+                        subagent: None,
                     },
                 ),
                 ChatEntryKind::Status(text) => {

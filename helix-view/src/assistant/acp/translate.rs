@@ -44,12 +44,16 @@ pub fn session_new(scope: &thread::Scope) -> acp::NewSessionRequest {
     acp::NewSessionRequest {
         mcp_servers: Vec::new(),
         cwd: scope.cwd.clone(),
+        additional_directories: Vec::new(),
     }
 }
 
 pub fn session_load(session: &Session) -> acp::LoadSessionRequest {
     acp::LoadSessionRequest {
         session_id: session.to_string(),
+        mcp_servers: Vec::new(),
+        cwd: None,
+        additional_directories: Vec::new(),
     }
 }
 
@@ -81,7 +85,7 @@ pub fn set_config(
     acp::SetSessionConfigOptionRequest {
         session_id: session.to_string(),
         config_id: option.to_string(),
-        value_id: value.to_string(),
+        value: acp::ConfigValue::Legacy(value.to_string()),
     }
 }
 
@@ -146,6 +150,15 @@ pub fn thread_event(update: acp::SessionUpdate) -> Option<thread::Event> {
                 locations: content_locations(std::slice::from_ref(&chunk.content)),
             }),
         )),
+        acp::SessionUpdate::AgentThoughtChunk(chunk) => Some(thread::Event::Content(
+            thread::Content::Append(thread::NewEntry {
+                turn: None,
+                kind: thread::EntryKind::Thought {
+                    text: content_text(chunk.content.clone()),
+                },
+                locations: content_locations(std::slice::from_ref(&chunk.content)),
+            }),
+        )),
         acp::SessionUpdate::ToolCall(info) => Some(thread::Event::Content(
             thread::Content::Append(thread::NewEntry {
                 turn: None,
@@ -167,6 +180,16 @@ pub fn thread_event(update: acp::SessionUpdate) -> Option<thread::Event> {
         acp::SessionUpdate::ConfigOptionUpdate(_) => None,
         acp::SessionUpdate::CurrentModeUpdate(_) => None,
         acp::SessionUpdate::AvailableCommandsUpdate(_) => None,
+        acp::SessionUpdate::UsageUpdate(update) => {
+            Some(thread::Event::Usage(thread::UsageUpdate {
+                input_tokens: update.input_tokens,
+                output_tokens: update.output_tokens,
+                total_input_tokens: update.total_input_tokens,
+                total_output_tokens: update.total_output_tokens,
+                cache_creation_input_tokens: update.cache_creation_input_tokens,
+                cache_read_input_tokens: update.cache_read_input_tokens,
+            }))
+        }
     }
 }
 
@@ -207,6 +230,8 @@ fn tool_call(info: acp::ToolCallInfo) -> tool::Call {
         name: info.title.unwrap_or_else(|| "tool".to_string()),
         state: tool_state(info.status),
         output: String::new(),
+        subagent: None,
+        sandbox: None,
     }
 }
 
@@ -229,6 +254,8 @@ fn tool_update(update: acp::ToolCallUpdate) -> tool::Call {
             .map(tool_state)
             .unwrap_or(tool::State::Pending),
         output,
+        subagent: None,
+        sandbox: None,
     }
 }
 
@@ -238,6 +265,50 @@ fn tool_state(state: acp::ToolCallStatus) -> tool::State {
         acp::ToolCallStatus::Completed => tool::State::Completed,
         acp::ToolCallStatus::Failed => tool::State::Failed { message: None },
         acp::ToolCallStatus::Cancelled => tool::State::Canceled,
+    }
+}
+
+pub(crate) fn elicitation(req: acp::CreateElicitationRequest) -> thread::Elicitation {
+    thread::Elicitation {
+        id: req.elicitation_id,
+        status: thread::ElicitationStatus::Pending,
+        mode: match req.mode {
+            acp::ElicitationMode::Form(form) => thread::ElicitationMode::Form {
+                message: form.message,
+                fields: form
+                    .schema
+                    .fields
+                    .into_iter()
+                    .map(|field| thread::ElicitationField {
+                        name: field.name,
+                        field_type: match field.field_type {
+                            acp::ElicitationFieldType::Text => thread::ElicitationFieldType::Text,
+                            acp::ElicitationFieldType::Select => {
+                                thread::ElicitationFieldType::Select
+                            }
+                            acp::ElicitationFieldType::Bool => thread::ElicitationFieldType::Bool,
+                            acp::ElicitationFieldType::Textarea => {
+                                thread::ElicitationFieldType::Textarea
+                            }
+                        },
+                        label: field.label,
+                        required: field.required.unwrap_or(false),
+                        options: field
+                            .options
+                            .into_iter()
+                            .map(|option| thread::ElicitationOption {
+                                value: option.value,
+                                label: option.label,
+                            })
+                            .collect(),
+                    })
+                    .collect(),
+            },
+            acp::ElicitationMode::Url(url) => thread::ElicitationMode::Url {
+                message: url.message,
+                url: url.url,
+            },
+        },
     }
 }
 
@@ -310,6 +381,7 @@ mod tests {
                     embedded_context: Some(true),
                 }),
                 mcp: None,
+                session: None,
             },
             agent_info: None,
             auth_methods: None,
@@ -339,6 +411,7 @@ mod tests {
                 name: Some("example".to_string()),
                 mime_type: None,
             })]),
+            meta: None,
         });
 
         let locations = update_locations(&update);
@@ -382,6 +455,7 @@ mod tests {
             content: Some(vec![acp::ContentBlock::Text(acp::TextContent {
                 text: "partial output".to_string(),
             })]),
+            meta: None,
         });
 
         let Some(thread::Event::Content(thread::Content::Append(entry))) = thread_event(update)

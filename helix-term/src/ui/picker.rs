@@ -2,9 +2,7 @@ mod handlers;
 mod query;
 
 use crate::{
-    alt,
     compositor::{self, Component, Context, Event, EventResult, PickerComponent, RenderContext},
-    ctrl, key, shift,
     ui::{
         self,
         document::{render_document, HighlighterInput, LinePos, TextRenderer},
@@ -63,6 +61,244 @@ pub(crate) const PICKER_TRACE_TARGET: &str = "dhx_picker";
 
 static NEXT_PICKER_TRACE_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_PICKER_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
+
+// Picker keys are component-local hardcoded bindings, not user keymap entries,
+// so this table is the single source for both dispatch and footer hints.
+const PICKER_BINDINGS: &[PickerBinding] = &[
+    PickerBinding::visible(
+        KeyEvent {
+            code: KeyCode::Enter,
+            modifiers: KeyModifiers::NONE,
+        },
+        PickerBindingAction::Open,
+        "Enter",
+        "open",
+        220,
+    ),
+    PickerBinding::visible(
+        KeyEvent {
+            code: KeyCode::Esc,
+            modifiers: KeyModifiers::NONE,
+        },
+        PickerBindingAction::Close,
+        "Esc",
+        "close",
+        210,
+    ),
+    PickerBinding::hidden(
+        KeyEvent {
+            code: KeyCode::Char('c'),
+            modifiers: KeyModifiers::CONTROL,
+        },
+        PickerBindingAction::Close,
+    ),
+    PickerBinding::visible(
+        KeyEvent {
+            code: KeyCode::Tab,
+            modifiers: KeyModifiers::NONE,
+        },
+        PickerBindingAction::Next,
+        "Tab",
+        "next",
+        200,
+    ),
+    PickerBinding::visible(
+        KeyEvent {
+            code: KeyCode::Tab,
+            modifiers: KeyModifiers::SHIFT,
+        },
+        PickerBindingAction::Previous,
+        "S-Tab",
+        "prev",
+        190,
+    ),
+    PickerBinding::hidden(
+        KeyEvent {
+            code: KeyCode::Up,
+            modifiers: KeyModifiers::NONE,
+        },
+        PickerBindingAction::Previous,
+    ),
+    PickerBinding::hidden(
+        KeyEvent {
+            code: KeyCode::Char('p'),
+            modifiers: KeyModifiers::CONTROL,
+        },
+        PickerBindingAction::Previous,
+    ),
+    PickerBinding::hidden(
+        KeyEvent {
+            code: KeyCode::Down,
+            modifiers: KeyModifiers::NONE,
+        },
+        PickerBindingAction::Next,
+    ),
+    PickerBinding::hidden(
+        KeyEvent {
+            code: KeyCode::Char('n'),
+            modifiers: KeyModifiers::CONTROL,
+        },
+        PickerBindingAction::Next,
+    ),
+    PickerBinding::hidden(
+        KeyEvent {
+            code: KeyCode::PageDown,
+            modifiers: KeyModifiers::NONE,
+        },
+        PickerBindingAction::PageDown,
+    ),
+    PickerBinding::hidden(
+        KeyEvent {
+            code: KeyCode::Char('d'),
+            modifiers: KeyModifiers::CONTROL,
+        },
+        PickerBindingAction::PageDown,
+    ),
+    PickerBinding::hidden(
+        KeyEvent {
+            code: KeyCode::PageUp,
+            modifiers: KeyModifiers::NONE,
+        },
+        PickerBindingAction::PageUp,
+    ),
+    PickerBinding::hidden(
+        KeyEvent {
+            code: KeyCode::Char('u'),
+            modifiers: KeyModifiers::CONTROL,
+        },
+        PickerBindingAction::PageUp,
+    ),
+    PickerBinding::hidden(
+        KeyEvent {
+            code: KeyCode::Home,
+            modifiers: KeyModifiers::NONE,
+        },
+        PickerBindingAction::Start,
+    ),
+    PickerBinding::hidden(
+        KeyEvent {
+            code: KeyCode::End,
+            modifiers: KeyModifiers::NONE,
+        },
+        PickerBindingAction::End,
+    ),
+    PickerBinding::visible(
+        KeyEvent {
+            code: KeyCode::Char(' '),
+            modifiers: KeyModifiers::NONE,
+        },
+        PickerBindingAction::ToggleMark,
+        "Space",
+        "mark",
+        205,
+    ),
+    PickerBinding::hidden(
+        KeyEvent {
+            code: KeyCode::Enter,
+            modifiers: KeyModifiers::ALT,
+        },
+        PickerBindingAction::OpenKeep,
+    ),
+    PickerBinding::visible(
+        KeyEvent {
+            code: KeyCode::Char('s'),
+            modifiers: KeyModifiers::CONTROL,
+        },
+        PickerBindingAction::HorizontalSplit,
+        "C-s",
+        "split",
+        120,
+    ),
+    PickerBinding::visible(
+        KeyEvent {
+            code: KeyCode::Char('v'),
+            modifiers: KeyModifiers::CONTROL,
+        },
+        PickerBindingAction::VerticalSplit,
+        "C-v",
+        "vsplit",
+        110,
+    ),
+    PickerBinding::visible(
+        KeyEvent {
+            code: KeyCode::Char('t'),
+            modifiers: KeyModifiers::CONTROL,
+        },
+        PickerBindingAction::TogglePreview,
+        "C-t",
+        "preview",
+        100,
+    ),
+];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PickerBindingAction {
+    Previous,
+    Next,
+    PageDown,
+    PageUp,
+    Start,
+    End,
+    ToggleMark,
+    Close,
+    OpenKeep,
+    Open,
+    HorizontalSplit,
+    VerticalSplit,
+    TogglePreview,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PickerBinding {
+    key: KeyEvent,
+    action: PickerBindingAction,
+    hint: PickerHintPolicy,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PickerHintPolicy {
+    Visible(PickerHint),
+    Hidden,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PickerHint {
+    key: &'static str,
+    label: &'static str,
+    priority: u8,
+}
+
+impl PickerBinding {
+    const fn visible(
+        key: KeyEvent,
+        action: PickerBindingAction,
+        hint_key: &'static str,
+        hint_label: &'static str,
+        priority: u8,
+    ) -> Self {
+        Self {
+            key,
+            action,
+            hint: PickerHintPolicy::Visible(PickerHint {
+                key: hint_key,
+                label: hint_label,
+                priority,
+            }),
+        }
+    }
+
+    const fn hidden(key: KeyEvent, action: PickerBindingAction) -> Self {
+        Self {
+            key,
+            action,
+            hint: PickerHintPolicy::Hidden,
+        }
+    }
+}
+
+fn picker_binding_for_key(key: KeyEvent) -> Option<&'static PickerBinding> {
+    PICKER_BINDINGS.iter().find(|binding| binding.key == key)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct PickerInstanceId(u64);
@@ -1846,21 +2082,22 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
         }
         .render(inner, surface);
 
-        // The picker render path does not currently receive resolved active-keymap
-        // labels, so this footer uses the canonical default bindings handled below.
-        let hints = [
-            crate::widgets::Hint::new("Enter", "open").priority(220),
-            crate::widgets::Hint::new("Esc", "close").priority(210),
-            crate::widgets::Hint::new("Tab", "next").priority(200),
-            crate::widgets::Hint::new("S-Tab", "prev").priority(190),
-            crate::widgets::Hint::new("C-s", "split").priority(120),
-            crate::widgets::Hint::new("C-v", "vsplit").priority(110),
-            crate::widgets::Hint::new("C-t", "preview").priority(100),
-        ];
+        let hints: Vec<_> = PICKER_BINDINGS
+            .iter()
+            .filter_map(|binding| match binding.hint {
+                PickerHintPolicy::Visible(hint)
+                    if binding.action != PickerBindingAction::ToggleMark
+                        || self.marked.is_some() =>
+                {
+                    Some(crate::widgets::Hint::new(hint.key, hint.label).priority(hint.priority))
+                }
+                _ => None,
+            })
+            .collect();
         crate::widgets::hint_bar(
             surface,
             hint_row,
-            &hints,
+            hints.as_slice(),
             crate::widgets::HintBarStyle {
                 background,
                 key: selected,
@@ -2223,35 +2460,44 @@ impl<I: 'static + Send + Sync, D: 'static + Send + Sync> Component for Picker<I,
             return EventResult::Consumed(None);
         }
 
-        match key_event {
-            shift!(Tab) | key!(Up) | ctrl!('p') => {
+        let Some(binding) = picker_binding_for_key(key_event) else {
+            self.prompt_handle_event(event, ctx);
+            return EventResult::Consumed(None);
+        };
+
+        match binding.action {
+            PickerBindingAction::Previous => {
                 self.move_by(1, Direction::Backward);
             }
-            key!(Tab) | key!(Down) | ctrl!('n') => {
+            PickerBindingAction::Next => {
                 self.move_by(1, Direction::Forward);
             }
-            key!(PageDown) | ctrl!('d') => {
+            PickerBindingAction::PageDown => {
                 self.page_down();
             }
-            key!(PageUp) | ctrl!('u') => {
+            PickerBindingAction::PageUp => {
                 self.page_up();
             }
-            key!(Home) => {
+            PickerBindingAction::Start => {
                 self.to_start();
             }
-            key!(End) => {
+            PickerBindingAction::End => {
                 self.to_end();
             }
-            key!(' ') if self.marked.is_some() => {
-                self.toggle_mark();
+            PickerBindingAction::ToggleMark => {
+                if self.marked.is_some() {
+                    self.toggle_mark();
+                } else {
+                    self.prompt_handle_event(event, ctx);
+                }
             }
-            key!(Esc) | ctrl!('c') => return close_fn(self),
-            alt!(Enter) => {
+            PickerBindingAction::Close => return close_fn(self),
+            PickerBindingAction::OpenKeep => {
                 if let Some(option) = self.selection() {
                     (self.callback_fn)(ctx, option, Action::Replace);
                 }
             }
-            key!(Enter) => {
+            PickerBindingAction::Open => {
                 // If the prompt has a history completion and is empty, use enter to accept
                 // that completion
                 if let Some(completion) = self
@@ -2286,23 +2532,20 @@ impl<I: 'static + Send + Sync, D: 'static + Send + Sync> Component for Picker<I,
                     return close_fn(self);
                 }
             }
-            ctrl!('s') => {
+            PickerBindingAction::HorizontalSplit => {
                 if let Some(option) = self.selection() {
                     (self.callback_fn)(ctx, option, Action::HorizontalSplit);
                 }
                 return close_fn(self);
             }
-            ctrl!('v') => {
+            PickerBindingAction::VerticalSplit => {
                 if let Some(option) = self.selection() {
                     (self.callback_fn)(ctx, option, Action::VerticalSplit);
                 }
                 return close_fn(self);
             }
-            ctrl!('t') => {
+            PickerBindingAction::TogglePreview => {
                 self.toggle_preview();
-            }
-            _ => {
-                self.prompt_handle_event(event, ctx);
             }
         }
 
@@ -2389,3 +2632,27 @@ impl<T: 'static + Send + Sync, D> Drop for Picker<T, D> {
 type PickerCallback<T> = Box<dyn Fn(&mut Context, &T, Action) + Send>;
 pub type PickerKeyHandler<T, D> = Box<dyn Fn(&mut Context, &T, Arc<D>, u32) + Send + 'static>;
 pub type PickerKeyHandlers<T, D> = HashMap<KeyEvent, PickerKeyHandler<T, D>>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn picker_bindings_all_have_hint_policy() {
+        let mut keys = HashSet::new();
+        for binding in PICKER_BINDINGS {
+            assert!(keys.insert(binding.key), "duplicate picker key binding");
+            match binding.hint {
+                PickerHintPolicy::Visible(hint) => {
+                    assert!(!hint.key.is_empty(), "visible hint key must be named");
+                    assert!(!hint.label.is_empty(), "visible hint label must be named");
+                }
+                PickerHintPolicy::Hidden => {}
+            }
+            assert_eq!(
+                picker_binding_for_key(binding.key).map(|binding| binding.action),
+                Some(binding.action)
+            );
+        }
+    }
+}

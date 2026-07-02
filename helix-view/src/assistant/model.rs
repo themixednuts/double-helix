@@ -488,6 +488,9 @@ impl Store {
                             thread::EntryKind::AssistantText { text } => {
                                 EntryKind::AssistantText { text: text.clone() }
                             }
+                            thread::EntryKind::Thought { text } => {
+                                EntryKind::AssistantText { text: text.clone() }
+                            }
                             thread::EntryKind::ToolCall(call) => EntryKind::ToolCall {
                                 id: call.id.to_string(),
                                 name: call.name.clone(),

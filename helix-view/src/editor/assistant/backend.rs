@@ -52,6 +52,7 @@ impl Editor {
             args,
             env: Vec::new(),
             cwd: cwd.clone(),
+            mcp_servers: Vec::new(),
             timeout_secs: 120,
         };
         let client_info = helix_acp::types::Implementation {

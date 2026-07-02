@@ -490,6 +490,9 @@ pub fn entry_kind_to_contract(
         helix_view::assistant::thread::EntryKind::AssistantText { text } => {
             ("assistant_text".into(), Some(text.clone()))
         }
+        helix_view::assistant::thread::EntryKind::Thought { text } => {
+            ("thought".into(), Some(text.clone()))
+        }
         helix_view::assistant::thread::EntryKind::ToolCall(call) => {
             ("tool_call".into(), Some(call.name.clone()))
         }

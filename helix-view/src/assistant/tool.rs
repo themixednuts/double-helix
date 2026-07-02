@@ -1,4 +1,5 @@
 use std::fmt;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -44,4 +45,23 @@ pub struct Call {
     pub name: String,
     pub state: State,
     pub output: String,
+    pub subagent: Option<SubagentSessionInfo>,
+    pub sandbox: Option<SandboxAuthorization>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubagentSessionInfo {
+    pub session_id: String,
+    pub message_start_index: Option<u64>,
+    pub message_end_index: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SandboxAuthorization {
+    pub command: Option<String>,
+    pub network_hosts: Vec<String>,
+    pub allow_fs_write_all: bool,
+    pub write_paths: Vec<PathBuf>,
+    pub unsandboxed: bool,
+    pub reason: Option<String>,
 }

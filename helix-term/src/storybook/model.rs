@@ -1,4 +1,7 @@
+use std::any::Any;
+
 use crate::render::CellSurface as Buffer;
+use crossterm::event::KeyEvent;
 use helix_view::{
     graphics::{Rect, Style},
     theme::Theme,
@@ -242,6 +245,14 @@ impl StoryCanvas {
 pub(super) enum StoryRenderer {
     Styled(fn(&mut Buffer, Rect, UiStyleGuide)),
     Runtime(for<'a> fn(&mut Buffer, Rect, StoryContext<'a>)),
+    Interactive(InteractiveStory),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct InteractiveStory {
+    pub(super) init: fn() -> Box<dyn Any>,
+    pub(super) update: fn(&mut dyn Any, KeyEvent),
+    pub(super) render: for<'a> fn(&dyn Any, &mut Buffer, Rect, StoryContext<'a>),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -260,10 +271,37 @@ pub struct Story {
 
 impl Story {
     pub(super) fn render(self, surface: &mut Buffer, area: Rect, context: StoryContext<'_>) {
+        self.render_with_state(surface, area, context, None);
+    }
+
+    pub(super) fn render_with_state(
+        self,
+        surface: &mut Buffer,
+        area: Rect,
+        context: StoryContext<'_>,
+        interactive_state: Option<&dyn Any>,
+    ) {
         let canvas = self.canvas.apply(area);
         match self.render {
             StoryRenderer::Styled(render) => render(surface, canvas, context.styles),
             StoryRenderer::Runtime(render) => render(surface, canvas, context),
+            StoryRenderer::Interactive(interactive) => {
+                let initial_state;
+                let state = if let Some(state) = interactive_state {
+                    state
+                } else {
+                    initial_state = (interactive.init)();
+                    initial_state.as_ref()
+                };
+                (interactive.render)(state, surface, canvas, context);
+            }
+        }
+    }
+
+    pub(super) fn interactive(self) -> Option<InteractiveStory> {
+        match self.render {
+            StoryRenderer::Interactive(interactive) => Some(interactive),
+            _ => None,
         }
     }
 }

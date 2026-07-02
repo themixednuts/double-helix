@@ -241,6 +241,10 @@ impl PersistedRecord {
             mode: self.mode.map(PersistedModeSet::into_domain).transpose()?,
             config: self.config.into_domain()?,
             review_mode: self.review_mode,
+            usage: thread::Usage::default(),
+            commands: Vec::new(),
+            pending_elicitations: Vec::new(),
+            caps: None,
             scope: self.scope.into_domain(),
             view: self.view.into_domain(),
             terminals: self
@@ -487,6 +491,7 @@ impl PersistedEntry {
 enum PersistedEntryKind {
     UserPrompt { text: String },
     AssistantText { text: String },
+    Thought { text: String },
     ToolCall(PersistedToolCall),
     Status { text: String },
     ChangeSummary { files: Vec<PersistedChangeFile> },
@@ -497,6 +502,7 @@ impl From<&thread::EntryKind> for PersistedEntryKind {
         match kind {
             thread::EntryKind::UserPrompt { text } => Self::UserPrompt { text: text.clone() },
             thread::EntryKind::AssistantText { text } => Self::AssistantText { text: text.clone() },
+            thread::EntryKind::Thought { text } => Self::Thought { text: text.clone() },
             thread::EntryKind::ToolCall(call) => Self::ToolCall(PersistedToolCall::from(call)),
             thread::EntryKind::Status { text } => Self::Status { text: text.clone() },
             thread::EntryKind::ChangeSummary(summary) => Self::ChangeSummary {
@@ -515,6 +521,7 @@ impl PersistedEntryKind {
         match self {
             Self::UserPrompt { text } => thread::EntryKind::UserPrompt { text },
             Self::AssistantText { text } => thread::EntryKind::AssistantText { text },
+            Self::Thought { text } => thread::EntryKind::Thought { text },
             Self::ToolCall(call) => thread::EntryKind::ToolCall(call.into_domain()),
             Self::Status { text } => thread::EntryKind::Status { text },
             Self::ChangeSummary { files } => thread::EntryKind::ChangeSummary(change::Summary {
@@ -554,6 +561,8 @@ impl PersistedToolCall {
             name: self.name,
             state: self.state.into_domain(),
             output: self.output,
+            subagent: None,
+            sandbox: None,
         }
     }
 }
@@ -1272,6 +1281,10 @@ mod tests {
             mode: None,
             config: config::State::new(Vec::new()),
             review_mode: review::Mode::Write,
+            usage: thread::Usage::default(),
+            commands: Vec::new(),
+            pending_elicitations: Vec::new(),
+            caps: None,
             scope: thread::Scope::new(PathBuf::from(".")),
             view: View {
                 focus: thread::Focus::Messages,

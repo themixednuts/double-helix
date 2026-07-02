@@ -19,6 +19,7 @@
 - [Insert mode](#insert-mode)
 - [Select / extend mode](#select--extend-mode)
 - [Picker](#picker)
+- [List-like and panel contexts](#list-like-and-panel-contexts)
 - [Prompt](#prompt)
 
 > 💡 Mappings marked (**LSP**) require an active language server for the file.
@@ -472,6 +473,7 @@ See the documentation page on [pickers](./pickers.md) for more info.
 | `Ctrl-s`                     | Open horizontally                                          |
 | `Ctrl-v`                     | Open vertically                                            |
 | `Ctrl-t`                     | Toggle preview                                             |
+| `Ctrl-r` `<reg>`             | Insert register contents into the picker filter            |
 | `Escape`, `Ctrl-c`           | Close picker                                               |
 
 ### File Explorer
@@ -480,11 +482,37 @@ There are additional keys accessible when using the File Explorer (`Space-e` and
 
 | Key                          | Description                                                |
 | -----                        | -------------                                              |
+| `j`, `Down`, `Ctrl-n`        | Select next item                                           |
+| `k`, `Up`, `Ctrl-p`          | Select previous item                                       |
+| `gg`, `Home`                 | Select first item                                          |
+| `G`, `End`                   | Select last item                                           |
+| `PageUp`, `Ctrl-u`           | Page up                                                    |
+| `PageDown`, `Ctrl-d`         | Page down                                                  |
+| `Enter`                      | Open file or toggle directory                              |
+| `Tab`, `Space`               | Expand or collapse directory                               |
+| `Escape`, `Ctrl-c`, `q`      | Close file explorer                                        |
+| `?`                          | Show file explorer key bindings                            |
 | `Alt-m`                      | Move selected file or directory                            |
 | `Alt-n`                      | Create a new file or directory                             |
 | `Alt-d`                      | Delete the selected file or directory                      |
 | `Alt-c`                      | Copy the selected file                                     |
 | `Alt-y`                      | Yank the path to the selected file or directory            |
+
+## List-like and panel contexts
+
+These contexts share the same intent where the operation exists. Context-specific actions keep their existing keys.
+
+| Context | Navigation | Accept | Secondary action | Dismiss | Fold / expand | Yank | Help |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Picker, thread picker, symbol/file/buffer pickers | `Tab`/`Shift-Tab`, `j`/`k` not used, `Down`/`Up`, `Ctrl-n`/`Ctrl-p`, `PageDown`/`PageUp`, `End`/`Home` | `Enter` | `Alt-Enter` background open, `Ctrl-s` horizontal split, `Ctrl-v` vertical split, `Ctrl-t` preview, `Ctrl-r` register paste | `Esc`, `Ctrl-c` | N/A | N/A | N/A |
+| Completion menu | `Tab`/`Shift-Tab`, `Down`/`Up`, `Ctrl-n`/`Ctrl-p`, `PageDown`/`PageUp` | `Enter` | N/A | `Esc`, `Ctrl-c` | N/A | N/A | N/A |
+| Prompt and command line | `Left`/`Right`, `Ctrl-b`/`Ctrl-f`, `Alt-b`/`Alt-f`, `Ctrl-a`/`Ctrl-e`, history with `Up`/`Down`, `Ctrl-p`/`Ctrl-n` | `Enter` | `Ctrl-r` register paste, `Ctrl-s` word under cursor | `Esc`, `Ctrl-c` | completion with `Tab`/`Shift-Tab` | N/A | N/A |
+| File explorer tree | `j`/`k`, `Down`/`Up`, `Ctrl-n`/`Ctrl-p`, `PageDown`/`PageUp`, `Ctrl-d`/`Ctrl-u`, `G`/`gg`, `End`/`Home`, mouse wheel | `Enter` | `Alt-m` move, `Alt-n` create, `Alt-d` delete, `Alt-c` copy, `Alt-y` yank path | `Esc`, `Ctrl-c`, `q` | `Tab`, `Space` | `y` | `?` |
+| Assistant messages | `j`/`k`, `Down`/`Up`, `Ctrl-n`/`Ctrl-p`, `PageDown`/`PageUp`, `Ctrl-d`/`Ctrl-u`, `G`/`gg`, `End`/`Home`, mouse wheel | `Enter` | `a`/`A` accept review, `x`/`X` reject review, `R` review mode, `t` follow | `Esc` returns to input or interrupts a running agent; `Ctrl-c` interrupts | `Tab` | `y` | N/A |
+| Assistant mention completion | `Down`/`Up`, `Ctrl-n`/`Ctrl-p` | `Enter`, `Tab` | N/A | `Esc` | N/A | N/A | N/A |
+| Menus and select popups | `Tab`/`Shift-Tab`, `Down`/`Up`, `Ctrl-n`/`Ctrl-p`, `PageDown`/`PageUp` | `Enter` | N/A | `Esc`, `Ctrl-c` | N/A | N/A | N/A |
+| Info popups, overlays, hover and floats | `Ctrl-d`/`Ctrl-u` where scrollable | N/A | N/A | `Esc` closes the topmost popup/layer | N/A | N/A | N/A |
+| Notifications | N/A; notifications never take focus | N/A | `:notifications-dismiss` dismisses all active notifications | auto-dismiss or command dismiss | N/A | N/A | `:notifications-history` |
 
 ## Prompt
 

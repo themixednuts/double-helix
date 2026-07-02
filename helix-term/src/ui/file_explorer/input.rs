@@ -411,9 +411,12 @@ pub(super) fn explorer_local_keymap(editing_engine: EditingEngineConfig) -> Moda
     root.command(ctrl!('c'), ExplorerCommand::Close);
     root.command(key!('q'), ExplorerCommand::Close);
     root.command(key!('?'), ExplorerCommand::ShowHelp);
+    root.command(ctrl!('p'), ExplorerCommand::SelectPrevious);
+    root.command(ctrl!('n'), ExplorerCommand::SelectNext);
 
     root.command(key!(Enter), ExplorerCommand::Open);
     root.command(alt!(Enter), ExplorerCommand::Open);
+    root.command(key!(Tab), ExplorerCommand::ToggleDirectory);
     root.command(key!(' '), ExplorerCommand::ToggleDirectory);
     root.command(key!(Left), ExplorerCommand::CollapseOrSelectParent);
     root.command(key!(Backspace), ExplorerCommand::RootParent);

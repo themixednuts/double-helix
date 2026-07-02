@@ -66,6 +66,7 @@ pub struct AssistantPanel {
     spinner: Spinner,
     /// Selection animation that replays when message focus moves back onto a row.
     message_focus_animation: Animation,
+    pending_message_g: bool,
     markdown_cache: RefCell<HashMap<helix_view::assistant::thread::EntryId, CachedMarkdown>>,
     mention: MentionPopup,
 }
@@ -373,6 +374,7 @@ impl AssistantPanel {
                 spec.frame_interval = Duration::from_millis(16);
                 spec
             }),
+            pending_message_g: false,
             markdown_cache: RefCell::new(HashMap::new()),
             mention: MentionPopup::default(),
         }
@@ -2209,6 +2211,20 @@ impl AssistantPanel {
                 }
                 EventResult::Consumed(None)
             }
+            MouseEventKind::ScrollUp if in_output => {
+                let lines = editor.config().scroll_lines.unsigned_abs().max(1);
+                let scroll = Scrollable::scroll(&self.output).saturating_sub(lines);
+                Scrollable::scroll_to(&mut self.output, scroll);
+                self.set_content_scroll(editor, Scrollable::scroll(&self.output));
+                EventResult::Consumed(None)
+            }
+            MouseEventKind::ScrollDown if in_output => {
+                let lines = editor.config().scroll_lines.unsigned_abs().max(1);
+                let scroll = Scrollable::scroll(&self.output).saturating_add(lines);
+                Scrollable::scroll_to(&mut self.output, scroll);
+                self.set_content_scroll(editor, Scrollable::scroll(&self.output));
+                EventResult::Consumed(None)
+            }
             _ => EventResult::Ignored(None),
         }
     }
@@ -2473,6 +2489,13 @@ impl Component for AssistantPanel {
 
         if model.focus() == helix_view::assistant::thread::Focus::Messages {
             let viewport_height = self.output.area().height as usize;
+            let is_message_g = matches!(
+                (key.code, key.modifiers),
+                (KeyCode::Char('g'), KeyModifiers::NONE)
+            );
+            if !is_message_g {
+                self.pending_message_g = false;
+            }
             let handled = match (key.code, key.modifiers) {
                 (KeyCode::Esc, KeyModifiers::NONE) => {
                     if model.agent_busy {
@@ -2580,6 +2603,15 @@ impl Component for AssistantPanel {
                 }
                 (KeyCode::Down, KeyModifiers::NONE) | (KeyCode::Char('j'), KeyModifiers::NONE) => {
                     self.select_next_message(cx.editor);
+                    true
+                }
+                (KeyCode::Char('g'), KeyModifiers::NONE) => {
+                    if self.pending_message_g {
+                        self.pending_message_g = false;
+                        self.select_first_message(cx.editor);
+                    } else {
+                        self.pending_message_g = true;
+                    }
                     true
                 }
                 (KeyCode::Home, KeyModifiers::NONE) => {

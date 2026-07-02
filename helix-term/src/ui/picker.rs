@@ -1780,6 +1780,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             header,
             widths: &self.widths,
             text_style,
+            placeholder_style: theme.get("ui.text.inactive"),
             selected_style: selected,
             header_style,
             highlight_symbol: picker_symbol,

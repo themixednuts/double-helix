@@ -1393,6 +1393,30 @@ impl FileExplorerPanel {
         now: Instant,
     ) -> EventResult {
         let start = Instant::now();
+        if matches!(
+            event.kind,
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+        ) && self.area.contains(event.column, event.row)
+        {
+            let lines = cx.editor.config().scroll_lines.unsigned_abs().max(1);
+            let delta = match event.kind {
+                MouseEventKind::ScrollUp => -(lines as isize),
+                MouseEventKind::ScrollDown => lines as isize,
+                _ => unreachable!(),
+            };
+            self.move_selection_by(delta);
+            self.queue_selected_preview(cx.editor, cx.ingress.clone());
+            log::info!(
+                "[file_explorer] mouse_scroll delta={} scroll={} selection={} selected={} elapsed_us={}",
+                delta,
+                self.scroll,
+                self.selection,
+                selected_path_for_log(&self.rows, self.selection),
+                start.elapsed().as_micros()
+            );
+            return EventResult::Consumed(None);
+        }
+
         if !matches!(event.kind, MouseEventKind::Down(MouseButton::Left)) {
             return EventResult::Ignored(None);
         }
@@ -1971,6 +1995,25 @@ mod tests {
             panic!("local explorer help binding should exist");
         };
         assert!(matches!(binding.intent(), ModalIntent::Component(_)));
+    }
+
+    #[test]
+    fn explorer_local_keymap_has_list_navigation_aliases() {
+        let mut input = ExplorerInputEngine::default();
+        input.prepare_test_keymaps(EditingEngineConfig::Helix);
+
+        assert_eq!(
+            input.translate(ctrl!('p')),
+            ExplorerInput::Execute(ExplorerAction::MoveSelection(-1))
+        );
+        assert_eq!(
+            input.translate(ctrl!('n')),
+            ExplorerInput::Execute(ExplorerAction::MoveSelection(1))
+        );
+        assert_eq!(
+            input.translate(key!(Tab)),
+            ExplorerInput::Execute(ExplorerAction::ToggleDirectory)
+        );
     }
 
     #[test]

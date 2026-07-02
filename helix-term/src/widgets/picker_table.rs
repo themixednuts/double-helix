@@ -148,6 +148,7 @@ pub struct PickerTable<'a> {
     pub header: Option<TableRow<'a>>,
     pub widths: &'a [Constraint],
     pub text_style: Style,
+    pub placeholder_style: Style,
     pub selected_style: Style,
     pub header_style: Style,
     pub highlight_symbol: &'a str,
@@ -208,6 +209,23 @@ impl PickerTable<'_> {
         }
 
         if current_height >= area.height {
+            return;
+        }
+
+        if self.rows.is_empty() {
+            let y = area.top() + current_height;
+            let text = "No results";
+            let text_width = text.width() as u16;
+            let x = area
+                .left()
+                .saturating_add(area.width.saturating_sub(text_width) / 2);
+            surface.set_stringn(
+                x,
+                y,
+                text,
+                area.width.saturating_sub(x.saturating_sub(area.left())) as usize,
+                tui::ratatui::to_ratatui_style(self.placeholder_style),
+            );
             return;
         }
 
@@ -303,6 +321,7 @@ mod tests {
             header: None,
             widths: &widths,
             text_style: Style::default(),
+            placeholder_style: Style::default(),
             selected_style: Style::default(),
             header_style: Style::default(),
             highlight_symbol: "> ",
@@ -313,5 +332,27 @@ mod tests {
 
         assert_eq!(surface[(0, 1)].symbol(), ">");
         assert_eq!(surface[(2, 1)].symbol(), "s");
+    }
+
+    #[test]
+    fn empty_table_renders_placeholder() {
+        let mut surface = Buffer::empty(RatatuiRect::new(0, 0, 20, 3));
+        let widths = [Constraint::Length(18)];
+
+        PickerTable {
+            rows: Vec::new(),
+            header: None,
+            widths: &widths,
+            text_style: Style::default(),
+            placeholder_style: Style::default(),
+            selected_style: Style::default(),
+            header_style: Style::default(),
+            highlight_symbol: "> ",
+            selected_row: None,
+            truncate_start: false,
+        }
+        .render(Rect::new(0, 0, 20, 3), &mut surface);
+
+        assert_eq!(surface[(5, 0)].symbol(), "N");
     }
 }

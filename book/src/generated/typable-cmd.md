@@ -73,10 +73,11 @@
 | `:toggle-option`, `:toggle` | Toggle a config option at runtime.<br>For example to toggle smart case search, use `:toggle search.smart-case`. |
 | `:get-option`, `:get` | Get the current value of a config option. |
 | `:sort` | Sort ranges in selection. |
-| `:index` | Inserts indexes into selections. |
+| `:index`, `:i` | Inserts indexes into selections. |
 | `:reflow` | Hard-wrap the current selection of lines to a given width. |
 | `:tree-sitter-subtree`, `:ts-subtree` | Display the smallest tree-sitter subtree that spans the primary selection, primarily for debugging queries. |
 | `:config-reload` | Refresh user config. |
+| `:reload-all-plugins` | Reload all plugins. |
 | `:config-open` | Open the user config.toml file. |
 | `:config-open-workspace` | Open the workspace config.toml file. |
 | `:log-open` | Open the Double Helix log file. |
@@ -97,3 +98,29 @@
 | `:fold` | Fold text. |
 | `:unfold` | Unfold text. |
 | `:noop` | Does nothing. |
+| `:notifications-history`, `:notif-history`, `:nh` | Show notification history. |
+| `:notifications-clear`, `:notif-clear`, `:nc` | Clear notification history. |
+| `:notifications-dismiss`, `:notif-dismiss`, `:nd` | Dismiss all active notifications. |
+| `:notifications-test`, `:notif-test`, `:nt` | Test notification system with sample notifications. |
+| `:assistant-connect`, `:agent` | Connect to an assistant backend. Shows picker if no args, or use: :assistant-connect <command> [args...] |
+| `:assistant-prompt`, `:ask` | Send a prompt to the active assistant thread. Usage: :assistant-prompt <message> |
+| `:assistant-open`, `:assistant` | Open the assistant panel. |
+| `:assistant-cancel`, `:stop` | Cancel the active assistant run. |
+| `:assistant-open-history`, `:sessions` | Browse and load assistant history for the current scope. |
+| `:assistant-new-thread`, `:new-thread` | Create a new assistant thread on the active backend. |
+| `:assistant-close-thread`, `:close-thread` | Close the active assistant thread. |
+| `:assistant-next-thread`, `:next-thread` | Activate the next assistant thread tab. |
+| `:assistant-prev-thread`, `:prev-thread` | Activate the previous assistant thread tab. |
+| `:assistant-toggle-follow`, `:follow` | Toggle following for the active assistant thread. |
+| `:assistant-toggle-review-mode`, `:review-mode` | Toggle the active assistant thread between write and review mode. |
+| `:assistant-permissions-reset` | Clear persisted assistant permission rules. |
+| `:assistant-open-entry-scratch`, `:scratch` | Open the selected assistant entry in a scratch buffer. |
+| `:assistant-open-turn-changes` | Open the selected assistant turn changes in a scratch buffer. |
+| `:assistant-open-thread-changes` | Open aggregated changes for the active assistant thread. |
+| `:assistant-attach-selection`, `:attach-sel` | Attach the current selection as assistant context. |
+| `:assistant-attach-symbol`, `:attach-sym` | Attach the current selection as symbol context. |
+| `:assistant-attach-file`, `:attach-file` | Attach the current file as assistant context. |
+| `:assistant-attach-diagnostics`, `:attach-diag` | Attach current-file diagnostics as assistant context. |
+| `:assistant-attach-diff`, `:attach-diff` | Attach current-file diff summary as assistant context. |
+| `:assistant-detach-context`, `:detach` | Detach an attached assistant context item. |
+| `:assistant-reveal-entry-location` | Reveal the first location associated with the selected assistant entry. |

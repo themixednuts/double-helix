@@ -11,8 +11,9 @@ pub mod store;
 pub use config::{NativeInstallPolicy, PkgConfig, Policy, RegistrySource};
 pub use lock::{Lock, LockedPackage, Manifest};
 pub use ops::{
-    Backend, BackendInstall, DoctorReport, OpEvent, Ops, PackageChange, PluginBackend,
-    PluginBackendTransport, RegistryUpdate, ResolvedPackage, UpdatePlan,
+    release_age_label, Backend, BackendInstall, DoctorReport, LockOptions, OpEvent, Ops,
+    PackageChange, PluginBackend, PluginBackendTransport, RegistryUpdate, ResolvedPackage,
+    UpdatePlan,
 };
 pub use registry::Registry;
 pub use spec::{Artifact, NativeManager, NativeSource, PackageSpec, PkgKind, Source};

@@ -79,6 +79,20 @@ pub struct DocumentSemanticTokens {
     pub tokens: Vec<DocumentSemanticToken>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct DocumentSemanticTokenDeltaState {
+    pub result_id: Option<String>,
+    pub data: Vec<lsp::SemanticToken>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DocumentSemanticTokenUpdate {
+    pub version: i32,
+    pub result_id: Option<String>,
+    pub data: Vec<lsp::SemanticToken>,
+    pub tokens: Vec<DocumentSemanticToken>,
+}
+
 #[derive(Debug, Clone)]
 pub struct InlineCompletionGhost {
     pub view_id: ViewId,
@@ -101,6 +115,7 @@ pub struct DocumentLspState {
     code_lenses: Option<DocumentCodeLenses>,
     document_links: Option<DocumentLinks>,
     semantic_tokens: HashMap<LanguageServerId, DocumentSemanticTokens>,
+    semantic_token_delta_states: HashMap<LanguageServerId, DocumentSemanticTokenDeltaState>,
     inline_completion: Option<InlineCompletionGhost>,
     inline_values: Option<DocumentInlineValues>,
     color_swatch_cancel: Option<Token>,
@@ -295,8 +310,16 @@ impl DocumentLspState {
         &self.semantic_tokens
     }
 
+    pub fn semantic_token_delta_state(
+        &self,
+        server_id: LanguageServerId,
+    ) -> Option<&DocumentSemanticTokenDeltaState> {
+        self.semantic_token_delta_states.get(&server_id)
+    }
+
     pub fn clear_semantic_tokens(&mut self) {
         self.semantic_tokens.clear();
+        self.semantic_token_delta_states.clear();
     }
 
     pub fn set_semantic_tokens(
@@ -307,8 +330,30 @@ impl DocumentLspState {
         self.semantic_tokens.insert(server_id, tokens);
     }
 
+    pub fn set_semantic_token_update(
+        &mut self,
+        server_id: LanguageServerId,
+        update: DocumentSemanticTokenUpdate,
+    ) {
+        self.semantic_token_delta_states.insert(
+            server_id,
+            DocumentSemanticTokenDeltaState {
+                result_id: update.result_id,
+                data: update.data,
+            },
+        );
+        self.semantic_tokens.insert(
+            server_id,
+            DocumentSemanticTokens {
+                version: update.version,
+                tokens: update.tokens,
+            },
+        );
+    }
+
     pub fn update_semantic_tokens(&mut self, changes: &ChangeSet) {
         self.semantic_tokens.clear();
+        self.semantic_token_delta_states.clear();
         if let Some(ghost) = &mut self.inline_completion {
             changes.update_positions([(&mut ghost.cursor, Assoc::After)].into_iter());
             changes.update_positions([(&mut ghost.annotation.char_idx, Assoc::After)].into_iter());
@@ -364,6 +409,7 @@ impl DocumentLspState {
 
     pub fn restart_inline_values(&mut self) -> Token {
         self.cancel_inline_values();
+        self.inline_values = None;
         let token = Token::new();
         self.inline_value_cancel = Some(token.clone());
         token
@@ -375,6 +421,7 @@ impl DocumentLspState {
         };
         let was_active = !token.is_canceled();
         token.cancel();
+        self.inline_values = None;
         was_active
     }
 
@@ -417,6 +464,57 @@ impl DocumentLspState {
     pub fn is_lsp_fold_container(&self, view_id: ViewId) -> bool {
         self.lsp_fold_views.contains(&view_id)
     }
+}
+
+fn pack_semantic_tokens(tokens: &[lsp::SemanticToken]) -> Vec<u32> {
+    let mut data = Vec::with_capacity(tokens.len() * 5);
+    for token in tokens {
+        data.extend([
+            token.delta_line,
+            token.delta_start,
+            token.length,
+            token.token_type,
+            token.token_modifiers_bitset,
+        ]);
+    }
+    data
+}
+
+fn unpack_semantic_tokens(data: Vec<u32>) -> Option<Vec<lsp::SemanticToken>> {
+    let chunks = data.chunks_exact(5);
+    chunks.remainder().is_empty().then(|| {
+        chunks
+            .map(|chunk| lsp::SemanticToken {
+                delta_line: chunk[0],
+                delta_start: chunk[1],
+                length: chunk[2],
+                token_type: chunk[3],
+                token_modifiers_bitset: chunk[4],
+            })
+            .collect()
+    })
+}
+
+pub fn apply_semantic_token_delta_edits(
+    tokens: &[lsp::SemanticToken],
+    edits: &[lsp::SemanticTokensEdit],
+) -> Option<Vec<lsp::SemanticToken>> {
+    let mut data = pack_semantic_tokens(tokens);
+    let mut edits = edits.iter().collect::<Vec<_>>();
+    edits.sort_by_key(|edit| edit.start);
+
+    for edit in edits.into_iter().rev() {
+        let start = edit.start as usize;
+        let delete_count = edit.delete_count as usize;
+        let end = start.checked_add(delete_count)?;
+        if end > data.len() {
+            return None;
+        }
+        let replacement = edit.data.clone().unwrap_or_default();
+        data.splice(start..end, replacement);
+    }
+
+    unpack_semantic_tokens(data)
 }
 
 pub fn decode_semantic_tokens(
@@ -733,6 +831,45 @@ mod tests {
     }
 
     #[test]
+    fn semantic_token_delta_edits_apply_to_packed_stream() {
+        let before = vec![
+            lsp::SemanticToken {
+                delta_line: 2,
+                delta_start: 5,
+                length: 3,
+                token_type: 0,
+                token_modifiers_bitset: 3,
+            },
+            lsp::SemanticToken {
+                delta_line: 0,
+                delta_start: 5,
+                length: 4,
+                token_type: 1,
+                token_modifiers_bitset: 0,
+            },
+            lsp::SemanticToken {
+                delta_line: 3,
+                delta_start: 2,
+                length: 7,
+                token_type: 2,
+                token_modifiers_bitset: 0,
+            },
+        ];
+        let edits = vec![lsp::SemanticTokensEdit {
+            start: 0,
+            delete_count: 1,
+            data: Some(vec![3]),
+        }];
+
+        let after = apply_semantic_token_delta_edits(&before, &edits).unwrap();
+
+        assert_eq!(
+            pack_semantic_tokens(&after),
+            vec![3, 5, 3, 0, 3, 0, 5, 4, 1, 0, 3, 2, 7, 2, 0]
+        );
+    }
+
+    #[test]
     fn inline_completion_cancel_dismisses_ghost_text() {
         let mut state = DocumentLspState::default();
         state.set_inline_completion(InlineCompletionGhost {
@@ -747,5 +884,20 @@ mod tests {
         assert!(state.inline_completion().is_some());
         assert!(!state.cancel_inline_completion());
         assert!(state.inline_completion().is_none());
+    }
+
+    #[test]
+    fn inline_value_restart_clears_and_cancels_previous_frame_values() {
+        let mut state = DocumentLspState::default();
+        let first = state.restart_inline_values();
+        state.set_inline_values(DocumentInlineValues {
+            annotations: vec![InlineAnnotation::new(3, " = 1")],
+        });
+
+        let second = state.restart_inline_values();
+
+        assert!(first.is_canceled());
+        assert!(!second.is_canceled());
+        assert!(state.inline_values().is_none());
     }
 }

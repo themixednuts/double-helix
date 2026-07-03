@@ -1,0 +1,27 @@
+name = "ruff"
+kind = "linter"
+description = "Fast Python linter and formatter"
+homepage = "https://docs.astral.sh/ruff/"
+categories = ["formatter"]
+languages = ["python"]
+
+[version]
+tag-source = "pip:ruff"
+
+[[artifact]]
+os = "windows"
+arch = "x86_64"
+source = { pip = "ruff" }
+bin = "ruff"
+
+[[artifact]]
+os = "linux"
+arch = "x86_64"
+source = { pip = "ruff" }
+bin = "ruff"
+
+[[artifact]]
+os = "macos"
+arch = "aarch64"
+source = { pip = "ruff" }
+bin = "ruff"

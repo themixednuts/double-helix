@@ -5,8 +5,9 @@ Owner: architecture; implemented by staged codex waves.
 
 Implementation status (2026-07 W-pkg-4): `helix-pkg` engine, `dhx pkg` CLI,
 editor `:pkg` UI, github-release, archive, system, npm, pip, cargo, go,
-grammar git, native OS package-manager sources, install policy checks, and the
-plugin backend contract surface are implemented.
+grammar git, native OS package-manager sources, first-class formatter/linter
+metadata, install policy checks, and the plugin backend contract surface are
+implemented.
 
 ## Problem
 
@@ -21,8 +22,8 @@ it?").
 ## Goals
 
 1. One surface — `dhx pkg <cmd>` on the CLI and `:pkg` inside the editor —
-   for **LSP servers, DAP adapters, tree-sitter grammars, and plugins**
-   (extensible to themes/queries later).
+   for **LSP servers, DAP adapters, formatters, linters, tree-sitter grammars,
+   and plugins** (extensible to themes/queries later).
 2. Reproducible: a per-user (and optionally per-project) manifest plus a
    lockfile with exact versions and content hashes.
 3. Zero-config first run: opening a file whose language wants an
@@ -65,7 +66,7 @@ helix-pkg
 # registry entry (registry/<kind>/<name>.toml in-repo; user registries are
 # git repos/dirs with the same layout, merged with later-wins precedence)
 name = "rust-analyzer"
-kind = "lsp"                     # lsp | dap | grammar | plugin
+kind = "lsp"                     # lsp | dap | formatter | linter | grammar | plugin
 description = "Rust language server"
 homepage = "https://rust-analyzer.github.io"
 aliases = ["ra"]                 # optional search/discovery aliases
@@ -218,6 +219,9 @@ backends are never enabled by `run-scripts`; they always require an explicit
   runtimes/{node,py}/                    # shared npm prefix / venv, versioned
 ```
 
+- `dhx pkg lock --fetch-hashes` resolves the lockfile and downloads
+  archive/github-release artifacts only long enough to compute sha256 pins;
+  it writes the hash to the lock and discards the download without installing.
 - Activation = writing a shim + receipt for store-managed packages; native
   packages write a receipt only. The store keeps versions side by side and
   records the previous active version so rollback reactivates the prior
@@ -226,8 +230,7 @@ backends are never enabled by `run-scripts`; they always require an explicit
   binaries — no symlink privilege required. Unix: symlinks.
 - Archive downloads are hash-verified when the registry or lockfile supplies a
   sha256. Installs record the observed archive hash in receipts. Lock-only
-  refreshes do not download archives, so entries without registry-pinned hashes
-  remain unpinned until installed or refreshed by a future hash-fetching mode.
+  refreshes skip archive downloads unless `--fetch-hashes` is supplied.
 
 ### Manifest + lockfile
 
@@ -247,7 +250,7 @@ backends are never enabled by `run-scripts`; they always require an explicit
 
 `resolve::binary(kind, name)` returns the activated shim path. Language
 configuration keeps working untouched: when languages.toml specifies a bare
-LSP, DAP, or formatter command name, the lookup order becomes
+LSP, DAP, formatter, or linter command name, the lookup order becomes
 
 1. explicit absolute path in config (always wins),
 2. `<data>/pkg/bin/<command>` shim,

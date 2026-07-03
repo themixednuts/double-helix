@@ -447,7 +447,7 @@ pub enum RuntimeTaskEvent {
     ApplySemanticTokens {
         doc_id: DocumentId,
         server_id: LanguageServerId,
-        tokens: helix_view::document_lsp::DocumentSemanticTokens,
+        tokens: helix_view::document_lsp::DocumentSemanticTokenUpdate,
     },
     ApplyInlineCompletion {
         doc_id: DocumentId,

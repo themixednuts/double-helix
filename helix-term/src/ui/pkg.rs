@@ -5,7 +5,8 @@ use std::{
 };
 
 use helix_pkg::{
-    OpEvent, Ops, PackageChange, PackageSpec, PkgKind, Receipt, RegistrySource, Source,
+    release_age_label, OpEvent, Ops, PackageChange, PackageSpec, PkgKind, Receipt, RegistrySource,
+    Source,
 };
 use helix_view::{
     graphics::{CursorKind, Rect, Style},
@@ -1044,11 +1045,11 @@ impl PkgManager {
 
     fn cycle_kind_filter(&mut self) {
         self.kind_filter = match self.kind_filter {
-            None => Some(PkgKind::Lsp),
-            Some(PkgKind::Lsp) => Some(PkgKind::Dap),
-            Some(PkgKind::Dap) => Some(PkgKind::Grammar),
-            Some(PkgKind::Grammar) => Some(PkgKind::Plugin),
-            Some(PkgKind::Plugin) => None,
+            None => Some(PkgKind::ALL[0]),
+            Some(kind) => PkgKind::ALL
+                .iter()
+                .position(|candidate| *candidate == kind)
+                .and_then(|index| PkgKind::ALL.get(index + 1).copied()),
         };
         self.rebuild_filter();
     }
@@ -1272,13 +1273,20 @@ impl PkgManager {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        let state = crate::widgets::item_list_with_marks(
+        let sticky_rows = self
+            .rows
+            .iter()
+            .enumerate()
+            .filter_map(|(index, row)| matches!(row, PkgRow::Section(_)).then_some(index))
+            .collect::<Vec<_>>();
+        let state = crate::widgets::item_list_with_marks_and_sticky(
             surface,
             area,
             self.rows.len(),
             (!self.rows.is_empty()).then_some(self.selection),
             self.scroll,
             Some(crate::widgets::MarkedItems::new(&marks, "✓")),
+            Some(crate::widgets::StickyRows::new(&sticky_rows)),
             &list_styles,
             |row_index, row_area, surface, selected, _marked| {
                 self.render_row(surface, row_area, row_index, selected, styles);
@@ -1564,12 +1572,7 @@ fn render_section_row(
     kind: PkgKind,
     styles: PkgManagerStyles,
 ) {
-    let label = match kind {
-        PkgKind::Lsp => "Language servers",
-        PkgKind::Dap => "Debug adapters",
-        PkgKind::Grammar => "Grammars",
-        PkgKind::Plugin => "Plugins",
-    };
+    let label = section_label(kind);
     surface.set_stringn(
         area.x,
         area.y,
@@ -1577,6 +1580,17 @@ fn render_section_row(
         area.width as usize,
         tui::ratatui::to_ratatui_style(styles.inactive),
     );
+}
+
+fn section_label(kind: PkgKind) -> &'static str {
+    match kind {
+        PkgKind::Lsp => "Language servers",
+        PkgKind::Dap => "Debug adapters",
+        PkgKind::Formatter => "Formatters",
+        PkgKind::Linter => "Linters",
+        PkgKind::Grammar => "Grammars",
+        PkgKind::Plugin => "Plugins",
+    }
 }
 
 fn render_package_row(
@@ -1797,7 +1811,7 @@ fn render_package_detail(
             styles.inactive
         },
     );
-    write_wrapped_text(
+    write_text_layout(
         surface,
         area,
         &mut y,
@@ -1869,23 +1883,24 @@ fn render_update_detail(
         styles.text,
     );
     if let Some(candidate) = &change.candidate {
+        let release = release_age_label(
+            candidate.published_at.as_deref(),
+            &candidate.version,
+            SystemTime::now(),
+        );
         write_line(
             surface,
             area,
             &mut y,
-            &format!(
-                "source: {}  published: {}",
-                candidate.source,
-                candidate.published_at.as_deref().unwrap_or("-")
-            ),
+            &format!("source: {}  release: {}", candidate.source, release),
             styles.inactive,
         );
         if let Some(url) = candidate.source_url() {
-            write_wrapped_text(surface, area, &mut y, url, styles.inactive);
+            write_text_layout(surface, area, &mut y, url, styles.inactive);
         }
     }
     for warning in &change.warnings {
-        write_wrapped_text(
+        write_text_layout(
             surface,
             area,
             &mut y,
@@ -1894,7 +1909,7 @@ fn render_update_detail(
         );
     }
     if let Some(error) = &change.error {
-        write_wrapped_text(
+        write_text_layout(
             surface,
             area,
             &mut y,
@@ -1918,7 +1933,7 @@ fn render_registry_detail(
         &format!("{}  registry source", registry.name),
         styles.title,
     );
-    write_wrapped_text(
+    write_text_layout(
         surface,
         area,
         &mut y,
@@ -1936,7 +1951,7 @@ fn render_registry_detail(
         styles.inactive,
     );
     if let Some(problem) = &registry.problem {
-        write_wrapped_text(surface, area, &mut y, problem, styles.error);
+        write_text_layout(surface, area, &mut y, problem, styles.error);
     }
 }
 
@@ -1983,7 +1998,7 @@ fn write_line(
     *y = y.saturating_add(1);
 }
 
-fn write_wrapped_text(
+fn write_text_layout(
     surface: &mut crate::render::CellSurface,
     area: Rect,
     y: &mut u16,

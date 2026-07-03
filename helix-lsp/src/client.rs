@@ -496,7 +496,32 @@ impl Client {
             .semantic_tokens_provider
             .as_ref()
             .and_then(|capabilities| Self::semantic_tokens_options(capabilities).full.as_ref())
-            .is_some()
+            .is_some_and(|options| match options {
+                lsp::SemanticTokensFullOptions::Bool(supported) => *supported,
+                lsp::SemanticTokensFullOptions::Delta { .. } => true,
+            })
+    }
+
+    pub fn supports_semantic_tokens_delta(&self) -> bool {
+        self.capabilities()
+            .semantic_tokens_provider
+            .as_ref()
+            .and_then(|capabilities| Self::semantic_tokens_options(capabilities).full.as_ref())
+            .is_some_and(|options| {
+                matches!(
+                    options,
+                    lsp::SemanticTokensFullOptions::Delta { delta: Some(true) }
+                )
+            })
+    }
+
+    pub fn semantic_tokens_delta_previous_result_id(
+        supports_delta: bool,
+        previous_result_id: Option<&str>,
+    ) -> Option<String> {
+        supports_delta
+            .then_some(previous_result_id?)
+            .map(ToOwned::to_owned)
     }
 
     pub fn supports_semantic_tokens_range(&self) -> bool {
@@ -881,7 +906,7 @@ impl Client {
                         dynamic_registration: Some(false),
                         requests: lsp::SemanticTokensClientCapabilitiesRequests {
                             range: Some(true),
-                            full: Some(lsp::SemanticTokensFullOptions::Bool(true)),
+                            full: Some(lsp::SemanticTokensFullOptions::Delta { delta: Some(true) }),
                         },
                         token_types: vec![
                             lsp::SemanticTokenType::NAMESPACE,
@@ -1447,6 +1472,30 @@ impl Client {
         };
 
         Some(self.call::<lsp::request::SemanticTokensFullRequest>(params))
+    }
+
+    pub fn text_document_semantic_tokens_full_delta(
+        &self,
+        text_document: lsp::TextDocumentIdentifier,
+        previous_result_id: String,
+        work_done_token: Option<lsp::ProgressToken>,
+    ) -> Option<impl Future<Output = Result<Option<lsp::SemanticTokensFullDeltaResult>>>> {
+        if !self.supports_semantic_tokens_delta() {
+            return None;
+        }
+
+        let params = lsp::SemanticTokensDeltaParams {
+            text_document,
+            previous_result_id,
+            work_done_progress_params: lsp::WorkDoneProgressParams {
+                work_done_token: work_done_token.clone(),
+            },
+            partial_result_params: lsp::PartialResultParams {
+                partial_result_token: work_done_token,
+            },
+        };
+
+        Some(self.call::<lsp::request::SemanticTokensFullDeltaRequest>(params))
     }
 
     pub fn text_document_semantic_tokens_range(
@@ -2361,6 +2410,22 @@ mod tests {
     fn normalize_locale_uses_lsp_locale_shape() {
         assert_eq!(normalize_locale("en_US.UTF-8"), Some("en-US".to_string()));
         assert_eq!(normalize_locale("C"), None);
+    }
+
+    #[test]
+    fn semantic_tokens_missing_result_id_uses_full_fallback() {
+        assert_eq!(
+            Client::semantic_tokens_delta_previous_result_id(true, Some("1")),
+            Some("1".to_string())
+        );
+        assert_eq!(
+            Client::semantic_tokens_delta_previous_result_id(true, None),
+            None
+        );
+        assert_eq!(
+            Client::semantic_tokens_delta_previous_result_id(false, Some("1")),
+            None
+        );
     }
 
     #[cfg(windows)]

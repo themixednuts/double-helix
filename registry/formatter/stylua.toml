@@ -1,0 +1,26 @@
+name = "stylua"
+kind = "formatter"
+description = "Deterministic formatter for Lua, LuaJIT, Luau, and CfxLua"
+homepage = "https://github.com/JohnnyMorganz/StyLua"
+languages = ["lua", "luau"]
+
+[version]
+tag-source = "github:JohnnyMorganz/StyLua"
+
+[[artifact]]
+os = "windows"
+arch = "x86_64"
+source = { github-release = "JohnnyMorganz/StyLua", asset = "stylua-windows-x86_64.zip" }
+bin = "stylua.exe"
+
+[[artifact]]
+os = "linux"
+arch = "x86_64"
+source = { github-release = "JohnnyMorganz/StyLua", asset = "stylua-linux-x86_64.zip" }
+bin = "stylua"
+
+[[artifact]]
+os = "macos"
+arch = "aarch64"
+source = { github-release = "JohnnyMorganz/StyLua", asset = "stylua-macos-aarch64.zip" }
+bin = "stylua"

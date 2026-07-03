@@ -2388,12 +2388,27 @@ impl Document {
         self.lsp.clear_semantic_tokens();
     }
 
+    pub fn semantic_token_delta_state(
+        &self,
+        server_id: helix_lsp::LanguageServerId,
+    ) -> Option<&crate::document_lsp::DocumentSemanticTokenDeltaState> {
+        self.lsp.semantic_token_delta_state(server_id)
+    }
+
     pub fn set_semantic_tokens(
         &mut self,
         server_id: helix_lsp::LanguageServerId,
         tokens: crate::document_lsp::DocumentSemanticTokens,
     ) {
         self.lsp.set_semantic_tokens(server_id, tokens);
+    }
+
+    pub fn set_semantic_token_update(
+        &mut self,
+        server_id: helix_lsp::LanguageServerId,
+        update: crate::document_lsp::DocumentSemanticTokenUpdate,
+    ) {
+        self.lsp.set_semantic_token_update(server_id, update);
     }
 
     pub fn semantic_tokens_overlay(

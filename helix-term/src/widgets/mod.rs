@@ -45,7 +45,10 @@ pub use diff_view::{
 pub use divider::{border, hdivider, vdivider};
 pub use header::{header, header_with_counts};
 pub use hint_bar::{hint_bar, hint_bar_layout, Hint, HintBarState, HintBarStyle};
-pub use item_list::{item_list, item_list_with_marks, ListState, ListStyles, MarkedItems};
+pub use item_list::{
+    item_list, item_list_with_marks, item_list_with_marks_and_sticky, pinned_sticky_row, ListState,
+    ListStyles, MarkedItems, StickyRows,
+};
 pub use marquee::{
     schedule_redraw_at, Marquee, DEFAULT_HOLD_END, DEFAULT_HOLD_START, DEFAULT_INACTIVITY_TIMEOUT,
     DEFAULT_SCROLL_DURATION,

@@ -22,9 +22,9 @@ use helix_stdx::rope::RopeSliceExt;
 use helix_view::{
     document::{DocumentInlayHint, DocumentInlayHints, DocumentInlayHintsId, PluginAnnotation},
     document_lsp::{
-        decode_semantic_tokens, DocumentCodeLens, DocumentCodeLenses, DocumentColorSwatches,
-        DocumentInlineValues, DocumentLink, DocumentLinks, DocumentSemanticTokens,
-        InlineCompletionGhost,
+        apply_semantic_token_delta_edits, decode_semantic_tokens, DocumentCodeLens,
+        DocumentCodeLenses, DocumentColorSwatches, DocumentInlineValues, DocumentLink,
+        DocumentLinks, DocumentSemanticTokenUpdate, InlineCompletionGhost,
     },
     handlers::lsp::{SignatureHelpInvoked, SignatureHelpRequestId},
     DocumentId, Editor, Theme, ViewId,
@@ -38,6 +38,7 @@ use crate::runtime::{
 
 const CODE_LENS_PLUGIN_SCOPE: &str = "helix-lsp-code-lens";
 const INLINE_VALUE_LIMIT: usize = 128;
+const INLINE_VALUE_EVALUATE_LIMIT: usize = 16;
 const SEMANTIC_TOKENS_FULL_LINE_LIMIT: usize = 10_000;
 
 pub(crate) fn request_document_diagnostics_for_language_servers(
@@ -383,10 +384,12 @@ pub(crate) fn request_document_links(
         .detach();
 }
 
-fn semantic_result_data(result: lsp::SemanticTokensResult) -> Vec<lsp::SemanticToken> {
+fn semantic_result_data(
+    result: lsp::SemanticTokensResult,
+) -> (Vec<lsp::SemanticToken>, Option<String>) {
     match result {
-        lsp::SemanticTokensResult::Tokens(tokens) => tokens.data,
-        lsp::SemanticTokensResult::Partial(tokens) => tokens.data,
+        lsp::SemanticTokensResult::Tokens(tokens) => (tokens.data, tokens.result_id),
+        lsp::SemanticTokensResult::Partial(tokens) => (tokens.data, None),
     }
 }
 
@@ -394,6 +397,25 @@ fn semantic_range_result_data(result: lsp::SemanticTokensRangeResult) -> Vec<lsp
     match result {
         lsp::SemanticTokensRangeResult::Tokens(tokens) => tokens.data,
         lsp::SemanticTokensRangeResult::Partial(tokens) => tokens.data,
+    }
+}
+
+fn semantic_delta_result_data(
+    previous_data: &[lsp::SemanticToken],
+    result: lsp::SemanticTokensFullDeltaResult,
+) -> anyhow::Result<(Vec<lsp::SemanticToken>, Option<String>)> {
+    match result {
+        lsp::SemanticTokensFullDeltaResult::Tokens(tokens) => Ok((tokens.data, tokens.result_id)),
+        lsp::SemanticTokensFullDeltaResult::TokensDelta(delta) => {
+            let data = apply_semantic_token_delta_edits(previous_data, &delta.edits)
+                .ok_or_else(|| anyhow::anyhow!("invalid semantic token delta edit"))?;
+            Ok((data, delta.result_id))
+        }
+        lsp::SemanticTokensFullDeltaResult::PartialTokensDelta { edits } => {
+            let data = apply_semantic_token_delta_edits(previous_data, &edits)
+                .ok_or_else(|| anyhow::anyhow!("invalid semantic token delta edit"))?;
+            Ok((data, None))
+        }
     }
 }
 
@@ -447,21 +469,64 @@ pub(crate) fn request_semantic_tokens(
                 futures_util::future::Either::Left(async move {
                     request
                         .await
-                        .map(|result| result.map(semantic_range_result_data).unwrap_or_default())
+                        .map(|result| (result.map(semantic_range_result_data).unwrap_or_default(), None))
                 })
             } else {
-                let request =
+                let full_request =
                     language_server.text_document_semantic_tokens_full(doc.identifier(), None)?;
+                let previous = doc
+                    .semantic_token_delta_state(server_id)
+                    .and_then(|state| {
+                        helix_lsp::Client::semantic_tokens_delta_previous_result_id(
+                            language_server.supports_semantic_tokens_delta(),
+                            state.result_id.as_deref(),
+                        )
+                        .map(|result_id| (result_id, state.data.clone()))
+                    });
+                let delta_request = previous.as_ref().and_then(|(result_id, _)| {
+                    language_server.text_document_semantic_tokens_full_delta(
+                        doc.identifier(),
+                        result_id.clone(),
+                        None,
+                    )
+                });
                 futures_util::future::Either::Right(async move {
-                    request
+                    if let (Some(delta_request), Some((_, previous_data))) =
+                        (delta_request, previous)
+                    {
+                        match delta_request.await {
+                            Ok(Some(result)) => match semantic_delta_result_data(&previous_data, result) {
+                                Ok(data) => return Ok(data),
+                                Err(err) => log::debug!(
+                                    "semantic token delta failed, falling back to full request: {err}"
+                                ),
+                            },
+                            Ok(None) => log::debug!(
+                                "semantic token delta returned no data, falling back to full request"
+                            ),
+                            Err(err) => log::debug!(
+                                "semantic token delta request failed, falling back to full request: {err}"
+                            ),
+                        }
+                    }
+
+                    full_request
                         .await
                         .map(|result| result.map(semantic_result_data).unwrap_or_default())
                 })
             };
             let text = text.clone();
             Some(async move {
-                let data = request.await?;
-                anyhow::Ok((server_id, version, legend, offset_encoding, text, data))
+                let (data, result_id) = request.await?;
+                anyhow::Ok((
+                    server_id,
+                    version,
+                    legend,
+                    offset_encoding,
+                    text,
+                    data,
+                    result_id,
+                ))
             })
         })
         .collect();
@@ -480,13 +545,18 @@ pub(crate) fn request_semantic_tokens(
                 next = futures.next() => next,
             } {
                 match next {
-                    Ok((server_id, version, legend, offset_encoding, text, data)) => {
+                    Ok((server_id, version, legend, offset_encoding, text, data, result_id)) => {
                         let tokens = decode_semantic_tokens(&text, &legend, offset_encoding, &data);
                         send_task_event_with(
                             RuntimeTaskEvent::ApplySemanticTokens {
                                 doc_id,
                                 server_id,
-                                tokens: DocumentSemanticTokens { version, tokens },
+                                tokens: DocumentSemanticTokenUpdate {
+                                    version,
+                                    result_id,
+                                    data,
+                                    tokens,
+                                },
                             },
                             ingress.clone(),
                         )
@@ -1014,7 +1084,7 @@ pub(crate) fn apply_semantic_tokens(
     editor: &mut Editor,
     doc_id: DocumentId,
     server_id: LanguageServerId,
-    tokens: DocumentSemanticTokens,
+    tokens: DocumentSemanticTokenUpdate,
 ) {
     if !editor.config().lsp.semantic_tokens {
         return;
@@ -1025,7 +1095,7 @@ pub(crate) fn apply_semantic_tokens(
     if doc.version() != tokens.version {
         return;
     }
-    doc.set_semantic_tokens(server_id, tokens);
+    doc.set_semantic_token_update(server_id, tokens);
 }
 
 pub(crate) fn apply_inline_completion(
@@ -1188,7 +1258,18 @@ pub(crate) fn request_inline_values(
     if !editor.config().lsp.inline_values {
         return;
     }
-    let Some(frame) = editor.debug_adapters.current_stack_frame().cloned() else {
+    let Some((frame, dap, cached_frame_variables)) = editor
+        .debug_adapters
+        .get_active_client()
+        .and_then(|debugger| {
+            let frame = debugger.current_stack_frame()?.clone();
+            Some((
+                frame.clone(),
+                debugger.request_handle(),
+                debugger.frame_variables(frame.id).cloned(),
+            ))
+        })
+    else {
         return;
     };
     let Some(doc) = editor.document_mut(doc_id) else {
@@ -1213,6 +1294,7 @@ pub(crate) fn request_inline_values(
     let Some(request) = request else {
         return;
     };
+    let frame_id = frame.id;
     let cancel = doc.restart_inline_values();
 
     editor
@@ -1226,7 +1308,16 @@ pub(crate) fn request_inline_values(
             };
             match values {
                 Ok(Some(values)) => {
-                    let annotations = inline_value_annotations(&text, offset_encoding, values);
+                    let annotations = inline_value_annotations(
+                        &text,
+                        offset_encoding,
+                        values,
+                        cached_frame_variables,
+                        dap,
+                        frame_id,
+                        cancel.clone(),
+                    )
+                    .await;
                     send_task_event_with(
                         RuntimeTaskEvent::ApplyInlineValues {
                             doc_id,
@@ -1272,40 +1363,167 @@ fn inline_value_context(
     }
 }
 
-fn inline_value_annotations(
+fn pending_inline_value_annotations(
     text: &helix_core::Rope,
     offset_encoding: helix_lsp::OffsetEncoding,
     values: Vec<lsp::InlineValue>,
-) -> Vec<InlineAnnotation> {
+) -> Vec<PendingInlineValueAnnotation> {
     values
         .into_iter()
         .take(INLINE_VALUE_LIMIT)
         .filter_map(|value| {
             let (range, label) = match value {
-                lsp::InlineValue::Text(value) => (value.range, value.text),
+                lsp::InlineValue::Text(value) => {
+                    (value.range, PendingInlineValueLabel::Text(value.text))
+                }
                 lsp::InlineValue::VariableLookup(value) => {
-                    let label = value.variable_name.unwrap_or_else(|| {
+                    let name = value.variable_name.unwrap_or_else(|| {
                         lsp_range_to_range(text, value.range, offset_encoding)
                             .map(|range| text.slice(range.from()..range.to()).to_string())
                             .unwrap_or_default()
                     });
-                    (value.range, format!(" = {label}"))
+                    (
+                        value.range,
+                        PendingInlineValueLabel::Variable {
+                            name,
+                            case_sensitive: value.case_sensitive_lookup,
+                        },
+                    )
                 }
                 lsp::InlineValue::EvaluatableExpression(value) => {
-                    let label = value.expression.unwrap_or_else(|| {
+                    let expression = value.expression.unwrap_or_else(|| {
                         lsp_range_to_range(text, value.range, offset_encoding)
                             .map(|range| text.slice(range.from()..range.to()).to_string())
                             .unwrap_or_default()
                     });
-                    (value.range, format!(" = {label}"))
+                    (value.range, PendingInlineValueLabel::Expression(expression))
                 }
             };
             let range = lsp_range_to_range(text, range, offset_encoding)?;
             let line = text.char_to_line(range.to().min(text.len_chars()));
-            let line_end = helix_core::line_ending::line_end_char_index(&text.slice(..), line);
-            (!label.is_empty()).then(|| InlineAnnotation::new(line_end, label))
+            let char_idx = helix_core::line_ending::line_end_char_index(&text.slice(..), line);
+            Some(PendingInlineValueAnnotation { char_idx, label })
         })
         .collect()
+}
+
+#[derive(Debug)]
+struct PendingInlineValueAnnotation {
+    char_idx: usize,
+    label: PendingInlineValueLabel,
+}
+
+#[derive(Debug)]
+enum PendingInlineValueLabel {
+    Text(String),
+    Variable { name: String, case_sensitive: bool },
+    Expression(String),
+}
+
+async fn fetch_inline_value_variables(
+    dap: &helix_dap::RequestHandle,
+    frame_id: usize,
+    cancel: &Token,
+) -> Option<helix_dap::FrameVariables> {
+    let scopes = tokio::select! {
+        _ = cancel.canceled() => return None,
+        scopes = dap.scopes(frame_id) => scopes.ok()?,
+    };
+    let mut variables = Vec::new();
+    for scope in &scopes {
+        let scope_variables = tokio::select! {
+            _ = cancel.canceled() => return None,
+            variables = dap.variables(scope.variables_reference) => variables.ok()?,
+        };
+        variables.extend(scope_variables);
+    }
+    Some(helix_dap::FrameVariables { scopes, variables })
+}
+
+async fn inline_value_annotations(
+    text: &helix_core::Rope,
+    offset_encoding: helix_lsp::OffsetEncoding,
+    values: Vec<lsp::InlineValue>,
+    cached_frame_variables: Option<helix_dap::FrameVariables>,
+    dap: helix_dap::RequestHandle,
+    frame_id: usize,
+    cancel: Token,
+) -> Vec<InlineAnnotation> {
+    let pending = pending_inline_value_annotations(text, offset_encoding, values);
+    let needs_variables = pending
+        .iter()
+        .any(|value| matches!(value.label, PendingInlineValueLabel::Variable { .. }));
+    let frame_variables = if needs_variables {
+        match cached_frame_variables {
+            Some(frame_variables) => Some(frame_variables),
+            None => fetch_inline_value_variables(&dap, frame_id, &cancel).await,
+        }
+    } else {
+        None
+    };
+
+    let mut annotations = Vec::new();
+    let mut evaluations = FuturesUnordered::new();
+    let mut in_flight_evaluations = 0;
+
+    for value in pending {
+        match value.label {
+            PendingInlineValueLabel::Text(text) => {
+                if !text.is_empty() {
+                    annotations.push(InlineAnnotation::new(value.char_idx, text));
+                }
+            }
+            PendingInlineValueLabel::Variable {
+                name,
+                case_sensitive,
+            } => {
+                let Some(label) = frame_variables
+                    .as_ref()
+                    .and_then(|variables| variables.variable_value(&name, case_sensitive))
+                else {
+                    continue;
+                };
+                annotations.push(InlineAnnotation::new(value.char_idx, format!(" = {label}")));
+            }
+            PendingInlineValueLabel::Expression(expression) => {
+                if expression.is_empty()
+                    || !helix_dap::should_evaluate_inline_value(
+                        in_flight_evaluations,
+                        INLINE_VALUE_EVALUATE_LIMIT,
+                    )
+                {
+                    continue;
+                }
+                in_flight_evaluations += 1;
+                let dap = dap.clone();
+                let cancel = cancel.clone();
+                evaluations.push(async move {
+                    let response = tokio::select! {
+                        _ = cancel.canceled() => return None,
+                        response = dap.evaluate(
+                            expression,
+                            Some(frame_id),
+                            Some("watch".to_string()),
+                        ) => response.ok()?,
+                    };
+                    (!response.result.is_empty()).then(|| {
+                        InlineAnnotation::new(value.char_idx, format!(" = {}", response.result))
+                    })
+                });
+            }
+        }
+    }
+
+    while let Some(annotation) = tokio::select! {
+        _ = cancel.canceled() => return Vec::new(),
+        annotation = evaluations.next() => annotation,
+    } {
+        if let Some(annotation) = annotation {
+            annotations.push(annotation);
+        }
+    }
+
+    annotations
 }
 
 pub(crate) fn apply_document_links(
@@ -1599,9 +1817,9 @@ mod tests {
     }
 
     #[test]
-    fn inline_value_annotations_render_at_line_end() {
+    fn pending_inline_value_annotations_render_at_line_end() {
         let text = Rope::from("let x = 1;\n");
-        let annotations = inline_value_annotations(
+        let annotations = pending_inline_value_annotations(
             &text,
             helix_lsp::OffsetEncoding::Utf8,
             vec![lsp::InlineValue::VariableLookup(
@@ -1615,7 +1833,10 @@ mod tests {
 
         assert_eq!(annotations.len(), 1);
         assert_eq!(annotations[0].char_idx, 10);
-        assert_eq!(&annotations[0].text[..], " = x");
+        let PendingInlineValueLabel::Variable { name, .. } = &annotations[0].label else {
+            panic!("expected variable lookup");
+        };
+        assert_eq!(name, "x");
     }
 }
 

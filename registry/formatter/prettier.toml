@@ -1,0 +1,26 @@
+name = "prettier"
+kind = "formatter"
+description = "Opinionated formatter for JavaScript, TypeScript, CSS, HTML, JSON, Markdown, and YAML"
+homepage = "https://prettier.io"
+languages = ["javascript", "typescript", "css", "html", "json", "markdown", "yaml"]
+
+[version]
+tag-source = "npm:prettier"
+
+[[artifact]]
+os = "windows"
+arch = "x86_64"
+source = { npm = "prettier", bin = "prettier" }
+bin = "prettier"
+
+[[artifact]]
+os = "linux"
+arch = "x86_64"
+source = { npm = "prettier", bin = "prettier" }
+bin = "prettier"
+
+[[artifact]]
+os = "macos"
+arch = "aarch64"
+source = { npm = "prettier", bin = "prettier" }
+bin = "prettier"

@@ -11,6 +11,10 @@ pub struct Manifest {
     #[serde(default)]
     pub dap: Vec<String>,
     #[serde(default)]
+    pub formatter: Vec<String>,
+    #[serde(default)]
+    pub linter: Vec<String>,
+    #[serde(default)]
     pub grammar: Vec<String>,
     #[serde(default)]
     pub plugin: Vec<String>,
@@ -38,6 +42,16 @@ impl Manifest {
             .map(|name| (PkgKind::Lsp, name.as_str()))
             .chain(self.dap.iter().map(|name| (PkgKind::Dap, name.as_str())))
             .chain(
+                self.formatter
+                    .iter()
+                    .map(|name| (PkgKind::Formatter, name.as_str())),
+            )
+            .chain(
+                self.linter
+                    .iter()
+                    .map(|name| (PkgKind::Linter, name.as_str())),
+            )
+            .chain(
                 self.grammar
                     .iter()
                     .map(|name| (PkgKind::Grammar, name.as_str())),
@@ -53,6 +67,8 @@ impl Manifest {
         match kind {
             PkgKind::Lsp => self.lsp.iter().any(|package| package == name),
             PkgKind::Dap => self.dap.iter().any(|package| package == name),
+            PkgKind::Formatter => self.formatter.iter().any(|package| package == name),
+            PkgKind::Linter => self.linter.iter().any(|package| package == name),
             PkgKind::Grammar => self.grammar.iter().any(|package| package == name),
             PkgKind::Plugin => self.plugin.iter().any(|package| package == name),
         }
@@ -62,6 +78,8 @@ impl Manifest {
         Self {
             lsp: merge_package_names(&self.lsp, &overlay.lsp),
             dap: merge_package_names(&self.dap, &overlay.dap),
+            formatter: merge_package_names(&self.formatter, &overlay.formatter),
+            linter: merge_package_names(&self.linter, &overlay.linter),
             grammar: merge_package_names(&self.grammar, &overlay.grammar),
             plugin: merge_package_names(&self.plugin, &overlay.plugin),
         }

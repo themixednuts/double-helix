@@ -9,17 +9,28 @@ use crate::{Error, Result};
 pub enum PkgKind {
     Lsp,
     Dap,
+    Formatter,
+    Linter,
     Grammar,
     Plugin,
 }
 
 impl PkgKind {
-    pub const ALL: [Self; 4] = [Self::Lsp, Self::Dap, Self::Grammar, Self::Plugin];
+    pub const ALL: [Self; 6] = [
+        Self::Lsp,
+        Self::Dap,
+        Self::Formatter,
+        Self::Linter,
+        Self::Grammar,
+        Self::Plugin,
+    ];
 
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Lsp => "lsp",
             Self::Dap => "dap",
+            Self::Formatter => "formatter",
+            Self::Linter => "linter",
             Self::Grammar => "grammar",
             Self::Plugin => "plugin",
         }
@@ -29,6 +40,8 @@ impl PkgKind {
         match self {
             Self::Lsp => "language-server",
             Self::Dap => "debug-adapter",
+            Self::Formatter => "formatter",
+            Self::Linter => "linter",
             Self::Grammar => "tree-sitter-grammar",
             Self::Plugin => "plugin",
         }
@@ -48,6 +61,8 @@ impl FromStr for PkgKind {
         match value {
             "lsp" => Ok(Self::Lsp),
             "dap" => Ok(Self::Dap),
+            "formatter" => Ok(Self::Formatter),
+            "linter" => Ok(Self::Linter),
             "grammar" => Ok(Self::Grammar),
             "plugin" => Ok(Self::Plugin),
             other => Err(Error::Message(format!("unknown package kind: {other}"))),

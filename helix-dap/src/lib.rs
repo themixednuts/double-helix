@@ -2,7 +2,7 @@ mod client;
 pub mod registry;
 mod transport;
 
-pub use client::Client;
+pub use client::{should_evaluate_inline_value, Client, FrameVariables, RequestHandle};
 pub use helix_dap_types::*;
 pub use transport::{Payload, Response, Transport};
 

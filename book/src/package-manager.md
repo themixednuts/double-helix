@@ -1,16 +1,17 @@
 # Package Manager
 
 `dhx pkg` installs editor runtime tools into the Double Helix user data
-directory. It supports LSP servers, DAP adapters, and package-managed grammars
-from the builtin registry using GitHub release assets, direct archives, npm,
-pip, cargo, go, grammar git sources, system PATH probes, native OS package
-managers, and explicitly allowed plugin backends.
+directory. It supports LSP servers, DAP adapters, formatters, linters, and
+package-managed grammars from the builtin registry using GitHub release assets,
+direct archives, npm, pip, cargo, go, grammar git sources, system PATH probes,
+native OS package managers, and explicitly allowed plugin backends.
 
 ```sh
 dhx pkg search rust
 dhx pkg install rust-analyzer marksman
 dhx pkg outdated
 dhx pkg update rust-analyzer
+dhx pkg lock --fetch-hashes
 dhx pkg rollback rust-analyzer
 dhx pkg list
 dhx pkg doctor
@@ -44,6 +45,10 @@ dhx pkg sync
 
 `sync` installs the exact locked artifacts. Network access is only needed when
 the locked source is remote and not already available locally.
+
+`dhx pkg lock --fetch-hashes` refreshes the lockfile without installing. For
+archive and GitHub release packages, it downloads the artifact only long enough
+to compute and write the archive sha256, then discards the download.
 
 ## Backends
 

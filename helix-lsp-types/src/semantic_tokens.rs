@@ -191,41 +191,6 @@ impl SemanticToken {
         }
         seq.end()
     }
-
-    fn deserialize_tokens_opt<'de, D>(
-        deserializer: D,
-    ) -> Result<Option<Vec<SemanticToken>>, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        #[serde(transparent)]
-        struct Wrapper {
-            #[serde(deserialize_with = "SemanticToken::deserialize_tokens")]
-            tokens: Vec<SemanticToken>,
-        }
-
-        Ok(Option::<Wrapper>::deserialize(deserializer)?.map(|wrapper| wrapper.tokens))
-    }
-
-    fn serialize_tokens_opt<S>(
-        data: &Option<Vec<SemanticToken>>,
-        serializer: S,
-    ) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        #[derive(Serialize)]
-        #[serde(transparent)]
-        struct Wrapper {
-            #[serde(serialize_with = "SemanticToken::serialize_tokens")]
-            tokens: Vec<SemanticToken>,
-        }
-
-        let opt = data.as_ref().map(|t| Wrapper { tokens: t.to_vec() });
-
-        opt.serialize(serializer)
-    }
 }
 
 /// @since 3.16.0
@@ -287,13 +252,8 @@ pub struct SemanticTokensEdit {
     pub start: u32,
     pub delete_count: u32,
 
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "SemanticToken::deserialize_tokens_opt",
-        serialize_with = "SemanticToken::serialize_tokens_opt"
-    )]
-    pub data: Option<Vec<SemanticToken>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<Vec<u32>>,
 }
 
 #[derive(Debug, Eq, PartialEq, Clone, Deserialize, Serialize)]
@@ -667,22 +627,7 @@ mod tests {
             &SemanticTokensEdit {
                 start: 0,
                 delete_count: 1,
-                data: Some(vec![
-                    SemanticToken {
-                        delta_line: 2,
-                        delta_start: 5,
-                        length: 3,
-                        token_type: 0,
-                        token_modifiers_bitset: 3,
-                    },
-                    SemanticToken {
-                        delta_line: 0,
-                        delta_start: 5,
-                        length: 4,
-                        token_type: 1,
-                        token_modifiers_bitset: 0,
-                    },
-                ]),
+                data: Some(vec![2, 5, 3, 0, 3, 0, 5, 4, 1, 0]),
             },
         );
 
@@ -702,22 +647,7 @@ mod tests {
             &SemanticTokensEdit {
                 start: 0,
                 delete_count: 1,
-                data: Some(vec![
-                    SemanticToken {
-                        delta_line: 2,
-                        delta_start: 5,
-                        length: 3,
-                        token_type: 0,
-                        token_modifiers_bitset: 3,
-                    },
-                    SemanticToken {
-                        delta_line: 0,
-                        delta_start: 5,
-                        length: 4,
-                        token_type: 1,
-                        token_modifiers_bitset: 0,
-                    },
-                ]),
+                data: Some(vec![2, 5, 3, 0, 3, 0, 5, 4, 1, 0]),
             },
             r#"{"start":0,"deleteCount":1,"data":[2,5,3,0,3,0,5,4,1,0]}"#,
         );

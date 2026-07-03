@@ -45,6 +45,25 @@ impl<'a> MarkedItems<'a> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StickyRows<'a> {
+    rows: &'a [usize],
+}
+
+impl<'a> StickyRows<'a> {
+    pub const fn new(rows: &'a [usize]) -> Self {
+        Self { rows }
+    }
+
+    pub fn pinned_row(self, scroll: usize) -> Option<usize> {
+        pinned_sticky_row(self.rows, scroll)
+    }
+}
+
+pub fn pinned_sticky_row(rows: &[usize], scroll: usize) -> Option<usize> {
+    rows.iter().copied().take_while(|row| *row <= scroll).last()
+}
+
 /// Render a scrollable item list with selection highlight.
 ///
 /// `render_item` is called for each visible item with `(index, area, surface, is_selected)`.
@@ -89,6 +108,37 @@ pub fn item_list_with_marks<F>(
     selected: Option<usize>,
     scroll: usize,
     marks: Option<MarkedItems<'_>>,
+    styles: &ListStyles,
+    render_item: F,
+) -> ListState
+where
+    F: Fn(usize, Rect, &mut crate::render::CellSurface, bool, bool),
+{
+    item_list_with_marks_and_sticky(
+        surface,
+        area,
+        item_count,
+        selected,
+        scroll,
+        marks,
+        None,
+        styles,
+        render_item,
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "widget renderer keeps state, styles, and row callback explicit for call-site clarity"
+)]
+pub fn item_list_with_marks_and_sticky<F>(
+    surface: &mut crate::render::CellSurface,
+    area: Rect,
+    item_count: usize,
+    selected: Option<usize>,
+    scroll: usize,
+    marks: Option<MarkedItems<'_>>,
+    sticky_rows: Option<StickyRows<'_>>,
     styles: &ListStyles,
     render_item: F,
 ) -> ListState
@@ -161,6 +211,24 @@ where
         render_item(item_idx, item_area, surface, is_selected, is_marked);
     }
 
+    if let Some(sticky_idx) = sticky_rows.and_then(|rows| rows.pinned_row(scroll)) {
+        if sticky_idx < item_count {
+            let item_area = Rect::new(content_area.x, content_area.y, content_area.width, 1);
+            {
+                let area = tui::ratatui::to_ratatui_rect(item_area);
+                tui::ratatui::widgets::Widget::render(tui::ratatui::widgets::Clear, area, surface);
+                surface.set_style(area, tui::ratatui::to_ratatui_style(styles.normal));
+            };
+            render_item(
+                sticky_idx,
+                item_area,
+                surface,
+                selected == Some(sticky_idx),
+                false,
+            );
+        }
+    }
+
     if needs_scrollbar {
         super::scrollbar::Scrollbar::new(item_count, scroll, win_height)
             .thumb_style(styles.scrollbar_thumb)
@@ -184,5 +252,21 @@ mod tests {
         let marks = MarkedItems::new(&[1, 3], "✓");
         assert!(marks.is_marked(1));
         assert!(!marks.is_marked(2));
+    }
+
+    #[test]
+    fn sticky_header_pins_last_header_at_or_before_scroll() {
+        let headers = [0, 4, 9];
+        assert_eq!(pinned_sticky_row(&headers, 0), Some(0));
+        assert_eq!(pinned_sticky_row(&headers, 3), Some(0));
+        assert_eq!(pinned_sticky_row(&headers, 4), Some(4));
+        assert_eq!(pinned_sticky_row(&headers, 8), Some(4));
+        assert_eq!(pinned_sticky_row(&headers, 9), Some(9));
+        assert_eq!(pinned_sticky_row(&headers, 99), Some(9));
+    }
+
+    #[test]
+    fn sticky_header_is_none_before_first_group() {
+        assert_eq!(pinned_sticky_row(&[2, 5], 0), None);
     }
 }

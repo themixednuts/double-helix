@@ -36,6 +36,7 @@ pub enum PkgCommand {
     Search(String),
     Lock {
         project: Option<PathBuf>,
+        fetch_hashes: bool,
         names: Vec<String>,
     },
     Sync {
@@ -212,6 +213,7 @@ fn parse_pkg_args(args: Vec<String>) -> Result<PkgArgs> {
         }
         Some("lock") => {
             let mut project = None;
+            let mut fetch_hashes = false;
             let mut names = Vec::new();
             while let Some(arg) = args.next() {
                 match arg.as_str() {
@@ -221,10 +223,15 @@ fn parse_pkg_args(args: Vec<String>) -> Result<PkgArgs> {
                         };
                         project = Some(PathBuf::from(path));
                     }
+                    "--fetch-hashes" => fetch_hashes = true,
                     name => names.push(name.to_owned()),
                 }
             }
-            PkgCommand::Lock { project, names }
+            PkgCommand::Lock {
+                project,
+                fetch_hashes,
+                names,
+            }
         }
         Some("sync") => {
             let mut project = None;

@@ -228,12 +228,17 @@ fn run_pkg(command: PkgCommand) -> Result<i32> {
             }
             Ok(0)
         }
-        PkgCommand::Lock { project, names } => {
+        PkgCommand::Lock {
+            project,
+            fetch_hashes,
+            names,
+        } => {
             let ops = Ops::open_default()?;
+            let options = helix_pkg::LockOptions { fetch_hashes };
             let lock = if let Some(project) = project {
-                ops.lock_project(&project, &names, &mut print_pkg_event)?
+                ops.lock_project_with_options(&project, &names, options, &mut print_pkg_event)?
             } else {
-                ops.lock_manifest(&names, &mut print_pkg_event)?
+                ops.lock_manifest_with_options(&names, options, &mut print_pkg_event)?
             };
             println!("wrote pkg.lock with {} package(s)", lock.packages.len());
             Ok(0)

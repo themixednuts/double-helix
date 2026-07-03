@@ -241,6 +241,37 @@ bin = "clangd"
     }
 
     #[test]
+    fn formatter_kind_parses_and_resolves_by_command() {
+        let mut registry = Registry::default();
+        registry
+            .insert_str(
+                "formatter",
+                r#"
+name = "prettier"
+kind = "formatter"
+description = "Prettier"
+languages = ["javascript"]
+
+[[artifact]]
+os = "windows"
+arch = "x86_64"
+source = { npm = "prettier", bin = "prettier" }
+bin = "prettier"
+"#,
+            )
+            .unwrap();
+
+        let package = package_for_missing_command(
+            &registry,
+            PkgKind::Formatter,
+            Some("javascript"),
+            "prettier",
+        )
+        .unwrap();
+        assert_eq!(package.name, "prettier");
+    }
+
+    #[test]
     fn nudge_session_emits_once_per_server_package() {
         let mut session = NudgeSession::default();
         assert!(session.should_emit("rust-analyzer", "rust-analyzer"));

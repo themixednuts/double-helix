@@ -17,7 +17,10 @@ use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::PathBuf,
     process::Stdio,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
 };
 use tokio::{
     io::{AsyncBufRead, AsyncWrite, BufReader, BufWriter},
@@ -31,7 +34,7 @@ pub struct Client {
     id: DebugAdapterId,
     _process: Option<Child>,
     server_tx: Sender<Payload>,
-    request_counter: AtomicU64,
+    request_counter: Arc<AtomicU64>,
     connection_type: Option<ConnectionType>,
     starting_request_args: Option<Value>,
     /// The socket address of the debugger, if using TCP transport.
@@ -39,6 +42,7 @@ pub struct Client {
     pub caps: Option<DebuggerCapabilities>,
     // thread_id -> frames
     pub stack_frames: HashMap<ThreadId, Vec<StackFrame>>,
+    frame_variables: HashMap<usize, FrameVariables>,
     pub thread_states: ThreadStates,
     pub thread_id: Option<ThreadId>,
     /// Currently active frame for the current thread.
@@ -46,6 +50,129 @@ pub struct Client {
     pub quirks: DebuggerQuirks,
     /// The config which was used to start this debugger.
     pub config: Option<DebugAdapterConfig>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FrameVariables {
+    pub scopes: Vec<Scope>,
+    pub variables: Vec<Variable>,
+}
+
+impl FrameVariables {
+    pub fn variable_value(&self, name: &str, case_sensitive: bool) -> Option<&str> {
+        self.variables
+            .iter()
+            .find(|variable| {
+                if case_sensitive {
+                    variable.name == name
+                } else {
+                    variable.name.eq_ignore_ascii_case(name)
+                }
+            })
+            .map(|variable| variable.value.as_str())
+    }
+}
+
+pub fn should_evaluate_inline_value(in_flight: usize, cap: usize) -> bool {
+    in_flight < cap
+}
+
+#[derive(Debug, Clone)]
+pub struct RequestHandle {
+    server_tx: Sender<Payload>,
+    request_counter: Arc<AtomicU64>,
+}
+
+impl RequestHandle {
+    fn next_request_id(&self) -> u64 {
+        self.request_counter.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    pub fn call<R: helix_dap_types::Request>(
+        &self,
+        arguments: R::Arguments,
+    ) -> impl Future<Output = Result<Value>>
+    where
+        R::Arguments: serde::Serialize,
+    {
+        let server_tx = self.server_tx.clone();
+        let id = self.next_request_id();
+
+        async move {
+            use std::time::Duration;
+            use tokio::time::timeout;
+
+            let arguments = Some(serde_json::to_value(arguments)?);
+
+            let (callback_tx, mut callback_rx) = channel(1);
+
+            let req = Request {
+                back_ch: Some(callback_tx),
+                seq: id,
+                command: R::COMMAND.to_string(),
+                arguments,
+            };
+
+            server_tx
+                .send(Payload::Request(req))
+                .await
+                .map_err(|e| Error::Other(e.into()))?;
+
+            timeout(Duration::from_secs(20), callback_rx.recv())
+                .await
+                .map_err(|_| Error::Timeout(id))?
+                .ok_or(Error::StreamClosed)?
+                .map(|response| response.body.unwrap_or_default())
+        }
+    }
+
+    pub async fn request<R: helix_dap_types::Request>(
+        &self,
+        params: R::Arguments,
+    ) -> Result<R::Result>
+    where
+        R::Arguments: serde::Serialize,
+        R::Result: core::fmt::Debug,
+    {
+        let json = self.call::<R>(params).await?;
+        let response = serde_json::from_value(json)?;
+        Ok(response)
+    }
+
+    pub async fn scopes(&self, frame_id: usize) -> Result<Vec<Scope>> {
+        let response = self
+            .request::<requests::Scopes>(requests::ScopesArguments { frame_id })
+            .await?;
+        Ok(response.scopes)
+    }
+
+    pub async fn variables(&self, variables_reference: usize) -> Result<Vec<Variable>> {
+        let response = self
+            .request::<requests::Variables>(requests::VariablesArguments {
+                variables_reference,
+                filter: None,
+                start: None,
+                count: None,
+                format: None,
+            })
+            .await?;
+        Ok(response.variables)
+    }
+
+    pub async fn evaluate(
+        &self,
+        expression: String,
+        frame_id: Option<usize>,
+        context: Option<String>,
+    ) -> Result<requests::EvaluateResponse> {
+        self.request::<requests::Evaluate>(requests::EvaluateArguments {
+            expression,
+            frame_id,
+            context,
+            format: None,
+        })
+        .await
+    }
 }
 
 impl Client {
@@ -82,12 +209,13 @@ impl Client {
             id,
             _process: process,
             server_tx,
-            request_counter: AtomicU64::new(0),
+            request_counter: Arc::new(AtomicU64::new(0)),
             caps: None,
             connection_type: None,
             starting_request_args: None,
             socket: None,
             stack_frames: HashMap::new(),
+            frame_variables: HashMap::new(),
             thread_states: HashMap::new(),
             thread_id: None,
             active_frame: None,
@@ -234,12 +362,20 @@ impl Client {
         self.request_counter.fetch_add(1, Ordering::Relaxed) + 1
     }
 
+    pub fn request_handle(&self) -> RequestHandle {
+        RequestHandle {
+            server_tx: self.server_tx.clone(),
+            request_counter: self.request_counter.clone(),
+        }
+    }
+
     // Internal, called by specific DAP commands when resuming
     pub fn resume_application(&mut self) {
         if let Some(thread_id) = self.thread_id {
             self.thread_states.insert(thread_id, "running".to_string());
             self.stack_frames.remove(&thread_id);
         }
+        self.frame_variables.clear();
         self.active_frame = None;
         self.thread_id = None;
     }
@@ -542,6 +678,40 @@ impl Client {
         self.request::<requests::Evaluate>(args).await
     }
 
+    pub async fn eval_with_context(
+        &self,
+        expression: String,
+        frame_id: Option<usize>,
+        context: Option<String>,
+    ) -> Result<requests::EvaluateResponse> {
+        let args = requests::EvaluateArguments {
+            expression,
+            frame_id,
+            context,
+            format: None,
+        };
+
+        self.request::<requests::Evaluate>(args).await
+    }
+
+    pub fn cache_frame_variables(
+        &mut self,
+        frame_id: usize,
+        scopes: Vec<Scope>,
+        variables: Vec<Variable>,
+    ) {
+        self.frame_variables
+            .insert(frame_id, FrameVariables { scopes, variables });
+    }
+
+    pub fn frame_variables(&self, frame_id: usize) -> Option<&FrameVariables> {
+        self.frame_variables.get(&frame_id)
+    }
+
+    pub fn clear_frame_variables(&mut self) {
+        self.frame_variables.clear();
+    }
+
     pub fn set_exception_breakpoints(
         &self,
         filters: Vec<String>,
@@ -562,5 +732,42 @@ fn resolve_adapter_command(cmd: &str) -> Result<std::path::PathBuf> {
     match helix_pkg::resolve::command(&helix_pkg::Store::open_default(), cmd) {
         Some(resolved) => Ok(resolved.path),
         None => Ok(helix_stdx::env::which(cmd)?),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn variable(name: &str, value: &str) -> Variable {
+        Variable {
+            name: name.to_string(),
+            value: value.to_string(),
+            ty: None,
+            presentation_hint: None,
+            evaluate_name: None,
+            variables_reference: 0,
+            named_variables: None,
+            indexed_variables: None,
+            memory_reference: None,
+        }
+    }
+
+    #[test]
+    fn inline_variable_lookup_resolves_from_frame_snapshot() {
+        let snapshot = FrameVariables {
+            scopes: Vec::new(),
+            variables: vec![variable("count", "42")],
+        };
+
+        assert_eq!(snapshot.variable_value("count", true), Some("42"));
+        assert_eq!(snapshot.variable_value("COUNT", true), None);
+        assert_eq!(snapshot.variable_value("COUNT", false), Some("42"));
+    }
+
+    #[test]
+    fn inline_evaluate_cap_skips_excess_requests() {
+        assert!(should_evaluate_inline_value(3, 4));
+        assert!(!should_evaluate_inline_value(4, 4));
     }
 }

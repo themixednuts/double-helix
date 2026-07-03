@@ -7,7 +7,7 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use flate2::read::GzDecoder;
@@ -140,6 +140,11 @@ pub struct Ops {
     plugin_backends: BTreeMap<String, Arc<dyn Backend>>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LockOptions {
+    pub fetch_hashes: bool,
+}
+
 impl Ops {
     pub fn new(registry: Registry, store: Store, config_dir: PathBuf) -> Self {
         Self {
@@ -242,9 +247,18 @@ impl Ops {
     }
 
     pub fn lock_manifest(&self, names: &[String], progress: &mut Progress<'_>) -> Result<Lock> {
+        self.lock_manifest_with_options(names, LockOptions::default(), progress)
+    }
+
+    pub fn lock_manifest_with_options(
+        &self,
+        names: &[String],
+        options: LockOptions,
+        progress: &mut Progress<'_>,
+    ) -> Result<Lock> {
         let manifest_path = self.config_dir.join("pkg.toml");
         let lock_path = self.config_dir.join("pkg.lock");
-        self.lock_manifest_at(&manifest_path, &lock_path, names, progress)
+        self.lock_manifest_at(&manifest_path, &lock_path, names, options, progress)
     }
 
     pub fn lock_project(
@@ -253,10 +267,21 @@ impl Ops {
         names: &[String],
         progress: &mut Progress<'_>,
     ) -> Result<Lock> {
+        self.lock_project_with_options(project_root, names, LockOptions::default(), progress)
+    }
+
+    pub fn lock_project_with_options(
+        &self,
+        project_root: &Path,
+        names: &[String],
+        options: LockOptions,
+        progress: &mut Progress<'_>,
+    ) -> Result<Lock> {
         self.lock_manifest_at(
             &project_manifest_path(project_root),
             &project_lock_path(project_root),
             names,
+            options,
             progress,
         )
     }
@@ -624,6 +649,7 @@ impl Ops {
         manifest_path: &Path,
         lock_path: &Path,
         names: &[String],
+        options: LockOptions,
         progress: &mut Progress<'_>,
     ) -> Result<Lock> {
         let manifest = Manifest::read(manifest_path)?;
@@ -651,7 +677,7 @@ impl Ops {
             progress(OpEvent::Started {
                 name: name.to_owned(),
             });
-            match self.lock_package(package, lock.find(kind, name), progress) {
+            match self.lock_package(package, lock.find(kind, name), options, progress) {
                 Ok(locked) => {
                     lock.upsert(locked);
                     progress(OpEvent::Done {
@@ -675,11 +701,12 @@ impl Ops {
         &self,
         package: &PackageSpec,
         previous: Option<&LockedPackage>,
+        options: LockOptions,
         progress: &mut Progress<'_>,
     ) -> Result<LockedPackage> {
         let artifact = self.artifact_for_host(package)?;
         self.config.policy.check_source(package, artifact)?;
-        let resolved = self.resolve_source(package, artifact, progress)?;
+        let mut resolved = self.resolve_source(package, artifact, progress)?;
         let policy = self.config.policy.check(package, artifact, &resolved)?;
         for warning in policy.warnings {
             progress(OpEvent::Progress {
@@ -687,6 +714,10 @@ impl Ops {
                 message: format!("warning: {warning}"),
                 percent: None,
             });
+        }
+        if options.fetch_hashes && resolved.sha256.is_none() {
+            resolved.sha256 =
+                self.fetch_resolved_archive_hash(package, artifact, &resolved, progress)?;
         }
         let previous_version = previous.and_then(|locked| {
             if locked.version != resolved.version {
@@ -705,6 +736,26 @@ impl Ops {
             sha256: resolved.sha256.unwrap_or_default(),
             bin: artifact.bin.clone(),
         })
+    }
+
+    fn fetch_resolved_archive_hash(
+        &self,
+        package: &PackageSpec,
+        artifact: &Artifact,
+        resolved: &ResolvedPackage,
+        progress: &mut Progress<'_>,
+    ) -> Result<Option<String>> {
+        let source = &artifact.source;
+        if source.github_release.is_none() && source.archive.is_none() {
+            return Ok(None);
+        }
+        let archive = download(
+            &resolved.url,
+            &package.name,
+            &format!("hashing {}", resolved.url),
+            progress,
+        )?;
+        Ok(Some(sha256_bytes(&archive)))
     }
 
     fn install_package(
@@ -1058,6 +1109,90 @@ impl ResolvedPackage {
             })
             .or_else(|| self.url.starts_with("file://").then_some(self.url.as_str()))
     }
+}
+
+pub fn release_age_label(published_at: Option<&str>, version: &str, now: SystemTime) -> String {
+    published_at
+        .and_then(parse_utc_timestamp)
+        .map(|published| age_label(published, now))
+        .unwrap_or_else(|| version.to_owned())
+}
+
+fn age_label(published: SystemTime, now: SystemTime) -> String {
+    let days = now
+        .duration_since(published)
+        .unwrap_or(Duration::ZERO)
+        .as_secs()
+        / 86_400;
+    if days == 0 {
+        "today".to_owned()
+    } else if days < 7 {
+        format!("{days}d ago")
+    } else if days < 30 {
+        format!("{}w ago", days / 7)
+    } else if days < 365 {
+        format!("{}mo ago", days / 30)
+    } else {
+        format!("{}y ago", days / 365)
+    }
+}
+
+fn parse_utc_timestamp(value: &str) -> Option<SystemTime> {
+    if value.len() < 20 {
+        return None;
+    }
+    let year = value.get(0..4)?.parse::<i32>().ok()?;
+    let month = value.get(5..7)?.parse::<u32>().ok()?;
+    let day = value.get(8..10)?.parse::<u32>().ok()?;
+    let hour = value.get(11..13)?.parse::<u64>().ok()?;
+    let minute = value.get(14..16)?.parse::<u64>().ok()?;
+    let second = value.get(17..19)?.parse::<u64>().ok()?;
+    if value.as_bytes().get(4) != Some(&b'-')
+        || value.as_bytes().get(7) != Some(&b'-')
+        || value.as_bytes().get(10) != Some(&b'T')
+        || value.as_bytes().get(13) != Some(&b':')
+        || value.as_bytes().get(16) != Some(&b':')
+        || !matches!(value.as_bytes().get(19), Some(b'Z' | b'.'))
+        || !(1..=12).contains(&month)
+        || day == 0
+        || day > days_in_month(year, month)
+        || hour > 23
+        || minute > 59
+        || second > 60
+    {
+        return None;
+    }
+    let days = days_from_civil(year, month, day);
+    if days < 0 {
+        return None;
+    }
+    let seconds = days as u64 * 86_400 + hour * 3_600 + minute * 60 + second;
+    Some(UNIX_EPOCH + Duration::from_secs(seconds))
+}
+
+fn days_in_month(year: i32, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if is_leap_year(year) => 29,
+        2 => 28,
+        _ => 0,
+    }
+}
+
+fn is_leap_year(year: i32) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+}
+
+fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
+    let year = year - i32::from(month <= 2);
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let yoe = year - era * 400;
+    let month = month as i32;
+    let day = day as i32;
+    let doy = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    (era * 146_097 + doe - 719_468) as i64
 }
 
 fn install_into(
@@ -2481,6 +2616,31 @@ bin = "demo.exe"
     }
 
     #[test]
+    fn lock_fetch_hashes_pins_local_archive_without_installing() {
+        let dir = TempDir::new().unwrap();
+        let archive = dir.path().join("demo.zip");
+        make_zip(&archive, "demo.exe", b"demo");
+        let expected_hash = crate::store::sha256_file(&archive).unwrap();
+        let config = dir.path().join("config");
+        Manifest {
+            lsp: vec!["demo".to_owned()],
+            ..Manifest::default()
+        }
+        .write(&config.join("pkg.toml"))
+        .unwrap();
+
+        let store = Store::open(dir.path().join("pkg"));
+        let ops = Ops::new(registry_for_archive("1", &archive), store.clone(), config);
+        let lock = ops
+            .lock_manifest_with_options(&[], LockOptions { fetch_hashes: true }, &mut |_| {})
+            .unwrap();
+
+        let locked = lock.find(PkgKind::Lsp, "demo").unwrap();
+        assert_eq!(locked.sha256, expected_hash);
+        assert!(store.receipts().unwrap().is_empty());
+    }
+
+    #[test]
     fn lock_manifest_rejects_names_not_in_manifest() {
         let dir = TempDir::new().unwrap();
         let config = dir.path().join("config");
@@ -2500,6 +2660,37 @@ bin = "demo.exe"
             .lock_manifest(&["missing".to_owned()], &mut |_| {})
             .unwrap_err();
         assert!(err.to_string().contains("missing is not listed"));
+    }
+
+    #[test]
+    fn release_age_label_formats_elapsed_time() {
+        let now = parse_utc_timestamp("2026-07-03T12:00:00Z").unwrap();
+        assert_eq!(
+            release_age_label(Some("2026-07-01T12:00:00Z"), "v1", now),
+            "2d ago"
+        );
+        assert_eq!(
+            release_age_label(Some("2026-06-12T12:00:00Z"), "v1", now),
+            "3w ago"
+        );
+        assert_eq!(
+            release_age_label(Some("2026-02-03T12:00:00Z"), "v1", now),
+            "5mo ago"
+        );
+        assert_eq!(
+            release_age_label(Some("2026-07-03T08:00:00Z"), "v1", now),
+            "today"
+        );
+    }
+
+    #[test]
+    fn release_age_label_falls_back_to_version_without_timestamp() {
+        let now = parse_utc_timestamp("2026-07-03T12:00:00Z").unwrap();
+        assert_eq!(release_age_label(None, "v1.2.3", now), "v1.2.3");
+        assert_eq!(
+            release_age_label(Some("not-a-date"), "v1.2.3", now),
+            "v1.2.3"
+        );
     }
 
     #[test]

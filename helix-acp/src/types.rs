@@ -14,7 +14,7 @@ pub type UsageUpdateData = UsageUpdate;
 pub type ToolCallInfo = ToolCall;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(default, rename_all = "camelCase")]
 pub struct AgentCaps {
     pub load_session: bool,
     pub list_sessions: bool,
@@ -25,6 +25,7 @@ pub struct AgentCaps {
     pub auth: bool,
     pub config_options: bool,
     pub additional_directories: bool,
+    pub fork_session: bool,
 }
 
 #[must_use]
@@ -53,6 +54,7 @@ pub fn agent_caps(init: &InitializeResponse) -> AgentCaps {
             .session_capabilities
             .additional_directories
             .is_some(),
+        fork_session: init.agent_capabilities.session_capabilities.fork.is_some(),
     }
 }
 

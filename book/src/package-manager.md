@@ -116,11 +116,18 @@ allowed-plugin-backends = ["corp-tool-cache"]
 
 ## Editor UI
 
-Inside the editor, `:pkg` opens the package picker. The picker shows the merged
-registry and installed view with package name, kind, installed version, latest
-source, and languages. Use `Space` to mark entries, `Enter` to install the
-selected package, `u` to update, `d` to remove an installed package, and `!` to
-run doctor. Direct commands are also available:
+Inside the editor, `:pkg` opens the package manager overlay. It has Browse,
+Installed, Updates, and Registries tabs; package rows show install/update/work
+state, version, status, language chips, and a detail pane with source, receipt,
+doctor, homepage, and schema metadata.
+
+Use `1`-`4` or `[`/`]` to switch tabs, `/` to search, `lang:`, `kind:`, and
+`cat:` prefixes to narrow results, `f` to cycle package kind filters, `Space`
+to mark packages or accept update-plan rows, and `?` for the full key table.
+`Enter` or `i` installs the marked or selected package, `u` updates the
+selection or refreshes the Updates plan, `U` applies accepted update-plan rows,
+`d` removes installed packages, `r` rolls back, `!` runs doctor, and `R` updates
+the selected registry source. Direct commands are also available:
 
 ```text
 :pkg-install rust-analyzer

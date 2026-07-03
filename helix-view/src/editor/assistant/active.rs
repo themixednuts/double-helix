@@ -133,6 +133,20 @@ impl Editor {
         Ok(self.submit_assistant_prompt(thread, text))
     }
 
+    pub fn fork_submit_active_assistant_prompt(
+        &mut self,
+        entry: crate::assistant::thread::EntryId,
+        text: String,
+    ) -> anyhow::Result<Vec<crate::assistant::effect::Effect>> {
+        let thread = self
+            .assistant
+            .active_id()
+            .zip(self.assistant.active_backend_id())
+            .map(|(thread, _)| thread)
+            .context("Active assistant thread is not bound to a backend")?;
+        Ok(self.fork_submit_assistant_prompt(thread, entry, text))
+    }
+
     pub fn retry_active_assistant_prompt(
         &mut self,
     ) -> anyhow::Result<Vec<crate::assistant::effect::Effect>> {

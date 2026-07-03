@@ -6,7 +6,7 @@ use helix_acp::client::{AgentConfig, IncomingReceiver};
 use helix_acp::types as acp;
 use helix_acp::AcpAgent;
 
-use super::super::{auth, backend, host, permission, review, thread, tool};
+use super::super::{auth, backend, host, permission, prompt, review, thread, tool};
 use super::{translate, Session};
 
 pub struct Driver {
@@ -458,6 +458,71 @@ fn client_caps(host: &host::Set) -> acp::ClientCapabilities {
         .terminal(host.terminal.is_some())
 }
 
+async fn start_prompt_turn(
+    work: &helix_runtime::Work,
+    agent: &Arc<AcpAgent>,
+    tx: &helix_runtime::Sender<backend::Update>,
+    state: &mut State,
+    thread: thread::Id,
+    prompt: prompt::Request,
+) {
+    let Some(session) = state.sessions.get(&thread).cloned() else {
+        let _ = tx
+            .send(backend::Update::Error {
+                at: backend::Target::Thread(thread),
+                error: backend::Error::Other(anyhow::anyhow!("thread is not bound to ACP session")),
+            })
+            .await;
+        return;
+    };
+    let _ = tx
+        .send(backend::Update::Thread {
+            thread,
+            event: thread::Event::Run(thread::Run::Running),
+        })
+        .await;
+    let tx2 = tx.clone();
+    let agent = agent.clone();
+    let auth_methods = state.auth_methods.clone();
+    state.pending_auth = Some(backend::Command::Submit {
+        thread,
+        prompt: prompt.clone(),
+    });
+    work.spawn(async move {
+        let result = agent
+            .prompt(
+                session.to_string().into(),
+                prompt
+                    .parts()
+                    .iter()
+                    .cloned()
+                    .map(translate::content_block)
+                    .collect(),
+            )
+            .await;
+        let event = match result {
+            Ok(_) => backend::Update::Thread {
+                thread,
+                event: thread::Event::Run(thread::Run::Idle),
+            },
+            Err(err) if is_auth_required(&err) => backend::Update::Auth {
+                thread,
+                event: auth::Event::Required {
+                    methods: auth_methods,
+                    pending_prompt: None,
+                    error: Some(err.to_string()),
+                },
+            },
+            Err(err) => backend::Update::Error {
+                at: backend::Target::Thread(thread),
+                error: backend::Error::Other(anyhow::anyhow!(err.to_string())),
+            },
+        };
+        let _ = tx2.send(event).await;
+    })
+    .detach();
+}
+
 async fn handle_command(
     backend_id: &backend::Id,
     work: &helix_runtime::Work,
@@ -592,63 +657,69 @@ async fn handle_command(
             }
         }
         backend::Command::Submit { thread, prompt } => {
-            let Some(session) = state.sessions.get(&thread).cloned() else {
-                let _ = tx
-                    .send(backend::Update::Error {
-                        at: backend::Target::Thread(thread),
-                        error: backend::Error::Other(anyhow::anyhow!(
-                            "thread is not bound to ACP session"
-                        )),
-                    })
-                    .await;
-                return;
-            };
-            let _ = tx
-                .send(backend::Update::Thread {
-                    thread,
-                    event: thread::Event::Run(thread::Run::Running),
-                })
-                .await;
-            let tx2 = tx.clone();
-            let agent = agent.clone();
-            let auth_methods = state.auth_methods.clone();
-            state.pending_auth = Some(backend::Command::Submit {
-                thread,
-                prompt: prompt.clone(),
-            });
-            work.spawn(async move {
-                let result = agent
-                    .prompt(
-                        session.to_string().into(),
-                        prompt
-                            .parts()
-                            .iter()
-                            .cloned()
-                            .map(translate::content_block)
-                            .collect(),
-                    )
-                    .await;
-                let event = match result {
-                    Ok(_) => backend::Update::Thread {
-                        thread,
-                        event: thread::Event::Run(thread::Run::Idle),
-                    },
-                    Err(err) if is_auth_required(&err) => backend::Update::Auth {
-                        thread,
-                        event: auth::Event::Required {
-                            methods: auth_methods,
-                            pending_prompt: None,
-                            error: Some(err.to_string()),
-                        },
-                    },
-                    Err(err) => backend::Update::Error {
-                        at: backend::Target::Thread(thread),
-                        error: backend::Error::Other(anyhow::anyhow!(err.to_string())),
-                    },
+            start_prompt_turn(work, agent, tx, state, thread, prompt).await;
+        }
+        backend::Command::ForkSubmit { thread, prompt } => {
+            if state.caps.fork_session {
+                let Some(session) = state.sessions.get(&thread).cloned() else {
+                    let _ = tx
+                        .send(backend::Update::Error {
+                            at: backend::Target::Thread(thread),
+                            error: backend::Error::Other(anyhow::anyhow!(
+                                "thread is not bound to ACP session"
+                            )),
+                        })
+                        .await;
+                    return;
                 };
-                let _ = tx2.send(event).await;
-            })
-            .detach();
+                match agent.fork_session(session.to_string().into()).await {
+                    Ok(resp) => {
+                        let session = Session::new(resp.session_id.to_string());
+                        state.sessions.insert(thread, session.clone());
+                        let _ = tx
+                            .send(backend::Update::Backend {
+                                backend: backend_id.clone(),
+                                event: backend::Event::Bound {
+                                    thread,
+                                    remote: (&session).into(),
+                                },
+                            })
+                            .await;
+                        if let Some(modes) = resp.modes.as_ref() {
+                            if let Ok(mode_set) = translate::mode_set(modes) {
+                                let _ = tx
+                                    .send(backend::Update::Thread {
+                                        thread,
+                                        event: thread::Event::Mode(mode_set),
+                                    })
+                                    .await;
+                            }
+                        }
+                        if let Some(config) = resp
+                            .config_options
+                            .as_ref()
+                            .and_then(|items| translate::config_state(items).ok())
+                        {
+                            let _ = tx
+                                .send(backend::Update::Thread {
+                                    thread,
+                                    event: thread::Event::Config(config),
+                                })
+                                .await;
+                        }
+                    }
+                    Err(err) => {
+                        let _ = tx
+                            .send(backend::Update::Error {
+                                at: backend::Target::Thread(thread),
+                                error: backend::Error::Other(anyhow::anyhow!(err.to_string())),
+                            })
+                            .await;
+                        return;
+                    }
+                }
+            }
+            start_prompt_turn(work, agent, tx, state, thread, prompt).await;
         }
         backend::Command::Cancel { thread } => {
             if let Some(session) = state.sessions.get(&thread) {

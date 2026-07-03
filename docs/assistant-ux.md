@@ -36,6 +36,22 @@ Input normal mode sends with Enter.
 
 Input insert mode edits text and uses Enter as a newline.
 
+When editing a prior user prompt, Input mode is still the active layer.
+
+The header shows `editing message · esc cancels`.
+
+The footer badge shows `EDIT`.
+
+Esc while editing cancels the edit, restores the previous draft, returns to the previous focus, and does not mutate the thread.
+
+Enter in Input normal mode while editing resubmits the edit.
+
+Edit resubmit forks at the edited user prompt: the edited entry and every later entry are removed locally, entries before it remain, and the edited text is sent as the replacement user prompt.
+
+If the ACP agent advertises session forking, Helix forks the remote session before sending so the agent context matches the local fork.
+
+If the agent does not advertise session forking, Helix still truncates the local view and sends the edited text, then shows a status note that the agent does not support editing history and earlier context may be retained.
+
 The prompt supports `@` mention triggers and `/` command triggers.
 
 The mode/model/config selector is opened as a standard picker.
@@ -55,6 +71,10 @@ Messages mode uses one list grammar.
 `y` yanks the selected entry or selected request URL.
 
 `t` follows output or jumps to a selected subagent target.
+
+`e` edits the selected entry when it is a user prompt.
+
+`e` on non-user entries is a no-op with a status note.
 
 Cards are list entries.
 

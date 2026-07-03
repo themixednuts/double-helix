@@ -365,6 +365,16 @@ impl AcpAgent {
         )
     }
 
+    pub async fn fork_session(&self, session_id: SessionId) -> Result<ForkSessionResponse> {
+        let params = ForkSessionRequest::new(session_id, self.cwd.clone())
+            .mcp_servers(self.mcp_servers.clone());
+        let resp: ForkSessionResponse = self
+            .call(methods::SESSION_FORK, params, self.timeout_secs)
+            .await?;
+        *self.session_id.lock().await = Some(resp.session_id.clone());
+        Ok(resp)
+    }
+
     pub fn delete_session(
         &self,
         session_id: SessionId,

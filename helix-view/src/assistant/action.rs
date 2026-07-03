@@ -69,6 +69,11 @@ pub enum Action {
         thread: thread::Id,
         text: String,
     },
+    ForkSubmit {
+        thread: thread::Id,
+        entry: thread::EntryId,
+        text: String,
+    },
     Cancel {
         thread: thread::Id,
     },

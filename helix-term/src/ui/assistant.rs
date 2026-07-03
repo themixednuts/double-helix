@@ -70,8 +70,16 @@ pub struct AssistantPanel {
     auth_selected: usize,
     auth_transient: bool,
     pending_subagent_jump: Option<PendingSubagentJump>,
+    editing: Option<EditState>,
     /// Layer whose key help is currently shown via `editor.autoinfo`.
     shown_help: Option<AssistantLayer>,
+}
+
+#[derive(Debug, Clone)]
+struct EditState {
+    target: helix_view::assistant::thread::EntryId,
+    previous_draft: String,
+    previous_focus: helix_view::assistant::thread::Focus,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,6 +112,7 @@ enum AssistantAction {
     PagePrevious,
     PageNext,
     Retry,
+    EditMessage,
     ToggleReviewMode,
     AcceptReview,
     AcceptAllReview,
@@ -340,6 +349,11 @@ const MESSAGE_BINDINGS: &[AssistantBinding] = &[
         BindingKey::new(BindingCode::Char('r')),
         AssistantAction::Retry,
         Some(("r", "retry", 120)),
+    ),
+    AssistantBinding::new(
+        BindingKey::new(BindingCode::Char('e')),
+        AssistantAction::EditMessage,
+        Some(("e", "edit", 125)),
     ),
     AssistantBinding::new(
         BindingKey::new(BindingCode::Char('R')),
@@ -842,6 +856,7 @@ impl AssistantPanel {
             auth_selected: 0,
             auth_transient: false,
             pending_subagent_jump: None,
+            editing: None,
             shown_help: None,
         }
     }
@@ -943,6 +958,16 @@ impl AssistantPanel {
             .filter_map(|binding| binding.hint)
             .collect::<Vec<_>>();
 
+        if layer == AssistantLayer::Input && self.editing.is_some() {
+            for entry in &mut entries {
+                if entry.0 == "enter" {
+                    entry.1 = "resubmit";
+                } else if entry.0 == "esc" {
+                    entry.1 = "cancel edit";
+                }
+            }
+        }
+
         if layer == AssistantLayer::Messages {
             let review_selected = model
                 .selected_entry_id()
@@ -980,7 +1005,12 @@ impl AssistantPanel {
         layer: AssistantLayer,
     ) -> helix_view::info::Info {
         let entries = self.layer_help_entries(model, layer);
-        helix_view::info::Info::new(Self::layer_title(layer), &entries)
+        let title = if layer == AssistantLayer::Input && self.editing.is_some() {
+            "Assistant: edit"
+        } else {
+            Self::layer_title(layer)
+        };
+        helix_view::info::Info::new(title, &entries)
     }
 
     /// Reconcile the help popup with the active layer. Transient layers
@@ -1995,6 +2025,7 @@ impl AssistantPanel {
 
         let mut blocks = Vec::new();
         let selected = model.selected_entry_id();
+        let edit_target = self.editing.as_ref().map(|editing| editing.target);
 
         for entry in self.output.content().iter() {
             let entry_id = Some(entry.id);
@@ -2003,7 +2034,7 @@ impl AssistantPanel {
             } else {
                 None
             };
-            let selected = entry_id == selected;
+            let selected = entry_id == selected || edit_target == Some(entry.id);
             let collapsed = model.is_folded(entry.id);
             if let helix_view::model::AssistantEntryKind::ToolCall {
                 name,
@@ -2461,7 +2492,13 @@ impl AssistantPanel {
                 tui::ratatui::to_ratatui_rect(header_area),
                 tui::ratatui::to_ratatui_style(header_style),
             );
-            let header = model.header();
+            let mut header = model.header();
+            if self.editing.is_some() {
+                header.leading.push(helix_view::model::AssistantHeaderItem {
+                    label: "editing message · esc cancels".to_string(),
+                    tone: helix_view::model::AssistantHeaderTone::Warning,
+                });
+            }
             let agent_busy = model.agent_busy;
             // Agent status indicator: filled circle when the agent is doing
             // work (gets attention), middle-dot when idle (quiet, harmonises
@@ -2547,11 +2584,15 @@ impl AssistantPanel {
             // editor-wide rule that statuslines never list shortcuts.
             let theme = cx.assistant_theme();
             let layer = self.active_layer_for_model(&model);
-            let badge = match layer {
-                AssistantLayer::Input => "INPUT",
-                AssistantLayer::Messages => "MESSAGES",
-                AssistantLayer::Elicitation => "FORM",
-                AssistantLayer::Auth => "AUTH",
+            let badge = if self.editing.is_some() {
+                "EDIT"
+            } else {
+                match layer {
+                    AssistantLayer::Input => "INPUT",
+                    AssistantLayer::Messages => "MESSAGES",
+                    AssistantLayer::Elicitation => "FORM",
+                    AssistantLayer::Auth => "AUTH",
+                }
             };
             let badge_style = if self.focused {
                 theme.get("ui.text.focus").add_modifier(Modifier::BOLD)
@@ -3014,6 +3055,51 @@ impl AssistantPanel {
         self.output.content().get(index)
     }
 
+    fn selected_user_message(
+        &self,
+        editor: &Editor,
+    ) -> Option<(helix_view::assistant::thread::EntryId, String)> {
+        let entry = self.selected_entry_ref(editor)?;
+        let helix_view::model::AssistantEntryKind::UserMessage(text) = &entry.kind else {
+            return None;
+        };
+        Some((entry.id, text.clone()))
+    }
+
+    fn enter_edit_selected_message(&mut self, editor: &mut Editor) -> bool {
+        let Some((target, text)) = self.selected_user_message(editor) else {
+            editor.set_status("Only user messages can be edited");
+            return false;
+        };
+        let model = Self::assistant_model(editor);
+        self.editing = Some(EditState {
+            target,
+            previous_draft: model.input.clone(),
+            previous_focus: model.focus(),
+        });
+        self.sync_input_from_assistant(editor, &text);
+        self.set_draft(editor, text);
+        self.focus_input_region(editor);
+        self.input
+            .enter_insert_at(editor, helix_view::edit_region::InsertEntry::AtLineEnd);
+        editor.set_status("Editing assistant message");
+        true
+    }
+
+    fn cancel_edit(&mut self, editor: &mut Editor) -> bool {
+        let Some(editing) = self.editing.take() else {
+            return false;
+        };
+        self.sync_input_from_assistant(editor, &editing.previous_draft);
+        self.set_draft(editor, editing.previous_draft);
+        match editing.previous_focus {
+            helix_view::assistant::thread::Focus::Input => self.focus_input_region(editor),
+            helix_view::assistant::thread::Focus::Messages => self.focus_messages(editor),
+        }
+        editor.set_status("Canceled assistant message edit");
+        true
+    }
+
     pub fn selected_message_details(&self, editor: &Editor) -> Option<String> {
         let entry = Self::assistant_model(editor).selected_entry_id()?;
         editor.assistant_entry_markdown(false, entry)
@@ -3204,6 +3290,23 @@ impl AssistantPanel {
         true
     }
 
+    fn fork_submit_prompt(
+        target: helix_view::assistant::thread::EntryId,
+        text: String,
+        cx: &mut Context,
+    ) -> bool {
+        let effects = match cx.editor.fork_submit_active_assistant_prompt(target, text) {
+            Ok(effects) => effects,
+            Err(err) => {
+                cx.editor
+                    .set_error(format!("{err}. Use :assistant-connect first."));
+                return false;
+            }
+        };
+        Self::apply_assistant_effects(cx.editor, effects);
+        true
+    }
+
     /// Dispatch a key through the input region's own engine + modal keymaps.
     /// Dispatch a key through the engine. Returns `true` if consumed, `false` if unbound
     /// (should bubble up to the editor).
@@ -3273,20 +3376,27 @@ impl AssistantPanel {
     }
 
     fn send_current_prompt(&mut self, cx: &mut Context) {
+        if Self::assistant_model(cx.editor).agent_busy {
+            self.sync_draft_to_assistant(cx.editor);
+            cx.editor
+                .set_status("Assistant is busy; wait for the current turn or cancel it.");
+            return;
+        }
         let text = match self.input.take_text(cx.editor) {
             Some(t) => t,
             None => return,
         };
         if !text.is_empty() {
             self.panel_error = None;
-            if Self::assistant_model(cx.editor).agent_busy {
-                self.sync_draft_to_assistant(cx.editor);
-                cx.editor
-                    .set_status("Assistant is busy; wait for the current turn or cancel it.");
-                return;
-            }
-
-            if !Self::submit_prompt(text, cx) {
+            if let Some(editing) = self.editing.take() {
+                if !Self::fork_submit_prompt(editing.target, text.clone(), cx) {
+                    self.editing = Some(editing);
+                    self.sync_input_from_assistant(cx.editor, &text);
+                    self.sync_draft_to_assistant(cx.editor);
+                } else {
+                    cx.editor.set_status("Resubmitted edited assistant message");
+                }
+            } else if !Self::submit_prompt(text, cx) {
                 self.sync_draft_to_assistant(cx.editor);
             }
         }
@@ -3436,6 +3546,9 @@ impl AssistantPanel {
                 }
                 Err(err) => cx.editor.set_status(err.to_string()),
             },
+            AssistantAction::EditMessage => {
+                self.enter_edit_selected_message(cx.editor);
+            }
             AssistantAction::ToggleReviewMode => {
                 match cx.editor.toggle_active_assistant_review_mode() {
                     Ok((status, effects)) => {
@@ -3596,6 +3709,9 @@ impl AssistantPanel {
             AssistantAction::InputEscape => {
                 if self.mention.active {
                     self.mention.active = false;
+                    return Some(EventResult::Consumed(None));
+                }
+                if self.cancel_edit(cx.editor) {
                     return Some(EventResult::Consumed(None));
                 }
                 if self.input.mode() == Mode::Insert {
@@ -3838,6 +3954,9 @@ impl Component for AssistantPanel {
                     cx.editor.set_status("Canceled assistant request");
                     return EventResult::Consumed(None);
                 }
+                if self.cancel_edit(cx.editor) {
+                    return EventResult::Consumed(None);
+                }
                 self.input.exit_insert_mode();
                 return EventResult::Consumed(None);
             }
@@ -4056,6 +4175,18 @@ mod tests {
                 assert_eq!(dispatched.action, binding.action);
             }
         }
+    }
+
+    #[test]
+    fn message_bindings_include_edit_hint() {
+        assert!(AssistantPanel::bindings_for_layer(AssistantLayer::Messages)
+            .iter()
+            .any(|binding| {
+                binding.action == AssistantAction::EditMessage
+                    && binding
+                        .hint
+                        .is_some_and(|(key, label, _)| key == "e" && label == "edit")
+            }));
     }
 
     #[test]
@@ -4282,6 +4413,43 @@ mod tests {
                 .slice(..)
                 .to_string()
                 .starts_with("# Agent Message\n"));
+        });
+    }
+
+    #[test]
+    fn editing_user_message_loads_input_and_cancel_restores_draft() {
+        with_test_runtime(|| {
+            let mut editor = test_editor();
+            seed_default_thread(&mut editor);
+            let effects = editor
+                .set_active_assistant_draft_if_changed("draft".to_string())
+                .expect("draft changed");
+            editor.apply_assistant_effects(effects);
+            let mut panel = AssistantPanel::new();
+            panel.sync_from_assistant(&mut editor);
+            select_thread_entry(&mut editor, 1);
+
+            assert!(panel.enter_edit_selected_message(&mut editor));
+
+            let target = editor.assistant_entry_id_at(false, 1).expect("entry");
+            assert_eq!(
+                panel.editing.as_ref().map(|editing| editing.target),
+                Some(target)
+            );
+            let model = editor.assistant_model(false);
+            assert_eq!(model.input, "hi there from user");
+            assert_eq!(model.focus(), helix_view::assistant::thread::Focus::Input);
+
+            assert!(panel.cancel_edit(&mut editor));
+
+            assert!(panel.editing.is_none());
+            let model = editor.assistant_model(false);
+            assert_eq!(model.input, "draft");
+            assert_eq!(
+                model.focus(),
+                helix_view::assistant::thread::Focus::Messages
+            );
+            assert_eq!(model.entries.len(), 2);
         });
     }
 

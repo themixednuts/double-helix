@@ -167,6 +167,19 @@ impl Editor {
         self.assistant_act(crate::assistant::Action::Submit { thread, text })
     }
 
+    pub fn fork_submit_assistant_prompt(
+        &mut self,
+        thread: crate::assistant::thread::Id,
+        entry: crate::assistant::thread::EntryId,
+        text: String,
+    ) -> Vec<crate::assistant::effect::Effect> {
+        self.assistant_act(crate::assistant::Action::ForkSubmit {
+            thread,
+            entry,
+            text,
+        })
+    }
+
     pub fn set_assistant_review_mode(
         &mut self,
         thread: crate::assistant::thread::Id,

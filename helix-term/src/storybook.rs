@@ -668,6 +668,22 @@ static STORIES: &[Story] = &[
         render: StoryRenderer::Runtime(render_assistant_panel_story),
     },
     Story {
+        id: "ui/pkg-manager",
+        title: "Package Manager",
+        category: "UI Patterns",
+        component: "Editor/Package Manager",
+        variant: "Browse Detail",
+        summary: "Package manager Browse tab with virtualized rows and detail pane.",
+        kind: StoryKind::Pattern,
+        args: &[StoryArg::new(
+            "fixture",
+            "browse-detail",
+            "Deterministic package rows and detail pane",
+        )],
+        canvas: StoryCanvas::FullBleed,
+        render: StoryRenderer::Runtime(render_pkg_manager_story),
+    },
+    Story {
         id: "ui/lsp",
         title: "LSP Surfaces",
         category: "UI Patterns",
@@ -2897,6 +2913,12 @@ fn render_lsp_story(surface: &mut Buffer, area: Rect, context: StoryContext<'_>)
     let mut hover_popup =
         crate::ui::lsp::hover::Hover::new(vec![("rust-analyzer".to_string(), hover)], syn_loader);
     stage.draw(surface, &mut hover_popup);
+}
+
+fn render_pkg_manager_story(surface: &mut Buffer, area: Rect, context: StoryContext<'_>) {
+    let mut stage = Stage::new(area, context);
+    let mut manager = crate::ui::pkg::PkgManager::storybook_sample(stage.ingress());
+    stage.draw(surface, &mut manager);
 }
 
 fn render_status_notifications_story(surface: &mut Buffer, area: Rect, context: StoryContext<'_>) {

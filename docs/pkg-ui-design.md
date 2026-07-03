@@ -1,6 +1,6 @@
 # :pkg Manager UI — Design
 
-Status: approved design (2026-07-03). Reference point: mason.nvim's manager
+Status: implemented (2026-07-03). Reference point: mason.nvim's manager
 buffer — kept: full-surface manager, sections, single-key ops, live rows.
 Improved: real detail pane, update review, structured progress, registry
 management, and consistency with this editor's interaction grammar.

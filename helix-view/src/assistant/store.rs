@@ -772,6 +772,54 @@ impl Store {
                     Vec::new()
                 }
             }
+            action::Action::ForkSubmit {
+                thread,
+                entry,
+                text,
+            } => {
+                if let Some(state) = self.thread_mut(thread) {
+                    let thread::Origin::Backend { backend, .. } = state.origin() else {
+                        return Vec::new();
+                    };
+                    let backend = backend.clone();
+                    let supports_fork = state.caps().is_some_and(|caps| caps.fork_session);
+                    if !state.fork_before(entry) {
+                        return Vec::new();
+                    }
+                    let mut prompt =
+                        super::prompt::Request::builder(thread, super::prompt::Role::User)
+                            .text(text.clone());
+                    for item in state.context_items() {
+                        prompt = prompt.push_context(item.kind.clone());
+                    }
+                    state.set_draft(String::new());
+                    state.apply(thread::Event::Content(thread::Content::Append(
+                        thread::NewEntry {
+                            turn: None,
+                            kind: thread::EntryKind::UserPrompt { text },
+                            locations: Vec::new(),
+                        },
+                    )));
+                    let mut effects = Vec::new();
+                    if !supports_fork {
+                        effects.push(effect::Effect::SetStatus {
+                            message: "agent doesn't support editing history — resent as a new message; earlier context may be retained".to_string(),
+                        });
+                    }
+                    effects.push(effect::Effect::SendBackendCommand {
+                        backend,
+                        command: backend::Command::ForkSubmit {
+                            thread,
+                            prompt: prompt.build(),
+                        },
+                    });
+                    effects.push(effect::Effect::Save { thread });
+                    effects.push(effect::Effect::SyncModel);
+                    effects
+                } else {
+                    Vec::new()
+                }
+            }
             action::Action::Cancel { thread } => {
                 let Some(state) = self.thread_mut(thread) else {
                     return Vec::new();
@@ -1140,6 +1188,29 @@ mod tests {
         )
     }
 
+    fn append(store: &mut Store, thread: thread::Id, kind: thread::EntryKind) -> thread::EntryId {
+        let _ = store.apply(event::Event::Thread {
+            thread,
+            event: thread::Event::Content(thread::Content::Append(thread::NewEntry {
+                turn: None,
+                kind,
+                locations: Vec::new(),
+            })),
+        });
+        store
+            .thread(thread)
+            .and_then(|thread| thread.entries().last())
+            .expect("entry")
+            .id
+    }
+
+    fn set_caps(store: &mut Store, thread: thread::Id, caps: helix_acp::AgentCaps) {
+        let _ = store.apply(event::Event::Thread {
+            thread,
+            event: thread::Event::Caps(caps),
+        });
+    }
+
     #[test]
     fn review_accepted_file_emits_apply_effect_for_live_thread() {
         let (mut store, thread) = store();
@@ -1308,6 +1379,125 @@ mod tests {
             store.thread(thread).and_then(|thread| thread.entries().last()),
             Some(thread::Entry { kind: thread::EntryKind::UserPrompt { text }, .. }) if text == "hello"
         ));
+    }
+
+    #[test]
+    fn fork_submit_truncates_at_target_and_emits_fork_backend_command() {
+        let (mut store, thread, backend) = backend_store();
+        let mut caps = helix_acp::AgentCaps::default();
+        caps.fork_session = true;
+        set_caps(&mut store, thread, caps);
+        append(
+            &mut store,
+            thread,
+            thread::EntryKind::UserPrompt { text: "U0".into() },
+        );
+        append(
+            &mut store,
+            thread,
+            thread::EntryKind::AssistantText { text: "A0".into() },
+        );
+        let u1 = append(
+            &mut store,
+            thread,
+            thread::EntryKind::UserPrompt { text: "U1".into() },
+        );
+        append(
+            &mut store,
+            thread,
+            thread::EntryKind::AssistantText { text: "A1".into() },
+        );
+        append(
+            &mut store,
+            thread,
+            thread::EntryKind::UserPrompt { text: "U2".into() },
+        );
+
+        let effects = store.act(action::Action::ForkSubmit {
+            thread,
+            entry: u1,
+            text: "edited U1".to_string(),
+        });
+
+        let entries = store.thread(thread).expect("thread").entries();
+        assert_eq!(entries.len(), 3);
+        assert!(matches!(
+            &entries[0].kind,
+            thread::EntryKind::UserPrompt { text } if text == "U0"
+        ));
+        assert!(matches!(
+            &entries[1].kind,
+            thread::EntryKind::AssistantText { text } if text == "A0"
+        ));
+        assert!(matches!(
+            &entries[2].kind,
+            thread::EntryKind::UserPrompt { text } if text == "edited U1"
+        ));
+        assert!(effects.iter().any(|effect| {
+            matches!(
+                effect,
+                effect::Effect::SendBackendCommand {
+                    backend: current,
+                    command: backend::Command::ForkSubmit { thread: current_thread, prompt },
+                } if current == &backend
+                    && *current_thread == thread
+                    && prompt.parts().iter().any(|part| {
+                        matches!(part, super::super::prompt::Part::Text(text) if text == "edited U1")
+                    })
+            )
+        }));
+        assert!(!effects
+            .iter()
+            .any(|effect| matches!(effect, effect::Effect::SetStatus { .. })));
+    }
+
+    #[test]
+    fn fork_submit_without_capability_emits_fallback_status_and_still_truncates() {
+        let (mut store, thread, backend) = backend_store();
+        append(
+            &mut store,
+            thread,
+            thread::EntryKind::UserPrompt { text: "U0".into() },
+        );
+        let u1 = append(
+            &mut store,
+            thread,
+            thread::EntryKind::UserPrompt { text: "U1".into() },
+        );
+        append(
+            &mut store,
+            thread,
+            thread::EntryKind::AssistantText { text: "A1".into() },
+        );
+
+        let effects = store.act(action::Action::ForkSubmit {
+            thread,
+            entry: u1,
+            text: "edited U1".to_string(),
+        });
+
+        let entries = store.thread(thread).expect("thread").entries();
+        assert_eq!(entries.len(), 2);
+        assert!(matches!(
+            &entries[1].kind,
+            thread::EntryKind::UserPrompt { text } if text == "edited U1"
+        ));
+        assert!(effects.iter().any(|effect| {
+            matches!(
+                effect,
+                effect::Effect::SetStatus { message }
+                    if message.contains("doesn't support editing history")
+            )
+        }));
+        assert!(effects.iter().any(|effect| {
+            matches!(
+                effect,
+                effect::Effect::SendBackendCommand {
+                    backend: current,
+                    command: backend::Command::ForkSubmit { thread: current_thread, .. },
+                } if current == &backend && *current_thread == thread
+            )
+        }));
     }
 
     #[test]

@@ -51,6 +51,7 @@ Messages focus is a single transcript list. Cards are entries in that list; they
 | `Tab` | Expand or collapse the selected entry; tool calls are collapsed by default |
 | `y` | Yank a pending request URL; otherwise yank the selected entry |
 | `t` | Follow output or jump to a selected subagent target |
+| `e` | Edit the selected user prompt |
 | `r` | Retry the last user prompt after a failed or canceled run |
 | `R` | Toggle write/review mode for the active thread |
 | `a` / `A` | Accept the selected/all pending review changes |
@@ -59,6 +60,12 @@ Messages focus is a single transcript list. Cards are entries in that list; they
 | `Ctrl-c` | Cancel pending assistant work |
 | `Ctrl-o` | Open the standard mode/model/config picker |
 | `?` | Toggle the key-help info popup |
+
+Editing is available only for user prompts. Press `e` on a selected user prompt to load that text into Input mode. The header shows `editing message · esc cancels`, the footer badge shows `EDIT`, and the target message remains highlighted in the transcript.
+
+While editing, `Esc` cancels the edit, restores the draft that was in the input before editing, and returns to the previous focus without changing the thread. The normal send action resubmits the edit: Helix locally forks at that prompt by removing the edited prompt and every later entry, then sends the edited text as the replacement prompt.
+
+When the ACP agent advertises `session/fork`, Helix forks the remote session before sending so the agent context matches the local transcript. If the agent does not support session forking, Helix still updates the local transcript and sends the edited text, but shows a status note that earlier agent context may be retained.
 
 ### Card Transients
 

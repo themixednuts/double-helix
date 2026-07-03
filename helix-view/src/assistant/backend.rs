@@ -174,6 +174,10 @@ pub enum Command {
         thread: thread::Id,
         prompt: prompt::Request,
     },
+    ForkSubmit {
+        thread: thread::Id,
+        prompt: prompt::Request,
+    },
     Cancel {
         thread: thread::Id,
     },

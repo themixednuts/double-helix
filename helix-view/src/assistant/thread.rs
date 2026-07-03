@@ -597,6 +597,15 @@ impl Thread {
         self.selected_entry().and_then(|id| self.entry(id))
     }
 
+    #[must_use]
+    pub fn selected_user_prompt(&self) -> Option<(EntryId, String)> {
+        let entry = self.selected()?;
+        let EntryKind::UserPrompt { text } = &entry.kind else {
+            return None;
+        };
+        Some((entry.id, text.clone()))
+    }
+
     pub fn folded_entries(&self) -> impl Iterator<Item = EntryId> + '_ {
         self.view.folded.iter().copied()
     }
@@ -659,6 +668,33 @@ impl Thread {
 
     pub fn untrack_opened_doc(&mut self, entry: EntryId) {
         self.view.opened_docs.remove(&entry);
+    }
+
+    #[must_use]
+    pub fn fork_before(&mut self, entry: EntryId) -> bool {
+        let Some(index) = self.entries.iter().position(|current| current.id == entry) else {
+            return false;
+        };
+        let removed = self
+            .entries
+            .drain(index..)
+            .map(|entry| entry.id)
+            .collect::<HashSet<_>>();
+        self.turns.retain(|turn| {
+            turn.prompt != entry && !turn.entries.iter().any(|entry| removed.contains(entry))
+        });
+        self.view.folded.retain(|entry| !removed.contains(entry));
+        self.view
+            .opened_docs
+            .retain(|entry, _| !removed.contains(entry));
+        if self
+            .view
+            .selected
+            .is_some_and(|entry| removed.contains(&entry))
+        {
+            self.view.selected = self.entries.last().map(|entry| entry.id);
+        }
+        true
     }
 
     #[must_use]
@@ -1044,4 +1080,48 @@ fn collect_change_summaries(
         .flat_map(|summary| summary.files)
         .collect::<Vec<_>>();
     (!files.is_empty()).then_some(change::Summary { files })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn thread() -> Thread {
+        Thread::new(
+            Id::new(NonZeroU64::new(1).unwrap()),
+            Origin::Local,
+            Scope::new(std::path::PathBuf::from(".")),
+        )
+    }
+
+    fn append(thread: &mut Thread, kind: EntryKind) -> EntryId {
+        thread.apply(Event::Content(Content::Append(NewEntry {
+            turn: None,
+            kind,
+            locations: Vec::new(),
+        })));
+        thread.entries().last().expect("entry").id
+    }
+
+    #[test]
+    fn fork_before_user_prompt_drops_target_and_later_entries() {
+        let mut thread = thread();
+        append(&mut thread, EntryKind::UserPrompt { text: "U0".into() });
+        append(&mut thread, EntryKind::AssistantText { text: "A0".into() });
+        let u1 = append(&mut thread, EntryKind::UserPrompt { text: "U1".into() });
+        append(&mut thread, EntryKind::AssistantText { text: "A1".into() });
+        append(&mut thread, EntryKind::UserPrompt { text: "U2".into() });
+
+        assert!(thread.fork_before(u1));
+
+        let texts = thread
+            .entries()
+            .iter()
+            .map(|entry| match &entry.kind {
+                EntryKind::UserPrompt { text } | EntryKind::AssistantText { text } => text.as_str(),
+                _ => "",
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(texts, vec!["U0", "A0"]);
+    }
 }

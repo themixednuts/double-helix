@@ -108,3 +108,37 @@ No render-path optimization candidate was kept in Round 2. The kept code change 
 - Add a narrower allocation counter around `render_document/main_loop` or a Criterion micro-bench for `CacheStore::compose_batch`; whole-frame counts still include flush/cursor work.
 - Retry `compose_batch` reuse only if a compose-specific benchmark shows allocation wins without giant-render regressions.
 - Revisit whitespace marker storage only with a render-document-scoped allocation measurement; whole-frame counts showed mixed results.
+
+## Latency Round: Main-thread bounded work
+
+Date: 2026-07-02
+
+### Methodology
+
+Measurements used the existing `hx-bench` release harness with `HELIX_LOG_LEVEL=error` and `CARGO_TARGET_DIR=C:\Users\jonfo\AppData\Local\Temp\helix-fork-target-latency`.
+
+- `cargo run --quiet -p helix-term --bin hx-bench --features "integration bench" --release -- --fixture semantic-token-overlay --lines 200000 --renders 5 --width 120 --height 50`
+- `cargo run --quiet -p helix-term --bin hx-bench --features "integration bench" --release -- --fixture giant-lines-render --lines 1 --bytes-per-line 10000000 --renders 5 --width 120 --height 50`
+- `cargo run --quiet -p helix-term --bin hx-bench --features "integration bench" --release -- --fixture document-change-fanout --lines 1000000 --renders 2 --width 120 --height 50`
+
+The new `semantic-token-overlay` fixture generates content on demand and installs one synthetic semantic token per line at the current document version. This creates a deterministic full-document semantic token set without committing a large blob.
+
+### Findings
+
+| Site | Trigger | Before | After | Technique |
+| --- | --- | ---: | ---: | --- |
+| Semantic token overlay construction | 200k tokens, first render | 93,303 us frame; `render_view/overlays` 67,374 us; `overlay_advances=190,468` | 10,904 us frame; `render_view/total` 6,408 us; `overlay_advances=283` | Filter semantic tokens to viewport char range before theme lookup/sort; render work becomes O(visible tokens). |
+| 10MB single line | `giant-lines-render --lines 1 --bytes-per-line 10000000` | Existing path | Verified bounded: first render 26,972 us, cached renders 3,829-6,145 us; `formatter_next_calls=114`, `skip_right_eof_fast_paths=1`, skipped 9,999,888 offscreen chars. |
+| 1M+ line edit fanout | `document-change-fanout --lines 1000000` | Existing path | Verified bounded edit/render: mutation 52 us; cached renders 621-623 us; render loop maps 148 rows. |
+| Path and word completion filesystem scans | Completion request on path/word providers | Existing path | Verified already off main thread: both providers are scheduled with `JoinSet::spawn_blocking`; key dispatch only builds request state. |
+| Event loop input vs ingress | Runtime ingress flood risk | Existing path | Verified input priority: `tokio::select! { biased; ... input_stream.next() ... ingress.rx.recv() ... }` polls terminal input before runtime ingress deliveries. |
+| Diagnostics render overlays | Large diagnostic sets | Existing path | Verified viewport bounded: render passes viewport range and `diagnostic_highlights` partitions diagnostics before building ranges. |
+| Markdown streaming layout | Assistant markdown chunks | Existing path | Verified cached/incremental shape: complete prefix is cached and only incomplete tail is reparsed on append. |
+| Diff view rendering | Large parsed diff document | Existing path | Verified render is visible-area bounded over precomputed hunks; hunk computation remains outside per-frame render. |
+
+### Kept Changes
+
+- `Document::semantic_tokens_overlay` now accepts an optional viewport char range.
+- `render_view` converts the existing viewport byte range to a char range and passes it to semantic-token overlay construction.
+- `hx-bench` gained the generated `semantic-token-overlay` fixture.
+- Package-manager UI compile fixes were required to run the bench on the current tree: re-export `PkgConfig`, return the correct ratatui span type for package statusline rendering, derive `Hash` for package statusline cache keys, route `:pkg` through typed layer ingress, and fix a language-server borrow/name mismatch.

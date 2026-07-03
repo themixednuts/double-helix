@@ -2395,11 +2395,13 @@ impl Document {
     pub fn semantic_tokens_overlay(
         &self,
         theme: &Theme,
+        viewport: Option<std::ops::Range<usize>>,
     ) -> Option<helix_core::syntax::OverlayHighlights> {
         crate::document_lsp::semantic_tokens_overlay(
             theme,
             self.lsp.semantic_tokens(),
             self.version(),
+            viewport,
         )
     }
 

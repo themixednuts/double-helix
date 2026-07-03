@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::ops::Range as StdRange;
 
 use crate::ViewId;
 use helix_core::syntax::{self, OverlayHighlights};
@@ -513,12 +514,18 @@ pub fn semantic_tokens_overlay(
     theme: &crate::Theme,
     tokens: &HashMap<LanguageServerId, DocumentSemanticTokens>,
     version: i32,
+    viewport: Option<StdRange<usize>>,
 ) -> Option<OverlayHighlights> {
     let mut highlights = tokens
         .values()
         .filter(|set| set.version == version)
         .flat_map(|set| {
             set.tokens.iter().filter_map(|token| {
+                if viewport.as_ref().is_some_and(|viewport| {
+                    token.range.to() < viewport.start || token.range.from() > viewport.end
+                }) {
+                    return None;
+                }
                 semantic_highlight(theme, &token.token_type, &token.token_modifiers)
                     .map(|highlight| (highlight, token.range.from()..token.range.to()))
             })
@@ -712,7 +719,7 @@ mod tests {
             },
         );
 
-        let overlay = semantic_tokens_overlay(&theme, &tokens, 7).expect("overlay");
+        let overlay = semantic_tokens_overlay(&theme, &tokens, 7, None).expect("overlay");
         let OverlayHighlights::Heterogenous { highlights } = overlay else {
             panic!("semantic tokens use heterogeneous overlay highlights");
         };
@@ -720,7 +727,9 @@ mod tests {
         assert_eq!(highlights.len(), 1);
         assert_eq!(theme.scope(highlights[0].0), "semantic.function.static");
         assert_eq!(highlights[0].1, 2..6);
-        assert!(semantic_tokens_overlay(&theme, &tokens, 8).is_none());
+        assert!(semantic_tokens_overlay(&theme, &tokens, 8, None).is_none());
+        assert!(semantic_tokens_overlay(&theme, &tokens, 7, Some(7..9)).is_none());
+        assert!(semantic_tokens_overlay(&theme, &tokens, 7, Some(0..2)).is_some());
     }
 
     #[test]

@@ -23,6 +23,7 @@
       ]
     },
     "editor": { "$ref": "#/$defs/editor" },
+    "pkg": { "$ref": "#/$defs/pkg" },
     "keys": { "$ref": "#/$defs/keymaps" },
     "icons": { "$ref": "#/$defs/icons" }
   },
@@ -362,6 +363,14 @@
           }
         },
         "editing-engine": { "type": "string", "enum": ["helix", "vim"] }
+      }
+    },
+    "pkg": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "auto-install": { "type": "boolean" },
+        "registries": { "$ref": "#/$defs/arrayOfStrings" }
       }
     },
     "gutterLayout": {

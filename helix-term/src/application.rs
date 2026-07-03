@@ -567,6 +567,11 @@ impl Application {
     }
 
     async fn handle_runtime_task(&mut self, task: crate::runtime::RuntimeTaskEvent) {
+        if let crate::runtime::RuntimeTaskEvent::PkgEvent(event) = &task {
+            if let Some(editor_view) = self.compositor.find::<ui::EditorView>() {
+                editor_view.pkg_progress_mut().apply(event);
+            }
+        }
         let ingress = self.ingress().tx.clone();
         crate::effect::apply_runtime_task_event(
             &mut self.editor,

@@ -59,3 +59,63 @@ the locked source is remote and not already available locally.
 Node/npm, Python, Cargo, and Go are prerequisites when installing packages that
 use those backends; `dhx pkg` detects missing runtimes and reports the missing
 tool. Registry entries are declarative and do not run arbitrary install scripts.
+
+## Editor UI
+
+Inside the editor, `:pkg` opens the package picker. The picker shows the merged
+registry and installed view with package name, kind, installed version, latest
+source, and languages. Use `Space` to mark entries, `Enter` to install the
+selected package, `u` to update, `d` to remove an installed package, and `!` to
+run doctor. Direct commands are also available:
+
+```text
+:pkg-install rust-analyzer
+:pkg-update rust-analyzer
+:pkg-update
+:pkg-sync
+```
+
+Package operations run in the background. Progress is delivered as editor
+notifications and through the statusline spinner/progress slot. Closing the
+picker or dropping the UI interest does not undo a package operation; installs
+are transactional and either finish activation or leave the previous receipt in
+place.
+
+## Command Resolution
+
+Bare language-server and debug-adapter commands are resolved in this order:
+
+1. an explicit absolute path in `languages.toml`,
+2. the active shim in `<data>/pkg/bin`,
+3. `PATH`.
+
+After `dhx pkg install rust-analyzer`, a language configuration that says
+`command = "rust-analyzer"` starts using the package shim without further
+configuration.
+
+## Missing Servers
+
+When a document uses a configured language server whose command is missing, the
+editor checks the package registry. If the registry has an installable package
+for the command or language, the statusline shows a one-time session hint such
+as:
+
+```text
+rust-analyzer not installed - :pkg-install rust-analyzer
+```
+
+Packages that are `system`-only are not suggested when absent because the
+package manager cannot install them. To install actionable missing servers
+automatically, add this to `config.toml`:
+
+```toml
+[pkg]
+auto-install = true
+```
+
+Additional registry directories can be merged after the builtin registry:
+
+```toml
+[pkg]
+registries = ["C:/path/to/my-registry"]
+```

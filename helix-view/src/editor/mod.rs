@@ -38,9 +38,10 @@ pub use config::{
     KittyKeyboardProtocolConfig, LineEndingConfig, LineNumber, LspConfig, LspSelectionRangeConfig,
     ModeConfig, NotificationBorderConfig, NotificationBorderStyle, NotificationConfig,
     NotificationEmojis, NotificationIcons, NotificationPosition, NotificationShadowConfig,
-    NotificationStyle, PickerStartPosition, PopupBorderConfig, SearchConfig, SignatureHelpPosition,
-    SmartTabConfig, StatusLineConfig, StatusLineElement, TerminalConfig, WhitespaceCharacters,
-    WhitespaceConfig, WhitespaceRender, WhitespaceRenderValue, WordCompletion,
+    NotificationStyle, PickerStartPosition, PkgConfig, PopupBorderConfig, SearchConfig,
+    SignatureHelpPosition, SmartTabConfig, StatusLineConfig, StatusLineElement, TerminalConfig,
+    WhitespaceCharacters, WhitespaceConfig, WhitespaceRender, WhitespaceRenderValue,
+    WordCompletion,
 };
 pub use core::Editor;
 pub use embed::{

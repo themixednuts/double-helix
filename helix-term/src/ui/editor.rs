@@ -573,6 +573,7 @@ pub struct EditorView {
     pseudo_pending: Vec<KeyEvent>,
     pub(crate) completion: Option<Completion>,
     spinners: ProgressSpinners,
+    pkg_progress: crate::ui::pkg::PkgProgressState,
     bufferline_info: BufferLineInfo,
     /// Tracks if the terminal window is focused by reaction to terminal focus events
     terminal_focused: bool,
@@ -640,6 +641,7 @@ impl EditorView {
                 mode: cx.mode(),
                 selected_register: self.engine_input_state().selected_register,
                 spinners: &self.spinners,
+                pkg_progress: self.pkg_progress.statusline(),
             },
             doc,
             view,
@@ -661,6 +663,7 @@ impl EditorView {
             pseudo_pending: Vec::new(),
             completion: None,
             spinners: ProgressSpinners::default(),
+            pkg_progress: crate::ui::pkg::PkgProgressState::default(),
             bufferline_info: BufferLineInfo::default(),
             terminal_focused: true,
             prompt_active: false,
@@ -874,6 +877,10 @@ impl EditorView {
 
     pub fn spinners_mut(&mut self) -> &mut ProgressSpinners {
         &mut self.spinners
+    }
+
+    pub fn pkg_progress_mut(&mut self) -> &mut crate::ui::pkg::PkgProgressState {
+        &mut self.pkg_progress
     }
 
     pub fn draw_welcome(theme: &Theme, view: &View, surface: &mut CellSurface, is_colorful: bool) {
@@ -1234,8 +1241,14 @@ impl EditorView {
         let mut overlays = Vec::new();
 
         let overlays_start = std::time::Instant::now();
+        let viewport_range =
+            doc.viewport_byte_range(&text_annotations, view_offset.anchor, inner.height);
+        let viewport_char_range = {
+            let text = doc.text().slice(..);
+            text.byte_to_char(viewport_range.start)..text.byte_to_char(viewport_range.end)
+        };
         if config.lsp.semantic_tokens {
-            if let Some(overlay) = doc.semantic_tokens_overlay(theme) {
+            if let Some(overlay) = doc.semantic_tokens_overlay(theme, Some(viewport_char_range)) {
                 overlays.push(overlay);
             }
         }
@@ -1261,8 +1274,6 @@ impl EditorView {
             }
         }
 
-        let viewport_range =
-            doc.viewport_byte_range(&text_annotations, view_offset.anchor, inner.height);
         overlays.extend(doc.diagnostic_highlights(theme, Some(viewport_range)));
 
         if is_focused {

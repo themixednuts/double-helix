@@ -1,8 +1,14 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{Arc, LazyLock, Mutex},
+};
 
 use crate::DocumentId;
 
 use super::Editor;
+
+static PKG_NUDGED_SERVERS: LazyLock<Mutex<HashSet<String>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
 
 impl Editor {
     #[inline]
@@ -119,16 +125,18 @@ impl Editor {
         if !self.config().lsp.enable {
             return;
         }
-        let Some(doc) = self.documents.get_mut(&doc_id) else {
+        let Some(doc) = self.documents.get(&doc_id) else {
             return;
         };
         let Some(doc_url) = doc.url() else {
             return;
         };
         let (lang, path) = (doc.language_configuration().cloned(), doc.path().cloned());
+        let had_language_servers = doc.has_language_servers();
         let config = doc.config.load();
         let root_dirs = &config.workspace_lsp_roots;
 
+        let mut missing_servers = Vec::new();
         let language_servers = lang.as_ref().map_or_else(HashMap::default, |language| {
             self.language_servers
                 .get(language, path.as_ref(), root_dirs, config.lsp.snippets)
@@ -142,6 +150,7 @@ impl Editor {
                                 lang,
                                 err,
                             );
+                            missing_servers.push(lang);
                         } else {
                             log::error!(
                                 "Failed to initialize the language servers for `{}` - `{}` {{ {} }}",
@@ -155,10 +164,19 @@ impl Editor {
                 })
                 .collect::<HashMap<_, _>>()
         });
+        if let Some(language) = lang.as_ref() {
+            for server in missing_servers {
+                self.handle_missing_language_server(language, &server);
+            }
+        }
 
-        if language_servers.is_empty() && !doc.has_language_servers() {
+        if language_servers.is_empty() && !had_language_servers {
             return;
         }
+
+        let Some(doc) = self.documents.get_mut(&doc_id) else {
+            return;
+        };
 
         let language_id = doc.language_id().map(ToOwned::to_owned).unwrap_or_default();
 
@@ -188,5 +206,59 @@ impl Editor {
         }
 
         doc.set_language_servers(language_servers);
+    }
+
+    fn handle_missing_language_server(
+        &mut self,
+        language: &helix_core::syntax::config::LanguageConfiguration,
+        server: &str,
+    ) {
+        let loader = self.syn_loader.load();
+        let Some(server_config) = loader.language_server_configs().get(server) else {
+            return;
+        };
+        let config = self.config();
+        let registry = match helix_pkg::Registry::from_dirs(&config.pkg.registries) {
+            Ok(registry) => registry,
+            Err(err) => {
+                log::warn!("failed to load package registries for missing-server nudge: {err}");
+                return;
+            }
+        };
+        let Some(package) = helix_pkg::resolve::package_for_missing_command(
+            &registry,
+            helix_pkg::PkgKind::Lsp,
+            Some(&language.language_id),
+            &server_config.command,
+        ) else {
+            return;
+        };
+        let key = format!("{}:{}", server, package.name);
+        {
+            let mut nudged = PKG_NUDGED_SERVERS.lock().expect("pkg nudge state");
+            if !nudged.insert(key) {
+                return;
+            }
+        }
+
+        if config.pkg.auto_install {
+            let package = package.name.clone();
+            self.set_status(format!("Installing package {package}"));
+            self.work()
+                .spawn(async move {
+                    let _ = tokio::task::spawn_blocking(move || {
+                        let ops = helix_pkg::Ops::open_default()?;
+                        ops.install(&[package], &mut |_| {})?;
+                        anyhow::Ok(())
+                    })
+                    .await;
+                })
+                .detach();
+        } else {
+            self.set_status(format!(
+                "{} not installed - :pkg-install {}",
+                server_config.command, package.name
+            ));
+        }
     }
 }

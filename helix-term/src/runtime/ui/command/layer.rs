@@ -18,6 +18,8 @@ pub enum LayerCommand {
     },
     /// Push the directory file picker rooted at `root` (cmdline `:open` on a directory).
     PushFilePicker { root: PathBuf },
+    /// Push the runtime package picker.
+    PkgPicker,
     /// Picker to run an LSP command when multiple servers advertise the same command list.
     LspCommandPicker {
         commands: Vec<(LanguageServerId, lsp::Command)>,

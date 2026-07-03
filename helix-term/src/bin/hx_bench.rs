@@ -188,7 +188,7 @@ fn parse_args() -> BenchArgs {
             }
             "--help" | "-h" => {
                 eprintln!(
-                    "Usage: hx-bench [--seed N] [--duration SECS] [--width N] [--height N] [--fixture giant-lines-render|giant-lines-collapse-render|document-change-fanout|document-change-fanout-matrix] [--lines N] [--bytes-per-line N] [--renders N]"
+                    "Usage: hx-bench [--seed N] [--duration SECS] [--width N] [--height N] [--fixture giant-lines-render|giant-lines-collapse-render|document-change-fanout|document-change-fanout-matrix|semantic-token-overlay] [--lines N] [--bytes-per-line N] [--renders N]"
                 );
                 std::process::exit(0);
             }
@@ -229,7 +229,10 @@ async fn main_impl(runtime: helix_runtime::Runtime) -> anyhow::Result<()> {
     eprintln!("  term:     {}x{}", bench_args.width, bench_args.height);
 
     // Build the application
-    let config = Config::default();
+    let mut config = Config::default();
+    if bench_args.fixture.as_deref() == Some("semantic-token-overlay") {
+        config.editor.lsp.semantic_tokens = true;
+    }
     let lang_config = helix_loader::config::default_lang_config();
     let syn_loader = syntax::Loader::new(lang_config.try_into().unwrap()).unwrap();
     let mut app = Application::new(Args::default(), config, syn_loader, runtime)?;
@@ -253,7 +256,9 @@ async fn main_impl(runtime: helix_runtime::Runtime) -> anyhow::Result<()> {
                 giant_lines_fixture(bench_args.lines, bench_args.bytes_per_line),
                 bench_args.lines,
             ),
-            "document-change-fanout" | "document-change-fanout-matrix" => {
+            "document-change-fanout"
+            | "document-change-fanout-matrix"
+            | "semantic-token-overlay" => {
                 let content = generate_bench_content(bench_args.seed, bench_args.lines.max(500));
                 let requested_lines = content.lines().count();
                 (content, requested_lines)
@@ -265,6 +270,9 @@ async fn main_impl(runtime: helix_runtime::Runtime) -> anyhow::Result<()> {
 
         let (view_id, doc_id) =
             install_fixture_document(&mut app, &fixture_content, requested_lines);
+        if fixture_name == "semantic-token-overlay" {
+            install_semantic_token_fixture(&mut app, doc_id);
+        }
 
         eprintln!("Helix Benchmark (deterministic render fixture)");
         eprintln!(
@@ -639,4 +647,26 @@ fn install_fixture_document(
         doc.append_changes_to_history(view)
     });
     (view_id, doc_id)
+}
+
+fn install_semantic_token_fixture(app: &mut Application, doc_id: helix_view::DocumentId) {
+    let doc = app.editor.documents.get_mut(&doc_id).unwrap();
+    let text = doc.text();
+    let last_line = text.len_lines().saturating_sub(1);
+    let tokens = (0..last_line)
+        .filter_map(|line| {
+            let start = text.line_to_char(line);
+            let end = text.line_to_char(line + 1).saturating_sub(1);
+            (start < end).then(|| helix_view::document_lsp::DocumentSemanticToken {
+                range: helix_core::Range::new(start, (start + 1).min(end)),
+                token_type: "function".to_string(),
+                token_modifiers: Vec::new(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let version = doc.version();
+    doc.set_semantic_tokens(
+        helix_lsp::LanguageServerId::default(),
+        helix_view::document_lsp::DocumentSemanticTokens { version, tokens },
+    );
 }

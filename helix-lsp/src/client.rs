@@ -272,8 +272,14 @@ impl Client {
         name: String,
         req_timeout: u64,
     ) -> Result<(Self, Receiver<(LanguageServerId, Call)>, Arc<Notify>)> {
-        // Resolve path to the binary
-        let cmd = helix_stdx::env::which(cmd)?;
+        let cmd = match helix_pkg::resolve::command(
+            &helix_pkg::Store::open_default(),
+            helix_pkg::PkgKind::Lsp,
+            cmd,
+        ) {
+            Some(resolved) => resolved.path,
+            None => helix_stdx::env::which(cmd)?,
+        };
 
         let process = Command::new(cmd)
             .envs(server_environment)

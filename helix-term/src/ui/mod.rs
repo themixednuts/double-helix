@@ -15,6 +15,7 @@ pub mod menu;
 mod notification_popup;
 pub mod overlay;
 pub mod picker;
+pub(crate) mod pkg;
 pub(crate) mod plugin_float;
 pub mod plugin_panel;
 pub(crate) mod plugin_render;

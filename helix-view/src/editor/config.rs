@@ -353,6 +353,15 @@ pub struct Config {
     pub assistant: AssistantConfig,
     #[serde(default)]
     pub editing_engine: EditingEngineConfig,
+    #[serde(default)]
+    pub pkg: PkgConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
+pub struct PkgConfig {
+    pub auto_install: bool,
+    pub registries: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1588,6 +1597,7 @@ impl Default for Config {
             acp: AcpConfig::default(),
             assistant: AssistantConfig::default(),
             editing_engine: EditingEngineConfig::default(),
+            pkg: PkgConfig::default(),
         }
     }
 }

@@ -721,6 +721,57 @@ fn set_line_ending(
 
     Ok(())
 }
+
+fn pkg(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+    cx.spawn_ui(async { Ok(UiCommand::Layer(LayerCommand::PkgPicker)) });
+    Ok(())
+}
+
+fn pkg_install(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+    let names = pkg_names(args)?;
+    crate::runtime::spawn_pkg_operation(
+        crate::runtime::PkgOperation::Install(names),
+        cx.editor.work(),
+        cx.ingress.clone(),
+    );
+    Ok(())
+}
+
+fn pkg_update(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+    crate::runtime::spawn_pkg_operation(
+        crate::runtime::PkgOperation::Update(args.iter().map(ToString::to_string).collect()),
+        cx.editor.work(),
+        cx.ingress.clone(),
+    );
+    Ok(())
+}
+
+fn pkg_sync(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+    crate::runtime::spawn_pkg_operation(
+        crate::runtime::PkgOperation::Sync,
+        cx.editor.work(),
+        cx.ingress.clone(),
+    );
+    Ok(())
+}
+
+fn pkg_names(args: Args) -> anyhow::Result<Vec<String>> {
+    anyhow::ensure!(!args.is_empty(), "package name required");
+    Ok(args.iter().map(ToString::to_string).collect())
+}
+
 fn earlier(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow::Result<()> {
     if event != PromptEvent::Validate {
         return Ok(());
@@ -4127,6 +4178,50 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         completer: CommandCompleter::all(completers::filename),
         signature: Signature {
             positionals: (1, None),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "pkg",
+        aliases: &[],
+        doc: "Open the package manager picker.",
+        fun: pkg,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "pkg-install",
+        aliases: &["pkg install"],
+        doc: "Install one or more packages.",
+        fun: pkg_install,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (1, None),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "pkg-update",
+        aliases: &["pkg update"],
+        doc: "Update packages, or all installed packages when no name is supplied.",
+        fun: pkg_update,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, None),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "pkg-sync",
+        aliases: &["pkg sync"],
+        doc: "Sync installed packages from pkg.toml and pkg.lock.",
+        fun: pkg_sync,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
             ..Signature::DEFAULT
         },
     },

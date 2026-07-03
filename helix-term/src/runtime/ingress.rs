@@ -492,6 +492,8 @@ pub enum RuntimeTaskEvent {
     UnsetActiveDebugClient,
     /// DAP exception breakpoint configuration completed.
     DapExceptionsConfigured,
+    /// Package-manager operation progress from a blocking engine task.
+    PkgEvent(helix_pkg::OpEvent),
     /// Restore a persisted assistant thread record into editor-owned state.
     RestoreAssistantHistoryThread {
         record: Box<helix_view::assistant::history::Record>,

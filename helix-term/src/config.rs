@@ -27,6 +27,7 @@ pub struct ConfigRaw {
     pub theme: Option<theme::Config>,
     pub keys: Option<HashMap<Mode, KeyTrie>>,
     pub editor: Option<toml::Value>,
+    pub pkg: Option<toml::Value>,
     pub icons: Option<toml::Value>,
 }
 
@@ -81,7 +82,7 @@ impl Config {
                     merge_keys(&mut keys, local_keys)
                 }
 
-                let editor = match (global.editor, local.editor) {
+                let mut editor = match (global.editor, local.editor) {
                     (None, None) => helix_view::editor::Config::default(),
                     (None, Some(val)) | (Some(val), None) => {
                         val.try_into().map_err(ConfigLoadError::BadConfig)?
@@ -90,6 +91,9 @@ impl Config {
                         .try_into()
                         .map_err(ConfigLoadError::BadConfig)?,
                 };
+                if let Some(pkg) = merge_pkg_config(global.pkg, local.pkg)? {
+                    editor.pkg = pkg;
+                }
 
                 let icons: Icons = match (global.icons, local.icons) {
                     (None, None) => Icons::default(),
@@ -130,10 +134,16 @@ impl Config {
                 Config {
                     theme: config.theme,
                     keys,
-                    editor: config.editor.map_or_else(
-                        || Ok(helix_view::editor::Config::default()),
-                        |val| val.try_into().map_err(ConfigLoadError::BadConfig),
-                    )?,
+                    editor: {
+                        let mut editor = config.editor.map_or_else(
+                            || Ok(helix_view::editor::Config::default()),
+                            |val| val.try_into().map_err(ConfigLoadError::BadConfig),
+                        )?;
+                        if let Some(pkg) = merge_pkg_config(config.pkg, None)? {
+                            editor.pkg = pkg;
+                        }
+                        editor
+                    },
                 }
             }
 
@@ -150,6 +160,23 @@ impl Config {
         let local_config = fs::read_to_string(helix_loader::workspace_config_file())
             .map_err(ConfigLoadError::Error);
         Config::load(global_config, local_config)
+    }
+}
+
+fn merge_pkg_config(
+    global: Option<toml::Value>,
+    local: Option<toml::Value>,
+) -> Result<Option<helix_view::editor::PkgConfig>, ConfigLoadError> {
+    match (global, local) {
+        (None, None) => Ok(None),
+        (None, Some(value)) | (Some(value), None) => value
+            .try_into()
+            .map(Some)
+            .map_err(ConfigLoadError::BadConfig),
+        (Some(global), Some(local)) => merge_toml_values(global, local, 3)
+            .try_into()
+            .map(Some)
+            .map_err(ConfigLoadError::BadConfig),
     }
 }
 

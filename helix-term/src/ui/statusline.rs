@@ -37,6 +37,7 @@ pub struct StatuslineModel {
     pub color_modes: bool,
     pub snapshot: StatuslineSnapshot<'static>,
     pub bench_overlay: Option<BenchOverlay>,
+    pub pkg_progress: Option<crate::ui::pkg::PkgStatusline>,
 }
 
 impl StatuslineModel {
@@ -104,6 +105,7 @@ impl StatuslineModel {
                 actions_executed: bench.actions_executed,
                 remaining_seconds: bench.remaining_seconds,
             }),
+            pkg_progress: context.pkg_progress,
         }
     }
 }
@@ -118,6 +120,7 @@ pub struct StatuslineContext<'a> {
     pub mode: Mode,
     pub selected_register: Option<char>,
     pub spinners: &'a ProgressSpinners,
+    pub pkg_progress: Option<crate::ui::pkg::PkgStatusline>,
 }
 
 pub(crate) fn cache_id(view_id: ViewId) -> crate::render::CacheId {
@@ -157,6 +160,7 @@ impl<'a> Statusline<'a> {
                 &model.theme_name,
                 model.color_modes,
                 &model.snapshot,
+                &model.pkg_progress,
                 model.bench_overlay.map(|overlay| {
                     (
                         overlay.rolling_fps.to_bits(),
@@ -374,6 +378,14 @@ fn render_lsp_spinner<'a, F>(statusline: &mut Statusline<'a>, write: F)
 where
     F: Fn(&mut Statusline<'a>, Span<'a>) + Copy,
 {
+    if let Some(progress) = &statusline.model.pkg_progress {
+        write(
+            statusline,
+            crate::ui::pkg::render_statusline(progress, &statusline.model.theme, 0),
+        );
+        return;
+    }
+
     if let Some(progress) = statusline.model.snapshot.lsp_progress {
         let width = 6;
         let state = crate::widgets::progress_fill(width, progress as f32 / 100.0);

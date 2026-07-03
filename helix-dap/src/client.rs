@@ -114,8 +114,7 @@ impl Client {
         args: Vec<&str>,
         id: DebugAdapterId,
     ) -> Result<(Self, Receiver<(DebugAdapterId, Payload)>)> {
-        // Resolve path to the binary
-        let cmd = helix_stdx::env::which(cmd)?;
+        let cmd = resolve_adapter_command(cmd)?;
 
         let process = Command::new(cmd)
             .args(args)
@@ -167,6 +166,7 @@ impl Client {
         id: DebugAdapterId,
     ) -> Result<(Self, Receiver<(DebugAdapterId, Payload)>)> {
         let port = Self::get_port().await.unwrap();
+        let cmd = resolve_adapter_command(cmd)?;
 
         let process = Command::new(cmd)
             .args(args)
@@ -555,5 +555,16 @@ impl Client {
         self.stack_frames
             .get(&self.thread_id?)?
             .get(self.active_frame?)
+    }
+}
+
+fn resolve_adapter_command(cmd: &str) -> Result<std::path::PathBuf> {
+    match helix_pkg::resolve::command(
+        &helix_pkg::Store::open_default(),
+        helix_pkg::PkgKind::Dap,
+        cmd,
+    ) {
+        Some(resolved) => Ok(resolved.path),
+        None => Ok(helix_stdx::env::which(cmd)?),
     }
 }

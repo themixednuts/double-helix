@@ -2,6 +2,7 @@ pub mod app_event;
 pub mod exit;
 pub mod idle;
 pub mod ingress;
+pub mod pkg;
 pub mod ui;
 
 use helix_runtime::{TaskError, WaitSet};
@@ -19,6 +20,7 @@ pub use ingress::{
     IdleRender, PendingFormatWrite, RuntimeDelivery, RuntimeIngress, RuntimeIngressReceiver,
     RuntimeTaskDebouncer, RuntimeTaskEvent, RuntimeUiDebouncer,
 };
+pub use pkg::{spawn as spawn_pkg_operation, PkgOperation};
 pub use ui::{
     apply_ui_command, apply_ui_command_opt, AssistantCommand, DapCommand, LayerCommand,
     PickerCommand, UiCommand,

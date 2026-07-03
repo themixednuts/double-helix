@@ -6,6 +6,7 @@
 pub(crate) mod assistant;
 pub(crate) mod dap;
 pub(crate) mod language_server;
+pub(crate) mod pkg;
 pub(crate) mod plugin;
 
 use std::{
@@ -290,6 +291,7 @@ pub(crate) fn apply_runtime_task_event(
             }
         }
         RuntimeTaskEvent::DapExceptionsConfigured => {}
+        RuntimeTaskEvent::PkgEvent(event) => pkg::apply_event(editor, &event),
         RuntimeTaskEvent::RestoreAssistantHistoryThread {
             record,
             activation,

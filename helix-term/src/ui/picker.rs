@@ -667,6 +667,7 @@ pub struct Picker<T: 'static + Send + Sync, D: 'static> {
     /// If `None`, items are stored as `PickerItemData::Plain`.
     item_data_fn: Option<PickerItemDataFn<T>>,
     selection_changed_handler: Option<PickerSelectionHandler<T, D>>,
+    custom_hints: Vec<crate::widgets::Hint<'static>>,
     marked: Option<HashSet<u32>>,
     ingress: SharedIngress,
     redraw: SharedRedraw,
@@ -843,6 +844,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             model_layer_id: None,
             item_data_fn: None,
             selection_changed_handler: None,
+            custom_hints: Vec::new(),
             marked: None,
             ingress,
             redraw,
@@ -859,6 +861,14 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
 
     pub fn with_selection_changed_handler(mut self, handler: PickerSelectionHandler<T, D>) -> Self {
         self.selection_changed_handler = Some(handler);
+        self
+    }
+
+    pub fn with_custom_hints(
+        mut self,
+        hints: impl IntoIterator<Item = crate::widgets::Hint<'static>>,
+    ) -> Self {
+        self.custom_hints.extend(hints);
         self
     }
 
@@ -1330,6 +1340,23 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             .snapshot()
             .get_matched_item(self.cursor)
             .map(|item| item.data)
+    }
+
+    fn activate_selection(&self, ctx: &mut Context, action: Action) {
+        let marked = self.marked_indices();
+        if marked.is_empty() {
+            if let Some(option) = self.selection() {
+                (self.callback_fn)(ctx, option, action);
+            }
+            return;
+        }
+
+        let snapshot = self.matcher.snapshot();
+        for index in marked {
+            if let Some(option) = snapshot.get_matched_item(index) {
+                (self.callback_fn)(ctx, option.data, action);
+            }
+        }
     }
 
     fn primary_query(&self) -> Arc<str> {
@@ -2100,7 +2127,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
         }
         .render(inner, surface);
 
-        let hints: Vec<_> = PICKER_BINDINGS
+        let mut hints: Vec<_> = PICKER_BINDINGS
             .iter()
             .filter_map(|binding| match binding.hint {
                 PickerHintPolicy::Visible(hint)
@@ -2112,6 +2139,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
                 _ => None,
             })
             .collect();
+        hints.extend(self.custom_hints.iter().cloned());
         crate::widgets::hint_bar(
             surface,
             hint_row,
@@ -2517,9 +2545,7 @@ impl<I: 'static + Send + Sync, D: 'static + Send + Sync> Component for Picker<I,
             }
             PickerBindingAction::Close => return close_fn(self),
             PickerBindingAction::OpenKeep => {
-                if let Some(option) = self.selection() {
-                    (self.callback_fn)(ctx, option, Action::Replace);
-                }
+                self.activate_selection(ctx, Action::Replace);
             }
             PickerBindingAction::Open => {
                 // If the prompt has a history completion and is empty, use enter to accept
@@ -2541,9 +2567,7 @@ impl<I: 'static + Send + Sync, D: 'static + Send + Sync> Component for Picker<I,
                     // Inserting from the history register is a paste.
                     self.handle_prompt_change(true);
                 } else {
-                    if let Some(option) = self.selection() {
-                        (self.callback_fn)(ctx, option, Action::Replace);
-                    }
+                    self.activate_selection(ctx, Action::Replace);
                     if let Some(history_register) = self.prompt.history_register() {
                         if let Err(err) = ctx
                             .editor

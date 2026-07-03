@@ -4,7 +4,9 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use super::{Backend, Record, Stub, View};
-use crate::assistant::{change, config, context, mode, plan, review, terminal, thread, tool};
+use crate::assistant::{
+    change, config, context, mode, plan, profile, review, terminal, thread, tool,
+};
 use crate::collab::{self, location};
 
 pub fn local_backend() -> Backend {
@@ -108,6 +110,7 @@ impl PersistedThread {
                 scope: record.scope.clone(),
                 unread: record.unread,
                 run: record.run.clone(),
+                feedback: record.feedback.clone(),
             }),
             record: PersistedRecord::from_domain(record)?,
         })
@@ -121,6 +124,8 @@ struct PersistedStub {
     scope: PersistedScope,
     unread: bool,
     run: PersistedRun,
+    #[serde(default)]
+    feedback: PersistedFeedback,
 }
 
 impl PersistedStub {
@@ -131,6 +136,7 @@ impl PersistedStub {
             scope: PersistedScope::from(&stub.scope),
             unread: stub.unread,
             run: PersistedRun::from(&stub.run),
+            feedback: PersistedFeedback::from_domain(&stub.feedback),
         }
     }
 
@@ -142,6 +148,7 @@ impl PersistedStub {
             scope: self.scope.into_domain(),
             unread: self.unread,
             run: self.run.into_domain(),
+            feedback: self.feedback.into_domain(),
         }
     }
 }
@@ -161,6 +168,10 @@ struct PersistedRecord {
     unread: bool,
     mode: Option<PersistedModeSet>,
     config: PersistedConfigState,
+    #[serde(default)]
+    profile: Option<PersistedProfile>,
+    #[serde(default)]
+    feedback: PersistedFeedback,
     #[serde(default)]
     review_mode: review::Mode,
     scope: PersistedScope,
@@ -200,6 +211,8 @@ impl PersistedRecord {
             unread: record.unread,
             mode: record.mode.as_ref().map(PersistedModeSet::from_domain),
             config: PersistedConfigState::from_domain(&record.config),
+            profile: record.profile.as_ref().map(PersistedProfile::from_domain),
+            feedback: PersistedFeedback::from_domain(&record.feedback),
             review_mode: record.review_mode,
             scope: PersistedScope::from(&record.scope),
             view: PersistedView::from_domain(&record.view),
@@ -242,6 +255,8 @@ impl PersistedRecord {
             unread: self.unread,
             mode: self.mode.map(PersistedModeSet::into_domain).transpose()?,
             config: self.config.into_domain()?,
+            profile: self.profile.map(PersistedProfile::into_domain),
+            feedback: self.feedback.into_domain(),
             review_mode: self.review_mode,
             usage: thread::Usage::default(),
             commands: Vec::new(),
@@ -565,6 +580,105 @@ impl PersistedToolCall {
             output: self.output,
             subagent: None,
             sandbox: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct PersistedProfile {
+    name: String,
+    mode: Option<String>,
+    config: Vec<PersistedProfileConfig>,
+}
+
+impl PersistedProfile {
+    fn from_domain(profile: &profile::Defaults) -> Self {
+        Self {
+            name: profile.name.clone(),
+            mode: profile.mode.as_ref().map(ToString::to_string),
+            config: profile
+                .config
+                .iter()
+                .map(|(option, value)| PersistedProfileConfig {
+                    option: option.to_string(),
+                    value: value.to_string(),
+                })
+                .collect(),
+        }
+    }
+
+    fn into_domain(self) -> profile::Defaults {
+        profile::Defaults {
+            name: self.name,
+            mode: self.mode.map(mode::Id::new),
+            config: self
+                .config
+                .into_iter()
+                .map(|item| {
+                    (
+                        config::Id::new(item.option),
+                        config::ValueId::new(item.value),
+                    )
+                })
+                .collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct PersistedProfileConfig {
+    option: String,
+    value: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+struct PersistedFeedback {
+    #[serde(default)]
+    rating: PersistedRating,
+    #[serde(default)]
+    note: Option<String>,
+}
+
+impl PersistedFeedback {
+    fn from_domain(feedback: &thread::Feedback) -> Self {
+        Self {
+            rating: PersistedRating::from(feedback.rating),
+            note: feedback.note.clone(),
+        }
+    }
+
+    fn into_domain(self) -> thread::Feedback {
+        thread::Feedback {
+            rating: self.rating.into_domain(),
+            note: self.note,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+enum PersistedRating {
+    #[default]
+    None,
+    Up,
+    Down,
+}
+
+impl From<thread::Rating> for PersistedRating {
+    fn from(rating: thread::Rating) -> Self {
+        match rating {
+            thread::Rating::None => Self::None,
+            thread::Rating::Up => Self::Up,
+            thread::Rating::Down => Self::Down,
+        }
+    }
+}
+
+impl PersistedRating {
+    fn into_domain(self) -> thread::Rating {
+        match self {
+            Self::None => thread::Rating::None,
+            Self::Up => thread::Rating::Up,
+            Self::Down => thread::Rating::Down,
         }
     }
 }
@@ -1287,6 +1401,15 @@ mod tests {
             commands: Vec::new(),
             pending_elicitations: Vec::new(),
             caps: None,
+            profile: Some(profile::Defaults {
+                name: "review".to_string(),
+                mode: Some(mode::Id::new("review")),
+                config: vec![(config::Id::new("thinking"), config::ValueId::new("high"))],
+            }),
+            feedback: thread::Feedback {
+                rating: thread::Rating::Up,
+                note: Some("useful review".to_string()),
+            },
             scope: thread::Scope::new(PathBuf::from(".")),
             view: View {
                 focus: thread::Focus::Messages,
@@ -1319,6 +1442,7 @@ mod tests {
             assert_eq!(listed.len(), 1);
             assert_eq!(listed[0].id, record.id);
             assert_eq!(listed[0].title, record.title);
+            assert_eq!(listed[0].feedback, record.feedback);
 
             let loaded = backend.load(record.id).await.unwrap().unwrap();
             assert_eq!(loaded, record);

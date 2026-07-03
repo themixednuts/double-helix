@@ -1,4 +1,4 @@
-use super::{config, context, history, mode, permission, review, thread};
+use super::{config, context, history, mode, permission, profile, review, thread};
 use crate::DocumentId;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6,6 +6,7 @@ pub enum Action {
     NewThread {
         backend: super::backend::Id,
         scope: thread::Scope,
+        profile: Option<profile::Defaults>,
     },
     LoadThread {
         record: Box<history::Record>,
@@ -107,6 +108,18 @@ pub enum Action {
         thread: thread::Id,
         option: config::Id,
         value: config::ValueId,
+    },
+    SetProfile {
+        thread: thread::Id,
+        profile: profile::Defaults,
+    },
+    SetRating {
+        thread: thread::Id,
+        rating: thread::Rating,
+    },
+    SetNote {
+        thread: thread::Id,
+        note: Option<String>,
     },
     ResolvePermission {
         thread: thread::Id,

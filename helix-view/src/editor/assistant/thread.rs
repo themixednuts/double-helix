@@ -69,8 +69,13 @@ impl Editor {
         &mut self,
         backend: crate::assistant::backend::Id,
         scope: crate::assistant::thread::Scope,
+        profile: Option<crate::assistant::profile::Defaults>,
     ) -> Vec<crate::assistant::effect::Effect> {
-        self.assistant_act(crate::assistant::Action::NewThread { backend, scope })
+        self.assistant_act(crate::assistant::Action::NewThread {
+            backend,
+            scope,
+            profile,
+        })
     }
 
     pub fn cancel_assistant_thread(
@@ -107,6 +112,30 @@ impl Editor {
             option,
             value,
         })
+    }
+
+    pub fn set_assistant_profile(
+        &mut self,
+        thread: crate::assistant::thread::Id,
+        profile: crate::assistant::profile::Defaults,
+    ) -> Vec<crate::assistant::effect::Effect> {
+        self.assistant_act(crate::assistant::Action::SetProfile { thread, profile })
+    }
+
+    pub fn set_assistant_rating(
+        &mut self,
+        thread: crate::assistant::thread::Id,
+        rating: crate::assistant::thread::Rating,
+    ) -> Vec<crate::assistant::effect::Effect> {
+        self.assistant_act(crate::assistant::Action::SetRating { thread, rating })
+    }
+
+    pub fn set_assistant_note(
+        &mut self,
+        thread: crate::assistant::thread::Id,
+        note: Option<String>,
+    ) -> Vec<crate::assistant::effect::Effect> {
+        self.assistant_act(crate::assistant::Action::SetNote { thread, note })
     }
 
     pub fn set_assistant_mode(

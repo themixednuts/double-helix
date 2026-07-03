@@ -526,6 +526,8 @@ pub enum RuntimeTaskEvent {
     ConnectAssistantBackend {
         command: String,
         args: Vec<String>,
+        mcp_servers: Vec<helix_acp::types::McpServer>,
+        profile: Option<helix_view::assistant::profile::Defaults>,
         panel: PanelBehavior,
     },
     /// Cycle the active assistant thread and open the panel.

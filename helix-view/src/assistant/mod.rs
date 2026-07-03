@@ -18,6 +18,7 @@ pub mod mode;
 pub mod model;
 pub mod permission;
 pub mod plan;
+pub mod profile;
 pub mod prompt;
 pub mod review;
 pub mod store;
@@ -92,6 +93,8 @@ mod tests {
             commands: Vec::new(),
             pending_elicitations: Vec::new(),
             caps: None,
+            profile: None,
+            feedback: thread::Feedback::default(),
         });
         thread
     }

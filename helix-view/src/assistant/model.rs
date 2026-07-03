@@ -42,6 +42,8 @@ pub struct ThreadView {
     pub follow: Follow,
     pub mode_name: Option<String>,
     pub model_label: Option<String>,
+    pub profile_name: Option<String>,
+    pub feedback: thread::Feedback,
     pub plan: Vec<plan::Item>,
     pub selected: Option<thread::EntryId>,
     pub folded: Vec<thread::EntryId>,
@@ -126,6 +128,7 @@ pub struct HistoryThread {
     pub title: Option<String>,
     pub unread: bool,
     pub run: thread::Run,
+    pub feedback: thread::Feedback,
 }
 
 impl Follow {
@@ -289,6 +292,7 @@ impl HistoryThread {
             title: self.title,
             unread: self.unread,
             run: self.run,
+            feedback: self.feedback,
         }
     }
 }
@@ -322,6 +326,7 @@ impl Store {
                 title: entry.title,
                 unread: entry.unread,
                 run: entry.run,
+                feedback: entry.feedback,
             })
             .map(HistoryThread::to_model)
             .collect();
@@ -380,6 +385,8 @@ impl Store {
                 content_scroll: active.content_scroll,
                 mode_name: active.mode_name,
                 model_label: active.model_label,
+                active_profile: active.profile_name,
+                feedback: active.feedback,
                 follow: Some(active.follow.to_model()),
                 review_mode: active.review_mode,
                 agent_name: active.title.unwrap_or_else(|| "Agent".to_string()),
@@ -416,6 +423,8 @@ impl Store {
                 content_scroll: 0,
                 mode_name: None,
                 model_label: None,
+                active_profile: None,
+                feedback: thread::Feedback::default(),
                 follow: None,
                 review_mode: review::Mode::Write,
                 agent_name: fallback_agent_name,
@@ -452,6 +461,7 @@ impl Store {
                     title: entry.title.clone(),
                     unread: entry.unread,
                     run: entry.run.clone(),
+                    feedback: entry.feedback.clone(),
                 })
                 .collect(),
             next: page.next.clone(),
@@ -592,6 +602,8 @@ impl Store {
                         .unwrap_or_else(|| next.to_string()),
                 }),
                 model_label: thread.config().selected_value_label("model"),
+                profile_name: thread.profile_name().map(ToOwned::to_owned),
+                feedback: thread.feedback().clone(),
                 plan: thread.plan().to_vec(),
                 selected: thread.selected_entry(),
                 folded: thread.folded_entries().collect(),

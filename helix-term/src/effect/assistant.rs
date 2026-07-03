@@ -76,15 +76,18 @@ pub(crate) fn apply_connect_assistant_backend(
     ingress: crate::runtime::RuntimeIngress,
     command: String,
     args: Vec<String>,
+    mcp_servers: Vec<helix_acp::types::McpServer>,
+    profile: Option<helix_view::assistant::profile::Defaults>,
     panel: helix_view::editor::PanelBehavior,
 ) {
-    let (_, effects) = match editor.connect_assistant_backend(command.clone(), args) {
-        Ok(result) => result,
-        Err(err) => {
-            editor.set_error(format!("Agent failed: {err}"));
-            return;
-        }
-    };
+    let (_, effects) =
+        match editor.connect_assistant_backend(command.clone(), args, mcp_servers, profile) {
+            Ok(result) => result,
+            Err(err) => {
+                editor.set_error(format!("Agent failed: {err}"));
+                return;
+            }
+        };
     editor.apply_assistant_effects(effects);
     editor.persist_assistant_layout();
 

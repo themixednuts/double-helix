@@ -6,7 +6,7 @@ use crate::collab::{FollowState, Location};
 use crate::id::Id as StableId;
 use crate::DocumentId;
 
-use super::{auth, backend, change, config, context, mode, plan, review, terminal, tool};
+use super::{auth, backend, change, config, context, mode, plan, profile, review, terminal, tool};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ThreadKind {}
@@ -84,6 +84,8 @@ pub struct PersistedState {
     pub commands: Vec<Command>,
     pub pending_elicitations: Vec<Elicitation>,
     pub caps: Option<helix_acp::AgentCaps>,
+    pub profile: Option<profile::Defaults>,
+    pub feedback: Feedback,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,6 +105,8 @@ pub struct Thread {
     commands: Vec<Command>,
     pending_elicitations: Vec<Elicitation>,
     caps: Option<helix_acp::AgentCaps>,
+    profile: Option<profile::Active>,
+    feedback: Feedback,
     pub follow: FollowState,
     mode: Option<mode::Set>,
     config: config::State,
@@ -118,6 +122,20 @@ pub struct Snapshot {
     pub draft: String,
     pub context: Vec<context::Item>,
     pub scope: Scope,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Rating {
+    #[default]
+    None,
+    Up,
+    Down,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Feedback {
+    pub rating: Rating,
+    pub note: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -338,6 +356,8 @@ impl Thread {
             commands: Vec::new(),
             pending_elicitations: Vec::new(),
             caps: None,
+            profile: None,
+            feedback: Feedback::default(),
             follow: FollowState::Off,
             mode: None,
             config: config::State::new(Vec::new()),
@@ -448,6 +468,48 @@ impl Thread {
 
     pub fn caps(&self) -> Option<&helix_acp::AgentCaps> {
         self.caps.as_ref()
+    }
+
+    #[must_use]
+    pub fn profile(&self) -> Option<&profile::Active> {
+        self.profile.as_ref()
+    }
+
+    #[must_use]
+    pub fn profile_name(&self) -> Option<&str> {
+        self.profile.as_ref().map(profile::Active::name)
+    }
+
+    pub fn set_profile(&mut self, profile: Option<profile::Defaults>) {
+        self.profile = profile.map(profile::Active::new);
+    }
+
+    pub fn profile_mut(&mut self) -> Option<&mut profile::Active> {
+        self.profile.as_mut()
+    }
+
+    #[must_use]
+    pub fn feedback(&self) -> &Feedback {
+        &self.feedback
+    }
+
+    pub fn set_rating(&mut self, rating: Rating) {
+        self.feedback.rating = rating;
+    }
+
+    pub fn toggle_rating(&mut self, rating: Rating) {
+        self.feedback.rating = if self.feedback.rating == rating {
+            Rating::None
+        } else {
+            rating
+        };
+    }
+
+    pub fn set_note(&mut self, note: Option<String>) {
+        self.feedback.note = note.and_then(|note| {
+            let note = note.trim().to_string();
+            (!note.is_empty()).then_some(note)
+        });
     }
 
     pub fn set_terminals(&mut self, terminals: Vec<terminal::Terminal>) {
@@ -562,6 +624,8 @@ impl Thread {
         self.commands = state.commands;
         self.pending_elicitations = state.pending_elicitations;
         self.caps = state.caps;
+        self.profile = state.profile.map(profile::Active::restored);
+        self.feedback = state.feedback;
     }
 
     #[must_use]

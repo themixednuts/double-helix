@@ -90,14 +90,19 @@ impl Editor {
         &mut self,
         command: String,
         args: Vec<String>,
+        mcp_servers: Vec<helix_acp::types::McpServer>,
+        profile: Option<crate::assistant::profile::Defaults>,
     ) -> anyhow::Result<(
         crate::assistant::backend::Id,
         Vec<crate::assistant::effect::Effect>,
     )> {
         let cwd = std::env::current_dir().unwrap_or_default();
-        let handle = self.spawn_assistant_backend(command, args, Vec::new())?;
-        let effects =
-            self.new_assistant_thread(handle.id.clone(), crate::assistant::thread::Scope::new(cwd));
+        let handle = self.spawn_assistant_backend(command, args, mcp_servers)?;
+        let effects = self.new_assistant_thread(
+            handle.id.clone(),
+            crate::assistant::thread::Scope::new(cwd),
+            profile,
+        );
         Ok((handle.id, effects))
     }
 }

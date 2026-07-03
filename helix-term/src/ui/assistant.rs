@@ -100,6 +100,9 @@ enum AssistantAction {
     SendPrompt,
     OpenConfig,
     CancelRun,
+    RateUp,
+    RateDown,
+    EditNote,
     Primary,
     ToggleFold,
     Yank,
@@ -359,6 +362,21 @@ const MESSAGE_BINDINGS: &[AssistantBinding] = &[
         BindingKey::new(BindingCode::Char('R')),
         AssistantAction::ToggleReviewMode,
         Some(("R", "review", 110)),
+    ),
+    AssistantBinding::new(
+        BindingKey::new(BindingCode::Char('+')),
+        AssistantAction::RateUp,
+        Some(("+/-", "rate", 105)),
+    ),
+    AssistantBinding::new(
+        BindingKey::new(BindingCode::Char('-')),
+        AssistantAction::RateDown,
+        None,
+    ),
+    AssistantBinding::new(
+        BindingKey::new(BindingCode::Char('n')),
+        AssistantAction::EditNote,
+        Some(("n", "note", 102)),
     ),
     AssistantBinding::new(
         BindingKey::new(BindingCode::Char('a')),
@@ -3405,12 +3423,21 @@ impl AssistantPanel {
     fn open_mode_config_picker(&mut self, cx: &mut Context) -> bool {
         use crate::runtime::ui::command::{AssistantCommand, ModeConfigPickerItem, UiCommand};
 
-        let Some((thread, mode, config)) = cx.editor.active_assistant_mode_config() else {
+        let Some((thread, mode, config, active_profile)) = cx.editor.active_assistant_mode_config()
+        else {
             cx.editor.set_status("No active assistant thread");
             return true;
         };
 
         let mut items = Vec::new();
+        items.extend(cx.editor.config().assistant.profiles.iter().map(|profile| {
+            ModeConfigPickerItem::Profile {
+                profile: profile.defaults(),
+                name: profile.name.clone(),
+                agent: profile.agent.clone(),
+                current: active_profile.as_deref() == Some(profile.name.as_str()),
+            }
+        }));
         if let Some(mode) = mode {
             let selected = match mode.selected() {
                 helix_view::assistant::mode::Selected::Current(id) => id,
@@ -3446,6 +3473,48 @@ impl AssistantPanel {
             AssistantCommand::PushModeConfigPicker { thread, items },
         ));
         true
+    }
+
+    fn set_active_rating(
+        &mut self,
+        cx: &mut Context,
+        rating: helix_view::assistant::thread::Rating,
+    ) {
+        let effects = match cx.editor.set_active_assistant_rating(rating) {
+            Ok(effects) => effects,
+            Err(err) => {
+                cx.editor.set_error(err.to_string());
+                return;
+            }
+        };
+        Self::apply_assistant_effects(cx.editor, effects);
+        cx.editor.set_status("Updated assistant thread rating");
+    }
+
+    fn open_note_prompt(&mut self, cx: &mut Context) -> Option<crate::compositor::PostAction> {
+        let current = cx.editor.active_assistant_note().unwrap_or_default();
+        let mut prompt = crate::ui::Prompt::new(
+            "assistant note:".into(),
+            None,
+            |_editor, _input| Vec::new(),
+            |cx: &mut Context, input: &str, event: crate::ui::PromptEvent| {
+                if event != crate::ui::PromptEvent::Validate {
+                    return;
+                }
+                let note = (!input.trim().is_empty()).then(|| input.trim().to_string());
+                let effects = match cx.editor.set_active_assistant_note(note) {
+                    Ok(effects) => effects,
+                    Err(err) => {
+                        cx.editor.set_error(err.to_string());
+                        return;
+                    }
+                };
+                cx.editor.apply_assistant_effects(effects);
+                cx.editor.set_status("Updated assistant thread note");
+            },
+        );
+        prompt.set_line(current, cx.editor);
+        Some(crate::compositor::PostAction::PushLayer(Box::new(prompt)))
     }
 
     fn cancel_active_run(&mut self, cx: &mut Context) {
@@ -3557,6 +3626,15 @@ impl AssistantPanel {
                     }
                     Err(err) => cx.editor.set_status(err.to_string()),
                 }
+            }
+            AssistantAction::RateUp => {
+                self.set_active_rating(cx, helix_view::assistant::thread::Rating::Up);
+            }
+            AssistantAction::RateDown => {
+                self.set_active_rating(cx, helix_view::assistant::thread::Rating::Down);
+            }
+            AssistantAction::EditNote => {
+                return EventResult::Consumed(self.open_note_prompt(cx));
             }
             AssistantAction::AcceptReview => match cx
                 .editor
@@ -4187,6 +4265,27 @@ mod tests {
                         .hint
                         .is_some_and(|(key, label, _)| key == "e" && label == "edit")
             }));
+    }
+
+    #[test]
+    fn message_bindings_include_feedback_hints() {
+        let bindings = AssistantPanel::bindings_for_layer(AssistantLayer::Messages);
+
+        assert!(bindings.iter().any(|binding| {
+            binding.action == AssistantAction::RateUp
+                && binding
+                    .hint
+                    .is_some_and(|(key, label, _)| key == "+/-" && label == "rate")
+        }));
+        assert!(bindings
+            .iter()
+            .any(|binding| binding.action == AssistantAction::RateDown));
+        assert!(bindings.iter().any(|binding| {
+            binding.action == AssistantAction::EditNote
+                && binding
+                    .hint
+                    .is_some_and(|(key, label, _)| key == "n" && label == "note")
+        }));
     }
 
     #[test]

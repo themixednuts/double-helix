@@ -2,7 +2,7 @@ mod local;
 
 use std::sync::Arc;
 
-use super::{backend, config, context, mode, plan, review, terminal, thread};
+use super::{backend, config, context, mode, plan, profile, review, terminal, thread};
 use crate::collab::FollowState;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -36,6 +36,7 @@ pub struct Stub {
     pub scope: thread::Scope,
     pub unread: bool,
     pub run: thread::Run,
+    pub feedback: thread::Feedback,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,6 +59,8 @@ pub struct Record {
     pub commands: Vec<thread::Command>,
     pub pending_elicitations: Vec<thread::Elicitation>,
     pub caps: Option<helix_acp::AgentCaps>,
+    pub profile: Option<profile::Defaults>,
+    pub feedback: thread::Feedback,
     pub scope: thread::Scope,
     pub view: View,
     pub terminals: Vec<terminal::Terminal>,
@@ -119,6 +122,7 @@ impl State {
         entry.scope = thread.clone_scope();
         entry.unread = thread.unread();
         entry.run = thread.run().clone();
+        entry.feedback = thread.feedback().clone();
     }
 
     pub fn upsert(&mut self, entry: Stub) {
@@ -174,6 +178,7 @@ impl Stub {
             scope: thread.clone_scope(),
             unread: thread.unread(),
             run: thread.run().clone(),
+            feedback: thread.feedback().clone(),
         }
     }
 }
@@ -194,6 +199,7 @@ impl Stub {
             scope,
             unread: false,
             run: thread::Run::Idle,
+            feedback: thread::Feedback::default(),
         }
     }
 }
@@ -220,6 +226,8 @@ impl Record {
             commands: thread.commands().to_vec(),
             pending_elicitations: thread.pending_elicitations().to_vec(),
             caps: thread.caps().cloned(),
+            profile: thread.profile().map(|profile| profile.defaults().clone()),
+            feedback: thread.feedback().clone(),
             scope: thread.clone_scope(),
             view: View {
                 focus: thread.focus(),
@@ -253,6 +261,8 @@ impl Record {
             commands: Vec::new(),
             pending_elicitations: Vec::new(),
             caps: None,
+            profile: self.profile,
+            feedback: self.feedback,
         });
         thread.restore_transient_view(
             self.view.focus,
@@ -317,6 +327,7 @@ mod tests {
             scope: thread::Scope::new(PathBuf::from(".")),
             unread: false,
             run: thread::Run::Idle,
+            feedback: thread::Feedback::default(),
         }
     }
 

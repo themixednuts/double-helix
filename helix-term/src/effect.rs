@@ -334,10 +334,20 @@ pub(crate) fn apply_runtime_task_event(
         RuntimeTaskEvent::ConnectAssistantBackend {
             command,
             args,
+            mcp_servers,
+            profile,
             panel,
         } => {
             let before: Vec<_> = editor.assistant.threads().map(|t| t.id).collect();
-            assistant::apply_connect_assistant_backend(editor, ingress, command, args, panel);
+            assistant::apply_connect_assistant_backend(
+                editor,
+                ingress,
+                command,
+                args,
+                mcp_servers,
+                profile,
+                panel,
+            );
             emit_new_thread_events(editor, &plugin_manager, &before);
         }
         RuntimeTaskEvent::CycleAssistantThread { delta } => {

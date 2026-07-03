@@ -111,7 +111,7 @@ impl Editor {
         let backend = thread
             .backend_id()
             .context("Active assistant thread is not backend-backed")?;
-        Ok(self.new_assistant_thread(backend, thread.clone_scope()))
+        Ok(self.new_assistant_thread(backend, thread.clone_scope(), None))
     }
 
     pub fn cancel_active_assistant_thread(
@@ -231,9 +231,54 @@ impl Editor {
         crate::assistant::thread::Id,
         Option<crate::assistant::mode::Set>,
         crate::assistant::config::State,
+        Option<String>,
     )> {
         let (id, thread) = self.assistant.active_thread()?;
-        Some((id, thread.mode().cloned(), thread.config().clone()))
+        Some((
+            id,
+            thread.mode().cloned(),
+            thread.config().clone(),
+            thread.profile_name().map(ToOwned::to_owned),
+        ))
+    }
+
+    pub fn active_assistant_note(&self) -> Option<String> {
+        self.assistant
+            .active_thread()
+            .and_then(|(_, thread)| thread.feedback().note.clone())
+    }
+
+    pub fn set_active_assistant_profile(
+        &mut self,
+        profile: crate::assistant::profile::Defaults,
+    ) -> anyhow::Result<Vec<crate::assistant::effect::Effect>> {
+        let thread = self
+            .assistant
+            .active_id()
+            .context("No active assistant thread")?;
+        Ok(self.set_assistant_profile(thread, profile))
+    }
+
+    pub fn set_active_assistant_rating(
+        &mut self,
+        rating: crate::assistant::thread::Rating,
+    ) -> anyhow::Result<Vec<crate::assistant::effect::Effect>> {
+        let thread = self
+            .assistant
+            .active_id()
+            .context("No active assistant thread")?;
+        Ok(self.set_assistant_rating(thread, rating))
+    }
+
+    pub fn set_active_assistant_note(
+        &mut self,
+        note: Option<String>,
+    ) -> anyhow::Result<Vec<crate::assistant::effect::Effect>> {
+        let thread = self
+            .assistant
+            .active_id()
+            .context("No active assistant thread")?;
+        Ok(self.set_assistant_note(thread, note))
     }
 
     pub fn cycle_active_assistant_thread(

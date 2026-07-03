@@ -19,6 +19,20 @@ Assistant completion notifications are enabled by default:
 notify-on-done = true
 ```
 
+Profiles are optional named bundles for starting or switching assistant sessions:
+
+```toml
+[[editor.assistant.profiles]]
+name = "review"
+agent = "Claude"
+mode = "review"
+model = "claude-opus-4"
+config = { thinking = "high" }
+mcp-servers = ["fs", "git"]
+```
+
+`agent` selects a configured `[[editor.agents]]` entry by name. If omitted, Helix uses the current agent when switching an active thread, or the first configured agent when starting from `:assistant-profile`. `mode`, `model`, and `config` are applied through the normal ACP session mode/config paths. `mcp-servers` filters the selected agent's configured MCP servers by their `name`.
+
 Open or connect with `:assistant-open` and `:assistant-connect`. With no arguments, `:assistant-connect` shows configured agents. With arguments, it starts that command directly. Browse previous sessions with `:assistant-open-history`; press `d` on a selected session and then `d` again to confirm deletion.
 
 ## Panel Keys
@@ -54,6 +68,8 @@ Messages focus is a single transcript list. Cards are entries in that list; they
 | `e` | Edit the selected user prompt |
 | `r` | Retry the last user prompt after a failed or canceled run |
 | `R` | Toggle write/review mode for the active thread |
+| `+` / `-` | Toggle a local up/down rating for the thread |
+| `n` | Add, edit, or clear a local thread note |
 | `a` / `A` | Accept the selected/all pending review changes |
 | `x` / `X` | Reject the selected/all pending review changes |
 | `Esc` | Return to Input |
@@ -79,7 +95,9 @@ Authentication method choice and elicitation form editing are transient layers e
 | `Esc` | Pop back to Messages |
 | `Ctrl-c` | Cancel pending assistant work |
 
-The panel header shows the active thread title, focus mode, current mode/model when the agent provides them, compact token usage, and run state. The first token number is cumulative thread usage, and `last` is the most recent turn.
+The panel header shows the active thread title, focus mode, current profile, current mode/model when the agent provides them, local rating/note state, compact token usage, and run state. The first token number is cumulative thread usage, and `last` is the most recent turn.
+
+Ratings and notes are local history metadata only. They are persisted with the thread record and shown in `:assistant-open-history`, where the picker can be filtered by `up`, `down`, or `note`; they are not sent to the agent or any telemetry service.
 
 ## Permissions
 
@@ -128,7 +146,7 @@ Type `/` at the start of the input to open slash-command completion. Commands co
 
 ACP elicitations render as request cards in the thread. Form cards list text, textarea, select, and boolean fields with required markers. Press `Enter` from Messages to edit a form as a transient layer. URL cards show the URL; press `y` to yank it.
 
-The selector opened with `Ctrl-o` lists session modes first, followed by session config options such as model and thought level. Selecting a row applies it through the active ACP session; pending values show in the header while the agent confirms them.
+The selector opened with `Ctrl-o` lists configured profiles first, then session modes and config options such as model and thought level. Selecting a profile sets the active thread profile and applies its mode/config defaults through the active ACP session; pending values show in the header while the agent confirms them. `:assistant-profile` opens the profile picker directly and can start a profiled session when no assistant thread is active.
 
 Thought entries render as dim `thinking...` blocks and are folded by default. `Tab` expands or collapses the selected thought like other foldable entries.
 

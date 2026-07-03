@@ -3604,6 +3604,8 @@ pub(crate) fn do_assistant_connect(
     _editor: &mut helix_view::Editor,
     command: String,
     cmd_args: Vec<String>,
+    mcp_servers: Vec<helix_acp::types::McpServer>,
+    profile: Option<helix_view::assistant::profile::Defaults>,
     ingress: crate::runtime::RuntimeIngress,
     _agent_index: Option<usize>,
     _activate_input: bool,
@@ -3611,6 +3613,8 @@ pub(crate) fn do_assistant_connect(
     ingress.task(crate::runtime::RuntimeTaskEvent::ConnectAssistantBackend {
         command,
         args: cmd_args,
+        mcp_servers,
+        profile,
         panel: PanelBehavior::Open,
     });
 
@@ -3634,6 +3638,8 @@ fn assistant_connect(
             cx.editor,
             command,
             cmd_args,
+            Vec::new(),
+            None,
             cx.ingress.clone(),
             None,
             false,
@@ -3698,6 +3704,8 @@ fn assistant_open(
             cx.editor,
             agent.command,
             agent.args,
+            agent.mcp_servers,
+            None,
             cx.ingress.clone(),
             Some(0),
             false,
@@ -3705,6 +3713,28 @@ fn assistant_open(
     }
 
     cx.spawn_ui(async { Ok(UiCommand::Assistant(AssistantCommand::OpenPanel)) });
+
+    Ok(())
+}
+
+fn assistant_profile(
+    cx: &mut compositor::Context,
+    _args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+
+    let profiles = cx.editor.config().assistant.profiles.clone();
+    if profiles.is_empty() {
+        bail!("No assistant profiles configured");
+    }
+    cx.spawn_ui(async move {
+        Ok(UiCommand::Assistant(AssistantCommand::PushProfilePicker {
+            profiles,
+        }))
+    });
 
     Ok(())
 }
@@ -5402,6 +5432,17 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         aliases: &["sessions"],
         doc: "Browse and load assistant history for the current scope.",
         fun: assistant_open_history,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "assistant-profile",
+        aliases: &["profile"],
+        doc: "Select an assistant profile for the active or next assistant thread.",
+        fun: assistant_profile,
         completer: CommandCompleter::none(),
         signature: Signature {
             positionals: (0, Some(0)),

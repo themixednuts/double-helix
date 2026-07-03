@@ -24,12 +24,56 @@ fn connect_assistant_backend(
     ingress: &crate::runtime::RuntimeIngress,
     command: String,
     args: Vec<String>,
+    mcp_servers: Vec<helix_acp::types::McpServer>,
+    profile: Option<helix_view::assistant::profile::Defaults>,
 ) {
     ingress.task(RuntimeTaskEvent::ConnectAssistantBackend {
         command,
         args,
+        mcp_servers,
+        profile,
         panel: helix_view::editor::PanelBehavior::Open,
     });
+}
+
+fn profile_agent(
+    editor: &helix_view::Editor,
+    profile: &helix_view::assistant::profile::Definition,
+) -> Option<helix_view::editor::AgentConfig> {
+    if let Some(agent_name) = &profile.agent {
+        return editor
+            .config()
+            .agents
+            .iter()
+            .find(|agent| agent.name == *agent_name)
+            .cloned();
+    }
+    editor
+        .active_assistant_backend_id()
+        .and_then(|backend| editor.assistant_agent(&backend))
+        .or_else(|| editor.config().agents.first().cloned())
+}
+
+fn connect_profile(
+    editor: &mut helix_view::Editor,
+    ingress: &crate::runtime::RuntimeIngress,
+    profile: &helix_view::assistant::profile::Definition,
+) {
+    let Some(agent) = profile_agent(editor, profile) else {
+        editor.set_error("No assistant agent available for profile");
+        return;
+    };
+    let defaults = helix_view::assistant::profile::assemble_session_defaults(
+        Some(profile),
+        &agent.mcp_servers,
+    );
+    connect_assistant_backend(
+        ingress,
+        agent.command,
+        agent.args,
+        defaults.mcp_servers,
+        defaults.profile,
+    );
 }
 
 #[derive(Debug, Clone)]
@@ -74,7 +118,13 @@ pub(crate) fn apply_assistant_command(
             } else if editor.has_assistant_threads() {
                 compositor.push(Box::new(AssistantPanel::new()));
             } else if let Some(agent) = editor.config().agents.first().cloned() {
-                connect_assistant_backend(&ingress, agent.command, agent.args);
+                connect_assistant_backend(
+                    &ingress,
+                    agent.command,
+                    agent.args,
+                    agent.mcp_servers,
+                    None,
+                );
             } else {
                 compositor.push(Box::new(AssistantPanel::new()));
             }
@@ -95,7 +145,13 @@ pub(crate) fn apply_assistant_command(
                 panel.activate_input(editor);
                 compositor.push(Box::new(panel));
             } else if let Some(agent) = editor.config().agents.first().cloned() {
-                connect_assistant_backend(&ingress, agent.command, agent.args);
+                connect_assistant_backend(
+                    &ingress,
+                    agent.command,
+                    agent.args,
+                    agent.mcp_servers,
+                    None,
+                );
             } else {
                 let mut panel = AssistantPanel::new();
                 panel.activate_input(editor);
@@ -115,7 +171,13 @@ pub(crate) fn apply_assistant_command(
                 panel.focus_messages(editor);
                 compositor.push(Box::new(panel));
             } else if let Some(agent) = editor.config().agents.first().cloned() {
-                connect_assistant_backend(&ingress, agent.command, agent.args);
+                connect_assistant_backend(
+                    &ingress,
+                    agent.command,
+                    agent.args,
+                    agent.mcp_servers,
+                    None,
+                );
             } else {
                 let mut panel = AssistantPanel::new();
                 panel.focus_messages(editor);
@@ -192,6 +254,25 @@ pub(crate) fn apply_assistant_command(
             ));
 
             let columns = [
+                crate::ui::PickerColumn::new(
+                    "rating",
+                    |item: &helix_view::assistant::history::Stub, _: &()| match item.feedback.rating
+                    {
+                        helix_view::assistant::thread::Rating::None => "".into(),
+                        helix_view::assistant::thread::Rating::Up => "up".into(),
+                        helix_view::assistant::thread::Rating::Down => "down".into(),
+                    },
+                ),
+                crate::ui::PickerColumn::new(
+                    "note",
+                    |item: &helix_view::assistant::history::Stub, _: &()| {
+                        if item.feedback.note.is_some() {
+                            "note".into()
+                        } else {
+                            "".into()
+                        }
+                    },
+                ),
                 crate::ui::PickerColumn::new(
                     "title",
                     |item: &helix_view::assistant::history::Stub, _: &()| {
@@ -318,6 +399,57 @@ pub(crate) fn apply_assistant_command(
 
             compositor.push(Box::new(crate::ui::overlay::overlaid(picker)));
         }
+        AssistantCommand::PushProfilePicker { profiles } => {
+            if profiles.is_empty() {
+                editor.set_status("No assistant profiles configured");
+                return;
+            }
+
+            let columns = [
+                crate::ui::PickerColumn::new(
+                    "profile",
+                    |item: &helix_view::assistant::profile::Definition, _: &()| {
+                        item.name.as_str().into()
+                    },
+                ),
+                crate::ui::PickerColumn::new(
+                    "agent",
+                    |item: &helix_view::assistant::profile::Definition, _: &()| {
+                        item.agent.as_deref().unwrap_or("current").into()
+                    },
+                ),
+            ];
+
+            let picker = crate::ui::Picker::new(
+                columns,
+                0,
+                profiles,
+                (),
+                crate::ui::PickerRuntime::new(editor),
+                ingress.clone(),
+                move |cx: &mut crate::compositor::Context,
+                      item: &helix_view::assistant::profile::Definition,
+                      _action| {
+                    if cx.editor.active_assistant_mode_config().is_some() {
+                        let effects = match cx.editor.set_active_assistant_profile(item.defaults())
+                        {
+                            Ok(effects) => effects,
+                            Err(err) => {
+                                cx.editor.set_error(err.to_string());
+                                return;
+                            }
+                        };
+                        cx.editor.apply_assistant_effects(effects);
+                        cx.editor
+                            .set_status(format!("Assistant profile: {}", item.name));
+                    } else {
+                        connect_profile(cx.editor, &cx.ingress, item);
+                    }
+                },
+            );
+
+            compositor.push(Box::new(crate::ui::overlay::overlaid(picker)));
+        }
         AssistantCommand::PushDetachContextPicker { items } => {
             let picker = crate::ui::Picker::new(
                 [crate::ui::PickerColumn::new(
@@ -353,6 +485,7 @@ pub(crate) fn apply_assistant_command(
             let columns = [
                 crate::ui::PickerColumn::new("kind", |item: &ModeConfigPickerItem, _: &()| {
                     match item {
+                        ModeConfigPickerItem::Profile { .. } => "profile".into(),
                         ModeConfigPickerItem::Mode { .. } => "mode".into(),
                         ModeConfigPickerItem::Config { category, .. } => {
                             category.as_deref().unwrap_or("config").into()
@@ -361,12 +494,21 @@ pub(crate) fn apply_assistant_command(
                 }),
                 crate::ui::PickerColumn::new("name", |item: &ModeConfigPickerItem, _: &()| {
                     match item {
+                        ModeConfigPickerItem::Profile { name, .. } => name.as_str().into(),
                         ModeConfigPickerItem::Mode { name, .. }
                         | ModeConfigPickerItem::Config { name, .. } => name.as_str().into(),
                     }
                 }),
                 crate::ui::PickerColumn::new("value", |item: &ModeConfigPickerItem, _: &()| {
                     match item {
+                        ModeConfigPickerItem::Profile { agent, current, .. } => {
+                            let label = agent.as_deref().unwrap_or("current agent");
+                            if *current {
+                                format!("{label} current").into()
+                            } else {
+                                label.into()
+                            }
+                        }
                         ModeConfigPickerItem::Mode { current, .. } => {
                             if *current { "current" } else { "" }.into()
                         }
@@ -394,6 +536,9 @@ pub(crate) fn apply_assistant_command(
                 ingress,
                 move |cx: &mut crate::compositor::Context, item: &ModeConfigPickerItem, _action| {
                     let effects = match item {
+                        ModeConfigPickerItem::Profile { profile, .. } => {
+                            cx.editor.set_assistant_profile(thread, profile.clone())
+                        }
                         ModeConfigPickerItem::Mode { id, .. } => {
                             cx.editor.set_assistant_mode(thread, id.clone())
                         }
@@ -436,7 +581,13 @@ pub(crate) fn apply_assistant_command(
                 move |cx: &mut crate::compositor::Context,
                       item: &helix_view::editor::AgentConfig,
                       _action| {
-                    connect_assistant_backend(&cx.ingress, item.command.clone(), item.args.clone());
+                    connect_assistant_backend(
+                        &cx.ingress,
+                        item.command.clone(),
+                        item.args.clone(),
+                        item.mcp_servers.clone(),
+                        None,
+                    );
                 },
             );
 

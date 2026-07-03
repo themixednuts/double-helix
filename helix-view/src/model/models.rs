@@ -165,6 +165,10 @@ pub struct AssistantModel {
     pub mode_name: Option<String>,
     /// Active assistant model label.
     pub model_label: Option<String>,
+    /// Active assistant profile label.
+    pub active_profile: Option<String>,
+    /// Local active thread rating/note.
+    pub feedback: crate::assistant::thread::Feedback,
     /// Active assistant follow status.
     pub follow: Option<AssistantFollow>,
     /// Active assistant write/review mode.
@@ -399,6 +403,18 @@ impl AssistantModel {
                 tone: AssistantHeaderTone::Default,
             });
         }
+        if let Some(profile) = &self.active_profile {
+            trailing.push(AssistantHeaderItem {
+                label: format!("profile {profile}"),
+                tone: AssistantHeaderTone::Default,
+            });
+        }
+        if let Some(feedback) = self.feedback_label() {
+            trailing.push(AssistantHeaderItem {
+                label: feedback,
+                tone: AssistantHeaderTone::Default,
+            });
+        }
         if let Some(status) = &self.agent_status {
             trailing.push(AssistantHeaderItem {
                 label: status.clone(),
@@ -430,6 +446,21 @@ impl AssistantModel {
         }
 
         AssistantHeaderModel { leading, trailing }
+    }
+
+    #[must_use]
+    pub fn feedback_label(&self) -> Option<String> {
+        let rating = match self.feedback.rating {
+            crate::assistant::thread::Rating::None => "",
+            crate::assistant::thread::Rating::Up => "rated up",
+            crate::assistant::thread::Rating::Down => "rated down",
+        };
+        match (rating.is_empty(), self.feedback.note.is_some()) {
+            (true, false) => None,
+            (false, false) => Some(rating.to_string()),
+            (true, true) => Some("note".to_string()),
+            (false, true) => Some(format!("{rating} · note")),
+        }
     }
 
     #[must_use]
@@ -544,6 +575,7 @@ pub struct AssistantHistoryEntry {
     pub title: Option<String>,
     pub unread: bool,
     pub run: thread::Run,
+    pub feedback: crate::assistant::thread::Feedback,
 }
 
 #[derive(Debug, Clone)]

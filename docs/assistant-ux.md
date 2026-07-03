@@ -8,7 +8,7 @@ The panel participates in editor layout as chrome beside the editor.
 
 The panel has one header line and one footer status row.
 
-The header shows the active thread title, focus mode, assistant mode, model, token usage, and run state.
+The header shows the active thread title, focus mode, active profile when set, assistant mode, model, local rating/note state, token usage, and run state.
 
 The footer shows status only: the active layer badge and, in Messages, the selection position. It never lists shortcuts.
 
@@ -56,6 +56,8 @@ The prompt supports `@` mention triggers and `/` command triggers.
 
 The mode/model/config selector is opened as a standard picker.
 
+Configured agent profiles are rows in that selector before mode and config rows.
+
 Messages mode uses one list grammar.
 
 `j` and `k` move the selected entry.
@@ -75,6 +77,12 @@ Messages mode uses one list grammar.
 `e` edits the selected entry when it is a user prompt.
 
 `e` on non-user entries is a no-op with a status note.
+
+`+` toggles a local up rating for the thread.
+
+`-` toggles a local down rating for the thread.
+
+`n` opens a standard prompt to add, edit, or clear the local thread note.
 
 Cards are list entries.
 
@@ -106,7 +114,9 @@ Ctrl-c is the explicit cancel path for pending assistant work.
 
 Popups are standard editor components.
 
-Mode, model, config, session history, permission requests, and confirmations use standard picker or confirm behavior.
+Mode, model, config, profiles, session history, permission requests, and confirmations use standard picker or confirm behavior.
+
+Thread ratings and notes are local persisted history metadata only.
 
 Popups stack above the docked panel.
 

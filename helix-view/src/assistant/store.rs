@@ -358,8 +358,13 @@ impl Store {
                         thread::Event::Follow(location) => Some(location.clone()),
                         _ => None,
                     };
+                    let event_applies_profile_mode = matches!(event, thread::Event::Mode(_));
+                    let event_applies_profile_config = matches!(event, thread::Event::Config(_));
                     state.apply(event);
                     let mut effects = Vec::new();
+                    if event_applies_profile_mode || event_applies_profile_config {
+                        effects.extend(Self::apply_profile_defaults(thread, state));
+                    }
                     if let Some(location) = publish_location {
                         effects.push(effect::Effect::PublishLocation {
                             thread,
@@ -608,6 +613,35 @@ impl Store {
                     } else {
                         Vec::new()
                     }
+                } else {
+                    Vec::new()
+                }
+            }
+            action::Action::SetProfile { thread, profile } => {
+                if let Some(state) = self.thread_mut(thread) {
+                    state.set_profile(Some(profile));
+                    let mut effects = Self::apply_profile_defaults(thread, state);
+                    effects.push(effect::Effect::Save { thread });
+                    effects.push(effect::Effect::SyncModel);
+                    effects
+                } else {
+                    Vec::new()
+                }
+            }
+            action::Action::SetRating { thread, rating } => {
+                if let Some(state) = self.thread_mut(thread) {
+                    state.toggle_rating(rating);
+                    self.sync_history(thread);
+                    vec![effect::Effect::Save { thread }, effect::Effect::SyncModel]
+                } else {
+                    Vec::new()
+                }
+            }
+            action::Action::SetNote { thread, note } => {
+                if let Some(state) = self.thread_mut(thread) {
+                    state.set_note(note);
+                    self.sync_history(thread);
+                    vec![effect::Effect::Save { thread }, effect::Effect::SyncModel]
                 } else {
                     Vec::new()
                 }
@@ -968,8 +1002,15 @@ impl Store {
                 effects.push(effect::Effect::SyncModel);
                 effects
             }
-            action::Action::NewThread { backend, scope } => {
+            action::Action::NewThread {
+                backend,
+                scope,
+                profile,
+            } => {
                 let thread = self.create(thread::Origin::Local, scope.clone());
+                if let Some(state) = self.thread_mut(thread) {
+                    state.set_profile(profile);
+                }
                 let _ = self.activate(thread);
                 self.sync_history(thread);
                 vec![
@@ -1031,6 +1072,62 @@ impl Store {
 }
 
 impl Store {
+    fn apply_profile_defaults(
+        thread: thread::Id,
+        state: &mut thread::Thread,
+    ) -> Vec<effect::Effect> {
+        let Some(profile) = state.profile() else {
+            return Vec::new();
+        };
+
+        let mut effects = Vec::new();
+        let pending_mode = profile.mode_pending().cloned();
+        let pending_config = profile.config_pending().map(|config| config.to_vec());
+
+        if let Some(mode) = pending_mode {
+            if let Some(mode_set) = state.mode_mut() {
+                if mode_set.set_pending(mode.clone()).is_ok() {
+                    if let thread::Origin::Backend { backend, .. } = state.origin() {
+                        effects.push(effect::Effect::SendBackendCommand {
+                            backend: backend.clone(),
+                            command: backend::Command::SetMode { thread, mode },
+                        });
+                    }
+                }
+                if let Some(profile) = state.profile_mut() {
+                    profile.mark_mode_applied();
+                }
+            }
+        }
+
+        if let Some(config) = pending_config {
+            if state.config().items().next().is_some() {
+                for (option, value) in config {
+                    if state
+                        .config_mut()
+                        .set_pending(&option, value.clone())
+                        .is_ok()
+                    {
+                        if let thread::Origin::Backend { backend, .. } = state.origin() {
+                            effects.push(effect::Effect::SendBackendCommand {
+                                backend: backend.clone(),
+                                command: backend::Command::SetConfig {
+                                    thread,
+                                    option,
+                                    value,
+                                },
+                            });
+                        }
+                    }
+                }
+                if let Some(profile) = state.profile_mut() {
+                    profile.mark_config_applied();
+                }
+            }
+        }
+        effects
+    }
+
     fn next_id(&self) -> thread::Id {
         let next = self
             .threads()
@@ -1508,6 +1605,7 @@ mod tests {
         let effects = store.act(action::Action::NewThread {
             backend: backend.clone(),
             scope: scope.clone(),
+            profile: None,
         });
 
         assert!(effects.iter().any(|effect| {
@@ -1752,6 +1850,7 @@ mod tests {
                 scope: scope.clone(),
                 unread: false,
                 run: thread::Run::Idle,
+                feedback: thread::Feedback::default(),
             }],
             None,
         );

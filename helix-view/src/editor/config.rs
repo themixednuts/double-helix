@@ -455,16 +455,18 @@ pub struct AgentConfig {
     pub theme: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", default, deny_unknown_fields)]
 pub struct AssistantConfig {
     pub notify_on_done: bool,
+    pub profiles: Vec<crate::assistant::profile::Definition>,
 }
 
 impl Default for AssistantConfig {
     fn default() -> Self {
         Self {
             notify_on_done: true,
+            profiles: Vec::new(),
         }
     }
 }

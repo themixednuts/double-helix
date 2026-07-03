@@ -1015,6 +1015,7 @@ async fn handle_command(
                         scope: scope.clone(),
                         unread: false,
                         run: thread::Run::Idle,
+                        feedback: thread::Feedback::default(),
                     })
                     .collect();
                 let _ = tx

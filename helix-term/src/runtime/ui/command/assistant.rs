@@ -11,6 +11,9 @@ pub enum AssistantCommand {
     PushConfiguredAgentsPicker {
         agents: Vec<AgentConfig>,
     },
+    PushProfilePicker {
+        profiles: Vec<helix_view::assistant::profile::Definition>,
+    },
     /// Show assistant history entries using normalized history stubs.
     PushHistoryPicker {
         scope: helix_view::assistant::thread::Scope,
@@ -38,6 +41,12 @@ pub enum ModeConfigPickerItem {
     Mode {
         id: helix_view::assistant::mode::Id,
         name: String,
+        current: bool,
+    },
+    Profile {
+        profile: helix_view::assistant::profile::Defaults,
+        name: String,
+        agent: Option<String>,
         current: bool,
     },
     Config {

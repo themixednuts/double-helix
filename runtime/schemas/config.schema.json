@@ -32,6 +32,13 @@
       "type": "array",
       "items": { "type": "string" }
     },
+    "assistantProfileValue": {
+      "oneOf": [
+        { "type": "string" },
+        { "type": "boolean" },
+        { "type": "integer" }
+      ]
+    },
     "severity": {
       "type": "string",
       "enum": ["hint", "info", "warning", "error"]
@@ -341,6 +348,21 @@
               "name": { "type": "string" },
               "command": { "type": "string" },
               "args": { "$ref": "#/$defs/arrayOfStrings" },
+              "mcp-servers": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "required": ["name"],
+                  "properties": {
+                    "type": { "type": "string" },
+                    "name": { "type": "string" },
+                    "command": { "type": "string" },
+                    "args": { "$ref": "#/$defs/arrayOfStrings" },
+                    "url": { "type": "string" }
+                  }
+                }
+              },
               "theme": { "type": "string" }
             }
           }
@@ -359,7 +381,26 @@
           "type": "object",
           "additionalProperties": false,
           "properties": {
-            "notify-on-done": { "type": "boolean" }
+            "notify-on-done": { "type": "boolean" },
+            "profiles": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["name"],
+                "properties": {
+                  "name": { "type": "string" },
+                  "agent": { "type": "string" },
+                  "mode": { "type": "string" },
+                  "model": { "$ref": "#/$defs/assistantProfileValue" },
+                  "config": {
+                    "type": "object",
+                    "additionalProperties": { "$ref": "#/$defs/assistantProfileValue" }
+                  },
+                  "mcp-servers": { "$ref": "#/$defs/arrayOfStrings" }
+                }
+              }
+            }
           }
         },
         "editing-engine": { "type": "string", "enum": ["helix", "vim"] }

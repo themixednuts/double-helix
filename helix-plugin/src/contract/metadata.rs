@@ -40,6 +40,8 @@ pub enum Capability {
     Tabs,
     /// Floating window overlays.
     Floats,
+    /// Package-manager backend registration.
+    PkgBackend,
 }
 
 /// Description of a single event kind in the host's catalog.
@@ -83,6 +85,7 @@ impl Capability {
         Capability::Splits,
         Capability::Tabs,
         Capability::Floats,
+        Capability::PkgBackend,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -97,6 +100,7 @@ impl Capability {
             Capability::Splits => "splits",
             Capability::Tabs => "tabs",
             Capability::Floats => "floats",
+            Capability::PkgBackend => "pkg-backend",
         }
     }
 }

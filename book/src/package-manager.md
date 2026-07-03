@@ -3,7 +3,8 @@
 `dhx pkg` installs editor runtime tools into the Double Helix user data
 directory. It supports LSP servers, DAP adapters, and package-managed grammars
 from the builtin registry using GitHub release assets, direct archives, npm,
-pip, cargo, go, grammar git sources, and system PATH probes.
+pip, cargo, go, grammar git sources, system PATH probes, native OS package
+managers, and explicitly allowed plugin backends.
 
 ```sh
 dhx pkg search rust
@@ -55,10 +56,63 @@ the locked source is remote and not already available locally.
 - `go`: uses system Go; installs with `GOBIN=... go install module@version`.
 - `git` grammars: uses helix-loader's existing grammar fetch/build pipeline.
 - `system`: verifies a command exists on `PATH` and records a receipt.
+- `native`: delegates to WinGet, Homebrew, apt, dnf, or pacman and records the
+  manager package as a global install.
+- `plugin`: delegates to a plugin-registered backend allowed by policy.
 
 Node/npm, Python, Cargo, and Go are prerequisites when installing packages that
 use those backends; `dhx pkg` detects missing runtimes and reports the missing
 tool. Registry entries are declarative and do not run arbitrary install scripts.
+Artifacts are tried in registry order for the current OS and architecture; the
+first available backend wins.
+
+## Native Managers
+
+Native package managers install globally and may need elevation. Double Helix
+does not elevate silently. If a native manager reports a permission error, the
+error includes the exact command to run yourself, for example:
+
+```text
+sudo apt install clangd
+winget install --id LLVM.LLVM --exact
+```
+
+Enable or block native manager use with:
+
+```toml
+[pkg]
+allow-native = "prompt" # "true", "false", or "prompt"
+```
+
+Native receipts record the manager, package ID, and reported version. Native
+packages do not create shims; command resolution finds their binaries on `PATH`.
+
+## Policy
+
+Install policy lives under `[pkg.policy]`:
+
+```toml
+[pkg.policy]
+run-scripts = false
+allow-build = true
+min-release-age-days = 0
+blocked-backends = ["plugin"]
+allowed-sources = ["https://github.com/*"]
+allowed-plugin-backends = []
+```
+
+Policy is checked before a backend runs. `run-scripts = false` keeps npm
+scripts disabled. `allow-build = false` rejects cargo, go, and grammar git
+builds. `min-release-age-days` refuses fresh releases when publish timestamps
+are available from GitHub, npm, PyPI, or crates.io; undated sources are skipped
+with a warning.
+
+Plugin package backends always require an explicit allowlist entry:
+
+```toml
+[pkg.policy]
+allowed-plugin-backends = ["corp-tool-cache"]
+```
 
 ## Editor UI
 

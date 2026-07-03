@@ -723,6 +723,9 @@ fn main() {
                         callback_id: _,
                         value: _,
                     } => Ok(PluginResponse::Unit),
+                    HostRequest::PkgBackend(_) => Err(internal(
+                        "package backend RPC dispatch is not available in this host",
+                    )),
                     HostRequest::Shutdown => break,
                     HostRequest::Init { .. } => Err(internal("duplicate Init")),
                 };
@@ -743,6 +746,9 @@ fn main() {
             }
             Frame::Notify {
                 body: HostRequest::UiCallback { .. },
+            }
+            | Frame::Notify {
+                body: HostRequest::PkgBackend(_),
             }
             | Frame::Notify {
                 body: HostRequest::Init { .. },

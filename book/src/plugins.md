@@ -24,7 +24,7 @@ min_api_version = 2
 capabilities = ["query", "mutation", "ui", "events"]
 ```
 
-`min_api_version` and `capabilities` are optional. Loading is refused if `min_api_version` is greater than the host API version or if a capability name is unknown. Capability names are `query`, `mutation`, `ui`, `panels`, `commands`, `events`, `render`, `splits`, `tabs`, and `floats`.
+`min_api_version` and `capabilities` are optional. Loading is refused if `min_api_version` is greater than the host API version or if a capability name is unknown. Capability names are `query`, `mutation`, `ui`, `panels`, `commands`, `events`, `render`, `splits`, `tabs`, `floats`, and `pkg-backend`.
 
 ## Errors
 
@@ -73,6 +73,37 @@ The Lua sandbox removes `os.execute`, `os.exit`, `io`, `package`, `load`, `loads
 
 Default limits are `max_memory = 268435456` bytes and `max_instructions = 5000000` VM instructions per plugin dispatch. Setting either value to `0` disables that limit.
 
+## Package Backends
+
+Plugins can register package-manager backends for registry entries such as:
+
+```toml
+source = { plugin = "corp-tool-cache", ref = "rust-analyzer" }
+```
+
+Lua registration uses `helix.pkg.register_backend`:
+
+```lua
+helix.pkg.register_backend({
+  name = "corp-tool-cache",
+  probe = function() return true end,
+  resolve = function(ref) return { version = "1.2.3" } end,
+  install = function(staging_dir, progress)
+    progress("installing")
+  end,
+  remove = function(ref) return true end,
+  doctor = function(ref) return true end,
+})
+```
+
+Package backends execute plugin code during package operations. They are denied
+unless package policy explicitly allows the backend name:
+
+```toml
+[pkg.policy]
+allowed-plugin-backends = ["corp-tool-cache"]
+```
+
 ## API
 
 `helix.workspace`: `focused_document()`, `focused_view()`, `mode()`, `set_mode(mode)`, `documents()`, `views()`, `snapshot()`, `theme()`, `editor_config()`.
@@ -108,6 +139,8 @@ Event kinds are `host_ready`, `document_opened`, `document_changed`, `document_p
 `helix.assistant`: `snapshot()`, `thread(thread)`, `entries(thread)`, `context(thread)`, `is_ready()`, `active_thread()`, `thread_count()`, `submit(thread_or_nil, text)`, `cancel(thread_or_nil)`.
 
 `helix.lsp`: `get_clients()`.
+
+`helix.pkg`: `register_backend(spec)`.
 
 `helix.layout`: `split_vertical(area, constraints)`, `split_horizontal(area, constraints)`, `center(area, width, height)`.
 

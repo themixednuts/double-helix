@@ -14,6 +14,12 @@ source = { github-release = "rust-lang/rust-analyzer", asset = "rust-analyzer-x8
 bin = "rust-analyzer.exe"
 
 [[artifact]]
+os = "windows"
+arch = "x86_64"
+source = { native = { winget = "Rustlang.rust-analyzer" } }
+bin = "rust-analyzer"
+
+[[artifact]]
 os = "linux"
 arch = "x86_64"
 source = { github-release = "rust-lang/rust-analyzer", asset = "rust-analyzer-x86_64-unknown-linux-gnu.gz" }
@@ -25,3 +31,8 @@ arch = "aarch64"
 source = { github-release = "rust-lang/rust-analyzer", asset = "rust-analyzer-aarch64-apple-darwin.gz" }
 bin = "rust-analyzer"
 
+[[artifact]]
+os = "macos"
+arch = "aarch64"
+source = { native = { brew = "rust-analyzer" } }
+bin = "rust-analyzer"

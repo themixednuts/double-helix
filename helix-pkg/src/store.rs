@@ -104,8 +104,10 @@ impl Store {
             None
         };
         if let Some(receipt) = receipt {
-            let shim = self.bin_dir().join(&receipt.shim);
-            remove_path(&shim)?;
+            if !receipt.shim.is_empty() {
+                let shim = self.bin_dir().join(&receipt.shim);
+                remove_path(&shim)?;
+            }
         } else {
             for extension in ["", ".exe", ".cmd", ".bat"] {
                 remove_path(&self.bin_dir().join(format!("{name}{extension}")))?;
@@ -175,6 +177,10 @@ pub struct Receipt {
     pub files: BTreeMap<String, String>,
     #[serde(default)]
     pub installed_at: String,
+    #[serde(default)]
+    pub native_manager: Option<String>,
+    #[serde(default)]
+    pub native_id: Option<String>,
 }
 
 impl Receipt {
@@ -357,6 +363,8 @@ mod tests {
             previous_version: None,
             files: hash_tree(&install).unwrap(),
             installed_at: "now".to_owned(),
+            native_manager: None,
+            native_id: None,
         };
         store
             .activate(&mut receipt, &install.join("demo.exe"))
@@ -369,5 +377,33 @@ mod tests {
             store.verify(&receipt),
             Err(Error::HashMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn native_receipt_round_trip_keeps_manager_metadata_without_shim() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path());
+        store.prepare().unwrap();
+        let receipt = Receipt {
+            name: "rust-analyzer".to_owned(),
+            kind: PkgKind::Lsp,
+            version: "2026-06-29".to_owned(),
+            source: "native:winget".to_owned(),
+            url: "native:winget:Rustlang.rust-analyzer".to_owned(),
+            archive_sha256: String::new(),
+            bin: "rust-analyzer".to_owned(),
+            shim: String::new(),
+            previous_version: None,
+            files: BTreeMap::new(),
+            installed_at: "now".to_owned(),
+            native_manager: Some("winget".to_owned()),
+            native_id: Some("Rustlang.rust-analyzer".to_owned()),
+        };
+        store.write_receipt(&receipt).unwrap();
+        let read = Receipt::read(&store.receipt_path(PkgKind::Lsp, "rust-analyzer")).unwrap();
+        assert_eq!(read.native_manager.as_deref(), Some("winget"));
+        assert_eq!(read.native_id.as_deref(), Some("Rustlang.rust-analyzer"));
+        store.remove(PkgKind::Lsp, "rust-analyzer").unwrap();
+        assert!(store.bin_dir().exists());
     }
 }

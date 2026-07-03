@@ -1,5 +1,6 @@
 //! Package manager engine for LSP servers, DAP adapters, grammars, and plugins.
 
+pub mod config;
 pub mod lock;
 pub mod ops;
 pub mod registry;
@@ -7,10 +8,14 @@ pub mod resolve;
 pub mod spec;
 pub mod store;
 
+pub use config::{NativeInstallPolicy, PkgConfig, Policy};
 pub use lock::{Lock, LockedPackage, Manifest};
-pub use ops::{DoctorReport, OpEvent, Ops};
+pub use ops::{
+    Backend, BackendInstall, DoctorReport, OpEvent, Ops, PluginBackend, PluginBackendTransport,
+    ResolvedPackage,
+};
 pub use registry::Registry;
-pub use spec::{Artifact, PackageSpec, PkgKind, Source};
+pub use spec::{Artifact, NativeManager, NativeSource, PackageSpec, PkgKind, Source};
 pub use store::{Receipt, Store};
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -76,6 +81,8 @@ pub enum Error {
         stdout: String,
         stderr: String,
     },
+    #[error("policy violation ({key}): {message}")]
+    PolicyViolation { key: &'static str, message: String },
     #[error("{0}")]
     Message(String),
 }

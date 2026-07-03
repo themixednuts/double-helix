@@ -1,9 +1,12 @@
 use std::{
+    collections::BTreeMap,
     ffi::OsStr,
+    ffi::OsString,
     fs,
     io::{self, Cursor, Read, Write},
     path::{Path, PathBuf},
     process::Command,
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -13,11 +16,12 @@ use tempfile::TempDir;
 use xz2::read::XzDecoder;
 
 use crate::{
+    config::{NativeInstallPolicy, PkgConfig},
     io as pkg_io,
     lock::{Lock, LockedPackage, Manifest},
     registry::Registry,
     resolve,
-    spec::{Artifact, PackageSpec, PkgKind, Source},
+    spec::{Artifact, NativeManager, NativeSource, PackageSpec, PkgKind, Source},
     store::{hash_tree, Receipt, Store},
     Error, Result,
 };
@@ -32,11 +36,97 @@ pub enum OpEvent {
 
 pub type Progress<'a> = dyn FnMut(OpEvent) + 'a;
 
-#[derive(Debug)]
+pub trait Backend: Send + Sync {
+    fn probe(&self) -> Result<bool> {
+        Ok(true)
+    }
+
+    fn resolve_version(
+        &self,
+        package: &PackageSpec,
+        artifact: &Artifact,
+    ) -> Result<ResolvedPackage>;
+
+    fn install(&self, install: BackendInstall<'_>) -> Result<()>;
+
+    fn remove(&self, _package: &PackageSpec, _artifact: &Artifact) -> Result<()> {
+        Ok(())
+    }
+
+    fn doctor(&self, _receipt: &Receipt) -> Result<()> {
+        Ok(())
+    }
+}
+
+pub struct BackendInstall<'a> {
+    pub package: &'a PackageSpec,
+    pub artifact: &'a Artifact,
+    pub resolved: &'a ResolvedPackage,
+    pub dest: &'a Path,
+    pub store: &'a Store,
+    pub progress: &'a mut Progress<'a>,
+}
+
+pub trait PluginBackendTransport: Send + Sync {
+    fn probe(&self, backend: &str) -> Result<bool>;
+    fn resolve_version(
+        &self,
+        backend: &str,
+        package: &PackageSpec,
+        artifact: &Artifact,
+    ) -> Result<ResolvedPackage>;
+    fn install(&self, backend: &str, install: BackendInstall<'_>) -> Result<()>;
+    fn remove(&self, backend: &str, package: &PackageSpec, artifact: &Artifact) -> Result<()>;
+    fn doctor(&self, backend: &str, receipt: &Receipt) -> Result<()>;
+}
+
+pub struct PluginBackend<T> {
+    name: String,
+    transport: T,
+}
+
+impl<T> PluginBackend<T> {
+    pub fn new(name: impl Into<String>, transport: T) -> Self {
+        Self {
+            name: name.into(),
+            transport,
+        }
+    }
+}
+
+impl<T: PluginBackendTransport> Backend for PluginBackend<T> {
+    fn probe(&self) -> Result<bool> {
+        self.transport.probe(&self.name)
+    }
+
+    fn resolve_version(
+        &self,
+        package: &PackageSpec,
+        artifact: &Artifact,
+    ) -> Result<ResolvedPackage> {
+        self.transport
+            .resolve_version(&self.name, package, artifact)
+    }
+
+    fn install(&self, install: BackendInstall<'_>) -> Result<()> {
+        self.transport.install(&self.name, install)
+    }
+
+    fn remove(&self, package: &PackageSpec, artifact: &Artifact) -> Result<()> {
+        self.transport.remove(&self.name, package, artifact)
+    }
+
+    fn doctor(&self, receipt: &Receipt) -> Result<()> {
+        self.transport.doctor(&self.name, receipt)
+    }
+}
+
 pub struct Ops {
     registry: Registry,
     store: Store,
     config_dir: PathBuf,
+    config: PkgConfig,
+    plugin_backends: BTreeMap<String, Arc<dyn Backend>>,
 }
 
 impl Ops {
@@ -45,16 +135,29 @@ impl Ops {
             registry,
             store,
             config_dir,
+            config: PkgConfig::default(),
+            plugin_backends: BTreeMap::new(),
         }
+    }
+
+    pub fn with_config(mut self, config: PkgConfig) -> Self {
+        self.config = config;
+        self
+    }
+
+    pub fn register_backend(&mut self, name: impl Into<String>, backend: Arc<dyn Backend>) {
+        self.plugin_backends.insert(name.into(), backend);
     }
 
     pub fn open_default() -> Result<Self> {
         let config_dir = config_dir();
+        let config = read_pkg_config(&config_dir)?;
         Ok(Self::new(
-            Registry::builtin()?,
+            Registry::from_dirs(&config.registries)?,
             Store::open_default(),
             config_dir,
-        ))
+        )
+        .with_config(config))
     }
 
     pub fn registry(&self) -> &Registry {
@@ -63,6 +166,10 @@ impl Ops {
 
     pub fn store(&self) -> &Store {
         &self.store
+    }
+
+    pub fn config(&self) -> &PkgConfig {
+        &self.config
     }
 
     pub fn install(&self, names: &[String], progress: &mut Progress<'_>) -> Result<Lock> {
@@ -99,6 +206,23 @@ impl Ops {
                 .registry
                 .find(name)
                 .ok_or_else(|| Error::NotFound(name.clone()))?;
+            if let Some(receipt) = self.active_receipt(package.kind, &package.name)? {
+                if let (Some(manager), Some(id)) = (
+                    receipt.native_manager.as_deref(),
+                    receipt.native_id.as_deref(),
+                ) {
+                    native_remove(parse_native_manager(manager)?, id)?;
+                } else if let Some(artifact) = package
+                    .artifacts_for(std::env::consts::OS, std::env::consts::ARCH)
+                    .find(|artifact| artifact.source.plugin.is_some())
+                {
+                    if let Some(name) = &artifact.source.plugin {
+                        if let Some(backend) = self.plugin_backends.get(name) {
+                            backend.remove(package, artifact)?;
+                        }
+                    }
+                }
+            }
             self.store.remove(package.kind, &package.name)?;
         }
         Ok(())
@@ -132,7 +256,32 @@ impl Ops {
     pub fn doctor(&self) -> Result<DoctorReport> {
         let mut report = DoctorReport::default();
         for receipt in self.store.receipts()? {
-            match self.store.verify(&receipt) {
+            let result = if let (Some(manager), Some(id)) = (
+                receipt.native_manager.as_deref(),
+                receipt.native_id.as_deref(),
+            ) {
+                native_doctor(parse_native_manager(manager)?, id)
+            } else if let Some(package) = self.registry.get(receipt.kind, &receipt.name) {
+                if let Some(artifact) = package
+                    .artifacts_for(std::env::consts::OS, std::env::consts::ARCH)
+                    .find(|artifact| artifact.source.plugin.is_some())
+                {
+                    artifact
+                        .source
+                        .plugin
+                        .as_ref()
+                        .and_then(|name| self.plugin_backends.get(name))
+                        .map_or_else(
+                            || self.store.verify(&receipt),
+                            |backend| backend.doctor(&receipt),
+                        )
+                } else {
+                    self.store.verify(&receipt)
+                }
+            } else {
+                self.store.verify(&receipt)
+            };
+            match result {
                 Ok(()) => report.ok.push(receipt.name),
                 Err(err) => report.bad.push((receipt.name, err.to_string())),
             }
@@ -157,7 +306,7 @@ impl Ops {
                 });
                 continue;
             };
-            let artifact = package.artifact()?;
+            let artifact = self.artifact_for_host(package)?;
             match latest_version(package, artifact) {
                 Ok(latest) => reports.push(OutdatedPackage {
                     name: receipt.name,
@@ -197,7 +346,7 @@ impl Ops {
                 .registry
                 .find(&name)
                 .ok_or_else(|| Error::NotFound(name.clone()))?;
-            let artifact = package.artifact()?;
+            let artifact = self.artifact_for_host(package)?;
             let current = self.active_receipt(package.kind, &package.name)?;
             let latest = latest_version(package, artifact)?;
             if current
@@ -240,7 +389,7 @@ impl Ops {
                 "previous version {previous} for {name} is no longer present"
             )));
         }
-        let artifact = package.artifact()?;
+        let artifact = self.artifact_for_host(package)?;
         let mut receipt = Receipt {
             name: package.name.clone(),
             kind: package.kind,
@@ -253,6 +402,8 @@ impl Ops {
             previous_version: Some(current.version),
             files: hash_tree(&install_dir)?,
             installed_at: timestamp(),
+            native_manager: current.native_manager.clone(),
+            native_id: current.native_id.clone(),
         };
         self.activate_installed(package, artifact, &install_dir, &mut receipt)?;
         self.store.write_receipt(&receipt)?;
@@ -280,7 +431,7 @@ impl Ops {
         locked: Option<&LockedPackage>,
         progress: &mut Progress<'_>,
     ) -> Result<LockedPackage> {
-        let artifact = package.artifact()?;
+        let artifact = self.artifact_for_host(package)?;
         let previous_version = self
             .active_receipt(package.kind, &package.name)?
             .map(|receipt| receipt.version);
@@ -299,22 +450,39 @@ impl Ops {
                 previous_version,
                 files: Default::default(),
                 installed_at: timestamp(),
+                native_manager: None,
+                native_id: None,
             };
             self.store.activate(&mut receipt, &path)?;
             self.store.write_receipt(&receipt)?;
             return Ok(lock_from_receipt(receipt));
         }
 
+        self.config.policy.check_source(package, artifact)?;
+
         let resolved = if let Some(locked) = locked {
-            ResolvedSource {
+            ResolvedPackage {
                 version: locked.version.clone(),
                 url: locked.url.clone(),
                 sha256: Some(locked.sha256.clone()),
                 source: locked.source.clone(),
+                published_at: None,
             }
         } else {
-            resolve_source(package, artifact, progress)?
+            self.resolve_source(package, artifact, progress)?
         };
+
+        let policy = self.config.policy.check(package, artifact, &resolved)?;
+        for warning in policy.warnings {
+            progress(OpEvent::Progress {
+                name: package.name.clone(),
+                message: format!("warning: {warning}"),
+            });
+        }
+
+        if artifact.source.native.is_some() {
+            return self.install_native(package, artifact, &resolved, previous_version);
+        }
 
         let install_dir = self
             .store
@@ -335,6 +503,7 @@ impl Ops {
                 &resolved,
                 tmp.path(),
                 &self.store,
+                &self.plugin_backends,
                 progress,
             )?;
             fs::rename(tmp.path(), &install_dir)
@@ -355,6 +524,8 @@ impl Ops {
             previous_version,
             files: hash_tree(&install_dir)?,
             installed_at: timestamp(),
+            native_manager: None,
+            native_id: None,
         };
         self.activate_installed(package, artifact, &install_dir, &mut receipt)?;
         self.store.write_receipt(&receipt)?;
@@ -369,6 +540,110 @@ impl Ops {
         } else {
             Ok(None)
         }
+    }
+
+    fn artifact_for_host<'a>(&self, package: &'a PackageSpec) -> Result<&'a Artifact> {
+        package
+            .artifacts_for(std::env::consts::OS, std::env::consts::ARCH)
+            .find(|artifact| self.backend_available(&artifact.source))
+            .ok_or_else(|| Error::NoArtifact {
+                name: package.name.clone(),
+                os: std::env::consts::OS.to_owned(),
+                arch: std::env::consts::ARCH.to_owned(),
+            })
+    }
+
+    fn backend_available(&self, source: &Source) -> bool {
+        if let Some(native) = &source.native {
+            return detect_native_manager(native).is_some();
+        }
+        if let Some(command) = &source.system {
+            return resolve::system_binary(command).is_ok();
+        }
+        if let Some(name) = &source.plugin {
+            return self
+                .plugin_backends
+                .get(name)
+                .is_some_and(|backend| backend.probe().unwrap_or(false));
+        }
+        true
+    }
+
+    fn resolve_source(
+        &self,
+        package: &PackageSpec,
+        artifact: &Artifact,
+        progress: &mut Progress<'_>,
+    ) -> Result<ResolvedPackage> {
+        if let Some(native) = &artifact.source.native {
+            let selected = select_native(native)?;
+            return Ok(ResolvedPackage {
+                version: native_installed_version(selected.manager, &selected.id)
+                    .unwrap_or_else(|_| "native".to_owned()),
+                url: format!("native:{}:{}", selected.manager, selected.id),
+                sha256: None,
+                source: format!("native:{}", selected.manager),
+                published_at: None,
+            });
+        }
+        if let Some(name) = &artifact.source.plugin {
+            let backend = self
+                .plugin_backends
+                .get(name)
+                .ok_or_else(|| Error::Message(format!("plugin backend not registered: {name}")))?;
+            return backend.resolve_version(package, artifact);
+        }
+        resolve_source(package, artifact, progress)
+    }
+
+    fn install_native(
+        &self,
+        package: &PackageSpec,
+        artifact: &Artifact,
+        resolved: &ResolvedPackage,
+        previous_version: Option<String>,
+    ) -> Result<LockedPackage> {
+        let native = artifact
+            .source
+            .native
+            .as_ref()
+            .ok_or_else(|| Error::Message("native source missing".to_owned()))?;
+        let selected = select_native(native)?;
+        match self.config.allow_native {
+            NativeInstallPolicy::True => {}
+            NativeInstallPolicy::False => {
+                return Err(Error::Message(
+                    "native installs are disabled by [pkg] allow-native".to_owned(),
+                ));
+            }
+            NativeInstallPolicy::Prompt => {
+                let command =
+                    native_user_command(selected.manager, &selected.id, NativeAction::Install);
+                return Err(Error::Message(format!(
+                    "native install requires confirmation; run this command yourself or set [pkg] allow-native = true: {command}"
+                )));
+            }
+        }
+        native_install(selected.manager, &selected.id)?;
+        let version = native_installed_version(selected.manager, &selected.id)
+            .unwrap_or_else(|_| resolved.version.clone());
+        let receipt = Receipt {
+            name: package.name.clone(),
+            kind: package.kind,
+            version,
+            source: format!("native:{}", selected.manager),
+            url: format!("native:{}:{}", selected.manager, selected.id),
+            archive_sha256: String::new(),
+            bin: artifact.bin.clone(),
+            shim: String::new(),
+            previous_version,
+            files: Default::default(),
+            installed_at: timestamp(),
+            native_manager: Some(selected.manager.to_string()),
+            native_id: Some(selected.id),
+        };
+        self.store.write_receipt(&receipt)?;
+        Ok(lock_from_receipt(receipt))
     }
 
     fn activate_installed(
@@ -428,23 +703,58 @@ impl OutdatedPackage {
     }
 }
 
-#[derive(Debug)]
-struct ResolvedSource {
-    version: String,
-    url: String,
-    sha256: Option<String>,
-    source: String,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedPackage {
+    pub version: String,
+    pub url: String,
+    pub sha256: Option<String>,
+    pub source: String,
+    pub published_at: Option<String>,
+}
+
+impl ResolvedPackage {
+    pub fn source_url(&self) -> Option<&str> {
+        self.url
+            .starts_with("http://")
+            .then_some(self.url.as_str())
+            .or_else(|| {
+                self.url
+                    .starts_with("https://")
+                    .then_some(self.url.as_str())
+            })
+            .or_else(|| self.url.starts_with("file://").then_some(self.url.as_str()))
+    }
 }
 
 fn install_into(
     package: &PackageSpec,
     artifact: &Artifact,
-    resolved: &ResolvedSource,
+    resolved: &ResolvedPackage,
     dest: &Path,
     store: &Store,
+    plugin_backends: &BTreeMap<String, Arc<dyn Backend>>,
     progress: &mut Progress<'_>,
 ) -> Result<Option<String>> {
     let source = &artifact.source;
+    if let Some(name) = &source.plugin {
+        let backend = plugin_backends
+            .get(name)
+            .ok_or_else(|| Error::Message(format!("plugin backend not registered: {name}")))?;
+        progress(OpEvent::Progress {
+            name: package.name.clone(),
+            message: format!("plugin backend {name} install"),
+        });
+        backend.install(BackendInstall {
+            package,
+            artifact,
+            resolved,
+            dest,
+            store,
+            progress,
+        })?;
+        return Ok(None);
+    }
+
     if source.github_release.is_some() || source.archive.is_some() {
         progress(OpEvent::Progress {
             name: package.name.clone(),
@@ -528,7 +838,7 @@ fn resolve_source(
     package: &PackageSpec,
     artifact: &Artifact,
     progress: &mut Progress<'_>,
-) -> Result<ResolvedSource> {
+) -> Result<ResolvedPackage> {
     let source = &artifact.source;
     if let Some(repo) = &source.github_release {
         progress(OpEvent::Progress {
@@ -553,30 +863,33 @@ fn resolve_source(
                     release.tag_name
                 ))
             })?;
-        return Ok(ResolvedSource {
+        return Ok(ResolvedPackage {
             version: release.tag_name,
             url: asset.browser_download_url.clone(),
             sha256: source.sha256.clone(),
             source: "github-release".to_owned(),
+            published_at: release.published_at,
         });
     }
 
     if let Some(url) = &source.archive {
         let version = latest_version(package, artifact)?;
-        return Ok(ResolvedSource {
+        return Ok(ResolvedPackage {
             version: version.clone(),
             url: expand_asset(url, &version),
             sha256: source.sha256.clone(),
             source: "archive".to_owned(),
+            published_at: publish_time(package, artifact).ok().flatten(),
         });
     }
 
     let version = latest_version(package, artifact)?;
-    Ok(ResolvedSource {
+    Ok(ResolvedPackage {
         version: version.clone(),
         url: format!("{}:{version}", source.kind()),
         sha256: None,
         source: source.kind().to_owned(),
+        published_at: publish_time(package, artifact).ok().flatten(),
     })
 }
 
@@ -618,8 +931,39 @@ fn latest_version(package: &PackageSpec, artifact: &Artifact) -> Result<String> 
             .ok_or_else(|| Error::Message("git source missing rev".to_owned()))
     } else if source.system.is_some() {
         Ok("system".to_owned())
+    } else if source.native.is_some() {
+        Ok("native".to_owned())
+    } else if source.plugin.is_some() {
+        Ok("plugin".to_owned())
     } else {
         Ok("archive".to_owned())
+    }
+}
+
+fn publish_time(package: &PackageSpec, artifact: &Artifact) -> Result<Option<String>> {
+    if let Some(tag_source) = package.version.tag_source.as_deref() {
+        if let Some(repo) = tag_source.strip_prefix("github:") {
+            return Ok(github_latest(repo)?.published_at);
+        }
+        if let Some(package_name) = tag_source.strip_prefix("npm:") {
+            return npm_latest_with_time(package_name).map(|(_, time)| time);
+        }
+        if let Some(package_name) = tag_source.strip_prefix("pip:") {
+            return pip_latest_with_time(package_name).map(|(_, time)| time);
+        }
+        if let Some(crate_name) = tag_source.strip_prefix("crates:") {
+            return crates_latest_with_time(crate_name).map(|(_, time)| time);
+        }
+    }
+    let source = &artifact.source;
+    if let Some(package_name) = &source.npm {
+        npm_latest_with_time(package_name).map(|(_, time)| time)
+    } else if let Some(package_name) = &source.pip {
+        pip_latest_with_time(package_name).map(|(_, time)| time)
+    } else if let Some(crate_name) = &source.cargo {
+        crates_latest_with_time(crate_name).map(|(_, time)| time)
+    } else {
+        Ok(None)
     }
 }
 
@@ -828,6 +1172,7 @@ fn wildcard(pattern: &str, name: &str, tag: &str) -> bool {
 #[derive(Debug, Deserialize)]
 struct GithubRelease {
     tag_name: String,
+    published_at: Option<String>,
     assets: Vec<GithubAsset>,
 }
 
@@ -844,53 +1189,94 @@ fn github_latest(repo: &str) -> Result<GithubRelease> {
 }
 
 fn npm_latest(package: &str) -> Result<String> {
+    npm_latest_with_time(package).map(|(version, _)| version)
+}
+
+fn npm_latest_with_time(package: &str) -> Result<(String, Option<String>)> {
     #[derive(Deserialize)]
-    struct NpmLatest {
-        version: String,
+    struct NpmPackage {
+        #[serde(rename = "dist-tags")]
+        dist_tags: NpmDistTags,
+        time: std::collections::BTreeMap<String, String>,
+    }
+    #[derive(Deserialize)]
+    struct NpmDistTags {
+        latest: String,
     }
     let escaped = package.replace('/', "%2f");
-    let url = format!("https://registry.npmjs.org/{escaped}/latest");
+    let url = format!("https://registry.npmjs.org/{escaped}");
     let bytes = http_get(&url)?;
-    let latest: NpmLatest =
+    let package: NpmPackage =
         serde_json::from_slice(&bytes).map_err(|source| Error::Json { url, source })?;
-    Ok(latest.version)
+    let time = package.time.get(&package.dist_tags.latest).cloned();
+    Ok((package.dist_tags.latest, time))
 }
 
 fn pip_latest(package: &str) -> Result<String> {
+    pip_latest_with_time(package).map(|(version, _)| version)
+}
+
+fn pip_latest_with_time(package: &str) -> Result<(String, Option<String>)> {
     #[derive(Deserialize)]
     struct PipJson {
         info: PipInfo,
+        releases: std::collections::BTreeMap<String, Vec<PipFile>>,
     }
     #[derive(Deserialize)]
     struct PipInfo {
         version: String,
     }
+    #[derive(Deserialize)]
+    struct PipFile {
+        upload_time_iso_8601: Option<String>,
+    }
     let url = format!("https://pypi.org/pypi/{package}/json");
     let bytes = http_get(&url)?;
     let latest: PipJson =
         serde_json::from_slice(&bytes).map_err(|source| Error::Json { url, source })?;
-    Ok(latest.info.version)
+    let time = latest
+        .releases
+        .get(&latest.info.version)
+        .and_then(|files| files.first())
+        .and_then(|file| file.upload_time_iso_8601.clone());
+    Ok((latest.info.version, time))
 }
 
 fn crates_latest(crate_name: &str) -> Result<String> {
+    crates_latest_with_time(crate_name).map(|(version, _)| version)
+}
+
+fn crates_latest_with_time(crate_name: &str) -> Result<(String, Option<String>)> {
     #[derive(Deserialize)]
     struct CratesJson {
         #[serde(rename = "crate")]
         krate: CrateInfo,
+        versions: Vec<CrateVersion>,
     }
     #[derive(Deserialize)]
     struct CrateInfo {
         newest_version: String,
         max_stable_version: Option<String>,
     }
+    #[derive(Deserialize)]
+    struct CrateVersion {
+        num: String,
+        created_at: Option<String>,
+    }
     let url = format!("https://crates.io/api/v1/crates/{crate_name}");
     let bytes = http_get(&url)?;
     let latest: CratesJson =
         serde_json::from_slice(&bytes).map_err(|source| Error::Json { url, source })?;
-    Ok(latest
+    let version = latest
         .krate
         .max_stable_version
-        .unwrap_or(latest.krate.newest_version))
+        .unwrap_or(latest.krate.newest_version);
+    let time = latest
+        .versions
+        .iter()
+        .find(|candidate| candidate.num == version)
+        .and_then(|candidate| candidate.created_at.clone());
+    Ok((version, time))
 }
 
 fn go_latest(module: &str) -> Result<String> {
@@ -912,6 +1298,245 @@ fn go_latest(module: &str) -> Result<String> {
         source,
     })?;
     Ok(latest.version)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SelectedNative {
+    manager: NativeManager,
+    id: String,
+}
+
+fn select_native(source: &NativeSource) -> Result<SelectedNative> {
+    detect_native_manager(source)
+        .and_then(|manager| {
+            source.id_for(manager).map(|id| SelectedNative {
+                manager,
+                id: id.to_owned(),
+            })
+        })
+        .ok_or_else(|| {
+            Error::Message("no configured native package manager is available".to_owned())
+        })
+}
+
+fn detect_native_manager(source: &NativeSource) -> Option<NativeManager> {
+    detect_native_manager_with_paths(source, std::env::consts::OS, std::env::var_os("PATH"))
+}
+
+fn detect_native_manager_with_paths(
+    source: &NativeSource,
+    os: &str,
+    paths: Option<OsString>,
+) -> Option<NativeManager> {
+    let candidates: &[NativeManager] = match os {
+        "windows" => &[NativeManager::Winget],
+        "macos" => &[NativeManager::Brew],
+        "linux" => &[
+            NativeManager::Apt,
+            NativeManager::Dnf,
+            NativeManager::Pacman,
+        ],
+        _ => &[],
+    };
+    candidates.iter().copied().find(|manager| {
+        source.id_for(*manager).is_some()
+            && which_in_paths(manager.command(), paths.clone()).is_some()
+    })
+}
+
+fn which_in_paths(name: &str, paths: Option<OsString>) -> Option<PathBuf> {
+    let paths = paths?;
+    std::env::split_paths(&paths).find_map(|dir| {
+        let path = dir.join(name);
+        if path.exists() {
+            return Some(path);
+        }
+        if cfg!(windows) {
+            for ext in ["exe", "cmd", "bat"] {
+                let path = dir.join(format!("{name}.{ext}"));
+                if path.exists() {
+                    return Some(path);
+                }
+            }
+        }
+        None
+    })
+}
+
+fn native_install(manager: NativeManager, id: &str) -> Result<()> {
+    let args = native_install_args(manager, id);
+    let program = required_tool(manager.command(), "native package manager is required")?;
+    let mut command = Command::new(&program);
+    command.args(&args);
+    run_native(
+        manager,
+        id,
+        NativeAction::Install,
+        program.as_os_str(),
+        &args,
+        &mut command,
+    )
+}
+
+fn native_remove(manager: NativeManager, id: &str) -> Result<()> {
+    let args = native_remove_args(manager, id);
+    let program = required_tool(manager.command(), "native package manager is required")?;
+    let mut command = Command::new(&program);
+    command.args(&args);
+    run_native(
+        manager,
+        id,
+        NativeAction::Remove,
+        program.as_os_str(),
+        &args,
+        &mut command,
+    )
+}
+
+fn native_doctor(manager: NativeManager, id: &str) -> Result<()> {
+    native_installed_version(manager, id).map(|_| ())
+}
+
+fn native_installed_version(manager: NativeManager, id: &str) -> Result<String> {
+    let args = native_query_args(manager, id);
+    let program = required_tool(manager.command(), "native package manager is required")?;
+    let stdout = command_stdout(&program, &args)?;
+    Ok(parse_native_version(manager, id, &stdout).unwrap_or_else(|| "native".to_owned()))
+}
+
+#[derive(Debug, Clone, Copy)]
+enum NativeAction {
+    Install,
+    Remove,
+}
+
+fn run_native(
+    manager: NativeManager,
+    id: &str,
+    action: NativeAction,
+    program: &OsStr,
+    args: &[String],
+    command: &mut Command,
+) -> Result<()> {
+    let output = command
+        .output()
+        .map_err(|source| pkg_io(program.to_string_lossy(), source))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    if native_permission_denied(&stdout) || native_permission_denied(&stderr) {
+        let command = native_user_command(manager, id, action);
+        return Err(Error::Message(format!(
+            "native package manager needs user permission; run this command yourself: {command}\nstdout: {stdout}\nstderr: {stderr}"
+        )));
+    }
+    Err(Error::CommandFailed {
+        program: program.to_string_lossy().into_owned(),
+        args: args.join(" "),
+        stdout,
+        stderr,
+    })
+}
+
+fn native_permission_denied(output: &str) -> bool {
+    let output = output.to_ascii_lowercase();
+    output.contains("administrator")
+        || output.contains("access is denied")
+        || output.contains("permission denied")
+        || output.contains("root privileges")
+        || output.contains("are you root")
+        || output.contains("must be run as root")
+        || output.contains("unable to acquire the dpkg frontend lock")
+}
+
+fn native_install_args(manager: NativeManager, id: &str) -> Vec<String> {
+    match manager {
+        NativeManager::Winget => vec!["install", "--id", id, "--exact"],
+        NativeManager::Brew => vec!["install", id],
+        NativeManager::Apt => vec!["install", id],
+        NativeManager::Pacman => vec!["-S", id],
+        NativeManager::Dnf => vec!["install", id],
+    }
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
+}
+
+fn native_remove_args(manager: NativeManager, id: &str) -> Vec<String> {
+    match manager {
+        NativeManager::Winget => vec!["uninstall", "--id", id, "--exact"],
+        NativeManager::Brew => vec!["uninstall", id],
+        NativeManager::Apt => vec!["remove", id],
+        NativeManager::Pacman => vec!["-R", id],
+        NativeManager::Dnf => vec!["remove", id],
+    }
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
+}
+
+fn native_query_args(manager: NativeManager, id: &str) -> Vec<String> {
+    match manager {
+        NativeManager::Winget => vec!["list", "--id", id, "--exact"],
+        NativeManager::Brew => vec!["list", "--versions", id],
+        NativeManager::Apt => vec!["show", id],
+        NativeManager::Pacman => vec!["-Qi", id],
+        NativeManager::Dnf => vec!["list", "installed", id],
+    }
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
+}
+
+fn native_user_command(manager: NativeManager, id: &str, action: NativeAction) -> String {
+    let verb = match action {
+        NativeAction::Install => match manager {
+            NativeManager::Winget
+            | NativeManager::Brew
+            | NativeManager::Apt
+            | NativeManager::Dnf => "install",
+            NativeManager::Pacman => "-S",
+        },
+        NativeAction::Remove => match manager {
+            NativeManager::Winget => "uninstall",
+            NativeManager::Brew => "uninstall",
+            NativeManager::Apt | NativeManager::Dnf => "remove",
+            NativeManager::Pacman => "-R",
+        },
+    };
+    match manager {
+        NativeManager::Winget => format!("winget {verb} --id {id} --exact"),
+        NativeManager::Brew => format!("brew {verb} {id}"),
+        NativeManager::Apt => format!("sudo apt {verb} {id}"),
+        NativeManager::Dnf => format!("sudo dnf {verb} {id}"),
+        NativeManager::Pacman => format!("sudo pacman {verb} {id}"),
+    }
+}
+
+fn parse_native_version(_manager: NativeManager, id: &str, stdout: &str) -> Option<String> {
+    stdout
+        .lines()
+        .find(|line| line.contains(id))
+        .and_then(|line| {
+            line.split_whitespace()
+                .find(|part| part.chars().any(|ch| ch.is_ascii_digit()))
+        })
+        .map(str::to_owned)
+}
+
+fn parse_native_manager(value: &str) -> Result<NativeManager> {
+    match value {
+        "winget" => Ok(NativeManager::Winget),
+        "brew" => Ok(NativeManager::Brew),
+        "apt" => Ok(NativeManager::Apt),
+        "pacman" => Ok(NativeManager::Pacman),
+        "dnf" => Ok(NativeManager::Dnf),
+        other => Err(Error::Message(format!(
+            "unknown native manager in receipt: {other}"
+        ))),
+    }
 }
 
 fn download(url: &str) -> Result<Vec<u8>> {
@@ -1033,9 +1658,35 @@ fn config_dir() -> PathBuf {
         .join("double-helix")
 }
 
+fn read_pkg_config(config_dir: &Path) -> Result<PkgConfig> {
+    #[derive(Deserialize)]
+    struct ConfigFile {
+        #[serde(default)]
+        pkg: PkgConfig,
+    }
+    let path = config_dir.join("config.toml");
+    if !path.exists() {
+        return Ok(PkgConfig::default());
+    }
+    let content = fs::read_to_string(&path).map_err(|source| pkg_io(path.display(), source))?;
+    toml::from_str::<ConfigFile>(&content)
+        .map(|config| config.pkg)
+        .map_err(|source| Error::TomlDe {
+            path: path.display().to_string(),
+            source,
+        })
+}
+
 #[cfg(test)]
 mod tests {
-    use std::{fs, io::Write};
+    use std::{
+        fs,
+        io::Write,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
+    };
 
     use assert_fs::TempDir;
     use zip::{write::SimpleFileOptions, ZipWriter};
@@ -1043,6 +1694,34 @@ mod tests {
     use crate::{lock::Manifest, registry::Registry, spec::PkgKind, Store};
 
     use super::*;
+
+    struct FixtureBackend {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl Backend for FixtureBackend {
+        fn resolve_version(
+            &self,
+            _package: &PackageSpec,
+            _artifact: &Artifact,
+        ) -> Result<ResolvedPackage> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(ResolvedPackage {
+                version: "1".to_owned(),
+                url: "plugin:fixture:demo".to_owned(),
+                sha256: None,
+                source: "plugin:fixture".to_owned(),
+                published_at: Some("2000-01-01T00:00:00Z".to_owned()),
+            })
+        }
+
+        fn install(&self, install: BackendInstall<'_>) -> Result<()> {
+            fs::create_dir_all(install.dest)
+                .map_err(|source| pkg_io(install.dest.display(), source))?;
+            fs::write(install.dest.join(&install.artifact.bin), b"plugin")
+                .map_err(|source| pkg_io(install.dest.display(), source))
+        }
+    }
 
     #[test]
     fn install_activate_remove_round_trip_with_local_archive() {
@@ -1232,6 +1911,126 @@ bin = "demo.exe"
     }
 
     #[test]
+    fn plugin_backend_installs_when_policy_allows_it() {
+        let dir = TempDir::new().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut registry = Registry::default();
+        registry
+            .insert_str(
+                "plugin",
+                &format!(
+                    r#"
+name = "demo"
+kind = "lsp"
+description = "Demo"
+
+[[artifact]]
+os = "{}"
+arch = "{}"
+source = {{ plugin = "fixture", ref = "demo" }}
+bin = "demo.exe"
+"#,
+                    std::env::consts::OS,
+                    std::env::consts::ARCH
+                ),
+            )
+            .unwrap();
+        let mut ops = Ops::new(
+            registry,
+            Store::open(dir.path().join("pkg")),
+            dir.path().join("config"),
+        )
+        .with_config(PkgConfig {
+            policy: crate::Policy {
+                allowed_plugin_backends: vec!["fixture".to_owned()],
+                ..crate::Policy::default()
+            },
+            ..PkgConfig::default()
+        });
+        ops.register_backend(
+            "fixture",
+            Arc::new(FixtureBackend {
+                calls: calls.clone(),
+            }),
+        );
+        let lock = ops.install(&["demo".to_owned()], &mut |_| {}).unwrap();
+        assert_eq!(lock.packages[0].source, "plugin:fixture");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let receipt = ops.store().receipts().unwrap().pop().unwrap();
+        assert!(ops.store().bin_dir().join(receipt.shim).exists());
+    }
+
+    #[test]
+    fn policy_rejects_plugin_backend_before_resolve() {
+        let dir = TempDir::new().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut registry = Registry::default();
+        registry
+            .insert_str(
+                "plugin",
+                &format!(
+                    r#"
+name = "demo"
+kind = "lsp"
+description = "Demo"
+
+[[artifact]]
+os = "{}"
+arch = "{}"
+source = {{ plugin = "fixture", ref = "demo" }}
+bin = "demo.exe"
+"#,
+                    std::env::consts::OS,
+                    std::env::consts::ARCH
+                ),
+            )
+            .unwrap();
+        let mut ops = Ops::new(
+            registry,
+            Store::open(dir.path().join("pkg")),
+            dir.path().join("config"),
+        );
+        ops.register_backend(
+            "fixture",
+            Arc::new(FixtureBackend {
+                calls: calls.clone(),
+            }),
+        );
+        let err = ops.install(&["demo".to_owned()], &mut |_| {}).unwrap_err();
+        assert!(err.to_string().contains("allowed-plugin-backends"));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn native_manager_detection_uses_host_order_and_path() {
+        let dir = TempDir::new().unwrap();
+        let bin = dir.path().join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        fs::write(bin.join(executable_name("dnf")), b"").unwrap();
+        fs::write(bin.join(executable_name("apt")), b"").unwrap();
+        let paths = std::env::join_paths([bin]).unwrap();
+        let source = NativeSource {
+            apt: Some("demo".to_owned()),
+            dnf: Some("demo".to_owned()),
+            pacman: Some("demo".to_owned()),
+            ..NativeSource::default()
+        };
+        assert_eq!(
+            detect_native_manager_with_paths(&source, "linux", Some(paths)),
+            Some(NativeManager::Apt)
+        );
+    }
+
+    #[test]
+    fn native_permission_error_names_user_command() {
+        assert!(native_permission_denied(
+            "E: Could not open lock file - permission denied"
+        ));
+        let command = native_user_command(NativeManager::Apt, "clangd", NativeAction::Install);
+        assert_eq!(command, "sudo apt install clangd");
+    }
+
+    #[test]
     fn node_bin_js_activation_writes_runtime_wrapper() {
         let dir = TempDir::new().unwrap();
         let store = Store::open(dir.path().join("pkg"));
@@ -1270,6 +2069,8 @@ bin = "demo"
             previous_version: None,
             files: Default::default(),
             installed_at: "now".to_owned(),
+            native_manager: None,
+            native_id: None,
         };
         let result = ops.activate_installed(
             &package,
@@ -1326,6 +2127,8 @@ bin = "debugpy-adapter"
             previous_version: None,
             files: Default::default(),
             installed_at: "now".to_owned(),
+            native_manager: None,
+            native_id: None,
         };
         ops.activate_installed(
             &package,
@@ -1526,5 +2329,13 @@ bin = "demo.exe"
         zip.start_file(name, SimpleFileOptions::default()).unwrap();
         zip.write_all(bytes).unwrap();
         zip.finish().unwrap();
+    }
+
+    fn executable_name(name: &str) -> String {
+        if cfg!(windows) {
+            format!("{name}.exe")
+        } else {
+            name.to_owned()
+        }
     }
 }

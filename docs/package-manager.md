@@ -3,11 +3,10 @@
 Status: approved design, implementation staged (2026-07).
 Owner: architecture; implemented by staged codex waves.
 
-Implementation status (2026-07 W-pkg-2): `helix-pkg` engine and `dhx pkg`
-CLI are implemented for github-release, archive, system, npm, pip, cargo, go,
-and grammar git sources. Receipts, lockfile sync, sha256 verification,
-outdated/update, rollback, and loader grammar fold-in are implemented. Editor
-command resolution and `:pkg` UI remain wave 3.
+Implementation status (2026-07 W-pkg-4): `helix-pkg` engine, `dhx pkg` CLI,
+editor `:pkg` UI, github-release, archive, system, npm, pip, cargo, go,
+grammar git, native OS package-manager sources, install policy checks, and the
+plugin backend contract surface are implemented.
 
 ## Problem
 
@@ -52,9 +51,10 @@ helix-loader (grammar path resolution).
 helix-pkg
 ├── registry   — package database parsing/merging (builtin + user registries)
 ├── spec       — PackageSpec: what to install and how (per-OS artifacts)
-├── source     — install backends (github-release, archive, npm, cargo, pip, go, system)
+├── source     — install backends (github-release, archive, npm, cargo, pip, go, system, native, plugin)
 ├── store      — on-disk layout, receipts, junction/copy activation
 ├── lock       — manifest + lockfile round-trip
+├── policy     — install policy checks before backend dispatch
 ├── resolve    — "language/tool → package → installed binary" resolution
 └── ops        — install/update/remove/doctor orchestration (async, progress events)
 ```
@@ -85,6 +85,8 @@ bin = "rust-analyzer.exe"        # path inside the unpacked artifact
 # source = { pip = "debugpy" }
 # source = { go = "golang.org/x/tools/gopls" }
 # source = { system = "clangd" }        # PATH detection only, never installed
+# source = { native = { winget = "Rustlang.rust-analyzer", brew = "rust-analyzer" } }
+# source = { plugin = "corp-tool-cache", ref = "rust-analyzer" }
 # grammars: source = { git = "https://github.com/tree-sitter/tree-sitter-rust", rev = "..." }
 ```
 
@@ -104,6 +106,84 @@ Design rulings:
   uses `GOBIN=<store> go install module@version`. Node/npm, Python, Cargo, and
   Go themselves are user prerequisites and are detected on PATH with actionable
   errors. The package manager does not install those runtimes.
+- **Ordered artifact fallback** is literal registry file order among artifacts
+  matching the host OS/arch. The first available backend wins. `system` is
+  available only when the binary is already on PATH; `native` is available only
+  when the configured manager is on PATH; plugin artifacts are available only
+  after their backend is registered.
+
+### Native OS package managers
+
+`source = { native = { winget = "...", brew = "...", apt = "...", pacman = "...", dnf = "..." } }`
+is a per-manager package ID map. Selection is host-specific: Windows uses
+WinGet, macOS uses Homebrew, and Linux checks apt, dnf, then pacman. Native
+managers install globally and may require elevation. `dhx pkg` never elevates
+silently; it attempts the manager command directly and maps permission failures
+to an actionable error containing the exact command the user can run, such as
+`winget install --id LLVM.LLVM --exact` or `sudo apt install clangd`.
+
+`[pkg] allow-native = true|false|prompt` controls whether native artifacts may
+run. The default is `prompt`. Receipts for native installs record the manager,
+manager package ID, and manager-reported version, but do not create shims:
+resolution finds the binary on PATH like a system install. `remove` delegates to
+the native manager using the same permission-error behavior. `doctor` re-queries
+the manager. `outdated`/`update` query cheap manager metadata where practical;
+otherwise they report the package as managed natively.
+
+Verified builtin native IDs are intentionally sparse: `rust-analyzer` uses
+WinGet `Rustlang.rust-analyzer` and Homebrew `rust-analyzer`; `clangd` uses
+WinGet `LLVM.LLVM` and Homebrew `llvm`.
+
+### Install policy
+
+Policy is configured under `[pkg.policy]` in `config.toml` and is enforced in
+`ops` before any backend install or plugin backend resolve/install call:
+
+```toml
+[pkg.policy]
+run-scripts = false
+allow-build = true
+min-release-age-days = 0
+allowed-backends = []
+blocked-backends = []
+allowed-sources = ["https://github.com/*"]
+allowed-plugin-backends = []
+```
+
+`run-scripts = false` is the default; npm remains `--ignore-scripts`, and future
+script-capable backends must check this key. `allow-build = false` rejects cargo,
+go, and grammar git build backends, leaving prebuilt archives, native managers,
+and system probes. Cargo `build.rs` can execute arbitrary code, so `allow-build`
+is a trust decision even though it is compilation rather than a package script.
+
+`min-release-age-days` refuses versions newer than the configured age when the
+backend provides publish metadata. GitHub releases, npm, PyPI, and crates.io
+provide timestamps. Native, system, direct archive, and other undated sources
+skip the age check with a warning. `allowed-backends`/`blocked-backends` gate
+backend names, and `allowed-sources` is a URL allowlist with `*` wildcards.
+
+### Plugin package backends
+
+Plugins can register package backends over the plugin contract capability
+`PkgBackend`. The contract mirrors the package backend boundary: `probe`,
+`resolve_version`, `install(staging_dir, progress)`, `remove`, and `doctor`.
+Lua plugins expose this as:
+
+```lua
+helix.pkg.register_backend({
+  name = "corp-tool-cache",
+  probe = function() return true end,
+  resolve = function(ref) return { version = "1.2.3" } end,
+  install = function(staging_dir, progress) progress("copying") end,
+  remove = function(ref) return true end,
+  doctor = function(ref) return true end,
+})
+```
+
+Registry entries reference a registered backend with
+`source = { plugin = "corp-tool-cache", ref = "rust-analyzer" }`. Plugin
+backends are never enabled by `run-scripts`; they always require an explicit
+`[pkg.policy] allowed-plugin-backends = ["corp-tool-cache"]` entry.
 
 ### Store layout (data dir)
 
@@ -115,9 +195,10 @@ Design rulings:
   runtimes/{node,py}/                    # shared npm prefix / venv, versioned
 ```
 
-- Activation = writing a shim + receipt; deactivation = removing them. The
-  store keeps versions side by side and records the previous active version so
-  rollback reactivates the prior still-present tree (`dhx pkg rollback <name>`).
+- Activation = writing a shim + receipt for store-managed packages; native
+  packages write a receipt only. The store keeps versions side by side and
+  records the previous active version so rollback reactivates the prior
+  still-present tree (`dhx pkg rollback <name>`).
 - Windows: junctions for directories, generated `.cmd`/copied exe shims for
   binaries — no symlink privilege required. Unix: symlinks.
 - Everything hash-verified: release assets against a sha256 recorded at
@@ -196,3 +277,5 @@ untouched. `doctor` re-verifies receipts against the store and re-runs
   fold-in; `update/outdated/search/rollback`; registry expansion.
 - **W-pkg-3**: editor UI (`:pkg` picker, statusline nudge, toasts/progress),
   registry expansion (~40 entries), book docs.
+- **W-pkg-4**: native OS package-manager backends, install policy engine, and
+  plugin package-backend contract.

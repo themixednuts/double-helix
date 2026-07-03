@@ -2,6 +2,7 @@ use crate::contract::errors::ContractError;
 use crate::contract::events::{EventKind, PluginEvent};
 use crate::contract::handles::*;
 use crate::contract::metadata::{ApiMetadata, EventKindInfo};
+use crate::contract::pkg::{PkgBackendRequest, PkgBackendResponse};
 use crate::contract::requests::*;
 use crate::contract::snapshots::*;
 use crate::contract::value::DynamicValue;
@@ -37,6 +38,7 @@ pub enum HostRequest {
         callback_id: u64,
         value: DynamicValue,
     },
+    PkgBackend(PkgBackendRequest),
     Shutdown,
 }
 
@@ -44,6 +46,7 @@ pub enum HostRequest {
 pub enum PluginResponse {
     Unit,
     Commands(Vec<crate::types::CommandMetadata>),
+    PkgBackend(PkgBackendResponse),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

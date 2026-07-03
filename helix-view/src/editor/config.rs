@@ -357,12 +357,7 @@ pub struct Config {
     pub pkg: PkgConfig,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
-pub struct PkgConfig {
-    pub auto_install: bool,
-    pub registries: Vec<PathBuf>,
-}
+pub type PkgConfig = helix_pkg::PkgConfig;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", default, deny_unknown_fields)]

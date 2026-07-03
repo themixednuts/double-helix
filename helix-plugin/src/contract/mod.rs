@@ -13,6 +13,7 @@
 //! - [`events`] — typed event enum and payloads
 //! - [`errors`] — structured error types for all contract operations
 //! - [`metadata`] — API version, capability discovery, event catalog
+//! - [`pkg`] — package-manager backend request and response types
 //! - [`host`] — capability traits that hosts implement
 //! - [`codec`] — msgpack-based serialization for wire transport
 
@@ -24,6 +25,7 @@ pub mod events;
 pub mod handles;
 pub mod host;
 pub mod metadata;
+pub mod pkg;
 pub mod requests;
 pub mod snapshots;
 pub mod value;

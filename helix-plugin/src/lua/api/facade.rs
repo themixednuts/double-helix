@@ -14,6 +14,7 @@
 //! - `helix.tabs`       — per-view tab groups (open, close, focus, cycle, list)
 //! - `helix.floats`     — floating windows (create, update, close, list)
 //! - `helix.lsp`        — LSP client queries
+//! - `helix.pkg`        — package-manager backend registration
 //! - `helix.layout`     — layout combinators
 //! - `helix.log`        — logging
 //! - `helix.async(fn)`  — launch a coroutine from synchronous context
@@ -2576,6 +2577,39 @@ fn parse_float_content(
 }
 
 // ---------------------------------------------------------------------------
+// helix.pkg — package-manager backend registration
+// ---------------------------------------------------------------------------
+
+fn register_pkg_module(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
+    let m = lua.create_table()?;
+    let backends = lua.create_table()?;
+    m.set("_backends", backends.clone())?;
+    m.set(
+        "register_backend",
+        lua.create_function(move |_lua, spec: LuaTable| {
+            let name: String = spec.get("name")?;
+            if name.trim().is_empty() {
+                return Err(LuaError::RuntimeError(
+                    "package backend name must not be empty".into(),
+                ));
+            }
+            for key in ["probe", "resolve", "install", "remove", "doctor"] {
+                let value: LuaValue = spec.get(key)?;
+                if !matches!(value, LuaValue::Function(_)) {
+                    return Err(LuaError::RuntimeError(format!(
+                        "package backend {name} requires function field {key}"
+                    )));
+                }
+            }
+            backends.set(name, spec)?;
+            Ok(())
+        })?,
+    )?;
+    helix_table.set("pkg", m)?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // helix.assistant — assistant/AI system queries and mutations
 // ---------------------------------------------------------------------------
 
@@ -2744,6 +2778,7 @@ pub(crate) fn register_facade(
     register_splits_module(lua, helix_table)?;
     register_tabs_module(lua, helix_table)?;
     register_floats_module(lua, helix_table)?;
+    register_pkg_module(lua, helix_table)?;
     register_assistant_module(lua, helix_table)?;
     register_lsp_module(lua, helix_table)?;
     register_layout_module(lua, helix_table)?;
@@ -3475,6 +3510,34 @@ mod tests {
         assert!(floats.contains_key("create").unwrap());
         assert!(floats.contains_key("close").unwrap());
         assert!(floats.contains_key("list").unwrap());
+    }
+
+    #[test]
+    fn pkg_module_registers_backend() {
+        let lua = Lua::new();
+        let helix_table = lua.create_table().unwrap();
+        register_pkg_module(&lua, &helix_table).unwrap();
+        lua.globals().set("helix", helix_table).unwrap();
+
+        lua.load(
+            r#"
+            helix.pkg.register_backend({
+                name = "fixture",
+                probe = function() return true end,
+                resolve = function() return { version = "1" } end,
+                install = function(_staging, _progress) return true end,
+                remove = function() return true end,
+                doctor = function() return true end,
+            })
+            "#,
+        )
+        .exec()
+        .unwrap();
+
+        let helix: LuaTable = lua.globals().get("helix").unwrap();
+        let pkg: LuaTable = helix.get("pkg").unwrap();
+        let backends: LuaTable = pkg.get("_backends").unwrap();
+        assert!(backends.contains_key("fixture").unwrap());
     }
 
     #[test]

@@ -75,6 +75,18 @@ impl PackageSpec {
             })
     }
 
+    pub fn artifacts_for<'a>(
+        &'a self,
+        os: &str,
+        arch: &str,
+    ) -> impl Iterator<Item = &'a Artifact> + 'a {
+        let os = os.to_owned();
+        let arch = arch.to_owned();
+        self.artifacts
+            .iter()
+            .filter(move |artifact| artifact.matches(&os, &arch))
+    }
+
     pub fn artifact(&self) -> Result<&Artifact> {
         self.artifact_for(std::env::consts::OS, std::env::consts::ARCH)
     }
@@ -129,6 +141,12 @@ pub struct Source {
     #[serde(default)]
     pub system: Option<String>,
     #[serde(default)]
+    pub native: Option<NativeSource>,
+    #[serde(default)]
+    pub plugin: Option<String>,
+    #[serde(default, rename = "ref")]
+    pub plugin_ref: Option<String>,
+    #[serde(default)]
     pub asset: Option<String>,
     #[serde(default)]
     pub rev: Option<String>,
@@ -162,6 +180,10 @@ impl Source {
             "git"
         } else if self.system.is_some() {
             "system"
+        } else if self.native.is_some() {
+            "native"
+        } else if self.plugin.is_some() {
+            "plugin"
         } else {
             "unknown"
         }
@@ -175,7 +197,9 @@ impl Source {
             + self.cargo.is_some() as usize
             + self.go.is_some() as usize
             + self.git.is_some() as usize
-            + self.system.is_some() as usize;
+            + self.system.is_some() as usize
+            + self.native.is_some() as usize
+            + self.plugin.is_some() as usize;
         if count != 1 {
             return Err(Error::InvalidPackage {
                 name: package.to_owned(),
@@ -200,6 +224,71 @@ impl Source {
                 message: "npm source accepts either bin or bin-js, not both".to_owned(),
             });
         }
+        if self.plugin.is_some() && self.plugin_ref.is_none() {
+            return Err(Error::InvalidPackage {
+                name: package.to_owned(),
+                message: "plugin source requires a ref".to_owned(),
+            });
+        }
         Ok(())
+    }
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct NativeSource {
+    #[serde(default)]
+    pub winget: Option<String>,
+    #[serde(default)]
+    pub brew: Option<String>,
+    #[serde(default)]
+    pub apt: Option<String>,
+    #[serde(default)]
+    pub pacman: Option<String>,
+    #[serde(default)]
+    pub dnf: Option<String>,
+}
+
+impl NativeSource {
+    pub fn id_for(&self, manager: NativeManager) -> Option<&str> {
+        match manager {
+            NativeManager::Winget => self.winget.as_deref(),
+            NativeManager::Brew => self.brew.as_deref(),
+            NativeManager::Apt => self.apt.as_deref(),
+            NativeManager::Pacman => self.pacman.as_deref(),
+            NativeManager::Dnf => self.dnf.as_deref(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum NativeManager {
+    Winget,
+    Brew,
+    Apt,
+    Pacman,
+    Dnf,
+}
+
+impl NativeManager {
+    pub const fn command(self) -> &'static str {
+        match self {
+            Self::Winget => "winget",
+            Self::Brew => "brew",
+            Self::Apt => "apt",
+            Self::Pacman => "pacman",
+            Self::Dnf => "dnf",
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        self.command()
+    }
+}
+
+impl fmt::Display for NativeManager {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
     }
 }

@@ -51,7 +51,7 @@ use helix_core::{
 
 use crate::{
     bench::{current_bench_command_context, log_command_phase},
-    document_lsp::{DocumentColorSwatches, DocumentLspState},
+    document_lsp::{DocumentCodeLenses, DocumentColorSwatches, DocumentLinks, DocumentLspState},
     editor::{Config, CursorShapeConfig, LifecycleBus},
     events::{DocumentDidChange, SelectionDidChange},
     expansion,
@@ -1699,6 +1699,8 @@ impl Document {
         };
 
         self.presentation.mark_inlay_hints_outdated();
+        self.lsp.update_code_lenses(changes);
+        self.lsp.update_document_links(changes);
         let inlay_start = Instant::now();
         for text_annotation in self.presentation.inlay_hints_mut() {
             let DocumentInlayHints {
@@ -2311,6 +2313,58 @@ impl Document {
 
     pub fn update_color_swatches(&mut self, changes: &ChangeSet) {
         self.lsp.update_color_swatches(changes);
+    }
+
+    pub fn restart_code_lenses(&mut self) -> helix_runtime::Token {
+        self.lsp.restart_code_lenses()
+    }
+
+    pub fn cancel_code_lenses(&mut self) -> bool {
+        self.lsp.cancel_code_lenses()
+    }
+
+    pub fn code_lenses(&self) -> Option<&DocumentCodeLenses> {
+        self.lsp.code_lenses()
+    }
+
+    pub fn code_lenses_mut(&mut self) -> Option<&mut DocumentCodeLenses> {
+        self.lsp.code_lenses_mut()
+    }
+
+    pub fn clear_code_lenses(&mut self) {
+        self.lsp.clear_code_lenses();
+    }
+
+    pub fn set_code_lenses(&mut self, code_lenses: DocumentCodeLenses) {
+        self.lsp.set_code_lenses(code_lenses);
+    }
+
+    pub fn restart_document_links(&mut self) -> helix_runtime::Token {
+        self.lsp.restart_document_links()
+    }
+
+    pub fn cancel_document_links(&mut self) -> bool {
+        self.lsp.cancel_document_links()
+    }
+
+    pub fn document_links(&self) -> Option<&DocumentLinks> {
+        self.lsp.document_links()
+    }
+
+    pub fn clear_document_links(&mut self) {
+        self.lsp.clear_document_links();
+    }
+
+    pub fn set_document_links(&mut self, document_links: DocumentLinks) {
+        self.lsp.set_document_links(document_links);
+    }
+
+    pub fn restart_folding_ranges(&mut self) -> helix_runtime::Token {
+        self.lsp.restart_folding_ranges()
+    }
+
+    pub fn cancel_folding_ranges(&mut self) -> bool {
+        self.lsp.cancel_folding_ranges()
     }
 
     pub fn diff_handle(&self) -> Option<&DiffHandle> {
@@ -3353,6 +3407,18 @@ impl Document {
         self.presentation.insert_fold_container(view_id, container);
     }
 
+    pub fn mark_lsp_fold_container(&mut self, view_id: ViewId) {
+        self.lsp.mark_lsp_fold_container(view_id);
+    }
+
+    pub fn clear_lsp_fold_container(&mut self, view_id: ViewId) {
+        self.lsp.clear_lsp_fold_container(view_id);
+    }
+
+    pub fn is_lsp_fold_container(&self, view_id: ViewId) -> bool {
+        self.lsp.is_lsp_fold_container(view_id)
+    }
+
     /// `None` when container is empty.
     pub fn fold_container(&self, view_id: ViewId) -> Option<&FoldContainer> {
         self.presentation.fold_container(view_id)
@@ -3409,6 +3475,7 @@ impl Document {
         fold_points: Vec<(StartFoldPoint, EndFoldPoint)>,
         replace: bool,
     ) {
+        self.clear_lsp_fold_container(view.id);
         let text = self.buffer.text().slice(..);
         let range = self.selection(view.id).primary();
         let container = self.presentation.fold_container_mut(view.id);
@@ -3435,6 +3502,7 @@ impl Document {
     }
 
     pub fn remove_folds(&mut self, view: &View, start_indices: &[usize]) {
+        self.clear_lsp_fold_container(view.id);
         let text = self.buffer.text().slice(..);
         let container = self
             .presentation

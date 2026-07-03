@@ -45,14 +45,10 @@ impl TerminalManager {
     ) -> anyhow::Result<CreateTerminalResponse> {
         let mut cmd = Command::new(&req.command);
 
-        if let Some(ref args) = req.args {
-            cmd.args(args);
-        }
+        cmd.args(&req.args);
 
-        if let Some(ref env_vars) = req.env {
-            for var in env_vars {
-                cmd.env(&var.name, &var.value);
-            }
+        for var in &req.env {
+            cmd.env(&var.name, &var.value);
         }
 
         if let Some(ref cwd) = req.cwd {
@@ -151,7 +147,7 @@ impl TerminalManager {
             .await
             .insert(terminal_id.clone(), managed);
 
-        Ok(CreateTerminalResponse { terminal_id })
+        Ok(CreateTerminalResponse::new(terminal_id))
     }
 
     /// Get the current output of a terminal.
@@ -160,8 +156,9 @@ impl TerminalManager {
         req: &TerminalOutputRequest,
     ) -> anyhow::Result<TerminalOutputResponse> {
         let terms = self.terminals.lock().await;
+        let terminal_id = req.terminal_id.to_string();
         let term = terms
-            .get(&req.terminal_id)
+            .get(&terminal_id)
             .ok_or_else(|| anyhow::anyhow!("Unknown terminal: {}", req.terminal_id))?;
 
         let data = term.output.lock().await;
@@ -169,16 +166,11 @@ impl TerminalManager {
         let output = String::from_utf8_lossy(&data).to_string();
 
         let exit_result = term.exit_result.lock().await;
-        let exit_status = exit_result.as_ref().map(|r| TerminalExitStatus {
-            exit_code: r.exit_code,
-            signal: None,
-        });
+        let exit_status = exit_result
+            .as_ref()
+            .map(|r| terminal_exit_status(r.exit_code));
 
-        Ok(TerminalOutputResponse {
-            output,
-            truncated,
-            exit_status,
-        })
+        Ok(TerminalOutputResponse::new(output, truncated).exit_status(exit_status))
     }
 
     /// Wait for a terminal to exit.
@@ -188,17 +180,17 @@ impl TerminalManager {
     ) -> anyhow::Result<WaitForTerminalExitResponse> {
         let notify = {
             let terms = self.terminals.lock().await;
+            let terminal_id = req.terminal_id.to_string();
             let term = terms
-                .get(&req.terminal_id)
+                .get(&terminal_id)
                 .ok_or_else(|| anyhow::anyhow!("Unknown terminal: {}", req.terminal_id))?;
 
             // Already exited?
             let exit = term.exit_result.lock().await;
             if let Some(ref result) = *exit {
-                return Ok(WaitForTerminalExitResponse {
-                    exit_code: result.exit_code,
-                    signal: None,
-                });
+                return Ok(WaitForTerminalExitResponse::new(terminal_exit_status(
+                    result.exit_code,
+                )));
             }
 
             term.exit_notify.clone()
@@ -208,8 +200,9 @@ impl TerminalManager {
         notify.notified().await;
 
         let terms = self.terminals.lock().await;
+        let terminal_id = req.terminal_id.to_string();
         let term = terms
-            .get(&req.terminal_id)
+            .get(&terminal_id)
             .ok_or_else(|| anyhow::anyhow!("Unknown terminal: {}", req.terminal_id))?;
 
         let exit = term.exit_result.lock().await;
@@ -217,10 +210,9 @@ impl TerminalManager {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Terminal exit result missing"))?;
 
-        Ok(WaitForTerminalExitResponse {
-            exit_code: result.exit_code,
-            signal: None,
-        })
+        Ok(WaitForTerminalExitResponse::new(terminal_exit_status(
+            result.exit_code,
+        )))
     }
 
     /// Kill a terminal process.
@@ -230,11 +222,11 @@ impl TerminalManager {
         // The kill_on_drop will handle it when the terminal is released.
         // For a proper kill, we'd need to store the child PID and send a signal.
         let terms = self.terminals.lock().await;
-        if !terms.contains_key(&req.terminal_id) {
+        if !terms.contains_key(&req.terminal_id.to_string()) {
             anyhow::bail!("Unknown terminal: {}", req.terminal_id);
         }
         // kill_on_drop will kill when the terminal is released
-        Ok(KillTerminalResponse {})
+        Ok(KillTerminalResponse::new())
     }
 
     /// Release (remove) a terminal from tracking.
@@ -242,11 +234,18 @@ impl TerminalManager {
         &self,
         req: &ReleaseTerminalRequest,
     ) -> anyhow::Result<ReleaseTerminalResponse> {
-        self.terminals.lock().await.remove(&req.terminal_id);
+        self.terminals
+            .lock()
+            .await
+            .remove(&req.terminal_id.to_string());
         // Dropping ManagedTerminal drops the Arc refs; the background tasks
         // will finish on their own, and kill_on_drop handles the child.
-        Ok(ReleaseTerminalResponse {})
+        Ok(ReleaseTerminalResponse::new())
     }
+}
+
+fn terminal_exit_status(exit_code: Option<i32>) -> TerminalExitStatus {
+    TerminalExitStatus::new().exit_code(exit_code.and_then(|code| u32::try_from(code).ok()))
 }
 
 impl Default for TerminalManager {

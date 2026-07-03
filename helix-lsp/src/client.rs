@@ -396,6 +396,30 @@ impl Client {
                         | ColorProviderCapability::Options(_)
                 )
             ),
+            LanguageServerFeature::CodeLens => capabilities.code_lens_provider.is_some(),
+            LanguageServerFeature::DocumentLinks => capabilities.document_link_provider.is_some(),
+            LanguageServerFeature::FoldingRange => matches!(
+                capabilities.folding_range_provider,
+                Some(
+                    lsp::FoldingRangeProviderCapability::Simple(true)
+                        | lsp::FoldingRangeProviderCapability::FoldingProvider(_)
+                        | lsp::FoldingRangeProviderCapability::Options(_)
+                )
+            ),
+            LanguageServerFeature::SelectionRange => {
+                capabilities.selection_range_provider.is_some()
+            }
+            LanguageServerFeature::LinkedEditingRange => matches!(
+                capabilities.linked_editing_range_provider,
+                Some(
+                    lsp::LinkedEditingRangeServerCapabilities::Simple(true)
+                        | lsp::LinkedEditingRangeServerCapabilities::Options(_)
+                        | lsp::LinkedEditingRangeServerCapabilities::RegistrationOptions(_)
+                )
+            ),
+            LanguageServerFeature::OnTypeFormatting => {
+                capabilities.document_on_type_formatting_provider.is_some()
+            }
         }
     }
 
@@ -578,6 +602,9 @@ impl Client {
                     inlay_hint: Some(lsp::InlayHintWorkspaceClientCapabilities {
                         refresh_support: Some(false),
                     }),
+                    code_lens: Some(lsp::CodeLensWorkspaceClientCapabilities {
+                        refresh_support: Some(true),
+                    }),
                     workspace_edit: Some(lsp::WorkspaceEditClientCapabilities {
                         document_changes: Some(true),
                         resource_operations: Some(vec![
@@ -693,6 +720,7 @@ impl Client {
                             value_set: vec![
                                 lsp::DiagnosticTag::UNNECESSARY,
                                 lsp::DiagnosticTag::DEPRECATED,
+                                lsp::DiagnosticTag::UNNEEDED_PARENTHESES,
                             ],
                         }),
                         ..Default::default()
@@ -700,6 +728,32 @@ impl Client {
                     inlay_hint: Some(lsp::InlayHintClientCapabilities {
                         dynamic_registration: Some(false),
                         resolve_support: None,
+                    }),
+                    code_lens: Some(lsp::CodeLensClientCapabilities {
+                        dynamic_registration: Some(false),
+                    }),
+                    document_link: Some(lsp::DocumentLinkClientCapabilities {
+                        dynamic_registration: Some(false),
+                        tooltip_support: Some(true),
+                    }),
+                    folding_range: Some(lsp::FoldingRangeClientCapabilities {
+                        dynamic_registration: Some(false),
+                        line_folding_only: Some(false),
+                        folding_range_kind: Some(lsp::FoldingRangeKindCapability {
+                            value_set: Some(vec![
+                                lsp::FoldingRangeKind::Comment,
+                                lsp::FoldingRangeKind::Imports,
+                                lsp::FoldingRangeKind::Region,
+                            ]),
+                        }),
+                        ..Default::default()
+                    }),
+                    selection_range: None,
+                    linked_editing_range: Some(lsp::LinkedEditingRangeClientCapabilities {
+                        dynamic_registration: Some(false),
+                    }),
+                    on_type_formatting: Some(lsp::DocumentOnTypeFormattingClientCapabilities {
+                        dynamic_registration: Some(false),
                     }),
                     ..Default::default()
                 }),
@@ -1182,6 +1236,207 @@ impl Client {
         };
 
         Some(self.call::<lsp::request::InlayHintRequest>(params))
+    }
+
+    pub fn resolve_inlay_hint(
+        &self,
+        hint: &lsp::InlayHint,
+    ) -> Option<impl Future<Output = Result<lsp::InlayHint>>> {
+        let capabilities = self.capabilities.get().unwrap();
+
+        match capabilities.inlay_hint_provider {
+            Some(lsp::OneOf::Right(lsp::InlayHintServerCapabilities::Options(
+                lsp::InlayHintOptions {
+                    resolve_provider: Some(true),
+                    ..
+                },
+            ))) => (),
+            _ => return None,
+        }
+
+        Some(self.call_with_ref::<lsp::request::InlayHintResolveRequest>(hint))
+    }
+
+    pub fn text_document_code_lens(
+        &self,
+        text_document: lsp::TextDocumentIdentifier,
+        work_done_token: Option<lsp::ProgressToken>,
+    ) -> Option<impl Future<Output = Result<Option<Vec<lsp::CodeLens>>>>> {
+        self.capabilities
+            .get()
+            .unwrap()
+            .code_lens_provider
+            .as_ref()?;
+        let params = lsp::CodeLensParams {
+            text_document,
+            work_done_progress_params: lsp::WorkDoneProgressParams {
+                work_done_token: work_done_token.clone(),
+            },
+            partial_result_params: helix_lsp_types::PartialResultParams {
+                partial_result_token: work_done_token,
+            },
+        };
+
+        Some(self.call::<lsp::request::CodeLensRequest>(params))
+    }
+
+    pub fn resolve_code_lens(
+        &self,
+        code_lens: &lsp::CodeLens,
+    ) -> Option<impl Future<Output = Result<lsp::CodeLens>>> {
+        match self.capabilities.get().unwrap().code_lens_provider {
+            Some(lsp::CodeLensOptions {
+                resolve_provider: Some(true),
+            }) => (),
+            _ => return None,
+        }
+
+        Some(self.call_with_ref::<lsp::request::CodeLensResolve>(code_lens))
+    }
+
+    pub fn text_document_document_link(
+        &self,
+        text_document: lsp::TextDocumentIdentifier,
+        work_done_token: Option<lsp::ProgressToken>,
+    ) -> Option<impl Future<Output = Result<Option<Vec<lsp::DocumentLink>>>>> {
+        self.capabilities
+            .get()
+            .unwrap()
+            .document_link_provider
+            .as_ref()?;
+        let params = lsp::DocumentLinkParams {
+            text_document,
+            work_done_progress_params: lsp::WorkDoneProgressParams {
+                work_done_token: work_done_token.clone(),
+            },
+            partial_result_params: helix_lsp_types::PartialResultParams {
+                partial_result_token: work_done_token,
+            },
+        };
+
+        Some(self.call::<lsp::request::DocumentLinkRequest>(params))
+    }
+
+    pub fn resolve_document_link(
+        &self,
+        document_link: &lsp::DocumentLink,
+    ) -> Option<impl Future<Output = Result<lsp::DocumentLink>>> {
+        match self.capabilities.get().unwrap().document_link_provider {
+            Some(lsp::DocumentLinkOptions {
+                resolve_provider: Some(true),
+                ..
+            }) => (),
+            _ => return None,
+        }
+
+        Some(self.call_with_ref::<lsp::request::DocumentLinkResolve>(document_link))
+    }
+
+    pub fn text_document_folding_range(
+        &self,
+        text_document: lsp::TextDocumentIdentifier,
+        work_done_token: Option<lsp::ProgressToken>,
+    ) -> Option<impl Future<Output = Result<Option<Vec<lsp::FoldingRange>>>>> {
+        match self.capabilities.get().unwrap().folding_range_provider {
+            Some(
+                lsp::FoldingRangeProviderCapability::Simple(true)
+                | lsp::FoldingRangeProviderCapability::FoldingProvider(_)
+                | lsp::FoldingRangeProviderCapability::Options(_),
+            ) => (),
+            _ => return None,
+        }
+        let params = lsp::FoldingRangeParams {
+            text_document,
+            work_done_progress_params: lsp::WorkDoneProgressParams {
+                work_done_token: work_done_token.clone(),
+            },
+            partial_result_params: helix_lsp_types::PartialResultParams {
+                partial_result_token: work_done_token,
+            },
+        };
+
+        Some(self.call::<lsp::request::FoldingRangeRequest>(params))
+    }
+
+    pub fn text_document_linked_editing_range(
+        &self,
+        text_document: lsp::TextDocumentIdentifier,
+        position: lsp::Position,
+        work_done_token: Option<lsp::ProgressToken>,
+    ) -> Option<impl Future<Output = Result<Option<lsp::LinkedEditingRanges>>>> {
+        match self
+            .capabilities
+            .get()
+            .unwrap()
+            .linked_editing_range_provider
+        {
+            Some(
+                lsp::LinkedEditingRangeServerCapabilities::Simple(true)
+                | lsp::LinkedEditingRangeServerCapabilities::Options(_)
+                | lsp::LinkedEditingRangeServerCapabilities::RegistrationOptions(_),
+            ) => (),
+            _ => return None,
+        }
+        let params = lsp::LinkedEditingRangeParams {
+            text_document_position_params: lsp::TextDocumentPositionParams {
+                text_document,
+                position,
+            },
+            work_done_progress_params: lsp::WorkDoneProgressParams { work_done_token },
+        };
+
+        Some(self.call::<lsp::request::LinkedEditingRange>(params))
+    }
+
+    pub fn text_document_selection_range(
+        &self,
+        text_document: lsp::TextDocumentIdentifier,
+        positions: Vec<lsp::Position>,
+        work_done_token: Option<lsp::ProgressToken>,
+    ) -> Option<impl Future<Output = Result<Option<Vec<lsp::SelectionRange>>>>> {
+        self.capabilities
+            .get()
+            .unwrap()
+            .selection_range_provider
+            .as_ref()?;
+        let params = lsp::SelectionRangeParams {
+            text_document,
+            positions,
+            work_done_progress_params: lsp::WorkDoneProgressParams { work_done_token },
+            partial_result_params: Default::default(),
+        };
+
+        Some(self.call::<lsp::request::SelectionRangeRequest>(params))
+    }
+
+    pub fn text_document_on_type_formatting(
+        &self,
+        text_document: lsp::TextDocumentIdentifier,
+        position: lsp::Position,
+        ch: String,
+        options: lsp::FormattingOptions,
+    ) -> Option<impl Future<Output = Result<Option<Vec<lsp::TextEdit>>>>> {
+        let capabilities = self.capabilities.get().unwrap();
+        let on_type = capabilities.document_on_type_formatting_provider.as_ref()?;
+        if on_type.first_trigger_character != ch
+            && !on_type
+                .more_trigger_character
+                .as_ref()
+                .is_some_and(|chars| chars.iter().any(|trigger| trigger == &ch))
+        {
+            return None;
+        }
+
+        let params = lsp::DocumentOnTypeFormattingParams {
+            text_document_position: lsp::TextDocumentPositionParams {
+                text_document,
+                position,
+            },
+            ch,
+            options: self.get_merged_formatting_options(options),
+        };
+
+        Some(self.call::<lsp::request::OnTypeFormatting>(params))
     }
 
     pub fn text_document_document_color(

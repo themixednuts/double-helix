@@ -476,6 +476,8 @@ pub enum MethodCall {
     UnregisterCapability(lsp::UnregistrationParams),
     ShowDocument(lsp::ShowDocumentParams),
     WorkspaceDiagnosticRefresh,
+    CodeLensRefresh,
+    InlayHintRefresh,
     ShowMessageRequest(lsp::ShowMessageRequestParams),
 }
 
@@ -509,6 +511,8 @@ impl MethodCall {
                 Self::ShowDocument(params)
             }
             lsp::request::WorkspaceDiagnosticRefresh::METHOD => Self::WorkspaceDiagnosticRefresh,
+            lsp::request::CodeLensRefresh::METHOD => Self::CodeLensRefresh,
+            lsp::request::InlayHintRefreshRequest::METHOD => Self::InlayHintRefresh,
             lsp::request::ShowMessageRequest::METHOD => {
                 let params: lsp::ShowMessageRequestParams = params.parse()?;
                 Self::ShowMessageRequest(params)

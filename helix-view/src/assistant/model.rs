@@ -48,6 +48,10 @@ pub struct ThreadView {
     pub opened_docs: HashMap<thread::EntryId, DocumentId>,
     pub content_scroll: usize,
     pub terminals: Vec<Terminal>,
+    pub usage: thread::Usage,
+    pub commands: Vec<thread::Command>,
+    pub pending_elicitations: Vec<thread::Elicitation>,
+    pub caps: Option<helix_acp::AgentCaps>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,6 +67,9 @@ pub enum EntryKind {
         text: String,
     },
     AssistantText {
+        text: String,
+    },
+    Thought {
         text: String,
     },
     ToolCall {
@@ -143,6 +150,7 @@ impl EntryView {
                 EntryKind::AssistantText { text } => {
                     crate::model::AssistantEntryKind::AgentText(text)
                 }
+                EntryKind::Thought { text } => crate::model::AssistantEntryKind::Thought(text),
                 EntryKind::ToolCall {
                     id,
                     name,
@@ -383,6 +391,10 @@ impl Store {
                     .into_iter()
                     .map(Terminal::to_model)
                     .collect(),
+                usage: active.usage,
+                commands: active.commands,
+                pending_elicitations: active.pending_elicitations,
+                caps: active.caps,
             }
         } else {
             crate::model::AssistantModel {
@@ -414,6 +426,10 @@ impl Store {
                 plan_items: None,
                 queued_messages: 0,
                 terminals: Vec::new(),
+                usage: thread::Usage::default(),
+                commands: Vec::new(),
+                pending_elicitations: Vec::new(),
+                caps: None,
             }
         }
     }
@@ -489,7 +505,7 @@ impl Store {
                                 EntryKind::AssistantText { text: text.clone() }
                             }
                             thread::EntryKind::Thought { text } => {
-                                EntryKind::AssistantText { text: text.clone() }
+                                EntryKind::Thought { text: text.clone() }
                             }
                             thread::EntryKind::ToolCall(call) => EntryKind::ToolCall {
                                 id: call.id.to_string(),
@@ -571,6 +587,10 @@ impl Store {
                 folded: thread.folded_entries().collect(),
                 opened_docs: thread.opened_docs().clone(),
                 content_scroll: thread.content_scroll(),
+                usage: thread.usage().clone(),
+                commands: thread.commands().to_vec(),
+                pending_elicitations: thread.pending_elicitations().to_vec(),
+                caps: thread.caps().cloned(),
                 terminals: thread
                     .terminals()
                     .iter()

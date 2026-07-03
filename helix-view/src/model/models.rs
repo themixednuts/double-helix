@@ -201,6 +201,14 @@ pub struct AssistantModel {
 
     /// Terminals associated with the active thread.
     pub terminals: Vec<AssistantTerminal>,
+    /// Active thread usage counters/context window data.
+    pub usage: crate::assistant::thread::Usage,
+    /// Agent commands available for the active thread.
+    pub commands: Vec<crate::assistant::thread::Command>,
+    /// Pending or recently completed elicitations for the active thread.
+    pub pending_elicitations: Vec<crate::assistant::thread::Elicitation>,
+    /// ACP capabilities advertised by the active agent.
+    pub caps: Option<helix_acp::AgentCaps>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -382,6 +390,24 @@ impl AssistantModel {
                 tone: AssistantHeaderTone::Warning,
             });
         }
+        let total_tokens = self
+            .usage
+            .total_input_tokens
+            .saturating_add(self.usage.total_output_tokens);
+        let last_tokens = self
+            .usage
+            .input_tokens
+            .saturating_add(self.usage.output_tokens);
+        if total_tokens > 0 || last_tokens > 0 {
+            trailing.push(AssistantHeaderItem {
+                label: format!(
+                    "{} tok · last {}",
+                    compact_count(total_tokens),
+                    compact_count(last_tokens)
+                ),
+                tone: AssistantHeaderTone::Default,
+            });
+        }
 
         AssistantHeaderModel { leading, trailing }
     }
@@ -409,6 +435,16 @@ impl AssistantModel {
                 })
                 .collect(),
         })
+    }
+}
+
+fn compact_count(value: u64) -> String {
+    if value >= 1_000_000 {
+        format!("{:.1}m", value as f64 / 1_000_000.0)
+    } else if value >= 1_000 {
+        format!("{:.1}k", value as f64 / 1_000.0)
+    } else {
+        value.to_string()
     }
 }
 
@@ -586,6 +622,8 @@ pub enum AssistantEntryKind {
     UserMessage(String),
     /// Agent response text (may contain markdown).
     AgentText(String),
+    /// Agent thought text, folded by default.
+    Thought(String),
     /// Tool call with status tracking.
     ToolCall {
         id: String,
@@ -611,6 +649,7 @@ impl AssistantEntry {
             self.kind,
             AssistantEntryKind::UserMessage(_)
                 | AssistantEntryKind::AgentText(_)
+                | AssistantEntryKind::Thought(_)
                 | AssistantEntryKind::ReviewSummary { .. }
         )
     }
@@ -619,7 +658,9 @@ impl AssistantEntry {
     pub const fn role(&self) -> AssistantEntryRole {
         match self.kind {
             AssistantEntryKind::UserMessage(_) => AssistantEntryRole::User,
-            AssistantEntryKind::AgentText(_) => AssistantEntryRole::Agent,
+            AssistantEntryKind::AgentText(_) | AssistantEntryKind::Thought(_) => {
+                AssistantEntryRole::Agent
+            }
             AssistantEntryKind::ToolCall { .. } => AssistantEntryRole::Tool,
             AssistantEntryKind::Status(_) => AssistantEntryRole::Status,
             AssistantEntryKind::ChangeSummary { .. } | AssistantEntryKind::ReviewSummary { .. } => {
@@ -633,6 +674,7 @@ impl AssistantEntry {
         match &self.kind {
             AssistantEntryKind::UserMessage(message)
             | AssistantEntryKind::AgentText(message)
+            | AssistantEntryKind::Thought(message)
             | AssistantEntryKind::Status(message) => message.clone(),
             AssistantEntryKind::ToolCall {
                 id,
@@ -675,6 +717,11 @@ impl AssistantEntry {
             },
             AssistantEntryKind::AgentText(message) => AssistantEntryDetails {
                 heading: agent_name.to_string(),
+                body: Some(message.clone()),
+                lines: Vec::new(),
+            },
+            AssistantEntryKind::Thought(message) => AssistantEntryDetails {
+                heading: "thinking".to_string(),
                 body: Some(message.clone()),
                 lines: Vec::new(),
             },
@@ -821,7 +868,9 @@ impl AssistantEntry {
                     accessory_tone: AssistantEntryTone::Inactive,
                 })
             }
-            AssistantEntryKind::UserMessage(_) | AssistantEntryKind::AgentText(_) => None,
+            AssistantEntryKind::UserMessage(_)
+            | AssistantEntryKind::AgentText(_)
+            | AssistantEntryKind::Thought(_) => None,
         }
     }
 
@@ -859,6 +908,15 @@ impl AssistantEntry {
                     text: text.clone(),
                 })
             }
+            AssistantEntryKind::Thought(text) => AssistantEntryDisplay::Plain(AssistantEntryRow {
+                leading: " … ".to_string(),
+                leading_tone: AssistantEntryTone::Inactive,
+                animate_leading: false,
+                body: format!("thinking... {}", Self::summary(text, 96)),
+                body_tone: AssistantEntryTone::Inactive,
+                accessory: None,
+                accessory_tone: AssistantEntryTone::Default,
+            }),
             AssistantEntryKind::ToolCall { .. }
             | AssistantEntryKind::Status(_)
             | AssistantEntryKind::ChangeSummary { .. }

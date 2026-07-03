@@ -14,6 +14,18 @@ use super::Handlers;
 
 pub struct DocumentColorsEvent(pub DocumentId);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LspFeatureRefreshKind {
+    CodeLens,
+    DocumentLinks,
+    FoldingRanges,
+}
+
+pub struct LspFeatureRefreshEvent {
+    pub doc_id: DocumentId,
+    pub kind: LspFeatureRefreshKind,
+}
+
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum SignatureHelpInvoked {
     Automatic,

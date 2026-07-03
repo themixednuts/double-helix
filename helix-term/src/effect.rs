@@ -141,6 +141,24 @@ pub(crate) fn apply_runtime_task_event(
                 language_server::request_document_colors(editor, doc_id, ingress.clone());
             }
         }
+        RuntimeTaskEvent::RequestLspFeaturesDebounced { docs } => {
+            use helix_view::handlers::lsp::LspFeatureRefreshKind;
+            for (doc_id, kinds) in docs {
+                for kind in kinds {
+                    match kind {
+                        LspFeatureRefreshKind::CodeLens => {
+                            language_server::request_code_lenses(editor, doc_id, ingress.clone())
+                        }
+                        LspFeatureRefreshKind::DocumentLinks => {
+                            language_server::request_document_links(editor, doc_id, ingress.clone())
+                        }
+                        LspFeatureRefreshKind::FoldingRanges => {
+                            language_server::request_folding_ranges(editor, doc_id, ingress.clone())
+                        }
+                    }
+                }
+            }
+        }
         RuntimeTaskEvent::PullDiagnosticsDebounced { document_ids } => {
             for document_id in document_ids {
                 language_server::request_document_diagnostics(editor, document_id, ingress.clone());
@@ -180,6 +198,33 @@ pub(crate) fn apply_runtime_task_event(
         } => {
             language_server::apply_inlay_hints(editor, view_id, doc_id, offset_encoding, id, hints)
         }
+        RuntimeTaskEvent::ApplyCodeLenses { doc_id, lenses } => {
+            language_server::apply_code_lenses(editor, doc_id, lenses)
+        }
+        RuntimeTaskEvent::ApplyDocumentLinks { doc_id, links } => {
+            language_server::apply_document_links(editor, doc_id, links)
+        }
+        RuntimeTaskEvent::ApplyFoldingRanges { doc_id, ranges } => {
+            language_server::apply_folding_ranges(editor, doc_id, ranges)
+        }
+        RuntimeTaskEvent::ApplyLinkedEditingRanges {
+            offset_encoding,
+            ranges,
+        } => language_server::apply_linked_editing_ranges(editor, offset_encoding, ranges),
+        RuntimeTaskEvent::ApplyOnTypeFormatting {
+            doc_id,
+            view_id,
+            expected_version,
+            offset_encoding,
+            edits,
+        } => language_server::apply_on_type_formatting(
+            editor,
+            doc_id,
+            view_id,
+            expected_version,
+            offset_encoding,
+            edits,
+        ),
         RuntimeTaskEvent::DapRestarted => dap::apply_dap_restarted(editor),
         RuntimeTaskEvent::ResumeDebuggerApplication => {
             dap::apply_resume_debugger_application(editor)

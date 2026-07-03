@@ -20,8 +20,8 @@ use helix_core::{
 };
 use helix_stdx::path;
 use helix_view::{
-    document::DocumentInlayHintsId, handlers::lsp::SignatureHelpInvoked, icons::ICONS,
-    theme::Style, Document, View,
+    document::DocumentInlayHintsId, editor::Action, handlers::lsp::SignatureHelpInvoked,
+    icons::ICONS, theme::Style, Document, View,
 };
 
 use crate::{
@@ -38,6 +38,20 @@ use crate::{
 };
 
 use std::{cmp::Ordering, collections::HashSet, fmt::Display, future::Future};
+
+#[derive(Clone)]
+struct LspCodeLensPickerItem {
+    server_id: LanguageServerId,
+    lens: lsp::CodeLens,
+}
+
+#[derive(Clone)]
+struct LspDocumentLinkPickerItem {
+    server_id: LanguageServerId,
+    offset_encoding: OffsetEncoding,
+    link: lsp::DocumentLink,
+    text: String,
+}
 
 /// Gets the first language server that is attached to a document which supports a specific feature.
 /// If there is no configured language server that supports the feature, this displays a status message.
@@ -533,6 +547,319 @@ pub fn code_action(cx: &mut Context) {
 
 pub fn code_action_picker(cx: &mut Context) {
     code_action_inner(cx, true);
+}
+
+pub fn code_lens(cx: &mut Context) {
+    let (view_id, doc) = focused_ref!(cx.editor);
+    let text = doc.text();
+    let selection_lines: HashSet<_> = doc
+        .selection(view_id)
+        .iter()
+        .flat_map(|range| {
+            let (start, end) = range.line_range(text.slice(..));
+            start..=end
+        })
+        .collect();
+
+    let Some(code_lenses) = doc.code_lenses() else {
+        cx.editor.set_status("No code lenses available");
+        return;
+    };
+
+    let mut items: Vec<_> = code_lenses
+        .lenses
+        .iter()
+        .filter(|lens| {
+            let line = text.char_to_line(lens.range.from().min(text.len_chars()));
+            selection_lines.contains(&line)
+        })
+        .map(|lens| LspCodeLensPickerItem {
+            server_id: lens.server_id,
+            lens: lens.lens.clone(),
+        })
+        .collect();
+
+    if items.is_empty() {
+        items = code_lenses
+            .lenses
+            .iter()
+            .map(|lens| LspCodeLensPickerItem {
+                server_id: lens.server_id,
+                lens: lens.lens.clone(),
+            })
+            .collect();
+    }
+
+    if items.is_empty() {
+        cx.editor.set_status("No code lenses available");
+        return;
+    }
+
+    let columns = [ui::PickerColumn::new(
+        "title",
+        |item: &LspCodeLensPickerItem, _| {
+            item.lens
+                .command
+                .as_ref()
+                .map(|command| command.title.as_str())
+                .unwrap_or("unresolved code lens")
+                .into()
+        },
+    )];
+    let picker = Picker::new(
+        columns,
+        0,
+        items,
+        (),
+        crate::ui::PickerRuntime::new(cx.editor),
+        cx.ingress.clone(),
+        move |cx: &mut compositor::Context, item: &LspCodeLensPickerItem, _action| {
+            let Some(language_server) = cx.editor.language_server_by_id(item.server_id) else {
+                cx.editor.set_error("Language Server disappeared");
+                return;
+            };
+            let mut lens = item.lens.clone();
+            if lens.command.is_none() {
+                if let Some(resolve) = language_server.resolve_code_lens(&lens) {
+                    match block_on(resolve) {
+                        Ok(resolved) => {
+                            for doc in cx.editor.documents_mut() {
+                                let Some(code_lenses) = doc.code_lenses_mut() else {
+                                    continue;
+                                };
+                                if let Some(stored) = code_lenses.lenses.iter_mut().find(|stored| {
+                                    stored.server_id == item.server_id && stored.lens == item.lens
+                                }) {
+                                    stored.lens = resolved.clone();
+                                    stored.resolved = true;
+                                    break;
+                                }
+                            }
+                            lens = resolved;
+                        }
+                        Err(err) => {
+                            cx.editor
+                                .set_error(format!("Failed to resolve code lens: {err}"));
+                            return;
+                        }
+                    }
+                }
+            }
+            let Some(command) = lens.command else {
+                cx.editor
+                    .set_error("Code lens did not resolve to a command");
+                return;
+            };
+            cx.ingress.task(RuntimeTaskEvent::ExecuteLspCommand {
+                command,
+                server_id: item.server_id,
+            });
+        },
+    );
+    cx.push_layer(Box::new(overlaid(picker)));
+}
+
+pub fn document_links(cx: &mut Context) {
+    let (_, doc) = focused_ref!(cx.editor);
+    let Some(document_links) = doc.document_links() else {
+        cx.editor.set_status("No document links available");
+        return;
+    };
+    let text = doc.text().slice(..);
+    let items: Vec<_> = document_links
+        .links
+        .iter()
+        .map(|link| LspDocumentLinkPickerItem {
+            server_id: link.server_id,
+            offset_encoding: link.offset_encoding,
+            text: link.range.fragment(text).into(),
+            link: link.link.clone(),
+        })
+        .collect();
+    if items.is_empty() {
+        cx.editor.set_status("No document links available");
+        return;
+    }
+
+    let columns = [
+        ui::PickerColumn::new("text", |item: &LspDocumentLinkPickerItem, _| {
+            item.text.as_str().into()
+        }),
+        ui::PickerColumn::new("target", |item: &LspDocumentLinkPickerItem, _| {
+            item.link
+                .target
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_else(|| "unresolved".to_owned())
+                .into()
+        }),
+    ];
+    let picker = Picker::new(
+        columns,
+        0,
+        items,
+        (),
+        crate::ui::PickerRuntime::new(cx.editor),
+        cx.ingress.clone(),
+        move |cx: &mut compositor::Context, item: &LspDocumentLinkPickerItem, action| {
+            open_document_link(cx.editor, cx.ingress.clone(), item.clone(), action);
+        },
+    )
+    .truncate_start(false);
+    cx.push_layer(Box::new(overlaid(picker)));
+}
+
+fn open_document_link(
+    editor: &mut Editor,
+    ingress: crate::runtime::RuntimeIngress,
+    item: LspDocumentLinkPickerItem,
+    action: Action,
+) {
+    let Some(language_server) = editor.language_server_by_id(item.server_id) else {
+        editor.set_error("Language Server disappeared");
+        return;
+    };
+    let mut link = item.link;
+    if link.target.is_none() {
+        if let Some(resolve) = language_server.resolve_document_link(&link) {
+            match block_on(resolve) {
+                Ok(resolved) => link = resolved,
+                Err(err) => {
+                    editor.set_error(format!("Failed to resolve document link: {err}"));
+                    return;
+                }
+            }
+        }
+    }
+    let Some(target) = link.target else {
+        editor.set_error("Document link did not resolve to a target");
+        return;
+    };
+    if target.scheme() == "file" {
+        let Ok(uri) = Uri::try_from(target) else {
+            editor.set_error("Document link target is not a valid file URI");
+            return;
+        };
+        let Some(path) = uri.as_path() else {
+            editor.set_error("Document link target is not a local path");
+            return;
+        };
+        let result = editor.show_document(helix_view::editor::ShowDocumentRequest {
+            path: path.to_path_buf(),
+            action,
+            selection: None,
+            offset_encoding: item.offset_encoding,
+        });
+        if let Err(err) = result {
+            editor.set_error(format!("Failed to open document link: {err}"));
+        }
+    } else {
+        crate::runtime::ingress::spawn_task_event_with_future(
+            editor.work(),
+            crate::open_external_url_task_event(target),
+            ingress,
+        );
+    }
+}
+
+pub(crate) fn try_open_document_link_at_cursor(cx: &mut Context, action: Action) -> bool {
+    let (view_id, doc) = focused_ref!(cx.editor);
+    let text = doc.text();
+    let cursor = doc.selection(view_id).primary().cursor(text.slice(..));
+    let Some(document_links) = doc.document_links() else {
+        return false;
+    };
+    let Some(link) = document_links
+        .links
+        .iter()
+        .find(|link| link.range.contains(cursor))
+    else {
+        return false;
+    };
+    open_document_link(
+        cx.editor,
+        cx.ingress.clone(),
+        LspDocumentLinkPickerItem {
+            server_id: link.server_id,
+            offset_encoding: link.offset_encoding,
+            link: link.link.clone(),
+            text: String::new(),
+        },
+        action,
+    );
+    true
+}
+
+pub fn linked_editing_range(cx: &mut Context) {
+    let (view_id, doc) = focused_ref!(cx.editor);
+    let Some(language_server) = doc
+        .language_servers_with_feature(LanguageServerFeature::LinkedEditingRange)
+        .next()
+    else {
+        cx.editor
+            .set_error("No configured language server supports linked editing ranges");
+        return;
+    };
+    let offset_encoding = language_server.offset_encoding();
+    let pos = doc.position(view_id, offset_encoding);
+    let Some(future) =
+        language_server.text_document_linked_editing_range(doc.identifier(), pos, None)
+    else {
+        cx.editor
+            .set_error("No configured language server supports linked editing ranges");
+        return;
+    };
+    cx.spawn_task_event(async move {
+        let Some(ranges) = future.await? else {
+            return Ok(RuntimeTaskEvent::Stub);
+        };
+        Ok(RuntimeTaskEvent::ApplyLinkedEditingRanges {
+            offset_encoding,
+            ranges,
+        })
+    });
+}
+
+pub(crate) fn request_on_type_formatting(cx: &mut Context, ch: char) {
+    if !cx.editor.config().lsp.on_type_formatting {
+        return;
+    }
+    let (view_id, doc) = focused_ref!(cx.editor);
+    let Some(language_server) = doc
+        .language_servers_with_feature(LanguageServerFeature::OnTypeFormatting)
+        .next()
+    else {
+        return;
+    };
+    let offset_encoding = language_server.offset_encoding();
+    let pos = doc.position(view_id, offset_encoding);
+    let options = lsp::FormattingOptions {
+        tab_size: doc.tab_width() as u32,
+        insert_spaces: matches!(
+            doc.indent_style(),
+            helix_core::indent::IndentStyle::Spaces(_)
+        ),
+        ..Default::default()
+    };
+    let Some(future) = language_server.text_document_on_type_formatting(
+        doc.identifier(),
+        pos,
+        ch.to_string(),
+        options,
+    ) else {
+        return;
+    };
+    let doc_id = doc.id();
+    let expected_version = doc.version();
+    cx.spawn_task_event(async move {
+        Ok(RuntimeTaskEvent::ApplyOnTypeFormatting {
+            doc_id,
+            view_id,
+            expected_version,
+            offset_encoding,
+            edits: future.await?.unwrap_or_default(),
+        })
+    });
 }
 
 pub fn code_action_inner(cx: &mut Context, use_picker: bool) {

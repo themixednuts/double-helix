@@ -21,18 +21,20 @@ In message focus:
 | Key | Action |
 | --- | --- |
 | `j` / `k` | Move between entries |
-| `Enter` | Open the selected entry in a scratch buffer |
+| `Enter` | Submit a pending agent request; otherwise open the selected entry in a scratch buffer |
 | `Tab` | Expand or collapse the selected entry; tool calls are collapsed by default |
-| `y` | Yank the selected entry |
+| `y` | Yank a pending request URL; otherwise yank the selected entry |
 | `t` | Toggle follow mode |
 | `R` | Toggle write/review mode for the active thread |
 | `a` / `A` | Accept the selected/all pending review changes |
 | `x` / `X` | Reject the selected/all pending review changes |
 | `G` / `End` | Jump back to the live tail |
-| `Esc` | Interrupt a running agent; otherwise return to input |
+| `Esc` | Cancel a pending agent request; interrupt a running agent; otherwise return to input |
 | `Ctrl-c` | Interrupt a running agent |
 
-In input focus, type the prompt and submit normally. `Esc` leaves insert mode.
+In input focus, type the prompt and submit normally. If an agent request is pending, `Enter` submits it and `Esc` cancels it; otherwise `Esc` leaves insert mode.
+
+The panel header shows the current mode/model when the agent provides them and compact token usage when usage is available. The first number is cumulative thread usage, and `last` is the most recent turn.
 
 ## Permissions
 
@@ -74,6 +76,16 @@ Attached context appears as chips above the input. Context can be attached with 
 Type `@` in the assistant input to open inline context completion. The popup lists workspace files, open buffers, and fixed entries for `@selection`, `@diagnostics`, and `@diff`.
 
 Filter by typing after `@`. Use `C-n`/`C-p` or `Up`/`Down` to move, `Enter` or `Tab` to insert the selected mention, and `Esc` to dismiss. Accepted mentions insert `@relative/path` or the fixed token and attach the matching context as a chip. Removing the mention token from the draft detaches that mention-owned context.
+
+Type `/` at the start of the input to open slash-command completion. Commands come from the active ACP session. Accepting a completion inserts the command text; unknown slash commands are still sent as normal prompt text.
+
+## Agent Requests
+
+ACP elicitations render as request cards in the thread. Form cards list text, textarea, select, and boolean fields with required markers. URL cards show the URL; press `y` to yank it. Press `Enter` to submit the request or `Esc` to cancel it explicitly.
+
+Thought entries render as dim `thinking...` blocks and are folded by default. `Tab` expands or collapses the selected thought like other foldable entries.
+
+Agent-spawned terminals render as cards with a running/exited/failed status badge and the latest output tail.
 
 ## Markdown
 

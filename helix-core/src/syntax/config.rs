@@ -319,6 +319,12 @@ pub enum LanguageServerFeature {
     RenameSymbol,
     InlayHints,
     DocumentColors,
+    CodeLens,
+    DocumentLinks,
+    FoldingRange,
+    SelectionRange,
+    LinkedEditingRange,
+    OnTypeFormatting,
 }
 
 impl Display for LanguageServerFeature {
@@ -344,6 +350,12 @@ impl Display for LanguageServerFeature {
             RenameSymbol => "rename-symbol",
             InlayHints => "inlay-hints",
             DocumentColors => "document-colors",
+            CodeLens => "code-lens",
+            DocumentLinks => "document-links",
+            FoldingRange => "folding-range",
+            SelectionRange => "selection-range",
+            LinkedEditingRange => "linked-editing-range",
+            OnTypeFormatting => "on-type-formatting",
         };
         write!(f, "{feature}",)
     }

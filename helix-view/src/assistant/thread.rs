@@ -278,7 +278,26 @@ pub struct ElicitationOption {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ElicitationEvent {
     Request(Elicitation),
-    Complete { id: String, status: ElicitationStatus },
+    Complete {
+        id: String,
+        status: ElicitationStatus,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ElicitationValue {
+    String(String),
+    Integer(i64),
+    Number(String),
+    Boolean(bool),
+    StringArray(Vec<String>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ElicitationResponse {
+    Accept(Vec<(String, ElicitationValue)>),
+    Decline,
+    Cancel,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

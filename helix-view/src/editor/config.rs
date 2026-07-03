@@ -444,6 +444,8 @@ pub struct AgentConfig {
     #[serde(default)]
     pub args: Vec<String>,
     #[serde(default)]
+    pub mcp_servers: Vec<helix_acp::types::McpServer>,
+    #[serde(default)]
     pub theme: Option<String>,
 }
 
@@ -466,24 +468,28 @@ pub(super) fn default_agents() -> Vec<AgentConfig> {
             name: "Claude Agent".into(),
             command: claude_cmd.0,
             args: claude_cmd.1,
+            mcp_servers: Vec::new(),
             theme: None,
         },
         AgentConfig {
             name: "Cursor".into(),
             command: "cursor".into(),
             args: vec!["agent".into(), "acp".into()],
+            mcp_servers: Vec::new(),
             theme: None,
         },
         AgentConfig {
             name: "Gemini CLI".into(),
             command: "gemini".into(),
             args: vec!["--experimental-acp".into()],
+            mcp_servers: Vec::new(),
             theme: None,
         },
         AgentConfig {
             name: "Goose".into(),
             command: "goose".into(),
             args: vec!["acp".into()],
+            mcp_servers: Vec::new(),
             theme: None,
         },
     ]
@@ -852,6 +858,10 @@ pub struct LspConfig {
     pub display_inlay_hints: bool,
     pub inlay_hints_length_limit: Option<NonZeroU8>,
     pub display_color_swatches: bool,
+    pub code_lens: bool,
+    pub folding: bool,
+    pub document_links: bool,
+    pub on_type_formatting: bool,
     pub color_swatches_string: String,
     pub snippets: bool,
     pub goto_reference_include_declaration: bool,
@@ -868,6 +878,10 @@ impl Default for LspConfig {
             signature_help_position: SignatureHelpPosition::Above,
             display_inlay_hints: false,
             inlay_hints_length_limit: None,
+            code_lens: true,
+            folding: true,
+            document_links: true,
+            on_type_formatting: false,
             snippets: true,
             goto_reference_include_declaration: true,
             display_color_swatches: true,

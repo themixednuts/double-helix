@@ -123,6 +123,19 @@ impl Editor {
         })
     }
 
+    pub fn complete_assistant_elicitation(
+        &mut self,
+        thread: crate::assistant::thread::Id,
+        id: String,
+        response: crate::assistant::thread::ElicitationResponse,
+    ) -> Vec<crate::assistant::effect::Effect> {
+        self.assistant_act(crate::assistant::Action::CompleteElicitation {
+            thread,
+            id,
+            response,
+        })
+    }
+
     pub fn submit_assistant_prompt(
         &mut self,
         thread: crate::assistant::thread::Id,

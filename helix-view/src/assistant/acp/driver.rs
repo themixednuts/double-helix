@@ -1,4 +1,6 @@
-use std::collections::HashMap;
+use std::collections::{hash_map::DefaultHasher, BTreeMap, HashMap};
+use std::hash::{Hash, Hasher};
+use std::num::NonZeroU64;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -89,9 +91,11 @@ struct State {
     sessions: HashMap<thread::Id, Session>,
     terminals: HashMap<String, (thread::Id, host::TerminalId)>,
     permissions: HashMap<permission::RequestId, PendingPermission>,
+    elicitations: HashMap<String, PendingElicitation>,
     review_modes: HashMap<thread::Id, review::Mode>,
     staged: HashMap<thread::Id, HashMap<PathBuf, review::File>>,
     rules: permission::Rules,
+    caps: helix_acp::AgentCaps,
 }
 
 struct PendingPermission {
@@ -101,15 +105,22 @@ struct PendingPermission {
     choices: Vec<permission::Choice>,
 }
 
+struct PendingElicitation {
+    rpc: helix_acp::jsonrpc::Id,
+    thread: thread::Id,
+}
+
 impl State {
-    fn new() -> Self {
+    fn new(caps: helix_acp::AgentCaps) -> Self {
         Self {
             sessions: HashMap::new(),
             terminals: HashMap::new(),
             permissions: HashMap::new(),
+            elicitations: HashMap::new(),
             review_modes: HashMap::new(),
             staged: HashMap::new(),
             rules: permission::Rules::load(),
+            caps,
         }
     }
 
@@ -164,13 +175,49 @@ impl State {
     }
 }
 
-fn thread_for_session(state: &State, session_id: &str) -> Option<thread::Id> {
+fn thread_for_session(state: &State, session_id: impl std::fmt::Display) -> Option<thread::Id> {
     let session = Session::new(session_id.to_string());
     state
         .sessions
         .iter()
         .find(|(_, current)| **current == session)
         .map(|(&thread, _)| thread)
+}
+
+fn thread_id_for_remote(remote: &str) -> thread::Id {
+    let mut hasher = DefaultHasher::new();
+    remote.hash(&mut hasher);
+    let id = hasher.finish().max(1);
+    thread::Id::new(NonZeroU64::new(id).expect("hash id is non-zero"))
+}
+
+fn elicitation_action(response: thread::ElicitationResponse) -> acp::ElicitationAction {
+    match response {
+        thread::ElicitationResponse::Accept(values) => {
+            let content = values
+                .into_iter()
+                .map(|(key, value)| (key, elicitation_value(value)))
+                .collect::<BTreeMap<_, _>>();
+            acp::ElicitationAction::Accept(acp::ElicitationAcceptAction::new().content(content))
+        }
+        thread::ElicitationResponse::Decline => acp::ElicitationAction::Decline,
+        thread::ElicitationResponse::Cancel => acp::ElicitationAction::Cancel,
+    }
+}
+
+fn elicitation_value(value: thread::ElicitationValue) -> acp::ElicitationContentValue {
+    match value {
+        thread::ElicitationValue::String(value) => acp::ElicitationContentValue::String(value),
+        thread::ElicitationValue::Integer(value) => acp::ElicitationContentValue::Integer(value),
+        thread::ElicitationValue::Number(value) => value
+            .parse::<f64>()
+            .map(acp::ElicitationContentValue::Number)
+            .unwrap_or(acp::ElicitationContentValue::String(value)),
+        thread::ElicitationValue::Boolean(value) => acp::ElicitationContentValue::Boolean(value),
+        thread::ElicitationValue::StringArray(value) => {
+            acp::ElicitationContentValue::StringArray(value)
+        }
+    }
 }
 
 struct RunAgent {
@@ -201,16 +248,21 @@ async fn run_agent(
     let init = agent
         .initialize(client_info, client_caps(&host))
         .await
-        .map(|response| translate::caps(&response, &connect));
+        .map(|response| {
+            let acp_caps = helix_acp::agent_caps(&response);
+            let caps = translate::caps(&response, &connect);
+            (caps, acp_caps)
+        });
 
-    match init {
-        Ok(caps) => {
+    let acp_caps = match init {
+        Ok((caps, acp_caps)) => {
             let _ = tx
                 .send(backend::Update::Backend {
                     backend: backend_id.clone(),
                     event: backend::Event::Ready { caps },
                 })
                 .await;
+            acp_caps
         }
         Err(err) => {
             let _ = tx
@@ -221,9 +273,9 @@ async fn run_agent(
                 .await;
             return;
         }
-    }
+    };
 
-    let mut state = State::new();
+    let mut state = State::new(acp_caps);
 
     loop {
         tokio::select! {
@@ -251,15 +303,11 @@ async fn run_agent(
 }
 
 fn client_caps(host: &host::Set) -> acp::ClientCapabilities {
-    acp::ClientCapabilities {
-        fs: Some(acp::FileSystemCapabilities {
-            read_text_file: Some(true),
-            write_text_file: Some(true),
-        }),
-        terminal: Some(host.terminal.is_some()),
-        session: None,
-        elicitation: None,
-    }
+    acp::ClientCapabilities::new()
+        .fs(acp::FileSystemCapabilities::new()
+            .read_text_file(true)
+            .write_text_file(true))
+        .terminal(host.terminal.is_some())
 }
 
 async fn handle_command(
@@ -274,7 +322,7 @@ async fn handle_command(
     match cmd {
         backend::Command::NewThread { thread, scope } => match agent.new_session(scope.cwd).await {
             Ok(resp) => {
-                let session = Session::new(resp.session_id.clone());
+                let session = Session::new(resp.session_id.to_string());
                 state.sessions.insert(thread, session.clone());
                 let _ = tx
                     .send(backend::Update::Backend {
@@ -285,11 +333,14 @@ async fn handle_command(
                         },
                     })
                     .await;
-                if let Some(modes) = resp.session_modes.as_ref() {
-                    if let Ok(mode_set) = translate::mode_set(
-                        modes.first().map(|m| m.id.as_ref()).unwrap_or_default(),
-                        modes,
-                    ) {
+                let _ = tx
+                    .send(backend::Update::Thread {
+                        thread,
+                        event: thread::Event::Caps(state.caps.clone()),
+                    })
+                    .await;
+                if let Some(modes) = resp.modes.as_ref() {
+                    if let Ok(mode_set) = translate::mode_set(modes) {
                         let _ = tx
                             .send(backend::Update::Thread {
                                 thread,
@@ -327,9 +378,9 @@ async fn handle_command(
             }
         },
         backend::Command::LoadThread { thread, remote } => {
-            match agent.load_session(remote.to_string()).await {
+            match agent.load_session(remote.to_string().into()).await {
                 Ok(resp) => {
-                    let session = Session::new(resp.session_id.clone());
+                    let session = Session::new(remote.to_string());
                     state.sessions.insert(thread, session.clone());
                     let _ = tx
                         .send(backend::Update::Backend {
@@ -340,11 +391,14 @@ async fn handle_command(
                             },
                         })
                         .await;
-                    if let Some(modes) = resp.session_modes.as_ref() {
-                        if let Ok(mode_set) = translate::mode_set(
-                            modes.first().map(|m| m.id.as_ref()).unwrap_or_default(),
-                            modes,
-                        ) {
+                    let _ = tx
+                        .send(backend::Update::Thread {
+                            thread,
+                            event: thread::Event::Caps(state.caps.clone()),
+                        })
+                        .await;
+                    if let Some(modes) = resp.modes.as_ref() {
+                        if let Ok(mode_set) = translate::mode_set(modes) {
                             let _ = tx
                                 .send(backend::Update::Thread {
                                     thread,
@@ -405,7 +459,7 @@ async fn handle_command(
             work.spawn(async move {
                 let result = agent
                     .prompt(
-                        session.to_string(),
+                        session.to_string().into(),
                         prompt
                             .parts()
                             .iter()
@@ -430,7 +484,7 @@ async fn handle_command(
         }
         backend::Command::Cancel { thread } => {
             if let Some(session) = state.sessions.get(&thread) {
-                agent.cancel(session.to_string());
+                agent.cancel(session.to_string().into());
                 let _ = tx
                     .send(backend::Update::Thread {
                         thread,
@@ -458,7 +512,7 @@ async fn handle_command(
                 let session = session.clone();
                 work.spawn(async move {
                     let result = agent
-                        .set_session_mode(session.to_string(), mode.to_string())
+                        .set_session_mode(session.to_string().into(), mode.to_string())
                         .await;
                     if let Err(err) = result {
                         let _ = tx2
@@ -484,9 +538,9 @@ async fn handle_command(
                 work.spawn(async move {
                     let result = agent
                         .set_session_config_option(
-                            session.to_string(),
+                            session.to_string().into(),
                             option.to_string(),
-                            value.to_string(),
+                            translate::config_value(&value),
                         )
                         .await;
                     if let Err(err) = result {
@@ -499,6 +553,43 @@ async fn handle_command(
                     }
                 })
                 .detach();
+            }
+        }
+        backend::Command::CompleteElicitation {
+            thread,
+            id,
+            response,
+        } => {
+            if let Some(pending) = state.elicitations.remove(&id) {
+                let action = elicitation_action(response);
+                let status = match &action {
+                    acp::ElicitationAction::Accept(_) => thread::ElicitationStatus::Completed,
+                    acp::ElicitationAction::Decline => thread::ElicitationStatus::Declined,
+                    acp::ElicitationAction::Cancel => thread::ElicitationStatus::Canceled,
+                    _ => thread::ElicitationStatus::Canceled,
+                };
+                agent.reply(
+                    pending.rpc,
+                    serde_json::to_value(acp::CreateElicitationResponse::new(action)).unwrap(),
+                );
+                let _ = tx
+                    .send(backend::Update::Thread {
+                        thread: pending.thread,
+                        event: thread::Event::Elicitation(thread::ElicitationEvent::Complete {
+                            id,
+                            status,
+                        }),
+                    })
+                    .await;
+            } else {
+                let _ = tx
+                    .send(backend::Update::Error {
+                        at: backend::Target::Thread(thread),
+                        error: backend::Error::Other(anyhow::anyhow!(
+                            "elicitation request is no longer pending"
+                        )),
+                    })
+                    .await;
             }
         }
         backend::Command::ResolvePermission {
@@ -518,15 +609,15 @@ async fn handle_command(
                                 log::warn!("assistant permission rule save failed: {err}");
                             }
                         }
-                        acp::RequestPermissionOutcome::Selected {
-                            id: choice.to_string(),
-                        }
+                        acp::RequestPermissionOutcome::Selected(
+                            acp::SelectedPermissionOutcome::new(choice.to_string()),
+                        )
                     }
-                    permission::Decision::Dismiss => acp::RequestPermissionOutcome::Dismissed,
+                    permission::Decision::Dismiss => acp::RequestPermissionOutcome::Cancelled,
                 };
                 agent.reply(
                     pending.rpc,
-                    serde_json::to_value(acp::RequestPermissionResponse { outcome }).unwrap(),
+                    serde_json::to_value(acp::RequestPermissionResponse::new(outcome)).unwrap(),
                 );
             }
         }
@@ -562,26 +653,73 @@ async fn handle_command(
             }
         },
         backend::Command::ListThreads { scope, cursor } => {
-            let _ = cursor;
-            let entries = state
-                .sessions
-                .keys()
-                .copied()
-                .map(|thread| super::super::history::Stub {
-                    id: thread,
-                    title: None,
-                    scope: scope.clone(),
-                    unread: false,
-                    run: thread::Run::Idle,
-                })
-                .collect();
-            let _ = tx
-                .send(backend::Update::History {
-                    scope,
-                    entries,
-                    next: None,
-                })
-                .await;
+            if state.caps.list_sessions {
+                match agent
+                    .list_sessions(cursor.as_ref().map(|cursor| cursor.as_str().to_string()))
+                    .await
+                {
+                    Ok(resp) => {
+                        let entries = resp
+                            .sessions
+                            .into_iter()
+                            .map(|session| {
+                                let session_id = session.session_id.to_string();
+                                let id = state
+                                    .sessions
+                                    .iter()
+                                    .find(|(_, current)| current.to_string() == session_id)
+                                    .map(|(&thread, _)| thread)
+                                    .unwrap_or_else(|| thread_id_for_remote(&session_id));
+                                super::super::history::Stub {
+                                    id,
+                                    title: session.title,
+                                    scope: thread::Scope {
+                                        cwd: session.cwd,
+                                        worktrees: session.additional_directories,
+                                    },
+                                    unread: false,
+                                    run: thread::Run::Idle,
+                                }
+                            })
+                            .collect();
+                        let _ = tx
+                            .send(backend::Update::History {
+                                scope,
+                                entries,
+                                next: resp.next_cursor.map(super::super::history::Cursor::new),
+                            })
+                            .await;
+                    }
+                    Err(err) => {
+                        let _ = tx
+                            .send(backend::Update::Error {
+                                at: backend::Target::Backend(backend_id.clone()),
+                                error: backend::Error::Other(anyhow::anyhow!(err.to_string())),
+                            })
+                            .await;
+                    }
+                }
+            } else {
+                let entries = state
+                    .sessions
+                    .keys()
+                    .copied()
+                    .map(|thread| super::super::history::Stub {
+                        id: thread,
+                        title: None,
+                        scope: scope.clone(),
+                        unread: false,
+                        run: thread::Run::Idle,
+                    })
+                    .collect();
+                let _ = tx
+                    .send(backend::Update::History {
+                        scope,
+                        entries,
+                        next: None,
+                    })
+                    .await;
+            }
         }
         backend::Command::CloseThread { thread } => {
             state.sessions.remove(&thread);
@@ -607,7 +745,7 @@ async fn handle_call(
         Call::Notification(helix_acp::jsonrpc::Notification { method, params, .. }) => {
             match AgentNotification::parse(&method, params) {
                 Ok(AgentNotification::SessionUpdate(notif)) => {
-                    let session = Session::new(notif.session_id.clone());
+                    let session = Session::new(notif.session_id.to_string());
                     if let Some((&thread, _)) = state
                         .sessions
                         .iter()
@@ -622,6 +760,22 @@ async fn handle_call(
                                 .send(backend::Update::Location { thread, location })
                                 .await;
                         }
+                    }
+                }
+                Ok(AgentNotification::CompleteElicitation(notif)) => {
+                    let id = notif.elicitation_id.to_string();
+                    for &thread in state.sessions.keys() {
+                        let _ = tx
+                            .send(backend::Update::Thread {
+                                thread,
+                                event: thread::Event::Elicitation(
+                                    thread::ElicitationEvent::Complete {
+                                        id: id.clone(),
+                                        status: thread::ElicitationStatus::Completed,
+                                    },
+                                ),
+                            })
+                            .await;
                     }
                 }
                 Err(_) => {}
@@ -653,7 +807,7 @@ async fn handle_call(
                         }
                         agent.reply(
                             id,
-                            serde_json::to_value(acp::ReadTextFileResponse { content }).unwrap(),
+                            serde_json::to_value(acp::ReadTextFileResponse::new(content)).unwrap(),
                         )
                     }
                     Err(err) => agent.reply_error(
@@ -687,7 +841,7 @@ async fn handle_call(
                             .await;
                         agent.reply(
                             id,
-                            serde_json::to_value(acp::WriteTextFileResponse {}).unwrap(),
+                            serde_json::to_value(acp::WriteTextFileResponse::new()).unwrap(),
                         );
                         return;
                     }
@@ -725,7 +879,7 @@ async fn handle_call(
                         }
                         agent.reply(
                             id,
-                            serde_json::to_value(acp::WriteTextFileResponse {}).unwrap(),
+                            serde_json::to_value(acp::WriteTextFileResponse::new()).unwrap(),
                         )
                     }
                     Err(err) => agent.reply_error(
@@ -752,11 +906,10 @@ async fn handle_call(
                 };
                 let create = host::CreateTerminal {
                     command: req.command.into(),
-                    args: req.args.unwrap_or_default(),
+                    args: req.args,
                     cwd: req.cwd.map(Into::into),
                     env: req
                         .env
-                        .unwrap_or_default()
                         .into_iter()
                         .map(|env| host::Env {
                             key: env.name,
@@ -784,9 +937,9 @@ async fn handle_call(
                             .await;
                         agent.reply(
                             id,
-                            serde_json::to_value(acp::CreateTerminalResponse {
-                                terminal_id: host_id.to_string(),
-                            })
+                            serde_json::to_value(acp::CreateTerminalResponse::new(
+                                host_id.to_string(),
+                            ))
                             .unwrap(),
                         );
                     }
@@ -797,7 +950,8 @@ async fn handle_call(
                 }
             }
             Ok(AgentMethodCall::TerminalOutput(req)) => {
-                let Some((thread, term)) = state.terminals.get(&req.terminal_id) else {
+                let terminal_id = req.terminal_id.to_string();
+                let Some((thread, term)) = state.terminals.get(&terminal_id) else {
                     agent.reply_error(
                         id,
                         helix_acp::jsonrpc::Error::invalid_params("unknown terminal"),
@@ -817,19 +971,15 @@ async fn handle_call(
                             .send(backend::Update::Terminal {
                                 thread: *thread,
                                 event: super::super::terminal::Event::Output {
-                                    id: super::super::terminal::Id::new(req.terminal_id.clone()),
+                                    id: super::super::terminal::Id::new(terminal_id.clone()),
                                     chunk: output.clone(),
                                 },
                             })
                             .await;
                         agent.reply(
                             id,
-                            serde_json::to_value(acp::TerminalOutputResponse {
-                                output,
-                                truncated: false,
-                                exit_status: None,
-                            })
-                            .unwrap(),
+                            serde_json::to_value(acp::TerminalOutputResponse::new(output, false))
+                                .unwrap(),
                         )
                     }
                     Err(err) => agent.reply_error(
@@ -839,7 +989,8 @@ async fn handle_call(
                 }
             }
             Ok(AgentMethodCall::WaitForTerminalExit(req)) => {
-                let Some((thread, term)) = state.terminals.get(&req.terminal_id) else {
+                let terminal_id = req.terminal_id.to_string();
+                let Some((thread, term)) = state.terminals.get(&terminal_id) else {
                     agent.reply_error(
                         id,
                         helix_acp::jsonrpc::Error::invalid_params("unknown terminal"),
@@ -855,14 +1006,11 @@ async fn handle_call(
                 };
                 match terminal.wait(term).await {
                     Ok(status) => {
-                        let (exit_code, signal, state) = match status {
-                            host::ExitStatus::Code(code) => (
-                                Some(code),
-                                None,
-                                super::super::terminal::State::Exited { code },
-                            ),
+                        let (exit_code, state) = match status {
+                            host::ExitStatus::Code(code) => {
+                                (Some(code), super::super::terminal::State::Exited { code })
+                            }
                             host::ExitStatus::Other => (
-                                None,
                                 None,
                                 super::super::terminal::State::Failed {
                                     message: "terminal exited without status".to_string(),
@@ -873,17 +1021,16 @@ async fn handle_call(
                             .send(backend::Update::Terminal {
                                 thread: *thread,
                                 event: super::super::terminal::Event::Exit {
-                                    id: super::super::terminal::Id::new(req.terminal_id.clone()),
+                                    id: super::super::terminal::Id::new(terminal_id.clone()),
                                     state,
                                 },
                             })
                             .await;
                         agent.reply(
                             id,
-                            serde_json::to_value(acp::WaitForTerminalExitResponse {
-                                exit_code,
-                                signal,
-                            })
+                            serde_json::to_value(acp::WaitForTerminalExitResponse::new(
+                                terminal_exit_status(exit_code),
+                            ))
                             .unwrap(),
                         );
                     }
@@ -894,7 +1041,8 @@ async fn handle_call(
                 }
             }
             Ok(AgentMethodCall::KillTerminal(req)) => {
-                let Some((_, term)) = state.terminals.get(&req.terminal_id) else {
+                let terminal_id = req.terminal_id.to_string();
+                let Some((_, term)) = state.terminals.get(&terminal_id) else {
                     agent.reply_error(
                         id,
                         helix_acp::jsonrpc::Error::invalid_params("unknown terminal"),
@@ -911,7 +1059,7 @@ async fn handle_call(
                 match terminal.kill(term).await {
                     Ok(()) => agent.reply(
                         id,
-                        serde_json::to_value(acp::KillTerminalResponse {}).unwrap(),
+                        serde_json::to_value(acp::KillTerminalResponse::new()).unwrap(),
                     ),
                     Err(err) => agent.reply_error(
                         id,
@@ -920,7 +1068,8 @@ async fn handle_call(
                 }
             }
             Ok(AgentMethodCall::ReleaseTerminal(req)) => {
-                let Some((_, term)) = state.terminals.remove(&req.terminal_id) else {
+                let terminal_id = req.terminal_id.to_string();
+                let Some((_, term)) = state.terminals.remove(&terminal_id) else {
                     agent.reply_error(
                         id,
                         helix_acp::jsonrpc::Error::invalid_params("unknown terminal"),
@@ -937,7 +1086,7 @@ async fn handle_call(
                 match terminal.release(&term).await {
                     Ok(()) => agent.reply(
                         id,
-                        serde_json::to_value(acp::ReleaseTerminalResponse {}).unwrap(),
+                        serde_json::to_value(acp::ReleaseTerminalResponse::new()).unwrap(),
                     ),
                     Err(err) => agent.reply_error(
                         id,
@@ -946,7 +1095,7 @@ async fn handle_call(
                 }
             }
             Ok(AgentMethodCall::RequestPermission(req)) => {
-                let session = Session::new(req.session_id.clone());
+                let session = Session::new(req.session_id.to_string());
                 let Some((&thread, _)) = state
                     .sessions
                     .iter()
@@ -958,24 +1107,36 @@ async fn handle_call(
                     );
                     return;
                 };
-                let mut options = req.permissions.into_iter();
+                let mut options = req.options.into_iter();
                 let Some(first) = options.next() else {
                     agent.reply(
                         id,
-                        serde_json::to_value(acp::RequestPermissionResponse {
-                            outcome: acp::RequestPermissionOutcome::Dismissed,
-                        })
+                        serde_json::to_value(acp::RequestPermissionResponse::new(
+                            acp::RequestPermissionOutcome::Cancelled,
+                        ))
                         .unwrap(),
                     );
                     return;
                 };
                 let request_id = permission::RequestId::new(format!("perm:{:?}", &id));
-                let tool = req.title;
+                let tool = req
+                    .tool_call
+                    .fields
+                    .title
+                    .clone()
+                    .unwrap_or_else(|| req.tool_call.tool_call_id.to_string());
+                let description = req
+                    .tool_call
+                    .fields
+                    .content
+                    .as_deref()
+                    .map(permission_description)
+                    .unwrap_or_default();
                 let mut builder = permission::Request::builder(
                     request_id.clone(),
                     thread,
                     tool.clone(),
-                    req.description.unwrap_or_default(),
+                    description,
                 )
                 .choice(permission_choice(first));
                 for option in options {
@@ -1000,11 +1161,11 @@ async fn handle_call(
                         .unwrap_or("auto-allowed");
                     agent.reply(
                         id,
-                        serde_json::to_value(acp::RequestPermissionResponse {
-                            outcome: acp::RequestPermissionOutcome::Selected {
-                                id: choice.to_string(),
-                            },
-                        })
+                        serde_json::to_value(acp::RequestPermissionResponse::new(
+                            acp::RequestPermissionOutcome::Selected(
+                                acp::SelectedPermissionOutcome::new(choice.to_string()),
+                            ),
+                        ))
                         .unwrap(),
                     );
                     let _ = tx
@@ -1037,12 +1198,22 @@ async fn handle_call(
                     .await;
             }
             Ok(AgentMethodCall::CreateElicitation(req)) => {
-                let Some(session_id) = req.session_id.as_deref() else {
-                    agent.reply_error(
-                        id,
-                        helix_acp::jsonrpc::Error::invalid_params("missing session_id"),
-                    );
-                    return;
+                let session_id = match req.scope() {
+                    acp::ElicitationScope::Session(scope) => scope.session_id.to_string(),
+                    acp::ElicitationScope::Request(_) => {
+                        agent.reply_error(
+                            id,
+                            helix_acp::jsonrpc::Error::invalid_params("missing session scope"),
+                        );
+                        return;
+                    }
+                    _ => {
+                        agent.reply_error(
+                            id,
+                            helix_acp::jsonrpc::Error::invalid_params("unknown elicitation scope"),
+                        );
+                        return;
+                    }
                 };
                 let Some(thread) = thread_for_session(state, session_id) else {
                     agent.reply_error(
@@ -1051,21 +1222,22 @@ async fn handle_call(
                     );
                     return;
                 };
+                let elicitation = translate::elicitation(req);
+                state.elicitations.insert(
+                    elicitation.id.clone(),
+                    PendingElicitation {
+                        rpc: id,
+                        thread,
+                    },
+                );
                 let _ = tx
                     .send(backend::Update::Thread {
                         thread,
                         event: thread::Event::Elicitation(thread::ElicitationEvent::Request(
-                            translate::elicitation(req),
+                            elicitation,
                         )),
                     })
                     .await;
-                agent.reply(
-                    id,
-                    serde_json::to_value(acp::CreateElicitationResponse {
-                        action: acp::ElicitationAction::Cancel,
-                    })
-                    .unwrap(),
-                );
             }
             Err(err) => {
                 let _ = tx
@@ -1081,8 +1253,49 @@ async fn handle_call(
 }
 
 fn permission_choice(option: acp::PermissionOption) -> permission::Choice {
-    let kind = permission::Kind::from_label(&option.id, &option.title);
-    permission::Choice::new(permission::ChoiceId::new(option.id), option.title, kind)
+    let kind = match option.kind {
+        acp::PermissionOptionKind::AllowOnce => permission::Kind::AllowOnce,
+        acp::PermissionOptionKind::AllowAlways => permission::Kind::AllowAlways,
+        acp::PermissionOptionKind::RejectOnce => permission::Kind::RejectOnce,
+        acp::PermissionOptionKind::RejectAlways => permission::Kind::RejectAlways,
+        _ => permission::Kind::from_label(&option.option_id.to_string(), &option.name),
+    };
+    permission::Choice::new(
+        permission::ChoiceId::new(option.option_id.to_string()),
+        option.name,
+        kind,
+    )
+}
+
+fn permission_description(content: &[acp::ToolCallContent]) -> String {
+    content
+        .iter()
+        .map(|item| match item {
+            acp::ToolCallContent::Content(content) => match &content.content {
+                acp::ContentBlock::Text(text) => text.text.clone(),
+                acp::ContentBlock::ResourceLink(link) => link.uri.clone(),
+                acp::ContentBlock::Resource(resource) => match &resource.resource {
+                    acp::EmbeddedResourceResource::TextResourceContents(resource) => {
+                        resource.text.clone()
+                    }
+                    acp::EmbeddedResourceResource::BlobResourceContents(resource) => {
+                        resource.uri.clone()
+                    }
+                    _ => String::new(),
+                },
+                _ => String::new(),
+            },
+            acp::ToolCallContent::Diff(diff) => diff.path.display().to_string(),
+            acp::ToolCallContent::Terminal(term) => format!("terminal:{}", term.terminal_id),
+            _ => String::new(),
+        })
+        .filter(|item| !item.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn terminal_exit_status(exit_code: Option<i32>) -> acp::TerminalExitStatus {
+    acp::TerminalExitStatus::new().exit_code(exit_code.and_then(|code| u32::try_from(code).ok()))
 }
 
 fn write_location(path: PathBuf, previous: Option<&str>, current: &str) -> crate::collab::Location {
@@ -1149,7 +1362,7 @@ mod tests {
 
     #[test]
     fn staged_overlay_reads_through_until_resolved() {
-        let mut state = State::new();
+        let mut state = State::new(helix_acp::AgentCaps::default());
         let thread = thread::Id::new(NonZeroU64::new(1).unwrap());
         let path = std::path::PathBuf::from("file.rs");
         state.stage(

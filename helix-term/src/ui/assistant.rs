@@ -100,6 +100,7 @@ enum MentionCandidateKind {
     Selection,
     Diagnostics,
     Diff,
+    Command,
 }
 
 fn byte_index_at_char(text: &str, char_index: usize) -> usize {
@@ -669,6 +670,100 @@ impl AssistantPanel {
         }
     }
 
+    fn pending_elicitation(
+        editor: &Editor,
+    ) -> Option<helix_view::assistant::thread::Elicitation> {
+        Self::assistant_model(editor)
+            .pending_elicitations
+            .into_iter()
+            .find(|item| {
+                item.status == helix_view::assistant::thread::ElicitationStatus::Pending
+            })
+    }
+
+    fn complete_pending_elicitation(
+        &mut self,
+        editor: &mut Editor,
+        response: helix_view::assistant::thread::ElicitationResponse,
+    ) -> bool {
+        let model = Self::assistant_model(editor);
+        let Some(thread) = model.active_thread else {
+            return false;
+        };
+        let Some(elicitation) = model.pending_elicitations.into_iter().find(|item| {
+            item.status == helix_view::assistant::thread::ElicitationStatus::Pending
+        }) else {
+            return false;
+        };
+        let effects = editor.complete_assistant_elicitation(thread, elicitation.id, response);
+        Self::apply_assistant_effects(editor, effects);
+        true
+    }
+
+    fn accept_pending_elicitation(&mut self, editor: &mut Editor) -> bool {
+        let Some(elicitation) = Self::pending_elicitation(editor) else {
+            return false;
+        };
+        let values = match &elicitation.mode {
+            helix_view::assistant::thread::ElicitationMode::Form { fields, .. } => fields
+                .iter()
+                .map(|field| {
+                    let value = match field.field_type {
+                        helix_view::assistant::thread::ElicitationFieldType::Bool => {
+                            helix_view::assistant::thread::ElicitationValue::Boolean(false)
+                        }
+                        helix_view::assistant::thread::ElicitationFieldType::Select => {
+                            helix_view::assistant::thread::ElicitationValue::String(
+                                field
+                                    .options
+                                    .first()
+                                    .map(|option| option.value.clone())
+                                    .unwrap_or_default(),
+                            )
+                        }
+                        helix_view::assistant::thread::ElicitationFieldType::Text
+                        | helix_view::assistant::thread::ElicitationFieldType::Textarea => {
+                            helix_view::assistant::thread::ElicitationValue::String(String::new())
+                        }
+                    };
+                    (field.name.clone(), value)
+                })
+                .collect(),
+            helix_view::assistant::thread::ElicitationMode::Url { .. } => Vec::new(),
+        };
+        self.complete_pending_elicitation(
+            editor,
+            helix_view::assistant::thread::ElicitationResponse::Accept(values),
+        )
+    }
+
+    fn cancel_pending_elicitation(&mut self, editor: &mut Editor) -> bool {
+        self.complete_pending_elicitation(
+            editor,
+            helix_view::assistant::thread::ElicitationResponse::Cancel,
+        )
+    }
+
+    fn yank_pending_elicitation_url(&mut self, editor: &mut Editor) -> bool {
+        let Some(elicitation) = Self::pending_elicitation(editor) else {
+            return false;
+        };
+        let helix_view::assistant::thread::ElicitationMode::Url { url, .. } = elicitation.mode
+        else {
+            return false;
+        };
+        match editor.registers.write('"', vec![url]) {
+            Ok(()) => {
+                editor.set_status("Assistant URL yanked");
+                true
+            }
+            Err(err) => {
+                editor.set_error(err.to_string());
+                false
+            }
+        }
+    }
+
     fn toggle_selected_message_fold(&mut self, editor: &mut Editor) -> bool {
         let model = Self::assistant_model(editor);
         let Some(entry) = model.selected_entry_id() else {
@@ -848,18 +943,28 @@ impl AssistantPanel {
             self.mention.active = false;
             return;
         };
-        let Some(active) = helix_view::assistant::mention::active_query(&input, cursor) else {
+        let active_slash = helix_view::assistant::mention::active_slash_query(&input, cursor);
+        let active_at = helix_view::assistant::mention::active_query(&input, cursor);
+        let Some(active) = active_slash.clone().or(active_at) else {
             self.mention.active = false;
             return;
         };
-        let token_end = helix_view::assistant::mention::active_token(&input, cursor)
-            .map(|token| token.end)
-            .unwrap_or(active.end);
+        let token_end = if active_slash.is_some() {
+            active.end
+        } else {
+            helix_view::assistant::mention::active_token(&input, cursor)
+                .map(|token| token.end)
+                .unwrap_or(active.end)
+        };
         self.mention.active = true;
         self.mention.query = active.query;
         self.mention.token_start = active.start;
         self.mention.token_end = token_end;
-        self.mention.candidates = self.mention_candidates(editor, &self.mention.query);
+        self.mention.candidates = if active_slash.is_some() {
+            self.command_candidates(editor, &self.mention.query)
+        } else {
+            self.mention_candidates(editor, &self.mention.query)
+        };
         if self.mention.selected >= self.mention.candidates.len() {
             self.mention.selected = self.mention.candidates.len().saturating_sub(1);
         }
@@ -890,6 +995,28 @@ impl AssistantPanel {
             .into_iter()
             .filter(|candidate| seen.insert(candidate.replacement.clone()))
             .take(LIMIT)
+            .collect()
+    }
+
+    fn command_candidates(&self, editor: &Editor, query: &str) -> Vec<MentionCandidate> {
+        let model = Self::assistant_model(editor);
+        model
+            .commands
+            .iter()
+            .filter(|command| mention_matches(&command.name, query))
+            .take(40)
+            .map(|command| MentionCandidate {
+                label: format!("/{}", command.name),
+                detail: command.description.clone().unwrap_or_else(|| {
+                    match command.category {
+                        helix_view::assistant::thread::CommandCategory::Native => "native command",
+                        helix_view::assistant::thread::CommandCategory::Mcp => "mcp command",
+                    }
+                    .to_string()
+                }),
+                replacement: command.name.clone(),
+                kind: MentionCandidateKind::Command,
+            })
             .collect()
     }
 
@@ -981,7 +1108,11 @@ impl AssistantPanel {
         };
         let start = char_index_at_byte(&doc.text().to_string(), self.mention.token_start);
         let end = char_index_at_byte(&doc.text().to_string(), self.mention.token_end);
-        let replacement = helix_core::Tendril::from(format!("@{}", candidate.replacement));
+        let prefix = match candidate.kind {
+            MentionCandidateKind::Command => "/",
+            _ => "@",
+        };
+        let replacement = helix_core::Tendril::from(format!("{prefix}{}", candidate.replacement));
         let transaction = helix_core::Transaction::change(
             doc.text(),
             [(start, end, Some(replacement))].into_iter(),
@@ -997,6 +1128,7 @@ impl AssistantPanel {
             }
             MentionCandidateKind::Diagnostics => Self::diagnostics_context(editor),
             MentionCandidateKind::Diff => Self::diff_context(editor),
+            MentionCandidateKind::Command => None,
         };
         if let (Some(thread), Some(item)) = (Self::assistant_model(editor).active_thread, item) {
             Self::apply(
@@ -1366,7 +1498,105 @@ impl AssistantPanel {
             }
         }
 
+        for elicitation in model
+            .pending_elicitations
+            .iter()
+            .filter(|item| item.status == helix_view::assistant::thread::ElicitationStatus::Pending)
+        {
+            blocks.push(Self::elicitation_message(elicitation, theme));
+        }
+
+        for terminal in &model.terminals {
+            blocks.push(Self::terminal_message(terminal, theme));
+        }
+
         blocks
+    }
+
+    fn elicitation_message<'a>(
+        elicitation: &helix_view::assistant::thread::Elicitation,
+        theme: &helix_view::Theme,
+    ) -> Message<'a> {
+        let title_style = theme.get("ui.text.focus").add_modifier(Modifier::BOLD);
+        let muted_style = theme.get("ui.text.inactive");
+        let warning_style = theme.get("warning");
+        let mut lines = Vec::new();
+        match &elicitation.mode {
+            helix_view::assistant::thread::ElicitationMode::Form { message, fields } => {
+                lines.push(Spans::from(vec![
+                    Span::styled(" ? ", warning_style),
+                    Span::styled(message.clone(), title_style),
+                    Span::styled("  enter submit  esc cancel", muted_style),
+                ]));
+                for field in fields {
+                    let required = if field.required { " *" } else { "" };
+                    let kind = match field.field_type {
+                        helix_view::assistant::thread::ElicitationFieldType::Text => "text",
+                        helix_view::assistant::thread::ElicitationFieldType::Textarea => "textarea",
+                        helix_view::assistant::thread::ElicitationFieldType::Select => "select",
+                        helix_view::assistant::thread::ElicitationFieldType::Bool => "bool",
+                    };
+                    let label = field.label.as_deref().unwrap_or(&field.name);
+                    let options = if field.options.is_empty() {
+                        String::new()
+                    } else {
+                        format!(
+                            " [{}]",
+                            field
+                                .options
+                                .iter()
+                                .map(|option| option.label.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )
+                    };
+                    lines.push(Spans::from(Span::styled(
+                        format!("   {label}{required}: {kind}{options}"),
+                        muted_style,
+                    )));
+                }
+            }
+            helix_view::assistant::thread::ElicitationMode::Url { message, url } => {
+                lines.push(Spans::from(vec![
+                    Span::styled(" ? ", warning_style),
+                    Span::styled(message.clone(), title_style),
+                    Span::styled("  y copy  esc cancel", muted_style),
+                ]));
+                lines.push(Spans::from(Span::styled(format!("   {url}"), muted_style)));
+            }
+        }
+        Message::plain(lines)
+    }
+
+    fn terminal_message<'a>(
+        terminal: &helix_view::model::AssistantTerminal,
+        theme: &helix_view::Theme,
+    ) -> Message<'a> {
+        let title_style = theme.get("ui.text.focus").add_modifier(Modifier::BOLD);
+        let muted_style = theme.get("ui.text.inactive");
+        let status_style = match terminal.state.as_str() {
+            "running" => theme.get("warning"),
+            state if state.starts_with("exited:0") => theme.get("diff.plus"),
+            state if state.starts_with("failed:") || state.starts_with("exited:") => {
+                theme.get("error")
+            }
+            _ => muted_style,
+        };
+        let mut lines = vec![Spans::from(vec![
+            Span::styled(" $ ", status_style),
+            Span::styled(
+                terminal
+                    .title
+                    .clone()
+                    .unwrap_or_else(|| terminal.id.to_string()),
+                title_style,
+            ),
+            Span::styled(format!("  {}", terminal.state), status_style),
+        ])];
+        for line in terminal.output.lines().rev().take(8).collect::<Vec<_>>().into_iter().rev() {
+            lines.push(Spans::from(Span::styled(format!("   {line}"), muted_style)));
+        }
+        Message::plain(lines)
     }
 
     /// Render chat blocks directly to the surface with proper scroll.
@@ -2427,7 +2657,9 @@ impl Component for AssistantPanel {
             }
             let handled = match (key.code, key.modifiers) {
                 (KeyCode::Esc, KeyModifiers::NONE) => {
-                    if model.agent_busy {
+                    if self.cancel_pending_elicitation(cx.editor) {
+                        cx.editor.set_status("Canceled assistant request");
+                    } else if model.agent_busy {
                         if let Some(effects) = cx.editor.cancel_active_assistant_thread() {
                             Self::apply_assistant_effects(cx.editor, effects);
                         }
@@ -2443,6 +2675,10 @@ impl Component for AssistantPanel {
                     true
                 }
                 (KeyCode::Enter, KeyModifiers::NONE) => {
+                    if self.accept_pending_elicitation(cx.editor) {
+                        cx.editor.set_status("Submitted assistant request");
+                        return EventResult::Consumed(None);
+                    }
                     log::warn!(
                         "[assistant_ui] enter open selected={:?} focus={:?}",
                         model.selected_entry_id(),
@@ -2458,7 +2694,9 @@ impl Component for AssistantPanel {
                     true
                 }
                 (KeyCode::Char('y'), KeyModifiers::NONE) => {
-                    self.yank_selected_message(cx.editor);
+                    if !self.yank_pending_elicitation_url(cx.editor) {
+                        self.yank_selected_message(cx.editor);
+                    }
                     true
                 }
                 (KeyCode::Char('a'), KeyModifiers::NONE) => {
@@ -2648,6 +2886,10 @@ impl Component for AssistantPanel {
             }
             // Escape in insert mode → back to normal.
             if matches!(key.code, KeyCode::Esc) && key.modifiers.is_empty() {
+                if self.cancel_pending_elicitation(cx.editor) {
+                    cx.editor.set_status("Canceled assistant request");
+                    return EventResult::Consumed(None);
+                }
                 self.input.exit_insert_mode();
                 return EventResult::Consumed(None);
             }
@@ -2699,6 +2941,10 @@ impl Component for AssistantPanel {
                 match key.code {
                     // Enter → send prompt.
                     KeyCode::Enter => {
+                        if self.accept_pending_elicitation(cx.editor) {
+                            cx.editor.set_status("Submitted assistant request");
+                            return EventResult::Consumed(None);
+                        }
                         self.send_current_prompt(cx);
                         return EventResult::Consumed(None);
                     }
@@ -3117,6 +3363,9 @@ mod tests {
                 }
                 ChatEntryKind::AgentText(text) => {
                     helix_view::assistant::thread::EntryKind::AssistantText { text }
+                }
+                ChatEntryKind::Thought(text) => {
+                    helix_view::assistant::thread::EntryKind::Thought { text }
                 }
                 ChatEntryKind::ToolCall {
                     id, name, status, ..

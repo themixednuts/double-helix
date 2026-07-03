@@ -45,6 +45,7 @@ pub struct Handlers {
     pub auto_save: Sender<AutoSaveEvent>,
     pub auto_reload: Sender<AutoReloadEvent>,
     pub document_colors: Sender<lsp::DocumentColorsEvent>,
+    pub lsp_feature_refresh: Sender<lsp::LspFeatureRefreshEvent>,
     pub blame: Sender<BlameEvent>,
     pub word_index: word_index::Handler,
     pub pull_diagnostics: Sender<lsp::PullDiagnosticsEvent>,
@@ -63,6 +64,7 @@ impl Handlers {
         let (auto_save_tx, _) = channel(1);
         let (auto_reload_tx, _) = channel(1);
         let (doc_colors_tx, _) = channel(1);
+        let (lsp_feature_refresh_tx, _) = channel(1);
         let (blame_tx, _) = channel(1);
         let (pull_diag_tx, _) = channel(1);
         let (pull_all_diag_tx, _) = channel(1);
@@ -72,6 +74,7 @@ impl Handlers {
             auto_save: auto_save_tx,
             auto_reload: auto_reload_tx,
             document_colors: doc_colors_tx,
+            lsp_feature_refresh: lsp_feature_refresh_tx,
             blame: blame_tx,
             word_index: word_index::Handler::dummy(),
             pull_diagnostics: pull_diag_tx,

@@ -155,25 +155,23 @@ impl Terminal {
         match self {
             Self::Local { inner } => {
                 let response = inner
-                    .create(&helix_acp::types::CreateTerminalRequest {
-                        command: req.command.display().to_string(),
-                        args: Some(req.args),
-                        env: Some(
+                    .create(
+                        &helix_acp::types::CreateTerminalRequest::new(
+                            "assistant",
+                            req.command.display().to_string(),
+                        )
+                        .args(req.args)
+                        .env(
                             req.env
                                 .into_iter()
-                                .map(|env| helix_acp::types::EnvVariable {
-                                    name: env.key,
-                                    value: env.value,
-                                })
+                                .map(|env| helix_acp::types::EnvVariable::new(env.key, env.value))
                                 .collect(),
-                        ),
-                        cwd: req.cwd.map(|cwd| cwd.display().to_string()),
-                        output_byte_limit: None,
-                        session_id: "assistant".to_string(),
-                    })
+                        )
+                        .cwd(req.cwd),
+                    )
                     .await
                     .map_err(Error::Other)?;
-                Ok(TerminalId::new(response.terminal_id))
+                Ok(TerminalId::new(response.terminal_id.to_string()))
             }
         }
     }
@@ -181,10 +179,10 @@ impl Terminal {
     pub async fn output(&self, id: &TerminalId) -> Result<String, Error> {
         match self {
             Self::Local { inner } => inner
-                .output(&helix_acp::types::TerminalOutputRequest {
-                    session_id: "assistant".to_string(),
-                    terminal_id: id.to_string(),
-                })
+                .output(&helix_acp::types::TerminalOutputRequest::new(
+                    "assistant",
+                    id.to_string(),
+                ))
                 .await
                 .map(|out| out.output)
                 .map_err(Error::Other),
@@ -195,16 +193,22 @@ impl Terminal {
         match self {
             Self::Local { inner } => {
                 let out = inner
-                    .wait_for_exit(&helix_acp::types::WaitForTerminalExitRequest {
-                        session_id: "assistant".to_string(),
-                        terminal_id: id.to_string(),
-                    })
+                    .wait_for_exit(&helix_acp::types::WaitForTerminalExitRequest::new(
+                        "assistant",
+                        id.to_string(),
+                    ))
                     .await
                     .map_err(Error::Other)?;
-                Ok(match out.exit_code {
-                    Some(code) => ExitStatus::Code(code),
-                    None => ExitStatus::Other,
-                })
+                Ok(
+                    match out
+                        .exit_status
+                        .exit_code
+                        .and_then(|code| i32::try_from(code).ok())
+                    {
+                        Some(code) => ExitStatus::Code(code),
+                        None => ExitStatus::Other,
+                    },
+                )
             }
         }
     }
@@ -212,10 +216,10 @@ impl Terminal {
     pub async fn kill(&self, id: &TerminalId) -> Result<(), Error> {
         match self {
             Self::Local { inner } => inner
-                .kill(&helix_acp::types::KillTerminalRequest {
-                    session_id: "assistant".to_string(),
-                    terminal_id: id.to_string(),
-                })
+                .kill(&helix_acp::types::KillTerminalRequest::new(
+                    "assistant",
+                    id.to_string(),
+                ))
                 .await
                 .map(|_| ())
                 .map_err(Error::Other),
@@ -225,10 +229,10 @@ impl Terminal {
     pub async fn release(&self, id: &TerminalId) -> Result<(), Error> {
         match self {
             Self::Local { inner } => inner
-                .release(&helix_acp::types::ReleaseTerminalRequest {
-                    session_id: "assistant".to_string(),
-                    terminal_id: id.to_string(),
-                })
+                .release(&helix_acp::types::ReleaseTerminalRequest::new(
+                    "assistant",
+                    id.to_string(),
+                ))
                 .await
                 .map(|_| ())
                 .map_err(Error::Other),

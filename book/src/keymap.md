@@ -306,6 +306,9 @@ This layer is a kludge of mappings, mostly pickers.
 | `r`     | Rename symbol (**LSP**)                                                 | `rename_symbol`                            |
 | `a`     | Apply code action (**LSP**)                                             | `code_action`                              |
 | `h`     | Select symbol references (**LSP**)                                      | `select_references_to_symbol_under_cursor` |
+| Unbound | Open code lens picker (**LSP**)                                        | `code_lens`                                |
+| Unbound | Open document links picker (**LSP**)                                   | `document_links`                           |
+| Unbound | Select linked editing ranges (**LSP**)                                 | `linked_editing_range`                     |
 | `'`     | Open last fuzzy picker                                                  | `last_picker`                              |
 | `w`     | Enter [window mode](#window-mode)                                       | N/A                                        |
 | `c`     | Comment/uncomment selections                                            | `toggle_comments`                          |

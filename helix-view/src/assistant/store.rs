@@ -754,6 +754,42 @@ impl Store {
                     thread::Origin::Local => None,
                 })
                 .unwrap_or_default(),
+            action::Action::CompleteElicitation {
+                thread,
+                id,
+                response,
+            } => {
+                let Some(state) = self.thread_mut(thread) else {
+                    return Vec::new();
+                };
+                let thread::Origin::Backend { backend, .. } = state.origin() else {
+                    return Vec::new();
+                };
+                let backend = backend.clone();
+                let status = match response {
+                    thread::ElicitationResponse::Accept(_) => {
+                        thread::ElicitationStatus::Completed
+                    }
+                    thread::ElicitationResponse::Decline => thread::ElicitationStatus::Declined,
+                    thread::ElicitationResponse::Cancel => thread::ElicitationStatus::Canceled,
+                };
+                state.apply(thread::Event::Elicitation(thread::ElicitationEvent::Complete {
+                    id: id.clone(),
+                    status,
+                }));
+                vec![
+                    effect::Effect::SendBackendCommand {
+                        backend,
+                        command: backend::Command::CompleteElicitation {
+                            thread,
+                            id,
+                            response,
+                        },
+                    },
+                    effect::Effect::Save { thread },
+                    effect::Effect::SyncModel,
+                ]
+            }
             action::Action::SetReviewMode { thread, mode } => {
                 let Some(state) = self.thread_mut(thread) else {
                     return Vec::new();
@@ -1223,6 +1259,63 @@ mod tests {
                     && *current_thread == thread
                     && current_request == &request
                     && current_decision == &decision
+            )
+        }));
+    }
+
+    #[test]
+    fn complete_elicitation_updates_state_and_emits_backend_command() {
+        let (mut store, thread, backend) = backend_store();
+        let request = thread::Elicitation {
+            id: "elicit-1".to_string(),
+            status: thread::ElicitationStatus::Pending,
+            mode: thread::ElicitationMode::Form {
+                message: "Need input".to_string(),
+                fields: vec![thread::ElicitationField {
+                    name: "approved".to_string(),
+                    field_type: thread::ElicitationFieldType::Bool,
+                    label: None,
+                    required: true,
+                    options: Vec::new(),
+                }],
+            },
+        };
+        let _ = store.apply(event::Event::Thread {
+            thread,
+            event: thread::Event::Elicitation(thread::ElicitationEvent::Request(request)),
+        });
+
+        let response = thread::ElicitationResponse::Accept(vec![(
+            "approved".to_string(),
+            thread::ElicitationValue::Boolean(true),
+        )]);
+        let effects = store.act(action::Action::CompleteElicitation {
+            thread,
+            id: "elicit-1".to_string(),
+            response: response.clone(),
+        });
+
+        assert_eq!(
+            store
+                .thread(thread)
+                .and_then(|thread| thread.pending_elicitations().first())
+                .map(|elicitation| elicitation.status),
+            Some(thread::ElicitationStatus::Completed)
+        );
+        assert!(effects.iter().any(|effect| {
+            matches!(
+                effect,
+                effect::Effect::SendBackendCommand {
+                    backend: current,
+                    command: backend::Command::CompleteElicitation {
+                        thread: current_thread,
+                        id,
+                        response: current_response,
+                    },
+                } if current == &backend
+                    && *current_thread == thread
+                    && id == "elicit-1"
+                    && current_response == &response
             )
         }));
     }

@@ -488,6 +488,11 @@ impl DiagnosticTag {
     /// Deprecated or obsolete code.
     /// Clients are allowed to rendered diagnostics with this tag strike through.
     pub const DEPRECATED: DiagnosticTag = DiagnosticTag(2);
+
+    /// Unneeded parentheses.
+    ///
+    /// @since 3.18.0
+    pub const UNNEEDED_PARENTHESES: DiagnosticTag = DiagnosticTag(3);
 }
 }
 

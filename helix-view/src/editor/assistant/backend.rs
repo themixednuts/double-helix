@@ -44,6 +44,7 @@ impl Editor {
         &mut self,
         command: String,
         args: Vec<String>,
+        mcp_servers: Vec<helix_acp::types::McpServer>,
     ) -> anyhow::Result<crate::assistant::BackendHandle> {
         let runtime = self.assistant_runtime();
         let cwd = std::env::current_dir().unwrap_or_default();
@@ -52,14 +53,11 @@ impl Editor {
             args,
             env: Vec::new(),
             cwd: cwd.clone(),
-            mcp_servers: Vec::new(),
+            mcp_servers,
             timeout_secs: 120,
         };
-        let client_info = helix_acp::types::Implementation {
-            name: "helix".to_string(),
-            title: Some("Helix Editor".to_string()),
-            version: env!("CARGO_PKG_VERSION").to_string(),
-        };
+        let client_info = helix_acp::types::Implementation::new("helix", env!("CARGO_PKG_VERSION"))
+            .title("Helix Editor");
 
         let driver = crate::assistant::acp::Driver::new(config, client_info);
         let handle = driver.spawn(
@@ -84,7 +82,8 @@ impl Editor {
         }
 
         let agent = self.assistant_agent(backend)?;
-        self.spawn_assistant_backend(agent.command, agent.args).ok()
+        self.spawn_assistant_backend(agent.command, agent.args, agent.mcp_servers)
+            .ok()
     }
 
     pub fn connect_assistant_backend(
@@ -96,7 +95,7 @@ impl Editor {
         Vec<crate::assistant::effect::Effect>,
     )> {
         let cwd = std::env::current_dir().unwrap_or_default();
-        let handle = self.spawn_assistant_backend(command, args)?;
+        let handle = self.spawn_assistant_backend(command, args, Vec::new())?;
         let effects =
             self.new_assistant_thread(handle.id.clone(), crate::assistant::thread::Scope::new(cwd));
         Ok((handle.id, effects))

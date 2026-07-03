@@ -98,6 +98,11 @@ pub enum Action {
         request: permission::RequestId,
         decision: permission::Decision,
     },
+    CompleteElicitation {
+        thread: thread::Id,
+        id: String,
+        response: thread::ElicitationResponse,
+    },
     SetReviewMode {
         thread: thread::Id,
         mode: review::Mode,

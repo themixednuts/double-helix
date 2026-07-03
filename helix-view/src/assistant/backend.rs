@@ -186,6 +186,11 @@ pub enum Command {
         option: config::Id,
         value: config::ValueId,
     },
+    CompleteElicitation {
+        thread: thread::Id,
+        id: String,
+        response: thread::ElicitationResponse,
+    },
     ResolvePermission {
         thread: thread::Id,
         request: permission::RequestId,

@@ -8,7 +8,7 @@
 //! [`UiCommand`] drives compositor / layers / widgets. Keep that boundary when adding variants.
 
 use std::borrow::Cow;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -21,7 +21,9 @@ use helix_runtime::DebouncedSender;
 use helix_runtime::{Receiver as IngressReceiver, Sender as IngressSender, TimerId, Token, Work};
 use helix_view::document::DocumentInlayHintsId;
 use helix_view::document::FormatterError;
-use helix_view::handlers::lsp::{SignatureHelpInvoked, SignatureHelpRequestId};
+use helix_view::handlers::lsp::{
+    LspFeatureRefreshKind, SignatureHelpInvoked, SignatureHelpRequestId,
+};
 use helix_view::{
     editor::{Activation, FrameSelection, PanelBehavior, SavePolicy, ThreadSelectPolicy},
     DocumentId, ViewId,
@@ -401,6 +403,9 @@ pub enum RuntimeTaskEvent {
     },
     /// Debounced document color refresh (after [`DocumentColorsHandler`] debounce).
     RequestDocumentColorsDebounced { doc_ids: HashSet<DocumentId> },
+    RequestLspFeaturesDebounced {
+        docs: HashMap<DocumentId, HashSet<LspFeatureRefreshKind>>,
+    },
     /// Debounced pull diagnostics for listed documents.
     PullDiagnosticsDebounced { document_ids: HashSet<DocumentId> },
     /// Debounced pull diagnostics for inter-file dependency language servers.
@@ -431,6 +436,37 @@ pub enum RuntimeTaskEvent {
         offset_encoding: helix_lsp::OffsetEncoding,
         id: DocumentInlayHintsId,
         hints: Vec<lsp::InlayHint>,
+    },
+    ApplyCodeLenses {
+        doc_id: DocumentId,
+        lenses: Vec<(LanguageServerId, helix_lsp::OffsetEncoding, lsp::CodeLens)>,
+    },
+    ApplyDocumentLinks {
+        doc_id: DocumentId,
+        links: Vec<(
+            LanguageServerId,
+            helix_lsp::OffsetEncoding,
+            lsp::DocumentLink,
+        )>,
+    },
+    ApplyFoldingRanges {
+        doc_id: DocumentId,
+        ranges: Vec<(
+            LanguageServerId,
+            helix_lsp::OffsetEncoding,
+            lsp::FoldingRange,
+        )>,
+    },
+    ApplyLinkedEditingRanges {
+        offset_encoding: helix_lsp::OffsetEncoding,
+        ranges: lsp::LinkedEditingRanges,
+    },
+    ApplyOnTypeFormatting {
+        doc_id: DocumentId,
+        view_id: ViewId,
+        expected_version: i32,
+        offset_encoding: helix_lsp::OffsetEncoding,
+        edits: Vec<lsp::TextEdit>,
     },
     /// DAP restart completed; update editor state and status.
     DapRestarted,

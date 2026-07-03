@@ -47,7 +47,7 @@ pub mod methods {
     pub const TERMINAL_WAIT_FOR_EXIT: &str = "terminal/wait_for_exit";
     pub const TERMINAL_KILL: &str = "terminal/kill";
     pub const TERMINAL_RELEASE: &str = "terminal/release";
-    pub const REQUEST_PERMISSION: &str = "request_permission";
+    pub const REQUEST_PERMISSION: &str = "session/request_permission";
 
     // Agent -> Client notifications
     pub const SESSION_UPDATE: &str = "session/update";

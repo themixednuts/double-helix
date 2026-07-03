@@ -365,6 +365,34 @@ impl Application {
 
                         Ok(serde_json::Value::Null)
                     }
+                    Ok(MethodCall::CodeLensRefresh) => {
+                        let language_server = language_server!().id();
+                        let documents = self
+                            .editor
+                            .documents_supporting_language_server(language_server);
+                        let ingress = self.ingress().tx.clone();
+
+                        for document in documents {
+                            crate::effect::language_server::request_code_lenses(
+                                &mut self.editor,
+                                document,
+                                ingress.clone(),
+                            );
+                        }
+
+                        Ok(serde_json::Value::Null)
+                    }
+                    Ok(MethodCall::InlayHintRefresh) => {
+                        for doc in self.editor.documents_mut() {
+                            doc.mark_inlay_hints_outdated();
+                        }
+                        let ingress = self.ingress().tx.clone();
+                        crate::commands::compute_inlay_hints_for_all_views(
+                            &mut self.editor,
+                            ingress,
+                        );
+                        Ok(serde_json::Value::Null)
+                    }
                     Ok(MethodCall::ShowMessageRequest(params)) => {
                         if let Some(actions) = params.actions.filter(|a| !a.is_empty()) {
                             let id = id.clone();

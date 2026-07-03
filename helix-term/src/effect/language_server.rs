@@ -5,14 +5,20 @@ use futures_util::{
     StreamExt,
 };
 use helix_core::{
-    diagnostic::DiagnosticProvider, syntax::config::LanguageServerFeature,
-    text_annotations::InlineAnnotation, Uri,
+    diagnostic::DiagnosticProvider,
+    syntax::config::LanguageServerFeature,
+    text_annotations::InlineAnnotation,
+    text_folding::{Fold, FoldContainer, FoldObject},
+    Selection, SmallVec, Uri,
 };
 use helix_lsp::{self, lsp, util::lsp_range_to_range, LanguageServerId};
 use helix_runtime::Token;
+use helix_stdx::rope::RopeSliceExt;
 use helix_view::{
-    document::{DocumentInlayHints, DocumentInlayHintsId},
-    document_lsp::DocumentColorSwatches,
+    document::{DocumentInlayHints, DocumentInlayHintsId, PluginAnnotation},
+    document_lsp::{
+        DocumentCodeLens, DocumentCodeLenses, DocumentColorSwatches, DocumentLink, DocumentLinks,
+    },
     handlers::lsp::{SignatureHelpInvoked, SignatureHelpRequestId},
     DocumentId, Editor, Theme, ViewId,
 };
@@ -22,6 +28,8 @@ use crate::runtime::{
     ui::command::LspCodeActionItem,
     RuntimeTaskEvent, UiCommand,
 };
+
+const CODE_LENS_PLUGIN_SCOPE: &str = "helix-lsp-code-lens";
 
 pub(crate) fn request_document_diagnostics_for_language_servers(
     editor: &mut Editor,
@@ -227,6 +235,204 @@ pub(crate) fn request_document_colors(
                     doc_id,
                     colors: all_colors,
                 },
+                ingress,
+            )
+            .await;
+        })
+        .detach();
+}
+
+pub(crate) fn request_code_lenses(
+    editor: &mut Editor,
+    doc_id: DocumentId,
+    ingress: crate::runtime::RuntimeIngress,
+) {
+    if !editor.config().lsp.code_lens {
+        return;
+    }
+    let Some(doc) = editor.document_mut(doc_id) else {
+        return;
+    };
+    let cancel = doc.restart_code_lenses();
+    let mut seen_language_servers = HashSet::new();
+    let mut futures: FuturesOrdered<_> = doc
+        .language_servers_with_feature(LanguageServerFeature::CodeLens)
+        .filter(|language_server| seen_language_servers.insert(language_server.id()))
+        .map(|language_server| {
+            let server_id = language_server.id();
+            let offset_encoding = language_server.offset_encoding();
+            let request = language_server
+                .text_document_code_lens(doc.identifier(), None)
+                .unwrap();
+            async move {
+                anyhow::Ok((
+                    server_id,
+                    offset_encoding,
+                    request.await?.unwrap_or_default(),
+                ))
+            }
+        })
+        .collect();
+    if futures.is_empty() {
+        return;
+    }
+    editor
+        .runtime()
+        .work()
+        .clone()
+        .spawn(async move {
+            let mut lenses = Vec::new();
+            loop {
+                let next = tokio::select! {
+                    _ = cancel.canceled() => return,
+                    next = futures.next() => next,
+                };
+                match next {
+                    Some(Ok((server_id, offset_encoding, items))) => {
+                        lenses.extend(
+                            items
+                                .into_iter()
+                                .map(|lens| (server_id, offset_encoding, lens)),
+                        );
+                    }
+                    Some(Err(err)) => log::error!("code lens request failed: {err}"),
+                    None => break,
+                }
+            }
+            send_task_event_with(
+                RuntimeTaskEvent::ApplyCodeLenses { doc_id, lenses },
+                ingress,
+            )
+            .await;
+        })
+        .detach();
+}
+
+pub(crate) fn request_document_links(
+    editor: &mut Editor,
+    doc_id: DocumentId,
+    ingress: crate::runtime::RuntimeIngress,
+) {
+    if !editor.config().lsp.document_links {
+        return;
+    }
+    let Some(doc) = editor.document_mut(doc_id) else {
+        return;
+    };
+    let cancel = doc.restart_document_links();
+    let mut seen_language_servers = HashSet::new();
+    let mut futures: FuturesOrdered<_> = doc
+        .language_servers_with_feature(LanguageServerFeature::DocumentLinks)
+        .filter(|language_server| seen_language_servers.insert(language_server.id()))
+        .map(|language_server| {
+            let server_id = language_server.id();
+            let offset_encoding = language_server.offset_encoding();
+            let request = language_server
+                .text_document_document_link(doc.identifier(), None)
+                .unwrap();
+            async move {
+                anyhow::Ok((
+                    server_id,
+                    offset_encoding,
+                    request.await?.unwrap_or_default(),
+                ))
+            }
+        })
+        .collect();
+    if futures.is_empty() {
+        return;
+    }
+    editor
+        .runtime()
+        .work()
+        .clone()
+        .spawn(async move {
+            let mut links = Vec::new();
+            loop {
+                let next = tokio::select! {
+                    _ = cancel.canceled() => return,
+                    next = futures.next() => next,
+                };
+                match next {
+                    Some(Ok((server_id, offset_encoding, items))) => {
+                        links.extend(
+                            items
+                                .into_iter()
+                                .map(|link| (server_id, offset_encoding, link)),
+                        );
+                    }
+                    Some(Err(err)) => log::error!("document link request failed: {err}"),
+                    None => break,
+                }
+            }
+            send_task_event_with(
+                RuntimeTaskEvent::ApplyDocumentLinks { doc_id, links },
+                ingress,
+            )
+            .await;
+        })
+        .detach();
+}
+
+pub(crate) fn request_folding_ranges(
+    editor: &mut Editor,
+    doc_id: DocumentId,
+    ingress: crate::runtime::RuntimeIngress,
+) {
+    if !editor.config().lsp.folding {
+        return;
+    }
+    let Some(doc) = editor.document_mut(doc_id) else {
+        return;
+    };
+    let cancel = doc.restart_folding_ranges();
+    let mut seen_language_servers = HashSet::new();
+    let mut futures: FuturesOrdered<_> = doc
+        .language_servers_with_feature(LanguageServerFeature::FoldingRange)
+        .filter(|language_server| seen_language_servers.insert(language_server.id()))
+        .map(|language_server| {
+            let server_id = language_server.id();
+            let offset_encoding = language_server.offset_encoding();
+            let request = language_server
+                .text_document_folding_range(doc.identifier(), None)
+                .unwrap();
+            async move {
+                anyhow::Ok((
+                    server_id,
+                    offset_encoding,
+                    request.await?.unwrap_or_default(),
+                ))
+            }
+        })
+        .collect();
+    if futures.is_empty() {
+        return;
+    }
+    editor
+        .runtime()
+        .work()
+        .clone()
+        .spawn(async move {
+            let mut ranges = Vec::new();
+            loop {
+                let next = tokio::select! {
+                    _ = cancel.canceled() => return,
+                    next = futures.next() => next,
+                };
+                match next {
+                    Some(Ok((server_id, offset_encoding, items))) => {
+                        ranges.extend(
+                            items
+                                .into_iter()
+                                .map(|range| (server_id, offset_encoding, range)),
+                        );
+                    }
+                    Some(Err(err)) => log::error!("folding range request failed: {err}"),
+                    None => break,
+                }
+            }
+            send_task_event_with(
+                RuntimeTaskEvent::ApplyFoldingRanges { doc_id, ranges },
                 ingress,
             )
             .await;
@@ -504,6 +710,358 @@ pub(crate) fn apply_inlay_hints(
         },
     );
     doc.clear_inlay_hints_outdated();
+}
+
+fn code_lens_annotations(doc: &helix_view::Document) -> Vec<PluginAnnotation> {
+    let Some(code_lenses) = doc.code_lenses() else {
+        return Vec::new();
+    };
+
+    let text = doc.text();
+    let mut annotations = Vec::new();
+    let mut current_line = None;
+    let mut current_text = String::new();
+
+    for lens in &code_lenses.lenses {
+        let Some(title) = lens.title() else {
+            continue;
+        };
+        let line = text.char_to_line(lens.range.from().min(text.len_chars()));
+        if current_line == Some(line) {
+            current_text.push_str("  |  ");
+            current_text.push_str(title);
+        } else {
+            if let Some(line) = current_line {
+                annotations.push(PluginAnnotation {
+                    char_idx: text.line_to_char(line),
+                    text: current_text,
+                    style: Some("ui.virtual".to_owned()),
+                    fg: None,
+                    bg: None,
+                    offset: 0,
+                    is_line: true,
+                    virt_line_idx: Some(0),
+                    dropped_text: None,
+                });
+            }
+            current_line = Some(line);
+            current_text = title.to_owned();
+        }
+    }
+
+    if let Some(line) = current_line {
+        annotations.push(PluginAnnotation {
+            char_idx: text.line_to_char(line),
+            text: current_text,
+            style: Some("ui.virtual".to_owned()),
+            fg: None,
+            bg: None,
+            offset: 0,
+            is_line: true,
+            virt_line_idx: Some(0),
+            dropped_text: None,
+        });
+    }
+
+    annotations
+}
+
+fn refresh_code_lens_annotations(editor: &mut Editor, doc_id: DocumentId) {
+    let view_ids: Vec<_> = editor
+        .tree
+        .views()
+        .filter_map(|(view, _)| (view.doc == doc_id).then_some(view.id))
+        .collect();
+    let Some(doc) = editor.document_mut(doc_id) else {
+        return;
+    };
+    let annotations = code_lens_annotations(doc);
+    for view_id in view_ids {
+        doc.set_plugin_annotations(
+            view_id,
+            CODE_LENS_PLUGIN_SCOPE.to_owned(),
+            annotations.clone(),
+        );
+    }
+}
+
+pub(crate) fn apply_code_lenses(
+    editor: &mut Editor,
+    doc_id: DocumentId,
+    lenses: Vec<(LanguageServerId, helix_lsp::OffsetEncoding, lsp::CodeLens)>,
+) {
+    if !editor.config().lsp.code_lens {
+        return;
+    }
+    let Some(doc) = editor.document_mut(doc_id) else {
+        return;
+    };
+    let text = doc.text();
+    let lenses = lenses
+        .into_iter()
+        .filter_map(|(server_id, offset_encoding, lens)| {
+            let range = lsp_range_to_range(text, lens.range, offset_encoding)?;
+            Some(DocumentCodeLens {
+                server_id,
+                range,
+                offset_encoding,
+                resolved: lens.command.is_some(),
+                lens,
+            })
+        })
+        .collect();
+    doc.set_code_lenses(DocumentCodeLenses::sorted(lenses));
+    refresh_code_lens_annotations(editor, doc_id);
+}
+
+pub(crate) fn apply_document_links(
+    editor: &mut Editor,
+    doc_id: DocumentId,
+    links: Vec<(
+        LanguageServerId,
+        helix_lsp::OffsetEncoding,
+        lsp::DocumentLink,
+    )>,
+) {
+    let Some(doc) = editor.document_mut(doc_id) else {
+        return;
+    };
+    let text = doc.text();
+    let links = links
+        .into_iter()
+        .filter_map(|(server_id, offset_encoding, link)| {
+            let range = lsp_range_to_range(text, link.range, offset_encoding)?;
+            Some(DocumentLink {
+                server_id,
+                range,
+                offset_encoding,
+                resolved: link.target.is_some(),
+                link,
+            })
+        })
+        .collect();
+    doc.set_document_links(DocumentLinks::sorted(links));
+}
+
+pub(crate) fn folding_range_to_fold(
+    text: &helix_core::Rope,
+    offset_encoding: helix_lsp::OffsetEncoding,
+    range: &lsp::FoldingRange,
+) -> Option<(
+    helix_core::text_folding::StartFoldPoint,
+    helix_core::text_folding::EndFoldPoint,
+)> {
+    let start_line = range.start_line as usize;
+    let end_line = range.end_line as usize;
+    if start_line >= end_line || end_line >= text.len_lines() {
+        return None;
+    }
+
+    let text_slice = text.slice(..);
+    let line_start = text.line_to_char(start_line);
+    let line_end = helix_core::line_ending::line_end_char_index(&text_slice, start_line);
+    let start = range
+        .start_character
+        .and_then(|character| {
+            let pos = lsp::Position::new(range.start_line, character);
+            helix_lsp::util::lsp_pos_to_pos(text, pos, offset_encoding)
+        })
+        .filter(|start| *start >= line_start && *start <= line_end)
+        .unwrap_or_else(|| {
+            line_start
+                + text_slice
+                    .line(start_line)
+                    .first_non_whitespace_char()
+                    .unwrap_or(0)
+        });
+
+    let end = range
+        .end_character
+        .and_then(|character| {
+            let pos = lsp::Position::new(range.end_line, character);
+            helix_lsp::util::lsp_pos_to_pos(text, pos, offset_encoding)
+        })
+        .unwrap_or_else(|| helix_core::line_ending::line_end_char_index(&text_slice, end_line))
+        .saturating_sub(1);
+
+    let object = match range.kind {
+        Some(lsp::FoldingRangeKind::Comment) => FoldObject::TextObject("comment"),
+        Some(lsp::FoldingRangeKind::Imports) => FoldObject::TextObject("imports"),
+        Some(lsp::FoldingRangeKind::Region) => FoldObject::TextObject("region"),
+        None => FoldObject::TextObject("lsp"),
+    };
+    Some(Fold::new_points(text_slice, object, start, &(start..=end)))
+}
+
+pub(crate) fn apply_folding_ranges(
+    editor: &mut Editor,
+    doc_id: DocumentId,
+    ranges: Vec<(
+        LanguageServerId,
+        helix_lsp::OffsetEncoding,
+        lsp::FoldingRange,
+    )>,
+) {
+    if !editor.config().lsp.folding {
+        return;
+    }
+    let view_ids: Vec<_> = editor
+        .tree
+        .views()
+        .filter_map(|(view, _)| (view.doc == doc_id).then_some(view.id))
+        .collect();
+    let Some(doc) = editor.document_mut(doc_id) else {
+        return;
+    };
+    let text = doc.text().clone();
+    let points = ranges
+        .iter()
+        .filter_map(|(_, offset_encoding, range)| {
+            folding_range_to_fold(&text, *offset_encoding, range)
+        })
+        .collect::<Vec<_>>();
+    for view_id in view_ids {
+        if should_replace_folds_with_lsp(
+            doc.fold_container(view_id),
+            doc.is_lsp_fold_container(view_id),
+        ) {
+            doc.insert_fold_container(view_id, FoldContainer::from(text.slice(..), points.clone()));
+            doc.mark_lsp_fold_container(view_id);
+        }
+    }
+}
+
+pub(crate) fn should_replace_folds_with_lsp(
+    existing: Option<&FoldContainer>,
+    lsp_owned: bool,
+) -> bool {
+    lsp_owned || existing.is_none_or(FoldContainer::is_empty)
+}
+
+pub(crate) fn apply_linked_editing_ranges(
+    editor: &mut Editor,
+    offset_encoding: helix_lsp::OffsetEncoding,
+    linked: lsp::LinkedEditingRanges,
+) {
+    let (view_id, doc) = focused!(editor);
+    let text = doc.text();
+    let pos = doc.selection(view_id).primary().cursor(text.slice(..));
+    let mut primary_index = 0;
+    let ranges: SmallVec<[_; 1]> = linked
+        .ranges
+        .into_iter()
+        .filter_map(|range| lsp_range_to_range(text, range, offset_encoding))
+        .enumerate()
+        .map(|(idx, range)| {
+            if range.contains(pos) {
+                primary_index = idx;
+            }
+            range
+        })
+        .collect();
+    if !ranges.is_empty() {
+        doc.set_selection(view_id, Selection::new(ranges, primary_index));
+    }
+}
+
+pub(crate) fn apply_on_type_formatting(
+    editor: &mut Editor,
+    doc_id: DocumentId,
+    view_id: ViewId,
+    expected_version: i32,
+    offset_encoding: helix_lsp::OffsetEncoding,
+    edits: Vec<lsp::TextEdit>,
+) {
+    if !editor.contains_document(doc_id) || !editor.contains_view(view_id) {
+        return;
+    }
+    let scrolloff = editor.config().scrolloff;
+    let doc = doc_mut!(editor, &doc_id);
+    if doc.version() != expected_version {
+        return;
+    }
+    let transaction =
+        helix_lsp::util::generate_transaction_from_edits(doc.text(), edits, offset_encoding);
+    doc.apply(&transaction, view_id);
+    let view = view_mut!(editor, view_id);
+    doc.append_changes_to_history(view);
+    view.ensure_cursor_in_view(doc, scrolloff);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use helix_core::Rope;
+
+    #[test]
+    fn folding_range_conversion_rejects_empty_and_out_of_bounds_ranges() {
+        let text = Rope::from("fn main() {\n    call();\n}\n");
+
+        assert!(folding_range_to_fold(
+            &text,
+            helix_lsp::OffsetEncoding::Utf8,
+            &lsp::FoldingRange {
+                start_line: 1,
+                end_line: 1,
+                ..Default::default()
+            },
+        )
+        .is_none());
+
+        assert!(folding_range_to_fold(
+            &text,
+            helix_lsp::OffsetEncoding::Utf8,
+            &lsp::FoldingRange {
+                start_line: 0,
+                end_line: 99,
+                ..Default::default()
+            },
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn folding_range_conversion_creates_fold_for_multiline_range() {
+        let text = Rope::from("fn main() {\n    call();\n}\n");
+        let points = folding_range_to_fold(
+            &text,
+            helix_lsp::OffsetEncoding::Utf8,
+            &lsp::FoldingRange {
+                start_line: 0,
+                end_line: 2,
+                kind: Some(lsp::FoldingRangeKind::Region),
+                ..Default::default()
+            },
+        )
+        .expect("valid folding range");
+
+        let container = FoldContainer::from(text.slice(..), vec![points]);
+        assert_eq!(container.len(), 1);
+    }
+
+    #[test]
+    fn lsp_folds_only_replace_empty_existing_folds() {
+        let text = Rope::from("fn main() {\n    call();\n}\n");
+        let points = folding_range_to_fold(
+            &text,
+            helix_lsp::OffsetEncoding::Utf8,
+            &lsp::FoldingRange {
+                start_line: 0,
+                end_line: 2,
+                ..Default::default()
+            },
+        )
+        .expect("valid folding range");
+        let non_empty = FoldContainer::from(text.slice(..), vec![points]);
+
+        assert!(should_replace_folds_with_lsp(None, false));
+        assert!(should_replace_folds_with_lsp(
+            Some(&FoldContainer::new()),
+            false
+        ));
+        assert!(should_replace_folds_with_lsp(Some(&non_empty), true));
+        assert!(!should_replace_folds_with_lsp(Some(&non_empty), false));
+    }
 }
 
 pub(crate) fn attach_document_colors(

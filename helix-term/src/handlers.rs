@@ -12,6 +12,7 @@ pub use helix_view::handlers::{word_index, Handlers};
 
 use self::blame::BlameHandler;
 use self::document_colors::DocumentColorsHandler;
+use self::lsp_features::LspFeatureRefreshHandler;
 
 pub(super) mod auto_reload;
 mod auto_save;
@@ -20,6 +21,7 @@ pub mod completion;
 pub mod diagnostics;
 mod document_colors;
 pub mod local;
+mod lsp_features;
 mod prompt;
 mod signature_help;
 mod snippet;
@@ -43,6 +45,7 @@ pub fn setup(
     let auto_save = AutoSaveHandler::spawn(runtime.clone(), ingress.clone());
     let auto_reload = AutoReloadHandler::spawn(runtime.clone(), ingress.clone());
     let document_colors = DocumentColorsHandler::spawn(runtime.clone(), ingress.clone());
+    let lsp_feature_refresh = LspFeatureRefreshHandler::spawn(runtime.clone(), ingress.clone());
     let blame = BlameHandler::spawn(runtime.clone(), ingress.clone());
     let word_index = word_index::Handler::spawn(runtime.clone());
     let pull_diagnostics = PullDiagnosticsHandler::spawn(runtime.clone(), ingress.clone());
@@ -55,6 +58,7 @@ pub fn setup(
         auto_save,
         auto_reload,
         document_colors,
+        lsp_feature_refresh,
         blame,
         word_index,
         pull_diagnostics,
@@ -74,6 +78,7 @@ pub fn attach(
     diagnostics::attach(editor, handlers, ingress.clone());
     snippet::attach(editor, handlers);
     document_colors::attach(editor, handlers, ingress.clone());
+    lsp_features::attach(editor, handlers, ingress.clone());
     prompt::attach(editor, handlers, ingress.clone());
     blame::attach(editor, handlers);
     attach_assistant_hooks(editor);

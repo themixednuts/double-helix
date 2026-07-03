@@ -42,11 +42,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    let client_info = Implementation {
-        name: "call_session_new".into(),
-        title: Some("Example".into()),
-        version: "0.1".into(),
-    };
+    let client_info = Implementation::new("call_session_new", "0.1").title("Example");
     let caps = ClientCapabilities::default();
 
     eprintln!("Calling initialize ...");

@@ -311,6 +311,9 @@ impl MappableCommand {
         file_explorer_in_current_directory => "Open file explorer panel at current working directory",
         code_action => "Perform code action",
         code_action_picker => "Perform code action in a picker",
+        code_lens => "Open code lens picker",
+        document_links => "Open document links picker",
+        linked_editing_range => "Select linked editing ranges",
         buffer_picker => "Open buffer picker",
         jumplist_picker => "Open jumplist picker",
         symbol_picker => "Open symbol picker",
@@ -760,6 +763,10 @@ fn goto_file_vsplit(cx: &mut Context) {
 
 /// Goto files in selection.
 fn goto_file_impl(cx: &mut Context, action: Action) {
+    if lsp::try_open_document_link_at_cursor(cx, action) {
+        return;
+    }
+
     let (view_id, doc) = focused_ref!(cx.editor);
     let text = doc.text().slice(..);
     let selections = doc.selection(view_id);
@@ -3170,6 +3177,7 @@ pub mod insert {
         let doc_id = cx.editor.focused_document_id();
         helix_view::commands::editing::insert_char(cx.editor, view_id, doc_id, c);
         local::post_insert_char(c, cx);
+        lsp::request_on_type_formatting(cx, c);
     }
 
     pub fn smart_tab(cx: &mut Context) {

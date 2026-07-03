@@ -3,9 +3,7 @@
 //! Manages a connection to a single ACP agent subprocess.
 //! Follows the same patterns as `helix-lsp::Client`.
 
-use crate::{
-    jsonrpc, methods, transport::Payload, types::*, AgentId, Error, Result, PROTOCOL_VERSION,
-};
+use crate::{jsonrpc, methods, transport::Payload, types::*, AgentId, Error, Result};
 use helix_runtime::{channel, send_blocking, Receiver, Sender};
 use log::warn;
 use serde::Serialize;
@@ -69,6 +67,8 @@ pub struct AcpAgent {
     agent_info: OnceCell<Implementation>,
     initialize_notify: Arc<Notify>,
     timeout_secs: u64,
+    cwd: PathBuf,
+    mcp_servers: Vec<McpServer>,
     /// The current session ID, set after `new_session` or `load_session`.
     session_id: Mutex<Option<SessionId>>,
 }
@@ -140,6 +140,8 @@ impl AcpAgent {
             agent_info: OnceCell::new(),
             initialize_notify,
             timeout_secs: config.timeout_secs,
+            cwd: config.cwd.clone(),
+            mcp_servers: config.mcp_servers.clone(),
             session_id: Mutex::new(None),
         });
 
@@ -299,11 +301,9 @@ impl AcpAgent {
         client_info: Implementation,
         client_capabilities: ClientCapabilities,
     ) -> Result<InitializeResponse> {
-        let params = InitializeRequest {
-            protocol_version: PROTOCOL_VERSION,
-            client_capabilities,
-            client_info: Some(client_info),
-        };
+        let params = InitializeRequest::new(ProtocolVersion::V1)
+            .client_capabilities(client_capabilities)
+            .client_info(client_info);
 
         let response: InitializeResponse = self
             .call(methods::INITIALIZE, params, self.timeout_secs)
@@ -323,11 +323,7 @@ impl AcpAgent {
 
     /// Create a new session and store the session ID.
     pub async fn new_session(&self, cwd: PathBuf) -> Result<NewSessionResponse> {
-        let params = NewSessionRequest {
-            mcp_servers: Vec::new(),
-            cwd,
-            additional_directories: Vec::new(),
-        };
+        let params = NewSessionRequest::new(cwd).mcp_servers(self.mcp_servers.clone());
         let resp: NewSessionResponse = self
             .call(methods::SESSION_NEW, params, self.timeout_secs)
             .await?;
@@ -337,16 +333,12 @@ impl AcpAgent {
 
     /// Load an existing session and store the session ID.
     pub async fn load_session(&self, session_id: SessionId) -> Result<LoadSessionResponse> {
-        let params = LoadSessionRequest {
-            session_id: session_id.clone(),
-            mcp_servers: Vec::new(),
-            cwd: None,
-            additional_directories: Vec::new(),
-        };
+        let params = LoadSessionRequest::new(session_id.clone(), self.cwd.clone())
+            .mcp_servers(self.mcp_servers.clone());
         let resp: LoadSessionResponse = self
             .call(methods::SESSION_LOAD, params, self.timeout_secs)
             .await?;
-        *self.session_id.lock().await = Some(resp.session_id.clone());
+        *self.session_id.lock().await = Some(session_id);
         Ok(resp)
     }
 
@@ -356,7 +348,7 @@ impl AcpAgent {
     ) -> impl Future<Output = Result<ListSessionsResponse>> {
         self.call(
             methods::SESSION_LIST,
-            ListSessionsRequest { cursor },
+            ListSessionsRequest::new().cursor(cursor),
             self.timeout_secs,
         )
     }
@@ -368,12 +360,7 @@ impl AcpAgent {
     ) -> impl Future<Output = Result<ResumeSessionResponse>> {
         self.call(
             methods::SESSION_RESUME,
-            ResumeSessionRequest {
-                session_id,
-                cwd,
-                mcp_servers: Vec::new(),
-                additional_directories: Vec::new(),
-            },
+            ResumeSessionRequest::new(session_id, cwd).mcp_servers(self.mcp_servers.clone()),
             self.timeout_secs,
         )
     }
@@ -384,7 +371,7 @@ impl AcpAgent {
     ) -> impl Future<Output = Result<DeleteSessionResponse>> {
         self.call(
             methods::SESSION_DELETE,
-            DeleteSessionRequest { session_id },
+            DeleteSessionRequest::new(session_id),
             self.timeout_secs,
         )
     }
@@ -395,13 +382,13 @@ impl AcpAgent {
     ) -> impl Future<Output = Result<AuthenticateResponse>> {
         self.call(
             methods::AUTHENTICATE,
-            AuthenticateRequest { method_id },
+            AuthenticateRequest::new(method_id),
             self.timeout_secs,
         )
     }
 
     pub fn logout(&self) -> impl Future<Output = Result<LogoutResponse>> {
-        self.call(methods::LOGOUT, LogoutRequest {}, self.timeout_secs)
+        self.call(methods::LOGOUT, LogoutRequest::new(), self.timeout_secs)
     }
 
     /// Send a prompt to the agent within a session.
@@ -414,14 +401,14 @@ impl AcpAgent {
         session_id: SessionId,
         prompt: Vec<ContentBlock>,
     ) -> impl Future<Output = Result<PromptResponse>> {
-        let params = PromptRequest { session_id, prompt };
+        let params = PromptRequest::new(session_id, prompt);
         // Prompts can take a very long time (agent is doing work)
         self.call(methods::SESSION_PROMPT, params, 600)
     }
 
     /// Cancel an ongoing prompt turn.
     pub fn cancel(&self, session_id: SessionId) {
-        self.notify(methods::SESSION_CANCEL, CancelNotification { session_id });
+        self.notify(methods::SESSION_CANCEL, CancelNotification::new(session_id));
     }
 
     /// Set the session mode.
@@ -430,10 +417,7 @@ impl AcpAgent {
         session_id: SessionId,
         mode_id: String,
     ) -> impl Future<Output = Result<SetSessionModeResponse>> {
-        let params = SetSessionModeRequest {
-            session_id,
-            mode_id,
-        };
+        let params = SetSessionModeRequest::new(session_id, mode_id);
         self.call(methods::SESSION_SET_MODE, params, self.timeout_secs)
     }
 
@@ -442,20 +426,16 @@ impl AcpAgent {
         &self,
         session_id: SessionId,
         config_id: String,
-        value_id: String,
+        value: SessionConfigOptionValue,
     ) -> impl Future<Output = Result<SetSessionConfigOptionResponse>> {
-        let params = SetSessionConfigOptionRequest {
-            session_id,
-            config_id,
-            value: ConfigValue::Legacy(value_id),
-        };
+        let params = SetSessionConfigOptionRequest::new(session_id, config_id, value);
         self.call(methods::SESSION_SET_CONFIG, params, self.timeout_secs)
     }
 
     pub fn complete_elicitation(&self, elicitation_id: String) {
         self.notify(
             methods::ELICITATION_COMPLETE,
-            CompleteElicitationNotification { elicitation_id },
+            CompleteElicitationNotification::new(elicitation_id),
         );
     }
 }

@@ -13,6 +13,11 @@ impl Cursor {
     pub fn new(cursor: impl Into<Arc<str>>) -> Self {
         Self(cursor.into())
     }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]

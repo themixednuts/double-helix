@@ -78,6 +78,22 @@ pub fn active_query(input: &str, cursor: usize) -> Option<Active> {
 }
 
 #[must_use]
+pub fn active_slash_query(input: &str, cursor: usize) -> Option<Active> {
+    let cursor = cursor.min(input.len());
+    if !input.starts_with('/') {
+        return None;
+    }
+    if input[..cursor].chars().any(char::is_whitespace) {
+        return None;
+    }
+    Some(Active {
+        query: input[1..cursor].to_string(),
+        start: 0,
+        end: cursor,
+    })
+}
+
+#[must_use]
 pub fn context_id(key: &str) -> context::Id {
     context::Id::new(format!("{CONTEXT_ID_PREFIX}{key}"))
 }
@@ -151,5 +167,15 @@ mod tests {
             active_query("ask @", "ask @".len()).map(|active| active.query),
             Some(String::new())
         );
+    }
+
+    #[test]
+    fn active_slash_query_only_matches_start_of_input() {
+        assert_eq!(
+            active_slash_query("/compact", "/compact".len()).map(|active| active.query),
+            Some("compact".to_string())
+        );
+        assert!(active_slash_query("ask /compact", "ask /compact".len()).is_none());
+        assert!(active_slash_query("/compact now", "/compact now".len()).is_none());
     }
 }

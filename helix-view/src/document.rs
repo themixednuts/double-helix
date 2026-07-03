@@ -911,7 +911,7 @@ impl Document {
             .and_then(|c| c.formatter.as_ref())
             .and_then(|formatter| {
                 Some((
-                    helix_pkg::resolve::tool_command(
+                    helix_pkg::resolve::command(
                         &helix_pkg::Store::open_default(),
                         &formatter.command,
                     )?

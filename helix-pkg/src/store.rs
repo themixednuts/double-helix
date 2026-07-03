@@ -6,6 +6,7 @@ use std::{
 };
 
 use etcetera::base_strategy::{choose_base_strategy, BaseStrategy};
+use fs4::{FileExt, TryLockError};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -173,17 +174,19 @@ impl Store {
         let dir = self.staging_dir();
         fs::create_dir_all(&dir).map_err(|source| io(dir.display(), source))?;
         let path = dir.join(format!("{}-{name}.lock", kind.as_str()));
-        match OpenOptions::new().write(true).create_new(true).open(&path) {
-            Ok(file) => Ok(PackageLock {
-                path,
-                file: Some(file),
-            }),
-            Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
-                Err(Error::Message(format!(
-                    "package operation already running for {kind} {name}"
-                )))
-            }
-            Err(source) => Err(io(path.display(), source)),
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|source| io(path.display(), source))?;
+        match FileExt::try_lock(&file) {
+            Ok(()) => Ok(PackageLock { file }),
+            Err(TryLockError::WouldBlock) => Err(Error::Message(format!(
+                "package operation already running for {kind} {name}"
+            ))),
+            Err(TryLockError::Error(source)) => Err(io(path.display(), source)),
         }
     }
 }
@@ -191,14 +194,14 @@ impl Store {
 #[derive(Debug)]
 #[must_use]
 pub(crate) struct PackageLock {
-    path: PathBuf,
-    file: Option<File>,
+    file: File,
 }
 
 impl Drop for PackageLock {
     fn drop(&mut self) {
-        drop(self.file.take());
-        let _ = fs::remove_file(&self.path);
+        let _ = FileExt::unlock(&self.file);
+        // The lock file is intentionally retained: the advisory OS lock is tied
+        // to this handle and is released on process death, so stale files are harmless.
     }
 }
 
@@ -462,5 +465,17 @@ mod tests {
 
         drop(lock);
         let _lock = store.acquire_package_lock(PkgKind::Lsp, "demo").unwrap();
+    }
+
+    #[test]
+    fn package_lock_ignores_stale_lock_file() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path());
+        let lock_path = store.staging_dir().join("lsp-demo.lock");
+        fs::create_dir_all(store.staging_dir()).unwrap();
+        fs::write(&lock_path, b"stale").unwrap();
+
+        let _lock = store.acquire_package_lock(PkgKind::Lsp, "demo").unwrap();
+        assert!(lock_path.exists());
     }
 }

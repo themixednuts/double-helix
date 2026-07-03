@@ -272,11 +272,7 @@ impl Client {
         name: String,
         req_timeout: u64,
     ) -> Result<(Self, Receiver<(LanguageServerId, Call)>, Arc<Notify>)> {
-        let cmd = match helix_pkg::resolve::command(
-            &helix_pkg::Store::open_default(),
-            helix_pkg::PkgKind::Lsp,
-            cmd,
-        ) {
+        let cmd = match helix_pkg::resolve::command(&helix_pkg::Store::open_default(), cmd) {
             Some(resolved) => resolved.path,
             None => helix_stdx::env::which(cmd)?,
         };

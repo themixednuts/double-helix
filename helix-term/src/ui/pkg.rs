@@ -34,12 +34,16 @@ impl PkgProgressState {
                     },
                 );
             }
-            OpEvent::Progress { name, message } => {
+            OpEvent::Progress {
+                name,
+                message,
+                percent,
+            } => {
                 self.active.insert(
                     name.clone(),
                     PkgStatusline {
                         label: format!("pkg {name}: {message}"),
-                        percent: parse_percent(message),
+                        percent: *percent,
                     },
                 );
             }
@@ -1100,15 +1104,6 @@ pub fn render_statusline<'a>(
     tui::ratatui::text::Span::styled(label, tui::ratatui::to_ratatui_style(style))
 }
 
-fn parse_percent(message: &str) -> Option<u8> {
-    let number = message
-        .split(|ch: char| !ch.is_ascii_digit())
-        .find(|part| !part.is_empty())?
-        .parse::<u8>()
-        .ok()?;
-    (number <= 100).then_some(number)
-}
-
 #[allow(dead_code)]
 pub fn statusline_rect(view: &helix_view::View) -> Rect {
     view.area.clip_top(view.area.height.saturating_sub(1))
@@ -1199,6 +1194,7 @@ mod tests {
         state.apply(&OpEvent::Progress {
             name: "rust-analyzer".into(),
             message: "download 42%".into(),
+            percent: Some(42),
         });
         assert_eq!(state.statusline().unwrap().percent, Some(42));
 

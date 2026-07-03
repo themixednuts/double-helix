@@ -28,10 +28,21 @@ use crate::{
 
 #[derive(Debug, Clone)]
 pub enum OpEvent {
-    Started { name: String },
-    Progress { name: String, message: String },
-    Done { name: String },
-    Failed { name: String, message: String },
+    Started {
+        name: String,
+    },
+    Progress {
+        name: String,
+        message: String,
+        percent: Option<u8>,
+    },
+    Done {
+        name: String,
+    },
+    Failed {
+        name: String,
+        message: String,
+    },
 }
 
 pub type Progress<'a> = dyn FnMut(OpEvent) + 'a;
@@ -465,6 +476,7 @@ impl Ops {
                 progress(OpEvent::Progress {
                     name,
                     message: format!("already at {latest}"),
+                    percent: Some(100),
                 });
                 continue;
             }
@@ -673,6 +685,7 @@ impl Ops {
             progress(OpEvent::Progress {
                 name: package.name.clone(),
                 message: format!("warning: {warning}"),
+                percent: None,
             });
         }
         let previous_version = previous.and_then(|locked| {
@@ -749,6 +762,7 @@ impl Ops {
             progress(OpEvent::Progress {
                 name: package.name.clone(),
                 message: format!("warning: {warning}"),
+                percent: None,
             });
         }
 
@@ -1063,6 +1077,7 @@ fn install_into(
         progress(OpEvent::Progress {
             name: package.name.clone(),
             message: format!("plugin backend {name} install"),
+            percent: None,
         });
         backend.install(BackendInstall {
             package,
@@ -1076,11 +1091,12 @@ fn install_into(
     }
 
     if source.github_release.is_some() || source.archive.is_some() {
-        progress(OpEvent::Progress {
-            name: package.name.clone(),
-            message: format!("downloading {}", resolved.url),
-        });
-        let archive = download(&resolved.url)?;
+        let archive = download(
+            &resolved.url,
+            &package.name,
+            &format!("downloading {}", resolved.url),
+            progress,
+        )?;
         let actual = sha256_bytes(&archive);
         if let Some(expected) = resolved.sha256.as_deref().or(source.sha256.as_deref()) {
             if expected != actual {
@@ -1099,6 +1115,7 @@ fn install_into(
         progress(OpEvent::Progress {
             name: package.name.clone(),
             message: format!("npm install {package_name}@{}", resolved.version),
+            percent: None,
         });
         install_npm(package_name, &resolved.version, dest, store)?;
         return Ok(None);
@@ -1108,6 +1125,7 @@ fn install_into(
         progress(OpEvent::Progress {
             name: package.name.clone(),
             message: format!("pip install {package_name}=={}", resolved.version),
+            percent: None,
         });
         install_pip(package_name, &resolved.version, dest)?;
         return Ok(None);
@@ -1117,6 +1135,7 @@ fn install_into(
         progress(OpEvent::Progress {
             name: package.name.clone(),
             message: format!("cargo install {crate_name} {}", resolved.version),
+            percent: None,
         });
         install_cargo(crate_name, &resolved.version, &source.features, dest)?;
         return Ok(None);
@@ -1126,6 +1145,7 @@ fn install_into(
         progress(OpEvent::Progress {
             name: package.name.clone(),
             message: format!("go install {module}@{}", resolved.version),
+            percent: None,
         });
         install_go(module, &resolved.version, dest)?;
         return Ok(None);
@@ -1139,6 +1159,7 @@ fn install_into(
         progress(OpEvent::Progress {
             name: package.name.clone(),
             message: format!("building grammar {remote}@{rev}"),
+            percent: None,
         });
         helix_loader::grammar::install_pkg_grammar(
             &package.name,
@@ -1164,6 +1185,7 @@ fn resolve_source(
         progress(OpEvent::Progress {
             name: package.name.clone(),
             message: format!("querying github release {repo}"),
+            percent: None,
         });
         let release = github_latest(repo)?;
         let pattern = source
@@ -1996,11 +2018,23 @@ fn parse_native_manager(value: &str) -> Result<NativeManager> {
     }
 }
 
-fn download(url: &str) -> Result<Vec<u8>> {
+fn download(url: &str, name: &str, message: &str, progress: &mut Progress<'_>) -> Result<Vec<u8>> {
     if let Some(path) = url.strip_prefix("file://") {
-        return fs::read(path).map_err(|source| pkg_io(path, source));
+        return read_file_with_progress(path, name, message, progress);
     }
-    http_get(url)
+    http_get_with_progress(url, name, message, progress)
+}
+
+fn read_file_with_progress(
+    path: &str,
+    name: &str,
+    message: &str,
+    progress: &mut Progress<'_>,
+) -> Result<Vec<u8>> {
+    let mut file = fs::File::open(path).map_err(|source| pkg_io(path, source))?;
+    let total = file.metadata().ok().map(|metadata| metadata.len());
+    read_with_progress(&mut file, total, name, message, progress)
+        .map_err(|source| pkg_io(path, source))
 }
 
 fn http_get(url: &str) -> Result<Vec<u8>> {
@@ -2016,6 +2050,66 @@ fn http_get(url: &str) -> Result<Vec<u8>> {
         .into_reader()
         .read_to_end(&mut bytes)
         .map_err(|source| pkg_io(url, source))?;
+    Ok(bytes)
+}
+
+fn http_get_with_progress(
+    url: &str,
+    name: &str,
+    message: &str,
+    progress: &mut Progress<'_>,
+) -> Result<Vec<u8>> {
+    let response = ureq::get(url)
+        .set("User-Agent", "dhx-pkg")
+        .call()
+        .map_err(|source| Error::Http {
+            url: url.to_owned(),
+            source: Box::new(source),
+        })?;
+    let total = response
+        .header("content-length")
+        .and_then(|value| value.parse::<u64>().ok());
+    read_with_progress(&mut response.into_reader(), total, name, message, progress)
+        .map_err(|source| pkg_io(url, source))
+}
+
+fn read_with_progress(
+    reader: &mut impl Read,
+    total: Option<u64>,
+    name: &str,
+    label: &str,
+    progress: &mut Progress<'_>,
+) -> std::io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    let mut buf = [0; 64 * 1024];
+    let mut read = 0u64;
+    let mut last_percent = Some(0);
+    loop {
+        let count = reader.read(&mut buf)?;
+        if count == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&buf[..count]);
+        read += count as u64;
+        let percent = total
+            .filter(|total| *total > 0)
+            .map(|total| ((read.saturating_mul(100)) / total).min(100) as u8);
+        if percent != last_percent {
+            progress(OpEvent::Progress {
+                name: name.to_owned(),
+                message: label.to_owned(),
+                percent,
+            });
+            last_percent = percent;
+        }
+    }
+    if total.is_some() && last_percent != Some(100) {
+        progress(OpEvent::Progress {
+            name: name.to_owned(),
+            message: label.to_owned(),
+            percent: Some(100),
+        });
+    }
     Ok(bytes)
 }
 

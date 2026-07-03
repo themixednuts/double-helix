@@ -7,11 +7,7 @@ use std::{
 
 use crate::{registry::Registry, spec::PkgKind, store::Store, PackageSpec, Result};
 
-pub fn binary(store: &Store, _kind: PkgKind, name: &str) -> Option<PathBuf> {
-    tool_binary(store, name)
-}
-
-pub fn tool_binary(store: &Store, name: &str) -> Option<PathBuf> {
+pub fn binary(store: &Store, name: &str) -> Option<PathBuf> {
     shim_binary(store, name).or_else(|| which(name))
 }
 
@@ -28,24 +24,11 @@ pub struct ResolvedCommand {
     pub source: CommandSource,
 }
 
-pub fn command(store: &Store, kind: PkgKind, command: &str) -> Option<ResolvedCommand> {
-    command_with_paths(store, kind, command, env::var_os("PATH"))
-}
-
-pub fn tool_command(store: &Store, command: &str) -> Option<ResolvedCommand> {
-    tool_command_with_paths(store, command, env::var_os("PATH"))
+pub fn command(store: &Store, command: &str) -> Option<ResolvedCommand> {
+    command_with_paths(store, command, env::var_os("PATH"))
 }
 
 pub fn command_with_paths(
-    store: &Store,
-    _kind: PkgKind,
-    command: &str,
-    paths: Option<OsString>,
-) -> Option<ResolvedCommand> {
-    tool_command_with_paths(store, command, paths)
-}
-
-pub fn tool_command_with_paths(
     store: &Store,
     command: &str,
     paths: Option<OsString>,
@@ -187,18 +170,17 @@ mod tests {
         let paths = env::join_paths([path_dir]).unwrap();
 
         let resolved =
-            tool_command_with_paths(&store, explicit.to_str().unwrap(), Some(paths.clone()))
-                .unwrap();
+            command_with_paths(&store, explicit.to_str().unwrap(), Some(paths.clone())).unwrap();
         assert_eq!(resolved.source, CommandSource::Explicit);
         assert_eq!(resolved.path, explicit);
 
-        let resolved = tool_command_with_paths(&store, "demo", Some(paths)).unwrap();
+        let resolved = command_with_paths(&store, "demo", Some(paths)).unwrap();
         assert_eq!(resolved.source, CommandSource::Shim);
         assert_eq!(resolved.path, shim);
 
         fs::remove_file(store.bin_dir().join(executable_name("demo"))).unwrap();
         let paths = env::join_paths([dir.path().join("path")]).unwrap();
-        let resolved = command_with_paths(&store, PkgKind::Lsp, "demo", Some(paths)).unwrap();
+        let resolved = command_with_paths(&store, "demo", Some(paths)).unwrap();
         assert_eq!(resolved.source, CommandSource::Path);
         assert_eq!(resolved.path, path_bin);
     }

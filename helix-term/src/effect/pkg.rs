@@ -7,7 +7,7 @@ pub(crate) fn apply_event(editor: &mut Editor, event: &OpEvent) {
         OpEvent::Started { name } => {
             editor.notify_with_severity(format!("pkg: started {name}"), Severity::Info);
         }
-        OpEvent::Progress { name, message } => {
+        OpEvent::Progress { name, message, .. } => {
             editor.set_status(format!("pkg {name}: {message}"));
         }
         OpEvent::Done { name } => {

@@ -63,6 +63,7 @@ fn run_blocking(operation: PkgOperation, ingress: RuntimeIngress) -> anyhow::Res
             progress(OpEvent::Progress {
                 name: "doctor".to_owned(),
                 message: format!("{} ok, {} problems", report.ok.len(), report.bad.len()),
+                percent: None,
             });
             progress(OpEvent::Done {
                 name: "doctor".to_owned(),

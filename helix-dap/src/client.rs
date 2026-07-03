@@ -559,11 +559,7 @@ impl Client {
 }
 
 fn resolve_adapter_command(cmd: &str) -> Result<std::path::PathBuf> {
-    match helix_pkg::resolve::command(
-        &helix_pkg::Store::open_default(),
-        helix_pkg::PkgKind::Dap,
-        cmd,
-    ) {
+    match helix_pkg::resolve::command(&helix_pkg::Store::open_default(), cmd) {
         Some(resolved) => Ok(resolved.path),
         None => Ok(helix_stdx::env::which(cmd)?),
     }

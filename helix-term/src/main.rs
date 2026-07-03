@@ -425,7 +425,7 @@ fn package_tags(package: &PackageSpec) -> String {
 fn print_pkg_event(event: OpEvent) {
     match event {
         OpEvent::Started { name } => println!("installing {name}"),
-        OpEvent::Progress { name, message } => println!("{name}: {message}"),
+        OpEvent::Progress { name, message, .. } => println!("{name}: {message}"),
         OpEvent::Done { name } => println!("done {name}"),
         OpEvent::Failed { name, message } => eprintln!("failed {name}: {message}"),
     }

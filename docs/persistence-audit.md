@@ -4,6 +4,11 @@ Date: 2026-07-03
 
 Scope: structured state persistence in the `double-helix`/`dhx` workspace. User-facing logs are explicitly out of scope for database migration: they should stay plain text files because they are immediately grabbable, tailable, and useful during failure.
 
+## Status
+
+- 2026-07-03: S0 foundation completed in `helix-store`. The workspace MSRV is now Rust 1.95, and `helix-store` is a workspace member with SQLite state/cache databases, WAL/busy-timeout/foreign-key setup, a forward-only schema-version migration runner, drizzle-rs schema derives, and typed repository APIs. No consumer crate is wired yet.
+- 2026-07-03: Drizzle-rs native SQLite proof passed on Windows using `drizzle` 0.1.12 with the `rusqlite` bundled-SQLite backend. The integration test opens temp-file databases, applies migrations, verifies WAL, performs insert/select/update/delete round trips for assistant threads, frecency, and package receipts through drizzle query builders, and exercises two concurrent writer connections using repository transactions.
+
 ## Executive Recommendation
 
 Introduce a small SQLite-backed persistence layer for structured, multi-record state, but do not make `drizzle-rs` the default access layer yet. The strongest first migrations are assistant history/feedback/layout and file-picker frecency/query history. Package receipts are a good later candidate. User config, language/theme files, plugin metadata, package manifests/locks, registry TOMLs, logs, and user documents should stay as files.

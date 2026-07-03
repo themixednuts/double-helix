@@ -8,6 +8,7 @@ members = [
   "helix-lsp-types",
   "helix-lsp",
   "helix-runtime",
+  "helix-store",
   "helix-dap-types",
   "helix-dap",
   "helix-loader",
@@ -64,6 +65,8 @@ termina = "0.1"
 sonic-rs = "0.5"
 globset = "0.4"
 etcetera = "0.11"
+drizzle = { version = "0.1.12", features = ["rusqlite"] }
+rusqlite = { version = ">=0.36, <0.40", features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
@@ -83,7 +86,7 @@ categories = ["editor"]
 repository = "https://github.com/helix-editor/helix"
 homepage = "https://helix-editor.com"
 license = "MPL-2.0"
-rust-version = "1.94"
+rust-version = "1.95"
 
 [patch.crates-io]
 tree-house = { path = "vendor/tree-house" }

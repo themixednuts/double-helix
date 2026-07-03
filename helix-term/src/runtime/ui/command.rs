@@ -14,15 +14,16 @@ mod lsp;
 mod picker;
 mod plugin;
 
-pub use assistant::AssistantCommand;
+pub use assistant::{AssistantCommand, ModeConfigPickerItem};
 pub use completion::CompletionCommand;
 pub use dap::{DapCommand, DapThreadAction};
 pub use document::DocumentCommand;
 pub use file_explorer::{FileExplorerCommand, ModifiedBufferCheck};
 pub use layer::LayerCommand;
 pub use lsp::{
-    DocumentSymbolPickerItem, LspCodeActionItem, LspCodeActionPresentation, LspCommand,
-    LspHoverDisplay, LspLocation,
+    DocumentSymbolPickerItem, LspCallHierarchyDirection, LspCodeActionItem,
+    LspCodeActionPresentation, LspCommand, LspHierarchyPickerItem, LspHierarchyPrepareItem,
+    LspHoverDisplay, LspLocation, LspTypeHierarchyDirection,
 };
 pub use picker::PickerCommand;
 pub use plugin::PluginCommand;
@@ -62,6 +63,8 @@ impl std::fmt::Debug for UiCommand {
                 LspCommand::Hover { .. } => f.write_str("Lsp(Hover(..))"),
                 LspCommand::CodeActions { .. } => f.write_str("Lsp(CodeActions(..))"),
                 LspCommand::DocumentSymbols { .. } => f.write_str("Lsp(DocumentSymbols(..))"),
+                LspCommand::HierarchyPrepare { .. } => f.write_str("Lsp(HierarchyPrepare(..))"),
+                LspCommand::Hierarchy { .. } => f.write_str("Lsp(Hierarchy(..))"),
                 LspCommand::SignatureHelp { .. } => f.write_str("Lsp(SignatureHelp(..))"),
                 LspCommand::PrepareRename { .. } => f.write_str("Lsp(PrepareRename(..))"),
             },

@@ -15,6 +15,7 @@
   - [Keymap](./keymap.md)
   - [Command line](./command-line.md)
   - [Commands](./commands.md)
+  - [Package Manager](./package-manager.md)
   - [Assistant](./assistant.md)
   - [Language support](./lang-support.md)
   - [Plugins](./plugins.md)

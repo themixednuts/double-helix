@@ -1,0 +1,27 @@
+name = "marksman"
+kind = "lsp"
+description = "Markdown language server"
+homepage = "https://github.com/artempyanykh/marksman"
+languages = ["markdown"]
+
+[version]
+tag-source = "github:artempyanykh/marksman"
+
+[[artifact]]
+os = "windows"
+arch = "x86_64"
+source = { github-release = "artempyanykh/marksman", asset = "marksman.exe" }
+bin = "marksman.exe"
+
+[[artifact]]
+os = "linux"
+arch = "x86_64"
+source = { github-release = "artempyanykh/marksman", asset = "marksman-linux-x64" }
+bin = "marksman"
+
+[[artifact]]
+os = "macos"
+arch = "aarch64"
+source = { github-release = "artempyanykh/marksman", asset = "marksman-macos" }
+bin = "marksman"
+

@@ -90,7 +90,7 @@ impl State {
 
     pub fn replace(&mut self, scope: thread::Scope, entries: Vec<Stub>, next: Option<Cursor>) {
         if let Some(page) = self.pages.iter_mut().find(|page| page.scope == scope) {
-            page.entries = entries;
+            page.entries = merge_stubs(page.entries.clone(), entries);
             page.next = next;
         } else {
             self.pages.push(Page {
@@ -139,6 +139,19 @@ impl State {
             });
         }
     }
+}
+
+#[must_use]
+pub fn merge_stubs(existing: Vec<Stub>, incoming: Vec<Stub>) -> Vec<Stub> {
+    let mut merged = existing;
+    for entry in incoming {
+        if let Some(current) = merged.iter_mut().find(|current| current.id == entry.id) {
+            *current = entry;
+        } else {
+            merged.push(entry);
+        }
+    }
+    merged
 }
 
 impl Stub {
@@ -252,3 +265,45 @@ impl Backend {
 }
 
 pub use local::local_backend;
+
+#[cfg(test)]
+mod tests {
+    use std::num::NonZeroU64;
+    use std::path::PathBuf;
+
+    use super::*;
+
+    fn id(value: u64) -> thread::Id {
+        thread::Id::new(NonZeroU64::new(value).unwrap())
+    }
+
+    fn stub(value: u64, title: &str) -> Stub {
+        Stub {
+            id: id(value),
+            title: Some(title.to_string()),
+            scope: thread::Scope::new(PathBuf::from(".")),
+            unread: false,
+            run: thread::Run::Idle,
+        }
+    }
+
+    #[test]
+    fn merge_stubs_dedupes_by_thread_id_and_prefers_incoming() {
+        let merged = merge_stubs(
+            vec![stub(1, "local one"), stub(2, "local two")],
+            vec![stub(2, "remote two"), stub(3, "remote three")],
+        );
+
+        assert_eq!(
+            merged
+                .iter()
+                .map(|stub| (stub.id, stub.title.as_deref().unwrap()))
+                .collect::<Vec<_>>(),
+            vec![
+                (id(1), "local one"),
+                (id(2), "remote two"),
+                (id(3), "remote three")
+            ]
+        );
+    }
+}

@@ -1,0 +1,27 @@
+name = "omnisharp"
+kind = "lsp"
+description = "C# language server based on Roslyn"
+homepage = "https://github.com/OmniSharp/omnisharp-roslyn"
+languages = ["c-sharp"]
+
+[version]
+tag-source = "github:OmniSharp/omnisharp-roslyn"
+
+[[artifact]]
+os = "windows"
+arch = "x86_64"
+source = { github-release = "OmniSharp/omnisharp-roslyn", asset = "omnisharp-win-x64-net6.0.zip" }
+bin = "OmniSharp.exe"
+
+[[artifact]]
+os = "linux"
+arch = "x86_64"
+source = { github-release = "OmniSharp/omnisharp-roslyn", asset = "omnisharp-linux-x64-net6.0.tar.gz" }
+bin = "OmniSharp"
+
+[[artifact]]
+os = "macos"
+arch = "aarch64"
+source = { github-release = "OmniSharp/omnisharp-roslyn", asset = "omnisharp-osx-arm64-net6.0.tar.gz" }
+bin = "OmniSharp"
+

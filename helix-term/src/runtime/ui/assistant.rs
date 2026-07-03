@@ -247,6 +247,71 @@ pub(crate) fn apply_assistant_command(
 
             compositor.push(Box::new(crate::ui::overlay::overlaid(picker)));
         }
+        AssistantCommand::PushModeConfigPicker { thread, items } => {
+            use crate::runtime::ui::command::ModeConfigPickerItem;
+
+            if items.is_empty() {
+                editor.set_status("No assistant mode or config options");
+                return;
+            }
+
+            let columns = [
+                crate::ui::PickerColumn::new("kind", |item: &ModeConfigPickerItem, _: &()| {
+                    match item {
+                        ModeConfigPickerItem::Mode { .. } => "mode".into(),
+                        ModeConfigPickerItem::Config { category, .. } => {
+                            category.as_deref().unwrap_or("config").into()
+                        }
+                    }
+                }),
+                crate::ui::PickerColumn::new("name", |item: &ModeConfigPickerItem, _: &()| {
+                    match item {
+                        ModeConfigPickerItem::Mode { name, .. }
+                        | ModeConfigPickerItem::Config { name, .. } => name.as_str().into(),
+                    }
+                }),
+                crate::ui::PickerColumn::new("value", |item: &ModeConfigPickerItem, _: &()| {
+                    match item {
+                        ModeConfigPickerItem::Mode { current, .. } => {
+                            if *current { "current" } else { "" }.into()
+                        }
+                        ModeConfigPickerItem::Config {
+                            value_label,
+                            current,
+                            ..
+                        } => {
+                            if *current {
+                                format!("{value_label} current").into()
+                            } else {
+                                value_label.as_str().into()
+                            }
+                        }
+                    }
+                }),
+            ];
+
+            let picker = crate::ui::Picker::new(
+                columns,
+                0,
+                items,
+                (),
+                crate::ui::PickerRuntime::new(editor),
+                ingress,
+                move |cx: &mut crate::compositor::Context, item: &ModeConfigPickerItem, _action| {
+                    let effects = match item {
+                        ModeConfigPickerItem::Mode { id, .. } => {
+                            cx.editor.set_assistant_mode(thread, id.clone())
+                        }
+                        ModeConfigPickerItem::Config { option, value, .. } => cx
+                            .editor
+                            .set_assistant_config(thread, option.clone(), value.clone()),
+                    };
+                    cx.editor.apply_assistant_effects(effects);
+                },
+            );
+
+            compositor.push(Box::new(crate::ui::overlay::overlaid(picker)));
+        }
         AssistantCommand::PushConfiguredAgentsPicker { agents } => {
             let columns = [
                 crate::ui::PickerColumn::new(

@@ -20,15 +20,20 @@ use helix_core::{
 };
 use helix_stdx::path;
 use helix_view::{
-    document::DocumentInlayHintsId, editor::Action, handlers::lsp::SignatureHelpInvoked,
-    icons::ICONS, theme::Style, Document, View,
+    document::{DocumentInlayHint, DocumentInlayHintsId},
+    editor::Action,
+    handlers::lsp::SignatureHelpInvoked,
+    icons::ICONS,
+    theme::Style,
+    Document, View,
 };
 
 use crate::{
     compositor::{self, Component},
     runtime::ui::command::{
-        DocumentSymbolPickerItem, LspCodeActionItem, LspCodeActionPresentation, LspCommand,
-        LspHoverDisplay, LspLocation,
+        DocumentSymbolPickerItem, LspCallHierarchyDirection, LspCodeActionItem,
+        LspCodeActionPresentation, LspCommand, LspHierarchyPickerItem, LspHierarchyPrepareItem,
+        LspHoverDisplay, LspLocation, LspTypeHierarchyDirection,
     },
     runtime::{RuntimeTaskEvent, UiCommand},
     ui::{
@@ -1149,6 +1154,198 @@ pub fn goto_reference(cx: &mut Context) {
     });
 }
 
+pub fn call_hierarchy_incoming(cx: &mut Context) {
+    call_hierarchy(cx, LspCallHierarchyDirection::Incoming);
+}
+
+pub fn call_hierarchy_outgoing(cx: &mut Context) {
+    call_hierarchy(cx, LspCallHierarchyDirection::Outgoing);
+}
+
+fn call_hierarchy(cx: &mut Context, direction: LspCallHierarchyDirection) {
+    let (view_id, doc) = focused_ref!(cx.editor);
+    let mut futures: FuturesOrdered<_> = doc
+        .language_servers()
+        .filter_map(|language_server| {
+            let offset_encoding = language_server.offset_encoding();
+            let pos = doc.position(view_id, offset_encoding);
+            let request = language_server.text_document_prepare_call_hierarchy(
+                doc.identifier(),
+                pos,
+                None,
+            )?;
+            let server_id = language_server.id();
+            Some(async move { anyhow::Ok((server_id, offset_encoding, request.await?)) })
+        })
+        .collect();
+
+    if futures.is_empty() {
+        cx.editor
+            .set_error("No configured language server supports call hierarchy");
+        return;
+    }
+
+    cx.spawn_ui(async move {
+        let mut prepared = Vec::new();
+        while let Some(response) = futures.next().await {
+            match response {
+                Ok((server_id, offset_encoding, Some(items))) => {
+                    prepared.extend(items.into_iter().map(|item| LspHierarchyPrepareItem::Call {
+                        server_id,
+                        offset_encoding,
+                        item,
+                        direction,
+                    }));
+                }
+                Ok(_) => (),
+                Err(err) => log::error!("Error preparing call hierarchy: {err}"),
+            }
+        }
+
+        Ok(UiCommand::Lsp(LspCommand::HierarchyPrepare {
+            items: prepared,
+            empty_message: "No call hierarchy found.",
+        }))
+    });
+}
+
+pub fn type_hierarchy_super(cx: &mut Context) {
+    type_hierarchy(cx, LspTypeHierarchyDirection::Supertypes);
+}
+
+pub fn type_hierarchy_sub(cx: &mut Context) {
+    type_hierarchy(cx, LspTypeHierarchyDirection::Subtypes);
+}
+
+fn type_hierarchy(cx: &mut Context, direction: LspTypeHierarchyDirection) {
+    let (view_id, doc) = focused_ref!(cx.editor);
+    let mut futures: FuturesOrdered<_> = doc
+        .language_servers()
+        .filter_map(|language_server| {
+            let offset_encoding = language_server.offset_encoding();
+            let pos = doc.position(view_id, offset_encoding);
+            let request = language_server.text_document_prepare_type_hierarchy(
+                doc.identifier(),
+                pos,
+                None,
+            )?;
+            let server_id = language_server.id();
+            Some(async move { anyhow::Ok((server_id, offset_encoding, request.await?)) })
+        })
+        .collect();
+
+    if futures.is_empty() {
+        cx.editor
+            .set_error("No configured language server supports type hierarchy");
+        return;
+    }
+
+    cx.spawn_ui(async move {
+        let mut prepared = Vec::new();
+        while let Some(response) = futures.next().await {
+            match response {
+                Ok((server_id, offset_encoding, Some(items))) => {
+                    prepared.extend(items.into_iter().map(|item| LspHierarchyPrepareItem::Type {
+                        server_id,
+                        offset_encoding,
+                        item,
+                        direction,
+                    }));
+                }
+                Ok(_) => (),
+                Err(err) => log::error!("Error preparing type hierarchy: {err}"),
+            }
+        }
+
+        Ok(UiCommand::Lsp(LspCommand::HierarchyPrepare {
+            items: prepared,
+            empty_message: "No type hierarchy found.",
+        }))
+    });
+}
+
+pub fn call_hierarchy_incoming_picker_items(
+    calls: Vec<lsp::CallHierarchyIncomingCall>,
+    offset_encoding: OffsetEncoding,
+) -> Vec<LspHierarchyPickerItem> {
+    calls
+        .into_iter()
+        .filter_map(|call| {
+            let range = call
+                .from_ranges
+                .first()
+                .copied()
+                .unwrap_or(call.from.selection_range);
+            hierarchy_picker_item(
+                call.from.name,
+                call.from.detail,
+                call.from.kind,
+                call.from.uri,
+                range,
+                offset_encoding,
+            )
+        })
+        .collect()
+}
+
+pub fn call_hierarchy_outgoing_picker_items(
+    calls: Vec<lsp::CallHierarchyOutgoingCall>,
+    offset_encoding: OffsetEncoding,
+) -> Vec<LspHierarchyPickerItem> {
+    calls
+        .into_iter()
+        .filter_map(|call| {
+            hierarchy_picker_item(
+                call.to.name,
+                call.to.detail,
+                call.to.kind,
+                call.to.uri,
+                call.to.selection_range,
+                offset_encoding,
+            )
+        })
+        .collect()
+}
+
+pub fn type_hierarchy_picker_items(
+    items: Vec<lsp::TypeHierarchyItem>,
+    offset_encoding: OffsetEncoding,
+) -> Vec<LspHierarchyPickerItem> {
+    items
+        .into_iter()
+        .filter_map(|item| {
+            hierarchy_picker_item(
+                item.name,
+                item.detail,
+                item.kind,
+                item.uri,
+                item.selection_range,
+                offset_encoding,
+            )
+        })
+        .collect()
+}
+
+fn hierarchy_picker_item(
+    name: String,
+    detail: Option<String>,
+    kind: lsp::SymbolKind,
+    uri: lsp::Url,
+    range: lsp::Range,
+    offset_encoding: OffsetEncoding,
+) -> Option<LspHierarchyPickerItem> {
+    Some(LspHierarchyPickerItem {
+        name,
+        detail,
+        kind,
+        location: LspLocation {
+            uri: uri.try_into().ok()?,
+            range,
+            offset_encoding,
+        },
+    })
+}
+
 pub fn signature_help(cx: &mut Context) {
     cx.editor
         .handlers
@@ -1156,11 +1353,13 @@ pub fn signature_help(cx: &mut Context) {
 }
 
 fn hover_impl(cx: &mut Context, display: LspHoverDisplay) {
-    let (view_id, doc) = focused!(cx.editor);
+    let (view_id, doc) = focused_ref!(cx.editor);
+    let inlay_hints = inlay_hints_at_cursor(cx.editor, view_id, doc);
     if doc
         .language_servers_with_feature(LanguageServerFeature::Hover)
         .count()
         == 0
+        && inlay_hints.is_empty()
     {
         cx.editor
             .set_error("No configured language server supports hover");
@@ -1183,6 +1382,27 @@ fn hover_impl(cx: &mut Context, display: LspHoverDisplay) {
         })
         .collect();
 
+    let mut inlay_futures: FuturesOrdered<_> = inlay_hints
+        .into_iter()
+        .filter_map(|hint| {
+            let language_server = cx.editor.language_server_by_id(hint.server_id)?;
+            let server_name = language_server.name().to_string();
+            let resolve = hint
+                .hint
+                .tooltip
+                .is_none()
+                .then(|| language_server.resolve_inlay_hint(&hint.hint))
+                .flatten();
+            Some(async move {
+                let hint = match resolve {
+                    Some(resolve) => resolve.await.unwrap_or(hint.hint),
+                    None => hint.hint,
+                };
+                anyhow::Ok((server_name, hint))
+            })
+        })
+        .collect();
+
     cx.spawn_ui(async move {
         let mut hovers: Vec<(String, lsp::Hover)> = Vec::new();
 
@@ -1193,9 +1413,90 @@ fn hover_impl(cx: &mut Context, display: LspHoverDisplay) {
                 Err(err) => log::error!("Error requesting hover: {err}"),
             }
         }
+        while let Some(response) = inlay_futures.next().await {
+            match response {
+                Ok((server_name, hint)) => {
+                    hovers.extend(
+                        inlay_hint_to_hover(hint)
+                            .map(|hover| (format!("{server_name} inlay hint"), hover)),
+                    );
+                }
+                Err(err) => log::error!("Error resolving inlay hint: {err}"),
+            }
+        }
 
         Ok(UiCommand::Lsp(LspCommand::Hover { hovers, display }))
     });
+}
+
+fn inlay_hints_at_cursor(
+    editor: &Editor,
+    view_id: helix_view::ViewId,
+    doc: &Document,
+) -> Vec<DocumentInlayHint> {
+    let Some(inlay_hints) = doc.inlay_hints(view_id) else {
+        return Vec::new();
+    };
+    let cursor = doc
+        .selection(view_id)
+        .primary()
+        .cursor(doc.text().slice(..));
+    inlay_hints
+        .lsp_hints
+        .iter()
+        .filter_map(|hint| {
+            let pos = helix_lsp::util::lsp_pos_to_pos(
+                doc.text(),
+                hint.hint.position,
+                hint.offset_encoding,
+            )?;
+            (pos.abs_diff(cursor) <= 1).then_some(hint.clone())
+        })
+        .filter(|hint| editor.language_server_by_id(hint.server_id).is_some())
+        .collect()
+}
+
+fn inlay_hint_to_hover(hint: lsp::InlayHint) -> Option<lsp::Hover> {
+    let contents = hint
+        .tooltip
+        .map(inlay_hint_tooltip_to_hover_contents)
+        .or_else(|| match hint.label {
+            lsp::InlayHintLabel::String(_) => None,
+            lsp::InlayHintLabel::LabelParts(parts) => parts
+                .into_iter()
+                .find_map(|part| part.tooltip.map(inlay_hint_label_tooltip_to_hover_contents)),
+        })?;
+
+    Some(lsp::Hover {
+        contents,
+        range: None,
+    })
+}
+
+fn inlay_hint_tooltip_to_hover_contents(tooltip: lsp::InlayHintTooltip) -> lsp::HoverContents {
+    match tooltip {
+        lsp::InlayHintTooltip::String(value) => lsp::HoverContents::Markup(lsp::MarkupContent {
+            kind: lsp::MarkupKind::PlainText,
+            value,
+        }),
+        lsp::InlayHintTooltip::MarkupContent(content) => lsp::HoverContents::Markup(content),
+    }
+}
+
+fn inlay_hint_label_tooltip_to_hover_contents(
+    tooltip: lsp::InlayHintLabelPartTooltip,
+) -> lsp::HoverContents {
+    match tooltip {
+        lsp::InlayHintLabelPartTooltip::String(value) => {
+            lsp::HoverContents::Markup(lsp::MarkupContent {
+                kind: lsp::MarkupKind::PlainText,
+                value,
+            })
+        }
+        lsp::InlayHintLabelPartTooltip::MarkupContent(content) => {
+            lsp::HoverContents::Markup(content)
+        }
+    }
 }
 
 pub fn hover(cx: &mut Context) {
@@ -1454,6 +1755,7 @@ fn compute_inlay_hints_for_view(
     let language_server = doc
         .language_servers_with_feature(LanguageServerFeature::InlayHints)
         .next()?;
+    let server_id = language_server.id();
 
     let doc_text = doc.text();
     let annotations = &view.fold_annotations(doc);
@@ -1503,6 +1805,7 @@ fn compute_inlay_hints_for_view(
         Ok(RuntimeTaskEvent::ApplyInlayHints {
             view_id,
             doc_id,
+            server_id,
             offset_encoding,
             id: new_doc_inlay_hints_id,
             hints,
@@ -1510,4 +1813,102 @@ fn compute_inlay_hints_for_view(
     });
 
     Some(callback)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn url() -> lsp::Url {
+        // Drive-letter form so Url::to_file_path works on Windows too.
+        lsp::Url::parse("file:///C:/test.rs").expect("url")
+    }
+
+    fn range(start: u32, end: u32) -> lsp::Range {
+        lsp::Range::new(lsp::Position::new(0, start), lsp::Position::new(0, end))
+    }
+
+    fn call_item(name: &str, selection_range: lsp::Range) -> lsp::CallHierarchyItem {
+        lsp::CallHierarchyItem {
+            name: name.to_owned(),
+            kind: lsp::SymbolKind::FUNCTION,
+            tags: None,
+            detail: Some("detail".to_owned()),
+            uri: url(),
+            range: selection_range,
+            selection_range,
+            data: None,
+        }
+    }
+
+    fn type_item(name: &str, selection_range: lsp::Range) -> lsp::TypeHierarchyItem {
+        lsp::TypeHierarchyItem {
+            name: name.to_owned(),
+            kind: lsp::SymbolKind::CLASS,
+            tags: None,
+            detail: None,
+            uri: url(),
+            range: selection_range,
+            selection_range,
+            data: None,
+        }
+    }
+
+    #[test]
+    fn incoming_call_picker_items_jump_to_first_call_site() {
+        let calls = vec![lsp::CallHierarchyIncomingCall {
+            from: call_item("caller", range(1, 7)),
+            from_ranges: vec![range(10, 14)],
+        }];
+
+        let items = call_hierarchy_incoming_picker_items(calls, OffsetEncoding::Utf8);
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].name, "caller");
+        assert_eq!(items[0].location.range, range(10, 14));
+    }
+
+    #[test]
+    fn outgoing_call_picker_items_jump_to_callee_selection() {
+        let calls = vec![lsp::CallHierarchyOutgoingCall {
+            to: call_item("callee", range(3, 9)),
+            from_ranges: vec![range(10, 14)],
+        }];
+
+        let items = call_hierarchy_outgoing_picker_items(calls, OffsetEncoding::Utf8);
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].name, "callee");
+        assert_eq!(items[0].location.range, range(3, 9));
+    }
+
+    #[test]
+    fn type_hierarchy_picker_items_map_selection_range() {
+        let items =
+            type_hierarchy_picker_items(vec![type_item("Base", range(2, 6))], OffsetEncoding::Utf8);
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].name, "Base");
+        assert_eq!(items[0].location.range, range(2, 6));
+    }
+
+    #[test]
+    fn inlay_hint_tooltip_becomes_hover_content() {
+        let hover = inlay_hint_to_hover(lsp::InlayHint {
+            position: lsp::Position::new(0, 1),
+            label: lsp::InlayHintLabel::String(": i32".to_owned()),
+            kind: Some(lsp::InlayHintKind::TYPE),
+            text_edits: None,
+            tooltip: Some(lsp::InlayHintTooltip::String("resolved tooltip".to_owned())),
+            padding_left: None,
+            padding_right: None,
+            data: None,
+        })
+        .expect("hover");
+
+        assert!(matches!(
+            hover.contents,
+            lsp::HoverContents::Markup(lsp::MarkupContent { value, .. }) if value == "resolved tooltip"
+        ));
+    }
 }

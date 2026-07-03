@@ -152,6 +152,17 @@ impl Editor {
         Ok(self.set_assistant_mode(thread, next))
     }
 
+    pub fn active_assistant_mode_config(
+        &self,
+    ) -> Option<(
+        crate::assistant::thread::Id,
+        Option<crate::assistant::mode::Set>,
+        crate::assistant::config::State,
+    )> {
+        let (id, thread) = self.assistant.active_thread()?;
+        Some((id, thread.mode().cloned(), thread.config().clone()))
+    }
+
     pub fn cycle_active_assistant_thread(
         &mut self,
         delta: isize,

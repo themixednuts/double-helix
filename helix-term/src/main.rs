@@ -1,7 +1,8 @@
 use anyhow::{Context, Error, Result};
 use helix_loader::VERSION_AND_GIT_HASH;
+use helix_pkg::{OpEvent, Ops, PkgKind};
 use helix_term::application::Application;
-use helix_term::args::Args;
+use helix_term::args::{Args, PkgCommand};
 use helix_term::config::{Config, ConfigLoadError};
 
 fn setup_logging(verbosity: u64) -> Result<()> {
@@ -71,6 +72,7 @@ FLAGS:
     -h, --help                     Print help information
     --tutor                        Load the tutorial
     --migrate                      Copy existing Helix config into Double Helix config paths
+    pkg <cmd>                      Manage LSP/DAP packages (install, remove, list, search, sync, doctor)
     --health [CATEGORY]            Check for potential errors in editor setup
                                    CATEGORY can be a language or one of 'clipboard', 'languages',
                                    'all-languages' or 'all'. 'languages' is filtered according to
@@ -100,6 +102,10 @@ FLAGS:
     if args.display_version {
         println!("double-helix {}", VERSION_AND_GIT_HASH);
         std::process::exit(0);
+    }
+
+    if let Some(pkg) = args.pkg {
+        return run_pkg(pkg.command);
     }
 
     if args.health {
@@ -166,4 +172,100 @@ FLAGS:
     let exit_code = app.run(&mut events).await?;
 
     Ok(exit_code)
+}
+
+fn run_pkg(command: PkgCommand) -> Result<i32> {
+    match command {
+        PkgCommand::Help => {
+            print_pkg_help();
+            Ok(0)
+        }
+        PkgCommand::Install(names) => {
+            let ops = Ops::default()?;
+            ops.install(&names, &mut print_pkg_event)?;
+            Ok(0)
+        }
+        PkgCommand::Remove(name) => {
+            let ops = Ops::default()?;
+            ops.remove(&[name.clone()])?;
+            println!("removed {name}");
+            Ok(0)
+        }
+        PkgCommand::List { kind } => {
+            let ops = Ops::default()?;
+            let kind = kind
+                .as_deref()
+                .map(str::parse::<PkgKind>)
+                .transpose()
+                .context("invalid --kind")?;
+            let receipts = ops.store().receipts()?;
+            let mut count = 0usize;
+            for receipt in receipts {
+                if kind.is_some_and(|kind| kind != receipt.kind) {
+                    continue;
+                }
+                count += 1;
+                println!(
+                    "{:<12} {:<24} {:<16} {}",
+                    receipt.kind, receipt.name, receipt.version, receipt.shim
+                );
+            }
+            if count == 0 {
+                println!("no packages installed");
+            }
+            Ok(0)
+        }
+        PkgCommand::Search(term) => {
+            let ops = Ops::default()?;
+            for package in ops.registry().search(&term) {
+                println!(
+                    "{:<12} {:<24} {}",
+                    package.kind, package.name, package.description
+                );
+            }
+            Ok(0)
+        }
+        PkgCommand::Sync => {
+            let ops = Ops::default()?;
+            ops.sync(&mut print_pkg_event)?;
+            Ok(0)
+        }
+        PkgCommand::Doctor => {
+            let ops = Ops::default()?;
+            let report = ops.doctor()?;
+            for name in &report.ok {
+                println!("ok {name}");
+            }
+            for (name, err) in &report.bad {
+                eprintln!("bad {name}: {err}");
+            }
+            Ok(if report.bad.is_empty() { 0 } else { 1 })
+        }
+    }
+}
+
+fn print_pkg_event(event: OpEvent) {
+    match event {
+        OpEvent::Started { name } => println!("installing {name}"),
+        OpEvent::Progress { name, message } => println!("{name}: {message}"),
+        OpEvent::Done { name } => println!("done {name}"),
+        OpEvent::Failed { name, message } => eprintln!("failed {name}: {message}"),
+    }
+}
+
+fn print_pkg_help() {
+    print!(
+        "\
+USAGE:
+    dhx pkg <COMMAND>
+
+COMMANDS:
+    install <name>...       Install packages from the builtin registry
+    remove <name>           Deactivate an installed package
+    list [--kind <kind>]    List installed packages
+    search <term>           Search builtin registry entries
+    sync                    Install packages pinned in pkg.lock
+    doctor                  Verify receipts and installed files
+"
+    );
 }

@@ -25,6 +25,32 @@ pub struct TypeHierarchyRegistrationOptions {
 }
 
 #[derive(Debug, Eq, PartialEq, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum TypeHierarchyServerCapability {
+    Simple(bool),
+    Options(TypeHierarchyOptions),
+    RegistrationOptions(TypeHierarchyRegistrationOptions),
+}
+
+impl From<bool> for TypeHierarchyServerCapability {
+    fn from(from: bool) -> Self {
+        Self::Simple(from)
+    }
+}
+
+impl From<TypeHierarchyOptions> for TypeHierarchyServerCapability {
+    fn from(from: TypeHierarchyOptions) -> Self {
+        Self::Options(from)
+    }
+}
+
+impl From<TypeHierarchyRegistrationOptions> for TypeHierarchyServerCapability {
+    fn from(from: TypeHierarchyRegistrationOptions) -> Self {
+        Self::RegistrationOptions(from)
+    }
+}
+
+#[derive(Debug, Eq, PartialEq, Clone, Deserialize, Serialize)]
 pub struct TypeHierarchyPrepareParams {
     #[serde(flatten)]
     pub text_document_position_params: TextDocumentPositionParams,

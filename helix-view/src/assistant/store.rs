@@ -767,16 +767,16 @@ impl Store {
                 };
                 let backend = backend.clone();
                 let status = match response {
-                    thread::ElicitationResponse::Accept(_) => {
-                        thread::ElicitationStatus::Completed
-                    }
+                    thread::ElicitationResponse::Accept(_) => thread::ElicitationStatus::Completed,
                     thread::ElicitationResponse::Decline => thread::ElicitationStatus::Declined,
                     thread::ElicitationResponse::Cancel => thread::ElicitationStatus::Canceled,
                 };
-                state.apply(thread::Event::Elicitation(thread::ElicitationEvent::Complete {
-                    id: id.clone(),
-                    status,
-                }));
+                state.apply(thread::Event::Elicitation(
+                    thread::ElicitationEvent::Complete {
+                        id: id.clone(),
+                        status,
+                    },
+                ));
                 vec![
                     effect::Effect::SendBackendCommand {
                         backend,

@@ -7,6 +7,7 @@ use std::borrow::Cow;
 use std::char::{ToLowercase, ToUppercase};
 use std::time::Instant;
 
+use crate::editor::LspSelectionRangeConfig;
 use helix_core::{
     auto_pairs, comment,
     graphemes::{self, prev_grapheme_boundary},
@@ -15,7 +16,10 @@ use helix_core::{
     movement::{self, Direction, Movement},
     object,
     surround::FindType,
-    syntax::{config::BlockCommentToken, Syntax},
+    syntax::{
+        config::{BlockCommentToken, LanguageServerFeature},
+        Syntax,
+    },
     text_annotations::TextAnnotations,
     textobject, Position, Range, Rope, RopeSlice, Selection, SmallVec, Tendril, Transaction,
 };
@@ -2728,6 +2732,14 @@ pub fn expand_selection(editor: &mut Editor, view_id: ViewId, doc_id: DocumentId
                 view.object_selections_mut().push(current_selection.clone());
                 doc.set_selection(view_id, selection);
             }
+        } else if let Some(selection) =
+            lsp_selection_range_fallback(doc, view_id, LspSelectionRangeDirection::Expand)
+        {
+            let current_selection = doc.selection(view_id);
+            if *current_selection != selection {
+                view.object_selections_mut().push(current_selection.clone());
+                doc.set_selection(view_id, selection);
+            }
         }
     });
 }
@@ -2750,8 +2762,125 @@ pub fn shrink_selection(editor: &mut Editor, view_id: ViewId, doc_id: DocumentId
             let current_selection = doc.selection(view_id).clone();
             let selection = object::shrink_selection(syntax, text, current_selection);
             doc.set_selection(view_id, selection);
+        } else if let Some(selection) =
+            lsp_selection_range_fallback(doc, view_id, LspSelectionRangeDirection::Shrink)
+        {
+            doc.set_selection(view_id, selection);
         }
     });
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LspSelectionRangeDirection {
+    Expand,
+    Shrink,
+}
+
+fn lsp_selection_range_fallback(
+    doc: &Document,
+    view_id: ViewId,
+    direction: LspSelectionRangeDirection,
+) -> Option<Selection> {
+    if doc.config.load().lsp.selection_ranges == LspSelectionRangeConfig::Disabled {
+        return None;
+    }
+
+    let language_server = doc
+        .language_servers_with_feature(LanguageServerFeature::SelectionRange)
+        .next()?;
+    let offset_encoding = language_server.offset_encoding();
+    let current_selection = doc.selection(view_id).clone();
+    let positions = current_selection
+        .ranges()
+        .iter()
+        .map(|range| {
+            helix_lsp::util::pos_to_lsp_pos(
+                doc.text(),
+                range.cursor(doc.text().slice(..)),
+                offset_encoding,
+            )
+        })
+        .collect();
+    let request =
+        language_server.text_document_selection_range(doc.identifier(), positions, None)?;
+    let response = helix_lsp::block_on(request).ok().flatten()?;
+    selection_from_lsp_selection_ranges(
+        doc.text(),
+        &current_selection,
+        response,
+        offset_encoding,
+        direction,
+    )
+}
+
+fn selection_from_lsp_selection_ranges(
+    text: &Rope,
+    current_selection: &Selection,
+    response: Vec<helix_lsp::lsp::SelectionRange>,
+    offset_encoding: helix_lsp::OffsetEncoding,
+    direction: LspSelectionRangeDirection,
+) -> Option<Selection> {
+    if response.len() != current_selection.ranges().len() {
+        log::warn!(
+            "discarding selectionRange response: expected {} ranges, got {}",
+            current_selection.ranges().len(),
+            response.len()
+        );
+        return None;
+    }
+
+    let ranges = current_selection
+        .ranges()
+        .iter()
+        .zip(response)
+        .map(|(current, selection_range)| {
+            let chain = lsp_selection_range_chain(text, selection_range, offset_encoding);
+            match direction {
+                LspSelectionRangeDirection::Expand => next_lsp_selection_range(current, &chain),
+                LspSelectionRangeDirection::Shrink => previous_lsp_selection_range(current, &chain),
+            }
+            .unwrap_or(*current)
+        })
+        .collect();
+
+    Some(Selection::new(ranges, current_selection.primary_index()))
+}
+
+fn lsp_selection_range_chain(
+    text: &Rope,
+    mut selection_range: helix_lsp::lsp::SelectionRange,
+    offset_encoding: helix_lsp::OffsetEncoding,
+) -> Vec<Range> {
+    let mut chain = Vec::new();
+    loop {
+        if let Some(range) =
+            helix_lsp::util::lsp_range_to_range(text, selection_range.range, offset_encoding)
+        {
+            if chain.last() != Some(&range) {
+                chain.push(range);
+            }
+        }
+        let Some(parent) = selection_range.parent else {
+            break;
+        };
+        selection_range = *parent;
+    }
+    chain
+}
+
+fn next_lsp_selection_range(current: &Range, chain: &[Range]) -> Option<Range> {
+    chain
+        .iter()
+        .copied()
+        .find(|range| range.contains_range(current) && range != current)
+}
+
+fn previous_lsp_selection_range(current: &Range, chain: &[Range]) -> Option<Range> {
+    chain
+        .iter()
+        .copied()
+        .take_while(|range| current.contains_range(range) && range != current)
+        .last()
 }
 
 // ─── Sibling selection ───────────────────────────────────────────────
@@ -2948,6 +3077,89 @@ mod tests {
             .expect("document")
             .set_selection(view_id, Selection::single(0, end));
         (editor, view_id, doc_id)
+    }
+
+    fn lsp_selection_range(
+        start: u32,
+        end: u32,
+        parent: Option<helix_lsp::lsp::SelectionRange>,
+    ) -> helix_lsp::lsp::SelectionRange {
+        helix_lsp::lsp::SelectionRange {
+            range: helix_lsp::lsp::Range::new(
+                helix_lsp::lsp::Position::new(0, start),
+                helix_lsp::lsp::Position::new(0, end),
+            ),
+            parent: parent.map(Box::new),
+        }
+    }
+
+    #[test]
+    fn lsp_selection_range_expand_uses_next_parent_chain_range() {
+        let text = Rope::from("abcdef");
+        let selection = Selection::single(1, 2);
+        let response = vec![lsp_selection_range(
+            1,
+            2,
+            Some(lsp_selection_range(
+                1,
+                4,
+                Some(lsp_selection_range(0, 6, None)),
+            )),
+        )];
+
+        let result = selection_from_lsp_selection_ranges(
+            &text,
+            &selection,
+            response,
+            helix_lsp::OffsetEncoding::Utf8,
+            LspSelectionRangeDirection::Expand,
+        )
+        .expect("selection");
+
+        assert_eq!(result, Selection::single(1, 4));
+    }
+
+    #[test]
+    fn lsp_selection_range_shrink_uses_previous_child_chain_range() {
+        let text = Rope::from("abcdef");
+        let selection = Selection::single(1, 4);
+        let response = vec![lsp_selection_range(
+            1,
+            2,
+            Some(lsp_selection_range(
+                1,
+                4,
+                Some(lsp_selection_range(0, 6, None)),
+            )),
+        )];
+
+        let result = selection_from_lsp_selection_ranges(
+            &text,
+            &selection,
+            response,
+            helix_lsp::OffsetEncoding::Utf8,
+            LspSelectionRangeDirection::Shrink,
+        )
+        .expect("selection");
+
+        assert_eq!(result, Selection::single(1, 2));
+    }
+
+    #[test]
+    fn lsp_selection_range_discards_mismatched_multi_position_response() {
+        let text = Rope::from("abcdef");
+        let selection = Selection::new(vec![Range::point(1), Range::point(4)].into(), 0);
+        let response = vec![lsp_selection_range(1, 2, None)];
+
+        let result = selection_from_lsp_selection_ranges(
+            &text,
+            &selection,
+            response,
+            helix_lsp::OffsetEncoding::Utf8,
+            LspSelectionRangeDirection::Expand,
+        );
+
+        assert!(result.is_none());
     }
 
     #[test]

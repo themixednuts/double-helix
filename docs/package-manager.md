@@ -3,6 +3,11 @@
 Status: approved design, implementation staged (2026-07).
 Owner: architecture; implemented by staged codex waves.
 
+Implementation status (2026-07 W-pkg-1): `helix-pkg` engine and `dhx pkg`
+CLI are implemented for the github-release, archive, and system backends.
+Editor command resolution, loader grammar fold-in, and editor UI remain later
+waves.
+
 ## Problem
 
 Today every runtime asset has a different acquisition story: grammars are

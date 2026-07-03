@@ -14,12 +14,27 @@ pub struct Args {
     pub migrate: bool,
     pub fetch_grammars: bool,
     pub build_grammars: bool,
+    pub pkg: Option<PkgArgs>,
     pub split: Option<Layout>,
     pub verbosity: u64,
     pub log_file: Option<PathBuf>,
     pub config_file: Option<PathBuf>,
     pub files: IndexMap<PathBuf, Vec<Position>>,
     pub working_directory: Option<PathBuf>,
+}
+
+pub struct PkgArgs {
+    pub command: PkgCommand,
+}
+
+pub enum PkgCommand {
+    Install(Vec<String>),
+    Remove(String),
+    List { kind: Option<String> },
+    Search(String),
+    Sync,
+    Doctor,
+    Help,
 }
 
 impl Args {
@@ -68,6 +83,10 @@ impl Args {
                         anyhow::bail!("--grammar must be followed by either 'fetch' or 'build'")
                     }
                 },
+                "pkg" => {
+                    args.pkg = Some(parse_pkg_args(argv.by_ref().collect())?);
+                    break;
+                }
                 "-c" | "--config" => match argv.next().as_deref() {
                     Some(path) => args.config_file = Some(path.into()),
                     None => anyhow::bail!("--config must specify a path to read"),
@@ -132,6 +151,57 @@ impl Args {
 
         Ok(args)
     }
+}
+
+fn parse_pkg_args(args: Vec<String>) -> Result<PkgArgs> {
+    let mut args = args.into_iter();
+    let command = match args.next().as_deref() {
+        Some("install") => {
+            let names: Vec<String> = args.collect();
+            if names.is_empty() {
+                anyhow::bail!("pkg install requires at least one package name");
+            }
+            PkgCommand::Install(names)
+        }
+        Some("remove") => {
+            let Some(name) = args.next() else {
+                anyhow::bail!("pkg remove requires a package name");
+            };
+            if args.next().is_some() {
+                anyhow::bail!("pkg remove accepts one package name");
+            }
+            PkgCommand::Remove(name)
+        }
+        Some("list") => {
+            let mut kind = None;
+            while let Some(arg) = args.next() {
+                match arg.as_str() {
+                    "--kind" => {
+                        let Some(value) = args.next() else {
+                            anyhow::bail!("pkg list --kind requires a value");
+                        };
+                        kind = Some(value);
+                    }
+                    other => anyhow::bail!("unexpected pkg list argument: {other}"),
+                }
+            }
+            PkgCommand::List { kind }
+        }
+        Some("search") => {
+            let Some(term) = args.next() else {
+                anyhow::bail!("pkg search requires a search term");
+            };
+            if args.next().is_some() {
+                anyhow::bail!("pkg search accepts one search term");
+            }
+            PkgCommand::Search(term)
+        }
+        Some("sync") => PkgCommand::Sync,
+        Some("doctor") => PkgCommand::Doctor,
+        Some("-h" | "--help") | None => PkgCommand::Help,
+        Some(other) => anyhow::bail!("unknown pkg command: {other}"),
+    };
+    Ok(PkgArgs { command })
 }
 
 /// Parse arg into [`PathBuf`] and position.

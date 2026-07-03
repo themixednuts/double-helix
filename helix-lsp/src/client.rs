@@ -406,9 +406,14 @@ impl Client {
                         | lsp::FoldingRangeProviderCapability::Options(_)
                 )
             ),
-            LanguageServerFeature::SelectionRange => {
-                capabilities.selection_range_provider.is_some()
-            }
+            LanguageServerFeature::SelectionRange => matches!(
+                capabilities.selection_range_provider,
+                Some(
+                    lsp::SelectionRangeProviderCapability::Simple(true)
+                        | lsp::SelectionRangeProviderCapability::Options(_)
+                        | lsp::SelectionRangeProviderCapability::RegistrationOptions(_)
+                )
+            ),
             LanguageServerFeature::LinkedEditingRange => matches!(
                 capabilities.linked_editing_range_provider,
                 Some(
@@ -727,7 +732,9 @@ impl Client {
                     }),
                     inlay_hint: Some(lsp::InlayHintClientCapabilities {
                         dynamic_registration: Some(false),
-                        resolve_support: None,
+                        resolve_support: Some(lsp::InlayHintResolveClientCapabilities {
+                            properties: vec!["tooltip".to_owned(), "label.tooltip".to_owned()],
+                        }),
                     }),
                     code_lens: Some(lsp::CodeLensClientCapabilities {
                         dynamic_registration: Some(false),
@@ -748,8 +755,16 @@ impl Client {
                         }),
                         ..Default::default()
                     }),
-                    selection_range: None,
+                    selection_range: Some(lsp::SelectionRangeClientCapabilities {
+                        dynamic_registration: Some(false),
+                    }),
                     linked_editing_range: Some(lsp::LinkedEditingRangeClientCapabilities {
+                        dynamic_registration: Some(false),
+                    }),
+                    call_hierarchy: Some(lsp::CallHierarchyClientCapabilities {
+                        dynamic_registration: Some(false),
+                    }),
+                    type_hierarchy: Some(lsp::TypeHierarchyClientCapabilities {
                         dynamic_registration: Some(false),
                     }),
                     on_type_formatting: Some(lsp::DocumentOnTypeFormattingClientCapabilities {
@@ -1394,11 +1409,14 @@ impl Client {
         positions: Vec<lsp::Position>,
         work_done_token: Option<lsp::ProgressToken>,
     ) -> Option<impl Future<Output = Result<Option<Vec<lsp::SelectionRange>>>>> {
-        self.capabilities
-            .get()
-            .unwrap()
-            .selection_range_provider
-            .as_ref()?;
+        match self.capabilities.get().unwrap().selection_range_provider {
+            Some(
+                lsp::SelectionRangeProviderCapability::Simple(true)
+                | lsp::SelectionRangeProviderCapability::Options(_)
+                | lsp::SelectionRangeProviderCapability::RegistrationOptions(_),
+            ) => (),
+            _ => return None,
+        }
         let params = lsp::SelectionRangeParams {
             text_document,
             positions,
@@ -1407,6 +1425,163 @@ impl Client {
         };
 
         Some(self.call::<lsp::request::SelectionRangeRequest>(params))
+    }
+
+    pub fn text_document_prepare_call_hierarchy(
+        &self,
+        text_document: lsp::TextDocumentIdentifier,
+        position: lsp::Position,
+        work_done_token: Option<lsp::ProgressToken>,
+    ) -> Option<impl Future<Output = Result<Option<Vec<lsp::CallHierarchyItem>>>>> {
+        match self.capabilities.get().unwrap().call_hierarchy_provider {
+            Some(
+                lsp::CallHierarchyServerCapability::Simple(true)
+                | lsp::CallHierarchyServerCapability::Options(_),
+            ) => (),
+            _ => return None,
+        }
+
+        let params = lsp::CallHierarchyPrepareParams {
+            text_document_position_params: lsp::TextDocumentPositionParams {
+                text_document,
+                position,
+            },
+            work_done_progress_params: lsp::WorkDoneProgressParams { work_done_token },
+        };
+
+        Some(self.call::<lsp::request::CallHierarchyPrepare>(params))
+    }
+
+    pub fn call_hierarchy_incoming_calls(
+        &self,
+        item: lsp::CallHierarchyItem,
+        work_done_token: Option<lsp::ProgressToken>,
+    ) -> Option<impl Future<Output = Result<Option<Vec<lsp::CallHierarchyIncomingCall>>>>> {
+        match self.capabilities.get().unwrap().call_hierarchy_provider {
+            Some(
+                lsp::CallHierarchyServerCapability::Simple(true)
+                | lsp::CallHierarchyServerCapability::Options(_),
+            ) => (),
+            _ => return None,
+        }
+
+        let params = lsp::CallHierarchyIncomingCallsParams {
+            item,
+            work_done_progress_params: lsp::WorkDoneProgressParams {
+                work_done_token: work_done_token.clone(),
+            },
+            partial_result_params: lsp::PartialResultParams {
+                partial_result_token: work_done_token,
+            },
+        };
+
+        Some(self.call::<lsp::request::CallHierarchyIncomingCalls>(params))
+    }
+
+    pub fn call_hierarchy_outgoing_calls(
+        &self,
+        item: lsp::CallHierarchyItem,
+        work_done_token: Option<lsp::ProgressToken>,
+    ) -> Option<impl Future<Output = Result<Option<Vec<lsp::CallHierarchyOutgoingCall>>>>> {
+        match self.capabilities.get().unwrap().call_hierarchy_provider {
+            Some(
+                lsp::CallHierarchyServerCapability::Simple(true)
+                | lsp::CallHierarchyServerCapability::Options(_),
+            ) => (),
+            _ => return None,
+        }
+
+        let params = lsp::CallHierarchyOutgoingCallsParams {
+            item,
+            work_done_progress_params: lsp::WorkDoneProgressParams {
+                work_done_token: work_done_token.clone(),
+            },
+            partial_result_params: lsp::PartialResultParams {
+                partial_result_token: work_done_token,
+            },
+        };
+
+        Some(self.call::<lsp::request::CallHierarchyOutgoingCalls>(params))
+    }
+
+    pub fn text_document_prepare_type_hierarchy(
+        &self,
+        text_document: lsp::TextDocumentIdentifier,
+        position: lsp::Position,
+        work_done_token: Option<lsp::ProgressToken>,
+    ) -> Option<impl Future<Output = Result<Option<Vec<lsp::TypeHierarchyItem>>>>> {
+        match self.capabilities.get().unwrap().type_hierarchy_provider {
+            Some(
+                lsp::TypeHierarchyServerCapability::Simple(true)
+                | lsp::TypeHierarchyServerCapability::Options(_)
+                | lsp::TypeHierarchyServerCapability::RegistrationOptions(_),
+            ) => (),
+            _ => return None,
+        }
+
+        let params = lsp::TypeHierarchyPrepareParams {
+            text_document_position_params: lsp::TextDocumentPositionParams {
+                text_document,
+                position,
+            },
+            work_done_progress_params: lsp::WorkDoneProgressParams { work_done_token },
+        };
+
+        Some(self.call::<lsp::request::TypeHierarchyPrepare>(params))
+    }
+
+    pub fn type_hierarchy_supertypes(
+        &self,
+        item: lsp::TypeHierarchyItem,
+        work_done_token: Option<lsp::ProgressToken>,
+    ) -> Option<impl Future<Output = Result<Option<Vec<lsp::TypeHierarchyItem>>>>> {
+        match self.capabilities.get().unwrap().type_hierarchy_provider {
+            Some(
+                lsp::TypeHierarchyServerCapability::Simple(true)
+                | lsp::TypeHierarchyServerCapability::Options(_)
+                | lsp::TypeHierarchyServerCapability::RegistrationOptions(_),
+            ) => (),
+            _ => return None,
+        }
+
+        let params = lsp::TypeHierarchySupertypesParams {
+            item,
+            work_done_progress_params: lsp::WorkDoneProgressParams {
+                work_done_token: work_done_token.clone(),
+            },
+            partial_result_params: lsp::PartialResultParams {
+                partial_result_token: work_done_token,
+            },
+        };
+
+        Some(self.call::<lsp::request::TypeHierarchySupertypes>(params))
+    }
+
+    pub fn type_hierarchy_subtypes(
+        &self,
+        item: lsp::TypeHierarchyItem,
+        work_done_token: Option<lsp::ProgressToken>,
+    ) -> Option<impl Future<Output = Result<Option<Vec<lsp::TypeHierarchyItem>>>>> {
+        match self.capabilities.get().unwrap().type_hierarchy_provider {
+            Some(
+                lsp::TypeHierarchyServerCapability::Simple(true)
+                | lsp::TypeHierarchyServerCapability::Options(_)
+                | lsp::TypeHierarchyServerCapability::RegistrationOptions(_),
+            ) => (),
+            _ => return None,
+        }
+
+        let params = lsp::TypeHierarchySubtypesParams {
+            item,
+            work_done_progress_params: lsp::WorkDoneProgressParams {
+                work_done_token: work_done_token.clone(),
+            },
+            partial_result_params: lsp::PartialResultParams {
+                partial_result_token: work_done_token,
+            },
+        };
+
+        Some(self.call::<lsp::request::TypeHierarchySubtypes>(params))
     }
 
     pub fn text_document_on_type_formatting(

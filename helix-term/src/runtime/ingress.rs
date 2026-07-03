@@ -433,6 +433,7 @@ pub enum RuntimeTaskEvent {
     ApplyInlayHints {
         view_id: ViewId,
         doc_id: DocumentId,
+        server_id: LanguageServerId,
         offset_encoding: helix_lsp::OffsetEncoding,
         id: DocumentInlayHintsId,
         hints: Vec<lsp::InlayHint>,

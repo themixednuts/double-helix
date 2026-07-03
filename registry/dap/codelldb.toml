@@ -1,0 +1,27 @@
+name = "codelldb"
+kind = "dap"
+description = "LLDB Debug Adapter Protocol adapter"
+homepage = "https://github.com/vadimcn/codelldb"
+languages = ["c", "cpp", "rust", "zig"]
+
+[version]
+tag-source = "github:vadimcn/codelldb"
+
+[[artifact]]
+os = "windows"
+arch = "x86_64"
+source = { github-release = "vadimcn/codelldb", asset = "codelldb-win32-x64.vsix" }
+bin = "extension/adapter/codelldb.exe"
+
+[[artifact]]
+os = "linux"
+arch = "x86_64"
+source = { github-release = "vadimcn/codelldb", asset = "codelldb-linux-x64.vsix" }
+bin = "extension/adapter/codelldb"
+
+[[artifact]]
+os = "macos"
+arch = "aarch64"
+source = { github-release = "vadimcn/codelldb", asset = "codelldb-darwin-arm64.vsix" }
+bin = "extension/adapter/codelldb"
+

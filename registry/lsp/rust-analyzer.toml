@@ -1,0 +1,27 @@
+name = "rust-analyzer"
+kind = "lsp"
+description = "Rust language server"
+homepage = "https://rust-analyzer.github.io"
+languages = ["rust"]
+
+[version]
+tag-source = "github:rust-lang/rust-analyzer"
+
+[[artifact]]
+os = "windows"
+arch = "x86_64"
+source = { github-release = "rust-lang/rust-analyzer", asset = "rust-analyzer-x86_64-pc-windows-msvc.zip" }
+bin = "rust-analyzer.exe"
+
+[[artifact]]
+os = "linux"
+arch = "x86_64"
+source = { github-release = "rust-lang/rust-analyzer", asset = "rust-analyzer-x86_64-unknown-linux-gnu.gz" }
+bin = "rust-analyzer"
+
+[[artifact]]
+os = "macos"
+arch = "aarch64"
+source = { github-release = "rust-lang/rust-analyzer", asset = "rust-analyzer-aarch64-apple-darwin.gz" }
+bin = "rust-analyzer"
+

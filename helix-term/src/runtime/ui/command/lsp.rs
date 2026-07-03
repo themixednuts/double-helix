@@ -39,6 +39,42 @@ pub struct DocumentSymbolPickerItem {
     pub symbol: lsp::SymbolInformation,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LspCallHierarchyDirection {
+    Incoming,
+    Outgoing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LspTypeHierarchyDirection {
+    Supertypes,
+    Subtypes,
+}
+
+#[derive(Debug, Clone)]
+pub enum LspHierarchyPrepareItem {
+    Call {
+        server_id: LanguageServerId,
+        offset_encoding: OffsetEncoding,
+        item: lsp::CallHierarchyItem,
+        direction: LspCallHierarchyDirection,
+    },
+    Type {
+        server_id: LanguageServerId,
+        offset_encoding: OffsetEncoding,
+        item: lsp::TypeHierarchyItem,
+        direction: LspTypeHierarchyDirection,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct LspHierarchyPickerItem {
+    pub name: String,
+    pub detail: Option<String>,
+    pub kind: lsp::SymbolKind,
+    pub location: LspLocation,
+}
+
 /// LSP-driven compositor UI.
 #[derive(Debug)]
 pub enum LspCommand {
@@ -60,6 +96,14 @@ pub enum LspCommand {
     /// Document symbols picker; empty `symbols` -> status in apply.
     DocumentSymbols {
         symbols: Vec<DocumentSymbolPickerItem>,
+    },
+    HierarchyPrepare {
+        items: Vec<LspHierarchyPrepareItem>,
+        empty_message: &'static str,
+    },
+    Hierarchy {
+        items: Vec<LspHierarchyPickerItem>,
+        empty_message: &'static str,
     },
     SignatureHelp {
         invoked: SignatureHelpInvoked,

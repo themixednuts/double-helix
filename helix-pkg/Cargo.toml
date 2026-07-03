@@ -1,0 +1,29 @@
+[package]
+name = "helix-pkg"
+description = "Package manager engine for Double Helix runtime tools"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+categories.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+etcetera.workspace = true
+flate2.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tar.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+toml.workspace = true
+ureq.workspace = true
+xz2.workspace = true
+zip.workspace = true
+
+[dev-dependencies]
+assert_fs.workspace = true
+

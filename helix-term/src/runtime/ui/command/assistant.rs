@@ -19,10 +19,31 @@ pub enum AssistantCommand {
     PushDetachContextPicker {
         items: Vec<helix_view::assistant::context::Item>,
     },
+    PushModeConfigPicker {
+        thread: helix_view::assistant::thread::Id,
+        items: Vec<ModeConfigPickerItem>,
+    },
     ShowPermissionRequest {
         thread: helix_view::assistant::thread::Id,
         request: helix_view::assistant::permission::Request,
     },
     /// Open the assistant panel shell; assistant data comes from editor-owned state.
     OpenPanel,
+}
+
+#[derive(Debug, Clone)]
+pub enum ModeConfigPickerItem {
+    Mode {
+        id: helix_view::assistant::mode::Id,
+        name: String,
+        current: bool,
+    },
+    Config {
+        option: helix_view::assistant::config::Id,
+        value: helix_view::assistant::config::ValueId,
+        name: String,
+        value_label: String,
+        category: Option<String>,
+        current: bool,
+    },
 }

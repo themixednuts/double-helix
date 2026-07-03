@@ -77,6 +77,7 @@ pub enum EntryKind {
         name: String,
         state: String,
         output: String,
+        subagent: Option<String>,
     },
     Status {
         text: String,
@@ -156,11 +157,13 @@ impl EntryView {
                     name,
                     state,
                     output,
+                    subagent,
                 } => crate::model::AssistantEntryKind::ToolCall {
                     id,
                     name,
                     status: state,
                     output,
+                    subagent,
                 },
                 EntryKind::Status { text } => crate::model::AssistantEntryKind::Status(text),
                 EntryKind::ChangeSummary { files } => {
@@ -519,6 +522,10 @@ impl Store {
                                     super::tool::State::Unknown(value) => value.to_string(),
                                 },
                                 output: call.output.clone(),
+                                subagent: call
+                                    .subagent
+                                    .as_ref()
+                                    .map(|info| info.session_id.clone()),
                             },
                             thread::EntryKind::Status { text } => {
                                 EntryKind::Status { text: text.clone() }

@@ -1,0 +1,27 @@
+name = "taplo"
+kind = "lsp"
+description = "TOML language server and formatter"
+homepage = "https://taplo.tamasfe.dev"
+languages = ["toml"]
+
+[version]
+tag-source = "github:tamasfe/taplo"
+
+[[artifact]]
+os = "windows"
+arch = "x86_64"
+source = { github-release = "tamasfe/taplo", asset = "taplo-windows-x86_64.zip" }
+bin = "taplo.exe"
+
+[[artifact]]
+os = "linux"
+arch = "x86_64"
+source = { github-release = "tamasfe/taplo", asset = "taplo-linux-x86_64.gz" }
+bin = "taplo"
+
+[[artifact]]
+os = "macos"
+arch = "aarch64"
+source = { github-release = "tamasfe/taplo", asset = "taplo-darwin-aarch64.gz" }
+bin = "taplo"
+

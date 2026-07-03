@@ -363,6 +363,9 @@ pub struct DocumentInlayHints {
     /// added first, then the regular inlay hints, then the `after` padding.
     pub padding_before_inlay_hints: Vec<InlineAnnotation>,
     pub padding_after_inlay_hints: Vec<InlineAnnotation>,
+
+    /// Raw LSP hints used for lazy tooltip resolution on hover.
+    pub lsp_hints: Vec<DocumentInlayHint>,
 }
 
 impl DocumentInlayHints {
@@ -375,8 +378,16 @@ impl DocumentInlayHints {
             other_inlay_hints: Vec::new(),
             padding_before_inlay_hints: Vec::new(),
             padding_after_inlay_hints: Vec::new(),
+            lsp_hints: Vec::new(),
         }
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct DocumentInlayHint {
+    pub server_id: helix_lsp::LanguageServerId,
+    pub offset_encoding: helix_lsp::OffsetEncoding,
+    pub hint: helix_lsp::lsp::InlayHint,
 }
 
 /// Associated with a [`Document`] and [`ViewId`], uniquely identifies the state of inlay hints for
@@ -1710,6 +1721,7 @@ impl Document {
                 other_inlay_hints,
                 padding_before_inlay_hints,
                 padding_after_inlay_hints,
+                lsp_hints: _,
             } = text_annotation;
 
             apply_inlay_hint_changes(padding_before_inlay_hints);

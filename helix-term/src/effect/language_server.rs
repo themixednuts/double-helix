@@ -15,7 +15,7 @@ use helix_lsp::{self, lsp, util::lsp_range_to_range, LanguageServerId};
 use helix_runtime::Token;
 use helix_stdx::rope::RopeSliceExt;
 use helix_view::{
-    document::{DocumentInlayHints, DocumentInlayHintsId, PluginAnnotation},
+    document::{DocumentInlayHint, DocumentInlayHints, DocumentInlayHintsId, PluginAnnotation},
     document_lsp::{
         DocumentCodeLens, DocumentCodeLenses, DocumentColorSwatches, DocumentLink, DocumentLinks,
     },
@@ -614,6 +614,7 @@ pub(crate) fn apply_inlay_hints(
     editor: &mut Editor,
     view_id: ViewId,
     doc_id: DocumentId,
+    server_id: LanguageServerId,
     offset_encoding: helix_lsp::OffsetEncoding,
     id: DocumentInlayHintsId,
     mut hints: Vec<lsp::InlayHint>,
@@ -633,6 +634,15 @@ pub(crate) fn apply_inlay_hints(
     }
 
     hints.sort_by_key(|inlay_hint| inlay_hint.position);
+    let lsp_hints = hints
+        .iter()
+        .cloned()
+        .map(|hint| DocumentInlayHint {
+            server_id,
+            offset_encoding,
+            hint,
+        })
+        .collect();
 
     let mut padding_before_inlay_hints = Vec::new();
     let mut type_inlay_hints = Vec::new();
@@ -707,6 +717,7 @@ pub(crate) fn apply_inlay_hints(
             other_inlay_hints,
             padding_before_inlay_hints,
             padding_after_inlay_hints,
+            lsp_hints,
         },
     );
     doc.clear_inlay_hints_outdated();

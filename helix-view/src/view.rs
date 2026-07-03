@@ -1088,6 +1088,7 @@ impl View {
             other_inlay_hints,
             padding_before_inlay_hints,
             padding_after_inlay_hints,
+            lsp_hints: _,
         }) = doc.inlay_hints(self.id)
         {
             let type_style = theme.and_then(|t| t.find_highlight("ui.virtual.inlay-hint.type"));

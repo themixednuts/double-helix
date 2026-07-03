@@ -67,6 +67,7 @@ pub struct AssistantPanel {
     pending_message_g: bool,
     markdown_cache: RefCell<HashMap<helix_view::assistant::thread::EntryId, MarkdownCache>>,
     mention: MentionPopup,
+    elicitation_form: Option<helix_view::assistant::elicitation::FormState>,
 }
 
 #[derive(Clone, Copy)]
@@ -368,6 +369,7 @@ impl AssistantPanel {
             pending_message_g: false,
             markdown_cache: RefCell::new(HashMap::new()),
             mention: MentionPopup::default(),
+            elicitation_form: None,
         }
     }
 
@@ -670,15 +672,11 @@ impl AssistantPanel {
         }
     }
 
-    fn pending_elicitation(
-        editor: &Editor,
-    ) -> Option<helix_view::assistant::thread::Elicitation> {
+    fn pending_elicitation(editor: &Editor) -> Option<helix_view::assistant::thread::Elicitation> {
         Self::assistant_model(editor)
             .pending_elicitations
             .into_iter()
-            .find(|item| {
-                item.status == helix_view::assistant::thread::ElicitationStatus::Pending
-            })
+            .find(|item| item.status == helix_view::assistant::thread::ElicitationStatus::Pending)
     }
 
     fn complete_pending_elicitation(
@@ -690,51 +688,123 @@ impl AssistantPanel {
         let Some(thread) = model.active_thread else {
             return false;
         };
-        let Some(elicitation) = model.pending_elicitations.into_iter().find(|item| {
-            item.status == helix_view::assistant::thread::ElicitationStatus::Pending
-        }) else {
+        let Some(elicitation) = model
+            .pending_elicitations
+            .into_iter()
+            .find(|item| item.status == helix_view::assistant::thread::ElicitationStatus::Pending)
+        else {
             return false;
         };
         let effects = editor.complete_assistant_elicitation(thread, elicitation.id, response);
         Self::apply_assistant_effects(editor, effects);
+        self.elicitation_form = None;
         true
+    }
+
+    fn sync_elicitation_form(
+        &mut self,
+        elicitation: &helix_view::assistant::thread::Elicitation,
+    ) -> bool {
+        if !matches!(
+            elicitation.mode,
+            helix_view::assistant::thread::ElicitationMode::Form { .. }
+        ) {
+            self.elicitation_form = None;
+            return false;
+        }
+        self.elicitation_form = match self.elicitation_form.take() {
+            Some(state) => state.sync(elicitation),
+            None => helix_view::assistant::elicitation::FormState::new(elicitation),
+        };
+        self.elicitation_form.is_some()
     }
 
     fn accept_pending_elicitation(&mut self, editor: &mut Editor) -> bool {
         let Some(elicitation) = Self::pending_elicitation(editor) else {
+            self.elicitation_form = None;
             return false;
         };
         let values = match &elicitation.mode {
-            helix_view::assistant::thread::ElicitationMode::Form { fields, .. } => fields
-                .iter()
-                .map(|field| {
-                    let value = match field.field_type {
-                        helix_view::assistant::thread::ElicitationFieldType::Bool => {
-                            helix_view::assistant::thread::ElicitationValue::Boolean(false)
-                        }
-                        helix_view::assistant::thread::ElicitationFieldType::Select => {
-                            helix_view::assistant::thread::ElicitationValue::String(
-                                field
-                                    .options
-                                    .first()
-                                    .map(|option| option.value.clone())
-                                    .unwrap_or_default(),
-                            )
-                        }
-                        helix_view::assistant::thread::ElicitationFieldType::Text
-                        | helix_view::assistant::thread::ElicitationFieldType::Textarea => {
-                            helix_view::assistant::thread::ElicitationValue::String(String::new())
-                        }
-                    };
-                    (field.name.clone(), value)
-                })
-                .collect(),
+            helix_view::assistant::thread::ElicitationMode::Form { fields, .. } => {
+                self.sync_elicitation_form(&elicitation);
+                let Some(form) = &self.elicitation_form else {
+                    return false;
+                };
+                match form.submit_values(fields) {
+                    Ok(values) => values,
+                    Err(err) => {
+                        editor.set_status(format!("Required field missing: {}", err.field));
+                        return true;
+                    }
+                }
+            }
             helix_view::assistant::thread::ElicitationMode::Url { .. } => Vec::new(),
         };
         self.complete_pending_elicitation(
             editor,
             helix_view::assistant::thread::ElicitationResponse::Accept(values),
         )
+    }
+
+    fn handle_elicitation_key(&mut self, key: &KeyEvent, editor: &mut Editor) -> bool {
+        let Some(elicitation) = Self::pending_elicitation(editor) else {
+            self.elicitation_form = None;
+            return false;
+        };
+        let helix_view::assistant::thread::ElicitationMode::Form { fields, .. } = &elicitation.mode
+        else {
+            return false;
+        };
+        self.sync_elicitation_form(&elicitation);
+        match (key.code, key.modifiers) {
+            (KeyCode::Enter, KeyModifiers::NONE) => {
+                if self.accept_pending_elicitation(editor) {
+                    editor.set_status("Submitted assistant request");
+                }
+                return true;
+            }
+            (KeyCode::Esc, KeyModifiers::NONE) => {
+                if self.cancel_pending_elicitation(editor) {
+                    editor.set_status("Canceled assistant request");
+                }
+                return true;
+            }
+            _ => {}
+        }
+        let Some(form) = &mut self.elicitation_form else {
+            return false;
+        };
+        match (key.code, key.modifiers) {
+            (KeyCode::Tab, KeyModifiers::NONE) => {
+                form.focus_next();
+                true
+            }
+            (KeyCode::Tab, modifiers) if modifiers.contains(KeyModifiers::SHIFT) => {
+                form.focus_prev();
+                true
+            }
+            (KeyCode::Backspace, KeyModifiers::NONE) => {
+                form.backspace();
+                true
+            }
+            (KeyCode::Char('h'), KeyModifiers::NONE) | (KeyCode::Left, KeyModifiers::NONE) => {
+                form.activate_focused(fields, -1);
+                true
+            }
+            (KeyCode::Char('l'), KeyModifiers::NONE)
+            | (KeyCode::Right, KeyModifiers::NONE)
+            | (KeyCode::Char(' '), KeyModifiers::NONE) => {
+                form.activate_focused(fields, 1);
+                true
+            }
+            (KeyCode::Char(ch), modifiers)
+                if modifiers.is_empty() || modifiers == KeyModifiers::SHIFT =>
+            {
+                form.insert_char(ch);
+                true
+            }
+            _ => false,
+        }
     }
 
     fn cancel_pending_elicitation(&mut self, editor: &mut Editor) -> bool {
@@ -1503,7 +1573,7 @@ impl AssistantPanel {
             .iter()
             .filter(|item| item.status == helix_view::assistant::thread::ElicitationStatus::Pending)
         {
-            blocks.push(Self::elicitation_message(elicitation, theme));
+            blocks.push(self.elicitation_message(elicitation, theme));
         }
 
         for terminal in &model.terminals {
@@ -1514,6 +1584,7 @@ impl AssistantPanel {
     }
 
     fn elicitation_message<'a>(
+        &self,
         elicitation: &helix_view::assistant::thread::Elicitation,
         theme: &helix_view::Theme,
     ) -> Message<'a> {
@@ -1526,33 +1597,66 @@ impl AssistantPanel {
                 lines.push(Spans::from(vec![
                     Span::styled(" ? ", warning_style),
                     Span::styled(message.clone(), title_style),
-                    Span::styled("  enter submit  esc cancel", muted_style),
+                    Span::styled("  tab field  enter submit  esc cancel", muted_style),
                 ]));
-                for field in fields {
+                let form = self
+                    .elicitation_form
+                    .as_ref()
+                    .filter(|form| form.request_id() == elicitation.id.as_str());
+                for (index, field) in fields.iter().enumerate() {
                     let required = if field.required { " *" } else { "" };
-                    let kind = match field.field_type {
-                        helix_view::assistant::thread::ElicitationFieldType::Text => "text",
-                        helix_view::assistant::thread::ElicitationFieldType::Textarea => "textarea",
-                        helix_view::assistant::thread::ElicitationFieldType::Select => "select",
-                        helix_view::assistant::thread::ElicitationFieldType::Bool => "bool",
+                    let marker = if form.is_some_and(|form| form.focused() == index) {
+                        " > "
+                    } else {
+                        "   "
+                    };
+                    let value = match (form.and_then(|form| form.value(index)), field.field_type) {
+                        (
+                            Some(helix_view::assistant::elicitation::FieldValue::Text(text)),
+                            helix_view::assistant::thread::ElicitationFieldType::Text
+                            | helix_view::assistant::thread::ElicitationFieldType::Textarea,
+                        ) => text.clone(),
+                        (
+                            Some(helix_view::assistant::elicitation::FieldValue::Select(selected)),
+                            helix_view::assistant::thread::ElicitationFieldType::Select,
+                        ) => field
+                            .options
+                            .get(*selected)
+                            .map(|option| option.label.clone())
+                            .unwrap_or_else(|| "<none>".to_string()),
+                        (
+                            Some(helix_view::assistant::elicitation::FieldValue::Bool(value)),
+                            helix_view::assistant::thread::ElicitationFieldType::Bool,
+                        ) => {
+                            if *value {
+                                "yes".to_string()
+                            } else {
+                                "no".to_string()
+                            }
+                        }
+                        _ => match field.field_type {
+                            helix_view::assistant::thread::ElicitationFieldType::Select => field
+                                .options
+                                .first()
+                                .map(|option| option.label.clone())
+                                .unwrap_or_else(|| "<none>".to_string()),
+                            helix_view::assistant::thread::ElicitationFieldType::Bool => {
+                                "no".to_string()
+                            }
+                            helix_view::assistant::thread::ElicitationFieldType::Text
+                            | helix_view::assistant::thread::ElicitationFieldType::Textarea => {
+                                String::new()
+                            }
+                        },
                     };
                     let label = field.label.as_deref().unwrap_or(&field.name);
-                    let options = if field.options.is_empty() {
-                        String::new()
-                    } else {
-                        format!(
-                            " [{}]",
-                            field
-                                .options
-                                .iter()
-                                .map(|option| option.label.as_str())
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        )
-                    };
                     lines.push(Spans::from(Span::styled(
-                        format!("   {label}{required}: {kind}{options}"),
-                        muted_style,
+                        format!("{marker}{label}{required}: {value}"),
+                        if marker.trim().is_empty() {
+                            muted_style
+                        } else {
+                            title_style
+                        },
                     )));
                 }
             }
@@ -1593,7 +1697,15 @@ impl AssistantPanel {
             ),
             Span::styled(format!("  {}", terminal.state), status_style),
         ])];
-        for line in terminal.output.lines().rev().take(8).collect::<Vec<_>>().into_iter().rev() {
+        for line in terminal
+            .output
+            .lines()
+            .rev()
+            .take(8)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+        {
             lines.push(Spans::from(Span::styled(format!("   {line}"), muted_style)));
         }
         Message::plain(lines)
@@ -2518,6 +2630,52 @@ impl AssistantPanel {
         }
         Some(EventResult::Consumed(None))
     }
+
+    fn open_mode_config_picker(&mut self, cx: &mut Context) -> bool {
+        use crate::runtime::ui::command::{AssistantCommand, ModeConfigPickerItem, UiCommand};
+
+        let Some((thread, mode, config)) = cx.editor.active_assistant_mode_config() else {
+            cx.editor.set_status("No active assistant thread");
+            return true;
+        };
+
+        let mut items = Vec::new();
+        if let Some(mode) = mode {
+            let selected = match mode.selected() {
+                helix_view::assistant::mode::Selected::Current(id) => id,
+                helix_view::assistant::mode::Selected::Pending { next, .. } => next,
+            };
+            items.extend(mode.items().map(|item| ModeConfigPickerItem::Mode {
+                id: item.id.clone(),
+                name: item.name.clone(),
+                current: &item.id == selected,
+            }));
+        }
+        for option in config.items() {
+            let selected = match &option.selected {
+                helix_view::assistant::config::Selected::Current(id) => id,
+                helix_view::assistant::config::Selected::Pending { next, .. } => next,
+            };
+            items.extend(
+                option
+                    .values
+                    .iter()
+                    .map(|value| ModeConfigPickerItem::Config {
+                        option: option.id.clone(),
+                        value: value.id.clone(),
+                        name: option.name.clone(),
+                        value_label: value.label.clone(),
+                        category: option.category.clone(),
+                        current: &value.id == selected,
+                    }),
+            );
+        }
+
+        cx.ingress.ui(UiCommand::Assistant(
+            AssistantCommand::PushModeConfigPicker { thread, items },
+        ));
+        true
+    }
 }
 
 impl Focusable for AssistantPanel {
@@ -2613,6 +2771,18 @@ impl Component for AssistantPanel {
         }
 
         if matches!(
+            key,
+            KeyEvent {
+                code: KeyCode::Char('o'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            }
+        ) && self.open_mode_config_picker(cx)
+        {
+            return EventResult::Consumed(None);
+        }
+
+        if matches!(
             (key.code, key.modifiers),
             (KeyCode::PageUp, KeyModifiers::CONTROL)
                 | (KeyCode::Left, KeyModifiers::ALT)
@@ -2629,6 +2799,10 @@ impl Component for AssistantPanel {
                 | (KeyCode::Char('l'), KeyModifiers::ALT)
         ) && self.cycle_thread(cx.editor, 1)
         {
+            return EventResult::Consumed(None);
+        }
+
+        if self.handle_elicitation_key(&key, cx.editor) {
             return EventResult::Consumed(None);
         }
 

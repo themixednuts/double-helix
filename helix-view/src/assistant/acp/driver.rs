@@ -1225,10 +1225,7 @@ async fn handle_call(
                 let elicitation = translate::elicitation(req);
                 state.elicitations.insert(
                     elicitation.id.clone(),
-                    PendingElicitation {
-                        rpc: id,
-                        thread,
-                    },
+                    PendingElicitation { rpc: id, thread },
                 );
                 let _ = tx
                     .send(backend::Update::Thread {

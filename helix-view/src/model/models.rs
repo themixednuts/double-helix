@@ -630,6 +630,7 @@ pub enum AssistantEntryKind {
         name: String,
         status: String,
         output: String,
+        subagent: Option<String>,
     },
     /// Status separator (e.g. "Session started", "Connected").
     Status(String),
@@ -681,12 +682,16 @@ impl AssistantEntry {
                 name,
                 status,
                 output,
+                subagent,
             } => {
                 let mut lines = vec![
                     format!("id: {id}"),
                     format!("name: {name}"),
                     format!("status: {status}"),
                 ];
+                if let Some(session) = subagent {
+                    lines.push(format!("subagent: {session}"));
+                }
                 if self.locations > 0 {
                     lines.push(format!("locations: {}", self.locations));
                 }
@@ -730,6 +735,7 @@ impl AssistantEntry {
                 name,
                 status,
                 output,
+                subagent,
             } => {
                 let mut lines = vec![
                     AssistantEntryDetailLine {
@@ -741,6 +747,12 @@ impl AssistantEntry {
                         value: status.clone(),
                     },
                 ];
+                if let Some(session) = subagent {
+                    lines.push(AssistantEntryDetailLine {
+                        label: "subagent".to_string(),
+                        value: session.clone(),
+                    });
+                }
                 if self.locations > 0 {
                     lines.push(AssistantEntryDetailLine {
                         label: "locations".to_string(),
@@ -813,6 +825,7 @@ impl AssistantEntry {
                 name,
                 status,
                 output,
+                subagent,
                 ..
             } => Some(AssistantEntryRow {
                 leading: format!(" {} ", Self::status_icon(status)),
@@ -824,7 +837,11 @@ impl AssistantEntry {
                     format!("{name} - {}", Self::summary(output, 72))
                 },
                 body_tone: AssistantEntryTone::Focus,
-                accessory: Some(format!(" {status}")),
+                accessory: Some(if subagent.is_some() {
+                    format!(" ↳ subagent  {status}")
+                } else {
+                    format!(" {status}")
+                }),
                 accessory_tone: Self::status_tone(status),
             }),
             AssistantEntryKind::Status(text) => Some(AssistantEntryRow {

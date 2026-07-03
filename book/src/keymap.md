@@ -306,6 +306,7 @@ This layer is a kludge of mappings, mostly pickers.
 | `r`     | Rename symbol (**LSP**)                                                 | `rename_symbol`                            |
 | `a`     | Apply code action (**LSP**)                                             | `code_action`                              |
 | `h`     | Select symbol references (**LSP**)                                      | `select_references_to_symbol_under_cursor` |
+| `H`     | Enter hierarchy mode (**LSP**)                                         | N/A                                        |
 | Unbound | Open code lens picker (**LSP**)                                        | `code_lens`                                |
 | Unbound | Open document links picker (**LSP**)                                   | `document_links`                           |
 | Unbound | Select linked editing ranges (**LSP**)                                 | `linked_editing_range`                     |
@@ -314,6 +315,17 @@ This layer is a kludge of mappings, mostly pickers.
 | `c`     | Comment/uncomment selections                                            | `toggle_comments`                          |
 | `C`     | Block comment/uncomment selections                                      | `toggle_block_comments`                    |
 | `Alt-c` | Line comment/uncomment selections                                       | `toggle_line_comments`                     |
+
+#### Hierarchy mode
+
+Accessed by typing `Space-H`.
+
+| Key | Description                    | Command                   |
+| --- | ------------------------------ | ------------------------- |
+| `i` | Show incoming calls (**LSP**)  | `call_hierarchy_incoming` |
+| `o` | Show outgoing calls (**LSP**)  | `call_hierarchy_outgoing` |
+| `s` | Show supertypes (**LSP**)      | `type_hierarchy_super`    |
+| `t` | Show subtypes (**LSP**)        | `type_hierarchy_sub`      |
 | `p`     | Paste system clipboard after selections                                 | `paste_clipboard_after`                    |
 | `P`     | Paste system clipboard before selections                                | `paste_clipboard_before`                   |
 | `y`     | Yank selections to clipboard                                            | `yank_to_clipboard`                        |

@@ -65,3 +65,93 @@ pub struct SandboxAuthorization {
     pub unsandboxed: bool,
     pub reason: Option<String>,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubagentJumpTarget {
+    Existing {
+        thread: super::thread::Id,
+        message_start_index: Option<u64>,
+        message_end_index: Option<u64>,
+    },
+    LoadRemote {
+        message_start_index: Option<u64>,
+        message_end_index: Option<u64>,
+    },
+    Unsupported,
+}
+
+#[must_use]
+pub fn resolve_subagent_jump(
+    info: &SubagentSessionInfo,
+    known_sessions: impl IntoIterator<Item = (String, super::thread::Id)>,
+    can_load_remote: bool,
+) -> SubagentJumpTarget {
+    if let Some((_, thread)) = known_sessions
+        .into_iter()
+        .find(|(session, _)| session == &info.session_id)
+    {
+        return SubagentJumpTarget::Existing {
+            thread,
+            message_start_index: info.message_start_index,
+            message_end_index: info.message_end_index,
+        };
+    }
+    if can_load_remote {
+        SubagentJumpTarget::LoadRemote {
+            message_start_index: info.message_start_index,
+            message_end_index: info.message_end_index,
+        }
+    } else {
+        SubagentJumpTarget::Unsupported
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::num::NonZeroU64;
+
+    use super::*;
+
+    fn thread(value: u64) -> super::super::thread::Id {
+        super::super::thread::Id::new(NonZeroU64::new(value).unwrap())
+    }
+
+    #[test]
+    fn resolves_known_subagent_session_to_existing_thread() {
+        let info = SubagentSessionInfo {
+            session_id: "remote-1".to_string(),
+            message_start_index: Some(2),
+            message_end_index: Some(5),
+        };
+
+        assert_eq!(
+            resolve_subagent_jump(&info, [("remote-1".to_string(), thread(7))], true),
+            SubagentJumpTarget::Existing {
+                thread: thread(7),
+                message_start_index: Some(2),
+                message_end_index: Some(5),
+            }
+        );
+    }
+
+    #[test]
+    fn resolves_unknown_subagent_session_to_load_when_supported() {
+        let info = SubagentSessionInfo {
+            session_id: "remote-2".to_string(),
+            message_start_index: None,
+            message_end_index: None,
+        };
+
+        assert_eq!(
+            resolve_subagent_jump(
+                &info,
+                Vec::<(String, super::super::thread::Id)>::new(),
+                true
+            ),
+            SubagentJumpTarget::LoadRemote {
+                message_start_index: None,
+                message_end_index: None,
+            }
+        );
+    }
+}

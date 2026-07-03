@@ -192,12 +192,19 @@ pub(crate) fn apply_runtime_task_event(
         RuntimeTaskEvent::ApplyInlayHints {
             view_id,
             doc_id,
+            server_id,
             offset_encoding,
             id,
             hints,
-        } => {
-            language_server::apply_inlay_hints(editor, view_id, doc_id, offset_encoding, id, hints)
-        }
+        } => language_server::apply_inlay_hints(
+            editor,
+            view_id,
+            doc_id,
+            server_id,
+            offset_encoding,
+            id,
+            hints,
+        ),
         RuntimeTaskEvent::ApplyCodeLenses { doc_id, lenses } => {
             language_server::apply_code_lenses(editor, doc_id, lenses)
         }

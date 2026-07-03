@@ -2,11 +2,13 @@
 
 pub mod acp;
 pub mod action;
+pub mod auth;
 pub mod backend;
 pub mod change;
 pub mod config;
 pub mod context;
 pub mod effect;
+pub mod elicitation;
 pub mod event;
 pub mod history;
 pub mod host;

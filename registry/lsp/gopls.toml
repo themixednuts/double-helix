@@ -1,0 +1,24 @@
+name = "gopls"
+kind = "lsp"
+description = "Go language server"
+homepage = "https://pkg.go.dev/golang.org/x/tools/gopls"
+languages = ["go"]
+
+[[artifact]]
+os = "windows"
+arch = "x86_64"
+source = { system = "gopls" }
+bin = "gopls"
+
+[[artifact]]
+os = "linux"
+arch = "x86_64"
+source = { system = "gopls" }
+bin = "gopls"
+
+[[artifact]]
+os = "macos"
+arch = "aarch64"
+source = { system = "gopls" }
+bin = "gopls"
+

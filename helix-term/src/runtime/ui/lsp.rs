@@ -50,6 +50,30 @@ pub(crate) fn apply_lsp_command(
                 editor, compositor, ingress, symbols,
             );
         }
+        LspCommand::HierarchyPrepare {
+            items,
+            empty_message,
+        } => {
+            crate::ui::lsp::document_symbols::show_hierarchy_prepare_picker(
+                editor,
+                compositor,
+                ingress,
+                items,
+                empty_message,
+            );
+        }
+        LspCommand::Hierarchy {
+            items,
+            empty_message,
+        } => {
+            crate::ui::lsp::document_symbols::show_hierarchy_picker(
+                editor,
+                compositor,
+                ingress,
+                items,
+                empty_message,
+            );
+        }
         LspCommand::SignatureHelp {
             invoked,
             request,

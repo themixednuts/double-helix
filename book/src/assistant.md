@@ -31,10 +31,11 @@ In message focus:
 | `G` / `End` | Jump back to the live tail |
 | `Esc` | Cancel a pending agent request; interrupt a running agent; otherwise return to input |
 | `Ctrl-c` | Interrupt a running agent |
+| `Ctrl-o` | Open the mode/model/config selector when the agent provides options |
 
-In input focus, type the prompt and submit normally. If an agent request is pending, `Enter` submits it and `Esc` cancels it; otherwise `Esc` leaves insert mode.
+In input focus, type the prompt and submit normally. If an agent form request is pending, `Tab` and `Shift-Tab` move between fields, text fields accept typed input and backspace, select fields use `h`/`l` or `Space`, and boolean fields toggle with `Space`. `Enter` submits after required fields are filled and `Esc` cancels the request; otherwise `Esc` leaves insert mode.
 
-The panel header shows the current mode/model when the agent provides them and compact token usage when usage is available. The first number is cumulative thread usage, and `last` is the most recent turn.
+The panel header shows the current mode/model when the agent provides them and compact token usage when usage is available. The first number is cumulative thread usage, and `last` is the most recent turn. Fast cycle keys are `Shift-Tab` for mode, `Ctrl-m` for model, and `Ctrl-t` for thinking level unless overridden by ACP config.
 
 ## Permissions
 
@@ -83,9 +84,13 @@ Type `/` at the start of the input to open slash-command completion. Commands co
 
 ACP elicitations render as request cards in the thread. Form cards list text, textarea, select, and boolean fields with required markers. URL cards show the URL; press `y` to yank it. Press `Enter` to submit the request or `Esc` to cancel it explicitly.
 
+The selector opened with `Ctrl-o` lists session modes first, followed by session config options such as model and thought level. Selecting a row applies it through the active ACP session; pending values show in the header while the agent confirms them.
+
 Thought entries render as dim `thinking...` blocks and are folded by default. `Tab` expands or collapses the selected thought like other foldable entries.
 
 Agent-spawned terminals render as cards with a running/exited/failed status badge and the latest output tail.
+
+Tool calls that refer to a subagent session show a subagent marker in the row and include the subagent session id in the entry details.
 
 ## Markdown
 

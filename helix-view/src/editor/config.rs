@@ -862,6 +862,7 @@ pub struct LspConfig {
     pub folding: bool,
     pub document_links: bool,
     pub on_type_formatting: bool,
+    pub selection_ranges: LspSelectionRangeConfig,
     pub color_swatches_string: String,
     pub snippets: bool,
     pub goto_reference_include_declaration: bool,
@@ -882,12 +883,20 @@ impl Default for LspConfig {
             folding: true,
             document_links: true,
             on_type_formatting: false,
+            selection_ranges: LspSelectionRangeConfig::Fallback,
             snippets: true,
             goto_reference_include_declaration: true,
             display_color_swatches: true,
             color_swatches_string: "■".to_owned(),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LspSelectionRangeConfig {
+    Fallback,
+    Disabled,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -1,0 +1,27 @@
+name = "netcoredbg"
+kind = "dap"
+description = ".NET Core debugger with DAP support"
+homepage = "https://github.com/Samsung/netcoredbg"
+languages = ["c-sharp"]
+
+[version]
+tag-source = "github:Samsung/netcoredbg"
+
+[[artifact]]
+os = "windows"
+arch = "x86_64"
+source = { github-release = "Samsung/netcoredbg", asset = "netcoredbg-win64.zip" }
+bin = "netcoredbg/netcoredbg.exe"
+
+[[artifact]]
+os = "linux"
+arch = "x86_64"
+source = { github-release = "Samsung/netcoredbg", asset = "netcoredbg-linux-amd64.tar.gz" }
+bin = "netcoredbg/netcoredbg"
+
+[[artifact]]
+os = "macos"
+arch = "aarch64"
+source = { github-release = "Samsung/netcoredbg", asset = "netcoredbg-osx-arm64.zip" }
+bin = "netcoredbg/netcoredbg"
+

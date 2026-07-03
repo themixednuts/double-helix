@@ -1,0 +1,24 @@
+name = "clangd"
+kind = "lsp"
+description = "C and C++ language server"
+homepage = "https://clangd.llvm.org"
+languages = ["c", "cpp"]
+
+[[artifact]]
+os = "windows"
+arch = "x86_64"
+source = { system = "clangd" }
+bin = "clangd"
+
+[[artifact]]
+os = "linux"
+arch = "x86_64"
+source = { system = "clangd" }
+bin = "clangd"
+
+[[artifact]]
+os = "macos"
+arch = "aarch64"
+source = { system = "clangd" }
+bin = "clangd"
+

@@ -1,0 +1,27 @@
+name = "jdtls"
+kind = "lsp"
+description = "Eclipse Java language server"
+homepage = "https://github.com/eclipse-jdtls/eclipse.jdt.ls"
+languages = ["java"]
+
+[version]
+tag-source = "static:1.60.0"
+
+[[artifact]]
+os = "windows"
+arch = "x86_64"
+source = { archive = "https://www.eclipse.org/downloads/download.php?file=/jdtls/milestones/1.60.0/jdt-language-server-1.60.0-202606262232.tar.gz", sha256 = "e94c303d8198f977930803582738771fd18c52c5492878410bf222b1aa81ef1d" }
+bin = "bin/jdtls.bat"
+
+[[artifact]]
+os = "linux"
+arch = "x86_64"
+source = { archive = "https://www.eclipse.org/downloads/download.php?file=/jdtls/milestones/1.60.0/jdt-language-server-1.60.0-202606262232.tar.gz", sha256 = "e94c303d8198f977930803582738771fd18c52c5492878410bf222b1aa81ef1d" }
+bin = "bin/jdtls"
+
+[[artifact]]
+os = "macos"
+arch = "aarch64"
+source = { archive = "https://www.eclipse.org/downloads/download.php?file=/jdtls/milestones/1.60.0/jdt-language-server-1.60.0-202606262232.tar.gz", sha256 = "e94c303d8198f977930803582738771fd18c52c5492878410bf222b1aa81ef1d" }
+bin = "bin/jdtls"
+

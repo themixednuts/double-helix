@@ -2029,6 +2029,12 @@ pub struct ServerCapabilities {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub call_hierarchy_provider: Option<CallHierarchyServerCapability>,
 
+    /// Type hierarchy provider capabilities.
+    ///
+    /// @since 3.17.0
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub type_hierarchy_provider: Option<TypeHierarchyServerCapability>,
+
     /// Semantic tokens server capabilities.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub semantic_tokens_provider: Option<SemanticTokensServerCapabilities>,

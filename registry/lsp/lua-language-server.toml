@@ -1,0 +1,27 @@
+name = "lua-language-server"
+kind = "lsp"
+description = "Lua language server"
+homepage = "https://luals.github.io"
+languages = ["lua"]
+
+[version]
+tag-source = "github:LuaLS/lua-language-server"
+
+[[artifact]]
+os = "windows"
+arch = "x86_64"
+source = { github-release = "LuaLS/lua-language-server", asset = "lua-language-server-{version}-win32-x64.zip" }
+bin = "bin/lua-language-server.exe"
+
+[[artifact]]
+os = "linux"
+arch = "x86_64"
+source = { github-release = "LuaLS/lua-language-server", asset = "lua-language-server-{version}-linux-x64.tar.gz" }
+bin = "bin/lua-language-server"
+
+[[artifact]]
+os = "macos"
+arch = "aarch64"
+source = { github-release = "LuaLS/lua-language-server", asset = "lua-language-server-{version}-darwin-arm64.tar.gz" }
+bin = "bin/lua-language-server"
+

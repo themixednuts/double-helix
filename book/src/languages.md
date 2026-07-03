@@ -210,6 +210,7 @@ The list of supported features is:
 - `document-links`
 - `folding-range`
 - `linked-editing-range`
+- `selection-range`
 - `on-type-formatting`
 - `workspace-command`
 - `document-symbols`
@@ -219,8 +220,10 @@ The list of supported features is:
 - `inlay-hints`
 
 The global `[editor.lsp]` config also controls several language-server features:
-`code-lens`, `folding`, and `document-links` are enabled by default. `on-type-formatting`
-is disabled by default and only runs when enabled and the server advertises the typed
+`code-lens`, `folding`, and `document-links` are enabled by default. `selection-ranges`
+defaults to `fallback`, so `expand_selection` and `shrink_selection` use LSP selection
+ranges only when tree-sitter syntax ranges are unavailable. `on-type-formatting` is
+disabled by default and only runs when enabled and the server advertises the typed
 character as a trigger.
 
 ## Tree-sitter grammar configuration

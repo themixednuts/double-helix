@@ -1,0 +1,27 @@
+name = "zls"
+kind = "lsp"
+description = "Zig language server"
+homepage = "https://zigtools.org/zls"
+languages = ["zig"]
+
+[version]
+tag-source = "github:zigtools/zls"
+
+[[artifact]]
+os = "windows"
+arch = "x86_64"
+source = { github-release = "zigtools/zls", asset = "zls-x86_64-windows.zip" }
+bin = "zls.exe"
+
+[[artifact]]
+os = "linux"
+arch = "x86_64"
+source = { github-release = "zigtools/zls", asset = "zls-x86_64-linux.tar.xz" }
+bin = "zls"
+
+[[artifact]]
+os = "macos"
+arch = "aarch64"
+source = { github-release = "zigtools/zls", asset = "zls-aarch64-macos.tar.xz" }
+bin = "zls"
+

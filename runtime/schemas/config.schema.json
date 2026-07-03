@@ -474,6 +474,7 @@
         "folding": { "type": "boolean" },
         "document-links": { "type": "boolean" },
         "on-type-formatting": { "type": "boolean" },
+        "selection-ranges": { "type": "string", "enum": ["fallback", "disabled"] },
         "color-swatches-string": { "type": "string" },
         "snippets": { "type": "boolean" },
         "goto-reference-include-declaration": { "type": "boolean" }

@@ -348,6 +348,12 @@ pub fn default() -> HashMap<Mode, KeyTrie> {
             "K" => goto_hover,
             "r" => rename_symbol,
             "h" => select_references_to_symbol_under_cursor,
+            "H" => { "Hierarchy"
+                "i" => call_hierarchy_incoming,
+                "o" => call_hierarchy_outgoing,
+                "s" => type_hierarchy_super,
+                "t" => type_hierarchy_sub,
+            },
             "c" => toggle_comments,
             "C" => toggle_block_comments,
             "A-c" => toggle_line_comments,

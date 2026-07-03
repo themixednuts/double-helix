@@ -23,7 +23,7 @@ Open or connect with `:assistant-open` and `:assistant-connect`. With no argumen
 
 ## Panel Keys
 
-The assistant is a docked panel with two focus modes: Input and Messages. The footer hint bar shows the active layer's keys.
+The assistant is a docked panel with two focus modes: Input and Messages. Press `?` in Messages (or the auth card) to show the active layer's keys in the standard info popup; form and auth layers show it automatically when `editor.auto-info` is enabled. The panel footer shows only the layer badge and message position — never key hints.
 
 ### Input
 
@@ -58,6 +58,7 @@ Messages focus is a single transcript list. Cards are entries in that list; they
 | `Esc` | Return to Input |
 | `Ctrl-c` | Cancel pending assistant work |
 | `Ctrl-o` | Open the standard mode/model/config picker |
+| `?` | Toggle the key-help info popup |
 
 ### Card Transients
 

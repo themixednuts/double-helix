@@ -6,15 +6,15 @@ It is not a window, a modal editor, or a collection of nested widgets.
 
 The panel participates in editor layout as chrome beside the editor.
 
-The panel has one header line and one footer hint bar.
+The panel has one header line and one footer status row.
 
 The header shows the active thread title, focus mode, assistant mode, model, token usage, and run state.
 
-The footer is the interaction contract.
+The footer shows status only: the active layer badge and, in Messages, the selection position. It never lists shortcuts.
 
-Every key shown in the footer is active for the current layer.
+Key discoverability uses the editor's standard info popup, generated from the layer binding tables.
 
-Every active panel key that should be discoverable is shown in the footer.
+`?` toggles the popup in Messages and Auth. Form and Auth layers auto-show it on entry when `editor.auto-info` is enabled. `?` stays typable in form fields and the input box, so those layers do not bind it.
 
 The panel has exactly two focus modes.
 
@@ -62,7 +62,7 @@ Tool calls, diffs, terminals, thoughts, review summaries, and subagents do not o
 
 A selected card can expose extra keys.
 
-Those extra keys appear in the footer while that card is selected.
+Those extra keys appear in the info popup while that card is selected.
 
 Review cards expose accept and reject keys.
 
@@ -106,6 +106,6 @@ Input insert Esc returns to Input normal mode.
 
 Input normal Esc follows the editor's normal focused-component convention.
 
-The hint bar is tested against the binding tables.
+The info popup is generated from the binding tables and tested against them.
 
-If hints and dispatch diverge, it is a bug.
+If help and dispatch diverge, it is a bug.

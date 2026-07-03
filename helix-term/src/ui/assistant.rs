@@ -4,7 +4,7 @@ use crate::ui::animation::{
     Animation, AnimationDirection, AnimationFillMode, AnimationIterationCount, AnimationSpec,
     AnimationTimingFunction,
 };
-use crate::widgets::{hint_bar, schedule_redraw_at, Hint, HintBarStyle, Marquee};
+use crate::widgets::{schedule_redraw_at, Marquee};
 use crate::widgets::{
     message_list, Message, MessageAccessoryAlign, MessageAlign, MessageCorners, MessageCursor,
     MessageListState, MessageStyle, Spinner,
@@ -70,6 +70,8 @@ pub struct AssistantPanel {
     auth_selected: usize,
     auth_transient: bool,
     pending_subagent_jump: Option<PendingSubagentJump>,
+    /// Layer whose key help is currently shown via `editor.autoinfo`.
+    shown_help: Option<AssistantLayer>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,6 +116,7 @@ enum AssistantAction {
     TransientActivatePrevious,
     TransientActivateNext,
     TransientBackspace,
+    ToggleHelp,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -373,6 +376,11 @@ const MESSAGE_BINDINGS: &[AssistantBinding] = &[
         AssistantAction::CancelRun,
         Some(("C-c", "cancel", 70)),
     ),
+    AssistantBinding::new(
+        BindingKey::new(BindingCode::Char('?')),
+        AssistantAction::ToggleHelp,
+        Some(("?", "help", 10)),
+    ),
 ];
 
 const ELICITATION_BINDINGS: &[AssistantBinding] = &[
@@ -473,6 +481,11 @@ const AUTH_BINDINGS: &[AssistantBinding] = &[
         BindingKey::new(BindingCode::Down),
         AssistantAction::TransientNext,
         None,
+    ),
+    AssistantBinding::new(
+        BindingKey::new(BindingCode::Char('?')),
+        AssistantAction::ToggleHelp,
+        Some(("?", "help", 10)),
     ),
 ];
 
@@ -829,6 +842,7 @@ impl AssistantPanel {
             auth_selected: 0,
             auth_transient: false,
             pending_subagent_jump: None,
+            shown_help: None,
         }
     }
 
@@ -917,17 +931,16 @@ impl AssistantPanel {
             .find(|binding| binding.key.matches(key))
     }
 
-    fn layer_hints(
+    /// Key help for a layer: (key, label) pairs, highest priority first.
+    /// Single source: the layer binding tables — this feeds the info popup.
+    fn layer_help_entries(
         &self,
         model: &helix_view::model::AssistantModel,
         layer: AssistantLayer,
-    ) -> Vec<Hint<'static>> {
-        let mut hints = Self::bindings_for_layer(layer)
+    ) -> Vec<(&'static str, &'static str)> {
+        let mut entries = Self::bindings_for_layer(layer)
             .iter()
-            .filter_map(|binding| {
-                let (key, label, priority) = binding.hint?;
-                Some(Hint::new(key, label).priority(priority))
-            })
+            .filter_map(|binding| binding.hint)
             .collect::<Vec<_>>();
 
         if layer == AssistantLayer::Messages {
@@ -941,11 +954,65 @@ impl AssistantPanel {
                     )
                 });
             if !review_selected {
-                hints.retain(|hint| !matches!(hint.key.as_ref(), "a/x" | "A/X" | "R"));
+                entries.retain(|(key, _, _)| !matches!(*key, "a/x" | "A/X" | "R"));
             }
         }
 
-        hints
+        entries.sort_by(|a, b| b.2.cmp(&a.2));
+        entries
+            .into_iter()
+            .map(|(key, label, _)| (key, label))
+            .collect()
+    }
+
+    const fn layer_title(layer: AssistantLayer) -> &'static str {
+        match layer {
+            AssistantLayer::Input => "Assistant: input",
+            AssistantLayer::Messages => "Assistant: messages",
+            AssistantLayer::Elicitation => "Assistant: form",
+            AssistantLayer::Auth => "Assistant: auth",
+        }
+    }
+
+    fn layer_info(
+        &self,
+        model: &helix_view::model::AssistantModel,
+        layer: AssistantLayer,
+    ) -> helix_view::info::Info {
+        let entries = self.layer_help_entries(model, layer);
+        helix_view::info::Info::new(Self::layer_title(layer), &entries)
+    }
+
+    /// Reconcile the help popup with the active layer. Transient layers
+    /// (form/auth) auto-show their keys (gated by `editor.auto-info`);
+    /// other layers only show help while `?`-toggled, and any layer
+    /// change dismisses a stale popup.
+    fn sync_help(&mut self, editor: &mut Editor) {
+        let layer = self.active_layer(editor);
+        if let Some(shown) = self.shown_help {
+            if shown != layer || !self.focused {
+                self.shown_help = None;
+                editor.autoinfo = None;
+            }
+        }
+        let transient = matches!(layer, AssistantLayer::Elicitation | AssistantLayer::Auth);
+        if self.focused && transient && self.shown_help.is_none() && editor.config().auto_info {
+            let info = self.layer_info(&Self::assistant_model(editor), layer);
+            editor.autoinfo = Some(info);
+            self.shown_help = Some(layer);
+        }
+    }
+
+    fn toggle_help(&mut self, editor: &mut Editor) {
+        let layer = self.active_layer(editor);
+        if self.shown_help == Some(layer) {
+            self.shown_help = None;
+            editor.autoinfo = None;
+        } else {
+            let info = self.layer_info(&Self::assistant_model(editor), layer);
+            editor.autoinfo = Some(info);
+            self.shown_help = Some(layer);
+        }
     }
 
     fn restart_message_focus_animation(&mut self, editor: &Editor) {
@@ -2476,19 +2543,55 @@ impl AssistantPanel {
                 tui::ratatui::to_ratatui_rect(bar_area),
                 tui::ratatui::to_ratatui_style(bar_style),
             );
+            // Status only — key help lives in the info popup (`?`), per the
+            // editor-wide rule that statuslines never list shortcuts.
             let theme = cx.assistant_theme();
-            let hints = self.layer_hints(&model, self.active_layer_for_model(&model));
-            hint_bar(
-                surface,
-                bar_area,
-                &hints,
-                HintBarStyle {
-                    background: bar_style,
-                    key: theme.get("ui.text.focus").add_modifier(Modifier::BOLD),
-                    label: theme.get("ui.text.inactive"),
-                    separator: bar_style,
-                },
+            let layer = self.active_layer_for_model(&model);
+            let badge = match layer {
+                AssistantLayer::Input => "INPUT",
+                AssistantLayer::Messages => "MESSAGES",
+                AssistantLayer::Elicitation => "FORM",
+                AssistantLayer::Auth => "AUTH",
+            };
+            let badge_style = if self.focused {
+                theme.get("ui.text.focus").add_modifier(Modifier::BOLD)
+            } else {
+                theme.get("ui.text.inactive")
+            };
+            surface.set_stringn(
+                bar_area.x + 1,
+                bar_area.y,
+                badge,
+                bar_area.width.saturating_sub(2) as usize,
+                tui::ratatui::to_ratatui_style(badge_style.patch(bar_style)),
             );
+            if layer == AssistantLayer::Messages {
+                let total = self.output.content().len();
+                if total > 0 {
+                    let position = model
+                        .selected_entry_id()
+                        .and_then(|id| {
+                            self.output
+                                .content()
+                                .iter()
+                                .position(|entry| entry.id == id)
+                        })
+                        .map(|idx| format!("{}/{}", idx + 1, total))
+                        .unwrap_or_else(|| total.to_string());
+                    let width = UnicodeWidthStr::width(position.as_str()) as u16;
+                    if bar_area.width > width + 2 {
+                        surface.set_stringn(
+                            bar_area.x + bar_area.width - width - 1,
+                            bar_area.y,
+                            &position,
+                            width as usize,
+                            tui::ratatui::to_ratatui_style(
+                                theme.get("ui.text.inactive").patch(bar_style),
+                            ),
+                        );
+                    }
+                }
+            }
         }
 
         // ── Error line ──
@@ -3388,6 +3491,7 @@ impl AssistantPanel {
                 self.open_mode_config_picker(cx);
             }
             AssistantAction::CancelRun => self.cancel_active_run(cx),
+            AssistantAction::ToggleHelp => self.toggle_help(cx.editor),
             _ => {}
         }
 
@@ -3466,6 +3570,7 @@ impl AssistantPanel {
                 }
             }
             AssistantAction::CancelRun => self.cancel_active_run(cx),
+            AssistantAction::ToggleHelp => self.toggle_help(cx.editor),
             _ => {}
         }
         EventResult::Consumed(None)
@@ -3588,6 +3693,9 @@ impl Component for AssistantPanel {
 
         // When unfocused, pass all events through to the editor.
         if !self.focused {
+            if self.shown_help.take().is_some() {
+                cx.editor.autoinfo = None;
+            }
             return EventResult::Ignored(None);
         }
 
@@ -3618,15 +3726,23 @@ impl Component for AssistantPanel {
             match layer {
                 AssistantLayer::Input => {
                     if let Some(result) = self.execute_input_binding(binding.action, cx) {
+                        self.sync_help(cx.editor);
                         return result;
                     }
                 }
-                AssistantLayer::Messages => return self.execute_message_action(binding.action, cx),
+                AssistantLayer::Messages => {
+                    let result = self.execute_message_action(binding.action, cx);
+                    self.sync_help(cx.editor);
+                    return result;
+                }
                 AssistantLayer::Elicitation | AssistantLayer::Auth => {
-                    return self.execute_transient_action(layer, binding.action, cx);
+                    let result = self.execute_transient_action(layer, binding.action, cx);
+                    self.sync_help(cx.editor);
+                    return result;
                 }
             }
         }
+        self.sync_help(cx.editor);
 
         if layer == AssistantLayer::Elicitation {
             if let Some(form) = &mut self.elicitation_form {
@@ -3940,6 +4056,20 @@ mod tests {
                 assert_eq!(dispatched.action, binding.action);
             }
         }
+    }
+
+    #[test]
+    fn help_toggle_bound_where_typing_cannot_shadow_it() {
+        let has_toggle = |layer| {
+            AssistantPanel::bindings_for_layer(layer)
+                .iter()
+                .any(|binding| binding.action == AssistantAction::ToggleHelp)
+        };
+        assert!(has_toggle(AssistantLayer::Messages));
+        assert!(has_toggle(AssistantLayer::Auth));
+        // `?` must stay typable in form fields and the input box.
+        assert!(!has_toggle(AssistantLayer::Elicitation));
+        assert!(!has_toggle(AssistantLayer::Input));
     }
 
     #[test]

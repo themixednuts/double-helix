@@ -8,11 +8,11 @@ pub mod resolve;
 pub mod spec;
 pub mod store;
 
-pub use config::{NativeInstallPolicy, PkgConfig, Policy};
+pub use config::{NativeInstallPolicy, PkgConfig, Policy, RegistrySource};
 pub use lock::{Lock, LockedPackage, Manifest};
 pub use ops::{
-    Backend, BackendInstall, DoctorReport, OpEvent, Ops, PluginBackend, PluginBackendTransport,
-    ResolvedPackage,
+    Backend, BackendInstall, DoctorReport, OpEvent, Ops, PackageChange, PluginBackend,
+    PluginBackendTransport, RegistryUpdate, ResolvedPackage, UpdatePlan,
 };
 pub use registry::Registry;
 pub use spec::{Artifact, NativeManager, NativeSource, PackageSpec, PkgKind, Source};

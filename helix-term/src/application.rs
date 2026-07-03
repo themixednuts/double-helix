@@ -105,6 +105,17 @@ struct LoopState {
     shutdown_rx: Option<tokio::sync::mpsc::UnboundedReceiver<()>>,
 }
 
+impl LoopState {
+    fn sync_editor_streams(&mut self, editor: &mut Editor) {
+        for incoming in editor.take_lsp_incoming() {
+            self.lsp_incoming.push(incoming);
+        }
+        for incoming in editor.take_debugger_incoming() {
+            self.debugger_incoming.push(incoming);
+        }
+    }
+}
+
 struct ExitState {
     tasks: ExitTaskSet,
     work: Work,
@@ -817,6 +828,7 @@ impl Application {
             if self.editor.should_close() {
                 return false;
             }
+            self.loop_state.sync_editor_streams(&mut self.editor);
 
             use futures_util::future::{pending, Either};
             use futures_util::StreamExt;
@@ -983,5 +995,49 @@ impl ui::menu::Item for lsp_types::MessageActionItem {
     type Data = ();
     fn format(&self, _data: &Self::Data) -> ui::menu::Row<'_> {
         self.title.as_str().into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use helix_view::graphics::Rect;
+
+    #[cfg(not(windows))]
+    fn empty_signals() -> Signals {
+        Signals::new([signal::SIGTERM]).expect("signals")
+    }
+
+    #[cfg(windows)]
+    fn empty_signals() -> Signals {
+        futures_util::stream::empty()
+    }
+
+    #[test]
+    fn loop_state_picks_up_streams_registered_after_initial_take() {
+        let tokio = tokio::runtime::Runtime::new().expect("runtime");
+        let _guard = tokio.enter();
+        let runtime = Runtime::new(tokio.handle().clone());
+        let mut editor = EditorBuilder::new(Rect::new(0, 0, 80, 24), runtime).build();
+
+        let mut loop_state = LoopState {
+            signals: empty_signals(),
+            lsp_incoming: editor.take_lsp_incoming(),
+            debugger_incoming: editor.take_debugger_incoming(),
+            shutdown_rx: None,
+        };
+
+        let (_lsp_tx, lsp_rx) = helix_runtime::channel(1);
+        editor.language_servers.incoming.push(lsp_rx);
+        let (_dap_tx, dap_rx) = helix_runtime::channel(1);
+        editor.debug_adapters.incoming.push(dap_rx);
+
+        assert_eq!(loop_state.lsp_incoming.len(), 0);
+        assert_eq!(loop_state.debugger_incoming.len(), 0);
+
+        loop_state.sync_editor_streams(&mut editor);
+
+        assert_eq!(loop_state.lsp_incoming.len(), 1);
+        assert_eq!(loop_state.debugger_incoming.len(), 1);
     }
 }

@@ -2,6 +2,7 @@ name = "codelldb"
 kind = "dap"
 description = "LLDB Debug Adapter Protocol adapter"
 homepage = "https://github.com/vadimcn/codelldb"
+aliases = ["lldb"]
 languages = ["c", "cpp", "rust", "zig"]
 
 [version]
@@ -24,4 +25,3 @@ os = "macos"
 arch = "aarch64"
 source = { github-release = "vadimcn/codelldb", asset = "codelldb-darwin-arm64.vsix" }
 bin = "extension/adapter/codelldb"
-

@@ -1,3 +1,29 @@
+//! Fuzzy picker component.
+//!
+//! # Custom key handlers and the confirmation seam
+//!
+//! Pickers can register component-local key bindings via [`PickerKeyHandlers`]
+//! and [`Picker::with_key_handlers`]. Two kinds of actions are supported:
+//!
+//! - [`PickerKeyHandlers::insert`] registers an action that runs immediately
+//!   on the key press (with the currently selected item).
+//! - [`PickerKeyHandlers::insert_confirmed`] registers an action that requires
+//!   user confirmation. The handler runs at keypress time with the selected
+//!   item and returns an optional [`PickerConfirmation`]: the message to show
+//!   and the deferred action to run once the user confirms. Returning `None`
+//!   skips the prompt entirely (e.g. the action does not apply to the selected
+//!   item); the handler may set a status message itself in that case.
+//!
+//! Confirmation reuses the standard [`Prompt`] y/n affordance — the same
+//! interaction as the file explorer delete prompt: the picker pushes a prompt
+//! reading `"<message> (y/n): "`, typing `y` and pressing Enter executes the
+//! deferred action, any other input (or Esc) cancels it. Because the deferred
+//! action is built at keypress time, handlers clone exactly the item state
+//! they need and no `Clone` bound is imposed on picker items.
+//!
+//! The `:pkg` picker's `d` (remove) action is the reference adopter; other
+//! pickers can opt in by switching `insert` to `insert_confirmed`.
+
 mod handlers;
 mod query;
 
@@ -362,6 +388,29 @@ pub const ID: &str = "picker";
 
 pub const MIN_AREA_WIDTH_FOR_PREVIEW: u16 = 72;
 pub const MIN_AREA_HEIGHT_FOR_PREVIEW: u16 = 24;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PickerPreviewLayout {
+    Hidden,
+    Stacked,
+    SideBySide,
+}
+
+fn picker_preview_layout(show_preview: bool, has_preview: bool, area: Rect) -> PickerPreviewLayout {
+    if !show_preview
+        || !has_preview
+        || area.width < MIN_AREA_WIDTH_FOR_PREVIEW
+        || area.height < MIN_AREA_HEIGHT_FOR_PREVIEW
+    {
+        return PickerPreviewLayout::Hidden;
+    }
+
+    if area.width > MIN_AREA_WIDTH_FOR_PREVIEW {
+        PickerPreviewLayout::SideBySide
+    } else {
+        PickerPreviewLayout::Stacked
+    }
+}
 /// Biggest file size to preview in bytes
 pub const MAX_FILE_SIZE_FOR_PREVIEW: u64 = 10 * 1024 * 1024;
 
@@ -826,7 +875,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             list_region: ContentRegion::default(),
             nav: helix_view::list_nav::ListNav::new(),
             preview_cache: HashMap::new(),
-            custom_key_handlers: HashMap::new(),
+            custom_key_handlers: PickerKeyHandlers::new(),
             file_fn: None,
             preview_highlight_handler: PreviewHighlightHandler::new(
                 instance_id,
@@ -1619,13 +1668,20 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             return EventResult::Ignored(None);
         }
 
-        if let (Some(callback), Some(selected)) =
-            (self.custom_key_handlers.get(event), self.selection())
-        {
-            callback(cx, selected, Arc::clone(&self.editor_data), self.cursor);
-            EventResult::Consumed(None)
-        } else {
-            EventResult::Ignored(None)
+        match (self.custom_key_handlers.get(event), self.selection()) {
+            (Some(PickerKeyAction::Immediate(callback)), Some(selected)) => {
+                callback(cx, selected, Arc::clone(&self.editor_data), self.cursor);
+                EventResult::Consumed(None)
+            }
+            (Some(PickerKeyAction::Confirmed(handler)), Some(selected)) => {
+                // Confirmation seam: build the deferred action from the
+                // selected item now, then hand the standard y/n prompt to the
+                // compositor. See the module docs.
+                let confirmation =
+                    handler(cx, selected, Arc::clone(&self.editor_data), self.cursor);
+                EventResult::Consumed(confirmation.map(PickerConfirmation::into_post_action))
+            }
+            _ => EventResult::Ignored(None),
         }
     }
 
@@ -2393,22 +2449,18 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
     {
         use helix_view::layout::{split_horizontal, split_vertical, Size};
 
-        let render_preview = self.show_preview
-            && self.file_fn.is_some()
-            && area.width >= MIN_AREA_WIDTH_FOR_PREVIEW
-            && area.height >= MIN_AREA_HEIGHT_FOR_PREVIEW;
-        let stack_vertically = area.width / 2 < MIN_AREA_WIDTH_FOR_PREVIEW;
+        let preview_layout = picker_preview_layout(self.show_preview, self.file_fn.is_some(), area);
 
-        let (picker_area, preview_area) = if render_preview {
-            if stack_vertically {
+        let (picker_area, preview_area) = match preview_layout {
+            PickerPreviewLayout::Stacked => {
                 let areas = split_vertical(area, &[Size::Percent(33), Size::Fill]);
                 (areas[0], Some(areas[1]))
-            } else {
+            }
+            PickerPreviewLayout::SideBySide => {
                 let areas = split_horizontal(area, &[Size::Percent(50), Size::Fill]);
                 (areas[0], Some(areas[1]))
             }
-        } else {
-            (area, None)
+            PickerPreviewLayout::Hidden => (area, None),
         };
 
         // Update completion_height from the actual picker area BEFORE syncing
@@ -2420,7 +2472,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             trace.log(
                 "render_layout",
                 format_args!(
-                    "frame={} area={}x{}+{},{} picker_area={}x{}+{},{} preview_area={} render_preview={} stack_vertically={} completion_height={} prompt={:?}",
+                    "frame={} area={}x{}+{},{} picker_area={}x{}+{},{} preview_area={} preview_layout={:?} completion_height={} prompt={:?}",
                     self.render_count,
                     area.width,
                     area.height,
@@ -2433,8 +2485,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
                     preview_area
                         .map(|area| format!("{}x{}+{},{}", area.width, area.height, area.x, area.y))
                         .unwrap_or_else(|| "none".to_string()),
-                    render_preview,
-                    stack_vertically,
+                    preview_layout,
                     self.completion_height,
                     self.prompt.line(),
                 ),
@@ -2501,9 +2552,11 @@ impl<I: 'static + Send + Sync, D: 'static + Send + Sync> Component for Picker<I,
             EventResult::Consumed(Some(action))
         };
 
-        // handle custom keybindings, if exist
-        if let EventResult::Consumed(_) = self.custom_key_event_handler(&key_event, ctx) {
-            return EventResult::Consumed(None);
+        // handle custom keybindings, if exist (a confirmed action surfaces its
+        // y/n prompt as a `PushLayer` post action which must reach the
+        // compositor, so the result is propagated rather than flattened)
+        if let EventResult::Consumed(action) = self.custom_key_event_handler(&key_event, ctx) {
+            return EventResult::Consumed(action);
         }
 
         let Some(binding) = picker_binding_for_key(key_event) else {
@@ -2614,19 +2667,12 @@ impl<I: 'static + Send + Sync, D: 'static + Send + Sync> Component for Picker<I,
             crate::widgets::inset(area, 1, 1)
         };
 
-        // prompt area
-        let render_preview = self.show_preview
-            && self.file_fn.is_some()
-            && area.width >= MIN_AREA_WIDTH_FOR_PREVIEW
-            && area.height >= MIN_AREA_HEIGHT_FOR_PREVIEW;
-        let stack_vertically = area.width / 2 < MIN_AREA_WIDTH_FOR_PREVIEW;
-
-        let picker_width = if render_preview && !stack_vertically {
-            inner.width / 2
-        } else {
-            inner.width
-        };
-        let area = inner.clip_left(1).with_height(1).with_width(picker_width);
+        let picker_width =
+            match picker_preview_layout(self.show_preview, self.file_fn.is_some(), area) {
+                PickerPreviewLayout::SideBySide => inner.width / 2,
+                PickerPreviewLayout::Stacked | PickerPreviewLayout::Hidden => inner.width,
+            };
+        let area = inner.clip_left(2).with_height(1).with_width(picker_width);
 
         self.prompt.cursor(area, editor)
     }
@@ -2679,13 +2725,186 @@ impl<T: 'static + Send + Sync, D> Drop for Picker<T, D> {
 
 type PickerCallback<T> = Box<dyn Fn(&mut Context, &T, Action) + Send>;
 pub type PickerKeyHandler<T, D> = Box<dyn Fn(&mut Context, &T, Arc<D>, u32) + Send + 'static>;
-pub type PickerKeyHandlers<T, D> = HashMap<KeyEvent, PickerKeyHandler<T, D>>;
+
+/// Handler for a key action that requires confirmation. Runs at keypress time
+/// with the selected item; returns the confirmation to show, or `None` to skip
+/// the prompt (the handler may set a status message itself in that case).
+pub type PickerConfirmHandler<T, D> =
+    Box<dyn Fn(&mut Context, &T, Arc<D>, u32) -> Option<PickerConfirmation> + Send + 'static>;
+
+/// A pending confirmed picker action: the message rendered in the standard
+/// y/n prompt plus the deferred action to run when the user confirms.
+///
+/// Built by [`PickerConfirmHandler`]s at keypress time so the deferred action
+/// captures exactly the (cloned) item state it needs; see the module docs for
+/// the full seam contract.
+pub struct PickerConfirmation {
+    message: String,
+    on_confirm: Box<dyn FnOnce(&mut Context) + Send>,
+}
+
+impl PickerConfirmation {
+    pub fn new(
+        message: impl Into<String>,
+        on_confirm: impl FnOnce(&mut Context) + Send + 'static,
+    ) -> Self {
+        Self {
+            message: message.into(),
+            on_confirm: Box::new(on_confirm),
+        }
+    }
+
+    /// Render the confirmation as the standard y/n [`Prompt`] affordance,
+    /// matching the file explorer delete interaction: `y` + Enter executes
+    /// the deferred action, any other input (or Esc) cancels.
+    pub(crate) fn into_post_action(self) -> compositor::PostAction {
+        let Self {
+            message,
+            on_confirm,
+        } = self;
+        let mut on_confirm = Some(on_confirm);
+        let prompt = Prompt::new(
+            format!("{message} (y/n): ").into(),
+            None,
+            ui::completers::none,
+            move |cx: &mut Context, input: &str, event: PromptEvent| {
+                if event != PromptEvent::Validate {
+                    return;
+                }
+
+                if input != "y" {
+                    cx.editor.clear_status();
+                    return;
+                }
+
+                if let Some(action) = on_confirm.take() {
+                    action(cx);
+                }
+            },
+        );
+        compositor::PostAction::PushLayer(Box::new(prompt))
+    }
+}
+
+enum PickerKeyAction<T, D> {
+    Immediate(PickerKeyHandler<T, D>),
+    Confirmed(PickerConfirmHandler<T, D>),
+}
+
+/// Component-local key bindings for picker actions (see module docs).
+pub struct PickerKeyHandlers<T, D>(HashMap<KeyEvent, PickerKeyAction<T, D>>);
+
+impl<T, D> PickerKeyHandlers<T, D> {
+    pub fn new() -> Self {
+        Self(HashMap::new())
+    }
+
+    /// Register an action that runs immediately when `key` is pressed.
+    pub fn insert(&mut self, key: KeyEvent, handler: PickerKeyHandler<T, D>) {
+        self.0.insert(key, PickerKeyAction::Immediate(handler));
+    }
+
+    /// Register an action that asks for y/n confirmation before running.
+    pub fn insert_confirmed(&mut self, key: KeyEvent, handler: PickerConfirmHandler<T, D>) {
+        self.0.insert(key, PickerKeyAction::Confirmed(handler));
+    }
+
+    fn get(&self, key: &KeyEvent) -> Option<&PickerKeyAction<T, D>> {
+        self.0.get(key)
+    }
+}
+
+impl<T, D> Default for PickerKeyHandlers<T, D> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 pub type PickerSelectionHandler<T, D> =
     Box<dyn Fn(&mut Context, Option<&T>, Arc<D>, u32) + Send + 'static>;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compositor::PostAction;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    fn with_test_context(test: impl FnOnce(&mut Context<'_>)) {
+        let runtime = helix_runtime::test::runtime();
+        let mut editor = helix_view::editor::EditorBuilder::new(
+            helix_view::graphics::Rect::new(0, 0, 80, 24),
+            runtime.clone(),
+        )
+        .build();
+        let (ingress, _rx) = crate::runtime::RuntimeIngress::channel(runtime.work().clone());
+        let (plugin_events, _plugin_events_rx) = helix_runtime::channel(1);
+        let idle_reset = crate::runtime::IdleResetGate::new().handle();
+        let redraw = editor.redraw_handle();
+        let notifier = crate::handlers::local::Notifier {
+            redraw: redraw.clone(),
+            plugin_events,
+        };
+        let mut exit_tasks = crate::runtime::ExitTaskSet::default();
+        let exit_task_work = editor.work();
+        let mut cx = Context::new(
+            &mut editor,
+            &mut exit_tasks,
+            exit_task_work,
+            notifier,
+            ingress,
+            idle_reset,
+            None,
+        );
+        test(&mut cx);
+    }
+
+    fn key_event(code: KeyCode) -> Event {
+        Event::Key(KeyEvent {
+            code,
+            modifiers: KeyModifiers::NONE,
+        })
+    }
+
+    #[tokio::test]
+    async fn picker_confirmation_confirm_runs_deferred_action() {
+        let ran = Arc::new(AtomicBool::new(false));
+        let ran_for_action = ran.clone();
+        let confirmation = PickerConfirmation::new("Run action?", move |_cx| {
+            ran_for_action.store(true, Ordering::Relaxed);
+        });
+
+        let action = confirmation.into_post_action();
+        let PostAction::PushLayer(mut prompt) = action else {
+            panic!("confirmation should push a prompt layer");
+        };
+
+        with_test_context(|cx| {
+            prompt.handle_event(&key_event(KeyCode::Char('y')), cx);
+            prompt.handle_event(&key_event(KeyCode::Enter), cx);
+        });
+
+        assert!(ran.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn picker_confirmation_cancel_skips_deferred_action() {
+        let ran = Arc::new(AtomicBool::new(false));
+        let ran_for_action = ran.clone();
+        let confirmation = PickerConfirmation::new("Run action?", move |_cx| {
+            ran_for_action.store(true, Ordering::Relaxed);
+        });
+
+        let action = confirmation.into_post_action();
+        let PostAction::PushLayer(mut prompt) = action else {
+            panic!("confirmation should push a prompt layer");
+        };
+
+        with_test_context(|cx| {
+            prompt.handle_event(&key_event(KeyCode::Char('n')), cx);
+            prompt.handle_event(&key_event(KeyCode::Enter), cx);
+        });
+
+        assert!(!ran.load(Ordering::Relaxed));
+    }
 
     #[test]
     fn picker_bindings_all_have_hint_policy() {
@@ -2704,5 +2923,68 @@ mod tests {
                 Some(binding.action)
             );
         }
+    }
+
+    #[test]
+    fn picker_preview_layout_uses_side_by_side_once_window_is_wide_enough() {
+        assert_eq!(
+            picker_preview_layout(true, true, Rect::new(0, 0, 120, 30)),
+            PickerPreviewLayout::SideBySide
+        );
+    }
+
+    #[test]
+    fn picker_preview_layout_keeps_stacked_fallback_at_minimum_width() {
+        assert_eq!(
+            picker_preview_layout(
+                true,
+                true,
+                Rect::new(
+                    0,
+                    0,
+                    MIN_AREA_WIDTH_FOR_PREVIEW,
+                    MIN_AREA_HEIGHT_FOR_PREVIEW
+                ),
+            ),
+            PickerPreviewLayout::Stacked
+        );
+    }
+
+    #[test]
+    fn picker_preview_layout_hides_preview_when_space_or_preview_is_missing() {
+        assert_eq!(
+            picker_preview_layout(
+                true,
+                true,
+                Rect::new(
+                    0,
+                    0,
+                    MIN_AREA_WIDTH_FOR_PREVIEW.saturating_sub(1),
+                    MIN_AREA_HEIGHT_FOR_PREVIEW,
+                ),
+            ),
+            PickerPreviewLayout::Hidden
+        );
+        assert_eq!(
+            picker_preview_layout(
+                true,
+                true,
+                Rect::new(
+                    0,
+                    0,
+                    MIN_AREA_WIDTH_FOR_PREVIEW,
+                    MIN_AREA_HEIGHT_FOR_PREVIEW.saturating_sub(1),
+                ),
+            ),
+            PickerPreviewLayout::Hidden
+        );
+        assert_eq!(
+            picker_preview_layout(false, true, Rect::new(0, 0, 120, 30)),
+            PickerPreviewLayout::Hidden
+        );
+        assert_eq!(
+            picker_preview_layout(true, false, Rect::new(0, 0, 120, 30)),
+            PickerPreviewLayout::Hidden
+        );
     }
 }

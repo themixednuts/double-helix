@@ -142,3 +142,27 @@ The new `semantic-token-overlay` fixture generates content on demand and install
 - `render_view` converts the existing viewport byte range to a char range and passes it to semantic-token overlay construction.
 - `hx-bench` gained the generated `semantic-token-overlay` fixture.
 - Package-manager UI compile fixes were required to run the bench on the current tree: re-export `PkgConfig`, return the correct ratatui span type for package statusline rendering, derive `Hash` for package statusline cache keys, route `:pkg` through typed layer ingress, and fix a language-server borrow/name mismatch.
+
+## Loose End: 10MB Single-Line Cached Frames
+
+Date: 2026-07-03
+
+### Methodology
+
+Measured the documented loose end with the same generated fixture on Windows:
+
+- `HELIX_LOG_LEVEL=error CARGO_TARGET_DIR=C:\Users\jonfo\AppData\Local\Temp\helix-fork-target-task cargo run --quiet -p helix-term --bin hx-bench --features "integration bench" --release -- --fixture giant-lines-render --lines 1 --bytes-per-line 10000000 --renders 5 --width 120 --height 50`
+
+### Results
+
+| Run | First render | Cached frames | Cached avg | Finding |
+| --- | ---: | ---: | ---: | --- |
+| 1 | 14,824 us | 1,952 / 1,350 / 1,280 / 1,318 us | 1,475 us | Under 2ms after build settled. |
+| 2 | 420,911 us | 7,024 / 12,861 / 4,458 / 4,425 us | 7,192 us | Noisy host run; cached phases show statusline/compositor/frame composition, not `render_document`. |
+| 3 | 36,127 us | 4,504 / 4,040 / 4,119 / 4,987 us | 4,413 us | Cached phases remain pure cached-cell composition. |
+
+### Finding
+
+No render-path code change was kept. Current cached frames do not redo 10MB-line text work: after the first render, event logs omit `render_document/main_loop` and show only cached-frame phases such as `editor_render/final_total_ratatui`, `compositor_layer/base_batch`, `render/compositor_render_only`, and `render/compositor_total`. The first render still records bounded text work (`formatter_next_calls=114`, `skip_right_eof_fast_paths=1`, and 9,999,888 offscreen chars skipped).
+
+The remaining >2ms samples are therefore the ratatui cell-buffer/statusline/compositor/flush floor on this Windows run, not repeated grapheme scanning, style-span assembly, or full-line cursor/selection math. Hitting a hard <2ms target would require a broader retained-frame/composition change rather than another long-line text-render cache.

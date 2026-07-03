@@ -1,6 +1,6 @@
 use std::{
     collections::BTreeMap,
-    fs,
+    fs::{self, File, OpenOptions},
     io::Read,
     path::{Path, PathBuf},
 };
@@ -48,6 +48,14 @@ impl Store {
         self.root.join("bin")
     }
 
+    pub fn staging_dir(&self) -> PathBuf {
+        self.root.join("staging")
+    }
+
+    pub fn registry_dir(&self) -> PathBuf {
+        self.root.join("registries")
+    }
+
     pub fn runtime_dir(&self, name: &str) -> PathBuf {
         self.root.join("runtimes").join(name)
     }
@@ -62,6 +70,8 @@ impl Store {
         for path in [
             self.root.join("store"),
             self.bin_dir(),
+            self.staging_dir(),
+            self.registry_dir(),
             self.root.join("receipts"),
             self.runtime_dir("node"),
             self.runtime_dir("py"),
@@ -157,6 +167,38 @@ impl Store {
             }
         }
         Ok(())
+    }
+
+    pub(crate) fn acquire_package_lock(&self, kind: PkgKind, name: &str) -> Result<PackageLock> {
+        let dir = self.staging_dir();
+        fs::create_dir_all(&dir).map_err(|source| io(dir.display(), source))?;
+        let path = dir.join(format!("{}-{name}.lock", kind.as_str()));
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => Ok(PackageLock {
+                path,
+                file: Some(file),
+            }),
+            Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
+                Err(Error::Message(format!(
+                    "package operation already running for {kind} {name}"
+                )))
+            }
+            Err(source) => Err(io(path.display(), source)),
+        }
+    }
+}
+
+#[derive(Debug)]
+#[must_use]
+pub(crate) struct PackageLock {
+    path: PathBuf,
+    file: Option<File>,
+}
+
+impl Drop for PackageLock {
+    fn drop(&mut self) {
+        drop(self.file.take());
+        let _ = fs::remove_file(&self.path);
     }
 }
 
@@ -405,5 +447,20 @@ mod tests {
         assert_eq!(read.native_id.as_deref(), Some("Rustlang.rust-analyzer"));
         store.remove(PkgKind::Lsp, "rust-analyzer").unwrap();
         assert!(store.bin_dir().exists());
+    }
+
+    #[test]
+    fn package_lock_rejects_concurrent_mutation_and_releases_on_drop() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path());
+
+        let lock = store.acquire_package_lock(PkgKind::Lsp, "demo").unwrap();
+        let err = store
+            .acquire_package_lock(PkgKind::Lsp, "demo")
+            .unwrap_err();
+        assert!(err.to_string().contains("already running"));
+
+        drop(lock);
+        let _lock = store.acquire_package_lock(PkgKind::Lsp, "demo").unwrap();
     }
 }

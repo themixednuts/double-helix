@@ -78,6 +78,7 @@ impl FileExplorerPanel {
         let refresh_start = Instant::now();
         let original_root = self.root.clone();
         let original_selection = self.selection;
+        let original_selection_path = self.rows.get(self.selection).map(|row| row.path.clone());
         let original_rows = self.rows.len();
         let original_cache_entries = self.children_cache.len();
         let mut root_changed = false;
@@ -155,7 +156,8 @@ impl FileExplorerPanel {
                 build.rows.len()
             );
         }
-        self.rows = rows;
+        self.all_rows = rows;
+        self.apply_search_filter();
         let build_us = build_start.elapsed().as_micros();
 
         let selection_start = Instant::now();
@@ -166,8 +168,12 @@ impl FileExplorerPanel {
             let followed_selection = followed_file
                 .as_deref()
                 .and_then(|path| self.selection_for_path(path));
+            let restored_selection = original_selection_path
+                .as_deref()
+                .and_then(|path| self.selection_for_path(path));
             let target = cursor
                 .or(followed_selection)
+                .or(restored_selection)
                 .unwrap_or(self.selection)
                 .min(self.rows.len() - 1);
             self.seek_to(target);

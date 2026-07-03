@@ -429,10 +429,9 @@ fn write_impl(
         cx.exit_task_event(task);
     } else {
         cx.editor.save(doc_id, path, options.policy)?;
-        if path.is_some() {
-            cx.block_try_flush_writes()?;
-        }
     }
+
+    cx.block_try_flush_writes()?;
 
     Ok(())
 }
@@ -726,7 +725,7 @@ fn pkg(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> anyhow:
     if event != PromptEvent::Validate {
         return Ok(());
     }
-    cx.spawn_ui(async { Ok(UiCommand::Layer(LayerCommand::PkgPicker)) });
+    cx.spawn_ui(async { Ok(UiCommand::Layer(LayerCommand::PkgManager)) });
     Ok(())
 }
 
@@ -892,7 +891,8 @@ pub fn write_all_impl(
         Some(cx.exit_tasks),
         Some(&cx.exit_task_work),
         options,
-    )
+    )?;
+    cx.block_try_flush_writes()
 }
 
 pub fn write_all_editor_impl(
@@ -1045,14 +1045,14 @@ fn force_write_all_quit(
     if event != PromptEvent::Validate {
         return Ok(());
     }
-    let _ = write_all_impl(
+    write_all_impl(
         cx,
         WriteAllOptions {
             policy: SavePolicy::Overwrite,
             write_scratch: true,
             auto_format: !args.has_flag(WRITE_NO_FORMAT_FLAG.name),
         },
-    );
+    )?;
     quit_all_impl(cx, QuitPolicy::DiscardBuffers)
 }
 

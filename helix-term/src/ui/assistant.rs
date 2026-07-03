@@ -4,11 +4,11 @@ use crate::ui::animation::{
     Animation, AnimationDirection, AnimationFillMode, AnimationIterationCount, AnimationSpec,
     AnimationTimingFunction,
 };
-use crate::widgets::{schedule_redraw_at, Marquee};
 use crate::widgets::{
     message_list, Message, MessageAccessoryAlign, MessageAlign, MessageCorners, MessageCursor,
     MessageListState, MessageStyle, Spinner,
 };
+use crate::widgets::{schedule_redraw_at, Marquee};
 use helix_core::unicode::width::UnicodeWidthStr;
 use helix_core::Position;
 use helix_view::content_region::ContentRegion;

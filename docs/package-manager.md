@@ -68,10 +68,16 @@ name = "rust-analyzer"
 kind = "lsp"                     # lsp | dap | grammar | plugin
 description = "Rust language server"
 homepage = "https://rust-analyzer.github.io"
+aliases = ["ra"]                 # optional search/discovery aliases
+categories = ["language-server"] # optional extra discovery tags
 languages = ["rust"]             # what resolve uses to suggest it
 
 [version]
 tag-source = "github:rust-lang/rust-analyzer"   # where `update` finds versions
+
+# optional schema links used for discovery/validation later
+[schemas]
+lsp = "https://example.invalid/rust-analyzer-lsp-schema.json"
 
 [[artifact]]                     # per-platform artifacts, first match wins
 os = "windows"                   # windows | linux | macos
@@ -93,7 +99,24 @@ bin = "rust-analyzer.exe"        # path inside the unpacked artifact
 Design rulings:
 - **Data-in-git registry** (like mason-registry / Zed extensions), not a
   service: auditable, pinnable, forkable. The builtin registry ships in the
-  repo under `registry/`; `[[pkg.registries]]` config adds user registries.
+  repo under `registry/`; `[pkg] registries = ["..."]` adds direct local
+  registry dirs, and `[[pkg.registry-sources]]` adds named local or cached git
+  registries.
+
+```toml
+[[pkg.registry-sources]]
+name = "corp-tools"
+git = "https://example.com/corp/helix-registry.git"
+branch = "main"
+
+[[pkg.registry-sources]]
+name = "local-dev"
+path = "E:/registries/local-dev"
+```
+
+Git registry sources are cached under `<data>/pkg/registries/<name>` and are
+updated explicitly with `dhx pkg registry update [name]`. Startup merges cached
+registries when present; missing caches are skipped until updated.
 - **Per-OS artifact table** instead of install scripts. No arbitrary
   postinstall execution: `npm` runs with `--ignore-scripts`, archives are
   just unpacked, cargo/pip/go build in isolated roots. The only compiler
@@ -201,24 +224,30 @@ backends are never enabled by `run-scripts`; they always require an explicit
   still-present tree (`dhx pkg rollback <name>`).
 - Windows: junctions for directories, generated `.cmd`/copied exe shims for
   binaries — no symlink privilege required. Unix: symlinks.
-- Everything hash-verified: release assets against a sha256 recorded at
-  lock time (TOFU on first install, then pinned; registry entries MAY
-  pre-pin hashes).
+- Archive downloads are hash-verified when the registry or lockfile supplies a
+  sha256. Installs record the observed archive hash in receipts. Lock-only
+  refreshes do not download archives, so entries without registry-pinned hashes
+  remain unpinned until installed or refreshed by a future hash-fetching mode.
 
 ### Manifest + lockfile
 
 - `<config>/pkg.toml` — user intent: `lsp = ["rust-analyzer", ...]`,
   version ranges optional (default: track registry latest).
 - Optional per-project `.helix/pkg.toml` merged on top (workspace-pinned
-  toolchains).
+  toolchains). When a project manifest names a package, `.helix/pkg.lock` must
+  pin that package; project pins take precedence over the user lock for the same
+  package during `dhx pkg sync --project <dir>`. Use
+  `dhx pkg lock --project <dir> [name]...` to refresh that project lock without
+  installing anything.
 - `<config>/pkg.lock` — exact resolved versions + hashes; `dhx pkg sync`
-  reproduces the store from it on a new machine.
+  reproduces the store from it on a new machine. Use `dhx pkg lock [name]...`
+  to refresh the user lock from `<config>/pkg.toml` without installing.
 
 ### Resolution (the integration seam)
 
 `resolve::binary(kind, name)` returns the activated shim path. Language
 configuration keeps working untouched: when languages.toml specifies a bare
-command name, the lookup order becomes
+LSP, DAP, or formatter command name, the lookup order becomes
 
 1. explicit absolute path in config (always wins),
 2. `<data>/pkg/bin/<command>` shim,
@@ -226,6 +255,8 @@ command name, the lookup order becomes
 
 So packages need no languages.toml edits, and users can always override.
 helix-loader's grammar loading gains the same fallback into the pkg store.
+Editor missing-server discovery and CLI commands load registries through the
+same config path, including cached `[[pkg.registry-sources]]`.
 
 ### Async + UI
 
@@ -241,7 +272,7 @@ helix-loader's grammar loading gains the same fallback into the pkg store.
   command that resolution can't find but the registry can supply, show a
   dismissable statusline hint once per session; `:pkg install <name>`
   one-shot. `auto-install = true` makes it silent.
-- CLI parity: `dhx pkg install|update|remove|list|search|outdated|sync|doctor|rollback`.
+- CLI parity: `dhx pkg install|update|update --plan|remove|list|search|outdated|lock|lock --project|sync|sync --project|doctor|rollback|registry list|registry update`.
 
 ### Grammar fold-in
 
@@ -265,7 +296,8 @@ remote side against the same lockfile; no editor-driven remote provisioning.
 Every op is transactional per package: install into a temp dir in the
 store, verify hashes, then activate; failures leave the previous activation
 untouched. `doctor` re-verifies receipts against the store and re-runs
-`--version` probes.
+`--version` probes. It also checks registry sources, including missing git
+registry caches that need `dhx pkg registry update`.
 
 ## Implementation waves
 

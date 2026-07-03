@@ -2,6 +2,7 @@ name = "typescript-language-server"
 kind = "lsp"
 description = "TypeScript and JavaScript language server"
 homepage = "https://github.com/typescript-language-server/typescript-language-server"
+aliases = ["tsserver", "typescript-lsp"]
 languages = ["typescript", "javascript"]
 
 [version]

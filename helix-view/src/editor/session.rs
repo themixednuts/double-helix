@@ -364,6 +364,10 @@ impl Editor {
         &self.handlers.auto_reload
     }
 
+    pub fn pkg_sender(&self) -> &helix_runtime::Sender<crate::handlers::PkgEvent> {
+        &self.handlers.pkg
+    }
+
     pub fn word_index(&self) -> &crate::handlers::word_index::WordIndex {
         self.handlers.word_index()
     }

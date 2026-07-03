@@ -1,4 +1,4 @@
-use std::{fmt, str::FromStr};
+use std::{collections::BTreeMap, fmt, str::FromStr};
 
 use serde::{Deserialize, Serialize};
 
@@ -21,6 +21,15 @@ impl PkgKind {
             Self::Lsp => "lsp",
             Self::Dap => "dap",
             Self::Grammar => "grammar",
+            Self::Plugin => "plugin",
+        }
+    }
+
+    pub fn default_category(self) -> &'static str {
+        match self {
+            Self::Lsp => "language-server",
+            Self::Dap => "debug-adapter",
+            Self::Grammar => "tree-sitter-grammar",
             Self::Plugin => "plugin",
         }
     }
@@ -56,7 +65,13 @@ pub struct PackageSpec {
     #[serde(default)]
     pub homepage: Option<String>,
     #[serde(default)]
+    pub aliases: Vec<String>,
+    #[serde(default)]
+    pub categories: Vec<String>,
+    #[serde(default)]
     pub languages: Vec<String>,
+    #[serde(default)]
+    pub schemas: BTreeMap<String, String>,
     #[serde(default)]
     pub version: VersionSpec,
     #[serde(default, rename = "artifact")]
@@ -95,6 +110,31 @@ impl PackageSpec {
         self.artifacts
             .iter()
             .all(|artifact| artifact.source.system.is_some())
+    }
+
+    pub fn matches_search(&self, term: &str) -> bool {
+        let needle = term.trim().to_ascii_lowercase();
+        if needle.is_empty() {
+            return true;
+        }
+        self.search_terms()
+            .any(|term| term.to_ascii_lowercase().contains(&needle))
+    }
+
+    pub fn search_terms(&self) -> impl Iterator<Item = &str> {
+        std::iter::once(self.name.as_str())
+            .chain(std::iter::once(self.kind.as_str()))
+            .chain(std::iter::once(self.kind.default_category()))
+            .chain(std::iter::once(self.description.as_str()))
+            .chain(self.homepage.iter().map(String::as_str))
+            .chain(self.aliases.iter().map(String::as_str))
+            .chain(self.categories.iter().map(String::as_str))
+            .chain(self.languages.iter().map(String::as_str))
+            .chain(
+                self.schemas
+                    .iter()
+                    .flat_map(|(name, url)| [name.as_str(), url.as_str()]),
+            )
     }
 }
 

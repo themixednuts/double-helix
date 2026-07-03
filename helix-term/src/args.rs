@@ -30,12 +30,23 @@ pub struct PkgArgs {
 pub enum PkgCommand {
     Install(Vec<String>),
     Remove(String),
-    List { kind: Option<String> },
+    List {
+        kind: Option<String>,
+    },
     Search(String),
-    Sync,
+    Lock {
+        project: Option<PathBuf>,
+        names: Vec<String>,
+    },
+    Sync {
+        project: Option<PathBuf>,
+    },
     Doctor,
     Outdated(Vec<String>),
     Update(Vec<String>),
+    UpdatePlan(Vec<String>),
+    RegistryList,
+    RegistryUpdate(Vec<String>),
     Rollback(String),
     Help,
 }
@@ -199,10 +210,66 @@ fn parse_pkg_args(args: Vec<String>) -> Result<PkgArgs> {
             }
             PkgCommand::Search(term)
         }
-        Some("sync") => PkgCommand::Sync,
+        Some("lock") => {
+            let mut project = None;
+            let mut names = Vec::new();
+            while let Some(arg) = args.next() {
+                match arg.as_str() {
+                    "--project" => {
+                        let Some(path) = args.next() else {
+                            anyhow::bail!("pkg lock --project requires a directory");
+                        };
+                        project = Some(PathBuf::from(path));
+                    }
+                    name => names.push(name.to_owned()),
+                }
+            }
+            PkgCommand::Lock { project, names }
+        }
+        Some("sync") => {
+            let mut project = None;
+            while let Some(arg) = args.next() {
+                match arg.as_str() {
+                    "--project" => {
+                        let Some(path) = args.next() else {
+                            anyhow::bail!("pkg sync --project requires a directory");
+                        };
+                        project = Some(PathBuf::from(path));
+                    }
+                    other => anyhow::bail!("unexpected pkg sync argument: {other}"),
+                }
+            }
+            PkgCommand::Sync { project }
+        }
         Some("doctor") => PkgCommand::Doctor,
         Some("outdated") => PkgCommand::Outdated(args.collect()),
-        Some("update") => PkgCommand::Update(args.collect()),
+        Some("update") => {
+            let mut plan = false;
+            let mut names = Vec::new();
+            for arg in args {
+                if arg == "--plan" {
+                    plan = true;
+                } else {
+                    names.push(arg);
+                }
+            }
+            if plan {
+                PkgCommand::UpdatePlan(names)
+            } else {
+                PkgCommand::Update(names)
+            }
+        }
+        Some("registry") => match args.next().as_deref() {
+            Some("list") => {
+                if args.next().is_some() {
+                    anyhow::bail!("pkg registry list accepts no arguments");
+                }
+                PkgCommand::RegistryList
+            }
+            Some("update") => PkgCommand::RegistryUpdate(args.collect()),
+            Some("-h" | "--help") | None => PkgCommand::Help,
+            Some(other) => anyhow::bail!("unknown pkg registry command: {other}"),
+        },
         Some("rollback") => {
             let Some(name) = args.next() else {
                 anyhow::bail!("pkg rollback requires a package name");

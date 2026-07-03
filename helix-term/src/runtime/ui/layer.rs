@@ -24,9 +24,9 @@ pub(crate) fn apply_layer_command(
             let picker = crate::ui::file_picker(editor, root, ingress);
             compositor.push(Box::new(crate::ui::overlay::overlaid(picker)));
         }
-        LayerCommand::PkgPicker => match crate::ui::pkg::picker(editor, ingress) {
-            Ok(picker) => compositor.push(Box::new(crate::ui::overlay::overlaid(picker))),
-            Err(err) => editor.set_error(format!("Failed to open package picker: {err}")),
+        LayerCommand::PkgManager => match crate::ui::pkg::manager(editor, ingress) {
+            Ok(manager) => compositor.push(Box::new(crate::ui::overlay::overlaid(manager))),
+            Err(err) => editor.set_error(format!("Failed to open package manager: {err}")),
         },
         LayerCommand::LspCommandPicker { commands } => {
             let columns = [crate::ui::PickerColumn::new(

@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     ops::ResolvedPackage,
     spec::{Artifact, PackageSpec},
-    Error, Result,
+    Error, Result, Store,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -13,6 +13,7 @@ use crate::{
 pub struct PkgConfig {
     pub auto_install: bool,
     pub registries: Vec<PathBuf>,
+    pub registry_sources: Vec<RegistrySource>,
     pub allow_native: NativeInstallPolicy,
     pub policy: Policy,
 }
@@ -22,10 +23,104 @@ impl Default for PkgConfig {
         Self {
             auto_install: false,
             registries: Vec::new(),
+            registry_sources: Vec::new(),
             allow_native: NativeInstallPolicy::Prompt,
             policy: Policy::default(),
         }
     }
+}
+
+impl PkgConfig {
+    pub fn registry_dirs(&self, store: &Store) -> Result<Vec<PathBuf>> {
+        let mut dirs = self.registries.clone();
+        for source in &self.registry_sources {
+            dirs.push(source.active_dir(store)?);
+        }
+        Ok(dirs)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct RegistrySource {
+    pub name: String,
+    #[serde(default)]
+    pub path: Option<PathBuf>,
+    #[serde(default)]
+    pub git: Option<String>,
+    #[serde(default)]
+    pub branch: Option<String>,
+    #[serde(default)]
+    pub rev: Option<String>,
+}
+
+impl RegistrySource {
+    pub fn validate(&self) -> Result<()> {
+        if self.name.trim().is_empty() {
+            return Err(Error::Message(
+                "registry source name must not be empty".to_owned(),
+            ));
+        }
+        if sanitize_registry_name(&self.name).is_empty() {
+            return Err(Error::Message(format!(
+                "registry source {} does not produce a usable cache name",
+                self.name
+            )));
+        }
+        let source_count = self.path.is_some() as usize + self.git.is_some() as usize;
+        if source_count != 1 {
+            return Err(Error::Message(format!(
+                "registry source {} must specify exactly one of path or git",
+                self.name
+            )));
+        }
+        if self.branch.is_some() && self.rev.is_some() {
+            return Err(Error::Message(format!(
+                "registry source {} accepts either branch or rev, not both",
+                self.name
+            )));
+        }
+        if self.path.is_some() && (self.branch.is_some() || self.rev.is_some()) {
+            return Err(Error::Message(format!(
+                "registry source {} uses path and cannot specify branch or rev",
+                self.name
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn active_dir(&self, store: &Store) -> Result<PathBuf> {
+        self.validate()?;
+        Ok(self.path.clone().unwrap_or_else(|| self.cache_dir(store)))
+    }
+
+    pub fn cache_dir(&self, store: &Store) -> PathBuf {
+        store
+            .registry_dir()
+            .join(sanitize_registry_name(&self.name))
+    }
+
+    pub fn source_label(&self) -> String {
+        self.path
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .or_else(|| self.git.clone())
+            .unwrap_or_default()
+    }
+}
+
+fn sanitize_registry_name(name: &str) -> String {
+    let sanitized: String = name
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    sanitized.trim_matches('-').to_owned()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -295,7 +390,10 @@ mod tests {
             kind: crate::PkgKind::Lsp,
             description: String::new(),
             homepage: None,
+            aliases: Vec::new(),
+            categories: Vec::new(),
             languages: Vec::new(),
+            schemas: Default::default(),
             version: Default::default(),
             artifacts: vec![artifact.clone()],
         };
@@ -388,5 +486,24 @@ mod tests {
         assert_eq!(enabled.allow_native, NativeInstallPolicy::True);
         let prompt: PkgConfig = toml::from_str("allow-native = \"prompt\"").unwrap();
         assert_eq!(prompt.allow_native, NativeInstallPolicy::Prompt);
+    }
+
+    #[test]
+    fn registry_sources_parse_and_resolve_cache_dirs() {
+        let config: PkgConfig = toml::from_str(
+            r#"
+registries = ["C:/local-registry"]
+
+[[registry-sources]]
+name = "corp/tools"
+git = "https://example.com/tools.git"
+branch = "main"
+"#,
+        )
+        .unwrap();
+        let store = Store::open("C:/data/pkg");
+        let dirs = config.registry_dirs(&store).unwrap();
+        assert_eq!(dirs[0], PathBuf::from("C:/local-registry"));
+        assert!(dirs[1].ends_with("corp-tools"));
     }
 }

@@ -10,8 +10,9 @@ use helix_view::{
 use crate::compositor::RenderContext;
 
 use super::{
-    selected_path_for_log, ExplorerRow, FileExplorerPanel, VcsStatus, FALLBACK_FILE_ICON,
-    FALLBACK_FOLDER_ICON, FALLBACK_FOLDER_OPEN_ICON, FOOTER_ROWS, HEADER_ROWS,
+    selected_path_for_log, text_width, ExplorerRow, FileExplorerPanel, VcsStatus,
+    FALLBACK_FILE_ICON, FALLBACK_FOLDER_ICON, FALLBACK_FOLDER_OPEN_ICON, FOOTER_ROWS, HEADER_ROWS,
+    SEARCH_ROWS,
 };
 #[derive(Clone)]
 pub(super) struct ExplorerTreeItemStyles {
@@ -210,9 +211,16 @@ impl FileExplorerPanel {
         // Header is now just the section label — counts moved to the
         // statusline below so the top reads as a clean orientation cue.
         crate::widgets::header(surface, inner, " FILES", styles.header);
+        let search_area = Rect::new(
+            inner.x,
+            inner.y.saturating_add(HEADER_ROWS),
+            inner.width,
+            SEARCH_ROWS,
+        );
+        self.render_search_bar(surface, search_area, styles);
 
         let list = inner
-            .clip_top(HEADER_ROWS)
+            .clip_top(HEADER_ROWS + SEARCH_ROWS)
             .clip_bottom(FOOTER_ROWS)
             .clip_left(1);
         if list.height == 0 {
@@ -341,6 +349,80 @@ impl FileExplorerPanel {
             cx.document_count(),
             cx.component_document_count(),
             render_start.elapsed().as_micros()
+        );
+    }
+
+    fn render_search_bar(
+        &self,
+        surface: &mut crate::render::CellSurface,
+        area: Rect,
+        styles: crate::ui::design::FileExplorerStyles,
+    ) {
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+
+        surface.set_style(
+            tui::ratatui::to_ratatui_rect(area),
+            tui::ratatui::to_ratatui_style(styles.background),
+        );
+
+        let marker_style = if self.search_active {
+            styles.header
+        } else {
+            styles.inactive
+        };
+        if area.width > 1 {
+            surface.set_stringn(
+                area.x.saturating_add(1),
+                area.y,
+                "/",
+                1,
+                tui::ratatui::to_ratatui_style(marker_style),
+            );
+        }
+
+        let mut input_area = Rect::new(
+            area.x.saturating_add(3),
+            area.y,
+            area.width.saturating_sub(4),
+            1,
+        );
+
+        let count = (!self.search_query.is_empty())
+            .then(|| format!("{} / {}", self.rows.len(), self.all_rows.len()));
+        if let Some(count) = count.as_ref() {
+            let width = text_width(count);
+            if input_area.width > width.saturating_add(1) {
+                surface.set_stringn(
+                    area.right().saturating_sub(width).saturating_sub(1),
+                    area.y,
+                    count,
+                    width as usize,
+                    tui::ratatui::to_ratatui_style(styles.inactive),
+                );
+                input_area = input_area.clip_right(width.saturating_add(2));
+            }
+        }
+
+        if self.search_query.is_empty() && !self.search_active {
+            surface.set_stringn(
+                input_area.x,
+                input_area.y,
+                "search files",
+                input_area.width as usize,
+                tui::ratatui::to_ratatui_style(styles.inactive),
+            );
+            return;
+        }
+
+        crate::widgets::text_input(
+            surface,
+            input_area,
+            &self.search_query,
+            self.search_query.len(),
+            styles.text,
+            styles.selection,
         );
     }
 

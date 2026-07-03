@@ -5,8 +5,10 @@ use std::{
 };
 
 use crate::{
+    config::PkgConfig,
     io,
     spec::{PackageSpec, PkgKind},
+    store::Store,
     Error, Result,
 };
 
@@ -57,6 +59,10 @@ impl Registry {
         Ok(registry)
     }
 
+    pub fn from_config(config: &PkgConfig, store: &Store) -> Result<Self> {
+        Self::from_dirs(&config.registry_dirs(store)?)
+    }
+
     pub fn insert_str(&mut self, path: &str, content: &str) -> Result<()> {
         let package: PackageSpec = toml::from_str(content).map_err(|source| Error::TomlDe {
             path: path.to_owned(),
@@ -103,17 +109,9 @@ impl Registry {
     }
 
     pub fn search(&self, term: &str) -> Vec<&PackageSpec> {
-        let needle = term.to_ascii_lowercase();
         self.packages
             .values()
-            .filter(|package| {
-                package.name.to_ascii_lowercase().contains(&needle)
-                    || package.description.to_ascii_lowercase().contains(&needle)
-                    || package
-                        .languages
-                        .iter()
-                        .any(|language| language.to_ascii_lowercase().contains(&needle))
-            })
+            .filter(|package| package.matches_search(term))
             .collect()
     }
 
@@ -129,6 +127,17 @@ impl Registry {
                 name: package.name.clone(),
                 message: "at least one artifact is required".to_owned(),
             });
+        }
+        lint_non_empty_list(package, "aliases", &package.aliases)?;
+        lint_non_empty_list(package, "categories", &package.categories)?;
+        lint_non_empty_list(package, "languages", &package.languages)?;
+        for (name, url) in &package.schemas {
+            if name.trim().is_empty() || url.trim().is_empty() {
+                return Err(Error::InvalidPackage {
+                    name: package.name.clone(),
+                    message: "schemas must not contain empty names or urls".to_owned(),
+                });
+            }
         }
         for artifact in &package.artifacts {
             artifact.source.validate(&package.name)?;
@@ -157,8 +166,24 @@ impl Registry {
     }
 }
 
+fn lint_non_empty_list(package: &PackageSpec, field: &str, values: &[String]) -> Result<()> {
+    if values.iter().any(|value| value.trim().is_empty()) {
+        return Err(Error::InvalidPackage {
+            name: package.name.clone(),
+            message: format!("{field} must not contain empty values"),
+        });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
+    use assert_fs::TempDir;
+
+    use crate::{RegistrySource, Store};
+
     use super::*;
 
     #[test]
@@ -211,5 +236,87 @@ bin = "demo2"
         let package = registry.find("demo").unwrap();
         assert_eq!(package.description, "new");
         assert_eq!(package.artifacts[0].bin, "demo2");
+    }
+
+    #[test]
+    fn search_includes_progressive_metadata() {
+        let mut registry = Registry::default();
+        registry
+            .insert_str(
+                "metadata",
+                r#"
+name = "rust-analyzer"
+kind = "lsp"
+description = "Rust language server"
+aliases = ["ra"]
+categories = ["language-server"]
+languages = ["rust"]
+
+[schemas]
+lsp = "https://example.com/rust-analyzer-schema.json"
+
+[[artifact]]
+os = "windows"
+arch = "x86_64"
+source = { archive = "file:///rust-analyzer.zip" }
+bin = "rust-analyzer"
+"#,
+            )
+            .unwrap();
+
+        assert_eq!(registry.search("ra")[0].name, "rust-analyzer");
+        assert_eq!(registry.search("language-server")[0].name, "rust-analyzer");
+        assert_eq!(registry.search("schema")[0].name, "rust-analyzer");
+    }
+
+    #[test]
+    fn from_config_loads_direct_and_source_registries() {
+        let dir = TempDir::new().unwrap();
+        let direct = dir.path().join("direct");
+        let sourced = dir.path().join("sourced");
+        fs::create_dir_all(direct.join("lsp")).unwrap();
+        fs::create_dir_all(sourced.join("lsp")).unwrap();
+        fs::write(
+            direct.join("lsp").join("direct.toml"),
+            registry_package("direct"),
+        )
+        .unwrap();
+        fs::write(
+            sourced.join("lsp").join("sourced.toml"),
+            registry_package("sourced"),
+        )
+        .unwrap();
+        let store = Store::open(dir.path().join("pkg"));
+        let config = PkgConfig {
+            registries: vec![direct],
+            registry_sources: vec![RegistrySource {
+                name: "fixture".to_owned(),
+                path: Some(sourced),
+                git: None,
+                branch: None,
+                rev: None,
+            }],
+            ..PkgConfig::default()
+        };
+
+        let registry = Registry::from_config(&config, &store).unwrap();
+        assert!(registry.find("direct").is_some());
+        assert!(registry.find("sourced").is_some());
+    }
+
+    fn registry_package(name: &str) -> String {
+        format!(
+            r#"
+name = "{name}"
+kind = "lsp"
+description = "{name}"
+
+[[artifact]]
+os = "windows"
+arch = "x86_64"
+source = {{ system = "{name}" }}
+bin = "{name}"
+"#
+        )
     }
 }

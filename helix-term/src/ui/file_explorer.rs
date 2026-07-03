@@ -14,6 +14,7 @@ use helix_view::{
     graphics::{CursorKind, Rect},
     icons::{Icon, ICONS},
     input::{KeyEvent, MouseButton, MouseEvent, MouseEventKind},
+    keyboard::{KeyCode, KeyModifiers},
     modal_text::{
         ModalTextMotion as LabelMotion, ModalTextObject as LabelTextObject,
         ModalTextSelection as LabelSelection,
@@ -59,6 +60,7 @@ use scan::ExplorerChild;
 pub const ID: &str = "file-explorer-panel";
 
 const HEADER_ROWS: u16 = 1;
+const SEARCH_ROWS: u16 = 1;
 /// Single statusline strip beneath the tree (mode chip · summary chips ·
 /// counts). Transient error / info messages live in the editor's global
 /// status row (rendered by `EditorView` from `cx.status_msg()`) — no
@@ -79,7 +81,10 @@ const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(500);
 
 pub struct FileExplorerPanel {
     root: PathBuf,
+    all_rows: Vec<ExplorerRow>,
     rows: Vec<ExplorerRow>,
+    search_query: String,
+    search_active: bool,
     expanded_dirs: HashSet<PathBuf>,
     children_cache: HashMap<PathBuf, Vec<ExplorerChild>>,
     vcs_snapshot: VcsSnapshot,
@@ -221,6 +226,48 @@ fn selected_path_for_log(rows: &[ExplorerRow], selection: usize) -> String {
         .unwrap_or_else(|| String::from("<none>"))
 }
 
+fn filter_explorer_rows(rows: &[ExplorerRow], query: &str) -> Vec<ExplorerRow> {
+    let query = query.trim().to_ascii_lowercase();
+    if query.is_empty() {
+        return rows.to_vec();
+    }
+
+    let mut include = vec![false; rows.len()];
+    for (index, row) in rows.iter().enumerate() {
+        if !explorer_row_matches(row, &query) {
+            continue;
+        }
+
+        include[index] = true;
+        let mut depth = row.depth;
+        for ancestor_index in (0..index).rev() {
+            let ancestor = &rows[ancestor_index];
+            if ancestor.depth >= depth {
+                continue;
+            }
+            include[ancestor_index] = true;
+            depth = ancestor.depth;
+            if depth == 0 {
+                break;
+            }
+        }
+    }
+
+    rows.iter()
+        .zip(include)
+        .filter_map(|(row, include)| include.then(|| row.clone()))
+        .collect()
+}
+
+fn explorer_row_matches(row: &ExplorerRow, query: &str) -> bool {
+    row.label.to_ascii_lowercase().contains(query)
+        || row
+            .path
+            .to_string_lossy()
+            .to_ascii_lowercase()
+            .contains(query)
+}
+
 fn row_status_width(row: &ExplorerRow) -> u16 {
     let icons = ICONS.load();
     let mut width = 0u16;
@@ -250,7 +297,10 @@ impl FileExplorerPanel {
         let root = helix_stdx::path::normalize(&root);
         let mut panel = Self {
             root: root.clone(),
+            all_rows: Vec::new(),
             rows: Vec::new(),
+            search_query: String::new(),
+            search_active: false,
             expanded_dirs: HashSet::from([root.clone()]),
             children_cache: HashMap::new(),
             vcs_snapshot: VcsSnapshot::empty(&root, editor.config().file_explorer.vcs),
@@ -280,7 +330,9 @@ impl FileExplorerPanel {
     }
 
     fn visible_height(&self) -> usize {
-        self.area.height.saturating_sub(HEADER_ROWS) as usize
+        self.area
+            .height
+            .saturating_sub(HEADER_ROWS + SEARCH_ROWS + FOOTER_ROWS) as usize
     }
 
     /// Pull `nav`'s state into the cached `selection` / `scroll`
@@ -333,6 +385,93 @@ impl FileExplorerPanel {
 
     fn selected(&self) -> Option<&ExplorerRow> {
         self.rows.get(self.selection)
+    }
+
+    fn apply_search_filter(&mut self) {
+        let selected_path = self.selected().map(|row| row.path.clone());
+        self.rows = filter_explorer_rows(&self.all_rows, &self.search_query);
+
+        if self.rows.is_empty() {
+            self.label_selection = LabelSelection::default();
+            self.seek_to(0);
+            return;
+        }
+
+        let target = selected_path
+            .and_then(|path| self.rows.iter().position(|row| row.path == path))
+            .unwrap_or_else(|| self.selection.min(self.rows.len() - 1));
+        self.seek_to(target);
+        self.clamp_label_selection();
+        self.collapse_label_selection_to_cursor();
+    }
+
+    fn start_search(&mut self) {
+        self.search_active = true;
+    }
+
+    fn clear_search(&mut self) {
+        if self.search_query.is_empty() {
+            return;
+        }
+        self.search_query.clear();
+        self.apply_search_filter();
+    }
+
+    fn handle_search_key(&mut self, key: KeyEvent) -> Option<EventResult> {
+        if self.search_active {
+            match key {
+                KeyEvent {
+                    code: KeyCode::Esc | KeyCode::Enter,
+                    modifiers: KeyModifiers::NONE,
+                } => {
+                    self.search_active = false;
+                    return Some(EventResult::Consumed(None));
+                }
+                KeyEvent {
+                    code: KeyCode::Backspace,
+                    modifiers: KeyModifiers::NONE,
+                } => {
+                    self.search_query.pop();
+                    self.apply_search_filter();
+                    return Some(EventResult::Consumed(None));
+                }
+                KeyEvent {
+                    code: KeyCode::Char('u'),
+                    modifiers: KeyModifiers::CONTROL,
+                } => {
+                    self.clear_search();
+                    return Some(EventResult::Consumed(None));
+                }
+                KeyEvent {
+                    code: KeyCode::Char(ch),
+                    modifiers,
+                } if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
+                    self.search_query.push(ch);
+                    self.apply_search_filter();
+                    return Some(EventResult::Consumed(None));
+                }
+                _ => return Some(EventResult::Consumed(None)),
+            }
+        }
+
+        match key {
+            KeyEvent {
+                code: KeyCode::Char('/'),
+                modifiers: KeyModifiers::NONE,
+            } => {
+                self.start_search();
+                Some(EventResult::Consumed(None))
+            }
+            KeyEvent {
+                code: KeyCode::Esc,
+                modifiers: KeyModifiers::NONE,
+            } if !self.search_query.is_empty() => {
+                self.search_active = false;
+                self.clear_search();
+                Some(EventResult::Consumed(None))
+            }
+            _ => None,
+        }
     }
 
     fn selected_base_dir(&self) -> PathBuf {
@@ -1293,6 +1432,10 @@ impl FileExplorerPanel {
             return self.handle_label_edit_key(key, cx);
         }
 
+        if let Some(result) = self.handle_search_key(key) {
+            return result;
+        }
+
         self.input.prepare_keymaps(cx.editor);
         let input = self.input.translate(key);
         cx.editor.frontend_mut().focused_modal_input = self.input.modal_input_state();
@@ -1333,7 +1476,7 @@ impl FileExplorerPanel {
     }
 
     fn list_area(area: Rect) -> Option<Rect> {
-        if area.width == 0 || area.height <= HEADER_ROWS + FOOTER_ROWS {
+        if area.width == 0 || area.height <= HEADER_ROWS + SEARCH_ROWS + FOOTER_ROWS {
             return None;
         }
 
@@ -1347,10 +1490,44 @@ impl FileExplorerPanel {
         }
 
         let list = inner
-            .clip_top(HEADER_ROWS)
+            .clip_top(HEADER_ROWS + SEARCH_ROWS)
             .clip_bottom(FOOTER_ROWS)
             .clip_left(1);
         (list.width > 0 && list.height > 0).then_some(list)
+    }
+
+    fn search_input_area(area: Rect) -> Option<Rect> {
+        if area.width == 0 || area.height <= HEADER_ROWS + FOOTER_ROWS {
+            return None;
+        }
+
+        let inner = crate::widgets::Panel::edge(
+            crate::widgets::PanelStyle::default(),
+            crate::widgets::PanelEdge::Right,
+        )
+        .content_area(area);
+        if inner.width <= 3 || inner.height <= HEADER_ROWS + FOOTER_ROWS {
+            return None;
+        }
+
+        Some(Rect::new(
+            inner.x.saturating_add(3),
+            inner.y.saturating_add(HEADER_ROWS),
+            inner.width.saturating_sub(4),
+            SEARCH_ROWS,
+        ))
+    }
+
+    fn search_cursor_area(&self, area: Rect) -> Option<Rect> {
+        let mut input = Self::search_input_area(area)?;
+        if !self.search_query.is_empty() {
+            let count = format!("{} / {}", self.rows.len(), self.all_rows.len());
+            let width = text_width(&count);
+            if input.width > width.saturating_add(1) {
+                input = input.clip_right(width.saturating_add(2));
+            }
+        }
+        Some(input)
     }
 
     fn row_index_at_mouse(&self, event: &MouseEvent) -> Option<usize> {
@@ -1497,7 +1674,27 @@ impl FileExplorerPanel {
     }
 
     fn cursor_position(&self, area: Rect, editor: &Editor) -> Option<Position> {
-        if !self.focused || self.rows.is_empty() {
+        if !self.focused {
+            return None;
+        }
+
+        if self.search_active {
+            let search_area = self.search_cursor_area(area)?;
+            let state = helix_view::layout::text_input_layout(
+                search_area,
+                &self.search_query,
+                self.search_query.len(),
+            );
+            if state.cursor_in_area {
+                return Some(Position::new(
+                    state.cursor_y as usize,
+                    state.cursor_x as usize,
+                ));
+            }
+            return None;
+        }
+
+        if self.rows.is_empty() {
             return None;
         }
 
@@ -1626,7 +1823,9 @@ impl Component for FileExplorerPanel {
             // so renaming feels like editing a normal buffer. Outside of
             // edit mode the cursor is a visual marker for the selected
             // row — keep it as Block.
-            let kind = if self.label_edit.is_some() {
+            let kind = if self.search_active {
+                CursorKind::Bar
+            } else if self.label_edit.is_some() {
                 editor.config().cursor_shape.from_mode(self.input.mode)
             } else {
                 CursorKind::Block
@@ -2606,6 +2805,86 @@ mod tests {
                 .rows
                 .iter()
                 .any(|row| display_name(&row.path) == "main.rs" && row.depth == 2));
+        });
+    }
+
+    #[test]
+    fn file_explorer_search_filters_rows_and_keeps_ancestors() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir(temp.path().join("src")).unwrap();
+        fs::write(temp.path().join("README.md"), "").unwrap();
+        fs::write(temp.path().join("src").join("main.rs"), "").unwrap();
+        let rt = helix_runtime::test::RuntimeTest::default();
+        rt.block_on(async {
+            let editor = test_editor(100, 30, rt.runtime());
+            let mut panel = FileExplorerPanel::new(temp.path().to_path_buf(), &editor).unwrap();
+            panel.selection = row_index_by_name(&panel, "src");
+            panel.toggle_selected_dir(&editor);
+
+            panel.search_query = "main".to_string();
+            panel.apply_search_filter();
+
+            assert!(panel
+                .rows
+                .iter()
+                .any(|row| display_name(&row.path) == display_name(temp.path())));
+            assert!(panel
+                .rows
+                .iter()
+                .any(|row| display_name(&row.path) == "src"));
+            assert!(panel
+                .rows
+                .iter()
+                .any(|row| display_name(&row.path) == "main.rs"));
+            assert!(!panel
+                .rows
+                .iter()
+                .any(|row| display_name(&row.path) == "README.md"));
+        });
+    }
+
+    #[test]
+    fn file_explorer_search_key_input_filters_and_escape_clears() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("alpha.rs"), "").unwrap();
+        fs::write(temp.path().join("beta.rs"), "").unwrap();
+        let rt = helix_runtime::test::RuntimeTest::default();
+        rt.block_on(async {
+            let mut editor = test_editor(100, 30, rt.runtime());
+            let mut panel = FileExplorerPanel::new(temp.path().to_path_buf(), &editor).unwrap();
+            let all_rows = panel.rows.len();
+
+            press_key(&mut panel, &mut editor, &rt, key!('/'));
+            assert!(panel.search_active);
+
+            for ch in ['a', 'l', 'p', 'h', 'a'] {
+                press_key(
+                    &mut panel,
+                    &mut editor,
+                    &rt,
+                    KeyEvent {
+                        code: KeyCode::Char(ch),
+                        modifiers: KeyModifiers::NONE,
+                    },
+                );
+            }
+            assert_eq!(panel.search_query, "alpha");
+            assert!(panel
+                .rows
+                .iter()
+                .any(|row| display_name(&row.path) == "alpha.rs"));
+            assert!(!panel
+                .rows
+                .iter()
+                .any(|row| display_name(&row.path) == "beta.rs"));
+
+            press_key(&mut panel, &mut editor, &rt, key!(Esc));
+            assert!(!panel.search_active);
+            assert_eq!(panel.search_query, "alpha");
+
+            press_key(&mut panel, &mut editor, &rt, key!(Esc));
+            assert!(panel.search_query.is_empty());
+            assert_eq!(panel.rows.len(), all_rows);
         });
     }
 
@@ -3592,7 +3871,10 @@ mod tests {
         };
         let panel = FileExplorerPanel {
             root: PathBuf::from("workspace"),
+            all_rows: Vec::new(),
             rows: Vec::new(),
+            search_query: String::new(),
+            search_active: false,
             expanded_dirs: HashSet::new(),
             children_cache: HashMap::new(),
             vcs_snapshot: VcsSnapshot::default(),
@@ -3640,7 +3922,10 @@ mod tests {
         };
         let panel = FileExplorerPanel {
             root: PathBuf::from("workspace"),
+            all_rows: Vec::new(),
             rows: Vec::new(),
+            search_query: String::new(),
+            search_active: false,
             expanded_dirs: HashSet::new(),
             children_cache: HashMap::new(),
             vcs_snapshot: VcsSnapshot::default(),
@@ -3698,7 +3983,10 @@ mod tests {
         };
         let panel = FileExplorerPanel {
             root: PathBuf::from("workspace"),
+            all_rows: Vec::new(),
             rows: Vec::new(),
+            search_query: String::new(),
+            search_active: false,
             expanded_dirs: HashSet::new(),
             children_cache: HashMap::new(),
             vcs_snapshot: VcsSnapshot::default(),
@@ -3738,7 +4026,10 @@ mod tests {
     fn tree_item_uses_distinct_folder_icons_for_open_and_closed_dirs() {
         let panel = FileExplorerPanel {
             root: PathBuf::from("workspace"),
+            all_rows: Vec::new(),
             rows: Vec::new(),
+            search_query: String::new(),
+            search_active: false,
             expanded_dirs: HashSet::new(),
             children_cache: HashMap::new(),
             vcs_snapshot: VcsSnapshot::default(),

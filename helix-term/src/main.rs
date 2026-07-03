@@ -1,6 +1,6 @@
 use anyhow::{Context, Error, Result};
 use helix_loader::VERSION_AND_GIT_HASH;
-use helix_pkg::{OpEvent, Ops, PkgKind};
+use helix_pkg::{OpEvent, Ops, PackageChange, PackageSpec, PkgKind, RegistrySource, UpdatePlan};
 use helix_term::application::Application;
 use helix_term::args::{Args, PkgCommand};
 use helix_term::config::{Config, ConfigLoadError};
@@ -219,15 +219,32 @@ fn run_pkg(command: PkgCommand) -> Result<i32> {
             let ops = Ops::open_default()?;
             for package in ops.registry().search(&term) {
                 println!(
-                    "{:<12} {:<24} {}",
-                    package.kind, package.name, package.description
+                    "{:<12} {:<24} {:<28} {}",
+                    package.kind,
+                    package.name,
+                    package_tags(package),
+                    package.description
                 );
             }
             Ok(0)
         }
-        PkgCommand::Sync => {
+        PkgCommand::Lock { project, names } => {
             let ops = Ops::open_default()?;
-            ops.sync(&mut print_pkg_event)?;
+            let lock = if let Some(project) = project {
+                ops.lock_project(&project, &names, &mut print_pkg_event)?
+            } else {
+                ops.lock_manifest(&names, &mut print_pkg_event)?
+            };
+            println!("wrote pkg.lock with {} package(s)", lock.packages.len());
+            Ok(0)
+        }
+        PkgCommand::Sync { project } => {
+            let ops = Ops::open_default()?;
+            if let Some(project) = project {
+                ops.sync_with_project(&project, &mut print_pkg_event)?;
+            } else {
+                ops.sync(&mut print_pkg_event)?;
+            }
             Ok(0)
         }
         PkgCommand::Doctor => {
@@ -274,6 +291,34 @@ fn run_pkg(command: PkgCommand) -> Result<i32> {
             ops.update(&names, &mut print_pkg_event)?;
             Ok(0)
         }
+        PkgCommand::UpdatePlan(names) => {
+            let ops = Ops::open_default()?;
+            let plan = ops.plan_update(&names)?;
+            print_update_plan(&plan);
+            Ok(if plan.has_errors() { 1 } else { 0 })
+        }
+        PkgCommand::RegistryList => {
+            let ops = Ops::open_default()?;
+            print_registry_sources(&ops);
+            Ok(0)
+        }
+        PkgCommand::RegistryUpdate(names) => {
+            let ops = Ops::open_default()?;
+            let updates = ops.update_registries(&names)?;
+            if updates.is_empty() {
+                println!("no registry sources configured");
+            }
+            for update in updates {
+                println!(
+                    "{:<12} {:<8} {:<40} {}",
+                    update.name,
+                    update.status,
+                    update.path.display(),
+                    update.source
+                );
+            }
+            Ok(0)
+        }
         PkgCommand::Rollback(name) => {
             let ops = Ops::open_default()?;
             let locked = ops.rollback(&name)?;
@@ -281,6 +326,100 @@ fn run_pkg(command: PkgCommand) -> Result<i32> {
             Ok(0)
         }
     }
+}
+
+fn print_registry_sources(ops: &Ops) {
+    let config = ops.config();
+    let mut count = 0usize;
+    for path in &config.registries {
+        count += 1;
+        println!("{:<12} {:<8} {}", "local", "path", path.display());
+    }
+    for source in &config.registry_sources {
+        count += 1;
+        println!(
+            "{:<12} {:<8} {:<40} {}",
+            source.name,
+            registry_source_kind(source),
+            source
+                .active_dir(ops.store())
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|err| format!("error: {err}")),
+            source.source_label()
+        );
+    }
+    if count == 0 {
+        println!("no registry sources configured");
+    }
+}
+
+fn registry_source_kind(source: &RegistrySource) -> &'static str {
+    if source.path.is_some() {
+        "path"
+    } else {
+        "git"
+    }
+}
+
+fn print_update_plan(plan: &UpdatePlan) {
+    if plan.changes.is_empty() {
+        println!("no packages to plan");
+        return;
+    }
+    for change in &plan.changes {
+        let candidate = change
+            .candidate
+            .as_ref()
+            .map(|candidate| candidate.version.as_str())
+            .unwrap_or("-");
+        let source = change
+            .candidate
+            .as_ref()
+            .map(|candidate| candidate.source.as_str())
+            .unwrap_or("-");
+        println!(
+            "{:<8} {:<12} {:<28} {:<16} -> {:<16} {:<14} {}",
+            update_plan_action(change),
+            change.kind,
+            change.name,
+            change.installed.as_deref().unwrap_or("-"),
+            candidate,
+            source,
+            change
+                .candidate
+                .as_ref()
+                .map(|candidate| candidate.url.as_str())
+                .unwrap_or("")
+        );
+        for warning in &change.warnings {
+            println!("  warning: {warning}");
+        }
+        if let Some(error) = &change.error {
+            println!("  error: {error}");
+        }
+    }
+}
+
+fn update_plan_action(change: &PackageChange) -> &'static str {
+    if change.error.is_some() {
+        "error"
+    } else if change.installed.is_none() && change.candidate.is_some() {
+        "install"
+    } else if change.needs_apply() {
+        "update"
+    } else {
+        "current"
+    }
+}
+
+fn package_tags(package: &PackageSpec) -> String {
+    let mut tags = vec![package.kind.default_category().to_owned()];
+    tags.extend(package.languages.iter().cloned());
+    tags.extend(package.categories.iter().cloned());
+    if !package.aliases.is_empty() {
+        tags.push(format!("alias:{}", package.aliases.join("|")));
+    }
+    tags.join(",")
 }
 
 fn print_pkg_event(event: OpEvent) {
@@ -301,12 +440,18 @@ USAGE:
 COMMANDS:
     install <name>...       Install packages from the builtin registry
     update [name]...        Update installed packages
+    update --plan [name]... Show the update plan without installing
+    registry list          List configured registry sources
+    registry update [name] Update cached git registry sources
     outdated [name]...      Show installed packages with newer versions
     rollback <name>         Reactivate the previous installed version
     remove <name>           Deactivate an installed package
     list [--kind <kind>]    List installed packages
-    search <term>           Search builtin registry entries
+    search <term>           Search registry names, languages, aliases, categories, and schemas
+    lock [--project <dir>] [name]...
+                            Refresh pkg.lock without installing
     sync                    Install packages pinned in pkg.lock
+    sync --project <dir>    Merge user pkg.toml with <dir>/.helix/pkg.toml
     doctor                  Verify receipts and installed files
 "
     );

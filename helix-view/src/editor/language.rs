@@ -218,7 +218,10 @@ impl Editor {
             return;
         };
         let config = self.config();
-        let registry = match helix_pkg::Registry::from_dirs(&config.pkg.registries) {
+        let registry = match helix_pkg::Registry::from_config(
+            &config.pkg,
+            &helix_pkg::Store::open_default(),
+        ) {
             Ok(registry) => registry,
             Err(err) => {
                 log::warn!("failed to load package registries for missing-server nudge: {err}");
@@ -243,17 +246,10 @@ impl Editor {
 
         if config.pkg.auto_install {
             let package = package.name.clone();
-            self.set_status(format!("Installing package {package}"));
-            self.work()
-                .spawn(async move {
-                    let _ = tokio::task::spawn_blocking(move || {
-                        let ops = helix_pkg::Ops::open_default()?;
-                        ops.install(&[package], &mut |_| {})?;
-                        anyhow::Ok(())
-                    })
-                    .await;
-                })
-                .detach();
+            helix_runtime::send_blocking(
+                self.pkg_sender(),
+                crate::handlers::PkgEvent::AutoInstall { name: package },
+            );
         } else {
             self.set_status(format!(
                 "{} not installed - :pkg-install {}",

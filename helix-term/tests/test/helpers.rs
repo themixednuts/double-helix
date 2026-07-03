@@ -2,6 +2,7 @@ use std::{
     io::{Read, Write},
     mem::replace,
     path::PathBuf,
+    sync::OnceLock,
     time::Duration,
 };
 
@@ -12,6 +13,24 @@ use helix_term::{application::Application, args::Args, config::Config, keymap::m
 use helix_view::{focused_ref, input::parse_macro, Editor};
 use tempfile::NamedTempFile;
 use tokio_stream::wrappers::UnboundedReceiverStream;
+
+static TEST_PROFILE_DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
+
+fn isolate_test_profile() {
+    let dir = TEST_PROFILE_DIR.get_or_init(|| tempfile::tempdir().expect("test profile dir"));
+
+    #[cfg(windows)]
+    {
+        std::env::set_var("APPDATA", dir.path());
+        std::env::set_var("LOCALAPPDATA", dir.path());
+    }
+
+    #[cfg(not(windows))]
+    {
+        std::env::set_var("XDG_CONFIG_HOME", dir.path().join("config"));
+        std::env::set_var("XDG_CACHE_HOME", dir.path().join("cache"));
+    }
+}
 
 #[cfg(windows)]
 use crossterm::event::{Event, KeyEvent};
@@ -398,6 +417,8 @@ impl AppBuilder {
     }
 
     pub fn build(self) -> anyhow::Result<Application> {
+        isolate_test_profile();
+
         if let Some(path) = &self.args.working_directory {
             bail!("Changing the working directory to {path:?} is not yet supported for integration tests");
         }

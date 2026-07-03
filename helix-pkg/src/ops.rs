@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     ffi::OsStr,
     ffi::OsString,
     fs,
@@ -16,7 +16,7 @@ use tempfile::TempDir;
 use xz2::read::XzDecoder;
 
 use crate::{
-    config::{NativeInstallPolicy, PkgConfig},
+    config::{NativeInstallPolicy, PkgConfig, RegistrySource},
     io as pkg_io,
     lock::{Lock, LockedPackage, Manifest},
     registry::Registry,
@@ -152,12 +152,11 @@ impl Ops {
     pub fn open_default() -> Result<Self> {
         let config_dir = config_dir();
         let config = read_pkg_config(&config_dir)?;
-        Ok(Self::new(
-            Registry::from_dirs(&config.registries)?,
-            Store::open_default(),
-            config_dir,
+        let store = Store::open_default();
+        Ok(
+            Self::new(Registry::from_config(&config, &store)?, store, config_dir)
+                .with_config(config),
         )
-        .with_config(config))
     }
 
     pub fn registry(&self) -> &Registry {
@@ -206,6 +205,9 @@ impl Ops {
                 .registry
                 .find(name)
                 .ok_or_else(|| Error::NotFound(name.clone()))?;
+            let _package_lock = self
+                .store
+                .acquire_package_lock(package.kind, &package.name)?;
             if let Some(receipt) = self.active_receipt(package.kind, &package.name)? {
                 if let (Some(manager), Some(id)) = (
                     receipt.native_manager.as_deref(),
@@ -228,6 +230,26 @@ impl Ops {
         Ok(())
     }
 
+    pub fn lock_manifest(&self, names: &[String], progress: &mut Progress<'_>) -> Result<Lock> {
+        let manifest_path = self.config_dir.join("pkg.toml");
+        let lock_path = self.config_dir.join("pkg.lock");
+        self.lock_manifest_at(&manifest_path, &lock_path, names, progress)
+    }
+
+    pub fn lock_project(
+        &self,
+        project_root: &Path,
+        names: &[String],
+        progress: &mut Progress<'_>,
+    ) -> Result<Lock> {
+        self.lock_manifest_at(
+            &project_manifest_path(project_root),
+            &project_lock_path(project_root),
+            names,
+            progress,
+        )
+    }
+
     pub fn sync(&self, progress: &mut Progress<'_>) -> Result<()> {
         self.store.prepare()?;
         let manifest_path = self.config_dir.join("pkg.toml");
@@ -242,6 +264,54 @@ impl Ops {
             let locked = lock
                 .find(kind, name)
                 .ok_or_else(|| Error::Message(format!("{name} is missing from pkg.lock")))?;
+            progress(OpEvent::Started {
+                name: name.to_owned(),
+            });
+            self.install_package(package, Some(locked), progress)?;
+            progress(OpEvent::Done {
+                name: name.to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    pub fn sync_with_project(
+        &self,
+        project_root: &Path,
+        progress: &mut Progress<'_>,
+    ) -> Result<()> {
+        self.store.prepare()?;
+        let user_manifest_path = self.config_dir.join("pkg.toml");
+        let user_lock_path = self.config_dir.join("pkg.lock");
+        let project_manifest_path = project_manifest_path(project_root);
+        let project_lock_path = project_lock_path(project_root);
+        let project_manifest = Manifest::read(&project_manifest_path)?;
+        let user_manifest = read_manifest_or_default(&user_manifest_path)?;
+        let manifest = user_manifest.merged_with(&project_manifest);
+        let user_lock = read_lock_or_default(&user_lock_path)?;
+        let project_lock = Lock::read(&project_lock_path)?;
+
+        for (kind, name) in manifest.packages() {
+            let package = self
+                .registry
+                .get(kind, name)
+                .ok_or_else(|| Error::NotFound(name.to_owned()))?;
+            let locked = if project_manifest.contains(kind, name) {
+                project_lock.find(kind, name).ok_or_else(|| {
+                    Error::Message(format!(
+                        "{name} is listed in {} but missing from {}",
+                        project_manifest_path.display(),
+                        project_lock_path.display()
+                    ))
+                })?
+            } else {
+                user_lock.find(kind, name).ok_or_else(|| {
+                    Error::Message(format!(
+                        "{name} is missing from {}",
+                        user_lock_path.display()
+                    ))
+                })?
+            };
             progress(OpEvent::Started {
                 name: name.to_owned(),
             });
@@ -286,6 +356,13 @@ impl Ops {
                 Err(err) => report.bad.push((receipt.name, err.to_string())),
             }
         }
+        for source in &self.config.registry_sources {
+            let name = format!("registry:{}", source.name);
+            match doctor_registry_source(source, &self.store) {
+                Ok(()) => report.ok.push(name),
+                Err(err) => report.bad.push((name, err.to_string())),
+            }
+        }
         Ok(report)
     }
 
@@ -325,6 +402,38 @@ impl Ops {
             }
         }
         Ok(reports)
+    }
+
+    pub fn plan_update(&self, names: &[String]) -> Result<UpdatePlan> {
+        let mut changes = Vec::new();
+        if names.is_empty() {
+            for receipt in self.store.receipts()? {
+                let Some(package) = self.registry.get(receipt.kind, &receipt.name) else {
+                    changes.push(PackageChange {
+                        name: receipt.name,
+                        kind: receipt.kind,
+                        installed: Some(receipt.version),
+                        candidate: None,
+                        warnings: Vec::new(),
+                        error: Some("package is no longer in the registry".to_owned()),
+                    });
+                    continue;
+                };
+                changes.push(self.plan_package(package, Some(receipt.version)));
+            }
+        } else {
+            for name in names {
+                let package = self
+                    .registry
+                    .find(name)
+                    .ok_or_else(|| Error::NotFound(name.clone()))?;
+                let installed = self
+                    .active_receipt(package.kind, &package.name)?
+                    .map(|receipt| receipt.version);
+                changes.push(self.plan_package(package, installed));
+            }
+        }
+        Ok(UpdatePlan { changes })
     }
 
     pub fn update(&self, names: &[String], progress: &mut Progress<'_>) -> Result<Lock> {
@@ -368,12 +477,54 @@ impl Ops {
         Ok(lock)
     }
 
+    fn plan_package(&self, package: &PackageSpec, installed: Option<String>) -> PackageChange {
+        let mut warnings = Vec::new();
+        let mut progress = |_event: OpEvent| {};
+        let result: Result<(ResolvedPackage, Vec<String>)> = (|| {
+            let artifact = self.artifact_for_host(package)?;
+            self.config.policy.check_source(package, artifact)?;
+            let resolved = self.resolve_source(package, artifact, &mut progress)?;
+            let policy = self.config.policy.check(package, artifact, &resolved)?;
+            let mut policy_warnings = policy.warnings;
+            if artifact.source.native.is_some() {
+                match self.config.allow_native {
+                    NativeInstallPolicy::True => {}
+                    NativeInstallPolicy::False => policy_warnings
+                        .push("native installs are disabled by [pkg] allow-native".to_owned()),
+                    NativeInstallPolicy::Prompt => policy_warnings.push(
+                        "native install would require confirmation before applying".to_owned(),
+                    ),
+                }
+            }
+            Ok((resolved, policy_warnings))
+        })();
+
+        let (candidate, error) = match result {
+            Ok((resolved, policy_warnings)) => {
+                warnings.extend(policy_warnings);
+                (Some(resolved), None)
+            }
+            Err(err) => (None, Some(err.to_string())),
+        };
+        PackageChange {
+            name: package.name.clone(),
+            kind: package.kind,
+            installed,
+            candidate,
+            warnings,
+            error,
+        }
+    }
+
     pub fn rollback(&self, name: &str) -> Result<LockedPackage> {
         self.store.prepare()?;
         let package = self
             .registry
             .find(name)
             .ok_or_else(|| Error::NotFound(name.to_owned()))?;
+        let _package_lock = self
+            .store
+            .acquire_package_lock(package.kind, &package.name)?;
         let current = self
             .active_receipt(package.kind, &package.name)?
             .ok_or_else(|| Error::Message(format!("{name} is not installed")))?;
@@ -425,12 +576,133 @@ impl Ops {
         Ok(locked)
     }
 
+    pub fn update_registries(&self, names: &[String]) -> Result<Vec<RegistryUpdate>> {
+        self.store.prepare()?;
+        let mut updates = Vec::new();
+        let mut matched = std::collections::BTreeSet::new();
+        for source in &self.config.registry_sources {
+            source.validate()?;
+            if !names.is_empty() && !names.iter().any(|name| name == &source.name) {
+                continue;
+            }
+            matched.insert(source.name.clone());
+            let path = source.active_dir(&self.store)?;
+            let status = if source.path.is_some() {
+                "local".to_owned()
+            } else {
+                update_git_registry(source, &path)?
+            };
+            updates.push(RegistryUpdate {
+                name: source.name.clone(),
+                source: source.source_label(),
+                path,
+                status,
+            });
+        }
+        for name in names {
+            if !matched.contains(name) {
+                return Err(Error::NotFound(name.clone()));
+            }
+        }
+        Ok(updates)
+    }
+
+    fn lock_manifest_at(
+        &self,
+        manifest_path: &Path,
+        lock_path: &Path,
+        names: &[String],
+        progress: &mut Progress<'_>,
+    ) -> Result<Lock> {
+        let manifest = Manifest::read(manifest_path)?;
+        let mut lock = read_lock_or_default(lock_path)?;
+        let requested = names.iter().map(String::as_str).collect::<BTreeSet<_>>();
+        let packages = manifest
+            .packages()
+            .filter(|(_, name)| requested.is_empty() || requested.contains(name))
+            .collect::<Vec<_>>();
+
+        for name in &requested {
+            if !manifest.packages().any(|(_, package)| package == *name) {
+                return Err(Error::Message(format!(
+                    "{name} is not listed in {}",
+                    manifest_path.display()
+                )));
+            }
+        }
+
+        for (kind, name) in packages {
+            let package = self
+                .registry
+                .get(kind, name)
+                .ok_or_else(|| Error::NotFound(name.to_owned()))?;
+            progress(OpEvent::Started {
+                name: name.to_owned(),
+            });
+            match self.lock_package(package, lock.find(kind, name), progress) {
+                Ok(locked) => {
+                    lock.upsert(locked);
+                    progress(OpEvent::Done {
+                        name: name.to_owned(),
+                    });
+                }
+                Err(err) => {
+                    progress(OpEvent::Failed {
+                        name: name.to_owned(),
+                        message: err.to_string(),
+                    });
+                    return Err(err);
+                }
+            }
+        }
+        lock.write(lock_path)?;
+        Ok(lock)
+    }
+
+    fn lock_package(
+        &self,
+        package: &PackageSpec,
+        previous: Option<&LockedPackage>,
+        progress: &mut Progress<'_>,
+    ) -> Result<LockedPackage> {
+        let artifact = self.artifact_for_host(package)?;
+        self.config.policy.check_source(package, artifact)?;
+        let resolved = self.resolve_source(package, artifact, progress)?;
+        let policy = self.config.policy.check(package, artifact, &resolved)?;
+        for warning in policy.warnings {
+            progress(OpEvent::Progress {
+                name: package.name.clone(),
+                message: format!("warning: {warning}"),
+            });
+        }
+        let previous_version = previous.and_then(|locked| {
+            if locked.version != resolved.version {
+                Some(locked.version.clone())
+            } else {
+                locked.previous_version.clone()
+            }
+        });
+        Ok(LockedPackage {
+            name: package.name.clone(),
+            kind: package.kind,
+            version: resolved.version,
+            previous_version,
+            source: resolved.source,
+            url: resolved.url,
+            sha256: resolved.sha256.unwrap_or_default(),
+            bin: artifact.bin.clone(),
+        })
+    }
+
     fn install_package(
         &self,
         package: &PackageSpec,
         locked: Option<&LockedPackage>,
         progress: &mut Progress<'_>,
     ) -> Result<LockedPackage> {
+        let _package_lock = self
+            .store
+            .acquire_package_lock(package.kind, &package.name)?;
         let artifact = self.artifact_for_host(package)?;
         let previous_version = self
             .active_receipt(package.kind, &package.name)?
@@ -464,7 +736,7 @@ impl Ops {
             ResolvedPackage {
                 version: locked.version.clone(),
                 url: locked.url.clone(),
-                sha256: Some(locked.sha256.clone()),
+                sha256: (!locked.sha256.is_empty()).then_some(locked.sha256.clone()),
                 source: locked.source.clone(),
                 published_at: None,
             }
@@ -687,6 +959,14 @@ pub struct DoctorReport {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegistryUpdate {
+    pub name: String,
+    pub source: String,
+    pub path: PathBuf,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutdatedPackage {
     pub name: String,
     pub kind: PkgKind,
@@ -700,6 +980,46 @@ impl OutdatedPackage {
         self.latest
             .as_ref()
             .is_some_and(|latest| latest != &self.installed)
+    }
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct UpdatePlan {
+    pub changes: Vec<PackageChange>,
+}
+
+impl UpdatePlan {
+    pub fn has_errors(&self) -> bool {
+        self.changes.iter().any(|change| change.error.is_some())
+    }
+
+    pub fn has_changes(&self) -> bool {
+        self.changes.iter().any(PackageChange::needs_apply)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackageChange {
+    pub name: String,
+    pub kind: PkgKind,
+    pub installed: Option<String>,
+    pub candidate: Option<ResolvedPackage>,
+    pub warnings: Vec<String>,
+    pub error: Option<String>,
+}
+
+impl PackageChange {
+    pub fn candidate_version(&self) -> Option<&str> {
+        self.candidate
+            .as_ref()
+            .map(|candidate| candidate.version.as_str())
+    }
+
+    pub fn needs_apply(&self) -> bool {
+        self.error.is_none()
+            && self
+                .candidate_version()
+                .is_some_and(|candidate| Some(candidate) != self.installed.as_deref())
     }
 }
 
@@ -1040,6 +1360,127 @@ fn install_go(module: &str, version: &str, dest: &Path) -> Result<()> {
     run_command(go.as_os_str(), &args, &mut command)
 }
 
+fn update_git_registry(source: &RegistrySource, dest: &Path) -> Result<String> {
+    let git = required_tool("git", "Git is required for git registry sources")?;
+    let repo = source
+        .git
+        .as_deref()
+        .ok_or_else(|| Error::Message("git registry source missing git url".to_owned()))?;
+    if !dest.exists() {
+        let parent = dest
+            .parent()
+            .ok_or_else(|| Error::Message("invalid registry cache path".to_owned()))?;
+        fs::create_dir_all(parent).map_err(|source| pkg_io(parent.display(), source))?;
+        let mut args = vec!["clone".to_owned()];
+        if let Some(branch) = source.branch.as_deref() {
+            args.extend([
+                "--branch".to_owned(),
+                branch.to_owned(),
+                "--depth".to_owned(),
+                "1".to_owned(),
+            ]);
+        }
+        args.extend([repo.to_owned(), dest.display().to_string()]);
+        let mut command = Command::new(&git);
+        command.args(&args);
+        run_command(git.as_os_str(), &args, &mut command)?;
+        if let Some(rev) = source.rev.as_deref() {
+            git_command(&git, dest, &["checkout", rev])?;
+        }
+        return Ok("cloned".to_owned());
+    }
+
+    if source.rev.is_some() {
+        git_command(&git, dest, &["fetch", "--all", "--tags", "--prune"])?;
+    } else if let Some(branch) = source.branch.as_deref() {
+        git_command(&git, dest, &["fetch", "origin", branch, "--prune"])?;
+        git_command(&git, dest, &["checkout", branch])?;
+        git_command(&git, dest, &["pull", "--ff-only", "origin", branch])?;
+        return Ok("updated".to_owned());
+    } else {
+        git_command(&git, dest, &["pull", "--ff-only"])?;
+        return Ok("updated".to_owned());
+    }
+    if let Some(rev) = source.rev.as_deref() {
+        git_command(&git, dest, &["checkout", rev])?;
+    }
+    Ok("updated".to_owned())
+}
+
+fn doctor_registry_source(source: &RegistrySource, store: &Store) -> Result<()> {
+    source.validate()?;
+    let path = source.active_dir(store)?;
+    if source.path.is_some() {
+        if path.exists() {
+            return Ok(());
+        }
+        return Err(Error::Message(format!(
+            "registry path {} does not exist",
+            path.display()
+        )));
+    }
+
+    if !path.exists() {
+        return Err(Error::Message(format!(
+            "registry cache missing; run `dhx pkg registry update {}`",
+            source.name
+        )));
+    }
+    if !path.join(".git").exists() {
+        return Err(Error::Message(format!(
+            "registry cache {} is not a git checkout",
+            path.display()
+        )));
+    }
+
+    if let Some(branch) = source.branch.as_deref() {
+        let current = git_output(&path, &["rev-parse", "--abbrev-ref", "HEAD"])?;
+        if current.trim() != branch {
+            return Err(Error::Message(format!(
+                "registry cache is on branch {}, expected {branch}",
+                current.trim()
+            )));
+        }
+    }
+    if let Some(rev) = source.rev.as_deref() {
+        let head = git_output(&path, &["rev-parse", "HEAD"])?;
+        if head.trim() != rev && !head.trim().starts_with(rev) {
+            return Err(Error::Message(format!(
+                "registry cache is at {}, expected {rev}",
+                head.trim()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn git_command(git: &Path, cwd: &Path, args: &[&str]) -> Result<()> {
+    let args: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
+    let mut command = Command::new(git);
+    command.current_dir(cwd).args(&args);
+    run_command(git.as_os_str(), &args, &mut command)
+}
+
+fn git_output(cwd: &Path, args: &[&str]) -> Result<String> {
+    let git = required_tool("git", "Git is required for git registry sources")?;
+    let args: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
+    let output = Command::new(&git)
+        .current_dir(cwd)
+        .args(&args)
+        .output()
+        .map_err(|source| pkg_io(git.display(), source))?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    } else {
+        Err(Error::CommandFailed {
+            program: git.display().to_string(),
+            args: args.join(" "),
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        })
+    }
+}
+
 fn required_tool(name: &str, context: &str) -> Result<PathBuf> {
     resolve::system_binary(name).map_err(|_| {
         Error::Message(format!(
@@ -1141,6 +1582,22 @@ fn read_lock_or_default(path: &Path) -> Result<Lock> {
     } else {
         Ok(Lock::default())
     }
+}
+
+fn read_manifest_or_default(path: &Path) -> Result<Manifest> {
+    if path.exists() {
+        Manifest::read(path)
+    } else {
+        Ok(Manifest::default())
+    }
+}
+
+fn project_manifest_path(project_root: &Path) -> PathBuf {
+    project_root.join(".helix").join("pkg.toml")
+}
+
+fn project_lock_path(project_root: &Path) -> PathBuf {
+    project_root.join(".helix").join("pkg.lock")
 }
 
 fn lock_from_receipt(receipt: Receipt) -> LockedPackage {
@@ -1682,6 +2139,7 @@ mod tests {
     use std::{
         fs,
         io::Write,
+        process::Command,
         sync::{
             atomic::{AtomicUsize, Ordering},
             Arc,
@@ -1816,6 +2274,141 @@ bin = "demo.exe"
     }
 
     #[test]
+    fn sync_with_project_uses_project_lock_for_project_entries() {
+        let dir = TempDir::new().unwrap();
+        let archive1 = dir.path().join("demo-1.zip");
+        let archive2 = dir.path().join("demo-2.zip");
+        make_zip(&archive1, "demo.exe", b"one");
+        make_zip(&archive2, "demo.exe", b"two");
+        let archive1_hash = crate::store::sha256_file(&archive1).unwrap();
+        let archive2_hash = crate::store::sha256_file(&archive2).unwrap();
+        let config = dir.path().join("config");
+        let project = dir.path().join("project");
+        let store = Store::open(dir.path().join("pkg"));
+
+        Manifest {
+            lsp: vec!["demo".to_owned()],
+            ..Manifest::default()
+        }
+        .write(&config.join("pkg.toml"))
+        .unwrap();
+        Lock {
+            packages: vec![LockedPackage {
+                name: "demo".to_owned(),
+                kind: PkgKind::Lsp,
+                version: "1".to_owned(),
+                previous_version: None,
+                source: "archive".to_owned(),
+                url: format!(
+                    "file://{}",
+                    archive1.display().to_string().replace('\\', "/")
+                ),
+                sha256: archive1_hash,
+                bin: "demo.exe".to_owned(),
+            }],
+        }
+        .write(&config.join("pkg.lock"))
+        .unwrap();
+
+        Manifest {
+            lsp: vec!["demo".to_owned()],
+            ..Manifest::default()
+        }
+        .write(&project_manifest_path(&project))
+        .unwrap();
+        Lock {
+            packages: vec![LockedPackage {
+                name: "demo".to_owned(),
+                kind: PkgKind::Lsp,
+                version: "2".to_owned(),
+                previous_version: None,
+                source: "archive".to_owned(),
+                url: format!(
+                    "file://{}",
+                    archive2.display().to_string().replace('\\', "/")
+                ),
+                sha256: archive2_hash,
+                bin: "demo.exe".to_owned(),
+            }],
+        }
+        .write(&project_lock_path(&project))
+        .unwrap();
+
+        let ops = Ops::new(registry_for_archive("2", &archive2), store, config);
+        ops.sync_with_project(&project, &mut |_| {}).unwrap();
+        let receipt = ops.store().receipts().unwrap().pop().unwrap();
+        assert_eq!(receipt.version, "2");
+        assert_eq!(
+            receipt.url,
+            format!(
+                "file://{}",
+                archive2.display().to_string().replace('\\', "/")
+            )
+        );
+    }
+
+    #[test]
+    fn lock_project_writes_project_lock_without_installing() {
+        let dir = TempDir::new().unwrap();
+        let archive = dir.path().join("demo.zip");
+        make_zip(&archive, "demo.exe", b"demo");
+        let config = dir.path().join("config");
+        let project = dir.path().join("project");
+        let store = Store::open(dir.path().join("pkg"));
+
+        Manifest {
+            lsp: vec!["demo".to_owned()],
+            ..Manifest::default()
+        }
+        .write(&project_manifest_path(&project))
+        .unwrap();
+
+        let ops = Ops::new(
+            registry_for_archive("1", &archive),
+            store.clone(),
+            config.clone(),
+        );
+        let lock = ops.lock_project(&project, &[], &mut |_| {}).unwrap();
+        assert_eq!(lock.packages.len(), 1);
+        assert!(store.receipts().unwrap().is_empty());
+
+        let locked = Lock::read(&project_lock_path(&project))
+            .unwrap()
+            .find(PkgKind::Lsp, "demo")
+            .unwrap()
+            .clone();
+        assert_eq!(locked.version, "1");
+        assert_eq!(locked.sha256, "");
+
+        ops.sync_with_project(&project, &mut |_| {}).unwrap();
+        let receipt = store.receipts().unwrap().pop().unwrap();
+        assert_eq!(receipt.version, "1");
+        assert!(!receipt.archive_sha256.is_empty());
+    }
+
+    #[test]
+    fn lock_manifest_rejects_names_not_in_manifest() {
+        let dir = TempDir::new().unwrap();
+        let config = dir.path().join("config");
+        Manifest {
+            lsp: vec!["demo".to_owned()],
+            ..Manifest::default()
+        }
+        .write(&config.join("pkg.toml"))
+        .unwrap();
+
+        let ops = Ops::new(
+            Registry::default(),
+            Store::open(dir.path().join("pkg")),
+            config,
+        );
+        let err = ops
+            .lock_manifest(&["missing".to_owned()], &mut |_| {})
+            .unwrap_err();
+        assert!(err.to_string().contains("missing is not listed"));
+    }
+
+    #[test]
     fn doctor_detects_corrupted_store_file() {
         let dir = TempDir::new().unwrap();
         let archive = dir.path().join("demo.zip");
@@ -1860,6 +2453,32 @@ bin = "demo.exe"
     }
 
     #[test]
+    fn doctor_reports_missing_git_registry_cache() {
+        let dir = TempDir::new().unwrap();
+        let config = PkgConfig {
+            registry_sources: vec![RegistrySource {
+                name: "fixture".to_owned(),
+                path: None,
+                git: Some("https://example.invalid/registry.git".to_owned()),
+                branch: None,
+                rev: None,
+            }],
+            ..PkgConfig::default()
+        };
+        let ops = Ops::new(
+            Registry::default(),
+            Store::open(dir.path().join("pkg")),
+            dir.path().join("config"),
+        )
+        .with_config(config);
+
+        let report = ops.doctor().unwrap();
+        assert_eq!(report.bad.len(), 1);
+        assert_eq!(report.bad[0].0, "registry:fixture");
+        assert!(report.bad[0].1.contains("registry cache missing"));
+    }
+
+    #[test]
     fn update_and_outdated_use_static_version_source_offline() {
         let dir = TempDir::new().unwrap();
         let archive1 = dir.path().join("demo-1.zip");
@@ -1884,6 +2503,134 @@ bin = "demo.exe"
         let receipt = ops.store().receipts().unwrap().into_iter().next().unwrap();
         assert_eq!(receipt.version, "2");
         assert_eq!(receipt.previous_version.as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn update_plan_resolves_candidate_without_mutating_store_or_lock() {
+        let dir = TempDir::new().unwrap();
+        let archive1 = dir.path().join("demo-1.zip");
+        let archive2 = dir.path().join("demo-2.zip");
+        make_zip(&archive1, "demo.exe", b"one");
+        make_zip(&archive2, "demo.exe", b"two");
+        let store = Store::open(dir.path().join("pkg"));
+        let config = dir.path().join("config");
+
+        let ops = Ops::new(
+            registry_for_archive("1", &archive1),
+            store.clone(),
+            config.clone(),
+        );
+        ops.install(&["demo".to_owned()], &mut |_| {}).unwrap();
+
+        let ops = Ops::new(
+            registry_for_archive("2", &archive2),
+            store.clone(),
+            config.clone(),
+        );
+        let plan = ops.plan_update(&[]).unwrap();
+        assert!(plan.has_changes());
+        assert!(!plan.has_errors());
+        assert_eq!(plan.changes.len(), 1);
+        assert_eq!(plan.changes[0].name, "demo");
+        assert_eq!(plan.changes[0].installed.as_deref(), Some("1"));
+        assert_eq!(plan.changes[0].candidate_version(), Some("2"));
+        assert!(plan.changes[0].needs_apply());
+
+        let receipt = store.receipts().unwrap().pop().unwrap();
+        assert_eq!(receipt.version, "1");
+        let locked = Lock::read(&config.join("pkg.lock"))
+            .unwrap()
+            .find(PkgKind::Lsp, "demo")
+            .unwrap()
+            .clone();
+        assert_eq!(locked.version, "1");
+    }
+
+    #[test]
+    fn update_plan_reports_policy_warnings_without_failing() {
+        let dir = TempDir::new().unwrap();
+        let archive = dir.path().join("demo.zip");
+        make_zip(&archive, "demo.exe", b"demo");
+        let ops = Ops::new(
+            registry_for_archive("1", &archive),
+            Store::open(dir.path().join("pkg")),
+            dir.path().join("config"),
+        )
+        .with_config(PkgConfig {
+            policy: crate::Policy {
+                min_release_age_days: 1,
+                ..crate::Policy::default()
+            },
+            ..PkgConfig::default()
+        });
+
+        let plan = ops.plan_update(&["demo".to_owned()]).unwrap();
+        assert_eq!(plan.changes.len(), 1);
+        assert!(plan.changes[0].error.is_none());
+        assert!(plan.changes[0]
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("min-release-age-days skipped")));
+    }
+
+    #[test]
+    fn update_registries_clones_git_source_into_cache() {
+        if !git_available() {
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        let source = dir.path().join("source-registry");
+        fs::create_dir_all(source.join("lsp")).unwrap();
+        run_git(&source, &["init"]);
+        run_git(&source, &["config", "user.email", "pkg@example.invalid"]);
+        run_git(&source, &["config", "user.name", "Pkg Test"]);
+        fs::write(
+            source.join("lsp").join("demo.toml"),
+            r#"
+name = "demo"
+kind = "lsp"
+description = "Demo registry package"
+
+[[artifact]]
+os = "windows"
+arch = "x86_64"
+source = { system = "demo" }
+bin = "demo"
+"#,
+        )
+        .unwrap();
+        run_git(&source, &["add", "."]);
+        run_git(&source, &["commit", "-m", "seed"]);
+
+        let config = PkgConfig {
+            registry_sources: vec![RegistrySource {
+                name: "fixture".to_owned(),
+                path: None,
+                git: Some(source.display().to_string()),
+                branch: None,
+                rev: None,
+            }],
+            ..PkgConfig::default()
+        };
+        let ops = Ops::new(
+            Registry::default(),
+            Store::open(dir.path().join("pkg")),
+            dir.path().join("config"),
+        )
+        .with_config(config);
+
+        let updates = ops.update_registries(&[]).unwrap();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].name, "fixture");
+        assert_eq!(updates[0].status, "cloned");
+        assert!(updates[0].path.join(".git").exists());
+
+        let registry = Registry::from_dirs(&ops.config().registry_dirs(ops.store()).unwrap())
+            .expect("cached registry loads");
+        assert_eq!(
+            registry.find("demo").unwrap().description,
+            "Demo registry package"
+        );
     }
 
     #[test]
@@ -2337,5 +3084,26 @@ bin = "demo.exe"
         } else {
             name.to_owned()
         }
+    }
+
+    fn git_available() -> bool {
+        Command::new("git")
+            .arg("--version")
+            .output()
+            .is_ok_and(|output| output.status.success())
+    }
+
+    fn run_git(cwd: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .current_dir(cwd)
+            .args(args)
+            .output()
+            .unwrap_or_else(|err| panic!("failed to run git {args:?}: {err}"));
+        assert!(
+            output.status.success(),
+            "git {args:?} failed\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }

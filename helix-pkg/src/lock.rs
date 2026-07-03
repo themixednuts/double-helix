@@ -48,6 +48,34 @@ impl Manifest {
                     .map(|name| (PkgKind::Plugin, name.as_str())),
             )
     }
+
+    pub fn contains(&self, kind: PkgKind, name: &str) -> bool {
+        match kind {
+            PkgKind::Lsp => self.lsp.iter().any(|package| package == name),
+            PkgKind::Dap => self.dap.iter().any(|package| package == name),
+            PkgKind::Grammar => self.grammar.iter().any(|package| package == name),
+            PkgKind::Plugin => self.plugin.iter().any(|package| package == name),
+        }
+    }
+
+    pub fn merged_with(&self, overlay: &Self) -> Self {
+        Self {
+            lsp: merge_package_names(&self.lsp, &overlay.lsp),
+            dap: merge_package_names(&self.dap, &overlay.dap),
+            grammar: merge_package_names(&self.grammar, &overlay.grammar),
+            plugin: merge_package_names(&self.plugin, &overlay.plugin),
+        }
+    }
+}
+
+fn merge_package_names(base: &[String], overlay: &[String]) -> Vec<String> {
+    let mut merged = Vec::with_capacity(base.len() + overlay.len());
+    for name in base.iter().chain(overlay) {
+        if !merged.iter().any(|existing| existing == name) {
+            merged.push(name.clone());
+        }
+    }
+    merged
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -136,5 +164,35 @@ mod tests {
         });
         lock.write(&lock_path).unwrap();
         assert_eq!(Lock::read(&lock_path).unwrap(), lock);
+    }
+
+    #[test]
+    fn manifest_merge_preserves_order_and_deduplicates_overlay() {
+        let user = Manifest {
+            lsp: vec!["rust-analyzer".to_owned(), "pyright".to_owned()],
+            grammar: vec!["rust".to_owned()],
+            ..Manifest::default()
+        };
+        let project = Manifest {
+            lsp: vec![
+                "rust-analyzer".to_owned(),
+                "typescript-language-server".to_owned(),
+            ],
+            dap: vec!["codelldb".to_owned()],
+            ..Manifest::default()
+        };
+
+        let merged = user.merged_with(&project);
+        assert_eq!(
+            merged.lsp,
+            vec![
+                "rust-analyzer".to_owned(),
+                "pyright".to_owned(),
+                "typescript-language-server".to_owned()
+            ]
+        );
+        assert_eq!(merged.dap, vec!["codelldb".to_owned()]);
+        assert!(project.contains(PkgKind::Lsp, "rust-analyzer"));
+        assert!(!project.contains(PkgKind::Grammar, "rust"));
     }
 }

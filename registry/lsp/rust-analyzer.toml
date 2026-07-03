@@ -2,6 +2,7 @@ name = "rust-analyzer"
 kind = "lsp"
 description = "Rust language server"
 homepage = "https://rust-analyzer.github.io"
+aliases = ["ra"]
 languages = ["rust"]
 
 [version]

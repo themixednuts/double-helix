@@ -7,6 +7,7 @@ use crate::config::Config;
 use crate::handlers::auto_reload::AutoReloadHandler;
 use crate::handlers::auto_save::AutoSaveHandler;
 use crate::handlers::diagnostics::PullDiagnosticsHandler;
+use crate::handlers::pkg::PkgHandler;
 
 pub use helix_view::handlers::{word_index, Handlers};
 
@@ -22,6 +23,7 @@ pub mod diagnostics;
 mod document_colors;
 pub mod local;
 mod lsp_features;
+mod pkg;
 mod prompt;
 mod signature_help;
 mod snippet;
@@ -44,6 +46,7 @@ pub fn setup(
         signature_help::SignatureHelpHandler::spawn(runtime.clone(), ingress.clone());
     let auto_save = AutoSaveHandler::spawn(runtime.clone(), ingress.clone());
     let auto_reload = AutoReloadHandler::spawn(runtime.clone(), ingress.clone());
+    let pkg = PkgHandler::spawn(runtime.clone(), ingress.clone());
     let document_colors = DocumentColorsHandler::spawn(runtime.clone(), ingress.clone());
     let lsp_feature_refresh = LspFeatureRefreshHandler::spawn(runtime.clone(), ingress.clone());
     let blame = BlameHandler::spawn(runtime.clone(), ingress.clone());
@@ -57,6 +60,7 @@ pub fn setup(
         signature_hints,
         auto_save,
         auto_reload,
+        pkg,
         document_colors,
         lsp_feature_refresh,
         blame,

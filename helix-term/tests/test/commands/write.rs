@@ -1,4 +1,5 @@
 use std::{
+    fs,
     io::{Read, Seek, Write},
     ops::RangeInclusive,
     path::Path,
@@ -6,8 +7,15 @@ use std::{
 
 use helix_core::diagnostic::Severity;
 use helix_stdx::path;
+use helix_view::input::parse_macro;
+use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use super::*;
+
+#[cfg(windows)]
+use crossterm::event::{Event, KeyEvent};
+#[cfg(not(windows))]
+use termina::{event::KeyEvent, Event};
 
 #[cfg(unix)]
 fn create_file_symlink(original: &Path, link: &Path) -> std::io::Result<()> {
@@ -29,6 +37,35 @@ fn try_create_file_symlink(original: &Path, link: &Path) -> anyhow::Result<bool>
         Err(err) if is_missing_symlink_privilege(&err) => Ok(false),
         Err(err) => Err(err.into()),
     }
+}
+
+fn assert_current_document_unmodified(app: &Application) {
+    let doc = helix_view::focused_ref!(app.editor).1;
+    assert!(!doc.is_modified(), "current document remains modified");
+}
+
+fn assert_all_documents_unmodified(app: &Application) {
+    let modified: Vec<_> = app
+        .editor
+        .documents()
+        .filter(|doc| doc.is_modified())
+        .map(|doc| doc.display_name())
+        .collect();
+    assert!(
+        modified.is_empty(),
+        "modified documents remain: {modified:?}"
+    );
+}
+
+async fn send_keys_and_focus_lost(app: &mut Application, keys: &str) -> anyhow::Result<()> {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut rx_stream = UnboundedReceiverStream::new(rx);
+    for key_event in parse_macro(keys)? {
+        tx.send(Ok(Event::Key(KeyEvent::from(key_event))))?;
+    }
+    tx.send(Ok(Event::FocusLost))?;
+    app.event_loop_until_idle(&mut rx_stream).await;
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -247,6 +284,86 @@ async fn test_write() -> anyhow::Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_write_family_plain_write_persists_bytes_and_clears_modified() -> anyhow::Result<()> {
+    let mut file = tempfile::NamedTempFile::new()?;
+    let mut app = helpers::AppBuilder::new()
+        .with_file(file.path(), None)
+        .build()?;
+
+    test_key_sequence(
+        &mut app,
+        Some("iplain write reached disk<esc>:w<ret>"),
+        Some(&assert_current_document_unmodified),
+        false,
+    )
+    .await?;
+
+    helpers::assert_file_has_content(
+        &mut file,
+        &LineFeedHandling::Native.apply("plain write reached disk"),
+    )?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_write_family_save_as_persists_bytes_and_clears_modified() -> anyhow::Result<()> {
+    let mut file = tempfile::NamedTempFile::new()?;
+
+    test_key_sequence(
+        &mut AppBuilder::new().build()?,
+        Some(
+            format!(
+                "isave as reached disk<esc>:w {}<ret>",
+                file.path().to_string_lossy()
+            )
+            .as_ref(),
+        ),
+        Some(&|app| {
+            assert_current_document_unmodified(app);
+            let doc = helix_view::focused_ref!(app.editor).1;
+            assert_eq!(Some(&path::normalize(file.path())), doc.path());
+        }),
+        false,
+    )
+    .await?;
+
+    helpers::assert_file_has_content(
+        &mut file,
+        &LineFeedHandling::Native.apply("save as reached disk"),
+    )?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_write_family_force_write_persists_bytes_and_clears_modified() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("missing-parent").join("forced.txt");
+
+    test_key_sequence(
+        &mut AppBuilder::new().build()?,
+        Some(
+            format!(
+                "iforce write reached disk<esc>:w! {}<ret>",
+                path.to_string_lossy()
+            )
+            .as_ref(),
+        ),
+        Some(&assert_current_document_unmodified),
+        false,
+    )
+    .await?;
+
+    assert_eq!(
+        LineFeedHandling::Native.apply("force write reached disk"),
+        fs::read_to_string(&path)?
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_write_while_file_explorer_focused() -> anyhow::Result<()> {
     let mut file = tempfile::NamedTempFile::new()?;
     let mut app = helpers::AppBuilder::new()
@@ -323,6 +440,191 @@ async fn test_write_quit() -> anyhow::Result<()> {
         LineFeedHandling::Native.apply("the gostak distims the doshes"),
         file_content
     );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_write_family_force_write_quit_persists_before_exit() -> anyhow::Result<()> {
+    let mut file = tempfile::NamedTempFile::new()?;
+    let mut app = helpers::AppBuilder::new()
+        .with_file(file.path(), None)
+        .build()?;
+
+    test_key_sequence(
+        &mut app,
+        Some("iforce write quit reached disk<esc>:wq!<ret>"),
+        None,
+        true,
+    )
+    .await?;
+
+    helpers::assert_file_has_content(
+        &mut file,
+        &LineFeedHandling::Native.apply("force write quit reached disk"),
+    )?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_write_family_write_all_persists_bytes_and_clears_modified() -> anyhow::Result<()> {
+    let mut file1 = tempfile::NamedTempFile::new()?;
+    let mut file2 = tempfile::NamedTempFile::new()?;
+    let mut app = helpers::AppBuilder::new()
+        .with_file(file1.path(), None)
+        .with_input_text("#[f|]#irst write-all buffer")
+        .build()?;
+
+    test_key_sequence(
+        &mut app,
+        Some(&format!(
+            ":o {}<ret>isecond write-all buffer<esc>:wa<ret>",
+            file2.path().to_string_lossy()
+        )),
+        Some(&assert_all_documents_unmodified),
+        false,
+    )
+    .await?;
+
+    helpers::assert_file_has_content(
+        &mut file1,
+        &LineFeedHandling::Native.apply("first write-all buffer"),
+    )?;
+    helpers::assert_file_has_content(
+        &mut file2,
+        &LineFeedHandling::Native.apply("second write-all buffer"),
+    )?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_write_family_write_all_quit_variants_persist_before_exit() -> anyhow::Result<()> {
+    for command in [":wqa<ret>", ":xa<ret>", ":wqa!<ret>"] {
+        let mut file1 = tempfile::NamedTempFile::new()?;
+        let mut file2 = tempfile::NamedTempFile::new()?;
+        let mut app = helpers::AppBuilder::new()
+            .with_file(file1.path(), None)
+            .with_input_text("#[f|]#irst all-quit buffer")
+            .build()?;
+
+        test_key_sequence(
+            &mut app,
+            Some(&format!(
+                ":o {}<ret>isecond all-quit buffer<esc>{command}",
+                file2.path().to_string_lossy()
+            )),
+            None,
+            true,
+        )
+        .await?;
+
+        helpers::assert_file_has_content(
+            &mut file1,
+            &LineFeedHandling::Native.apply("first all-quit buffer"),
+        )?;
+        helpers::assert_file_has_content(
+            &mut file2,
+            &LineFeedHandling::Native.apply("second all-quit buffer"),
+        )?;
+    }
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_write_family_write_buffer_close_persists_before_close() -> anyhow::Result<()> {
+    let mut file1 = tempfile::NamedTempFile::new()?;
+    let file2 = tempfile::NamedTempFile::new()?;
+    let mut app = helpers::AppBuilder::new()
+        .with_file(file1.path(), None)
+        .build()?;
+
+    test_key_sequence(
+        &mut app,
+        Some(&format!(
+            "iwrite buffer close reached disk<esc>:o {}<ret>:buffer-previous<ret>:write-buffer-close<ret>",
+            file2.path().to_string_lossy()
+        )),
+        Some(&|app| {
+            assert!(app.editor.document_by_path(file1.path()).is_none());
+            assert!(app.editor.document_by_path(file2.path()).is_some());
+        }),
+        false,
+    )
+    .await?;
+
+    helpers::assert_file_has_content(
+        &mut file1,
+        &LineFeedHandling::Native.apply("write buffer close reached disk"),
+    )?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_write_family_auto_save_after_delay_persists_bytes() -> anyhow::Result<()> {
+    let mut file = tempfile::NamedTempFile::new()?;
+    let mut app = helpers::AppBuilder::new()
+        .with_config(Config {
+            editor: helix_view::editor::Config {
+                auto_save: helix_view::editor::AutoSave {
+                    after_delay: helix_view::editor::AutoSaveAfterDelay {
+                        enable: true,
+                        timeout: 1,
+                    },
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .with_file(file.path(), None)
+        .build()?;
+
+    test_key_sequence(
+        &mut app,
+        Some("iauto-save after delay reached disk<esc>"),
+        Some(&assert_current_document_unmodified),
+        false,
+    )
+    .await?;
+
+    helpers::assert_file_has_content(
+        &mut file,
+        &LineFeedHandling::Native.apply("auto-save after delay reached disk"),
+    )?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_write_family_auto_save_focus_lost_persists_bytes() -> anyhow::Result<()> {
+    let mut file = tempfile::NamedTempFile::new()?;
+    let mut app = helpers::AppBuilder::new()
+        .with_config(Config {
+            editor: helix_view::editor::Config {
+                auto_save: helix_view::editor::AutoSave {
+                    focus_lost: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .with_file(file.path(), None)
+        .build()?;
+
+    send_keys_and_focus_lost(&mut app, "iauto-save focus lost reached disk<esc>").await?;
+    assert_current_document_unmodified(&app);
+
+    test_key_sequence(&mut app, None, None, false).await?;
+
+    helpers::assert_file_has_content(
+        &mut file,
+        &LineFeedHandling::Native.apply("auto-save focus lost reached disk"),
+    )?;
 
     Ok(())
 }

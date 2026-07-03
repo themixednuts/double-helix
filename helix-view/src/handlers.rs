@@ -38,12 +38,18 @@ pub enum AutoReloadEvent {
     LeftInsertMode,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PkgEvent {
+    AutoInstall { name: String },
+}
+
 pub struct Handlers {
     // only public because most of the actual implementation is in helix-term right now :/
     pub completions: CompletionHandler,
     pub signature_hints: Sender<lsp::SignatureHelpEvent>,
     pub auto_save: Sender<AutoSaveEvent>,
     pub auto_reload: Sender<AutoReloadEvent>,
+    pub pkg: Sender<PkgEvent>,
     pub document_colors: Sender<lsp::DocumentColorsEvent>,
     pub lsp_feature_refresh: Sender<lsp::LspFeatureRefreshEvent>,
     pub blame: Sender<BlameEvent>,
@@ -63,6 +69,7 @@ impl Handlers {
         let (sig_tx, _) = channel(1);
         let (auto_save_tx, _) = channel(1);
         let (auto_reload_tx, _) = channel(1);
+        let (pkg_tx, _) = channel(1);
         let (doc_colors_tx, _) = channel(1);
         let (lsp_feature_refresh_tx, _) = channel(1);
         let (blame_tx, _) = channel(1);
@@ -73,6 +80,7 @@ impl Handlers {
             signature_hints: sig_tx,
             auto_save: auto_save_tx,
             auto_reload: auto_reload_tx,
+            pkg: pkg_tx,
             document_colors: doc_colors_tx,
             lsp_feature_refresh: lsp_feature_refresh_tx,
             blame: blame_tx,

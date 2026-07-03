@@ -4840,6 +4840,7 @@ fn unfold(cx: &mut Context) {
 
 fn toggle_fold(cx: &mut Context) {
     use graphemes::ensure_grapheme_boundary_prev;
+    use helix_core::textobject;
     use text_folding::{Fold, FoldObject};
 
     let (view_id, doc) = focused!(cx.editor);
@@ -4868,19 +4869,24 @@ fn toggle_fold(cx: &mut Context) {
     let root_node = syntax.tree().root_node();
 
     // search for a textobject at the cursor
-    let Some((capture_name, node_range)) = textobject_query
-        .capture_nodes_all(textobjects, &root_node, text)
-        .map(|(cap, node)| (cap.name(textobject_query.query()), node.byte_range()))
-        .filter(|(_, range)| range.contains(&text.char_to_byte(cursor)))
-        .min_by_key(|(_, range)| range.len())
-        .map(|(cap, range)| {
-            (cap, {
-                let start = text.byte_to_char(range.start);
-                let end = ensure_grapheme_boundary_prev(text, text.byte_to_char(range.end - 1));
-                start..=end
-            })
+    let Some((capture_name, node_range)) = textobject::nearest_textobject_by_byte_range(
+        textobject_query
+            .capture_nodes_all(textobjects, &root_node, text)
+            .map(|(cap, node)| {
+                let capture_name = cap.name(textobject_query.query());
+                (capture_name, node)
+            }),
+        text.char_to_byte(cursor),
+        |(_, node)| node.byte_range(),
+    )
+    .map(|(cap, range)| {
+        let range = range.byte_range();
+        (cap, {
+            let start = text.byte_to_char(range.start);
+            let end = ensure_grapheme_boundary_prev(text, text.byte_to_char(range.end - 1));
+            start..=end
         })
-    else {
+    }) else {
         cx.editor
             .set_status("There is no text object at the cursor.");
         return;

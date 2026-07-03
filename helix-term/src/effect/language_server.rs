@@ -1617,6 +1617,10 @@ pub(crate) fn apply_folding_ranges(
     if !editor.config().lsp.folding {
         return;
     }
+    let fold_on_open = editor.config().fold_on_open;
+    if !fold_on_open {
+        return;
+    }
     let view_ids: Vec<_> = editor
         .tree
         .views()
@@ -1636,6 +1640,7 @@ pub(crate) fn apply_folding_ranges(
         if should_replace_folds_with_lsp(
             doc.fold_container(view_id),
             doc.is_lsp_fold_container(view_id),
+            fold_on_open,
         ) {
             doc.insert_fold_container(view_id, FoldContainer::from(text.slice(..), points.clone()));
             doc.mark_lsp_fold_container(view_id);
@@ -1646,8 +1651,9 @@ pub(crate) fn apply_folding_ranges(
 pub(crate) fn should_replace_folds_with_lsp(
     existing: Option<&FoldContainer>,
     lsp_owned: bool,
+    fold_on_open: bool,
 ) -> bool {
-    lsp_owned || existing.is_none_or(FoldContainer::is_empty)
+    fold_on_open && (lsp_owned || existing.is_none_or(FoldContainer::is_empty))
 }
 
 pub(crate) fn apply_linked_editing_ranges(
@@ -1704,6 +1710,27 @@ pub(crate) fn apply_on_type_formatting(
 mod tests {
     use super::*;
     use helix_core::Rope;
+    use helix_view::{
+        editor::{Action, Config, EditorBuilder},
+        graphics::Rect,
+        Document,
+    };
+
+    fn editor_with_text(text: &str, config: Config) -> (Editor, DocumentId, ViewId) {
+        let mut editor =
+            EditorBuilder::new(Rect::new(0, 0, 80, 24), helix_runtime::test::runtime())
+                .config(config)
+                .build();
+        let doc = Document::from(
+            Rope::from(text),
+            None,
+            editor.config.clone(),
+            editor.syn_loader.clone(),
+        );
+        let doc_id = editor.new_file_from_document(Action::VerticalSplit, doc);
+        let view_id = editor.tree.focus;
+        (editor, doc_id, view_id)
+    }
 
     #[test]
     fn folding_range_conversion_rejects_empty_and_out_of_bounds_ranges() {
@@ -1766,13 +1793,75 @@ mod tests {
         .expect("valid folding range");
         let non_empty = FoldContainer::from(text.slice(..), vec![points]);
 
-        assert!(should_replace_folds_with_lsp(None, false));
+        assert!(should_replace_folds_with_lsp(None, false, true));
         assert!(should_replace_folds_with_lsp(
             Some(&FoldContainer::new()),
+            false,
+            true
+        ));
+        assert!(should_replace_folds_with_lsp(Some(&non_empty), true, true));
+        assert!(!should_replace_folds_with_lsp(
+            Some(&non_empty),
+            false,
+            true
+        ));
+        assert!(!should_replace_folds_with_lsp(None, false, false));
+        assert!(!should_replace_folds_with_lsp(
+            Some(&FoldContainer::new()),
+            false,
             false
         ));
-        assert!(should_replace_folds_with_lsp(Some(&non_empty), true));
-        assert!(!should_replace_folds_with_lsp(Some(&non_empty), false));
+        assert!(!should_replace_folds_with_lsp(
+            Some(&non_empty),
+            true,
+            false
+        ));
+    }
+
+    #[test]
+    fn apply_folding_ranges_only_collapses_when_fold_on_open_is_enabled() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let _guard = runtime.enter();
+        let text = "fn main() {\n    call();\n}\n";
+        let range = lsp::FoldingRange {
+            start_line: 0,
+            end_line: 2,
+            ..Default::default()
+        };
+
+        let (mut editor, doc_id, view_id) = editor_with_text(text, Config::default());
+        apply_folding_ranges(
+            &mut editor,
+            doc_id,
+            vec![(
+                LanguageServerId::default(),
+                helix_lsp::OffsetEncoding::Utf8,
+                range,
+            )],
+        );
+        let doc = editor.document(doc_id).expect("document");
+        assert!(doc
+            .fold_container(view_id)
+            .is_none_or(FoldContainer::is_empty));
+
+        let mut config = Config::default();
+        config.fold_on_open = true;
+        let (mut editor, doc_id, view_id) = editor_with_text(text, config);
+        apply_folding_ranges(
+            &mut editor,
+            doc_id,
+            vec![(
+                LanguageServerId::default(),
+                helix_lsp::OffsetEncoding::Utf8,
+                lsp::FoldingRange {
+                    start_line: 0,
+                    end_line: 2,
+                    ..Default::default()
+                },
+            )],
+        );
+        let doc = editor.document(doc_id).expect("document");
+        assert_eq!(doc.fold_container(view_id).map(FoldContainer::len), Some(1));
     }
 
     #[test]

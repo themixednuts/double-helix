@@ -94,6 +94,109 @@ fn fold_container_add() {
 }
 
 #[test]
+fn fold_container_add_removes_partially_overlapping_fold() {
+    let text = RopeSlice::from(
+        "first {\n\
+            a\n\
+            second {\n\
+                b\n\
+            }\n\
+        }\n",
+    );
+    let points = vec![
+        new_fold_points(text, "first", 0, 1..=3),
+        new_fold_points(text, "second", 2, 3..=5),
+    ];
+
+    let container = FoldContainer::from(text, points);
+
+    assert_eq!(container.len(), 1);
+    assert!(matches!(
+        container.start_points()[0].object,
+        FoldObject::TextObject("second")
+    ));
+    assert!(container.start_points()[0].is_superest());
+}
+
+#[test]
+fn fold_container_remove_keeps_nested_links_valid() {
+    let text = RopeSlice::from(
+        "outer {\n\
+            inner {\n\
+                body\n\
+            }\n\
+        }\n",
+    );
+    let mut container = FoldContainer::from(
+        text,
+        vec![
+            new_fold_points(text, "outer", 0, 1..=4),
+            new_fold_points(text, "inner", 1, 2..=3),
+        ],
+    );
+
+    let inner_idx = container
+        .find(
+            &FoldObject::TextObject("inner"),
+            &(text.line_to_char(1)..=text.line_to_char(3)),
+            |fold| fold.header()..=fold.end.target,
+        )
+        .expect("inner fold")
+        .start_idx();
+    container.remove(text, &[inner_idx]);
+
+    assert_eq!(container.len(), 1);
+    let fold = container.start_points()[0].fold(&container);
+    assert!(matches!(fold.object(), FoldObject::TextObject("outer")));
+    assert!(fold.is_superest());
+    assert_eq!(
+        container
+            .find(
+                &FoldObject::TextObject("outer"),
+                &(fold.header()..=fold.end.target),
+                |fold| fold.header()..=fold.end.target,
+            )
+            .map(|fold| fold.start_idx()),
+        Some(0)
+    );
+}
+
+#[test]
+fn fold_container_remove_outer_promotes_inner_fold() {
+    let text = RopeSlice::from(
+        "outer {\n\
+            inner {\n\
+                body\n\
+            }\n\
+        }\n",
+    );
+    let mut container = FoldContainer::from(
+        text,
+        vec![
+            new_fold_points(text, "outer", 0, 1..=4),
+            new_fold_points(text, "inner", 1, 2..=3),
+        ],
+    );
+
+    let outer_idx = container
+        .find(
+            &FoldObject::TextObject("outer"),
+            &(container.start_points()[0].fold(&container).header()
+                ..=container.start_points()[0].fold(&container).end.target),
+            |fold| fold.header()..=fold.end.target,
+        )
+        .expect("outer fold")
+        .start_idx();
+    container.remove(text, &[outer_idx]);
+
+    assert_eq!(container.len(), 1);
+    let fold = container.start_points()[0].fold(&container);
+    assert!(matches!(fold.object(), FoldObject::TextObject("inner")));
+    assert!(fold.is_superest());
+    assert_eq!(fold.start_idx(), 0);
+}
+
+#[test]
 fn fold_container_replace() {
     // replacements, replaced
     let cases = [

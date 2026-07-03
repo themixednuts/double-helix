@@ -1,4 +1,4 @@
-use std::fmt::Display;
+use std::{fmt::Display, ops};
 
 use ropey::RopeSlice;
 
@@ -7,7 +7,7 @@ use crate::graphemes::{next_grapheme_boundary, prev_grapheme_boundary};
 use crate::line_ending::rope_is_line_ending;
 use crate::movement::Direction;
 use crate::surround::FindType;
-use crate::syntax;
+use crate::syntax::{self, CapturedNode, TextObjectQuery};
 use crate::Range;
 use crate::{surround, Syntax};
 
@@ -291,10 +291,8 @@ pub fn textobject_treesitter(
         let byte_pos = slice.char_to_byte(range.cursor(slice));
 
         let capture_name = format!("{}.{}", object_name, textobject); // eg. function.inner
-        let node = textobject_query?
-            .capture_nodes(&capture_name, &root, slice)?
-            .filter(|node| node.byte_range().contains(&byte_pos))
-            .min_by_key(|node| node.byte_range().len())?;
+        let node =
+            nearest_textobject_node(textobject_query?, &capture_name, &root, slice, byte_pos)?;
 
         let len = slice.len_bytes();
         let start_byte = node.start_byte();
@@ -311,12 +309,69 @@ pub fn textobject_treesitter(
     get_range().unwrap_or(range)
 }
 
+pub fn nearest_textobject_node<'a>(
+    textobject_query: &'a TextObjectQuery,
+    capture_name: &str,
+    root: &crate::tree_sitter::Node<'a>,
+    slice: RopeSlice<'a>,
+    byte_pos: usize,
+) -> Option<CapturedNode<'a>> {
+    nearest_textobject_node_from_iter(
+        textobject_query.capture_nodes(capture_name, root, slice)?,
+        byte_pos,
+    )
+}
+
+pub fn nearest_textobject_node_from_iter<'a>(
+    nodes: impl Iterator<Item = CapturedNode<'a>>,
+    byte_pos: usize,
+) -> Option<CapturedNode<'a>> {
+    nearest_textobject_by_byte_range(nodes, byte_pos, CapturedNode::byte_range)
+}
+
+pub fn nearest_textobject_by_byte_range<T>(
+    items: impl Iterator<Item = T>,
+    byte_pos: usize,
+    mut byte_range: impl FnMut(&T) -> ops::Range<usize>,
+) -> Option<T> {
+    let mut containing = None;
+    let mut after = None;
+    let mut before = None;
+
+    for item in items {
+        let range = byte_range(&item);
+        if range.contains(&byte_pos) {
+            if containing
+                .as_ref()
+                .is_none_or(|(_, current): &(T, ops::Range<usize>)| range.len() < current.len())
+            {
+                containing = Some((item, range));
+            }
+        } else if range.start >= byte_pos {
+            if after
+                .as_ref()
+                .is_none_or(|(_, current): &(T, ops::Range<usize>)| range.start < current.start)
+            {
+                after = Some((item, range));
+            }
+        } else if before
+            .as_ref()
+            .is_none_or(|(_, current): &(T, ops::Range<usize>)| range.end > current.end)
+        {
+            before = Some((item, range));
+        }
+    }
+
+    containing.or(after).or(before).map(|(item, _)| item)
+}
+
 #[cfg(test)]
 mod test {
     use super::TextObject::*;
     use super::*;
 
     use crate::Range;
+    use crate::{config, Syntax};
     use ropey::Rope;
 
     #[test]
@@ -615,5 +670,89 @@ mod test {
                 );
             }
         }
+    }
+
+    #[test]
+    fn textobject_treesitter_uses_nearest_object_when_cursor_is_outside() {
+        let loader = config::default_lang_loader();
+        let lang = loader.language_for_name("rust").unwrap();
+        let source = Rope::from(
+            "\n\
+            fn first() {\n\
+                one();\n\
+            }\n\
+            \n\
+            fn second() {\n\
+                two();\n\
+            }\n",
+        );
+        let text = source.slice(..);
+        let syntax = Syntax::new(text, lang, &loader).unwrap();
+        let first_start = source.to_string().find("fn first").unwrap();
+        let second_start = source.to_string().find("fn second").unwrap();
+        let first_start = text.byte_to_char(first_start);
+        let second_start = text.byte_to_char(second_start);
+
+        let before_first = textobject_treesitter(
+            text,
+            Range::point(0),
+            TextObject::Around,
+            "function",
+            &syntax,
+            &loader,
+            1,
+        );
+        assert_eq!(before_first.from(), first_start);
+
+        let between = textobject_treesitter(
+            text,
+            Range::point(second_start - 1),
+            TextObject::Around,
+            "function",
+            &syntax,
+            &loader,
+            1,
+        );
+        assert_eq!(between.from(), second_start);
+
+        let after_last = textobject_treesitter(
+            text,
+            Range::point(text.len_chars().saturating_sub(1)),
+            TextObject::Around,
+            "function",
+            &syntax,
+            &loader,
+            1,
+        );
+        assert_eq!(after_last.from(), second_start);
+    }
+
+    #[test]
+    fn textobject_treesitter_keeps_smallest_containing_object() {
+        let loader = config::default_lang_loader();
+        let lang = loader.language_for_name("rust").unwrap();
+        let source = Rope::from(
+            "impl Thing {\n\
+                fn method() {\n\
+                    call();\n\
+                }\n\
+            }\n",
+        );
+        let text = source.slice(..);
+        let syntax = Syntax::new(text, lang, &loader).unwrap();
+        let cursor = text.byte_to_char(source.to_string().find("call").unwrap());
+        let function_start = text.byte_to_char(source.to_string().find("fn method").unwrap());
+
+        let result = textobject_treesitter(
+            text,
+            Range::point(cursor),
+            TextObject::Around,
+            "function",
+            &syntax,
+            &loader,
+            1,
+        );
+
+        assert_eq!(result.from(), function_start);
     }
 }

@@ -64,12 +64,18 @@ impl LocalHistory {
 
     pub async fn load(&self, id: thread::Id) -> anyhow::Result<Option<Record>> {
         let path = self.path(id);
-        let raw = match tokio::fs::read_to_string(path).await {
+        let raw = match tokio::fs::read_to_string(&path).await {
             Ok(raw) => raw,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(err) => return Err(err.into()),
         };
-        let entry = serde_json::from_str::<PersistedThread>(&raw)?;
+        let entry = match serde_json::from_str::<PersistedThread>(&raw) {
+            Ok(entry) => entry,
+            Err(err) => {
+                log::warn!("assistant history decode failed {:?}: {}", path, err);
+                return Ok(None);
+            }
+        };
         Ok(Some(entry.record.into_domain()?))
     }
 
@@ -79,8 +85,8 @@ impl LocalHistory {
             Ok(payload) => payload,
             Err(err) => return Err(err),
         };
-        tokio::fs::create_dir_all(path.parent().expect("history root")).await?;
-        tokio::fs::write(path, serde_json::to_vec_pretty(&payload)?).await?;
+        crate::assistant::layout::atomic_write(&path, &serde_json::to_vec_pretty(&payload)?)
+            .await?;
         Ok(())
     }
 
@@ -1446,6 +1452,28 @@ mod tests {
 
             let loaded = backend.load(record.id).await.unwrap().unwrap();
             assert_eq!(loaded, record);
+        });
+    }
+
+    #[test]
+    fn load_scope_skips_corrupt_history_records() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let backend = LocalHistory {
+                root: dir.path().join("assistant-history"),
+            };
+            let record = sample_record();
+
+            backend.save(record.clone()).await.unwrap();
+            tokio::fs::write(backend.root.join("2.json"), b"{\"stub\":null} trailing")
+                .await
+                .unwrap();
+
+            let listed = backend.load_scope(&record.scope).await.unwrap();
+
+            assert_eq!(listed.len(), 1);
+            assert_eq!(listed[0].id, record.id);
         });
     }
 }

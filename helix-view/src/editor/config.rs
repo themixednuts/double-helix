@@ -345,6 +345,7 @@ pub struct Config {
     pub buffer_picker: BufferPickerConfig,
     #[serde(default)]
     pub fold_textobjects: Vec<String>,
+    pub fold_on_open: bool,
     #[serde(default = "default_agents")]
     pub agents: Vec<AgentConfig>,
     #[serde(default)]
@@ -1590,6 +1591,7 @@ impl Default for Config {
             completion_highlight: CompletionHighlight::default(),
             buffer_picker: BufferPickerConfig::default(),
             fold_textobjects: Vec::new(),
+            fold_on_open: false,
             agents: default_agents(),
             acp: AcpConfig::default(),
             assistant: AssistantConfig::default(),

@@ -338,6 +338,7 @@
           }
         },
         "fold-textobjects": { "$ref": "#/$defs/arrayOfStrings" },
+        "fold-on-open": { "type": "boolean" },
         "agents": {
           "type": "array",
           "items": {

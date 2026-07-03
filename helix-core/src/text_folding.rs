@@ -637,7 +637,7 @@ impl FoldContainer {
                 .take_while(|&next_fold| overlap(&range(fold), &range(next_fold)))
                 .find_map(|next_fold| {
                     let fold_range = &range(fold);
-                    let next_fold_range = &range(fold);
+                    let next_fold_range = &range(next_fold);
 
                     (!span(fold_range, next_fold_range) && !span(next_fold_range, fold_range))
                         .then(|| text.char_to_line(next_fold.header()) - 1)

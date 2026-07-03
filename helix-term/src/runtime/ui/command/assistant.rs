@@ -13,7 +13,9 @@ pub enum AssistantCommand {
     },
     /// Show assistant history entries using normalized history stubs.
     PushHistoryPicker {
+        scope: helix_view::assistant::thread::Scope,
         entries: Vec<helix_view::assistant::history::Stub>,
+        next: Option<helix_view::assistant::history::Cursor>,
     },
     /// Show a picker for detaching one of several attached assistant context items.
     PushDetachContextPicker {

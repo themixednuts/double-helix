@@ -15,7 +15,8 @@ use helix_view::{
 
 use crate::{
     effect::language_server::{
-        request_code_lenses, request_document_links, request_folding_ranges, request_semantic_tokens,
+        request_code_lenses, request_document_links, request_folding_ranges,
+        request_semantic_tokens,
     },
     runtime::RuntimeTaskEvent,
 };

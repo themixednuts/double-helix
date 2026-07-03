@@ -32,6 +32,24 @@ fn connect_assistant_backend(
     });
 }
 
+pub(crate) fn assistant_history_delete_remote(
+    origin: Option<&helix_view::assistant::thread::Origin>,
+    caps: Option<&helix_acp::AgentCaps>,
+) -> bool {
+    matches!(
+        origin,
+        Some(helix_view::assistant::thread::Origin::Backend { .. })
+    ) && caps.is_some_and(|caps| caps.delete_session)
+}
+
+pub(crate) fn assistant_history_should_fetch_more(
+    selected_index: usize,
+    len: usize,
+    next: Option<&helix_view::assistant::history::Cursor>,
+) -> bool {
+    next.is_some() && len != 0 && selected_index + 1 >= len
+}
+
 pub(crate) fn apply_assistant_command(
     editor: &mut helix_view::Editor,
     compositor: &mut Compositor,
@@ -159,11 +177,24 @@ pub(crate) fn apply_assistant_command(
                 })
                 .detach();
         }
-        AssistantCommand::PushHistoryPicker { entries } => {
+        AssistantCommand::PushHistoryPicker {
+            scope,
+            entries,
+            next,
+        } => {
             if entries.is_empty() {
                 editor.set_status("No assistant history for this scope");
                 return;
             }
+            let caps = editor.active_assistant_caps().cloned();
+            let pending_delete = std::sync::Arc::new(std::sync::Mutex::new(
+                None::<helix_view::assistant::thread::Id>,
+            ));
+            let entries_len = entries.len();
+            let page_next = next.clone();
+            let requested_next = std::sync::Arc::new(std::sync::Mutex::new(
+                None::<helix_view::assistant::history::Cursor>,
+            ));
 
             let columns = [
                 crate::ui::PickerColumn::new(
@@ -194,6 +225,46 @@ pub(crate) fn apply_assistant_command(
                 ),
             ];
 
+            let mut delete_handlers = crate::ui::picker::PickerKeyHandlers::new();
+            {
+                let pending_delete = pending_delete.clone();
+                let caps = caps.clone();
+                delete_handlers.insert(
+                    helix_view::input::KeyEvent {
+                        code: helix_view::input::KeyCode::Char('d'),
+                        modifiers: helix_view::input::KeyModifiers::NONE,
+                    },
+                    Box::new(
+                        move |cx: &mut crate::compositor::Context,
+                              item: &helix_view::assistant::history::Stub,
+                              _data,
+                              _cursor| {
+                            let mut pending = pending_delete.lock().expect("delete state");
+                            if *pending == Some(item.id) {
+                                let delete_remote = assistant_history_delete_remote(
+                                    item.origin.as_ref(),
+                                    caps.as_ref(),
+                                );
+                                cx.ingress
+                                    .task(RuntimeTaskEvent::DeleteAssistantHistoryThread {
+                                        thread: item.id,
+                                        delete_remote,
+                                    });
+                                *pending = None;
+                            } else {
+                                *pending = Some(item.id);
+                                let title = item.title.as_deref().map_or_else(
+                                    || format!("session {}", item.id),
+                                    ToString::to_string,
+                                );
+                                cx.editor
+                                    .set_status(format!("Press d again to delete {title}"));
+                            }
+                        },
+                    ),
+                );
+            }
+
             let picker = crate::ui::Picker::new(
                 columns,
                 0,
@@ -219,7 +290,36 @@ pub(crate) fn apply_assistant_command(
                             panel: helix_view::editor::PanelBehavior::Open,
                         });
                 },
-            );
+            )
+            .with_key_handlers(delete_handlers)
+            .with_selection_changed_handler(Box::new(
+                move |cx: &mut crate::compositor::Context,
+                      _item: Option<&helix_view::assistant::history::Stub>,
+                      _data,
+                      cursor| {
+                    if !assistant_history_should_fetch_more(
+                        cursor as usize,
+                        entries_len,
+                        page_next.as_ref(),
+                    ) {
+                        return;
+                    }
+                    let Some(cursor) = page_next.clone() else {
+                        return;
+                    };
+                    let mut requested = requested_next.lock().expect("pagination state");
+                    if requested.as_ref() == Some(&cursor) {
+                        return;
+                    }
+                    *requested = Some(cursor.clone());
+                    cx.ingress
+                        .task(RuntimeTaskEvent::FetchAssistantHistoryPage {
+                            scope: scope.clone(),
+                            cursor: Some(cursor),
+                        });
+                    cx.editor.set_status("Loading more assistant sessions...");
+                },
+            ));
 
             compositor.push(Box::new(crate::ui::overlay::overlaid(picker)));
         }
@@ -331,7 +431,6 @@ pub(crate) fn apply_assistant_command(
                 ),
             ];
 
-            let agents_for_callback = agents.clone();
             let picker = crate::ui::Picker::new(
                 columns,
                 0,
@@ -342,20 +441,45 @@ pub(crate) fn apply_assistant_command(
                 move |cx: &mut crate::compositor::Context,
                       item: &helix_view::editor::AgentConfig,
                       _action| {
-                    let idx = agents_for_callback
-                        .iter()
-                        .position(|a| a.name == item.name && a.command == item.command)
-                        .or_else(|| {
-                            agents_for_callback
-                                .iter()
-                                .position(|a| a.command == item.command)
-                        });
-                    let _ = idx;
                     connect_assistant_backend(&cx.ingress, item.command.clone(), item.args.clone());
                 },
             );
 
             compositor.push(Box::new(crate::ui::overlay::overlaid(picker)));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn assistant_history_delete_remote_requires_backend_origin_and_cap() {
+        let origin = helix_view::assistant::thread::Origin::Backend {
+            backend: helix_view::assistant::backend::Id::new("backend"),
+            remote: helix_view::assistant::backend::Remote::new("remote"),
+        };
+        let caps = helix_acp::AgentCaps {
+            delete_session: true,
+            ..Default::default()
+        };
+
+        assert!(assistant_history_delete_remote(Some(&origin), Some(&caps)));
+        assert!(!assistant_history_delete_remote(Some(&origin), None));
+        assert!(!assistant_history_delete_remote(
+            Some(&helix_view::assistant::thread::Origin::Local),
+            Some(&caps)
+        ));
+    }
+
+    #[test]
+    fn assistant_history_fetch_more_triggers_at_page_end_only_with_cursor() {
+        let cursor = helix_view::assistant::history::Cursor::new("next");
+
+        assert!(assistant_history_should_fetch_more(2, 3, Some(&cursor)));
+        assert!(!assistant_history_should_fetch_more(1, 3, Some(&cursor)));
+        assert!(!assistant_history_should_fetch_more(2, 3, None));
+        assert!(!assistant_history_should_fetch_more(0, 0, Some(&cursor)));
     }
 }

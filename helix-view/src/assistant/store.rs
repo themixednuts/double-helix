@@ -156,6 +156,15 @@ impl Store {
         Some((thread_id, review::Target::File(file.path.clone())))
     }
 
+    pub fn selected_subagent(&self) -> Option<super::tool::SubagentSessionInfo> {
+        let (_, thread) = self.active_thread()?;
+        let entry = thread.selected()?;
+        let thread::EntryKind::ToolCall(call) = &entry.kind else {
+            return None;
+        };
+        call.subagent.clone()
+    }
+
     pub fn active_backend_id(&self) -> Option<backend::Id> {
         let (_, thread) = self.active_thread()?;
         thread.backend_id()
@@ -295,6 +304,49 @@ impl Store {
                 Close::Missing(err) => Err(err),
             },
         }
+    }
+
+    pub fn delete_history_thread(
+        &mut self,
+        thread: thread::Id,
+        delete_remote: bool,
+    ) -> Vec<effect::Effect> {
+        let mut remote_delete = None;
+        if let Some(state) = self.thread(thread) {
+            if let thread::Origin::Backend { backend, remote } = state.origin() {
+                remote_delete = Some((backend.clone(), remote.clone()));
+            }
+        }
+
+        let closed = self.close(thread).ok().flatten();
+        let removed = match self {
+            Self::Empty(history) | Self::Ready { history, .. } => history.remove(thread),
+        };
+
+        if remote_delete.is_none() {
+            remote_delete = removed.as_ref().and_then(|entry| match &entry.origin {
+                Some(thread::Origin::Backend { backend, remote }) => {
+                    Some((backend.clone(), remote.clone()))
+                }
+                _ => None,
+            });
+        }
+
+        let mut effects = Vec::new();
+        if let Some(closed) = closed {
+            effects.push(effect::Effect::LeaveParticipant { thread: closed.id });
+        }
+        effects.push(effect::Effect::Delete { thread });
+        if delete_remote {
+            if let Some((backend, remote)) = remote_delete {
+                effects.push(effect::Effect::SendBackendCommand {
+                    backend,
+                    command: backend::Command::DeleteThread { remote },
+                });
+            }
+        }
+        effects.push(effect::Effect::SyncModel);
+        effects
     }
 
     pub fn apply(&mut self, event: event::Event) -> Vec<effect::Effect> {
@@ -441,6 +493,10 @@ impl Store {
                     Vec::new()
                 }
             }
+            action::Action::DeleteHistoryThread {
+                thread,
+                delete_remote,
+            } => self.delete_history_thread(thread, delete_remote),
             action::Action::SelectEntry { thread, entry } => {
                 if let Some(state) = self.thread_mut(thread) {
                     state.set_selected_entry(entry);
@@ -903,6 +959,24 @@ impl Store {
                 }
                 effects.push(effect::Effect::SyncModel);
                 effects
+            }
+            action::Action::LoadRemoteThread {
+                backend,
+                remote,
+                scope,
+                activation,
+            } => {
+                let thread = self.ensure_remote(backend.clone(), remote.clone(), scope);
+                if activation.should_activate() {
+                    let _ = self.activate(thread);
+                }
+                vec![
+                    effect::Effect::SendBackendCommand {
+                        backend,
+                        command: backend::Command::LoadThread { thread, remote },
+                    },
+                    effect::Effect::SyncModel,
+                ]
             }
         }
     }
@@ -1470,6 +1544,81 @@ mod tests {
                     backend: current,
                     command: backend::Command::CloseThread { thread: current_thread },
                 } if current == &backend && *current_thread == thread
+            )
+        }));
+    }
+
+    #[test]
+    fn delete_history_thread_removes_local_record_without_remote_command_when_disallowed() {
+        let mut store = Store::default();
+        let scope = thread::Scope::new(std::path::PathBuf::from("."));
+        let thread = thread::Id::new(NonZeroU64::new(9).unwrap());
+        store.replace_history(
+            scope.clone(),
+            vec![history::Stub {
+                id: thread,
+                origin: None,
+                title: Some("local".to_string()),
+                scope: scope.clone(),
+                unread: false,
+                run: thread::Run::Idle,
+            }],
+            None,
+        );
+
+        let effects = store.act(action::Action::DeleteHistoryThread {
+            thread,
+            delete_remote: false,
+        });
+
+        assert!(store
+            .history(&scope)
+            .is_some_and(|page| page.entries.is_empty()));
+        assert!(effects
+            .iter()
+            .any(|effect| matches!(effect, effect::Effect::Delete { thread: current } if *current == thread)));
+        assert!(!effects.iter().any(|effect| {
+            matches!(
+                effect,
+                effect::Effect::SendBackendCommand {
+                    command: backend::Command::DeleteThread { .. },
+                    ..
+                }
+            )
+        }));
+    }
+
+    #[test]
+    fn delete_history_thread_sends_protocol_delete_when_allowed() {
+        let mut store = Store::default();
+        let scope = thread::Scope::new(std::path::PathBuf::from("."));
+        let thread = thread::Id::new(NonZeroU64::new(9).unwrap());
+        let backend = backend::Id::new("backend");
+        let remote = backend::Remote::new("remote-session");
+        store.replace_history(
+            scope,
+            vec![history::Stub::remote_origin(
+                thread,
+                backend.clone(),
+                remote.clone(),
+                Some("remote".to_string()),
+                thread::Scope::new(std::path::PathBuf::from(".")),
+            )],
+            None,
+        );
+
+        let effects = store.act(action::Action::DeleteHistoryThread {
+            thread,
+            delete_remote: true,
+        });
+
+        assert!(effects.iter().any(|effect| {
+            matches!(
+                effect,
+                effect::Effect::SendBackendCommand {
+                    backend: current,
+                    command: backend::Command::DeleteThread { remote: current_remote },
+                } if current == &backend && current_remote == &remote
             )
         }));
     }

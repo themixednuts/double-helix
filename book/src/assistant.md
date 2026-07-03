@@ -19,7 +19,7 @@ Assistant completion notifications are enabled by default:
 notify-on-done = true
 ```
 
-Open or connect with `:assistant-open` and `:assistant-connect`. With no arguments, `:assistant-connect` shows configured agents. With arguments, it starts that command directly.
+Open or connect with `:assistant-open` and `:assistant-connect`. With no arguments, `:assistant-connect` shows configured agents. With arguments, it starts that command directly. Browse previous sessions with `:assistant-open-history`; press `d` on a selected session and then `d` again to confirm deletion.
 
 ## Panel Keys
 
@@ -28,10 +28,11 @@ In message focus:
 | Key | Action |
 | --- | --- |
 | `j` / `k` | Move between entries |
-| `Enter` | Submit a pending agent request; otherwise open the selected entry in a scratch buffer |
+| `Enter` | Submit a pending agent request; jump to a selected subagent tool session; otherwise open the selected entry in a scratch buffer |
 | `Tab` | Expand or collapse the selected entry; tool calls are collapsed by default |
 | `y` | Yank a pending request URL; otherwise yank the selected entry |
 | `t` | Toggle follow mode |
+| `r` | Retry the last user prompt after a failed or canceled run |
 | `R` | Toggle write/review mode for the active thread |
 | `a` / `A` | Accept the selected/all pending review changes |
 | `x` / `X` | Reject the selected/all pending review changes |
@@ -99,7 +100,7 @@ Thought entries render as dim `thinking...` blocks and are folded by default. `T
 
 Agent-spawned terminals render as cards with a running/exited/failed status badge and the latest output tail.
 
-Tool calls that refer to a subagent session show a subagent marker in the row and include the subagent session id in the entry details.
+Tool calls that refer to a subagent session show a subagent marker in the row and include the subagent session id in the entry details. Press `Enter` on that tool call to jump to the subagent session; when the backend supports session loading, unloaded subagent sessions are loaded first.
 
 ## Markdown
 

@@ -23,11 +23,17 @@ New Features
 5. Plugin hardening and RPC plugin hosts
    Lua plugins now use a typed host contract with memory/instruction limits, optional out-of-process `helix-plugin-host` runtimes, and msgpack RPC frames for local or SSH-hosted plugin execution.
 
-6. Assistant panel review workflow
-   ACP assistant threads support contextual `@` mentions, persistent permissions, write/review modes, and staged file changes that can be accepted or rejected from the panel.
+6. ACP v1.0.1 assistant panel
+   ACP assistant threads support auth cards, elicitation forms, mode/model/config selectors, contextual `@` mentions, session history browsing, subagent markers, completion notifications, persistent permissions, write/review modes, and staged file changes that can be accepted or rejected from the panel.
 
 7. Standalone modal core
    The modal editing state machines are available through `helix-modal` as a dependency-free core, with Helix and Vim style engines reusable outside the terminal frontend.
+
+8. Full LSP surface coverage
+   LSP integrations include code lens, call/type hierarchies, semantic tokens, inline completions, inline values, folding ranges, document links, linked editing, on-type formatting, color swatches, and pull diagnostics.
+
+9. Runtime package manager
+   `dhx pkg` installs, updates, rolls back, syncs, searches, and verifies LSP servers, DAP adapters, and package-managed grammars across GitHub release, archive, npm, pip, cargo, Go, git grammar, and system PATH backends.
 
 
    

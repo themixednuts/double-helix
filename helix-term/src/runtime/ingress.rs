@@ -552,6 +552,16 @@ pub enum RuntimeTaskEvent {
         scope: helix_view::assistant::thread::Scope,
         entries: Vec<helix_view::assistant::history::Stub>,
     },
+    /// Delete an assistant history entry locally and remotely when supported.
+    DeleteAssistantHistoryThread {
+        thread: helix_view::assistant::thread::Id,
+        delete_remote: bool,
+    },
+    /// Fetch another assistant history page from the active backend.
+    FetchAssistantHistoryPage {
+        scope: helix_view::assistant::thread::Scope,
+        cursor: Option<helix_view::assistant::history::Cursor>,
+    },
     /// Load an assistant history thread record for activation.
     LoadAssistantHistoryThread {
         thread: helix_view::assistant::thread::Id,

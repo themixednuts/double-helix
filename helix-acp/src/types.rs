@@ -57,6 +57,10 @@ pub fn agent_caps(init: &InitializeResponse) -> AgentCaps {
 }
 
 /// Parsed notification from the agent.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "protocol notifications are transient parse results; boxing would add churn at all match sites"
+)]
 pub enum AgentNotification {
     SessionUpdate(SessionNotification),
     CompleteElicitation(CompleteElicitationNotification),

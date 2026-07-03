@@ -151,6 +151,10 @@ pub struct NewEntry {
     pub locations: Vec<Location>,
 }
 
+#[allow(
+    clippy::large_enum_variant,
+    reason = "assistant entries are persisted and pattern-matched broadly; boxing ToolCall would create migration churn"
+)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EntryKind {
     UserPrompt { text: String },

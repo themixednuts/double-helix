@@ -48,7 +48,7 @@ impl Ops {
         }
     }
 
-    pub fn default() -> Result<Self> {
+    pub fn open_default() -> Result<Self> {
         let config_dir = config_dir();
         Ok(Self::new(
             Registry::builtin()?,

@@ -69,12 +69,19 @@ pub struct AssistantPanel {
     mention: MentionPopup,
     elicitation_form: Option<helix_view::assistant::elicitation::FormState>,
     auth_selected: usize,
+    pending_subagent_jump: Option<PendingSubagentJump>,
 }
 
 #[derive(Clone, Copy)]
 struct MessageNavigationState {
     selected: Option<usize>,
     scroll: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingSubagentJump {
+    session_id: String,
+    message_start_index: Option<usize>,
 }
 
 #[derive(Default)]
@@ -157,10 +164,44 @@ impl AssistantPanel {
         }
 
         self.sync_input_from_assistant(editor, &model.input);
+        let active_thread = model.active_thread;
+        let entries_len = model.entries.len();
         self.output.set_content(model.entries);
         if !self.output.is_following_end() {
             self.output.scroll_to(model.content_scroll);
         }
+        self.consume_pending_subagent_jump(editor, active_thread, entries_len);
+    }
+
+    fn consume_pending_subagent_jump(
+        &mut self,
+        editor: &mut Editor,
+        active_thread: Option<helix_view::assistant::thread::Id>,
+        entries_len: usize,
+    ) {
+        let Some(pending) = self.pending_subagent_jump.as_ref() else {
+            return;
+        };
+        let Some(active_thread) = active_thread else {
+            return;
+        };
+        let matches_active = editor
+            .assistant_known_sessions()
+            .into_iter()
+            .any(|(session, thread)| session == pending.session_id && thread == active_thread);
+        if !matches_active {
+            return;
+        }
+        let Some(index) = pending.message_start_index else {
+            self.pending_subagent_jump = None;
+            return;
+        };
+        if index >= entries_len {
+            return;
+        }
+        self.pending_subagent_jump = None;
+        self.select_message(editor, Some(index));
+        editor.set_status("Opened subagent session");
     }
 
     fn entry_id_at(
@@ -372,6 +413,7 @@ impl AssistantPanel {
             mention: MentionPopup::default(),
             elicitation_form: None,
             auth_selected: 0,
+            pending_subagent_jump: None,
         }
     }
 
@@ -902,6 +944,10 @@ impl AssistantPanel {
         preview
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "markdown cache lookup needs entry identity plus render style context"
+    )]
     fn render_markdown_cached(
         &self,
         entry: helix_view::assistant::thread::EntryId,
@@ -2533,6 +2579,69 @@ impl AssistantPanel {
         true
     }
 
+    fn jump_selected_subagent(&mut self, editor: &mut Editor) -> bool {
+        let Some(info) = editor.selected_assistant_subagent() else {
+            return false;
+        };
+        let can_load = editor
+            .active_assistant_caps()
+            .is_some_and(|caps| caps.load_session);
+        let target = helix_view::assistant::tool::resolve_subagent_jump(
+            &info,
+            editor.assistant_known_sessions(),
+            can_load,
+        );
+        match target {
+            helix_view::assistant::tool::SubagentJumpTarget::Existing {
+                thread,
+                message_start_index,
+                ..
+            } => {
+                let effects = editor.activate_assistant_thread(thread);
+                Self::apply_assistant_effects(editor, effects);
+                self.focus_messages(editor);
+                if let Some(index) =
+                    message_start_index.and_then(|index| usize::try_from(index).ok())
+                {
+                    self.sync_from_assistant(editor);
+                    self.select_message(editor, Some(index));
+                }
+                editor.set_status("Opened subagent session");
+                true
+            }
+            helix_view::assistant::tool::SubagentJumpTarget::LoadRemote {
+                message_start_index,
+                ..
+            } => {
+                let Some(backend) = editor.active_assistant_backend_id() else {
+                    editor.set_status("No active assistant backend for subagent session");
+                    return true;
+                };
+                let session_id = info.session_id;
+                let scope = editor.active_assistant_scope_or_layout();
+                let effects = editor.load_remote_assistant_thread(
+                    backend,
+                    helix_view::assistant::backend::Remote::new(session_id.clone()),
+                    scope,
+                    helix_view::editor::Activation::Activate,
+                );
+                Self::apply_assistant_effects(editor, effects);
+                self.focus_messages(editor);
+                self.pending_subagent_jump = Some(PendingSubagentJump {
+                    session_id,
+                    message_start_index: message_start_index
+                        .and_then(|index| usize::try_from(index).ok()),
+                });
+                editor.set_status("Loading subagent session...");
+                true
+            }
+            helix_view::assistant::tool::SubagentJumpTarget::Unsupported => {
+                editor.set_status("Assistant backend cannot load subagent sessions");
+                true
+            }
+        }
+    }
+
     fn handle_mouse_event(&mut self, event: &MouseEvent, editor: &mut Editor) -> EventResult {
         let MouseEvent {
             kind,
@@ -2975,6 +3084,9 @@ impl Component for AssistantPanel {
                         model.selected_entry_id(),
                         model.focus()
                     );
+                    if self.jump_selected_subagent(cx.editor) {
+                        return EventResult::Consumed(None);
+                    }
                     if !self.open_selected_message_details(cx.editor, Action::Replace) {
                         cx.editor.set_status("No assistant entry selected");
                     }
@@ -3043,6 +3155,16 @@ impl Component for AssistantPanel {
                         Ok((status, effects)) => {
                             Self::apply_assistant_effects(cx.editor, effects);
                             cx.editor.set_status(status);
+                        }
+                        Err(err) => cx.editor.set_status(err.to_string()),
+                    }
+                    true
+                }
+                (KeyCode::Char('r'), KeyModifiers::NONE) => {
+                    match cx.editor.retry_active_assistant_prompt() {
+                        Ok(effects) => {
+                            Self::apply_assistant_effects(cx.editor, effects);
+                            cx.editor.set_status("Retrying assistant prompt...");
                         }
                         Err(err) => cx.editor.set_status(err.to_string()),
                     }

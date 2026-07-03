@@ -43,6 +43,21 @@ impl Editor {
         })
     }
 
+    pub fn load_remote_assistant_thread(
+        &mut self,
+        backend: crate::assistant::backend::Id,
+        remote: crate::assistant::backend::Remote,
+        scope: crate::assistant::thread::Scope,
+        activation: crate::editor::Activation,
+    ) -> Vec<crate::assistant::effect::Effect> {
+        self.assistant_act(crate::assistant::Action::LoadRemoteThread {
+            backend,
+            remote,
+            scope,
+            activation,
+        })
+    }
+
     pub fn close_assistant_thread(
         &mut self,
         thread: crate::assistant::thread::Id,

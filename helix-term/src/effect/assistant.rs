@@ -233,6 +233,34 @@ pub(crate) fn apply_assistant_history_entries(
     editor.apply_assistant_effects(outcome.effects);
 }
 
+pub(crate) fn apply_delete_assistant_history_thread(
+    editor: &mut Editor,
+    thread: helix_view::assistant::thread::Id,
+    delete_remote: bool,
+) {
+    let effects = editor.delete_assistant_history_thread(thread, delete_remote);
+    editor.apply_assistant_effects(effects);
+    editor.set_status("Deleted assistant session");
+}
+
+pub(crate) fn request_fetch_assistant_history_page(
+    editor: &mut Editor,
+    scope: helix_view::assistant::thread::Scope,
+    cursor: Option<helix_view::assistant::history::Cursor>,
+) {
+    let Some(backend) = editor.active_assistant_backend_id() else {
+        editor.set_status("No active assistant backend for history pagination");
+        return;
+    };
+
+    editor.apply_assistant_effects(vec![
+        helix_view::assistant::effect::Effect::SendBackendCommand {
+            backend,
+            command: helix_view::assistant::backend::Command::ListThreads { scope, cursor },
+        },
+    ]);
+}
+
 pub(crate) fn request_load_assistant_history_thread(
     editor: &mut Editor,
     ingress: crate::runtime::RuntimeIngress,

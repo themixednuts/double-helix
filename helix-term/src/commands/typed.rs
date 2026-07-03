@@ -3683,10 +3683,14 @@ fn assistant_open_history(
 
     let scope = cx.editor.active_assistant_scope_or_layout();
 
-    if let Some(entries) = cx.editor.assistant_history_entries(&scope) {
+    if let Some(page) = cx.editor.assistant_history_page(&scope) {
+        let entries = page.entries;
+        let next = page.next;
         cx.spawn_ui(async move {
             Ok(UiCommand::Assistant(AssistantCommand::PushHistoryPicker {
+                scope,
                 entries,
+                next,
             }))
         });
         return Ok(());

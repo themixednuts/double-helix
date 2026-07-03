@@ -103,6 +103,7 @@ impl PersistedThread {
         Ok(Self {
             stub: PersistedStub::from_domain(&Stub {
                 id: record.id,
+                origin: Some(record.origin.clone()),
                 title: record.title.clone(),
                 scope: record.scope.clone(),
                 unread: record.unread,
@@ -136,6 +137,7 @@ impl PersistedStub {
     fn into_domain(self) -> Stub {
         Stub {
             id: thread_id(self.id),
+            origin: None,
             title: self.title,
             scope: self.scope.into_domain(),
             unread: self.unread,

@@ -1,3 +1,8 @@
+#![allow(
+    clippy::items_after_test_module,
+    reason = "LSP feature tests stay near the helper functions they cover in this large effect module"
+)]
+
 use std::{collections::HashSet, time::Duration};
 
 use futures_util::{
@@ -1160,12 +1165,8 @@ pub(crate) fn request_inline_values(
         helix_core::Range::new(0, text.len_chars()),
         offset_encoding,
     );
-    let request = language_server.text_document_inline_values(
-        doc.identifier(),
-        range,
-        context,
-        None,
-    );
+    let request =
+        language_server.text_document_inline_values(doc.identifier(), range, context, None);
     let Some(request) = request else {
         return;
     };
@@ -1562,10 +1563,7 @@ mod tests {
             helix_lsp::OffsetEncoding::Utf8,
             vec![lsp::InlineValue::VariableLookup(
                 lsp::InlineValueVariableLookup {
-                    range: lsp::Range::new(
-                        lsp::Position::new(0, 4),
-                        lsp::Position::new(0, 5),
-                    ),
+                    range: lsp::Range::new(lsp::Position::new(0, 4), lsp::Position::new(0, 5)),
                     variable_name: None,
                     case_sensitive_lookup: true,
                 },

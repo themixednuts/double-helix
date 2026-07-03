@@ -311,6 +311,10 @@ impl MarkdownCache {
         lines
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "cache storage needs the render key plus style context used to populate partial blocks"
+    )]
     fn store(
         &mut self,
         text: String,
@@ -492,11 +496,14 @@ pub fn render_markdown_lines<'a>(
     theme: Option<&Theme>,
     loader: &syntax::Loader,
 ) {
-    lines.extend(
-        render_markdown(text, usize::MAX / 4, base_style, styles, theme, loader)
-            .into_iter()
-            .map(|line| line),
-    );
+    lines.extend(render_markdown(
+        text,
+        usize::MAX / 4,
+        base_style,
+        styles,
+        theme,
+        loader,
+    ));
 }
 
 #[must_use]
@@ -765,7 +772,7 @@ fn render_markdown(
                 }
             }
             Event::Rule => {
-                let rule = "─".repeat(width.min(24).max(3));
+                let rule = "─".repeat(width.clamp(3, 24));
                 lines.push(Spans::from(Span::styled(rule, styles.separator)));
                 lines.push(Spans::default());
             }
@@ -869,12 +876,12 @@ fn render_table(table: &Table, width: usize, styles: &MarkdownLineStyles) -> Vec
     let mut lines = Vec::new();
     for (row_index, row) in table.rows.iter().enumerate() {
         let mut spans = Vec::new();
-        for column in 0..columns {
+        for (column, width) in widths.iter().copied().enumerate().take(columns) {
             if column > 0 {
                 spans.push(Span::styled(" | ".to_string(), styles.separator));
             }
             let cell = row.get(column).map(String::as_str).unwrap_or("");
-            let cell = text_layout::truncate(cell, widths[column], TruncateAt::End);
+            let cell = text_layout::truncate(cell, width, TruncateAt::End);
             let align = match table
                 .alignments
                 .get(column)
@@ -886,7 +893,7 @@ fn render_table(table: &Table, width: usize, styles: &MarkdownLineStyles) -> Vec
                 Alignment::None | Alignment::Left => Align::Left,
             };
             spans.push(Span::styled(
-                text_layout::pad(&cell, widths[column], align),
+                text_layout::pad(&cell, width, align),
                 styles.code,
             ));
         }

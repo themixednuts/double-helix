@@ -29,8 +29,9 @@ pub enum Event {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum State {
+    #[default]
     Unknown,
     Required {
         methods: Vec<Method>,
@@ -49,12 +50,6 @@ pub enum State {
         pending_prompt: Option<String>,
         error: String,
     },
-}
-
-impl Default for State {
-    fn default() -> Self {
-        Self::Unknown
-    }
 }
 
 impl State {

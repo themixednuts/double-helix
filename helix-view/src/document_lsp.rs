@@ -456,10 +456,10 @@ pub fn decode_semantic_tokens(
             .token_modifiers
             .iter()
             .enumerate()
-            .filter_map(|(idx, modifier)| {
-                (idx < u32::BITS as usize && token.token_modifiers_bitset & (1u32 << idx) != 0)
-                    .then(|| modifier.as_str().to_owned())
+            .filter(|(idx, _)| {
+                *idx < u32::BITS as usize && token.token_modifiers_bitset & (1u32 << *idx) != 0
             })
+            .map(|(_, modifier)| modifier.as_str().to_owned())
             .collect();
 
         decoded.push(DocumentSemanticToken {

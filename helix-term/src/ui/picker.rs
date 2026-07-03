@@ -666,6 +666,7 @@ pub struct Picker<T: 'static + Send + Sync, D: 'static> {
     /// Optional callback to convert a picker item `T` into `PickerItemData` for the UI model.
     /// If `None`, items are stored as `PickerItemData::Plain`.
     item_data_fn: Option<PickerItemDataFn<T>>,
+    selection_changed_handler: Option<PickerSelectionHandler<T, D>>,
     marked: Option<HashSet<u32>>,
     ingress: SharedIngress,
     redraw: SharedRedraw,
@@ -841,6 +842,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             instance_id,
             model_layer_id: None,
             item_data_fn: None,
+            selection_changed_handler: None,
             marked: None,
             ingress,
             redraw,
@@ -852,6 +854,11 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
 
     pub fn with_key_handlers(mut self, handlers: PickerKeyHandlers<T, D>) -> Self {
         self.custom_key_handlers = handlers;
+        self
+    }
+
+    pub fn with_selection_changed_handler(mut self, handler: PickerSelectionHandler<T, D>) -> Self {
+        self.selection_changed_handler = Some(handler);
         self
     }
 
@@ -1592,6 +1599,17 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             EventResult::Consumed(None)
         } else {
             EventResult::Ignored(None)
+        }
+    }
+
+    fn notify_selection_changed(&mut self, cx: &mut Context) {
+        if let Some(callback) = &self.selection_changed_handler {
+            callback(
+                cx,
+                self.selection(),
+                Arc::clone(&self.editor_data),
+                self.cursor,
+            );
         }
     }
 
@@ -2468,21 +2486,27 @@ impl<I: 'static + Send + Sync, D: 'static + Send + Sync> Component for Picker<I,
         match binding.action {
             PickerBindingAction::Previous => {
                 self.move_by(1, Direction::Backward);
+                self.notify_selection_changed(ctx);
             }
             PickerBindingAction::Next => {
                 self.move_by(1, Direction::Forward);
+                self.notify_selection_changed(ctx);
             }
             PickerBindingAction::PageDown => {
                 self.page_down();
+                self.notify_selection_changed(ctx);
             }
             PickerBindingAction::PageUp => {
                 self.page_up();
+                self.notify_selection_changed(ctx);
             }
             PickerBindingAction::Start => {
                 self.to_start();
+                self.notify_selection_changed(ctx);
             }
             PickerBindingAction::End => {
                 self.to_end();
+                self.notify_selection_changed(ctx);
             }
             PickerBindingAction::ToggleMark => {
                 if self.marked.is_some() {
@@ -2632,6 +2656,8 @@ impl<T: 'static + Send + Sync, D> Drop for Picker<T, D> {
 type PickerCallback<T> = Box<dyn Fn(&mut Context, &T, Action) + Send>;
 pub type PickerKeyHandler<T, D> = Box<dyn Fn(&mut Context, &T, Arc<D>, u32) + Send + 'static>;
 pub type PickerKeyHandlers<T, D> = HashMap<KeyEvent, PickerKeyHandler<T, D>>;
+pub type PickerSelectionHandler<T, D> =
+    Box<dyn Fn(&mut Context, Option<&T>, Arc<D>, u32) + Send + 'static>;
 
 #[cfg(test)]
 mod tests {

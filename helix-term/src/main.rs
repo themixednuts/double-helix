@@ -181,18 +181,18 @@ fn run_pkg(command: PkgCommand) -> Result<i32> {
             Ok(0)
         }
         PkgCommand::Install(names) => {
-            let ops = Ops::default()?;
+            let ops = Ops::open_default()?;
             ops.install(&names, &mut print_pkg_event)?;
             Ok(0)
         }
         PkgCommand::Remove(name) => {
-            let ops = Ops::default()?;
-            ops.remove(&[name.clone()])?;
+            let ops = Ops::open_default()?;
+            ops.remove(std::slice::from_ref(&name))?;
             println!("removed {name}");
             Ok(0)
         }
         PkgCommand::List { kind } => {
-            let ops = Ops::default()?;
+            let ops = Ops::open_default()?;
             let kind = kind
                 .as_deref()
                 .map(str::parse::<PkgKind>)
@@ -216,7 +216,7 @@ fn run_pkg(command: PkgCommand) -> Result<i32> {
             Ok(0)
         }
         PkgCommand::Search(term) => {
-            let ops = Ops::default()?;
+            let ops = Ops::open_default()?;
             for package in ops.registry().search(&term) {
                 println!(
                     "{:<12} {:<24} {}",
@@ -226,12 +226,12 @@ fn run_pkg(command: PkgCommand) -> Result<i32> {
             Ok(0)
         }
         PkgCommand::Sync => {
-            let ops = Ops::default()?;
+            let ops = Ops::open_default()?;
             ops.sync(&mut print_pkg_event)?;
             Ok(0)
         }
         PkgCommand::Doctor => {
-            let ops = Ops::default()?;
+            let ops = Ops::open_default()?;
             let report = ops.doctor()?;
             for name in &report.ok {
                 println!("ok {name}");
@@ -242,7 +242,7 @@ fn run_pkg(command: PkgCommand) -> Result<i32> {
             Ok(if report.bad.is_empty() { 0 } else { 1 })
         }
         PkgCommand::Outdated(names) => {
-            let ops = Ops::default()?;
+            let ops = Ops::open_default()?;
             let report = ops.outdated(&names)?;
             let mut count = 0usize;
             for package in report {
@@ -270,12 +270,12 @@ fn run_pkg(command: PkgCommand) -> Result<i32> {
             Ok(0)
         }
         PkgCommand::Update(names) => {
-            let ops = Ops::default()?;
+            let ops = Ops::open_default()?;
             ops.update(&names, &mut print_pkg_event)?;
             Ok(0)
         }
         PkgCommand::Rollback(name) => {
-            let ops = Ops::default()?;
+            let ops = Ops::open_default()?;
             let locked = ops.rollback(&name)?;
             println!("rolled back {} to {}", locked.name, locked.version);
             Ok(0)

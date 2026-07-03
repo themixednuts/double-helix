@@ -11,6 +11,12 @@ pub enum Action {
         record: Box<history::Record>,
         activation: crate::editor::Activation,
     },
+    LoadRemoteThread {
+        backend: super::backend::Id,
+        remote: super::backend::Remote,
+        scope: thread::Scope,
+        activation: crate::editor::Activation,
+    },
     Activate {
         thread: thread::Id,
     },
@@ -20,6 +26,10 @@ pub enum Action {
     },
     Close {
         thread: thread::Id,
+    },
+    DeleteHistoryThread {
+        thread: thread::Id,
+        delete_remote: bool,
     },
     SelectEntry {
         thread: thread::Id,

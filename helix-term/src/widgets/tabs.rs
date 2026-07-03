@@ -337,6 +337,10 @@ pub fn tabs_layout_with_options(
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "tab rendering needs separate logical and rendered coordinates while clipping"
+)]
 fn render_tab(
     surface: &mut crate::render::CellSurface,
     area: Rect,

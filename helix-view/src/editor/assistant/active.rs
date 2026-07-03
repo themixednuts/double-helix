@@ -30,6 +30,41 @@ impl Editor {
         self.assistant.history_entries(scope)
     }
 
+    pub fn assistant_history_page(
+        &self,
+        scope: &crate::assistant::thread::Scope,
+    ) -> Option<crate::assistant::history::Page> {
+        self.assistant.history(scope).cloned()
+    }
+
+    pub fn active_assistant_backend_id(&self) -> Option<crate::assistant::backend::Id> {
+        self.assistant.active_backend_id()
+    }
+
+    pub fn active_assistant_caps(&self) -> Option<&helix_acp::AgentCaps> {
+        self.assistant
+            .active_thread()
+            .and_then(|(_, thread)| thread.caps())
+    }
+
+    pub fn assistant_known_sessions(&self) -> Vec<(String, crate::assistant::thread::Id)> {
+        self.assistant
+            .threads()
+            .filter_map(|thread| match thread.origin() {
+                crate::assistant::thread::Origin::Backend { remote, .. } => {
+                    Some((remote.to_string(), thread.id))
+                }
+                crate::assistant::thread::Origin::Local => None,
+            })
+            .collect()
+    }
+
+    pub fn selected_assistant_subagent(
+        &self,
+    ) -> Option<crate::assistant::tool::SubagentSessionInfo> {
+        self.assistant.selected_subagent()
+    }
+
     pub fn assistant_model(&self, focused: bool) -> crate::model::AssistantModel {
         self.assistant.assistant_model(focused)
     }
@@ -96,6 +131,30 @@ impl Editor {
             .map(|(thread, _)| thread)
             .context("Active assistant thread is not bound to a backend")?;
         Ok(self.submit_assistant_prompt(thread, text))
+    }
+
+    pub fn retry_active_assistant_prompt(
+        &mut self,
+    ) -> anyhow::Result<Vec<crate::assistant::effect::Effect>> {
+        let (thread, text) = self
+            .assistant
+            .active_thread()
+            .and_then(|(thread, state)| {
+                crate::assistant::retry_prompt(state).map(|text| (thread, text))
+            })
+            .ok_or_else(|| anyhow::anyhow!("No failed assistant prompt to retry"))?;
+        Ok(self.submit_assistant_prompt(thread, text))
+    }
+
+    pub fn delete_assistant_history_thread(
+        &mut self,
+        thread: crate::assistant::thread::Id,
+        delete_remote: bool,
+    ) -> Vec<crate::assistant::effect::Effect> {
+        self.assistant_act(crate::assistant::Action::DeleteHistoryThread {
+            thread,
+            delete_remote,
+        })
     }
 
     pub fn set_active_assistant_draft_if_changed(

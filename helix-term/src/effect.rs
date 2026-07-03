@@ -400,6 +400,13 @@ pub(crate) fn apply_runtime_task_event(
         RuntimeTaskEvent::ApplyAssistantHistoryEntries { scope, entries } => {
             assistant::apply_assistant_history_entries(editor, scope, entries)
         }
+        RuntimeTaskEvent::DeleteAssistantHistoryThread {
+            thread,
+            delete_remote,
+        } => assistant::apply_delete_assistant_history_thread(editor, thread, delete_remote),
+        RuntimeTaskEvent::FetchAssistantHistoryPage { scope, cursor } => {
+            assistant::request_fetch_assistant_history_page(editor, scope, cursor)
+        }
         RuntimeTaskEvent::LoadAssistantHistoryThread {
             thread,
             activation,

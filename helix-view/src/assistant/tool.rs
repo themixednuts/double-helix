@@ -1,4 +1,6 @@
 use std::fmt;
+use std::hash::{Hash, Hasher};
+use std::num::NonZeroU64;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -78,6 +80,14 @@ pub enum SubagentJumpTarget {
         message_end_index: Option<u64>,
     },
     Unsupported,
+}
+
+#[must_use]
+pub fn thread_id_for_remote(remote: &str) -> super::thread::Id {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    remote.hash(&mut hasher);
+    let id = hasher.finish().max(1);
+    super::thread::Id::new(NonZeroU64::new(id).expect("remote thread id must be non-zero"))
 }
 
 #[must_use]

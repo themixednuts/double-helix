@@ -78,6 +78,10 @@ where
     )
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "widget renderer keeps state, styles, and row callback explicit for call-site clarity"
+)]
 pub fn item_list_with_marks<F>(
     surface: &mut crate::render::CellSurface,
     area: Rect,

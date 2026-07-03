@@ -33,7 +33,7 @@ pub enum ToastSeverity {
     Hint,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct ToastStyle {
     pub background: Style,
     pub error: Style,
@@ -41,19 +41,6 @@ pub struct ToastStyle {
     pub info: Style,
     pub hint: Style,
     pub overflow: Style,
-}
-
-impl Default for ToastStyle {
-    fn default() -> Self {
-        Self {
-            background: Style::default(),
-            error: Style::default(),
-            warning: Style::default(),
-            info: Style::default(),
-            hint: Style::default(),
-            overflow: Style::default(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

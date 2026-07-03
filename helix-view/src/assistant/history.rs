@@ -2,7 +2,7 @@ mod local;
 
 use std::sync::Arc;
 
-use super::{config, context, mode, plan, review, terminal, thread};
+use super::{backend, config, context, mode, plan, review, terminal, thread};
 use crate::collab::FollowState;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -31,6 +31,7 @@ pub struct Caps {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Stub {
     pub id: thread::Id,
+    pub origin: Option<thread::Origin>,
     pub title: Option<String>,
     pub scope: thread::Scope,
     pub unread: bool,
@@ -139,6 +140,15 @@ impl State {
             });
         }
     }
+
+    pub fn remove(&mut self, thread: thread::Id) -> Option<Stub> {
+        for page in &mut self.pages {
+            if let Some(index) = page.entries.iter().position(|entry| entry.id == thread) {
+                return Some(page.entries.remove(index));
+            }
+        }
+        None
+    }
 }
 
 #[must_use]
@@ -159,10 +169,31 @@ impl Stub {
     pub fn from_thread(thread: &thread::Thread) -> Self {
         Self {
             id: thread.id,
+            origin: Some(thread.origin().clone()),
             title: thread.title().map(ToOwned::to_owned),
             scope: thread.clone_scope(),
             unread: thread.unread(),
             run: thread.run().clone(),
+        }
+    }
+}
+
+impl Stub {
+    #[must_use]
+    pub fn remote_origin(
+        id: thread::Id,
+        backend: backend::Id,
+        remote: backend::Remote,
+        title: Option<String>,
+        scope: thread::Scope,
+    ) -> Self {
+        Self {
+            id,
+            origin: Some(thread::Origin::Backend { backend, remote }),
+            title,
+            scope,
+            unread: false,
+            run: thread::Run::Idle,
         }
     }
 }
@@ -281,6 +312,7 @@ mod tests {
     fn stub(value: u64, title: &str) -> Stub {
         Stub {
             id: id(value),
+            origin: None,
             title: Some(title.to_string()),
             scope: thread::Scope::new(PathBuf::from(".")),
             unread: false,

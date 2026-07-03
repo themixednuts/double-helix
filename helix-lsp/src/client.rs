@@ -680,18 +680,17 @@ impl Client {
                         relative_pattern_support: Some(true),
                     }),
                     file_operations: Some(lsp::WorkspaceFileOperationsClientCapabilities {
+                        dynamic_registration: None,
                         will_create: Some(true),
                         did_create: Some(true),
                         will_rename: Some(true),
                         did_rename: Some(true),
                         will_delete: Some(true),
                         did_delete: Some(true),
-                        ..Default::default()
                     }),
                     diagnostic: Some(lsp::DiagnosticWorkspaceClientCapabilities {
                         refresh_support: Some(true),
                     }),
-                    ..Default::default()
                 }),
                 text_document: Some(lsp::TextDocumentClientCapabilities {
                     completion: Some(lsp::CompletionClientCapabilities {

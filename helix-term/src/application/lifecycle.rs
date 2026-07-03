@@ -96,6 +96,16 @@ impl Application {
     ) {
         // Extract plugin events from the update before consuming it.
         let plugin_events = assistant_update_plugin_events(&update);
+        let assistant_panel_focused = self
+            .compositor
+            .find_id::<crate::ui::assistant::AssistantPanel>(crate::ui::assistant::ID)
+            .is_some_and(|panel| helix_view::traits::Focusable::is_focused(panel));
+        let completion_toast = assistant_completion_toast_for_update(
+            &self.editor,
+            &update,
+            self.editor.config().assistant.notify_on_done,
+            assistant_panel_focused,
+        );
 
         let outcome = self.editor.apply_assistant_update(update);
         if let Some((thread, request)) = outcome.permission_request {
@@ -108,6 +118,19 @@ impl Application {
             );
         }
         self.editor.apply_assistant_effects(outcome.effects);
+        if let Some(toast) = completion_toast {
+            match toast.severity {
+                helix_view::editor::Severity::Error => {
+                    self.editor.notify_error(toast.message);
+                }
+                helix_view::editor::Severity::Warning => {
+                    self.editor.notify_warning(toast.message);
+                }
+                _ => {
+                    self.editor.notify_info(toast.message);
+                }
+            }
+        }
 
         // Dispatch assistant plugin events after state is settled.
         for event in plugin_events {
@@ -155,6 +178,56 @@ impl Application {
 
         errs
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AssistantCompletionToast {
+    message: String,
+    severity: helix_view::editor::Severity,
+}
+
+fn assistant_completion_toast(
+    previous: Option<&helix_view::assistant::thread::Run>,
+    next: &helix_view::assistant::thread::Run,
+    notify_on_done: bool,
+    panel_focused: bool,
+) -> Option<AssistantCompletionToast> {
+    use helix_view::assistant::thread::Run;
+
+    if !notify_on_done || panel_focused {
+        return None;
+    }
+    if !matches!(previous, Some(Run::Running | Run::Waiting)) {
+        return None;
+    }
+    match next {
+        Run::Idle => Some(AssistantCompletionToast {
+            message: "Assistant run completed".to_string(),
+            severity: helix_view::editor::Severity::Info,
+        }),
+        Run::Failed { message } => Some(AssistantCompletionToast {
+            message: format!("Assistant run failed: {message}"),
+            severity: helix_view::editor::Severity::Error,
+        }),
+        Run::Running | Run::Waiting => None,
+    }
+}
+
+fn assistant_completion_toast_for_update(
+    editor: &helix_view::Editor,
+    update: &helix_view::assistant::backend::Update,
+    notify_on_done: bool,
+    panel_focused: bool,
+) -> Option<AssistantCompletionToast> {
+    let helix_view::assistant::backend::Update::Thread {
+        thread,
+        event: helix_view::assistant::thread::Event::Run(next),
+    } = update
+    else {
+        return None;
+    };
+    let previous = editor.assistant.thread(*thread).map(|thread| thread.run());
+    assistant_completion_toast(previous, next, notify_on_done, panel_focused)
 }
 
 /// Extract plugin-visible events from an assistant backend update.
@@ -241,5 +314,64 @@ fn format_written_size(size: usize) -> impl std::fmt::Display {
             i += 1;
         }
         Size::HumanReadable(size, SUFFIX[i])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use helix_view::assistant::thread::Run;
+
+    #[test]
+    fn assistant_completion_toast_notifies_when_unfocused_run_completes() {
+        assert_eq!(
+            assistant_completion_toast(Some(&Run::Running), &Run::Idle, true, false),
+            Some(AssistantCompletionToast {
+                message: "Assistant run completed".to_string(),
+                severity: helix_view::editor::Severity::Info,
+            })
+        );
+    }
+
+    #[test]
+    fn assistant_completion_toast_respects_config_and_focus() {
+        assert_eq!(
+            assistant_completion_toast(Some(&Run::Running), &Run::Idle, false, false),
+            None
+        );
+        assert_eq!(
+            assistant_completion_toast(Some(&Run::Running), &Run::Idle, true, true),
+            None
+        );
+    }
+
+    #[test]
+    fn assistant_completion_toast_reports_failed_runs() {
+        assert_eq!(
+            assistant_completion_toast(
+                Some(&Run::Waiting),
+                &Run::Failed {
+                    message: "boom".to_string()
+                },
+                true,
+                false
+            ),
+            Some(AssistantCompletionToast {
+                message: "Assistant run failed: boom".to_string(),
+                severity: helix_view::editor::Severity::Error,
+            })
+        );
+    }
+
+    #[test]
+    fn assistant_completion_toast_ignores_non_terminal_transitions() {
+        assert_eq!(
+            assistant_completion_toast(Some(&Run::Idle), &Run::Idle, true, false),
+            None
+        );
+        assert_eq!(
+            assistant_completion_toast(Some(&Run::Running), &Run::Running, true, false),
+            None
+        );
     }
 }

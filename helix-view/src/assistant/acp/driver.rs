@@ -1,6 +1,4 @@
-use std::collections::{hash_map::DefaultHasher, BTreeMap, HashMap};
-use std::hash::{Hash, Hasher};
-use std::num::NonZeroU64;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -8,7 +6,7 @@ use helix_acp::client::{AgentConfig, IncomingReceiver};
 use helix_acp::types as acp;
 use helix_acp::AcpAgent;
 
-use super::super::{auth, backend, host, permission, review, thread};
+use super::super::{auth, backend, host, permission, review, thread, tool};
 use super::{translate, Session};
 
 pub struct Driver {
@@ -188,13 +186,6 @@ fn thread_for_session(state: &State, session_id: impl std::fmt::Display) -> Opti
         .iter()
         .find(|(_, current)| **current == session)
         .map(|(&thread, _)| thread)
-}
-
-fn thread_id_for_remote(remote: &str) -> thread::Id {
-    let mut hasher = DefaultHasher::new();
-    remote.hash(&mut hasher);
-    let id = hasher.finish().max(1);
-    thread::Id::new(NonZeroU64::new(id).expect("hash id is non-zero"))
 }
 
 fn elicitation_action(response: thread::ElicitationResponse) -> acp::ElicitationAction {
@@ -911,17 +902,17 @@ async fn handle_command(
                                     .iter()
                                     .find(|(_, current)| current.to_string() == session_id)
                                     .map(|(&thread, _)| thread)
-                                    .unwrap_or_else(|| thread_id_for_remote(&session_id));
-                                super::super::history::Stub {
+                                    .unwrap_or_else(|| tool::thread_id_for_remote(&session_id));
+                                super::super::history::Stub::remote_origin(
                                     id,
-                                    title: session.title,
-                                    scope: thread::Scope {
+                                    backend_id.clone(),
+                                    backend::Remote::new(session_id),
+                                    session.title,
+                                    thread::Scope {
                                         cwd: session.cwd,
                                         worktrees: session.additional_directories,
                                     },
-                                    unread: false,
-                                    run: thread::Run::Idle,
-                                }
+                                )
                             })
                             .collect();
                         let _ = tx
@@ -948,6 +939,7 @@ async fn handle_command(
                     .copied()
                     .map(|thread| super::super::history::Stub {
                         id: thread,
+                        origin: None,
                         title: None,
                         scope: scope.clone(),
                         unread: false,
@@ -1072,7 +1064,7 @@ async fn handle_call(
             }
             Ok(AgentMethodCall::WriteTextFile(req)) => {
                 let thread = thread_for_session(state, &req.session_id);
-                let path = PathBuf::from(req.path.clone());
+                let path = req.path.clone();
                 let previous = match thread.and_then(|thread| state.staged_text(thread, &path)) {
                     Some(content) => Some(content),
                     None => host.fs.read_text(&path).await.ok(),
@@ -1161,7 +1153,7 @@ async fn handle_call(
                 let create = host::CreateTerminal {
                     command: req.command.into(),
                     args: req.args,
-                    cwd: req.cwd.map(Into::into),
+                    cwd: req.cwd,
                     env: req
                         .env
                         .into_iter()

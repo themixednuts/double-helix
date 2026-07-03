@@ -1,20 +1,10 @@
 use helix_view::graphics::{Rect, Style};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct ProgressStyle {
     pub track: Style,
     pub fill: Style,
     pub label: Style,
-}
-
-impl Default for ProgressStyle {
-    fn default() -> Self {
-        Self {
-            track: Style::default(),
-            fill: Style::default(),
-            label: Style::default(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

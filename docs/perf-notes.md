@@ -166,3 +166,31 @@ Measured the documented loose end with the same generated fixture on Windows:
 No render-path code change was kept. Current cached frames do not redo 10MB-line text work: after the first render, event logs omit `render_document/main_loop` and show only cached-frame phases such as `editor_render/final_total_ratatui`, `compositor_layer/base_batch`, `render/compositor_render_only`, and `render/compositor_total`. The first render still records bounded text work (`formatter_next_calls=114`, `skip_right_eof_fast_paths=1`, and 9,999,888 offscreen chars skipped).
 
 The remaining >2ms samples are therefore the ratatui cell-buffer/statusline/compositor/flush floor on this Windows run, not repeated grapheme scanning, style-span assembly, or full-line cursor/selection math. Hitting a hard <2ms target would require a broader retained-frame/composition change rather than another long-line text-render cache.
+
+## FFF Cache Migration: LMDB to SQLite
+
+Date: 2026-07-03
+
+### Methodology
+
+Measured the file-picker frecency cache migration with the ignored probe:
+
+- `cargo test -p helix-term fff_cache_perf_probe_50k -- --ignored --nocapture`
+
+The probe seeds 50,000 candidate paths with three recent accesses each, compares the old LMDB-style path-hash lookup and scoring loop with the new SQLite-backed tracker, and measures 100 write-through access bumps. The new tracker loads the workspace frecency map from `cache.sqlite3` once, then scores from memory.
+
+### Results
+
+| Path | Measurement |
+| --- | ---: |
+| Old LMDB hot read, 50k candidates | 107.4439 ms |
+| SQLite load into in-memory index, one-time per workspace | 279.4447 ms |
+| New in-memory hot read, 50k candidates | 81.3956 ms |
+| Old LMDB write path, 100 bumps | 30.9125 ms |
+| New SQLite write-through path, 100 bumps | 86.0026 ms |
+
+Both read paths produced the same score total: `150000`.
+
+### Decision
+
+Do not issue a SQLite query per candidate while the user types. The retained design is an in-memory workspace frecency index loaded once from SQLite, with SQLite used as the durable cache backing store on updates. This keeps the ranking/scoring hot path faster than the old LMDB read loop in the 50k-candidate probe. The write path is slower than LMDB, but remains below 1 ms per access bump in this measurement and is not on the per-keystroke ranking path.

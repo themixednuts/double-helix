@@ -2,7 +2,7 @@
 //!
 //! This crate provides the core search engine for [FFF (Fast File Finder)](https://github.com/dmtrKovalenko/fff.nvim).
 //! It includes filesystem indexing with real-time watching, fuzzy matching powered
-//! by [frizbee](https://docs.rs/neo_frizbee), frecency scoring backed by LMDB,
+//! by [frizbee](https://docs.rs/neo_frizbee), storage-agnostic frecency scoring,
 //! and multi-mode grep search.
 //!
 //! ## Architecture
@@ -10,8 +10,8 @@
 //! - [`file_picker::FilePicker`] — Main entry point. Indexes a directory tree in a
 //!   background thread, maintains a sorted file list, watches the filesystem for
 //!   changes, and performs fuzzy search with frecency-weighted scoring.
-//! - [`frecency::FrecencyTracker`] — LMDB-backed database that tracks file access
-//!   and modification patterns for intelligent result ranking.
+//! - [`frecency::FrecencyTracker`] — Tracks file access and modification patterns
+//!   for intelligent result ranking through a caller-provided persistence store.
 //! - [`query_tracker::QueryTracker`] — Tracks search query history and provides
 //!   "combo-boost" scoring for repeatedly matched files.
 //! - [`grep`] — Live grep search supporting regex, plain-text, and fuzzy modes
@@ -43,11 +43,11 @@
 //! let tmp = std::env::temp_dir().join("fff-doctest");
 //! std::fs::create_dir_all(&tmp).unwrap();
 //!
-//! // 1. Optionally initialize frecency and query tracker databases
-//! let frecency = FrecencyTracker::new(tmp.join("frecency"), false)?;
+//! // 1. Optionally initialize frecency and query tracker stores
+//! let frecency = FrecencyTracker::memory_only()?;
 //! shared_frecency.init(frecency)?;
 //!
-//! let query_tracker = QueryTracker::new(tmp.join("queries"), false)?;
+//! let query_tracker = QueryTracker::memory_only();
 //! shared_query_tracker.init(query_tracker)?;
 //!
 //! // 2. Init the file picker (spawns background scan + watcher)
@@ -111,7 +111,7 @@ pub mod file_picker;
 
 /// Frecency (frequency + recency) database for file access scoring.
 ///
-/// Backed by LMDB for persistent, crash-safe storage.
+/// Backed by a caller-provided persistence store and an in-memory scoring index.
 pub mod frecency;
 
 /// Git status caching and repository detection utilities.

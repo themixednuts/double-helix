@@ -1,7 +1,7 @@
 use std::sync::{Arc, Barrier};
 use std::thread;
 
-use helix_store::{AssistantThread, FrecencyEntry, PkgReceipt, Store, StorePaths};
+use helix_store::{AssistantThread, FrecencyEntry, PkgReceipt, QueryHistory, Store, StorePaths};
 
 #[test]
 fn migrations_wal_and_drizzle_round_trips() {
@@ -75,6 +75,45 @@ fn migrations_wal_and_drizzle_round_trips() {
     store.frecency().delete("workspace-a", "hash-1").unwrap();
     assert_eq!(store.frecency().get("workspace-a", "hash-1").unwrap(), None);
 
+    store
+        .query_history()
+        .save_query_match(
+            "workspace-a",
+            "main",
+            r#"{"file_path":"src/main.rs","open_count":2,"last_opened":300}"#,
+            300,
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .query_history()
+            .load_query_match("workspace-a", "main")
+            .unwrap(),
+        Some(r#"{"file_path":"src/main.rs","open_count":2,"last_opened":300}"#.to_owned())
+    );
+    store
+        .query_history()
+        .append_bounded_history("workspace-a", "file", "main", 300)
+        .unwrap();
+    store
+        .query_history()
+        .append_bounded_history("workspace-a", "grep", "struct", 301)
+        .unwrap();
+    assert_eq!(
+        store
+            .query_history()
+            .history_at("workspace-a", "file", 0)
+            .unwrap(),
+        Some("main".to_owned())
+    );
+    assert_eq!(
+        store
+            .query_history()
+            .history_at("workspace-a", "grep", 0)
+            .unwrap(),
+        Some("struct".to_owned())
+    );
+
     let receipt = PkgReceipt {
         kind: "lsp".to_owned(),
         name: "demo".to_owned(),
@@ -118,6 +157,70 @@ fn migrations_wal_and_drizzle_round_trips() {
         .unwrap());
     store.receipts().delete("lsp", "demo").unwrap();
     assert!(store.receipts().all().unwrap().is_empty());
+}
+
+#[test]
+fn fff_cache_import_is_marked_and_idempotent() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let paths = paths(temp.path());
+    let mut store = Store::open(paths).expect("open store");
+    let frecency = FrecencyEntry {
+        workspace: "workspace-a".to_owned(),
+        path_hash: "hash-1".to_owned(),
+        first_accessed_at: 100,
+        last_accessed_at: 200,
+        access_count: 2,
+        timestamps_json: "[100,200]".to_owned(),
+    };
+    let query = QueryHistory {
+        id: "fff:history:file:200:1".to_owned(),
+        workspace: "workspace-a".to_owned(),
+        query: "main".to_owned(),
+        opened_path: "fff:history:file".to_owned(),
+        ts: 200,
+    };
+
+    assert!(!store
+        .frecency()
+        .import_marker_exists("fff-cache-v1")
+        .unwrap());
+    assert!(store
+        .frecency()
+        .import_fff_cache_once("fff-cache-v1", &[frecency.clone()], &[query])
+        .unwrap());
+    assert!(store
+        .frecency()
+        .import_marker_exists("fff-cache-v1")
+        .unwrap());
+    assert_eq!(
+        store.frecency().get("workspace-a", "hash-1").unwrap(),
+        Some(frecency)
+    );
+    assert_eq!(
+        store
+            .query_history()
+            .history_at("workspace-a", "file", 0)
+            .unwrap(),
+        Some("main".to_owned())
+    );
+
+    let replacement = FrecencyEntry {
+        path_hash: "hash-2".to_owned(),
+        ..store
+            .frecency()
+            .get("workspace-a", "hash-1")
+            .unwrap()
+            .unwrap()
+    };
+    assert!(!store
+        .frecency()
+        .import_fff_cache_once("fff-cache-v1", &[replacement], &[])
+        .unwrap());
+    assert!(store
+        .frecency()
+        .get("workspace-a", "hash-2")
+        .unwrap()
+        .is_none());
 }
 
 #[test]

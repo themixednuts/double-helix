@@ -184,28 +184,11 @@ impl SharedFrecency {
         FrecencyTracker::spawn_gc(self.clone(), db_path, use_unsafe_no_lock)
     }
 
-    /// Drop the in-memory tracker and delete the on-disk database directory.
-    ///
-    /// Acquires the write lock, ensuring all readers (including any active mmap
-    /// access) are finished before the LMDB environment is closed and the files
-    /// are removed.
-    ///
-    /// Returns `Ok(Some(path))` with the deleted path, or `Ok(None)` if no
-    /// tracker was initialized.
+    /// Drop the in-memory tracker.
     pub fn destroy(&self) -> Result<Option<PathBuf>, Error> {
         let mut guard = self.write()?;
-        let Some(tracker) = guard.take() else {
-            return Ok(None);
-        };
-        let db_path = tracker.db_path().to_path_buf();
-        // Drop closes the LMDB env and unmaps the files
-        drop(tracker);
-        drop(guard);
-        std::fs::remove_dir_all(&db_path).map_err(|source| Error::RemoveDbDir {
-            path: db_path.clone(),
-            source,
-        })?;
-        Ok(Some(db_path))
+        guard.take();
+        Ok(None)
     }
 }
 
@@ -258,26 +241,10 @@ impl SharedQueryTracker {
         Ok(())
     }
 
-    /// Drop the in-memory tracker and delete the on-disk database directory.
-    ///
-    /// Acquires the write lock, ensuring all readers (including any active mmap
-    /// access) are finished before the LMDB environment is closed and the files
-    /// are removed.
-    ///
-    /// Returns `Ok(Some(path))` with the deleted path, or `Ok(None)` if no
-    /// tracker was initialized.
+    /// Drop the in-memory tracker.
     pub fn destroy(&self) -> Result<Option<PathBuf>, Error> {
         let mut guard = self.write()?;
-        let Some(tracker) = guard.take() else {
-            return Ok(None);
-        };
-        let db_path = tracker.db_path().to_path_buf();
-        drop(tracker);
-        drop(guard);
-        std::fs::remove_dir_all(&db_path).map_err(|source| Error::RemoveDbDir {
-            path: db_path.clone(),
-            source,
-        })?;
-        Ok(Some(db_path))
+        guard.take();
+        Ok(None)
     }
 }

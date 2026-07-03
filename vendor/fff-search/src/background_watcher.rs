@@ -150,7 +150,10 @@ impl BackgroundWatcher {
         })
     }
 
-    fn create_debouncer(context: WatchContext, watch_tx: mpsc::Sender<PathBuf>) -> Result<Debouncer, Error> {
+    fn create_debouncer(
+        context: WatchContext,
+        watch_tx: mpsc::Sender<PathBuf>,
+    ) -> Result<Debouncer, Error> {
         let WatchContext {
             base_path,
             git_workdir,

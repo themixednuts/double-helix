@@ -1,109 +1,202 @@
 use crate::db_healthcheck::DbHealthChecker;
 use crate::error::Error;
-use heed::types::Bytes;
-use heed::{Database, Env, EnvOpenOptions};
-use heed::{EnvFlags, types::SerdeBincode};
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
-use std::fs;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const MAX_HISTORY_ENTRIES: usize = 128;
 
-/// Simplified QueryFileEntry without redundant fields
-#[derive(Debug, Serialize, Deserialize, Clone)]
+pub type QueryPersistenceError = Box<dyn std::error::Error + Send + Sync + 'static>;
+pub type QueryPersistenceResult<T> = std::result::Result<T, QueryPersistenceError>;
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct QueryMatchEntry {
-    pub file_path: PathBuf, // File that was actually opened
-    pub open_count: u32,    // Number of times opened with this query
-    pub last_opened: u64,   // Unix timestamp
+    pub file_path: PathBuf,
+    pub open_count: u32,
+    pub last_opened: u64,
 }
 
-/// Entry for query history tracking
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct HistoryEntry {
-    query: String,
-    timestamp: u64,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum QueryHistoryKind {
+    File,
+    Grep,
 }
 
-#[derive(Debug)]
-pub struct QueryTracker {
-    env: Env,
-    // Database for (project_path, query) -> QueryMatchEntry mappings
-    query_file_db: Database<Bytes, SerdeBincode<QueryMatchEntry>>,
-    // Database for project_path -> VecDeque<HistoryEntry> mappings (file picker)
-    query_history_db: Database<Bytes, SerdeBincode<VecDeque<HistoryEntry>>>,
-    // Database for project_path -> VecDeque<HistoryEntry> mappings (grep)
-    grep_query_history_db: Database<Bytes, SerdeBincode<VecDeque<HistoryEntry>>>,
+pub trait QueryTrackerStore: std::fmt::Debug + Send + Sync {
+    fn load_match(
+        &self,
+        project_path: &Path,
+        query: &str,
+    ) -> QueryPersistenceResult<Option<QueryMatchEntry>>;
+    fn save_match(
+        &self,
+        project_path: &Path,
+        query: &str,
+        entry: &QueryMatchEntry,
+    ) -> QueryPersistenceResult<()>;
+    fn append_history(
+        &self,
+        project_path: &Path,
+        kind: QueryHistoryKind,
+        query: &str,
+        timestamp: u64,
+    ) -> QueryPersistenceResult<()>;
+    fn history_at(
+        &self,
+        project_path: &Path,
+        kind: QueryHistoryKind,
+        offset: usize,
+    ) -> QueryPersistenceResult<Option<String>>;
+    fn entry_counts(&self) -> QueryPersistenceResult<Vec<(&'static str, u64)>>;
+    fn disk_size(&self) -> QueryPersistenceResult<u64> {
+        Ok(0)
+    }
+    fn location(&self) -> String {
+        "memory".to_string()
+    }
 }
 
-impl DbHealthChecker for QueryTracker {
-    fn get_env(&self) -> &Env {
-        &self.env
+#[derive(Debug, Default)]
+pub struct InMemoryQueryTrackerStore {
+    matches: Mutex<HashMap<(PathBuf, String), QueryMatchEntry>>,
+    histories: Mutex<HashMap<(PathBuf, QueryHistoryKind), VecDeque<String>>>,
+}
+
+impl InMemoryQueryTrackerStore {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl QueryTrackerStore for InMemoryQueryTrackerStore {
+    fn load_match(
+        &self,
+        project_path: &Path,
+        query: &str,
+    ) -> QueryPersistenceResult<Option<QueryMatchEntry>> {
+        Ok(self
+            .matches
+            .lock()
+            .map_err(|_| "query tracker store lock poisoned")?
+            .get(&(project_path.to_path_buf(), query.to_string()))
+            .cloned())
     }
 
-    fn count_entries(&self) -> Result<Vec<(&'static str, u64)>, Error> {
-        let rtxn = self.env.read_txn().map_err(Error::DbStartReadTxn)?;
+    fn save_match(
+        &self,
+        project_path: &Path,
+        query: &str,
+        entry: &QueryMatchEntry,
+    ) -> QueryPersistenceResult<()> {
+        self.matches
+            .lock()
+            .map_err(|_| "query tracker store lock poisoned")?
+            .insert(
+                (project_path.to_path_buf(), query.to_string()),
+                entry.clone(),
+            );
+        Ok(())
+    }
 
-        let count_queries = self.query_file_db.len(&rtxn).map_err(Error::DbRead)?;
-        let count_histories = self.query_history_db.len(&rtxn).map_err(Error::DbRead)?;
-        let count_grep_histories = self
-            .grep_query_history_db
-            .len(&rtxn)
-            .map_err(Error::DbRead)?;
+    fn append_history(
+        &self,
+        project_path: &Path,
+        kind: QueryHistoryKind,
+        query: &str,
+        _timestamp: u64,
+    ) -> QueryPersistenceResult<()> {
+        let mut histories = self
+            .histories
+            .lock()
+            .map_err(|_| "query tracker store lock poisoned")?;
+        let history = histories
+            .entry((project_path.to_path_buf(), kind))
+            .or_default();
+        history.push_back(query.to_string());
+        while history.len() > MAX_HISTORY_ENTRIES {
+            history.pop_front();
+        }
+        Ok(())
+    }
+
+    fn history_at(
+        &self,
+        project_path: &Path,
+        kind: QueryHistoryKind,
+        offset: usize,
+    ) -> QueryPersistenceResult<Option<String>> {
+        let histories = self
+            .histories
+            .lock()
+            .map_err(|_| "query tracker store lock poisoned")?;
+        let query = histories
+            .get(&(project_path.to_path_buf(), kind))
+            .and_then(|history| {
+                history
+                    .len()
+                    .checked_sub(1 + offset)
+                    .and_then(|idx| history.get(idx))
+            })
+            .cloned();
+        Ok(query)
+    }
+
+    fn entry_counts(&self) -> QueryPersistenceResult<Vec<(&'static str, u64)>> {
+        let matches = self
+            .matches
+            .lock()
+            .map_err(|_| "query tracker store lock poisoned")?
+            .len() as u64;
+        let histories = self
+            .histories
+            .lock()
+            .map_err(|_| "query tracker store lock poisoned")?;
+        let file_history = histories
+            .iter()
+            .filter(|((_, kind), _)| *kind == QueryHistoryKind::File)
+            .map(|(_, history)| history.len() as u64)
+            .sum();
+        let grep_history = histories
+            .iter()
+            .filter(|((_, kind), _)| *kind == QueryHistoryKind::Grep)
+            .map(|(_, history)| history.len() as u64)
+            .sum();
 
         Ok(vec![
-            ("query_file_entries", count_queries),
-            ("query_history_entries", count_histories),
-            ("grep_query_history_entries", count_grep_histories),
+            ("query_file_entries", matches),
+            ("query_history_entries", file_history),
+            ("grep_query_history_entries", grep_history),
         ])
     }
 }
 
+#[derive(Debug)]
+pub struct QueryTracker {
+    store: Box<dyn QueryTrackerStore>,
+}
+
+impl DbHealthChecker for QueryTracker {
+    fn get_health(&self) -> Result<crate::db_healthcheck::DbHealth, Error> {
+        Ok(crate::db_healthcheck::DbHealth {
+            path: self.store.location(),
+            disk_size: self.store.disk_size().map_err(storage_error)?,
+            entry_counts: self.store.entry_counts().map_err(storage_error)?,
+        })
+    }
+}
+
 impl QueryTracker {
-    /// Returns the on-disk path of the LMDB environment directory.
-    pub fn db_path(&self) -> &Path {
-        self.env.path()
+    pub fn new(store: impl QueryTrackerStore + 'static) -> Self {
+        Self {
+            store: Box::new(store),
+        }
     }
 
-    pub fn new(db_path: impl AsRef<Path>, use_unsafe_no_lock: bool) -> Result<Self, Error> {
-        let db_path = db_path.as_ref();
-        fs::create_dir_all(db_path).map_err(Error::CreateDir)?;
-
-        let env = unsafe {
-            let mut opts = EnvOpenOptions::new();
-            opts.map_size(10 * 1024 * 1024); // 100 MiB
-            opts.max_dbs(16); // Allow up to 16 databases per environment
-            if use_unsafe_no_lock {
-                opts.flags(EnvFlags::NO_LOCK | EnvFlags::NO_SYNC | EnvFlags::NO_META_SYNC);
-            }
-            opts.open(db_path).map_err(Error::EnvOpen)?
-        };
-
-        env.clear_stale_readers()
-            .map_err(Error::DbClearStaleReaders)?;
-
-        let mut wtxn = env.write_txn().map_err(Error::DbStartWriteTxn)?;
-
-        // Create two named databases
-        let query_file_db = env
-            .create_database(&mut wtxn, Some("query_file_associations"))
-            .map_err(Error::DbCreate)?;
-        let query_history_db = env
-            .create_database(&mut wtxn, Some("query_history"))
-            .map_err(Error::DbCreate)?;
-        let grep_query_history_db = env
-            .create_database(&mut wtxn, Some("grep_query_history"))
-            .map_err(Error::DbCreate)?;
-
-        wtxn.commit().map_err(Error::DbCommit)?;
-
-        Ok(QueryTracker {
-            env,
-            query_file_db,
-            query_history_db,
-            grep_query_history_db,
-        })
+    pub fn memory_only() -> Self {
+        Self::new(InMemoryQueryTrackerStore::new())
     }
 
     fn get_now(&self) -> u64 {
@@ -113,6 +206,7 @@ impl QueryTracker {
             .as_secs()
     }
 
+    #[cfg(test)]
     fn create_query_key(project_path: &Path, query: &str) -> Result<[u8; 32], Error> {
         let project_str = project_path
             .to_str()
@@ -126,63 +220,13 @@ impl QueryTracker {
         Ok(*hasher.finalize().as_bytes())
     }
 
+    #[cfg(test)]
     fn create_project_key(project_path: &Path) -> Result<[u8; 32], Error> {
         let project_str = project_path
             .to_str()
             .ok_or_else(|| Error::InvalidPath(project_path.to_path_buf()))?;
 
         Ok(*blake3::hash(project_str.as_bytes()).as_bytes())
-    }
-
-    /// Append a query to a history database within an existing write transaction.
-    fn append_to_history(
-        db: &Database<Bytes, SerdeBincode<VecDeque<HistoryEntry>>>,
-        wtxn: &mut heed::RwTxn,
-        project_key: &[u8; 32],
-        query: &str,
-        now: u64,
-    ) -> Result<(), Error> {
-        let mut history = db
-            .get(wtxn, project_key)
-            .map_err(Error::DbRead)?
-            .unwrap_or_default();
-
-        history.push_back(HistoryEntry {
-            query: query.to_string(),
-            timestamp: now,
-        });
-        while history.len() > MAX_HISTORY_ENTRIES {
-            history.pop_front();
-        }
-
-        db.put(wtxn, project_key, &history)
-            .map_err(Error::DbWrite)?;
-        Ok(())
-    }
-
-    /// Read a query from a history database at a specific offset.
-    /// offset=0 returns most recent, offset=1 returns 2nd most recent, etc.
-    fn read_history_at_offset(
-        db: &Database<Bytes, SerdeBincode<VecDeque<HistoryEntry>>>,
-        env: &Env,
-        project_key: &[u8; 32],
-        offset: usize,
-    ) -> Result<Option<String>, Error> {
-        let rtxn = env.read_txn().map_err(Error::DbStartReadTxn)?;
-
-        let mut history = db
-            .get(&rtxn, project_key)
-            .map_err(Error::DbRead)?
-            .unwrap_or_default();
-
-        // history is FIFO, last element is most recent
-        if history.len() > offset {
-            let index = history.len() - 1 - offset;
-            let record = history.remove(index);
-            Ok(record.map(|r| r.query))
-        } else {
-            Ok(None)
-        }
     }
 
     pub fn track_query_completion(
@@ -194,13 +238,10 @@ impl QueryTracker {
         let now = self.get_now();
         let file_path_buf = file_path.to_path_buf();
 
-        let query_key = Self::create_query_key(project_path, query)?;
-        let mut wtxn = self.env.write_txn().map_err(Error::DbStartWriteTxn)?;
-
         let mut entry = self
-            .query_file_db
-            .get(&wtxn, &query_key)
-            .map_err(Error::DbRead)?
+            .store
+            .load_match(project_path, query)
+            .map_err(storage_error)?
             .unwrap_or_else(|| QueryMatchEntry {
                 file_path: file_path_buf.clone(),
                 open_count: 0,
@@ -213,8 +254,6 @@ impl QueryTracker {
                 ?file_path,
                 "Query completed for same file as last time"
             );
-
-            // Same file - just increment count
             entry.open_count += 1;
         } else {
             tracing::debug!(
@@ -222,23 +261,17 @@ impl QueryTracker {
                 ?file_path,
                 "Query completed for different file than last time"
             );
-
-            // Different file - replace and reset count to 1
             entry.file_path = file_path_buf;
             entry.open_count = 1;
         }
 
         entry.last_opened = now;
-
-        self.query_file_db
-            .put(&mut wtxn, &query_key, &entry)
-            .map_err(Error::DbWrite)?;
-
-        // Update query history database
-        let project_key = Self::create_project_key(project_path)?;
-        Self::append_to_history(&self.query_history_db, &mut wtxn, &project_key, query, now)?;
-
-        wtxn.commit().map_err(Error::DbCommit)?;
+        self.store
+            .save_match(project_path, query, &entry)
+            .map_err(storage_error)?;
+        self.store
+            .append_history(project_path, QueryHistoryKind::File, query, now)
+            .map_err(storage_error)?;
 
         tracing::debug!(?query, ?file_path, "Tracked query completion");
         Ok(())
@@ -250,13 +283,10 @@ impl QueryTracker {
         project_path: &Path,
         min_combo_count: u32,
     ) -> Result<Option<QueryMatchEntry>, Error> {
-        let query_key = Self::create_query_key(project_path, query)?;
-        let rtxn = self.env.read_txn().map_err(Error::DbStartReadTxn)?;
-
         let last_match = self
-            .query_file_db
-            .get(&rtxn, &query_key)
-            .map_err(Error::DbRead)?;
+            .store
+            .load_match(project_path, query)
+            .map_err(storage_error)?;
 
         Ok(last_match.filter(|entry| entry.open_count >= min_combo_count))
     }
@@ -268,69 +298,49 @@ impl QueryTracker {
         file_path: &Path,
         combo_boost: i32,
     ) -> Result<i32, Error> {
-        let query_key = Self::create_query_key(project_path, query)?;
-        tracing::debug!(?query_key, "HASH");
-        let rtxn = self.env.read_txn().map_err(Error::DbStartReadTxn)?;
-
         match self
-            .query_file_db
-            .get(&rtxn, &query_key)
-            .map_err(Error::DbRead)?
+            .store
+            .load_match(project_path, query)
+            .map_err(storage_error)?
         {
-            Some(entry) => {
-                // Check if the file path matches and return boost
-                if entry.file_path == file_path && entry.open_count >= 2 {
-                    Ok(combo_boost)
-                } else {
-                    Ok(0)
-                }
-            }
-            None => Ok(0), // Query not found
+            Some(entry) if entry.file_path == file_path && entry.open_count >= 2 => Ok(combo_boost),
+            _ => Ok(0),
         }
     }
 
-    /// Get query from file picker history at a specific offset.
-    /// offset=0 returns most recent query, offset=1 returns 2nd most recent, etc.
     pub fn get_historical_query(
         &self,
         project_path: &Path,
         offset: usize,
     ) -> Result<Option<String>, Error> {
-        let project_key = Self::create_project_key(project_path)?;
-        Self::read_history_at_offset(&self.query_history_db, &self.env, &project_key, offset)
+        self.store
+            .history_at(project_path, QueryHistoryKind::File, offset)
+            .map_err(storage_error)
     }
 
-    /// Track a grep query in the grep-specific history.
-    /// Only records query history (no file association tracking needed for grep).
     pub fn track_grep_query(&mut self, query: &str, project_path: &Path) -> Result<(), Error> {
         let now = self.get_now();
-        let project_key = Self::create_project_key(project_path)?;
-        let mut wtxn = self.env.write_txn().map_err(Error::DbStartWriteTxn)?;
-
-        Self::append_to_history(
-            &self.grep_query_history_db,
-            &mut wtxn,
-            &project_key,
-            query,
-            now,
-        )?;
-
-        wtxn.commit().map_err(Error::DbCommit)?;
+        self.store
+            .append_history(project_path, QueryHistoryKind::Grep, query, now)
+            .map_err(storage_error)?;
 
         tracing::debug!(?query, "Tracked grep query");
         Ok(())
     }
 
-    /// Get grep query from history at a specific offset.
-    /// offset=0 returns most recent grep query, offset=1 returns 2nd most recent, etc.
     pub fn get_historical_grep_query(
         &self,
         project_path: &Path,
         offset: usize,
     ) -> Result<Option<String>, Error> {
-        let project_key = Self::create_project_key(project_path)?;
-        Self::read_history_at_offset(&self.grep_query_history_db, &self.env, &project_key, offset)
+        self.store
+            .history_at(project_path, QueryHistoryKind::Grep, offset)
+            .map_err(storage_error)
     }
+}
+
+fn storage_error(error: QueryPersistenceError) -> Error {
+    Error::Persistence(error.to_string())
 }
 
 #[cfg(test)]
@@ -340,15 +350,11 @@ mod tests {
 
     #[test]
     fn test_query_tracking() {
-        let temp_dir = env::temp_dir().join("fff_test_query_tracking_new");
-        let _ = std::fs::remove_dir_all(&temp_dir);
-
-        let mut tracker = QueryTracker::new(temp_dir.to_str().unwrap(), true).unwrap();
+        let mut tracker = QueryTracker::memory_only();
 
         let project_path = PathBuf::from("/test/project");
         let file_path = PathBuf::from("/test/project/src/main.rs");
 
-        // First completion
         tracker
             .track_query_completion("main", &project_path, &file_path)
             .unwrap();
@@ -357,7 +363,6 @@ mod tests {
             .unwrap();
         assert_eq!(boost, 0, "First completion should not boost");
 
-        // Second completion - should boost now
         tracker
             .track_query_completion("main", &project_path, &file_path)
             .unwrap();
@@ -366,7 +371,6 @@ mod tests {
             .unwrap();
         assert_eq!(boost, 10000, "Second completion should boost");
 
-        // Different file for same query - should reset count and no boost
         let other_file = PathBuf::from("/test/project/src/lib.rs");
         tracker
             .track_query_completion("main", &project_path, &other_file)
@@ -376,25 +380,53 @@ mod tests {
             .unwrap();
         assert_eq!(boost, 0, "Different file should reset boost");
 
-        // Original file should no longer get boost (replaced by new file)
         let boost = tracker
             .get_last_query_path("main", &project_path, &file_path, 10000)
             .unwrap();
         assert_eq!(boost, 0, "Original file should not boost after replacement");
+    }
 
-        let _ = std::fs::remove_dir_all(&temp_dir);
+    #[test]
+    fn test_query_histories_are_bounded_and_separate() {
+        let mut tracker = QueryTracker::memory_only();
+        let project_path = PathBuf::from("/test/project");
+        let file_path = PathBuf::from("/test/project/src/main.rs");
+
+        for index in 0..140 {
+            tracker
+                .track_query_completion(&format!("file-{index}"), &project_path, &file_path)
+                .unwrap();
+            tracker
+                .track_grep_query(&format!("grep-{index}"), &project_path)
+                .unwrap();
+        }
+
+        assert_eq!(
+            tracker.get_historical_query(&project_path, 0).unwrap(),
+            Some("file-139".to_string())
+        );
+        assert_eq!(
+            tracker.get_historical_query(&project_path, 127).unwrap(),
+            Some("file-12".to_string())
+        );
+        assert_eq!(
+            tracker.get_historical_query(&project_path, 128).unwrap(),
+            None
+        );
+        assert_eq!(
+            tracker.get_historical_grep_query(&project_path, 0).unwrap(),
+            Some("grep-139".to_string())
+        );
     }
 
     #[test]
     fn test_hashing_functions() {
         let project_path = PathBuf::from("/test/project");
 
-        // Test project key hashing
         let key1 = QueryTracker::create_project_key(&project_path).unwrap();
         let key2 = QueryTracker::create_project_key(&project_path).unwrap();
         assert_eq!(key1, key2, "Same project should hash to same key");
 
-        // Test query key hashing
         let query_key1 = QueryTracker::create_query_key(&project_path, "test").unwrap();
         let query_key2 = QueryTracker::create_query_key(&project_path, "test").unwrap();
         assert_eq!(
@@ -402,19 +434,33 @@ mod tests {
             "Same project+query should hash to same key"
         );
 
-        // Different queries should hash differently
         let query_key3 = QueryTracker::create_query_key(&project_path, "different").unwrap();
         assert_ne!(
             query_key1, query_key3,
-            "Different queries should hash to different keys"
+            "Different queries should hash differently"
         );
 
-        // Different projects should hash differently
         let other_project = PathBuf::from("/other/project");
         let query_key4 = QueryTracker::create_query_key(&other_project, "test").unwrap();
         assert_ne!(
             query_key1, query_key4,
-            "Different projects should hash to different keys"
+            "Different projects should hash differently"
+        );
+    }
+
+    #[test]
+    fn test_env_temp_dir_does_not_affect_memory_store() {
+        let _ = env::temp_dir();
+        let tracker = QueryTracker::memory_only();
+        assert_eq!(
+            tracker
+                .store
+                .entry_counts()
+                .unwrap()
+                .into_iter()
+                .map(|(_, count)| count)
+                .sum::<u64>(),
+            0
         );
     }
 }

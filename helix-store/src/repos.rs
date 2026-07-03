@@ -532,6 +532,72 @@ impl<'a> FrecencyRepo<'a> {
         Ok(rows.into_iter().map(FrecencyEntry::from).collect())
     }
 
+    /// Imports rebuildable FFF cache rows once and records the marker in the same transaction.
+    ///
+    /// Returns `true` when this call performed the import, or `false` when the marker already
+    /// existed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the SQLite transaction fails.
+    pub fn import_fff_cache_once(
+        &mut self,
+        marker: &str,
+        frecency_entries: &[FrecencyEntry],
+        query_entries: &[QueryHistory],
+    ) -> Result<bool> {
+        self.backend.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| {
+            ensure_cache_import_marker_table(self.backend)?;
+            let exists: i64 = self.backend.conn().query_row(
+                "SELECT EXISTS(SELECT 1 FROM helix_store_import_markers WHERE name = ?1)",
+                params![marker],
+                |row| row.get(0),
+            )?;
+            if exists != 0 {
+                return Ok(false);
+            }
+
+            for entry in frecency_entries {
+                insert_frecency(self.backend.conn(), entry)?;
+            }
+            for entry in query_entries {
+                insert_query_history(self.backend.conn(), entry)?;
+            }
+            self.backend.execute(
+                "INSERT INTO helix_store_import_markers(name) VALUES (?1)",
+                params![marker],
+            )?;
+            Ok(true)
+        })();
+
+        match result {
+            Ok(imported) => {
+                self.backend.execute_batch("COMMIT")?;
+                Ok(imported)
+            }
+            Err(err) => {
+                let _ = self.backend.execute_batch("ROLLBACK");
+                Err(err)
+            }
+        }
+    }
+
+    /// Checks whether an import marker exists in the cache DB.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the SQLite query fails.
+    pub fn import_marker_exists(&mut self, marker: &str) -> Result<bool> {
+        ensure_cache_import_marker_table(self.backend)?;
+        let exists: i64 = self.backend.conn().query_row(
+            "SELECT EXISTS(SELECT 1 FROM helix_store_import_markers WHERE name = ?1)",
+            params![marker],
+            |row| row.get(0),
+        )?;
+        Ok(exists != 0)
+    }
+
     /// Deletes one frecency entry by workspace and path hash.
     ///
     /// # Errors
@@ -597,6 +663,115 @@ impl<'a> QueryHistoryRepo<'a> {
             .order_by(desc(table.ts))
             .all()?;
         Ok(rows.into_iter().map(QueryHistory::from).collect())
+    }
+
+    /// Saves the latest query-to-opened-file association payload for one workspace/query.
+    ///
+    /// The payload is owned by the caller so `fff-search` can stay storage-agnostic.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the SQLite write fails.
+    pub fn save_query_match(
+        &mut self,
+        workspace: &str,
+        query: &str,
+        payload_json: &str,
+        ts: i64,
+    ) -> Result<()> {
+        let item = QueryHistory {
+            id: query_match_id(workspace, query),
+            workspace: workspace.to_owned(),
+            query: query.to_owned(),
+            opened_path: payload_json.to_owned(),
+            ts,
+        };
+        insert_query_history(self.backend.conn(), &item)?;
+        Ok(())
+    }
+
+    /// Loads the latest query-to-opened-file association payload for one workspace/query.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the SQLite query fails.
+    pub fn load_query_match(&mut self, workspace: &str, query: &str) -> Result<Option<String>> {
+        self.backend
+            .conn()
+            .query_row(
+                "SELECT opened_path FROM query_history WHERE id = ?1 LIMIT 1",
+                params![query_match_id(workspace, query)],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(crate::Error::from)
+    }
+
+    /// Appends one bounded file-picker or grep query-history entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the SQLite write fails.
+    pub fn append_bounded_history(
+        &mut self,
+        workspace: &str,
+        kind: &str,
+        query: &str,
+        ts: i64,
+    ) -> Result<()> {
+        self.backend.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| {
+            let item = QueryHistory {
+                id: query_history_id(workspace, kind, query, ts),
+                workspace: workspace.to_owned(),
+                query: query.to_owned(),
+                opened_path: history_marker(kind),
+                ts,
+            };
+            insert_query_history(self.backend.conn(), &item)?;
+            prune_history(
+                self.backend.conn(),
+                workspace,
+                kind,
+                MAX_QUERY_HISTORY_ENTRIES,
+            )?;
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                self.backend.execute_batch("COMMIT")?;
+                Ok(())
+            }
+            Err(err) => {
+                let _ = self.backend.execute_batch("ROLLBACK");
+                Err(err)
+            }
+        }
+    }
+
+    /// Reads a bounded query-history item where offset 0 is the newest item.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the SQLite query fails.
+    pub fn history_at(
+        &mut self,
+        workspace: &str,
+        kind: &str,
+        offset: usize,
+    ) -> Result<Option<String>> {
+        self.backend
+            .conn()
+            .query_row(
+                "SELECT query FROM query_history \
+                 WHERE workspace = ?1 AND opened_path = ?2 \
+                 ORDER BY ts DESC, id DESC LIMIT 1 OFFSET ?3",
+                params![workspace, history_marker(kind), offset as i64],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(crate::Error::from)
     }
 }
 
@@ -920,4 +1095,122 @@ fn append_timestamp(raw: &str, ts: i64) -> Result<String> {
     let mut values: Vec<i64> = serde_json::from_str(raw)?;
     values.push(ts);
     Ok(serde_json::to_string(&values)?)
+}
+
+const FFF_CACHE_IMPORT_MARKER_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS helix_store_import_markers (
+    name TEXT PRIMARY KEY NOT NULL,
+    imported_at INTEGER NOT NULL DEFAULT (unixepoch())
+);
+"#;
+const MAX_QUERY_HISTORY_ENTRIES: usize = 128;
+
+fn ensure_cache_import_marker_table(backend: &mut DrizzleBackend) -> Result<()> {
+    backend.execute_batch(FFF_CACHE_IMPORT_MARKER_SQL)
+}
+
+fn insert_frecency(conn: &rusqlite::Connection, entry: &FrecencyEntry) -> Result<usize> {
+    conn.execute(
+        r#"
+INSERT INTO frecency (
+    workspace,
+    path_hash,
+    first_accessed_at,
+    last_accessed_at,
+    access_count,
+    timestamps_json
+) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+ON CONFLICT(workspace, path_hash) DO UPDATE SET
+    first_accessed_at = excluded.first_accessed_at,
+    last_accessed_at = excluded.last_accessed_at,
+    access_count = excluded.access_count,
+    timestamps_json = excluded.timestamps_json
+"#,
+        params![
+            &entry.workspace,
+            &entry.path_hash,
+            &entry.first_accessed_at,
+            &entry.last_accessed_at,
+            &entry.access_count,
+            &entry.timestamps_json,
+        ],
+    )
+    .map_err(crate::Error::from)
+}
+
+fn insert_query_history(conn: &rusqlite::Connection, item: &QueryHistory) -> Result<usize> {
+    conn.execute(
+        r#"
+INSERT INTO query_history (
+    id,
+    workspace,
+    query,
+    opened_path,
+    ts
+) VALUES (?1, ?2, ?3, ?4, ?5)
+ON CONFLICT(id) DO UPDATE SET
+    workspace = excluded.workspace,
+    query = excluded.query,
+    opened_path = excluded.opened_path,
+    ts = excluded.ts
+"#,
+        params![
+            &item.id,
+            &item.workspace,
+            &item.query,
+            &item.opened_path,
+            &item.ts,
+        ],
+    )
+    .map_err(crate::Error::from)
+}
+
+fn prune_history(
+    conn: &rusqlite::Connection,
+    workspace: &str,
+    kind: &str,
+    max_entries: usize,
+) -> Result<usize> {
+    conn.execute(
+        "DELETE FROM query_history \
+         WHERE workspace = ?1 AND opened_path = ?2 AND id NOT IN ( \
+             SELECT id FROM query_history \
+             WHERE workspace = ?1 AND opened_path = ?2 \
+             ORDER BY ts DESC, id DESC LIMIT ?3 \
+         )",
+        params![workspace, history_marker(kind), max_entries as i64],
+    )
+    .map_err(crate::Error::from)
+}
+
+fn query_match_id(workspace: &str, query: &str) -> String {
+    format!("fff:assoc:{:016x}", stable_hash(&[workspace, query]))
+}
+
+fn query_history_id(workspace: &str, kind: &str, query: &str, ts: i64) -> String {
+    let ts_string = ts.to_string();
+    format!(
+        "fff:history:{kind}:{ts}:{:016x}",
+        stable_hash(&[workspace, kind, query, &ts_string])
+    )
+}
+
+fn history_marker(kind: &str) -> String {
+    format!("fff:history:{kind}")
+}
+
+fn stable_hash(parts: &[&str]) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x00000100000001b3;
+
+    let mut hash = FNV_OFFSET;
+    for part in parts {
+        for byte in part.as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+        hash ^= 0xff;
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
 }

@@ -2,6 +2,7 @@ use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 
@@ -22,7 +23,28 @@ pub fn current_scope() -> thread::Scope {
 }
 
 pub async fn load_layout(scope: &thread::Scope) -> anyhow::Result<Option<Layout>> {
-    load_layout_from(layout_path(), scope).await
+    let scope_key = scope_key(scope)?;
+    match tokio::task::spawn_blocking(move || {
+        crate::assistant::history::import_legacy_if_needed_blocking()?;
+        let mut store = helix_store::Store::open_default()?;
+        store
+            .layout()
+            .get(&scope_key)?
+            .map(store_layout_into_domain)
+            .transpose()
+    })
+    .await
+    {
+        Ok(Ok(layout)) => Ok(layout),
+        Ok(Err(err)) => {
+            log::warn!("assistant layout store load failed, falling back to JSON: {err}");
+            load_layout_from(layout_path(), scope).await
+        }
+        Err(err) => {
+            log::warn!("assistant layout store load task failed, falling back to JSON: {err}");
+            load_layout_from(layout_path(), scope).await
+        }
+    }
 }
 
 async fn load_layout_from(path: PathBuf, scope: &thread::Scope) -> anyhow::Result<Option<Layout>> {
@@ -50,7 +72,29 @@ pub async fn save_layout(
     open: Vec<thread::Id>,
     active: Option<thread::Id>,
 ) -> anyhow::Result<()> {
-    save_layout_to(layout_path(), scope, open, active).await
+    let layout = store_layout_from_domain(Layout {
+        scope: scope.clone(),
+        open: open.clone(),
+        active,
+    })?;
+    match tokio::task::spawn_blocking(move || {
+        crate::assistant::history::import_legacy_if_needed_blocking()?;
+        let mut store = helix_store::Store::open_default()?;
+        store.layout().upsert(layout)?;
+        Ok::<_, anyhow::Error>(())
+    })
+    .await
+    {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(err)) => {
+            log::warn!("assistant layout store save failed, falling back to JSON: {err}");
+            save_layout_to(layout_path(), scope, open, active).await
+        }
+        Err(err) => {
+            log::warn!("assistant layout store save task failed, falling back to JSON: {err}");
+            save_layout_to(layout_path(), scope, open, active).await
+        }
+    }
 }
 
 async fn save_layout_to(
@@ -141,10 +185,65 @@ fn atomic_temp_path(path: &Path) -> anyhow::Result<PathBuf> {
     Ok(path.with_file_name(temp_name))
 }
 
-fn layout_path() -> PathBuf {
+pub(crate) fn layout_path() -> PathBuf {
     helix_loader::cache_dir()
         .join("assistant")
         .join("layout.json")
+}
+
+pub(crate) fn legacy_layouts_from_path(
+    path: impl AsRef<Path>,
+) -> anyhow::Result<Vec<helix_store::AssistantLayout>> {
+    let path = path.as_ref();
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err.into()),
+    };
+    let state: PersistedLayouts = match serde_json::from_str(&raw) {
+        Ok(state) => state,
+        Err(err) => {
+            log::warn!("assistant layout decode failed {:?}: {}", path, err);
+            return Ok(Vec::new());
+        }
+    };
+    state
+        .scopes
+        .into_iter()
+        .map(PersistedLayout::into_store)
+        .collect()
+}
+
+pub(crate) fn scope_key(scope: &thread::Scope) -> anyhow::Result<String> {
+    serde_json::to_string(&PersistedScope::from(scope)).context("serialize assistant scope")
+}
+
+fn store_layout_from_domain(layout: Layout) -> anyhow::Result<helix_store::AssistantLayout> {
+    Ok(helix_store::AssistantLayout {
+        scope: scope_key(&layout.scope)?,
+        open_ids: layout
+            .open
+            .into_iter()
+            .map(|id| id.value().get().to_string())
+            .collect(),
+        active_id: layout.active.map(|id| id.value().get().to_string()),
+    })
+}
+
+fn store_layout_into_domain(layout: helix_store::AssistantLayout) -> anyhow::Result<Layout> {
+    let scope: PersistedScope = serde_json::from_str(&layout.scope)?;
+    Ok(Layout {
+        scope: scope.into_domain(),
+        open: layout
+            .open_ids
+            .into_iter()
+            .map(|id| id.parse::<u64>().map(thread_id))
+            .collect::<Result<Vec<_>, _>>()?,
+        active: layout
+            .active_id
+            .map(|id| id.parse::<u64>().map(thread_id))
+            .transpose()?,
+    })
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -174,6 +273,14 @@ impl PersistedLayout {
             open: self.open.into_iter().map(thread_id).collect(),
             active: self.active.map(thread_id),
         }
+    }
+
+    fn into_store(self) -> anyhow::Result<helix_store::AssistantLayout> {
+        Ok(helix_store::AssistantLayout {
+            scope: serde_json::to_string(&self.scope)?,
+            open_ids: self.open.into_iter().map(|id| id.to_string()).collect(),
+            active_id: self.active.map(|id| id.to_string()),
+        })
     }
 }
 
@@ -291,6 +398,70 @@ mod tests {
             .unwrap()
             .unwrap();
         let loaded_b = load_layout_from(path, &scope_b).await.unwrap().unwrap();
+
+        assert_eq!(loaded_a.open, vec![id_a]);
+        assert_eq!(loaded_b.open, vec![id_b]);
+    }
+
+    #[test]
+    fn store_layout_upserts_independent_scopes_concurrently() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = helix_store::StorePaths::new(
+            dir.path().join("state.sqlite3"),
+            dir.path().join("cache.sqlite3"),
+        );
+        let scope_a = thread::Scope::new(PathBuf::from("project-a"));
+        let scope_b = thread::Scope::new(PathBuf::from("project-b"));
+        let id_a = thread::Id::new(NonZeroU64::new(1).unwrap());
+        let id_b = thread::Id::new(NonZeroU64::new(2).unwrap());
+        let layout_a = store_layout_from_domain(Layout {
+            scope: scope_a.clone(),
+            open: vec![id_a],
+            active: Some(id_a),
+        })
+        .unwrap();
+        let layout_b = store_layout_from_domain(Layout {
+            scope: scope_b.clone(),
+            open: vec![id_b],
+            active: Some(id_b),
+        })
+        .unwrap();
+        helix_store::Store::open(paths.clone()).unwrap();
+
+        let writer_a = {
+            let paths = paths.clone();
+            std::thread::spawn(move || {
+                let mut store = helix_store::Store::open(paths).unwrap();
+                store.layout().upsert(layout_a).unwrap();
+            })
+        };
+        let writer_b = {
+            let paths = paths.clone();
+            std::thread::spawn(move || {
+                let mut store = helix_store::Store::open(paths).unwrap();
+                store.layout().upsert(layout_b).unwrap();
+            })
+        };
+        writer_a.join().unwrap();
+        writer_b.join().unwrap();
+
+        let mut store = helix_store::Store::open(paths).unwrap();
+        let loaded_a = store
+            .layout()
+            .get(&scope_key(&scope_a).unwrap())
+            .unwrap()
+            .map(store_layout_into_domain)
+            .transpose()
+            .unwrap()
+            .unwrap();
+        let loaded_b = store
+            .layout()
+            .get(&scope_key(&scope_b).unwrap())
+            .unwrap()
+            .map(store_layout_into_domain)
+            .transpose()
+            .unwrap()
+            .unwrap();
 
         assert_eq!(loaded_a.open, vec![id_a]);
         assert_eq!(loaded_b.open, vec![id_b]);

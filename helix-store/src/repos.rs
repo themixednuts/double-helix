@@ -1,17 +1,18 @@
+use drizzle::core::desc;
 use drizzle::core::expr::{and, eq};
-use drizzle::core::{asc, desc};
 use drizzle::sqlite::connection::SQLiteTransactionType;
+use rusqlite::{params, OptionalExtension};
 
-use crate::backend::DrizzleBackend;
+use crate::backend::{Backend, DrizzleBackend};
 use crate::dto::{
     AssistantLayout, AssistantPermission, AssistantThread, FrecencyEntry, PkgReceipt, QueryHistory,
 };
 use crate::error::Result;
 use crate::schema::{
     InsertAssistantLayout, InsertAssistantPermissions, InsertAssistantThreads, InsertFrecency,
-    InsertPkgReceipts, InsertQueryHistory, SelectAssistantLayout, SelectAssistantPermissions,
-    SelectAssistantThreads, SelectFrecency, SelectPkgReceipts, SelectQueryHistory,
-    UpdateAssistantPermissions, UpdateFrecency, UpdatePkgReceipts,
+    InsertQueryHistory, SelectAssistantLayout, SelectAssistantPermissions, SelectAssistantThreads,
+    SelectFrecency, SelectPkgReceipts, SelectQueryHistory, UpdateAssistantPermissions,
+    UpdateFrecency,
 };
 
 pub struct AssistantThreadsRepo<'a> {
@@ -83,6 +84,50 @@ impl<'a> AssistantThreadsRepo<'a> {
         Ok(rows.into_iter().map(AssistantThread::from).collect())
     }
 
+    /// Lists thread stubs for one serialized scope, filtered by indexed feedback columns.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the SQLite query fails.
+    pub fn list_by_scope_filtered(
+        &mut self,
+        scope: &str,
+        rating: Option<&str>,
+        has_feedback: Option<bool>,
+    ) -> Result<Vec<AssistantThread>> {
+        let mut sql = String::from(
+            "SELECT id, scope, title, created_at, updated_at, rating, has_feedback, record_json \
+             FROM assistant_threads WHERE scope = ?1",
+        );
+        match (rating, has_feedback) {
+            (Some(_), Some(_)) => sql.push_str(" AND rating = ?2 AND has_feedback = ?3"),
+            (Some(_), None) => sql.push_str(" AND rating = ?2"),
+            (None, Some(_)) => sql.push_str(" AND has_feedback = ?2"),
+            (None, None) => {}
+        }
+        sql.push_str(" ORDER BY updated_at DESC");
+
+        let mut stmt = self.backend.conn().prepare(&sql)?;
+        let rows = match (rating, has_feedback) {
+            (Some(rating), Some(has_feedback)) => stmt
+                .query_map(
+                    params![scope, rating, bool_to_i64(has_feedback)],
+                    select_thread,
+                )?
+                .collect::<std::result::Result<Vec<_>, _>>()?,
+            (Some(rating), None) => stmt
+                .query_map(params![scope, rating], select_thread)?
+                .collect::<std::result::Result<Vec<_>, _>>()?,
+            (None, Some(has_feedback)) => stmt
+                .query_map(params![scope, bool_to_i64(has_feedback)], select_thread)?
+                .collect::<std::result::Result<Vec<_>, _>>()?,
+            (None, None) => stmt
+                .query_map(params![scope], select_thread)?
+                .collect::<std::result::Result<Vec<_>, _>>()?,
+        };
+        Ok(rows)
+    }
+
     /// Loads one assistant thread by id.
     ///
     /// # Errors
@@ -114,6 +159,112 @@ impl<'a> AssistantThreadsRepo<'a> {
             .r#where(eq(table.id, id))
             .execute()?;
         Ok(())
+    }
+
+    /// Returns true once legacy assistant files have been imported into the state DB.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the marker query fails.
+    pub fn has_assistant_import_marker(&mut self) -> Result<bool> {
+        ensure_assistant_import_marker_table(self.backend)?;
+        let value: Option<i64> = self
+            .backend
+            .conn()
+            .query_row(
+                "SELECT 1 FROM helix_store_import_markers WHERE name = ?1 LIMIT 1",
+                params![ASSISTANT_IMPORT_MARKER],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(value.is_some())
+    }
+
+    /// Imports legacy assistant state and records the marker in one transaction.
+    ///
+    /// Returns `true` when this call performed the import, or `false` when the marker already
+    /// existed and the inputs were ignored.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any SQLite write in the import transaction fails.
+    pub fn import_assistant_state_once(
+        &mut self,
+        threads: Vec<AssistantThread>,
+        layouts: Vec<AssistantLayout>,
+        permissions: Vec<AssistantPermission>,
+    ) -> Result<bool> {
+        self.backend.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| {
+            ensure_assistant_import_marker_table(self.backend)?;
+            let exists: Option<i64> = self
+                .backend
+                .conn()
+                .query_row(
+                    "SELECT 1 FROM helix_store_import_markers WHERE name = ?1 LIMIT 1",
+                    params![ASSISTANT_IMPORT_MARKER],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if exists.is_some() {
+                return Ok(false);
+            }
+
+            for thread in threads {
+                self.backend.execute(
+                    "INSERT OR REPLACE INTO assistant_threads \
+                     (id, scope, title, created_at, updated_at, rating, has_feedback, record_json) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    params![
+                        thread.id,
+                        thread.scope,
+                        thread.title,
+                        thread.created_at,
+                        thread.updated_at,
+                        thread.rating,
+                        bool_to_i64(thread.has_feedback),
+                        thread.record_json,
+                    ],
+                )?;
+            }
+
+            for layout in layouts {
+                self.backend.execute(
+                    "INSERT OR REPLACE INTO assistant_layout(scope, open_ids, active_id) \
+                     VALUES (?1, ?2, ?3)",
+                    params![
+                        layout.scope,
+                        serde_json::to_string(&layout.open_ids)?,
+                        layout.active_id,
+                    ],
+                )?;
+            }
+
+            for permission in permissions {
+                self.backend.execute(
+                    "INSERT OR REPLACE INTO assistant_permissions(agent, tool, choice) \
+                     VALUES (?1, ?2, ?3)",
+                    params![permission.agent, permission.tool, permission.choice],
+                )?;
+            }
+
+            self.backend.execute(
+                "INSERT INTO helix_store_import_markers(name) VALUES (?1)",
+                params![ASSISTANT_IMPORT_MARKER],
+            )?;
+            Ok(true)
+        })();
+
+        match result {
+            Ok(imported) => {
+                self.backend.execute_batch("COMMIT")?;
+                Ok(imported)
+            }
+            Err(err) => {
+                let _ = self.backend.execute_batch("ROLLBACK");
+                Err(err)
+            }
+        }
     }
 }
 
@@ -228,6 +379,42 @@ impl<'a> AssistantPermissionsRepo<'a> {
         let rows: Vec<SelectAssistantPermissions> =
             self.backend.db().select(()).from(table).all()?;
         Ok(rows.into_iter().map(AssistantPermission::from).collect())
+    }
+
+    /// Removes every stored assistant permission choice.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the SQLite delete fails.
+    pub fn clear(&mut self) -> Result<()> {
+        let table = self.backend.schema.assistant_permissions;
+        self.backend.db().delete(table).execute()?;
+        Ok(())
+    }
+
+    /// Replaces all stored assistant permission choices in one transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the SQLite transaction fails.
+    pub fn replace_all(&mut self, permissions: Vec<AssistantPermission>) -> Result<()> {
+        let table = self.backend.schema.assistant_permissions;
+        self.backend
+            .db()
+            .transaction(SQLiteTransactionType::Immediate, |tx| {
+                tx.delete(table).execute()?;
+                for permission in permissions {
+                    tx.insert(table)
+                        .value(InsertAssistantPermissions::new(
+                            permission.agent,
+                            permission.tool,
+                            permission.choice,
+                        ))
+                        .execute()?;
+                }
+                Ok(())
+            })?;
+        Ok(())
     }
 }
 
@@ -428,40 +615,68 @@ impl<'a> PkgReceiptsRepo<'a> {
     ///
     /// Returns an error if the SQLite write fails.
     pub fn upsert(&mut self, receipt: PkgReceipt) -> Result<()> {
-        let table = self.backend.schema.pkg_receipts;
+        self.in_immediate_transaction(|conn| insert_pkg_receipt(conn, &receipt).map(|_| ()))
+    }
+
+    /// Imports legacy package receipts once and records the marker in the same transaction.
+    ///
+    /// Returns `true` when the import ran, and `false` when the marker already existed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the SQLite import transaction fails.
+    pub fn import_once(&mut self, marker: &str, receipts: &[PkgReceipt]) -> Result<bool> {
+        self.in_immediate_transaction(|conn| {
+            ensure_pkg_import_marker_table(conn)?;
+            let exists: i64 = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM helix_store_import_markers WHERE name = ?1)",
+                params![marker],
+                |row| row.get(0),
+            )?;
+            if exists != 0 {
+                return Ok(false);
+            }
+            for receipt in receipts {
+                insert_pkg_receipt(conn, receipt)?;
+            }
+            conn.execute(
+                "INSERT INTO helix_store_import_markers(name) VALUES (?1)",
+                params![marker],
+            )?;
+            Ok(true)
+        })
+    }
+
+    /// Checks whether an import marker exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the SQLite query fails.
+    pub fn import_marker_exists(&mut self, marker: &str) -> Result<bool> {
+        self.backend.execute_batch(PKG_IMPORT_MARKERS_SQL)?;
+        let exists: i64 = self.backend.conn().query_row(
+            "SELECT EXISTS(SELECT 1 FROM helix_store_import_markers WHERE name = ?1)",
+            params![marker],
+            |row| row.get(0),
+        )?;
+        Ok(exists != 0)
+    }
+
+    /// Loads one package receipt by kind/name.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the SQLite query fails.
+    pub fn get(&mut self, kind: &str, name: &str) -> Result<Option<PkgReceipt>> {
         self.backend
-            .db()
-            .transaction(SQLiteTransactionType::Immediate, |tx| {
-                tx.insert(table)
-                    .value(InsertPkgReceipts::new(
-                        receipt.kind.clone(),
-                        receipt.name.clone(),
-                        receipt.version.clone(),
-                        receipt.source.clone(),
-                        receipt.hash.clone(),
-                        receipt.installed_at.clone(),
-                        receipt.receipt_json.clone(),
-                    ))
-                    .execute()
-                    .or_else(|_| {
-                        tx.update(table)
-                            .set(
-                                UpdatePkgReceipts::default()
-                                    .with_version(receipt.version)
-                                    .with_source(receipt.source)
-                                    .with_hash(receipt.hash)
-                                    .with_installed_at(receipt.installed_at)
-                                    .with_receipt_json(receipt.receipt_json),
-                            )
-                            .r#where(and(
-                                eq(table.kind, receipt.kind),
-                                eq(table.name, receipt.name),
-                            ))
-                            .execute()
-                    })?;
-                Ok(())
-            })?;
-        Ok(())
+            .conn()
+            .query_row(
+                PKG_RECEIPT_SELECT_SQL,
+                params![kind, name],
+                pkg_receipt_from_row,
+            )
+            .optional()
+            .map_err(crate::Error::from)
     }
 
     /// Lists all package receipts ordered by kind/name.
@@ -470,15 +685,11 @@ impl<'a> PkgReceiptsRepo<'a> {
     ///
     /// Returns an error if the SQLite query fails.
     pub fn all(&mut self) -> Result<Vec<PkgReceipt>> {
-        let table = self.backend.schema.pkg_receipts;
-        let rows: Vec<SelectPkgReceipts> = self
-            .backend
-            .db()
-            .select(())
-            .from(table)
-            .order_by((asc(table.kind), asc(table.name)))
-            .all()?;
-        Ok(rows.into_iter().map(PkgReceipt::from).collect())
+        let mut stmt = self.backend.conn().prepare(PKG_RECEIPT_SELECT_ALL_SQL)?;
+        let rows = stmt
+            .query_map([], pkg_receipt_from_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     /// Deletes one package receipt.
@@ -494,6 +705,24 @@ impl<'a> PkgReceiptsRepo<'a> {
             .r#where(and(eq(table.kind, kind), eq(table.name, name)))
             .execute()?;
         Ok(())
+    }
+
+    fn in_immediate_transaction<T>(
+        &mut self,
+        f: impl FnOnce(&rusqlite::Connection) -> Result<T>,
+    ) -> Result<T> {
+        self.backend.execute_batch("BEGIN IMMEDIATE")?;
+        let result = f(self.backend.conn());
+        match result {
+            Ok(value) => {
+                self.backend.execute_batch("COMMIT")?;
+                Ok(value)
+            }
+            Err(err) => {
+                let _ = self.backend.execute_batch("ROLLBACK");
+                Err(err)
+            }
+        }
     }
 }
 
@@ -567,14 +796,124 @@ impl From<SelectPkgReceipts> for PkgReceipt {
             version: row.version,
             source: row.source,
             hash: row.hash,
+            bin: row.bin,
+            shim: row.shim,
+            files_json: row.files_json,
             installed_at: row.installed_at,
+            native_manager: row.native_manager,
+            native_id: row.native_id,
             receipt_json: row.receipt_json,
         }
     }
 }
 
+const PKG_IMPORT_MARKERS_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS helix_store_import_markers (
+    name TEXT PRIMARY KEY NOT NULL,
+    imported_at INTEGER NOT NULL DEFAULT (unixepoch())
+);
+"#;
+
+const PKG_RECEIPT_SELECT_SQL: &str = "SELECT kind, name, version, source, hash, bin, shim, files_json, installed_at, native_manager, native_id, receipt_json FROM pkg_receipts WHERE kind = ?1 AND name = ?2";
+const PKG_RECEIPT_SELECT_ALL_SQL: &str = "SELECT kind, name, version, source, hash, bin, shim, files_json, installed_at, native_manager, native_id, receipt_json FROM pkg_receipts ORDER BY kind, name";
+
+fn ensure_pkg_import_marker_table(conn: &rusqlite::Connection) -> Result<()> {
+    conn.execute_batch(PKG_IMPORT_MARKERS_SQL)
+        .map_err(crate::Error::from)
+}
+
+fn insert_pkg_receipt(conn: &rusqlite::Connection, receipt: &PkgReceipt) -> Result<usize> {
+    conn.execute(
+        r#"
+INSERT INTO pkg_receipts (
+    kind,
+    name,
+    version,
+    source,
+    hash,
+    bin,
+    shim,
+    files_json,
+    installed_at,
+    native_manager,
+    native_id,
+    receipt_json
+) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+ON CONFLICT(kind, name) DO UPDATE SET
+    version = excluded.version,
+    source = excluded.source,
+    hash = excluded.hash,
+    bin = excluded.bin,
+    shim = excluded.shim,
+    files_json = excluded.files_json,
+    installed_at = excluded.installed_at,
+    native_manager = excluded.native_manager,
+    native_id = excluded.native_id,
+    receipt_json = excluded.receipt_json
+"#,
+        params![
+            &receipt.kind,
+            &receipt.name,
+            &receipt.version,
+            &receipt.source,
+            &receipt.hash,
+            &receipt.bin,
+            &receipt.shim,
+            &receipt.files_json,
+            &receipt.installed_at,
+            &receipt.native_manager,
+            &receipt.native_id,
+            &receipt.receipt_json,
+        ],
+    )
+    .map_err(crate::Error::from)
+}
+
+fn pkg_receipt_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PkgReceipt> {
+    Ok(PkgReceipt {
+        kind: row.get(0)?,
+        name: row.get(1)?,
+        version: row.get(2)?,
+        source: row.get(3)?,
+        hash: row.get(4)?,
+        bin: row.get(5)?,
+        shim: row.get(6)?,
+        files_json: row.get(7)?,
+        installed_at: row.get(8)?,
+        native_manager: row.get(9)?,
+        native_id: row.get(10)?,
+        receipt_json: row.get(11)?,
+    })
+}
+
 fn bool_to_i64(value: bool) -> i64 {
     i64::from(value)
+}
+
+const ASSISTANT_IMPORT_MARKER: &str = "assistant-state-v1";
+
+fn ensure_assistant_import_marker_table(backend: &mut DrizzleBackend) -> Result<()> {
+    backend.execute_batch(
+        r#"
+CREATE TABLE IF NOT EXISTS helix_store_import_markers (
+    name TEXT PRIMARY KEY NOT NULL,
+    imported_at INTEGER NOT NULL DEFAULT (unixepoch())
+);
+"#,
+    )
+}
+
+fn select_thread(row: &rusqlite::Row<'_>) -> rusqlite::Result<AssistantThread> {
+    Ok(AssistantThread {
+        id: row.get(0)?,
+        scope: row.get(1)?,
+        title: row.get(2)?,
+        created_at: row.get(3)?,
+        updated_at: row.get(4)?,
+        rating: row.get(5)?,
+        has_feedback: row.get::<_, i64>(6)? != 0,
+        record_json: row.get(7)?,
+    })
 }
 
 fn append_timestamp(raw: &str, ts: i64) -> Result<String> {

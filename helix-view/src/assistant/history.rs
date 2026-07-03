@@ -308,6 +308,10 @@ impl Backend {
 
 pub use local::local_backend;
 
+pub(crate) fn import_legacy_if_needed_blocking() -> anyhow::Result<()> {
+    local::import_legacy_if_needed_blocking()
+}
+
 #[cfg(test)]
 mod tests {
     use std::num::NonZeroU64;

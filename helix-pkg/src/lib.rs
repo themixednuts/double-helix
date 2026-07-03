@@ -37,6 +37,10 @@ pub enum Error {
     },
     #[error("failed to write TOML: {0}")]
     TomlSer(#[from] toml::ser::Error),
+    #[error("failed to encode or decode receipt JSON: {0}")]
+    ReceiptJson(#[from] serde_json::Error),
+    #[error("SQLite store error: {0}")]
+    Store(#[from] helix_store::Error),
     #[error("http request failed for {url}: {source}")]
     Http {
         url: String,

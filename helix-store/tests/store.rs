@@ -81,20 +81,41 @@ fn migrations_wal_and_drizzle_round_trips() {
         version: "1.0.0".to_owned(),
         source: "archive".to_owned(),
         hash: "abc".to_owned(),
+        bin: "demo".to_owned(),
+        shim: "demo.cmd".to_owned(),
+        files_json: r#"{"demo.exe":"abc"}"#.to_owned(),
         installed_at: "2026-07-03T00:00:00Z".to_owned(),
+        native_manager: None,
+        native_id: None,
         receipt_json: r#"{"name":"demo"}"#.to_owned(),
     };
     store.receipts().upsert(receipt.clone()).unwrap();
     assert_eq!(store.receipts().all().unwrap(), vec![receipt.clone()]);
+    assert_eq!(
+        store.receipts().get("lsp", "demo").unwrap(),
+        Some(receipt.clone())
+    );
 
     let updated_receipt = PkgReceipt {
         version: "1.0.1".to_owned(),
         hash: "def".to_owned(),
+        files_json: r#"{"demo.exe":"def"}"#.to_owned(),
         receipt_json: r#"{"name":"demo","version":"1.0.1"}"#.to_owned(),
         ..receipt
     };
     store.receipts().upsert(updated_receipt.clone()).unwrap();
-    assert_eq!(store.receipts().all().unwrap(), vec![updated_receipt]);
+    assert_eq!(
+        store.receipts().all().unwrap(),
+        vec![updated_receipt.clone()]
+    );
+    assert!(store
+        .receipts()
+        .import_once("pkg-test-marker", &[updated_receipt])
+        .unwrap());
+    assert!(store
+        .receipts()
+        .import_marker_exists("pkg-test-marker")
+        .unwrap());
     store.receipts().delete("lsp", "demo").unwrap();
     assert!(store.receipts().all().unwrap().is_empty());
 }

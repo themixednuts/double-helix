@@ -63,7 +63,12 @@ pub struct PkgReceipts {
     pub version: String,
     pub source: String,
     pub hash: String,
+    pub bin: String,
+    pub shim: String,
+    pub files_json: String,
     pub installed_at: String,
+    pub native_manager: Option<String>,
+    pub native_id: Option<String>,
     pub receipt_json: String,
 }
 

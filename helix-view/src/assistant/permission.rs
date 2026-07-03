@@ -255,7 +255,15 @@ impl Rules {
 
     #[must_use]
     pub fn load() -> Self {
-        Self::load_from_path(Self::path())
+        match Self::load_from_store() {
+            Ok(rules) => rules,
+            Err(err) => {
+                log::warn!(
+                    "assistant permission rules store load failed, falling back to TOML: {err}"
+                );
+                Self::load_from_path(Self::path())
+            }
+        }
     }
 
     #[must_use]
@@ -270,7 +278,15 @@ impl Rules {
     }
 
     pub fn save(&self) -> anyhow::Result<()> {
-        self.save_to_path(Self::path())
+        match self.save_to_store() {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                log::warn!(
+                    "assistant permission rules store save failed, falling back to TOML: {err}"
+                );
+                self.save_to_path(Self::path())
+            }
+        }
     }
 
     fn save_to_path(&self, path: impl AsRef<std::path::Path>) -> anyhow::Result<()> {
@@ -283,7 +299,15 @@ impl Rules {
     }
 
     pub fn reset() -> anyhow::Result<()> {
-        Self::reset_path(Self::path())
+        match Self::reset_store() {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                log::warn!(
+                    "assistant permission rules store reset failed, falling back to TOML: {err}"
+                );
+                Self::reset_path(Self::path())
+            }
+        }
     }
 
     fn reset_path(path: impl AsRef<std::path::Path>) -> anyhow::Result<()> {
@@ -325,6 +349,63 @@ impl Rules {
             choice: choice.id.as_str().to_string(),
         });
     }
+
+    fn load_from_store() -> anyhow::Result<Self> {
+        crate::assistant::history::import_legacy_if_needed_blocking()?;
+        let mut store = helix_store::Store::open_default()?;
+        Ok(Self {
+            rules: store
+                .permissions()
+                .all()?
+                .into_iter()
+                .map(Rule::from_store)
+                .collect(),
+        })
+    }
+
+    fn save_to_store(&self) -> anyhow::Result<()> {
+        crate::assistant::history::import_legacy_if_needed_blocking()?;
+        let mut store = helix_store::Store::open_default()?;
+        store
+            .permissions()
+            .replace_all(self.rules.iter().map(Rule::to_store).collect())?;
+        Ok(())
+    }
+
+    fn reset_store() -> anyhow::Result<()> {
+        crate::assistant::history::import_legacy_if_needed_blocking()?;
+        let mut store = helix_store::Store::open_default()?;
+        store.permissions().clear()?;
+        Ok(())
+    }
+}
+
+impl Rule {
+    fn to_store(&self) -> helix_store::AssistantPermission {
+        helix_store::AssistantPermission {
+            agent: self.agent.clone(),
+            tool: self.tool.clone(),
+            choice: self.choice.clone(),
+        }
+    }
+
+    fn from_store(rule: helix_store::AssistantPermission) -> Self {
+        Self {
+            agent: rule.agent,
+            tool: rule.tool,
+            choice: rule.choice,
+        }
+    }
+}
+
+pub(crate) fn legacy_permissions_from_path(
+    path: impl AsRef<std::path::Path>,
+) -> anyhow::Result<Vec<helix_store::AssistantPermission>> {
+    Ok(Rules::load_from_path(path)
+        .rules
+        .into_iter()
+        .map(|rule| rule.to_store())
+        .collect())
 }
 
 #[cfg(test)]

@@ -871,12 +871,7 @@ impl Ops {
     }
 
     fn active_receipt(&self, kind: PkgKind, name: &str) -> Result<Option<Receipt>> {
-        let path = self.store.receipt_path(kind, name);
-        if path.exists() {
-            Receipt::read(&path).map(Some)
-        } else {
-            Ok(None)
-        }
+        self.store.receipt(kind, name)
     }
 
     fn artifact_for_host<'a>(&self, package: &'a PackageSpec) -> Result<&'a Artifact> {
@@ -2378,6 +2373,8 @@ mod tests {
     use assert_fs::TempDir;
     use zip::{write::SimpleFileOptions, ZipWriter};
 
+    use helix_store::{Store as SqliteStore, StorePaths};
+
     use crate::{lock::Manifest, registry::Registry, spec::PkgKind, Store};
 
     use super::*;
@@ -2450,12 +2447,19 @@ bin = "bin/demo.exe"
         let receipts = store.receipts().unwrap();
         assert_eq!(receipts.len(), 1);
         store.verify(&receipts[0]).unwrap();
+        let mut sqlite = SqliteStore::open(StorePaths::new(
+            dir.path().join("state.sqlite3"),
+            dir.path().join("cache.sqlite3"),
+        ))
+        .unwrap();
+        assert!(sqlite.receipts().get("lsp", "demo").unwrap().is_some());
         let shim = store.bin_dir().join(&receipts[0].shim);
         assert!(shim.exists());
         if cfg!(windows) {
             assert_eq!(fs::read(&shim).unwrap(), b"demo");
         }
         ops.remove(&["demo".to_owned()]).unwrap();
+        assert!(sqlite.receipts().all().unwrap().is_empty());
         assert!(!store.receipt_path(PkgKind::Lsp, "demo").exists());
     }
 

@@ -12,6 +12,7 @@ homepage.workspace = true
 
 [dependencies]
 helix-loader = { path = "../helix-loader" }
+helix-store = { path = "../helix-store" }
 
 etcetera.workspace = true
 flate2.workspace = true

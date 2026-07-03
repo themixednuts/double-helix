@@ -1,5 +1,5 @@
 use std::num::NonZeroU64;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -12,12 +12,14 @@ use crate::collab::{self, location};
 pub fn local_backend() -> Backend {
     Backend::Local(LocalHistory {
         root: helix_loader::cache_dir().join("assistant").join("history"),
+        store_paths: None,
     })
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct LocalHistory {
     root: PathBuf,
+    store_paths: Option<helix_store::StorePaths>,
 }
 
 impl LocalHistory {
@@ -48,21 +50,82 @@ impl LocalHistory {
         out.sort_by_key(|item| item.stub.id);
         Ok(out)
     }
+
+    fn store_paths(&self) -> helix_store::StorePaths {
+        self.store_paths
+            .clone()
+            .unwrap_or_else(helix_store::StorePaths::default_paths)
+    }
+
+    fn open_imported_store(&self) -> anyhow::Result<helix_store::Store> {
+        let paths = self.store_paths();
+        import_legacy_from_paths(
+            &self.root,
+            crate::assistant::layout::layout_path(),
+            crate::assistant::permission::Rules::path(),
+            paths.clone(),
+        )?;
+        Ok(helix_store::Store::open(paths)?)
+    }
 }
 
 impl LocalHistory {
     pub async fn load_scope(&self, scope: &thread::Scope) -> anyhow::Result<Vec<Stub>> {
-        let scope = scope.clone();
-        Ok(self
-            .entries()
-            .await?
-            .into_iter()
-            .filter(|entry| entry.stub.scope == PersistedScope::from(&scope))
-            .map(|entry| entry.stub.into_domain())
-            .collect())
+        let store_scope = crate::assistant::layout::scope_key(scope)?;
+        let store_backend = self.clone();
+        match tokio::task::spawn_blocking(move || {
+            let mut store = store_backend.open_imported_store()?;
+            let rows = store.threads().list_by_scope(&store_scope)?;
+            let entries = rows
+                .into_iter()
+                .filter_map(|row| match persisted_thread_from_store(row) {
+                    Ok(thread) => Some(thread.stub.into_domain()),
+                    Err(err) => {
+                        log::warn!("assistant history store decode failed: {err}");
+                        None
+                    }
+                })
+                .collect::<Vec<_>>();
+            Ok::<_, anyhow::Error>(entries)
+        })
+        .await
+        {
+            Ok(Ok(entries)) => Ok(entries),
+            Ok(Err(err)) => {
+                log::warn!("assistant history store load failed, falling back to JSON: {err}");
+                self.load_scope_from_files(scope).await
+            }
+            Err(err) => {
+                log::warn!("assistant history store load task failed, falling back to JSON: {err}");
+                self.load_scope_from_files(scope).await
+            }
+        }
     }
 
     pub async fn load(&self, id: thread::Id) -> anyhow::Result<Option<Record>> {
+        let store_backend = self.clone();
+        let store_id = id.value().get().to_string();
+        match tokio::task::spawn_blocking(move || {
+            let mut store = store_backend.open_imported_store()?;
+            store
+                .threads()
+                .get(&store_id)?
+                .map(persisted_thread_from_store)
+                .transpose()?
+                .map(|thread| thread.record.into_domain())
+                .transpose()
+        })
+        .await
+        {
+            Ok(Ok(record)) => return Ok(record),
+            Ok(Err(err)) => {
+                log::warn!("assistant history store get failed, falling back to JSON: {err}");
+            }
+            Err(err) => {
+                log::warn!("assistant history store get task failed, falling back to JSON: {err}");
+            }
+        }
+
         let path = self.path(id);
         let raw = match tokio::fs::read_to_string(&path).await {
             Ok(raw) => raw,
@@ -80,6 +143,24 @@ impl LocalHistory {
     }
 
     pub async fn save(&self, record: Record) -> anyhow::Result<()> {
+        let store_backend = self.clone();
+        let store_thread = store_thread_from_record(&record)?;
+        match tokio::task::spawn_blocking(move || {
+            let mut store = store_backend.open_imported_store()?;
+            store.threads().upsert(store_thread)?;
+            Ok::<_, anyhow::Error>(())
+        })
+        .await
+        {
+            Ok(Ok(())) => return Ok(()),
+            Ok(Err(err)) => {
+                log::warn!("assistant history store save failed, falling back to JSON: {err}");
+            }
+            Err(err) => {
+                log::warn!("assistant history store save task failed, falling back to JSON: {err}");
+            }
+        }
+
         let path = self.path(record.id);
         let payload = match PersistedThread::from_domain(&record) {
             Ok(payload) => payload,
@@ -91,6 +172,26 @@ impl LocalHistory {
     }
 
     pub async fn delete(&self, id: thread::Id) -> anyhow::Result<()> {
+        let store_backend = self.clone();
+        let store_id = id.value().get().to_string();
+        match tokio::task::spawn_blocking(move || {
+            let mut store = store_backend.open_imported_store()?;
+            store.threads().delete(&store_id)?;
+            Ok::<_, anyhow::Error>(())
+        })
+        .await
+        {
+            Ok(Ok(())) => return Ok(()),
+            Ok(Err(err)) => {
+                log::warn!("assistant history store delete failed, falling back to JSON: {err}");
+            }
+            Err(err) => {
+                log::warn!(
+                    "assistant history store delete task failed, falling back to JSON: {err}"
+                );
+            }
+        }
+
         let path = self.path(id);
         match tokio::fs::remove_file(path).await {
             Ok(()) => Ok(()),
@@ -98,6 +199,123 @@ impl LocalHistory {
             Err(err) => Err(err.into()),
         }
     }
+
+    async fn load_scope_from_files(&self, scope: &thread::Scope) -> anyhow::Result<Vec<Stub>> {
+        let scope = scope.clone();
+        Ok(self
+            .entries()
+            .await?
+            .into_iter()
+            .filter(|entry| entry.stub.scope == PersistedScope::from(&scope))
+            .map(|entry| entry.stub.into_domain())
+            .collect())
+    }
+}
+
+pub(super) fn import_legacy_if_needed_blocking() -> anyhow::Result<()> {
+    import_legacy_from_paths(
+        helix_loader::cache_dir().join("assistant").join("history"),
+        crate::assistant::layout::layout_path(),
+        crate::assistant::permission::Rules::path(),
+        helix_store::StorePaths::default_paths(),
+    )
+}
+
+fn import_legacy_from_paths(
+    history_root: impl AsRef<Path>,
+    layout_path: impl AsRef<Path>,
+    permissions_path: impl AsRef<Path>,
+    store_paths: helix_store::StorePaths,
+) -> anyhow::Result<()> {
+    let mut store = helix_store::Store::open(store_paths)?;
+    if store.threads().has_assistant_import_marker()? {
+        return Ok(());
+    }
+
+    let threads = legacy_threads_from_root(history_root)?;
+    let layouts = crate::assistant::layout::legacy_layouts_from_path(layout_path)?;
+    let permissions = crate::assistant::permission::legacy_permissions_from_path(permissions_path)?;
+    store
+        .threads()
+        .import_assistant_state_once(threads, layouts, permissions)?;
+    Ok(())
+}
+
+fn legacy_threads_from_root(
+    root: impl AsRef<Path>,
+) -> anyhow::Result<Vec<helix_store::AssistantThread>> {
+    let root = root.as_ref();
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err.into()),
+    };
+    let mut out = Vec::new();
+    for entry in entries {
+        let path = match entry {
+            Ok(entry) => entry.path(),
+            Err(err) => {
+                log::warn!("assistant history directory entry read failed: {err}");
+                continue;
+            }
+        };
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(raw) => raw,
+            Err(err) => {
+                log::warn!("assistant history read failed {:?}: {}", path, err);
+                continue;
+            }
+        };
+        match serde_json::from_str::<PersistedThread>(&raw).and_then(persisted_thread_into_store) {
+            Ok(thread) => out.push(thread),
+            Err(err) => log::warn!("assistant history decode failed {:?}: {}", path, err),
+        }
+    }
+    Ok(out)
+}
+
+fn persisted_thread_from_store(
+    row: helix_store::AssistantThread,
+) -> anyhow::Result<PersistedThread> {
+    Ok(serde_json::from_str(&row.record_json)?)
+}
+
+fn persisted_thread_into_store(
+    thread: PersistedThread,
+) -> Result<helix_store::AssistantThread, serde_json::Error> {
+    let id = thread.stub.id;
+    let feedback = thread.stub.feedback.clone();
+    let scope = serde_json::to_string(&thread.stub.scope)?;
+    Ok(helix_store::AssistantThread {
+        id: id.to_string(),
+        scope,
+        title: thread.stub.title.clone(),
+        created_at: timestamp_from_id(id),
+        updated_at: timestamp_from_id(id),
+        rating: rating_column(feedback.rating).map(ToOwned::to_owned),
+        has_feedback: feedback.rating != PersistedRating::None || feedback.note.is_some(),
+        record_json: serde_json::to_string_pretty(&thread)?,
+    })
+}
+
+fn store_thread_from_record(record: &Record) -> anyhow::Result<helix_store::AssistantThread> {
+    let thread = PersistedThread::from_domain(record)?;
+    Ok(persisted_thread_into_store(thread)?)
+}
+
+fn rating_column(rating: PersistedRating) -> Option<&'static str> {
+    match rating {
+        PersistedRating::None => None,
+        PersistedRating::Up => Some("up"),
+        PersistedRating::Down => Some("down"),
+    }
+}
+
+fn timestamp_from_id(id: u64) -> i64 {
+    i64::try_from(id).unwrap_or(i64::MAX)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1432,6 +1650,16 @@ mod tests {
         }
     }
 
+    fn store_paths(root: &Path) -> helix_store::StorePaths {
+        helix_store::StorePaths::new(root.join("state.sqlite3"), root.join("cache.sqlite3"))
+    }
+
+    fn write_record(path: &Path, record: &Record) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let persisted = PersistedThread::from_domain(record).unwrap();
+        std::fs::write(path, serde_json::to_vec_pretty(&persisted).unwrap()).unwrap();
+    }
+
     #[test]
     fn local_history_round_trips_record_and_scope_listing() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -1439,6 +1667,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let backend = LocalHistory {
                 root: dir.path().join("assistant-history"),
+                store_paths: Some(store_paths(dir.path())),
             };
             let record = sample_record();
 
@@ -1456,12 +1685,114 @@ mod tests {
     }
 
     #[test]
-    fn load_scope_skips_corrupt_history_records() {
+    fn store_round_trip_populates_indexed_feedback_columns() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
             let dir = tempfile::tempdir().unwrap();
             let backend = LocalHistory {
                 root: dir.path().join("assistant-history"),
+                store_paths: Some(store_paths(dir.path())),
+            };
+            let record = sample_record();
+
+            backend.save(record.clone()).await.unwrap();
+
+            let mut store = helix_store::Store::open(store_paths(dir.path())).unwrap();
+            let scope = crate::assistant::layout::scope_key(&record.scope).unwrap();
+            let rows = store.threads().list_by_scope(&scope).unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].id, record.id.value().get().to_string());
+            assert_eq!(rows[0].title, record.title);
+            assert_eq!(rows[0].rating.as_deref(), Some("up"));
+            assert!(rows[0].has_feedback);
+
+            let up = store
+                .threads()
+                .list_by_scope_filtered(&scope, Some("up"), Some(true))
+                .unwrap();
+            let down = store
+                .threads()
+                .list_by_scope_filtered(&scope, Some("down"), Some(true))
+                .unwrap();
+            assert_eq!(up.len(), 1);
+            assert!(down.is_empty());
+        });
+    }
+
+    #[test]
+    fn one_time_import_preserves_legacy_files_and_sets_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let history_root = dir.path().join("assistant").join("history");
+        let layout_path = dir.path().join("assistant").join("layout.json");
+        let permissions_path = dir.path().join("assistant").join("permissions.toml");
+        let record = sample_record();
+        let mut other = sample_record();
+        other.id = thread::Id::new(NonZeroU64::new(2).unwrap());
+        other.scope = thread::Scope::new(PathBuf::from("other"));
+
+        write_record(&history_root.join("1.json"), &record);
+        write_record(&history_root.join("2.json"), &other);
+        std::fs::write(
+            &layout_path,
+            br#"{"scopes":[{"scope":{"cwd":".","worktrees":[]},"open":[1],"active":1}]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &permissions_path,
+            r#"[[rules]]
+agent = "agent"
+tool = "shell"
+choice = "allow-always"
+"#,
+        )
+        .unwrap();
+
+        let paths = store_paths(dir.path());
+        import_legacy_from_paths(
+            &history_root,
+            &layout_path,
+            &permissions_path,
+            paths.clone(),
+        )
+        .unwrap();
+
+        let mut store = helix_store::Store::open(paths.clone()).unwrap();
+        assert!(store.threads().has_assistant_import_marker().unwrap());
+        let scope = crate::assistant::layout::scope_key(&record.scope).unwrap();
+        assert_eq!(store.threads().list_by_scope(&scope).unwrap().len(), 1);
+        assert!(store.layout().get(&scope).unwrap().is_some());
+        assert_eq!(store.permissions().all().unwrap().len(), 1);
+        assert!(history_root.join("1.json").exists());
+        assert!(layout_path.exists());
+        assert!(permissions_path.exists());
+
+        let mut later = sample_record();
+        later.id = thread::Id::new(NonZeroU64::new(3).unwrap());
+        write_record(&history_root.join("3.json"), &later);
+        import_legacy_from_paths(
+            &history_root,
+            &layout_path,
+            &permissions_path,
+            paths.clone(),
+        )
+        .unwrap();
+        let mut store = helix_store::Store::open(paths).unwrap();
+        assert_eq!(store.threads().list_by_scope(&scope).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn db_open_failure_falls_back_to_json_without_panic() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let bad_state = dir.path().join("state-as-directory");
+            std::fs::create_dir_all(&bad_state).unwrap();
+            let backend = LocalHistory {
+                root: dir.path().join("assistant-history"),
+                store_paths: Some(helix_store::StorePaths::new(
+                    bad_state,
+                    dir.path().join("cache.sqlite3"),
+                )),
             };
             let record = sample_record();
 
@@ -1471,9 +1802,11 @@ mod tests {
                 .unwrap();
 
             let listed = backend.load_scope(&record.scope).await.unwrap();
+            let loaded = backend.load(record.id).await.unwrap().unwrap();
 
             assert_eq!(listed.len(), 1);
             assert_eq!(listed[0].id, record.id);
+            assert_eq!(loaded, record);
         });
     }
 }

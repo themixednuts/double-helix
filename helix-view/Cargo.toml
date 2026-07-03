@@ -22,6 +22,7 @@ helix-core = { path = "../helix-core" }
 helix-loader = { path = "../helix-loader" }
 helix-lsp = { path = "../helix-lsp" }
 helix-pkg = { path = "../helix-pkg" }
+helix-store = { path = "../helix-store" }
 helix-dap = { path = "../helix-dap" }
 helix-acp = { path = "../helix-acp" }
 helix-runtime = { path = "../helix-runtime" }

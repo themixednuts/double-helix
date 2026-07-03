@@ -21,7 +21,9 @@ dhx pkg remove marksman
 Installed tools are activated through shims under the package store's `bin`
 directory. Receipts record the resolved version, source URL, archive hash, and
 installed file hashes. `dhx pkg doctor` verifies those receipts and reports
-corrupted or missing files.
+corrupted or missing files. Active receipts are generated state stored in
+SQLite; `pkg.toml`, `pkg.lock`, registry specs, shims, artifacts, runtime
+directories, and advisory lock files remain ordinary files.
 
 Updates install the new version side by side, activate it, update `pkg.lock`,
 and keep the previous version available for `dhx pkg rollback <name>` while the

@@ -112,16 +112,38 @@ fn pkg_grammar_library_path_from(pkg: &Path, name: &str) -> Option<PathBuf> {
         version: String,
     }
 
-    let receipt_path = pkg.join("receipts").join(format!("grammar-{name}.toml"));
-    let receipt: Receipt = toml::from_str(&std::fs::read_to_string(receipt_path).ok()?).ok()?;
+    let version = pkg_grammar_receipt_version_from_db(pkg, name).or_else(|| {
+        let receipt_path = pkg.join("receipts").join(format!("grammar-{name}.toml"));
+        let receipt: Receipt = toml::from_str(&std::fs::read_to_string(receipt_path).ok()?).ok()?;
+        Some(receipt.version)
+    })?;
     let mut library_path = pkg
         .join("store")
         .join("grammar")
         .join(name)
-        .join(receipt.version)
+        .join(version)
         .join(name);
     library_path.set_extension(DYLIB_EXTENSION);
     library_path.exists().then_some(library_path)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn pkg_grammar_receipt_version_from_db(pkg: &Path, name: &str) -> Option<String> {
+    use rusqlite::{params, OpenFlags, OptionalExtension};
+
+    let db = pkg.parent()?.join("state.sqlite3");
+    if !db.exists() {
+        return None;
+    }
+    let conn = rusqlite::Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
+    conn.query_row(
+        "SELECT version FROM pkg_receipts WHERE kind = 'grammar' AND name = ?1",
+        params![name],
+        |row| row.get(0),
+    )
+    .optional()
+    .ok()
+    .flatten()
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -754,6 +776,39 @@ mod tests {
 
         assert_eq!(
             pkg_grammar_library_path_from(pkg, "rust").as_deref(),
+            Some(library.as_path())
+        );
+    }
+
+    #[test]
+    fn pkg_grammar_path_uses_sqlite_receipt_version() {
+        let dir = TempDir::new().unwrap();
+        let pkg = dir.path().join("pkg");
+        fs::create_dir_all(&pkg).unwrap();
+        let conn = rusqlite::Connection::open(dir.path().join("state.sqlite3")).unwrap();
+        conn.execute_batch(
+            r#"
+CREATE TABLE pkg_receipts (
+    kind TEXT NOT NULL,
+    name TEXT NOT NULL,
+    version TEXT NOT NULL
+);
+INSERT INTO pkg_receipts(kind, name, version) VALUES ('grammar', 'rust', 'rev2');
+"#,
+        )
+        .unwrap();
+        let mut library = pkg
+            .join("store")
+            .join("grammar")
+            .join("rust")
+            .join("rev2")
+            .join("rust");
+        library.set_extension(DYLIB_EXTENSION);
+        fs::create_dir_all(library.parent().unwrap()).unwrap();
+        fs::write(&library, b"").unwrap();
+
+        assert_eq!(
+            pkg_grammar_library_path_from(&pkg, "rust").as_deref(),
             Some(library.as_path())
         );
     }

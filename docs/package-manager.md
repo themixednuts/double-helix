@@ -215,10 +215,14 @@ backends are never enabled by `run-scripts`; they always require an explicit
 <data>/pkg/
   store/<kind>/<name>/<version>/...      # immutable install trees
   bin/<name>[.exe|.cmd]                  # activated shims (junction or thin launcher)
-  receipts/<kind>-<name>.toml            # resolved version, source, sha256 set, install date
+  receipts/<kind>-<name>.toml            # legacy receipt import source, preserved for compatibility
   runtimes/{node,py}/                    # shared npm prefix / venv, versioned
 ```
 
+- Active package receipt records live in `<data>/state.sqlite3` in the
+  `pkg_receipts` table. The first package-store open imports legacy TOML
+  receipts transactionally and records the `pkg-receipts-toml-v1` marker; the
+  TOML files are not deleted during that import.
 - `dhx pkg lock --fetch-hashes` resolves the lockfile and downloads
   archive/github-release artifacts only long enough to compute sha256 pins;
   it writes the hash to the lock and discards the download without installing.

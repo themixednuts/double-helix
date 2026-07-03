@@ -13,10 +13,11 @@ pub(crate) fn migrations(kind: DatabaseKind) -> &'static [Migration] {
     }
 }
 
-const STATE_MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    name: "store_foundation_state",
-    sql: r#"
+const STATE_MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "store_foundation_state",
+        sql: r#"
 CREATE TABLE IF NOT EXISTS assistant_threads (
     id TEXT PRIMARY KEY NOT NULL,
     scope TEXT NOT NULL,
@@ -55,7 +56,22 @@ CREATE TABLE IF NOT EXISTS pkg_receipts (
     PRIMARY KEY(kind, name)
 );
 "#,
-}];
+    },
+    Migration {
+        version: 2,
+        name: "pkg_receipts_indexed_columns",
+        sql: r#"
+ALTER TABLE pkg_receipts ADD COLUMN bin TEXT NOT NULL DEFAULT '';
+ALTER TABLE pkg_receipts ADD COLUMN shim TEXT NOT NULL DEFAULT '';
+ALTER TABLE pkg_receipts ADD COLUMN files_json TEXT NOT NULL DEFAULT '{}';
+ALTER TABLE pkg_receipts ADD COLUMN native_manager TEXT;
+ALTER TABLE pkg_receipts ADD COLUMN native_id TEXT;
+
+CREATE INDEX IF NOT EXISTS idx_pkg_receipts_kind_source
+    ON pkg_receipts(kind, source);
+"#,
+    },
+];
 
 const CACHE_MIGRATIONS: &[Migration] = &[Migration {
     version: 1,

@@ -3,16 +3,19 @@ use std::{
     fs::{self, File, OpenOptions},
     io::Read,
     path::{Path, PathBuf},
+    str::FromStr,
 };
 
 use etcetera::base_strategy::{choose_base_strategy, BaseStrategy};
 use fs4::{FileExt, TryLockError};
+use helix_store::{PkgReceipt as StorePkgReceipt, Store as SqliteStore, StorePaths};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{io, spec::PkgKind, Error, Result};
 
 const PRODUCT_CONFIG_DIR: &str = "double-helix";
+pub(crate) const PKG_RECEIPTS_TOML_IMPORT_MARKER: &str = "pkg-receipts-toml-v1";
 
 #[derive(Debug, Clone)]
 pub struct Store {
@@ -83,6 +86,27 @@ impl Store {
     }
 
     pub fn receipts(&self) -> Result<Vec<Receipt>> {
+        match self.db_receipts() {
+            Ok(receipts) => return Ok(receipts),
+            Err(_) => {}
+        }
+        self.legacy_receipts()
+    }
+
+    pub fn receipt(&self, kind: PkgKind, name: &str) -> Result<Option<Receipt>> {
+        match self.db_receipt(kind, name) {
+            Ok(receipt) => return Ok(receipt),
+            Err(_) => {}
+        }
+        let path = self.receipt_path(kind, name);
+        if path.exists() {
+            Receipt::read(&path).map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn legacy_receipts(&self) -> Result<Vec<Receipt>> {
         let dir = self.root.join("receipts");
         if !dir.exists() {
             return Ok(Vec::new());
@@ -99,6 +123,14 @@ impl Store {
     }
 
     pub fn write_receipt(&self, receipt: &Receipt) -> Result<()> {
+        match self.write_db_receipt(receipt) {
+            Ok(()) => return Ok(()),
+            Err(_) => {}
+        }
+        self.write_legacy_receipt(receipt)
+    }
+
+    fn write_legacy_receipt(&self, receipt: &Receipt) -> Result<()> {
         let path = self.receipt_path(receipt.kind, &receipt.name);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|source| io(parent.display(), source))?;
@@ -109,11 +141,7 @@ impl Store {
 
     pub fn remove(&self, kind: PkgKind, name: &str) -> Result<()> {
         let receipt_path = self.receipt_path(kind, name);
-        let receipt = if receipt_path.exists() {
-            Some(Receipt::read(&receipt_path)?)
-        } else {
-            None
-        };
+        let receipt = self.receipt(kind, name)?;
         if let Some(receipt) = receipt {
             if !receipt.shim.is_empty() {
                 let shim = self.bin_dir().join(&receipt.shim);
@@ -124,7 +152,10 @@ impl Store {
                 remove_path(&self.bin_dir().join(format!("{name}{extension}")))?;
             }
         }
-        remove_path(&receipt_path)
+        match self.delete_db_receipt(kind, name) {
+            Ok(()) => Ok(()),
+            Err(_) => remove_path(&receipt_path),
+        }
     }
 
     pub fn activate(&self, receipt: &mut Receipt, target: &Path) -> Result<()> {
@@ -189,6 +220,75 @@ impl Store {
             Err(TryLockError::Error(source)) => Err(io(path.display(), source)),
         }
     }
+
+    fn db_receipts(&self) -> Result<Vec<Receipt>> {
+        let mut store = self.open_receipt_store()?;
+        self.import_legacy_receipts(&mut store)?;
+        let mut receipts = store
+            .receipts()
+            .all()?
+            .into_iter()
+            .map(Receipt::try_from)
+            .collect::<Result<Vec<_>>>()?;
+        receipts.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(receipts)
+    }
+
+    fn db_receipt(&self, kind: PkgKind, name: &str) -> Result<Option<Receipt>> {
+        let mut store = self.open_receipt_store()?;
+        self.import_legacy_receipts(&mut store)?;
+        store
+            .receipts()
+            .get(kind.as_str(), name)?
+            .map(Receipt::try_from)
+            .transpose()
+    }
+
+    fn write_db_receipt(&self, receipt: &Receipt) -> Result<()> {
+        let mut store = self.open_receipt_store()?;
+        self.import_legacy_receipts(&mut store)?;
+        store
+            .receipts()
+            .upsert(StorePkgReceipt::try_from(receipt)?)?;
+        Ok(())
+    }
+
+    fn delete_db_receipt(&self, kind: PkgKind, name: &str) -> Result<()> {
+        let mut store = self.open_receipt_store()?;
+        self.import_legacy_receipts(&mut store)?;
+        store.receipts().delete(kind.as_str(), name)?;
+        Ok(())
+    }
+
+    fn import_legacy_receipts(&self, store: &mut SqliteStore) -> Result<()> {
+        if store
+            .receipts()
+            .import_marker_exists(PKG_RECEIPTS_TOML_IMPORT_MARKER)?
+        {
+            return Ok(());
+        }
+        let receipts = self
+            .legacy_receipts()?
+            .iter()
+            .map(StorePkgReceipt::try_from)
+            .collect::<Result<Vec<_>>>()?;
+        store
+            .receipts()
+            .import_once(PKG_RECEIPTS_TOML_IMPORT_MARKER, &receipts)?;
+        Ok(())
+    }
+
+    fn open_receipt_store(&self) -> Result<SqliteStore> {
+        Ok(SqliteStore::open(self.receipt_db_paths())?)
+    }
+
+    fn receipt_db_paths(&self) -> StorePaths {
+        if self.root == Self::default_root() {
+            return StorePaths::default_paths();
+        }
+        let base = self.root.parent().unwrap_or(&self.root);
+        StorePaths::new(base.join("state.sqlite3"), base.join("cache.sqlite3"))
+    }
 }
 
 #[derive(Debug)]
@@ -235,6 +335,45 @@ impl Receipt {
             path: path.display().to_string(),
             source,
         })
+    }
+}
+
+impl TryFrom<StorePkgReceipt> for Receipt {
+    type Error = Error;
+
+    fn try_from(receipt: StorePkgReceipt) -> Result<Self> {
+        serde_json::from_str(&receipt.receipt_json).map_err(Error::from)
+    }
+}
+
+impl TryFrom<&Receipt> for StorePkgReceipt {
+    type Error = Error;
+
+    fn try_from(receipt: &Receipt) -> Result<Self> {
+        Ok(Self {
+            kind: receipt.kind.as_str().to_owned(),
+            name: receipt.name.clone(),
+            version: receipt.version.clone(),
+            source: receipt.source.clone(),
+            hash: receipt.archive_sha256.clone(),
+            bin: receipt.bin.clone(),
+            shim: receipt.shim.clone(),
+            files_json: serde_json::to_string(&receipt.files)?,
+            installed_at: receipt.installed_at.clone(),
+            native_manager: receipt.native_manager.clone(),
+            native_id: receipt.native_id.clone(),
+            receipt_json: serde_json::to_string(receipt)?,
+        })
+    }
+}
+
+impl TryFrom<&StorePkgReceipt> for Receipt {
+    type Error = Error;
+
+    fn try_from(receipt: &StorePkgReceipt) -> Result<Self> {
+        let mut decoded: Receipt = serde_json::from_str(&receipt.receipt_json)?;
+        decoded.kind = PkgKind::from_str(&receipt.kind)?;
+        Ok(decoded)
     }
 }
 
@@ -386,6 +525,7 @@ fn remove_path(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use assert_fs::TempDir;
+    use helix_store::Store as SqliteStore;
 
     use super::*;
 
@@ -445,11 +585,62 @@ mod tests {
             native_id: Some("Rustlang.rust-analyzer".to_owned()),
         };
         store.write_receipt(&receipt).unwrap();
-        let read = Receipt::read(&store.receipt_path(PkgKind::Lsp, "rust-analyzer")).unwrap();
+        let read = store
+            .receipt(PkgKind::Lsp, "rust-analyzer")
+            .unwrap()
+            .unwrap();
         assert_eq!(read.native_manager.as_deref(), Some("winget"));
         assert_eq!(read.native_id.as_deref(), Some("Rustlang.rust-analyzer"));
         store.remove(PkgKind::Lsp, "rust-analyzer").unwrap();
         assert!(store.bin_dir().exists());
+    }
+
+    #[test]
+    fn imports_legacy_receipts_once_and_preserves_toml_files() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path().join("pkg"));
+        store.prepare().unwrap();
+        let first = test_receipt(PkgKind::Lsp, "demo", "1");
+        let second = test_receipt(PkgKind::Grammar, "rust", "rev1");
+        store.write_legacy_receipt(&first).unwrap();
+        store.write_legacy_receipt(&second).unwrap();
+
+        let receipts = store.receipts().unwrap();
+        assert_eq!(receipts.len(), 2);
+        assert_eq!(
+            receipts
+                .iter()
+                .map(|receipt| receipt.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["demo", "rust"]
+        );
+
+        let mut sqlite = SqliteStore::open(store.receipt_db_paths()).unwrap();
+        assert!(sqlite
+            .receipts()
+            .import_marker_exists(PKG_RECEIPTS_TOML_IMPORT_MARKER)
+            .unwrap());
+        assert_eq!(sqlite.receipts().all().unwrap().len(), 2);
+
+        let changed = test_receipt(PkgKind::Lsp, "demo", "9");
+        store.write_legacy_receipt(&changed).unwrap();
+        let demo = store.receipt(PkgKind::Lsp, "demo").unwrap().unwrap();
+        assert_eq!(demo.version, "1");
+        assert!(store.receipt_path(PkgKind::Lsp, "demo").exists());
+        assert!(store.receipt_path(PkgKind::Grammar, "rust").exists());
+    }
+
+    #[test]
+    fn falls_back_to_toml_receipts_when_database_cannot_open() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path().join("pkg"));
+        store.prepare().unwrap();
+        let receipt = test_receipt(PkgKind::Lsp, "demo", "1");
+        store.write_legacy_receipt(&receipt).unwrap();
+        fs::create_dir_all(dir.path().join("state.sqlite3")).unwrap();
+
+        assert_eq!(store.receipts().unwrap(), vec![receipt.clone()]);
+        assert_eq!(store.receipt(PkgKind::Lsp, "demo").unwrap(), Some(receipt));
     }
 
     #[test]
@@ -477,5 +668,23 @@ mod tests {
 
         let _lock = store.acquire_package_lock(PkgKind::Lsp, "demo").unwrap();
         assert!(lock_path.exists());
+    }
+
+    fn test_receipt(kind: PkgKind, name: &str, version: &str) -> Receipt {
+        Receipt {
+            name: name.to_owned(),
+            kind,
+            version: version.to_owned(),
+            source: "archive".to_owned(),
+            url: format!("file:///{name}.zip"),
+            archive_sha256: "abc".to_owned(),
+            bin: name.to_owned(),
+            shim: String::new(),
+            previous_version: None,
+            files: BTreeMap::new(),
+            installed_at: "now".to_owned(),
+            native_manager: None,
+            native_id: None,
+        }
     }
 }

@@ -1,0 +1,26 @@
+name = "basedpyright"
+kind = "lsp"
+description = "BasedPyright Python language server"
+homepage = "https://docs.basedpyright.com"
+languages = ["python"]
+
+[version]
+tag-source = "npm:basedpyright"
+
+[[artifact]]
+os = "windows"
+arch = "x86_64"
+source = { npm = "basedpyright", bin = "basedpyright-langserver" }
+bin = "basedpyright-langserver"
+
+[[artifact]]
+os = "linux"
+arch = "x86_64"
+source = { npm = "basedpyright", bin = "basedpyright-langserver" }
+bin = "basedpyright-langserver"
+
+[[artifact]]
+os = "macos"
+arch = "aarch64"
+source = { npm = "basedpyright", bin = "basedpyright-langserver" }
+bin = "basedpyright-langserver"

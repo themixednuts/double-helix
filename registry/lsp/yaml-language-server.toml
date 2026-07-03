@@ -1,0 +1,26 @@
+name = "yaml-language-server"
+kind = "lsp"
+description = "YAML language server"
+homepage = "https://github.com/redhat-developer/yaml-language-server"
+languages = ["yaml"]
+
+[version]
+tag-source = "npm:yaml-language-server"
+
+[[artifact]]
+os = "windows"
+arch = "x86_64"
+source = { npm = "yaml-language-server", bin = "yaml-language-server" }
+bin = "yaml-language-server"
+
+[[artifact]]
+os = "linux"
+arch = "x86_64"
+source = { npm = "yaml-language-server", bin = "yaml-language-server" }
+bin = "yaml-language-server"
+
+[[artifact]]
+os = "macos"
+arch = "aarch64"
+source = { npm = "yaml-language-server", bin = "yaml-language-server" }
+bin = "yaml-language-server"

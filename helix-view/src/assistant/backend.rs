@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use url::Url;
 
-use super::{config, history, host, mode, permission, prompt, review, terminal, thread};
+use super::{auth, config, history, host, mode, permission, prompt, review, terminal, thread};
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Id(Arc<str>);
@@ -191,6 +191,10 @@ pub enum Command {
         id: String,
         response: thread::ElicitationResponse,
     },
+    Authenticate {
+        thread: thread::Id,
+        method: String,
+    },
     ResolvePermission {
         thread: thread::Id,
         request: permission::RequestId,
@@ -199,6 +203,9 @@ pub enum Command {
     Review {
         thread: thread::Id,
         command: review::Command,
+    },
+    DeleteThread {
+        remote: Remote,
     },
 }
 
@@ -231,6 +238,10 @@ pub enum Update {
     Terminal {
         thread: thread::Id,
         event: terminal::Event,
+    },
+    Auth {
+        thread: thread::Id,
+        event: auth::Event,
     },
     Permission {
         thread: thread::Id,

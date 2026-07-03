@@ -72,7 +72,7 @@ FLAGS:
     -h, --help                     Print help information
     --tutor                        Load the tutorial
     --migrate                      Copy existing Helix config into Double Helix config paths
-    pkg <cmd>                      Manage LSP/DAP packages (install, remove, list, search, sync, doctor)
+    pkg <cmd>                      Manage runtime packages (install, update, rollback, list, search, sync, doctor)
     --health [CATEGORY]            Check for potential errors in editor setup
                                    CATEGORY can be a language or one of 'clipboard', 'languages',
                                    'all-languages' or 'all'. 'languages' is filtered according to
@@ -241,6 +241,45 @@ fn run_pkg(command: PkgCommand) -> Result<i32> {
             }
             Ok(if report.bad.is_empty() { 0 } else { 1 })
         }
+        PkgCommand::Outdated(names) => {
+            let ops = Ops::default()?;
+            let report = ops.outdated(&names)?;
+            let mut count = 0usize;
+            for package in report {
+                match (package.latest, package.error) {
+                    (Some(latest), _) if latest != package.installed => {
+                        count += 1;
+                        println!(
+                            "{:<12} {:<28} {:<16} {}",
+                            package.kind, package.name, package.installed, latest
+                        );
+                    }
+                    (None, Some(error)) => {
+                        count += 1;
+                        println!(
+                            "{:<12} {:<28} {:<16} error: {}",
+                            package.kind, package.name, package.installed, error
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            if count == 0 {
+                println!("all installed packages are current");
+            }
+            Ok(0)
+        }
+        PkgCommand::Update(names) => {
+            let ops = Ops::default()?;
+            ops.update(&names, &mut print_pkg_event)?;
+            Ok(0)
+        }
+        PkgCommand::Rollback(name) => {
+            let ops = Ops::default()?;
+            let locked = ops.rollback(&name)?;
+            println!("rolled back {} to {}", locked.name, locked.version);
+            Ok(0)
+        }
     }
 }
 
@@ -261,6 +300,9 @@ USAGE:
 
 COMMANDS:
     install <name>...       Install packages from the builtin registry
+    update [name]...        Update installed packages
+    outdated [name]...      Show installed packages with newer versions
+    rollback <name>         Reactivate the previous installed version
     remove <name>           Deactivate an installed package
     list [--kind <kind>]    List installed packages
     search <term>           Search builtin registry entries

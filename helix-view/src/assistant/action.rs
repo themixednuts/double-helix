@@ -103,6 +103,10 @@ pub enum Action {
         id: String,
         response: thread::ElicitationResponse,
     },
+    Authenticate {
+        thread: thread::Id,
+        method: String,
+    },
     SetReviewMode {
         thread: thread::Id,
         mode: review::Mode,

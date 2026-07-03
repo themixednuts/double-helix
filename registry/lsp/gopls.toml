@@ -4,21 +4,23 @@ description = "Go language server"
 homepage = "https://pkg.go.dev/golang.org/x/tools/gopls"
 languages = ["go"]
 
+[version]
+tag-source = "go:golang.org/x/tools/gopls"
+
 [[artifact]]
 os = "windows"
 arch = "x86_64"
-source = { system = "gopls" }
+source = { go = "golang.org/x/tools/gopls" }
 bin = "gopls"
 
 [[artifact]]
 os = "linux"
 arch = "x86_64"
-source = { system = "gopls" }
+source = { go = "golang.org/x/tools/gopls" }
 bin = "gopls"
 
 [[artifact]]
 os = "macos"
 arch = "aarch64"
-source = { system = "gopls" }
+source = { go = "golang.org/x/tools/gopls" }
 bin = "gopls"
-

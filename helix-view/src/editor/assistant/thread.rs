@@ -136,6 +136,14 @@ impl Editor {
         })
     }
 
+    pub fn authenticate_assistant(
+        &mut self,
+        thread: crate::assistant::thread::Id,
+        method: String,
+    ) -> Vec<crate::assistant::effect::Effect> {
+        self.assistant_act(crate::assistant::Action::Authenticate { thread, method })
+    }
+
     pub fn submit_assistant_prompt(
         &mut self,
         thread: crate::assistant::thread::Id,

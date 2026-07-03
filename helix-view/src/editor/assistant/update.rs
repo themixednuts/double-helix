@@ -95,6 +95,12 @@ impl Editor {
                 effects: self.apply_assistant_terminal_event(thread, event),
                 permission_request: None,
             },
+            backend::Update::Auth { thread, event } => AssistantUpdateOutcome {
+                effects: self
+                    .assistant
+                    .apply(crate::assistant::event::Event::Auth { thread, event }),
+                permission_request: None,
+            },
             backend::Update::Error { at, error } => {
                 match at {
                     backend::Target::Backend(_) => self.set_error(error.to_string()),

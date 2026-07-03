@@ -155,6 +155,29 @@ pub(crate) fn apply_runtime_task_event(
                         LspFeatureRefreshKind::FoldingRanges => {
                             language_server::request_folding_ranges(editor, doc_id, ingress.clone())
                         }
+                        LspFeatureRefreshKind::SemanticTokens => {
+                            language_server::request_semantic_tokens(
+                                editor,
+                                doc_id,
+                                ingress.clone(),
+                            )
+                        }
+                        LspFeatureRefreshKind::InlineCompletion => {
+                            let Some(view_id) = editor
+                                .tree
+                                .views()
+                                .find_map(|(view, _)| (view.doc == doc_id).then_some(view.id))
+                            else {
+                                continue;
+                            };
+                            language_server::request_inline_completion(
+                                editor,
+                                doc_id,
+                                view_id,
+                                false,
+                                ingress.clone(),
+                            )
+                        }
                     }
                 }
             }
@@ -208,6 +231,17 @@ pub(crate) fn apply_runtime_task_event(
         RuntimeTaskEvent::ApplyCodeLenses { doc_id, lenses } => {
             language_server::apply_code_lenses(editor, doc_id, lenses)
         }
+        RuntimeTaskEvent::ApplySemanticTokens {
+            doc_id,
+            server_id,
+            tokens,
+        } => language_server::apply_semantic_tokens(editor, doc_id, server_id, tokens),
+        RuntimeTaskEvent::ApplyInlineCompletion { doc_id, completion } => {
+            language_server::apply_inline_completion(editor, doc_id, completion)
+        }
+        RuntimeTaskEvent::ApplyInlineValues { doc_id, values } => {
+            language_server::apply_inline_values(editor, doc_id, values)
+        }
         RuntimeTaskEvent::ApplyDocumentLinks { doc_id, links } => {
             language_server::apply_document_links(editor, doc_id, links)
         }
@@ -234,9 +268,17 @@ pub(crate) fn apply_runtime_task_event(
         ),
         RuntimeTaskEvent::DapRestarted => dap::apply_dap_restarted(editor),
         RuntimeTaskEvent::ResumeDebuggerApplication => {
-            dap::apply_resume_debugger_application(editor)
+            dap::apply_resume_debugger_application(editor);
+            for doc in editor.documents_mut() {
+                doc.clear_inline_values();
+            }
         }
-        RuntimeTaskEvent::UnsetActiveDebugClient => dap::apply_unset_active_debug_client(editor),
+        RuntimeTaskEvent::UnsetActiveDebugClient => {
+            dap::apply_unset_active_debug_client(editor);
+            for doc in editor.documents_mut() {
+                doc.clear_inline_values();
+            }
+        }
         RuntimeTaskEvent::DapExceptionsConfigured => {}
         RuntimeTaskEvent::RestoreAssistantHistoryThread {
             record,
@@ -377,12 +419,20 @@ pub(crate) fn apply_runtime_task_event(
         RuntimeTaskEvent::SelectStackFrame {
             thread_id,
             frame_id,
-        } => dap::apply_select_stack_frame(editor, thread_id, frame_id),
+        } => {
+            dap::apply_select_stack_frame(editor, thread_id, frame_id);
+            let doc_id = focused_ref!(editor).1.id();
+            language_server::request_inline_values(editor, doc_id, ingress.clone());
+        }
         RuntimeTaskEvent::ApplyStackFrames {
             thread_id,
             frames,
             selection,
-        } => dap::apply_stack_frames(editor, thread_id, frames, selection),
+        } => {
+            dap::apply_stack_frames(editor, thread_id, frames, selection);
+            let doc_id = focused_ref!(editor).1.id();
+            language_server::request_inline_values(editor, doc_id, ingress.clone());
+        }
         RuntimeTaskEvent::ExecuteLspCommand { command, server_id } => {
             language_server::apply_execute_lsp_command(editor, command, server_id)
         }

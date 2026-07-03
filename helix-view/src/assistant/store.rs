@@ -340,6 +340,15 @@ impl Store {
                     Vec::new()
                 }
             }
+            event::Event::Auth { thread, event } => {
+                if let Some(state) = self.thread_mut(thread) {
+                    state.apply(thread::Event::Auth(event));
+                    self.sync_history(thread);
+                    vec![effect::Effect::Save { thread }, effect::Effect::SyncModel]
+                } else {
+                    Vec::new()
+                }
+            }
             event::Event::ContextResolved { thread, item } => {
                 if let Some(state) = self.thread_mut(thread) {
                     let next = state.context_items().len() + 1;
@@ -785,6 +794,26 @@ impl Store {
                             id,
                             response,
                         },
+                    },
+                    effect::Effect::Save { thread },
+                    effect::Effect::SyncModel,
+                ]
+            }
+            action::Action::Authenticate { thread, method } => {
+                let Some(state) = self.thread_mut(thread) else {
+                    return Vec::new();
+                };
+                let thread::Origin::Backend { backend, .. } = state.origin() else {
+                    return Vec::new();
+                };
+                let backend = backend.clone();
+                if !state.auth_mut().authenticate(&method) {
+                    return Vec::new();
+                }
+                vec![
+                    effect::Effect::SendBackendCommand {
+                        backend,
+                        command: backend::Command::Authenticate { thread, method },
                     },
                     effect::Effect::Save { thread },
                     effect::Effect::SyncModel,

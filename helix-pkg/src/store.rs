@@ -48,6 +48,10 @@ impl Store {
         self.root.join("bin")
     }
 
+    pub fn runtime_dir(&self, name: &str) -> PathBuf {
+        self.root.join("runtimes").join(name)
+    }
+
     pub fn receipt_path(&self, kind: PkgKind, name: &str) -> PathBuf {
         self.root
             .join("receipts")
@@ -59,6 +63,8 @@ impl Store {
             self.root.join("store"),
             self.bin_dir(),
             self.root.join("receipts"),
+            self.runtime_dir("node"),
+            self.runtime_dir("py"),
         ] {
             fs::create_dir_all(&path).map_err(|source| io(path.display(), source))?;
         }
@@ -119,6 +125,22 @@ impl Store {
         Ok(())
     }
 
+    pub fn activate_command(
+        &self,
+        receipt: &mut Receipt,
+        command: &Path,
+        first_arg: &Path,
+    ) -> Result<()> {
+        fs::create_dir_all(self.bin_dir())
+            .map_err(|source| io(self.bin_dir().display(), source))?;
+        let shim_name = command_shim_name(&receipt.name);
+        let shim = self.bin_dir().join(&shim_name);
+        remove_path(&shim)?;
+        write_command_shim(&shim, command, first_arg)?;
+        receipt.shim = shim_name;
+        Ok(())
+    }
+
     pub fn verify(&self, receipt: &Receipt) -> Result<()> {
         let install_dir = self.install_dir(receipt.kind, &receipt.name, &receipt.version);
         for (rel, expected) in &receipt.files {
@@ -147,6 +169,8 @@ pub struct Receipt {
     pub bin: String,
     #[serde(default)]
     pub shim: String,
+    #[serde(default)]
+    pub previous_version: Option<String>,
     #[serde(default)]
     pub files: BTreeMap<String, String>,
     #[serde(default)]
@@ -220,6 +244,14 @@ fn shim_name(name: &str, target: &Path) -> String {
     }
 }
 
+fn command_shim_name(name: &str) -> String {
+    if cfg!(windows) {
+        format!("{name}.cmd")
+    } else {
+        name.to_owned()
+    }
+}
+
 fn activate_target(target: &Path, shim: &Path) -> Result<()> {
     if cfg!(windows) {
         if target.is_dir() {
@@ -245,6 +277,33 @@ fn activate_target(target: &Path, shim: &Path) -> Result<()> {
             Ok(())
         }
     }
+}
+
+fn write_command_shim(shim: &Path, command: &Path, first_arg: &Path) -> Result<()> {
+    let content = if cfg!(windows) {
+        format!(
+            "@echo off\r\n\"{}\" \"{}\" %*\r\n",
+            command.display(),
+            first_arg.display()
+        )
+    } else {
+        format!(
+            "#!/bin/sh\nexec \"{}\" \"{}\" \"$@\"\n",
+            command.display(),
+            first_arg.display()
+        )
+    };
+    fs::write(shim, content).map_err(|source| io(shim.display(), source))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(shim)
+            .map_err(|source| io(shim.display(), source))?
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(shim, permissions).map_err(|source| io(shim.display(), source))?;
+    }
+    Ok(())
 }
 
 fn copy_dir(from: &Path, to: &Path) -> Result<()> {
@@ -295,6 +354,7 @@ mod tests {
             archive_sha256: "abc".to_owned(),
             bin: "demo.exe".to_owned(),
             shim: String::new(),
+            previous_version: None,
             files: hash_tree(&install).unwrap(),
             installed_at: "now".to_owned(),
         };

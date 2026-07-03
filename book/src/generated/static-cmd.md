@@ -35,6 +35,9 @@
 | `file_explorer_in_current_directory` | Open file explorer panel at current working directory |  |
 | `code_action` | Perform code action | normal: `` <space>a ``, select: `` <space>a `` |
 | `code_action_picker` | Perform code action in a picker |  |
+| `code_lens` | Open code lens picker |  |
+| `document_links` | Open document links picker |  |
+| `linked_editing_range` | Select linked editing ranges |  |
 | `buffer_picker` | Open buffer picker | normal: `` <space>b ``, select: `` <space>b `` |
 | `jumplist_picker` | Open jumplist picker | normal: `` <space>j ``, select: `` <space>j `` |
 | `symbol_picker` | Open symbol picker |  |
@@ -57,6 +60,10 @@
 | `goto_declaration` | Goto declaration | normal: `` gD ``, select: `` gD `` |
 | `goto_type_definition` | Goto type definition | normal: `` gy ``, select: `` gy `` |
 | `goto_implementation` | Goto implementation | normal: `` gi ``, select: `` gi `` |
+| `call_hierarchy_incoming` | Show incoming calls | normal: `` <space>Hi ``, select: `` <space>Hi `` |
+| `call_hierarchy_outgoing` | Show outgoing calls | normal: `` <space>Ho ``, select: `` <space>Ho `` |
+| `type_hierarchy_super` | Show supertypes | normal: `` <space>Hs ``, select: `` <space>Hs `` |
+| `type_hierarchy_sub` | Show subtypes | normal: `` <space>Ht ``, select: `` <space>Ht `` |
 | `goto_file` | Goto files/URLs in selections | normal: `` gf ``, select: `` gf `` |
 | `goto_file_hsplit` | Goto files in selections (hsplit) | normal: `` <C-w>f ``, `` <space>wf ``, select: `` <C-w>f ``, `` <space>wf `` |
 | `goto_file_vsplit` | Goto files in selections (vsplit) | normal: `` <C-w>F ``, `` <space>wF ``, select: `` <C-w>F ``, `` <space>wF `` |
@@ -107,6 +114,8 @@
 | `keep_selections` | Keep selections matching regex | normal: `` K ``, select: `` K `` |
 | `remove_selections` | Remove selections matching regex | normal: `` <A-K> ``, select: `` <A-K> `` |
 | `completion` | Invoke completion popup | insert: `` <C-x> `` |
+| `inline_completion` | Invoke inline completion | insert: `` <A-y> `` |
+| `accept_inline_completion` | Accept inline completion | insert: `` <C-y> `` |
 | `hover` | Show docs for item under cursor | normal: `` <space>k ``, select: `` <space>k `` |
 | `goto_hover` | Show docs for item under cursor in a new buffer | normal: `` <space>K ``, select: `` <space>K `` |
 | `jump_view_right` | Jump to right split | normal: `` <C-w>l ``, `` <space>wl ``, `` <C-w><C-l> ``, `` <C-w><right> ``, `` <space>w<C-l> ``, `` <space>w<right> ``, select: `` <C-w>l ``, `` <space>wl ``, `` <C-w><C-l> ``, `` <C-w><right> ``, `` <space>w<C-l> ``, `` <space>w<right> `` |

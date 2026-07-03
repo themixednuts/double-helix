@@ -1712,6 +1712,7 @@ impl Document {
         self.presentation.mark_inlay_hints_outdated();
         self.lsp.update_code_lenses(changes);
         self.lsp.update_document_links(changes);
+        self.lsp.update_semantic_tokens(changes);
         let inlay_start = Instant::now();
         for text_annotation in self.presentation.inlay_hints_mut() {
             let DocumentInlayHints {
@@ -2369,6 +2370,80 @@ impl Document {
 
     pub fn set_document_links(&mut self, document_links: DocumentLinks) {
         self.lsp.set_document_links(document_links);
+    }
+
+    pub fn restart_semantic_tokens(&mut self) -> helix_runtime::Token {
+        self.lsp.restart_semantic_tokens()
+    }
+
+    pub fn cancel_semantic_tokens(&mut self) -> bool {
+        self.lsp.cancel_semantic_tokens()
+    }
+
+    pub fn clear_semantic_tokens(&mut self) {
+        self.lsp.clear_semantic_tokens();
+    }
+
+    pub fn set_semantic_tokens(
+        &mut self,
+        server_id: helix_lsp::LanguageServerId,
+        tokens: crate::document_lsp::DocumentSemanticTokens,
+    ) {
+        self.lsp.set_semantic_tokens(server_id, tokens);
+    }
+
+    pub fn semantic_tokens_overlay(
+        &self,
+        theme: &Theme,
+    ) -> Option<helix_core::syntax::OverlayHighlights> {
+        crate::document_lsp::semantic_tokens_overlay(
+            theme,
+            self.lsp.semantic_tokens(),
+            self.version(),
+        )
+    }
+
+    pub fn restart_inline_completion(&mut self) -> helix_runtime::Token {
+        self.lsp.restart_inline_completion()
+    }
+
+    pub fn cancel_inline_completion(&mut self) -> bool {
+        self.lsp.cancel_inline_completion()
+    }
+
+    pub fn inline_completion(&self) -> Option<&crate::document_lsp::InlineCompletionGhost> {
+        self.lsp.inline_completion()
+    }
+
+    pub fn set_inline_completion(
+        &mut self,
+        completion: crate::document_lsp::InlineCompletionGhost,
+    ) {
+        self.lsp.set_inline_completion(completion);
+    }
+
+    pub fn clear_inline_completion(&mut self) {
+        self.lsp.clear_inline_completion();
+    }
+
+    pub fn restart_inline_values(&mut self) -> helix_runtime::Token {
+        self.lsp.restart_inline_values()
+    }
+
+    pub fn cancel_inline_values(&mut self) -> bool {
+        self.lsp.cancel_inline_values()
+    }
+
+    pub fn inline_values(&self) -> Option<&crate::document_lsp::DocumentInlineValues> {
+        self.lsp.inline_values()
+    }
+
+    pub fn set_inline_values(&mut self, values: crate::document_lsp::DocumentInlineValues) {
+        self.lsp.set_inline_values(values);
+    }
+
+    pub fn clear_inline_values(&mut self) {
+        self.lsp.clear_inline_values();
     }
 
     pub fn restart_folding_ranges(&mut self) -> helix_runtime::Token {

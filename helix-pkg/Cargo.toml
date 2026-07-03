@@ -11,6 +11,8 @@ repository.workspace = true
 homepage.workspace = true
 
 [dependencies]
+helix-loader = { path = "../helix-loader" }
+
 etcetera.workspace = true
 flate2.workspace = true
 serde.workspace = true
@@ -26,4 +28,3 @@ zip.workspace = true
 
 [dev-dependencies]
 assert_fs.workspace = true
-

@@ -1,0 +1,26 @@
+name = "bash-language-server"
+kind = "lsp"
+description = "Bash language server"
+homepage = "https://github.com/bash-lsp/bash-language-server"
+languages = ["bash"]
+
+[version]
+tag-source = "npm:bash-language-server"
+
+[[artifact]]
+os = "windows"
+arch = "x86_64"
+source = { npm = "bash-language-server", bin = "bash-language-server" }
+bin = "bash-language-server"
+
+[[artifact]]
+os = "linux"
+arch = "x86_64"
+source = { npm = "bash-language-server", bin = "bash-language-server" }
+bin = "bash-language-server"
+
+[[artifact]]
+os = "macos"
+arch = "aarch64"
+source = { npm = "bash-language-server", bin = "bash-language-server" }
+bin = "bash-language-server"

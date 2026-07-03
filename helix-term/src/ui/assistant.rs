@@ -68,6 +68,7 @@ pub struct AssistantPanel {
     markdown_cache: RefCell<HashMap<helix_view::assistant::thread::EntryId, MarkdownCache>>,
     mention: MentionPopup,
     elicitation_form: Option<helix_view::assistant::elicitation::FormState>,
+    auth_selected: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -370,6 +371,7 @@ impl AssistantPanel {
             markdown_cache: RefCell::new(HashMap::new()),
             mention: MentionPopup::default(),
             elicitation_form: None,
+            auth_selected: 0,
         }
     }
 
@@ -812,6 +814,45 @@ impl AssistantPanel {
             editor,
             helix_view::assistant::thread::ElicitationResponse::Cancel,
         )
+    }
+
+    fn active_auth_methods(editor: &Editor) -> Option<Vec<helix_view::assistant::auth::Method>> {
+        match Self::assistant_model(editor).auth {
+            helix_view::assistant::auth::State::Required { methods, .. }
+            | helix_view::assistant::auth::State::Failed { methods, .. } => Some(methods),
+            _ => None,
+        }
+    }
+
+    fn select_auth_method(&mut self, editor: &Editor, delta: isize) -> bool {
+        let Some(methods) = Self::active_auth_methods(editor) else {
+            return false;
+        };
+        if methods.is_empty() {
+            return true;
+        }
+        let len = methods.len() as isize;
+        self.auth_selected = (self.auth_selected as isize + delta).rem_euclid(len) as usize;
+        true
+    }
+
+    fn accept_auth_method(&mut self, editor: &mut Editor) -> bool {
+        let model = Self::assistant_model(editor);
+        let Some(thread) = model.active_thread else {
+            return false;
+        };
+        let methods = match model.auth {
+            helix_view::assistant::auth::State::Required { methods, .. }
+            | helix_view::assistant::auth::State::Failed { methods, .. } => methods,
+            _ => return false,
+        };
+        let Some(method) = methods.get(self.auth_selected.min(methods.len().saturating_sub(1)))
+        else {
+            return false;
+        };
+        let effects = editor.authenticate_assistant(thread, method.id.clone());
+        Self::apply_assistant_effects(editor, effects);
+        true
     }
 
     fn yank_pending_elicitation_url(&mut self, editor: &mut Editor) -> bool {
@@ -1576,6 +1617,10 @@ impl AssistantPanel {
             blocks.push(self.elicitation_message(elicitation, theme));
         }
 
+        if let Some(message) = self.auth_message(model, theme) {
+            blocks.push(message);
+        }
+
         for terminal in &model.terminals {
             blocks.push(Self::terminal_message(terminal, theme));
         }
@@ -1709,6 +1754,59 @@ impl AssistantPanel {
             lines.push(Spans::from(Span::styled(format!("   {line}"), muted_style)));
         }
         Message::plain(lines)
+    }
+
+    fn auth_message<'a>(
+        &self,
+        model: &helix_view::model::AssistantModel,
+        theme: &helix_view::Theme,
+    ) -> Option<Message<'a>> {
+        let (methods, error, authenticating) = match &model.auth {
+            helix_view::assistant::auth::State::Required { methods, error, .. } => {
+                (methods.as_slice(), error.as_deref(), None)
+            }
+            helix_view::assistant::auth::State::Failed { methods, error, .. } => {
+                (methods.as_slice(), Some(error.as_str()), None)
+            }
+            helix_view::assistant::auth::State::Authenticating { method, .. } => {
+                (&[][..], None, Some(method.name.as_str()))
+            }
+            _ => return None,
+        };
+        let title_style = theme.get("ui.text.focus").add_modifier(Modifier::BOLD);
+        let muted_style = theme.get("ui.text.inactive");
+        let warning_style = theme.get("warning");
+        let mut lines = vec![Spans::from(vec![
+            Span::styled(" ! ", warning_style),
+            Span::styled("Authentication required", title_style),
+            Span::styled("  j/k select  enter authenticate", muted_style),
+        ])];
+        if let Some(name) = authenticating {
+            lines.push(Spans::from(Span::styled(
+                format!("   Authenticating with {name}..."),
+                muted_style,
+            )));
+        }
+        if let Some(error) = error {
+            lines.push(Spans::from(Span::styled(
+                format!("   {error}"),
+                theme.get("error"),
+            )));
+        }
+        for (index, method) in methods.iter().enumerate() {
+            let selected = index == self.auth_selected.min(methods.len().saturating_sub(1));
+            let marker = if selected { " > " } else { "   " };
+            let suffix = if method.terminal.is_some() {
+                " terminal"
+            } else {
+                ""
+            };
+            lines.push(Spans::from(Span::styled(
+                format!("{marker}{}{suffix}", method.name),
+                if selected { title_style } else { muted_style },
+            )));
+        }
+        Some(Message::plain(lines))
     }
 
     /// Render chat blocks directly to the surface with proper scroll.
@@ -2748,6 +2846,25 @@ impl Component for AssistantPanel {
         }
 
         self.error_marquee.touch();
+
+        if key.modifiers.is_empty() && Self::active_auth_methods(cx.editor).is_some() {
+            match key.code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.select_auth_method(cx.editor, -1);
+                    return EventResult::Consumed(None);
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.select_auth_method(cx.editor, 1);
+                    return EventResult::Consumed(None);
+                }
+                KeyCode::Enter | KeyCode::Char('r') => {
+                    if self.accept_auth_method(cx.editor) {
+                        return EventResult::Consumed(None);
+                    }
+                }
+                _ => {}
+            }
+        }
 
         // Ctrl+c → cancel agent (any mode).
         if matches!(

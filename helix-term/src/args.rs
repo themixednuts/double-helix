@@ -34,6 +34,9 @@ pub enum PkgCommand {
     Search(String),
     Sync,
     Doctor,
+    Outdated(Vec<String>),
+    Update(Vec<String>),
+    Rollback(String),
     Help,
 }
 
@@ -198,6 +201,17 @@ fn parse_pkg_args(args: Vec<String>) -> Result<PkgArgs> {
         }
         Some("sync") => PkgCommand::Sync,
         Some("doctor") => PkgCommand::Doctor,
+        Some("outdated") => PkgCommand::Outdated(args.collect()),
+        Some("update") => PkgCommand::Update(args.collect()),
+        Some("rollback") => {
+            let Some(name) = args.next() else {
+                anyhow::bail!("pkg rollback requires a package name");
+            };
+            if args.next().is_some() {
+                anyhow::bail!("pkg rollback accepts one package name");
+            }
+            PkgCommand::Rollback(name)
+        }
         Some("-h" | "--help") | None => PkgCommand::Help,
         Some(other) => anyhow::bail!("unknown pkg command: {other}"),
     };

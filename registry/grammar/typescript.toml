@@ -1,0 +1,26 @@
+name = "typescript"
+kind = "grammar"
+description = "TypeScript tree-sitter grammar"
+homepage = "https://github.com/tree-sitter/tree-sitter-typescript"
+languages = ["typescript"]
+
+[version]
+tag-source = "static:75b3874edb2dc714fb1fd77a32013d0f8699989f"
+
+[[artifact]]
+os = "windows"
+arch = "x86_64"
+source = { git = "https://github.com/tree-sitter/tree-sitter-typescript", rev = "75b3874edb2dc714fb1fd77a32013d0f8699989f", subpath = "typescript" }
+bin = "typescript"
+
+[[artifact]]
+os = "linux"
+arch = "x86_64"
+source = { git = "https://github.com/tree-sitter/tree-sitter-typescript", rev = "75b3874edb2dc714fb1fd77a32013d0f8699989f", subpath = "typescript" }
+bin = "typescript"
+
+[[artifact]]
+os = "macos"
+arch = "aarch64"
+source = { git = "https://github.com/tree-sitter/tree-sitter-typescript", rev = "75b3874edb2dc714fb1fd77a32013d0f8699989f", subpath = "typescript" }
+bin = "typescript"

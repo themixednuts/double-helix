@@ -73,6 +73,13 @@ pub fn get_language(name: &str) -> Result<Option<Grammar>> {
     let mut rel_library_path = PathBuf::new().join("grammars").join(name);
     rel_library_path.set_extension(DYLIB_EXTENSION);
     let library_path = crate::runtime_file(&rel_library_path);
+    let library_path = if library_path.exists() {
+        library_path
+    } else if let Some(path) = pkg_grammar_library_path(name) {
+        path
+    } else {
+        return Ok(None);
+    };
     if !library_path.exists() {
         return Ok(None);
     }
@@ -83,6 +90,61 @@ pub fn get_language(name: &str) -> Result<Option<Grammar>> {
 
 fn ensure_git_is_available() -> Result<()> {
     helix_stdx::env::which("git")?;
+    Ok(())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn pkg_grammar_library_path(name: &str) -> Option<PathBuf> {
+    use etcetera::base_strategy::BaseStrategy;
+
+    let strategy = etcetera::base_strategy::choose_base_strategy().ok()?;
+    let pkg = strategy
+        .data_dir()
+        .join(crate::PRODUCT_CONFIG_DIR)
+        .join("pkg");
+    pkg_grammar_library_path_from(&pkg, name)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn pkg_grammar_library_path_from(pkg: &Path, name: &str) -> Option<PathBuf> {
+    #[derive(Deserialize)]
+    struct Receipt {
+        version: String,
+    }
+
+    let receipt_path = pkg.join("receipts").join(format!("grammar-{name}.toml"));
+    let receipt: Receipt = toml::from_str(&std::fs::read_to_string(receipt_path).ok()?).ok()?;
+    let mut library_path = pkg
+        .join("store")
+        .join("grammar")
+        .join(name)
+        .join(receipt.version)
+        .join(name);
+    library_path.set_extension(DYLIB_EXTENSION);
+    library_path.exists().then_some(library_path)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn install_pkg_grammar(
+    grammar_id: &str,
+    remote: &str,
+    revision: &str,
+    subpath: Option<&str>,
+    install_dir: &Path,
+) -> Result<()> {
+    ensure_git_is_available()?;
+    let sources = install_dir.join("sources").join(grammar_id);
+    let repo = VendoredGrammar::at(sources);
+    repo.fetch(remote, revision)?;
+    let grammar = GrammarConfiguration {
+        grammar_id: grammar_id.to_owned(),
+        source: GrammarSource::Git {
+            remote: remote.to_owned(),
+            revision: revision.to_owned(),
+            subpath: subpath.map(str::to_owned),
+        },
+    };
+    build_grammar_to(grammar, None, install_dir)?;
     Ok(())
 }
 
@@ -283,6 +345,10 @@ impl VendoredGrammar {
         Self { dir }
     }
 
+    fn at(dir: PathBuf) -> Self {
+        Self { dir }
+    }
+
     /// Gets the current revision of the repo.
     fn revision(&self) -> Option<String> {
         git(&self.dir, ["rev-parse", "HEAD"]).ok()
@@ -399,15 +465,22 @@ enum BuildStatus {
 }
 
 fn build_grammar(grammar: GrammarConfiguration, target: Option<&str>) -> Result<BuildStatus> {
+    let parser_lib_path = crate::runtime_dirs()
+        .first()
+        .expect("No runtime directories provided") // guaranteed by post-condition
+        .join("grammars");
+    build_grammar_to(grammar, target, &parser_lib_path)
+}
+
+fn build_grammar_to(
+    grammar: GrammarConfiguration,
+    target: Option<&str>,
+    parser_lib_path: &Path,
+) -> Result<BuildStatus> {
     let grammar_dir = if let GrammarSource::Local { path } = &grammar.source {
         PathBuf::from(&path)
     } else {
-        crate::runtime_dirs()
-            .first()
-            .expect("No runtime directories provided") // guaranteed by post-condition
-            .join("grammars")
-            .join("sources")
-            .join(&grammar.grammar_id)
+        parser_lib_path.join("sources").join(&grammar.grammar_id)
     };
 
     let grammar_dir_entries = grammar_dir.read_dir().with_context(|| {
@@ -433,13 +506,14 @@ fn build_grammar(grammar: GrammarConfiguration, target: Option<&str>) -> Result<
     }
     .join("src");
 
-    build_tree_sitter_library(&path, grammar, target)
+    build_tree_sitter_library(&path, grammar, target, parser_lib_path)
 }
 
 fn build_tree_sitter_library(
     src_path: &Path,
     grammar: GrammarConfiguration,
     target: Option<&str>,
+    parser_lib_path: &Path,
 ) -> Result<BuildStatus> {
     let header_path = src_path;
     let parser_path = src_path.join("parser.c");
@@ -455,10 +529,7 @@ fn build_tree_sitter_library(
             None
         }
     };
-    let parser_lib_path = crate::runtime_dirs()
-        .first()
-        .expect("No runtime directories provided") // guaranteed by post-condition
-        .join("grammars");
+    fs::create_dir_all(parser_lib_path).context("Failed to create grammar output directory")?;
     let mut library_path = parser_lib_path.join(&grammar.grammar_id);
     library_path.set_extension(DYLIB_EXTENSION);
 
@@ -651,4 +722,39 @@ fn mtime(path: &Path) -> Result<SystemTime> {
 pub fn load_runtime_file(language: &str, filename: &str) -> Result<String, std::io::Error> {
     let path = crate::runtime_file(PathBuf::new().join("queries").join(language).join(filename));
     std::fs::read_to_string(path)
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use std::fs;
+
+    use tempfile::TempDir;
+
+    use super::{pkg_grammar_library_path_from, DYLIB_EXTENSION};
+
+    #[test]
+    fn pkg_grammar_path_uses_active_receipt_version() {
+        let dir = TempDir::new().unwrap();
+        let pkg = dir.path();
+        fs::create_dir_all(pkg.join("receipts")).unwrap();
+        fs::write(
+            pkg.join("receipts").join("grammar-rust.toml"),
+            r#"version = "rev1""#,
+        )
+        .unwrap();
+        let mut library = pkg
+            .join("store")
+            .join("grammar")
+            .join("rust")
+            .join("rev1")
+            .join("rust");
+        library.set_extension(DYLIB_EXTENSION);
+        fs::create_dir_all(library.parent().unwrap()).unwrap();
+        fs::write(&library, b"").unwrap();
+
+        assert_eq!(
+            pkg_grammar_library_path_from(pkg, "rust").as_deref(),
+            Some(library.as_path())
+        );
+    }
 }

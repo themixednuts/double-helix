@@ -171,6 +171,9 @@ The following statusline elements can be configured:
 | `auto-signature-help` | Enable automatic popup of signature help (parameter hints)  | `true`  |
 | `display-inlay-hints` | Display inlay hints[^2]                                     | `false` |
 | `inlay-hints-length-limit` | Maximum displayed length (non-zero number) of inlay hints | Unset by default  |
+| `semantic-tokens` | Overlay LSP semantic token highlighting above tree-sitter highlighting | `false` |
+| `inline-completion` | Display LSP inline completion ghost text in insert mode. Accept with `Ctrl-y`; request manually with `Alt-y` | `false` |
+| `inline-values` | Display LSP inline values while stopped in a debug session | `false` |
 | `display-color-swatches` | Show color swatches next to colors | `true` |
 | `display-signature-help-docs` | Display docs under signature help popup             | `true`  |
 | `snippets`      | Enables snippet completions. Requires a server restart (`:lsp-restart`) to take effect after `:config-reload`/`:set`. | `true`  |

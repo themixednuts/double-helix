@@ -428,6 +428,54 @@ impl Client {
         }
     }
 
+    fn semantic_tokens_options(
+        capabilities: &lsp::SemanticTokensServerCapabilities,
+    ) -> &lsp::SemanticTokensOptions {
+        match capabilities {
+            lsp::SemanticTokensServerCapabilities::SemanticTokensOptions(options) => options,
+            lsp::SemanticTokensServerCapabilities::SemanticTokensRegistrationOptions(options) => {
+                &options.semantic_tokens_options
+            }
+        }
+    }
+
+    pub fn supports_semantic_tokens_full(&self) -> bool {
+        self.capabilities()
+            .semantic_tokens_provider
+            .as_ref()
+            .and_then(|capabilities| Self::semantic_tokens_options(capabilities).full.as_ref())
+            .is_some()
+    }
+
+    pub fn supports_semantic_tokens_range(&self) -> bool {
+        self.capabilities()
+            .semantic_tokens_provider
+            .as_ref()
+            .and_then(|capabilities| Self::semantic_tokens_options(capabilities).range)
+            .unwrap_or(false)
+    }
+
+    pub fn semantic_tokens_legend(&self) -> Option<&lsp::SemanticTokensLegend> {
+        self.capabilities()
+            .semantic_tokens_provider
+            .as_ref()
+            .map(|capabilities| &Self::semantic_tokens_options(capabilities).legend)
+    }
+
+    pub fn supports_inline_completion(&self) -> bool {
+        matches!(
+            self.capabilities().inline_completion_provider,
+            Some(lsp::OneOf::Left(true) | lsp::OneOf::Right(_))
+        )
+    }
+
+    pub fn supports_inline_values(&self) -> bool {
+        matches!(
+            self.capabilities().inline_value_provider,
+            Some(lsp::OneOf::Left(true) | lsp::OneOf::Right(_))
+        )
+    }
+
     pub fn offset_encoding(&self) -> OffsetEncoding {
         self.capabilities()
             .position_encoding
@@ -607,6 +655,12 @@ impl Client {
                     inlay_hint: Some(lsp::InlayHintWorkspaceClientCapabilities {
                         refresh_support: Some(false),
                     }),
+                    semantic_tokens: Some(lsp::SemanticTokensWorkspaceClientCapabilities {
+                        refresh_support: Some(true),
+                    }),
+                    inline_value: Some(lsp::InlineValueWorkspaceClientCapabilities {
+                        refresh_support: Some(true),
+                    }),
                     code_lens: Some(lsp::CodeLensWorkspaceClientCapabilities {
                         refresh_support: Some(true),
                     }),
@@ -765,6 +819,61 @@ impl Client {
                         dynamic_registration: Some(false),
                     }),
                     type_hierarchy: Some(lsp::TypeHierarchyClientCapabilities {
+                        dynamic_registration: Some(false),
+                    }),
+                    semantic_tokens: Some(lsp::SemanticTokensClientCapabilities {
+                        dynamic_registration: Some(false),
+                        requests: lsp::SemanticTokensClientCapabilitiesRequests {
+                            range: Some(true),
+                            full: Some(lsp::SemanticTokensFullOptions::Bool(true)),
+                        },
+                        token_types: vec![
+                            lsp::SemanticTokenType::NAMESPACE,
+                            lsp::SemanticTokenType::TYPE,
+                            lsp::SemanticTokenType::CLASS,
+                            lsp::SemanticTokenType::ENUM,
+                            lsp::SemanticTokenType::INTERFACE,
+                            lsp::SemanticTokenType::STRUCT,
+                            lsp::SemanticTokenType::TYPE_PARAMETER,
+                            lsp::SemanticTokenType::PARAMETER,
+                            lsp::SemanticTokenType::VARIABLE,
+                            lsp::SemanticTokenType::PROPERTY,
+                            lsp::SemanticTokenType::ENUM_MEMBER,
+                            lsp::SemanticTokenType::EVENT,
+                            lsp::SemanticTokenType::FUNCTION,
+                            lsp::SemanticTokenType::METHOD,
+                            lsp::SemanticTokenType::MACRO,
+                            lsp::SemanticTokenType::KEYWORD,
+                            lsp::SemanticTokenType::MODIFIER,
+                            lsp::SemanticTokenType::COMMENT,
+                            lsp::SemanticTokenType::STRING,
+                            lsp::SemanticTokenType::NUMBER,
+                            lsp::SemanticTokenType::REGEXP,
+                            lsp::SemanticTokenType::OPERATOR,
+                            lsp::SemanticTokenType::DECORATOR,
+                        ],
+                        token_modifiers: vec![
+                            lsp::SemanticTokenModifier::DECLARATION,
+                            lsp::SemanticTokenModifier::DEFINITION,
+                            lsp::SemanticTokenModifier::READONLY,
+                            lsp::SemanticTokenModifier::STATIC,
+                            lsp::SemanticTokenModifier::DEPRECATED,
+                            lsp::SemanticTokenModifier::ABSTRACT,
+                            lsp::SemanticTokenModifier::ASYNC,
+                            lsp::SemanticTokenModifier::MODIFICATION,
+                            lsp::SemanticTokenModifier::DOCUMENTATION,
+                            lsp::SemanticTokenModifier::DEFAULT_LIBRARY,
+                        ],
+                        formats: vec![lsp::TokenFormat::RELATIVE],
+                        overlapping_token_support: Some(false),
+                        multiline_token_support: Some(true),
+                        server_cancel_support: Some(true),
+                        augments_syntax_tokens: Some(true),
+                    }),
+                    inline_value: Some(lsp::InlineValueClientCapabilities {
+                        dynamic_registration: Some(false),
+                    }),
+                    inline_completion: Some(lsp::InlineCompletionClientCapabilities {
                         dynamic_registration: Some(false),
                     }),
                     on_type_formatting: Some(lsp::DocumentOnTypeFormattingClientCapabilities {
@@ -1251,6 +1360,92 @@ impl Client {
         };
 
         Some(self.call::<lsp::request::InlayHintRequest>(params))
+    }
+
+    pub fn text_document_semantic_tokens_full(
+        &self,
+        text_document: lsp::TextDocumentIdentifier,
+        work_done_token: Option<lsp::ProgressToken>,
+    ) -> Option<impl Future<Output = Result<Option<lsp::SemanticTokensResult>>>> {
+        if !self.supports_semantic_tokens_full() {
+            return None;
+        }
+
+        let params = lsp::SemanticTokensParams {
+            text_document,
+            work_done_progress_params: lsp::WorkDoneProgressParams {
+                work_done_token: work_done_token.clone(),
+            },
+            partial_result_params: lsp::PartialResultParams {
+                partial_result_token: work_done_token,
+            },
+        };
+
+        Some(self.call::<lsp::request::SemanticTokensFullRequest>(params))
+    }
+
+    pub fn text_document_semantic_tokens_range(
+        &self,
+        text_document: lsp::TextDocumentIdentifier,
+        range: lsp::Range,
+        work_done_token: Option<lsp::ProgressToken>,
+    ) -> Option<impl Future<Output = Result<Option<lsp::SemanticTokensRangeResult>>>> {
+        if !self.supports_semantic_tokens_range() {
+            return None;
+        }
+
+        let params = lsp::SemanticTokensRangeParams {
+            text_document,
+            range,
+            work_done_progress_params: lsp::WorkDoneProgressParams {
+                work_done_token: work_done_token.clone(),
+            },
+            partial_result_params: lsp::PartialResultParams {
+                partial_result_token: work_done_token,
+            },
+        };
+
+        Some(self.call::<lsp::request::SemanticTokensRangeRequest>(params))
+    }
+
+    pub fn text_document_inline_completion(
+        &self,
+        text_document_position: lsp::TextDocumentPositionParams,
+        context: lsp::InlineCompletionContext,
+        work_done_token: Option<lsp::ProgressToken>,
+    ) -> Option<impl Future<Output = Result<Option<lsp::InlineCompletionResponse>>>> {
+        if !self.supports_inline_completion() {
+            return None;
+        }
+
+        let params = lsp::InlineCompletionParams {
+            work_done_progress_params: lsp::WorkDoneProgressParams { work_done_token },
+            text_document_position,
+            context,
+        };
+
+        Some(self.call::<lsp::request::InlineCompletionRequest>(params))
+    }
+
+    pub fn text_document_inline_values(
+        &self,
+        text_document: lsp::TextDocumentIdentifier,
+        range: lsp::Range,
+        context: lsp::InlineValueContext,
+        work_done_token: Option<lsp::ProgressToken>,
+    ) -> Option<impl Future<Output = Result<Option<Vec<lsp::InlineValue>>>>> {
+        if !self.supports_inline_values() {
+            return None;
+        }
+
+        let params = lsp::InlineValueParams {
+            text_document,
+            range,
+            context,
+            work_done_progress_params: lsp::WorkDoneProgressParams { work_done_token },
+        };
+
+        Some(self.call::<lsp::request::InlineValueRequest>(params))
     }
 
     pub fn resolve_inlay_hint(

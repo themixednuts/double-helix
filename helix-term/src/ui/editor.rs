@@ -1234,6 +1234,11 @@ impl EditorView {
         let mut overlays = Vec::new();
 
         let overlays_start = std::time::Instant::now();
+        if config.lsp.semantic_tokens {
+            if let Some(overlay) = doc.semantic_tokens_overlay(theme) {
+                overlays.push(overlay);
+            }
+        }
         overlays.push(doc.viewport_overlay_highlights(
             &text_annotations,
             view_offset.anchor,

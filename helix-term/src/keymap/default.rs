@@ -458,6 +458,8 @@ pub fn default() -> HashMap<Mode, KeyTrie> {
 
         "C-s" => commit_undo_checkpoint,
         "C-x" => completion,
+        "A-y" => inline_completion,
+        "C-y" => accept_inline_completion,
         "C-r" => insert_register,
 
         "C-w" | "A-backspace" => delete_word_backward,

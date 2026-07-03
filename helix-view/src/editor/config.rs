@@ -350,6 +350,8 @@ pub struct Config {
     #[serde(default)]
     pub acp: AcpConfig,
     #[serde(default)]
+    pub assistant: AssistantConfig,
+    #[serde(default)]
     pub editing_engine: EditingEngineConfig,
 }
 
@@ -447,6 +449,20 @@ pub struct AgentConfig {
     pub mcp_servers: Vec<helix_acp::types::McpServer>,
     #[serde(default)]
     pub theme: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", default, deny_unknown_fields)]
+pub struct AssistantConfig {
+    pub notify_on_done: bool,
+}
+
+impl Default for AssistantConfig {
+    fn default() -> Self {
+        Self {
+            notify_on_done: true,
+        }
+    }
 }
 
 pub(super) fn default_agents() -> Vec<AgentConfig> {
@@ -857,6 +873,9 @@ pub struct LspConfig {
     pub signature_help_position: SignatureHelpPosition,
     pub display_inlay_hints: bool,
     pub inlay_hints_length_limit: Option<NonZeroU8>,
+    pub semantic_tokens: bool,
+    pub inline_completion: bool,
+    pub inline_values: bool,
     pub display_color_swatches: bool,
     pub code_lens: bool,
     pub folding: bool,
@@ -879,6 +898,9 @@ impl Default for LspConfig {
             signature_help_position: SignatureHelpPosition::Above,
             display_inlay_hints: false,
             inlay_hints_length_limit: None,
+            semantic_tokens: false,
+            inline_completion: false,
+            inline_values: false,
             code_lens: true,
             folding: true,
             document_links: true,
@@ -1564,6 +1586,7 @@ impl Default for Config {
             fold_textobjects: Vec::new(),
             agents: default_agents(),
             acp: AcpConfig::default(),
+            assistant: AssistantConfig::default(),
             editing_engine: EditingEngineConfig::default(),
         }
     }

@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use super::{backend, context, permission, thread};
+use super::{auth, backend, context, permission, thread};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
@@ -24,6 +24,10 @@ pub enum Event {
     Permission {
         thread: thread::Id,
         request: permission::Request,
+    },
+    Auth {
+        thread: thread::Id,
+        event: auth::Event,
     },
     Backend {
         backend: backend::Id,

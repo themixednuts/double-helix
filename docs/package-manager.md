@@ -3,10 +3,11 @@
 Status: approved design, implementation staged (2026-07).
 Owner: architecture; implemented by staged codex waves.
 
-Implementation status (2026-07 W-pkg-1): `helix-pkg` engine and `dhx pkg`
-CLI are implemented for the github-release, archive, and system backends.
-Editor command resolution, loader grammar fold-in, and editor UI remain later
-waves.
+Implementation status (2026-07 W-pkg-2): `helix-pkg` engine and `dhx pkg`
+CLI are implemented for github-release, archive, system, npm, pip, cargo, go,
+and grammar git sources. Receipts, lockfile sync, sha256 verification,
+outdated/update, rollback, and loader grammar fold-in are implemented. Editor
+command resolution and `:pkg` UI remain wave 3.
 
 ## Problem
 
@@ -97,6 +98,12 @@ Design rulings:
   invocation is the existing grammar cc path, folded in unchanged.
 - **`system` backend** exists so the registry can also *describe* tools the
   user manages themselves; resolution treats a system match as satisfied.
+- **Runtime backends are declarative**: npm runs `npm install --prefix <store>
+  --ignore-scripts`; pip installs into an isolated venv per package version;
+  cargo uses `cargo install --root <store> --locked --version <locked>`; go
+  uses `GOBIN=<store> go install module@version`. Node/npm, Python, Cargo, and
+  Go themselves are user prerequisites and are detected on PATH with actionable
+  errors. The package manager does not install those runtimes.
 
 ### Store layout (data dir)
 
@@ -109,8 +116,8 @@ Design rulings:
 ```
 
 - Activation = writing a shim + receipt; deactivation = removing them. The
-  store is content-addressed enough to keep two versions side by side and
-  roll back instantly (`dhx pkg rollback <name>`).
+  store keeps versions side by side and records the previous active version so
+  rollback reactivates the prior still-present tree (`dhx pkg rollback <name>`).
 - Windows: junctions for directories, generated `.cmd`/copied exe shims for
   binaries — no symlink privilege required. Unix: symlinks.
 - Everything hash-verified: release assets against a sha256 recorded at
@@ -157,10 +164,12 @@ helix-loader's grammar loading gains the same fallback into the pkg store.
 
 ### Grammar fold-in
 
-`hx --grammar fetch/build` remains as an alias; internally grammars become
-`kind = "grammar"` packages whose source is the existing git+cc pipeline,
-gaining receipts/locking for free. Prebuilt grammar artifacts per platform
-can be added to the registry later without engine changes.
+`hx --grammar fetch/build` remains unchanged. `kind = "grammar"` packages now
+drive the same helix-loader git+cc pipeline into the package store, gaining
+receipts/locking. Grammar loading remains additive: legacy runtime grammar
+paths are checked first, then the active package receipt's store path. Prebuilt
+grammar artifacts per platform can be added to the registry later without
+engine changes.
 
 ### Plugins
 
@@ -183,7 +192,7 @@ untouched. `doctor` re-verifies receipts against the store and re-runs
   github-release, archive, system; receipts; CLI `install/list/remove/sync/
   doctor`; command resolution seam in helix-term/loader; builtin registry
   seeded with ~15 flagship servers/adapters.
-- **W-pkg-2**: npm/cargo/pip/go backends with shared runtimes; grammar
-  fold-in; `update/outdated/search/rollback`; per-project manifests.
+- **W-pkg-2**: npm/cargo/pip/go backends with isolated runtime roots; grammar
+  fold-in; `update/outdated/search/rollback`; registry expansion.
 - **W-pkg-3**: editor UI (`:pkg` picker, statusline nudge, toasts/progress),
   registry expansion (~40 entries), book docs.

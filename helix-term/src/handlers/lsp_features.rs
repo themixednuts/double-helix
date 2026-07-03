@@ -15,7 +15,7 @@ use helix_view::{
 
 use crate::{
     effect::language_server::{
-        request_code_lenses, request_document_links, request_folding_ranges,
+        request_code_lenses, request_document_links, request_folding_ranges, request_semantic_tokens,
     },
     runtime::RuntimeTaskEvent,
 };
@@ -95,6 +95,7 @@ pub(super) fn attach(
         request_code_lenses(event.editor, event.doc, open_ingress.clone());
         request_document_links(event.editor, event.doc, open_ingress.clone());
         request_folding_ranges(event.editor, event.doc, open_ingress.clone());
+        request_semantic_tokens(event.editor, event.doc, open_ingress.clone());
         Ok(())
     });
 
@@ -104,10 +105,14 @@ pub(super) fn attach(
             event.doc.cancel_code_lenses();
             event.doc.cancel_document_links();
             event.doc.cancel_folding_ranges();
+            event.doc.cancel_semantic_tokens();
+            event.doc.cancel_inline_completion();
             for kind in [
                 LspFeatureRefreshKind::CodeLens,
                 LspFeatureRefreshKind::DocumentLinks,
                 LspFeatureRefreshKind::FoldingRanges,
+                LspFeatureRefreshKind::SemanticTokens,
+                LspFeatureRefreshKind::InlineCompletion,
             ] {
                 helix_runtime::send_blocking(
                     &tx,
@@ -130,6 +135,7 @@ pub(super) fn attach(
                 request_code_lenses(event.editor, doc_id, init_ingress.clone());
                 request_document_links(event.editor, doc_id, init_ingress.clone());
                 request_folding_ranges(event.editor, doc_id, init_ingress.clone());
+                request_semantic_tokens(event.editor, doc_id, init_ingress.clone());
             }
             Ok(())
         });
@@ -139,6 +145,8 @@ pub(super) fn attach(
             if doc.supports_language_server(event.server_id) {
                 doc.clear_code_lenses();
                 doc.clear_document_links();
+                doc.clear_semantic_tokens();
+                doc.clear_inline_completion();
                 doc.clear_plugin_annotations(CODE_LENS_PLUGIN_SCOPE);
             }
         }

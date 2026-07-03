@@ -217,6 +217,7 @@ impl Record {
             config: self.config,
             review_mode: self.review_mode,
             terminals: self.terminals,
+            auth: crate::assistant::auth::State::default(),
             usage: thread::Usage::default(),
             commands: Vec::new(),
             pending_elicitations: Vec::new(),

@@ -661,10 +661,8 @@ impl Request for PrepareRenameRequest {
 }
 
 #[derive(Debug)]
-#[cfg(feature = "proposed")]
 pub enum InlineCompletionRequest {}
 
-#[cfg(feature = "proposed")]
 impl Request for InlineCompletionRequest {
     type Params = InlineCompletionParams;
     type Result = Option<InlineCompletionResponse>;
@@ -871,7 +869,7 @@ pub enum InlineValueRequest {}
 
 impl Request for InlineValueRequest {
     type Params = InlineValueParams;
-    type Result = Option<InlineValue>;
+    type Result = Option<Vec<InlineValue>>;
     const METHOD: &'static str = "textDocument/inlineValue";
 }
 

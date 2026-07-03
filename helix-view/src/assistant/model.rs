@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use super::{context, history, mode, plan, review, terminal, thread, Store};
+use super::{auth, context, history, mode, plan, review, terminal, thread, Store};
 use crate::collab::Location;
 use crate::DocumentId;
 
@@ -48,6 +48,7 @@ pub struct ThreadView {
     pub opened_docs: HashMap<thread::EntryId, DocumentId>,
     pub content_scroll: usize,
     pub terminals: Vec<Terminal>,
+    pub auth: auth::State,
     pub usage: thread::Usage,
     pub commands: Vec<thread::Command>,
     pub pending_elicitations: Vec<thread::Elicitation>,
@@ -394,6 +395,7 @@ impl Store {
                     .into_iter()
                     .map(Terminal::to_model)
                     .collect(),
+                auth: active.auth,
                 usage: active.usage,
                 commands: active.commands,
                 pending_elicitations: active.pending_elicitations,
@@ -429,6 +431,7 @@ impl Store {
                 plan_items: None,
                 queued_messages: 0,
                 terminals: Vec::new(),
+                auth: auth::State::default(),
                 usage: thread::Usage::default(),
                 commands: Vec::new(),
                 pending_elicitations: Vec::new(),
@@ -598,6 +601,7 @@ impl Store {
                 commands: thread.commands().to_vec(),
                 pending_elicitations: thread.pending_elicitations().to_vec(),
                 caps: thread.caps().cloned(),
+                auth: thread.auth().clone(),
                 terminals: thread
                     .terminals()
                     .iter()

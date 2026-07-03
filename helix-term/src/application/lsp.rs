@@ -365,6 +365,23 @@ impl Application {
 
                         Ok(serde_json::Value::Null)
                     }
+                    Ok(MethodCall::SemanticTokensRefresh) => {
+                        let language_server = language_server!().id();
+                        let documents = self
+                            .editor
+                            .documents_supporting_language_server(language_server);
+                        let ingress = self.ingress().tx.clone();
+
+                        for document in documents {
+                            crate::effect::language_server::request_semantic_tokens(
+                                &mut self.editor,
+                                document,
+                                ingress.clone(),
+                            );
+                        }
+
+                        Ok(serde_json::Value::Null)
+                    }
                     Ok(MethodCall::CodeLensRefresh) => {
                         let language_server = language_server!().id();
                         let documents = self
@@ -391,6 +408,23 @@ impl Application {
                             &mut self.editor,
                             ingress,
                         );
+                        Ok(serde_json::Value::Null)
+                    }
+                    Ok(MethodCall::InlineValueRefresh) => {
+                        let language_server = language_server!().id();
+                        let documents = self
+                            .editor
+                            .documents_supporting_language_server(language_server);
+                        let ingress = self.ingress().tx.clone();
+
+                        for document in documents {
+                            crate::effect::language_server::request_inline_values(
+                                &mut self.editor,
+                                document,
+                                ingress.clone(),
+                            );
+                        }
+
                         Ok(serde_json::Value::Null)
                     }
                     Ok(MethodCall::ShowMessageRequest(params)) => {

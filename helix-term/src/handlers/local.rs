@@ -47,6 +47,13 @@ pub fn post_command(command: &'static crate::keymap::MappableCommand, cx: &mut c
         return;
     }
 
+    if !matches!(
+        command.name(),
+        "inline_completion" | "accept_inline_completion"
+    ) {
+        focused!(cx.editor).1.clear_inline_completion();
+    }
+
     if cx.editor.last_completion.is_some() {
         match command {
             crate::keymap::MappableCommand::Engine { .. }
@@ -105,6 +112,7 @@ pub fn post_insert_char(c: char, cx: &mut commands::Context) {
 
 pub fn mode_switch(event: &mut ModeSwitch<'_, '_>) {
     if event.old_mode == Mode::Insert {
+        focused!(event.cx.editor).1.clear_inline_completion();
         event
             .cx
             .editor

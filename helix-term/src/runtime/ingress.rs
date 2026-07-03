@@ -442,6 +442,19 @@ pub enum RuntimeTaskEvent {
         doc_id: DocumentId,
         lenses: Vec<(LanguageServerId, helix_lsp::OffsetEncoding, lsp::CodeLens)>,
     },
+    ApplySemanticTokens {
+        doc_id: DocumentId,
+        server_id: LanguageServerId,
+        tokens: helix_view::document_lsp::DocumentSemanticTokens,
+    },
+    ApplyInlineCompletion {
+        doc_id: DocumentId,
+        completion: helix_view::document_lsp::InlineCompletionGhost,
+    },
+    ApplyInlineValues {
+        doc_id: DocumentId,
+        values: helix_view::document_lsp::DocumentInlineValues,
+    },
     ApplyDocumentLinks {
         doc_id: DocumentId,
         links: Vec<(

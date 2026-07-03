@@ -1,0 +1,26 @@
+name = "python"
+kind = "grammar"
+description = "Python tree-sitter grammar"
+homepage = "https://github.com/tree-sitter/tree-sitter-python"
+languages = ["python"]
+
+[version]
+tag-source = "static:293fdc02038ee2bf0e2e206711b69c90ac0d413f"
+
+[[artifact]]
+os = "windows"
+arch = "x86_64"
+source = { git = "https://github.com/tree-sitter/tree-sitter-python", rev = "293fdc02038ee2bf0e2e206711b69c90ac0d413f" }
+bin = "python"
+
+[[artifact]]
+os = "linux"
+arch = "x86_64"
+source = { git = "https://github.com/tree-sitter/tree-sitter-python", rev = "293fdc02038ee2bf0e2e206711b69c90ac0d413f" }
+bin = "python"
+
+[[artifact]]
+os = "macos"
+arch = "aarch64"
+source = { git = "https://github.com/tree-sitter/tree-sitter-python", rev = "293fdc02038ee2bf0e2e206711b69c90ac0d413f" }
+bin = "python"

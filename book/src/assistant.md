@@ -12,6 +12,13 @@ args = ["@zed-industries/claude-agent-acp"]
 theme = "default"
 ```
 
+Assistant completion notifications are enabled by default:
+
+```toml
+[editor.assistant]
+notify-on-done = true
+```
+
 Open or connect with `:assistant-open` and `:assistant-connect`. With no arguments, `:assistant-connect` shows configured agents. With arguments, it starts that command directly.
 
 ## Panel Keys
@@ -32,6 +39,8 @@ In message focus:
 | `Esc` | Cancel a pending agent request; interrupt a running agent; otherwise return to input |
 | `Ctrl-c` | Interrupt a running agent |
 | `Ctrl-o` | Open the mode/model/config selector when the agent provides options |
+
+When authentication is required, the panel shows an auth card. Use `j`/`k` to select a method and `Enter` to authenticate; terminal-based auth renders as a live terminal card until the auth process exits.
 
 In input focus, type the prompt and submit normally. If an agent form request is pending, `Tab` and `Shift-Tab` move between fields, text fields accept typed input and backspace, select fields use `h`/`l` or `Space`, and boolean fields toggle with `Space`. `Enter` submits after required fields are filled and `Esc` cancels the request; otherwise `Esc` leaves insert mode.
 

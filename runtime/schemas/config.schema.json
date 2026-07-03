@@ -354,6 +354,13 @@
             "bubble-corners": { "type": "string", "enum": ["rounded", "squared"] }
           }
         },
+        "assistant": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "notify-on-done": { "type": "boolean" }
+          }
+        },
         "editing-engine": { "type": "string", "enum": ["helix", "vim"] }
       }
     },
@@ -469,6 +476,9 @@
         "signature-help-position": { "type": "string", "enum": ["above", "below"] },
         "display-inlay-hints": { "type": "boolean" },
         "inlay-hints-length-limit": { "type": "integer", "minimum": 1, "maximum": 255 },
+        "semantic-tokens": { "type": "boolean" },
+        "inline-completion": { "type": "boolean" },
+        "inline-values": { "type": "boolean" },
         "display-color-swatches": { "type": "boolean" },
         "code-lens": { "type": "boolean" },
         "folding": { "type": "boolean" },

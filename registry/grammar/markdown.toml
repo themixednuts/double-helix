@@ -1,0 +1,26 @@
+name = "markdown"
+kind = "grammar"
+description = "Markdown tree-sitter grammar"
+homepage = "https://github.com/tree-sitter-grammars/tree-sitter-markdown"
+languages = ["markdown"]
+
+[version]
+tag-source = "static:2dfd57f547f06ca5631a80f601e129d73fc8e9f0"
+
+[[artifact]]
+os = "windows"
+arch = "x86_64"
+source = { git = "https://github.com/tree-sitter-grammars/tree-sitter-markdown", rev = "2dfd57f547f06ca5631a80f601e129d73fc8e9f0", subpath = "tree-sitter-markdown" }
+bin = "markdown"
+
+[[artifact]]
+os = "linux"
+arch = "x86_64"
+source = { git = "https://github.com/tree-sitter-grammars/tree-sitter-markdown", rev = "2dfd57f547f06ca5631a80f601e129d73fc8e9f0", subpath = "tree-sitter-markdown" }
+bin = "markdown"
+
+[[artifact]]
+os = "macos"
+arch = "aarch64"
+source = { git = "https://github.com/tree-sitter-grammars/tree-sitter-markdown", rev = "2dfd57f547f06ca5631a80f601e129d73fc8e9f0", subpath = "tree-sitter-markdown" }
+bin = "markdown"

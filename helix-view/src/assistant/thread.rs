@@ -6,7 +6,7 @@ use crate::collab::{FollowState, Location};
 use crate::id::Id as StableId;
 use crate::DocumentId;
 
-use super::{backend, change, config, context, mode, plan, review, terminal, tool};
+use super::{auth, backend, change, config, context, mode, plan, review, terminal, tool};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ThreadKind {}
@@ -78,6 +78,7 @@ pub struct PersistedState {
     pub mode: Option<mode::Set>,
     pub config: config::State,
     pub terminals: Vec<terminal::Terminal>,
+    pub auth: auth::State,
     pub review_mode: review::Mode,
     pub usage: Usage,
     pub commands: Vec<Command>,
@@ -96,6 +97,7 @@ pub struct Thread {
     draft: String,
     context: Vec<context::Item>,
     terminals: Vec<terminal::Terminal>,
+    auth: auth::State,
     review_mode: review::Mode,
     usage: Usage,
     commands: Vec<Command>,
@@ -175,6 +177,7 @@ pub enum Event {
     Mode(mode::Set),
     Config(config::State),
     Terminal(terminal::Event),
+    Auth(auth::Event),
     Run(Run),
     Follow(Location),
     Review(review::Event),
@@ -325,6 +328,7 @@ impl Thread {
             draft: String::new(),
             context: Vec::new(),
             terminals: Vec::new(),
+            auth: auth::State::default(),
             review_mode: review::Mode::Write,
             usage: Usage::default(),
             commands: Vec::new(),
@@ -418,6 +422,14 @@ impl Thread {
         &self.terminals
     }
 
+    pub fn auth(&self) -> &auth::State {
+        &self.auth
+    }
+
+    pub fn auth_mut(&mut self) -> &mut auth::State {
+        &mut self.auth
+    }
+
     pub fn usage(&self) -> &Usage {
         &self.usage
     }
@@ -436,6 +448,10 @@ impl Thread {
 
     pub fn set_terminals(&mut self, terminals: Vec<terminal::Terminal>) {
         self.terminals = terminals;
+    }
+
+    pub fn set_auth(&mut self, auth: auth::State) {
+        self.auth = auth;
     }
 
     #[must_use]
@@ -536,6 +552,7 @@ impl Thread {
         self.mode = state.mode;
         self.config = state.config;
         self.terminals = state.terminals;
+        self.auth = state.auth;
         self.review_mode = state.review_mode;
         self.usage = state.usage;
         self.commands = state.commands;
@@ -670,6 +687,12 @@ impl Thread {
             Event::Mode(mode) => self.set_mode(Some(mode)),
             Event::Config(config) => self.set_config(config),
             Event::Terminal(event) => self.apply_terminal(event),
+            Event::Auth(event) => {
+                let retry = self.auth.apply(event);
+                if let Some(text) = retry {
+                    self.draft = text;
+                }
+            }
             Event::Run(run) => self.set_run(run),
             Event::Review(event) => self.apply_review(event),
             Event::Usage(update) => self.apply_usage(update),

@@ -9,7 +9,7 @@ use helix_core::{
     syntax::config::LanguageServerFeature,
     text_annotations::InlineAnnotation,
     text_folding::{Fold, FoldContainer, FoldObject},
-    Selection, SmallVec, Uri,
+    Selection, SmallVec, Transaction, Uri,
 };
 use helix_lsp::{self, lsp, util::lsp_range_to_range, LanguageServerId};
 use helix_runtime::Token;
@@ -17,7 +17,9 @@ use helix_stdx::rope::RopeSliceExt;
 use helix_view::{
     document::{DocumentInlayHint, DocumentInlayHints, DocumentInlayHintsId, PluginAnnotation},
     document_lsp::{
-        DocumentCodeLens, DocumentCodeLenses, DocumentColorSwatches, DocumentLink, DocumentLinks,
+        decode_semantic_tokens, DocumentCodeLens, DocumentCodeLenses, DocumentColorSwatches,
+        DocumentInlineValues, DocumentLink, DocumentLinks, DocumentSemanticTokens,
+        InlineCompletionGhost,
     },
     handlers::lsp::{SignatureHelpInvoked, SignatureHelpRequestId},
     DocumentId, Editor, Theme, ViewId,
@@ -30,6 +32,8 @@ use crate::runtime::{
 };
 
 const CODE_LENS_PLUGIN_SCOPE: &str = "helix-lsp-code-lens";
+const INLINE_VALUE_LIMIT: usize = 128;
+const SEMANTIC_TOKENS_FULL_LINE_LIMIT: usize = 10_000;
 
 pub(crate) fn request_document_diagnostics_for_language_servers(
     editor: &mut Editor,
@@ -372,6 +376,139 @@ pub(crate) fn request_document_links(
             .await;
         })
         .detach();
+}
+
+fn semantic_result_data(result: lsp::SemanticTokensResult) -> Vec<lsp::SemanticToken> {
+    match result {
+        lsp::SemanticTokensResult::Tokens(tokens) => tokens.data,
+        lsp::SemanticTokensResult::Partial(tokens) => tokens.data,
+    }
+}
+
+fn semantic_range_result_data(result: lsp::SemanticTokensRangeResult) -> Vec<lsp::SemanticToken> {
+    match result {
+        lsp::SemanticTokensRangeResult::Tokens(tokens) => tokens.data,
+        lsp::SemanticTokensRangeResult::Partial(tokens) => tokens.data,
+    }
+}
+
+pub(crate) fn request_semantic_tokens(
+    editor: &mut Editor,
+    doc_id: DocumentId,
+    ingress: crate::runtime::RuntimeIngress,
+) {
+    if !editor.config().lsp.semantic_tokens {
+        return;
+    }
+    let visible_line_window = editor.document(doc_id).and_then(|doc| {
+        editor
+            .tree
+            .views()
+            .filter(|(view, _)| view.doc == doc_id)
+            .max_by_key(|(_, focused)| *focused)
+            .map(|(view, _)| {
+                let offset = doc.view_offset(view.id);
+                let height = view.inner_area(doc).height as usize;
+                (doc.text().char_to_line(offset.anchor), height)
+            })
+    });
+    let Some(doc) = editor.document_mut(doc_id) else {
+        return;
+    };
+    let cancel = doc.restart_semantic_tokens();
+    let version = doc.version();
+    let text = doc.text().clone();
+    let use_range = text.len_lines() > SEMANTIC_TOKENS_FULL_LINE_LIMIT;
+    let range =
+        semantic_tokens_request_range(&text, use_range.then_some(visible_line_window).flatten());
+
+    let mut futures: FuturesOrdered<_> = doc
+        .language_servers()
+        .filter(|language_server| {
+            language_server.supports_semantic_tokens_full()
+                || language_server.supports_semantic_tokens_range()
+        })
+        .filter_map(|language_server| {
+            let server_id = language_server.id();
+            let offset_encoding = language_server.offset_encoding();
+            let legend = language_server.semantic_tokens_legend()?.clone();
+            let request = if use_range && language_server.supports_semantic_tokens_range() {
+                let lsp_range = helix_lsp::util::range_to_lsp_range(&text, range, offset_encoding);
+                let request = language_server.text_document_semantic_tokens_range(
+                    doc.identifier(),
+                    lsp_range,
+                    None,
+                )?;
+                futures_util::future::Either::Left(async move {
+                    request
+                        .await
+                        .map(|result| result.map(semantic_range_result_data).unwrap_or_default())
+                })
+            } else {
+                let request =
+                    language_server.text_document_semantic_tokens_full(doc.identifier(), None)?;
+                futures_util::future::Either::Right(async move {
+                    request
+                        .await
+                        .map(|result| result.map(semantic_result_data).unwrap_or_default())
+                })
+            };
+            let text = text.clone();
+            Some(async move {
+                let data = request.await?;
+                anyhow::Ok((server_id, version, legend, offset_encoding, text, data))
+            })
+        })
+        .collect();
+
+    if futures.is_empty() {
+        return;
+    }
+
+    editor
+        .runtime()
+        .work()
+        .clone()
+        .spawn(async move {
+            while let Some(next) = tokio::select! {
+                _ = cancel.canceled() => return,
+                next = futures.next() => next,
+            } {
+                match next {
+                    Ok((server_id, version, legend, offset_encoding, text, data)) => {
+                        let tokens = decode_semantic_tokens(&text, &legend, offset_encoding, &data);
+                        send_task_event_with(
+                            RuntimeTaskEvent::ApplySemanticTokens {
+                                doc_id,
+                                server_id,
+                                tokens: DocumentSemanticTokens { version, tokens },
+                            },
+                            ingress.clone(),
+                        )
+                        .await;
+                    }
+                    Err(err) => log::error!("semantic tokens request failed: {err}"),
+                }
+            }
+        })
+        .detach();
+}
+
+fn semantic_tokens_request_range(
+    text: &helix_core::Rope,
+    visible_line_window: Option<(usize, usize)>,
+) -> helix_core::Range {
+    let Some((first_line, height)) = visible_line_window else {
+        return helix_core::Range::new(0, text.len_chars());
+    };
+    let first_line = first_line.min(text.len_lines().saturating_sub(1));
+    let end_line = first_line.saturating_add(height).saturating_add(1);
+    let end = if end_line >= text.len_lines() {
+        text.len_chars()
+    } else {
+        text.line_to_char(end_line)
+    };
+    helix_core::Range::new(text.line_to_char(first_line), end)
 }
 
 pub(crate) fn request_folding_ranges(
@@ -825,6 +962,308 @@ pub(crate) fn apply_code_lenses(
     refresh_code_lens_annotations(editor, doc_id);
 }
 
+pub(crate) fn apply_semantic_tokens(
+    editor: &mut Editor,
+    doc_id: DocumentId,
+    server_id: LanguageServerId,
+    tokens: DocumentSemanticTokens,
+) {
+    if !editor.config().lsp.semantic_tokens {
+        return;
+    }
+    let Some(doc) = editor.document_mut(doc_id) else {
+        return;
+    };
+    if doc.version() != tokens.version {
+        return;
+    }
+    doc.set_semantic_tokens(server_id, tokens);
+}
+
+pub(crate) fn apply_inline_completion(
+    editor: &mut Editor,
+    doc_id: DocumentId,
+    completion: InlineCompletionGhost,
+) {
+    if !editor.config().lsp.inline_completion {
+        return;
+    }
+    let Some(doc) = editor.document_mut(doc_id) else {
+        return;
+    };
+    if doc.version() == completion.version {
+        doc.set_inline_completion(completion);
+    }
+}
+
+pub(crate) fn apply_inline_values(
+    editor: &mut Editor,
+    doc_id: DocumentId,
+    values: DocumentInlineValues,
+) {
+    if !editor.config().lsp.inline_values {
+        return;
+    }
+    if let Some(doc) = editor.document_mut(doc_id) {
+        doc.set_inline_values(values);
+    }
+}
+
+pub(crate) fn request_inline_completion(
+    editor: &mut Editor,
+    doc_id: DocumentId,
+    view_id: ViewId,
+    invoked: bool,
+    ingress: crate::runtime::RuntimeIngress,
+) {
+    if !editor.config().lsp.inline_completion || editor.mode() != helix_view::document::Mode::Insert
+    {
+        return;
+    }
+    let Some(doc) = editor.document_mut(doc_id) else {
+        return;
+    };
+    let Some(language_server) = doc
+        .language_servers()
+        .find(|language_server| language_server.supports_inline_completion())
+    else {
+        return;
+    };
+    let cursor = doc
+        .selection(view_id)
+        .primary()
+        .cursor(doc.text().slice(..));
+    let position =
+        helix_lsp::util::pos_to_lsp_pos(doc.text(), cursor, language_server.offset_encoding());
+    let request = language_server.text_document_inline_completion(
+        lsp::TextDocumentPositionParams {
+            text_document: doc.identifier(),
+            position,
+        },
+        lsp::InlineCompletionContext {
+            trigger_kind: if invoked {
+                lsp::InlineCompletionTriggerKind::Invoked
+            } else {
+                lsp::InlineCompletionTriggerKind::Automatic
+            },
+            selected_completion_info: None,
+        },
+        None,
+    );
+    let Some(request) = request else {
+        return;
+    };
+    let version = doc.version();
+    let text = doc.text().clone();
+    let offset_encoding = language_server.offset_encoding();
+    let cancel = doc.restart_inline_completion();
+
+    editor
+        .runtime()
+        .work()
+        .clone()
+        .spawn(async move {
+            let response = tokio::select! {
+                _ = cancel.canceled() => return,
+                response = request => response,
+            };
+            match response {
+                Ok(Some(response)) => {
+                    let item = match response {
+                        lsp::InlineCompletionResponse::Array(items) => items.into_iter().next(),
+                        lsp::InlineCompletionResponse::List(list) => list.items.into_iter().next(),
+                    };
+                    let Some(item) = item else {
+                        return;
+                    };
+                    let first_line = item
+                        .insert_text
+                        .lines()
+                        .next()
+                        .unwrap_or_default()
+                        .to_owned();
+                    if first_line.is_empty() {
+                        return;
+                    }
+                    let replace_range = item
+                        .range
+                        .and_then(|range| lsp_range_to_range(&text, range, offset_encoding));
+                    send_task_event_with(
+                        RuntimeTaskEvent::ApplyInlineCompletion {
+                            doc_id,
+                            completion: InlineCompletionGhost {
+                                view_id,
+                                version,
+                                cursor,
+                                text: item.insert_text,
+                                annotation: InlineAnnotation::new(cursor, first_line),
+                                replace_range,
+                            },
+                        },
+                        ingress,
+                    )
+                    .await;
+                }
+                Ok(None) => {}
+                Err(err) => log::error!("inline completion request failed: {err}"),
+            }
+        })
+        .detach();
+}
+
+pub(crate) fn accept_inline_completion(editor: &mut Editor) -> bool {
+    let (view_id, doc) = focused!(editor);
+    let Some(completion) = doc.inline_completion().cloned() else {
+        return false;
+    };
+    if completion.view_id != view_id || completion.version != doc.version() {
+        doc.clear_inline_completion();
+        return false;
+    }
+    let range = completion
+        .replace_range
+        .unwrap_or_else(|| helix_core::Range::new(completion.cursor, completion.cursor));
+    let transaction = Transaction::change(
+        doc.text(),
+        std::iter::once((range.from(), range.to(), Some(completion.text.into()))),
+    );
+    doc.apply(&transaction, view_id);
+    doc.clear_inline_completion();
+    true
+}
+
+pub(crate) fn request_inline_values(
+    editor: &mut Editor,
+    doc_id: DocumentId,
+    ingress: crate::runtime::RuntimeIngress,
+) {
+    if !editor.config().lsp.inline_values {
+        return;
+    }
+    let Some(frame) = editor.debug_adapters.current_stack_frame().cloned() else {
+        return;
+    };
+    let Some(doc) = editor.document_mut(doc_id) else {
+        return;
+    };
+    let Some(language_server) = doc
+        .language_servers()
+        .find(|language_server| language_server.supports_inline_values())
+    else {
+        return;
+    };
+    let offset_encoding = language_server.offset_encoding();
+    let text = doc.text().clone();
+    let context = inline_value_context(&text, &frame, offset_encoding);
+    let range = helix_lsp::util::range_to_lsp_range(
+        &text,
+        helix_core::Range::new(0, text.len_chars()),
+        offset_encoding,
+    );
+    let request = language_server.text_document_inline_values(
+        doc.identifier(),
+        range,
+        context,
+        None,
+    );
+    let Some(request) = request else {
+        return;
+    };
+    let cancel = doc.restart_inline_values();
+
+    editor
+        .runtime()
+        .work()
+        .clone()
+        .spawn(async move {
+            let values = tokio::select! {
+                _ = cancel.canceled() => return,
+                values = request => values,
+            };
+            match values {
+                Ok(Some(values)) => {
+                    let annotations = inline_value_annotations(&text, offset_encoding, values);
+                    send_task_event_with(
+                        RuntimeTaskEvent::ApplyInlineValues {
+                            doc_id,
+                            values: DocumentInlineValues { annotations },
+                        },
+                        ingress,
+                    )
+                    .await;
+                }
+                Ok(None) => {}
+                Err(err) => log::error!("inline value request failed: {err}"),
+            }
+        })
+        .detach();
+}
+
+fn inline_value_context(
+    text: &helix_core::Rope,
+    frame: &helix_dap::StackFrame,
+    offset_encoding: helix_lsp::OffsetEncoding,
+) -> lsp::InlineValueContext {
+    let start = helix_view::handlers::dap::dap_pos_to_pos(text, frame.line, frame.column)
+        .unwrap_or_else(|| text.line_to_char(frame.line.saturating_sub(1).min(text.len_lines())));
+    let end = frame
+        .end_line
+        .and_then(|line| {
+            helix_view::handlers::dap::dap_pos_to_pos(
+                text,
+                line,
+                frame.end_column.unwrap_or(frame.column),
+            )
+        })
+        .unwrap_or(start);
+    let stopped_location = helix_lsp::util::range_to_lsp_range(
+        text,
+        helix_core::Range::new(start, end),
+        offset_encoding,
+    );
+
+    lsp::InlineValueContext {
+        frame_id: frame.id as i32,
+        stopped_location,
+    }
+}
+
+fn inline_value_annotations(
+    text: &helix_core::Rope,
+    offset_encoding: helix_lsp::OffsetEncoding,
+    values: Vec<lsp::InlineValue>,
+) -> Vec<InlineAnnotation> {
+    values
+        .into_iter()
+        .take(INLINE_VALUE_LIMIT)
+        .filter_map(|value| {
+            let (range, label) = match value {
+                lsp::InlineValue::Text(value) => (value.range, value.text),
+                lsp::InlineValue::VariableLookup(value) => {
+                    let label = value.variable_name.unwrap_or_else(|| {
+                        lsp_range_to_range(text, value.range, offset_encoding)
+                            .map(|range| text.slice(range.from()..range.to()).to_string())
+                            .unwrap_or_default()
+                    });
+                    (value.range, format!(" = {label}"))
+                }
+                lsp::InlineValue::EvaluatableExpression(value) => {
+                    let label = value.expression.unwrap_or_else(|| {
+                        lsp_range_to_range(text, value.range, offset_encoding)
+                            .map(|range| text.slice(range.from()..range.to()).to_string())
+                            .unwrap_or_default()
+                    });
+                    (value.range, format!(" = {label}"))
+                }
+            };
+            let range = lsp_range_to_range(text, range, offset_encoding)?;
+            let line = text.char_to_line(range.to().min(text.len_chars()));
+            let line_end = helix_core::line_ending::line_end_char_index(&text.slice(..), line);
+            (!label.is_empty()).then(|| InlineAnnotation::new(line_end, label))
+        })
+        .collect()
+}
+
 pub(crate) fn apply_document_links(
     editor: &mut Editor,
     doc_id: DocumentId,
@@ -1072,6 +1511,70 @@ mod tests {
         ));
         assert!(should_replace_folds_with_lsp(Some(&non_empty), true));
         assert!(!should_replace_folds_with_lsp(Some(&non_empty), false));
+    }
+
+    #[test]
+    fn semantic_tokens_range_uses_visible_line_window() {
+        let text = Rope::from("zero\none\ntwo\nthree\n");
+        let range = semantic_tokens_request_range(&text, Some((1, 1)));
+
+        assert_eq!(
+            range,
+            helix_core::Range::new(text.line_to_char(1), text.line_to_char(3))
+        );
+        assert_eq!(
+            semantic_tokens_request_range(&text, None),
+            helix_core::Range::new(0, text.len_chars())
+        );
+    }
+
+    #[test]
+    fn inline_value_context_uses_stopped_stack_frame_range() {
+        let text = Rope::from("alpha\nbeta\n");
+        let frame = helix_dap::StackFrame {
+            id: 42,
+            name: "frame".to_string(),
+            source: None,
+            line: 2,
+            column: 2,
+            end_line: Some(2),
+            end_column: Some(4),
+            can_restart: None,
+            instruction_pointer_reference: None,
+            module_id: None,
+            presentation_hint: None,
+        };
+
+        let context = inline_value_context(&text, &frame, helix_lsp::OffsetEncoding::Utf8);
+
+        assert_eq!(context.frame_id, 42);
+        assert_eq!(
+            context.stopped_location,
+            lsp::Range::new(lsp::Position::new(1, 1), lsp::Position::new(1, 3))
+        );
+    }
+
+    #[test]
+    fn inline_value_annotations_render_at_line_end() {
+        let text = Rope::from("let x = 1;\n");
+        let annotations = inline_value_annotations(
+            &text,
+            helix_lsp::OffsetEncoding::Utf8,
+            vec![lsp::InlineValue::VariableLookup(
+                lsp::InlineValueVariableLookup {
+                    range: lsp::Range::new(
+                        lsp::Position::new(0, 4),
+                        lsp::Position::new(0, 5),
+                    ),
+                    variable_name: None,
+                    case_sensitive_lookup: true,
+                },
+            )],
+        );
+
+        assert_eq!(annotations.len(), 1);
+        assert_eq!(annotations[0].char_idx, 10);
+        assert_eq!(&annotations[0].text[..], " = x");
     }
 }
 

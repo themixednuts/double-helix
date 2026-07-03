@@ -18,10 +18,21 @@ const BUILTIN: &[&str] = &[
     include_str!("../../registry/lsp/zls.toml"),
     include_str!("../../registry/lsp/taplo.toml"),
     include_str!("../../registry/lsp/marksman.toml"),
+    include_str!("../../registry/lsp/pyright.toml"),
+    include_str!("../../registry/lsp/basedpyright.toml"),
+    include_str!("../../registry/lsp/typescript-language-server.toml"),
+    include_str!("../../registry/lsp/bash-language-server.toml"),
+    include_str!("../../registry/lsp/yaml-language-server.toml"),
     include_str!("../../registry/lsp/jdtls.toml"),
     include_str!("../../registry/lsp/omnisharp.toml"),
     include_str!("../../registry/dap/codelldb.toml"),
     include_str!("../../registry/dap/netcoredbg.toml"),
+    include_str!("../../registry/dap/debugpy.toml"),
+    include_str!("../../registry/grammar/rust.toml"),
+    include_str!("../../registry/grammar/python.toml"),
+    include_str!("../../registry/grammar/typescript.toml"),
+    include_str!("../../registry/grammar/go.toml"),
+    include_str!("../../registry/grammar/markdown.toml"),
 ];
 
 #[derive(Debug, Clone, Default)]

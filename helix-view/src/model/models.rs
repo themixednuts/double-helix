@@ -201,6 +201,8 @@ pub struct AssistantModel {
 
     /// Terminals associated with the active thread.
     pub terminals: Vec<AssistantTerminal>,
+    /// Authentication state for the active agent.
+    pub auth: crate::assistant::auth::State,
     /// Active thread usage counters/context window data.
     pub usage: crate::assistant::thread::Usage,
     /// Agent commands available for the active thread.

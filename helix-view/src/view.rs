@@ -1108,6 +1108,26 @@ impl View {
         };
         let config = doc.config.load();
 
+        if config.lsp.inline_completion {
+            if let Some(completion) = doc.inline_completion().filter(|completion| {
+                completion.view_id == self.id && completion.version == doc.version()
+            }) {
+                let style = theme.and_then(|t| t.find_highlight("ui.virtual.inline-completion"));
+                text_annotations
+                    .add_inline_annotations(std::slice::from_ref(&completion.annotation), style);
+            }
+        }
+
+        if config.lsp.inline_values {
+            if let Some(values) = doc.inline_values() {
+                let style = theme.and_then(|t| {
+                    t.find_highlight("ui.virtual.inline-value")
+                        .or_else(|| t.find_highlight("ui.virtual"))
+                });
+                text_annotations.add_inline_annotations(&values.annotations, style);
+            }
+        }
+
         if config.lsp.display_color_swatches {
             if let Some(DocumentColorSwatches {
                 color_swatches,

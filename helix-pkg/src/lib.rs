@@ -69,6 +69,13 @@ pub enum Error {
     },
     #[error("system command not found on PATH: {0}")]
     SystemMissing(String),
+    #[error("command failed: {program} {args}\nstdout: {stdout}\nstderr: {stderr}")]
+    CommandFailed {
+        program: String,
+        args: String,
+        stdout: String,
+        stderr: String,
+    },
     #[error("{0}")]
     Message(String),
 }

@@ -19,6 +19,8 @@ pub enum LspFeatureRefreshKind {
     CodeLens,
     DocumentLinks,
     FoldingRanges,
+    SemanticTokens,
+    InlineCompletion,
 }
 
 pub struct LspFeatureRefreshEvent {

@@ -390,6 +390,8 @@ impl MappableCommand {
         keep_selections => "Keep selections matching regex",
         remove_selections => "Remove selections matching regex",
         completion => "Invoke completion popup",
+        inline_completion => "Invoke inline completion",
+        accept_inline_completion => "Accept inline completion",
         hover => "Show docs for item under cursor",
         goto_hover => "Show docs for item under cursor in a new buffer",
         jump_view_right => "Jump to right split",
@@ -3693,6 +3695,24 @@ pub fn completion(cx: &mut Context) {
     cx.editor
         .handlers
         .trigger_completions(cursor, doc.id(), view_id);
+}
+
+pub fn inline_completion(cx: &mut Context) {
+    let (view_id, doc) = focused_ref!(cx.editor);
+    let doc_id = doc.id();
+    crate::effect::language_server::request_inline_completion(
+        cx.editor,
+        doc_id,
+        view_id,
+        true,
+        cx.ingress.clone(),
+    );
+}
+
+pub fn accept_inline_completion(cx: &mut Context) {
+    if !crate::effect::language_server::accept_inline_completion(cx.editor) {
+        cx.editor.set_error("No inline completion to accept");
+    }
 }
 
 fn save_selection(cx: &mut Context) {

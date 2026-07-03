@@ -8,7 +8,7 @@ use helix_acp::client::{AgentConfig, IncomingReceiver};
 use helix_acp::types as acp;
 use helix_acp::AcpAgent;
 
-use super::super::{backend, host, permission, review, thread};
+use super::super::{auth, backend, host, permission, review, thread};
 use super::{translate, Session};
 
 pub struct Driver {
@@ -61,6 +61,7 @@ impl backend::Driver for Driver {
         let host_loop = host.clone();
         let connect_loop = connect.clone();
         let client_info = self.client_info.clone();
+        let auth_command = self.config.command.clone();
         let backend_loop = backend_id.clone();
         let work = runtime.work().clone();
         runtime
@@ -75,6 +76,7 @@ impl backend::Driver for Driver {
                         host: host_loop,
                         connect: connect_loop,
                         client_info,
+                        auth_command,
                     },
                     &mut handle_rx,
                     &mut incoming,
@@ -96,6 +98,8 @@ struct State {
     staged: HashMap<thread::Id, HashMap<PathBuf, review::File>>,
     rules: permission::Rules,
     caps: helix_acp::AgentCaps,
+    auth_methods: Vec<auth::Method>,
+    pending_auth: Option<backend::Command>,
 }
 
 struct PendingPermission {
@@ -111,7 +115,7 @@ struct PendingElicitation {
 }
 
 impl State {
-    fn new(caps: helix_acp::AgentCaps) -> Self {
+    fn new(caps: helix_acp::AgentCaps, auth_methods: Vec<auth::Method>) -> Self {
         Self {
             sessions: HashMap::new(),
             terminals: HashMap::new(),
@@ -121,6 +125,8 @@ impl State {
             staged: HashMap::new(),
             rules: permission::Rules::load(),
             caps,
+            auth_methods,
+            pending_auth: None,
         }
     }
 
@@ -220,6 +226,154 @@ fn elicitation_value(value: thread::ElicitationValue) -> acp::ElicitationContent
     }
 }
 
+fn auth_methods(init: &acp::InitializeResponse, default_command: &str) -> Vec<auth::Method> {
+    init.auth_methods
+        .iter()
+        .map(|method| auth::Method {
+            id: method.id().to_string(),
+            name: method.name().to_string(),
+            terminal: terminal_auth(method, default_command),
+        })
+        .collect()
+}
+
+fn terminal_auth(method: &acp::AuthMethod, default_command: &str) -> Option<auth::Terminal> {
+    if let Some(meta) = method.meta() {
+        if let Some(value) = meta
+            .get("terminal-auth")
+            .or_else(|| meta.get("terminal_auth"))
+        {
+            let command = value
+                .get("command")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(default_command)
+                .to_string();
+            let args = value
+                .get("args")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_string)
+                .collect();
+            let env = value
+                .get("env")
+                .and_then(serde_json::Value::as_object)
+                .into_iter()
+                .flatten()
+                .filter_map(|(key, value)| {
+                    value
+                        .as_str()
+                        .map(|value| (key.to_string(), value.to_string()))
+                })
+                .collect();
+            return Some(auth::Terminal { command, args, env });
+        }
+    }
+
+    match method {
+        acp::AuthMethod::Terminal(term) => Some(auth::Terminal {
+            command: default_command.to_string(),
+            args: term.args.clone(),
+            env: term
+                .env
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+        }),
+        _ => None,
+    }
+}
+
+fn is_auth_required(err: &helix_acp::Error) -> bool {
+    matches!(
+        err,
+        helix_acp::Error::AgentError(error)
+            if matches!(error.code, helix_acp::jsonrpc::ErrorCode::ServerError(-32000))
+    )
+}
+
+async fn send_auth_required(
+    tx: &helix_runtime::Sender<backend::Update>,
+    thread: thread::Id,
+    methods: &[auth::Method],
+    pending_prompt: Option<String>,
+    error: Option<String>,
+) {
+    let _ = tx
+        .send(backend::Update::Auth {
+            thread,
+            event: auth::Event::Required {
+                methods: methods.to_vec(),
+                pending_prompt,
+                error,
+            },
+        })
+        .await;
+}
+
+async fn run_terminal_auth(
+    host: &host::Set,
+    tx: &helix_runtime::Sender<backend::Update>,
+    thread: thread::Id,
+    method: &auth::Method,
+    terminal: &auth::Terminal,
+) -> Result<(), helix_acp::Error> {
+    let Some(host_terminal) = &host.terminal else {
+        return Err(helix_acp::Error::Other(anyhow::anyhow!(
+            "terminal host unavailable"
+        )));
+    };
+    let host_id = host_terminal
+        .create(host::CreateTerminal {
+            command: terminal.command.clone().into(),
+            args: terminal.args.clone(),
+            cwd: std::env::current_dir().ok(),
+            env: terminal
+                .env
+                .iter()
+                .map(|(key, value)| host::Env {
+                    key: key.clone(),
+                    value: value.clone(),
+                })
+                .collect(),
+        })
+        .await
+        .map_err(|err| helix_acp::Error::Other(anyhow::anyhow!(err.to_string())))?;
+    let terminal_id = super::super::terminal::Id::new(host_id.to_string());
+    let _ = tx
+        .send(backend::Update::Terminal {
+            thread,
+            event: super::super::terminal::Event::Open(super::super::terminal::Terminal {
+                id: terminal_id.clone(),
+                title: Some(method.name.clone()),
+                state: super::super::terminal::State::Running,
+                output: String::new(),
+            }),
+        })
+        .await;
+    let status = host_terminal
+        .wait(&host_id)
+        .await
+        .map_err(|err| helix_acp::Error::Other(anyhow::anyhow!(err.to_string())))?;
+    let state = match status {
+        host::ExitStatus::Code(code) => super::super::terminal::State::Exited { code },
+        host::ExitStatus::Other => super::super::terminal::State::Failed {
+            message: "terminal exited without status".to_string(),
+        },
+    };
+    let _ = tx
+        .send(backend::Update::Terminal {
+            thread,
+            event: super::super::terminal::Event::Exit {
+                id: terminal_id,
+                state,
+            },
+        })
+        .await;
+    Ok(())
+}
+
 struct RunAgent {
     backend_id: backend::Id,
     work: helix_runtime::Work,
@@ -228,6 +382,7 @@ struct RunAgent {
     host: host::Set,
     connect: backend::Connect,
     client_info: acp::Implementation,
+    auth_command: String,
 }
 
 async fn run_agent(
@@ -243,6 +398,7 @@ async fn run_agent(
         host,
         connect,
         client_info,
+        auth_command,
     } = runner;
 
     let init = agent
@@ -250,19 +406,20 @@ async fn run_agent(
         .await
         .map(|response| {
             let acp_caps = helix_acp::agent_caps(&response);
+            let auth_methods = auth_methods(&response, &auth_command);
             let caps = translate::caps(&response, &connect);
-            (caps, acp_caps)
+            (caps, acp_caps, auth_methods)
         });
 
-    let acp_caps = match init {
-        Ok((caps, acp_caps)) => {
+    let (acp_caps, auth_methods) = match init {
+        Ok((caps, acp_caps, auth_methods)) => {
             let _ = tx
                 .send(backend::Update::Backend {
                     backend: backend_id.clone(),
                     event: backend::Event::Ready { caps },
                 })
                 .await;
-            acp_caps
+            (acp_caps, auth_methods)
         }
         Err(err) => {
             let _ = tx
@@ -275,7 +432,7 @@ async fn run_agent(
         }
     };
 
-    let mut state = State::new(acp_caps);
+    let mut state = State::new(acp_caps, auth_methods);
 
     loop {
         tokio::select! {
@@ -315,68 +472,75 @@ async fn handle_command(
     work: &helix_runtime::Work,
     agent: &Arc<AcpAgent>,
     tx: &helix_runtime::Sender<backend::Update>,
-    _host: &host::Set,
+    host: &host::Set,
     state: &mut State,
     cmd: backend::Command,
 ) {
     match cmd {
-        backend::Command::NewThread { thread, scope } => match agent.new_session(scope.cwd).await {
-            Ok(resp) => {
-                let session = Session::new(resp.session_id.to_string());
-                state.sessions.insert(thread, session.clone());
-                let _ = tx
-                    .send(backend::Update::Backend {
-                        backend: backend_id.clone(),
-                        event: backend::Event::Bound {
-                            thread,
-                            remote: (&session).into(),
-                        },
-                    })
-                    .await;
-                let _ = tx
-                    .send(backend::Update::Thread {
-                        thread,
-                        event: thread::Event::Caps(state.caps.clone()),
-                    })
-                    .await;
-                if let Some(modes) = resp.modes.as_ref() {
-                    if let Ok(mode_set) = translate::mode_set(modes) {
-                        let _ = tx
-                            .send(backend::Update::Thread {
+        backend::Command::NewThread { thread, scope } => {
+            match agent.new_session(scope.cwd.clone()).await {
+                Ok(resp) => {
+                    let session = Session::new(resp.session_id.to_string());
+                    state.sessions.insert(thread, session.clone());
+                    let _ = tx
+                        .send(backend::Update::Backend {
+                            backend: backend_id.clone(),
+                            event: backend::Event::Bound {
                                 thread,
-                                event: thread::Event::Mode(mode_set),
-                            })
-                            .await;
-                    }
-                }
-                if let Some(config) = resp
-                    .config_options
-                    .as_ref()
-                    .and_then(|items| translate::config_state(items).ok())
-                {
+                                remote: (&session).into(),
+                            },
+                        })
+                        .await;
                     let _ = tx
                         .send(backend::Update::Thread {
                             thread,
-                            event: thread::Event::Config(config),
+                            event: thread::Event::Caps(state.caps.clone()),
+                        })
+                        .await;
+                    if let Some(modes) = resp.modes.as_ref() {
+                        if let Ok(mode_set) = translate::mode_set(modes) {
+                            let _ = tx
+                                .send(backend::Update::Thread {
+                                    thread,
+                                    event: thread::Event::Mode(mode_set),
+                                })
+                                .await;
+                        }
+                    }
+                    if let Some(config) = resp
+                        .config_options
+                        .as_ref()
+                        .and_then(|items| translate::config_state(items).ok())
+                    {
+                        let _ = tx
+                            .send(backend::Update::Thread {
+                                thread,
+                                event: thread::Event::Config(config),
+                            })
+                            .await;
+                    }
+                    let _ = tx
+                        .send(backend::Update::Thread {
+                            thread,
+                            event: thread::Event::Run(thread::Run::Idle),
                         })
                         .await;
                 }
-                let _ = tx
-                    .send(backend::Update::Thread {
-                        thread,
-                        event: thread::Event::Run(thread::Run::Idle),
-                    })
-                    .await;
+                Err(err) => {
+                    if is_auth_required(&err) && !state.auth_methods.is_empty() {
+                        state.pending_auth = Some(backend::Command::NewThread { thread, scope });
+                        send_auth_required(tx, thread, &state.auth_methods, None, None).await;
+                        return;
+                    }
+                    let _ = tx
+                        .send(backend::Update::Error {
+                            at: backend::Target::Thread(thread),
+                            error: backend::Error::Other(anyhow::anyhow!(err.to_string())),
+                        })
+                        .await;
+                }
             }
-            Err(err) => {
-                let _ = tx
-                    .send(backend::Update::Error {
-                        at: backend::Target::Thread(thread),
-                        error: backend::Error::Other(anyhow::anyhow!(err.to_string())),
-                    })
-                    .await;
-            }
-        },
+        }
         backend::Command::LoadThread { thread, remote } => {
             match agent.load_session(remote.to_string().into()).await {
                 Ok(resp) => {
@@ -456,6 +620,11 @@ async fn handle_command(
                 .await;
             let tx2 = tx.clone();
             let agent = agent.clone();
+            let auth_methods = state.auth_methods.clone();
+            state.pending_auth = Some(backend::Command::Submit {
+                thread,
+                prompt: prompt.clone(),
+            });
             work.spawn(async move {
                 let result = agent
                     .prompt(
@@ -472,6 +641,14 @@ async fn handle_command(
                     Ok(_) => backend::Update::Thread {
                         thread,
                         event: thread::Event::Run(thread::Run::Idle),
+                    },
+                    Err(err) if is_auth_required(&err) => backend::Update::Auth {
+                        thread,
+                        event: auth::Event::Required {
+                            methods: auth_methods,
+                            pending_prompt: None,
+                            error: Some(err.to_string()),
+                        },
                     },
                     Err(err) => backend::Update::Error {
                         at: backend::Target::Thread(thread),
@@ -590,6 +767,71 @@ async fn handle_command(
                         )),
                     })
                     .await;
+            }
+        }
+        backend::Command::Authenticate { thread, method } => {
+            let Some(auth_method) = state
+                .auth_methods
+                .iter()
+                .find(|item| item.id == method)
+                .cloned()
+            else {
+                let _ = tx
+                    .send(backend::Update::Auth {
+                        thread,
+                        event: auth::Event::Failed {
+                            methods: state.auth_methods.clone(),
+                            error: "unknown authentication method".to_string(),
+                        },
+                    })
+                    .await;
+                return;
+            };
+
+            let _ = tx
+                .send(backend::Update::Auth {
+                    thread,
+                    event: auth::Event::Authenticating {
+                        method: auth_method.clone(),
+                    },
+                })
+                .await;
+
+            let result = if let Some(terminal) = &auth_method.terminal {
+                match run_terminal_auth(host, tx, thread, &auth_method, terminal).await {
+                    Ok(()) => agent.authenticate(method.clone()).await.map(|_| ()),
+                    Err(err) => Err(err),
+                }
+            } else {
+                agent.authenticate(method.clone()).await.map(|_| ())
+            };
+
+            match result {
+                Ok(()) => {
+                    let _ = tx
+                        .send(backend::Update::Auth {
+                            thread,
+                            event: auth::Event::Succeeded,
+                        })
+                        .await;
+                    if let Some(pending) = state.pending_auth.take() {
+                        Box::pin(handle_command(
+                            backend_id, work, agent, tx, host, state, pending,
+                        ))
+                        .await;
+                    }
+                }
+                Err(err) => {
+                    let _ = tx
+                        .send(backend::Update::Auth {
+                            thread,
+                            event: auth::Event::Failed {
+                                methods: state.auth_methods.clone(),
+                                error: err.to_string(),
+                            },
+                        })
+                        .await;
+                }
             }
         }
         backend::Command::ResolvePermission {
@@ -726,6 +968,18 @@ async fn handle_command(
             state.terminals.retain(|_, (owner, _)| *owner != thread);
             state.review_modes.remove(&thread);
             state.staged.remove(&thread);
+        }
+        backend::Command::DeleteThread { remote } => {
+            if state.caps.delete_session {
+                if let Err(err) = agent.delete_session(remote.to_string().into()).await {
+                    let _ = tx
+                        .send(backend::Update::Error {
+                            at: backend::Target::Backend(backend_id.clone()),
+                            error: backend::Error::Other(anyhow::anyhow!(err.to_string())),
+                        })
+                        .await;
+                }
+            }
         }
     }
 }
@@ -1359,7 +1613,7 @@ mod tests {
 
     #[test]
     fn staged_overlay_reads_through_until_resolved() {
-        let mut state = State::new(helix_acp::AgentCaps::default());
+        let mut state = State::new(helix_acp::AgentCaps::default(), Vec::new());
         let thread = thread::Id::new(NonZeroU64::new(1).unwrap());
         let path = std::path::PathBuf::from("file.rs");
         state.stage(

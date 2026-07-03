@@ -96,6 +96,8 @@ pub struct LockedPackage {
     pub name: String,
     pub kind: PkgKind,
     pub version: String,
+    #[serde(default)]
+    pub previous_version: Option<String>,
     pub source: String,
     pub url: String,
     pub sha256: String,
@@ -126,6 +128,7 @@ mod tests {
             name: "rust-analyzer".to_owned(),
             kind: PkgKind::Lsp,
             version: "1".to_owned(),
+            previous_version: None,
             source: "archive".to_owned(),
             url: "file:///tmp/ra.zip".to_owned(),
             sha256: "00".to_owned(),

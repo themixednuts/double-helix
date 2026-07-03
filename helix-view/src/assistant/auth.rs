@@ -2,6 +2,31 @@
 pub struct Method {
     pub id: String,
     pub name: String,
+    pub terminal: Option<Terminal>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Terminal {
+    pub command: String,
+    pub args: Vec<String>,
+    pub env: Vec<(String, String)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Event {
+    Required {
+        methods: Vec<Method>,
+        pending_prompt: Option<String>,
+        error: Option<String>,
+    },
+    Authenticating {
+        method: Method,
+    },
+    Succeeded,
+    Failed {
+        methods: Vec<Method>,
+        error: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -107,6 +132,41 @@ impl State {
             error,
         };
     }
+
+    pub fn apply(&mut self, event: Event) -> Option<String> {
+        match event {
+            Event::Required {
+                methods,
+                pending_prompt,
+                error,
+            } => {
+                *self = Self::Required {
+                    methods,
+                    pending_prompt,
+                    error,
+                };
+                None
+            }
+            Event::Authenticating { method } => {
+                let pending_prompt = match self {
+                    Self::Required { pending_prompt, .. } | Self::Failed { pending_prompt, .. } => {
+                        pending_prompt.clone()
+                    }
+                    _ => None,
+                };
+                *self = Self::Authenticating {
+                    method,
+                    pending_prompt,
+                };
+                None
+            }
+            Event::Succeeded => self.succeed(),
+            Event::Failed { methods, error } => {
+                self.fail(methods, error);
+                None
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -117,6 +177,7 @@ mod tests {
         Method {
             id: "browser".to_string(),
             name: "Browser".to_string(),
+            terminal: None,
         }
     }
 

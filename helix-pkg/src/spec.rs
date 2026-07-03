@@ -99,6 +99,7 @@ pub struct Artifact {
     pub os: String,
     pub arch: String,
     pub source: Source,
+    #[serde(default)]
     pub bin: String,
 }
 
@@ -116,9 +117,29 @@ pub struct Source {
     #[serde(default)]
     pub archive: Option<String>,
     #[serde(default)]
+    pub npm: Option<String>,
+    #[serde(default)]
+    pub pip: Option<String>,
+    #[serde(default)]
+    pub cargo: Option<String>,
+    #[serde(default)]
+    pub go: Option<String>,
+    #[serde(default)]
+    pub git: Option<String>,
+    #[serde(default)]
     pub system: Option<String>,
     #[serde(default)]
     pub asset: Option<String>,
+    #[serde(default)]
+    pub rev: Option<String>,
+    #[serde(default)]
+    pub subpath: Option<String>,
+    #[serde(default)]
+    pub bin: Option<String>,
+    #[serde(default, rename = "bin-js")]
+    pub bin_js: Option<String>,
+    #[serde(default)]
+    pub features: Vec<String>,
     #[serde(default)]
     pub sha256: Option<String>,
 }
@@ -129,6 +150,16 @@ impl Source {
             "github-release"
         } else if self.archive.is_some() {
             "archive"
+        } else if self.npm.is_some() {
+            "npm"
+        } else if self.pip.is_some() {
+            "pip"
+        } else if self.cargo.is_some() {
+            "cargo"
+        } else if self.go.is_some() {
+            "go"
+        } else if self.git.is_some() {
+            "git"
         } else if self.system.is_some() {
             "system"
         } else {
@@ -139,6 +170,11 @@ impl Source {
     pub fn validate(&self, package: &str) -> Result<()> {
         let count = self.github_release.is_some() as usize
             + self.archive.is_some() as usize
+            + self.npm.is_some() as usize
+            + self.pip.is_some() as usize
+            + self.cargo.is_some() as usize
+            + self.go.is_some() as usize
+            + self.git.is_some() as usize
             + self.system.is_some() as usize;
         if count != 1 {
             return Err(Error::InvalidPackage {
@@ -150,6 +186,18 @@ impl Source {
             return Err(Error::InvalidPackage {
                 name: package.to_owned(),
                 message: "github-release source requires an asset".to_owned(),
+            });
+        }
+        if self.git.is_some() && self.rev.is_none() {
+            return Err(Error::InvalidPackage {
+                name: package.to_owned(),
+                message: "git source requires a rev".to_owned(),
+            });
+        }
+        if self.npm.is_some() && self.bin.is_some() && self.bin_js.is_some() {
+            return Err(Error::InvalidPackage {
+                name: package.to_owned(),
+                message: "npm source accepts either bin or bin-js, not both".to_owned(),
             });
         }
         Ok(())

@@ -2424,6 +2424,7 @@ dependencies = [
  "assert_fs",
  "etcetera",
  "flate2",
+ "helix-loader",
  "serde",
  "serde_json",
  "sha2",

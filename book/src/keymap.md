@@ -416,6 +416,8 @@ escaping from insert mode to normal mode.
 | `Escape`                                    | Switch to normal mode       | `normal_mode`            |
 | `Ctrl-s`                                    | Commit undo checkpoint      | `commit_undo_checkpoint` |
 | `Ctrl-x`                                    | Autocomplete                | `completion`             |
+| `Alt-y`                                     | Invoke inline completion    | `inline_completion`      |
+| `Ctrl-y`                                    | Accept inline completion    | `accept_inline_completion` |
 | `Ctrl-r`                                    | Insert a register content   | `insert_register`        |
 | `Ctrl-w`, `Alt-Backspace`                   | Delete previous word        | `delete_word_backward`   |
 | `Alt-d`, `Alt-Delete`                       | Delete next word            | `delete_word_forward`    |

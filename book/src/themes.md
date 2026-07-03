@@ -274,6 +274,38 @@ See also [#2380]
     - `conflict` - merge conflicts
     - `gutter` - gutter indicator
 
+#### LSP semantic tokens
+
+When [`editor.lsp.semantic-tokens`](./editor.md#editorlsp-section) is enabled,
+semantic token styles are merged above tree-sitter syntax highlighting and
+below editor UI overlays.
+
+For each LSP semantic token, Helix looks up theme scopes in this order:
+
+1. `semantic.<type>.<modifier>` for each modifier reported by the server.
+2. `semantic.<type>`.
+3. A built-in fallback scope, when one is known.
+
+Unknown semantic token types without a matching `semantic.*` scope fall through
+to the existing tree-sitter highlight.
+
+| LSP token type | Fallback scope |
+| --- | --- |
+| `namespace` | `namespace` |
+| `type`, `class`, `enum`, `interface`, `struct`, `typeParameter` | `type` |
+| `parameter` | `variable.parameter` |
+| `variable` | `variable` |
+| `property`, `enumMember` | `variable.other.member` |
+| `function`, `method` | `function` |
+| `macro` | `function.macro` |
+| `keyword`, `modifier` | `keyword` |
+| `comment` | `comment` |
+| `string` | `string` |
+| `number` | `constant.numeric` |
+| `regexp` | `string.regexp` |
+| `operator` | `operator` |
+| `decorator` | `attribute` |
+
 #### Interface
 
 These scopes are used for theming the editor interface:
@@ -339,6 +371,8 @@ These scopes are used for theming the editor interface:
 | `ui.virtual.inlay-hint`           | Default style for inlay hints of all kinds                                                     |
 | `ui.virtual.inlay-hint.parameter` | Style for inlay hints of kind `parameter` (language servers are not required to set a kind)    |
 | `ui.virtual.inlay-hint.type`      | Style for inlay hints of kind `type` (language servers are not required to set a kind)         |
+| `ui.virtual.inline-completion`    | Style for LSP inline completion ghost text                                                     |
+| `ui.virtual.inline-value`         | Style for LSP inline values while debugging                                                    |
 | `ui.virtual.wrap`                 | Soft-wrap indicator (see the [`editor.soft-wrap` config][editor-section])                      |
 | `ui.virtual.jump-label`           | Style for virtual jump labels                                                                  |
 | `ui.virtual.inline-blame`         | Inline blame indicator (see the [`editor.inline-blame` config][editor-section])                |

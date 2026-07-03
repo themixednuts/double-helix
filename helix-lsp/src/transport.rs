@@ -11,7 +11,10 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::{
-    io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter},
+    io::{
+        AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
+        BufWriter,
+    },
     process::{ChildStderr, ChildStdin, ChildStdout},
     sync::{Mutex, Notify},
 };
@@ -21,6 +24,9 @@ pub enum Payload {
     Request {
         chan: Sender<Result<Value>>,
         value: jsonrpc::MethodCall,
+    },
+    CancelRequest {
+        id: jsonrpc::Id,
     },
     Notification(jsonrpc::Notification),
     Response(jsonrpc::Output),
@@ -155,11 +161,14 @@ impl Transport {
         Ok(())
     }
 
-    async fn send_payload_to_server(
+    async fn send_payload_to_server<W>(
         &self,
-        server_stdin: &mut BufWriter<ChildStdin>,
+        server_stdin: &mut BufWriter<W>,
         payload: Payload,
-    ) -> Result<()> {
+    ) -> Result<()>
+    where
+        W: AsyncWrite + Unpin + Send,
+    {
         //TODO: reuse string
         let json = match payload {
             Payload::Request { chan, value } => {
@@ -169,6 +178,28 @@ impl Transport {
                     .insert(value.id.clone(), chan);
                 serde_json::to_string(&value)?
             }
+            Payload::CancelRequest { id } => {
+                if self.pending_requests.lock().await.remove(&id).is_none() {
+                    log::trace!(
+                        "Skipping cancel for language server request that is no longer pending (id={:?})",
+                        id
+                    );
+                    return Ok(());
+                }
+                let notification = jsonrpc::Notification {
+                    jsonrpc: Some(jsonrpc::Version::V2),
+                    method: lsp::notification::Cancel::METHOD.to_string(),
+                    params: jsonrpc::Params::Map(
+                        serde_json::to_value(lsp::CancelParams {
+                            id: jsonrpc_id_to_lsp_id(&id),
+                        })?
+                        .as_object()
+                        .cloned()
+                        .context("cancel params must serialize to an object")?,
+                    ),
+                };
+                serde_json::to_string(&notification)?
+            }
             Payload::Notification(value) => serde_json::to_string(&value)?,
             Payload::Response(error) => serde_json::to_string(&error)?,
         };
@@ -176,12 +207,15 @@ impl Transport {
             .await
     }
 
-    async fn send_string_to_server(
+    async fn send_string_to_server<W>(
         &self,
-        server_stdin: &mut BufWriter<ChildStdin>,
+        server_stdin: &mut BufWriter<W>,
         request: String,
         language_server_name: &str,
-    ) -> Result<()> {
+    ) -> Result<()>
+    where
+        W: AsyncWrite + Unpin + Send,
+    {
         info!("{language_server_name} -> {request}");
 
         // send the headers
@@ -226,13 +260,13 @@ impl Transport {
     ) -> Result<()> {
         let (id, result) = match output {
             jsonrpc::Output::Success(jsonrpc::Success { id, result, .. }) => (id, Ok(result)),
-            jsonrpc::Output::Failure(jsonrpc::Failure { id, error, .. }) => {
-                error!("{language_server_name} <- {error}");
-                (id, Err(error.into()))
-            }
+            jsonrpc::Output::Failure(jsonrpc::Failure { id, error, .. }) => (id, Err(error.into())),
         };
 
         if let Some(tx) = self.pending_requests.lock().await.remove(&id) {
+            if let Err(error) = &result {
+                error!("{language_server_name} <- {error}");
+            }
             match tx.send(result).await {
                 Ok(_) => (),
                 Err(_) => error!(
@@ -241,8 +275,8 @@ impl Transport {
                 ),
             };
         } else {
-            log::error!(
-                "Discarding Language Server response without a request (id={:?}) {:?}",
+            log::trace!(
+                "Discarding Language Server response without a pending request (id={:?}) {:?}",
                 id,
                 result
             );
@@ -406,6 +440,25 @@ impl Transport {
                 }
                 msg = client_rx.recv() => {
                     if let Some(msg) = msg {
+                        if let Payload::CancelRequest { id } = &msg {
+                            pending_messages.retain(|payload| {
+                                !matches!(
+                                    payload,
+                                    Payload::Request {
+                                        value: jsonrpc::MethodCall { id: pending_id, .. },
+                                        ..
+                                    } if pending_id == id
+                                )
+                            });
+                            match transport.send_payload_to_server(&mut server_stdin, msg).await {
+                                Ok(_) => {}
+                                Err(err) => {
+                                    error!("{} err: <- {err:?}", transport.name);
+                                }
+                            }
+                            continue;
+                        }
+
                         if is_pending && is_shutdown(&msg) {
                             log::info!("Language server not initialized, shutting down");
                             break;
@@ -432,5 +485,74 @@ impl Transport {
                 }
             }
         }
+    }
+}
+
+fn jsonrpc_id_to_lsp_id(id: &jsonrpc::Id) -> lsp::NumberOrString {
+    match id {
+        jsonrpc::Id::Num(id) => i32::try_from(*id)
+            .map(lsp::NumberOrString::Number)
+            .unwrap_or_else(|_| lsp::NumberOrString::String(id.to_string())),
+        jsonrpc::Id::Str(id) => lsp::NumberOrString::String(id.clone()),
+        jsonrpc::Id::Null => lsp::NumberOrString::String("null".to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::jsonrpc::{Output, Success, Version};
+    use tokio::io::{duplex, AsyncReadExt};
+
+    #[tokio::test]
+    async fn cancel_request_removes_pending_and_sends_cancel_once() {
+        let transport = Transport {
+            id: Default::default(),
+            name: "test".to_string(),
+            pending_requests: Mutex::new(HashMap::default()),
+        };
+        let id = jsonrpc::Id::Num(7);
+        let (tx, _rx) = channel(1);
+        transport
+            .pending_requests
+            .lock()
+            .await
+            .insert(id.clone(), tx);
+
+        let (client, mut server) = duplex(1024);
+        let mut writer = BufWriter::new(client);
+        transport
+            .send_payload_to_server(&mut writer, Payload::CancelRequest { id: id.clone() })
+            .await
+            .unwrap();
+        transport
+            .send_payload_to_server(&mut writer, Payload::CancelRequest { id })
+            .await
+            .unwrap();
+        drop(writer);
+
+        let mut out = String::new();
+        server.read_to_string(&mut out).await.unwrap();
+        assert_eq!(out.matches("\"method\":\"$/cancelRequest\"").count(), 1);
+        assert!(transport.pending_requests.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn late_response_after_cancel_is_ignored() {
+        let transport = Transport {
+            id: Default::default(),
+            name: "test".to_string(),
+            pending_requests: Mutex::new(HashMap::default()),
+        };
+        let output = Output::Success(Success {
+            jsonrpc: Some(Version::V2),
+            id: jsonrpc::Id::Num(7),
+            result: Value::Null,
+        });
+
+        transport
+            .process_request_response(output, "test")
+            .await
+            .unwrap();
     }
 }

@@ -34,7 +34,7 @@ use std::{path::Path, process::Stdio};
 use tokio::{
     io::{BufReader, BufWriter},
     process::{Child, Command},
-    sync::{Notify, OnceCell},
+    sync::{Mutex as AsyncMutex, Notify, OnceCell},
 };
 
 fn workspace_for_uri(uri: lsp::Url) -> WorkspaceFolder {
@@ -58,10 +58,60 @@ fn file_operation_uri(path: &Path, is_dir: bool) -> Option<String> {
 }
 
 #[derive(Debug)]
+struct CancelOnDrop {
+    server_tx: Sender<Payload>,
+    id: jsonrpc::Id,
+    armed: bool,
+}
+
+impl CancelOnDrop {
+    fn new(server_tx: Sender<Payload>, id: jsonrpc::Id) -> Self {
+        Self {
+            server_tx,
+            id,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        if self.armed {
+            send_blocking(
+                &self.server_tx,
+                Payload::CancelRequest {
+                    id: self.id.clone(),
+                },
+            );
+        }
+    }
+}
+
+fn client_locale() -> Option<String> {
+    ["LC_ALL", "LC_MESSAGES", "LANG"]
+        .into_iter()
+        .filter_map(|key| std::env::var(key).ok())
+        .filter_map(|locale| normalize_locale(&locale))
+        .next()
+}
+
+fn normalize_locale(locale: &str) -> Option<String> {
+    let locale = locale.split(['.', '@']).next().unwrap_or(locale);
+    if locale.is_empty() || matches!(locale, "C" | "POSIX") {
+        return None;
+    }
+    Some(locale.replace('_', "-"))
+}
+
+#[derive(Debug)]
 pub struct Client {
     id: LanguageServerId,
     name: String,
-    _process: Child,
+    process: AsyncMutex<Child>,
     server_tx: Sender<Payload>,
     request_counter: AtomicU64,
     pub(crate) capabilities: OnceCell<lsp::ServerCapabilities>,
@@ -254,7 +304,7 @@ impl Client {
         let client = Self {
             id,
             name,
-            _process: process,
+            process: AsyncMutex::new(process),
             server_tx,
             request_counter: AtomicU64::new(0),
             capabilities: OnceCell::new(),
@@ -554,12 +604,14 @@ impl Client {
                 })
                 .await
                 .map_err(|e| Error::Other(e.into()))?;
+            let mut cancel_on_drop = CancelOnDrop::new(server_tx, id.clone());
             // TODO: delay other calls until initialize success
-            timeout(Duration::from_secs(timeout_secs), rx.recv())
+            let response = timeout(Duration::from_secs(timeout_secs), rx.recv())
                 .await
                 .map_err(|_| Error::Timeout(id))? // return Timeout
-                .ok_or(Error::StreamClosed)?
-                .and_then(|value| serde_json::from_value(value).map_err(Into::into))
+                .ok_or(Error::StreamClosed)?;
+            cancel_on_drop.disarm();
+            response.and_then(|value| serde_json::from_value(value).map_err(Into::into))
         }
     }
 
@@ -653,7 +705,7 @@ impl Client {
                         dynamic_registration: Some(false),
                     }),
                     inlay_hint: Some(lsp::InlayHintWorkspaceClientCapabilities {
-                        refresh_support: Some(false),
+                        refresh_support: Some(true),
                     }),
                     semantic_tokens: Some(lsp::SemanticTokensWorkspaceClientCapabilities {
                         refresh_support: Some(true),
@@ -701,9 +753,11 @@ impl Client {
                                     String::from("documentation"),
                                     String::from("detail"),
                                     String::from("additionalTextEdits"),
+                                    String::from("commitCharacters"),
                                 ],
                             }),
                             insert_replace_support: Some(true),
+                            label_details_support: Some(true),
                             deprecated_support: Some(true),
                             tag_support: Some(lsp::TagSupport {
                                 value_set: vec![lsp::CompletionItemTag::DEPRECATED],
@@ -730,6 +784,7 @@ impl Client {
                             }),
                             active_parameter_support: Some(true),
                         }),
+                        context_support: Some(true),
                         ..Default::default()
                     }),
                     rename: Some(lsp::RenameClientCapabilities {
@@ -904,7 +959,7 @@ impl Client {
                 name: String::from("helix"),
                 version: Some(String::from(VERSION_AND_GIT_HASH)),
             }),
-            locale: None, // TODO
+            locale: client_locale(),
             work_done_progress_params: lsp::WorkDoneProgressParams::default(),
         };
 
@@ -934,6 +989,15 @@ impl Client {
         }
         self.exit();
         Ok(())
+    }
+
+    pub async fn force_kill(&self) -> Result<()> {
+        self.process.lock().await.kill().await?;
+        Ok(())
+    }
+
+    pub async fn wait(&self) -> Result<std::process::ExitStatus> {
+        self.process.lock().await.wait().await.map_err(Into::into)
     }
 
     // -------------------------------------------------------------------------------------------
@@ -1317,6 +1381,7 @@ impl Client {
         text_document: lsp::TextDocumentIdentifier,
         position: lsp::Position,
         work_done_token: Option<lsp::ProgressToken>,
+        context: Option<lsp::SignatureHelpContext>,
     ) -> Option<impl Future<Output = Result<Option<SignatureHelp>>>> {
         let capabilities = self.capabilities.get().unwrap();
 
@@ -1329,8 +1394,7 @@ impl Client {
                 position,
             },
             work_done_progress_params: lsp::WorkDoneProgressParams { work_done_token },
-            context: None,
-            // lsp::SignatureHelpContext
+            context,
         };
 
         Some(self.call::<lsp::request::SignatureHelpRequest>(params))
@@ -2257,5 +2321,76 @@ impl Client {
         self.notify::<lsp::notification::DidChangeWatchedFiles>(lsp::DidChangeWatchedFilesParams {
             changes,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dropped_cancel_guard_sends_cancel_once() {
+        let (tx, mut rx) = channel(2);
+        let guard = CancelOnDrop::new(tx, jsonrpc::Id::Num(42));
+
+        drop(guard);
+
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Payload::CancelRequest {
+                id: jsonrpc::Id::Num(42)
+            })
+        ));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn disarmed_cancel_guard_does_not_cancel() {
+        let (tx, mut rx) = channel(2);
+        let mut guard = CancelOnDrop::new(tx, jsonrpc::Id::Num(42));
+
+        guard.disarm();
+        drop(guard);
+
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn normalize_locale_uses_lsp_locale_shape() {
+        assert_eq!(normalize_locale("en_US.UTF-8"), Some("en-US".to_string()));
+        assert_eq!(normalize_locale("C"), None);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn force_kill_reaps_unresponsive_server_process() {
+        let (client, _rx, _notify) = Client::start(
+            "powershell.exe",
+            &[
+                "-NoProfile".to_string(),
+                "-Command".to_string(),
+                "Start-Sleep -Seconds 60".to_string(),
+            ],
+            None,
+            std::iter::empty::<(&str, &str)>(),
+            std::env::current_dir().unwrap(),
+            None,
+            Default::default(),
+            "sleeping-test-server".to_string(),
+            60,
+        )
+        .unwrap();
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), async {
+                let _ = client.force_shutdown().await;
+                client.wait().await
+            })
+            .await
+            .is_err()
+        );
+
+        client.force_kill().await.unwrap();
+        assert!(client.process.lock().await.try_wait().unwrap().is_some());
     }
 }

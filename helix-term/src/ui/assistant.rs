@@ -4,11 +4,11 @@ use crate::ui::animation::{
     Animation, AnimationDirection, AnimationFillMode, AnimationIterationCount, AnimationSpec,
     AnimationTimingFunction,
 };
+use crate::widgets::{hint_bar, schedule_redraw_at, Hint, HintBarStyle, Marquee};
 use crate::widgets::{
     message_list, Message, MessageAccessoryAlign, MessageAlign, MessageCorners, MessageCursor,
     MessageListState, MessageStyle, Spinner,
 };
-use crate::widgets::{schedule_redraw_at, Marquee};
 use helix_core::unicode::width::UnicodeWidthStr;
 use helix_core::Position;
 use helix_view::content_region::ContentRegion;
@@ -30,7 +30,6 @@ use crate::ui::markdown::{
 };
 
 pub const ID: &str = "assistant-panel";
-pub const PERMISSION_ID: &str = "assistant-permission";
 
 // ---------------------------------------------------------------------------
 // Chat entries
@@ -69,7 +68,422 @@ pub struct AssistantPanel {
     mention: MentionPopup,
     elicitation_form: Option<helix_view::assistant::elicitation::FormState>,
     auth_selected: usize,
+    auth_transient: bool,
     pending_subagent_jump: Option<PendingSubagentJump>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AssistantLayer {
+    Input,
+    Messages,
+    Elicitation,
+    Auth,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AssistantAction {
+    FocusInput,
+    FocusInputInsert,
+    FocusMessages,
+    InputEscape,
+    InsertInputChar(char),
+    SendPrompt,
+    OpenConfig,
+    CancelRun,
+    Primary,
+    ToggleFold,
+    Yank,
+    FollowOrJump,
+    Previous,
+    Next,
+    First,
+    FirstPending,
+    Last,
+    PagePrevious,
+    PageNext,
+    Retry,
+    ToggleReviewMode,
+    AcceptReview,
+    AcceptAllReview,
+    RejectReview,
+    RejectAllReview,
+    TransientPrevious,
+    TransientNext,
+    TransientSubmit,
+    TransientPop,
+    TransientActivatePrevious,
+    TransientActivateNext,
+    TransientBackspace,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum BindingCode {
+    Char(char),
+    Enter,
+    Esc,
+    Tab,
+    Backspace,
+    Up,
+    Down,
+    Left,
+    Right,
+    Home,
+    End,
+    PageUp,
+    PageDown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct BindingKey {
+    code: BindingCode,
+    modifiers: KeyModifiers,
+}
+
+impl BindingKey {
+    const fn new(code: BindingCode) -> Self {
+        Self {
+            code,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    const fn modified(code: BindingCode, modifiers: KeyModifiers) -> Self {
+        Self { code, modifiers }
+    }
+
+    fn matches(self, key: &KeyEvent) -> bool {
+        let code_matches = match (self.code, key.code) {
+            (BindingCode::Char(lhs), KeyCode::Char(rhs)) => lhs == rhs,
+            (BindingCode::Enter, KeyCode::Enter)
+            | (BindingCode::Esc, KeyCode::Esc)
+            | (BindingCode::Tab, KeyCode::Tab)
+            | (BindingCode::Backspace, KeyCode::Backspace)
+            | (BindingCode::Up, KeyCode::Up)
+            | (BindingCode::Down, KeyCode::Down)
+            | (BindingCode::Left, KeyCode::Left)
+            | (BindingCode::Right, KeyCode::Right)
+            | (BindingCode::Home, KeyCode::Home)
+            | (BindingCode::End, KeyCode::End)
+            | (BindingCode::PageUp, KeyCode::PageUp)
+            | (BindingCode::PageDown, KeyCode::PageDown) => true,
+            _ => false,
+        };
+        code_matches && key.modifiers == self.modifiers
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AssistantBinding {
+    key: BindingKey,
+    action: AssistantAction,
+    hint: Option<(&'static str, &'static str, u8)>,
+}
+
+impl AssistantBinding {
+    const fn new(
+        key: BindingKey,
+        action: AssistantAction,
+        hint: Option<(&'static str, &'static str, u8)>,
+    ) -> Self {
+        Self { key, action, hint }
+    }
+}
+
+const INPUT_BINDINGS: &[AssistantBinding] = &[
+    AssistantBinding::new(
+        BindingKey::new(BindingCode::Tab),
+        AssistantAction::FocusMessages,
+        Some(("tab", "messages", 240)),
+    ),
+    AssistantBinding::new(
+        BindingKey::new(BindingCode::Enter),
+        AssistantAction::SendPrompt,
+        Some(("enter", "send/newline", 230)),
+    ),
+    AssistantBinding::new(
+        BindingKey::new(BindingCode::Char('@')),
+        AssistantAction::InsertInputChar('@'),
+        Some(("@", "mention", 140)),
+    ),
+    AssistantBinding::new(
+        BindingKey::new(BindingCode::Char('/')),
+        AssistantAction::InsertInputChar('/'),
+        Some(("/", "command", 130)),
+    ),
+    AssistantBinding::new(
+        BindingKey::modified(BindingCode::Char('j'), KeyModifiers::CONTROL),
+        AssistantAction::FocusMessages,
+        Some(("C-j", "messages", 180)),
+    ),
+    AssistantBinding::new(
+        BindingKey::modified(BindingCode::Char('o'), KeyModifiers::CONTROL),
+        AssistantAction::OpenConfig,
+        Some(("C-o", "mode/model", 170)),
+    ),
+    AssistantBinding::new(
+        BindingKey::modified(BindingCode::Char('c'), KeyModifiers::CONTROL),
+        AssistantAction::CancelRun,
+        Some(("C-c", "cancel", 160)),
+    ),
+    AssistantBinding::new(
+        BindingKey::new(BindingCode::Esc),
+        AssistantAction::InputEscape,
+        Some(("esc", "normal", 150)),
+    ),
+];
+
+const MESSAGE_BINDINGS: &[AssistantBinding] = &[
+    AssistantBinding::new(
+        BindingKey::new(BindingCode::Esc),
+        AssistantAction::FocusInput,
+        Some(("esc", "input", 210)),
+    ),
+    AssistantBinding::new(
+        BindingKey::new(BindingCode::Char('i')),
+        AssistantAction::FocusInputInsert,
+        Some(("i", "edit", 205)),
+    ),
+    AssistantBinding::new(
+        BindingKey::new(BindingCode::Enter),
+        AssistantAction::Primary,
+        Some(("enter", "open", 240)),
+    ),
+    AssistantBinding::new(
+        BindingKey::new(BindingCode::Tab),
+        AssistantAction::ToggleFold,
+        Some(("tab", "fold", 230)),
+    ),
+    AssistantBinding::new(
+        BindingKey::new(BindingCode::Char('y')),
+        AssistantAction::Yank,
+        Some(("y", "yank", 220)),
+    ),
+    AssistantBinding::new(
+        BindingKey::new(BindingCode::Char('t')),
+        AssistantAction::FollowOrJump,
+        Some(("t", "follow/jump", 215)),
+    ),
+    AssistantBinding::new(
+        BindingKey::new(BindingCode::Char('k')),
+        AssistantAction::Previous,
+        Some(("j/k", "select", 225)),
+    ),
+    AssistantBinding::new(
+        BindingKey::new(BindingCode::Up),
+        AssistantAction::Previous,
+        None,
+    ),
+    AssistantBinding::new(
+        BindingKey::new(BindingCode::Char('j')),
+        AssistantAction::Next,
+        None,
+    ),
+    AssistantBinding::new(
+        BindingKey::new(BindingCode::Down),
+        AssistantAction::Next,
+        None,
+    ),
+    AssistantBinding::new(
+        BindingKey::new(BindingCode::Char('g')),
+        AssistantAction::FirstPending,
+        Some(("gg/G", "edge", 200)),
+    ),
+    AssistantBinding::new(
+        BindingKey::new(BindingCode::Home),
+        AssistantAction::First,
+        None,
+    ),
+    AssistantBinding::new(
+        BindingKey::new(BindingCode::End),
+        AssistantAction::Last,
+        None,
+    ),
+    AssistantBinding::new(
+        BindingKey::new(BindingCode::Char('G')),
+        AssistantAction::Last,
+        None,
+    ),
+    AssistantBinding::new(
+        BindingKey::new(BindingCode::PageUp),
+        AssistantAction::PagePrevious,
+        None,
+    ),
+    AssistantBinding::new(
+        BindingKey::modified(BindingCode::Char('u'), KeyModifiers::CONTROL),
+        AssistantAction::PagePrevious,
+        None,
+    ),
+    AssistantBinding::new(
+        BindingKey::new(BindingCode::PageDown),
+        AssistantAction::PageNext,
+        None,
+    ),
+    AssistantBinding::new(
+        BindingKey::modified(BindingCode::Char('d'), KeyModifiers::CONTROL),
+        AssistantAction::PageNext,
+        None,
+    ),
+    AssistantBinding::new(
+        BindingKey::modified(BindingCode::Char('p'), KeyModifiers::CONTROL),
+        AssistantAction::Previous,
+        None,
+    ),
+    AssistantBinding::new(
+        BindingKey::modified(BindingCode::Char('n'), KeyModifiers::CONTROL),
+        AssistantAction::Next,
+        None,
+    ),
+    AssistantBinding::new(
+        BindingKey::new(BindingCode::Char('r')),
+        AssistantAction::Retry,
+        Some(("r", "retry", 120)),
+    ),
+    AssistantBinding::new(
+        BindingKey::new(BindingCode::Char('R')),
+        AssistantAction::ToggleReviewMode,
+        Some(("R", "review", 110)),
+    ),
+    AssistantBinding::new(
+        BindingKey::new(BindingCode::Char('a')),
+        AssistantAction::AcceptReview,
+        Some(("a/x", "review file", 100)),
+    ),
+    AssistantBinding::new(
+        BindingKey::new(BindingCode::Char('x')),
+        AssistantAction::RejectReview,
+        None,
+    ),
+    AssistantBinding::new(
+        BindingKey::new(BindingCode::Char('A')),
+        AssistantAction::AcceptAllReview,
+        Some(("A/X", "review all", 90)),
+    ),
+    AssistantBinding::new(
+        BindingKey::new(BindingCode::Char('X')),
+        AssistantAction::RejectAllReview,
+        None,
+    ),
+    AssistantBinding::new(
+        BindingKey::modified(BindingCode::Char('o'), KeyModifiers::CONTROL),
+        AssistantAction::OpenConfig,
+        Some(("C-o", "mode/model", 80)),
+    ),
+    AssistantBinding::new(
+        BindingKey::modified(BindingCode::Char('c'), KeyModifiers::CONTROL),
+        AssistantAction::CancelRun,
+        Some(("C-c", "cancel", 70)),
+    ),
+];
+
+const ELICITATION_BINDINGS: &[AssistantBinding] = &[
+    AssistantBinding::new(
+        BindingKey::new(BindingCode::Esc),
+        AssistantAction::TransientPop,
+        Some(("esc", "messages", 240)),
+    ),
+    AssistantBinding::new(
+        BindingKey::new(BindingCode::Tab),
+        AssistantAction::TransientNext,
+        Some(("tab", "next field", 230)),
+    ),
+    AssistantBinding::new(
+        BindingKey::modified(BindingCode::Tab, KeyModifiers::SHIFT),
+        AssistantAction::TransientPrevious,
+        Some(("S-tab", "prev field", 220)),
+    ),
+    AssistantBinding::new(
+        BindingKey::new(BindingCode::Enter),
+        AssistantAction::TransientSubmit,
+        Some(("enter", "submit", 235)),
+    ),
+    AssistantBinding::new(
+        BindingKey::new(BindingCode::Backspace),
+        AssistantAction::TransientBackspace,
+        None,
+    ),
+    AssistantBinding::new(
+        BindingKey::new(BindingCode::Char('h')),
+        AssistantAction::TransientActivatePrevious,
+        Some(("h/l", "change", 180)),
+    ),
+    AssistantBinding::new(
+        BindingKey::new(BindingCode::Left),
+        AssistantAction::TransientActivatePrevious,
+        None,
+    ),
+    AssistantBinding::new(
+        BindingKey::new(BindingCode::Char('l')),
+        AssistantAction::TransientActivateNext,
+        None,
+    ),
+    AssistantBinding::new(
+        BindingKey::new(BindingCode::Right),
+        AssistantAction::TransientActivateNext,
+        None,
+    ),
+    AssistantBinding::new(
+        BindingKey::new(BindingCode::Char(' ')),
+        AssistantAction::TransientActivateNext,
+        Some(("space", "toggle", 170)),
+    ),
+    AssistantBinding::new(
+        BindingKey::modified(BindingCode::Char('c'), KeyModifiers::CONTROL),
+        AssistantAction::CancelRun,
+        Some(("C-c", "cancel request", 160)),
+    ),
+];
+
+const AUTH_BINDINGS: &[AssistantBinding] = &[
+    AssistantBinding::new(
+        BindingKey::new(BindingCode::Esc),
+        AssistantAction::TransientPop,
+        Some(("esc", "messages", 240)),
+    ),
+    AssistantBinding::new(
+        BindingKey::new(BindingCode::Tab),
+        AssistantAction::TransientNext,
+        Some(("tab", "next method", 230)),
+    ),
+    AssistantBinding::new(
+        BindingKey::modified(BindingCode::Tab, KeyModifiers::SHIFT),
+        AssistantAction::TransientPrevious,
+        Some(("S-tab", "prev method", 220)),
+    ),
+    AssistantBinding::new(
+        BindingKey::new(BindingCode::Enter),
+        AssistantAction::TransientSubmit,
+        Some(("enter", "authenticate", 235)),
+    ),
+    AssistantBinding::new(
+        BindingKey::new(BindingCode::Char('k')),
+        AssistantAction::TransientPrevious,
+        Some(("j/k", "select", 210)),
+    ),
+    AssistantBinding::new(
+        BindingKey::new(BindingCode::Up),
+        AssistantAction::TransientPrevious,
+        None,
+    ),
+    AssistantBinding::new(
+        BindingKey::new(BindingCode::Char('j')),
+        AssistantAction::TransientNext,
+        None,
+    ),
+    AssistantBinding::new(
+        BindingKey::new(BindingCode::Down),
+        AssistantAction::TransientNext,
+        None,
+    ),
+];
+
+#[cfg(test)]
+fn assistant_escape_target(layer: AssistantLayer, input_insert: bool) -> Option<AssistantLayer> {
+    match layer {
+        AssistantLayer::Auth | AssistantLayer::Elicitation => Some(AssistantLayer::Messages),
+        AssistantLayer::Messages => Some(AssistantLayer::Input),
+        AssistantLayer::Input if input_insert => Some(AssistantLayer::Input),
+        AssistantLayer::Input => None,
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -413,6 +827,7 @@ impl AssistantPanel {
             mention: MentionPopup::default(),
             elicitation_form: None,
             auth_selected: 0,
+            auth_transient: false,
             pending_subagent_jump: None,
         }
     }
@@ -429,12 +844,16 @@ impl AssistantPanel {
     }
 
     pub fn activate_input(&mut self, editor: &mut Editor) {
+        self.elicitation_form = None;
+        self.auth_transient = false;
         self.set_focus(editor, helix_view::assistant::thread::Focus::Input);
         self.message_focus_animation.stop();
         self.set_focused(true);
     }
 
     pub fn focus_messages(&mut self, editor: &mut Editor) {
+        self.elicitation_form = None;
+        self.auth_transient = false;
         if self.input.mode() == Mode::Insert {
             self.input.exit_insert_mode();
         }
@@ -443,6 +862,8 @@ impl AssistantPanel {
     }
 
     fn focus_messages_without_animation(&mut self, editor: &mut Editor) {
+        self.elicitation_form = None;
+        self.auth_transient = false;
         if self.input.mode() == Mode::Insert {
             self.input.exit_insert_mode();
         }
@@ -451,9 +872,80 @@ impl AssistantPanel {
     }
 
     pub fn focus_input_region(&mut self, editor: &mut Editor) {
+        self.elicitation_form = None;
+        self.auth_transient = false;
         self.set_focused(true);
         self.set_focus(editor, helix_view::assistant::thread::Focus::Input);
         self.message_focus_animation.stop();
+    }
+
+    fn active_layer(&self, editor: &Editor) -> AssistantLayer {
+        self.active_layer_for_model(&Self::assistant_model(editor))
+    }
+
+    fn active_layer_for_model(&self, model: &helix_view::model::AssistantModel) -> AssistantLayer {
+        if self.elicitation_form.is_some() {
+            AssistantLayer::Elicitation
+        } else if self.auth_transient
+            && matches!(
+                model.auth,
+                helix_view::assistant::auth::State::Required { .. }
+                    | helix_view::assistant::auth::State::Failed { .. }
+            )
+        {
+            AssistantLayer::Auth
+        } else {
+            match model.focus() {
+                helix_view::assistant::thread::Focus::Input => AssistantLayer::Input,
+                helix_view::assistant::thread::Focus::Messages => AssistantLayer::Messages,
+            }
+        }
+    }
+
+    fn bindings_for_layer(layer: AssistantLayer) -> &'static [AssistantBinding] {
+        match layer {
+            AssistantLayer::Input => INPUT_BINDINGS,
+            AssistantLayer::Messages => MESSAGE_BINDINGS,
+            AssistantLayer::Elicitation => ELICITATION_BINDINGS,
+            AssistantLayer::Auth => AUTH_BINDINGS,
+        }
+    }
+
+    fn binding_for_key(layer: AssistantLayer, key: &KeyEvent) -> Option<&'static AssistantBinding> {
+        Self::bindings_for_layer(layer)
+            .iter()
+            .find(|binding| binding.key.matches(key))
+    }
+
+    fn layer_hints(
+        &self,
+        model: &helix_view::model::AssistantModel,
+        layer: AssistantLayer,
+    ) -> Vec<Hint<'static>> {
+        let mut hints = Self::bindings_for_layer(layer)
+            .iter()
+            .filter_map(|binding| {
+                let (key, label, priority) = binding.hint?;
+                Some(Hint::new(key, label).priority(priority))
+            })
+            .collect::<Vec<_>>();
+
+        if layer == AssistantLayer::Messages {
+            let review_selected = model
+                .selected_entry_id()
+                .and_then(|id| self.output.content().iter().find(|entry| entry.id == id))
+                .is_some_and(|entry| {
+                    matches!(
+                        &entry.kind,
+                        helix_view::model::AssistantEntryKind::ReviewSummary { .. }
+                    )
+                });
+            if !review_selected {
+                hints.retain(|hint| !matches!(hint.key.as_ref(), "a/x" | "A/X" | "R"));
+            }
+        }
+
+        hints
     }
 
     fn restart_message_focus_animation(&mut self, editor: &Editor) {
@@ -788,67 +1280,6 @@ impl AssistantPanel {
             editor,
             helix_view::assistant::thread::ElicitationResponse::Accept(values),
         )
-    }
-
-    fn handle_elicitation_key(&mut self, key: &KeyEvent, editor: &mut Editor) -> bool {
-        let Some(elicitation) = Self::pending_elicitation(editor) else {
-            self.elicitation_form = None;
-            return false;
-        };
-        let helix_view::assistant::thread::ElicitationMode::Form { fields, .. } = &elicitation.mode
-        else {
-            return false;
-        };
-        self.sync_elicitation_form(&elicitation);
-        match (key.code, key.modifiers) {
-            (KeyCode::Enter, KeyModifiers::NONE) => {
-                if self.accept_pending_elicitation(editor) {
-                    editor.set_status("Submitted assistant request");
-                }
-                return true;
-            }
-            (KeyCode::Esc, KeyModifiers::NONE) => {
-                if self.cancel_pending_elicitation(editor) {
-                    editor.set_status("Canceled assistant request");
-                }
-                return true;
-            }
-            _ => {}
-        }
-        let Some(form) = &mut self.elicitation_form else {
-            return false;
-        };
-        match (key.code, key.modifiers) {
-            (KeyCode::Tab, KeyModifiers::NONE) => {
-                form.focus_next();
-                true
-            }
-            (KeyCode::Tab, modifiers) if modifiers.contains(KeyModifiers::SHIFT) => {
-                form.focus_prev();
-                true
-            }
-            (KeyCode::Backspace, KeyModifiers::NONE) => {
-                form.backspace();
-                true
-            }
-            (KeyCode::Char('h'), KeyModifiers::NONE) | (KeyCode::Left, KeyModifiers::NONE) => {
-                form.activate_focused(fields, -1);
-                true
-            }
-            (KeyCode::Char('l'), KeyModifiers::NONE)
-            | (KeyCode::Right, KeyModifiers::NONE)
-            | (KeyCode::Char(' '), KeyModifiers::NONE) => {
-                form.activate_focused(fields, 1);
-                true
-            }
-            (KeyCode::Char(ch), modifiers)
-                if modifiers.is_empty() || modifiers == KeyModifiers::SHIFT =>
-            {
-                form.insert_char(ch);
-                true
-            }
-            _ => false,
-        }
     }
 
     fn cancel_pending_elicitation(&mut self, editor: &mut Editor) -> bool {
@@ -1907,7 +2338,6 @@ impl AssistantPanel {
         let plan = model.plan_section();
         let context_items = &model.context_items;
         let context_line = model.context_line();
-        let status_items = model.status_items();
         let plan_rows = plan
             .as_ref()
             .map(|section| (section.rows.len() + 1).min(6) as u16)
@@ -2046,69 +2476,19 @@ impl AssistantPanel {
                 tui::ratatui::to_ratatui_rect(bar_area),
                 tui::ratatui::to_ratatui_style(bar_style),
             );
-            // Bottom status: mode  model (gap between, no separator)
-            let use_status_colors = cx.config().color_modes;
             let theme = cx.assistant_theme();
-            let get_style = |assistant_scope: &str, statusline_fallback: &str| -> Style {
-                if use_status_colors {
-                    theme
-                        .try_get(assistant_scope)
-                        .unwrap_or_else(|| theme.get(statusline_fallback))
-                } else {
-                    bar_style
-                }
-            };
-            let muted_style = theme
-                .try_get("ui.text.inactive")
-                .or_else(|| theme.try_get("comment"))
-                .unwrap_or(bar_style);
-            let mut spans: Vec<Span> = Vec::new();
-            for (index, item) in status_items.iter().enumerate() {
-                if index > 0 {
-                    spans.push(Span::styled("  ".to_string(), bar_style));
-                }
-                match item.kind {
-                    helix_view::model::AssistantStatusItemKind::Mode => {
-                        let style = get_style("ui.assistant.mode", "ui.statusline.select");
-                        spans.push(Span::styled(
-                            format!(" {} ", item.label),
-                            bar_style.patch(style),
-                        ));
-                    }
-                    helix_view::model::AssistantStatusItemKind::Model => {
-                        let style = get_style("ui.assistant.model", "ui.statusline.normal");
-                        spans.push(Span::styled(
-                            format!(" {} ", item.label),
-                            bar_style.patch(style),
-                        ));
-                    }
-                    helix_view::model::AssistantStatusItemKind::Follow => {
-                        // Follow is metadata, not a state chip — render plain
-                        // with muted styling and the model's own `· follow X`
-                        // separator-prefixed label. No bg wrap.
-                        spans.push(Span::styled(
-                            item.label.clone(),
-                            bar_style.patch(muted_style),
-                        ));
-                    }
-                    helix_view::model::AssistantStatusItemKind::Review => {
-                        spans.push(Span::styled(
-                            item.label.clone(),
-                            bar_style.patch(muted_style),
-                        ));
-                    }
-                }
-            }
-            if !spans.is_empty() {
-                let combined = Spans::from(spans);
-                let line = tui::ratatui::to_ratatui_line(&combined);
-                surface.set_line(
-                    bar_area.x,
-                    bar_area.y,
-                    &line,
-                    combined.width().min(bar_area.width as usize) as u16,
-                );
-            }
+            let hints = self.layer_hints(&model, self.active_layer_for_model(&model));
+            hint_bar(
+                surface,
+                bar_area,
+                &hints,
+                HintBarStyle {
+                    background: bar_style,
+                    key: theme.get("ui.text.focus").add_modifier(Modifier::BOLD),
+                    label: theme.get("ui.text.inactive"),
+                    separator: bar_style,
+                },
+            );
         }
 
         // ── Error line ──
@@ -2809,35 +3189,6 @@ impl AssistantPanel {
         }
     }
 
-    /// Handle cycle key bindings (thinking, mode, model). Returns `Some` if consumed.
-    fn handle_cycle_key(&mut self, key: &KeyEvent, cx: &mut Context) -> Option<EventResult> {
-        let config = cx.editor.config();
-        let category = if *key == config.acp.cycle_thinking() {
-            "thinking"
-        } else if *key == config.acp.cycle_mode() {
-            "mode"
-        } else if *key == config.acp.cycle_model() {
-            "model"
-        } else {
-            return None;
-        };
-
-        let result = if category == "mode" {
-            cx.editor.cycle_active_assistant_mode()
-        } else {
-            cx.editor.cycle_active_assistant_config(category)
-        };
-
-        match result {
-            Ok(effects) => {
-                Self::apply_assistant_effects(cx.editor, effects);
-                cx.editor.set_status(format!("Cycled {category}"));
-            }
-            Err(err) => cx.editor.set_status(err.to_string()),
-        }
-        Some(EventResult::Consumed(None))
-    }
-
     fn open_mode_config_picker(&mut self, cx: &mut Context) -> bool {
         use crate::runtime::ui::command::{AssistantCommand, ModeConfigPickerItem, UiCommand};
 
@@ -2882,6 +3233,292 @@ impl AssistantPanel {
             AssistantCommand::PushModeConfigPicker { thread, items },
         ));
         true
+    }
+
+    fn cancel_active_run(&mut self, cx: &mut Context) {
+        if let Some(effects) = cx.editor.cancel_active_assistant_thread() {
+            Self::apply_assistant_effects(cx.editor, effects);
+        }
+        cx.editor.set_status("Canceling agent...");
+    }
+
+    fn enter_pending_elicitation(&mut self, editor: &mut Editor) -> bool {
+        let Some(elicitation) = Self::pending_elicitation(editor) else {
+            return false;
+        };
+        if self.sync_elicitation_form(&elicitation) {
+            self.set_focus(editor, helix_view::assistant::thread::Focus::Messages);
+            return true;
+        }
+        false
+    }
+
+    fn execute_message_action(&mut self, action: AssistantAction, cx: &mut Context) -> EventResult {
+        let model = Self::assistant_model(cx.editor);
+        match action {
+            AssistantAction::FocusInput => {
+                self.focus_input_region(cx.editor);
+            }
+            AssistantAction::FocusInputInsert => {
+                self.focus_input_region(cx.editor);
+                self.input.enter_insert_mode("insert_mode".into());
+            }
+            AssistantAction::Primary => {
+                if self.enter_pending_elicitation(cx.editor) {
+                    return EventResult::Consumed(None);
+                }
+                if Self::active_auth_methods(cx.editor).is_some() {
+                    self.auth_transient = true;
+                    self.set_focus(cx.editor, helix_view::assistant::thread::Focus::Messages);
+                    return EventResult::Consumed(None);
+                }
+                if self.jump_selected_subagent(cx.editor) {
+                    return EventResult::Consumed(None);
+                }
+                if !self.open_selected_message_details(cx.editor, Action::Replace) {
+                    cx.editor.set_status("No assistant entry selected");
+                }
+            }
+            AssistantAction::ToggleFold => {
+                self.toggle_selected_message_fold(cx.editor);
+            }
+            AssistantAction::Yank => {
+                if !self.yank_pending_elicitation_url(cx.editor) {
+                    self.yank_selected_message(cx.editor);
+                }
+            }
+            AssistantAction::FollowOrJump => {
+                if !self.jump_selected_subagent(cx.editor) {
+                    match cx.editor.toggle_active_assistant_follow() {
+                        Ok((status, effects)) => {
+                            Self::apply_assistant_effects(cx.editor, effects);
+                            cx.editor.set_status(status);
+                        }
+                        Err(err) => cx.editor.set_status(err.to_string()),
+                    }
+                }
+            }
+            AssistantAction::Previous => {
+                self.select_prev_message(cx.editor);
+            }
+            AssistantAction::Next => {
+                self.select_next_message(cx.editor);
+            }
+            AssistantAction::First => {
+                self.select_first_message(cx.editor);
+            }
+            AssistantAction::FirstPending => {
+                if self.pending_message_g {
+                    self.pending_message_g = false;
+                    self.select_first_message(cx.editor);
+                } else {
+                    self.pending_message_g = true;
+                }
+            }
+            AssistantAction::Last => {
+                self.select_last_message(cx.editor);
+                self.output.scroll_to_end();
+                self.set_content_scroll(cx.editor, self.output.max_scroll());
+            }
+            AssistantAction::PagePrevious => {
+                self.select_prev_message_page(cx.editor);
+            }
+            AssistantAction::PageNext => {
+                self.select_next_message_page(cx.editor);
+            }
+            AssistantAction::Retry => match cx.editor.retry_active_assistant_prompt() {
+                Ok(effects) => {
+                    Self::apply_assistant_effects(cx.editor, effects);
+                    cx.editor.set_status("Retrying assistant prompt...");
+                }
+                Err(err) => cx.editor.set_status(err.to_string()),
+            },
+            AssistantAction::ToggleReviewMode => {
+                match cx.editor.toggle_active_assistant_review_mode() {
+                    Ok((status, effects)) => {
+                        Self::apply_assistant_effects(cx.editor, effects);
+                        cx.editor.set_status(status);
+                    }
+                    Err(err) => cx.editor.set_status(err.to_string()),
+                }
+            }
+            AssistantAction::AcceptReview => match cx
+                .editor
+                .resolve_selected_assistant_review(helix_view::assistant::review::Decision::Accept)
+            {
+                Ok(effects) => {
+                    Self::apply_assistant_effects(cx.editor, effects);
+                    cx.editor.set_status("Accepted assistant change");
+                }
+                Err(err) => cx.editor.set_status(err.to_string()),
+            },
+            AssistantAction::AcceptAllReview => {
+                match cx.editor.resolve_all_active_assistant_review(
+                    helix_view::assistant::review::Decision::Accept,
+                ) {
+                    Ok(effects) => {
+                        Self::apply_assistant_effects(cx.editor, effects);
+                        cx.editor.set_status("Accepted all assistant changes");
+                    }
+                    Err(err) => cx.editor.set_status(err.to_string()),
+                }
+            }
+            AssistantAction::RejectReview => match cx
+                .editor
+                .resolve_selected_assistant_review(helix_view::assistant::review::Decision::Reject)
+            {
+                Ok(effects) => {
+                    Self::apply_assistant_effects(cx.editor, effects);
+                    cx.editor.set_status("Rejected assistant change");
+                }
+                Err(err) => cx.editor.set_status(err.to_string()),
+            },
+            AssistantAction::RejectAllReview => {
+                match cx.editor.resolve_all_active_assistant_review(
+                    helix_view::assistant::review::Decision::Reject,
+                ) {
+                    Ok(effects) => {
+                        Self::apply_assistant_effects(cx.editor, effects);
+                        cx.editor.set_status("Rejected all assistant changes");
+                    }
+                    Err(err) => cx.editor.set_status(err.to_string()),
+                }
+            }
+            AssistantAction::OpenConfig => {
+                self.open_mode_config_picker(cx);
+            }
+            AssistantAction::CancelRun => self.cancel_active_run(cx),
+            _ => {}
+        }
+
+        if !matches!(action, AssistantAction::FirstPending) {
+            self.pending_message_g = false;
+        }
+        if let Some(index) = self.selected_message(cx.editor) {
+            let viewport_height = self.output.area().height as usize;
+            let mut cursor = MessageCursor::new(Some(index), model.content_scroll());
+            cursor.sync(&self.chat_layout, viewport_height);
+            self.set_content_scroll(cx.editor, cursor.scroll());
+        }
+        EventResult::Consumed(None)
+    }
+
+    fn execute_transient_action(
+        &mut self,
+        layer: AssistantLayer,
+        action: AssistantAction,
+        cx: &mut Context,
+    ) -> EventResult {
+        match action {
+            AssistantAction::TransientPop => {
+                self.elicitation_form = None;
+                self.auth_transient = false;
+                self.focus_messages(cx.editor);
+            }
+            AssistantAction::TransientSubmit if layer == AssistantLayer::Elicitation => {
+                if self.accept_pending_elicitation(cx.editor) {
+                    cx.editor.set_status("Submitted assistant request");
+                }
+            }
+            AssistantAction::TransientSubmit if layer == AssistantLayer::Auth => {
+                if self.accept_auth_method(cx.editor) {
+                    self.auth_transient = false;
+                }
+            }
+            AssistantAction::TransientNext if layer == AssistantLayer::Elicitation => {
+                if let Some(form) = &mut self.elicitation_form {
+                    form.focus_next();
+                }
+            }
+            AssistantAction::TransientPrevious if layer == AssistantLayer::Elicitation => {
+                if let Some(form) = &mut self.elicitation_form {
+                    form.focus_prev();
+                }
+            }
+            AssistantAction::TransientNext if layer == AssistantLayer::Auth => {
+                self.select_auth_method(cx.editor, 1);
+            }
+            AssistantAction::TransientPrevious if layer == AssistantLayer::Auth => {
+                self.select_auth_method(cx.editor, -1);
+            }
+            AssistantAction::TransientBackspace => {
+                if let Some(form) = &mut self.elicitation_form {
+                    form.backspace();
+                }
+            }
+            AssistantAction::TransientActivatePrevious | AssistantAction::TransientActivateNext
+                if layer == AssistantLayer::Elicitation =>
+            {
+                if let (Some(elicitation), Some(form)) = (
+                    Self::pending_elicitation(cx.editor),
+                    &mut self.elicitation_form,
+                ) {
+                    if let helix_view::assistant::thread::ElicitationMode::Form { fields, .. } =
+                        &elicitation.mode
+                    {
+                        let delta = if action == AssistantAction::TransientActivatePrevious {
+                            -1
+                        } else {
+                            1
+                        };
+                        form.activate_focused(fields, delta);
+                    }
+                }
+            }
+            AssistantAction::CancelRun => self.cancel_active_run(cx),
+            _ => {}
+        }
+        EventResult::Consumed(None)
+    }
+
+    fn execute_input_binding(
+        &mut self,
+        action: AssistantAction,
+        cx: &mut Context,
+    ) -> Option<EventResult> {
+        match action {
+            AssistantAction::FocusMessages => {
+                self.focus_messages(cx.editor);
+                Some(EventResult::Consumed(None))
+            }
+            AssistantAction::SendPrompt => {
+                if self.input.mode() == Mode::Insert {
+                    return None;
+                }
+                self.send_current_prompt(cx);
+                Some(EventResult::Consumed(None))
+            }
+            AssistantAction::InputEscape => {
+                if self.mention.active {
+                    self.mention.active = false;
+                    return Some(EventResult::Consumed(None));
+                }
+                if self.input.mode() == Mode::Insert {
+                    self.input.exit_insert_mode();
+                    Some(EventResult::Consumed(None))
+                } else {
+                    None
+                }
+            }
+            AssistantAction::InsertInputChar(ch) => {
+                if self.input.mode() != Mode::Insert {
+                    self.input.enter_insert_mode("insert_mode".into());
+                }
+                self.insert_char_into_input(ch, cx.editor);
+                self.sync_draft_to_assistant(cx.editor);
+                self.refresh_mention_popup(cx.editor);
+                Some(EventResult::Consumed(None))
+            }
+            AssistantAction::OpenConfig => {
+                self.open_mode_config_picker(cx);
+                Some(EventResult::Consumed(None))
+            }
+            AssistantAction::CancelRun => {
+                self.cancel_active_run(cx);
+                Some(EventResult::Consumed(None))
+            }
+            _ => None,
+        }
     }
 }
 
@@ -2956,58 +3593,6 @@ impl Component for AssistantPanel {
 
         self.error_marquee.touch();
 
-        if key.modifiers.is_empty() && Self::active_auth_methods(cx.editor).is_some() {
-            match key.code {
-                KeyCode::Up | KeyCode::Char('k') => {
-                    self.select_auth_method(cx.editor, -1);
-                    return EventResult::Consumed(None);
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    self.select_auth_method(cx.editor, 1);
-                    return EventResult::Consumed(None);
-                }
-                KeyCode::Enter | KeyCode::Char('r') => {
-                    if self.accept_auth_method(cx.editor) {
-                        return EventResult::Consumed(None);
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        // Ctrl+c → cancel agent (any mode).
-        if matches!(
-            key,
-            KeyEvent {
-                code: KeyCode::Char('c'),
-                modifiers: KeyModifiers::CONTROL,
-                ..
-            }
-        ) {
-            if let Some(effects) = cx.editor.cancel_active_assistant_thread() {
-                Self::apply_assistant_effects(cx.editor, effects);
-            }
-            cx.editor.set_status("Canceling agent...");
-            return EventResult::Consumed(None);
-        }
-
-        // Cycle keys work in any mode.
-        if let Some(result) = self.handle_cycle_key(&key, cx) {
-            return result;
-        }
-
-        if matches!(
-            key,
-            KeyEvent {
-                code: KeyCode::Char('o'),
-                modifiers: KeyModifiers::CONTROL,
-                ..
-            }
-        ) && self.open_mode_config_picker(cx)
-        {
-            return EventResult::Consumed(None);
-        }
-
         if matches!(
             (key.code, key.modifiers),
             (KeyCode::PageUp, KeyModifiers::CONTROL)
@@ -3028,13 +3613,36 @@ impl Component for AssistantPanel {
             return EventResult::Consumed(None);
         }
 
-        if self.handle_elicitation_key(&key, cx.editor) {
+        let layer = self.active_layer(cx.editor);
+        if let Some(binding) = Self::binding_for_key(layer, &key) {
+            match layer {
+                AssistantLayer::Input => {
+                    if let Some(result) = self.execute_input_binding(binding.action, cx) {
+                        return result;
+                    }
+                }
+                AssistantLayer::Messages => return self.execute_message_action(binding.action, cx),
+                AssistantLayer::Elicitation | AssistantLayer::Auth => {
+                    return self.execute_transient_action(layer, binding.action, cx);
+                }
+            }
+        }
+
+        if layer == AssistantLayer::Elicitation {
+            if let Some(form) = &mut self.elicitation_form {
+                if let KeyCode::Char(ch) = key.code {
+                    if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT {
+                        form.insert_char(ch);
+                        return EventResult::Consumed(None);
+                    }
+                }
+            }
             return EventResult::Consumed(None);
         }
 
         let model = Self::assistant_model(cx.editor);
 
-        if model.focus() == helix_view::assistant::thread::Focus::Input
+        if layer == AssistantLayer::Input
             && matches!(key.code, KeyCode::Char(' '))
             && key.modifiers.is_empty()
         {
@@ -3044,195 +3652,6 @@ impl Component for AssistantPanel {
                 self.input.mode()
             );
             return EventResult::Ignored(None);
-        }
-
-        if model.focus() == helix_view::assistant::thread::Focus::Messages {
-            let viewport_height = self.output.area().height as usize;
-            let is_message_g = matches!(
-                (key.code, key.modifiers),
-                (KeyCode::Char('g'), KeyModifiers::NONE)
-            );
-            if !is_message_g {
-                self.pending_message_g = false;
-            }
-            let handled = match (key.code, key.modifiers) {
-                (KeyCode::Esc, KeyModifiers::NONE) => {
-                    if self.cancel_pending_elicitation(cx.editor) {
-                        cx.editor.set_status("Canceled assistant request");
-                    } else if model.agent_busy {
-                        if let Some(effects) = cx.editor.cancel_active_assistant_thread() {
-                            Self::apply_assistant_effects(cx.editor, effects);
-                        }
-                        cx.editor.set_status("Canceling agent...");
-                    } else {
-                        self.focus_input_region(cx.editor);
-                    }
-                    true
-                }
-                (KeyCode::Char('i'), KeyModifiers::NONE) => {
-                    self.focus_input_region(cx.editor);
-                    self.input.enter_insert_mode("insert_mode".into());
-                    true
-                }
-                (KeyCode::Enter, KeyModifiers::NONE) => {
-                    if self.accept_pending_elicitation(cx.editor) {
-                        cx.editor.set_status("Submitted assistant request");
-                        return EventResult::Consumed(None);
-                    }
-                    log::warn!(
-                        "[assistant_ui] enter open selected={:?} focus={:?}",
-                        model.selected_entry_id(),
-                        model.focus()
-                    );
-                    if self.jump_selected_subagent(cx.editor) {
-                        return EventResult::Consumed(None);
-                    }
-                    if !self.open_selected_message_details(cx.editor, Action::Replace) {
-                        cx.editor.set_status("No assistant entry selected");
-                    }
-                    true
-                }
-                (KeyCode::Tab, KeyModifiers::NONE) => {
-                    self.toggle_selected_message_fold(cx.editor);
-                    true
-                }
-                (KeyCode::Char('y'), KeyModifiers::NONE) => {
-                    if !self.yank_pending_elicitation_url(cx.editor) {
-                        self.yank_selected_message(cx.editor);
-                    }
-                    true
-                }
-                (KeyCode::Char('a'), KeyModifiers::NONE) => {
-                    match cx.editor.resolve_selected_assistant_review(
-                        helix_view::assistant::review::Decision::Accept,
-                    ) {
-                        Ok(effects) => {
-                            Self::apply_assistant_effects(cx.editor, effects);
-                            cx.editor.set_status("Accepted assistant change");
-                        }
-                        Err(err) => cx.editor.set_status(err.to_string()),
-                    }
-                    true
-                }
-                (KeyCode::Char('A'), KeyModifiers::NONE) => {
-                    match cx.editor.resolve_all_active_assistant_review(
-                        helix_view::assistant::review::Decision::Accept,
-                    ) {
-                        Ok(effects) => {
-                            Self::apply_assistant_effects(cx.editor, effects);
-                            cx.editor.set_status("Accepted all assistant changes");
-                        }
-                        Err(err) => cx.editor.set_status(err.to_string()),
-                    }
-                    true
-                }
-                (KeyCode::Char('x'), KeyModifiers::NONE) => {
-                    match cx.editor.resolve_selected_assistant_review(
-                        helix_view::assistant::review::Decision::Reject,
-                    ) {
-                        Ok(effects) => {
-                            Self::apply_assistant_effects(cx.editor, effects);
-                            cx.editor.set_status("Rejected assistant change");
-                        }
-                        Err(err) => cx.editor.set_status(err.to_string()),
-                    }
-                    true
-                }
-                (KeyCode::Char('X'), KeyModifiers::NONE) => {
-                    match cx.editor.resolve_all_active_assistant_review(
-                        helix_view::assistant::review::Decision::Reject,
-                    ) {
-                        Ok(effects) => {
-                            Self::apply_assistant_effects(cx.editor, effects);
-                            cx.editor.set_status("Rejected all assistant changes");
-                        }
-                        Err(err) => cx.editor.set_status(err.to_string()),
-                    }
-                    true
-                }
-                (KeyCode::Char('R'), KeyModifiers::NONE) => {
-                    match cx.editor.toggle_active_assistant_review_mode() {
-                        Ok((status, effects)) => {
-                            Self::apply_assistant_effects(cx.editor, effects);
-                            cx.editor.set_status(status);
-                        }
-                        Err(err) => cx.editor.set_status(err.to_string()),
-                    }
-                    true
-                }
-                (KeyCode::Char('r'), KeyModifiers::NONE) => {
-                    match cx.editor.retry_active_assistant_prompt() {
-                        Ok(effects) => {
-                            Self::apply_assistant_effects(cx.editor, effects);
-                            cx.editor.set_status("Retrying assistant prompt...");
-                        }
-                        Err(err) => cx.editor.set_status(err.to_string()),
-                    }
-                    true
-                }
-                (KeyCode::Char('t'), KeyModifiers::NONE) => {
-                    if let Ok((status, effects)) = cx.editor.toggle_active_assistant_follow() {
-                        Self::apply_assistant_effects(cx.editor, effects);
-                        cx.editor.set_status(status);
-                    }
-                    true
-                }
-                (KeyCode::Up, KeyModifiers::NONE) | (KeyCode::Char('k'), KeyModifiers::NONE) => {
-                    self.select_prev_message(cx.editor);
-                    true
-                }
-                (KeyCode::Down, KeyModifiers::NONE) | (KeyCode::Char('j'), KeyModifiers::NONE) => {
-                    self.select_next_message(cx.editor);
-                    true
-                }
-                (KeyCode::Char('g'), KeyModifiers::NONE) => {
-                    if self.pending_message_g {
-                        self.pending_message_g = false;
-                        self.select_first_message(cx.editor);
-                    } else {
-                        self.pending_message_g = true;
-                    }
-                    true
-                }
-                (KeyCode::Home, KeyModifiers::NONE) => {
-                    self.select_first_message(cx.editor);
-                    true
-                }
-                (KeyCode::End, KeyModifiers::NONE) | (KeyCode::Char('G'), KeyModifiers::NONE) => {
-                    self.select_last_message(cx.editor);
-                    self.output.scroll_to_end();
-                    self.set_content_scroll(cx.editor, self.output.max_scroll());
-                    true
-                }
-                (KeyCode::PageUp, KeyModifiers::NONE)
-                | (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
-                    self.select_prev_message_page(cx.editor);
-                    true
-                }
-                (KeyCode::PageDown, KeyModifiers::NONE)
-                | (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
-                    self.select_next_message_page(cx.editor);
-                    true
-                }
-                (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
-                    self.select_prev_message(cx.editor);
-                    true
-                }
-                (KeyCode::Char('n'), KeyModifiers::CONTROL) => {
-                    self.select_next_message(cx.editor);
-                    true
-                }
-                _ => false,
-            };
-
-            if handled {
-                if let Some(index) = self.selected_message(cx.editor) {
-                    let mut cursor = MessageCursor::new(Some(index), model.content_scroll());
-                    cursor.sync(&self.chat_layout, viewport_height);
-                    self.set_content_scroll(cx.editor, cursor.scroll());
-                }
-                return EventResult::Consumed(None);
-            }
         }
 
         // ── Mode transitions ──
@@ -3448,275 +3867,6 @@ impl Component for AssistantPanel {
     component_traits!(focusable, scrollable);
 }
 
-// ---------------------------------------------------------------------------
-// Permission popup
-// ---------------------------------------------------------------------------
-
-/// A popup that shows when an assistant backend requests permission.
-pub struct PermissionPopup {
-    title: String,
-    description: Option<String>,
-    options: Vec<PermissionChoice>,
-    selected: usize,
-    default: Option<String>,
-    /// Channel to send the response back to the handler.
-    response_tx: Option<tokio::sync::oneshot::Sender<PermissionResponse>>,
-}
-
-pub struct PermissionChoice {
-    pub id: String,
-    pub title: String,
-    pub description: Option<String>,
-    pub key: Option<char>,
-}
-
-pub enum PermissionResponse {
-    Selected(String),
-    Dismissed,
-}
-
-impl PermissionPopup {
-    pub fn new(
-        title: String,
-        description: Option<String>,
-        options: Vec<PermissionChoice>,
-        default: Option<String>,
-        response_tx: tokio::sync::oneshot::Sender<PermissionResponse>,
-    ) -> Self {
-        Self {
-            title,
-            description,
-            options,
-            selected: 0,
-            default,
-            response_tx: Some(response_tx),
-        }
-    }
-
-    fn send_response(&mut self, response: PermissionResponse) {
-        if let Some(tx) = self.response_tx.take() {
-            let _ = tx.send(response);
-        }
-    }
-
-    fn render_surface(
-        &mut self,
-        area: Rect,
-        surface: &mut crate::render::CellSurface,
-        cx: &RenderContext,
-    ) {
-        if area.width < 6 || area.height < 4 {
-            return;
-        }
-
-        let popup_width = 50u16.min(area.width.saturating_sub(4));
-        let option_lines = self.options.len() as u16;
-        let desc_lines = self
-            .description
-            .as_ref()
-            .map(|d| d.lines().count() as u16)
-            .unwrap_or(0);
-        let popup_height = (4 + option_lines + desc_lines).min(area.height.saturating_sub(4));
-
-        let x = (area.width.saturating_sub(popup_width)) / 2;
-        let y = (area.height.saturating_sub(popup_height)) / 2;
-
-        let popup_area = Rect {
-            x,
-            y,
-            width: popup_width,
-            height: popup_height,
-        };
-
-        // Background
-        let theme = cx.assistant_theme();
-        let bg = theme.get("ui.popup");
-        for py in popup_area.y..popup_area.y + popup_area.height {
-            for px in popup_area.x..popup_area.x + popup_area.width {
-                {
-                    if let Some(cell) = surface.cell_mut((px, py)) {
-                        cell.set_symbol(" ");
-                        cell.set_style(tui::ratatui::to_ratatui_style(bg));
-                    }
-                };
-            }
-        }
-
-        // Border top
-        let border_style = theme.get("ui.popup");
-        let top_border = format!("┌{}┐", "─".repeat(popup_width.saturating_sub(2) as usize));
-        surface.set_stringn(
-            x,
-            y,
-            &top_border,
-            popup_width as usize,
-            tui::ratatui::to_ratatui_style(border_style),
-        );
-
-        // Title
-        let title_style = theme.get("ui.text").add_modifier(Modifier::BOLD);
-        let title_line = format!(
-            "│ {:<width$}│",
-            self.title,
-            width = (popup_width - 4) as usize
-        );
-        surface.set_stringn(
-            x,
-            y + 1,
-            &title_line,
-            popup_width as usize,
-            tui::ratatui::to_ratatui_style(title_style),
-        );
-
-        let mut row = y + 2;
-
-        // Description
-        if let Some(ref desc) = self.description {
-            let desc_style = theme.get("ui.text.inactive");
-            for line in desc.lines() {
-                let padded = format!("│ {:<width$}│", line, width = (popup_width - 4) as usize);
-                surface.set_stringn(
-                    x,
-                    row,
-                    &padded,
-                    popup_width as usize,
-                    tui::ratatui::to_ratatui_style(desc_style),
-                );
-                row += 1;
-            }
-        }
-
-        // Separator
-        let sep = format!("├{}┤", "─".repeat(popup_width.saturating_sub(2) as usize));
-        surface.set_stringn(
-            x,
-            row,
-            &sep,
-            popup_width as usize,
-            tui::ratatui::to_ratatui_style(border_style),
-        );
-        row += 1;
-
-        // Options
-        for (i, opt) in self.options.iter().enumerate() {
-            let is_selected = i == self.selected;
-            let marker = if is_selected { ">" } else { " " };
-            let key = opt.key.map(|key| format!(" [{key}]")).unwrap_or_default();
-            let default = if self.default.as_deref() == Some(opt.id.as_str()) {
-                " default"
-            } else {
-                ""
-            };
-            let style = if is_selected {
-                theme.get("ui.menu.selected")
-            } else {
-                theme.get("ui.text")
-            };
-            let opt_line = format!(
-                "│{marker} {:<width$}│",
-                format!("{}{}{}", opt.title, key, default),
-                width = (popup_width - 5) as usize
-            );
-            surface.set_stringn(
-                x,
-                row,
-                &opt_line,
-                popup_width as usize,
-                tui::ratatui::to_ratatui_style(style),
-            );
-            row += 1;
-        }
-
-        // Border bottom
-        let bottom_border = format!("└{}┘", "─".repeat(popup_width.saturating_sub(2) as usize));
-        if row < popup_area.y + popup_area.height {
-            surface.set_stringn(
-                x,
-                row,
-                &bottom_border,
-                popup_width as usize,
-                tui::ratatui::to_ratatui_style(border_style),
-            );
-        }
-    }
-}
-
-impl Component for PermissionPopup {
-    fn render(&mut self, area: Rect, surface: &mut crate::render::CellSurface, cx: &RenderContext) {
-        self.render_surface(area, surface, cx);
-    }
-
-    fn handle_event(&mut self, event: &Event, _cx: &mut Context) -> EventResult {
-        let Event::Key(key) = event else {
-            return EventResult::Ignored(None);
-        };
-
-        match key.code {
-            KeyCode::Up | KeyCode::Char('k') => {
-                self.selected = self.selected.saturating_sub(1);
-                EventResult::Consumed(None)
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                if self.selected + 1 < self.options.len() {
-                    self.selected += 1;
-                }
-                EventResult::Consumed(None)
-            }
-            KeyCode::Enter => {
-                let selected = self
-                    .default
-                    .as_ref()
-                    .and_then(|default| self.options.iter().find(|opt| &opt.id == default))
-                    .or_else(|| self.options.get(self.selected));
-                if let Some(opt) = selected {
-                    self.send_response(PermissionResponse::Selected(opt.id.clone()));
-                }
-                EventResult::Consumed(Some(crate::compositor::PostAction::RemoveById(
-                    PERMISSION_ID,
-                )))
-            }
-            KeyCode::Esc | KeyCode::Char('q') => {
-                self.send_response(PermissionResponse::Dismissed);
-                EventResult::Consumed(Some(crate::compositor::PostAction::RemoveById(
-                    PERMISSION_ID,
-                )))
-            }
-            // Number shortcuts: 1-9 to select
-            KeyCode::Char(c @ '1'..='9') => {
-                let idx = (c as usize) - ('1' as usize);
-                if idx < self.options.len() {
-                    self.send_response(PermissionResponse::Selected(self.options[idx].id.clone()));
-                    EventResult::Consumed(Some(crate::compositor::PostAction::RemoveById(
-                        PERMISSION_ID,
-                    )))
-                } else {
-                    EventResult::Consumed(None)
-                }
-            }
-            KeyCode::Char(c) => {
-                let c = c.to_ascii_lowercase();
-                if let Some(opt) = self
-                    .options
-                    .iter()
-                    .find(|opt| opt.key.is_some_and(|key| key == c))
-                {
-                    self.send_response(PermissionResponse::Selected(opt.id.clone()));
-                    EventResult::Consumed(Some(crate::compositor::PostAction::RemoveById(
-                        PERMISSION_ID,
-                    )))
-                } else {
-                    EventResult::Consumed(None)
-                }
-            }
-            _ => EventResult::Consumed(None),
-        }
-    }
-
-    fn id(&self) -> Option<&str> {
-        Some(PERMISSION_ID)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3727,8 +3877,91 @@ mod tests {
     use helix_view::editor::Config;
     use helix_view::theme;
     use helix_view::Document;
+    use std::collections::HashSet;
     use std::path::Path;
     use std::sync::Arc;
+
+    fn key_event_for_binding(key: BindingKey) -> KeyEvent {
+        let code = match key.code {
+            BindingCode::Char(ch) => KeyCode::Char(ch),
+            BindingCode::Enter => KeyCode::Enter,
+            BindingCode::Esc => KeyCode::Esc,
+            BindingCode::Tab => KeyCode::Tab,
+            BindingCode::Backspace => KeyCode::Backspace,
+            BindingCode::Up => KeyCode::Up,
+            BindingCode::Down => KeyCode::Down,
+            BindingCode::Left => KeyCode::Left,
+            BindingCode::Right => KeyCode::Right,
+            BindingCode::Home => KeyCode::Home,
+            BindingCode::End => KeyCode::End,
+            BindingCode::PageUp => KeyCode::PageUp,
+            BindingCode::PageDown => KeyCode::PageDown,
+        };
+        KeyEvent {
+            code,
+            modifiers: key.modifiers,
+        }
+    }
+
+    #[test]
+    fn assistant_bindings_have_no_layer_collisions() {
+        for layer in [
+            AssistantLayer::Input,
+            AssistantLayer::Messages,
+            AssistantLayer::Elicitation,
+            AssistantLayer::Auth,
+        ] {
+            let mut keys = HashSet::new();
+            for binding in AssistantPanel::bindings_for_layer(layer) {
+                assert!(
+                    keys.insert(binding.key),
+                    "duplicate assistant binding in {layer:?}: {:?}",
+                    binding.key
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn assistant_hint_bindings_dispatch_to_same_action() {
+        for layer in [
+            AssistantLayer::Input,
+            AssistantLayer::Messages,
+            AssistantLayer::Elicitation,
+            AssistantLayer::Auth,
+        ] {
+            for binding in AssistantPanel::bindings_for_layer(layer)
+                .iter()
+                .filter(|binding| binding.hint.is_some())
+            {
+                let key = key_event_for_binding(binding.key);
+                let dispatched = AssistantPanel::binding_for_key(layer, &key)
+                    .expect("hinted binding must dispatch");
+                assert_eq!(dispatched.action, binding.action);
+            }
+        }
+    }
+
+    #[test]
+    fn assistant_escape_pops_one_layer() {
+        assert_eq!(
+            assistant_escape_target(AssistantLayer::Elicitation, false),
+            Some(AssistantLayer::Messages)
+        );
+        assert_eq!(
+            assistant_escape_target(AssistantLayer::Auth, false),
+            Some(AssistantLayer::Messages)
+        );
+        assert_eq!(
+            assistant_escape_target(AssistantLayer::Messages, false),
+            Some(AssistantLayer::Input)
+        );
+        assert_eq!(
+            assistant_escape_target(AssistantLayer::Input, true),
+            Some(AssistantLayer::Input)
+        );
+        assert_eq!(assistant_escape_target(AssistantLayer::Input, false), None);
+    }
 
     fn test_editor() -> Editor {
         let theme_loader = theme::Loader::new(runtime_dirs());

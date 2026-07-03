@@ -416,6 +416,8 @@ pub enum RuntimeTaskEvent {
     RequestSignatureDebounced {
         invoked: SignatureHelpInvoked,
         request: SignatureHelpRequestId,
+        trigger_kind: lsp::SignatureHelpTriggerKind,
+        is_retrigger: bool,
         cancel: Token,
     },
     /// Debounced blame fetch for statusline / inline blame.

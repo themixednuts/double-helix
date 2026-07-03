@@ -359,16 +359,21 @@ impl AssistantModel {
                 tone: AssistantHeaderTone::Default,
             });
         } else {
-            for tab in &self.tabs {
+            for tab in self
+                .tabs
+                .iter()
+                .filter(|tab| Some(tab.id) == self.active_thread)
+                .take(1)
+            {
                 leading.push(AssistantHeaderItem {
                     label: tab.label(),
-                    tone: if Some(tab.id) == self.active_thread {
-                        AssistantHeaderTone::Active
-                    } else if tab.unread {
-                        AssistantHeaderTone::Warning
-                    } else {
-                        AssistantHeaderTone::Default
-                    },
+                    tone: AssistantHeaderTone::Active,
+                });
+            }
+            if leading.is_empty() {
+                leading.push(AssistantHeaderItem {
+                    label: self.agent_name.clone(),
+                    tone: AssistantHeaderTone::Default,
                 });
             }
         }
@@ -381,6 +386,19 @@ impl AssistantModel {
             },
             tone: AssistantHeaderTone::Active,
         });
+        for item in self.status_items().into_iter().filter(|item| {
+            matches!(
+                item.kind,
+                AssistantStatusItemKind::Mode
+                    | AssistantStatusItemKind::Model
+                    | AssistantStatusItemKind::Review
+            )
+        }) {
+            trailing.push(AssistantHeaderItem {
+                label: item.label,
+                tone: AssistantHeaderTone::Default,
+            });
+        }
         if let Some(status) = &self.agent_status {
             trailing.push(AssistantHeaderItem {
                 label: status.clone(),

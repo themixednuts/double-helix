@@ -169,12 +169,11 @@ impl Application {
 
         errs.extend(self.editor.flush_assistant_persistence().await);
 
-        if self.editor.close_language_servers(None).await.is_err() {
-            log::error!("Timed out waiting for language servers to shutdown");
-            errs.push(anyhow::format_err!(
-                "Timed out waiting for language servers to shutdown"
-            ));
+        if let Err(err) = self.restore_term() {
+            log::error!("Error restoring terminal: {}", err);
+            errs.push(err.into());
         }
+        self.editor.close_language_servers(None).await;
 
         errs
     }

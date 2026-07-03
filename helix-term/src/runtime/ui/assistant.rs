@@ -32,6 +32,14 @@ fn connect_assistant_backend(
     });
 }
 
+#[derive(Debug, Clone)]
+struct PermissionPickerItem {
+    id: helix_view::assistant::permission::ChoiceId,
+    title: String,
+    description: String,
+    default: bool,
+}
+
 pub(crate) fn assistant_history_delete_remote(
     origin: Option<&helix_view::assistant::thread::Origin>,
     caps: Option<&helix_acp::AgentCaps>,
@@ -119,63 +127,50 @@ pub(crate) fn apply_assistant_command(
             compositor.replace_or_push(ASSISTANT_PANEL_ID, AssistantPanel::new());
         }
         AssistantCommand::ShowPermissionRequest { thread, request } => {
-            use crate::ui::assistant::{
-                PermissionChoice, PermissionPopup, PermissionResponse, PERMISSION_ID,
-            };
-
-            let (tx, rx) = tokio::sync::oneshot::channel::<PermissionResponse>();
-            let choices = request
+            let request_id = request.id().clone();
+            let default = request.default().cloned();
+            let items = request
                 .choices()
                 .iter()
-                .map(|choice| PermissionChoice {
-                    id: choice.id.as_str().to_string(),
+                .map(|choice| PermissionPickerItem {
+                    id: choice.id.clone(),
                     title: choice.label.clone(),
                     description: match &choice.kind {
-                        helix_view::assistant::permission::Kind::Custom(kind) => {
-                            Some(kind.to_string())
-                        }
-                        _ => None,
+                        helix_view::assistant::permission::Kind::Custom(kind) => kind.to_string(),
+                        _ => request.body().to_string(),
                     },
-                    key: match &choice.kind {
-                        helix_view::assistant::permission::Kind::AllowOnce => Some('y'),
-                        helix_view::assistant::permission::Kind::AllowAlways => Some('a'),
-                        helix_view::assistant::permission::Kind::RejectOnce => Some('n'),
-                        helix_view::assistant::permission::Kind::RejectAlways => Some('r'),
-                        helix_view::assistant::permission::Kind::Custom(_) => choice
-                            .label
-                            .chars()
-                            .find(|ch| ch.is_ascii_alphanumeric())
-                            .map(|ch| ch.to_ascii_lowercase()),
-                    },
+                    default: default.as_ref() == Some(&choice.id),
                 })
-                .collect();
-
-            let popup = PermissionPopup::new(
-                request.title().to_string(),
-                Some(request.body().to_string()),
-                choices,
-                request.default().map(|id| id.as_str().to_string()),
-                tx,
+                .collect::<Vec<_>>();
+            let columns = [
+                crate::ui::PickerColumn::new("choice", |item: &PermissionPickerItem, _: &()| {
+                    if item.default {
+                        format!("{} default", item.title).into()
+                    } else {
+                        item.title.as_str().into()
+                    }
+                }),
+                crate::ui::PickerColumn::new("details", |item: &PermissionPickerItem, _: &()| {
+                    item.description.as_str().into()
+                }),
+            ];
+            let picker = crate::ui::Picker::new(
+                columns,
+                0,
+                items,
+                (),
+                crate::ui::PickerRuntime::new(editor),
+                ingress.clone(),
+                move |cx: &mut crate::compositor::Context, item: &PermissionPickerItem, _action| {
+                    cx.ingress.assistant_permission_resolved(
+                        thread,
+                        request_id.clone(),
+                        helix_view::assistant::permission::Decision::Choose(item.id.clone()),
+                    );
+                },
             );
-            compositor.replace_or_push(PERMISSION_ID, popup);
 
-            let request_id = request.id().clone();
-            editor
-                .work()
-                .spawn(async move {
-                    let decision = match rx.await {
-                        Ok(PermissionResponse::Selected(id)) => {
-                            helix_view::assistant::permission::Decision::Choose(
-                                helix_view::assistant::permission::ChoiceId::new(id),
-                            )
-                        }
-                        _ => helix_view::assistant::permission::Decision::Dismiss,
-                    };
-                    ingress
-                        .send_assistant_permission_resolved(thread, request_id, decision)
-                        .await;
-                })
-                .detach();
+            compositor.push(Box::new(crate::ui::overlay::overlaid(picker)));
         }
         AssistantCommand::PushHistoryPicker {
             scope,

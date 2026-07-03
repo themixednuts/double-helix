@@ -157,8 +157,10 @@ pub(crate) struct PanelLayout {
 /// determined by iteration order of the SlotMap.
 pub(crate) fn compute_panel_layout(area: Rect, editor: &Editor) -> PanelLayout {
     // Reserve the very bottom row of the terminal for the global status
-    // line (cmdline / status_msg / errors). Both panels and the editor live
-    // above this row, so every column's chrome aligns on the same baseline.
+    // line (cmdline / status_msg / errors). The editor lives above this row.
+    // Side panels underlap it by one row because their own final internal row
+    // is transient/error chrome; the global row paints over that row, leaving
+    // the panel footer on the same baseline as the editor statusline.
     // The Popup-full-height cmdline opts out — there's no reserved row.
     let config = editor.config();
     let reserve_global = !matches!(
@@ -216,9 +218,9 @@ pub(crate) fn compute_panel_layout(area: Rect, editor: &Editor) -> PanelLayout {
                 let w = panel_size.max(30).min(editor_area.width.saturating_sub(40));
                 let panel_rect = Rect {
                     x: editor_area.x + editor_area.width - w,
-                    y: editor_area.y,
+                    y: area.y,
                     width: w,
-                    height: editor_area.height,
+                    height: area.height,
                 };
                 editor_area.width = editor_area.width.saturating_sub(w);
                 panel_areas.push((panel_id, panel_rect));
@@ -230,9 +232,9 @@ pub(crate) fn compute_panel_layout(area: Rect, editor: &Editor) -> PanelLayout {
                 let w = panel_size.max(20).min(editor_area.width.saturating_sub(40));
                 let panel_rect = Rect {
                     x: editor_area.x,
-                    y: editor_area.y,
+                    y: area.y,
                     width: w,
-                    height: editor_area.height,
+                    height: area.height,
                 };
                 editor_area.x += w;
                 editor_area.width = editor_area.width.saturating_sub(w);
@@ -1595,10 +1597,36 @@ mod tests {
         assert_eq!(layout.editor_area.width, 78); // 120 - 42
         assert_eq!(layout.editor_area.x, 0);
         assert_eq!(panel_rect.x, 78);
-        // Bottom row reserved for the global status line.
+        // Bottom row reserved for the global status line; side panels
+        // underlap it so their internal footer/status row aligns with the
+        // editor statusline one row above the global message row.
         assert_eq!(layout.editor_area.height, 39);
-        assert_eq!(panel_rect.height, 39);
+        assert_eq!(panel_rect.height, 40);
         assert_eq!(layout.global_status_row, Rect::new(0, 39, 120, 1));
+    }
+
+    #[tokio::test]
+    async fn panel_layout_side_panel_footer_aligns_with_editor_statusline() {
+        let mut editor = test_editor(120, 40);
+        editor.model.insert_panel(
+            "Assistant",
+            Box::new(AssistantModel::default()),
+            PanelSide::Right,
+            PanelSize::Percent(35),
+        );
+        let layout = compute_panel_layout(Rect::new(0, 0, 120, 40), &editor);
+        let (_, panel_rect) = &layout.panel_areas[0];
+
+        // AssistantPanel lays out [header, content, input, footer, error].
+        // The global status row paints over the error row, so the footer must
+        // land on the editor's own statusline baseline.
+        let editor_statusline_row = layout.editor_area.bottom().saturating_sub(1);
+        let panel_footer_row = panel_rect.bottom().saturating_sub(2);
+        assert_eq!(panel_footer_row, editor_statusline_row);
+        assert_eq!(
+            layout.global_status_row.y,
+            panel_rect.bottom().saturating_sub(1)
+        );
     }
 
     #[tokio::test]

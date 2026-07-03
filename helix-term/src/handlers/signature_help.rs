@@ -58,7 +58,13 @@ impl SignatureHelpHandler {
         SignatureHelpRequestId::new(id)
     }
 
-    fn dispatch_request(&mut self, invocation: SignatureHelpInvoked, delay: bool) {
+    fn dispatch_request(
+        &mut self,
+        invocation: SignatureHelpInvoked,
+        trigger_kind: lsp::SignatureHelpTriggerKind,
+        is_retrigger: bool,
+        delay: bool,
+    ) {
         let request = self.next_request();
         let cancel = Token::new();
         if let Some(current) = self.cancel.replace(cancel.clone()) {
@@ -69,6 +75,8 @@ impl SignatureHelpHandler {
         let event = RuntimeTaskEvent::RequestSignatureDebounced {
             invoked: invocation,
             request,
+            trigger_kind,
+            is_retrigger,
             cancel,
         };
 
@@ -84,10 +92,28 @@ impl SignatureHelpHandler {
             SignatureHelpEvent::Invoked => {
                 self.trigger = Some(SignatureHelpInvoked::Manual);
                 self.state = State::Closed;
-                self.dispatch_request(SignatureHelpInvoked::Manual, false);
+                self.dispatch_request(
+                    SignatureHelpInvoked::Manual,
+                    lsp::SignatureHelpTriggerKind::INVOKED,
+                    false,
+                    false,
+                );
                 return;
             }
-            SignatureHelpEvent::Trigger => {}
+            SignatureHelpEvent::Trigger => {
+                let is_retrigger = !matches!(self.state, State::Closed);
+                if self.trigger.is_none() {
+                    self.trigger = Some(SignatureHelpInvoked::Automatic)
+                }
+                let invocation = self.trigger.take().unwrap();
+                self.dispatch_request(
+                    invocation,
+                    lsp::SignatureHelpTriggerKind::TRIGGER_CHARACTER,
+                    is_retrigger,
+                    true,
+                );
+                return;
+            }
             SignatureHelpEvent::ReTrigger => {
                 // don't retrigger if we aren't open/pending yet
                 if matches!(self.state, State::Closed) {
@@ -117,7 +143,12 @@ impl SignatureHelpHandler {
             self.trigger = Some(SignatureHelpInvoked::Automatic)
         }
         let invocation = self.trigger.take().unwrap();
-        self.dispatch_request(invocation, true);
+        self.dispatch_request(
+            invocation,
+            lsp::SignatureHelpTriggerKind::CONTENT_CHANGE,
+            true,
+            true,
+        );
     }
 
     pub fn spawn(

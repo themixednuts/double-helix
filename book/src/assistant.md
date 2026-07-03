@@ -23,33 +23,59 @@ Open or connect with `:assistant-open` and `:assistant-connect`. With no argumen
 
 ## Panel Keys
 
-In message focus:
+The assistant is a docked panel with two focus modes: Input and Messages. The footer hint bar shows the active layer's keys.
+
+### Input
+
+Input focus is the prompt box. It uses Helix modal editing through the assistant EditRegion.
+
+| Key | Action |
+| --- | --- |
+| `Tab` / `Ctrl-j` | Move to Messages |
+| `Enter` | Send in normal mode; insert a newline in insert mode |
+| `@` | Start mention completion |
+| `/` | Start slash-command completion |
+| `Ctrl-o` | Open the standard mode/model/config picker |
+| `Ctrl-c` | Cancel pending assistant work |
+| `Esc` | Leave insert mode; in normal mode follows the editor focused-component convention |
+
+### Messages
+
+Messages focus is a single transcript list. Cards are entries in that list; they do not own focus.
 
 | Key | Action |
 | --- | --- |
 | `j` / `k` | Move between entries |
-| `Enter` | Submit a pending agent request; jump to a selected subagent tool session; otherwise open the selected entry in a scratch buffer |
+| `gg` / `G` | Move to the first/newest entry |
+| `Enter` | Primary action: enter a pending card transient, jump to a subagent target, or open the selected entry |
 | `Tab` | Expand or collapse the selected entry; tool calls are collapsed by default |
 | `y` | Yank a pending request URL; otherwise yank the selected entry |
-| `t` | Toggle follow mode |
+| `t` | Follow output or jump to a selected subagent target |
 | `r` | Retry the last user prompt after a failed or canceled run |
 | `R` | Toggle write/review mode for the active thread |
 | `a` / `A` | Accept the selected/all pending review changes |
 | `x` / `X` | Reject the selected/all pending review changes |
-| `G` / `End` | Jump back to the live tail |
-| `Esc` | Cancel a pending agent request; interrupt a running agent; otherwise return to input |
-| `Ctrl-c` | Interrupt a running agent |
-| `Ctrl-o` | Open the mode/model/config selector when the agent provides options |
+| `Esc` | Return to Input |
+| `Ctrl-c` | Cancel pending assistant work |
+| `Ctrl-o` | Open the standard mode/model/config picker |
 
-When authentication is required, the panel shows an auth card. Use `j`/`k` to select a method and `Enter` to authenticate; terminal-based auth renders as a live terminal card until the auth process exits.
+### Card Transients
 
-In input focus, type the prompt and submit normally. If an agent form request is pending, `Tab` and `Shift-Tab` move between fields, text fields accept typed input and backspace, select fields use `h`/`l` or `Space`, and boolean fields toggle with `Space`. `Enter` submits after required fields are filled and `Esc` cancels the request; otherwise `Esc` leaves insert mode.
+Authentication method choice and elicitation form editing are transient layers entered from Messages.
 
-The panel header shows the current mode/model when the agent provides them and compact token usage when usage is available. The first number is cumulative thread usage, and `last` is the most recent turn. Fast cycle keys are `Shift-Tab` for mode, `Ctrl-m` for model, and `Ctrl-t` for thinking level unless overridden by ACP config.
+| Key | Action |
+| --- | --- |
+| `Tab` / `Shift-Tab` | Move between fields or methods |
+| `h` / `l` / `Space` | Change select and boolean fields |
+| `Enter` | Submit or confirm |
+| `Esc` | Pop back to Messages |
+| `Ctrl-c` | Cancel pending assistant work |
+
+The panel header shows the active thread title, focus mode, current mode/model when the agent provides them, compact token usage, and run state. The first token number is cumulative thread usage, and `last` is the most recent turn.
 
 ## Permissions
 
-When an agent asks for permission, Helix shows a popup with the tool name, request body, available choices, shortcut keys, and the default choice when the request provides one.
+When an agent asks for permission, Helix shows a standard picker with the request choices. The picker uses normal picker keys; selecting a row sends that choice to the agent.
 
 Choices such as allow always or reject always are stored in the assistant permission rules file:
 
@@ -92,7 +118,7 @@ Type `/` at the start of the input to open slash-command completion. Commands co
 
 ## Agent Requests
 
-ACP elicitations render as request cards in the thread. Form cards list text, textarea, select, and boolean fields with required markers. URL cards show the URL; press `y` to yank it. Press `Enter` to submit the request or `Esc` to cancel it explicitly.
+ACP elicitations render as request cards in the thread. Form cards list text, textarea, select, and boolean fields with required markers. Press `Enter` from Messages to edit a form as a transient layer. URL cards show the URL; press `y` to yank it.
 
 The selector opened with `Ctrl-o` lists session modes first, followed by session config options such as model and thought level. Selecting a row applies it through the active ACP session; pending values show in the header while the agent confirms them.
 
@@ -100,7 +126,7 @@ Thought entries render as dim `thinking...` blocks and are folded by default. `T
 
 Agent-spawned terminals render as cards with a running/exited/failed status badge and the latest output tail.
 
-Tool calls that refer to a subagent session show a subagent marker in the row and include the subagent session id in the entry details. Press `Enter` on that tool call to jump to the subagent session; when the backend supports session loading, unloaded subagent sessions are loaded first.
+Tool calls that refer to a subagent session show a subagent marker in the row and include the subagent session id in the entry details. Press `Enter` or `t` on that tool call to jump to the subagent session; when the backend supports session loading, unloaded subagent sessions are loaded first.
 
 ## Markdown
 

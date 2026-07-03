@@ -586,6 +586,8 @@ pub(crate) fn request_signature_help(
     editor: &mut Editor,
     invoked: SignatureHelpInvoked,
     request: SignatureHelpRequestId,
+    trigger_kind: lsp::SignatureHelpTriggerKind,
+    is_retrigger: bool,
     cancel: Token,
     ingress: crate::runtime::RuntimeIngress,
 ) {
@@ -595,7 +597,18 @@ pub(crate) fn request_signature_help(
         .language_servers_with_feature(LanguageServerFeature::SignatureHelp)
         .find_map(|language_server| {
             let pos = doc.position(view_id, language_server.offset_encoding());
-            language_server.text_document_signature_help(doc.identifier(), pos, None)
+            let context = lsp::SignatureHelpContext {
+                trigger_kind: trigger_kind.clone(),
+                trigger_character: signature_help_trigger_character(
+                    doc,
+                    view_id,
+                    language_server,
+                    &trigger_kind,
+                ),
+                is_retrigger,
+                active_signature_help: None,
+            };
+            language_server.text_document_signature_help(doc.identifier(), pos, None, Some(context))
         });
 
     let Some(future) = future else {
@@ -629,6 +642,36 @@ pub(crate) fn request_signature_help(
             }
         })
         .detach();
+}
+
+fn signature_help_trigger_character(
+    doc: &helix_view::Document,
+    view_id: ViewId,
+    language_server: &helix_lsp::Client,
+    trigger_kind: &lsp::SignatureHelpTriggerKind,
+) -> Option<String> {
+    if trigger_kind != &lsp::SignatureHelpTriggerKind::TRIGGER_CHARACTER {
+        return None;
+    }
+
+    let lsp::ServerCapabilities {
+        signature_help_provider: Some(options),
+        ..
+    } = language_server.capabilities()
+    else {
+        return None;
+    };
+
+    let text = doc.text().slice(..);
+    let cursor = doc.selection(view_id).primary().cursor(text);
+    let text_before_cursor = text.slice(..cursor);
+    options
+        .trigger_characters
+        .iter()
+        .chain(options.retrigger_characters.iter())
+        .flatten()
+        .find(|trigger| text_before_cursor.ends_with(trigger))
+        .cloned()
 }
 
 pub(crate) fn apply_execute_lsp_command(

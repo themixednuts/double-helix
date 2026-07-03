@@ -201,9 +201,19 @@ pub(crate) fn apply_runtime_task_event(
         RuntimeTaskEvent::RequestSignatureDebounced {
             invoked,
             request,
+            trigger_kind,
+            is_retrigger,
             cancel,
         } => {
-            language_server::request_signature_help(editor, invoked, request, cancel, ingress);
+            language_server::request_signature_help(
+                editor,
+                invoked,
+                request,
+                trigger_kind,
+                is_retrigger,
+                cancel,
+                ingress,
+            );
         }
         RuntimeTaskEvent::BlameFetchDebounced { doc_id, path, line } => {
             apply_blame_fetch_debounced(editor, doc_id, path, line);

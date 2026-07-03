@@ -204,28 +204,52 @@ impl Editor {
         }
     }
 
-    /// Closes language servers with timeout. The default timeout is 10000 ms, use
-    /// `timeout` parameter to override this.
-    pub async fn close_language_servers(
-        &self,
-        timeout: Option<u64>,
-    ) -> Result<(), tokio::time::error::Elapsed> {
+    /// Closes language servers with a short grace period, then kills any server
+    /// process that did not shut down in time.
+    pub async fn close_language_servers(&self, timeout: Option<u64>) {
         for client in self.language_servers.iter_clients() {
             self.language_servers
                 .file_event_handler
                 .remove_client(client.id());
         }
 
-        tokio::time::timeout(
-            tokio::time::Duration::from_millis(timeout.unwrap_or(3000)),
-            future::join_all(
-                self.language_servers
-                    .iter_clients()
-                    .map(|client| client.force_shutdown()),
-            ),
+        let grace = tokio::time::Duration::from_millis(timeout.unwrap_or(3000));
+        future::join_all(
+            self.language_servers
+                .iter_clients()
+                .map(|client| async move {
+                    match tokio::time::timeout(grace, async {
+                        let _ = client.force_shutdown().await;
+                        client.wait().await
+                    })
+                    .await
+                    {
+                        Ok(Ok(_)) => {}
+                        Ok(Err(err)) => {
+                            log::warn!(
+                                "failed to wait for language server '{}' during shutdown: {}",
+                                client.name(),
+                                err
+                            );
+                        }
+                        Err(_) => {
+                            log::warn!(
+                                "language server '{}' did not shut down within {:?}; killing process",
+                                client.name(),
+                                grace
+                            );
+                            if let Err(err) = client.force_kill().await {
+                                log::warn!(
+                                    "failed to kill language server '{}' after shutdown timeout: {}",
+                                    client.name(),
+                                    err
+                                );
+                            }
+                        }
+                    }
+                }),
         )
-        .await
-        .map(|_| ())
+        .await;
     }
 
     /// Switches the editor into normal mode.

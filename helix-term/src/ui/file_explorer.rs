@@ -51,11 +51,11 @@ use model::DiagnosticStatus;
 use model::{DiagnosticSnapshot, ExplorerRow, VcsSnapshot, VcsStatus};
 #[cfg(test)]
 use path_ops::LabelRenameError;
-use path_ops::{display_path, selected_cursor, LabelEditRange};
+use path_ops::{display_path, relative_display, selected_cursor, LabelEditRange};
 use preview::{ExplorerPreview, PreviewDocumentCache};
 #[cfg(test)]
 use render::{ExplorerStatusStyles, ExplorerTreeItemStyles};
-use scan::ExplorerChild;
+use scan::{DirectoryScanner, ExplorerChild};
 
 pub const ID: &str = "file-explorer-panel";
 
@@ -86,6 +86,7 @@ pub struct FileExplorerPanel {
     search_query: String,
     search_active: bool,
     expanded_dirs: HashSet<PathBuf>,
+    search_saved_expanded_dirs: Option<HashSet<PathBuf>>,
     children_cache: HashMap<PathBuf, Vec<ExplorerChild>>,
     vcs_snapshot: VcsSnapshot,
     diagnostic_snapshot: DiagnosticSnapshot,
@@ -269,6 +270,17 @@ fn explorer_row_matches(row: &ExplorerRow, query: &str) -> bool {
             .contains(query)
 }
 
+fn explorer_child_matches(parent: &Path, child: &ExplorerChild, query: &str) -> bool {
+    relative_display(parent, &child.path)
+        .to_ascii_lowercase()
+        .contains(query)
+        || child
+            .path
+            .to_string_lossy()
+            .to_ascii_lowercase()
+            .contains(query)
+}
+
 fn row_status_width(row: &ExplorerRow) -> u16 {
     let icons = ICONS.load();
     let mut width = 0u16;
@@ -303,6 +315,7 @@ impl FileExplorerPanel {
             search_query: String::new(),
             search_active: false,
             expanded_dirs: HashSet::from([root.clone()]),
+            search_saved_expanded_dirs: None,
             children_cache: HashMap::new(),
             vcs_snapshot: VcsSnapshot::empty(&root, editor.config().file_explorer.vcs),
             diagnostic_snapshot: DiagnosticSnapshot::empty(
@@ -388,9 +401,83 @@ impl FileExplorerPanel {
         self.rows.get(self.selection)
     }
 
-    fn apply_search_filter(&mut self) {
+    fn collect_search_matches(
+        &mut self,
+        scanner: &DirectoryScanner<'_>,
+        root: &Path,
+        query: &str,
+        seen: &mut HashSet<PathBuf>,
+        matches: &mut Vec<PathBuf>,
+    ) -> Result<(), std::io::Error> {
+        let children = if let Some(children) = self.children_cache.get(root) {
+            children.clone()
+        } else {
+            let children = scanner.children(root)?;
+            self.children_cache
+                .insert(root.to_path_buf(), children.clone());
+            children
+        };
+
+        for child in children {
+            if explorer_child_matches(root, &child, query) {
+                matches.push(child.path.clone());
+            }
+
+            if !child.is_dir {
+                continue;
+            }
+
+            let canonical = child
+                .path
+                .canonicalize()
+                .unwrap_or_else(|_| child.path.clone());
+            if seen.insert(canonical) {
+                self.collect_search_matches(scanner, &child.path, query, seen, matches)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn expand_search_matches(
+        &mut self,
+        editor: &Editor,
+        query: &str,
+    ) -> Result<(), std::io::Error> {
+        let config = editor.config();
+        let scanner = DirectoryScanner::new(&config.file_explorer);
+        let root = self.root.clone();
+        let mut seen = HashSet::new();
+        if let Ok(canonical_root) = root.canonicalize() {
+            seen.insert(canonical_root);
+        }
+
+        let mut matches = Vec::new();
+        self.collect_search_matches(&scanner, &root, query, &mut seen, &mut matches)?;
+        for path in matches {
+            self.expand_to_path(&path);
+        }
+        Ok(())
+    }
+
+    fn apply_search_filter(&mut self, editor: &Editor) {
         let selected_path = self.selected().map(|row| row.path.clone());
-        self.rows = filter_explorer_rows(&self.all_rows, &self.search_query);
+        let query = self.search_query.trim().to_ascii_lowercase();
+        if query.is_empty() {
+            self.search_saved_expanded_dirs = None;
+            self.rows = filter_explorer_rows(&self.all_rows, &self.search_query);
+        } else {
+            if self.search_saved_expanded_dirs.is_none() {
+                self.search_saved_expanded_dirs = Some(self.expanded_dirs.clone());
+            }
+            if let Err(err) = self.expand_search_matches(editor, &query) {
+                log::debug!("failed to scan file explorer search matches: {err}");
+            }
+            if let Err(err) = self.rebuild_visible_rows(editor) {
+                log::debug!("failed to rebuild file explorer rows after search expansion: {err}");
+            }
+            self.rows = filter_explorer_rows(&self.all_rows, &self.search_query);
+        }
 
         if self.rows.is_empty() {
             self.label_selection = LabelSelection::default();
@@ -410,15 +497,21 @@ impl FileExplorerPanel {
         self.search_active = true;
     }
 
-    fn clear_search(&mut self) {
+    fn clear_search(&mut self, editor: &Editor) {
         if self.search_query.is_empty() {
             return;
         }
         self.search_query.clear();
-        self.apply_search_filter();
+        if let Some(expanded_dirs) = self.search_saved_expanded_dirs.take() {
+            self.expanded_dirs = expanded_dirs;
+            if let Err(err) = self.rebuild_visible_rows(editor) {
+                log::debug!("failed to rebuild file explorer rows after clearing search: {err}");
+            }
+        }
+        self.apply_search_filter(editor);
     }
 
-    fn handle_search_key(&mut self, key: KeyEvent) -> Option<EventResult> {
+    fn handle_search_key(&mut self, key: KeyEvent, editor: &Editor) -> Option<EventResult> {
         if self.search_active {
             match key {
                 KeyEvent {
@@ -433,14 +526,14 @@ impl FileExplorerPanel {
                     modifiers: KeyModifiers::NONE,
                 } => {
                     self.search_query.pop();
-                    self.apply_search_filter();
+                    self.apply_search_filter(editor);
                     return Some(EventResult::Consumed(None));
                 }
                 KeyEvent {
                     code: KeyCode::Char('u'),
                     modifiers: KeyModifiers::CONTROL,
                 } => {
-                    self.clear_search();
+                    self.clear_search(editor);
                     return Some(EventResult::Consumed(None));
                 }
                 KeyEvent {
@@ -448,7 +541,7 @@ impl FileExplorerPanel {
                     modifiers,
                 } if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
                     self.search_query.push(ch);
-                    self.apply_search_filter();
+                    self.apply_search_filter(editor);
                     return Some(EventResult::Consumed(None));
                 }
                 _ => return Some(EventResult::Consumed(None)),
@@ -468,7 +561,7 @@ impl FileExplorerPanel {
                 modifiers: KeyModifiers::NONE,
             } if !self.search_query.is_empty() => {
                 self.search_active = false;
-                self.clear_search();
+                self.clear_search(editor);
                 Some(EventResult::Consumed(None))
             }
             _ => None,
@@ -1433,7 +1526,7 @@ impl FileExplorerPanel {
             return self.handle_label_edit_key(key, cx);
         }
 
-        if let Some(result) = self.handle_search_key(key) {
+        if let Some(result) = self.handle_search_key(key, cx.editor) {
             return result;
         }
 
@@ -2823,7 +2916,7 @@ mod tests {
             panel.toggle_selected_dir(&editor);
 
             panel.search_query = "main".to_string();
-            panel.apply_search_filter();
+            panel.apply_search_filter(&editor);
 
             assert!(panel
                 .rows
@@ -2841,6 +2934,68 @@ mod tests {
                 .rows
                 .iter()
                 .any(|row| display_name(&row.path) == "README.md"));
+        });
+    }
+
+    #[test]
+    fn file_explorer_search_expands_collapsed_ancestors_and_restores_on_clear() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path().join("src").join("nested").join("deep")).unwrap();
+        fs::write(temp.path().join("src").join("keep.txt"), "").unwrap();
+        fs::write(
+            temp.path().join("src").join("nested").join("keep.txt"),
+            "",
+        )
+        .unwrap();
+        let target = temp
+            .path()
+            .join("src")
+            .join("nested")
+            .join("deep")
+            .join("needle.rs");
+        fs::write(&target, "").unwrap();
+        let rt = helix_runtime::test::RuntimeTest::default();
+        rt.block_on(async {
+            let editor = test_editor(100, 30, rt.runtime());
+            let mut panel = FileExplorerPanel::new(temp.path().to_path_buf(), &editor).unwrap();
+
+            let src = helix_stdx::path::normalize(temp.path().join("src"));
+            let nested = src.join("nested");
+            let deep = nested.join("deep");
+            let target = helix_stdx::path::normalize(&target);
+            assert!(!panel.expanded_dirs.contains(&src));
+            assert!(!panel.rows.iter().any(|row| row.path == target));
+
+            panel.search_query = "needle".to_string();
+            panel.apply_search_filter(&editor);
+
+            assert!(panel.expanded_dirs.contains(&src));
+            assert!(panel.expanded_dirs.contains(&nested));
+            assert!(panel.expanded_dirs.contains(&deep));
+            assert!(panel.rows.iter().any(|row| row.path == target));
+            assert!(panel
+                .rows
+                .iter()
+                .any(|row| row.path == src && row.is_dir && row.expanded));
+            assert!(panel
+                .rows
+                .iter()
+                .any(|row| row.path == nested && row.is_dir && row.expanded));
+            assert!(panel
+                .rows
+                .iter()
+                .any(|row| row.path == deep && row.is_dir && row.expanded));
+
+            panel.clear_search(&editor);
+
+            assert!(!panel.expanded_dirs.contains(&src));
+            assert!(!panel.expanded_dirs.contains(&nested));
+            assert!(!panel.expanded_dirs.contains(&deep));
+            assert!(panel
+                .rows
+                .iter()
+                .any(|row| row.path == src && row.is_dir && !row.expanded));
+            assert!(!panel.rows.iter().any(|row| row.path == target));
         });
     }
 
@@ -3877,6 +4032,7 @@ mod tests {
             search_query: String::new(),
             search_active: false,
             expanded_dirs: HashSet::new(),
+            search_saved_expanded_dirs: None,
             children_cache: HashMap::new(),
             vcs_snapshot: VcsSnapshot::default(),
             diagnostic_snapshot: DiagnosticSnapshot::default(),
@@ -3928,6 +4084,7 @@ mod tests {
             search_query: String::new(),
             search_active: false,
             expanded_dirs: HashSet::new(),
+            search_saved_expanded_dirs: None,
             children_cache: HashMap::new(),
             vcs_snapshot: VcsSnapshot::default(),
             diagnostic_snapshot: DiagnosticSnapshot::default(),
@@ -3989,6 +4146,7 @@ mod tests {
             search_query: String::new(),
             search_active: false,
             expanded_dirs: HashSet::new(),
+            search_saved_expanded_dirs: None,
             children_cache: HashMap::new(),
             vcs_snapshot: VcsSnapshot::default(),
             diagnostic_snapshot: DiagnosticSnapshot::default(),
@@ -4032,6 +4190,7 @@ mod tests {
             search_query: String::new(),
             search_active: false,
             expanded_dirs: HashSet::new(),
+            search_saved_expanded_dirs: None,
             children_cache: HashMap::new(),
             vcs_snapshot: VcsSnapshot::default(),
             diagnostic_snapshot: DiagnosticSnapshot::default(),

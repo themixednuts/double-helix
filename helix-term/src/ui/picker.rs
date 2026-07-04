@@ -469,6 +469,24 @@ enum PreparedPreviewSource {
     Document(DocumentId),
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PreviewSelectionKey {
+    Path(Arc<Path>),
+    Document(DocumentId),
+}
+
+fn should_request_preview_for_current_selection(
+    last_preview_selection: &mut Option<PreviewSelectionKey>,
+    current: PreviewSelectionKey,
+) -> bool {
+    if last_preview_selection.as_ref() == Some(&current) {
+        return false;
+    }
+
+    *last_preview_selection = Some(current);
+    true
+}
+
 enum RenderPreview<'a> {
     Cached(&'a CachedPreview),
     Document(&'a Document),
@@ -702,6 +720,7 @@ pub struct Picker<T: 'static + Send + Sync, D: 'static> {
     preview_region: ContentRegion<()>,
     /// Preview source resolved during sync so render does not query editor state.
     prepared_preview: Option<PreparedPreview>,
+    last_preview_selection: Option<PreviewSelectionKey>,
     dynamic_query: DynamicQuery<T, D>,
     /// Cached gradient border for rendering when enabled in config
     gradient_border: Option<GradientBorder>,
@@ -885,6 +904,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             ),
             preview_region: ContentRegion::default(),
             prepared_preview: None,
+            last_preview_selection: None,
             dynamic_query: DynamicQuery::Disabled,
             gradient_border: None,
             trace: None,
@@ -1384,6 +1404,16 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
         let _ = self.matcher.tick(DRAIN_TIMEOUT_MS);
     }
 
+    fn sync_matcher_for_current_selection(&mut self) {
+        let status = self.matcher.tick(10);
+        if status.changed {
+            let snapshot = self.matcher.snapshot();
+            self.cursor = self
+                .cursor
+                .min(snapshot.matched_item_count().saturating_sub(1));
+        }
+    }
+
     pub fn selection(&self) -> Option<&T> {
         self.matcher
             .snapshot()
@@ -1774,18 +1804,26 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
 
         let preview_start = std::time::Instant::now();
         let Some(current) = self.selection() else {
+            self.last_preview_selection = None;
             return;
         };
         let Some(file_fn) = self.file_fn.as_ref() else {
             return;
         };
         let Some((path_or_id, range)) = file_fn(editor, current) else {
+            self.last_preview_selection = None;
             return;
         };
 
         match path_or_id {
             PathOrId::Path(path) => {
-                if let Some(doc) = editor.document_by_path(path) {
+                let path: Arc<Path> = path.into();
+                let selection_changed = should_request_preview_for_current_selection(
+                    &mut self.last_preview_selection,
+                    PreviewSelectionKey::Path(path.clone()),
+                );
+
+                if let Some(doc) = editor.document_by_path(path.as_ref()) {
                     if let Some(trace) = self.trace {
                         trace.log(
                             "preview_resolve",
@@ -1803,12 +1841,13 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
                     return;
                 }
 
-                if self.preview_cache.contains_key(path) {
+                if self.preview_cache.contains_key(path.as_ref()) {
                     // NOTE: we use `HashMap::get_key_value` here instead of indexing so we can
-                    // retrieve the `Arc<Path>` key. The `path` in scope here is a `&Path` and
-                    // we can cheaply clone the key for the preview highlight handler.
-                    let (path, preview) = self.preview_cache.get_key_value(path).unwrap();
-                    if matches!(preview, CachedPreview::Document(doc) if doc.language_config().is_none())
+                    // retrieve and cheaply clone the canonical `Arc<Path>` cache key for the
+                    // preview highlight handler.
+                    let (path, preview) = self.preview_cache.get_key_value(path.as_ref()).unwrap();
+                    if selection_changed
+                        && matches!(preview, CachedPreview::Document(doc) if doc.language_config().is_none())
                     {
                         self.preview_highlight_handler.request(path.clone());
                     }
@@ -1830,7 +1869,6 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
                     return;
                 }
 
-                let path: Arc<Path> = path.into();
                 let preview = CachedPreview::Loading;
                 if let Some(trace) = self.trace {
                     trace.log(
@@ -1851,6 +1889,10 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
                 });
             }
             PathOrId::Id(id) => {
+                should_request_preview_for_current_selection(
+                    &mut self.last_preview_selection,
+                    PreviewSelectionKey::Document(id),
+                );
                 if !editor.documents.contains_key(&id) {
                     return;
                 }
@@ -2509,6 +2551,7 @@ impl<I: 'static + Send + Sync, D: 'static + Send + Sync> Component for Picker<I,
     fn sync(&mut self, editor: &mut Editor) {
         self.list_region.ensure_init(editor);
         self.preview_region.ensure_init(editor);
+        self.sync_matcher_for_current_selection();
         self.prepare_preview(editor);
         self.sync_to_model(editor);
     }
@@ -2923,6 +2966,74 @@ mod tests {
                 Some(binding.action)
             );
         }
+    }
+
+    #[test]
+    fn picker_preview_request_decision_triggers_initial_populate_and_dedupes() {
+        let first: Arc<Path> = Arc::from(std::path::Path::new("first.rs"));
+        let second: Arc<Path> = Arc::from(std::path::Path::new("second.rs"));
+        let mut last = None;
+
+        assert!(should_request_preview_for_current_selection(
+            &mut last,
+            PreviewSelectionKey::Path(first.clone())
+        ));
+        assert!(!should_request_preview_for_current_selection(
+            &mut last,
+            PreviewSelectionKey::Path(first)
+        ));
+        assert!(should_request_preview_for_current_selection(
+            &mut last,
+            PreviewSelectionKey::Path(second)
+        ));
+
+        last = None;
+        assert!(should_request_preview_for_current_selection(
+            &mut last,
+            PreviewSelectionKey::Path(Arc::from(std::path::Path::new("first.rs")))
+        ));
+    }
+
+    #[test]
+    fn picker_sync_prepares_preview_for_initial_first_result() {
+        fn path_cell(item: &PathBuf, _: &()) -> Cell<'static> {
+            Cell::from(item.display().to_string())
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("first.rs");
+        std::fs::write(&path, "fn main() {}\n").unwrap();
+        let rt = helix_runtime::test::RuntimeTest::default();
+        rt.block_on(async {
+            let runtime = rt.runtime();
+            let mut editor = helix_view::editor::EditorBuilder::new(
+                helix_view::graphics::Rect::new(0, 0, 80, 24),
+                runtime.clone(),
+            )
+            .build();
+            let (ingress, _rx) = crate::runtime::RuntimeIngress::channel(runtime.work().clone());
+            let mut picker = Picker::new(
+                [Column::new("path", path_cell)],
+                0,
+                [path.clone()],
+                (),
+                PickerRuntime::new(&editor),
+                ingress,
+                |_cx, _item, _action| {},
+            )
+            .with_preview(|_editor, item| Some((PathOrId::Path(item.as_path()), None)));
+
+            <Picker<PathBuf, ()> as Component>::sync(&mut picker, &mut editor);
+
+            assert!(picker.preview_cache.contains_key(path.as_path()));
+            assert!(matches!(
+                picker.prepared_preview,
+                Some(PreparedPreview {
+                    source: PreparedPreviewSource::CachedPath(ref preview_path),
+                    ..
+                }) if preview_path.as_ref() == path.as_path()
+            ));
+        });
     }
 
     #[test]

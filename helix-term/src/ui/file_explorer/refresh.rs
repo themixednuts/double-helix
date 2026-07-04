@@ -157,7 +157,7 @@ impl FileExplorerPanel {
             );
         }
         self.all_rows = rows;
-        self.apply_search_filter();
+        self.apply_search_filter(editor);
         let build_us = build_start.elapsed().as_micros();
 
         let selection_start = Instant::now();
@@ -261,7 +261,7 @@ impl FileExplorerPanel {
         path.starts_with(&self.root).then_some(path)
     }
 
-    fn expand_to_path(&mut self, path: &Path) {
+    pub(super) fn expand_to_path(&mut self, path: &Path) {
         let mut ancestor = path.parent();
         while let Some(dir) = ancestor {
             if !dir.starts_with(&self.root) {
@@ -354,6 +354,46 @@ impl FileExplorerPanel {
                 )?;
             }
         }
+        Ok(())
+    }
+
+    pub(super) fn rebuild_visible_rows(&mut self, editor: &Editor) -> Result<(), std::io::Error> {
+        let config = editor.config();
+        let scanner = DirectoryScanner::new(&config.file_explorer);
+        let root = self.root.clone();
+        let mut rows = Vec::new();
+        let mut seen = HashSet::new();
+        if let Ok(canonical_root) = root.canonicalize() {
+            seen.insert(canonical_root);
+        }
+        let root_expanded = self.expanded_dirs.contains(&root);
+        rows.push(ExplorerRow {
+            path: root.clone(),
+            label: display_name(&root),
+            is_dir: true,
+            depth: 0,
+            expanded: root_expanded,
+            is_last: true,
+            ancestor_last: Vec::new(),
+            vcs_status: self.vcs_snapshot.status(&root),
+            diagnostic_status: self.diagnostic_snapshot.status(&root),
+        });
+        if root_expanded {
+            let mut build = RowBuildContext {
+                scanner,
+                vcs: &self.vcs_snapshot,
+                diagnostics: &self.diagnostic_snapshot,
+                seen: &mut seen,
+                rows: &mut rows,
+                children_cache: &mut self.children_cache,
+                cache_hits: 0,
+                cache_misses: 0,
+                scan_us: 0,
+                scanned_children: 0,
+            };
+            Self::collect_rows(&root, 1, &[], &self.expanded_dirs, &mut build)?;
+        }
+        self.all_rows = rows;
         Ok(())
     }
 

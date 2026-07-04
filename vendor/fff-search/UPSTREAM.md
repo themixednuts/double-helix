@@ -1,15 +1,16 @@
 # FFF Upstream Tracking
 
-This directory vendors `fff-search`, the core crate from
-`https://github.com/dmtrKovalenko/fff.nvim`.
+This directory vendors `fff-search`, the search crate from
+`https://github.com/dmtrKovalenko/fff`.
 
 ## Current Mapping
 
-- Upstream repo: `dmtrKovalenko/fff.nvim`
-- Upstream crate path: `crates/fff-core`
+- Upstream repo: `dmtrKovalenko/fff`
+- Upstream crate path: `crates/fff-core` (published as crate `fff-search`)
 - Vendored path: `vendor/fff-search`
-- Current vendored crate version: `0.6.4`
-- Latest nightly checked: `0.6.5-nightly.0f5ead1`
+- Current vendored crate version: `0.9.6`
+- Previous vendored crate version: `0.6.4`
+- Latest nightly checked: `0.9.7-nightly.1cd8d31` (crates.io, 2026-07-02)
 
 ## Local Extension Contract
 
@@ -18,6 +19,7 @@ on these local extension points:
 
 - `FilePickerScanOptions` and `FilePickerOptions::scan` for preserving Helix file-picker ignore/hidden/depth/link semantics.
 - `ContentOverlay`, `OwnedGrepMatch`, `OwnedGrepResult`, `FilePicker::grep_owned`, and `grep_bytes` for searching unsaved editor buffers without writing them to disk.
+- `FrecencyStore` and `QueryTrackerStore` for keeping fff-search storage-agnostic; `helix-term` supplies the SQLite-backed `helix-store` implementations. Do not add `heed`/LMDB back to `vendor/fff-search`.
 
 If upstream gains equivalent APIs, delete the local extension and migrate the
 adapter. If upstream does not, keep the patch small and isolated so it can be
@@ -54,4 +56,3 @@ and reports which local extension symbols are absent upstream.
 4. Run `cargo check -p helix-term --bin dhx --manifest-path E:/helix/helix-fork/Cargo.toml`.
 5. Run `cargo test -p helix-term --manifest-path E:/helix/helix-fork/Cargo.toml --lib picker`.
 6. Run `cargo clippy -p helix-term --lib --manifest-path E:/helix/helix-fork/Cargo.toml -- -D warnings`.
-

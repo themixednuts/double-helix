@@ -7,7 +7,7 @@ use tempfile::TempDir;
 
 use fff_search::file_picker::{FFFMode, FilePicker};
 use fff_search::grep::{GrepMode, GrepSearchOptions, parse_grep_query};
-use fff_search::{FilePickerOptions, SharedFrecency, SharedPicker};
+use fff_search::{FilePickerOptions, SharedFilePicker, SharedFrecency};
 
 /// Create a temp directory with some initial files, run the full picker lifecycle,
 /// then modify a file and verify grep finds the new content.
@@ -25,7 +25,7 @@ fn modified_file_findable_via_overlay() {
     .unwrap();
     fs::write(base.join("gamma.txt"), "yet another file\nmore lines\n").unwrap();
 
-    let shared_picker = SharedPicker::default();
+    let shared_picker = SharedFilePicker::default();
     let shared_frecency = SharedFrecency::default();
 
     FilePicker::new_with_shared_state(
@@ -36,6 +36,7 @@ fn modified_file_findable_via_overlay() {
             enable_mmap_cache: true,
             enable_content_indexing: true,
             mode: FFFMode::Neovim,
+            watch: false, // we drive events manually
             ..Default::default()
         },
     )
@@ -112,7 +113,7 @@ fn modified_file_findable_via_overlay() {
     {
         let mut guard = shared_picker.write().unwrap();
         let picker = guard.as_mut().unwrap();
-        let result = picker.on_create_or_modify(&modified_path);
+        let result = picker.handle_create_or_modify(&modified_path);
         assert!(
             result.is_some(),
             "on_create_or_modify should return the file"
@@ -143,21 +144,6 @@ fn modified_file_findable_via_overlay() {
         );
     }
 
-    // Prove the overlay is actually doing something: without it, the bigram
-    // index would filter out beta.txt and the search would miss the needle.
-    {
-        let guard = shared_picker.read().unwrap();
-        let picker = guard.as_ref().unwrap();
-        let parsed = parse_grep_query("UNIQUE_NEEDLE");
-        let opts = grep_opts();
-        let result = picker.grep_without_overlay(&parsed, &opts);
-        assert_eq!(
-            result.matches.len(),
-            0,
-            "Without overlay, bigram prefiltering should exclude the modified file"
-        );
-    }
-
     // Cleanup: stop background watcher.
     if let Ok(mut guard) = shared_picker.write() {
         if let Some(ref mut picker) = *guard {
@@ -175,7 +161,7 @@ fn deleted_file_excluded_via_overlay() {
     fs::write(base.join("keep.txt"), "keep this content\n").unwrap();
     fs::write(base.join("remove.txt"), "DELETEME_TOKEN is here\n").unwrap();
 
-    let shared_picker = SharedPicker::default();
+    let shared_picker = SharedFilePicker::default();
     let shared_frecency = SharedFrecency::default();
 
     FilePicker::new_with_shared_state(
@@ -186,6 +172,7 @@ fn deleted_file_excluded_via_overlay() {
             enable_mmap_cache: true,
             enable_content_indexing: true,
             mode: FFFMode::Neovim,
+            watch: false, // we drive events manually
             ..Default::default()
         },
     )
@@ -244,7 +231,7 @@ fn new_file_findable_after_add() {
 
     fs::write(base.join("existing.txt"), "original content\n").unwrap();
 
-    let shared_picker = SharedPicker::default();
+    let shared_picker = SharedFilePicker::default();
     let shared_frecency = SharedFrecency::default();
 
     FilePicker::new_with_shared_state(
@@ -255,6 +242,7 @@ fn new_file_findable_after_add() {
             enable_mmap_cache: true,
             enable_content_indexing: true,
             mode: FFFMode::Neovim,
+            watch: false, // we drive events manually
             ..Default::default()
         },
     )
@@ -270,7 +258,7 @@ fn new_file_findable_after_add() {
     {
         let mut guard = shared_picker.write().unwrap();
         let picker = guard.as_mut().unwrap();
-        let result = picker.on_create_or_modify(&new_path);
+        let result = picker.handle_create_or_modify(&new_path);
         assert!(
             result.is_some(),
             "on_create_or_modify should return the new file"
@@ -314,7 +302,7 @@ fn modified_file_findable_via_regex_overlay() {
     )
     .unwrap();
 
-    let shared_picker = SharedPicker::default();
+    let shared_picker = SharedFilePicker::default();
     let shared_frecency = SharedFrecency::default();
 
     FilePicker::new_with_shared_state(
@@ -325,6 +313,7 @@ fn modified_file_findable_via_regex_overlay() {
             enable_mmap_cache: true,
             enable_content_indexing: true,
             mode: FFFMode::Neovim,
+            watch: false, // we drive events manually
             ..Default::default()
         },
     )
@@ -346,7 +335,7 @@ fn modified_file_findable_via_regex_overlay() {
     {
         let mut guard = shared_picker.write().unwrap();
         let picker = guard.as_mut().unwrap();
-        assert!(picker.on_create_or_modify(&modified_path).is_some());
+        assert!(picker.handle_create_or_modify(&modified_path).is_some());
     }
 
     // Regex grep should find the modified file through the overlay.
@@ -397,7 +386,7 @@ fn grep_for<'a>(picker: &'a FilePicker, query: &str) -> fff_search::grep::GrepRe
     picker.grep(&parsed, &grep_opts())
 }
 
-fn wait_for_bigram(shared_picker: &SharedPicker) {
+fn wait_for_bigram(shared_picker: &SharedFilePicker) {
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     loop {
         std::thread::sleep(Duration::from_millis(50));

@@ -60,7 +60,7 @@ impl std::fmt::Debug for SimdChunk {
     }
 }
 
-pub const PATH_BUF_SIZE: usize = 4096;
+pub use crate::constants::PATH_BUF_SIZE;
 
 /// Indices into a shared `SimdChunk` arena representing a file path.
 ///
@@ -172,10 +172,12 @@ impl ChunkedString {
         let usable_chunks = total.div_ceil(SIMD_CHUNK_BYTES);
         let chunks_to_copy = usable_chunks.min(self.indices.len());
         let base = arena.as_ptr();
+
         for (i, &idx) in self.indices[..chunks_to_copy].iter().enumerate() {
             let src = unsafe { base.add(idx as usize * SIMD_CHUNK_BYTES) };
             let dst_offset = i * SIMD_CHUNK_BYTES;
             let take = SIMD_CHUNK_BYTES.min(total - dst_offset);
+
             unsafe {
                 core::ptr::copy_nonoverlapping(src, buf.as_mut_ptr().add(dst_offset), take);
             }
@@ -293,10 +295,11 @@ pub(crate) struct ChunkedPathStoreBuilder {
 
 impl ChunkedPathStoreBuilder {
     pub fn new(estimated_files: usize) -> Self {
-        let est_chunks = estimated_files * 3;
+        let est_chunks = estimated_files * INLINE_CHUNKS; // we know that most of repos will fit
+        // most paths into 64 = 16 * INLINE_CHUNKS
         Self {
-            arena: Vec::with_capacity(est_chunks / 2),
-            chunk_dedup: AHashMap::with_capacity(est_chunks / 2),
+            arena: Vec::with_capacity(est_chunks),
+            chunk_dedup: AHashMap::with_capacity(est_chunks),
         }
     }
 
@@ -317,15 +320,11 @@ impl ChunkedPathStoreBuilder {
     pub fn add_file_immediate(&mut self, rel_path: &str, filename_offset: u16) -> ChunkedString {
         let path_bytes = rel_path.as_bytes();
         let byte_len = rel_path.len();
-        let n_chunks = chunks_needed(byte_len);
-        let mut indices = ChunkIndices::with_capacity(n_chunks);
+        let mut indices = ChunkIndices::with_capacity(chunks_needed(byte_len));
 
-        for i in 0..n_chunks {
-            let chunk_start = i * SIMD_CHUNK_BYTES;
-            let chunk_end = (chunk_start + SIMD_CHUNK_BYTES).min(byte_len);
+        for chunk in path_bytes.chunks(SIMD_CHUNK_BYTES) {
             let mut chunk_bytes = [0u8; SIMD_CHUNK_BYTES];
-            chunk_bytes[..chunk_end - chunk_start]
-                .copy_from_slice(&path_bytes[chunk_start..chunk_end]);
+            chunk_bytes[..chunk.len()].copy_from_slice(chunk);
 
             let arena_idx = match self.chunk_dedup.get(&chunk_bytes) {
                 Some(&idx) => idx,
@@ -336,6 +335,7 @@ impl ChunkedPathStoreBuilder {
                     idx
                 }
             };
+
             indices.push(arena_idx);
         }
 

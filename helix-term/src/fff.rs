@@ -355,6 +355,9 @@ impl FffWorkspace {
                 mode: FFFMode::Neovim,
                 cache_budget: None,
                 watch: true,
+                follow_symlinks: scan.follow_links,
+                enable_fs_root_scanning: true,
+                enable_home_dir_scanning: true,
                 scan,
             },
         )?;

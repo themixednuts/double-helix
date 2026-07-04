@@ -20,7 +20,9 @@ use rand::{RngCore, SeedableRng};
 
 use fff_search::file_picker::{FFFMode, FilePicker, FuzzySearchOptions};
 use fff_search::grep::{GrepMode, GrepSearchOptions, parse_grep_query};
-use fff_search::{FilePickerOptions, PaginationArgs, QueryParser, SharedFrecency, SharedPicker};
+use fff_search::{
+    FilePickerOptions, PaginationArgs, QueryParser, SharedFilePicker, SharedFrecency,
+};
 
 const DOMAINS: &[&str] = &[
     r#"
@@ -308,7 +310,7 @@ fn fuzz_file_operations_stress() {
     git_init_and_commit(base);
     t_git += t0.elapsed();
 
-    let shared_picker = SharedPicker::default();
+    let shared_picker = SharedFilePicker::default();
 
     FilePicker::new_with_shared_state(
         shared_picker.clone(),
@@ -377,7 +379,7 @@ fn fuzz_file_operations_stress() {
                 let mut guard = shared_picker.write().unwrap();
                 let picker = guard.as_mut().unwrap();
                 assert!(
-                    picker.on_create_or_modify(base.join(name)).is_some(),
+                    picker.handle_create_or_modify(base.join(name)).is_some(),
                     "round {round}: on_create_or_modify({name}) should succeed for edit"
                 );
             }
@@ -397,7 +399,7 @@ fn fuzz_file_operations_stress() {
                 let mut guard = shared_picker.write().unwrap();
                 let picker = guard.as_mut().unwrap();
                 assert!(
-                    picker.on_create_or_modify(base.join(&name)).is_some(),
+                    picker.handle_create_or_modify(base.join(&name)).is_some(),
                     "round {round}: on_create_or_modify({name}) should succeed for create"
                 );
             }
@@ -451,7 +453,9 @@ fn fuzz_file_operations_stress() {
                 let mut guard = shared_picker.write().unwrap();
                 let picker = guard.as_mut().unwrap();
                 assert!(
-                    picker.on_create_or_modify(base.join(&new_name)).is_some(),
+                    picker
+                        .handle_create_or_modify(base.join(&new_name))
+                        .is_some(),
                     "round {round}: on_create_or_modify({new_name}) should succeed for rename"
                 );
             }
@@ -711,7 +715,7 @@ fn fuzzy_search_paths(picker: &FilePicker, query: &str) -> Vec<String> {
         .collect()
 }
 
-fn wait_for_bigram(shared_picker: &SharedPicker) {
+fn wait_for_bigram(shared_picker: &SharedFilePicker) {
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
         std::thread::sleep(Duration::from_millis(50));
@@ -763,4 +767,94 @@ fn git_init_and_commit(dir: &Path) {
     git_run(dir, &["init"]);
     git_run(dir, &["add", "-A"]);
     git_run(dir, &["commit", "-m", "initial"]);
+}
+
+/// Proves that dropping the picker while post-scan (warmup + bigram build)
+/// is actively iterating raw pointers does NOT segfault. The Drop impl
+/// sets `cancelled`, waits for `post_scan_indexing_active` to clear, and
+/// only then frees the backing Vec.
+///
+/// Runs 10 iterations to exercise the race window reliably.
+#[test]
+fn drop_during_post_scan_does_not_crash() {
+    let mut caught_active = 0u32;
+
+    for round in 0..10 {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path();
+
+        // Create enough files so bigram build takes measurable time
+        for i in 0..2000 {
+            let dir = base.join(format!("d_{:02}", i % 20));
+            fs::create_dir_all(&dir).unwrap();
+            let content = format!(
+                "fn func_{i}() {{ let x = {i}; println!(\"{{x}}\"); }}\n\
+                 const T_{i}: &str = \"TOKEN_{i}\";\n"
+            );
+            fs::write(dir.join(format!("f_{i:04}.rs")), content).unwrap();
+        }
+
+        git_init_and_commit(base);
+
+        let shared_picker = SharedFilePicker::default();
+
+        FilePicker::new_with_shared_state(
+            shared_picker.clone(),
+            SharedFrecency::noop(),
+            FilePickerOptions {
+                base_path: base.to_string_lossy().to_string(),
+                enable_mmap_cache: true,
+                enable_content_indexing: true,
+                watch: false,
+                mode: FFFMode::Neovim,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // Wait for scan but NOT for bigram — drop while post-scan is active
+        shared_picker.wait_for_scan(Duration::from_secs(10));
+
+        // Poll until post_scan_indexing_active is true (bigram started)
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut was_active = false;
+        loop {
+            if let Ok(guard) = shared_picker.read() {
+                if let Some(picker) = guard.as_ref() {
+                    if picker.is_post_scan_active() {
+                        was_active = true;
+                        break;
+                    }
+                }
+            }
+            if std::time::Instant::now() > deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        if was_active {
+            caught_active += 1;
+        }
+
+        // Drop the picker while post_scan_indexing_active is set.
+        // Take it out of the shared handle first, then drop outside the lock —
+        // Drop spins until post-scan finishes, which needs the write lock for
+        // bigram install, so we can't hold it during Drop.
+        let old_picker = shared_picker.write().unwrap().take();
+        drop(old_picker); // Drop fires here — spins until post-scan exits
+
+        assert!(
+            shared_picker.read().unwrap().is_none(),
+            "round {round}: picker should be None after drop"
+        );
+    }
+
+    // At least some rounds must have caught the post-scan active window
+    assert!(
+        caught_active > 0,
+        "Test didn't catch post_scan_indexing_active=true in any round. \
+         The test is not exercising the race. ({caught_active}/10)"
+    );
+    eprintln!("Caught post-scan active in {caught_active}/10 rounds");
 }

@@ -2,7 +2,7 @@
 //!
 //! This crate provides the core search engine for [FFF (Fast File Finder)](https://github.com/dmtrKovalenko/fff.nvim).
 //! It includes filesystem indexing with real-time watching, fuzzy matching powered
-//! by [frizbee](https://docs.rs/neo_frizbee), storage-agnostic frecency scoring,
+//! by [frizbee](https://docs.rs/neo_frizbee), frecency scoring backed by LMDB,
 //! and multi-mode grep search.
 //!
 //! ## Architecture
@@ -10,8 +10,8 @@
 //! - [`file_picker::FilePicker`] — Main entry point. Indexes a directory tree in a
 //!   background thread, maintains a sorted file list, watches the filesystem for
 //!   changes, and performs fuzzy search with frecency-weighted scoring.
-//! - [`frecency::FrecencyTracker`] — Tracks file access and modification patterns
-//!   for intelligent result ranking through a caller-provided persistence store.
+//! - [`frecency::FrecencyTracker`] — LMDB-backed database that tracks file access
+//!   and modification patterns for intelligent result ranking.
 //! - [`query_tracker::QueryTracker`] — Tracks search query history and provides
 //!   "combo-boost" scoring for repeatedly matched files.
 //! - [`grep`] — Live grep search supporting regex, plain-text, and fuzzy modes
@@ -20,7 +20,7 @@
 //!
 //! ## Shared State
 //!
-//! [`SharedPicker`], [`SharedFrecency`], and [`SharedQueryTracker`] are
+//! [`SharedFilePicker`], [`SharedFrecency`], and [`SharedQueryTracker`] are
 //! newtype wrappers around `Arc<RwLock<Option<T>>>` for thread-safe shared
 //! access. They provide `read()` / `write()` methods with built-in error
 //! conversion and convenience helpers like `wait_for_scan()`.
@@ -33,17 +33,17 @@
 //! use fff_search::query_tracker::QueryTracker;
 //! use fff_search::{
 //!     FFFMode, FilePickerOptions, FuzzySearchOptions, PaginationArgs, QueryParser,
-//!     SharedFrecency, SharedPicker, SharedQueryTracker,
+//!     SharedFrecency, SharedFilePicker, SharedQueryTracker,
 //! };
 //!
-//! let shared_picker = SharedPicker::default();
+//! let shared_picker = SharedFilePicker::default();
 //! let shared_frecency = SharedFrecency::default();
 //! let shared_query_tracker = SharedQueryTracker::default();
 //!
 //! let tmp = std::env::temp_dir().join("fff-doctest");
 //! std::fs::create_dir_all(&tmp).unwrap();
 //!
-//! // 1. Optionally initialize frecency and query tracker stores
+//! // 1. Optionally initialize frecency and query trackers
 //! let frecency = FrecencyTracker::memory_only()?;
 //! shared_frecency.init(frecency)?;
 //!
@@ -92,13 +92,19 @@
 //! ```
 
 mod background_watcher;
-mod bigram_filter;
+pub(crate) mod parallelism;
+mod scan;
+// public only for benchmarks — the inverted index is still re-exported via
+// `pub use bigram_filter::*` below for external consumers.
+#[doc(hidden)]
+pub mod bigram_filter;
 pub mod bigram_query;
+pub mod constants;
 mod constraints;
-mod db_healthcheck;
 mod error;
 mod score;
 mod sort_buffer;
+pub(crate) mod stable_vec;
 // this is pub only for benchmarks
 pub mod case_insensitive_memmem;
 
@@ -109,10 +115,9 @@ pub(crate) mod simd_path;
 /// See [`FilePicker`](file_picker::FilePicker) for the main entry point.
 pub mod file_picker;
 
-/// Frecency (frequency + recency) database for file access scoring.
-///
-/// Backed by a caller-provided persistence store and an in-memory scoring index.
-pub mod frecency;
+/// Database-backed persistence: frecency, query history, LMDB plumbing.
+pub mod dbs;
+pub use dbs::frecency;
 
 /// Git status caching and repository detection utilities.
 pub mod git;
@@ -130,11 +135,7 @@ pub mod log;
 /// directory distance penalties for search scoring.
 pub mod path_utils;
 
-/// Search query history tracker for combo-boost scoring.
-///
-/// Records which files a user selects for each query, enabling the scorer
-/// to boost files that were previously chosen for similar searches.
-pub mod query_tracker;
+pub use dbs::query_tracker;
 
 /// Core data types shared across the crate.
 pub mod types;
@@ -145,7 +146,7 @@ mod ignore;
 pub mod shared;
 
 pub use bigram_filter::*;
-pub use db_healthcheck::{DbHealth, DbHealthChecker};
+pub use dbs::db_healthcheck::{DbHealth, DbHealthChecker};
 pub use error::{Error, Result};
 pub use fff_query_parser::*;
 pub use file_picker::*;

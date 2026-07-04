@@ -12,7 +12,7 @@
 [package]
 edition = "2024"
 name = "fff-search"
-version = "0.6.4"
+version = "0.9.6"
 authors = ["Dmitriy Kovalenko <dmtr.kovalenko@outlook.com>"]
 build = "build.rs"
 autolib = false
@@ -52,6 +52,10 @@ name = "bigram_overlay_integration"
 path = "tests/bigram_overlay_integration.rs"
 
 [[test]]
+name = "drop_during_post_scan"
+path = "tests/drop_during_post_scan.rs"
+
+[[test]]
 name = "fs_delete_handler_test"
 path = "tests/fs_delete_handler_test.rs"
 
@@ -60,17 +64,51 @@ name = "fuzz_file_operations"
 path = "tests/fuzz_file_operations.rs"
 
 [[test]]
+name = "fuzz_git_watcher_stress"
+path = "tests/fuzz_git_watcher_stress.rs"
+
+[[test]]
+name = "fuzz_real_repos"
+path = "tests/fuzz_real_repos.rs"
+
+[[test]]
 name = "grep_integration"
 path = "tests/grep_integration.rs"
+
+[[test]]
+name = "grep_overflow_path_constraint_segfault"
+path = "tests/grep_overflow_path_constraint_segfault.rs"
 
 [[test]]
 name = "new_directory_watcher_test"
 path = "tests/new_directory_watcher_test.rs"
 
+[[test]]
+name = "path_separator_constraint_test"
+path = "tests/path_separator_constraint_test.rs"
+
+[[test]]
+name = "real_binary_fixtures"
+path = "tests/real_binary_fixtures.rs"
+
+[[test]]
+name = "watcher_stop_under_lock"
+path = "tests/watcher_stop_under_lock.rs"
+
+[[test]]
+name = "watcher_thread_lifecycle_test"
+path = "tests/watcher_thread_lifecycle_test.rs"
+
 [[bench]]
 name = "bigram_bench"
 path = "benches/bigram_bench.rs"
 harness = false
+
+[[bench]]
+name = "glob_bench"
+path = "benches/glob_bench.rs"
+harness = false
+required-features = ["zlob"]
 
 [[bench]]
 name = "memmem_bench"
@@ -88,24 +126,17 @@ version = "0.8"
 [dependencies.aho-corasick]
 version = "1"
 
-[dependencies.bindet]
-version = "0.3"
-
 [dependencies.blake3]
 version = "1.8.2"
-
-[dependencies.chrono]
-version = "0.4"
-features = ["serde"]
 
 [dependencies.dirs]
 version = "5.0"
 
 [dependencies.fff-grep]
-version = "0.6.4"
+version = "0.9.6"
 
 [dependencies.fff-query-parser]
-version = "0.6.4"
+version = "0.9.6"
 default-features = false
 
 [dependencies.git2]
@@ -145,18 +176,15 @@ features = ["local_dynamic_tls"]
 optional = true
 
 [dependencies.neo_frizbee]
-version = "0.10.1"
+version = "0.10.3"
 features = ["match_end_col"]
 
 [dependencies.notify]
 version = "9.0.0-rc.3"
 
 [dependencies.notify-debouncer-full]
-version = "0.9.1"
+version = "0.9.4"
 package = "fff-notify-debouncer-full"
-
-[dependencies.once_cell]
-version = "1.20.2"
 
 [dependencies.parking_lot]
 version = "0.12"
@@ -177,9 +205,6 @@ version = "0.8"
 version = "1.0"
 features = ["derive"]
 
-[dependencies.serde_json]
-version = "1.0"
-
 [dependencies.smallvec]
 version = "1.13"
 features = [
@@ -187,15 +212,8 @@ features = [
     "union",
 ]
 
-[dependencies.smartstring]
-version = "1.0.1"
-features = ["serde"]
-
 [dependencies.thiserror]
 version = "2.0.10"
-
-[dependencies.toml]
-version = "0.8"
 
 [dependencies.tracing]
 version = "0.1"
@@ -208,12 +226,23 @@ version = "0.3"
 features = ["env-filter"]
 
 [dependencies.zlob]
-version = "1.3.3"
+version = "1.4.1"
 optional = true
 
 [dev-dependencies.criterion]
 version = "0.5"
 features = ["html_reports"]
+
+[dev-dependencies.ctor]
+version = "0.2"
+
+[dev-dependencies.proptest]
+version = "1"
+features = [
+    "std",
+    "fork",
+]
+default-features = false
 
 [dev-dependencies.rand]
 version = "0.8"
@@ -221,6 +250,9 @@ features = ["small_rng"]
 
 [dev-dependencies.tempfile]
 version = "3.8"
+
+[target."cfg(unix)".dependencies.signal-hook-registry]
+version = "1.4"
 
 [target."cfg(windows)".dependencies.dunce]
 version = "1.0"

@@ -10,9 +10,23 @@ pub fn canonicalize(path: impl AsRef<Path>) -> std::io::Result<PathBuf> {
     std::fs::canonicalize(path)
 }
 
+/// Git requires a normalized forward-slashed paths on windows
+#[cfg(windows)]
+pub fn normalize(path: PathBuf) -> PathBuf {
+    let as_str = path.to_string_lossy();
+    let with_backslashes: String = as_str.replace('/', "\\");
+    let buf = PathBuf::from(with_backslashes);
+    dunce::canonicalize(&buf).unwrap_or(buf)
+}
+
+#[cfg(not(windows))]
+pub fn normalize(path: PathBuf) -> PathBuf {
+    path
+}
+
 #[cfg(windows)]
 pub fn expand_tilde(path: &str) -> PathBuf {
-    PathBuf::from(path)
+    return PathBuf::from(path);
 }
 
 #[cfg(not(windows))]

@@ -21,7 +21,9 @@ use tempfile::TempDir;
 
 use fff_search::file_picker::{FFFMode, FilePicker, FuzzySearchOptions};
 use fff_search::grep::{GrepMode, GrepSearchOptions, parse_grep_query};
-use fff_search::{FilePickerOptions, PaginationArgs, QueryParser, SharedFrecency, SharedPicker};
+use fff_search::{
+    FilePickerOptions, PaginationArgs, QueryParser, SharedFilePicker, SharedFrecency,
+};
 
 /// Stress test: 200 base files, 3 rounds of edits + deletes. New files
 /// are tracked but NOT verified via grep (see Group 3 for that bug).
@@ -82,7 +84,7 @@ fn bigram_overlay_coherence_stress_base_edits_and_deletes() {
                 let mut guard = shared_picker.write().unwrap();
                 let picker = guard.as_mut().unwrap();
                 assert!(
-                    picker.on_create_or_modify(base.join(name)).is_some(),
+                    picker.handle_create_or_modify(base.join(name)).is_some(),
                     "round {round}: modify({name}) should succeed"
                 );
             }
@@ -146,7 +148,7 @@ fn bigram_overlay_coherence_long_session_incremental_edits() {
             {
                 let mut guard = shared_picker.write().unwrap();
                 let picker = guard.as_mut().unwrap();
-                picker.on_create_or_modify(base.join(name));
+                picker.handle_create_or_modify(base.join(name));
             }
             latest_tokens[file_idx] = new_token;
         }
@@ -223,7 +225,7 @@ fn bigram_overlay_coherence_resurrect_tombstoned_file() {
     {
         let mut guard = shared_picker.write().unwrap();
         let picker = guard.as_mut().unwrap();
-        assert!(picker.on_create_or_modify(&target_path).is_some());
+        assert!(picker.handle_create_or_modify(&target_path).is_some());
     }
 
     {
@@ -273,7 +275,7 @@ fn bigram_overlay_coherence_proves_contribution_for_modified_base() {
     {
         let mut guard = shared_picker.write().unwrap();
         let picker = guard.as_mut().unwrap();
-        picker.on_create_or_modify(&target_path);
+        picker.handle_create_or_modify(&target_path);
     }
 
     {
@@ -282,12 +284,6 @@ fn bigram_overlay_coherence_proves_contribution_for_modified_base() {
 
         let with_overlay = grep_count(picker, unique);
         assert_eq!(with_overlay, 1, "overlay should find the new token");
-
-        let without_overlay = grep_without_overlay_count(picker, unique);
-        assert_eq!(
-            without_overlay, 0,
-            "without overlay, bigram should exclude the file (stale bigrams)"
-        );
     }
 
     stop_picker(&shared_picker);
@@ -331,7 +327,7 @@ fn bigram_overlay_coherence_rapid_create_delete_same_base_path() {
         {
             let mut guard = shared_picker.write().unwrap();
             let picker = guard.as_mut().unwrap();
-            picker.on_create_or_modify(&volatile_path);
+            picker.handle_create_or_modify(&volatile_path);
         }
 
         {
@@ -374,7 +370,7 @@ fn bigram_overlay_coherence_rapid_create_delete_same_base_path() {
         {
             let mut guard = shared_picker.write().unwrap();
             let picker = guard.as_mut().unwrap();
-            picker.on_create_or_modify(&volatile_path);
+            picker.handle_create_or_modify(&volatile_path);
         }
     }
 
@@ -432,7 +428,7 @@ fn bigram_overlay_coherence_overflow_files_searchable_via_grep() {
     {
         let mut guard = shared_picker.write().unwrap();
         let picker = guard.as_mut().unwrap();
-        assert!(picker.on_create_or_modify(&new_path).is_some());
+        assert!(picker.handle_create_or_modify(&new_path).is_some());
     }
 
     // Overflow file is tracked.
@@ -497,15 +493,16 @@ fn bigram_overlay_coherence_mixed_tombstones_and_overflow() {
         write_file_with_token(base, &name, &token);
         let mut guard = shared_picker.write().unwrap();
         let picker = guard.as_mut().unwrap();
-        picker.on_create_or_modify(base.join(&name));
+        picker.handle_create_or_modify(base.join(&name));
         new_tokens.push(token);
     }
 
     {
+        // assert
         let guard = shared_picker.read().unwrap();
         let picker = guard.as_ref().unwrap();
 
-        // Tombstones work: deleted tokens are gone.
+        // deleted tokens are gon
         for token in &deleted_tokens {
             assert_eq!(
                 grep_count(picker, token),
@@ -517,16 +514,16 @@ fn bigram_overlay_coherence_mixed_tombstones_and_overflow() {
         // Surviving base files still findable.
         for (name, token) in &repo_files[15..] {
             assert!(
-                grep_count(picker, token) >= 1,
+                grep_count(picker, token) == 1,
                 "surviving {name} token should be findable"
             );
         }
 
-        // BUG: Overflow files not findable via grep.
+        // New tokens needs to be findable
         for token in &new_tokens {
             assert!(
-                grep_count(picker, token) >= 1,
-                "BUG: overflow token {token} should be findable but bigram skips overflow"
+                grep_count(picker, token) == 1,
+                "BUG: overflow token {token} should be findable"
             );
         }
     }
@@ -570,7 +567,7 @@ fn bigram_overlay_coherence_full_stress_loop_with_overflow() {
             write_file_with_token(base, name, &new_token);
             let mut guard = shared_picker.write().unwrap();
             let picker = guard.as_mut().unwrap();
-            picker.on_create_or_modify(base.join(name));
+            picker.handle_create_or_modify(base.join(name));
             dead_tokens.push(old_token.clone());
             *old_token = new_token;
         }
@@ -582,7 +579,7 @@ fn bigram_overlay_coherence_full_stress_loop_with_overflow() {
             write_file_with_token(base, &name, &token);
             let mut guard = shared_picker.write().unwrap();
             let picker = guard.as_mut().unwrap();
-            picker.on_create_or_modify(base.join(&name));
+            picker.handle_create_or_modify(base.join(&name));
             live_overflow.push((name, token));
         }
 
@@ -645,7 +642,7 @@ fn bigram_overlay_coherence_overflow_file_edit_and_delete() {
         {
             let mut guard = shared_picker.write().unwrap();
             let picker = guard.as_mut().unwrap();
-            picker.on_create_or_modify(&path);
+            picker.handle_create_or_modify(&path);
         }
         overflow_files.push((path, token));
     }
@@ -670,7 +667,7 @@ fn bigram_overlay_coherence_overflow_file_edit_and_delete() {
         {
             let mut guard = shared_picker.write().unwrap();
             let picker = guard.as_mut().unwrap();
-            picker.on_create_or_modify(path);
+            picker.handle_create_or_modify(path);
         }
         edited_tokens.push(new_token);
     }
@@ -686,14 +683,19 @@ fn bigram_overlay_coherence_overflow_file_edit_and_delete() {
         }
     }
 
-    // Verify 5 overflow remain.
+    // Verify 5 overflow remain live (tombstones still occupy slots by design —
+    // StableVec never shifts, so get_overflow_files().len() stays at 10).
     {
         let guard = shared_picker.read().unwrap();
         let picker = guard.as_ref().unwrap();
+        let live = picker
+            .get_overflow_files()
+            .iter()
+            .filter(|f| !f.is_deleted())
+            .count();
         assert_eq!(
-            picker.get_overflow_files().len(),
-            5,
-            "should have 5 overflow files after deleting 5"
+            live, 5,
+            "should have 5 live overflow files after deleting 5"
         );
     }
 
@@ -734,7 +736,7 @@ fn bigram_overlay_coherence_rescan_after_git_commit() {
         {
             let mut guard = shared_picker.write().unwrap();
             let picker = guard.as_mut().unwrap();
-            picker.on_create_or_modify(base.join(name));
+            picker.handle_create_or_modify(base.join(name));
         }
         edited_tokens.push(token);
     }
@@ -747,25 +749,23 @@ fn bigram_overlay_coherence_rescan_after_git_commit() {
         {
             let mut guard = shared_picker.write().unwrap();
             let picker = guard.as_mut().unwrap();
-            picker.on_create_or_modify(base.join(&name));
+            picker.handle_create_or_modify(base.join(&name));
         }
         new_tokens.push(token);
     }
 
     // Phase 2: Commit and rescan.
     git_add_and_commit(base, "batch edit");
-
-    {
-        let mut guard = shared_picker.write().unwrap();
-        let picker = guard.as_mut().unwrap();
-        picker
-            .trigger_rescan(&shared_frecency)
-            .expect("trigger_rescan should succeed");
-    }
+    shared_picker
+        .trigger_full_rescan_async(&shared_frecency)
+        .expect("rescan should succeed");
 
     // After trigger_rescan, sync_data is replaced (and bigram_index dropped
     // with it). Wait for the synchronous scan to finish.
-    wait_for_scan(&shared_picker);
+    assert!(
+        shared_picker.wait_for_scan(Duration::from_secs(15)),
+        "Timed out waiting for scan to complete"
+    );
 
     // Verify the file list is refreshed: all base_count + 5 files should
     // be present as base files (not overflow, since they're committed).
@@ -799,14 +799,6 @@ fn bigram_overlay_coherence_rescan_after_git_commit() {
             assert!(
                 with >= 1,
                 "post-rescan: edited token {token} should be findable"
-            );
-
-            // The content is now in the base index, so it should be
-            // findable even without the overlay.
-            let without = grep_without_overlay_count(picker, token);
-            assert!(
-                without >= 1,
-                "post-rescan: {token} should be in base index (without overlay: {without})"
             );
         }
 
@@ -850,7 +842,7 @@ fn bigram_overlay_coherence_full_lifecycle_seed_edit_commit_rescan_edit() {
         {
             let mut guard = shared_picker.write().unwrap();
             let picker = guard.as_mut().unwrap();
-            picker.on_create_or_modify(base.join(name));
+            picker.handle_create_or_modify(base.join(name));
         }
         phase1_tokens.push(token);
     }
@@ -890,18 +882,14 @@ fn bigram_overlay_coherence_full_lifecycle_seed_edit_commit_rescan_edit() {
 
     // -- Phase 2: Commit and rescan --
     git_add_and_commit(base, "phase 1 changes");
+    shared_picker
+        .trigger_full_rescan_async(&shared_frecency)
+        .expect("rescan should succeed");
 
-    {
-        let mut guard = shared_picker.write().unwrap();
-        let picker = guard.as_mut().unwrap();
-        picker
-            .trigger_rescan(&shared_frecency)
-            .expect("rescan should succeed");
-    }
-
-    // After rescan, bigram is dropped with old FileSync. Grep falls back
-    // to full search, which is correct.
-    wait_for_scan(&shared_picker);
+    assert!(
+        shared_picker.wait_for_scan(Duration::from_secs(15)),
+        "Timed out waiting for scan to complete"
+    );
 
     // Phase1 tokens should still be findable (now in base index).
     {
@@ -933,7 +921,7 @@ fn bigram_overlay_coherence_full_lifecycle_seed_edit_commit_rescan_edit() {
         {
             let mut guard = shared_picker.write().unwrap();
             let picker = guard.as_mut().unwrap();
-            picker.on_create_or_modify(base.join(name));
+            picker.handle_create_or_modify(base.join(name));
         }
         phase3_tokens.push(token);
     }
@@ -1012,7 +1000,7 @@ fn bigram_overlay_coherence_nested_directory_edits() {
         {
             let mut guard = shared_picker.write().unwrap();
             let picker = guard.as_mut().unwrap();
-            picker.on_create_or_modify(base.join(name));
+            picker.handle_create_or_modify(base.join(name));
         }
         edited.push(token);
     }
@@ -1130,7 +1118,7 @@ fn bigram_overlay_coherence_fuzzy_search_base_overflow_and_deleted() {
     {
         let mut guard = shared_picker.write().unwrap();
         let picker = guard.as_mut().unwrap();
-        picker.on_create_or_modify(base.join("controller_admin.rs"));
+        picker.handle_create_or_modify(base.join("controller_admin.rs"));
     }
 
     // Fuzzy search should find the new overflow file.
@@ -1177,7 +1165,7 @@ fn bigram_overlay_coherence_fuzzy_search_after_rescan() {
     {
         let mut guard = shared_picker.write().unwrap();
         let picker = guard.as_mut().unwrap();
-        picker.on_create_or_modify(base.join("router_grpc.rs"));
+        picker.handle_create_or_modify(base.join("router_grpc.rs"));
     }
 
     let web_path = base.join("router_web.rs");
@@ -1191,14 +1179,13 @@ fn bigram_overlay_coherence_fuzzy_search_after_rescan() {
     // Commit and rescan.
     git_add_and_commit(base, "add grpc, remove web");
 
-    {
-        let mut guard = shared_picker.write().unwrap();
-        let picker = guard.as_mut().unwrap();
-        picker
-            .trigger_rescan(&shared_frecency)
-            .expect("rescan should succeed");
-    }
-    wait_for_scan(&shared_picker);
+    shared_picker
+        .trigger_full_rescan_async(&shared_frecency)
+        .expect("rescan should succeed");
+    assert!(
+        shared_picker.wait_for_scan(Duration::from_secs(15)),
+        "Timed out waiting for scan to complete"
+    );
 
     // After rescan, fuzzy search should reflect the committed state.
     {
@@ -1243,7 +1230,7 @@ fn bigram_overlay_coherence_fuzzy_and_grep_combined() {
     {
         let mut guard = shared_picker.write().unwrap();
         let picker = guard.as_mut().unwrap();
-        picker.on_create_or_modify(base.join(edit_name));
+        picker.handle_create_or_modify(base.join(edit_name));
     }
 
     // Add an overflow file with a distinctive name.
@@ -1255,7 +1242,7 @@ fn bigram_overlay_coherence_fuzzy_and_grep_combined() {
     {
         let mut guard = shared_picker.write().unwrap();
         let picker = guard.as_mut().unwrap();
-        picker.on_create_or_modify(base.join("unique_overflow_widget.rs"));
+        picker.handle_create_or_modify(base.join("unique_overflow_widget.rs"));
     }
 
     // Delete a base file.
@@ -1298,15 +1285,17 @@ fn bigram_overlay_coherence_fuzzy_and_grep_combined() {
 
         // Fuzzy: deleted file not in results.
         let fuzzy_del = fuzzy_search_paths(picker, del_name);
+        let del_file = Path::new(del_name).file_name().unwrap().to_str().unwrap();
         assert!(
-            !fuzzy_del.iter().any(|p| p.contains(del_name)),
+            !fuzzy_del.iter().any(|p| p.contains(del_file)),
             "fuzzy should not find deleted file"
         );
 
         // Fuzzy: edited file still findable by name.
         let fuzzy_edit = fuzzy_search_paths(picker, edit_name);
+        let edit_file = Path::new(edit_name).file_name().unwrap().to_str().unwrap();
         assert!(
-            fuzzy_edit.iter().any(|p| p.contains(edit_name)),
+            fuzzy_edit.iter().any(|p| p.contains(edit_file)),
             "fuzzy should find edited file by name"
         );
     }
@@ -1336,37 +1325,10 @@ fn grep_count(picker: &FilePicker, query: &str) -> usize {
     picker.grep(&parsed, &grep_opts()).matches.len()
 }
 
-fn grep_without_overlay_count(picker: &FilePicker, query: &str) -> usize {
-    let parsed = parse_grep_query(query);
-    picker
-        .grep_without_overlay(&parsed, &grep_opts())
-        .matches
-        .len()
-}
-
 /// Wait for scanning to finish (no bigram requirement).
 /// Use after `trigger_rescan` which replaces sync_data but does not
 /// rebuild the bigram index.
-fn wait_for_scan(shared_picker: &SharedPicker) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(15);
-    loop {
-        std::thread::sleep(Duration::from_millis(50));
-        let ready = shared_picker
-            .read()
-            .ok()
-            .map(|guard| guard.as_ref().map_or(false, |p| !p.is_scan_active()))
-            .unwrap_or(false);
-        if ready {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "Timed out waiting for scan to complete"
-        );
-    }
-}
-
-fn wait_for_bigram(shared_picker: &SharedPicker) {
+fn wait_for_bigram(shared_picker: &SharedFilePicker) {
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
         std::thread::sleep(Duration::from_millis(50));
@@ -1389,7 +1351,7 @@ fn wait_for_bigram(shared_picker: &SharedPicker) {
     }
 }
 
-fn stop_picker(shared_picker: &SharedPicker) {
+fn stop_picker(shared_picker: &SharedFilePicker) {
     if let Ok(mut guard) = shared_picker.write() {
         if let Some(ref mut picker) = *guard {
             picker.stop_background_monitor();
@@ -1426,8 +1388,8 @@ fn git_add_and_commit(dir: &Path, msg: &str) {
     git_run(dir, &["commit", "-m", msg]);
 }
 
-fn make_picker(base: &Path) -> (SharedPicker, SharedFrecency) {
-    let shared_picker = SharedPicker::default();
+fn make_picker(base: &Path) -> (SharedFilePicker, SharedFrecency) {
+    let shared_picker = SharedFilePicker::default();
     let shared_frecency = SharedFrecency::default();
 
     FilePicker::new_with_shared_state(
@@ -1659,7 +1621,7 @@ fn bigram_overlay_coherence_fuzzy_grep_finds_overflow_files() {
     {
         let mut guard = shared_picker.write().unwrap();
         let picker = guard.as_mut().unwrap();
-        assert!(picker.on_create_or_modify(&new_path).is_some());
+        assert!(picker.handle_create_or_modify(&new_path).is_some());
         assert_eq!(picker.get_overflow_files().len(), 1);
     }
 

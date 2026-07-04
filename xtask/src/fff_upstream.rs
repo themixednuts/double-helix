@@ -7,7 +7,7 @@ use std::{
 
 use crate::DynError;
 
-const UPSTREAM_REPO: &str = "https://github.com/dmtrKovalenko/fff.nvim.git";
+const UPSTREAM_REPO: &str = "https://github.com/dmtrKovalenko/fff.git";
 const UPSTREAM_CORE_PATH: &str = "crates/fff-core";
 const VENDOR_CORE_PATH: &str = "vendor/fff-search";
 
@@ -19,6 +19,8 @@ const LOCAL_EXTENSION_SYMBOLS: &[&str] = &[
     "OwnedGrepResult",
     "grep_owned",
     "grep_bytes",
+    "FrecencyStore",
+    "QueryTrackerStore",
 ];
 
 #[derive(Debug)]
@@ -162,8 +164,8 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Options, DynError> {
                     "\
 Usage: cargo xtask fff-upstream [--ref REF] [--fail-on-drift] [--keep-temp]
 
-Compares vendor/fff-search against dmtrKovalenko/fff.nvim crates/fff-core.
-Defaults to --ref main. Use a nightly tag, e.g. --ref 0.6.5-nightly.0f5ead1,
+Compares vendor/fff-search against dmtrKovalenko/fff crates/fff-core.
+Defaults to --ref main. Use a nightly tag, e.g. --ref 0.9.7-nightly.1cd8d31,
 to inspect a published prerelease.
 "
                 );

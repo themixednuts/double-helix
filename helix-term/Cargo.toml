@@ -113,7 +113,7 @@ serde = { version = "1.0", features = ["derive"] }
 
 dashmap = "6.0"
 rayon = "1.11"
-fff-search = "=0.6.4"
+fff-search = "=0.9.6"
 blake3 = "1.8.2"
 heed = "0.22.0"
 

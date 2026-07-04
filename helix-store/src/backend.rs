@@ -40,7 +40,7 @@ impl DrizzleBackend {
         conn.busy_timeout(BUSY_TIMEOUT)?;
         let (db, schema) = Drizzle::new(conn, Schema::new());
         let mut backend = Self { db, schema };
-        backend.configure_connection()?;
+        backend.configure_connection(kind)?;
         backend.run_migrations(kind)?;
         Ok(backend)
     }
@@ -57,13 +57,16 @@ impl DrizzleBackend {
         self.query_row("PRAGMA journal_mode", [], |row| row.get(0))
     }
 
-    fn configure_connection(&mut self) -> Result<()> {
+    fn configure_connection(&mut self, kind: DatabaseKind) -> Result<()> {
         self.execute_batch(
             r#"
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
 "#,
         )?;
+        if kind == DatabaseKind::Cache {
+            self.execute_batch("PRAGMA synchronous = NORMAL")?;
+        }
         self.execute_batch("PRAGMA busy_timeout = 5000")?;
         Ok(())
     }

@@ -51,6 +51,10 @@ pub struct Store {
     cache: DrizzleBackend,
 }
 
+pub struct CacheStore {
+    cache: DrizzleBackend,
+}
+
 impl Store {
     /// Opens the default durable and rebuildable-cache databases.
     ///
@@ -109,6 +113,49 @@ impl Store {
     /// Returns an error if the pragma query fails.
     pub fn state_journal_mode(&mut self) -> Result<String> {
         self.state.journal_mode()
+    }
+
+    /// Returns the SQLite journal mode currently reported by the cache database.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the pragma query fails.
+    pub fn cache_journal_mode(&mut self) -> Result<String> {
+        self.cache.journal_mode()
+    }
+}
+
+impl CacheStore {
+    /// Opens only the default rebuildable-cache database.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the cache database path cannot be prepared, opened, configured, or migrated.
+    pub fn open_default() -> Result<Self> {
+        Self::open(StorePaths::default_paths())
+    }
+
+    /// Opens only the rebuildable-cache database from explicit paths.
+    ///
+    /// The durable state path is ignored; callers that need assistant or package state should use
+    /// [`Store`] instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the cache database path cannot be prepared, opened, configured, or migrated.
+    pub fn open(paths: StorePaths) -> Result<Self> {
+        let cache = DrizzleBackend::open(paths.cache, DatabaseKind::Cache)?;
+        Ok(Self { cache })
+    }
+
+    #[must_use]
+    pub fn frecency(&mut self) -> FrecencyRepo<'_> {
+        FrecencyRepo::new(&mut self.cache)
+    }
+
+    #[must_use]
+    pub fn query_history(&mut self) -> QueryHistoryRepo<'_> {
+        QueryHistoryRepo::new(&mut self.cache)
     }
 
     /// Returns the SQLite journal mode currently reported by the cache database.

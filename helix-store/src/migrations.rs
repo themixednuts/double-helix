@@ -71,6 +71,14 @@ CREATE INDEX IF NOT EXISTS idx_pkg_receipts_kind_source
     ON pkg_receipts(kind, source);
 "#,
     },
+    Migration {
+        version: 3,
+        name: "assistant_threads_filtered_scope_index",
+        sql: r#"
+CREATE INDEX IF NOT EXISTS idx_assistant_threads_scope_rating_feedback_updated
+    ON assistant_threads(scope, rating, has_feedback, updated_at DESC);
+"#,
+    },
 ];
 
 const CACHE_MIGRATIONS: &[Migration] = &[Migration {

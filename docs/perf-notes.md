@@ -202,3 +202,40 @@ Date: 2026-07-04
 The file explorer search path no longer recursively walks the whole tree on each query edit. Opening the explorer and changing its root prewarms an explorer-scoped fff-search `FilePicker` using `config.file_explorer` scan semantics. Search key input is debounced, and the due query uses the fff zero-wait path so the UI thread only consumes already-indexed results and never performs an unbounded cold scan.
 
 Matched fff paths still expand their ancestor directories before the existing visible-row rebuild/filter pass runs, so files under collapsed directories remain discoverable while clearing search restores the saved expansion set.
+
+## Tightening Pass: FFF and SQLite hot paths
+
+Date: 2026-07-04
+
+### Methodology
+
+Measurements used the existing ignored probes plus narrow probes added for this pass, with `CARGO_TARGET_DIR=C:\Users\jonfo\AppData\Local\Temp\helix-fork-target-tightening`:
+
+- `cargo test -p helix-term fff_cache_perf_probe_50k -- --ignored --nocapture`
+- `cargo test -p helix-term file_picker_explorer_workspace_reuse_probe -- --ignored --nocapture`
+- `cargo test -p helix-term file_search_timing_current_workspace -- --ignored --nocapture` with `DHX_FFF_PROBE_ROOT=E:\helix\helix-fork`
+- `cargo test -p helix-store sqlite_open_perf_probe -- --ignored --nocapture`
+- `cargo test -p helix-store assistant_filtered_list_perf_probe -- --ignored --nocapture`
+- Direct health-style timing: `dhx.exe --health clipboard`
+
+### Kept Changes
+
+| Change | Probe | Before | After | Delta / rationale |
+| --- | --- | ---: | ---: | --- |
+| Share scan-equivalent FFF workspace when only `FilePickerConfig::hide_preview` differs | `file_picker_explorer_workspace_reuse_probe` | `same_workspace=false`, second init 28.0652 ms | `same_workspace=true`, second init 2.7936 ms | Eliminates a redundant second fff index for the same root and same scan semantics. |
+| FFF persistence uses cache-only SQLite store | `sqlite_open_perf_probe` | Full `Store::open`: 75,429 us/open avg over 50 fresh opens | `CacheStore::open`: 42,143 us/open avg | -44.1%; FFF frecency/query history never touches durable assistant/pkg state. |
+| Cache DB uses `PRAGMA synchronous=NORMAL` under WAL | `fff_cache_perf_probe_50k` | SQLite write-through 100 bumps: 339.3008 ms | 24.6311 ms | -92.7%; scoped only to rebuildable `cache.sqlite3`, state DB remains durable/default. |
+| Assistant filtered list composite index on `(scope, rating, has_feedback, updated_at DESC)` | `assistant_filtered_list_perf_probe` | Filtered 12.5k/50k rows: 56.738 ms | 41.6208 ms | -26.6% for the measured `list_by_scope_filtered(scope, Some(rating), Some(has_feedback))` path. |
+
+`fff_cache_perf_probe_50k` after the cache changes: old LMDB hot read 135.0076 ms, SQLite load 336.281 ms, new in-memory hot read 97.9997 ms, old LMDB 100 writes 34.3072 ms, new SQLite 100 writes 24.6311 ms, totals `(150000,150000)`.
+
+Repo-root FFF timing after the changes (`file_search_timing_current_workspace`): workspace init 14.3969 ms, first results 94.1538 ms, empty query 1.3392 ms, `src` 24.4501 ms, `picker` 19.696 ms, `fff` 5.8725 ms.
+
+Direct `dhx.exe --health clipboard` timing after build: 188.9 ms. The health path exits before application startup, so it does not pay the async FFF prewarm or assistant bootstrap cost.
+
+### Rejected / Audited
+
+- Explorer search does not issue an fff query on every sync tick: `apply_due_search_filter` clears `search_due_at` after applying, so there was no repeated per-frame query to cache. No query-result cache was kept.
+- `EXPLORER_SEARCH_DEBOUNCE` stayed at 80 ms. The zero-wait FFF query path is already bounded, and no probe showed debounce spam after the due-search guard audit.
+- Assistant/pkg state lazy-open at app startup was not changed. Package state is only opened by `pkg` commands or package-resolution nudges; assistant bootstrap also restores previously open assistant layout, so deferring it would change startup-visible behavior.
+- Package receipt queries already use primary-key lookup for `(kind, name)`, a bounded `ORDER BY kind, name` full list, and one transaction for legacy receipt import. No measured low-risk package receipt change was kept.

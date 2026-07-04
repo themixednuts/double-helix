@@ -12,7 +12,7 @@ use fff_search::{
 };
 use heed::types::{Bytes, SerdeBincode};
 use heed::{Database, EnvOpenOptions};
-use helix_store::{FrecencyEntry, QueryHistory, Store};
+use helix_store::{CacheStore, FrecencyEntry, QueryHistory};
 use helix_view::editor::{FileExplorerConfig, FilePickerConfig};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
@@ -321,7 +321,7 @@ fn workspace_for_root(root: &Path, config: &FilePickerConfig) -> anyhow::Result<
         .map_err(|_| anyhow::anyhow!("FFF workspace lock was poisoned"))?;
 
     if let Some(workspace) = guard.as_ref() {
-        if workspace.root == root && workspace.config == *config {
+        if workspace.root == root && same_file_index_config(&workspace.config, config) {
             log::info!(
                 target: PICKER_TRACE_TARGET,
                 "phase=fff_workspace root={} state=reused elapsed_us={}",
@@ -352,7 +352,7 @@ impl FffWorkspace {
     fn new(root: PathBuf, config: FilePickerConfig) -> anyhow::Result<Self> {
         let picker = SharedPicker::default();
         let workspace = stable_path_hash(&root);
-        let store = match Store::open_default() {
+        let store = match CacheStore::open_default() {
             Ok(store) => Some(Arc::new(Mutex::new(store))),
             Err(err) => {
                 log::debug!(
@@ -396,6 +396,18 @@ impl FffWorkspace {
     }
 }
 
+fn same_file_index_config(left: &FilePickerConfig, right: &FilePickerConfig) -> bool {
+    left.hidden == right.hidden
+        && left.follow_symlinks == right.follow_symlinks
+        && left.deduplicate_links == right.deduplicate_links
+        && left.parents == right.parents
+        && left.ignore == right.ignore
+        && left.git_ignore == right.git_ignore
+        && left.git_global == right.git_global
+        && left.git_exclude == right.git_exclude
+        && left.max_depth == right.max_depth
+}
+
 fn scan_options(config: &FilePickerConfig) -> FilePickerScanOptions {
     FilePickerScanOptions {
         hidden: config.hidden,
@@ -429,7 +441,11 @@ fn file_explorer_picker_config(config: &FileExplorerConfig) -> FilePickerConfig 
     }
 }
 
-fn init_frecency(root: &Path, workspace: &str, store: Option<Arc<Mutex<Store>>>) -> SharedFrecency {
+fn init_frecency(
+    root: &Path,
+    workspace: &str,
+    store: Option<Arc<Mutex<CacheStore>>>,
+) -> SharedFrecency {
     let shared = SharedFrecency::default();
     let Some(store) = store else {
         return SharedFrecency::noop();
@@ -453,7 +469,7 @@ fn init_frecency(root: &Path, workspace: &str, store: Option<Arc<Mutex<Store>>>)
 fn init_query_tracker(
     root: &Path,
     workspace: &str,
-    store: Option<Arc<Mutex<Store>>>,
+    store: Option<Arc<Mutex<CacheStore>>>,
 ) -> SharedQueryTracker {
     let shared = SharedQueryTracker::default();
     let Some(store) = store else {
@@ -477,7 +493,7 @@ fn init_query_tracker(
 
 #[derive(Clone)]
 struct HelixFrecencyStore {
-    store: Arc<Mutex<Store>>,
+    store: Arc<Mutex<CacheStore>>,
     workspace: String,
 }
 
@@ -554,7 +570,7 @@ impl FrecencyStore for HelixFrecencyStore {
 
 #[derive(Clone)]
 struct HelixQueryTrackerStore {
-    store: Arc<Mutex<Store>>,
+    store: Arc<Mutex<CacheStore>>,
     workspace: String,
 }
 
@@ -666,7 +682,7 @@ impl QueryTrackerStore for HelixQueryTrackerStore {
     }
 }
 
-fn import_legacy_fff_cache(root: &Path, workspace: &str, store: &Arc<Mutex<Store>>) {
+fn import_legacy_fff_cache(root: &Path, workspace: &str, store: &Arc<Mutex<CacheStore>>) {
     let legacy_dir = db_dir(root);
     if !legacy_dir.join("frecency").join("data.mdb").exists()
         && !legacy_dir.join("queries").join("data.mdb").exists()
@@ -1073,7 +1089,7 @@ mod tests {
     fn sqlite_frecency_store_stays_consistent_with_index() {
         let temp = tempfile::tempdir().expect("tempdir");
         let store = Arc::new(Mutex::new(
-            Store::open(helix_store::StorePaths::new(
+            CacheStore::open(helix_store::StorePaths::new(
                 temp.path().join("state.sqlite3"),
                 temp.path().join("cache.sqlite3"),
             ))
@@ -1125,7 +1141,7 @@ mod tests {
             .iter()
             .any(|row| row.opened_path == "fff:history:file"));
 
-        let mut store = Store::open(helix_store::StorePaths::new(
+        let mut store = CacheStore::open(helix_store::StorePaths::new(
             temp.path().join("state.sqlite3"),
             temp.path().join("cache.sqlite3"),
         ))
@@ -1295,7 +1311,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let store = Arc::new(Mutex::new(
-            Store::open(helix_store::StorePaths::new(
+            CacheStore::open(helix_store::StorePaths::new(
                 temp.path().join("state.sqlite3"),
                 temp.path().join("cache.sqlite3"),
             ))
@@ -1356,6 +1372,45 @@ mod tests {
 
     fn path_hash(path: &Path) -> [u8; 32] {
         *blake3::hash(path.to_string_lossy().as_bytes()).as_bytes()
+    }
+
+    #[test]
+    #[ignore]
+    fn file_picker_explorer_workspace_reuse_probe() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("project");
+        std::fs::create_dir_all(root.join("src")).expect("project dirs");
+        std::fs::write(root.join("src").join("main.rs"), "fn main() {}\n").expect("fixture file");
+
+        let picker_config = FilePickerConfig {
+            hidden: false,
+            follow_symlinks: false,
+            deduplicate_links: true,
+            parents: false,
+            ignore: false,
+            git_ignore: false,
+            git_global: false,
+            git_exclude: false,
+            max_depth: None,
+            hide_preview: false,
+        };
+        let explorer_config = FilePickerConfig {
+            hide_preview: true,
+            ..picker_config.clone()
+        };
+
+        let first_start = std::time::Instant::now();
+        let picker_workspace = workspace_for_root(&root, &picker_config).expect("picker workspace");
+        let first_init = first_start.elapsed();
+        let second_start = std::time::Instant::now();
+        let explorer_workspace =
+            workspace_for_root(&root, &explorer_config).expect("explorer workspace");
+        let second_init = second_start.elapsed();
+
+        eprintln!(
+            "fff_workspace_reuse same_workspace={} first_init={first_init:?} second_init={second_init:?}",
+            Arc::ptr_eq(&picker_workspace, &explorer_workspace),
+        );
     }
 
     #[test]

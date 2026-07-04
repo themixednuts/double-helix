@@ -1,7 +1,9 @@
 use std::sync::{Arc, Barrier};
 use std::thread;
 
-use helix_store::{AssistantThread, FrecencyEntry, PkgReceipt, QueryHistory, Store, StorePaths};
+use helix_store::{
+    AssistantThread, CacheStore, FrecencyEntry, PkgReceipt, QueryHistory, Store, StorePaths,
+};
 
 #[test]
 fn migrations_wal_and_drizzle_round_trips() {
@@ -262,6 +264,78 @@ fn concurrent_writer_connections_do_not_corrupt_state() {
     let mut store = Store::open(paths).expect("reopen store");
     let rows = store.threads().list_by_scope("shared").unwrap();
     assert_eq!(rows.len(), 100);
+}
+
+#[test]
+#[ignore]
+fn sqlite_open_perf_probe() {
+    const RUNS: usize = 50;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let full_start = std::time::Instant::now();
+    for index in 0..RUNS {
+        let root = temp.path().join(format!("full-{index}"));
+        Store::open(paths(&root)).expect("open full store");
+    }
+    let full = full_start.elapsed();
+
+    let cache_start = std::time::Instant::now();
+    for index in 0..RUNS {
+        let root = temp.path().join(format!("cache-{index}"));
+        CacheStore::open(paths(&root)).expect("open cache store");
+    }
+    let cache = cache_start.elapsed();
+
+    eprintln!(
+        "sqlite_open_perf runs={RUNS} full_open={full:?} cache_open={cache:?} full_avg_us={} cache_avg_us={}",
+        full.as_micros() / RUNS as u128,
+        cache.as_micros() / RUNS as u128,
+    );
+}
+
+#[test]
+#[ignore]
+fn assistant_filtered_list_perf_probe() {
+    const THREADS: usize = 50_000;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let mut store = Store::open(paths(temp.path())).expect("open store");
+    let threads = (0..THREADS)
+        .map(|index| AssistantThread {
+            id: format!("thread-{index:05}"),
+            scope: "workspace-a".to_owned(),
+            title: Some(format!("Thread {index}")),
+            created_at: index as i64,
+            updated_at: index as i64,
+            rating: (index % 4 == 0).then(|| "up".to_owned()),
+            has_feedback: index % 2 == 0,
+            record_json: format!(r#"{{"id":"thread-{index:05}"}}"#),
+        })
+        .collect::<Vec<_>>();
+    store
+        .threads()
+        .import_assistant_state_once(threads, Vec::new(), Vec::new())
+        .expect("seed threads");
+
+    let unfiltered_start = std::time::Instant::now();
+    let unfiltered = store
+        .threads()
+        .list_by_scope_filtered("workspace-a", None, None)
+        .expect("unfiltered rows");
+    let unfiltered_elapsed = unfiltered_start.elapsed();
+
+    let filtered_start = std::time::Instant::now();
+    let filtered = store
+        .threads()
+        .list_by_scope_filtered("workspace-a", Some("up"), Some(true))
+        .expect("filtered rows");
+    let filtered_elapsed = filtered_start.elapsed();
+
+    eprintln!(
+        "assistant_filtered_list threads={THREADS} unfiltered={unfiltered_elapsed:?} rows={} filtered={filtered_elapsed:?} rows={}",
+        unfiltered.len(),
+        filtered.len(),
+    );
 }
 
 fn paths(root: &std::path::Path) -> StorePaths {

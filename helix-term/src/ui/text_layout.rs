@@ -3,6 +3,7 @@ use helix_core::unicode::{segmentation::UnicodeSegmentation, width::UnicodeWidth
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TruncateAt {
     Start,
+    #[cfg(any(test, feature = "storybook"))]
     Middle,
     End,
 }
@@ -71,6 +72,7 @@ pub fn truncate(text: &str, width: usize, at: TruncateAt) -> String {
             out.push_str(&take_suffix(text, width - 1));
             out
         }
+        #[cfg(any(test, feature = "storybook"))]
         TruncateAt::Middle => {
             let left = (width - 1) / 2;
             let right = width - 1 - left;

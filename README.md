@@ -85,6 +85,12 @@ cargo install --path helix-term --locked
 
 ```
 
+To build the UI storybook development binary:
+
+```bash
+cargo build -p helix-term --bin dhx-ui-storybook --features storybook
+```
+
 Or if you have `just` installed, you can simply run `just` recipes in the folder where you checked the source code. For more information please see the `justfile` 
 
 THEN THE IMPORTANT PART that is missing from the docs page(this way you get all the default themes and gramars), [source](https://github.com/helix-editor/helix/discussions/7549#discussioncomment-6948696)

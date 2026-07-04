@@ -50,6 +50,13 @@ RUSTFLAGS="-C target-feature=-crt-static"
    Either command will create the `dhx` executable and construct the tree-sitter
    grammars in the local `runtime` folder.
 
+   The terminal UI storybook is a development binary and is not built by the
+   default install command. Build it explicitly with:
+
+   ```sh
+   cargo build -p helix-term --bin dhx-ui-storybook --features storybook
+   ```
+
 > 💡 If you do not want to fetch or build grammars, set an environment variable `HELIX_DISABLE_AUTO_GRAMMAR_BUILD`
 
 > 💡 Tree-sitter grammars can be fetched and compiled if not pre-packaged. Fetch

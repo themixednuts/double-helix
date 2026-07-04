@@ -229,6 +229,7 @@ impl FileExplorerStyles {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(feature = "storybook")]
 pub(crate) struct HelixUiDesign {
     pub bufferline: BufferlineStyles,
     pub gutter: GutterStyles,
@@ -240,6 +241,7 @@ pub(crate) struct HelixUiDesign {
     pub file_explorer: FileExplorerStyles,
 }
 
+#[cfg(feature = "storybook")]
 impl HelixUiDesign {
     pub(crate) fn from_theme(theme: &Theme) -> Self {
         Self {

@@ -1408,6 +1408,7 @@ impl PkgManager {
         );
     }
 
+    #[cfg(feature = "storybook")]
     pub(crate) fn storybook_sample(ingress: crate::runtime::RuntimeIngress) -> Self {
         let receipt = Receipt {
             name: "rust-analyzer".to_owned(),
@@ -1438,6 +1439,7 @@ impl PkgManager {
     }
 }
 
+#[cfg(feature = "storybook")]
 fn story_item(
     name: &str,
     kind: PkgKind,

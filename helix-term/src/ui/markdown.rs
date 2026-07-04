@@ -195,6 +195,7 @@ pub struct MarkdownCache {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg(any(test, feature = "storybook"))]
 pub struct MarkdownCacheStats {
     pub hits: usize,
     pub misses: usize,
@@ -237,6 +238,7 @@ pub fn render_to_surface(
 }
 
 impl MarkdownCache {
+    #[cfg(any(test, feature = "storybook"))]
     #[must_use]
     pub fn stats(&self) -> MarkdownCacheStats {
         MarkdownCacheStats {
@@ -488,6 +490,7 @@ pub fn wrap_text(text: &str, max_width: usize) -> Vec<String> {
     text_layout::wrap_to_width(text, max_width)
 }
 
+#[cfg(feature = "storybook")]
 pub fn render_markdown_lines<'a>(
     text: &str,
     lines: &mut Vec<Spans<'a>>,

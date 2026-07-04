@@ -23,6 +23,7 @@ pub mod render;
 pub mod runtime;
 pub use runtime::AppEvent;
 pub mod shutdown;
+#[cfg(feature = "storybook")]
 pub mod storybook;
 pub mod ui;
 pub mod widgets;

@@ -36,6 +36,7 @@ default = ["git"]
 unicode-lines = ["helix-core/unicode-lines", "helix-view/unicode-lines"]
 integration = []
 git = ["helix-vcs/git"]
+storybook = []
 bench = [
   "helix-core/bench",
   "helix-view/bench",
@@ -49,6 +50,7 @@ path = "src/main.rs"
 [[bin]]
 name = "dhx-ui-storybook"
 path = "src/bin/dhx_ui_storybook.rs"
+required-features = ["storybook"]
 
 [[bin]]
 name = "hx-bench"

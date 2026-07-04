@@ -32,6 +32,7 @@ use crate::runtime::{send_ui_command_with, LayerCommand, UiCommand};
 pub use cmdline_popup::CmdlinePopup;
 pub use completion::Completion;
 pub use editor::EditorView;
+#[cfg(any(test, feature = "storybook"))]
 pub(crate) use file_explorer::PANEL_WIDTH as FILE_EXPLORER_PANEL_WIDTH;
 pub use file_explorer::{FileExplorerPanel, ID as FILE_EXPLORER_ID};
 use helix_stdx::rope;

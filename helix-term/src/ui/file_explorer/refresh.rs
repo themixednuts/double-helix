@@ -89,8 +89,11 @@ impl FileExplorerPanel {
                 self.root = root.clone();
                 self.expanded_dirs.clear();
                 self.expanded_dirs.insert(root);
+                self.search_due_at = None;
+                self.search_saved_expanded_dirs = None;
                 self.children_cache.clear();
                 self.invalidate_vcs_snapshot(editor);
+                self.prewarm_search_index(editor);
             }
         }
 

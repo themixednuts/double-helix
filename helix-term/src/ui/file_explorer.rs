@@ -51,11 +51,11 @@ use model::DiagnosticStatus;
 use model::{DiagnosticSnapshot, ExplorerRow, VcsSnapshot, VcsStatus};
 #[cfg(test)]
 use path_ops::LabelRenameError;
-use path_ops::{display_path, relative_display, selected_cursor, LabelEditRange};
+use path_ops::{display_path, selected_cursor, LabelEditRange};
 use preview::{ExplorerPreview, PreviewDocumentCache};
 #[cfg(test)]
 use render::{ExplorerStatusStyles, ExplorerTreeItemStyles};
-use scan::{DirectoryScanner, ExplorerChild};
+use scan::ExplorerChild;
 
 pub const ID: &str = "file-explorer-panel";
 
@@ -67,6 +67,7 @@ const SEARCH_ROWS: u16 = 1;
 /// need to duplicate them here.
 const FOOTER_ROWS: u16 = 1;
 pub(crate) const PANEL_WIDTH: u16 = 34;
+const EXPLORER_SEARCH_DEBOUNCE: Duration = Duration::from_millis(80);
 const FALLBACK_FOLDER_ICON: &str = "";
 const FALLBACK_FOLDER_OPEN_ICON: &str = "󰝰";
 const FALLBACK_FILE_ICON: &str = "󰈔";
@@ -115,6 +116,8 @@ pub struct FileExplorerPanel {
     preview: ExplorerPreview,
     preview_cache: PreviewDocumentCache,
     preview_debouncer: Option<crate::runtime::RuntimeUiDebouncer>,
+    search_debouncer: Option<crate::runtime::RuntimeUiDebouncer>,
+    search_due_at: Option<Instant>,
     model_panel_id: Option<PanelId>,
     last_click: Option<ExplorerClick>,
     /// In-place edit state for the currently-selected row.
@@ -270,15 +273,31 @@ fn explorer_row_matches(row: &ExplorerRow, query: &str) -> bool {
             .contains(query)
 }
 
-fn explorer_child_matches(parent: &Path, child: &ExplorerChild, query: &str) -> bool {
-    relative_display(parent, &child.path)
-        .to_ascii_lowercase()
-        .contains(query)
-        || child
-            .path
-            .to_string_lossy()
-            .to_ascii_lowercase()
-            .contains(query)
+fn file_explorer_search_paths(
+    root: &Path,
+    query: &str,
+    config: &helix_view::editor::FileExplorerConfig,
+) -> anyhow::Result<Vec<PathBuf>> {
+    #[cfg(test)]
+    if let Some(paths) = test_file_explorer_search_paths() {
+        return Ok(paths);
+    }
+
+    crate::fff::search_file_explorer_available(root, query, config)
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_FILE_EXPLORER_SEARCH_PATHS: std::cell::RefCell<Option<Vec<PathBuf>>> =
+        const { std::cell::RefCell::new(None) };
+    static TEST_FILE_EXPLORER_SEARCH_CALLS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn test_file_explorer_search_paths() -> Option<Vec<PathBuf>> {
+    TEST_FILE_EXPLORER_SEARCH_CALLS.with(|calls| calls.set(calls.get().saturating_add(1)));
+    TEST_FILE_EXPLORER_SEARCH_PATHS.with(|paths| paths.borrow().clone())
 }
 
 fn row_status_width(row: &ExplorerRow) -> u16 {
@@ -332,6 +351,8 @@ impl FileExplorerPanel {
             preview: ExplorerPreview::None,
             preview_cache: PreviewDocumentCache::default(),
             preview_debouncer: None,
+            search_debouncer: None,
+            search_due_at: None,
             model_panel_id: None,
             last_click: None,
             label_edit: None,
@@ -339,6 +360,7 @@ impl FileExplorerPanel {
             jump_session: None,
             nav: helix_view::list_nav::ListNav::new(),
         };
+        panel.prewarm_search_index(editor);
         panel.refresh(editor, None, cursor)?;
         Ok(panel)
     }
@@ -401,77 +423,33 @@ impl FileExplorerPanel {
         self.rows.get(self.selection)
     }
 
-    fn collect_search_matches(
-        &mut self,
-        scanner: &DirectoryScanner<'_>,
-        root: &Path,
-        query: &str,
-        seen: &mut HashSet<PathBuf>,
-        matches: &mut Vec<PathBuf>,
-    ) -> Result<(), std::io::Error> {
-        let children = if let Some(children) = self.children_cache.get(root) {
-            children.clone()
-        } else {
-            let children = scanner.children(root)?;
-            self.children_cache
-                .insert(root.to_path_buf(), children.clone());
-            children
-        };
-
-        for child in children {
-            if explorer_child_matches(root, &child, query) {
-                matches.push(child.path.clone());
-            }
-
-            if !child.is_dir {
-                continue;
-            }
-
-            let canonical = child
-                .path
-                .canonicalize()
-                .unwrap_or_else(|_| child.path.clone());
-            if seen.insert(canonical) {
-                self.collect_search_matches(scanner, &child.path, query, seen, matches)?;
-            }
-        }
-
-        Ok(())
-    }
-
-    fn expand_search_matches(
-        &mut self,
-        editor: &Editor,
-        query: &str,
-    ) -> Result<(), std::io::Error> {
-        let config = editor.config();
-        let scanner = DirectoryScanner::new(&config.file_explorer);
-        let root = self.root.clone();
-        let mut seen = HashSet::new();
-        if let Ok(canonical_root) = root.canonicalize() {
-            seen.insert(canonical_root);
-        }
-
-        let mut matches = Vec::new();
-        self.collect_search_matches(&scanner, &root, query, &mut seen, &mut matches)?;
+    fn expand_fff_search_matches(&mut self, matches: impl IntoIterator<Item = PathBuf>) {
         for path in matches {
             self.expand_to_path(&path);
         }
-        Ok(())
     }
 
     fn apply_search_filter(&mut self, editor: &Editor) {
+        self.search_due_at = None;
         let selected_path = self.selected().map(|row| row.path.clone());
         let query = self.search_query.trim().to_ascii_lowercase();
         if query.is_empty() {
-            self.search_saved_expanded_dirs = None;
+            if let Some(expanded_dirs) = self.search_saved_expanded_dirs.take() {
+                self.expanded_dirs = expanded_dirs;
+                if let Err(err) = self.rebuild_visible_rows(editor) {
+                    log::debug!(
+                        "failed to rebuild file explorer rows after emptying search: {err}"
+                    );
+                }
+            }
             self.rows = filter_explorer_rows(&self.all_rows, &self.search_query);
         } else {
             if self.search_saved_expanded_dirs.is_none() {
                 self.search_saved_expanded_dirs = Some(self.expanded_dirs.clone());
             }
-            if let Err(err) = self.expand_search_matches(editor, &query) {
-                log::debug!("failed to scan file explorer search matches: {err}");
+            match file_explorer_search_paths(&self.root, &query, &editor.config().file_explorer) {
+                Ok(matches) => self.expand_fff_search_matches(matches),
+                Err(err) => log::debug!("failed to query FFF file explorer search: {err:#}"),
             }
             if let Err(err) = self.rebuild_visible_rows(editor) {
                 log::debug!("failed to rebuild file explorer rows after search expansion: {err}");
@@ -497,11 +475,25 @@ impl FileExplorerPanel {
         self.search_active = true;
     }
 
+    fn prewarm_search_index(&self, editor: &Editor) {
+        let root = self.root.clone();
+        let config = editor.config().file_explorer.clone();
+        editor
+            .runtime()
+            .block()
+            .spawn(move || crate::fff::prewarm_file_explorer(&root, &config))
+            .detach();
+    }
+
     fn clear_search(&mut self, editor: &Editor) {
         if self.search_query.is_empty() {
             return;
         }
         self.search_query.clear();
+        self.search_due_at = None;
+        if let Some(debouncer) = &self.search_debouncer {
+            debouncer.cancel();
+        }
         if let Some(expanded_dirs) = self.search_saved_expanded_dirs.take() {
             self.expanded_dirs = expanded_dirs;
             if let Err(err) = self.rebuild_visible_rows(editor) {
@@ -511,7 +503,31 @@ impl FileExplorerPanel {
         self.apply_search_filter(editor);
     }
 
-    fn handle_search_key(&mut self, key: KeyEvent, editor: &Editor) -> Option<EventResult> {
+    fn schedule_search_filter(&mut self, cx: &mut Context) {
+        self.search_due_at = Some(Instant::now() + EXPLORER_SEARCH_DEBOUNCE);
+        if self.search_debouncer.is_none() {
+            self.search_debouncer = Some(crate::runtime::RuntimeUiDebouncer::new(
+                EXPLORER_SEARCH_DEBOUNCE,
+                cx.editor.work(),
+                cx.editor.runtime().clock().clone(),
+                cx.ingress.clone(),
+            ));
+        }
+        if let Some(debouncer) = &self.search_debouncer {
+            debouncer.send(UiCommand::NeedFullRedraw);
+        }
+    }
+
+    fn apply_due_search_filter(&mut self, editor: &Editor) {
+        if self
+            .search_due_at
+            .is_some_and(|due_at| Instant::now() >= due_at)
+        {
+            self.apply_search_filter(editor);
+        }
+    }
+
+    fn handle_search_key(&mut self, key: KeyEvent, cx: &mut Context) -> Option<EventResult> {
         if self.search_active {
             match key {
                 KeyEvent {
@@ -526,14 +542,14 @@ impl FileExplorerPanel {
                     modifiers: KeyModifiers::NONE,
                 } => {
                     self.search_query.pop();
-                    self.apply_search_filter(editor);
+                    self.schedule_search_filter(cx);
                     return Some(EventResult::Consumed(None));
                 }
                 KeyEvent {
                     code: KeyCode::Char('u'),
                     modifiers: KeyModifiers::CONTROL,
                 } => {
-                    self.clear_search(editor);
+                    self.clear_search(cx.editor);
                     return Some(EventResult::Consumed(None));
                 }
                 KeyEvent {
@@ -541,7 +557,7 @@ impl FileExplorerPanel {
                     modifiers,
                 } if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
                     self.search_query.push(ch);
-                    self.apply_search_filter(editor);
+                    self.schedule_search_filter(cx);
                     return Some(EventResult::Consumed(None));
                 }
                 _ => return Some(EventResult::Consumed(None)),
@@ -561,7 +577,7 @@ impl FileExplorerPanel {
                 modifiers: KeyModifiers::NONE,
             } if !self.search_query.is_empty() => {
                 self.search_active = false;
-                self.clear_search(editor);
+                self.clear_search(cx.editor);
                 Some(EventResult::Consumed(None))
             }
             _ => None,
@@ -1526,7 +1542,7 @@ impl FileExplorerPanel {
             return self.handle_label_edit_key(key, cx);
         }
 
-        if let Some(result) = self.handle_search_key(key, cx.editor) {
+        if let Some(result) = self.handle_search_key(key, cx) {
             return result;
         }
 
@@ -1871,6 +1887,7 @@ impl Scrollable for FileExplorerPanel {
 impl Component for FileExplorerPanel {
     fn sync(&mut self, editor: &mut Editor) {
         let start = Instant::now();
+        self.apply_due_search_filter(editor);
         if self.refresh_diagnostic_snapshot(editor) {
             let selection = Some(self.selection);
             if let Err(err) = self.refresh_preserving_tree(editor, None, selection) {
@@ -2027,6 +2044,19 @@ mod tests {
     };
     use std::{fs, sync::Arc};
     use tui::ratatui::{buffer::Buffer, layout::Rect as RatatuiRect};
+
+    fn set_test_file_explorer_search_paths(paths: Vec<PathBuf>) {
+        TEST_FILE_EXPLORER_SEARCH_PATHS.with(|slot| *slot.borrow_mut() = Some(paths));
+        TEST_FILE_EXPLORER_SEARCH_CALLS.with(|calls| calls.set(0));
+    }
+
+    fn clear_test_file_explorer_search_paths() {
+        TEST_FILE_EXPLORER_SEARCH_PATHS.with(|slot| *slot.borrow_mut() = None);
+    }
+
+    fn test_file_explorer_search_call_count() -> usize {
+        TEST_FILE_EXPLORER_SEARCH_CALLS.with(std::cell::Cell::get)
+    }
 
     fn test_editor(width: u16, height: u16, runtime: helix_runtime::Runtime) -> Editor {
         test_editor_with_engine(width, height, runtime, EditingEngineConfig::Helix)
@@ -2962,9 +2992,11 @@ mod tests {
             assert!(!panel.expanded_dirs.contains(&src));
             assert!(!panel.rows.iter().any(|row| row.path == target));
 
+            set_test_file_explorer_search_paths(vec![target.clone()]);
             panel.search_query = "needle".to_string();
             panel.apply_search_filter(&editor);
 
+            assert_eq!(test_file_explorer_search_call_count(), 1);
             assert!(panel.expanded_dirs.contains(&src));
             assert!(panel.expanded_dirs.contains(&nested));
             assert!(panel.expanded_dirs.contains(&deep));
@@ -2983,6 +3015,7 @@ mod tests {
                 .any(|row| row.path == deep && row.is_dir && row.expanded));
 
             panel.clear_search(&editor);
+            clear_test_file_explorer_search_paths();
 
             assert!(!panel.expanded_dirs.contains(&src));
             assert!(!panel.expanded_dirs.contains(&nested));
@@ -3021,6 +3054,8 @@ mod tests {
                 );
             }
             assert_eq!(panel.search_query, "alpha");
+            panel.search_due_at = Some(Instant::now());
+            panel.sync(&mut editor);
             assert!(panel
                 .rows
                 .iter()
@@ -4042,6 +4077,8 @@ mod tests {
             preview: ExplorerPreview::None,
             preview_cache: PreviewDocumentCache::default(),
             preview_debouncer: None,
+            search_debouncer: None,
+            search_due_at: None,
             model_panel_id: None,
             last_click: None,
             label_edit: None,
@@ -4094,6 +4131,8 @@ mod tests {
             preview: ExplorerPreview::None,
             preview_cache: PreviewDocumentCache::default(),
             preview_debouncer: None,
+            search_debouncer: None,
+            search_due_at: None,
             model_panel_id: None,
             last_click: None,
             label_edit: None,
@@ -4156,6 +4195,8 @@ mod tests {
             preview: ExplorerPreview::None,
             preview_cache: PreviewDocumentCache::default(),
             preview_debouncer: None,
+            search_debouncer: None,
+            search_due_at: None,
             model_panel_id: None,
             last_click: None,
             label_edit: None,
@@ -4200,6 +4241,8 @@ mod tests {
             preview: ExplorerPreview::None,
             preview_cache: PreviewDocumentCache::default(),
             preview_debouncer: None,
+            search_debouncer: None,
+            search_due_at: None,
             model_panel_id: None,
             last_click: None,
             label_edit: None,

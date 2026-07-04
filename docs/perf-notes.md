@@ -194,3 +194,11 @@ Both read paths produced the same score total: `150000`.
 ### Decision
 
 Do not issue a SQLite query per candidate while the user types. The retained design is an in-memory workspace frecency index loaded once from SQLite, with SQLite used as the durable cache backing store on updates. This keeps the ranking/scoring hot path faster than the old LMDB read loop in the 50k-candidate probe. The write path is slower than LMDB, but remains below 1 ms per access bump in this measurement and is not on the per-keystroke ranking path.
+
+## File Explorer Search: FFF-backed Expansion
+
+Date: 2026-07-04
+
+The file explorer search path no longer recursively walks the whole tree on each query edit. Opening the explorer and changing its root prewarms an explorer-scoped fff-search `FilePicker` using `config.file_explorer` scan semantics. Search key input is debounced, and the due query uses the fff zero-wait path so the UI thread only consumes already-indexed results and never performs an unbounded cold scan.
+
+Matched fff paths still expand their ancestor directories before the existing visible-row rebuild/filter pass runs, so files under collapsed directories remain discoverable while clearing search restores the saved expansion set.

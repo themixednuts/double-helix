@@ -13,7 +13,7 @@ use fff_search::{
 use heed::types::{Bytes, SerdeBincode};
 use heed::{Database, EnvOpenOptions};
 use helix_store::{FrecencyEntry, QueryHistory, Store};
-use helix_view::editor::FilePickerConfig;
+use helix_view::editor::{FileExplorerConfig, FilePickerConfig};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 
@@ -67,6 +67,20 @@ pub(crate) fn search_files_available(
     search_files_with_scan_wait(root, query, current_file, config, Duration::ZERO)
 }
 
+pub(crate) fn search_file_explorer_available(
+    root: &Path,
+    query: &str,
+    config: &FileExplorerConfig,
+) -> anyhow::Result<Vec<PathBuf>> {
+    let config = file_explorer_picker_config(config);
+    search_files_with_scan_wait(root, query, None, &config, Duration::ZERO).map(|matches| {
+        matches
+            .into_iter()
+            .map(|file_match| file_match.path)
+            .collect()
+    })
+}
+
 pub(crate) fn wait_for_initial_file_scan(
     root: &Path,
     config: &FilePickerConfig,
@@ -103,6 +117,16 @@ pub(crate) fn prewarm(root: &Path, config: &FilePickerConfig) {
     if let Err(err) = workspace_for_root(root, config) {
         log::debug!(
             "failed to prewarm FFF workspace for {}: {err:#}",
+            root.display()
+        );
+    }
+}
+
+pub(crate) fn prewarm_file_explorer(root: &Path, config: &FileExplorerConfig) {
+    let config = file_explorer_picker_config(config);
+    if let Err(err) = workspace_for_root(root, &config) {
+        log::debug!(
+            "failed to prewarm FFF file explorer workspace for {}: {err:#}",
             root.display()
         );
     }
@@ -387,6 +411,21 @@ fn scan_options(config: &FilePickerConfig) -> FilePickerScanOptions {
             helix_loader::workspace_ignore_file_name().into(),
         ]),
         deduplicate_links: config.deduplicate_links,
+    }
+}
+
+fn file_explorer_picker_config(config: &FileExplorerConfig) -> FilePickerConfig {
+    FilePickerConfig {
+        hidden: config.hidden,
+        follow_symlinks: config.follow_symlinks,
+        deduplicate_links: true,
+        parents: config.parents,
+        ignore: config.ignore,
+        git_ignore: config.git_ignore,
+        git_global: config.git_global,
+        git_exclude: config.git_exclude,
+        max_depth: None,
+        hide_preview: true,
     }
 }
 
@@ -955,6 +994,31 @@ mod tests {
         assert!(!scan.ignore);
         assert!(!scan.git_ignore);
         assert_eq!(scan.max_depth, Some(2));
+    }
+
+    #[test]
+    fn explorer_picker_config_preserves_explorer_scan_semantics() {
+        let config = FileExplorerConfig {
+            hidden: false,
+            follow_symlinks: false,
+            parents: true,
+            ignore: false,
+            git_ignore: false,
+            git_global: false,
+            git_exclude: false,
+            ..FileExplorerConfig::default()
+        };
+        let picker_config = file_explorer_picker_config(&config);
+        let scan = scan_options(&picker_config);
+
+        assert_eq!(scan.hidden, config.hidden);
+        assert_eq!(scan.follow_links, config.follow_symlinks);
+        assert_eq!(scan.parents, config.parents);
+        assert_eq!(scan.ignore, config.ignore);
+        assert_eq!(scan.git_ignore, config.git_ignore);
+        assert_eq!(scan.git_global, config.git_global);
+        assert_eq!(scan.git_exclude, config.git_exclude);
+        assert_eq!(scan.max_depth, None);
     }
 
     #[test]

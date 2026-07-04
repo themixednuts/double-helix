@@ -1844,8 +1844,10 @@ mod tests {
             .fold_container(view_id)
             .is_none_or(FoldContainer::is_empty));
 
-        let mut config = Config::default();
-        config.fold_on_open = true;
+        let config = Config {
+            fold_on_open: true,
+            ..Default::default()
+        };
         let (mut editor, doc_id, view_id) = editor_with_text(text, config);
         apply_folding_ranges(
             &mut editor,

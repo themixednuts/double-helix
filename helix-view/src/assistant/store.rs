@@ -1481,8 +1481,10 @@ mod tests {
     #[test]
     fn fork_submit_truncates_at_target_and_emits_fork_backend_command() {
         let (mut store, thread, backend) = backend_store();
-        let mut caps = helix_acp::AgentCaps::default();
-        caps.fork_session = true;
+        let caps = helix_acp::AgentCaps {
+            fork_session: true,
+            ..Default::default()
+        };
         set_caps(&mut store, thread, caps);
         append(
             &mut store,

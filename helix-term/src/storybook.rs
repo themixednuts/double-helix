@@ -941,18 +941,13 @@ fn run_interactive(
                     }
                     KeyCode::Home => selected = 0,
                     KeyCode::End => selected = STORIES.len().saturating_sub(1),
-                    KeyCode::Tab | KeyCode::Char(']') => {
-                        if !themes.is_empty() {
-                            theme_index = (theme_index + 1) % themes.len();
-                            active_theme = load_named_storybook_theme(&themes[theme_index])?;
-                        }
+                    KeyCode::Tab | KeyCode::Char(']') if !themes.is_empty() => {
+                        theme_index = (theme_index + 1) % themes.len();
+                        active_theme = load_named_storybook_theme(&themes[theme_index])?;
                     }
-                    KeyCode::BackTab | KeyCode::Char('[') => {
-                        if !themes.is_empty() {
-                            theme_index =
-                                (theme_index + themes.len().saturating_sub(1)) % themes.len();
-                            active_theme = load_named_storybook_theme(&themes[theme_index])?;
-                        }
+                    KeyCode::BackTab | KeyCode::Char('[') if !themes.is_empty() => {
+                        theme_index = (theme_index + themes.len().saturating_sub(1)) % themes.len();
+                        active_theme = load_named_storybook_theme(&themes[theme_index])?;
                     }
                     _ => {}
                 },
@@ -2000,10 +1995,8 @@ fn update_multi_select_story(state: &mut dyn Any, key: CrosstermKeyEvent) {
         CrosstermKeyCode::Char('k') | CrosstermKeyCode::Up => {
             state.selected = state.selected.saturating_sub(1);
         }
-        CrosstermKeyCode::Char(' ') => {
-            if !state.marks.remove(&state.selected) {
-                state.marks.insert(state.selected);
-            }
+        CrosstermKeyCode::Char(' ') if !state.marks.remove(&state.selected) => {
+            state.marks.insert(state.selected);
         }
         _ => {}
     }

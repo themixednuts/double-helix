@@ -186,7 +186,7 @@ fn fff_cache_import_is_marked_and_idempotent() {
         .unwrap());
     assert!(store
         .frecency()
-        .import_fff_cache_once("fff-cache-v1", &[frecency.clone()], &[query])
+        .import_fff_cache_once("fff-cache-v1", std::slice::from_ref(&frecency), &[query])
         .unwrap());
     assert!(store
         .frecency()

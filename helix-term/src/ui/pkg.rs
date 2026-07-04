@@ -1098,7 +1098,7 @@ impl PkgManager {
             .iter()
             .filter_map(|binding| binding.hint)
             .collect::<Vec<_>>();
-        entries.sort_by(|a, b| b.2.cmp(&a.2));
+        entries.sort_by_key(|entry| std::cmp::Reverse(entry.2));
         entries
             .into_iter()
             .map(|(key, label, _)| (key, label))

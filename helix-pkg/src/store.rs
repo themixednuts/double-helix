@@ -86,17 +86,15 @@ impl Store {
     }
 
     pub fn receipts(&self) -> Result<Vec<Receipt>> {
-        match self.db_receipts() {
-            Ok(receipts) => return Ok(receipts),
-            Err(_) => {}
+        if let Ok(receipts) = self.db_receipts() {
+            return Ok(receipts);
         }
         self.legacy_receipts()
     }
 
     pub fn receipt(&self, kind: PkgKind, name: &str) -> Result<Option<Receipt>> {
-        match self.db_receipt(kind, name) {
-            Ok(receipt) => return Ok(receipt),
-            Err(_) => {}
+        if let Ok(receipt) = self.db_receipt(kind, name) {
+            return Ok(receipt);
         }
         let path = self.receipt_path(kind, name);
         if path.exists() {
@@ -123,9 +121,8 @@ impl Store {
     }
 
     pub fn write_receipt(&self, receipt: &Receipt) -> Result<()> {
-        match self.write_db_receipt(receipt) {
-            Ok(()) => return Ok(()),
-            Err(_) => {}
+        if let Ok(()) = self.write_db_receipt(receipt) {
+            return Ok(());
         }
         self.write_legacy_receipt(receipt)
     }

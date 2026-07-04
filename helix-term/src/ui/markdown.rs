@@ -580,10 +580,10 @@ fn render_markdown(
                 Event::End(TagEnd::TableCell) => {
                     table_state.row.push(table_state.cell.trim().to_string())
                 }
-                Event::End(TagEnd::TableRow) | Event::End(TagEnd::TableHead) => {
-                    if !table_state.row.is_empty() {
-                        table_state.rows.push(std::mem::take(&mut table_state.row));
-                    }
+                Event::End(TagEnd::TableRow) | Event::End(TagEnd::TableHead)
+                    if !table_state.row.is_empty() =>
+                {
+                    table_state.rows.push(std::mem::take(&mut table_state.row));
                 }
                 Event::End(TagEnd::Table) => {
                     finish_table = true;
@@ -709,10 +709,10 @@ fn render_markdown(
             Event::End(tag) => {
                 tags.pop();
                 match tag {
-                    TagEnd::Heading(_) | TagEnd::Paragraph | TagEnd::CodeBlock | TagEnd::Item => {
-                        if !spans.is_empty() {
-                            push_line(&mut spans, &mut lines, width);
-                        }
+                    TagEnd::Heading(_) | TagEnd::Paragraph | TagEnd::CodeBlock | TagEnd::Item
+                        if !spans.is_empty() =>
+                    {
+                        push_line(&mut spans, &mut lines, width);
                     }
                     _ => {}
                 }

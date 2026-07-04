@@ -219,7 +219,7 @@ backends are never enabled by `run-scripts`; they always require an explicit
   runtimes/{node,py}/                    # shared npm prefix / venv, versioned
 ```
 
-- Active package receipt records live in `<data>/state.sqlite3` in the
+- Active package receipt records live in `<data-dir>/double-helix/state.sqlite3` in the
   `pkg_receipts` table. The first package-store open imports legacy TOML
   receipts transactionally and records the `pkg-receipts-toml-v1` marker; the
   TOML files are not deleted during that import.

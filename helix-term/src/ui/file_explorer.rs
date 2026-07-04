@@ -255,7 +255,8 @@ fn filter_explorer_rows(rows: &[ExplorerRow], query: &str) -> Vec<ExplorerRow> {
 
     rows.iter()
         .zip(include)
-        .filter_map(|(row, include)| include.then(|| row.clone()))
+        .filter(|(_, include)| *include)
+        .map(|(row, _)| row.clone())
         .collect()
 }
 

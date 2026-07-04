@@ -271,7 +271,7 @@ impl BackupSnapshot {
                 BackupEntry::Directory { .. } => None,
             })
             .collect();
-        files.sort_by(|(left, ..), (right, ..)| left.cmp(right));
+        files.sort_by_key(|(relative_path, ..)| *relative_path);
         for (relative_path, compressed_data, readonly) in files {
             let target = snapshot_target(path, relative_path);
             if let Some(parent) = target.parent() {

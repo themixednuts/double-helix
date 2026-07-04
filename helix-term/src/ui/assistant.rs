@@ -1001,7 +1001,7 @@ impl AssistantPanel {
             }
         }
 
-        entries.sort_by(|a, b| b.2.cmp(&a.2));
+        entries.sort_by_key(|entry| std::cmp::Reverse(entry.2));
         entries
             .into_iter()
             .map(|(key, label, _)| (key, label))
@@ -3564,20 +3564,16 @@ impl AssistantPanel {
             AssistantAction::ToggleFold => {
                 self.toggle_selected_message_fold(cx.editor);
             }
-            AssistantAction::Yank => {
-                if !self.yank_pending_elicitation_url(cx.editor) {
-                    self.yank_selected_message(cx.editor);
-                }
+            AssistantAction::Yank if !self.yank_pending_elicitation_url(cx.editor) => {
+                self.yank_selected_message(cx.editor);
             }
-            AssistantAction::FollowOrJump => {
-                if !self.jump_selected_subagent(cx.editor) {
-                    match cx.editor.toggle_active_assistant_follow() {
-                        Ok((status, effects)) => {
-                            Self::apply_assistant_effects(cx.editor, effects);
-                            cx.editor.set_status(status);
-                        }
-                        Err(err) => cx.editor.set_status(err.to_string()),
+            AssistantAction::FollowOrJump if !self.jump_selected_subagent(cx.editor) => {
+                match cx.editor.toggle_active_assistant_follow() {
+                    Ok((status, effects)) => {
+                        Self::apply_assistant_effects(cx.editor, effects);
+                        cx.editor.set_status(status);
                     }
+                    Err(err) => cx.editor.set_status(err.to_string()),
                 }
             }
             AssistantAction::Previous => {
@@ -3710,15 +3706,16 @@ impl AssistantPanel {
                 self.auth_transient = false;
                 self.focus_messages(cx.editor);
             }
-            AssistantAction::TransientSubmit if layer == AssistantLayer::Elicitation => {
-                if self.accept_pending_elicitation(cx.editor) {
-                    cx.editor.set_status("Submitted assistant request");
-                }
+            AssistantAction::TransientSubmit
+                if layer == AssistantLayer::Elicitation
+                    && self.accept_pending_elicitation(cx.editor) =>
+            {
+                cx.editor.set_status("Submitted assistant request");
             }
-            AssistantAction::TransientSubmit if layer == AssistantLayer::Auth => {
-                if self.accept_auth_method(cx.editor) {
-                    self.auth_transient = false;
-                }
+            AssistantAction::TransientSubmit
+                if layer == AssistantLayer::Auth && self.accept_auth_method(cx.editor) =>
+            {
+                self.auth_transient = false;
             }
             AssistantAction::TransientNext if layer == AssistantLayer::Elicitation => {
                 if let Some(form) = &mut self.elicitation_form {
@@ -4018,10 +4015,8 @@ impl Component for AssistantPanel {
                         code: KeyCode::Enter | KeyCode::Tab,
                         modifiers,
                         ..
-                    } if modifiers.is_empty() => {
-                        if self.accept_selected_mention(cx.editor) {
-                            return EventResult::Consumed(None);
-                        }
+                    } if modifiers.is_empty() && self.accept_selected_mention(cx.editor) => {
+                        return EventResult::Consumed(None);
                     }
                     _ => {}
                 }

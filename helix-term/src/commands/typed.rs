@@ -3600,6 +3600,10 @@ fn reload_all_plugins(
 /// Launch and initialize an assistant backend, then open the panel.
 /// `agent_index` is the index in config.agents (for cycling); None when connecting with explicit command.
 /// `activate_input` when true, focuses the chat input line when the panel is created.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "command adapters mirror typable command call sites"
+)]
 pub(crate) fn do_assistant_connect(
     _editor: &mut helix_view::Editor,
     command: String,

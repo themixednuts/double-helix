@@ -106,12 +106,36 @@ When an agent asks for permission, Helix shows a standard picker with the reques
 Choices such as allow always or reject always are stored in the assistant permission rules file:
 
 ```text
-<cache-dir>/assistant/permissions.toml
+<data-dir>/double-helix/state.sqlite3
 ```
+
+The legacy `<cache-dir>/double-helix/assistant/permissions.toml` file is still
+imported or used as a fallback if the SQLite store cannot be opened.
 
 Future matching requests for the same agent and tool are answered automatically, and the thread shows a transient status such as `auto-allowed shell (always)` or `auto-rejected shell (always)`.
 
 Use `:assistant-permissions-reset` to clear stored rules.
+
+## Storage
+
+Generated assistant state is stored in SQLite through `helix-store`:
+
+```text
+<data-dir>/double-helix/state.sqlite3
+```
+
+That database holds assistant threads, history metadata, layout, permissions,
+and package receipts. The rebuildable file-picker frecency and query cache lives
+in:
+
+```text
+<cache-dir>/double-helix/cache.sqlite3
+```
+
+Legacy assistant files under `<cache-dir>/double-helix/assistant/` are preserved
+as one-release import or fallback sources. Log output remains a plain text log
+file, defaulting to `<cache-dir>/double-helix/double-helix.log` unless `--log`
+specifies another path.
 
 ## Review Mode
 

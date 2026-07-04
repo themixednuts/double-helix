@@ -42,7 +42,7 @@ use helix_runtime::FrameHandle;
 use helix_view::bench::log_run_phase;
 use helix_view::graphics::{CursorKind, Rect};
 use helix_view::input::{MouseButton, MouseEvent, MouseEventKind};
-use helix_view::model::{PanelId, PanelSide, PanelSize};
+use helix_view::model::{PanelEntry, PanelId, PanelSide, PanelSize, TreePanelModel};
 use helix_view::Editor;
 use std::sync::Arc;
 
@@ -220,7 +220,7 @@ pub(crate) fn compute_panel_layout(area: Rect, editor: &Editor) -> PanelLayout {
                     x: editor_area.x + editor_area.width - w,
                     y: area.y,
                     width: w,
-                    height: area.height,
+                    height: side_panel_height(area, chrome_area, panel),
                 };
                 editor_area.width = editor_area.width.saturating_sub(w);
                 panel_areas.push((panel_id, panel_rect));
@@ -234,7 +234,7 @@ pub(crate) fn compute_panel_layout(area: Rect, editor: &Editor) -> PanelLayout {
                     x: editor_area.x,
                     y: area.y,
                     width: w,
-                    height: area.height,
+                    height: side_panel_height(area, chrome_area, panel),
                 };
                 editor_area.x += w;
                 editor_area.width = editor_area.width.saturating_sub(w);
@@ -278,6 +278,23 @@ pub(crate) fn compute_panel_layout(area: Rect, editor: &Editor) -> PanelLayout {
         panel_areas,
         global_status_row,
     }
+}
+
+fn side_panel_height(area: Rect, chrome_area: Rect, panel: &PanelEntry) -> u16 {
+    if side_panel_underlaps_global_status_row(panel) {
+        area.height
+    } else {
+        chrome_area.height
+    }
+}
+
+fn side_panel_underlaps_global_status_row(panel: &PanelEntry) -> bool {
+    // The assistant has an internal transient/error row below its statusline,
+    // so it keeps the full-height underlap and lets the global row paint over
+    // that final internal row. The file explorer has only a one-row footer;
+    // clipping it to the chrome area puts that footer on the editor
+    // statusline baseline and leaves the global row to the compositor.
+    !(panel.title == "Files" && panel.content.is::<TreePanelModel>())
 }
 
 /// Render the global status row at the bottom of the terminal.
@@ -1627,6 +1644,39 @@ mod tests {
             layout.global_status_row.y,
             panel_rect.bottom().saturating_sub(1)
         );
+    }
+
+    #[tokio::test]
+    async fn panel_layout_file_explorer_footer_aligns_without_global_underlap() {
+        let mut editor = test_editor(120, 40);
+        editor.model.insert_panel(
+            "Files",
+            Box::new(helix_view::model::TreePanelModel::default()),
+            PanelSide::Left,
+            PanelSize::fixed(crate::ui::FILE_EXPLORER_PANEL_WIDTH),
+        );
+        let layout = compute_panel_layout(Rect::new(0, 0, 120, 40), &editor);
+        let (_, panel_rect) = &layout.panel_areas[0];
+
+        // H = 40. The editor renders inside chrome_area (0..39), so its
+        // statusline is row H-2 = 38 and the compositor-owned global
+        // status/error row is H-1 = 39.
+        let editor_statusline_row = layout.editor_area.bottom().saturating_sub(1);
+        assert_eq!(editor_statusline_row, 38);
+        assert_eq!(layout.global_status_row, Rect::new(0, 39, 120, 1));
+
+        // FileExplorerPanel has a single-row footer and uses Panel::edge,
+        // whose content area only removes the side divider. Giving the
+        // explorer chrome_area height makes its footer row match the editor
+        // statusline and keeps row H-1 outside the explorer rect.
+        let explorer_inner = crate::widgets::Panel::edge(
+            crate::widgets::PanelStyle::default(),
+            crate::widgets::PanelEdge::Right,
+        )
+        .content_area(*panel_rect);
+        let explorer_statusline_row = explorer_inner.bottom().saturating_sub(1);
+        assert_eq!(explorer_statusline_row, editor_statusline_row);
+        assert_eq!(panel_rect.bottom(), layout.global_status_row.y);
     }
 
     #[tokio::test]

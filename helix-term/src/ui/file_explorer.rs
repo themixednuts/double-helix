@@ -2942,11 +2942,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         fs::create_dir_all(temp.path().join("src").join("nested").join("deep")).unwrap();
         fs::write(temp.path().join("src").join("keep.txt"), "").unwrap();
-        fs::write(
-            temp.path().join("src").join("nested").join("keep.txt"),
-            "",
-        )
-        .unwrap();
+        fs::write(temp.path().join("src").join("nested").join("keep.txt"), "").unwrap();
         let target = temp
             .path()
             .join("src")

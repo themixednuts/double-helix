@@ -14,6 +14,7 @@ use helix_view::theme::{Style as ThemeStyle, Theme};
 use helix_view::{Document, DocumentId, View, ViewId};
 use std::borrow::Cow;
 use std::sync::{LazyLock, Mutex};
+use std::time::Instant;
 use tui::ratatui::{
     style::Style as RatatuiStyle,
     text::{Line, Span},
@@ -55,7 +56,7 @@ impl StatuslineModel {
                 context
                     .spinners
                     .get(server)
-                    .and_then(|spinner| spinner.frame())
+                    .and_then(|spinner| spinner.frame_at(context.frame_time))
             })
             .unwrap_or(" ");
         let lsp_progress = first_server
@@ -121,6 +122,7 @@ pub struct StatuslineContext<'a> {
     pub selected_register: Option<char>,
     pub spinners: &'a ProgressSpinners,
     pub pkg_progress: Option<crate::ui::pkg::PkgStatusline>,
+    pub frame_time: Instant,
 }
 
 pub(crate) fn cache_id(view_id: ViewId) -> crate::render::CacheId {
@@ -171,7 +173,7 @@ impl<'a> Statusline<'a> {
             )),
             area,
         };
-        PreparedRender::snapshot(tag, model, move |model| {
+        PreparedRender::snapshot(tag, model, move |model, _cancellation| {
             let mut component = Statusline::new(model);
             let mut output = RenderOutput::new(area);
             component.render_surface(area, output.surface_mut());
@@ -374,6 +376,10 @@ where
     write(statusline, themed_span(content, style));
 }
 
+fn lsp_progress_status_text(spinner_frame: &str, progress: u8) -> String {
+    format!(" {spinner_frame} {progress:>3}% ")
+}
+
 fn render_lsp_spinner<'a, F>(statusline: &mut Statusline<'a>, write: F)
 where
     F: Fn(&mut Statusline<'a>, Span<'a>) + Copy,
@@ -387,28 +393,6 @@ where
     }
 
     if let Some(progress) = statusline.model.snapshot.lsp_progress {
-        let width = 6;
-        let state = crate::widgets::progress_fill(width, progress as f32 / 100.0);
-        let mut bar = String::with_capacity(width as usize);
-        for i in 0..width {
-            let glyph = if i < state.filled_cells {
-                "█"
-            } else if i == state.filled_cells && state.partial_eighths > 0 {
-                match state.partial_eighths {
-                    1 => "▏",
-                    2 => "▎",
-                    3 => "▍",
-                    4 => "▌",
-                    5 => "▋",
-                    6 => "▊",
-                    7 => "▉",
-                    _ => "█",
-                }
-            } else {
-                " "
-            };
-            bar.push_str(glyph);
-        }
         let style = statusline
             .model
             .theme
@@ -417,7 +401,13 @@ where
             .unwrap_or_else(|| statusline.model.theme.get("ui.statusline"));
         write(
             statusline,
-            themed_span(format!(" {bar} {progress:>3}% "), style),
+            themed_span(
+                lsp_progress_status_text(
+                    statusline.model.snapshot.spinner_frame.as_ref(),
+                    progress,
+                ),
+                style,
+            ),
         );
         return;
     }
@@ -897,4 +887,15 @@ fn get_current_function_name_cached(
 
 fn get_current_function_name(doc: &Document, cursor_char: usize) -> Option<String> {
     doc.function_name_at_char(cursor_char)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lsp_progress_status_keeps_spinner_with_percentage() {
+        assert_eq!(lsp_progress_status_text("*", 7), " *   7% ");
+        assert_eq!(lsp_progress_status_text("*", 100), " * 100% ");
+    }
 }

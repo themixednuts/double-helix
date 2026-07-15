@@ -42,13 +42,13 @@ pub fn clip_rect_relative(rect: Rect, percent_horizontal: u8, percent_vertical: 
 }
 
 impl<T: Component + 'static> Component for Overlay<T> {
-    fn sync(&mut self, editor: &mut helix_view::Editor) {
-        self.content.sync(editor);
+    fn sync(&mut self, viewport: Rect, editor: &mut helix_view::Editor) {
+        self.content.sync((self.calc_child_size)(viewport), editor);
     }
 
-    fn render(&mut self, area: Rect, frame: &mut crate::render::CellSurface, ctx: &RenderContext) {
-        let dimensions = (self.calc_child_size)(area);
-        self.content.render(dimensions, frame, ctx)
+    fn prepare_render(&mut self, area: Rect, ctx: &RenderContext) -> crate::render::PreparedRender {
+        self.content
+            .prepare_render((self.calc_child_size)(area), ctx)
     }
 
     fn required_size(&mut self, (width, height): (u16, u16)) -> Option<(u16, u16)> {

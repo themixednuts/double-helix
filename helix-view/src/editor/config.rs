@@ -346,7 +346,7 @@ pub struct Config {
     #[serde(default)]
     pub fold_textobjects: Vec<String>,
     pub fold_on_open: bool,
-    #[serde(default = "default_agents")]
+    #[serde(default)]
     pub agents: Vec<AgentConfig>,
     #[serde(default)]
     pub acp: AcpConfig,
@@ -446,10 +446,14 @@ impl AcpConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct AgentConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
     pub name: String,
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
+    #[serde(default)]
+    pub env: HashMap<String, String>,
     #[serde(default)]
     pub mcp_servers: Vec<helix_acp::types::McpServer>,
     #[serde(default)]
@@ -470,52 +474,6 @@ impl Default for AssistantConfig {
             profiles: Vec::new(),
         }
     }
-}
-
-pub(super) fn default_agents() -> Vec<AgentConfig> {
-    let claude_cmd = if cfg!(windows) {
-        (
-            "npm.cmd".into(),
-            vec![
-                "exec".into(),
-                "--yes".into(),
-                "@zed-industries/claude-agent-acp@0.20.2".into(),
-            ],
-        )
-    } else {
-        ("claude-agent-acp".into(), vec![])
-    };
-
-    vec![
-        AgentConfig {
-            name: "Claude Agent".into(),
-            command: claude_cmd.0,
-            args: claude_cmd.1,
-            mcp_servers: Vec::new(),
-            theme: None,
-        },
-        AgentConfig {
-            name: "Cursor".into(),
-            command: "cursor".into(),
-            args: vec!["agent".into(), "acp".into()],
-            mcp_servers: Vec::new(),
-            theme: None,
-        },
-        AgentConfig {
-            name: "Gemini CLI".into(),
-            command: "gemini".into(),
-            args: vec!["--experimental-acp".into()],
-            mcp_servers: Vec::new(),
-            theme: None,
-        },
-        AgentConfig {
-            name: "Goose".into(),
-            command: "goose".into(),
-            args: vec!["acp".into()],
-            mcp_servers: Vec::new(),
-            theme: None,
-        },
-    ]
 }
 
 #[derive(Debug, Default, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize, Clone, Copy)]
@@ -983,7 +941,7 @@ impl Default for BufferLineConfig {
     fn default() -> Self {
         Self {
             render_mode: BufferLineRenderMode::default(),
-            separator: String::from("│"),
+            separator: String::new(),
         }
     }
 }
@@ -1592,7 +1550,7 @@ impl Default for Config {
             buffer_picker: BufferPickerConfig::default(),
             fold_textobjects: Vec::new(),
             fold_on_open: false,
-            agents: default_agents(),
+            agents: Vec::new(),
             acp: AcpConfig::default(),
             assistant: AssistantConfig::default(),
             editing_engine: EditingEngineConfig::default(),
@@ -1603,7 +1561,32 @@ impl Default for Config {
 
 #[cfg(test)]
 mod tests {
-    use super::{BufferLineRenderMode, Config, VcsProvider};
+    use super::{AgentConfig, BufferLineRenderMode, Config, VcsProvider};
+
+    #[test]
+    fn agent_config_id_is_optional_and_serialized_when_present() {
+        let legacy: AgentConfig = toml::from_str(
+            r#"
+            name = "Legacy"
+            command = "node"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(legacy.id, None);
+
+        let configured: AgentConfig = toml::from_str(
+            r#"
+            id = "review-agent"
+            name = "Review"
+            command = "node"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(configured.id.as_deref(), Some("review-agent"));
+        assert!(toml::to_string(&configured)
+            .unwrap()
+            .contains("id = \"review-agent\""));
+    }
 
     #[test]
     fn bufferline_accepts_render_mode_string() {
@@ -1613,7 +1596,7 @@ mod tests {
             config.bufferline.render_mode,
             BufferLineRenderMode::Multiple
         );
-        assert_eq!(config.bufferline.separator, "│");
+        assert!(config.bufferline.separator.is_empty());
     }
 
     #[test]

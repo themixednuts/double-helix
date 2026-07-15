@@ -17,6 +17,7 @@ pub(crate) mod fff;
 pub mod health;
 pub mod host;
 pub mod keymap;
+pub mod logging;
 pub mod migration;
 pub mod plugin_registry;
 pub mod render;

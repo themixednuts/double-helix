@@ -4,8 +4,6 @@
 //! menu, popup, and any component that needs a scrollbar.
 
 use helix_view::graphics::{Rect, Style};
-use std::borrow::Cow;
-
 /// A proportional scrollbar rendered in a 1-wide column.
 ///
 /// # Examples
@@ -23,16 +21,16 @@ use std::borrow::Cow;
 ///     .thumb_style(style)
 ///     .render(area, surface);
 /// ```
-pub struct Scrollbar {
+pub struct Scrollbar<'a> {
     total: usize,
     offset: usize,
     visible: usize,
-    thumb_symbol: Cow<'static, str>,
+    thumb_symbol: &'a str,
     thumb_style: Style,
-    track: Option<(Cow<'static, str>, Style)>,
+    track: Option<(&'a str, Style)>,
 }
 
-impl Scrollbar {
+impl<'a> Scrollbar<'a> {
     /// Create a scrollbar for `total` items with `offset` as the first visible
     /// index and `visible` items shown.
     pub fn new(total: usize, offset: usize, visible: usize) -> Self {
@@ -40,15 +38,15 @@ impl Scrollbar {
             total,
             offset,
             visible,
-            thumb_symbol: Cow::Borrowed("▐"),
+            thumb_symbol: "▐",
             thumb_style: Style::default(),
             track: None,
         }
     }
 
     /// Set the thumb symbol (default: "▐").
-    pub fn symbol(mut self, symbol: impl Into<Cow<'static, str>>) -> Self {
-        self.thumb_symbol = symbol.into();
+    pub fn symbol(mut self, symbol: &'a str) -> Self {
+        self.thumb_symbol = symbol;
         self
     }
 
@@ -60,8 +58,8 @@ impl Scrollbar {
 
     /// Enable track rendering with the given symbol and style.
     /// If not called, non-thumb cells are left untouched.
-    pub fn track(mut self, symbol: impl Into<Cow<'static, str>>, style: Style) -> Self {
-        self.track = Some((symbol.into(), style));
+    pub fn track(mut self, symbol: &'a str, style: Style) -> Self {
+        self.track = Some((symbol, style));
         self
     }
 
@@ -83,14 +81,14 @@ impl Scrollbar {
             if i >= thumb_top && i < thumb_top + thumb_height {
                 {
                     if let Some(cell) = surface.cell_mut((area.x, area.y + i as u16)) {
-                        cell.set_symbol(self.thumb_symbol.as_ref());
+                        cell.set_symbol(self.thumb_symbol);
                         cell.set_style(tui::ratatui::to_ratatui_style(self.thumb_style));
                     }
                 };
             } else if let Some((track_symbol, track_style)) = self.track.as_ref() {
                 {
                     if let Some(cell) = surface.cell_mut((area.x, area.y + i as u16)) {
-                        cell.set_symbol(track_symbol.as_ref());
+                        cell.set_symbol(track_symbol);
                         cell.set_style(tui::ratatui::to_ratatui_style(*track_style));
                     }
                 };

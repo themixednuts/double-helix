@@ -2,6 +2,7 @@
 
 use helix_core::unicode::width::UnicodeWidthStr;
 use helix_view::graphics::{Rect, Style};
+use std::sync::Arc;
 use tui::text::Spans;
 
 use super::{message, MessageAlign, MessageStyle};
@@ -28,8 +29,8 @@ pub enum MessageAccessoryAlign {
 }
 
 #[derive(Debug, Clone)]
-pub struct MessageAccessory<'a> {
-    lines: Vec<Spans<'a>>,
+pub struct MessageAccessory {
+    lines: Arc<[Spans<'static>]>,
     align: MessageAccessoryAlign,
     visibility: MessageAccessoryVisibility,
 }
@@ -40,24 +41,24 @@ pub enum MessageDecoration {
 }
 
 #[derive(Debug, Clone)]
-pub struct Message<'a> {
-    kind: MessageKind<'a>,
-    details: Vec<Spans<'a>>,
+pub struct Message {
+    kind: MessageKind,
+    details: Arc<[Spans<'static>]>,
     details_visibility: MessageDetailsVisibility,
-    accessories: Vec<MessageAccessory<'a>>,
+    accessories: Vec<MessageAccessory>,
     selected_decoration: Option<MessageDecoration>,
 }
 
 #[derive(Debug, Clone)]
-pub enum MessageKind<'a> {
+pub enum MessageKind {
     Bubble {
         label: Option<(String, Style)>,
-        lines: Vec<Spans<'a>>,
+        lines: Arc<[Spans<'static>]>,
         bubble_width: u16,
         align: MessageAlign,
         style: MessageStyle,
     },
-    Plain(Vec<Spans<'a>>),
+    Plain(Arc<[Spans<'static>]>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,13 +78,17 @@ impl MessageLayout {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MessageListState {
     pub total_height: usize,
     pub visible_start: usize,
     pub visible_end: usize,
     pub items: Vec<MessageLayout>,
     pub selected_area: Option<Rect>,
+    viewport_area: Rect,
+    scroll_hit_area: Rect,
+    scroll: usize,
+    selected: Option<usize>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -92,10 +97,28 @@ pub struct MessageCursor {
     scroll: usize,
 }
 
-impl<'a> Message<'a> {
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MessagePaintOverrides<'a> {
+    pub animated_prefix: Option<MessageAnimatedPrefix<'a>>,
+    pub selected_accent: Option<MessageSelectedAccent>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct MessageAnimatedPrefix<'a> {
+    pub index: usize,
+    pub text: &'a str,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct MessageSelectedAccent {
+    pub style: Style,
+    pub progress: f32,
+}
+
+impl Message {
     pub fn bubble(
         label: Option<(String, Style)>,
-        lines: Vec<Spans<'a>>,
+        lines: impl Into<Arc<[Spans<'static>]>>,
         bubble_width: u16,
         align: MessageAlign,
         style: MessageStyle,
@@ -103,43 +126,47 @@ impl<'a> Message<'a> {
         Self {
             kind: MessageKind::Bubble {
                 label,
-                lines,
+                lines: lines.into(),
                 bubble_width,
                 align,
                 style,
             },
-            details: Vec::new(),
+            details: Arc::from([]),
             details_visibility: MessageDetailsVisibility::Always,
             accessories: Vec::new(),
             selected_decoration: None,
         }
     }
 
-    pub fn plain(lines: Vec<Spans<'a>>) -> Self {
+    pub fn plain(lines: impl Into<Arc<[Spans<'static>]>>) -> Self {
         Self {
-            kind: MessageKind::Plain(lines),
-            details: Vec::new(),
+            kind: MessageKind::Plain(lines.into()),
+            details: Arc::from([]),
             details_visibility: MessageDetailsVisibility::Always,
             accessories: Vec::new(),
             selected_decoration: None,
         }
     }
 
-    pub fn with_details(mut self, details: Vec<Spans<'a>>) -> Self {
-        self.details = details;
+    pub fn with_details(mut self, details: impl Into<Arc<[Spans<'static>]>>) -> Self {
+        self.details = details.into();
         self.details_visibility = MessageDetailsVisibility::Always;
         self
     }
 
-    pub fn with_selected_details(mut self, details: Vec<Spans<'a>>) -> Self {
-        self.details = details;
+    pub fn with_selected_details(mut self, details: impl Into<Arc<[Spans<'static>]>>) -> Self {
+        self.details = details.into();
         self.details_visibility = MessageDetailsVisibility::Selected;
         self
     }
 
-    pub fn with_accessory(mut self, lines: Vec<Spans<'a>>, align: MessageAccessoryAlign) -> Self {
+    pub fn with_accessory(
+        mut self,
+        lines: impl Into<Arc<[Spans<'static>]>>,
+        align: MessageAccessoryAlign,
+    ) -> Self {
         self.accessories.push(MessageAccessory {
-            lines,
+            lines: lines.into(),
             align,
             visibility: MessageAccessoryVisibility::Always,
         });
@@ -148,11 +175,11 @@ impl<'a> Message<'a> {
 
     pub fn with_selected_accessory(
         mut self,
-        lines: Vec<Spans<'a>>,
+        lines: impl Into<Arc<[Spans<'static>]>>,
         align: MessageAccessoryAlign,
     ) -> Self {
         self.accessories.push(MessageAccessory {
-            lines,
+            lines: lines.into(),
             align,
             visibility: MessageAccessoryVisibility::Selected,
         });
@@ -169,7 +196,7 @@ impl<'a> Message<'a> {
         self
     }
 
-    pub fn details(&self, selected: bool) -> &[Spans<'a>] {
+    pub fn details(&self, selected: bool) -> &[Spans<'static>] {
         if self.details.is_empty() {
             return &[];
         }
@@ -181,7 +208,7 @@ impl<'a> Message<'a> {
         }
     }
 
-    pub fn accessories(&self, selected: bool) -> impl Iterator<Item = &MessageAccessory<'a>> {
+    pub fn accessories(&self, selected: bool) -> impl Iterator<Item = &MessageAccessory> {
         self.accessories
             .iter()
             .filter(move |accessory| match accessory.visibility {
@@ -213,8 +240,269 @@ impl<'a> Message<'a> {
 }
 
 impl MessageListState {
+    /// Computes message geometry and viewport metadata without requiring a surface.
+    pub fn layout(area: Rect, items: &[Message], scroll: usize, selected: Option<usize>) -> Self {
+        let mut layout = Vec::with_capacity(items.len());
+        let mut top = 0usize;
+        for (index, item) in items.iter().enumerate() {
+            let height = item.height(selected == Some(index));
+            layout.push(MessageLayout { index, top, height });
+            top += height as usize + 1;
+        }
+
+        let mut state = Self {
+            total_height: top,
+            visible_start: items.len(),
+            visible_end: items.len(),
+            items: layout,
+            selected_area: None,
+            viewport_area: Rect::default(),
+            scroll_hit_area: Rect::default(),
+            scroll,
+            selected,
+        };
+
+        if area.height == 0 || area.width == 0 {
+            return state;
+        }
+        state.viewport_area = area;
+        state.scroll_hit_area = scroll_hit_area(area, state.total_height);
+
+        let mut first_visible = None;
+        let mut last_visible = None;
+
+        for layout in &state.items {
+            let block_top = area.y as isize + layout.top as isize - scroll as isize;
+            let block_bottom = block_top + layout.height as isize;
+
+            if block_top < area.bottom() as isize && block_bottom > area.y as isize {
+                first_visible.get_or_insert(layout.index);
+                last_visible = Some(layout.index);
+
+                if selected == Some(layout.index) {
+                    let visible_top = block_top.max(area.y as isize) as u16;
+                    let visible_bottom = block_bottom.min(area.bottom() as isize) as u16;
+                    state.selected_area = Some(Rect::new(
+                        area.x,
+                        visible_top,
+                        area.width,
+                        visible_bottom.saturating_sub(visible_top),
+                    ));
+                }
+            }
+
+            if block_top >= area.bottom() as isize {
+                break;
+            }
+        }
+
+        if let Some(start) = first_visible {
+            state.visible_start = start;
+            state.visible_end = last_visible.map_or(start, |end| end + 1);
+        }
+
+        state
+    }
+
+    /// Paints messages using this precomputed layout without mutating it.
+    pub fn paint(&self, surface: &mut crate::render::CellSurface, items: &[Message]) {
+        self.paint_with_overrides(surface, items, MessagePaintOverrides::default());
+    }
+
+    pub fn paint_dynamic(
+        &self,
+        surface: &mut crate::render::CellSurface,
+        items: &[Message],
+        animated_prefix: Option<(usize, &str)>,
+        selected_accent: Option<(Style, f32)>,
+    ) {
+        self.paint_with_overrides(
+            surface,
+            items,
+            MessagePaintOverrides {
+                animated_prefix: animated_prefix
+                    .map(|(index, text)| MessageAnimatedPrefix { index, text }),
+                selected_accent: selected_accent
+                    .map(|(style, progress)| MessageSelectedAccent { style, progress }),
+            },
+        );
+    }
+
+    /// Paints precomputed message geometry with lightweight frame-only overrides.
+    fn paint_with_overrides(
+        &self,
+        surface: &mut crate::render::CellSurface,
+        items: &[Message],
+        overrides: MessagePaintOverrides<'_>,
+    ) {
+        let area = self.viewport_area;
+        if area.height == 0 || area.width == 0 {
+            return;
+        }
+
+        for layout in &self.items {
+            let Some(item) = items.get(layout.index) else {
+                continue;
+            };
+            let block_top = area.y as isize + layout.top as isize - self.scroll as isize;
+            let block_bottom = block_top + layout.height as isize;
+
+            if block_bottom <= area.y as isize {
+                continue;
+            }
+            if block_top >= area.bottom() as isize {
+                break;
+            }
+
+            let selected = self.selected == Some(layout.index);
+            let selected_accent = selected.then_some(overrides.selected_accent).flatten();
+            let animated_prefix = overrides
+                .animated_prefix
+                .filter(|prefix| prefix.index == layout.index)
+                .map(|prefix| prefix.text);
+            let selected_area = if selected { self.selected_area } else { None };
+            let content_area = if selected_area.is_some() && item.selected_decoration().is_some() {
+                area.clip_left(1)
+            } else {
+                area
+            };
+
+            match &item.kind {
+                MessageKind::Bubble {
+                    label,
+                    lines,
+                    bubble_width,
+                    align,
+                    style,
+                } => {
+                    let mut cur_y = block_top;
+
+                    if let Some((text, label_style)) = label {
+                        if cur_y >= content_area.y as isize
+                            && cur_y < content_area.bottom() as isize
+                        {
+                            let x =
+                                match align {
+                                    MessageAlign::Right => {
+                                        content_area.x
+                                            + content_area.width.saturating_sub(
+                                                UnicodeWidthStr::width(text.as_str()) as u16,
+                                            )
+                                    }
+                                    MessageAlign::Left => content_area.x,
+                                };
+                            surface.set_stringn(
+                                x,
+                                cur_y as u16,
+                                text,
+                                content_area.width as usize,
+                                tui::ratatui::to_ratatui_style(*label_style),
+                            );
+                        }
+                        cur_y += 1;
+                    }
+
+                    if cur_y < content_area.bottom() as isize
+                        && cur_y + lines.len() as isize + 2 > content_area.y as isize
+                    {
+                        let bubble_y = cur_y.max(content_area.y as isize) as u16;
+                        let bubble_bottom =
+                            ((cur_y + lines.len() as isize + 2) as u16).min(content_area.bottom());
+                        let visible_height = bubble_bottom.saturating_sub(bubble_y);
+
+                        if visible_height > 0 {
+                            let skip_top = (content_area.y as isize - cur_y).max(0) as usize;
+                            let mut effective_style = *style;
+                            if let Some(accent) = selected_accent {
+                                effective_style.accent = Some(accent.style);
+                                effective_style.accent_progress = accent.progress;
+                            }
+                            message(
+                                surface,
+                                Rect::new(
+                                    content_area.x,
+                                    bubble_y,
+                                    content_area.width,
+                                    visible_height,
+                                ),
+                                lines,
+                                *bubble_width,
+                                *align,
+                                effective_style,
+                                skip_top,
+                            );
+                        }
+                    }
+
+                    let details = item.details(selected);
+                    if !details.is_empty() {
+                        render_text_lines(
+                            surface,
+                            content_area,
+                            cur_y + lines.len() as isize + 2,
+                            details,
+                        );
+                    }
+
+                    let mut accessory_y = cur_y + lines.len() as isize + 2 + details.len() as isize;
+                    for accessory in item.accessories(selected) {
+                        render_accessory_lines(
+                            surface,
+                            content_area,
+                            accessory_y,
+                            &accessory.lines,
+                            accessory.align,
+                        );
+                        accessory_y += accessory.lines.len() as isize;
+                    }
+                }
+                MessageKind::Plain(lines) => {
+                    render_text_lines_with_overrides(
+                        surface,
+                        content_area,
+                        block_top,
+                        lines,
+                        animated_prefix,
+                        selected_accent.map(|accent| accent.style),
+                    );
+                    let details = item.details(selected);
+                    if !details.is_empty() {
+                        render_text_lines(
+                            surface,
+                            content_area,
+                            block_top + lines.len() as isize,
+                            details,
+                        );
+                    }
+
+                    let mut accessory_y = block_top + lines.len() as isize + details.len() as isize;
+                    for accessory in item.accessories(selected) {
+                        render_accessory_lines(
+                            surface,
+                            content_area,
+                            accessory_y,
+                            &accessory.lines,
+                            accessory.align,
+                        );
+                        accessory_y += accessory.lines.len() as isize;
+                    }
+                }
+            }
+
+            if let (Some(selected_area), Some(decoration)) =
+                (selected_area, item.selected_decoration())
+            {
+                render_selected_decoration(surface, selected_area, decoration);
+            }
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.items.len()
+    }
+
+    pub fn scroll(&self) -> usize {
+        self.scroll
     }
 
     pub fn is_empty(&self) -> bool {
@@ -250,6 +538,14 @@ impl MessageListState {
             .map(|item| item.index)
     }
 
+    pub fn contains_viewport(&self, x: u16, y: u16) -> bool {
+        rect_contains(self.viewport_area, x, y)
+    }
+
+    pub fn contains_scroll_target(&self, x: u16, y: u16) -> bool {
+        rect_contains(self.scroll_hit_area, x, y)
+    }
+
     pub fn scroll_to_item(&self, index: usize, scroll: usize, viewport_height: usize) -> usize {
         let Some(item) = self.item(index) else {
             return scroll;
@@ -269,6 +565,18 @@ impl MessageListState {
         } else {
             scroll
         }
+    }
+}
+
+fn rect_contains(area: Rect, x: u16, y: u16) -> bool {
+    x >= area.left() && x < area.right() && y >= area.top() && y < area.bottom()
+}
+
+fn scroll_hit_area(area: Rect, total_height: usize) -> Rect {
+    if total_height > area.height as usize {
+        Rect::new(area.x, area.y, area.width.saturating_add(1), area.height)
+    } else {
+        area
     }
 }
 
@@ -358,6 +666,17 @@ fn render_text_lines(
     y_offset: isize,
     lines: &[Spans<'_>],
 ) {
+    render_text_lines_with_overrides(surface, area, y_offset, lines, None, None);
+}
+
+fn render_text_lines_with_overrides(
+    surface: &mut crate::render::CellSurface,
+    area: Rect,
+    y_offset: isize,
+    lines: &[Spans<'_>],
+    first_prefix: Option<&str>,
+    style_override: Option<Style>,
+) {
     for (row, line) in lines.iter().enumerate() {
         let line_y = y_offset + row as isize;
         if line_y < area.y as isize {
@@ -367,12 +686,34 @@ fn render_text_lines(
             break;
         }
 
-        surface.set_line(
-            area.x,
-            line_y as u16,
-            &tui::ratatui::to_ratatui_line(line),
-            area.width,
+        if first_prefix.is_none() && style_override.is_none() {
+            surface.set_line(
+                area.x,
+                line_y as u16,
+                &tui::ratatui::to_ratatui_line(line),
+                area.width,
+            );
+            continue;
+        }
+
+        let rendered = tui::ratatui::text::Line::from(
+            line.0
+                .iter()
+                .enumerate()
+                .map(|(span_index, span)| {
+                    let content = if row == 0 && span_index == 0 {
+                        first_prefix
+                            .map(std::borrow::Cow::Borrowed)
+                            .unwrap_or_else(|| span.content.clone())
+                    } else {
+                        span.content.clone()
+                    };
+                    let style = style_override.unwrap_or(span.style);
+                    tui::ratatui::text::Span::styled(content, tui::ratatui::to_ratatui_style(style))
+                })
+                .collect::<Vec<_>>(),
         );
+        surface.set_line(area.x, line_y as u16, &rendered, area.width);
     }
 }
 
@@ -428,186 +769,12 @@ fn render_selected_decoration(
 pub fn message_list(
     surface: &mut crate::render::CellSurface,
     area: Rect,
-    items: &[Message<'_>],
+    items: &[Message],
     scroll: usize,
     selected: Option<usize>,
 ) -> MessageListState {
-    let mut layout = Vec::with_capacity(items.len());
-    let mut top = 0usize;
-    for (index, item) in items.iter().enumerate() {
-        let height = item.height(selected == Some(index));
-        layout.push(MessageLayout { index, top, height });
-        top += height as usize + 1;
-    }
-
-    let mut state = MessageListState {
-        total_height: top,
-        visible_start: items.len(),
-        visible_end: items.len(),
-        items: layout,
-        selected_area: None,
-    };
-
-    if area.height == 0 || area.width == 0 {
-        return state;
-    }
-
-    let mut y_offset = area.y as isize - scroll as isize;
-    let mut first_visible = None;
-    let mut last_visible = None;
-
-    for (item, layout) in items.iter().zip(state.items.iter()) {
-        let block_total = layout.height as usize + 1;
-        let block_top = y_offset;
-        let block_bottom = block_top + layout.height as isize;
-        let mut selected_area = None;
-
-        if block_top < area.bottom() as isize && block_bottom > area.y as isize {
-            first_visible.get_or_insert(layout.index);
-            last_visible = Some(layout.index);
-
-            if selected == Some(layout.index) {
-                let visible_top = block_top.max(area.y as isize) as u16;
-                let visible_bottom = block_bottom.min(area.bottom() as isize) as u16;
-                let area = Rect::new(
-                    area.x,
-                    visible_top,
-                    area.width,
-                    visible_bottom.saturating_sub(visible_top),
-                );
-                selected_area = Some(area);
-                state.selected_area = Some(area);
-            }
-        }
-
-        if y_offset + block_total as isize <= area.y as isize {
-            y_offset += block_total as isize;
-            continue;
-        }
-
-        if y_offset >= area.bottom() as isize {
-            break;
-        }
-
-        let content_area = if selected_area.is_some() && item.selected_decoration().is_some() {
-            area.clip_left(1)
-        } else {
-            area
-        };
-
-        match &item.kind {
-            MessageKind::Bubble {
-                label,
-                lines,
-                bubble_width,
-                align,
-                style,
-            } => {
-                let mut cur_y = y_offset;
-
-                if let Some((text, label_style)) = label {
-                    if cur_y >= content_area.y as isize && cur_y < content_area.bottom() as isize {
-                        let x = match align {
-                            MessageAlign::Right => content_area.x
-                                + content_area
-                                    .width
-                                    .saturating_sub(UnicodeWidthStr::width(text.as_str()) as u16),
-                            MessageAlign::Left => content_area.x,
-                        };
-                        surface.set_stringn(
-                            x,
-                            cur_y as u16,
-                            text,
-                            content_area.width as usize,
-                            tui::ratatui::to_ratatui_style(*label_style),
-                        );
-                    }
-                    cur_y += 1;
-                }
-
-                if cur_y < content_area.bottom() as isize
-                    && cur_y + lines.len() as isize + 2 > content_area.y as isize
-                {
-                    let bubble_y = cur_y.max(content_area.y as isize) as u16;
-                    let bubble_bottom =
-                        ((cur_y + lines.len() as isize + 2) as u16).min(content_area.bottom());
-                    let visible_height = bubble_bottom.saturating_sub(bubble_y);
-
-                    if visible_height > 0 {
-                        let skip_top = (content_area.y as isize - cur_y).max(0) as usize;
-                        message(
-                            surface,
-                            Rect::new(content_area.x, bubble_y, content_area.width, visible_height),
-                            lines,
-                            *bubble_width,
-                            *align,
-                            *style,
-                            skip_top,
-                        );
-                    }
-                }
-
-                let details = item.details(selected == Some(layout.index));
-                if !details.is_empty() {
-                    render_text_lines(
-                        surface,
-                        content_area,
-                        cur_y + lines.len() as isize + 2,
-                        details,
-                    );
-                }
-
-                let mut accessory_y = cur_y + lines.len() as isize + 2 + details.len() as isize;
-                for accessory in item.accessories(selected == Some(layout.index)) {
-                    render_accessory_lines(
-                        surface,
-                        content_area,
-                        accessory_y,
-                        &accessory.lines,
-                        accessory.align,
-                    );
-                    accessory_y += accessory.lines.len() as isize;
-                }
-            }
-            MessageKind::Plain(lines) => {
-                render_text_lines(surface, content_area, y_offset, lines);
-                let details = item.details(selected == Some(layout.index));
-                if !details.is_empty() {
-                    render_text_lines(
-                        surface,
-                        content_area,
-                        y_offset + lines.len() as isize,
-                        details,
-                    );
-                }
-
-                let mut accessory_y = y_offset + lines.len() as isize + details.len() as isize;
-                for accessory in item.accessories(selected == Some(layout.index)) {
-                    render_accessory_lines(
-                        surface,
-                        content_area,
-                        accessory_y,
-                        &accessory.lines,
-                        accessory.align,
-                    );
-                    accessory_y += accessory.lines.len() as isize;
-                }
-            }
-        }
-
-        if let (Some(selected_area), Some(decoration)) = (selected_area, item.selected_decoration())
-        {
-            render_selected_decoration(surface, selected_area, decoration);
-        }
-
-        y_offset += block_total as isize;
-    }
-
-    if let Some(start) = first_visible {
-        state.visible_start = start;
-        state.visible_end = last_visible.map_or(start, |end| end + 1);
-    }
-
+    let state = MessageListState::layout(area, items, scroll, selected);
+    state.paint(surface, items);
     state
 }
 
@@ -616,6 +783,17 @@ mod tests {
     use super::*;
     use helix_view::graphics::Style;
     use tui::ratatui::{buffer::Buffer as Surface, layout::Rect as SurfaceRect};
+
+    #[test]
+    fn message_keeps_shared_line_storage() {
+        let lines: Arc<[Spans<'static>]> = Arc::from([Spans::from("shared")]);
+        let message = Message::plain(Arc::clone(&lines));
+
+        let MessageKind::Plain(stored) = &message.kind else {
+            panic!("plain message expected");
+        };
+        assert!(Arc::ptr_eq(&lines, stored));
+    }
 
     #[test]
     fn message_list_tracks_item_layout() {
@@ -645,6 +823,65 @@ mod tests {
         assert_eq!(state.visible_start, 0);
         assert_eq!(state.visible_end, 2);
         assert_eq!(state.selected_area, Some(Rect::new(0, 2, 40, 4)));
+    }
+
+    #[test]
+    fn layout_only_state_matches_message_list_wrapper() {
+        let area = Rect::new(2, 1, 20, 4);
+        let items = vec![
+            Message::plain(vec![Spans::from("one")]),
+            Message::plain(vec![Spans::from("two")])
+                .with_selected_details(vec![Spans::from("details")]),
+        ];
+        let expected = MessageListState::layout(area, &items, 1, Some(1));
+        let mut surface = Surface::empty(SurfaceRect::new(0, 0, 24, 6));
+
+        let actual = message_list(&mut surface, area, &items, 1, Some(1));
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn paint_uses_supplied_item_layout() {
+        let area = Rect::new(0, 0, 10, 4);
+        let items = vec![
+            Message::plain(vec![Spans::from("one")]),
+            Message::plain(vec![Spans::from("two")]),
+        ];
+        let mut state = MessageListState::layout(area, &items, 0, None);
+        state.items[1].top = 3;
+        let mut surface = Surface::empty(SurfaceRect::new(0, 0, 10, 4));
+
+        state.paint(&mut surface, &items);
+
+        assert_eq!(surface[(0, 2)].symbol(), " ");
+        assert_eq!(surface[(0, 3)].symbol(), "t");
+    }
+
+    #[test]
+    fn message_list_scroll_target_includes_trailing_gutter_when_overflowing() {
+        let mut surface = Surface::empty(SurfaceRect::new(0, 0, 20, 8));
+        let items = vec![Message::plain(vec![Spans::from("row")]); 6];
+
+        let state = message_list(&mut surface, Rect::new(4, 2, 10, 3), &items, 0, None);
+
+        assert!(state.contains_viewport(4, 2));
+        assert!(state.contains_scroll_target(4, 2));
+        assert!(!state.contains_viewport(14, 2));
+        assert!(state.contains_scroll_target(14, 2));
+        assert!(!state.contains_scroll_target(15, 2));
+        assert!(!state.contains_scroll_target(14, 5));
+    }
+
+    #[test]
+    fn message_list_scroll_target_excludes_trailing_gutter_without_overflow() {
+        let mut surface = Surface::empty(SurfaceRect::new(0, 0, 20, 8));
+        let items = vec![Message::plain(vec![Spans::from("row")])];
+
+        let state = message_list(&mut surface, Rect::new(4, 2, 10, 3), &items, 0, None);
+
+        assert!(state.contains_scroll_target(4, 2));
+        assert!(!state.contains_scroll_target(14, 2));
     }
 
     #[test]

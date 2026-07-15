@@ -2,7 +2,6 @@ use std::{future::Future, num::NonZeroUsize};
 
 use helix_core::movement::Movement;
 use helix_modal::registry::CommandRegistry;
-use helix_plugin::PluginManager;
 use helix_view::{document::Mode, engine::CommandToken, input::KeyEvent, Editor};
 
 use crate::{
@@ -32,12 +31,25 @@ pub struct Context<'a> {
     pub exit_task_work: helix_runtime::Work,
     /// Mirrors [`compositor::Context::ingress`] when built from the live app.
     pub ingress: crate::runtime::RuntimeIngress,
+    pub foreground: crate::runtime::ForegroundEvents,
     pub redraw: helix_runtime::FrameHandle,
     pub idle_reset: crate::runtime::IdleResetHandle,
-    pub plugin_manager: Option<std::sync::Arc<PluginManager>>,
+    pub(crate) plugin_runtime: crate::plugin_registry::PluginRuntime,
 }
 
 impl Context<'_> {
+    pub fn submit_task(&mut self, task: RuntimeTaskEvent) {
+        if let Err(error) = self.foreground.task(task) {
+            self.editor.set_error(error.to_string());
+        }
+    }
+
+    pub fn submit_ui(&mut self, command: UiCommand) {
+        if let Err(error) = self.foreground.ui(command) {
+            self.editor.set_error(error.to_string());
+        }
+    }
+
     /// Push a new component onto the compositor.
     pub fn push_layer(&mut self, component: Box<dyn Component>) {
         self.callback
@@ -110,14 +122,15 @@ impl Context<'_> {
     }
 
     pub fn compositor_context(&mut self) -> compositor::Context<'_> {
-        compositor::Context::new(
+        compositor::Context::with_foreground(
             self.editor,
             self.exit_tasks,
             self.exit_task_work.clone(),
             self.notifier.clone(),
             self.ingress.clone(),
             self.idle_reset.clone(),
-            self.plugin_manager.clone(),
+            self.plugin_runtime.clone(),
+            self.foreground.clone(),
         )
     }
 
@@ -223,9 +236,10 @@ impl compositor::Context<'_> {
             exit_tasks: self.exit_tasks,
             exit_task_work: self.exit_task_work.clone(),
             ingress: self.ingress.clone(),
+            foreground: self.foreground.clone(),
             redraw: self.redraw.clone(),
             idle_reset: self.idle_reset.clone(),
-            plugin_manager: self.plugin_manager.clone(),
+            plugin_runtime: self.plugin_runtime.clone(),
         }
     }
 }

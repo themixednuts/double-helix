@@ -24,6 +24,7 @@
     },
     "editor": { "$ref": "#/$defs/editor" },
     "pkg": { "$ref": "#/$defs/pkg" },
+    "plugins": { "$ref": "#/$defs/plugins" },
     "keys": { "$ref": "#/$defs/keymaps" },
     "icons": { "$ref": "#/$defs/icons" }
   },
@@ -189,7 +190,7 @@
               "additionalProperties": false,
               "properties": {
                 "render-mode": { "type": "string", "enum": ["never", "always", "multiple"] },
-                "separator": { "type": "string" }
+                "separator": { "type": "string", "default": "" }
               }
             }
           ]
@@ -346,9 +347,14 @@
             "additionalProperties": false,
             "required": ["name", "command"],
             "properties": {
+              "id": { "type": "string" },
               "name": { "type": "string" },
               "command": { "type": "string" },
               "args": { "$ref": "#/$defs/arrayOfStrings" },
+              "env": {
+                "type": "object",
+                "additionalProperties": { "type": "string" }
+              },
               "mcp-servers": {
                 "type": "array",
                 "items": {
@@ -413,6 +419,45 @@
       "properties": {
         "auto-install": { "type": "boolean" },
         "registries": { "$ref": "#/$defs/arrayOfStrings" }
+      }
+    },
+    "plugins": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "plugin_dirs": { "$ref": "#/$defs/arrayOfStrings" },
+        "plugins": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/pluginConfig" }
+        },
+        "hosts": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/pluginHost" }
+        },
+        "max_memory": { "type": "integer", "minimum": 0 },
+        "max_instructions": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "pluginConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "enabled": { "type": "boolean" },
+        "config": {}
+      }
+    },
+    "pluginHost": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "command"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "command": { "type": "string", "minLength": 1 },
+        "args": { "$ref": "#/$defs/arrayOfStrings" },
+        "plugin_dirs": { "$ref": "#/$defs/arrayOfStrings" }
       }
     },
     "gutterLayout": {

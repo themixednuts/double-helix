@@ -1,6 +1,6 @@
 use crate::compositor::{Component, Context, Event, EventResult, RenderContext};
 use crate::ui::gradient_border::GradientBorder;
-use crate::ui::prompt::{Completion, Prompt, PromptEvent};
+use crate::ui::prompt::{Prompt, PromptEvent};
 use crate::widgets::{draw_string_anchored, AnchoredText};
 use helix_core::{unicode::width::UnicodeWidthStr, Position};
 use helix_view::{
@@ -9,6 +9,10 @@ use helix_view::{
     Editor,
 };
 use std::borrow::Cow;
+use std::sync::Arc;
+
+const GRADIENT_FRAME: helix_runtime::FrameSource =
+    helix_runtime::FrameSource::new("cmdline.gradient-border");
 
 pub struct CmdlinePopup {
     prompt: Prompt,
@@ -22,16 +26,201 @@ pub struct CmdlinePopup {
     gradient_border: Option<GradientBorder>,
 }
 
+struct CmdlineCompletionSnapshot {
+    content: Arc<str>,
+    style: helix_view::graphics::Style,
+    selected: bool,
+}
+
+struct CmdlinePopupSnapshot {
+    popup_area: Rect,
+    inner_area: Rect,
+    completion_area: Option<Rect>,
+    completion_inner: Option<Rect>,
+    theme: Arc<helix_view::Theme>,
+    gradient_border: Option<GradientBorder>,
+    rounded_corners: bool,
+    title: Arc<str>,
+    icon: Arc<str>,
+    input_area: Rect,
+    line: Arc<str>,
+    anchor: usize,
+    truncate_start: bool,
+    truncate_end: bool,
+    completions: Arc<[CmdlineCompletionSnapshot]>,
+    completion_scroll: usize,
+    completion_total: usize,
+    picker_symbol: Arc<str>,
+}
+
+impl CmdlinePopupSnapshot {
+    fn paint(
+        mut self,
+        surface: &mut crate::render::CellSurface,
+        cancellation: &crate::render::RenderCancellation,
+    ) {
+        if cancellation.is_cancelled() {
+            return;
+        }
+        let popup = tui::ratatui::to_ratatui_rect(self.popup_area);
+        tui::ratatui::widgets::Widget::render(tui::ratatui::widgets::Clear, popup, surface);
+        surface.set_style(
+            popup,
+            tui::ratatui::to_ratatui_style(self.theme.get("ui.popup")),
+        );
+        if let Some(gradient) = self.gradient_border.as_mut() {
+            gradient.render_with_title(
+                self.popup_area,
+                surface,
+                &self.theme,
+                Some(&self.title),
+                self.rounded_corners,
+            );
+        } else {
+            let border = self.theme.get("ui.popup.border");
+            crate::widgets::Panel::framed(
+                crate::widgets::PanelStyle::new(self.theme.get("ui.popup"), border, border),
+                self.rounded_corners,
+            )
+            .render(surface, self.popup_area);
+            if !self.title.is_empty()
+                && self.popup_area.width > UnicodeWidthStr::width(self.title.as_ref()) as u16 + 2
+            {
+                surface.set_stringn(
+                    self.popup_area.x.saturating_add(1),
+                    self.popup_area.y,
+                    &self.title,
+                    self.popup_area.width.saturating_sub(2) as usize,
+                    tui::ratatui::to_ratatui_style(border),
+                );
+            }
+        }
+        if !self.icon.is_empty() {
+            surface.set_string(
+                self.inner_area.x,
+                self.inner_area.y,
+                &self.icon,
+                tui::ratatui::to_ratatui_style(
+                    self.theme
+                        .get("ui.text.focus")
+                        .add_modifier(helix_view::theme::Modifier::BOLD),
+                ),
+            );
+        }
+        let mut style_for_offset = |_| tui::ratatui::to_ratatui_style(self.theme.get("ui.text"));
+        draw_string_anchored(
+            surface,
+            AnchoredText::new(
+                self.input_area.x,
+                self.input_area.y,
+                &self.line[self.anchor..],
+                self.input_area.width as usize,
+            )
+            .truncate_start(self.truncate_start)
+            .truncate_end(self.truncate_end),
+            &mut style_for_offset,
+        );
+        if cancellation.is_cancelled() {
+            return;
+        }
+        self.paint_completions(surface);
+    }
+
+    fn paint_completions(&mut self, surface: &mut crate::render::CellSurface) {
+        let (Some(area), Some(inner)) = (self.completion_area, self.completion_inner) else {
+            return;
+        };
+        let ratatui_area = tui::ratatui::to_ratatui_rect(area);
+        tui::ratatui::widgets::Widget::render(tui::ratatui::widgets::Clear, ratatui_area, surface);
+        let background = self.theme.get("ui.menu");
+        let selected = self.theme.get("ui.menu.selected");
+        surface.set_style(ratatui_area, tui::ratatui::to_ratatui_style(background));
+        if let Some(gradient) = self.gradient_border.as_mut() {
+            gradient.render(area, surface, &self.theme, self.rounded_corners);
+        } else {
+            crate::widgets::Panel::framed(
+                crate::widgets::PanelStyle::new(
+                    self.theme.get("ui.popup"),
+                    self.theme.get("ui.popup.border"),
+                    self.theme.get("ui.popup.border"),
+                ),
+                self.rounded_corners,
+            )
+            .render(surface, area);
+        }
+        let symbol_width = UnicodeWidthStr::width(self.picker_symbol.as_ref());
+        for (row, completion) in self.completions.iter().enumerate() {
+            if row as u16 >= inner.height {
+                break;
+            }
+            let y = inner.y.saturating_add(row as u16);
+            let style = if completion.selected {
+                surface.set_stringn(
+                    inner.x,
+                    y,
+                    " ".repeat(inner.width as usize),
+                    inner.width as usize,
+                    tui::ratatui::to_ratatui_style(selected),
+                );
+                selected
+            } else {
+                background.patch(completion.style)
+            };
+            let prefix = if completion.selected {
+                self.picker_symbol.as_ref()
+            } else {
+                ""
+            };
+            let text = if completion.selected {
+                format!("{prefix}{}", completion.content)
+            } else {
+                format!("{}{}", " ".repeat(symbol_width), completion.content)
+            };
+            surface.set_stringn(
+                inner.x,
+                y,
+                &text,
+                inner.width as usize,
+                tui::ratatui::to_ratatui_style(style),
+            );
+        }
+        let inactive = self.theme.get("ui.text.inactive");
+        if self.completion_total > self.completions.len() {
+            if self.completion_scroll > 0 {
+                surface.set_string(
+                    inner.right().saturating_sub(1),
+                    inner.y,
+                    "↑",
+                    tui::ratatui::to_ratatui_style(inactive),
+                );
+            }
+            if self.completion_scroll + self.completions.len() < self.completion_total {
+                surface.set_string(
+                    inner.right().saturating_sub(1),
+                    inner.bottom().saturating_sub(1),
+                    "↓",
+                    tui::ratatui::to_ratatui_style(inactive),
+                );
+            }
+        }
+    }
+}
+
 impl CmdlinePopup {
     pub fn new(
         prompt_text: Cow<'static, str>,
         history_register: Option<char>,
-        completion_fn: impl FnMut(&Editor, &str) -> Vec<Completion> + Send + 'static,
+        completion_provider: impl crate::ui::prompt::CompletionProvider + 'static,
         callback_fn: impl FnMut(&mut Context, &str, PromptEvent) + Send + 'static,
         style: CmdlineStyle,
     ) -> Self {
         Self {
-            prompt: Prompt::new(prompt_text, history_register, completion_fn, callback_fn),
+            prompt: Prompt::new(
+                prompt_text,
+                history_register,
+                completion_provider,
+                callback_fn,
+            ),
             style,
             popup_area: Rect::default(),
             min_width: 40,
@@ -53,6 +242,23 @@ impl CmdlinePopup {
     ) -> Self {
         self.prompt = self.prompt.with_language(language, loader);
         self
+    }
+
+    pub(crate) fn apply_completion_result(
+        &mut self,
+        result: crate::runtime::ui::PromptCompletionResult,
+    ) -> bool {
+        self.prompt.apply_completion_result(result)
+    }
+
+    pub(crate) fn prepare_completion(
+        &mut self,
+        editor: &Editor,
+        ingress: crate::runtime::RuntimeIngress,
+    ) {
+        self.prompt.recalculate_completion(editor);
+        self.prompt
+            .dispatch_completion_work(editor.runtime(), ingress);
     }
 
     /// Calculate optimal popup dimensions and position
@@ -89,293 +295,124 @@ impl CmdlinePopup {
         }
     }
 
-    /// Render popup-style cmdline
-    fn render_popup(
+    fn prepare_popup_snapshot(
         &mut self,
-        area: Rect,
-        surface: &mut crate::render::CellSurface,
+        viewport: Rect,
         cx: &RenderContext,
-    ) {
-        let popup_area = self.calculate_popup_area(area);
+    ) -> CmdlinePopupSnapshot {
+        let popup_area = self.calculate_popup_area(viewport);
         self.popup_area = popup_area;
-
-        let theme = cx.theme();
-        let editor_config = cx.config();
-        let gradient_config = &editor_config.gradient_borders;
-        let rounded_corners = editor_config.rounded_corners;
-
-        // Clear the area
+        let config = cx.config();
+        let gradient_enabled = config.gradient_borders.enable;
+        if gradient_enabled
+            && self
+                .gradient_border
+                .as_ref()
+                .is_none_or(|border| !border.matches_config(&config.gradient_borders))
         {
-            let area = tui::ratatui::to_ratatui_rect(popup_area);
-            tui::ratatui::widgets::Widget::render(tui::ratatui::widgets::Clear, area, surface);
-            surface.set_style(area, tui::ratatui::to_ratatui_style(theme.get("ui.popup")));
-        };
-
-        // Use gradient border if enabled, otherwise use default border
-        let inner_area = if gradient_config.enable && self.style == CmdlineStyle::Popup {
-            // Initialize gradient border if needed
-            if self.gradient_border.is_none() {
-                self.gradient_border = Some(GradientBorder::from_theme(theme, gradient_config));
-            }
-
-            // Render gradient border with title
-            if let Some(ref mut gradient_border) = self.gradient_border {
-                gradient_border.render_with_title(
-                    popup_area,
-                    surface,
-                    theme,
-                    Some(self.prompt.prompt()),
-                    rounded_corners,
-                );
-            }
-
-            // Calculate inner area manually using configured gradient thickness
-            {
-                let t: u16 = gradient_config.thickness as u16;
-                Rect {
-                    x: popup_area.x + t,
-                    y: popup_area.y + t,
-                    width: popup_area.width.saturating_sub(t * 2),
-                    height: popup_area.height.saturating_sub(t * 2),
-                }
-            }
+            self.gradient_border = Some(GradientBorder::from_theme(
+                cx.theme(),
+                &config.gradient_borders,
+            ));
+        } else if !gradient_enabled {
+            self.gradient_border = None;
+        }
+        if self
+            .gradient_border
+            .as_ref()
+            .is_some_and(GradientBorder::is_animated)
+        {
+            cx.request_frame_at(GRADIENT_FRAME, cx.clock().now());
+        }
+        let thickness = if gradient_enabled {
+            config.gradient_borders.thickness as u16
         } else {
-            // Use traditional border
-            let border_style = theme.get("ui.popup.border");
-            let background_style = theme.get("ui.popup");
-
-            let inner = crate::widgets::Panel::framed(
-                crate::widgets::PanelStyle::new(background_style, border_style, border_style),
-                rounded_corners,
-            )
-            .render(surface, popup_area);
-            let title = self.prompt.prompt();
-            if !title.is_empty() && popup_area.width > title.width() as u16 + 2 {
-                surface.set_stringn(
-                    popup_area.x + 1,
-                    popup_area.y,
-                    title,
-                    popup_area.width.saturating_sub(2) as usize,
-                    tui::ratatui::to_ratatui_style(border_style),
-                );
-            }
-            inner
+            1
         };
-
-        // Render command icon (if enabled) but not the prompt text since it's now on the border
-        let icon = if editor_config.cmdline.show_icons {
-            self.get_command_icon(&editor_config.cmdline.icons)
+        let inner_area = Rect::new(
+            popup_area.x.saturating_add(thickness),
+            popup_area.y.saturating_add(thickness),
+            popup_area.width.saturating_sub(thickness.saturating_mul(2)),
+            popup_area
+                .height
+                .saturating_sub(thickness.saturating_mul(2)),
+        );
+        let icon: Arc<str> = Arc::from(if config.cmdline.show_icons {
+            self.get_command_icon(&config.cmdline.icons)
         } else {
             ""
-        };
-        // Render icon without trailing space to avoid extra padding before input
-        let prefix_text = if icon.is_empty() {
-            "".to_string()
-        } else {
-            icon.to_string()
-        };
-
-        if !prefix_text.is_empty() {
-            let prompt_color = theme.get("ui.text.focus");
-            // Make the icon more prominent with bold styling
-            let icon_style = prompt_color.add_modifier(helix_view::theme::Modifier::BOLD);
-            surface.set_string(
-                inner_area.x,
-                inner_area.y,
-                &prefix_text,
-                tui::ratatui::to_ratatui_style(icon_style),
-            );
-        }
-
-        // Calculate input area
+        });
         let input_area = Rect::new(
-            inner_area.x + prefix_text.width() as u16,
+            inner_area
+                .x
+                .saturating_add(UnicodeWidthStr::width(icon.as_ref()) as u16),
             inner_area.y,
-            inner_area.width.saturating_sub(prefix_text.width() as u16),
+            inner_area
+                .width
+                .saturating_sub(UnicodeWidthStr::width(icon.as_ref()) as u16),
             1,
         );
+        self.prompt.update_scroll_anchor(input_area.width as usize);
 
-        // Render input text with syntax highlighting if available
-        self.render_input_text(input_area, surface, cx);
-
-        // Render completion popup if needed
-        if !self.prompt.completions().is_empty() {
-            self.render_completion_popup(popup_area, surface, cx);
-        }
-    }
-
-    /// Render the input text with horizontal scrolling support
-    fn render_input_text(
-        &mut self,
-        area: Rect,
-        surface: &mut crate::render::CellSurface,
-        cx: &RenderContext,
-    ) {
-        let theme = cx.theme();
-        let text_style = theme.get("ui.text");
-        let line_width = area.width as usize;
-
-        // Update scroll anchor based on cursor position and available width
-        self.prompt.update_scroll_anchor(line_width);
-
-        let anchor = self.prompt.anchor();
-        let line = self.prompt.line();
-        let visible_text = &line[anchor..];
-
-        let mut style_for_offset = |_| tui::ratatui::to_ratatui_style(text_style);
-        draw_string_anchored(
-            surface,
-            AnchoredText::new(area.x, area.y, visible_text, line_width)
-                .truncate_start(self.prompt.truncate_start())
-                .truncate_end(self.prompt.truncate_end()),
-            &mut style_for_offset,
-        );
-    }
-
-    /// Render completion popup
-    fn render_completion_popup(
-        &mut self,
-        base_area: Rect,
-        surface: &mut crate::render::CellSurface,
-        cx: &RenderContext,
-    ) {
-        let theme = cx.theme();
-        // Match global autocomplete/picker colors
-        let completion_bg = theme.get("ui.menu");
-        let selected_row_bg = theme.get("ui.menu.selected");
-
-        // Position completion popup below the main popup
-        let max_display_items = 10; // Fixed maximum items to display
-        let total_items = self.prompt.completions().len();
-        let visible_items = total_items.min(max_display_items);
-        let comp_height = visible_items as u16 + 2; // Fixed height based on visible items + borders
-        let comp_width = base_area.width;
-        let comp_area = Rect::new(
-            base_area.x,
-            base_area.y + base_area.height + 1,
-            comp_width,
-            comp_height,
-        );
-
-        // Clear and render completion background (match global autocomplete)
-        {
-            let area = tui::ratatui::to_ratatui_rect(comp_area);
-            tui::ratatui::widgets::Widget::render(tui::ratatui::widgets::Clear, area, surface);
-            surface.set_style(area, tui::ratatui::to_ratatui_style(completion_bg));
-        };
-
-        let editor_config = cx.config();
-        let gradient_config = &editor_config.gradient_borders;
-        let rounded_corners = editor_config.rounded_corners;
-
-        // Use gradient border for completion if enabled
-        let inner_area = if gradient_config.enable && self.style == CmdlineStyle::Popup {
-            // Reuse the gradient border for completion popup
-            if let Some(ref mut gradient_border) = self.gradient_border {
-                gradient_border.render(comp_area, surface, theme, rounded_corners);
-            }
-
-            // Calculate inner area manually using configured gradient thickness
-            {
-                let t: u16 = gradient_config.thickness as u16;
-                Rect {
-                    x: comp_area.x + t,
-                    y: comp_area.y + t,
-                    width: comp_area.width.saturating_sub(t * 2),
-                    height: comp_area.height.saturating_sub(t * 2),
-                }
-            }
-        } else {
-            // Use traditional border, matching popup card styling
-            crate::widgets::Panel::framed(
-                crate::widgets::PanelStyle::new(
-                    theme.get("ui.popup"),
-                    theme.get("ui.popup.border"),
-                    theme.get("ui.popup.border"),
-                ),
-                rounded_corners,
+        const MAX_COMPLETIONS: usize = 10;
+        let total = self.prompt.completions().len();
+        let visible = total.min(MAX_COMPLETIONS);
+        let completion_area = (visible > 0).then(|| {
+            Rect::new(
+                popup_area.x,
+                popup_area
+                    .y
+                    .saturating_add(popup_area.height)
+                    .saturating_add(1),
+                popup_area.width,
+                visible as u16 + 2,
             )
-            .render(surface, comp_area)
-        };
-
-        // Render completion items with scrolling support
-        let picker_symbol = editor_config.picker_symbol.as_str();
-        let symbol_width = picker_symbol.width();
-
-        let completions = self.prompt.completions();
-        let selected_index = self.prompt.selection().unwrap_or(0);
-
-        // Calculate scroll offset to keep selected item visible within the fixed window
-        let scroll_offset = if selected_index >= max_display_items {
-            selected_index.saturating_sub(max_display_items - 1)
-        } else {
-            0
-        };
-
-        // Render visible completion items
-        for (display_idx, (completion_idx, (_range, completion))) in completions
+        });
+        let completion_inner = completion_area.map(|area| {
+            Rect::new(
+                area.x.saturating_add(thickness),
+                area.y.saturating_add(thickness),
+                area.width.saturating_sub(thickness.saturating_mul(2)),
+                area.height.saturating_sub(thickness.saturating_mul(2)),
+            )
+        });
+        let selected = self.prompt.selection().unwrap_or(0);
+        let scroll = selected.saturating_sub(MAX_COMPLETIONS.saturating_sub(1));
+        let completions = self
+            .prompt
+            .completions()
             .iter()
             .enumerate()
-            .skip(scroll_offset)
-            .take(max_display_items)
-            .enumerate()
-        {
-            let y = inner_area.y + display_idx as u16;
-            let is_selected = self.prompt.selection() == Some(completion_idx);
-            let item_style = if is_selected {
-                // Fill the whole selected row across the popup width.
-                let spaces = " ".repeat(inner_area.width as usize);
-                surface.set_stringn(
-                    inner_area.x,
-                    y,
-                    &spaces,
-                    inner_area.width as usize,
-                    tui::ratatui::to_ratatui_style(selected_row_bg),
-                );
-                // Use the theme's selected style for text (fg+bg from ui.menu.selected)
-                selected_row_bg
-            } else {
-                completion_bg.patch(completion.style)
-            };
+            .skip(scroll)
+            .take(MAX_COMPLETIONS)
+            .map(|(index, (_, completion))| CmdlineCompletionSnapshot {
+                content: Arc::from(completion.content.as_ref()),
+                style: completion.style,
+                selected: self.prompt.selection() == Some(index),
+            })
+            .collect::<Vec<_>>();
 
-            let prefix = if is_selected {
-                picker_symbol.to_string()
-            } else {
-                " ".repeat(symbol_width)
-            };
-            let text = format!("{}{}", prefix, completion.content);
-            surface.set_stringn(
-                inner_area.x,
-                y,
-                &text,
-                inner_area.width as usize,
-                tui::ratatui::to_ratatui_style(item_style),
-            );
-        }
-
-        // Add scroll indicators if there are more items
-        if total_items > max_display_items {
-            let scroll_indicator_style = theme.get("ui.text.inactive");
-
-            // Show up arrow if we can scroll up
-            if scroll_offset > 0 {
-                surface.set_string(
-                    inner_area.x + inner_area.width.saturating_sub(1),
-                    inner_area.y,
-                    "↑",
-                    tui::ratatui::to_ratatui_style(scroll_indicator_style),
-                );
-            }
-
-            // Show down arrow if we can scroll down
-            if scroll_offset + max_display_items < total_items {
-                surface.set_string(
-                    inner_area.x + inner_area.width.saturating_sub(1),
-                    inner_area.y + inner_area.height.saturating_sub(1),
-                    "↓",
-                    tui::ratatui::to_ratatui_style(scroll_indicator_style),
-                );
-            }
+        CmdlinePopupSnapshot {
+            popup_area,
+            inner_area,
+            completion_area,
+            completion_inner,
+            theme: cx.theme_arc(),
+            gradient_border: gradient_enabled
+                .then(|| self.gradient_border.clone())
+                .flatten(),
+            rounded_corners: config.rounded_corners,
+            title: Arc::from(self.prompt.prompt()),
+            icon,
+            input_area,
+            line: Arc::from(self.prompt.line().as_str()),
+            anchor: self.prompt.anchor(),
+            truncate_start: self.prompt.truncate_start(),
+            truncate_end: self.prompt.truncate_end(),
+            completions: Arc::from(completions),
+            completion_scroll: scroll,
+            completion_total: total,
+            picker_symbol: Arc::from(config.picker_symbol.as_str()),
         }
     }
 }
@@ -386,10 +423,17 @@ impl Component for CmdlinePopup {
         self.prompt.handle_event(event, cx)
     }
 
-    fn render(&mut self, area: Rect, surface: &mut crate::render::CellSurface, cx: &RenderContext) {
+    fn prepare_render(&mut self, area: Rect, cx: &RenderContext) -> crate::render::PreparedRender {
         match self.style {
-            CmdlineStyle::Popup => self.render_popup(area, surface, cx),
-            CmdlineStyle::Bottom => self.prompt.render(area, surface, cx),
+            CmdlineStyle::Popup => {
+                let snapshot = self.prepare_popup_snapshot(area, cx);
+                crate::render::PreparedRender::deferred(move |cancellation| {
+                    let mut output = crate::render::RenderOutput::sparse(area);
+                    snapshot.paint(output.surface_mut(), cancellation);
+                    output
+                })
+            }
+            CmdlineStyle::Bottom => self.prompt.prepare_render(area, cx),
         }
     }
 

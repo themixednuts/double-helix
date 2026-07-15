@@ -4,9 +4,12 @@ use crate::{
     handlers::completion::CompletionItem,
     key,
     keymap::Keymaps,
-    render::{blit_cells, CacheStore, CellSurface, PreparedRender},
+    render::{blit_cells, CellSurface, PreparedRender},
     ui::{
-        document::{render_document, HighlighterInput, LinePos, RenderOutput, TextRenderer},
+        document::{
+            render_document, DocumentRenderSnapshot, LinePos, RenderOutput, SyntaxRenderSnapshot,
+            TextRenderer,
+        },
         statusline,
         text_decorations::{
             self, Decoration, DecorationManager, FoldDecoration, InlineDiagnostics,
@@ -14,7 +17,10 @@ use crate::{
         },
         Completion, NotificationPopup, ProgressSpinners,
     },
-    widgets::{tabs_with_options, Tab, TabCell, TabsOptions, TabsScrollPolicy, TabsStyle},
+    widgets::{
+        tabs_layout_with_options, tabs_with_options, Tab, TabCell, TabsOptions, TabsScrollPolicy,
+        TabsStyle,
+    },
 };
 
 use helix_core::{
@@ -25,7 +31,7 @@ use helix_loader::VERSION_AND_GIT_HASH;
 use helix_view::{
     // annotations::diagnostics::DiagnosticFilter,
     document::Mode,
-    editor::{CompleteAction, Config, CursorCache, InlineBlameConfig, InlineBlameShow},
+    editor::{CompleteAction, Config, InlineBlameConfig, InlineBlameShow},
     graphics::{Color, CursorKind, Modifier, Rect, Style},
     gutter::{DebugExecutionPosition, GutterContext},
     icons::ICONS,
@@ -53,11 +59,14 @@ use super::text_decorations::blame::InlineBlame;
 use helix_view::engine::{KeymapQuery, ModalInputState};
 use helix_view::model::FocusTarget;
 use helix_view::view::{
-    LayoutSnapshot, LineMap, RefreshState, RenderScope, RenderSnapshots, RenderSnapshotsRef,
-    RenderState, ReuseState, SyntaxStyleCache,
+    LineMap, RenderInputs, RenderScope, RenderSnapshots, RenderState, ViewPosition,
 };
 
 const MAX_SEED_LINE_MAP_GAP: usize = 4_096;
+
+fn view_content_area(area: Rect) -> Rect {
+    area.clip_bottom(1)
+}
 
 /// View render context grouping parameters for `render_view`.
 pub(crate) struct ViewRenderContext<'a> {
@@ -70,21 +79,504 @@ pub(crate) struct ViewRenderContext<'a> {
     pub theme: &'a Theme,
     pub mode: Mode,
     pub syntax_loader: &'a Arc<arc_swap::ArcSwap<helix_core::syntax::Loader>>,
-    pub cursor_cache: &'a CursorCache,
     pub gutter_context: GutterContext<'a>,
     pub debug_execution: Option<DebugExecutionPosition<'a>>,
-    /// Cached syntax styles to replay instead of running tree-sitter.
-    pub cached_syntax: Option<&'a SyntaxStyleCache>,
-    /// Set of dirty visual rows. Only these rows will be re-rendered.
-    /// `None` means all rows are dirty (full render).
-    pub dirty_rows: Option<&'a std::collections::HashSet<u16>>,
-    pub seed_line_map: Option<&'a LineMap>,
+}
+
+#[derive(Clone)]
+struct PreparedGutterCell {
+    text: String,
+    style: Option<Style>,
+    selected: bool,
+}
+
+struct PreparedGutterColumn {
+    x: u16,
+    width: usize,
+    first_doc_line: usize,
+    first_visual: Vec<PreparedGutterCell>,
+    continuation: Vec<PreparedGutterCell>,
+}
+
+struct PreparedGutters {
+    styles: crate::ui::design::GutterStyles,
+    columns: Vec<PreparedGutterColumn>,
+}
+
+impl PreparedGutters {
+    fn collect(
+        vctx: &ViewRenderContext<'_>,
+        annotations: &TextAnnotations<'_>,
+        terminal_focused: bool,
+    ) -> Self {
+        let doc = vctx.doc;
+        let view = vctx.view;
+        let text = doc.text().slice(..);
+        let first_doc_line =
+            text.char_to_line(doc.view_offset(view.id).anchor.min(text.len_chars()));
+        let last_doc_line = view
+            .estimate_last_doc_line(annotations, doc)
+            .saturating_add(1)
+            .min(text.len_lines().saturating_sub(1));
+        let line_count = last_doc_line
+            .saturating_sub(first_doc_line)
+            .saturating_add(1);
+        let (_, cursor_lines) = doc.cursor_lines(view.id);
+        let cursor_lines: HashSet<usize> = cursor_lines.into_iter().collect();
+        let mut columns = Vec::with_capacity(view.gutters().len());
+        let mut x = vctx.viewport.x;
+
+        for gutter_type in view.gutters() {
+            let width = gutter_type.width(view, doc);
+            let mut first_renderer = gutter_type.style(
+                &vctx.gutter_context,
+                doc,
+                view,
+                vctx.theme,
+                vctx.is_focused && terminal_focused,
+            );
+            let mut continuation_renderer = gutter_type.style(
+                &vctx.gutter_context,
+                doc,
+                view,
+                vctx.theme,
+                vctx.is_focused && terminal_focused,
+            );
+            let mut first_visual = Vec::with_capacity(line_count);
+            let mut continuation = Vec::with_capacity(line_count);
+            let mut text = String::with_capacity(width);
+
+            for line in first_doc_line..=last_doc_line {
+                let selected = cursor_lines.contains(&line);
+                let style = first_renderer(line, selected, true, &mut text);
+                first_visual.push(PreparedGutterCell {
+                    text: std::mem::take(&mut text),
+                    style,
+                    selected,
+                });
+                text = String::with_capacity(width);
+
+                let style = continuation_renderer(line, selected, false, &mut text);
+                continuation.push(PreparedGutterCell {
+                    text: std::mem::take(&mut text),
+                    style,
+                    selected,
+                });
+                text = String::with_capacity(width);
+            }
+
+            columns.push(PreparedGutterColumn {
+                x,
+                width,
+                first_doc_line,
+                first_visual,
+                continuation,
+            });
+            x = x.saturating_add(width as u16);
+        }
+
+        Self {
+            styles: crate::ui::design::GutterStyles::from_theme(vctx.theme),
+            columns,
+        }
+    }
+
+    fn add_to<'a>(self, decorations: &mut DecorationManager<'a>) {
+        let styles = self.styles;
+        for column in self.columns {
+            let decoration = move |renderer: &mut TextRenderer, pos: LinePos| {
+                let Some(index) = pos.doc_line.checked_sub(column.first_doc_line) else {
+                    return;
+                };
+                let cells = if pos.first_visual_line {
+                    &column.first_visual
+                } else {
+                    &column.continuation
+                };
+                let Some(cell) = cells.get(index) else {
+                    return;
+                };
+                let gutter_style = match (cell.selected, pos.first_visual_line) {
+                    (false, true) => styles.base,
+                    (true, true) => styles.selected,
+                    (false, false) => styles.virtual_line,
+                    (true, false) => styles.selected_virtual,
+                };
+
+                if let Some(style) = cell.style {
+                    renderer.set_stringn(
+                        column.x,
+                        pos.visual_line,
+                        &cell.text,
+                        column.width,
+                        gutter_style.patch(style),
+                    );
+                } else {
+                    renderer.set_style(
+                        Rect::new(column.x, pos.visual_line, column.width as u16, 1),
+                        gutter_style,
+                    );
+                }
+            };
+            decorations.add_decoration(decoration);
+        }
+    }
+}
+
+struct CursorColumnPaint {
+    selection: Arc<Selection>,
+    styles: crate::ui::design::CursorLineStyles,
+}
+
+struct DeferredViewPaint {
+    key: ViewRenderCacheKey,
+    view_id: ViewId,
+    view_area: Rect,
+    inner: Rect,
+    viewport: Rect,
+    view_offset: ViewPosition,
+    is_focused: bool,
+    terminal_focused: bool,
+    mode: Mode,
+    theme: Arc<Theme>,
+    render_inputs: RenderInputs,
+    selection: Arc<Selection>,
+    document: DocumentRenderSnapshot,
+    annotations: TextAnnotations<'static>,
+    live_syntax: SyntaxRenderSnapshot,
+    overlays: Vec<helix_core::syntax::OverlayHighlights>,
+    gutters: Option<PreparedGutters>,
+    cursor_lines: Option<(usize, Vec<usize>, crate::ui::design::CursorLineStyles)>,
+    cursor_columns: Option<CursorColumnPaint>,
+    debug_line: Option<usize>,
+    inline_blame: Option<InlineBlame>,
+    inline_diagnostics: InlineDiagnostics,
+    plugin_decoration: PluginDecoration,
+    primary_cursor: usize,
+    rulers: Vec<u16>,
+    ruler_char: String,
+    welcome: bool,
+    true_color: bool,
+    top_doc_line: usize,
+}
+
+impl DeferredViewPaint {
+    fn collect(editor: &EditorView, vctx: &ViewRenderContext<'_>, theme: Arc<Theme>) -> Self {
+        let ViewRenderContext {
+            doc,
+            view,
+            viewport,
+            is_focused,
+            config,
+            config_gen,
+            mode,
+            syntax_loader,
+            debug_execution,
+            ..
+        } = vctx;
+        let inner = view.inner_area(doc);
+        let view_offset = doc.view_offset(view.id);
+        let annotations = view.text_annotations(doc, Some(&theme));
+        let gutters = (view.gutter_offset(doc) != 0)
+            .then(|| PreparedGutters::collect(vctx, &annotations, editor.terminal_focused));
+        let viewport_range =
+            doc.viewport_byte_range(&annotations, view_offset.anchor, inner.height);
+        let loader = syntax_loader.load_full();
+        let live_syntax = SyntaxRenderSnapshot::live(
+            doc.syntax_arc(),
+            Arc::clone(&loader),
+            viewport_range.clone(),
+        );
+        let viewport_char_range = {
+            let text = doc.text().slice(..);
+            text.byte_to_char(viewport_range.start)..text.byte_to_char(viewport_range.end)
+        };
+        let mut overlays = Vec::new();
+        if config.lsp.semantic_tokens {
+            if let Some(overlay) =
+                doc.semantic_tokens_overlay(&theme, Some(viewport_char_range.clone()))
+            {
+                overlays.push(overlay);
+            }
+        }
+        overlays.push(doc.viewport_overlay_highlights(
+            &annotations,
+            view_offset.anchor,
+            inner.height,
+        ));
+        if doc
+            .language_config()
+            .and_then(|config| config.rainbow_brackets)
+            .unwrap_or(config.rainbow_brackets)
+        {
+            if let Some(overlay) = doc.viewport_rainbow_highlights(
+                &annotations,
+                view_offset.anchor,
+                inner.height,
+                &theme,
+                &loader,
+            ) {
+                overlays.push(overlay);
+            }
+        }
+        overlays.extend(doc.diagnostic_highlights(&theme, Some(viewport_range)));
+        if *is_focused {
+            if let Some(tabstops) = doc.tabstop_highlights(&theme) {
+                overlays.push(tabstops);
+            }
+            overlays.push(doc.selection_highlights(
+                view.id,
+                *mode,
+                &theme,
+                &config.cursor_shape,
+                editor.terminal_focused,
+                editor.prompt_active,
+            ));
+            if let Some(overlay) = doc.matching_bracket_highlights(view.id, &theme) {
+                overlays.push(overlay);
+            }
+        }
+
+        let primary_cursor = doc
+            .selection(view.id)
+            .primary()
+            .cursor(doc.text().slice(..));
+        let doc_config = doc.config.load();
+        let diagnostics_enabled = view
+            .diagnostics_handler
+            .show_cursorline_diagnostics(doc, view.id);
+        let inline_diagnostic_config = doc_config
+            .inline_diagnostics
+            .prepare(view.inner_width(doc), diagnostics_enabled);
+        let inline_diagnostics = InlineDiagnostics::new(
+            doc,
+            &theme,
+            primary_cursor,
+            inline_diagnostic_config,
+            doc_config.end_of_line_diagnostics,
+        );
+        let plugin_decoration = PluginDecoration::new(doc, &theme, view.id);
+        let cursor_styles = crate::ui::design::CursorLineStyles::from_theme(&theme);
+        let cursor_lines = (*is_focused && config.cursorline).then(|| {
+            let (primary, secondary) = doc.cursor_lines(view.id);
+            (primary, secondary, cursor_styles)
+        });
+        let selection = Arc::new(doc.selection(view.id).clone());
+        let cursor_columns = (*is_focused && config.cursorcolumn).then(|| CursorColumnPaint {
+            selection: Arc::clone(&selection),
+            styles: cursor_styles,
+        });
+        let text = doc.text().slice(..);
+        let top_doc_line = text.char_to_line(view_offset.anchor.min(text.len_chars()));
+
+        Self {
+            key: ViewRenderCacheKey::new(view.id, doc.id()),
+            view_id: view.id,
+            view_area: view.area,
+            inner,
+            viewport: *viewport,
+            view_offset,
+            is_focused: *is_focused,
+            terminal_focused: editor.terminal_focused,
+            mode: *mode,
+            theme,
+            render_inputs: view.render_inputs(doc, *config_gen, Arc::from(vctx.theme.name())),
+            selection,
+            document: DocumentRenderSnapshot::new(doc, inner.width, Some(vctx.theme)),
+            annotations,
+            live_syntax,
+            overlays,
+            gutters,
+            cursor_lines,
+            cursor_columns,
+            debug_line: debug_execution.map(|position| position.line),
+            inline_blame: EditorView::inline_blame_decoration(
+                &config.inline_blame,
+                doc,
+                view,
+                vctx.theme,
+            ),
+            inline_diagnostics,
+            plugin_decoration,
+            primary_cursor,
+            rulers: doc.ruler_columns(view, &config.rulers),
+            ruler_char: config.ruler_char.clone(),
+            welcome: config.welcome_screen && doc.version() == 0 && doc.is_welcome(),
+            true_color: config.true_color || crate::true_color(),
+            top_doc_line,
+        }
+    }
+
+    fn render_scope(&self) -> RenderScope<'_> {
+        RenderScope::new(
+            &self.selection,
+            self.mode,
+            self.is_focused,
+            self.terminal_focused,
+        )
+    }
+
+    fn content_area(&self) -> Rect {
+        view_content_area(self.view_area)
+    }
+
+    fn clear_dirty_rows(&self, dirty_rows: &HashSet<u16>, surface: &mut CellSurface) {
+        for &row in dirty_rows {
+            if row < self.inner.height {
+                let area = Rect::new(self.inner.x, self.inner.y + row, self.inner.width, 1);
+                tui::ratatui::widgets::Widget::render(
+                    tui::ratatui::widgets::Clear,
+                    tui::ratatui::to_ratatui_rect(area),
+                    surface,
+                );
+            }
+        }
+    }
+
+    fn draw_cursor_columns(&self, surface: &mut CellSurface) {
+        let Some(columns) = &self.cursor_columns else {
+            return;
+        };
+        let text = self.document.text().slice(..);
+        let primary = columns.selection.primary();
+        for range in columns.selection.iter() {
+            let cursor = range.cursor(text);
+            let Position { col, .. } = visual_offset_from_block(
+                text,
+                cursor,
+                cursor,
+                self.document.text_format(),
+                &self.annotations,
+            )
+            .0;
+            if col < self.view_offset.horizontal_offset
+                || self.inner.width <= (col - self.view_offset.horizontal_offset) as u16
+            {
+                continue;
+            }
+            let area = Rect::new(
+                self.inner.x + (col - self.view_offset.horizontal_offset) as u16,
+                self.view_area.y,
+                1,
+                self.view_area.height,
+            );
+            let style = if primary == *range {
+                columns.styles.column_primary
+            } else {
+                columns.styles.column_secondary
+            };
+            surface.set_style(
+                tui::ratatui::to_ratatui_rect(area),
+                tui::ratatui::to_ratatui_style(style),
+            );
+        }
+    }
+
+    fn paint(
+        self,
+        surface: &mut CellSurface,
+        cached_syntax: Option<Arc<[helix_view::view::SyntaxStyleEntry]>>,
+        dirty_rows: Option<&HashSet<u16>>,
+        seed_line_map: Option<&LineMap>,
+        cancellation: &crate::render::RenderCancellation,
+    ) -> RenderOutput {
+        if !(self.is_focused && self.terminal_focused) {
+            surface.set_style(
+                tui::ratatui::to_ratatui_rect(self.view_area),
+                tui::ratatui::to_ratatui_style(self.theme.get("ui.background.inactive")),
+            );
+        }
+        self.draw_cursor_columns(surface);
+
+        let mut decorations = DecorationManager::default();
+        if let Some((primary, secondary, styles)) = self.cursor_lines {
+            let area = self.view_area;
+            decorations.add_decoration(move |renderer: &mut TextRenderer, pos: LinePos| {
+                let line = Rect::new(area.x, pos.visual_line, area.width, 1);
+                if primary == pos.doc_line {
+                    renderer.set_style(line, styles.primary);
+                } else if secondary.binary_search(&pos.doc_line).is_ok() {
+                    renderer.set_style(line, styles.secondary);
+                }
+            });
+        }
+        decorations.add_decoration(FoldDecoration::new(&self.annotations, &self.theme));
+        if let Some(dap_line) = self.debug_line {
+            let inner = self.inner;
+            let style = self.theme.get("ui.highlight.frameline");
+            decorations.add_decoration(move |renderer: &mut TextRenderer, pos: LinePos| {
+                if pos.doc_line == dap_line {
+                    renderer.set_style(Rect::new(inner.x, pos.visual_line, inner.width, 1), style);
+                }
+            });
+        }
+        if let Some(gutters) = self.gutters {
+            gutters.add_to(&mut decorations);
+        }
+        if let Some(inline_blame) = self.inline_blame {
+            decorations.add_decoration(inline_blame);
+        }
+        if self.is_focused {
+            decorations.add_decoration(text_decorations::Cursor::new(self.primary_cursor));
+        }
+        decorations.add_decoration(self.inline_diagnostics);
+        decorations.add_decoration(self.plugin_decoration);
+
+        if self.welcome {
+            EditorView::draw_welcome(&self.theme, self.view_area, surface, self.true_color);
+        }
+        let syntax = cached_syntax
+            .map(SyntaxRenderSnapshot::cached)
+            .unwrap_or(self.live_syntax);
+        let render_seed = seed_line_map.and_then(|line_map| {
+            self.render_inputs.paint.layout.render_seed(
+                line_map,
+                self.top_doc_line,
+                MAX_SEED_LINE_MAP_GAP,
+            )
+        });
+        let output = render_document(
+            surface,
+            self.inner,
+            &self.document,
+            self.view_offset,
+            &self.annotations,
+            syntax,
+            self.overlays,
+            &self.theme,
+            decorations,
+            dirty_rows,
+            render_seed,
+            seed_line_map,
+            cancellation,
+        );
+
+        EditorView::draw_rulers(
+            &self.rulers,
+            &self.ruler_char,
+            self.inner,
+            surface,
+            &self.theme,
+        );
+        if self.viewport.right() != self.view_area.right() {
+            let x = self.view_area.right();
+            let style = tui::ratatui::to_ratatui_style(self.theme.get("ui.window"));
+            for y in self.view_area.top()..self.view_area.bottom() {
+                if let Some(cell) = surface.cell_mut((x, y)) {
+                    cell.set_symbol(tui::symbols::line::VERTICAL);
+                    cell.set_style(style);
+                }
+            }
+        }
+        output
+    }
 }
 
 struct ViewRenderCacheEntry {
     snapshots: RenderSnapshots,
     /// The rendered cells for the view's area.
     cells: CellSurface,
+    cursor_position: Option<Position>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -108,306 +600,6 @@ fn copy_cell_region(src: &CellSurface, area: Rect) -> CellSurface {
 impl ViewRenderCacheKey {
     const fn new(view: ViewId, doc: DocumentId) -> Self {
         Self { view, doc }
-    }
-}
-
-struct ViewFrame<'a> {
-    snapshot: ViewFrameSnapshot<'a>,
-    doc: &'a Document,
-    trace: ViewTrace<'a>,
-    area: Rect,
-}
-
-struct ViewFrameSnapshot<'a> {
-    config: arc_swap::access::DynGuard<Config>,
-    config_gen: u64,
-    theme: &'a Theme,
-    theme_name: &'a str,
-    mode: Mode,
-    syntax_loader: &'a Arc<arc_swap::ArcSwap<helix_core::syntax::Loader>>,
-    cursor_cache: &'a CursorCache,
-    focused_view_id: ViewId,
-    breakpoints: Option<&'a [helix_view::editor::Breakpoint]>,
-    debug_execution: Option<DebugExecutionPosition<'a>>,
-}
-
-struct ViewTrace<'a> {
-    view: &'a View,
-    selection: &'a Selection,
-    is_focused: bool,
-    frame_num: u64,
-    view_render_start: std::time::Instant,
-    render_start: std::time::Instant,
-}
-
-struct RenderRequest<'a> {
-    cached_syntax: Option<&'a SyntaxStyleCache>,
-    dirty_rows: Option<&'a HashSet<u16>>,
-    seed_line_map: Option<&'a LineMap>,
-}
-
-#[derive(Clone, Copy)]
-enum RenderPhase {
-    Dirty { rows: usize },
-    Full,
-}
-
-impl RenderPhase {
-    fn total_phase(self) -> &'static str {
-        match self {
-            Self::Dirty { .. } => "dirty_total",
-            Self::Full => "full_total",
-        }
-    }
-
-    fn path_label(self) -> &'static str {
-        match self {
-            Self::Dirty { .. } => "dirty",
-            Self::Full => "full",
-        }
-    }
-}
-
-impl ViewFrame<'_> {
-    fn render_state<'a>(
-        &self,
-        cached: Option<RenderSnapshotsRef<'a>>,
-        terminal_focused: bool,
-    ) -> RenderState {
-        self.view().resolve_render_state(
-            self.doc,
-            self.snapshot.config_gen,
-            Arc::from(self.snapshot.theme_name),
-            cached,
-            self.render_scope(terminal_focused),
-        )
-    }
-
-    fn render_scope(&self, terminal_focused: bool) -> RenderScope<'_> {
-        RenderScope::new(
-            self.trace.selection,
-            self.snapshot.mode,
-            self.trace.is_focused,
-            terminal_focused,
-        )
-    }
-
-    fn view(&self) -> &View {
-        self.trace.view
-    }
-
-    fn view_id(&self) -> ViewId {
-        self.view().id
-    }
-
-    fn cache_key(&self) -> ViewRenderCacheKey {
-        ViewRenderCacheKey::new(self.view_id(), self.doc.id())
-    }
-
-    fn update_cursor_cache(&self, layout: &LayoutSnapshot) {
-        if self.snapshot.focused_view_id == self.view_id() {
-            self.snapshot
-                .cursor_cache
-                .set(layout.cursor_position(self.doc, self.view()));
-        }
-    }
-
-    fn clear_dirty_rows(&self, dirty_rows: &HashSet<u16>, surface: &mut CellSurface) {
-        let inner = self.view().inner_area(self.doc);
-        for &row in dirty_rows {
-            if row < inner.height {
-                let y = inner.y + row;
-                tui::ratatui::widgets::Widget::render(
-                    tui::ratatui::widgets::Clear,
-                    tui::ratatui::to_ratatui_rect(Rect::new(inner.x, y, inner.width, 1)),
-                    surface,
-                );
-            }
-        }
-    }
-
-    fn render_context<'a>(
-        &'a self,
-        cached_syntax: Option<&'a SyntaxStyleCache>,
-        dirty_rows: Option<&'a HashSet<u16>>,
-        seed_line_map: Option<&'a LineMap>,
-    ) -> ViewRenderContext<'a> {
-        let wrap_indicator = self
-            .snapshot
-            .config
-            .soft_wrap
-            .wrap_indicator
-            .as_deref()
-            .map_or(Cow::Borrowed("↪"), Cow::Borrowed);
-        ViewRenderContext {
-            doc: self.doc,
-            view: self.view(),
-            viewport: self.area,
-            is_focused: self.trace.is_focused,
-            config: &self.snapshot.config,
-            config_gen: self.snapshot.config_gen,
-            theme: self.snapshot.theme,
-            mode: self.snapshot.mode,
-            syntax_loader: self.snapshot.syntax_loader,
-            cursor_cache: self.snapshot.cursor_cache,
-            gutter_context: GutterContext {
-                mode: self.snapshot.mode,
-                line_number: self.snapshot.config.line_number,
-                wrap_indicator,
-                breakpoints: self.snapshot.breakpoints,
-                debug_execution: self.snapshot.debug_execution,
-            },
-            debug_execution: self.snapshot.debug_execution,
-            cached_syntax,
-            dirty_rows,
-            seed_line_map,
-        }
-    }
-}
-
-impl ViewTrace<'_> {
-    fn log_state(&self) {
-        log::debug!(
-            "[view] id={:?} focused={} area=({},{} {}x{}) inner_height={} statusline_row={}",
-            self.view.id,
-            self.is_focused,
-            self.view.area.x,
-            self.view.area.y,
-            self.view.area.width,
-            self.view.area.height,
-            self.view.area.height.saturating_sub(1),
-            self.view.area.y + self.view.area.height.saturating_sub(1),
-        );
-    }
-
-    fn log_reuse(&self, reuse: &ReuseState) {
-        let sel = self.selection.primary();
-        let (sel_start, sel_end) = if sel.anchor <= sel.head {
-            (sel.anchor, sel.head)
-        } else {
-            (sel.head, sel.anchor)
-        };
-        let intersecting_rows: Vec<u16> = reuse
-            .line_map()
-            .lines
-            .iter()
-            .filter(|line| sel_start < line.char_range_end && sel_end >= line.char_range_start)
-            .map(|line| line.visual_row)
-            .collect();
-        log::info!(
-            "F{} CACHE HIT sel=({},{}) dirty={:?} sel_rows={:?} lines={}",
-            self.frame_num,
-            sel.anchor,
-            sel.head,
-            reuse.dirty_rows(),
-            intersecting_rows,
-            reuse.line_count(),
-        );
-    }
-
-    fn log_pure_reuse(&self) {
-        log::info!(
-            "F{} CACHE PURE_BLIT view={:?}",
-            self.frame_num,
-            self.view.id
-        );
-    }
-
-    fn log_dirty_reuse(&self, reuse: &ReuseState, output: &RenderOutput) {
-        log::info!(
-            concat!(
-                "F{} CACHE DIRTY_RERENDER view={:?} dirty_rows={:?}",
-                " new_syntax={} new_linemap={}",
-                " syntax_advances={} skip_right_syntax_advances={} skip_right_eof_fast_paths={}",
-                " elapsed={:?}"
-            ),
-            self.frame_num,
-            self.view.id,
-            reuse.dirty_rows(),
-            output.syntax_styles.len(),
-            output.line_map.lines.len(),
-            output.metrics.syntax_advances,
-            output.metrics.skip_right_syntax_advances,
-            output.metrics.skip_right_eof_fast_paths,
-            self.render_start.elapsed(),
-        );
-    }
-
-    fn log_refresh(&self, refresh: &RefreshState, output: &RenderOutput) {
-        let view_position = refresh.view_position();
-        log::info!(
-            concat!(
-                "F{} CACHE MISS view={:?} anchor={} voff={} area={}x{} syntax={} lines={}",
-                " syntax_advances={} skip_right_syntax_advances={} skip_right_eof_fast_paths={}",
-                " elapsed={:?}"
-            ),
-            self.frame_num,
-            self.view.id,
-            view_position.anchor,
-            view_position.vertical_offset,
-            self.view.area.width,
-            self.view.area.height,
-            output.syntax_styles.len(),
-            output.line_map.lines.len(),
-            output.metrics.syntax_advances,
-            output.metrics.skip_right_syntax_advances,
-            output.metrics.skip_right_eof_fast_paths,
-            self.render_start.elapsed(),
-        );
-    }
-
-    fn log_area_phase(&self, phase: &'static str, start: std::time::Instant) {
-        helix_view::bench::log_run_phase("editor_render_view", phase, start.elapsed(), || {
-            format!(
-                "view_id={:?} area={}x{}",
-                self.view.id, self.view.area.width, self.view.area.height
-            )
-        });
-    }
-
-    fn log_overlay_fingerprints(&self, start: std::time::Instant, rows: usize) {
-        helix_view::bench::log_run_phase(
-            "editor_render_view",
-            "overlay_fingerprints",
-            start.elapsed(),
-            || format!("view_id={:?} rows={}", self.view.id, rows),
-        );
-    }
-
-    fn log_blit(&self, start: std::time::Instant) {
-        self.log_area_phase("blit", start);
-    }
-
-    fn log_copy_region(&self, start: std::time::Instant) {
-        self.log_area_phase("copy_region", start);
-    }
-
-    fn log_render_phase(&self, phase: RenderPhase) {
-        match phase {
-            RenderPhase::Dirty { rows } => {
-                helix_view::bench::log_run_phase(
-                    "editor_render_view",
-                    "dirty_render_view",
-                    self.render_start.elapsed(),
-                    || format!("view_id={:?} dirty_rows={}", self.view.id, rows),
-                );
-            }
-            RenderPhase::Full => helix_view::bench::log_run_phase(
-                "editor_render_view",
-                "full_render_view",
-                self.view_render_start.elapsed(),
-                || format!("view_id={:?} path=full_before_fp", self.view.id),
-            ),
-        }
-    }
-
-    fn log_render_total(&self, phase: RenderPhase) {
-        helix_view::bench::log_run_phase(
-            "editor_render_view",
-            phase.total_phase(),
-            self.view_render_start.elapsed(),
-            || format!("view_id={:?} path={}", self.view.id, phase.path_label()),
-        );
     }
 }
 
@@ -446,11 +638,23 @@ impl ViewRenderCache {
         }
     }
 
-    fn store(&mut self, key: ViewRenderCacheKey, snapshots: RenderSnapshots, cells: CellSurface) {
+    fn store(
+        &mut self,
+        key: ViewRenderCacheKey,
+        snapshots: RenderSnapshots,
+        cells: CellSurface,
+        cursor_position: Option<Position>,
+    ) {
         self.order.retain(|cached| *cached != key);
         self.order.push_back(key);
-        self.entries
-            .insert(key, ViewRenderCacheEntry { snapshots, cells });
+        self.entries.insert(
+            key,
+            ViewRenderCacheEntry {
+                snapshots,
+                cells,
+                cursor_position,
+            },
+        );
         self.evict_view(key.view);
     }
 
@@ -470,11 +674,6 @@ impl ViewRenderCache {
                 self.entries.remove(&key);
             }
         }
-    }
-
-    fn clear(&mut self) {
-        self.entries.clear();
-        self.order.clear();
     }
 
     #[cfg(debug_assertions)]
@@ -524,6 +723,231 @@ impl ViewRenderCache {
 
     #[cfg(not(debug_assertions))]
     fn log_and_reset_stats(&mut self) {}
+}
+
+static EDITOR_VIEW_CACHE_DOMAIN: LazyLock<crate::render::CacheId> =
+    LazyLock::new(|| crate::render::CacheId::hashed(&"editor-view-cache"));
+
+struct EditorFrameSnapshot {
+    area: Rect,
+    background: Style,
+    active_views: HashSet<ViewId>,
+    views: Vec<DeferredViewPaint>,
+    cursor_owner: bool,
+    cursor_kind: CursorKind,
+    cursor_hidden_area: Option<Rect>,
+    frame_num: u64,
+}
+
+impl EditorFrameSnapshot {
+    fn collect(editor: &EditorView, area: Rect, cx: &RenderContext, frame_num: u64) -> Self {
+        let config = cx.config();
+        let config_gen = cx.config_gen();
+        let theme = cx.theme_arc();
+        let mode = cx.mode();
+        let syntax_loader = cx.syntax_loader();
+        let debug_execution = cx.debug_execution_position();
+        let mut active_views = HashSet::new();
+        let mut views = Vec::with_capacity(cx.views().count());
+
+        for (view, is_focused) in cx.views() {
+            let Some(doc) = cx.document(view.doc) else {
+                continue;
+            };
+            active_views.insert(view.id);
+            let wrap_indicator = config
+                .soft_wrap
+                .wrap_indicator
+                .as_deref()
+                .map_or(Cow::Borrowed("↪"), Cow::Borrowed);
+            let vctx = ViewRenderContext {
+                doc,
+                view,
+                viewport: area,
+                is_focused,
+                config: &config,
+                config_gen,
+                theme: &theme,
+                mode,
+                syntax_loader,
+                gutter_context: GutterContext {
+                    mode,
+                    line_number: config.line_number,
+                    wrap_indicator,
+                    breakpoints: cx.breakpoints_for_document(doc),
+                    debug_execution,
+                },
+                debug_execution,
+            };
+            views.push(DeferredViewPaint::collect(
+                editor,
+                &vctx,
+                Arc::clone(&theme),
+            ));
+        }
+
+        let cursor_hidden_area = config
+            .auto_info
+            .then(|| cx.autoinfo().map(|info| info.screen_area(cx.frame_area())))
+            .flatten();
+
+        Self {
+            area,
+            background: theme.get("ui.background"),
+            active_views,
+            views,
+            cursor_owner: cx.focus_target() == FocusTarget::Editor && !editor.prompt_active,
+            cursor_kind: if editor.terminal_focused {
+                config.cursor_shape.from_mode(mode)
+            } else {
+                CursorKind::Underline
+            },
+            cursor_hidden_area,
+            frame_num,
+        }
+    }
+
+    fn paint(
+        self,
+        surface: &mut CellSurface,
+        cache: &mut ViewRenderCache,
+        metadata: &mut crate::render::RenderMetadata,
+        cancellation: &crate::render::RenderCancellation,
+    ) {
+        surface.set_style(
+            tui::ratatui::to_ratatui_rect(self.area),
+            tui::ratatui::to_ratatui_style(self.background),
+        );
+        cache.retain_active_views(&self.active_views);
+        cache.record_frame();
+
+        let started = std::time::Instant::now();
+        for view in self.views {
+            if cancellation.is_cancelled() {
+                return;
+            }
+            let is_focused = view.is_focused;
+            let inner = view.inner;
+            let cursor = Self::paint_view(view, surface, cache, cancellation, self.frame_num);
+            if cancellation.is_cancelled() {
+                return;
+            }
+            if self.cursor_owner && is_focused {
+                let mut absolute = cursor.and_then(|position| {
+                    let col = usize::from(inner.x).checked_add(position.col)?;
+                    let row = usize::from(inner.y).checked_add(position.row)?;
+                    Some((u16::try_from(col).ok()?, u16::try_from(row).ok()?))
+                });
+                if absolute.is_some_and(|(col, row)| {
+                    self.cursor_hidden_area
+                        .is_some_and(|area| area.contains(col, row))
+                }) {
+                    absolute = None;
+                }
+                metadata.set_cursor(absolute, self.cursor_kind);
+            }
+        }
+
+        cache.log_and_reset_stats();
+        helix_view::bench::log_run_phase("editor_render", "actor_views", started.elapsed(), || {
+            format!("count={} frame={}", cache.entries.len(), self.frame_num)
+        });
+    }
+
+    fn paint_view(
+        view: DeferredViewPaint,
+        surface: &mut CellSurface,
+        cache: &mut ViewRenderCache,
+        cancellation: &crate::render::RenderCancellation,
+        frame_num: u64,
+    ) -> Option<Position> {
+        let key = view.key;
+        let cached_cursor = cache
+            .entries
+            .get(&key)
+            .map(|entry| entry.cursor_position)
+            .unwrap_or(None);
+        let state = view.render_inputs.clone().resolve(
+            cache
+                .entries
+                .get(&key)
+                .map(|entry| entry.snapshots.as_ref()),
+            view.render_scope(),
+        );
+
+        match state {
+            RenderState::Reuse(reuse) => {
+                if let Some(cached) = cache.entries.get(&key) {
+                    blit_cells(&cached.cells, surface);
+                }
+                cache.record_hit(reuse.dirty_count(), reuse.line_count());
+                if reuse.is_clean() {
+                    cache.update_overlay_fingerprints(key, reuse.overlay_fingerprints());
+                    log::trace!("F{frame_num} CACHE PURE_BLIT view={:?}", view.view_id);
+                    return cached_cursor;
+                }
+
+                view.clear_dirty_rows(reuse.dirty_rows(), surface);
+                let content_area = view.content_area();
+                let syntax = Arc::clone(&reuse.syntax_styles().entries);
+                let output = view.paint(
+                    surface,
+                    Some(syntax),
+                    Some(reuse.dirty_rows()),
+                    Some(reuse.line_map()),
+                    cancellation,
+                );
+                let cursor = output.cursor_position;
+                log::trace!(
+                    "F{frame_num} CACHE DIRTY_RERENDER view={:?} dirty_rows={} syntax_advances={} skip_right_syntax_advances={} skip_right_eof_fast_paths={}",
+                    key.view,
+                    reuse.dirty_count(),
+                    output.metrics.syntax_advances,
+                    output.metrics.skip_right_syntax_advances,
+                    output.metrics.skip_right_eof_fast_paths,
+                );
+                if cancellation.is_cancelled() {
+                    return cursor;
+                }
+                let snapshots = reuse.into_snapshots(output.line_map, output.syntax_styles);
+                let cells = copy_cell_region(surface, content_area);
+                cache.store(key, snapshots, cells, cursor);
+                cursor
+            }
+            RenderState::Refresh(refresh) => {
+                cache.record_miss();
+                let content_area = view.content_area();
+                let selection = Arc::clone(&view.selection);
+                let mode = view.mode;
+                let is_focused = view.is_focused;
+                let terminal_focused = view.terminal_focused;
+                let output = view.paint(surface, None, None, refresh.seed_line_map(), cancellation);
+                let cursor = output.cursor_position;
+                log::trace!(
+                    "F{frame_num} CACHE MISS view={:?} syntax_advances={} skip_right_syntax_advances={} skip_right_eof_fast_paths={}",
+                    key.view,
+                    output.metrics.syntax_advances,
+                    output.metrics.skip_right_syntax_advances,
+                    output.metrics.skip_right_eof_fast_paths,
+                );
+                if cancellation.is_cancelled() {
+                    return cursor;
+                }
+                let overlay_fingerprints = refresh.overlay_fingerprints(
+                    &output.line_map,
+                    RenderScope::new(&selection, mode, is_focused, terminal_focused),
+                );
+                let snapshots = refresh.into_snapshots(
+                    output.line_map,
+                    output.syntax_styles,
+                    overlay_fingerprints,
+                );
+                let cells = copy_cell_region(surface, content_area);
+                cache.store(key, snapshots, cells, cursor);
+                cursor
+            }
+        }
+    }
 }
 
 struct BufferlineModel<'a> {
@@ -580,14 +1004,66 @@ pub struct EditorView {
     /// Tracks if there are prompt layers active (updated by compositor)
     pub prompt_active: bool,
     notification_popup: NotificationPopup,
-    /// Per-view render cache for skipping re-render of unchanged views.
-    view_cache: ViewRenderCache,
-    chrome_cache: CacheStore,
 }
 
 impl EditorView {
-    fn content_area(view: &View) -> Rect {
-        view.area.clip_bottom(1)
+    pub(crate) fn execute_plugin_command(
+        &mut self,
+        context: &mut crate::compositor::Context<'_>,
+        request: &helix_plugin_api::requests::RunCommandRequest,
+    ) -> helix_plugin_api::ContractResult<Vec<crate::compositor::PostAction>> {
+        self.publish_focused_modal_input(context.editor);
+        let mut cx = commands::Context {
+            editor: context.editor,
+            registry: self.registry.clone(),
+            notifier: context.notifier.clone(),
+            count: self.engine_input_state().count,
+            register: self.engine_input_state().selected_register,
+            callback: Vec::new(),
+            on_next_key_callback: None,
+            exit_tasks: context.exit_tasks,
+            exit_task_work: context.exit_task_work.clone(),
+            ingress: context.ingress.clone(),
+            foreground: context.foreground.clone(),
+            redraw: context.redraw.clone(),
+            idle_reset: context.idle_reset.clone(),
+            plugin_runtime: context.plugin_runtime.clone(),
+        };
+
+        if let Some(command) = crate::commands::typed::TYPABLE_COMMAND_MAP
+            .get(request.name.as_str())
+            .copied()
+        {
+            let args = helix_core::command_line::Args::from_values(
+                request
+                    .args
+                    .iter()
+                    .map(|arg| std::borrow::Cow::Borrowed(arg.as_str())),
+                command.signature,
+                true,
+            )
+            .map_err(|error| helix_plugin_api::ContractError::invalid_request(error.to_string()))?;
+            (command.fun)(
+                &mut cx.compositor_context(),
+                args,
+                crate::ui::PromptEvent::Validate,
+            )
+            .map_err(|error| helix_plugin_api::ContractError::internal(error.to_string()))?;
+        } else {
+            if !request.args.is_empty() {
+                return Err(helix_plugin_api::ContractError::invalid_request(
+                    "static commands do not accept arguments",
+                ));
+            }
+            let command = commands::MappableCommand::named(&request.name).ok_or_else(|| {
+                helix_plugin_api::ContractError::not_found(format!("command {}", request.name))
+            })?;
+            command.execute(&mut cx);
+        }
+
+        self.on_next_key = cx.on_next_key_callback.take();
+        self.sync_engine_from_context(&mut cx);
+        Ok(cx.callback)
     }
 
     fn engine_input_state(&self) -> ModalInputState {
@@ -628,6 +1104,12 @@ impl EditorView {
         view: &View,
         is_focused: bool,
     ) -> PreparedRender {
+        if let Some(deadline) = self.spinners.next_redraw_at(cx.frame_time()) {
+            cx.request_frame_at(
+                helix_runtime::FrameSource::new("statusline.lsp-spinner"),
+                deadline,
+            );
+        }
         let statusline_area = view.area.clip_top(view.area.height.saturating_sub(1));
         let config = cx.config();
         let statusline_model = statusline::StatuslineModel::collect(
@@ -642,6 +1124,7 @@ impl EditorView {
                 selected_register: self.engine_input_state().selected_register,
                 spinners: &self.spinners,
                 pkg_progress: self.pkg_progress.statusline(),
+                frame_time: cx.frame_time(),
             },
             doc,
             view,
@@ -668,8 +1151,6 @@ impl EditorView {
             terminal_focused: true,
             prompt_active: false,
             notification_popup: NotificationPopup::new(),
-            view_cache: ViewRenderCache::default(),
-            chrome_cache: CacheStore::default(),
         }
     }
 
@@ -685,196 +1166,6 @@ impl EditorView {
         )
     }
 
-    fn blit_cached_view(
-        cache: &ViewRenderCache,
-        key: ViewRenderCacheKey,
-        surface: &mut CellSurface,
-    ) {
-        if let Some(cached) = cache.entries.get(&key) {
-            blit_cells(&cached.cells, surface);
-        }
-    }
-
-    fn store_view_render(
-        cache: &mut ViewRenderCache,
-        frame: &ViewFrame<'_>,
-        snapshots: RenderSnapshots,
-        surface: &CellSurface,
-    ) {
-        frame.update_cursor_cache(&snapshots.layout);
-        let copy_start = std::time::Instant::now();
-        let cells = copy_cell_region(surface, Self::content_area(frame.view()));
-        frame.trace.log_copy_region(copy_start);
-        cache.store(frame.cache_key(), snapshots, cells);
-    }
-
-    fn render_pass(
-        &self,
-        frame: &ViewFrame<'_>,
-        surface: &mut CellSurface,
-        request: RenderRequest<'_>,
-        phase: RenderPhase,
-    ) -> RenderOutput {
-        let vctx = frame.render_context(
-            request.cached_syntax,
-            request.dirty_rows,
-            request.seed_line_map,
-        );
-        let output = self.render_view(&vctx, surface);
-        frame.trace.log_render_phase(phase);
-        output
-    }
-
-    fn render_reuse_plan(
-        &self,
-        cache: &mut ViewRenderCache,
-        frame: ViewFrame<'_>,
-        surface: &mut CellSurface,
-        reuse: ReuseState,
-    ) {
-        let blit_start = std::time::Instant::now();
-        Self::blit_cached_view(cache, frame.cache_key(), surface);
-        frame.trace.log_blit(blit_start);
-
-        frame.update_cursor_cache(&reuse.layout_snapshot());
-        frame.trace.log_reuse(&reuse);
-
-        cache.record_hit(reuse.dirty_count(), reuse.line_count());
-
-        if reuse.is_clean() {
-            frame.trace.log_pure_reuse();
-            cache.update_overlay_fingerprints(frame.cache_key(), reuse.overlay_fingerprints());
-            return;
-        }
-
-        frame.clear_dirty_rows(reuse.dirty_rows(), surface);
-        let phase = RenderPhase::Dirty {
-            rows: reuse.dirty_count(),
-        };
-
-        let render_output = self.render_pass(
-            &frame,
-            surface,
-            RenderRequest {
-                cached_syntax: Some(reuse.syntax_styles()),
-                dirty_rows: Some(reuse.dirty_rows()),
-                seed_line_map: Some(reuse.line_map()),
-            },
-            phase,
-        );
-
-        frame.trace.log_dirty_reuse(&reuse, &render_output);
-
-        let snapshots = reuse.into_snapshots(render_output.line_map, render_output.syntax_styles);
-        Self::store_view_render(cache, &frame, snapshots, surface);
-        frame.trace.log_render_total(phase);
-    }
-
-    fn render_refresh_plan(
-        &self,
-        cache: &mut ViewRenderCache,
-        frame: ViewFrame<'_>,
-        surface: &mut CellSurface,
-        refresh: RefreshState,
-    ) {
-        cache.record_miss();
-
-        let render_output = self.render_pass(
-            &frame,
-            surface,
-            RenderRequest {
-                cached_syntax: None,
-                dirty_rows: None,
-                seed_line_map: refresh.seed_line_map(),
-            },
-            RenderPhase::Full,
-        );
-
-        let fp_start = std::time::Instant::now();
-        let overlay_fingerprints = refresh.overlay_fingerprints(
-            &render_output.line_map,
-            frame.render_scope(self.terminal_focused),
-        );
-        frame
-            .trace
-            .log_overlay_fingerprints(fp_start, render_output.line_map.lines.len());
-
-        frame.trace.log_refresh(&refresh, &render_output);
-
-        let snapshots = refresh.into_snapshots(
-            render_output.line_map,
-            render_output.syntax_styles,
-            overlay_fingerprints,
-        );
-        Self::store_view_render(cache, &frame, snapshots, surface);
-        frame.trace.log_render_total(RenderPhase::Full);
-    }
-
-    fn render_views(
-        &self,
-        area: Rect,
-        surface: &mut CellSurface,
-        cx: &RenderContext,
-        cache: &mut ViewRenderCache,
-        frame_num: u64,
-        render_start: std::time::Instant,
-    ) {
-        cache.record_frame();
-
-        log::debug!(
-            "[editor_render] area=({},{} {}x{}) views={}",
-            area.x,
-            area.y,
-            area.width,
-            area.height,
-            cx.views().count(),
-        );
-        for (view, is_focused) in cx.views() {
-            let view_render_start = std::time::Instant::now();
-            let doc = cx.document(view.doc).unwrap();
-            let selection = doc.selection(view.id);
-
-            let frame = ViewFrame {
-                snapshot: ViewFrameSnapshot {
-                    config: cx.config(),
-                    config_gen: cx.config_gen(),
-                    theme: cx.theme(),
-                    theme_name: cx.theme_name(),
-                    mode: cx.mode(),
-                    syntax_loader: cx.syntax_loader(),
-                    cursor_cache: cx.cursor_cache(),
-                    focused_view_id: cx.focused_view_id(),
-                    breakpoints: cx.breakpoints_for_document(doc),
-                    debug_execution: cx.debug_execution_position(),
-                },
-                doc,
-                trace: ViewTrace {
-                    view,
-                    selection,
-                    is_focused,
-                    frame_num,
-                    view_render_start,
-                    render_start,
-                },
-                area,
-            };
-            frame.trace.log_state();
-
-            match frame.render_state(
-                cache
-                    .entries
-                    .get(&ViewRenderCacheKey::new(view.id, view.doc))
-                    .map(|entry| entry.snapshots.as_ref()),
-                self.terminal_focused,
-            ) {
-                RenderState::Reuse(reuse) => self.render_reuse_plan(cache, frame, surface, reuse),
-                RenderState::Refresh(refresh) => {
-                    self.render_refresh_plan(cache, frame, surface, refresh)
-                }
-            }
-        }
-    }
-
     pub fn spinners_mut(&mut self) -> &mut ProgressSpinners {
         &mut self.spinners
     }
@@ -883,7 +1174,7 @@ impl EditorView {
         &mut self.pkg_progress
     }
 
-    pub fn draw_welcome(theme: &Theme, view: &View, surface: &mut CellSurface, is_colorful: bool) {
+    pub fn draw_welcome(theme: &Theme, area: Rect, surface: &mut CellSurface, is_colorful: bool) {
         /// Logo for Helix
         const LOGO_STR: &str = "\
 **             
@@ -1065,21 +1356,21 @@ impl EditorView {
 
         // the y-coordinate where we start drawing the welcome screen
         let start_drawing_at_y =
-            view.area.y + (view.area.height / 2).saturating_sub(help_lines.len() as u16 / 2);
+            area.y + (area.height / 2).saturating_sub(help_lines.len() as u16 / 2);
 
         // x-coordinate of the center of the viewport
-        let x_view_center = view.area.x + view.area.width / 2;
+        let x_view_center = area.x + area.width / 2;
 
         // the x-coordinate where we start drawing the `AlignLine::Left` lines
         // +2 to make the text look like more balanced relative to the center of the help
         let start_drawing_left_align_at_x =
-            view.area.x + (view.area.width / 2).saturating_sub(len_of_longest_left_align / 2) + 2;
+            area.x + (area.width / 2).saturating_sub(len_of_longest_left_align / 2) + 2;
 
         let are_any_left_aligned_lines_overflowing_x =
-            (start_drawing_left_align_at_x + len_of_longest_left_align) > view.area.width;
+            (start_drawing_left_align_at_x + len_of_longest_left_align) > area.width;
 
         let are_any_center_aligned_lines_overflowing_x =
-            len_of_longest_center_align as u16 > view.area.width;
+            len_of_longest_center_align as u16 > area.width;
 
         let is_help_x_overflowing =
             are_any_left_aligned_lines_overflowing_x || are_any_center_aligned_lines_overflowing_x;
@@ -1087,7 +1378,7 @@ impl EditorView {
         // we want `>=` so it does not get drawn over the status line
         // (essentially, it WON'T be marked as "overflowing" if the help
         // fully fits vertically in the viewport without touching the status line)
-        let is_help_y_overflowing = (help_lines.len() as u16) >= view.area.height;
+        let is_help_y_overflowing = (help_lines.len() as u16) >= area.height;
 
         // Not enough space to render the help text even without the logo. Render nothing.
         if is_help_x_overflowing || is_help_y_overflowing {
@@ -1102,7 +1393,7 @@ impl EditorView {
         // If there is not enough space to show LOGO + HELP, then don't show the logo at all
         //
         // If we get here we know that there IS enough space to show just the help
-        let show_logo = width_of_help_with_logo <= view.area.width;
+        let show_logo = width_of_help_with_logo <= area.width;
 
         // Each "help" line is effectively "chained" with a line of the logo (if present).
         for (lines_drawn, (line, align)) in help_lines.iter().enumerate() {
@@ -1143,314 +1434,12 @@ impl EditorView {
         }
     }
 
-    pub(crate) fn render_view(
-        &self,
-        vctx: &ViewRenderContext<'_>,
-        surface: &mut CellSurface,
-    ) -> RenderOutput {
-        let ViewRenderContext {
-            doc,
-            view,
-            viewport,
-            is_focused,
-            config,
-            config_gen,
-            theme,
-            mode,
-            syntax_loader,
-            cursor_cache,
-            gutter_context,
-            debug_execution,
-            cached_syntax,
-            dirty_rows,
-            seed_line_map,
-            ..
-        } = vctx;
-        let is_focused = *is_focused;
-        let inner = view.inner_area(doc);
-        let area = view.area;
-        let loader = syntax_loader.load();
-
-        let view_offset = doc.view_offset(view.id);
-
-        let render_view_start = std::time::Instant::now();
-        let text_annotations_start = std::time::Instant::now();
-        let text_annotations = view.text_annotations(doc, Some(theme));
-        helix_view::bench::log_run_phase(
-            "render_view",
-            "text_annotations",
-            text_annotations_start.elapsed(),
-            || format!("view_id={:?}", view.id),
-        );
-        let mut decorations = DecorationManager::default();
-
-        if !(is_focused && self.terminal_focused) {
-            surface.set_style(
-                tui::ratatui::to_ratatui_rect(area),
-                tui::ratatui::to_ratatui_style(theme.get("ui.background.inactive")),
-            )
-        }
-
-        if is_focused && config.cursorline {
-            decorations.add_decoration(Self::cursor_line_decoration(doc, view, theme));
-        }
-
-        decorations.add_decoration(FoldDecoration::new(&text_annotations, theme));
-
-        if is_focused && config.cursorcolumn {
-            let cursorcolumn_start = std::time::Instant::now();
-            Self::draw_cursor_column(doc, view, surface, theme, inner, &text_annotations);
-            helix_view::bench::log_run_phase(
-                "render_view",
-                "cursorcolumn",
-                cursorcolumn_start.elapsed(),
-                || format!("view_id={:?}", view.id),
-            );
-        }
-
-        // Set DAP highlights, if needed.
-        if let Some(position) = debug_execution {
-            let dap_line = position.line;
-            let style = theme.get("ui.highlight.frameline");
-            let line_decoration = move |renderer: &mut TextRenderer, pos: LinePos| {
-                if pos.doc_line != dap_line {
-                    return;
-                }
-                renderer.set_style(Rect::new(inner.x, pos.visual_line, inner.width, 1), style);
-            };
-
-            decorations.add_decoration(line_decoration);
-        }
-
-        let highlighter_start = std::time::Instant::now();
-        let highlighter_input = match cached_syntax {
-            Some(cache) => HighlighterInput::Cached(&cache.entries),
-            None => HighlighterInput::Live(doc.viewport_syntax_highlighter(
-                &loader,
-                &text_annotations,
-                view_offset.anchor,
-                inner.height,
-            )),
-        };
-        helix_view::bench::log_run_phase(
-            "render_view",
-            "highlighter_input",
-            highlighter_start.elapsed(),
-            || format!("view_id={:?} cached={}", view.id, cached_syntax.is_some()),
-        );
-        let mut overlays = Vec::new();
-
-        let overlays_start = std::time::Instant::now();
-        let viewport_range =
-            doc.viewport_byte_range(&text_annotations, view_offset.anchor, inner.height);
-        let viewport_char_range = {
-            let text = doc.text().slice(..);
-            text.byte_to_char(viewport_range.start)..text.byte_to_char(viewport_range.end)
-        };
-        if config.lsp.semantic_tokens {
-            if let Some(overlay) = doc.semantic_tokens_overlay(theme, Some(viewport_char_range)) {
-                overlays.push(overlay);
-            }
-        }
-        overlays.push(doc.viewport_overlay_highlights(
-            &text_annotations,
-            view_offset.anchor,
-            inner.height,
-        ));
-
-        if doc
-            .language_config()
-            .and_then(|config| config.rainbow_brackets)
-            .unwrap_or(config.rainbow_brackets)
-        {
-            if let Some(overlay) = doc.viewport_rainbow_highlights(
-                &text_annotations,
-                view_offset.anchor,
-                inner.height,
-                theme,
-                &loader,
-            ) {
-                overlays.push(overlay);
-            }
-        }
-
-        overlays.extend(doc.diagnostic_highlights(theme, Some(viewport_range)));
-
-        if is_focused {
-            if let Some(tabstops) = doc.tabstop_highlights(theme) {
-                overlays.push(tabstops);
-            }
-            overlays.push(doc.selection_highlights(
-                view.id,
-                *mode,
-                theme,
-                &config.cursor_shape,
-                self.terminal_focused,
-                self.prompt_active,
-            ));
-            if let Some(overlay) = doc.matching_bracket_highlights(view.id, theme) {
-                overlays.push(overlay);
-            }
-        }
-        helix_view::bench::log_run_phase(
-            "render_view",
-            "overlays",
-            overlays_start.elapsed(),
-            || format!("view_id={:?} count={}", view.id, overlays.len()),
-        );
-
-        let gutter_overflow = view.gutter_offset(doc) == 0;
-        if !gutter_overflow {
-            let gutter_start = std::time::Instant::now();
-            Self::render_gutter(
-                gutter_context,
-                doc,
-                view,
-                view.area,
-                theme,
-                is_focused & self.terminal_focused,
-                &mut decorations,
-            );
-            helix_view::bench::log_run_phase(
-                "render_view",
-                "gutter",
-                gutter_start.elapsed(),
-                || format!("view_id={:?}", view.id),
-            );
-        }
-
-        let inline_blame_start = std::time::Instant::now();
-        Self::add_inline_blame(&config.inline_blame, doc, view, &mut decorations, theme);
-        helix_view::bench::log_run_phase(
-            "render_view",
-            "inline_blame",
-            inline_blame_start.elapsed(),
-            || format!("view_id={:?}", view.id),
-        );
-
-        if config.welcome_screen && doc.version() == 0 && doc.is_welcome() {
-            Self::draw_welcome(
-                theme,
-                view,
-                surface,
-                config.true_color || crate::true_color(),
-            );
-        }
-
-        let primary_cursor = doc
-            .selection(view.id)
-            .primary()
-            .cursor(doc.text().slice(..));
-        if is_focused {
-            decorations.add_decoration(text_decorations::Cursor {
-                cache: cursor_cache,
-                primary_cursor,
-            });
-        }
-        let width = view.inner_width(doc);
-        let config = doc.config.load();
-        let enable_cursor_line = view
-            .diagnostics_handler
-            .show_cursorline_diagnostics(doc, view.id);
-        let inline_diagnostic_config = config.inline_diagnostics.prepare(width, enable_cursor_line);
-        decorations.add_decoration(InlineDiagnostics::new(
-            doc,
-            theme,
-            primary_cursor,
-            inline_diagnostic_config,
-            config.end_of_line_diagnostics,
-        ));
-
-        decorations.add_decoration(PluginDecoration::new(doc, theme, view.id));
-
-        let top_doc_line = doc
-            .text()
-            .char_to_line(view_offset.anchor.min(doc.text().len_chars()));
-        let layout_inputs = view.layout_inputs(doc, *config_gen);
-        let render_seed = seed_line_map.and_then(|line_map| {
-            layout_inputs.render_seed(line_map, top_doc_line, MAX_SEED_LINE_MAP_GAP)
-        });
-        let render_document_start = std::time::Instant::now();
-        let render_output = render_document(
-            surface,
-            inner,
-            doc,
-            view_offset,
-            &text_annotations,
-            highlighter_input,
-            overlays,
-            theme,
-            decorations,
-            *dirty_rows,
-            render_seed,
-            *seed_line_map,
-        );
-        helix_view::bench::log_run_phase(
-            "render_view",
-            "render_document",
-            render_document_start.elapsed(),
-            || format!("view_id={:?}", view.id),
-        );
-
-        // Draw rulers after document. Skip cells that already have content.
-        let rulers_start = std::time::Instant::now();
-        Self::draw_rulers(
-            &config.rulers,
-            &config.ruler_char,
-            doc,
-            view,
-            inner,
-            surface,
-            theme,
-        );
-        helix_view::bench::log_run_phase("render_view", "rulers", rulers_start.elapsed(), || {
-            format!("view_id={:?}", view.id)
-        });
-
-        // if we're not at the edge of the screen, draw a right border
-        if viewport.right() != view.area.right() {
-            let border_start = std::time::Instant::now();
-            let x = area.right();
-            let border_style = theme.get("ui.window");
-            for y in area.top()..area.bottom() {
-                {
-                    if let Some(cell) = surface.cell_mut((x, y)) {
-                        cell.set_symbol(tui::symbols::line::VERTICAL);
-                        cell.set_style(tui::ratatui::to_ratatui_style(border_style));
-                    }
-                };
-            }
-            helix_view::bench::log_run_phase(
-                "render_view",
-                "right_border",
-                border_start.elapsed(),
-                || format!("view_id={:?} height={}", view.id, area.height),
-            );
-        }
-
-        // if config.inline_diagnostics.disabled()
-        //     && config.end_of_line_diagnostics == DiagnosticFilter::Disable
-        // {
-        //     Self::draw_diagnostics(doc, view, inner, surface, theme);
-        // }
-
-        helix_view::bench::log_run_phase(
-            "render_view",
-            "total",
-            render_view_start.elapsed(),
-            || format!("view_id={:?}", view.id),
-        );
-
-        render_output
-    }
-
-    fn add_inline_blame(
+    fn inline_blame_decoration(
         inline_blame: &InlineBlameConfig,
         doc: &Document,
         view: &View,
-        decorations: &mut DecorationManager,
         theme: &Theme,
-    ) {
+    ) -> Option<InlineBlame> {
         const INLINE_BLAME_SCOPE: &str = "ui.virtual.inline-blame";
         // Blame is metadata — it should never compete with the
         // actual code for the reader's attention. Fall back through
@@ -1466,15 +1455,15 @@ impl EditorView {
             .unwrap_or_else(|| theme.get("ui.text"));
         let text = doc.text();
         match inline_blame.show {
-            InlineBlameShow::Never => (),
-            InlineBlameShow::CursorLine => {
-                if let Some(line_blame) = doc.line_blame_at_cursor(view.id, &inline_blame.format) {
-                    decorations.add_decoration(InlineBlame::new(
+            InlineBlameShow::Never => None,
+            InlineBlameShow::CursorLine => doc
+                .line_blame_at_cursor(view.id, &inline_blame.format)
+                .map(|line_blame| {
+                    InlineBlame::new(
                         blame_style,
                         text_decorations::blame::LineBlame::OneLine(line_blame),
-                    ));
-                }
-            }
+                    )
+                }),
             InlineBlameShow::AllLines => {
                 let mut blame_lines = vec![None; text.len_lines()];
 
@@ -1482,19 +1471,17 @@ impl EditorView {
                     blame_lines[line_idx] = Some(blame);
                 }
 
-                decorations.add_decoration(InlineBlame::new(
+                Some(InlineBlame::new(
                     blame_style,
                     text_decorations::blame::LineBlame::ManyLines(blame_lines),
-                ));
+                ))
             }
         }
     }
 
     pub fn draw_rulers(
-        editor_rulers: &[u16],
+        rulers: &[u16],
         ruler_char: &str,
-        doc: &Document,
-        view: &View,
         viewport: Rect,
         surface: &mut CellSurface,
         theme: &Theme,
@@ -1513,8 +1500,9 @@ impl EditorView {
             base_style
         };
 
-        doc.ruler_columns(view, editor_rulers)
-            .into_iter()
+        rulers
+            .iter()
+            .copied()
             .map(|ruler| viewport.clip_left(ruler).with_width(1))
             .for_each(|area| {
                 if ruler_char.is_empty() {
@@ -1558,18 +1546,12 @@ impl EditorView {
     }
 
     /// Render bufferline at the top from an explicit render model.
-    fn draw_bufferline_model(
+    fn prepare_bufferline_render(
         &mut self,
         model: &BufferlineModel<'_>,
         viewport: Rect,
-        surface: &mut CellSurface,
-    ) {
+    ) -> PreparedRender {
         let bufferline_styles = crate::ui::design::BufferlineStyles::from_theme(model.theme);
-        {
-            let area = tui::ratatui::to_ratatui_rect(viewport);
-            tui::ratatui::widgets::Widget::render(tui::ratatui::widgets::Clear, area, surface);
-        };
-
         let bufferline_active = bufferline_styles.active;
         let bufferline_inactive = bufferline_styles.inactive;
 
@@ -1621,23 +1603,19 @@ impl EditorView {
         let chevron_style = bufferline_styles
             .inactive
             .patch(model.theme.try_get("ui.text.inactive").unwrap_or_default());
-        let state = tabs_with_options(
-            surface,
-            viewport,
-            &tabs,
-            TabsOptions::new(active)
-                .separator(model.separator.as_str())
-                .scroll_policy(TabsScrollPolicy::CenterActive),
-            TabsStyle {
-                background: bufferline_styles.background,
-                active: bufferline_active,
-                inactive: bufferline_inactive,
-                hover: Style::default(),
-                badge: bufferline_inactive,
-                separator: bufferline_inactive,
-                overflow: chevron_style,
-            },
-        );
+        let options = TabsOptions::new(active)
+            .separator(model.separator.clone())
+            .scroll_policy(TabsScrollPolicy::CenterActive);
+        let styles = TabsStyle {
+            background: bufferline_styles.background,
+            active: bufferline_active,
+            inactive: bufferline_inactive,
+            hover: Style::default(),
+            badge: bufferline_inactive,
+            separator: bufferline_inactive,
+            overflow: chevron_style,
+        };
+        let state = tabs_layout_with_options(&tabs, viewport.width, &options);
 
         for range in &state.tab_ranges {
             if let Some(doc) = model.documents.get(range.index) {
@@ -1647,6 +1625,14 @@ impl EditorView {
                 );
             };
         }
+
+        PreparedRender::deferred(move |cancellation| {
+            let mut output = crate::render::RenderOutput::new(viewport);
+            if !cancellation.is_cancelled() {
+                tabs_with_options(output.surface_mut(), viewport, &tabs, options, styles);
+            }
+            output
+        })
     }
 
     pub fn render_gutter<'d>(
@@ -1855,6 +1841,24 @@ impl EditorView {
         let focused_view = cx.editor.tree.get(focus);
         let view_id = focused_view.id;
         let doc_id = focused_view.doc;
+
+        let keymap_context_changed = {
+            let doc = cx
+                .editor
+                .document(doc_id)
+                .expect("focused document must exist");
+            self.keymaps.set_context(
+                doc.language_name(),
+                doc.path().map(std::path::PathBuf::as_path),
+            )
+        };
+        if keymap_context_changed {
+            let effective = self.keymaps.map();
+            cx.editor
+                .set_modal_keymaps(crate::keymap::to_component_modal_keymaps(&effective));
+            cx.editor
+                .set_semantic_modal_keymaps(crate::keymap::to_semantic_modal_keymaps(&effective));
+        }
 
         // Step 1: Engine pre-resolve (count, register, dot-repeat, escape).
         let mut engine = self.engine.take().expect("engine is always present");
@@ -2378,9 +2382,10 @@ impl EditorView {
                         exit_tasks: cxt.exit_tasks,
                         exit_task_work: cxt.exit_task_work.clone(),
                         ingress: cxt.ingress.clone(),
+                        foreground: cxt.foreground.clone(),
                         redraw: cxt.redraw.clone(),
                         idle_reset: cxt.idle_reset.clone(),
-                        plugin_manager: cxt.plugin_manager.clone(),
+                        plugin_runtime: cxt.plugin_runtime.clone(),
                     };
                     commands::scroll(&mut scroll_cx, offset, direction, false);
                     cxt.callback = scroll_cx.callback;
@@ -2504,6 +2509,118 @@ impl EditorView {
     }
 }
 
+impl EditorView {
+    fn prepare_owned_render(&mut self, area: Rect, cx: &RenderContext) -> PreparedRender {
+        static FRAME_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+        let frame_num = FRAME_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let prepare_start = std::time::Instant::now();
+        let frame = EditorFrameSnapshot::collect(self, area, cx, frame_num);
+        cx.defer_stateful_paint(
+            "editor_views",
+            move |surface, cache_store, metadata, cancellation| {
+                let cache = cache_store.domain_mut::<ViewRenderCache>(*EDITOR_VIEW_CACHE_DOMAIN);
+                frame.paint(surface, cache, metadata, cancellation);
+            },
+        );
+
+        let config = cx.config();
+        use helix_view::editor::BufferLineRenderMode;
+        let use_bufferline = match config.bufferline.render_mode {
+            BufferLineRenderMode::Always => true,
+            BufferLineRenderMode::Multiple if cx.has_multiple_documents() => true,
+            _ => false,
+        };
+
+        if use_bufferline {
+            let bufferline_area = area.with_height(1);
+            let model =
+                BufferlineModel::from_render_context(cx, config.bufferline.separator.as_str());
+            let bufferline = self.prepare_bufferline_render(&model, bufferline_area);
+            cx.defer_prepared("bufferline", vec![bufferline]);
+        }
+
+        let statusline_start = std::time::Instant::now();
+        let statuslines: Vec<PreparedRender> = cx
+            .views()
+            .filter_map(|(view, is_focused)| {
+                cx.document(view.doc)
+                    .map(|doc| self.prepare_statusline(cx, doc, view, is_focused))
+            })
+            .collect();
+        let statusline_count = statuslines.len();
+        cx.defer_prepared("statusline", statuslines);
+        helix_view::bench::log_run_phase(
+            "editor_prepare",
+            "statusline_snapshot",
+            statusline_start.elapsed(),
+            || format!("count={statusline_count}"),
+        );
+
+        let key_width = 15u16;
+        if area.width > key_width {
+            let mut display = String::new();
+            if let Some(count) = self.engine_input_state().count {
+                display.push_str(&count.to_string());
+            }
+            if let Some(engine) = &self.engine {
+                display.push_str(engine.pending_display());
+            }
+            for key in self.keymaps.pending() {
+                display.push_str(&key.key_sequence_format());
+            }
+            for key in &self.pseudo_pending {
+                display.push_str(&key.key_sequence_format());
+            }
+
+            let style = cx.style("ui.text");
+            let register = cx.macro_recording_register();
+            let macro_width = u16::from(register.is_some()) * 3;
+            let display = display
+                .get(display.len().saturating_sub(key_width as usize)..)
+                .unwrap_or(&display)
+                .to_owned();
+            cx.defer_paint("pending_keys", move |surface, _cancellation| {
+                let y = area.y + area.height.saturating_sub(1);
+                surface.set_string(
+                    area.x + area.width.saturating_sub(key_width + macro_width),
+                    y,
+                    &display,
+                    tui::ratatui::to_ratatui_style(style),
+                );
+                if let Some(register) = register {
+                    let display = format!("[{register}]");
+                    let style = style
+                        .fg(helix_view::graphics::Color::Yellow)
+                        .add_modifier(Modifier::BOLD);
+                    surface.set_string(
+                        area.x + area.width.saturating_sub(3),
+                        y,
+                        &display,
+                        tui::ratatui::to_ratatui_style(style),
+                    );
+                }
+            });
+        }
+
+        if let Some(completion) = self.completion.as_mut() {
+            let completion = completion.prepare_render(area, cx);
+            cx.defer_prepared("completion", vec![completion]);
+        }
+        if let Some(prepared) = self.notification_popup.prepare_snapshot(area, cx) {
+            cx.defer_prepared("notifications", vec![prepared]);
+        }
+
+        helix_view::bench::log_run_phase(
+            "editor_prepare",
+            "total",
+            prepare_start.elapsed(),
+            || format!("area={}x{} frame={frame_num}", area.width, area.height),
+        );
+        PreparedRender::ready(crate::render::RenderOutput::sparse(area))
+    }
+}
+
 impl Component for EditorView {
     fn handle_event(
         &mut self,
@@ -2522,9 +2639,10 @@ impl Component for EditorView {
             exit_tasks: context.exit_tasks,
             exit_task_work: context.exit_task_work.clone(),
             ingress: context.ingress.clone(),
+            foreground: context.foreground.clone(),
             redraw: context.redraw.clone(),
             idle_reset: context.idle_reset.clone(),
-            plugin_manager: context.plugin_manager.clone(),
+            plugin_runtime: context.plugin_runtime.clone(),
         };
 
         match event {
@@ -2551,7 +2669,6 @@ impl Component for EditorView {
             Event::Resize(_width, _height) => {
                 // Ignore this event, we handle resizing just before rendering to screen.
                 // Handling it here but not re-rendering will cause flashing
-                self.view_cache.clear();
                 EventResult::Consumed(None)
             }
             Event::Key(key) => {
@@ -2701,7 +2818,6 @@ impl Component for EditorView {
             Event::IdleTimeout => self.handle_idle_timeout(&mut cx),
             Event::FocusGained => {
                 self.terminal_focused = true;
-                self.view_cache.clear();
                 EventResult::Consumed(None)
             }
             Event::FocusLost => {
@@ -2716,13 +2832,12 @@ impl Component for EditorView {
                     }
                 }
                 self.terminal_focused = false;
-                self.view_cache.clear();
                 EventResult::Consumed(None)
             }
         }
     }
 
-    fn sync(&mut self, editor: &mut Editor) {
+    fn sync(&mut self, _viewport: Rect, editor: &mut Editor) {
         if editor.model.focus == FocusTarget::Editor {
             self.publish_focused_modal_input(editor);
         }
@@ -2737,162 +2852,8 @@ impl Component for EditorView {
         crate::compositor::LayoutRole::Fill
     }
 
-    fn render(&mut self, area: Rect, surface: &mut CellSurface, cx: &RenderContext) {
-        static FRAME_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let frame_num = FRAME_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let render_start = std::time::Instant::now();
-        let clear_start = std::time::Instant::now();
-        surface.set_style(
-            tui::ratatui::to_ratatui_rect(area),
-            tui::ratatui::to_ratatui_style(cx.style("ui.background")),
-        );
-        helix_view::bench::log_run_phase(
-            "editor_render",
-            "clear_background_ratatui",
-            clear_start.elapsed(),
-            || format!("area={}x{}", area.width, area.height),
-        );
-        let config = cx.config();
-
-        use helix_view::editor::BufferLineRenderMode;
-        let use_bufferline = match config.bufferline.render_mode {
-            BufferLineRenderMode::Always => true,
-            BufferLineRenderMode::Multiple if cx.has_multiple_documents() => true,
-            _ => false,
-        };
-
-        if use_bufferline {
-            let bufferline_start = std::time::Instant::now();
-            let bufferline_area = area.with_height(1);
-            let mut output = crate::render::RenderOutput::new(bufferline_area);
-            let model =
-                BufferlineModel::from_render_context(cx, config.bufferline.separator.as_str());
-            self.draw_bufferline_model(&model, bufferline_area, output.surface_mut());
-            let prepared = PreparedRender::ready(output);
-            self.chrome_cache.compose(prepared, surface);
-            helix_view::bench::log_run_phase(
-                "editor_render",
-                "bufferline_ratatui",
-                bufferline_start.elapsed(),
-                || format!("area={}x{}", area.width, 1),
-            );
-        }
-
-        {
-            let active: std::collections::HashSet<ViewId> = cx.views().map(|(v, _)| v.id).collect();
-            self.view_cache.retain_active_views(&active);
-            self.chrome_cache.retain(|id| {
-                active
-                    .iter()
-                    .any(|view_id| statusline::cache_id(*view_id) == id)
-            });
-        }
-
-        let mut view_cache = std::mem::take(&mut self.view_cache);
-        self.render_views(area, surface, cx, &mut view_cache, frame_num, render_start);
-        self.view_cache = view_cache;
-
-        {
-            let statusline_start = std::time::Instant::now();
-            let batch: Vec<PreparedRender> = cx
-                .views()
-                .map(|(view, is_focused)| {
-                    let doc = cx.document(view.doc).unwrap();
-                    self.prepare_statusline(cx, doc, view, is_focused)
-                })
-                .collect();
-            let count = batch.len();
-            self.chrome_cache.compose_batch(batch, surface);
-            helix_view::bench::log_run_phase(
-                "editor_render",
-                "statusline_batch_ratatui",
-                statusline_start.elapsed(),
-                || format!("count={}", count),
-            );
-        }
-
-        self.view_cache.log_and_reset_stats();
-
-        let key_width = 15u16;
-        // status_msg is now rendered by the compositor in the reserved
-        // global status row (full terminal width, below all chrome), so
-        // EditorView no longer paints it inside its own area.
-        let status_msg_width = 0u16;
-
-        if area.width.saturating_sub(status_msg_width) > key_width {
-            let pending_start = std::time::Instant::now();
-            let mut disp = String::new();
-            if let Some(count) = self.engine_input_state().count {
-                disp.push_str(&count.to_string())
-            }
-            if let Some(ref engine) = self.engine {
-                let pending = engine.pending_display();
-                if !pending.is_empty() {
-                    disp.push_str(pending);
-                }
-            }
-            for key in self.keymaps.pending() {
-                disp.push_str(&key.key_sequence_format());
-            }
-            for key in &self.pseudo_pending {
-                disp.push_str(&key.key_sequence_format());
-            }
-            let style = cx.style("ui.text");
-            let macro_width = if cx.macro_recording_register().is_some() {
-                3
-            } else {
-                0
-            };
-            surface.set_string(
-                area.x + area.width.saturating_sub(key_width + macro_width),
-                area.y + area.height.saturating_sub(1),
-                disp.get(disp.len().saturating_sub(key_width as usize)..)
-                    .unwrap_or(&disp),
-                tui::ratatui::to_ratatui_style(style),
-            );
-            if let Some(reg) = cx.macro_recording_register() {
-                let disp = format!("[{}]", reg);
-                let style = style
-                    .fg(helix_view::graphics::Color::Yellow)
-                    .add_modifier(Modifier::BOLD);
-                surface.set_string(
-                    area.x + area.width.saturating_sub(3),
-                    area.y + area.height.saturating_sub(1),
-                    &disp,
-                    tui::ratatui::to_ratatui_style(style),
-                );
-            }
-            helix_view::bench::log_run_phase(
-                "editor_render",
-                "pending_keys_ratatui",
-                pending_start.elapsed(),
-                || format!("display_width={}", disp.len()),
-            );
-        }
-
-        {
-            let chrome_start = std::time::Instant::now();
-
-            if let Some(completion) = self.completion.as_mut() {
-                let prepared = completion.prepare_render(area, cx);
-                self.chrome_cache.compose(prepared, surface);
-            }
-            if let Some(prepared) = self.notification_popup.prepare_snapshot(area, cx) {
-                self.chrome_cache.compose(prepared, surface);
-            }
-            helix_view::bench::log_run_phase(
-                "editor_render",
-                "chrome_batch_ratatui",
-                chrome_start.elapsed(),
-                || format!("area={}x{}", area.width, area.height),
-            );
-        }
-        helix_view::bench::log_run_phase(
-            "editor_render",
-            "final_total_ratatui",
-            render_start.elapsed(),
-            || format!("area={}x{} frame={}", area.width, area.height, frame_num),
-        );
+    fn prepare_render(&mut self, area: Rect, cx: &RenderContext) -> PreparedRender {
+        self.prepare_owned_render(area, cx)
     }
 
     fn cursor(&self, _area: Rect, editor: &Editor) -> (Option<Position>, CursorKind) {
@@ -2900,13 +2861,9 @@ impl Component for EditorView {
             return (None, CursorKind::Hidden);
         }
 
-        let (pos, kind) = editor.cursor();
-        if self.terminal_focused {
-            (pos, kind)
-        } else {
-            // use underline cursor when terminal loses focus for visibility
-            (pos, CursorKind::Underline)
-        }
+        // The render actor resolves the exact formatted cursor while painting
+        // the focused document and returns it through RenderMetadata.
+        (None, CursorKind::Hidden)
     }
 }
 
@@ -2946,14 +2903,17 @@ struct BufferInfo {
 
 #[cfg(test)]
 mod tests {
-    use super::{BufferlineDocument, BufferlineModel, EditorView, ViewRenderContext};
+    use super::{
+        view_content_area, BufferlineDocument, BufferlineModel, DeferredViewPaint,
+        EditorFrameSnapshot, EditorView, ViewRenderCache, ViewRenderContext,
+    };
     use crate::compositor::Component;
+    use crate::handlers::completion::CompletionItem;
     use crate::handlers::Handlers;
     use crate::keymap::Keymaps;
     use crate::render::CellSurface;
     use arc_swap::ArcSwap;
-    use helix_core::Rope;
-    use helix_loader::runtime_dirs;
+    use helix_core::{completion::CompletionProvider, Rope, Transaction};
     use helix_modal::{helix::HelixEngine, CommandRegistry};
     use helix_view::graphics::{CursorKind, Rect};
     use helix_view::gutter::GutterContext;
@@ -2969,6 +2929,15 @@ mod tests {
     use std::borrow::Cow;
     use std::path::Path;
     use std::sync::Arc;
+
+    #[test]
+    fn actor_owned_editor_render_state_is_send() {
+        fn assert_send<T: Send>() {}
+
+        assert_send::<DeferredViewPaint>();
+        assert_send::<EditorFrameSnapshot>();
+        assert_send::<ViewRenderCache>();
+    }
 
     fn layout_inputs(
         doc_version: i32,
@@ -2996,7 +2965,7 @@ mod tests {
     }
 
     fn test_editor_with_text(text: &str) -> (Editor, helix_view::ViewId, DocumentId) {
-        let theme_loader = theme::Loader::new(runtime_dirs());
+        let theme_loader = theme::Loader::new(&[]);
         let syn_loader = helix_core::config::default_lang_loader();
         let config = Arc::new(ArcSwap::from_pointee(Config::default()));
         let mut editor = Editor::new(
@@ -3025,6 +2994,88 @@ mod tests {
             Box::new(HelixEngine::new(registry.clone())),
             registry,
         )
+    }
+
+    fn render_test_view(
+        editor_view: &EditorView,
+        vctx: &ViewRenderContext<'_>,
+        surface: &mut CellSurface,
+    ) -> super::RenderOutput {
+        DeferredViewPaint::collect(editor_view, vctx, Arc::new(vctx.theme.clone())).paint(
+            surface,
+            None,
+            None,
+            None,
+            &crate::render::RenderCancellation::never(),
+        )
+    }
+
+    #[test]
+    fn completion_popup_does_not_blank_editor_surface() {
+        let rt = helix_runtime::test::RuntimeTest::default();
+        rt.block_on(async {
+            let text = (0..20)
+                .map(|idx| {
+                    if idx == 15 {
+                        "KEEP_SENTINEL"
+                    } else {
+                        "plain line"
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            let (mut editor, _, doc_id) = test_editor_with_text(&text);
+            let mut editor_view = test_editor_view();
+            let area = Rect::new(0, 0, 80, 24);
+            editor.resize(area);
+
+            let completion_item = {
+                let doc = editor.document(doc_id).expect("document");
+                CompletionItem::Other(helix_core::CompletionItem {
+                    transaction: Transaction::new(doc.text()),
+                    label: Cow::Borrowed("plain_completion"),
+                    kind: Cow::Borrowed("word"),
+                    documentation: None,
+                    provider: CompletionProvider::Word,
+                })
+            };
+            let (ingress, _rx) = crate::runtime::RuntimeIngress::channel(editor.runtime().clone());
+            editor_view
+                .set_completion(&mut editor, vec![completion_item], 0, area, ingress.clone())
+                .expect("completion area");
+
+            let redraw = editor.redraw_handle();
+            let render_ctx = crate::compositor::RenderContext::new(&editor, ingress, redraw);
+            let seed = CellSurface::empty(tui::ratatui::to_ratatui_rect(area));
+            let prepared = editor_view.prepare_render(area, &render_ctx);
+            let mut plan = crate::render::RenderPlan::seeded(area, seed);
+            plan.extend(
+                crate::render::RenderStep::prepared("editor_test", vec![prepared]).into_iter(),
+            );
+            plan.extend(render_ctx.take_render_steps());
+            let seed = plan.take_seed().expect("editor test render seed");
+            let surface = plan
+                .execute(
+                    seed,
+                    &mut crate::render::CacheStore::default(),
+                    &crate::render::RenderCancellation::never(),
+                )
+                .surface;
+
+            let rows = (0..area.height)
+                .map(|y| {
+                    (0..area.width)
+                        .map(|x| surface[(area.x + x, area.y + y)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>();
+
+            assert!(
+                rows.iter().any(|row| row.contains("KEEP_SENTINEL")),
+                "completion overlay blanked editor contents:\n{}",
+                rows.join("\n")
+            );
+        });
     }
 
     #[test]
@@ -3178,7 +3229,6 @@ mod tests {
                 theme: &editor.theme,
                 mode: editor.mode(),
                 syntax_loader: &editor.syn_loader,
-                cursor_cache: &editor.cursor_cache,
                 gutter_context: GutterContext {
                     mode: editor.mode(),
                     line_number: config.line_number,
@@ -3194,13 +3244,10 @@ mod tests {
                     debug_execution: None,
                 },
                 debug_execution: None,
-                cached_syntax: None,
-                dirty_rows: None,
-                seed_line_map: None,
             };
             let mut surface = CellSurface::empty(tui::ratatui::layout::Rect::new(0, 0, 80, 24));
 
-            let output = editor_view.render_view(&vctx, &mut surface);
+            let output = render_test_view(&editor_view, &vctx, &mut surface);
 
             assert!(!output.line_map.lines.is_empty());
             assert!(surface.content.iter().any(|cell| cell.symbol() == "a"));
@@ -3281,7 +3328,7 @@ mod tests {
         let mut view = View::new(DocumentId::default(), Default::default());
         view.area = Rect::new(5, 7, 80, 10);
 
-        assert_eq!(EditorView::content_area(&view), Rect::new(5, 7, 80, 9));
+        assert_eq!(view_content_area(view.area), Rect::new(5, 7, 80, 9));
     }
 
     #[test]
@@ -3334,7 +3381,8 @@ mod tests {
                 })
                 .collect(),
         };
-        editor_view.draw_bufferline_model(&model, area, &mut surface);
+        let prepared = editor_view.prepare_bufferline_render(&model, area);
+        crate::render::CacheStore::default().compose(prepared, &mut surface);
 
         let second_x = editor_view.bufferline_info.visible_buffers[1].columns.start;
         let third_x = editor_view.bufferline_info.visible_buffers[2].columns.start;
@@ -3344,7 +3392,7 @@ mod tests {
 
         assert_eq!(
             surface[(second_x - 1, 0)].symbol(),
-            "│",
+            " ",
             "row={row:?} ranges={:?}",
             editor_view.bufferline_info.visible_buffers
         );
@@ -3362,7 +3410,12 @@ mod tests {
         );
         assert_eq!(
             surface[(third_x - 1, 0)].symbol(),
-            "│",
+            " ",
+            "row={row:?} ranges={:?}",
+            editor_view.bufferline_info.visible_buffers
+        );
+        assert!(
+            !row.contains('│'),
             "row={row:?} ranges={:?}",
             editor_view.bufferline_info.visible_buffers
         );
@@ -3433,7 +3486,6 @@ mod tests {
                 theme: &editor.theme,
                 mode: editor.mode(),
                 syntax_loader: &editor.syn_loader,
-                cursor_cache: &editor.cursor_cache,
                 gutter_context: GutterContext {
                     mode: editor.mode(),
                     line_number: config.line_number,
@@ -3449,11 +3501,8 @@ mod tests {
                     debug_execution: None,
                 },
                 debug_execution: None,
-                cached_syntax: None,
-                dirty_rows: None,
-                seed_line_map: None,
             };
-            let output = editor_view.render_view(&vctx, &mut surface);
+            let output = render_test_view(&editor_view, &vctx, &mut surface);
 
             eprintln!(
                 "render_view_many_giant_lines_repro: lines={} bytes_per_line={} elapsed_us={} mapped_lines={} bytes={}",

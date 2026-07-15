@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     path::{Path, PathBuf},
     str,
 };
@@ -108,6 +108,7 @@ impl<'de> Deserialize<'de> for Config {
 pub struct Loader {
     /// Theme directories to search from highest to lowest priority
     theme_dirs: Vec<PathBuf>,
+    runtime_assets: Option<helix_loader::RuntimeAssets>,
 }
 impl Loader {
     /// Creates a new loader that can load themes from multiple directories.
@@ -117,7 +118,15 @@ impl Loader {
     pub fn new(dirs: &[PathBuf]) -> Self {
         Self {
             theme_dirs: dirs.iter().map(|p| p.join("themes")).collect(),
+            runtime_assets: None,
         }
+    }
+
+    /// Adds the active packaged and bundled runtime as the lowest-priority theme source.
+    #[must_use]
+    pub fn with_runtime_assets(mut self, runtime_assets: helix_loader::RuntimeAssets) -> Self {
+        self.runtime_assets = Some(runtime_assets);
+        self
     }
 
     /// Loads a theme searching directories in priority order.
@@ -141,8 +150,12 @@ impl Loader {
         }
 
         let mut visited_paths = HashSet::new();
+        let runtime = self
+            .runtime_assets
+            .as_ref()
+            .map(helix_loader::RuntimeAssets::snapshot);
         let (theme, warnings) = self
-            .load_theme(name, &mut visited_paths)
+            .load_theme(name, &mut visited_paths, runtime.as_deref())
             .map(Theme::from_toml)?;
 
         let theme = Theme {
@@ -161,8 +174,13 @@ impl Loader {
     /// so long as the second file is in a themes directory with lower priority.
     /// However, it is not recommended that users do this as it will make tracing
     /// errors more difficult.
-    fn load_theme(&self, name: &str, visited_paths: &mut HashSet<PathBuf>) -> Result<Value> {
-        let path = self.path(name, visited_paths)?;
+    fn load_theme(
+        &self,
+        name: &str,
+        visited_paths: &mut HashSet<PathBuf>,
+        runtime: Option<&helix_loader::RuntimeAssetsSnapshot>,
+    ) -> Result<Value> {
+        let path = self.path(name, visited_paths, runtime)?;
 
         let theme_toml = self.load_toml(path)?;
 
@@ -177,7 +195,7 @@ impl Loader {
                 // load default themes's toml from const.
                 "default" => DEFAULT_THEME_DATA.clone(),
                 "base16_default" => BASE16_DEFAULT_THEME_DATA.clone(),
-                _ => self.load_theme(parent_theme_name, visited_paths)?,
+                _ => self.load_theme(parent_theme_name, visited_paths, runtime)?,
             };
 
             self.merge_themes(parent_theme_toml, theme_toml)
@@ -201,6 +219,28 @@ impl Loader {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// Returns all theme names visible through this loader in stable order.
+    pub fn names(&self) -> Result<Vec<String>> {
+        let mut names = BTreeSet::from(["base16_default".to_owned(), "default".to_owned()]);
+        for directory in &self.theme_dirs {
+            names.extend(Self::read_names(directory));
+        }
+        if let Some(runtime_assets) = &self.runtime_assets {
+            for key in runtime_assets.file_keys_in("themes")? {
+                let path = Path::new(&key);
+                if path
+                    .extension()
+                    .is_some_and(|extension| extension == "toml")
+                {
+                    if let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) {
+                        names.insert(stem.to_owned());
+                    }
+                }
+            }
+        }
+        Ok(names.into_iter().collect())
     }
 
     // merge one theme into the parent theme
@@ -240,32 +280,53 @@ impl Loader {
     /// Returns the path to the theme with the given name
     ///
     /// Ignores paths already visited and follows directory priority order.
-    fn path(&self, name: &str, visited_paths: &mut HashSet<PathBuf>) -> Result<PathBuf> {
-        let filename = format!("{}.toml", name);
+    fn path(
+        &self,
+        name: &str,
+        visited_paths: &mut HashSet<PathBuf>,
+        runtime: Option<&helix_loader::RuntimeAssetsSnapshot>,
+    ) -> Result<PathBuf> {
+        let name_path = Path::new(name);
+        if name_path.components().count() != 1 || name_path.file_name().is_none() {
+            return Err(anyhow!("Invalid theme name: {name}"));
+        }
+        let filename = format!("{name}.toml");
 
         let mut cycle_found = false; // track if there was a path, but it was in a cycle
-        self.theme_dirs
-            .iter()
-            .find_map(|dir| {
-                let path = dir.join(&filename);
-                if !path.exists() {
-                    None
-                } else if visited_paths.contains(&path) {
-                    // Avoiding cycle, continuing to look in lower priority directories
+        for directory in &self.theme_dirs {
+            let path = directory.join(&filename);
+            if !path.is_file() {
+                continue;
+            }
+            if visited_paths.contains(&path) {
+                cycle_found = true;
+                continue;
+            }
+            visited_paths.insert(path.clone());
+            return Ok(path);
+        }
+
+        if let Some(runtime_assets) = runtime {
+            let logical_path = Path::new("themes").join(&filename);
+            let resolved = runtime_assets.resolve_file_with(&logical_path, |path| {
+                if visited_paths.contains(path) {
                     cycle_found = true;
-                    None
+                    false
                 } else {
-                    visited_paths.insert(path.clone());
-                    Some(path)
+                    true
                 }
-            })
-            .ok_or_else(|| {
-                if cycle_found {
-                    anyhow!("Cycle found in inheriting: {}", name)
-                } else {
-                    anyhow!("File not found for: {}", name)
-                }
-            })
+            })?;
+            if let Some(resolved) = resolved {
+                visited_paths.insert(resolved.path.clone());
+                return Ok(resolved.path);
+            }
+        }
+
+        if cycle_found {
+            Err(anyhow!("Cycle found in inheriting: {name}"))
+        } else {
+            Err(anyhow!("File not found for: {name}"))
+        }
     }
 
     pub fn default_theme(&self, true_color: bool) -> Theme {
@@ -682,6 +743,69 @@ impl TryFrom<Value> for ThemePalette {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_assets_preserve_theme_priority_and_same_name_inheritance() {
+        use helix_loader::{
+            ActivePackage, RuntimeAsset, RuntimeAssetSpec, RuntimeAssets, RuntimeAssetsSnapshot,
+            RuntimeSnapshot,
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let explicit = temp.path().join("explicit");
+        let runtime_override = temp.path().join("runtime-override");
+        let managed = temp.path().join("managed-demo.toml");
+        let bundled = temp.path().join("bundled");
+        for root in [&explicit, &runtime_override, &bundled] {
+            std::fs::create_dir_all(root.join("themes")).unwrap();
+            std::fs::write(root.join("themes/demo.toml"), b"ui = 'red'").unwrap();
+        }
+        std::fs::write(&managed, b"ui = 'red'").unwrap();
+
+        let assets = RuntimeAssets::from_snapshot(RuntimeAssetsSnapshot::new(
+            RuntimeSnapshot {
+                generation: 1,
+                assets: vec![RuntimeAsset::from_spec(
+                    ActivePackage::new("theme", "demo", "1"),
+                    RuntimeAssetSpec::file("themes/demo.toml", &managed),
+                )],
+            },
+            vec![runtime_override.clone()],
+            vec![bundled.clone()],
+        ));
+        let loader = Loader::new(std::slice::from_ref(&explicit)).with_runtime_assets(assets);
+        let mut visited = HashSet::new();
+
+        let runtime = loader.runtime_assets.as_ref().unwrap().snapshot();
+        assert_eq!(
+            loader.path("demo", &mut visited, Some(&runtime)).unwrap(),
+            explicit.join("themes/demo.toml")
+        );
+        assert_eq!(
+            loader.path("demo", &mut visited, Some(&runtime)).unwrap(),
+            runtime_override.join("themes/demo.toml")
+        );
+        assert_eq!(
+            loader.path("demo", &mut visited, Some(&runtime)).unwrap(),
+            managed
+        );
+        assert_eq!(
+            loader.path("demo", &mut visited, Some(&runtime)).unwrap(),
+            bundled.join("themes/demo.toml")
+        );
+        assert!(loader
+            .path("demo", &mut visited, Some(&runtime))
+            .unwrap_err()
+            .to_string()
+            .contains("Cycle found"));
+        assert!(loader.names().unwrap().contains(&"demo".to_owned()));
+    }
+
+    #[test]
+    fn rejects_theme_names_that_escape_the_theme_directory() {
+        let loader = Loader::new(&[]);
+        assert!(loader.load("../config").is_err());
+    }
 
     #[test]
     fn test_parse_style_string() {

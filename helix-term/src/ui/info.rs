@@ -5,30 +5,50 @@ use crate::{
 };
 use helix_view::graphics::{Margin, Rect};
 use helix_view::info::Info;
+use std::sync::Arc;
 use tui::ratatui::widgets::{Paragraph, Widget};
 
+struct InfoRenderModel {
+    title: Arc<str>,
+    text: Arc<str>,
+    width: u16,
+    height: u16,
+    scroll: usize,
+    styles: InfoPopupStyles,
+    rounded_corners: bool,
+}
+
 impl Component for Info {
-    fn render(
+    fn prepare_render(
         &mut self,
         viewport: Rect,
-        surface: &mut crate::render::CellSurface,
         cx: &RenderContext,
-    ) {
-        let styles = design::InfoPopupStyles::from_theme(cx.theme());
-        let rounded = cx.config().rounded_corners;
-
-        render_info_popup(surface, viewport, self, styles, rounded);
+    ) -> crate::render::PreparedRender {
+        let model = InfoRenderModel {
+            title: Arc::from(self.title.as_ref()),
+            text: Arc::from(self.text.as_str()),
+            width: self.width,
+            height: self.height,
+            scroll: self.scroll,
+            styles: design::InfoPopupStyles::from_theme(cx.theme()),
+            rounded_corners: cx.config().rounded_corners,
+        };
+        crate::render::PreparedRender::deferred(move |cancellation| {
+            let mut output = crate::render::RenderOutput::sparse(viewport);
+            if !cancellation.is_cancelled() {
+                paint_info_popup(output.surface_mut(), viewport, &model);
+            }
+            output
+        })
     }
 }
 
-pub(crate) fn render_info_popup(
+fn paint_info_popup(
     surface: &mut crate::render::CellSurface,
     viewport: Rect,
-    info: &Info,
-    styles: InfoPopupStyles,
-    rounded_corners: bool,
+    model: &InfoRenderModel,
 ) -> Rect {
-    let area = design::info_popup_area(viewport, info);
+    let area = design::info_popup_area(viewport, model.width, model.height);
     if area.width == 0 || area.height == 0 {
         return area;
     }
@@ -40,27 +60,29 @@ pub(crate) fn render_info_popup(
     // area. Centralizing here means a future change to border
     // semantics (style key, glyph set, padding) propagates to every
     // popup that draws a frame.
-    let panel_style = PanelStyle::new(styles.popup, styles.popup, styles.popup);
-    let panel = Panel::framed(panel_style, rounded_corners).title(info.title.as_ref());
+    let panel_style = PanelStyle::new(model.styles.popup, model.styles.popup, model.styles.popup);
+    let panel = Panel::framed(panel_style, model.rounded_corners).title(model.title.as_ref());
     let inner = panel.render(surface, area).inner(Margin::horizontal(1));
 
-    let needs_scrollbar = info.height > inner.height;
+    let needs_scrollbar = model.height > inner.height;
     let body = if needs_scrollbar {
         inner.clip_right(1)
     } else {
         inner
     };
-    let scroll = info.visible_scroll(body.height);
+    let scroll = model
+        .scroll
+        .min((model.height as usize).saturating_sub(body.height as usize));
 
-    Paragraph::new(info.text.as_str())
-        .style(tui::ratatui::to_ratatui_style(styles.text))
+    Paragraph::new(model.text.as_ref())
+        .style(tui::ratatui::to_ratatui_style(model.styles.text))
         .scroll((scroll as u16, 0))
         .render(tui::ratatui::to_ratatui_rect(body), surface);
 
     if needs_scrollbar && inner.width > 0 {
-        crate::widgets::Scrollbar::new(info.height as usize, scroll, inner.height as usize)
+        crate::widgets::Scrollbar::new(model.height as usize, scroll, inner.height as usize)
             .symbol("▌")
-            .thumb_style(styles.scrollbar)
+            .thumb_style(model.styles.scrollbar)
             .render(
                 Rect::new(inner.right().saturating_sub(1), inner.y, 1, inner.height),
                 surface,

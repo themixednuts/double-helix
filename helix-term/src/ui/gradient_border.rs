@@ -4,6 +4,7 @@ use helix_view::{
     graphics::{Color, Rect, Style},
     theme::{Modifier, Theme},
 };
+use std::time::Instant;
 
 type Rgb = (u8, u8, u8);
 
@@ -11,7 +12,7 @@ type Rgb = (u8, u8, u8);
 #[derive(Clone)]
 pub struct GradientBorder {
     config: GradientBorderConfig,
-    animation_frame: u32,
+    started_at: Instant,
     // Cached parsed colors to avoid repeated hex parsing
     start_rgb: Rgb,
     end_rgb: Rgb,
@@ -23,18 +24,19 @@ impl GradientBorder {
         let (start_rgb, end_rgb, middle_rgb) = Self::compute_cached_colors(&config);
         Self {
             config,
-            animation_frame: 0,
+            started_at: Instant::now(),
             start_rgb,
             end_rgb,
             middle_rgb,
         }
     }
 
-    /// Update animation frame for animated gradients
-    pub fn tick(&mut self) {
-        if self.config.animation_speed > 0 {
-            self.animation_frame = self.animation_frame.wrapping_add(1);
-        }
+    pub fn is_animated(&self) -> bool {
+        self.config.enable && self.config.animation_speed > 0
+    }
+
+    pub fn matches_config(&self, config: &GradientBorderConfig) -> bool {
+        self.config == *config
     }
 
     /// Disable gradient animation (set speed to 0)
@@ -87,16 +89,22 @@ impl GradientBorder {
     }
 
     /// Calculate gradient color at a specific position
-    fn get_gradient_color(&self, x: u16, y: u16, area: Rect) -> Color {
+    fn animation_offset_at(&self, now: Instant) -> f32 {
+        if self.config.animation_speed == 0 {
+            return 0.0;
+        }
+
+        // Preserve the old speed scale at a nominal 60 redraws/second while
+        // making phase a function of elapsed time instead of frame count.
+        (now.saturating_duration_since(self.started_at).as_secs_f32()
+            * self.config.animation_speed as f32
+            * 0.6)
+            .fract()
+    }
+
+    fn get_gradient_color(&self, x: u16, y: u16, area: Rect, animation_offset: f32) -> Color {
         let start_color = self.start_rgb;
         let end_color = self.end_rgb;
-
-        // Apply animation offset if enabled
-        let animation_offset = if self.config.animation_speed > 0 {
-            (self.animation_frame as f32 * self.config.animation_speed as f32 * 0.01) % 1.0
-        } else {
-            0.0
-        };
 
         let ratio = match self.config.direction {
             GradientDirection::Horizontal => {
@@ -161,7 +169,7 @@ impl GradientBorder {
     /// Render the gradient border without requiring a theme reference.
     /// (The theme parameter on [`render`] is unused; this avoids the borrow.)
     pub fn render_no_theme(
-        &mut self,
+        &self,
         area: Rect,
         surface: &mut crate::render::CellSurface,
         rounded: bool,
@@ -171,7 +179,7 @@ impl GradientBorder {
 
     /// Render the gradient border around the given area
     pub fn render(
-        &mut self,
+        &self,
         area: Rect,
         surface: &mut crate::render::CellSurface,
         _theme: &Theme,
@@ -180,11 +188,21 @@ impl GradientBorder {
         self.render_inner(area, surface, rounded);
     }
 
-    fn render_inner(
-        &mut self,
+    fn render_inner(&self, area: Rect, surface: &mut crate::render::CellSurface, rounded: bool) {
+        self.render_inner_at(
+            area,
+            surface,
+            rounded,
+            self.animation_offset_at(Instant::now()),
+        );
+    }
+
+    fn render_inner_at(
+        &self,
         area: Rect,
         surface: &mut crate::render::CellSurface,
         rounded: bool,
+        animation_offset: f32,
     ) {
         if !self.config.enable || area.width < 2 || area.height < 2 {
             return;
@@ -202,7 +220,7 @@ impl GradientBorder {
 
         // Render top border
         for x in area.left()..area.right() {
-            let color = self.get_gradient_color(x, area.top(), area);
+            let color = self.get_gradient_color(x, area.top(), area, animation_offset);
             let style = Style::default().fg(color);
             let symbol = if x == area.left() {
                 top_left
@@ -223,7 +241,7 @@ impl GradientBorder {
         // Render bottom border
         let bottom_y = area.bottom() - 1;
         for x in area.left()..area.right() {
-            let color = self.get_gradient_color(x, bottom_y, area);
+            let color = self.get_gradient_color(x, bottom_y, area, animation_offset);
             let style = Style::default().fg(color);
             let symbol = if x == area.left() {
                 bottom_left
@@ -244,7 +262,7 @@ impl GradientBorder {
         // Render left and right borders (skip corners)
         for y in (area.top() + 1)..(area.bottom() - 1) {
             // Left border
-            let color = self.get_gradient_color(area.left(), y, area);
+            let color = self.get_gradient_color(area.left(), y, area, animation_offset);
             let style = Style::default().fg(color);
             {
                 if let Some(cell) = surface.cell_mut((area.left(), y)) {
@@ -255,7 +273,7 @@ impl GradientBorder {
 
             // Right border
             let right_x = area.right() - 1;
-            let color = self.get_gradient_color(right_x, y, area);
+            let color = self.get_gradient_color(right_x, y, area, animation_offset);
             let style = Style::default().fg(color);
             {
                 if let Some(cell) = surface.cell_mut((right_x, y)) {
@@ -264,21 +282,19 @@ impl GradientBorder {
                 }
             };
         }
-
-        // Update animation frame
-        self.tick();
     }
 
     /// Render gradient border with title (for pickers with titles)
     pub fn render_with_title(
-        &mut self,
+        &self,
         area: Rect,
         surface: &mut crate::render::CellSurface,
-        theme: &Theme,
+        _theme: &Theme,
         title: Option<&str>,
         rounded: bool,
     ) {
-        self.render(area, surface, theme, rounded);
+        let animation_offset = self.animation_offset_at(Instant::now());
+        self.render_inner_at(area, surface, rounded, animation_offset);
 
         // If there's a title, render it centered in the top border
         if let Some(title) = title {
@@ -286,7 +302,8 @@ impl GradientBorder {
             if !title.is_empty() && area.width > title_width + 4 {
                 // Center the title
                 let title_start = area.x + (area.width.saturating_sub(title_width)) / 2;
-                let title_color = self.get_gradient_color(title_start, area.y, area);
+                let title_color =
+                    self.get_gradient_color(title_start, area.y, area, animation_offset);
                 let title_style = Style::default()
                     .fg(title_color)
                     .add_modifier(Modifier::BOLD);
@@ -318,5 +335,39 @@ impl GradientBorder {
         }
 
         Self::new(border_config)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn animation_phase_depends_on_elapsed_time_not_render_count() {
+        let config = GradientBorderConfig {
+            enable: true,
+            animation_speed: 2,
+            ..GradientBorderConfig::default()
+        };
+        let border = GradientBorder::new(config);
+        let sample_time = border.started_at + Duration::from_millis(250);
+
+        let first = border.animation_offset_at(sample_time);
+        let repeated = border.animation_offset_at(sample_time);
+
+        assert!((first - 0.3).abs() < 0.000_1);
+        assert_eq!(first, repeated);
+    }
+
+    #[test]
+    fn disabled_animation_has_no_phase_or_redraw_driver() {
+        let border = GradientBorder::new(GradientBorderConfig::default());
+
+        assert!(!border.is_animated());
+        assert_eq!(
+            border.animation_offset_at(border.started_at + Duration::from_secs(10)),
+            0.0
+        );
     }
 }

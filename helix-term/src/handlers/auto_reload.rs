@@ -1,59 +1,37 @@
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::{
+    collections::BTreeSet,
+    sync::{Arc, Mutex},
+};
 
 use crate::runtime::{send_task_event_with, RuntimeTaskEvent};
-use helix_runtime::{send_blocking, Runtime, Work};
-use helix_view::file_watcher::FileWatcher;
+use helix_runtime::Runtime;
+use helix_view::file_watcher::{FileWatcher, FileWatcherEvent};
 use helix_view::handlers::{AutoReloadEvent, Handlers};
 use helix_view::Editor;
 
 #[derive(Debug)]
 pub(super) struct AutoReloadHandler {
-    reload_pending: Arc<AtomicBool>,
-    work: Work,
+    reload_pending: Arc<Mutex<BTreeSet<helix_view::DocumentId>>>,
     ingress: crate::runtime::RuntimeIngress,
 }
 
 impl AutoReloadHandler {
-    fn new(work: Work, ingress: crate::runtime::RuntimeIngress) -> AutoReloadHandler {
+    fn new(ingress: crate::runtime::RuntimeIngress) -> AutoReloadHandler {
         AutoReloadHandler {
             reload_pending: Default::default(),
-            work,
             ingress,
         }
     }
 
-    fn event(&mut self, event: AutoReloadEvent) {
-        match event {
-            AutoReloadEvent::FileChanged { .. } => {
-                let reload_pending = self.reload_pending.clone();
-                let ingress = self.ingress.clone();
-                self.work
-                    .spawn(async move {
-                        send_task_event_with(
-                            RuntimeTaskEvent::AutoReloadRun { reload_pending },
-                            ingress,
-                        )
-                        .await;
-                    })
-                    .detach();
-            }
-            AutoReloadEvent::LeftInsertMode => {
-                if self.reload_pending.load(Ordering::Relaxed) {
-                    let reload_pending = self.reload_pending.clone();
-                    let ingress = self.ingress.clone();
-                    self.work
-                        .spawn(async move {
-                            send_task_event_with(
-                                RuntimeTaskEvent::AutoReloadRun { reload_pending },
-                                ingress,
-                            )
-                            .await;
-                        })
-                        .detach();
-                }
-            }
-        }
+    async fn request_reload(&self, documents: BTreeSet<helix_view::DocumentId>) {
+        send_task_event_with(
+            RuntimeTaskEvent::AutoReloadRun {
+                documents,
+                reload_pending: self.reload_pending.clone(),
+            },
+            self.ingress.clone(),
+        )
+        .await;
     }
 
     pub fn spawn(
@@ -64,9 +42,23 @@ impl AutoReloadHandler {
         let work = runtime.work().clone();
         work.clone()
             .spawn(async move {
-                let mut handler = AutoReloadHandler::new(work, ingress);
+                let handler = AutoReloadHandler::new(ingress);
                 while let Some(event) = rx.recv().await {
-                    handler.event(event);
+                    let mut documents = BTreeSet::new();
+                    let mut left_insert_mode = matches!(event, AutoReloadEvent::LeftInsertMode);
+                    if let AutoReloadEvent::DocumentsChanged { doc_ids } = event {
+                        documents.extend(doc_ids);
+                    }
+                    while let Ok(event) = rx.try_recv() {
+                        left_insert_mode |= matches!(event, AutoReloadEvent::LeftInsertMode);
+                        if let AutoReloadEvent::DocumentsChanged { doc_ids } = event {
+                            documents.extend(doc_ids);
+                        }
+                    }
+
+                    if !documents.is_empty() || left_insert_mode {
+                        handler.request_reload(documents).await;
+                    }
                 }
             })
             .detach();
@@ -74,15 +66,24 @@ impl AutoReloadHandler {
     }
 }
 
-/// Initialize the file watcher and spawn the bridge task that forwards
-/// notify events into the auto-reload handler channel.
+/// Initialize the file watcher and publish directly into the auto-reload reducer.
 pub fn setup_file_watcher(editor: &mut Editor) {
     if !editor.config().auto_reload {
         return;
     }
 
-    let (watcher, mut rx) = match FileWatcher::new() {
-        Ok(pair) => pair,
+    let tx = editor.auto_reload_sender().clone();
+    let watcher = match FileWatcher::new(move |event| {
+        let doc_ids = match event {
+            FileWatcherEvent::Changed { path, doc_ids } => {
+                log::trace!("watched file changed: {}", path.display());
+                doc_ids
+            }
+            FileWatcherEvent::Rescan { doc_ids } => doc_ids,
+        };
+        tx.send(AutoReloadEvent::DocumentsChanged { doc_ids });
+    }) {
+        Ok(watcher) => watcher,
         Err(e) => {
             log::warn!("Failed to initialize file watcher: {e}");
             return;
@@ -90,22 +91,6 @@ pub fn setup_file_watcher(editor: &mut Editor) {
     };
 
     editor.file_watcher = Some(watcher);
-
-    let tx = editor.auto_reload_sender().clone();
-    editor
-        .work()
-        .spawn(async move {
-            while let Some(event) = rx.recv().await {
-                send_blocking(
-                    &tx,
-                    AutoReloadEvent::FileChanged {
-                        path: event.path,
-                        doc_ids: event.doc_ids,
-                    },
-                );
-            }
-        })
-        .detach();
 }
 
 pub(super) fn attach(editor: &helix_view::Editor, _handlers: &Handlers) {

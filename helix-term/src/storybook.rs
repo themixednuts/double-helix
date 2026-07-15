@@ -1,7 +1,7 @@
 //! UI storybook for terminal components.
 //!
 //! Stories are deterministic Ratatui renders. They give us a place to standardize
-//! Helix's terminal UI while keeping Lua plugins on the typed render-op ABI.
+//! Helix's terminal UI while keeping plugin rendering retained and host-owned.
 //!
 //! Interactive stories use `StoryRenderer::Interactive { init, update, render }`:
 //! keep all mutable state in the boxed `init` value, mutate it from terminal key
@@ -17,7 +17,7 @@ use anyhow::{bail, Result};
 #[cfg(test)]
 use crossterm::event::KeyModifiers as CrosstermKeyModifiers;
 use crossterm::event::{KeyCode as CrosstermKeyCode, KeyEvent as CrosstermKeyEvent};
-use helix_plugin::types::{SurfaceRenderOp, SurfaceRenderOps};
+use helix_plugin_api::requests::{UiRect, UiRenderNode};
 use helix_view::{document::Mode, graphics::Rect, info::Info, theme as helix_theme, Editor};
 use tui::ratatui::{
     buffer::Buffer,
@@ -750,19 +750,19 @@ static STORIES: &[Story] = &[
         render: StoryRenderer::Styled(render_messages_story),
     },
     Story {
-        id: "plugins/render-ops",
-        title: "Plugin Render Ops",
+        id: "plugins/retained-nodes",
+        title: "Plugin Retained Nodes",
         category: "Plugins",
-        component: "Plugins/Render Ops",
-        variant: "Typed Surface Ops",
-        summary: "Lua-facing typed render operations applied directly to a Ratatui buffer.",
+        component: "Plugins/Retained Nodes",
+        variant: "Host Rendered",
+        summary: "Serializable retained plugin nodes applied directly to a Ratatui buffer.",
         kind: StoryKind::Contract,
         args: &[
-            StoryArg::new("ops", "6", "Typed render operation count"),
-            StoryArg::new("surface", "ratatui", "Native terminal render target"),
+            StoryArg::new("nodes", "5", "Retained node count"),
+            StoryArg::new("target", "ratatui", "Native terminal render target"),
         ],
         canvas: StoryCanvas::Padded { x: 1, y: 1 },
-        render: StoryRenderer::Styled(render_plugin_ops_story),
+        render: StoryRenderer::Styled(render_plugin_retained_story),
     },
 ];
 
@@ -890,7 +890,7 @@ fn run_interactive(
     use tui::{backend::CrosstermBackend, ratatui::TerminalSession};
 
     let initial_index = story_index(story_id)?;
-    let themes = available_theme_names();
+    let themes = available_theme_names()?;
     let mut active_theme = load_storybook_theme(&theme_choice, theme_mode)?;
     let mut theme_index = themes
         .iter()
@@ -977,7 +977,7 @@ pub fn dump_story(story_id: &str, width: u16, height: u16) -> Result<String> {
     // and independent of the user's config. We load the named theme but pair
     // it with the default editor config so mode labels, bufferline visibility,
     // statusline elements, etc. don't drift with personal customizations.
-    let theme = theme_loader().load("default")?;
+    let theme = theme_loader()?.load("default")?;
     let editor_config = helix_view::editor::Config::default();
     let loaded = LoadedTheme::new(theme, editor_config);
     dump_story_with_theme(story_id, width, height, &loaded)
@@ -1638,7 +1638,7 @@ fn render_message_list_story(surface: &mut Buffer, area: Rect, styles: UiStyleGu
             message_style,
         )
         .with_selected_details(vec![hline(
-            "details: applied render ops, state model, and layout measurements",
+            "details: retained nodes, state model, and layout measurements",
             styles.info,
         )])
         .with_selected_bar("▎", styles.accent),
@@ -2381,7 +2381,7 @@ fn render_autoinfo_scroll_story(surface: &mut Buffer, area: Rect, context: Story
     let mut editor_view = harness::build_editor_view();
     stage.draw(surface, &mut editor_view);
     let mut info = space_key_infobox().clone();
-    let popup_area = design::info_popup_area(area, &info);
+    let popup_area = design::info_popup_area(area, info.width, info.height);
     let visible_body_height = design::info_popup_body_height(popup_area);
     info.scroll_to(info.max_scroll(visible_body_height), visible_body_height);
     stage.draw(surface, &mut info);
@@ -2596,21 +2596,17 @@ fn render_prompt_cmdline_story(surface: &mut Buffer, area: Rect, context: StoryC
 }
 
 fn build_cmdline_prompt(editor: &Editor, initial: &str) -> crate::ui::Prompt {
-    use crate::ui::prompt::{Completion, PromptEvent};
-    let completer = |_editor: &Editor, input: &str| -> Vec<Completion> {
-        const COMMANDS: &[&str] = &[
+    use crate::ui::prompt::PromptEvent;
+    let completer = crate::ui::completers::CandidateCompleter::prefix(
+        [
             "write",
             "write-all",
             "write-quit",
             "write-quit-all",
             "write-buffer-close",
-        ];
-        COMMANDS
-            .iter()
-            .filter(|name| name.starts_with(input))
-            .map(|name| (0.., (*name).into()))
-            .collect()
-    };
+        ]
+        .map(str::to_owned),
+    );
     let callback = |_cx: &mut crate::compositor::Context, _input: &str, _event: PromptEvent| {};
     // The "Cmdline" label is rewritten to `:` in CmdlineStyle::Bottom (which
     // is the default), giving us the real cmdline appearance for free.
@@ -2658,7 +2654,7 @@ fn render_completion_menu_story(surface: &mut Buffer, area: Rect, context: Story
             "Render the body of the currently selected story.",
         ),
         make_item(
-            "render_plugin_ops_story",
+            "render_plugin_retained_story",
             "fn",
             "Story: apply typed Lua render operations directly to a Ratatui buffer.",
         ),
@@ -2683,7 +2679,7 @@ fn render_completion_menu_story(surface: &mut Buffer, area: Rect, context: Story
     let ingress = stage.ingress();
     let mut completion =
         crate::ui::Completion::new(stage.editor(), items, 0, resolve_runtime, ingress);
-    // Select `render_plugin_ops_story` so the docs preview pane renders.
+    // Select `render_plugin_retained_story` so the docs preview pane renders.
     for _ in 0..3 {
         completion.move_down();
     }
@@ -2844,6 +2840,7 @@ fn render_assistant_panel_story(surface: &mut Buffer, area: Rect, context: Story
             thread,
             event: thread::Event::Content(Content::Append(NewEntry {
                 turn: None,
+                stream: None,
                 kind,
                 locations: Vec::new(),
             })),
@@ -2863,7 +2860,7 @@ fn render_assistant_panel_story(surface: &mut Buffer, area: Rect, context: Story
         thread_id,
         EntryKind::AssistantText {
             text: "The storybook now tracks widgets and app patterns. \
-                   Plugin render ops keep the same semantic look."
+                   Plugin retained nodes keep the same semantic look."
                 .into(),
         },
     );
@@ -3031,7 +3028,7 @@ fn render_messages_story(surface: &mut Buffer, area: Rect, styles: UiStyleGuide)
         crate::widgets::Message::plain(vec![Spans::from(vec![
             HSpan::styled("system ", styles.muted),
             HSpan::styled(
-                "Plugin render callbacks emit typed ops and stay backend-free.",
+                "Plugin panels publish retained nodes and stay backend-free.",
                 styles.text,
             ),
         ])])
@@ -3044,46 +3041,65 @@ fn render_messages_story(surface: &mut Buffer, area: Rect, styles: UiStyleGuide)
     crate::widgets::message_list(surface, area, &items, 0, Some(1));
 }
 
-fn render_plugin_ops_story(surface: &mut Buffer, area: Rect, styles: UiStyleGuide) {
-    let mut ops = SurfaceRenderOps::default();
-    ops.push(SurfaceRenderOp::Clear {
-        area,
-        style: styles.panel,
+fn render_plugin_retained_story(surface: &mut Buffer, area: Rect, styles: UiStyleGuide) {
+    let nodes = [
+        UiRenderNode::Fill {
+            area: UiRect {
+                x: 0,
+                y: 0,
+                width: area.width,
+                height: area.height,
+            },
+            style: "panel".into(),
+        },
+        UiRenderNode::Header {
+            area: UiRect {
+                x: 0,
+                y: 0,
+                width: area.width,
+                height: 1,
+            },
+            title: "Plugin panel from retained nodes".into(),
+            current: None,
+            total: None,
+            style: "accent".into(),
+        },
+        UiRenderNode::Text {
+            x: 1,
+            y: 2,
+            text: "Lua publishes data; term applies it directly to Ratatui.".into(),
+            style: "text".into(),
+            max_width: None,
+        },
+        UiRenderNode::Text {
+            x: 1,
+            y: 4,
+            text: "Retained nodes render without invoking plugin code during a frame.".into(),
+            style: "success".into(),
+            max_width: Some(area.width.saturating_sub(4)),
+        },
+        UiRenderNode::Scrollbar {
+            area: UiRect {
+                x: area.width.saturating_sub(1),
+                y: 1,
+                width: 1,
+                height: area.height.saturating_sub(2),
+            },
+            total: 40,
+            offset: cycling_scroll_offset(40, 12, styles.tick, 1),
+            visible: 12,
+            thumb_style: "accent".into(),
+            track_symbol: Some(" ".into()),
+            track_style: "border".into(),
+        },
+    ];
+    crate::ui::plugin_render::render_retained_nodes(surface, area, &nodes, |scope| match scope {
+        "panel" => styles.panel,
+        "accent" => styles.accent,
+        "success" => styles.success,
+        "border" => styles.border,
+        _ => styles.text,
     });
-    ops.push(SurfaceRenderOp::Header {
-        area: Rect::new(area.x, area.y, area.width, 1),
-        title: "Plugin panel from typed render ops".to_string(),
-        style: styles.accent,
-    });
-    ops.push(SurfaceRenderOp::SetString {
-        x: area.x.saturating_add(1),
-        y: area.y.saturating_add(2),
-        text: "Lua emits data; term applies directly to Ratatui.".to_string(),
-        style: styles.text,
-    });
-    ops.push(SurfaceRenderOp::SetStringN {
-        x: area.x.saturating_add(1),
-        y: area.y.saturating_add(4),
-        text: "Typed operations are applied directly to the active terminal buffer.".to_string(),
-        max_width: area.width.saturating_sub(4) as usize,
-        style: styles.success,
-    });
-    ops.push(SurfaceRenderOp::Scrollbar {
-        area: Rect::new(
-            area.right().saturating_sub(1),
-            area.y.saturating_add(1),
-            1,
-            area.height.saturating_sub(2),
-        ),
-        total: 40,
-        offset: cycling_scroll_offset(40, 12, styles.tick, 1),
-        visible: 12,
-        thumb_style: styles.accent,
-        track_symbol: Some(" ".to_string()),
-        track_style: styles.border,
-    });
-
-    crate::ui::plugin_render::apply_plugin_render_ops(surface, ops);
 }
 
 fn print_usage() {
@@ -3120,7 +3136,7 @@ fn print_story_list() {
 
 fn print_theme_list() -> Result<()> {
     let configured = load_storybook_theme(&ThemeChoice::Configured, None)?.name;
-    for name in available_theme_names() {
+    for name in available_theme_names()? {
         let marker = if name == configured { "*" } else { " " };
         println!("{marker} {name}");
     }
@@ -3426,7 +3442,7 @@ mod tests {
             "ui/status-notifications",
             "components/inputs",
             "components/messages",
-            "plugins/render-ops",
+            "plugins/retained-nodes",
         ];
 
         for id in required {
@@ -3447,7 +3463,7 @@ mod tests {
 
     #[test]
     fn storybook_helix_roles_match_runtime_design_contract() {
-        let theme = theme_loader().load("default").unwrap();
+        let theme = theme_loader().unwrap().load("default").unwrap();
         let storybook = UiStyleGuide::from_theme(&theme);
         let design = HelixUiDesign::from_theme(&theme);
 

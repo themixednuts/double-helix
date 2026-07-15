@@ -12,11 +12,10 @@ use helix_view::theme;
 
 use super::model::LoadedTheme;
 
-pub(super) fn theme_loader() -> theme::Loader {
+pub(super) fn theme_loader() -> Result<theme::Loader> {
     ensure_loader_paths();
-    let mut theme_parent_dirs = vec![helix_loader::config_dir()];
-    theme_parent_dirs.extend(helix_loader::runtime_dirs().iter().cloned());
-    theme::Loader::new(&theme_parent_dirs)
+    Ok(theme::Loader::new(&[helix_loader::config_dir()])
+        .with_runtime_assets(helix_loader::runtime_assets()?.clone()))
 }
 
 pub(super) fn ensure_loader_paths() {
@@ -38,14 +37,14 @@ pub(super) fn load_storybook_config() -> Result<crate::config::Config> {
 
 pub(super) fn load_named_storybook_theme(name: &str) -> Result<LoadedTheme> {
     let config = load_storybook_config()?;
-    Ok(LoadedTheme::new(theme_loader().load(name)?, config.editor))
+    Ok(LoadedTheme::new(theme_loader()?.load(name)?, config.editor))
 }
 
 pub(super) fn load_storybook_theme(
     choice: &ThemeChoice,
     mode: Option<theme::Mode>,
 ) -> Result<LoadedTheme> {
-    let loader = theme_loader();
+    let loader = theme_loader()?;
     let config = load_storybook_config()?;
     let theme = match choice {
         ThemeChoice::Configured => match config.theme.as_ref() {
@@ -58,17 +57,8 @@ pub(super) fn load_storybook_theme(
     Ok(LoadedTheme::new(theme, config.editor))
 }
 
-pub(super) fn available_theme_names() -> Vec<String> {
-    let mut names = vec!["default".to_string(), "base16_default".to_string()];
-    names.extend(theme::Loader::read_names(
-        &helix_loader::config_dir().join("themes"),
-    ));
-    for runtime_dir in helix_loader::runtime_dirs() {
-        names.extend(theme::Loader::read_names(&runtime_dir.join("themes")));
-    }
-    names.sort();
-    names.dedup();
-    names
+pub(super) fn available_theme_names() -> Result<Vec<String>> {
+    theme_loader()?.names()
 }
 
 pub(super) fn parse_theme_mode(value: &str) -> Result<theme::Mode> {

@@ -19,6 +19,25 @@ struct TextLayout {
     total_width: usize,
 }
 
+#[derive(Debug, Clone)]
+pub struct MarqueeFrame {
+    text: Arc<str>,
+    byte_start: usize,
+    pub next_redraw: Option<Instant>,
+}
+
+impl MarqueeFrame {
+    pub fn paint(&self, area: Rect, surface: &mut crate::render::CellSurface, style: Style) {
+        surface.set_stringn(
+            area.x,
+            area.y,
+            &self.text[self.byte_start..],
+            area.width as usize,
+            tui::ratatui::to_ratatui_style(style),
+        );
+    }
+}
+
 impl TextLayout {
     fn new(text: Arc<str>) -> Self {
         let mut byte_offsets = Vec::new();
@@ -47,27 +66,6 @@ impl TextLayout {
         match self.cum_widths.binary_search(&threshold) {
             Ok(i) | Err(i) => i,
         }
-    }
-
-    fn render_at_offset(
-        &self,
-        char_offset: usize,
-        area: Rect,
-        surface: &mut crate::render::CellSurface,
-        style: Style,
-    ) {
-        let byte_start = self
-            .byte_offsets
-            .get(char_offset)
-            .copied()
-            .unwrap_or(self.text.len());
-        surface.set_stringn(
-            area.x,
-            area.y,
-            &self.text[byte_start..],
-            area.width as usize,
-            tui::ratatui::to_ratatui_style(style),
-        );
     }
 }
 
@@ -145,35 +143,52 @@ impl Marquee {
         surface: &mut crate::render::CellSurface,
         style: Style,
     ) -> Option<Instant> {
+        let frame = self.sample(area.width, Instant::now())?;
+        frame.paint(area, surface, style);
+        frame.next_redraw
+    }
+
+    pub fn sample(&self, viewport_width: u16, now: Instant) -> Option<MarqueeFrame> {
         let layout = self.layout.as_ref()?;
-        let viewport = area.width as usize;
+        let viewport = viewport_width as usize;
         if viewport == 0 {
             return None;
         }
         if layout.total_width <= viewport {
-            layout.render_at_offset(0, area, surface, style);
-            return None;
+            return Some(MarqueeFrame {
+                text: Arc::clone(&layout.text),
+                byte_start: 0,
+                next_redraw: None,
+            });
         }
 
         let scroll_start = self.scroll_start?;
         let last_activity = self.last_activity?;
-        let now = Instant::now();
         if now.saturating_duration_since(last_activity) > self.inactivity_timeout {
-            layout.render_at_offset(0, area, surface, style);
-            return None;
+            return Some(MarqueeFrame {
+                text: Arc::clone(&layout.text),
+                byte_start: 0,
+                next_redraw: None,
+            });
         }
 
         let max_offset = layout.max_scroll_offset(viewport);
         if max_offset == 0 {
-            layout.render_at_offset(0, area, surface, style);
-            return None;
+            return Some(MarqueeFrame {
+                text: Arc::clone(&layout.text),
+                byte_start: 0,
+                next_redraw: None,
+            });
         }
 
         let cycle = self.scroll_duration + self.hold_end + self.hold_start;
         let cycle_secs = cycle.as_secs_f64();
         if cycle_secs <= 0.0 {
-            layout.render_at_offset(0, area, surface, style);
-            return None;
+            return Some(MarqueeFrame {
+                text: Arc::clone(&layout.text),
+                byte_start: 0,
+                next_redraw: None,
+            });
         }
 
         let pos = now.saturating_duration_since(scroll_start).as_secs_f64() % cycle_secs;
@@ -201,21 +216,17 @@ impl Marquee {
             (0, now + Duration::from_secs_f64(cycle_secs - pos))
         };
 
-        layout.render_at_offset(char_offset, area, surface, style);
-        Some(next_frame)
+        let byte_start = layout
+            .byte_offsets
+            .get(char_offset)
+            .copied()
+            .unwrap_or(layout.text.len());
+        Some(MarqueeFrame {
+            text: Arc::clone(&layout.text),
+            byte_start,
+            next_redraw: Some(next_frame),
+        })
     }
-}
-
-pub fn schedule_redraw_at(
-    work: helix_runtime::Work,
-    when: Instant,
-    redraw: helix_runtime::FrameHandle,
-) {
-    work.spawn(async move {
-        tokio::time::sleep_until(tokio::time::Instant::from_std(when)).await;
-        redraw.request_redraw();
-    })
-    .detach();
 }
 
 #[cfg(test)]
@@ -260,5 +271,17 @@ mod tests {
         assert!(marquee
             .render(area, &mut surface, Style::default())
             .is_some());
+    }
+
+    #[test]
+    fn sampled_frame_is_owned_and_send() {
+        fn assert_send<T: Send>() {}
+
+        let mut marquee = Marquee::new();
+        marquee.set_text(Some("owned frame"));
+        let frame = marquee.sample(5, Instant::now()).expect("frame");
+
+        assert_send::<MarqueeFrame>();
+        assert!(Arc::strong_count(&frame.text) >= 2);
     }
 }

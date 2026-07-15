@@ -5,6 +5,10 @@
 | `:quit`, `:q` | Close the current view. |
 | `:quit!`, `:q!` | Force close the current view, ignoring unsaved changes. |
 | `:open`, `:o`, `:edit`, `:e` | Open a file from disk into the current view. |
+| `:pkg` | Open the package manager picker. |
+| `:pkg-install`, `:pkg install` | Install one or more packages. |
+| `:pkg-update`, `:pkg update` | Update packages, or all installed packages when no name is supplied. |
+| `:pkg-sync`, `:pkg sync` | Sync installed packages from pkg.toml and pkg.lock. |
 | `:buffer-close`, `:bc`, `:bclose` | Close the current buffer. |
 | `:buffer-close!`, `:bc!`, `:bclose!` | Close the current buffer forcefully, ignoring unsaved changes. |
 | `:buffer-close-others`, `:bco`, `:bcloseother` | Close all buffers but the currently focused one. |
@@ -103,10 +107,12 @@
 | `:notifications-dismiss`, `:notif-dismiss`, `:nd` | Dismiss all active notifications. |
 | `:notifications-test`, `:notif-test`, `:nt` | Test notification system with sample notifications. |
 | `:assistant-connect`, `:agent` | Connect to an assistant backend. Shows picker if no args, or use: :assistant-connect <command> [args...] |
+| `:assistant-agents`, `:acp-agents` | Browse, install, update, remove, and connect ACP assistant agents. |
 | `:assistant-prompt`, `:ask` | Send a prompt to the active assistant thread. Usage: :assistant-prompt <message> |
 | `:assistant-open`, `:assistant` | Open the assistant panel. |
 | `:assistant-cancel`, `:stop` | Cancel the active assistant run. |
 | `:assistant-open-history`, `:sessions` | Browse and load assistant history for the current scope. |
+| `:assistant-profile`, `:profile` | Select an assistant profile for the active or next assistant thread. |
 | `:assistant-new-thread`, `:new-thread` | Create a new assistant thread on the active backend. |
 | `:assistant-close-thread`, `:close-thread` | Close the active assistant thread. |
 | `:assistant-next-thread`, `:next-thread` | Activate the next assistant thread tab. |

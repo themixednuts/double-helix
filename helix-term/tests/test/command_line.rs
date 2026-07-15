@@ -3,6 +3,58 @@ use super::*;
 use helix_core::diagnostic::Severity;
 
 #[tokio::test(flavor = "multi_thread")]
+async fn startup_accepts_delayed_terminal_input() -> anyhow::Result<()> {
+    let mut app = AppBuilder::new().build()?;
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut events = tokio_stream::wrappers::UnboundedReceiverStream::new(rx);
+
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        for key_event in helix_view::input::parse_macro(":q!<ret>").unwrap() {
+            #[cfg(windows)]
+            let event = crossterm::event::Event::Key(crossterm::event::KeyEvent::from(key_event));
+            #[cfg(not(windows))]
+            let event = termina::event::Event::Key(termina::event::KeyEvent::from(key_event));
+            tx.send(Ok(event)).unwrap();
+        }
+    });
+
+    let exit_code =
+        tokio::time::timeout(std::time::Duration::from_secs(5), app.run(&mut events)).await??;
+    assert_eq!(exit_code, 0);
+    assert!(app.editor.should_close());
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn startup_input_is_not_starved_by_background_handlers() -> anyhow::Result<()> {
+    let mut app = AppBuilder::new().build()?;
+    let enabled = |app: &helix_term::application::Application| {
+        assert!(app.editor.config().cursorline);
+    };
+    let disabled = |app: &helix_term::application::Application| {
+        assert!(!app.editor.config().cursorline);
+    };
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        test_key_sequences(
+            &mut app,
+            vec![
+                (Some(":set cursorline true<ret>"), Some(&enabled)),
+                (Some("<space><esc>"), None),
+                (Some(":set cursorline false<ret>"), Some(&disabled)),
+            ],
+            false,
+        ),
+    )
+    .await??;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn history_completion() -> anyhow::Result<()> {
     test_key_sequence(
         &mut AppBuilder::new().build()?,

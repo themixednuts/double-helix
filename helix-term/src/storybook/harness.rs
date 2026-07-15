@@ -56,7 +56,7 @@ impl Stage {
         };
         let mut embedded = EmbeddedEditorBuilder::new(area, runtime)
             .config(config)
-            .theme_loader(Arc::new(super::theme_loader()))
+            .theme_loader(Arc::new(helix_view::theme::Loader::new(&[])))
             .build()
             .expect("storybook embedded editor");
         embedded.editor_mut().set_theme(context.theme.clone());
@@ -126,7 +126,7 @@ impl Stage {
     pub fn render_context(&self) -> RenderContext<'_> {
         let editor = self.embedded.editor();
         let redraw = editor.redraw_handle();
-        RenderContext::new(editor, self.embedded.ingress(), redraw, None)
+        RenderContext::new(editor, self.embedded.ingress(), redraw)
     }
 
     /// Drive a component's `required_size` → `sync` → `render` lifecycle on
@@ -139,7 +139,7 @@ impl Stage {
     /// Like [`Stage::draw`] but renders into a sub-region of the stage area.
     pub fn draw_in<C: Component>(&mut self, area: Rect, surface: &mut Buffer, component: &mut C) {
         component.required_size((area.width, area.height));
-        component.sync(self.embedded.editor_mut());
+        component.sync(area, self.embedded.editor_mut());
         let render_ctx = self.render_context();
         component.render(area, surface, &render_ctx);
     }

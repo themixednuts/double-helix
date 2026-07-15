@@ -136,6 +136,11 @@ async fn test_exit_wo_buffer_wo_path() -> anyhow::Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_quit_last_view_does_not_render_empty_tree() -> anyhow::Result<()> {
+    test_key_sequence(&mut AppBuilder::new().build()?, Some(":q<ret>"), None, true).await
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_exit_w_buffer_wo_file() -> anyhow::Result<()> {
     let mut file = tempfile::NamedTempFile::new()?;
     test_key_sequence(

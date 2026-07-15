@@ -1,6 +1,5 @@
 use helix_view::{
     graphics::{Modifier, Rect, Style},
-    info::Info,
     theme::Theme,
 };
 
@@ -257,11 +256,11 @@ impl HelixUiDesign {
     }
 }
 
-pub(crate) fn info_popup_area(viewport: Rect, info: &Info) -> Rect {
+pub(crate) fn info_popup_area(viewport: Rect, content_width: u16, content_height: u16) -> Rect {
     let reserved_bottom = if viewport.height > 2 { 2 } else { 0 };
     let available_height = viewport.height.saturating_sub(reserved_bottom);
-    let width = info.width.saturating_add(4).min(viewport.width);
-    let height = info.height.saturating_add(2).min(available_height);
+    let width = content_width.saturating_add(4).min(viewport.width);
+    let height = content_height.saturating_add(2).min(available_height);
     Rect::new(
         viewport.x + viewport.width.saturating_sub(width),
         viewport.y

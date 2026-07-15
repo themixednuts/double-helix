@@ -18,7 +18,6 @@ use std::{
     collections::HashSet,
     hash::{Hash, Hasher},
 };
-use tokio::time::sleep as tokio_sleep;
 
 // ---------------------------------------------------------------------------
 // Stateful popup — tracks notification lifecycle (add / expire / dismiss)
@@ -78,6 +77,7 @@ impl NotificationPopup {
         config: &Config,
         notifications: &[Notification],
         work: helix_runtime::Work,
+        clock: helix_runtime::Clock,
         ingress: crate::runtime::RuntimeIngress,
     ) {
         let notifications_config = &config.notifications;
@@ -131,9 +131,12 @@ impl NotificationPopup {
                         std::time::Duration::from_millis(0)
                     };
                     let ingress = ingress.clone();
+                    let clock = clock.clone();
 
                     work.spawn(async move {
-                        tokio_sleep(remaining).await;
+                        if clock.timer(remaining).await.is_err() {
+                            return;
+                        }
                         crate::runtime::send_task_event_with(
                             RuntimeTaskEvent::DismissNotification { id },
                             ingress,
@@ -161,6 +164,7 @@ impl NotificationPopup {
             config,
             cx.notification_history(),
             cx.work(),
+            cx.clock(),
             cx.ingress.clone(),
         );
         let notifications_config = &config.notifications;
@@ -271,44 +275,6 @@ impl NotificationPopup {
         }
     }
 
-    fn render_surface(
-        &mut self,
-        area: Rect,
-        surface: &mut crate::render::CellSurface,
-        cx: &RenderContext,
-    ) {
-        let config = cx.config();
-        let config = &*config;
-        self.update(
-            config,
-            cx.notification_history(),
-            cx.work(),
-            cx.ingress.clone(),
-        );
-        let notifications_config = &config.notifications;
-
-        self.layout_thickness = if config.gradient_borders.enable {
-            config.gradient_borders.thickness as u16
-        } else {
-            notifications_config.border.width as u16
-        };
-        self.layout_rounded = config.rounded_corners || notifications_config.border.radius > 0;
-        self.layout_padding = notifications_config.padding;
-
-        if self.notifications.is_empty() {
-            return;
-        }
-
-        self.apply_queue_layout(notifications_config);
-        self.calculate_notification_areas(area, notifications_config);
-
-        let mut model = NotificationModel::collect(self, config, cx.theme());
-        let items: Vec<NotificationRenderItem> = model.items.clone();
-        for item in items.iter().rev() {
-            render_notification(&mut model, item, surface);
-        }
-    }
-
     fn toasts(&self) -> Vec<Toast<'static>> {
         self.notifications
             .iter()
@@ -347,8 +313,12 @@ impl Component for NotificationPopup {
         EventResult::Ignored(None)
     }
 
-    fn render(&mut self, area: Rect, surface: &mut crate::render::CellSurface, cx: &RenderContext) {
-        self.render_surface(area, surface, cx);
+    fn prepare_render(&mut self, area: Rect, cx: &RenderContext) -> crate::render::PreparedRender {
+        self.prepare_snapshot(area, cx).unwrap_or_else(|| {
+            crate::render::PreparedRender::deferred(move |_cancellation| {
+                crate::render::RenderOutput::sparse(area)
+            })
+        })
     }
 }
 
@@ -556,10 +526,13 @@ fn prepare_notification_render(
         key: model.cache_key(),
         area,
     };
-    PreparedRender::snapshot(tag, model, move |mut model| {
+    PreparedRender::snapshot(tag, model, move |mut model, cancellation| {
         let mut output = RenderOutput::new(area);
         let items: Vec<NotificationRenderItem> = model.items.clone();
         for item in items.iter().rev() {
+            if cancellation.is_cancelled() {
+                break;
+            }
             render_notification(&mut model, item, output.surface_mut());
         }
         output

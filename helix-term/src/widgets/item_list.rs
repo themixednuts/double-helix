@@ -155,7 +155,7 @@ where
 
     let win_height = area.height as usize;
     let viewport = ListViewport::new(item_count, selected, win_height, scroll);
-    let visible_range = viewport.visible_range();
+    let visible_range = viewport.selected_visible_range();
     let scroll = visible_range.start;
     let visible_end = visible_range.end;
 
@@ -268,5 +268,24 @@ mod tests {
     #[test]
     fn sticky_header_is_none_before_first_group() {
         assert_eq!(pinned_sticky_row(&[2, 5], 0), None);
+    }
+
+    #[test]
+    fn item_list_scrolls_selected_row_into_view() {
+        let mut surface =
+            crate::render::CellSurface::empty(tui::ratatui::layout::Rect::new(0, 0, 10, 3));
+        let state = item_list(
+            &mut surface,
+            Rect::new(0, 0, 10, 3),
+            10,
+            Some(7),
+            0,
+            &ListStyles::default(),
+            |_index, _area, _surface, _selected| {},
+        );
+
+        assert_eq!(state.scroll, 5);
+        assert_eq!(state.visible_start, 5);
+        assert_eq!(state.visible_end, 8);
     }
 }

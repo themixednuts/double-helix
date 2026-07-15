@@ -50,7 +50,7 @@ pub use item_list::{
     ListStyles, MarkedItems, StickyRows,
 };
 pub use marquee::{
-    schedule_redraw_at, Marquee, DEFAULT_HOLD_END, DEFAULT_HOLD_START, DEFAULT_INACTIVITY_TIMEOUT,
+    Marquee, MarqueeFrame, DEFAULT_HOLD_END, DEFAULT_HOLD_START, DEFAULT_INACTIVITY_TIMEOUT,
     DEFAULT_SCROLL_DURATION,
 };
 pub use message::{message, MessageAlign, MessageCorners, MessageState, MessageStyle};
@@ -73,7 +73,7 @@ pub use tabs::{
     tabs, tabs_layout, tabs_layout_with_options, tabs_with_options, Tab, TabCell, TabRange,
     TabsOptions, TabsScrollPolicy, TabsState, TabsStyle,
 };
-pub use text_input::{text_input, TextInputState};
+pub use text_input::{paint_text_input, text_input, TextInputState};
 pub use toast::{
     toast_queue, Toast, ToastId, ToastQueue, ToastQueueState, ToastSeverity, ToastStyle,
 };

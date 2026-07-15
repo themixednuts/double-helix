@@ -13,6 +13,8 @@ use tui::ratatui::layout::Constraint;
 
 pub use crate::widgets::{TableCell as Cell, TableRow as Row};
 
+const LEFT_PADDING: usize = 1;
+
 fn constrained_width(constraint: Constraint, length: u16) -> u16 {
     match constraint {
         Constraint::Percentage(percent) => {
@@ -73,9 +75,18 @@ pub struct Menu<T: Item> {
     auto_close: bool,
 }
 
-impl<T: Item> Menu<T> {
-    const LEFT_PADDING: usize = 1;
+struct MenuRenderModel {
+    rows: Vec<Row<'static>>,
+    total_rows: usize,
+    scroll: usize,
+    selected: Option<usize>,
+    widths: Vec<Constraint>,
+    styles: crate::ui::design::MenuStyles,
+    accent_rail_color: Option<helix_view::theme::Color>,
+    render_borders: bool,
+}
 
+impl<T: Item> Menu<T> {
     // TODO: it's like a slimmed down picker, share code? (picker = menu + prompt with different
     // rendering)
     pub fn new(
@@ -246,7 +257,7 @@ impl<T: Item> Menu<T> {
             len += 1; // +1: reserve some space for scrollbar
         }
 
-        len += Self::LEFT_PADDING;
+        len += LEFT_PADDING;
         let width = len.min(viewport.0 as usize);
 
         self.widths = max_lens
@@ -323,112 +334,117 @@ impl<T: Item> Menu<T> {
         self.effective_cursor()
     }
 
-    fn render_surface(
-        &mut self,
-        area: Rect,
-        surface: &mut crate::render::CellSurface,
-        cx: &RenderContext,
-    ) {
+    fn render_model(&self, area: Rect, cx: &RenderContext) -> MenuRenderModel {
         let theme = cx.theme();
         let styles = crate::ui::design::MenuStyles::from_theme(theme);
-        let style = styles.background;
-        let selected = styles.selected;
-        // Thin accent rail at the left of the selected row — visible even when
-        // the selection background is subtle, and consistent with the picker's
-        // chevron affordance. Reuses ui.text.focus so the accent is the same
-        // colour across every menu surface (completion, select, etc.).
         let accent_rail_color = theme.try_get("ui.text.focus").and_then(|s| s.fg);
-
-        {
-            let area = tui::ratatui::to_ratatui_rect(area);
-            tui::ratatui::widgets::Widget::render(tui::ratatui::widgets::Clear, area, surface);
-            surface.set_style(area, tui::ratatui::to_ratatui_style(style));
-        };
-
         let scroll = self.scroll;
-        let options: Vec<_> = self
+        let rows = self
             .matches
             .iter()
-            .map(|(index, _score)| &self.options[*index as usize])
+            .skip(scroll)
+            .take(area.height as usize)
+            .map(|(index, _score)| {
+                self.options[*index as usize]
+                    .format(&self.editor_data)
+                    .into_owned()
+            })
             .collect();
-        let len = options.len();
-        let win_height = area.height as usize;
-        if len == 0 || win_height == 0 {
-            return;
+        MenuRenderModel {
+            rows,
+            total_rows: self.matches.len(),
+            scroll,
+            selected: self.effective_cursor(),
+            widths: self.widths.clone(),
+            styles,
+            accent_rail_color,
+            render_borders: cx.menu_border(),
+        }
+    }
+}
+
+fn paint_menu(surface: &mut crate::render::CellSurface, area: Rect, model: &MenuRenderModel) {
+    let style = model.styles.background;
+    let selected = model.styles.selected;
+    let ratatui_area = tui::ratatui::to_ratatui_rect(area);
+    tui::ratatui::widgets::Widget::render(tui::ratatui::widgets::Clear, ratatui_area, surface);
+    surface.set_style(ratatui_area, tui::ratatui::to_ratatui_style(style));
+
+    let len = model.total_rows;
+    let win_height = area.height as usize;
+    if len == 0 || win_height == 0 {
+        return;
+    }
+
+    let table_area = area.clip_left(LEFT_PADDING as u16).clip_right(1);
+
+    for (visible_row, row) in model.rows.iter().enumerate() {
+        let y = table_area.y + visible_row as u16;
+        if y >= table_area.bottom() {
+            break;
         }
 
-        let table_area = area.clip_left(Self::LEFT_PADDING as u16).clip_right(1);
-        let render_borders = cx.menu_border();
-
-        for (visible_row, option) in options.iter().skip(scroll).take(win_height).enumerate() {
-            let y = table_area.y + visible_row as u16;
-            if y >= table_area.bottom() {
-                break;
-            }
-
-            let option_index = scroll + visible_row;
-            let is_selected = self
-                .effective_cursor()
-                .map(|cursor| cursor == option_index)
-                .unwrap_or(false);
-            let row_area = Rect::new(area.x, y, area.width, 1);
-            if is_selected {
-                surface.set_style(
-                    tui::ratatui::to_ratatui_rect(row_area),
-                    tui::ratatui::to_ratatui_style(selected),
-                );
-            }
-
-            let row = option.format(&self.editor_data);
-            let mut x = table_area.x;
-            for (constraint, cell) in self.widths.iter().zip(row.cells.iter()) {
-                if x >= table_area.right() {
-                    break;
-                }
-                let width = constrained_width(*constraint, table_area.width);
-                let width = width.min(table_area.right().saturating_sub(x));
-                render_menu_cell(
-                    surface,
-                    cell,
-                    Rect::new(x, y, width, 1),
-                    is_selected.then_some(selected),
-                );
-                x = x.saturating_add(width).saturating_add(1);
-            }
-
-            if is_selected && !render_borders {
-                // Left edge: accent rail glyph if the theme has a focus colour,
-                // otherwise just the selection background extending to the edge.
-                if let Some(cell) = surface.cell_mut((area.left(), y)) {
-                    let mut cell_style = tui::ratatui::to_ratatui_style(selected);
-                    if let Some(fg) = accent_rail_color {
-                        cell.set_symbol("▎");
-                        cell_style = cell_style.fg(tui::ratatui::to_ratatui_color(fg));
-                    }
-                    cell.set_style(cell_style);
-                };
-                if let Some(cell) = surface.cell_mut((area.right().saturating_sub(1), y)) {
-                    cell.set_style(tui::ratatui::to_ratatui_style(selected));
-                };
-            }
-        }
-
-        let fits = len <= win_height;
-        if !fits {
-            let scroll_style = styles.scroll;
-            let thumb_fg = scroll_style.fg.unwrap_or(helix_view::theme::Color::Reset);
-            let mut sb = crate::widgets::Scrollbar::new(len, scroll, win_height)
-                .symbol(if render_borders { "▌" } else { "▐" })
-                .thumb_style(helix_view::graphics::Style::default().fg(thumb_fg));
-            if !render_borders {
-                let track_fg = scroll_style.bg.unwrap_or(helix_view::theme::Color::Reset);
-                sb = sb.track("▐", helix_view::graphics::Style::default().fg(track_fg));
-            }
-            sb.render(
-                Rect::new(area.right() - 1, area.top(), 1, area.height),
-                surface,
+        let option_index = model.scroll + visible_row;
+        let is_selected = model
+            .selected
+            .map(|cursor| cursor == option_index)
+            .unwrap_or(false);
+        let row_area = Rect::new(area.x, y, area.width, 1);
+        if is_selected {
+            surface.set_style(
+                tui::ratatui::to_ratatui_rect(row_area),
+                tui::ratatui::to_ratatui_style(selected),
             );
         }
+
+        let mut x = table_area.x;
+        for (constraint, cell) in model.widths.iter().zip(row.cells.iter()) {
+            if x >= table_area.right() {
+                break;
+            }
+            let width = constrained_width(*constraint, table_area.width);
+            let width = width.min(table_area.right().saturating_sub(x));
+            render_menu_cell(
+                surface,
+                cell,
+                Rect::new(x, y, width, 1),
+                is_selected.then_some(selected),
+            );
+            x = x.saturating_add(width).saturating_add(1);
+        }
+
+        if is_selected && !model.render_borders {
+            // Left edge: accent rail glyph if the theme has a focus colour,
+            // otherwise just the selection background extending to the edge.
+            if let Some(cell) = surface.cell_mut((area.left(), y)) {
+                let mut cell_style = tui::ratatui::to_ratatui_style(selected);
+                if let Some(fg) = model.accent_rail_color {
+                    cell.set_symbol("▎");
+                    cell_style = cell_style.fg(tui::ratatui::to_ratatui_color(fg));
+                }
+                cell.set_style(cell_style);
+            };
+            if let Some(cell) = surface.cell_mut((area.right().saturating_sub(1), y)) {
+                cell.set_style(tui::ratatui::to_ratatui_style(selected));
+            };
+        }
+    }
+
+    let fits = len <= win_height;
+    if !fits {
+        let scroll_style = model.styles.scroll;
+        let thumb_fg = scroll_style.fg.unwrap_or(helix_view::theme::Color::Reset);
+        let mut sb = crate::widgets::Scrollbar::new(len, model.scroll, win_height)
+            .symbol(if model.render_borders { "▌" } else { "▐" })
+            .thumb_style(helix_view::graphics::Style::default().fg(thumb_fg));
+        if !model.render_borders {
+            let track_fg = scroll_style.bg.unwrap_or(helix_view::theme::Color::Reset);
+            sb = sb.track("▐", helix_view::graphics::Style::default().fg(track_fg));
+        }
+        sb.render(
+            Rect::new(area.right() - 1, area.top(), 1, area.height),
+            surface,
+        );
     }
 }
 
@@ -542,8 +558,15 @@ impl<T: Item + 'static> Component for Menu<T> {
         Some(self.size)
     }
 
-    fn render(&mut self, area: Rect, surface: &mut crate::render::CellSurface, cx: &RenderContext) {
-        self.render_surface(area, surface, cx);
+    fn prepare_render(&mut self, area: Rect, cx: &RenderContext) -> crate::render::PreparedRender {
+        let model = self.render_model(area, cx);
+        crate::render::PreparedRender::deferred(move |cancellation| {
+            let mut output = crate::render::RenderOutput::sparse(area);
+            if !cancellation.is_cancelled() {
+                paint_menu(output.surface_mut(), area, &model);
+            }
+            output
+        })
     }
 }
 

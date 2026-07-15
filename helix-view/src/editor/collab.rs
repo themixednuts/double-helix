@@ -1,8 +1,3 @@
-use crate::traits::HistoryViewport;
-use crate::view::ensure_cursor_in_view_center_in;
-use crate::{DocumentId, ViewId};
-use helix_core::Selection;
-
 use super::{Action, Editor};
 
 impl Editor {
@@ -40,7 +35,10 @@ impl Editor {
         }
 
         for location in reveals {
-            let _ = self.reveal_location(&location, Action::Replace);
+            self.request_location_reveal(
+                &location,
+                crate::handlers::NavigationPurpose::CollaborationReveal,
+            );
         }
     }
 
@@ -198,53 +196,48 @@ impl Editor {
         }
     }
 
-    pub fn reveal_location(
+    pub(crate) fn request_location_reveal(
         &mut self,
         location: &crate::collab::Location,
-        action: crate::editor::Action,
-    ) -> Result<(), crate::document::DocumentOpenError> {
-        let doc_id = self.open(&location.path, action)?;
+        purpose: crate::handlers::NavigationPurpose,
+    ) {
+        let existing_document = self.document_id_by_path(&location.path);
         let target_view = location
             .surface
             .and_then(|id| self.surface_registry.get(id))
             .map(|surface| surface.view)
             .filter(|view_id| self.tree.contains(*view_id))
             .or_else(|| {
-                self.tree
-                    .views()
-                    .find(|(view, _)| view.doc == doc_id)
-                    .map(|(view, _)| view.id)
+                existing_document.and_then(|document| {
+                    self.tree
+                        .views()
+                        .find(|(view, _)| view.doc == document)
+                        .map(|(view, _)| view.id)
+                })
             })
             .unwrap_or(self.tree.focus);
-        self.reveal_location_in_view(target_view, doc_id, location);
-        Ok(())
+        let request = crate::handlers::NavigationRequest {
+            path: location.path.clone(),
+            action: Action::Replace,
+            target: target_view,
+            range: location
+                .range
+                .map(|range| helix_core::Range::new(range.anchor, range.head)),
+            purpose,
+        };
+        if let Err(error) = self.handlers.navigation.try_send(request) {
+            log::warn!(
+                "dropping location reveal because navigation ingress is unavailable: {error:?}"
+            );
+            self.notify_warning("Could not reveal location because navigation is busy");
+        }
     }
 
-    fn reveal_location_in_view(
-        &mut self,
-        view_id: ViewId,
-        doc_id: DocumentId,
-        location: &crate::collab::Location,
-    ) {
-        if self.tree.contains(view_id) && self.tree.focus != view_id {
-            self.focus(view_id);
+    pub fn complete_location_reveal(&mut self, assistant_follow: bool) {
+        if assistant_follow {
+            self.assistant_follow.suppress_pause = true;
         }
-
-        let scrolloff = self.config().scrolloff;
-        self.with_view_doc_mut(view_id, doc_id, |view, doc| {
-            if view.doc_id() != doc_id {
-                return;
-            }
-
-            doc.ensure_view_init(view_id);
-            view.sync_changes(doc);
-
-            if let Some(range) = location.range {
-                doc.set_selection(view_id, Selection::single(range.anchor, range.head));
-            }
-
-            ensure_cursor_in_view_center_in(view, doc, scrolloff);
-        });
+        self.sync_collab_presence();
     }
 
     pub fn apply_presence(
@@ -427,10 +420,13 @@ mod tests {
         let _ = fs::remove_file(new_path);
     }
 
-    #[test]
-    fn collab_reveal_switches_focus_to_target_document() {
+    #[tokio::test]
+    async fn collab_reveal_emits_navigation_intent_without_opening_on_the_ui_thread() {
         let mut editor = test_support::collab_test_editor();
         let active_doc = editor.tree.get(editor.tree.focus).doc;
+        let target_view = editor.tree.focus;
+        let (navigation, mut navigation_rx) = helix_runtime::channel(4);
+        editor.handlers.navigation = navigation;
         let alice = participant(1, "alice");
 
         let join_effects = editor.join_participant(alice.clone());
@@ -445,9 +441,15 @@ mod tests {
             location,
         }]);
 
-        let new_doc_id = editor.document_id_by_path(&new_path).expect("target doc");
-        assert_eq!(editor.tree.get(editor.tree.focus).doc, new_doc_id);
-        assert_ne!(editor.tree.get(editor.tree.focus).doc, active_doc);
+        let request = navigation_rx.recv().await.expect("navigation request");
+        assert_eq!(request.path, new_path);
+        assert_eq!(request.target, target_view);
+        assert_eq!(
+            request.purpose,
+            crate::handlers::NavigationPurpose::CollaborationReveal
+        );
+        assert_eq!(editor.tree.get(editor.tree.focus).doc, active_doc);
+        assert!(editor.document_id_by_path(&request.path).is_none());
         let _ = fs::remove_file(new_path);
     }
 }

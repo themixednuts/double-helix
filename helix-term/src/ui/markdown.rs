@@ -4,7 +4,10 @@ use tui::text::{Span, Spans, Text};
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 
 use pulldown_cmark::{
     Alignment, CodeBlockKind, Event, HeadingLevel, LinkType, Options, Parser, Tag, TagEnd,
@@ -12,6 +15,7 @@ use pulldown_cmark::{
 
 use helix_core::{
     syntax::{self, HighlightEvent, OverlayHighlights},
+    unicode::width::UnicodeWidthChar,
     RopeSlice, Syntax,
 };
 use helix_view::{
@@ -256,26 +260,38 @@ impl MarkdownCache {
         theme: Option<&Theme>,
         loader: &syntax::Loader,
     ) -> Vec<Spans<'static>> {
-        let key = MarkdownCacheKey::new(&doc.text, width);
-        if self.key.as_ref() == Some(&key) && self.text == doc.text {
+        self.layout_text(&doc.text, width, base_style, styles, theme, loader)
+    }
+
+    pub fn layout_text(
+        &mut self,
+        text: &str,
+        width: usize,
+        base_style: Style,
+        styles: &MarkdownLineStyles,
+        theme: Option<&Theme>,
+        loader: &syntax::Loader,
+    ) -> Vec<Spans<'static>> {
+        let key = MarkdownCacheKey::new(text, width);
+        if self.key.as_ref() == Some(&key) && self.text == text {
             self.hits += 1;
             return self.lines.clone();
         }
 
-        if doc.text.starts_with(&self.text) {
+        if text.starts_with(&self.text) {
             if let Some(previous) = &self.key {
                 if previous.width == width && previous.complete_len > 0 {
-                    let prefix_len = previous.complete_len.min(doc.text.len());
-                    let prefix_hash = content_hash(&doc.text[..prefix_len]);
+                    let prefix_len = previous.complete_len.min(text.len());
+                    let prefix_hash = content_hash(&text[..prefix_len]);
                     if prefix_hash == self.complete_hash {
                         self.hits += 1;
-                        let tail = &doc.text[prefix_len..];
+                        let tail = &text[prefix_len..];
                         let mut lines = self.complete_lines.clone();
                         lines.extend(render_markdown(
                             tail, width, base_style, styles, theme, loader,
                         ));
                         self.store(
-                            doc.text.clone(),
+                            text.to_owned(),
                             key,
                             lines.clone(),
                             width,
@@ -291,17 +307,17 @@ impl MarkdownCache {
         }
 
         self.misses += 1;
-        let cache_key = (content_hash(&doc.text), width);
+        let cache_key = (content_hash(text), width);
         if let Some(lines) = self.block_lines.get(&cache_key).cloned() {
             self.hits += 1;
-            self.store_from_lines(doc.text.clone(), key, lines.clone());
+            self.store_from_lines(text.to_owned(), key, lines.clone());
             return lines;
         }
 
-        let lines = render_markdown(&doc.text, width, base_style, styles, theme, loader);
+        let lines = render_markdown(text, width, base_style, styles, theme, loader);
         self.block_lines.insert(cache_key, lines.clone());
         self.store(
-            doc.text.clone(),
+            text.to_owned(),
             key,
             lines.clone(),
             width,
@@ -394,11 +410,45 @@ impl Doc {
 }
 
 pub struct Markdown {
-    pub contents: String,
+    pub contents: Arc<str>,
 
     config_loader: Arc<ArcSwap<syntax::Loader>>,
     cache: MarkdownCache,
+    render_cache_id: crate::render::CacheId,
 }
+
+#[derive(Clone)]
+pub(crate) struct MarkdownRenderSource {
+    contents: Arc<str>,
+    loader: Arc<syntax::Loader>,
+}
+
+impl MarkdownRenderSource {
+    pub(crate) fn new(contents: Arc<str>, loader: Arc<syntax::Loader>) -> Self {
+        Self { contents, loader }
+    }
+
+    pub(crate) fn layout(&self, width: usize, theme: &Theme) -> Text<'static> {
+        let base = theme.get(Markdown::TEXT_STYLE);
+        let styles = Markdown::styles(Some(theme));
+        Text::from(render_markdown(
+            &self.contents,
+            width,
+            base,
+            &styles,
+            Some(theme),
+            &self.loader,
+        ))
+    }
+}
+
+#[derive(Default)]
+struct MarkdownRenderCache {
+    theme_generation: Option<u64>,
+    cache: MarkdownCache,
+}
+
+static NEXT_MARKDOWN_RENDER_CACHE: AtomicU64 = AtomicU64::new(1);
 
 impl Markdown {
     const TEXT_STYLE: &'static str = "ui.text";
@@ -416,10 +466,15 @@ impl Markdown {
 
     #[must_use]
     pub fn new(contents: String, config_loader: Arc<ArcSwap<syntax::Loader>>) -> Self {
+        let render_cache_id = crate::render::CacheId::hashed(&(
+            "markdown",
+            NEXT_MARKDOWN_RENDER_CACHE.fetch_add(1, Ordering::Relaxed),
+        ));
         Self {
-            contents,
+            contents: Arc::from(contents),
             config_loader,
             cache: MarkdownCache::default(),
+            render_cache_id,
         }
     }
 
@@ -428,13 +483,25 @@ impl Markdown {
         Doc::new(text)
     }
 
+    pub(crate) fn render_source(&self) -> MarkdownRenderSource {
+        MarkdownRenderSource {
+            contents: self.contents.clone(),
+            loader: self.config_loader.load_full(),
+        }
+    }
+
+    pub(crate) fn estimated_size(&self, max_width: u16, max_height: u16) -> (u16, u16) {
+        estimated_text_size(&self.contents, max_width, max_height)
+    }
+
     #[must_use]
     pub fn parse(&self, theme: Option<&Theme>) -> tui::text::Text<'static> {
         let base = theme
             .map(|theme| theme.get(Self::TEXT_STYLE))
             .unwrap_or_default();
         let styles = MarkdownLineStyles::from_theme(theme, base);
-        Text::from(Doc::new(self.contents.clone()).layout(
+        Text::from(render_markdown(
+            &self.contents,
             usize::MAX / 4,
             base,
             &styles,
@@ -448,9 +515,8 @@ impl Markdown {
             .map(|theme| theme.get(Self::TEXT_STYLE))
             .unwrap_or_default();
         let styles = Self::styles(theme);
-        let doc = Doc::new(self.contents.clone());
-        Text::from(self.cache.layout(
-            &doc,
+        Text::from(self.cache.layout_text(
+            &self.contents,
             width,
             base,
             &styles,
@@ -476,12 +542,26 @@ pub fn fit_bubble_width(text: &str, min_w: usize, max_w: usize) -> usize {
     let max_w = max_w.max(4);
     let min_w = min_w.min(max_w);
     let inner_max = max_w.saturating_sub(4).max(1);
-    let wrapped = wrap_text(text, inner_max);
-    let longest = wrapped
-        .iter()
-        .map(|l| text_layout::display_width(l))
-        .max()
-        .unwrap_or(0);
+    let sample_limit = inner_max.saturating_mul(4);
+    let mut sampled = 0usize;
+    let mut line_width = 0usize;
+    let mut longest = 0usize;
+    for ch in text.chars() {
+        if sampled >= sample_limit {
+            return max_w;
+        }
+        sampled += 1;
+        if ch == '\n' {
+            longest = longest.max(line_width);
+            line_width = 0;
+            continue;
+        }
+        line_width = line_width.saturating_add(ch.width().unwrap_or(0));
+        if line_width >= inner_max {
+            return max_w;
+        }
+    }
+    longest = longest.max(line_width);
     (longest + 4).clamp(min_w, max_w)
 }
 
@@ -923,48 +1003,66 @@ fn content_hash(text: &str) -> u64 {
 }
 
 impl Component for Markdown {
-    fn render(&mut self, area: Rect, surface: &mut crate::render::CellSurface, cx: &RenderContext) {
-        let margin = Margin::all(1);
-        let area = area.inner(margin);
-        let theme = cx.theme();
-        let base = theme.get(Self::TEXT_STYLE);
-        let styles = Self::styles(Some(theme));
-        let doc = Doc::new(self.contents.clone());
-        let lines = self.cache.layout(
-            &doc,
-            area.width as usize,
-            base,
-            &styles,
-            Some(theme),
-            &self.config_loader.load(),
+    fn prepare_render(&mut self, area: Rect, cx: &RenderContext) -> crate::render::PreparedRender {
+        let area = area.inner(Margin::all(1));
+        let contents = Arc::clone(&self.contents);
+        let theme = cx.theme_arc();
+        let theme_generation = cx.theme_generation();
+        let loader = self.config_loader.load_full();
+        let scroll = cx.scroll().unwrap_or_default() as u16;
+        let cache_id = self.render_cache_id;
+        cx.defer_stateful_paint(
+            "markdown",
+            move |surface, cache_store, _metadata, cancellation| {
+                if cancellation.is_cancelled() || area.width == 0 || area.height == 0 {
+                    return;
+                }
+                let state = cache_store.domain_mut::<MarkdownRenderCache>(cache_id);
+                if state.theme_generation != Some(theme_generation) {
+                    state.theme_generation = Some(theme_generation);
+                    state.cache = MarkdownCache::default();
+                }
+                let base = theme.get(Self::TEXT_STYLE);
+                let styles = Self::styles(Some(&theme));
+                let lines = state.cache.layout_text(
+                    &contents,
+                    area.width as usize,
+                    base,
+                    &styles,
+                    Some(&theme),
+                    &loader,
+                );
+                if !cancellation.is_cancelled() {
+                    render_to_surface(surface, area, &lines, scroll);
+                }
+            },
         );
-        render_to_surface(
-            surface,
-            area,
-            &lines,
-            cx.scroll().unwrap_or_default() as u16,
-        );
+        crate::render::PreparedRender::ready(crate::render::RenderOutput::sparse(area))
     }
 
     fn required_size(&mut self, viewport: (u16, u16)) -> Option<(u16, u16)> {
         let padding = 2;
         let max_text_width = (viewport.0.saturating_sub(padding)).min(120);
-        let base = Style::default();
-        let styles = Self::styles(None);
-        let doc = Doc::new(self.contents.clone());
-        let lines = self.cache.layout(
-            &doc,
-            max_text_width as usize,
-            base,
-            &styles,
-            None,
-            &self.config_loader.load(),
-        );
-        let contents = Text::from(lines);
-        let (width, height) = crate::ui::text::required_size(&contents, max_text_width);
+        let (width, height) = estimated_text_size(&self.contents, max_text_width, viewport.1);
 
         Some((width + padding, height + padding))
     }
+}
+
+fn estimated_text_size(text: &str, max_width: u16, max_height: u16) -> (u16, u16) {
+    let max_width = max_width.max(1) as usize;
+    let mut width = 0u16;
+    let mut height = 0u16;
+    for line in text.lines() {
+        let line_width = helix_core::unicode::width::UnicodeWidthStr::width(line);
+        width = width.max(line_width.min(max_width) as u16);
+        let rows = line_width.max(1).div_ceil(max_width) as u16;
+        height = height.saturating_add(rows).min(max_height);
+        if height == max_height {
+            break;
+        }
+    }
+    (width, height)
 }
 
 #[cfg(test)]

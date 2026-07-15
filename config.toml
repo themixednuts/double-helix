@@ -58,7 +58,6 @@ s = ":w"
 [editor.inline-diagnostics]
 cursor-line = "hint"
 
-[[editor.agents]]
-name = "Mock Echo"
-command = "node"
-args = ["scripts/mock-acp-agent.js"]
+# Builds made with `--features mock-acp` add the repository's development ACP
+# fixture automatically. Builds without that feature, including default release
+# builds, contain no mock agent.

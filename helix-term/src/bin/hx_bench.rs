@@ -24,7 +24,7 @@ use helix_view::bench::{
     enter_bench_command, generate_bench_content, log_run_event, BenchCommandContext,
 };
 use helix_view::commands::editing;
-use tokio_stream::wrappers::UnboundedReceiverStream;
+use tokio_stream::wrappers::ReceiverStream;
 
 #[global_allocator]
 static ALLOCATOR: CountingAllocator = CountingAllocator;
@@ -571,8 +571,8 @@ async fn main_impl(runtime: helix_runtime::Runtime) -> anyhow::Result<()> {
     }
 
     // Set up a dummy input stream (bench_run_loop polls it for Ctrl+C)
-    let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    let mut rx_stream = UnboundedReceiverStream::new(rx);
+    let (_tx, rx) = tokio::sync::mpsc::channel(1);
+    let mut rx_stream = ReceiverStream::new(rx);
 
     // Initial render
     app.render_timed().await;

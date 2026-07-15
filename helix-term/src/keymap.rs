@@ -2,10 +2,7 @@ pub mod default;
 pub mod macros;
 
 pub use crate::commands::MappableCommand;
-use arc_swap::{
-    access::{DynAccess, DynGuard},
-    ArcSwap,
-};
+use arc_swap::{ArcSwap, Guard};
 use helix_modal::registry::CommandScope;
 use helix_view::{
     document::Mode,
@@ -324,8 +321,29 @@ pub enum KeymapResult {
 /// A map of command names to keybinds that will execute the command.
 pub type ReverseKeymap = HashMap<String, Vec<Vec<KeyEvent>>>;
 
+#[derive(Debug, Clone)]
+pub struct CompiledKeymapScope {
+    pub language: Option<String>,
+    pub path_prefix: Option<std::path::PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CompiledKeymapContribution {
+    pub scope: CompiledKeymapScope,
+    pub keymap: HashMap<Mode, KeyTrie>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ActiveKeymapContext {
+    language: Option<String>,
+    path: Option<std::path::PathBuf>,
+}
+
 pub struct Keymaps {
-    pub map: Box<dyn DynAccess<HashMap<Mode, KeyTrie>> + Send + Sync>,
+    base: HashMap<Mode, KeyTrie>,
+    contributions: HashMap<helix_plugin_api::KeymapHandle, CompiledKeymapContribution>,
+    effective: ArcSwap<HashMap<Mode, KeyTrie>>,
+    active_context: ActiveKeymapContext,
     /// Stores pending keys waiting for the next key. This is relative to a
     /// sticky node if one is in use.
     state: Vec<KeyEvent>,
@@ -334,16 +352,72 @@ pub struct Keymaps {
 }
 
 impl Keymaps {
-    pub fn new(map: Box<dyn DynAccess<HashMap<Mode, KeyTrie>> + Send + Sync>) -> Self {
+    pub fn new(base: HashMap<Mode, KeyTrie>) -> Self {
+        let effective = ArcSwap::from_pointee(base.clone());
         Self {
-            map,
+            base,
+            contributions: HashMap::new(),
+            effective,
+            active_context: ActiveKeymapContext::default(),
             state: Vec::new(),
             sticky: None,
         }
     }
 
-    pub fn map(&self) -> DynGuard<HashMap<Mode, KeyTrie>> {
-        self.map.load()
+    pub fn map(&self) -> Guard<Arc<HashMap<Mode, KeyTrie>>> {
+        self.effective.load()
+    }
+
+    pub fn replace_base(&mut self, base: HashMap<Mode, KeyTrie>) {
+        self.base = base;
+        self.rebuild();
+    }
+
+    pub fn set_contribution(
+        &mut self,
+        handle: helix_plugin_api::KeymapHandle,
+        contribution: CompiledKeymapContribution,
+    ) {
+        self.contributions.insert(handle, contribution);
+        self.rebuild();
+    }
+
+    pub fn remove_contribution(&mut self, handle: helix_plugin_api::KeymapHandle) -> bool {
+        let removed = self.contributions.remove(&handle).is_some();
+        if removed {
+            self.rebuild();
+        }
+        removed
+    }
+
+    /// Select the immutable keymap snapshot for the current dispatch context.
+    /// Returns true only when the published snapshot changed.
+    pub fn set_context(&mut self, language: Option<&str>, path: Option<&std::path::Path>) -> bool {
+        if self.active_context.language.as_deref() == language
+            && self.active_context.path.as_deref() == path
+        {
+            return false;
+        }
+        self.active_context = ActiveKeymapContext {
+            language: language.map(str::to_owned),
+            path: path.map(std::path::Path::to_owned),
+        };
+        self.rebuild();
+        true
+    }
+
+    fn rebuild(&mut self) {
+        let mut effective = self.base.clone();
+        let mut contributions = self.contributions.iter().collect::<Vec<_>>();
+        contributions.sort_unstable_by_key(|(handle, _)| handle.raw());
+        for (_, contribution) in contributions {
+            if contribution.scope.matches(&self.active_context) {
+                merge_keys(&mut effective, contribution.keymap.clone());
+            }
+        }
+        self.effective.store(Arc::new(effective));
+        self.state.clear();
+        self.sticky = None;
     }
 
     /// Returns list of keys waiting to be disambiguated in current mode.
@@ -370,9 +444,23 @@ impl Keymaps {
     }
 }
 
+impl CompiledKeymapScope {
+    fn matches(&self, context: &ActiveKeymapContext) -> bool {
+        self.language
+            .as_deref()
+            .is_none_or(|language| context.language.as_deref() == Some(language))
+            && self.path_prefix.as_deref().is_none_or(|prefix| {
+                context
+                    .path
+                    .as_deref()
+                    .is_some_and(|path| path.starts_with(prefix))
+            })
+    }
+}
+
 impl Default for Keymaps {
     fn default() -> Self {
-        Self::new(Box::new(ArcSwap::new(Arc::new(default()))))
+        Self::new(default())
     }
 }
 
@@ -676,11 +764,99 @@ pub fn merge_keys(dst: &mut HashMap<Mode, KeyTrie>, mut delta: HashMap<Mode, Key
     }
 }
 
+pub fn compile_plugin_keymap(
+    definition: &helix_plugin_api::KeymapDefinition,
+) -> anyhow::Result<CompiledKeymapContribution> {
+    use std::str::FromStr;
+
+    let mode = match definition.mode {
+        helix_plugin_api::KeymapMode::Normal => Mode::Normal,
+        helix_plugin_api::KeymapMode::Insert => Mode::Insert,
+        helix_plugin_api::KeymapMode::Select => Mode::Select,
+    };
+    let mut root = KeyTrieNode::default();
+    for binding in &definition.bindings {
+        anyhow::ensure!(!binding.keys.is_empty(), "key sequence cannot be empty");
+        anyhow::ensure!(
+            !binding.commands.is_empty(),
+            "command sequence cannot be empty"
+        );
+        let keys = binding
+            .keys
+            .iter()
+            .map(|key| KeyEvent::from_str(key).map(KeyEvent::canonicalize))
+            .collect::<Result<Vec<_>, _>>()?;
+        let commands = binding
+            .commands
+            .iter()
+            .map(|command| MappableCommand::from_str(command))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        anyhow::ensure!(
+            !commands
+                .iter()
+                .any(|command| matches!(command, MappableCommand::Macro { .. })),
+            "macro commands cannot be used in plugin keymaps"
+        );
+        let command = if commands.len() == 1 {
+            KeyTrie::MappableCommand(commands.into_iter().next().unwrap())
+        } else {
+            KeyTrie::Sequence(commands)
+        };
+        insert_compiled_binding(&mut root, &keys, command)?;
+    }
+
+    Ok(CompiledKeymapContribution {
+        scope: CompiledKeymapScope {
+            language: definition.scope.language.clone(),
+            path_prefix: definition
+                .scope
+                .path_prefix
+                .as_deref()
+                .map(std::path::PathBuf::from),
+        },
+        keymap: HashMap::from([(mode, KeyTrie::Node(root))]),
+    })
+}
+
+fn insert_compiled_binding(
+    node: &mut KeyTrieNode,
+    keys: &[KeyEvent],
+    command: KeyTrie,
+) -> anyhow::Result<()> {
+    let key = keys[0];
+    if keys.len() == 1 {
+        anyhow::ensure!(
+            !node.map.contains_key(&key),
+            "duplicate or prefix-conflicting key binding: {}",
+            key.key_sequence_format()
+        );
+        node.map.insert(key, command);
+        node.order.push(key);
+        return Ok(());
+    }
+
+    if !node.map.contains_key(&key) {
+        node.map.insert(key, KeyTrie::Node(KeyTrieNode::default()));
+        node.order.push(key);
+    }
+    let child = node
+        .map
+        .get_mut(&key)
+        .and_then(KeyTrie::node_mut)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "key binding extends an existing command at {}",
+                key.key_sequence_format()
+            )
+        })?;
+    insert_compiled_binding(child, &keys[1..], command)
+}
+
 #[cfg(test)]
 mod tests {
     use super::macros::keymap;
     use super::*;
-    use arc_swap::{access::Constant, ArcSwap};
+    use arc_swap::ArcSwap;
     use helix_core::{hashmap, Selection, Transaction};
     use helix_view::{
         document::Mode,
@@ -698,8 +874,27 @@ mod tests {
         MappableCommand::named(name).expect("named command must exist")
     }
 
+    fn plugin_keymap(
+        language: Option<&str>,
+        path_prefix: Option<&str>,
+        keys: &[&str],
+        command: &str,
+    ) -> helix_plugin_api::KeymapDefinition {
+        helix_plugin_api::KeymapDefinition {
+            mode: helix_plugin_api::KeymapMode::Normal,
+            scope: helix_plugin_api::KeymapScope {
+                language: language.map(str::to_owned),
+                path_prefix: path_prefix.map(str::to_owned),
+            },
+            bindings: vec![helix_plugin_api::KeymapBinding {
+                keys: keys.iter().map(|key| (*key).into()).collect(),
+                commands: vec![command.into()],
+            }],
+        }
+    }
+
     fn test_editor() -> Editor {
-        let theme_loader = theme::Loader::new(helix_loader::runtime_dirs());
+        let theme_loader = theme::Loader::new(&[]);
         let syn_loader = helix_core::config::default_lang_loader();
         let config = helix_view::editor::Config::default();
         let config = Arc::new(ArcSwap::from_pointee(config));
@@ -786,7 +981,7 @@ mod tests {
         merge_keys(&mut merged_keyamp, keymap.clone());
         assert_ne!(keymap, merged_keyamp);
 
-        let mut keymap = Keymaps::new(Box::new(Constant(merged_keyamp.clone())));
+        let mut keymap = Keymaps::new(merged_keyamp.clone());
         assert_eq!(
             keymap.get(Mode::Normal, key!('i')),
             KeymapResult::Matched(named_command("normal_mode")),
@@ -837,6 +1032,53 @@ mod tests {
             .and_then(|key_trie| key_trie.node())
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn plugin_keymap_scope_switches_published_snapshot_without_hot_path_parsing() {
+        let definition = plugin_keymap(Some("rust"), Some("workspace"), &["F24"], ":write");
+        let contribution = compile_plugin_keymap(&definition).unwrap();
+        let handle =
+            helix_plugin_api::KeymapHandle::from_raw(std::num::NonZeroU64::new(1).unwrap());
+        let mut keymaps = Keymaps::default();
+        keymaps.set_contribution(handle, contribution);
+
+        keymaps.set_context(
+            Some("text"),
+            Some(std::path::Path::new("workspace/main.rs")),
+        );
+        assert!(matches!(
+            keymaps.get(Mode::Normal, "F24".parse().unwrap()),
+            KeymapResult::NotFound
+        ));
+
+        keymaps.set_context(
+            Some("rust"),
+            Some(std::path::Path::new("workspace/main.rs")),
+        );
+        assert!(matches!(
+            keymaps.get(Mode::Normal, "F24".parse().unwrap()),
+            KeymapResult::Matched(MappableCommand::Typable { ref name, .. }) if name == "write"
+        ));
+
+        assert!(keymaps.remove_contribution(handle));
+        assert!(matches!(
+            keymaps.get(Mode::Normal, "F24".parse().unwrap()),
+            KeymapResult::NotFound
+        ));
+    }
+
+    #[test]
+    fn plugin_keymap_compilation_rejects_prefix_conflicts() {
+        let mut definition = plugin_keymap(None, None, &["F24"], ":write");
+        definition.bindings.push(helix_plugin_api::KeymapBinding {
+            keys: vec!["F24".into(), "x".into()],
+            commands: vec![":quit".into()],
+        });
+        assert!(compile_plugin_keymap(&definition)
+            .unwrap_err()
+            .to_string()
+            .contains("extends an existing command"));
     }
 
     #[test]

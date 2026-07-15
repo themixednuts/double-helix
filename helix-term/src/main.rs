@@ -5,35 +5,12 @@ use helix_term::application::Application;
 use helix_term::args::{Args, PkgCommand};
 use helix_term::config::{Config, ConfigLoadError};
 
-fn setup_logging(verbosity: u64) -> Result<()> {
-    let mut base_config = fern::Dispatch::new();
-
-    base_config = match verbosity {
-        0 => base_config.level(log::LevelFilter::Warn),
-        1 => base_config.level(log::LevelFilter::Info),
-        2 => base_config.level(log::LevelFilter::Debug),
-        _3_or_more => base_config.level(log::LevelFilter::Trace),
-    };
-
-    // Separate file config so we can include year, month and day in file logs
-    let file_config = fern::Dispatch::new()
-        .format(|out, message, record| {
-            out.finish(format_args!(
-                "{} {} [{}] {}",
-                chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%.3f"),
-                record.target(),
-                record.level(),
-                message
-            ))
-        })
-        .chain(fern::log_file(helix_loader::log_file())?);
-
-    base_config.chain(file_config).apply()?;
-
-    Ok(())
-}
-
 fn main() -> Result<()> {
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--plugin-host")) {
+        helix_plugin::rpc::run_plugin_host();
+        return Ok(());
+    }
+
     let tokio_runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -130,7 +107,8 @@ FLAGS:
         return Ok(0);
     }
 
-    setup_logging(args.verbosity).context("failed to initialize logging")?;
+    let _logging = helix_term::logging::setup(args.verbosity, &helix_loader::log_file())
+        .context("failed to initialize logging")?;
 
     // NOTE: Set the working directory early so the correct configuration is loaded. Be aware that
     // Application::new() depends on this logic so it must be updated if this changes.
@@ -149,6 +127,13 @@ FLAGS:
         Err(ConfigLoadError::Error(err)) => return Err(Error::new(err)),
         Err(ConfigLoadError::BadConfig(err)) => {
             eprintln!("Bad config: {}", err);
+            eprintln!("Press <ENTER> to continue with default config");
+            use std::io::Read;
+            let _ = std::io::stdin().read(&mut []);
+            Config::default()
+        }
+        Err(ConfigLoadError::Plugin(err)) => {
+            eprintln!("Bad plugin config: {err}");
             eprintln!("Press <ENTER> to continue with default config");
             use std::io::Read;
             let _ = std::io::stdin().read(&mut []);

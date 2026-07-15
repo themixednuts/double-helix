@@ -43,7 +43,6 @@ pub struct AnimationSpec {
     pub iteration_count: AnimationIterationCount,
     pub direction: AnimationDirection,
     pub fill_mode: AnimationFillMode,
-    pub frame_interval: Duration,
 }
 
 impl AnimationSpec {
@@ -55,7 +54,6 @@ impl AnimationSpec {
             iteration_count: AnimationIterationCount::Count(1),
             direction: AnimationDirection::Normal,
             fill_mode: AnimationFillMode::Forwards,
-            frame_interval: Duration::from_millis(16),
         }
     }
 }
@@ -121,11 +119,6 @@ impl Animation {
 
     pub fn is_running(&self) -> bool {
         self.play_state == AnimationPlayState::Running
-    }
-
-    pub fn sample(&self) -> AnimationSample {
-        let now = Instant::now();
-        self.sample_at(now)
     }
 
     pub fn sample_at(&self, now: Instant) -> AnimationSample {
@@ -208,7 +201,7 @@ impl Animation {
             next_redraw: if finished || self.play_state != AnimationPlayState::Running {
                 None
             } else {
-                Some(now + self.spec.frame_interval)
+                Some(now)
             },
             play_state: self.play_state,
             finished,
@@ -300,6 +293,19 @@ mod tests {
         assert_eq!(end.progress, 1.0);
         assert!(end.finished);
         assert!(end.next_redraw.is_none());
+    }
+
+    #[test]
+    fn running_animation_uses_elapsed_time_and_requests_the_next_available_frame() {
+        let mut animation = Animation::new(AnimationSpec::new(Duration::from_millis(100)));
+        animation.restart();
+        let start = animation.started_at.expect("animation should have started");
+        let now = start + Duration::from_millis(75);
+
+        let sample = animation.sample_at(now);
+
+        assert!((sample.progress - 0.75).abs() < f32::EPSILON);
+        assert_eq!(sample.next_redraw, Some(now));
     }
 
     #[test]

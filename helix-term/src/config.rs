@@ -19,6 +19,7 @@ pub struct Config {
     pub theme: Option<theme::Config>,
     pub keys: HashMap<Mode, KeyTrie>,
     pub editor: helix_view::editor::Config,
+    pub plugins: helix_plugin::PluginConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -28,6 +29,7 @@ pub struct ConfigRaw {
     pub keys: Option<HashMap<Mode, KeyTrie>>,
     pub editor: Option<toml::Value>,
     pub pkg: Option<toml::Value>,
+    pub plugins: Option<toml::Value>,
     pub icons: Option<toml::Value>,
 }
 
@@ -37,6 +39,7 @@ impl Default for Config {
             theme: None,
             keys: keymap::default(),
             editor: helix_view::editor::Config::default(),
+            plugins: helix_plugin::PluginConfig::default(),
         }
     }
 }
@@ -44,6 +47,7 @@ impl Default for Config {
 #[derive(Debug)]
 pub enum ConfigLoadError {
     BadConfig(TomlError),
+    Plugin(helix_plugin::PluginConfigError),
     Error(IOError),
 }
 
@@ -57,6 +61,7 @@ impl Display for ConfigLoadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ConfigLoadError::BadConfig(err) => err.fmt(f),
+            ConfigLoadError::Plugin(err) => err.fmt(f),
             ConfigLoadError::Error(err) => err.fmt(f),
         }
     }
@@ -94,6 +99,9 @@ impl Config {
                 if let Some(pkg) = merge_pkg_config(global.pkg, local.pkg)? {
                     editor.pkg = pkg;
                 }
+                let plugins =
+                    merge_plugin_config(global.plugins, local.plugins)?.unwrap_or_default();
+                plugins.validate().map_err(ConfigLoadError::Plugin)?;
 
                 let icons: Icons = match (global.icons, local.icons) {
                     (None, None) => Icons::default(),
@@ -111,6 +119,7 @@ impl Config {
                     theme: local.theme.or(global.theme),
                     keys,
                     editor,
+                    plugins,
                 }
             }
             // if any configs are invalid return that first
@@ -131,9 +140,13 @@ impl Config {
 
                 ICONS.store(Arc::new(icons));
 
+                let plugins = merge_plugin_config(config.plugins, None)?.unwrap_or_default();
+                plugins.validate().map_err(ConfigLoadError::Plugin)?;
+
                 Config {
                     theme: config.theme,
                     keys,
+                    plugins,
                     editor: {
                         let mut editor = config.editor.map_or_else(
                             || Ok(helix_view::editor::Config::default()),
@@ -167,6 +180,23 @@ fn merge_pkg_config(
     global: Option<toml::Value>,
     local: Option<toml::Value>,
 ) -> Result<Option<helix_view::editor::PkgConfig>, ConfigLoadError> {
+    match (global, local) {
+        (None, None) => Ok(None),
+        (None, Some(value)) | (Some(value), None) => value
+            .try_into()
+            .map(Some)
+            .map_err(ConfigLoadError::BadConfig),
+        (Some(global), Some(local)) => merge_toml_values(global, local, 3)
+            .try_into()
+            .map(Some)
+            .map_err(ConfigLoadError::BadConfig),
+    }
+}
+
+fn merge_plugin_config(
+    global: Option<toml::Value>,
+    local: Option<toml::Value>,
+) -> Result<Option<helix_plugin::PluginConfig>, ConfigLoadError> {
     match (global, local) {
         (None, None) => Ok(None),
         (None, Some(value)) | (Some(value), None) => value
@@ -242,6 +272,117 @@ mod tests {
             helix_view::editor::BufferLineRenderMode::Multiple
         );
         assert_eq!(config.editor.bufferline.separator, "│");
+    }
+
+    #[test]
+    fn parsing_plugin_runtime_config() {
+        let config = Config::load_test(
+            r#"
+            [plugins]
+            enabled = true
+            plugin_dirs = ["plugins", "workspace-plugins"]
+            max_memory = 1048576
+            max_instructions = 250000
+
+            [[plugins.hosts]]
+            name = "remote"
+            command = "ssh"
+            args = ["build-box", "dhx", "--plugin-host"]
+            plugin_dirs = ["/srv/helix/plugins"]
+
+            [[plugins.plugins]]
+            name = "example"
+            enabled = false
+
+            [plugins.plugins.config]
+            level = "trace"
+            "#,
+        );
+
+        assert_eq!(
+            config.plugins.plugin_dirs,
+            [
+                std::path::PathBuf::from("plugins"),
+                std::path::PathBuf::from("workspace-plugins")
+            ]
+        );
+        assert_eq!(config.plugins.max_memory, 1_048_576);
+        assert_eq!(config.plugins.max_instructions, 250_000);
+        assert_eq!(config.plugins.hosts.len(), 1);
+        assert_eq!(config.plugins.hosts[0].name, "remote");
+        assert_eq!(config.plugins.hosts[0].command, std::path::Path::new("ssh"));
+        assert_eq!(
+            config.plugins.hosts[0].args,
+            ["build-box", "dhx", "--plugin-host"]
+        );
+        assert_eq!(config.plugins.plugins.len(), 1);
+        assert!(!config.plugins.plugins[0].enabled);
+        assert_eq!(
+            config.plugins.plugins[0].config["level"],
+            serde_json::json!("trace")
+        );
+    }
+
+    #[test]
+    fn local_plugin_config_overrides_only_declared_fields() {
+        let config = Config::load(
+            Ok(r#"
+                [plugins]
+                plugin_dirs = ["global-plugins"]
+                max_memory = 2048
+                max_instructions = 3000
+                "#
+            .to_owned()),
+            Ok(r#"
+                [plugins]
+                enabled = false
+                max_instructions = 4000
+                "#
+            .to_owned()),
+        )
+        .unwrap();
+
+        assert!(!config.plugins.enabled);
+        assert_eq!(
+            config.plugins.plugin_dirs,
+            [std::path::PathBuf::from("global-plugins")]
+        );
+        assert_eq!(config.plugins.max_memory, 2048);
+        assert_eq!(config.plugins.max_instructions, 4000);
+    }
+
+    #[test]
+    fn plugin_config_rejects_unknown_fields() {
+        let result = Config::load(
+            Ok("[plugins]\nunknown = true\n".to_owned()),
+            Err(ConfigLoadError::default()),
+        );
+
+        assert!(matches!(result, Err(ConfigLoadError::BadConfig(_))));
+    }
+
+    #[test]
+    fn plugin_config_rejects_duplicate_host_names() {
+        let result = Config::load(
+            Ok(r#"
+                [[plugins.hosts]]
+                name = "duplicate"
+                command = "dhx"
+
+                [[plugins.hosts]]
+                name = "duplicate"
+                command = "ssh"
+                "#
+            .to_owned()),
+            Err(ConfigLoadError::default()),
+        );
+
+        assert!(matches!(
+            result,
+            Err(ConfigLoadError::Plugin(
+                helix_plugin::PluginConfigError::DuplicateHostName { .. }
+            ))
+        ));
     }
 
     #[test]

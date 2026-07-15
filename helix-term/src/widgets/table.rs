@@ -21,6 +21,28 @@ impl TableCell<'_> {
     pub fn set_style(&mut self, style: Style) {
         self.content.patch_style(style);
     }
+
+    pub fn into_owned(self) -> TableCell<'static> {
+        TableCell {
+            content: Text {
+                lines: self
+                    .content
+                    .lines
+                    .into_iter()
+                    .map(|line| {
+                        tui::text::Spans::from(
+                            line.0
+                                .into_iter()
+                                .map(|span| {
+                                    tui::text::Span::styled(span.content.into_owned(), span.style)
+                                })
+                                .collect::<Vec<_>>(),
+                        )
+                    })
+                    .collect(),
+            },
+        }
+    }
 }
 
 impl<'a, T> From<T> for TableCell<'a>
@@ -56,6 +78,12 @@ impl<'a> TableRow<'a> {
             cell.set_style(style);
         }
         self
+    }
+
+    pub fn into_owned(self) -> TableRow<'static> {
+        TableRow {
+            cells: self.cells.into_iter().map(TableCell::into_owned).collect(),
+        }
     }
 }
 

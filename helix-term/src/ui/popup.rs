@@ -235,87 +235,6 @@ impl<T: Component> Popup<T> {
         }
     }
 
-    fn render_surface<F>(
-        &mut self,
-        viewport: Rect,
-        surface: &mut crate::render::CellSurface,
-        cx: &RenderContext,
-        render_child: F,
-    ) where
-        F: FnOnce(&mut T, Rect, &mut crate::render::CellSurface, &RenderContext),
-    {
-        let RenderInfo {
-            area,
-            child_height,
-            render_borders,
-            is_menu,
-        } = self.render_info_at(
-            viewport,
-            cx.cursor_position(),
-            cx.popup_border(),
-            cx.menu_border(),
-        );
-        self.area = area;
-
-        let menu_styles = crate::ui::design::MenuStyles::from_theme(cx.theme());
-        let popup_styles = crate::ui::design::PopupStyles::from_theme(cx.theme());
-        let background = if is_menu {
-            menu_styles.background
-        } else {
-            popup_styles.background
-        };
-        let inner = if render_borders {
-            crate::widgets::Panel::framed(
-                crate::widgets::PanelStyle::plain(background),
-                cx.config().rounded_corners,
-            )
-            .render(surface, area)
-        } else {
-            {
-                let area = tui::ratatui::to_ratatui_rect(area);
-                tui::ratatui::widgets::Widget::render(tui::ratatui::widgets::Clear, area, surface);
-                surface.set_style(area, tui::ratatui::to_ratatui_style(background));
-            };
-            area
-        };
-        let border = usize::from(render_borders);
-
-        let max_offset = child_height.saturating_sub(inner.height) as usize;
-        let half_page_size = (inner.height / 2) as usize;
-        let scroll = max_offset.min(self.scroll_half_pages * half_page_size);
-        if let Some(div) = scroll.checked_div(half_page_size) {
-            self.scroll_half_pages = div;
-        }
-        cx.set_scroll(Some(scroll));
-        render_child(&mut self.contents, inner, surface, cx);
-
-        if self.has_scrollbar {
-            let win_height = inner.height as usize;
-            let len = child_height as usize;
-
-            if len > win_height {
-                let scroll_style = menu_styles.scroll;
-                let thumb_fg = scroll_style.fg.unwrap_or(helix_view::theme::Color::Reset);
-                let mut sb = crate::widgets::Scrollbar::new(len, scroll, win_height)
-                    .symbol(if render_borders { "▌" } else { "▐" })
-                    .thumb_style(helix_view::graphics::Style::default().fg(thumb_fg));
-                if !render_borders {
-                    let track_fg = scroll_style.bg.unwrap_or(helix_view::theme::Color::Reset);
-                    sb = sb.track("▐", helix_view::graphics::Style::default().fg(track_fg));
-                }
-                sb.render(
-                    Rect::new(
-                        inner.right() - 1 + border as u16,
-                        inner.top(),
-                        1,
-                        inner.height,
-                    ),
-                    surface,
-                );
-            }
-        }
-    }
-
     fn handle_mouse_event(
         &mut self,
         &MouseEvent {
@@ -407,15 +326,77 @@ impl<T: Component> Component for Popup<T> {
         }
     }
 
-    fn render(
+    fn prepare_render(
         &mut self,
         viewport: Rect,
-        surface: &mut crate::render::CellSurface,
         cx: &RenderContext,
-    ) {
-        self.render_surface(viewport, surface, cx, |contents, inner, surface, cx| {
-            contents.render(inner, surface, cx);
+    ) -> crate::render::PreparedRender {
+        let RenderInfo {
+            area,
+            child_height,
+            render_borders,
+            is_menu,
+        } = self.render_info_at(
+            viewport,
+            cx.cursor_position(),
+            cx.popup_border(),
+            cx.menu_border(),
+        );
+        self.area = area;
+
+        let menu_styles = crate::ui::design::MenuStyles::from_theme(cx.theme());
+        let popup_styles = crate::ui::design::PopupStyles::from_theme(cx.theme());
+        let background = if is_menu {
+            menu_styles.background
+        } else {
+            popup_styles.background
+        };
+        let rounded = cx.config().rounded_corners;
+        let panel = if render_borders {
+            crate::widgets::Panel::framed(crate::widgets::PanelStyle::plain(background), rounded)
+        } else {
+            crate::widgets::Panel::surface(crate::widgets::PanelStyle::plain(background))
+        };
+        let inner = panel.content_area(area);
+        cx.defer_paint("popup_chrome", move |surface, _cancellation| {
+            panel.render(surface, area);
         });
+
+        let max_offset = child_height.saturating_sub(inner.height) as usize;
+        let half_page_size = (inner.height / 2) as usize;
+        let scroll = max_offset.min(self.scroll_half_pages * half_page_size);
+        if let Some(div) = scroll.checked_div(half_page_size) {
+            self.scroll_half_pages = div;
+        }
+        cx.set_scroll(Some(scroll));
+        let child = self.contents.prepare_render(inner, cx);
+        cx.defer_prepared("popup_content", vec![child]);
+
+        if self.has_scrollbar && inner.width > 0 && child_height as usize > inner.height as usize {
+            let scroll_style = menu_styles.scroll;
+            let border = u16::from(render_borders);
+            cx.defer_paint("popup_scrollbar", move |surface, _cancellation| {
+                let thumb_fg = scroll_style.fg.unwrap_or(helix_view::theme::Color::Reset);
+                let mut scrollbar = crate::widgets::Scrollbar::new(
+                    child_height as usize,
+                    scroll,
+                    inner.height as usize,
+                )
+                .symbol(if render_borders { "▌" } else { "▐" })
+                .thumb_style(helix_view::graphics::Style::default().fg(thumb_fg));
+                if !render_borders {
+                    let track_fg = scroll_style.bg.unwrap_or(helix_view::theme::Color::Reset);
+                    scrollbar =
+                        scrollbar.track("▐", helix_view::graphics::Style::default().fg(track_fg));
+                }
+                scrollbar.render(
+                    Rect::new(inner.right() - 1 + border, inner.top(), 1, inner.height),
+                    surface,
+                );
+            });
+        }
+
+        crate::render::PreparedRender::ready(crate::render::RenderOutput::sparse(viewport))
     }
 
     fn id(&self) -> Option<&str> {

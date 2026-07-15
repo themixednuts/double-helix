@@ -7,7 +7,10 @@ use std::borrow::Cow;
 use std::char::{ToLowercase, ToUppercase};
 use std::time::Instant;
 
-use crate::editor::LspSelectionRangeConfig;
+use crate::{
+    editor::LspSelectionRangeConfig,
+    handlers::lsp::{SelectionRangeDirection, SelectionRangeResponse},
+};
 use helix_core::{
     auto_pairs, comment,
     graphemes::{self, prev_grapheme_boundary},
@@ -2723,7 +2726,7 @@ pub fn textobject_surrounding_pair(
 
 /// Expand selection to parent syntax node.
 pub fn expand_selection(editor: &mut Editor, view_id: ViewId, doc_id: DocumentId) {
-    editor.with_view_doc_mut(view_id, doc_id, |view, doc| {
+    let request_lsp_fallback = editor.with_view_doc_mut(view_id, doc_id, |view, doc| {
         if let Some((syntax, text)) = doc.syntax_text() {
             let current_selection = doc.selection(view_id);
             let selection = object::expand_selection(syntax, text, current_selection.clone());
@@ -2732,28 +2735,26 @@ pub fn expand_selection(editor: &mut Editor, view_id: ViewId, doc_id: DocumentId
                 view.object_selections_mut().push(current_selection.clone());
                 doc.set_selection(view_id, selection);
             }
-        } else if let Some(selection) =
-            lsp_selection_range_fallback(doc, view_id, LspSelectionRangeDirection::Expand)
-        {
-            let current_selection = doc.selection(view_id);
-            if *current_selection != selection {
-                view.object_selections_mut().push(current_selection.clone());
-                doc.set_selection(view_id, selection);
-            }
+            false
+        } else {
+            true
         }
     });
+    if request_lsp_fallback {
+        request_lsp_selection_range(editor, view_id, doc_id, SelectionRangeDirection::Expand);
+    }
 }
 
 /// Shrink selection to previous or first child syntax node.
 pub fn shrink_selection(editor: &mut Editor, view_id: ViewId, doc_id: DocumentId) {
     // Check if we have a saved object selection to restore
-    editor.with_view_doc_mut(view_id, doc_id, |view, doc| {
+    let request_lsp_fallback = editor.with_view_doc_mut(view_id, doc_id, |view, doc| {
         let prev_selection = view.object_selections_mut().pop();
         let current_selection = doc.selection(view_id);
         if let Some(prev_selection) = prev_selection {
             if current_selection.contains(&prev_selection) {
                 doc.set_selection(view_id, prev_selection);
-                return;
+                return false;
             }
             view.object_selections_mut().clear();
         }
@@ -2762,35 +2763,38 @@ pub fn shrink_selection(editor: &mut Editor, view_id: ViewId, doc_id: DocumentId
             let current_selection = doc.selection(view_id).clone();
             let selection = object::shrink_selection(syntax, text, current_selection);
             doc.set_selection(view_id, selection);
-        } else if let Some(selection) =
-            lsp_selection_range_fallback(doc, view_id, LspSelectionRangeDirection::Shrink)
-        {
-            doc.set_selection(view_id, selection);
+            false
+        } else {
+            true
         }
     });
+    if request_lsp_fallback {
+        request_lsp_selection_range(editor, view_id, doc_id, SelectionRangeDirection::Shrink);
+    }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LspSelectionRangeDirection {
-    Expand,
-    Shrink,
-}
-
-fn lsp_selection_range_fallback(
-    doc: &Document,
+fn request_lsp_selection_range(
+    editor: &Editor,
     view_id: ViewId,
-    direction: LspSelectionRangeDirection,
-) -> Option<Selection> {
+    doc_id: DocumentId,
+    direction: SelectionRangeDirection,
+) {
+    let Some(doc) = editor.document(doc_id) else {
+        return;
+    };
     if doc.config.load().lsp.selection_ranges == LspSelectionRangeConfig::Disabled {
-        return None;
+        return;
     }
 
-    let language_server = doc
+    let Some(language_server) = doc
         .language_servers_with_feature(LanguageServerFeature::SelectionRange)
-        .next()?;
+        .next()
+    else {
+        return;
+    };
     let offset_encoding = language_server.offset_encoding();
-    let current_selection = doc.selection(view_id).clone();
-    let positions = current_selection
+    let expected_selection = doc.selection(view_id).clone();
+    let positions = expected_selection
         .ranges()
         .iter()
         .map(|range| {
@@ -2801,16 +2805,79 @@ fn lsp_selection_range_fallback(
             )
         })
         .collect();
-    let request =
-        language_server.text_document_selection_range(doc.identifier(), positions, None)?;
-    let response = helix_lsp::block_on(request).ok().flatten()?;
-    selection_from_lsp_selection_ranges(
-        doc.text(),
-        &current_selection,
-        response,
+    let Some(request) =
+        language_server.text_document_selection_range(doc.identifier(), positions, None)
+    else {
+        return;
+    };
+    let expected_version = doc.version();
+    let responses = editor.handlers.selection_ranges.clone();
+    editor
+        .work()
+        .spawn(async move {
+            match request.await {
+                Ok(Some(ranges)) => {
+                    let _ = responses
+                        .send(SelectionRangeResponse {
+                            doc_id,
+                            view_id,
+                            expected_version,
+                            expected_selection,
+                            offset_encoding,
+                            direction,
+                            ranges,
+                        })
+                        .await;
+                }
+                Ok(None) => {}
+                Err(error) => log::debug!("LSP selectionRange request failed: {error}"),
+            }
+        })
+        .detach();
+}
+
+pub fn apply_lsp_selection_range_response(
+    editor: &mut Editor,
+    response: SelectionRangeResponse,
+) -> bool {
+    let SelectionRangeResponse {
+        doc_id,
+        view_id,
+        expected_version,
+        expected_selection,
         offset_encoding,
         direction,
-    )
+        ranges,
+    } = response;
+    if !editor.tree.contains(view_id) || editor.tree.get(view_id).doc != doc_id {
+        return false;
+    }
+    let Some(doc) = editor.document(doc_id) else {
+        return false;
+    };
+    if doc.version() != expected_version || doc.selection(view_id) != &expected_selection {
+        return false;
+    }
+    let Some(selection) = selection_from_lsp_selection_ranges(
+        doc.text(),
+        &expected_selection,
+        ranges,
+        offset_encoding,
+        direction,
+    ) else {
+        return false;
+    };
+    if selection == expected_selection {
+        return false;
+    }
+
+    editor.with_view_doc_mut(view_id, doc_id, |view, doc| {
+        if direction == SelectionRangeDirection::Expand {
+            view.object_selections_mut().push(expected_selection);
+        }
+        doc.set_selection(view_id, selection);
+    });
+    true
 }
 
 fn selection_from_lsp_selection_ranges(
@@ -2818,7 +2885,7 @@ fn selection_from_lsp_selection_ranges(
     current_selection: &Selection,
     response: Vec<helix_lsp::lsp::SelectionRange>,
     offset_encoding: helix_lsp::OffsetEncoding,
-    direction: LspSelectionRangeDirection,
+    direction: SelectionRangeDirection,
 ) -> Option<Selection> {
     if response.len() != current_selection.ranges().len() {
         log::warn!(
@@ -2836,8 +2903,8 @@ fn selection_from_lsp_selection_ranges(
         .map(|(current, selection_range)| {
             let chain = lsp_selection_range_chain(text, selection_range, offset_encoding);
             match direction {
-                LspSelectionRangeDirection::Expand => next_lsp_selection_range(current, &chain),
-                LspSelectionRangeDirection::Shrink => previous_lsp_selection_range(current, &chain),
+                SelectionRangeDirection::Expand => next_lsp_selection_range(current, &chain),
+                SelectionRangeDirection::Shrink => previous_lsp_selection_range(current, &chain),
             }
             .unwrap_or(*current)
         })
@@ -3004,7 +3071,6 @@ mod tests {
 
     use arc_swap::ArcSwap;
     use helix_core::syntax;
-    use helix_loader::runtime_dirs;
 
     use super::*;
     use crate::{
@@ -3048,7 +3114,7 @@ mod tests {
     }
 
     fn test_editor_with_text(text: &str) -> (Editor, ViewId, DocumentId) {
-        let theme_loader = theme::Loader::new(runtime_dirs());
+        let theme_loader = theme::Loader::new(&[]);
         let syn_loader = helix_core::config::default_lang_loader();
         let config = Arc::new(ArcSwap::from_pointee(Config::default()));
         let mut editor = Editor::new(
@@ -3093,6 +3159,25 @@ mod tests {
         }
     }
 
+    fn lsp_selection_range_response(
+        editor: &Editor,
+        view_id: ViewId,
+        doc_id: DocumentId,
+        expected_selection: Selection,
+        direction: SelectionRangeDirection,
+        ranges: Vec<helix_lsp::lsp::SelectionRange>,
+    ) -> SelectionRangeResponse {
+        SelectionRangeResponse {
+            doc_id,
+            view_id,
+            expected_version: editor.document(doc_id).expect("document").version(),
+            expected_selection,
+            offset_encoding: helix_lsp::OffsetEncoding::Utf8,
+            direction,
+            ranges,
+        }
+    }
+
     #[test]
     fn lsp_selection_range_expand_uses_next_parent_chain_range() {
         let text = Rope::from("abcdef");
@@ -3112,7 +3197,7 @@ mod tests {
             &selection,
             response,
             helix_lsp::OffsetEncoding::Utf8,
-            LspSelectionRangeDirection::Expand,
+            SelectionRangeDirection::Expand,
         )
         .expect("selection");
 
@@ -3138,7 +3223,7 @@ mod tests {
             &selection,
             response,
             helix_lsp::OffsetEncoding::Utf8,
-            LspSelectionRangeDirection::Shrink,
+            SelectionRangeDirection::Shrink,
         )
         .expect("selection");
 
@@ -3156,10 +3241,123 @@ mod tests {
             &selection,
             response,
             helix_lsp::OffsetEncoding::Utf8,
-            LspSelectionRangeDirection::Expand,
+            SelectionRangeDirection::Expand,
         );
 
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn async_lsp_selection_range_applies_to_exact_source_and_restores_history() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let _guard = runtime.enter();
+        let (mut editor, view_id, doc_id) = test_editor_with_text("abcdef");
+        let expected = Selection::single(1, 2);
+        editor
+            .document_mut(doc_id)
+            .expect("document")
+            .set_selection(view_id, expected.clone());
+        let response = lsp_selection_range_response(
+            &editor,
+            view_id,
+            doc_id,
+            expected.clone(),
+            SelectionRangeDirection::Expand,
+            vec![lsp_selection_range(
+                1,
+                2,
+                Some(lsp_selection_range(1, 4, None)),
+            )],
+        );
+
+        assert!(apply_lsp_selection_range_response(&mut editor, response));
+        assert_eq!(
+            editor
+                .document(doc_id)
+                .expect("document")
+                .selection(view_id),
+            &Selection::single(1, 4)
+        );
+        assert_eq!(
+            editor.tree.get(view_id).object_selections,
+            [expected.clone()]
+        );
+
+        shrink_selection(&mut editor, view_id, doc_id);
+        assert_eq!(
+            editor
+                .document(doc_id)
+                .expect("document")
+                .selection(view_id),
+            &expected
+        );
+        assert!(editor.tree.get(view_id).object_selections.is_empty());
+    }
+
+    #[test]
+    fn async_lsp_selection_range_discards_changed_selection() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let _guard = runtime.enter();
+        let (mut editor, view_id, doc_id) = test_editor_with_text("abcdef");
+        let expected = Selection::single(1, 2);
+        editor
+            .document_mut(doc_id)
+            .expect("document")
+            .set_selection(view_id, expected.clone());
+        let response = lsp_selection_range_response(
+            &editor,
+            view_id,
+            doc_id,
+            expected,
+            SelectionRangeDirection::Expand,
+            vec![lsp_selection_range(1, 4, None)],
+        );
+        let changed = Selection::single(2, 3);
+        editor
+            .document_mut(doc_id)
+            .expect("document")
+            .set_selection(view_id, changed.clone());
+
+        assert!(!apply_lsp_selection_range_response(&mut editor, response));
+        assert_eq!(
+            editor
+                .document(doc_id)
+                .expect("document")
+                .selection(view_id),
+            &changed
+        );
+        assert!(editor.tree.get(view_id).object_selections.is_empty());
+    }
+
+    #[test]
+    fn async_lsp_selection_range_discards_stale_document_version() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let _guard = runtime.enter();
+        let (mut editor, view_id, doc_id) = test_editor_with_text("abcdef");
+        let expected = Selection::single(1, 2);
+        editor
+            .document_mut(doc_id)
+            .expect("document")
+            .set_selection(view_id, expected.clone());
+        let mut response = lsp_selection_range_response(
+            &editor,
+            view_id,
+            doc_id,
+            expected.clone(),
+            SelectionRangeDirection::Expand,
+            vec![lsp_selection_range(1, 4, None)],
+        );
+        response.expected_version += 1;
+
+        assert!(!apply_lsp_selection_range_response(&mut editor, response));
+        assert_eq!(
+            editor
+                .document(doc_id)
+                .expect("document")
+                .selection(view_id),
+            &expected
+        );
+        assert!(editor.tree.get(view_id).object_selections.is_empty());
     }
 
     #[test]

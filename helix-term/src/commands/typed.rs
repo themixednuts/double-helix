@@ -1,8 +1,12 @@
+use std::collections::HashMap;
 use std::fmt::Write;
 use std::io::BufReader;
 use std::ops::{self, Deref};
 
-use crate::runtime::{AssistantCommand, LayerCommand, PendingFormatWrite, UiCommand};
+use crate::runtime::ui::DocumentCommand;
+use crate::runtime::{
+    AssistantBackendConnection, AssistantCommand, LayerCommand, PendingFormatWrite, UiCommand,
+};
 
 use super::*;
 
@@ -12,12 +16,10 @@ use helix_core::indent::MAX_INDENT;
 use helix_core::syntax::Loader;
 use helix_core::text_folding;
 use helix_core::{line_ending, SmartString};
-use helix_plugin::PluginManager;
 use helix_stdx::path::home_dir;
 use helix_view::document::{read_to_string, DEFAULT_LANGUAGE_NAME};
 use helix_view::editor::{CloseError, ClosePolicy, ConfigEvent, PanelBehavior, SavePolicy};
 use helix_view::expansion;
-use helix_view::handlers::BlameEvent;
 use serde_json::Value;
 use std::sync::Arc;
 use ui::completers::{self, Completer};
@@ -34,7 +36,7 @@ pub struct TypableCommand {
     pub signature: Signature,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 pub struct CommandCompleter {
     // Arguments with specific completion methods based on their position.
     positional_args: &'static [Completer],
@@ -65,11 +67,56 @@ impl CommandCompleter {
         }
     }
 
-    fn for_argument_number(&self, n: usize) -> &Completer {
+    fn for_argument_number(&self, n: usize) -> Completer {
         match self.positional_args.get(n) {
-            Some(completer) => completer,
-            _ => &self.var_args,
+            Some(completer) => *completer,
+            _ => self.var_args,
         }
+    }
+
+    fn snapshots(self, editor: &Editor) -> HashMap<Completer, ui::completers::CompleterSnapshot> {
+        self.positional_args
+            .iter()
+            .copied()
+            .chain(std::iter::once(self.var_args))
+            .map(|completer| (completer, completer.capture_snapshot(editor)))
+            .collect()
+    }
+}
+
+pub(crate) struct CommandArgsCompletionProvider {
+    signature: Signature,
+    completer: CommandCompleter,
+    offset: usize,
+}
+
+impl CommandArgsCompletionProvider {
+    pub(crate) const fn new(
+        signature: Signature,
+        completer: CommandCompleter,
+        offset: usize,
+    ) -> Self {
+        Self {
+            signature,
+            completer,
+            offset,
+        }
+    }
+}
+
+impl ui::prompt::CompletionProvider for CommandArgsCompletionProvider {
+    fn capture(
+        &mut self,
+        editor: &Editor,
+        input: Arc<str>,
+    ) -> ui::prompt::completion::CompletionRequest {
+        let snapshots = self.completer.snapshots(editor);
+        let signature = self.signature;
+        let completer = self.completer;
+        let offset = self.offset;
+        ui::prompt::completion::CompletionRequest::new(move || {
+            complete_command_args(signature, completer, &snapshots, &input, offset)
+        })
     }
 }
 
@@ -78,18 +125,19 @@ fn exit(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow:
         return Ok(());
     }
 
+    let mut required = Vec::new();
     if focused_ref!(cx.editor).1.is_modified() {
-        write_impl(
+        required.push(write_impl(
             cx,
             args.first(),
             WriteOptions {
                 policy: SavePolicy::Safe,
                 auto_format: !args.has_flag(WRITE_NO_FORMAT_FLAG.name),
             },
-        )?;
+        )?);
     }
-    cx.block_try_flush_writes()?;
-    quit(cx, Args::default(), event)
+    queue_close_view(cx, &required, true);
+    Ok(())
 }
 
 fn force_exit(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow::Result<()> {
@@ -97,18 +145,19 @@ fn force_exit(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> a
         return Ok(());
     }
 
+    let mut required = Vec::new();
     if focused_ref!(cx.editor).1.is_modified() {
-        write_impl(
+        required.push(write_impl(
             cx,
             args.first(),
             WriteOptions {
                 policy: SavePolicy::Overwrite,
                 auto_format: !args.has_flag(WRITE_NO_FORMAT_FLAG.name),
             },
-        )?;
+        )?);
     }
-    cx.block_try_flush_writes()?;
-    quit(cx, Args::default(), event)
+    queue_close_view(cx, &required, true);
+    Ok(())
 }
 
 fn quit(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> anyhow::Result<()> {
@@ -118,14 +167,7 @@ fn quit(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> anyhow
         return Ok(());
     }
 
-    // last view and we have unsaved changes
-    if cx.editor.has_single_view() {
-        buffers_remaining_impl(cx.editor)?
-    }
-
-    cx.block_try_flush_writes()?;
-    cx.editor.close(view!(cx.editor).id);
-
+    queue_close_view(cx, &[], true);
     Ok(())
 }
 
@@ -134,10 +176,33 @@ fn force_quit(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> 
         return Ok(());
     }
 
-    cx.block_try_flush_writes()?;
-    cx.editor.close(view!(cx.editor).id);
-
+    queue_close_view(cx, &[], false);
     Ok(())
+}
+
+fn queue_after_writes(cx: &mut compositor::Context, required: &[DocumentId], command: UiCommand) {
+    let mut documents: Vec<_> = cx.editor.pending_write_documents().collect();
+    for document in required {
+        if !documents.contains(document) {
+            documents.push(*document);
+        }
+    }
+    cx.submit_ui(UiCommand::AfterWrites {
+        documents,
+        command: Box::new(command),
+    });
+}
+
+fn queue_close_view(cx: &mut compositor::Context, required: &[DocumentId], check_buffers: bool) {
+    let view = view!(cx.editor).id;
+    queue_after_writes(
+        cx,
+        required,
+        UiCommand::Document(DocumentCommand::CloseView {
+            view,
+            check_buffers,
+        }),
+    );
 }
 
 fn open(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow::Result<()> {
@@ -149,44 +214,88 @@ fn open(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow:
 }
 
 fn open_impl(cx: &mut compositor::Context, args: Args, action: Action) -> anyhow::Result<()> {
-    for arg in args {
-        let (path, pos) = crate::args::parse_file(&arg);
-        let path = helix_stdx::path::expand_tilde(path);
-        // If the path is a directory, open a file picker on that directory and update the status
-        // message
-        if let Ok(true) = std::fs::canonicalize(&path).map(|p| p.is_dir()) {
-            let callback = async move {
-                Ok(UiCommand::Layer(LayerCommand::PushFilePicker {
-                    root: path.into_owned(),
-                }))
-            };
-            cx.spawn_ui(callback);
-        } else {
-            // Otherwise, just open the file
-            let _ = cx.editor.open(&path, action)?;
-            let (view_id, doc) = focused!(cx.editor);
-            let pos = Selection::point(pos_at_coords(doc.text().slice(..), pos, true));
-            doc.set_selection(view_id, pos);
-            // does not affect opening a buffer without pos
-            let view = view!(cx.editor, view_id);
-            align_view(doc, view, Align::Center);
-        }
-    }
+    let initial_view = cx.editor.focused_view_id();
+    let requests = args
+        .into_iter()
+        .enumerate()
+        .map(|(index, arg)| {
+            let (path, pos) = crate::args::parse_file(&arg);
+            crate::runtime::DocumentOpenRequest {
+                path: helix_stdx::path::expand_tilde(path).into_owned(),
+                action,
+                lane: crate::runtime::DocumentOpenLane::Command,
+                target: if index == 0 {
+                    crate::runtime::DocumentOpenTarget::View(initial_view)
+                } else {
+                    crate::runtime::DocumentOpenTarget::PreviousResult
+                },
+                selection: crate::runtime::DocumentOpenSelection::Position(pos),
+                alignment: crate::runtime::DocumentOpenAlignment::Center,
+                default_folding_if_new: false,
+                fff_record: None,
+                external_if_binary: None,
+                post_action: crate::runtime::DocumentOpenPostAction::None,
+                completion: crate::runtime::DocumentOpenCompletionTarget::Editor,
+            }
+        })
+        .collect::<Vec<_>>();
+    crate::runtime::ui::document::queue_document_open_batch(cx.editor, &cx.ingress, requests);
     Ok(())
+}
+
+fn queue_plain_document_open(
+    cx: &mut compositor::Context,
+    path: PathBuf,
+    action: Action,
+    post_action: crate::runtime::DocumentOpenPostAction,
+) {
+    let target = cx.editor.focused_view_id();
+    crate::runtime::ui::document::queue_document_open(
+        cx.editor,
+        &cx.ingress,
+        &cx.foreground,
+        crate::runtime::DocumentOpenRequest {
+            path,
+            action,
+            lane: crate::runtime::DocumentOpenLane::Command,
+            target: crate::runtime::DocumentOpenTarget::View(target),
+            selection: crate::runtime::DocumentOpenSelection::None,
+            alignment: crate::runtime::DocumentOpenAlignment::None,
+            default_folding_if_new: false,
+            fff_record: None,
+            external_if_binary: None,
+            post_action,
+            completion: crate::runtime::DocumentOpenCompletionTarget::Editor,
+        },
+    );
 }
 
 fn buffer_close_by_ids_impl(
     cx: &mut compositor::Context,
     doc_ids: &[DocumentId],
     policy: ClosePolicy,
+    required: &[DocumentId],
 ) -> anyhow::Result<()> {
-    cx.block_try_flush_writes()?;
+    queue_after_writes(
+        cx,
+        required,
+        UiCommand::Document(DocumentCommand::CloseDocuments {
+            documents: doc_ids.to_vec(),
+            policy,
+        }),
+    );
+    Ok(())
+}
 
+pub(crate) fn close_documents_now(
+    editor: &mut Editor,
+    doc_ids: &[DocumentId],
+    policy: ClosePolicy,
+) -> anyhow::Result<()> {
     let (modified_ids, modified_names): (Vec<_>, Vec<_>) = doc_ids
         .iter()
         .filter_map(|&doc_id| {
-            if let Err(CloseError::BufferModified(name)) = cx.editor.close_document(doc_id, policy)
-            {
+            if let Err(CloseError::BufferModified(name)) = editor.close_document(doc_id, policy) {
                 Some((doc_id, name))
             } else {
                 None
@@ -195,11 +304,11 @@ fn buffer_close_by_ids_impl(
         .unzip();
 
     if let Some(first) = modified_ids.first() {
-        let (_, current) = focused_ref!(cx.editor);
+        let (_, current) = focused_ref!(editor);
         // If the current document is unmodified, and there are modified
         // documents, switch focus to the first modified doc.
         if !modified_ids.contains(&current.id()) {
-            cx.editor.switch(*first, Action::Replace);
+            editor.switch(*first, Action::Replace);
         }
         bail!(
             "{} unsaved buffer{} remaining: {:?}",
@@ -257,7 +366,7 @@ fn buffer_close(
     }
 
     let document_ids = buffer_gather_paths_impl(cx.editor, args);
-    buffer_close_by_ids_impl(cx, &document_ids, ClosePolicy::ProtectModified)
+    buffer_close_by_ids_impl(cx, &document_ids, ClosePolicy::ProtectModified, &[])
 }
 
 fn force_buffer_close(
@@ -270,7 +379,7 @@ fn force_buffer_close(
     }
 
     let document_ids = buffer_gather_paths_impl(cx.editor, args);
-    buffer_close_by_ids_impl(cx, &document_ids, ClosePolicy::DiscardModified)
+    buffer_close_by_ids_impl(cx, &document_ids, ClosePolicy::DiscardModified, &[])
 }
 
 fn buffer_gather_others_impl(editor: &mut Editor, skip_visible: bool) -> Vec<DocumentId> {
@@ -305,7 +414,7 @@ fn buffer_close_others(
     }
 
     let document_ids = buffer_gather_others_impl(cx.editor, args.has_flag("skip-visible"));
-    buffer_close_by_ids_impl(cx, &document_ids, ClosePolicy::ProtectModified)
+    buffer_close_by_ids_impl(cx, &document_ids, ClosePolicy::ProtectModified, &[])
 }
 
 fn force_buffer_close_others(
@@ -318,7 +427,7 @@ fn force_buffer_close_others(
     }
 
     let document_ids = buffer_gather_others_impl(cx.editor, args.has_flag("skip-visible"));
-    buffer_close_by_ids_impl(cx, &document_ids, ClosePolicy::DiscardModified)
+    buffer_close_by_ids_impl(cx, &document_ids, ClosePolicy::DiscardModified, &[])
 }
 
 fn buffer_gather_all_impl(editor: &mut Editor) -> Vec<DocumentId> {
@@ -335,7 +444,7 @@ fn buffer_close_all(
     }
 
     let document_ids = buffer_gather_all_impl(cx.editor);
-    buffer_close_by_ids_impl(cx, &document_ids, ClosePolicy::ProtectModified)
+    buffer_close_by_ids_impl(cx, &document_ids, ClosePolicy::ProtectModified, &[])
 }
 
 fn force_buffer_close_all(
@@ -348,7 +457,7 @@ fn force_buffer_close_all(
     }
 
     let document_ids = buffer_gather_all_impl(cx.editor);
-    buffer_close_by_ids_impl(cx, &document_ids, ClosePolicy::DiscardModified)
+    buffer_close_by_ids_impl(cx, &document_ids, ClosePolicy::DiscardModified, &[])
 }
 
 fn buffer_next(
@@ -381,7 +490,7 @@ fn write_impl(
     cx: &mut compositor::Context,
     path: Option<&str>,
     options: WriteOptions,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<DocumentId> {
     let path = path.filter(|path| !path.is_empty());
     let config = cx.editor.config();
     let (view_id, doc) = focused!(cx.editor);
@@ -431,9 +540,7 @@ fn write_impl(
         cx.editor.save(doc_id, path, options.policy)?;
     }
 
-    cx.block_try_flush_writes()?;
-
-    Ok(())
+    Ok(doc_id)
 }
 
 /// Trim all whitespace preceding line-endings in a document.
@@ -514,6 +621,7 @@ fn write(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow
             auto_format: !args.has_flag(WRITE_NO_FORMAT_FLAG.name),
         },
     )
+    .map(|_| ())
 }
 
 fn force_write(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow::Result<()> {
@@ -529,6 +637,7 @@ fn force_write(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> 
             auto_format: !args.has_flag(WRITE_NO_FORMAT_FLAG.name),
         },
     )
+    .map(|_| ())
 }
 
 fn write_buffer_close(
@@ -540,7 +649,7 @@ fn write_buffer_close(
         return Ok(());
     }
 
-    write_impl(
+    let saved = write_impl(
         cx,
         args.first(),
         WriteOptions {
@@ -550,7 +659,7 @@ fn write_buffer_close(
     )?;
 
     let document_ids = buffer_gather_paths_impl(cx.editor, args);
-    buffer_close_by_ids_impl(cx, &document_ids, ClosePolicy::ProtectModified)
+    buffer_close_by_ids_impl(cx, &document_ids, ClosePolicy::ProtectModified, &[saved])
 }
 
 fn force_write_buffer_close(
@@ -562,7 +671,7 @@ fn force_write_buffer_close(
         return Ok(());
     }
 
-    write_impl(
+    let saved = write_impl(
         cx,
         args.first(),
         WriteOptions {
@@ -572,7 +681,7 @@ fn force_write_buffer_close(
     )?;
 
     let document_ids = buffer_gather_paths_impl(cx.editor, args);
-    buffer_close_by_ids_impl(cx, &document_ids, ClosePolicy::ProtectModified)
+    buffer_close_by_ids_impl(cx, &document_ids, ClosePolicy::ProtectModified, &[saved])
 }
 
 fn new_file(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> anyhow::Result<()> {
@@ -734,11 +843,10 @@ fn pkg_install(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> 
         return Ok(());
     }
     let names = pkg_names(args)?;
-    crate::runtime::spawn_pkg_operation(
+    cx.ingress.package(
         crate::runtime::PkgOperation::Install(names),
-        cx.editor.work(),
-        cx.ingress.clone(),
-    );
+        cx.editor.config().pkg.clone(),
+    )?;
     Ok(())
 }
 
@@ -746,11 +854,10 @@ fn pkg_update(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> a
     if event != PromptEvent::Validate {
         return Ok(());
     }
-    crate::runtime::spawn_pkg_operation(
+    cx.ingress.package(
         crate::runtime::PkgOperation::Update(args.iter().map(ToString::to_string).collect()),
-        cx.editor.work(),
-        cx.ingress.clone(),
-    );
+        cx.editor.config().pkg.clone(),
+    )?;
     Ok(())
 }
 
@@ -758,11 +865,10 @@ fn pkg_sync(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> an
     if event != PromptEvent::Validate {
         return Ok(());
     }
-    crate::runtime::spawn_pkg_operation(
+    cx.ingress.package(
         crate::runtime::PkgOperation::Sync,
-        cx.editor.work(),
-        cx.ingress.clone(),
-    );
+        cx.editor.config().pkg.clone(),
+    )?;
     Ok(())
 }
 
@@ -809,7 +915,7 @@ fn write_quit(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> a
         return Ok(());
     }
 
-    write_impl(
+    let saved = write_impl(
         cx,
         args.first(),
         WriteOptions {
@@ -817,8 +923,8 @@ fn write_quit(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> a
             auto_format: !args.has_flag(WRITE_NO_FORMAT_FLAG.name),
         },
     )?;
-    cx.block_try_flush_writes()?;
-    quit(cx, Args::default(), event)
+    queue_close_view(cx, &[saved], true);
+    Ok(())
 }
 
 fn force_write_quit(
@@ -830,7 +936,7 @@ fn force_write_quit(
         return Ok(());
     }
 
-    write_impl(
+    let saved = write_impl(
         cx,
         args.first(),
         WriteOptions {
@@ -838,14 +944,14 @@ fn force_write_quit(
             auto_format: !args.has_flag(WRITE_NO_FORMAT_FLAG.name),
         },
     )?;
-    cx.block_try_flush_writes()?;
-    force_quit(cx, Args::default(), event)
+    queue_close_view(cx, &[saved], false);
+    Ok(())
 }
 
 /// Results in an error if there are modified buffers remaining and sets editor
 /// error, otherwise returns `Ok(())`. If the current document is unmodified,
 /// and there are modified documents, switches focus to one of them.
-pub(super) fn buffers_remaining_impl(editor: &mut Editor) -> anyhow::Result<()> {
+pub(crate) fn buffers_remaining_impl(editor: &mut Editor) -> anyhow::Result<()> {
     let modified_ids: Vec<_> = editor
         .documents()
         .filter(|doc| doc.is_modified())
@@ -885,14 +991,13 @@ pub struct WriteAllOptions {
 pub fn write_all_impl(
     cx: &mut compositor::Context,
     options: WriteAllOptions,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Vec<DocumentId>> {
     write_all_editor_impl(
         cx.editor,
         Some(cx.exit_tasks),
         Some(&cx.exit_task_work),
         options,
-    )?;
-    cx.block_try_flush_writes()
+    )
 }
 
 pub fn write_all_editor_impl(
@@ -900,7 +1005,7 @@ pub fn write_all_editor_impl(
     mut exit_tasks: Option<&mut crate::runtime::ExitTaskSet>,
     exit_task_work: Option<&helix_runtime::Work>,
     options: WriteAllOptions,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Vec<DocumentId>> {
     let mut errors: Vec<&'static str> = Vec::new();
     let config = editor.config();
     let saves: Vec<_> = editor
@@ -927,7 +1032,9 @@ pub fn write_all_editor_impl(
         })
         .collect();
 
+    let mut saved_documents = Vec::with_capacity(saves.len());
     for (doc_id, target_view) in saves {
+        saved_documents.push(doc_id);
         let doc = doc_mut!(editor, &doc_id);
         let view = view_mut!(editor, target_view);
 
@@ -981,7 +1088,7 @@ pub fn write_all_editor_impl(
         bail!("{:?}", errors);
     }
 
-    Ok(())
+    Ok(saved_documents)
 }
 
 fn write_all(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow::Result<()> {
@@ -997,6 +1104,7 @@ fn write_all(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> an
             auto_format: !args.has_flag(WRITE_NO_FORMAT_FLAG.name),
         },
     )
+    .map(|_| ())
 }
 
 fn force_write_all(
@@ -1016,6 +1124,7 @@ fn force_write_all(
             auto_format: !args.has_flag(WRITE_NO_FORMAT_FLAG.name),
         },
     )
+    .map(|_| ())
 }
 
 fn write_all_quit(
@@ -1026,7 +1135,7 @@ fn write_all_quit(
     if event != PromptEvent::Validate {
         return Ok(());
     }
-    write_all_impl(
+    let saved = write_all_impl(
         cx,
         WriteAllOptions {
             policy: SavePolicy::Safe,
@@ -1034,7 +1143,7 @@ fn write_all_quit(
             auto_format: !args.has_flag(WRITE_NO_FORMAT_FLAG.name),
         },
     )?;
-    quit_all_impl(cx, QuitPolicy::CheckBuffers)
+    quit_all_impl(cx, QuitPolicy::CheckBuffers, &saved)
 }
 
 fn force_write_all_quit(
@@ -1045,7 +1154,7 @@ fn force_write_all_quit(
     if event != PromptEvent::Validate {
         return Ok(());
     }
-    write_all_impl(
+    let saved = write_all_impl(
         cx,
         WriteAllOptions {
             policy: SavePolicy::Overwrite,
@@ -1053,7 +1162,7 @@ fn force_write_all_quit(
             auto_format: !args.has_flag(WRITE_NO_FORMAT_FLAG.name),
         },
     )?;
-    quit_all_impl(cx, QuitPolicy::DiscardBuffers)
+    quit_all_impl(cx, QuitPolicy::DiscardBuffers, &saved)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1068,18 +1177,18 @@ impl QuitPolicy {
     }
 }
 
-fn quit_all_impl(cx: &mut compositor::Context, policy: QuitPolicy) -> anyhow::Result<()> {
-    cx.block_try_flush_writes()?;
-    if policy.should_check_buffers() {
-        buffers_remaining_impl(cx.editor)?;
-    }
-
-    // close all views
-    let views: Vec<_> = cx.editor.tree.views().map(|(view, _)| view.id).collect();
-    for view_id in views {
-        cx.editor.close(view_id);
-    }
-
+fn quit_all_impl(
+    cx: &mut compositor::Context,
+    policy: QuitPolicy,
+    required: &[DocumentId],
+) -> anyhow::Result<()> {
+    queue_after_writes(
+        cx,
+        required,
+        UiCommand::Document(DocumentCommand::CloseAllViews {
+            check_buffers: policy.should_check_buffers(),
+        }),
+    );
     Ok(())
 }
 
@@ -1088,7 +1197,7 @@ fn quit_all(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> an
         return Ok(());
     }
 
-    quit_all_impl(cx, QuitPolicy::CheckBuffers)
+    quit_all_impl(cx, QuitPolicy::CheckBuffers, &[])
 }
 
 fn force_quit_all(
@@ -1100,7 +1209,7 @@ fn force_quit_all(
         return Ok(());
     }
 
-    quit_all_impl(cx, QuitPolicy::DiscardBuffers)
+    quit_all_impl(cx, QuitPolicy::DiscardBuffers, &[])
 }
 
 fn cquit(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow::Result<()> {
@@ -1114,7 +1223,7 @@ fn cquit(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow
         .unwrap_or(1);
 
     cx.editor.exit_code = exit_code;
-    quit_all_impl(cx, QuitPolicy::CheckBuffers)
+    quit_all_impl(cx, QuitPolicy::CheckBuffers, &[])
 }
 
 fn force_cquit(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow::Result<()> {
@@ -1128,7 +1237,7 @@ fn force_cquit(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> 
         .unwrap_or(1);
     cx.editor.exit_code = exit_code;
 
-    quit_all_impl(cx, QuitPolicy::DiscardBuffers)
+    quit_all_impl(cx, QuitPolicy::DiscardBuffers, &[])
 }
 
 fn theme(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow::Result<()> {
@@ -1524,34 +1633,13 @@ fn reload(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> anyh
         return Ok(());
     }
 
-    let scrolloff = cx.editor.config().scrolloff;
-    let auto_fetch = cx.editor.config().inline_blame.auto_fetch;
-    let diff_providers = cx.editor.diff_providers.clone();
-    let redraw = cx.editor.document_redraw_handle();
-    let (view_id, doc) = focused!(cx.editor);
-    let view = view_mut!(cx.editor, view_id);
-    doc.reload(view, &diff_providers, &redraw).map(|_| {
-        view.ensure_cursor_in_view(doc, scrolloff);
-    })?;
-    let doc_id = doc.id();
-    let changed_path = doc.path().cloned();
-    let blame_request = doc.path().and_then(|path| {
-        doc.should_request_full_file_blame(auto_fetch)
-            .then(|| BlameEvent {
-                path: path.to_path_buf(),
-                doc_id,
-                line: None,
-            })
-    });
-    doc.mark_blame_outdated();
-    let _ = doc;
-
-    if let Some(path) = changed_path {
-        cx.editor.notify_file_changed(path);
-    }
-    if let Some(event) = blame_request {
-        cx.editor.request_blame(event);
-    }
+    let document = focused_ref!(cx.editor).1.id();
+    crate::runtime::ui::document::queue_document_reload(
+        cx.editor,
+        &cx.ingress,
+        document,
+        crate::runtime::DocumentReloadOrigin::Explicit,
+    );
 
     Ok(())
 }
@@ -1565,73 +1653,13 @@ pub fn reload_all(
         return Ok(());
     }
 
-    reload_all_impl(cx.editor)
-}
-
-pub fn reload_all_impl(editor: &mut Editor) -> anyhow::Result<()> {
-    let scrolloff = editor.config().scrolloff;
-    let view_id = view!(editor).id;
-
-    let docs_view_ids: Vec<(DocumentId, Vec<ViewId>)> = editor
-        .documents_mut()
-        .map(|doc| {
-            let mut view_ids: Vec<_> = doc.selections().keys().cloned().collect();
-
-            if view_ids.is_empty() {
-                doc.ensure_view_init(view_id);
-                view_ids.push(view_id);
-            };
-
-            (doc.id(), view_ids)
-        })
-        .collect();
-
-    let blame_compute = editor.config().inline_blame.auto_fetch;
-    let diff_providers = editor.diff_providers.clone();
-    let redraw = editor.document_redraw_handle();
-
-    for (doc_id, view_ids) in docs_view_ids {
-        let doc = doc_mut!(editor, &doc_id);
-
-        // Every doc is guaranteed to have at least 1 view at this point.
-        let view = view_mut!(editor, view_ids[0]);
-
-        // Ensure that the view is synced with the document's history.
-        view.sync_changes(doc);
-
-        if let Err(error) = doc.reload(view, &diff_providers, &redraw) {
-            editor.set_error(format!("{}", error));
-            continue;
-        }
-
-        let changed_path = doc.path().cloned();
-
-        for view_id in view_ids {
-            let view = view_mut!(editor, view_id);
-            if view.doc.eq(&doc_id) {
-                view.ensure_cursor_in_view(doc, scrolloff);
-            }
-        }
-
-        let blame_request = doc.path().and_then(|path| {
-            doc.should_request_full_file_blame(blame_compute)
-                .then(|| BlameEvent {
-                    path: path.to_path_buf(),
-                    doc_id,
-                    line: None,
-                })
-        });
-        doc.mark_blame_outdated();
-        let _ = doc;
-
-        if let Some(path) = changed_path {
-            editor.notify_file_changed(path);
-        }
-        if let Some(event) = blame_request {
-            editor.request_blame(event);
-        }
-    }
-
+    let documents: Vec<_> = cx.editor.document_ids().collect();
+    crate::runtime::ui::document::queue_document_reloads(
+        cx.editor,
+        &cx.ingress,
+        documents,
+        crate::runtime::DocumentReloadOrigin::ReloadAll,
+    );
     Ok(())
 }
 
@@ -1651,6 +1679,7 @@ fn update(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyho
                 auto_format: !args.has_flag(WRITE_NO_FORMAT_FLAG.name),
             },
         )
+        .map(|_| ())
     } else {
         Ok(())
     }
@@ -1714,15 +1743,14 @@ fn lsp_workspace_command(
                     .transpose()?
                     .filter(|args| !args.is_empty());
 
-                cx.ingress
-                    .task(crate::runtime::RuntimeTaskEvent::ExecuteLspCommand {
-                        command: helix_lsp::lsp::Command {
-                            title: command.clone(),
-                            arguments,
-                            command,
-                        },
-                        server_id: *ls_id,
-                    });
+                cx.submit_task(crate::runtime::RuntimeTaskEvent::ExecuteLspCommand {
+                    command: helix_lsp::lsp::Command {
+                        title: command.clone(),
+                        arguments,
+                        command,
+                    },
+                    server_id: *ls_id,
+                });
             }
             [] => {
                 cx.editor.set_status(format!(
@@ -1744,84 +1772,31 @@ fn lsp_restart(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> 
         return Ok(());
     }
 
-    let editor_config = cx.editor.config.load();
     let (_, doc) = focused_ref!(cx.editor);
     let config = doc
         .language_config()
         .context("LSP not defined for the current document")?;
 
-    let language_servers: Vec<_> = config
+    let configured_servers: Vec<_> = config
         .language_servers
         .iter()
-        .map(|ls| ls.name.as_str())
+        .map(|ls| ls.name.clone())
         .collect();
     let language_servers = if args.is_empty() {
-        language_servers
+        configured_servers.iter().cloned().collect()
     } else {
         let (valid, invalid): (Vec<_>, Vec<_>) = args
             .iter()
-            .map(|arg| arg.as_ref())
-            .partition(|name| language_servers.contains(name));
+            .map(|arg| arg.to_string())
+            .partition(|name| configured_servers.contains(name));
         if !invalid.is_empty() {
             let s = if invalid.len() == 1 { "" } else { "s" };
             bail!("Unknown language server{s}: {}", invalid.join(", "));
         }
-        valid
+        valid.into_iter().collect()
     };
-
-    let mut errors = Vec::new();
-    for server in language_servers.iter() {
-        match cx
-            .editor
-            .language_servers
-            .restart_server(
-                server,
-                config,
-                doc.path(),
-                &editor_config.workspace_lsp_roots,
-                editor_config.lsp.snippets,
-            )
-            .transpose()
-        {
-            // Ignore the executable-not-found error unless the server was explicitly requested
-            // in the arguments.
-            Err(helix_lsp::Error::ExecutableNotFound(_))
-                if !args.iter().any(|arg| arg == server) => {}
-            Err(err) => errors.push(err.to_string()),
-            _ => (),
-        }
-    }
-
-    // This collect is needed because refresh_language_server would need to re-borrow editor.
-    let document_ids_to_refresh: Vec<DocumentId> = cx
-        .editor
-        .documents()
-        .filter_map(|doc| match doc.language_config() {
-            Some(config)
-                if config.language_servers.iter().any(|ls| {
-                    language_servers
-                        .iter()
-                        .any(|restarted_ls| restarted_ls == &ls.name)
-                }) =>
-            {
-                Some(doc.id())
-            }
-            _ => None,
-        })
-        .collect();
-
-    for document_id in document_ids_to_refresh {
-        cx.editor.refresh_language_servers(document_id);
-    }
-
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(anyhow::anyhow!(
-            "Error restarting language servers: {}",
-            errors.join(", ")
-        ))
-    }
+    cx.editor.restart_language_servers(&language_servers);
+    Ok(())
 }
 
 fn lsp_stop(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow::Result<()> {
@@ -1831,8 +1806,11 @@ fn lsp_stop(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> any
     let (_, doc) = focused_ref!(cx.editor);
 
     let language_servers: Vec<_> = doc
-        .language_servers()
-        .map(|ls| ls.name().to_string())
+        .language_config()
+        .context("LSP not defined for the current document")?
+        .language_servers
+        .iter()
+        .map(|ls| ls.name.clone())
         .collect();
     let language_servers = if args.is_empty() {
         language_servers
@@ -1850,14 +1828,6 @@ fn lsp_stop(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> any
 
     for ls_name in &language_servers {
         cx.editor.stop_language_server(ls_name);
-
-        for doc in cx.editor.documents_mut() {
-            if let Some(client) = doc.remove_language_server_by_name(ls_name) {
-                doc.clear_diagnostics_for_language_server(client.id());
-                doc.reset_all_inlay_hints();
-                doc.mark_inlay_hints_outdated();
-            }
-        }
     }
 
     Ok(())
@@ -2040,8 +2010,21 @@ fn debug_eval(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> a
         // TODO: support no frame_id
 
         let frame_id = debugger.stack_frames[&thread_id][frame].id;
-        let response = helix_lsp::block_on(debugger.eval(args.join(" "), Some(frame_id)))?;
-        cx.editor.set_status(response.result);
+        let request = debugger.request_handle();
+        let expression = args.join(" ");
+        let ingress = cx.ingress.clone();
+        cx.editor.set_status("Evaluating debugger expression...");
+        cx.editor
+            .work()
+            .spawn(async move {
+                match request.evaluate(expression, Some(frame_id), None).await {
+                    Ok(response) => ingress.status(response.result),
+                    Err(error) => ingress.status(anyhow::anyhow!(
+                        "Failed to evaluate debugger expression: {error}"
+                    )),
+                }
+            })
+            .detach();
     }
     Ok(())
 }
@@ -2085,10 +2068,13 @@ fn tutor(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> anyho
         return Ok(());
     }
 
-    let path = helix_loader::runtime_file(Path::new("tutor"));
-    cx.editor.open(&path, Action::Replace)?;
-    // Unset path to prevent accidentally saving to the original tutor file.
-    focused!(cx.editor).1.set_path(None);
+    let path = helix_loader::runtime_assets()?.require_file("tutor")?.path;
+    queue_plain_document_open(
+        cx,
+        path,
+        Action::Replace,
+        crate::runtime::DocumentOpenPostAction::DetachPath,
+    );
     Ok(())
 }
 
@@ -2203,7 +2189,7 @@ fn set_option(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> a
     };
     let config = serde_json::from_value(config).map_err(field_error)?;
 
-    helix_runtime::send_blocking(&cx.editor.config_events.0, ConfigEvent::Update(config));
+    queue_config_event(cx, ConfigEvent::Update(config))?;
     Ok(())
 }
 
@@ -2295,7 +2281,7 @@ fn toggle_option(
     let config = serde_json::from_value(config)
         .map_err(|err| anyhow::anyhow!("Failed to parse config: {err}"))?;
 
-    helix_runtime::send_blocking(&cx.editor.config_events.0, ConfigEvent::Update(config));
+    queue_config_event(cx, ConfigEvent::Update(config))?;
     cx.editor.set_status(status);
     Ok(())
 }
@@ -2317,7 +2303,7 @@ fn language(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> any
 
     let loader = cx.editor.syn_loader.load();
     if &args[0] == DEFAULT_LANGUAGE_NAME {
-        doc.set_language(None, &loader)
+        doc.set_language(None)
     } else {
         doc.set_language_by_language_id(&args[0], &loader)?;
     }
@@ -2329,6 +2315,15 @@ fn language(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> any
     let diagnostics =
         Editor::doc_diagnostics(&cx.editor.language_servers, &cx.editor.diagnostics, doc);
     doc.replace_diagnostics(diagnostics, &[], None);
+    if let Some(request) = cx
+        .editor
+        .document(id)
+        .and_then(helix_view::Document::prepare_syntax_refresh)
+    {
+        if let Err(error) = cx.ingress.syntax_refresh(request) {
+            log::warn!("[syntax_service] language_change_admission_failed error={error}");
+        }
+    }
     Ok(())
 }
 
@@ -2558,8 +2553,12 @@ fn open_config(
         return Ok(());
     }
 
-    cx.editor
-        .open(&helix_loader::config_file(), Action::Replace)?;
+    queue_plain_document_open(
+        cx,
+        helix_loader::config_file(),
+        Action::Replace,
+        crate::runtime::DocumentOpenPostAction::None,
+    );
     Ok(())
 }
 
@@ -2572,8 +2571,12 @@ fn open_workspace_config(
         return Ok(());
     }
 
-    cx.editor
-        .open(&helix_loader::workspace_config_file(), Action::Replace)?;
+    queue_plain_document_open(
+        cx,
+        helix_loader::workspace_config_file(),
+        Action::Replace,
+        crate::runtime::DocumentOpenPostAction::None,
+    );
     Ok(())
 }
 
@@ -2582,7 +2585,12 @@ fn open_log(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> an
         return Ok(());
     }
 
-    cx.editor.open(&helix_loader::log_file(), Action::Replace)?;
+    queue_plain_document_open(
+        cx,
+        helix_loader::log_file(),
+        Action::Replace,
+        crate::runtime::DocumentOpenPostAction::None,
+    );
     Ok(())
 }
 
@@ -2595,8 +2603,19 @@ fn refresh_config(
         return Ok(());
     }
 
-    helix_runtime::send_blocking(&cx.editor.config_events.0, ConfigEvent::Refresh);
-    Ok(())
+    queue_config_event(cx, ConfigEvent::Refresh)
+}
+
+fn queue_config_event(cx: &mut compositor::Context, event: ConfigEvent) -> anyhow::Result<()> {
+    match cx.editor.config_events.0.try_send(event) {
+        Ok(()) => Ok(()),
+        Err(helix_runtime::TrySend::Full(_)) => {
+            bail!("configuration update queue is busy; retry the command")
+        }
+        Err(helix_runtime::TrySend::Closed(_)) => {
+            bail!("configuration update queue is closed")
+        }
+    }
 }
 
 fn append_output(
@@ -2844,31 +2863,16 @@ fn move_buffer_impl(
         .context("Scratch buffer cannot be moved. Use :write instead")?
         .clone();
 
-    // if new_path is a directory, append the original file name
-    // to move the file into that directory.
-    let new_path = old_path
-        .file_name()
-        .filter(|_| new_path.is_dir())
-        .map(|old_file_name| new_path.join(old_file_name))
-        .unwrap_or(new_path);
-
-    if old_path.exists() {
-        if let Some(parent) = new_path.parent() {
-            if !parent.exists() {
-                if options.parent.should_create_missing() {
-                    std::fs::DirBuilder::new().recursive(true).create(parent)?;
-                } else {
-                    bail!(
-                        "can't move file, parent directory does not exist (use :mv! to create it)"
-                    )
-                }
-            }
-        }
-    }
-
-    if let Err(err) = cx.editor.move_path(&old_path, new_path.as_ref()) {
-        bail!("Could not move file: {err}");
-    }
+    crate::effect::file_operation::submit(
+        cx.editor,
+        cx.ingress.clone(),
+        helix_view::editor::FileOperationRequest::move_to_destination(
+            helix_view::editor::FileOperationOrigin::Command,
+            old_path,
+            helix_view::editor::FileOperationDestination::PathOrDirectory(new_path),
+            options.parent.should_create_missing(),
+        ),
+    );
     Ok(())
 }
 
@@ -2918,28 +2922,45 @@ fn read(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow:
     }
 
     let scrolloff = cx.editor.config().scrolloff;
-    let (view_id, doc) = focused!(cx.editor);
+    let (view_id, doc) = focused_ref!(cx.editor);
 
     let filename = args.first().unwrap();
-    let path = helix_stdx::path::expand_tilde(PathBuf::from(filename.to_string()));
-
-    ensure!(
-        path.exists() && path.is_file(),
-        "path is not a file: {:?}",
-        path
-    );
-
-    let file = std::fs::File::open(path).map_err(|err| anyhow!("error opening file: {}", err))?;
-    let mut reader = BufReader::new(file);
-    let (contents, _, _) = read_to_string(&mut reader, Some(doc.encoding()))
-        .map_err(|err| anyhow!("error reading file: {}", err))?;
-    let contents = Tendril::from(contents);
-    let selection = doc.selection(view_id);
-    let transaction = Transaction::insert(doc.text(), selection, contents);
-    doc.apply(&transaction, view_id);
-    let view = view_mut!(cx.editor, view_id);
-    doc.append_changes_to_history(view);
-    view.ensure_cursor_in_view(doc, scrolloff);
+    let path = helix_stdx::path::expand_tilde(PathBuf::from(filename.to_string())).into_owned();
+    let document = doc.id();
+    let version = doc.version();
+    let encoding = doc.encoding();
+    let selection = doc.selection(view_id).clone();
+    let read_path = path.clone();
+    let ingress = cx.ingress.clone();
+    let read = cx.editor.runtime().block().spawn(move || {
+        let file = std::fs::File::open(&read_path)
+            .map_err(|error| format!("error opening file: {error}"))?;
+        let mut reader = BufReader::new(file);
+        read_to_string(&mut reader, Some(encoding))
+            .map(|(contents, _, _)| contents)
+            .map_err(|error| format!("error reading file: {error}"))
+    });
+    cx.editor
+        .work()
+        .spawn(async move {
+            let result = read
+                .await
+                .unwrap_or_else(|error| Err(format!("document read worker failed: {error}")));
+            let _ = ingress
+                .send_ui(crate::runtime::UiCommand::Document(
+                    crate::runtime::DocumentCommand::InsertFileFinished {
+                        document,
+                        view: view_id,
+                        version,
+                        selection,
+                        scrolloff,
+                        path,
+                        result,
+                    },
+                ))
+                .await;
+        })
+        .detach();
 
     Ok(())
 }
@@ -3583,15 +3604,11 @@ fn reload_all_plugins(
         return Ok(());
     }
 
-    if let Some(plugin_manager) = &cx.plugin_manager {
-        if let Err(e) = plugin_manager.reload_plugins(cx.editor) {
-            cx.editor
-                .set_error(format!("Failed to reload plugins: {}", e));
-        } else {
-            cx.editor.set_status("Plugins reloaded");
-        }
+    if let Err(error) = cx.plugin_runtime.reload() {
+        cx.editor
+            .set_error(format!("Failed to reload plugins: {error}"));
     } else {
-        cx.editor.set_error("Plugin system not enabled".to_string());
+        cx.editor.set_status("Plugins reloaded");
     }
 
     Ok(())
@@ -3608,19 +3625,23 @@ pub(crate) fn do_assistant_connect(
     _editor: &mut helix_view::Editor,
     command: String,
     cmd_args: Vec<String>,
+    env: Vec<(String, String)>,
     mcp_servers: Vec<helix_acp::types::McpServer>,
     profile: Option<helix_view::assistant::profile::Defaults>,
-    ingress: crate::runtime::RuntimeIngress,
+    foreground: crate::runtime::ForegroundEvents,
     _agent_index: Option<usize>,
     _activate_input: bool,
 ) -> anyhow::Result<()> {
-    ingress.task(crate::runtime::RuntimeTaskEvent::ConnectAssistantBackend {
-        command,
-        args: cmd_args,
-        mcp_servers,
-        profile,
-        panel: PanelBehavior::Open,
-    });
+    foreground.task(crate::runtime::RuntimeTaskEvent::ConnectAssistantBackend(
+        Box::new(AssistantBackendConnection::direct(
+            command,
+            cmd_args,
+            env,
+            mcp_servers,
+            profile,
+            PanelBehavior::Open,
+        )),
+    ))?;
 
     Ok(())
 }
@@ -3643,17 +3664,21 @@ fn assistant_connect(
             command,
             cmd_args,
             Vec::new(),
+            Vec::new(),
             None,
-            cx.ingress.clone(),
+            cx.foreground.clone(),
             None,
             false,
         );
     }
 
     // No args — show picker from configured agents
-    let agents = cx.editor.config().agents.clone();
+    let agents = cx.editor.assistant_agents();
     if agents.is_empty() {
-        bail!("No agents configured. Add [[editor.agents]] to config.toml or use :assistant-connect <command> [args...]");
+        cx.editor
+            .notify_info("No assistant agents installed; opening ACP Agents");
+        cx.spawn_ui(async { Ok(UiCommand::Layer(LayerCommand::AcpAgentsManager)) });
+        return Ok(());
     }
 
     let callback = async move {
@@ -3663,6 +3688,18 @@ fn assistant_connect(
     };
     cx.spawn_ui(callback);
 
+    Ok(())
+}
+
+fn assistant_agents(
+    cx: &mut compositor::Context,
+    _args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+    cx.spawn_ui(async { Ok(UiCommand::Layer(LayerCommand::AcpAgentsManager)) });
     Ok(())
 }
 
@@ -3684,8 +3721,7 @@ fn assistant_prompt(
         bail!("Usage: assistant-prompt <message>");
     }
 
-    cx.ingress
-        .task(crate::runtime::RuntimeTaskEvent::SubmitAssistantPrompt { text: prompt_text });
+    cx.submit_task(crate::runtime::RuntimeTaskEvent::SubmitAssistantPrompt { text: prompt_text });
 
     Ok(())
 }
@@ -3700,20 +3736,22 @@ fn assistant_open(
     }
 
     let has_agent = cx.editor.has_assistant_threads();
-    let agents = cx.editor.config().agents.clone();
+    let agents = cx.editor.assistant_agents();
+
+    if !has_agent && agents.is_empty() {
+        cx.editor
+            .notify_info("No assistant agents installed; opening ACP Agents");
+        cx.spawn_ui(async { Ok(UiCommand::Layer(LayerCommand::AcpAgentsManager)) });
+        return Ok(());
+    }
 
     if !has_agent && !agents.is_empty() {
-        let agent = agents[0].clone();
-        return do_assistant_connect(
-            cx.editor,
-            agent.command,
-            agent.args,
-            agent.mcp_servers,
-            None,
-            cx.ingress.clone(),
-            Some(0),
-            false,
-        );
+        cx.spawn_ui(async move {
+            Ok(UiCommand::Assistant(
+                AssistantCommand::PushConfiguredAgentsPicker { agents },
+            ))
+        });
+        return Ok(());
     }
 
     cx.spawn_ui(async { Ok(UiCommand::Assistant(AssistantCommand::OpenPanel)) });
@@ -3752,8 +3790,7 @@ fn assistant_cancel(
         return Ok(());
     }
 
-    cx.ingress
-        .task(crate::runtime::RuntimeTaskEvent::CancelActiveAssistantThread);
+    cx.submit_task(crate::runtime::RuntimeTaskEvent::CancelActiveAssistantThread);
     Ok(())
 }
 
@@ -3781,8 +3818,7 @@ fn assistant_open_history(
         return Ok(());
     }
 
-    cx.ingress
-        .task(crate::runtime::RuntimeTaskEvent::BootstrapAssistantHistory { scope });
+    cx.submit_task(crate::runtime::RuntimeTaskEvent::BootstrapAssistantHistory { scope });
 
     cx.editor.set_status("Loading assistant history...");
 
@@ -3790,8 +3826,7 @@ fn assistant_open_history(
 }
 
 fn cycle_assistant_thread(cx: &mut compositor::Context, delta: isize) -> anyhow::Result<()> {
-    cx.ingress
-        .task(crate::runtime::RuntimeTaskEvent::CycleAssistantThread { delta });
+    cx.submit_task(crate::runtime::RuntimeTaskEvent::CycleAssistantThread { delta });
     Ok(())
 }
 
@@ -3826,8 +3861,7 @@ fn assistant_close_thread(
         return Ok(());
     }
 
-    cx.ingress
-        .task(crate::runtime::RuntimeTaskEvent::CloseActiveAssistantThread);
+    cx.submit_task(crate::runtime::RuntimeTaskEvent::CloseActiveAssistantThread);
     Ok(())
 }
 
@@ -3840,8 +3874,7 @@ fn assistant_new_thread(
         return Ok(());
     }
 
-    cx.ingress
-        .task(crate::runtime::RuntimeTaskEvent::NewAssistantThreadFromActiveBackend);
+    cx.submit_task(crate::runtime::RuntimeTaskEvent::NewAssistantThreadFromActiveBackend);
     Ok(())
 }
 
@@ -3854,8 +3887,7 @@ fn assistant_toggle_follow(
         return Ok(());
     }
 
-    cx.ingress
-        .task(crate::runtime::RuntimeTaskEvent::ToggleActiveAssistantFollow);
+    cx.submit_task(crate::runtime::RuntimeTaskEvent::ToggleActiveAssistantFollow);
     Ok(())
 }
 
@@ -3888,7 +3920,7 @@ fn assistant_permissions_reset(
     Ok(())
 }
 
-async fn resolve_context_provider(
+fn resolve_context_provider(
     editor: &helix_view::Editor,
     key: &helix_view::assistant::context::Key,
 ) -> anyhow::Result<helix_view::assistant::context::Kind> {
@@ -3902,7 +3934,6 @@ async fn resolve_context_provider(
         .context("Assistant context provider missing")?;
     provider
         .provide(editor, &snapshot, None)
-        .await
         .map_err(anyhow::Error::from)
 }
 
@@ -3914,14 +3945,13 @@ fn assistant_attach_selection(
     if event != PromptEvent::Validate {
         return Ok(());
     }
-    cx.ingress
-        .task(crate::runtime::RuntimeTaskEvent::AttachAssistantContext {
-            item: cx
-                .editor
-                .capture_current_surface(helix_view::collab::surface::Capture::Selection)
-                .context("Selection context unavailable")?,
-            status: "Attached selection context",
-        });
+    cx.submit_task(crate::runtime::RuntimeTaskEvent::AttachAssistantContext {
+        item: cx
+            .editor
+            .capture_current_surface(helix_view::collab::surface::Capture::Selection)
+            .context("Selection context unavailable")?,
+        status: "Attached selection context",
+    });
     Ok(())
 }
 
@@ -3933,14 +3963,13 @@ fn assistant_attach_symbol(
     if event != PromptEvent::Validate {
         return Ok(());
     }
-    cx.ingress
-        .task(crate::runtime::RuntimeTaskEvent::AttachAssistantContext {
-            item: cx
-                .editor
-                .capture_current_surface(helix_view::collab::surface::Capture::Symbol)
-                .context("Symbol context unavailable")?,
-            status: "Attached symbol context",
-        });
+    cx.submit_task(crate::runtime::RuntimeTaskEvent::AttachAssistantContext {
+        item: cx
+            .editor
+            .capture_current_surface(helix_view::collab::surface::Capture::Symbol)
+            .context("Symbol context unavailable")?,
+        status: "Attached symbol context",
+    });
     Ok(())
 }
 
@@ -3952,15 +3981,14 @@ fn assistant_attach_file(
     if event != PromptEvent::Validate {
         return Ok(());
     }
-    let item = helix_lsp::block_on(resolve_context_provider(
+    let item = resolve_context_provider(
         cx.editor,
         &helix_view::assistant::context::Key::core("file"),
-    ))?;
-    cx.ingress
-        .task(crate::runtime::RuntimeTaskEvent::AttachAssistantContext {
-            item,
-            status: "Attached file context",
-        });
+    )?;
+    cx.submit_task(crate::runtime::RuntimeTaskEvent::AttachAssistantContext {
+        item,
+        status: "Attached file context",
+    });
     Ok(())
 }
 
@@ -3972,15 +4000,14 @@ fn assistant_attach_diagnostics(
     if event != PromptEvent::Validate {
         return Ok(());
     }
-    let item = helix_lsp::block_on(resolve_context_provider(
+    let item = resolve_context_provider(
         cx.editor,
         &helix_view::assistant::context::Key::core("diagnostics"),
-    ))?;
-    cx.ingress
-        .task(crate::runtime::RuntimeTaskEvent::AttachAssistantContext {
-            item,
-            status: "Attached diagnostics context",
-        });
+    )?;
+    cx.submit_task(crate::runtime::RuntimeTaskEvent::AttachAssistantContext {
+        item,
+        status: "Attached diagnostics context",
+    });
     Ok(())
 }
 
@@ -3992,15 +4019,14 @@ fn assistant_attach_diff(
     if event != PromptEvent::Validate {
         return Ok(());
     }
-    let item = helix_lsp::block_on(resolve_context_provider(
+    let item = resolve_context_provider(
         cx.editor,
         &helix_view::assistant::context::Key::core("diff"),
-    ))?;
-    cx.ingress
-        .task(crate::runtime::RuntimeTaskEvent::AttachAssistantContext {
-            item,
-            status: "Attached diff context",
-        });
+    )?;
+    cx.submit_task(crate::runtime::RuntimeTaskEvent::AttachAssistantContext {
+        item,
+        status: "Attached diff context",
+    });
     Ok(())
 }
 
@@ -4021,10 +4047,9 @@ fn assistant_detach_context(
         bail!("No attached assistant context")
     }
     if items.len() == 1 {
-        cx.ingress
-            .task(crate::runtime::RuntimeTaskEvent::DetachAssistantContext {
-                item: items[0].id.clone(),
-            });
+        cx.submit_task(crate::runtime::RuntimeTaskEvent::DetachAssistantContext {
+            item: items[0].id.clone(),
+        });
         return Ok(());
     }
 
@@ -4045,8 +4070,7 @@ fn assistant_open_entry_scratch(
         return Ok(());
     }
 
-    cx.ingress
-        .task(crate::runtime::RuntimeTaskEvent::OpenSelectedAssistantEntryScratch);
+    cx.submit_task(crate::runtime::RuntimeTaskEvent::OpenSelectedAssistantEntryScratch);
     Ok(())
 }
 
@@ -4068,7 +4092,12 @@ fn assistant_reveal_entry_location(
         .into_iter()
         .next()
         .context("Selected assistant entry has no location")?;
-    cx.editor.open(&location.path, Action::Replace)?;
+    queue_plain_document_open(
+        cx,
+        location.path,
+        Action::Replace,
+        crate::runtime::DocumentOpenPostAction::None,
+    );
     Ok(())
 }
 
@@ -4081,8 +4110,7 @@ fn assistant_open_turn_changes(
         return Ok(());
     }
 
-    cx.ingress
-        .task(crate::runtime::RuntimeTaskEvent::OpenSelectedAssistantTurnChanges);
+    cx.submit_task(crate::runtime::RuntimeTaskEvent::OpenSelectedAssistantTurnChanges);
     Ok(())
 }
 
@@ -4095,8 +4123,7 @@ fn assistant_open_thread_changes(
         return Ok(());
     }
 
-    cx.ingress
-        .task(crate::runtime::RuntimeTaskEvent::OpenActiveAssistantThreadChanges);
+    cx.submit_task(crate::runtime::RuntimeTaskEvent::OpenActiveAssistantThreadChanges);
     Ok(())
 }
 
@@ -5399,6 +5426,17 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         },
     },
     TypableCommand {
+        name: "assistant-agents",
+        aliases: &["acp-agents"],
+        doc: "Browse, install, update, remove, and connect ACP assistant agents.",
+        fun: assistant_agents,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
         name: "assistant-prompt",
         aliases: &["ask"],
         doc: "Send a prompt to the active assistant thread. Usage: :assistant-prompt <message>",
@@ -5685,14 +5723,16 @@ fn execute_command_line(
         Some(cmd) => execute_command(cx, cmd, rest, event),
         None => {
             if event == PromptEvent::Validate {
-                if let Some(pm) = &cx.plugin_manager {
-                    let args: Vec<String> =
-                        rest.split_whitespace().map(|s| s.to_string()).collect();
-                    if let Err(e) = pm.execute_command(cx.editor, command, args) {
-                        Err(anyhow!("{}", e))
-                    } else {
-                        Ok(())
-                    }
+                let args: Vec<String> = rest.split_whitespace().map(str::to_owned).collect();
+                if let Some(remote) = cx
+                    .plugin_runtime
+                    .command_snapshot()
+                    .into_iter()
+                    .find(|candidate| candidate.descriptor.name == command)
+                {
+                    cx.plugin_runtime
+                        .invoke_command(remote.id, args)
+                        .map_err(|error| anyhow!(error.to_string()))
                 } else {
                     Err(anyhow!("no such command: '{command}'"))
                 }
@@ -5733,9 +5773,8 @@ pub(super) fn command_mode(cx: &mut Context) {
 
     match cmdline_style {
         CmdlineStyle::Popup => {
-            let plugin_manager = cx.plugin_manager.clone();
-            let completer = move |editor: &Editor, input: &str| {
-                complete_command_line(editor, input, plugin_manager.clone())
+            let completer = CommandLineCompletionProvider {
+                plugin_runtime: cx.plugin_runtime.clone(),
             };
             let mut cmdline = ui::CmdlinePopup::new(
                 "Cmdline".into(),
@@ -5751,13 +5790,13 @@ pub(super) fn command_mode(cx: &mut Context) {
 
             // Configure popup-specific settings
             cmdline = cmdline.with_language("sh", cx.editor.syn_loader.clone());
+            cmdline.prepare_completion(cx.editor, cx.ingress.clone());
 
             cx.push_layer(Box::new(cmdline));
         }
         CmdlineStyle::Bottom => {
-            let plugin_manager = cx.plugin_manager.clone();
-            let completer = move |editor: &Editor, input: &str| {
-                complete_command_line(editor, input, plugin_manager.clone())
+            let completer = CommandLineCompletionProvider {
+                plugin_runtime: cx.plugin_runtime.clone(),
             };
 
             // Use traditional prompt
@@ -5771,10 +5810,11 @@ pub(super) fn command_mode(cx: &mut Context) {
                     }
                 },
             );
-            prompt.doc_fn = Box::new(command_line_doc);
+            prompt.doc_fn = Arc::new(command_line_doc);
 
             // Calculate initial completion
             prompt.recalculate_completion(cx.editor);
+            prompt.dispatch_completion_work(cx.editor.runtime(), cx.ingress.clone());
             cx.push_layer(Box::new(prompt));
         }
     }
@@ -5852,46 +5892,62 @@ fn command_line_doc(input: &str) -> Option<Cow<'_, str>> {
     Some(Cow::Owned(doc))
 }
 
-fn complete_command_line(
-    editor: &Editor,
-    input: &str,
-    plugin_manager: Option<Arc<PluginManager>>,
-) -> Vec<ui::prompt::Completion> {
-    let (command, rest, complete_command) = command_line::split(input);
+struct CommandLineCompletionProvider {
+    plugin_runtime: crate::plugin_registry::PluginRuntime,
+}
 
-    if complete_command {
-        let mut completions: Vec<_> = fuzzy_match(
-            input,
-            TYPABLE_COMMAND_LIST.iter().map(|command| command.name),
-            false,
-        )
-        .into_iter()
-        .map(|(name, _)| (0.., name.into()))
-        .collect();
-
-        if let Some(pm) = plugin_manager {
-            let commands = pm.get_commands();
-            let plugin_completions =
-                fuzzy_match(input, commands.iter().map(|c| c.name.as_str()), false)
+impl ui::prompt::CompletionProvider for CommandLineCompletionProvider {
+    fn capture(
+        &mut self,
+        editor: &Editor,
+        input: Arc<str>,
+    ) -> ui::prompt::completion::CompletionRequest {
+        let (command, rest, complete_command) = command_line::split(&input);
+        if complete_command {
+            let plugin_runtime = self.plugin_runtime.clone();
+            return ui::prompt::completion::CompletionRequest::new(move || {
+                let mut completions = fuzzy_match(
+                    input.as_ref(),
+                    TYPABLE_COMMAND_LIST.iter().map(|command| command.name),
+                    false,
+                )
+                .into_iter()
+                .map(|(name, _)| (0.., name.into()))
+                .collect::<Vec<_>>();
+                completions.extend(
+                    fuzzy_match(
+                        input.as_ref(),
+                        plugin_runtime
+                            .command_snapshot()
+                            .iter()
+                            .map(|command| command.descriptor.name.as_str()),
+                        false,
+                    )
                     .into_iter()
-                    .map(|(name, _)| (0.., name.to_string().into()));
-            completions.extend(plugin_completions);
+                    .map(|(name, _)| (0.., name.to_owned().into())),
+                );
+                completions
+            });
         }
-        completions
-    } else {
-        TYPABLE_COMMAND_MAP
-            .get(command)
-            .map_or_else(Vec::new, |cmd| {
-                let args_offset = command.len() + 1;
-                complete_command_args(editor, cmd.signature, &cmd.completer, rest, args_offset)
-            })
+
+        let Some(command) = TYPABLE_COMMAND_MAP.get(command) else {
+            return ui::prompt::completion::CompletionRequest::new(Vec::new);
+        };
+        let signature = command.signature;
+        let completer = command.completer;
+        let snapshots = completer.snapshots(editor);
+        let args: Arc<str> = Arc::from(rest);
+        let offset = input.len().saturating_sub(rest.len());
+        ui::prompt::completion::CompletionRequest::new(move || {
+            complete_command_args(signature, completer, &snapshots, &args, offset)
+        })
     }
 }
 
-pub fn complete_command_args(
-    editor: &Editor,
+pub(crate) fn complete_command_args(
     signature: Signature,
-    completer: &CommandCompleter,
+    completer: CommandCompleter,
+    snapshots: &HashMap<Completer, ui::completers::CompleterSnapshot>,
     input: &str,
     offset: usize,
 ) -> Vec<ui::prompt::Completion> {
@@ -5948,8 +6004,12 @@ pub fn complete_command_args(
                         .checked_sub(1)
                         .expect("completion state to be positional");
                     let completer = completer.for_argument_number(n);
+                    let snapshot = snapshots
+                        .get(&completer)
+                        .expect("command completer snapshot missing");
 
-                    completer(editor, &token.content)
+                    completer
+                        .complete(snapshot, &token.content)
                         .into_iter()
                         .map(|(range, span)| quote_completion(&token, range, span, offset))
                         .collect()
@@ -5983,7 +6043,12 @@ pub fn complete_command_args(
                         .expect("completion state to be positional");
                     completer.for_argument_number(n)
                 });
-            complete_expand(editor, &token, arg_completer, offset + token.content_start)
+            complete_expand(
+                snapshots,
+                &token,
+                arg_completer,
+                offset + token.content_start,
+            )
         }
         TokenKind::Expansion(ExpansionKind::Variable) => {
             complete_variable_expansion(&token.content, offset + token.content_start)
@@ -6044,9 +6109,9 @@ fn quote_completion<'a>(
 }
 
 fn complete_expand(
-    editor: &Editor,
+    snapshots: &HashMap<Completer, ui::completers::CompleterSnapshot>,
     token: &Token,
-    completer: Option<&Completer>,
+    completer: Option<Completer>,
     offset: usize,
 ) -> Vec<ui::prompt::Completion> {
     use command_line::{ExpansionKind, Tokenizer};
@@ -6081,7 +6146,7 @@ fn complete_expand(
                     return complete_variable_expansion(&token.content, local_offset);
                 }
                 TokenKind::Expansion(ExpansionKind::Shell) => {
-                    return complete_expand(editor, &token, None, local_offset);
+                    return complete_expand(snapshots, &token, None, local_offset);
                 }
                 TokenKind::ExpansionKind => {
                     return complete_expansion_kind(&token.content, local_offset);
@@ -6093,10 +6158,16 @@ fn complete_expand(
 
     match completer {
         // If no expansions were found and an argument is being completed,
-        Some(completer) if start == 0 => completer(editor, &token.content)
-            .into_iter()
-            .map(|(range, span)| quote_completion(token, range, span, offset))
-            .collect(),
+        Some(completer) if start == 0 => {
+            let snapshot = snapshots
+                .get(&completer)
+                .expect("command completer snapshot missing");
+            completer
+                .complete(snapshot, &token.content)
+                .into_iter()
+                .map(|(range, span)| quote_completion(token, range, span, offset))
+                .collect()
+        }
         _ => Vec::new(),
     }
 }

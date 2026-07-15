@@ -31,7 +31,6 @@ use helix_core::{
     line_ending::{get_line_ending_of_str, line_end_char_index},
     match_brackets,
     movement::{self, move_vertically, Direction},
-    pos_at_coords,
     regex::{self, Regex},
     selection,
     syntax::config::LanguageServerFeature,
@@ -67,14 +66,7 @@ use crate::{
     runtime::{send_task_event_with, AssistantCommand, RuntimeTaskEvent, UiCommand},
     ui::{self, menu::Cell, overlay::overlaid, Picker, PickerColumn, Prompt, PromptEvent},
 };
-use std::{
-    collections::{HashMap, HashSet},
-    error::Error,
-    fmt,
-    io::Read,
-    num::NonZeroUsize,
-    sync::OnceLock,
-};
+use std::{collections::HashSet, fmt, num::NonZeroUsize, sync::OnceLock};
 
 use std::{
     borrow::Cow,
@@ -89,7 +81,7 @@ use grep_regex::RegexMatcherBuilder;
 use grep_searcher::{sinks, BinaryDetection, SearcherBuilder};
 use ignore::{DirEntry, WalkBuilder, WalkState};
 
-use helix_view::{align_view, Align};
+use helix_view::Align;
 
 type FrontendCommandSpec = CommandSpec<fn(&mut Context)>;
 
@@ -154,11 +146,15 @@ impl MappableCommand {
                     ) {
                         compositor_cx.editor.set_error(format!("{}", e));
                     }
-                } else if let Some(plugin_manager) = &cx.plugin_manager {
-                    let args: Vec<String> =
-                        args.split_whitespace().map(|s| s.to_string()).collect();
-                    if let Err(e) = plugin_manager.execute_command(cx.editor, name, args) {
-                        cx.editor.set_error(format!("{}", e));
+                } else if let Some(command) = cx
+                    .plugin_runtime
+                    .command_snapshot()
+                    .into_iter()
+                    .find(|command| command.descriptor.name == *name)
+                {
+                    let args = args.split_whitespace().map(str::to_owned).collect();
+                    if let Err(error) = cx.plugin_runtime.invoke_command(command.id, args) {
+                        cx.editor.set_error(error.to_string());
                     }
                 } else {
                     cx.editor.set_error(format!("no such command: '{name}'"));
@@ -767,6 +763,34 @@ fn goto_file_vsplit(cx: &mut Context) {
     goto_file_impl(cx, Action::VerticalSplit);
 }
 
+fn queue_picker_document_open(
+    cx: &mut compositor::Context,
+    path: PathBuf,
+    action: Action,
+    selection: crate::runtime::DocumentOpenSelection,
+    alignment: crate::runtime::DocumentOpenAlignment,
+) {
+    let target = cx.editor.focused_view_id();
+    crate::runtime::ui::document::queue_document_open(
+        cx.editor,
+        &cx.ingress,
+        &cx.foreground,
+        crate::runtime::DocumentOpenRequest {
+            path,
+            action,
+            lane: crate::runtime::DocumentOpenLane::Navigation,
+            target: crate::runtime::DocumentOpenTarget::View(target),
+            selection,
+            alignment,
+            default_folding_if_new: false,
+            fff_record: None,
+            external_if_binary: None,
+            post_action: crate::runtime::DocumentOpenPostAction::None,
+            completion: crate::runtime::DocumentOpenCompletionTarget::Editor,
+        },
+    );
+}
+
 /// Goto files in selection.
 fn goto_file_impl(cx: &mut Context, action: Action) {
     if lsp::try_open_document_link_at_cursor(cx, action) {
@@ -812,60 +836,37 @@ fn goto_file_impl(cx: &mut Context, action: Action) {
             .collect()
     };
 
-    for sel in paths {
-        if let Ok(url) = Url::parse(&sel) {
-            open_url(cx, url, action);
-            continue;
-        }
-
-        let path = path::expand(&sel);
-        let path = &rel_path.join(path);
-        if path.is_dir() {
-            let picker = ui::file_picker(cx.editor, path.into(), cx.ingress.clone());
-            cx.push_layer(Box::new(overlaid(picker)));
-        } else if let Err(e) = cx.editor.open(path, action) {
-            cx.editor.set_error(format!("Open file failed: {:?}", e));
-        }
-    }
-}
-
-/// Opens the given url. If the URL points to a valid textual file it is open in helix.
-//  Otherwise, the file is open using external program.
-fn open_url(cx: &mut Context, url: Url, action: Action) {
-    let (_, doc) = focused_ref!(cx.editor);
-    let rel_path = doc
-        .relative_path()
-        .map(|path| path.parent().unwrap().to_path_buf())
-        .unwrap_or_default();
-
-    if url.scheme() != "file" {
-        cx.spawn_task_event(crate::open_external_url_task_event(url));
-        return;
-    }
-
-    let content_type = std::fs::File::open(url.path()).and_then(|file| {
-        // Read up to 1kb to detect the content type
-        let mut read_buffer = Vec::new();
-        let n = file.take(1024).read_to_end(&mut read_buffer)?;
-        Ok(content_inspector::inspect(&read_buffer[..n]))
-    });
-
-    // we attempt to open binary files - files that can't be open in helix - using external
-    // program as well, e.g. pdf files or images
-    match content_type {
-        Ok(content_inspector::ContentType::BINARY) => {
-            cx.spawn_task_event(crate::open_external_url_task_event(url))
-        }
-        Ok(_) | Err(_) => {
-            let path = &rel_path.join(url.path());
-            if path.is_dir() {
-                let picker = ui::file_picker(cx.editor, path.into(), cx.ingress.clone());
-                cx.push_layer(Box::new(overlaid(picker)));
-            } else if let Err(e) = cx.editor.open(path, action) {
-                cx.editor.set_error(format!("Open file failed: {:?}", e));
+    let initial_view = cx.editor.focused_view_id();
+    let mut requests = Vec::new();
+    for selected in paths {
+        let (path, external_if_binary) = match Url::parse(&selected) {
+            Ok(url) if url.scheme() != "file" => {
+                cx.spawn_task_event(crate::open_external_url_task_event(url));
+                continue;
             }
-        }
+            Ok(url) => (rel_path.join(url.path()), Some(url)),
+            Err(_) => (rel_path.join(path::expand(&selected)), None),
+        };
+        let target = if requests.is_empty() {
+            crate::runtime::DocumentOpenTarget::View(initial_view)
+        } else {
+            crate::runtime::DocumentOpenTarget::PreviousResult
+        };
+        requests.push(crate::runtime::DocumentOpenRequest {
+            path,
+            action,
+            lane: crate::runtime::DocumentOpenLane::Command,
+            target,
+            selection: crate::runtime::DocumentOpenSelection::None,
+            alignment: crate::runtime::DocumentOpenAlignment::None,
+            default_folding_if_new: false,
+            fff_record: None,
+            external_if_binary,
+            post_action: crate::runtime::DocumentOpenPostAction::None,
+            completion: crate::runtime::DocumentOpenCompletionTarget::Editor,
+        });
     }
+    crate::runtime::ui::document::queue_document_open_batch(cx.editor, &cx.ingress, requests);
 }
 
 fn repeat_last_motion(cx: &mut Context) {
@@ -1135,13 +1136,7 @@ fn searcher(cx: &mut Context, direction: Direction) {
         cx,
         "Search".into(),
         Some(reg),
-        move |_editor: &Editor, input: &str| {
-            completions
-                .iter()
-                .filter(|comp| comp.starts_with(input))
-                .map(|comp| (0.., comp.clone().into()))
-                .collect()
-        },
+        ui::completers::CandidateCompleter::prefix(completions),
         move |cx, regex, event| {
             if event == PromptEvent::Validate {
                 cx.editor.registers.last_search_register = reg;
@@ -1390,29 +1385,23 @@ fn global_search(cx: &mut Context) {
                      editor: &mut Editor,
                      config: std::sync::Arc<GlobalSearchConfig>,
                      injector: &ui::picker::Injector<_, _>,
-                     work: helix_runtime::Work| {
+                     work: helix_runtime::Work,
+                     block: helix_runtime::Block| {
         if query.is_empty() {
             return work.spawn(async { Ok(()) });
         }
 
         let search_root = helix_stdx::env::current_working_dir();
-        if !search_root.exists() {
-            return work
-                .spawn(async { Err(anyhow::anyhow!("Current working directory does not exist")) });
-        }
-
-        let content_overlays: Vec<_> = editor
+        let content_overlay_snapshots: Vec<_> = editor
             .documents()
             .filter(|doc| doc.is_modified())
             .filter_map(|doc| {
                 let path = doc.path()?;
-                Some(fff_search::ContentOverlay {
-                    path: helix_stdx::path::normalize(path),
-                    bytes: std::sync::Arc::from(
-                        doc.text().to_string().into_bytes().into_boxed_slice(),
-                    ),
-                    revision: doc.version() as u64,
-                })
+                Some((
+                    helix_stdx::path::normalize(path),
+                    doc.text().clone(),
+                    doc.version() as u64,
+                ))
             })
             .collect();
 
@@ -1433,7 +1422,15 @@ fn global_search(cx: &mut Context) {
 
         let injector = injector.clone();
         let query = query.to_owned();
-        work.spawn(async move {
+        let search = block.spawn(move || -> anyhow::Result<()> {
+            let content_overlays: Vec<_> = content_overlay_snapshots
+                .into_iter()
+                .map(|(path, text, revision)| fff_search::ContentOverlay {
+                    path,
+                    bytes: std::sync::Arc::from(text.to_string().into_bytes().into_boxed_slice()),
+                    revision,
+                })
+                .collect();
             let matches = crate::fff::grep_files(
                 &search_root,
                 &query,
@@ -1450,6 +1447,10 @@ fn global_search(cx: &mut Context) {
                 }
             }
             Ok(())
+        });
+        work.spawn(async move {
+            search.await??;
+            Ok(())
         })
     };
 
@@ -1464,38 +1465,23 @@ fn global_search(cx: &mut Context) {
         crate::ui::PickerRuntime::new(cx.editor),
         cx.ingress.clone(),
         move |cx, FileResult { path, line_num, .. }, action| {
-            let doc = match cx.editor.open(path, action) {
-                Ok(id) => doc_mut!(cx.editor, &id),
-                Err(e) => {
-                    cx.editor
-                        .set_error(format!("Failed to open file '{}': {}", path.display(), e));
-                    return;
-                }
-            };
-
-            let line_num = *line_num;
-            let view = view_mut!(cx.editor);
-            let text = doc.text();
-            if line_num >= text.len_lines() {
-                cx.editor.set_error(
-                    "The line you jumped to does not exist anymore because the file has changed.",
-                );
-                return;
-            }
-            let start = text.line_to_char(line_num);
-            let end = text.line_to_char((line_num + 1).min(text.len_lines()));
-
-            doc.set_selection(view.id, Selection::single(start, end));
-            if action.align_view(view, doc.id()) {
-                align_view(doc, view, Align::Center);
-            }
+            queue_picker_document_open(
+                cx,
+                path.clone(),
+                action,
+                crate::runtime::DocumentOpenSelection::Line(*line_num),
+                crate::runtime::DocumentOpenAlignment::CenterIfAction,
+            );
         },
     )
     .with_preview(|_editor, FileResult { path, line_num, .. }| {
         Some((path.as_path().into(), Some((*line_num, *line_num))))
     })
     .with_history_register(Some(reg))
-    .with_dynamic_query(get_files, Some(275));
+    .with_dynamic_query(
+        get_files,
+        ui::picker::DynamicQuerySchedule::debounced_ms(275),
+    );
 
     cx.push_layer(Box::new(overlaid(picker)));
 }
@@ -1537,7 +1523,7 @@ fn local_search_grep(cx: &mut Context) {
             let line_num = (item.line_num + 1).to_string();
             // files can never contain more than 99_999_999 lines
             // thus using maximum line length to be 8 for this formatter is valid
-            let max_line_num_length = 8;
+            let max_line_num_length = 8usize;
             // whitespace padding to align results after the line number
             let padding_length = max_line_num_length - line_num.len();
             let padding = " ".repeat(padding_length);
@@ -1558,16 +1544,13 @@ fn local_search_grep(cx: &mut Context) {
                      editor: &mut Editor,
                      config: std::sync::Arc<LocalSearchConfig>,
                      injector: &ui::picker::Injector<_, _>,
-                     work: helix_runtime::Work| {
+                     work: helix_runtime::Work,
+                     block: helix_runtime::Block| {
         if query.is_empty() {
             return work.spawn(async { Ok(()) });
         }
 
         let search_root = helix_stdx::env::current_working_dir();
-        if !search_root.exists() {
-            return work
-                .spawn(async { Err(anyhow::anyhow!("Current working directory does not exist")) });
-        }
 
         // Only read the current document (not other documents opened in the buffer)
         let (_, doc) = focused_ref!(editor);
@@ -1589,12 +1572,11 @@ fn local_search_grep(cx: &mut Context) {
         };
 
         let dedup_symlinks = config.file_picker_config.deduplicate_links;
-        let absolute_root = search_root
-            .canonicalize()
-            .unwrap_or_else(|_| search_root.clone());
-
         let injector = injector.clone();
-        work.spawn(async move {
+        let search = block.spawn(move || {
+            let absolute_root = search_root
+                .canonicalize()
+                .unwrap_or_else(|_| search_root.clone());
             let searcher = SearcherBuilder::new()
                 .binary_detection(BinaryDetection::quit(b'\x00'))
                 .build();
@@ -1692,6 +1674,9 @@ fn local_search_grep(cx: &mut Context) {
                         }
                     })
                 });
+        });
+        work.spawn(async move {
+            search.await?;
             Ok(())
         })
     };
@@ -1707,38 +1692,23 @@ fn local_search_grep(cx: &mut Context) {
         crate::ui::PickerRuntime::new(cx.editor),
         cx.ingress.clone(),
         move |cx, FileResult { path, line_num, .. }, action| {
-            let doc = match cx.editor.open(path, action) {
-                Ok(id) => doc_mut!(cx.editor, &id),
-                Err(e) => {
-                    cx.editor
-                        .set_error(format!("Failed to open file '{}': {}", path.display(), e));
-                    return;
-                }
-            };
-
-            let line_num = *line_num;
-            let view = view_mut!(cx.editor);
-            let text = doc.text();
-            if line_num >= text.len_lines() {
-                cx.editor.set_error(
-                    "The line you jumped to does not exist anymore because the file has changed.",
-                );
-                return;
-            }
-            let start = text.line_to_char(line_num);
-            let end = text.line_to_char((line_num + 1).min(text.len_lines()));
-
-            doc.set_selection(view.id, Selection::single(start, end));
-            if action.align_view(view, doc.id()) {
-                align_view(doc, view, Align::Center);
-            }
+            queue_picker_document_open(
+                cx,
+                path.clone(),
+                action,
+                crate::runtime::DocumentOpenSelection::Line(*line_num),
+                crate::runtime::DocumentOpenAlignment::CenterIfAction,
+            );
         },
     )
     .with_preview(|_editor, FileResult { path, line_num, .. }| {
         Some((path.as_path().into(), Some((*line_num, *line_num))))
     })
     .with_history_register(Some(reg))
-    .with_dynamic_query(get_files, Some(275));
+    .with_dynamic_query(
+        get_files,
+        ui::picker::DynamicQuerySchedule::debounced_ms(275),
+    );
     cx.push_layer(Box::new(overlaid(picker)));
 }
 
@@ -1747,12 +1717,10 @@ fn local_search_fuzzy(cx: &mut Context) {
     struct FileResult {
         path: std::sync::Arc<PathBuf>,
         line_num: usize,
-        file_contents_byte_start: usize,
-        file_contents_byte_end: usize,
+        contents: String,
     }
 
     struct LocalSearchData {
-        file_contents: String,
         number_style: Style,
     }
 
@@ -1762,52 +1730,11 @@ fn local_search_fuzzy(cx: &mut Context) {
         return;
     };
 
-    let file_contents = std::fs::read_to_string(current_document_path).unwrap();
-
     let current_document_path = std::sync::Arc::new(current_document_path.clone());
-
-    let file_results: Vec<FileResult> = file_contents
-        .lines()
-        .enumerate()
-        .filter_map(|(line_num, line)| {
-            if !line.trim().is_empty() {
-                // SAFETY: The offsets will be used to index back into the original `file_contents` String
-                // as a byte slice. Since the `file_contents` will be moved into the `Picker` as part of
-                // `editor_data`, we know that the `Picker` will take ownership of the underlying String,
-                // so it will be valid for displaying the `Span` as long as the user uses the `Picker`
-                // (the `Picker` gets dropped only when a new `Picker` is created). Furthermore, the
-                // process of reconstructing a `&str` back requires that we have access to the original
-                // `String` anyways so we can index into it, as is the case when we construct the `Span`
-                // when creating the `PickerColumn`s, so we know that we are returning the correct
-                // substring from the original `file_contents`.
-                // In fact, since we only store offsets, and accessing them from safe rust, there is
-                // no risk of memory safety (like our &str not living long enough). The only real
-                // bug would be moving out the original underlying `String` (which we obviously
-                // don't do). This would lead to an out of bounds crash in the `PickerColumn` function
-                // call, or a crash when we recreate back the &str if the new underlying `String`
-                // makes it so that our byte offsets index into the middle of a Unicode grapheme cluster.
-                // Last but not least, it could make it so that we do display the lines correctly,
-                // but these are from a different underlying `String` than the original, which would be
-                // different from the lines in the current buffer.
-                let beg =
-                    unsafe { line.as_ptr().byte_offset_from(file_contents.as_ptr()) } as usize;
-                let end = beg + line.len();
-                let result = FileResult {
-                    path: current_document_path.clone(),
-                    line_num,
-                    file_contents_byte_start: beg,
-                    file_contents_byte_end: end,
-                };
-                Some(result)
-            } else {
-                None
-            }
-        })
-        .collect();
+    let text = current_document.text().clone();
 
     let config = LocalSearchData {
         number_style: cx.editor.theme.get("constant.numeric.integer"),
-        file_contents,
     };
 
     let columns = [
@@ -1815,9 +1742,9 @@ fn local_search_fuzzy(cx: &mut Context) {
             let line_num = (item.line_num + 1).to_string();
             // files can never contain more than 99_999_999 lines
             // thus using maximum line length to be 8 for this formatter is valid
-            let max_line_num_length = 8;
+            let max_line_num_length = 8usize;
             // whitespace padding to align results after the line number
-            let padding_length = max_line_num_length - line_num.len();
+            let padding_length = max_line_num_length.saturating_sub(line_num.len());
             let padding = " ".repeat(padding_length);
             // create column value to be displayed in the picker
             Cell::from(Spans::from(vec![
@@ -1825,13 +1752,8 @@ fn local_search_fuzzy(cx: &mut Context) {
                 Span::raw(padding),
             ]))
         }),
-        PickerColumn::new("", |item: &FileResult, config: &LocalSearchData| {
-            // extract line content to be displayed in the picker
-            let slice = &config.file_contents.as_bytes()
-                [item.file_contents_byte_start..item.file_contents_byte_end];
-            let content = std::str::from_utf8(slice).unwrap();
-            // create column value to be displayed in the picker
-            Cell::from(Spans::from(vec![Span::raw(content)]))
+        PickerColumn::new("", |item: &FileResult, _config: &LocalSearchData| {
+            Cell::from(Spans::from(vec![Span::raw(item.contents.as_str())]))
         }),
     ];
 
@@ -1846,31 +1768,13 @@ fn local_search_fuzzy(cx: &mut Context) {
         crate::ui::PickerRuntime::new(cx.editor),
         cx.ingress.clone(),
         move |cx, FileResult { path, line_num, .. }, action| {
-            let doc = match cx.editor.open(path, action) {
-                Ok(id) => doc_mut!(cx.editor, &id),
-                Err(e) => {
-                    cx.editor
-                        .set_error(format!("Failed to open file '{}': {}", path.display(), e));
-                    return;
-                }
-            };
-
-            let line_num = *line_num;
-            let view = view_mut!(cx.editor);
-            let text = doc.text();
-            if line_num >= text.len_lines() {
-                cx.editor.set_error(
-                    "The line you jumped to does not exist anymore because the file has changed.",
-                );
-                return;
-            }
-            let start = text.line_to_char(line_num);
-            let end = text.line_to_char((line_num + 1).min(text.len_lines()));
-
-            doc.set_selection(view.id, Selection::single(start, end));
-            if action.align_view(view, doc.id()) {
-                align_view(doc, view, Align::Center);
-            }
+            queue_picker_document_open(
+                cx,
+                path.as_ref().clone(),
+                action,
+                crate::runtime::DocumentOpenSelection::Line(*line_num),
+                crate::runtime::DocumentOpenAlignment::CenterIfAction,
+            );
         },
     )
     .with_preview(|_editor, FileResult { path, line_num, .. }| {
@@ -1879,15 +1783,31 @@ fn local_search_fuzzy(cx: &mut Context) {
     .with_history_register(Some(reg));
 
     let injector = picker.injector();
-    let timeout = std::time::Instant::now() + std::time::Duration::from_millis(30);
-    for file_result in file_results {
-        if injector.push(file_result).is_err() {
-            break;
-        }
-        if std::time::Instant::now() >= timeout {
-            break;
-        }
-    }
+    cx.editor
+        .runtime()
+        .block()
+        .spawn(move || {
+            for (line_num, line) in text.lines().enumerate() {
+                let mut contents = line.to_string();
+                while matches!(contents.as_bytes().last(), Some(b'\r' | b'\n')) {
+                    contents.pop();
+                }
+                if contents.trim().is_empty() {
+                    continue;
+                }
+                if injector
+                    .push(FileResult {
+                        path: current_document_path.clone(),
+                        line_num,
+                        contents,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
 
     cx.push_layer(Box::new(overlaid(picker)));
 }
@@ -1917,10 +1837,6 @@ fn file_picker(cx: &mut Context) {
         "phase=command_start command=file_picker root={}",
         root.display(),
     );
-    if !root.exists() {
-        cx.editor.set_error("Workspace directory does not exist");
-        return;
-    }
     let picker = ui::file_picker(cx.editor, root.clone(), cx.ingress.clone());
     if cx.editor.config().file_picker.hide_preview {
         let overlay = ui::overlay::Overlay {
@@ -1950,13 +1866,7 @@ fn file_picker_in_current_buffer_directory(cx: &mut Context) {
         Some(path) => path,
         None => {
             let cwd = helix_stdx::env::current_working_dir();
-            if !cwd.exists() {
-                cx.editor.set_error(
-                    "Current buffer has no parent and current working directory does not exist",
-                );
-                return;
-            }
-            cx.editor.set_error(
+            cx.editor.notify_warning(
                 "Current buffer has no parent, opening file picker in current working directory",
             );
             cwd
@@ -1983,11 +1893,6 @@ fn file_picker_in_current_directory(cx: &mut Context) {
         "phase=command_start command=file_picker_in_current_directory root={}",
         cwd.display(),
     );
-    if !cwd.exists() {
-        cx.editor
-            .set_error("Current working directory does not exist");
-        return;
-    }
     let picker = ui::file_picker(cx.editor, cwd, cx.ingress.clone());
     cx.push_layer(Box::new(overlaid(picker)));
     log::info!(
@@ -1998,11 +1903,6 @@ fn file_picker_in_current_directory(cx: &mut Context) {
 
 fn file_explorer(cx: &mut Context) {
     let root = find_workspace().0;
-    if !root.exists() {
-        cx.editor.set_error("Workspace directory does not exist");
-        return;
-    }
-
     open_file_explorer_panel(cx, root);
 }
 
@@ -2016,13 +1916,7 @@ fn file_explorer_in_current_buffer_directory(cx: &mut Context) {
         Some(path) => path,
         None => {
             let cwd = helix_stdx::env::current_working_dir();
-            if !cwd.exists() {
-                cx.editor.set_error(
-                    "Current buffer has no parent and current working directory does not exist",
-                );
-                return;
-            }
-            cx.editor.set_error(
+            cx.editor.notify_warning(
                 "Current buffer has no parent, opening file explorer in current working directory",
             );
             cwd
@@ -2034,29 +1928,28 @@ fn file_explorer_in_current_buffer_directory(cx: &mut Context) {
 
 fn file_explorer_in_current_directory(cx: &mut Context) {
     let cwd = helix_stdx::env::current_working_dir();
-    if !cwd.exists() {
-        cx.editor
-            .set_error("Current working directory does not exist");
-        return;
-    }
-
     open_file_explorer_panel(cx, cwd);
 }
 
 fn open_file_explorer_panel(cx: &mut Context, root: PathBuf) {
     let root = helix_stdx::path::normalize(root);
-    match ui::FileExplorerPanel::new(root.clone(), cx.editor) {
-        Ok(mut panel) => {
-            panel.queue_selected_preview(cx.editor, cx.ingress.clone());
-            cx.replace_or_push_layer(ui::FILE_EXPLORER_ID, panel);
-            crate::runtime::ui::file_explorer::queue_file_explorer_vcs_snapshot(
-                cx.editor,
-                cx.ingress.clone(),
-                root,
-            );
-        }
-        Err(err) => cx.editor.set_error(format!("{err}")),
-    }
+    let mut panel = ui::FileExplorerPanel::new_deferred(root.clone(), cx.editor);
+    crate::runtime::ui::file_explorer::queue_file_explorer_tree_refresh(
+        &mut panel,
+        cx.editor,
+        cx.ingress.clone(),
+        None,
+        None,
+        None,
+        true,
+        false,
+    );
+    cx.replace_or_push_layer(ui::FILE_EXPLORER_ID, panel);
+    crate::runtime::ui::file_explorer::queue_file_explorer_vcs_snapshot(
+        cx.editor,
+        cx.ingress.clone(),
+        root,
+    );
 }
 
 fn buffer_picker(cx: &mut Context) {
@@ -2303,12 +2196,6 @@ fn changed_file_picker(cx: &mut Context) {
     }
 
     let cwd = helix_stdx::env::current_working_dir();
-    if !cwd.exists() {
-        cx.editor
-            .set_error("Current working directory does not exist");
-        return;
-    }
-
     let added = cx.editor.theme.get("diff.plus");
     let modified = cx.editor.theme.get("diff.delta");
     let conflict = cx.editor.theme.get("diff.delta.conflict");
@@ -2377,15 +2264,13 @@ fn changed_file_picker(cx: &mut Context) {
         crate::ui::PickerRuntime::new(cx.editor),
         cx.ingress.clone(),
         |cx, meta: &FileChange, action| {
-            let path_to_open = meta.path();
-            if let Err(e) = cx.editor.open(path_to_open, action) {
-                let err = if let Some(err) = e.source() {
-                    format!("{}", err)
-                } else {
-                    format!("unable to open \"{}\"", path_to_open.display())
-                };
-                cx.editor.set_error(err);
-            }
+            queue_picker_document_open(
+                cx,
+                meta.path().to_path_buf(),
+                action,
+                crate::runtime::DocumentOpenSelection::None,
+                crate::runtime::DocumentOpenAlignment::None,
+            );
         },
     )
     .with_preview(|_editor, meta| Some((meta.path().into(), None)));
@@ -2438,17 +2323,16 @@ pub(crate) fn show_command_palette(
             }),
     );
 
-    if let Some(pm) = &cx.plugin_manager {
-        commands.extend(
-            pm.get_commands()
-                .into_iter()
-                .map(|meta| MappableCommand::Typable {
-                    name: meta.name,
-                    args: String::new(),
-                    doc: meta.doc,
-                }),
-        );
-    }
+    commands.extend(
+        cx.plugin_runtime
+            .command_snapshot()
+            .into_iter()
+            .map(|command| MappableCommand::Typable {
+                name: command.descriptor.name,
+                args: String::new(),
+                doc: command.descriptor.doc,
+            }),
+    );
 
     let columns = [
         ui::PickerColumn::new("name", |item, _| match item {
@@ -4231,7 +4115,7 @@ fn surround_delete(cx: &mut Context) {
     cx.editor.autoinfo = Some(Info::new("Delete surrounding pair of", &SURROUND_HELP_TEXT));
 }
 
-#[derive(Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 enum ShellBehavior {
     Replace,
     Ignore,
@@ -4257,39 +4141,47 @@ fn shell_append_output(cx: &mut Context) {
 
 fn shell_keep_pipe(cx: &mut Context) {
     shell_prompt(cx, "keep-pipe:".into(), |cx, args| {
-        let shell = &cx.editor.config().shell;
-        let (view_id, doc) = focused!(cx.editor);
-        let selection = doc.selection(view_id);
-
-        let mut ranges = SmallVec::with_capacity(selection.len());
-        let old_index = selection.primary_index();
-        let mut index: Option<usize> = None;
-        let text = doc.text().slice(..);
-
-        for (i, range) in selection.ranges().iter().enumerate() {
-            let fragment = range.slice(text);
-            if let Err(err) = shell_impl(shell, args.join(" ").as_str(), Some(fragment.into())) {
-                log::debug!("Shell command failed: {}", err);
-            } else {
-                ranges.push(*range);
-                if i >= old_index && index.is_none() {
-                    index = Some(ranges.len() - 1);
+        let shell = cx.editor.config().shell.clone();
+        let command = args.join(" ");
+        let (doc_id, view_id, expected_version, selection, text) = {
+            let (view_id, doc) = focused!(cx.editor);
+            (
+                doc.id(),
+                view_id,
+                doc.version(),
+                doc.selection(view_id).clone(),
+                doc.text().clone(),
+            )
+        };
+        cx.editor.set_status("Running shell command...");
+        cx.spawn_task_event(async move {
+            let mut ranges = SmallVec::with_capacity(selection.len());
+            let old_index = selection.primary_index();
+            let mut index = None;
+            for (i, range) in selection.ranges().iter().enumerate() {
+                let fragment = range.slice(text.slice(..)).into();
+                if let Err(error) = shell_impl_async(&shell, &command, Some(fragment)).await {
+                    log::debug!("Shell command failed: {error}");
+                } else {
+                    ranges.push(*range);
+                    if i >= old_index && index.is_none() {
+                        index = Some(ranges.len() - 1);
+                    }
                 }
             }
-        }
-
-        if ranges.is_empty() {
-            cx.editor.set_error("No selections remaining");
-            return;
-        }
-
-        let index = index.unwrap_or_else(|| ranges.len() - 1);
-        doc.set_selection(view_id, Selection::new(ranges, index));
+            if ranges.is_empty() {
+                anyhow::bail!("No selections remaining");
+            }
+            let index = index.unwrap_or_else(|| ranges.len() - 1);
+            Ok(crate::runtime::RuntimeTaskEvent::ApplyShellResult {
+                doc_id,
+                view_id,
+                expected_version,
+                transaction: None,
+                selection: Some(Selection::new(ranges, index)),
+            })
+        });
     });
-}
-
-fn shell_impl(shell: &[String], cmd: &str, input: Option<Rope>) -> anyhow::Result<Tendril> {
-    tokio::task::block_in_place(|| helix_lsp::block_on(shell_impl_async(shell, cmd, input)))
 }
 
 async fn shell_impl_async(
@@ -4358,86 +4250,81 @@ async fn shell_impl_async(
 }
 
 fn shell(cx: &mut compositor::Context, cmd: &str, behavior: &ShellBehavior) {
+    let behavior = *behavior;
     let pipe = match behavior {
         ShellBehavior::Replace | ShellBehavior::Ignore => true,
         ShellBehavior::Insert | ShellBehavior::Append => false,
     };
-
-    let config = cx.editor.config();
-    let shell = &config.shell;
-    let (view_id, doc) = focused!(cx.editor);
-    let selection = doc.selection(view_id);
-
-    let mut changes = Vec::with_capacity(selection.len());
-    let mut ranges = SmallVec::with_capacity(selection.len());
-    let text = doc.text().slice(..);
-
-    let mut shell_output: Option<Tendril> = None;
-    let mut offset = 0isize;
-    for range in selection.ranges() {
-        let output = if let Some(output) = shell_output.as_ref() {
-            output.clone()
-        } else {
-            let input = range.slice(text);
-            match shell_impl(shell, cmd, pipe.then(|| input.into())) {
-                Ok(mut output) => {
-                    if !input.ends_with("\n") && output.ends_with('\n') {
+    let shell = cx.editor.config().shell.clone();
+    let command = cmd.to_owned();
+    let (doc_id, view_id, expected_version, selection, text) = {
+        let (view_id, doc) = focused!(cx.editor);
+        (
+            doc.id(),
+            view_id,
+            doc.version(),
+            doc.selection(view_id).clone(),
+            doc.text().clone(),
+        )
+    };
+    cx.editor.set_status("Running shell command...");
+    cx.spawn_task_event(async move {
+        let mut changes = Vec::with_capacity(selection.len());
+        let mut ranges = SmallVec::with_capacity(selection.len());
+        let mut shell_output: Option<Tendril> = None;
+        let mut offset = 0isize;
+        for range in selection.ranges() {
+            let input_ends_with_newline = range.slice(text.slice(..)).ends_with("\n");
+            let output = if let Some(output) = shell_output.as_ref() {
+                output.clone()
+            } else {
+                let input = pipe.then(|| range.slice(text.slice(..)).into());
+                let mut output = shell_impl_async(&shell, &command, input).await?;
+                if !input_ends_with_newline && output.ends_with('\n') {
+                    output.pop();
+                    if output.ends_with('\r') {
                         output.pop();
-                        if output.ends_with('\r') {
-                            output.pop();
-                        }
                     }
-
-                    if !pipe {
-                        shell_output = Some(output.clone());
-                    }
-                    output
                 }
-                Err(err) => {
-                    cx.editor.set_error(err.to_string());
-                    return;
+                if !pipe {
+                    shell_output = Some(output.clone());
                 }
-            }
-        };
+                output
+            };
 
-        let output_len = output.chars().count();
+            let output_len = output.chars().count();
+            let (from, to, deleted_len) = match behavior {
+                ShellBehavior::Replace => (range.from(), range.to(), range.len()),
+                ShellBehavior::Insert => (range.from(), range.from(), 0),
+                ShellBehavior::Append => (range.to(), range.to(), 0),
+                ShellBehavior::Ignore => (range.from(), range.from(), 0),
+            };
+            let anchor = to
+                .checked_add_signed(offset)
+                .expect("Selection ranges cannot overlap")
+                .checked_sub(deleted_len)
+                .expect("Selection ranges cannot overlap");
+            ranges.push(Range::new(anchor, anchor + output_len).with_direction(range.direction()));
+            offset = offset
+                .checked_add_unsigned(output_len)
+                .expect("Selection ranges cannot overlap")
+                .checked_sub_unsigned(deleted_len)
+                .expect("Selection ranges cannot overlap");
+            changes.push((from, to, Some(output)));
+        }
 
-        let (from, to, deleted_len) = match behavior {
-            ShellBehavior::Replace => (range.from(), range.to(), range.len()),
-            ShellBehavior::Insert => (range.from(), range.from(), 0),
-            ShellBehavior::Append => (range.to(), range.to(), 0),
-            _ => (range.from(), range.from(), 0),
-        };
-
-        // These `usize`s cannot underflow because selection ranges cannot overlap.
-        let anchor = to
-            .checked_add_signed(offset)
-            .expect("Selection ranges cannot overlap")
-            .checked_sub(deleted_len)
-            .expect("Selection ranges cannot overlap");
-        let new_range = Range::new(anchor, anchor + output_len).with_direction(range.direction());
-        ranges.push(new_range);
-        offset = offset
-            .checked_add_unsigned(output_len)
-            .expect("Selection ranges cannot overlap")
-            .checked_sub_unsigned(deleted_len)
-            .expect("Selection ranges cannot overlap");
-
-        changes.push((from, to, Some(output)));
-    }
-
-    if behavior != &ShellBehavior::Ignore {
-        let transaction = Transaction::change(doc.text(), changes.into_iter())
-            .with_selection(Selection::new(ranges, selection.primary_index()));
-        doc.apply(&transaction, view_id);
-        let view = view_mut!(cx.editor, view_id);
-        doc.append_changes_to_history(view);
-    }
-
-    // after replace cursor may be out of bounds, do this to
-    // make sure cursor is in view and update scroll as well
-    let view = view_mut!(cx.editor, view_id);
-    view.ensure_cursor_in_view(doc, config.scrolloff);
+        let transaction = (behavior != ShellBehavior::Ignore).then(|| {
+            Transaction::change(&text, changes.into_iter())
+                .with_selection(Selection::new(ranges, selection.primary_index()))
+        });
+        Ok(crate::runtime::RuntimeTaskEvent::ApplyShellResult {
+            doc_id,
+            view_id,
+            expected_version,
+            transaction,
+            selection: None,
+        })
+    });
 }
 
 fn shell_prompt<F>(cx: &mut Context, prompt: Cow<'static, str>, mut callback_fn: F)
@@ -4448,7 +4335,11 @@ where
         cx,
         prompt,
         Some('|'),
-        |editor, input| complete_command_args(editor, SHELL_SIGNATURE, &SHELL_COMPLETER, input, 0),
+        crate::commands::typed::CommandArgsCompletionProvider::new(
+            SHELL_SIGNATURE,
+            SHELL_COMPLETER,
+            0,
+        ),
         move |cx, input, event| {
             if event != PromptEvent::Validate || input.is_empty() {
                 return;

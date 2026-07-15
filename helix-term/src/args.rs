@@ -295,9 +295,6 @@ fn parse_pkg_args(args: Vec<String>) -> Result<PkgArgs> {
 /// Parse arg into [`PathBuf`] and position.
 pub(crate) fn parse_file(s: &str) -> (PathBuf, Position) {
     let def = || (PathBuf::from(s), Position::default());
-    if Path::new(s).exists() {
-        return def();
-    }
     split_path_row_col(s)
         .or_else(|| split_path_row(s))
         .unwrap_or_else(def)

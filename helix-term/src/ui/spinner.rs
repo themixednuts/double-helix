@@ -1,4 +1,7 @@
-use std::{collections::HashMap, time::Duration};
+use std::{
+    collections::HashMap,
+    time::{Duration, Instant},
+};
 
 use helix_lsp::LanguageServerId;
 
@@ -14,6 +17,14 @@ impl ProgressSpinners {
 
     pub fn get_or_create(&mut self, id: LanguageServerId) -> &mut Spinner {
         self.inner.entry(id).or_default()
+    }
+
+    pub fn next_redraw_at(&self, now: Instant) -> Option<Instant> {
+        self.inner
+            .values()
+            .filter(|spinner| !spinner.is_stopped())
+            .map(|spinner| spinner.next_redraw_at(now))
+            .min()
     }
 }
 
@@ -54,8 +65,8 @@ impl Spinner {
         self.running = true;
     }
 
-    pub fn frame(&self) -> Option<&str> {
-        self.running.then(|| self.inner.frame())
+    pub fn frame_at(&self, now: Instant) -> Option<&str> {
+        self.running.then(|| self.inner.frame_at(now))
     }
 
     pub fn set_progress(&mut self, progress: Option<u8>) {
@@ -73,5 +84,9 @@ impl Spinner {
 
     pub fn is_stopped(&self) -> bool {
         !self.running
+    }
+
+    pub fn next_redraw_at(&self, now: Instant) -> Instant {
+        self.inner.next_redraw_at(now)
     }
 }

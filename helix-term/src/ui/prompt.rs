@@ -1,5 +1,5 @@
 use crate::compositor::{Component, Context, Event, EventResult, PostAction, RenderContext};
-use crate::{alt, ctrl, key, shift, ui};
+use crate::{alt, ctrl, key, shift};
 use arc_swap::ArcSwap;
 use helix_core::syntax;
 use helix_view::document::Mode;
@@ -8,6 +8,11 @@ use helix_view::keyboard::KeyCode;
 use std::sync::Arc;
 use std::{borrow::Cow, ops::RangeFrom};
 use tui::text::Span;
+
+pub(crate) mod completion;
+mod documentation;
+pub use completion::CompletionRequest;
+use documentation::DocumentationService;
 
 use helix_core::{
     unicode::segmentation::{GraphemeCursor, UnicodeSegmentation},
@@ -23,11 +28,19 @@ use helix_view::{
 type PromptCharHandler = Box<dyn Fn(&mut Prompt, char, &Context) + Send>;
 
 pub type Completion = (RangeFrom<usize>, Span<'static>);
-type CompletionFn = Box<dyn FnMut(&Editor, &str) -> Vec<Completion> + Send>;
 type CallbackFn = Box<dyn FnMut(&mut Context, &str, PromptEvent) + Send>;
-pub type DocFn = Box<dyn Fn(&str) -> Option<Cow<str>> + Send>;
+pub type DocFn = Arc<dyn for<'a> Fn(&'a str) -> Option<Cow<'a, str>> + Send + Sync>;
+
+pub trait CompletionProvider: Send {
+    fn capture(&mut self, editor: &Editor, input: Arc<str>) -> CompletionRequest;
+}
 
 pub struct Prompt {
+    completion_id: completion::PromptId,
+    completion_generation: u64,
+    completion_session: completion::CompletionSession,
+    completion_pipeline: completion::CompletionPipeline,
+    pending_completion_request: Option<completion::CompletionRequest>,
     prompt: Cow<'static, str>,
     line: String,
     cursor: usize,
@@ -40,12 +53,14 @@ pub struct Prompt {
     last_cursor_pos: (u16, u16),
     // ---
     completion: Vec<Completion>,
+    completion_max_width: u16,
     selection: Option<usize>,
     history_register: Option<char>,
     history_pos: Option<usize>,
-    completion_fn: CompletionFn,
+    completion_provider: Box<dyn CompletionProvider>,
     callback_fn: CallbackFn,
     pub doc_fn: DocFn,
+    documentation_service: Option<DocumentationService>,
     next_char_handler: Option<PromptCharHandler>,
     language: Option<(&'static str, Arc<ArcSwap<syntax::Loader>>)>,
     /// Model layer ID, set when this prompt is pushed to the layer stack.
@@ -86,10 +101,15 @@ impl Prompt {
     pub fn new(
         prompt: Cow<'static, str>,
         history_register: Option<char>,
-        completion_fn: impl FnMut(&Editor, &str) -> Vec<Completion> + Send + 'static,
+        completion_provider: impl CompletionProvider + 'static,
         callback_fn: impl FnMut(&mut Context, &str, PromptEvent) + Send + 'static,
     ) -> Self {
         Self {
+            completion_id: completion::PromptId::next(),
+            completion_generation: 0,
+            completion_session: completion::CompletionSession::default(),
+            completion_pipeline: completion::CompletionPipeline::default(),
+            pending_completion_request: None,
             prompt,
             line: String::new(),
             cursor: 0,
@@ -99,12 +119,14 @@ impl Prompt {
             truncate_end: false,
             last_cursor_pos: (0, 0),
             completion: Vec::new(),
+            completion_max_width: 30,
             selection: None,
             history_register,
             history_pos: None,
-            completion_fn: Box::new(completion_fn),
+            completion_provider: Box::new(completion_provider),
             callback_fn: Box::new(callback_fn),
-            doc_fn: Box::new(|_| None),
+            doc_fn: Arc::new(|_| None),
+            documentation_service: None,
             next_char_handler: None,
             language: None,
             model_layer_id: None,
@@ -160,8 +182,107 @@ impl Prompt {
     }
 
     pub fn recalculate_completion(&mut self, editor: &Editor) {
+        self.advance_completion_generation();
+        self.evaluate_completion(editor);
+    }
+
+    fn evaluate_completion(&mut self, editor: &Editor) {
         self.exit_selection();
-        self.completion = (self.completion_fn)(editor, &self.line);
+        self.set_completions(Vec::new());
+        self.pending_completion_request = Some(
+            self.completion_provider
+                .capture(editor, Arc::from(self.line.as_str())),
+        );
+    }
+
+    fn set_completions(&mut self, mut completion: Vec<Completion>) {
+        completion.retain(|(range, _)| {
+            range.start <= self.line.len() && self.line.is_char_boundary(range.start)
+        });
+        self.completion = completion;
+        self.completion_max_width = self
+            .completion
+            .iter()
+            .map(|(_, completion)| UnicodeWidthStr::width(completion.content.as_ref()) as u16)
+            .max()
+            .unwrap_or(BASE_WIDTH)
+            .max(BASE_WIDTH);
+        if self
+            .selection
+            .is_some_and(|selection| selection >= self.completion.len())
+        {
+            self.selection = None;
+        }
+    }
+
+    fn advance_completion_generation(&mut self) {
+        self.completion_generation = self.completion_generation.wrapping_add(1);
+        if self.completion_generation == 0 {
+            self.completion_generation = 1;
+        }
+    }
+
+    fn invalidate_completion_work(&mut self) {
+        self.advance_completion_generation();
+        self.pending_completion_request = None;
+        self.completion_pipeline.cancel();
+    }
+
+    fn documentation(
+        &mut self,
+        work: helix_runtime::Work,
+        block: helix_runtime::Block,
+        redraw: helix_runtime::FrameHandle,
+    ) -> Option<Arc<str>> {
+        let service = self
+            .documentation_service
+            .get_or_insert_with(|| DocumentationService::spawn(work, block, redraw));
+        service.resolve(&self.line, &self.doc_fn)
+    }
+
+    pub(crate) fn dispatch_completion_work(
+        &mut self,
+        runtime: &helix_runtime::Runtime,
+        ingress: crate::runtime::RuntimeIngress,
+    ) {
+        let Some(request) = self.pending_completion_request.take() else {
+            return;
+        };
+        self.completion_pipeline.submit(
+            self.completion_id,
+            self.completion_generation,
+            Arc::from(self.line.as_str()),
+            request,
+            self.completion_session.clone(),
+            runtime.work().clone(),
+            runtime.block().clone(),
+            ingress,
+        );
+    }
+
+    pub(crate) fn apply_completion_result(
+        &mut self,
+        result: crate::runtime::ui::PromptCompletionResult,
+    ) -> bool {
+        let result = result.0;
+        if result.prompt_id != self.completion_id
+            || result.generation != self.completion_generation
+            || result.query.as_ref() != self.line
+        {
+            return false;
+        }
+
+        self.set_completions(result.completions);
+        true
+    }
+
+    pub(crate) fn completion_id(&self) -> completion::PromptId {
+        self.completion_id
+    }
+
+    #[cfg(test)]
+    fn set_completion_loader(&mut self, loader: completion::CompletionLoader) {
+        self.completion_pipeline.set_loader(loader);
     }
 
     /// Compute the cursor position after applying movement
@@ -392,10 +513,18 @@ impl Prompt {
         self.selection = Some(index);
 
         let (range, item) = &self.completion[index];
+        let range = range.clone();
+        let content = item.content.clone();
+        if range.start > self.line.len() || !self.line.is_char_boundary(range.start) {
+            self.selection = None;
+            self.invalidate_completion_work();
+            return;
+        }
 
-        self.line.replace_range(range.clone(), &item.content);
+        self.line.replace_range(range, &content);
 
         self.move_end();
+        self.invalidate_completion_work();
     }
 
     pub fn exit_selection(&mut self) {
@@ -509,12 +638,17 @@ impl Prompt {
             }
         };
 
+        let doc_text = self
+            .documentation(
+                editor.work(),
+                editor.runtime().block().clone(),
+                editor.redraw_handle(),
+            )
+            .map(|text| text.to_string());
+
         let Some(model) = editor.model.layer_model_mut::<PromptModel>(layer_id) else {
             return;
         };
-
-        // Compute doc text eagerly so the model is render-ready.
-        let doc_text = (self.doc_fn)(&self.line).map(|c| c.into_owned());
 
         model.prompt_text = self.prompt.clone();
         model.input.clone_from(&self.line);
@@ -531,200 +665,280 @@ impl Prompt {
 
 const BASE_WIDTH: u16 = 30;
 
-impl Prompt {
-    fn render_prompt_surface<F>(
-        &mut self,
-        area: Rect,
+struct PromptCompletionSnapshot {
+    content: Arc<str>,
+    style: helix_view::graphics::Style,
+    selected: bool,
+}
+
+struct PromptRenderSnapshot {
+    area: Rect,
+    completion_area: Rect,
+    completion_columns: u16,
+    completion_column_width: u16,
+    completions: Arc<[PromptCompletionSnapshot]>,
+    documentation: Option<(Rect, Arc<str>)>,
+    label: Arc<str>,
+    line_area: Rect,
+    line: Arc<str>,
+    text_input: Option<crate::widgets::TextInputState>,
+    language: Option<(&'static str, Arc<syntax::Loader>)>,
+    suggestion: Option<Arc<str>>,
+    theme: Arc<helix_view::Theme>,
+    rounded_corners: bool,
+}
+
+impl PromptRenderSnapshot {
+    fn paint(
+        self,
         surface: &mut crate::render::CellSurface,
-        cx: &RenderContext,
-        mut render_text: F,
-    ) where
-        F: FnMut(&mut ui::Text, Rect, &mut crate::render::CellSurface, &RenderContext),
-    {
-        let theme = cx.theme();
-        let editor_config = cx.config();
-        let prompt_color = theme.get("ui.text");
-        // Accent the prompt label (`:` / `/` / custom prefix) so it reads as
-        // a distinct affordance, not as part of the typed query. Falls back
-        // to the regular text colour for themes without a focus accent.
-        let prompt_label_color = theme.try_get("ui.text.focus").unwrap_or(prompt_color);
-        let completion_color = theme.get("ui.menu");
-        let selected_color = theme.get("ui.menu.selected");
-        let suggestion_color = theme.get("ui.text.inactive");
-        let background = theme.get("ui.background");
-        // completion
+        cancellation: &crate::render::RenderCancellation,
+    ) {
+        if cancellation.is_cancelled() {
+            return;
+        }
+        self.paint_completions(surface);
+        if cancellation.is_cancelled() {
+            return;
+        }
+        self.paint_documentation(surface);
+        if cancellation.is_cancelled() {
+            return;
+        }
+        self.paint_line(surface);
+    }
 
-        let max_len = self
-            .completion
-            .iter()
-            .map(|(_, completion)| UnicodeWidthStr::width(completion.content.as_ref()) as u16)
-            .max()
-            .unwrap_or(BASE_WIDTH)
-            .max(BASE_WIDTH);
-
-        let cols = std::cmp::max(1, area.width / max_len);
-        let col_width = (area.width.saturating_sub(cols)) / cols;
-
-        let height = (self.completion.len() as u16)
-            .div_ceil(cols)
-            .min(10) // at most 10 rows (or less)
-            .min(area.height.saturating_sub(1));
-
-        let completion_area = Rect::new(
-            area.x,
-            area.y + (area.height - height).saturating_sub(1),
-            area.width,
-            height,
-        );
-
-        if completion_area.height > 0 && !self.completion.is_empty() {
-            let area = completion_area;
-            let background = theme.get("ui.menu");
-
-            let items = height as usize * cols as usize;
-
-            let offset = self
-                .selection
-                .map(|selection| selection / items * items)
-                .unwrap_or_default();
-
-            {
-                let area = tui::ratatui::to_ratatui_rect(area);
-                tui::ratatui::widgets::Widget::render(tui::ratatui::widgets::Clear, area, surface);
-                surface.set_style(area, tui::ratatui::to_ratatui_style(background));
+    fn paint_completions(&self, surface: &mut crate::render::CellSurface) {
+        if self.completions.is_empty() || self.completion_area.height == 0 {
+            return;
+        }
+        let background = self.theme.get("ui.menu");
+        let area = tui::ratatui::to_ratatui_rect(self.completion_area);
+        tui::ratatui::widgets::Widget::render(tui::ratatui::widgets::Clear, area, surface);
+        surface.set_style(area, tui::ratatui::to_ratatui_style(background));
+        let selected = self.theme.get("ui.menu.selected");
+        let mut row = 0u16;
+        let mut column = 0u16;
+        for completion in self.completions.iter() {
+            let style = if completion.selected {
+                selected
+            } else {
+                background.patch(completion.style)
             };
-
-            let mut row = 0;
-            let mut col = 0;
-
-            for (i, (_range, completion)) in
-                self.completion.iter().enumerate().skip(offset).take(items)
-            {
-                let is_selected = Some(i) == self.selection;
-
-                let completion_item_style = if is_selected {
-                    selected_color
-                } else {
-                    completion_color.patch(completion.style)
-                };
-
-                surface.set_stringn(
-                    area.x + col * (1 + col_width),
-                    area.y + row,
-                    &completion.content,
-                    col_width.saturating_sub(1) as usize,
-                    tui::ratatui::to_ratatui_style(completion_item_style),
-                );
-
-                row += 1;
-                if row > area.height - 1 {
-                    row = 0;
-                    col += 1;
+            surface.set_stringn(
+                self.completion_area
+                    .x
+                    .saturating_add(column.saturating_mul(1 + self.completion_column_width)),
+                self.completion_area.y.saturating_add(row),
+                &completion.content,
+                self.completion_column_width.saturating_sub(1) as usize,
+                tui::ratatui::to_ratatui_style(style),
+            );
+            row = row.saturating_add(1);
+            if row >= self.completion_area.height {
+                row = 0;
+                column = column.saturating_add(1);
+                if column >= self.completion_columns {
+                    break;
                 }
             }
         }
+    }
 
-        if let Some(doc) = (self.doc_fn)(&self.line) {
-            let mut text = ui::Text::new(doc.to_string());
-
-            let max_width = BASE_WIDTH * 3;
-            let padding = 1;
-
-            let viewport = area;
-
-            let (_width, height) = ui::text::required_size(&text.contents, max_width);
-
-            let area = viewport.intersection(Rect::new(
-                completion_area.x,
-                completion_area.y.saturating_sub(height + padding * 2),
-                max_width,
-                height + padding * 2,
-            ));
-
-            let background = theme.get("ui.help");
-            let inner = crate::widgets::Panel::framed(
-                crate::widgets::PanelStyle::plain(background),
-                editor_config.rounded_corners,
-            )
-            .render(surface, area);
-            let inner = Rect::new(
-                inner.x.saturating_add(1),
-                inner.y,
-                inner.width.saturating_sub(2),
-                inner.height,
-            );
-            render_text(&mut text, inner, surface, cx);
-        }
-
-        let line = area.height - 1;
-        {
-            let area = tui::ratatui::to_ratatui_rect(area.clip_top(line));
-            tui::ratatui::widgets::Widget::render(tui::ratatui::widgets::Clear, area, surface);
-            surface.set_style(area, tui::ratatui::to_ratatui_style(background));
+    fn paint_documentation(&self, surface: &mut crate::render::CellSurface) {
+        let Some((area, documentation)) = &self.documentation else {
+            return;
         };
-        // render buffer text
-        // Map generic labels to traditional bottom-style symbols
-        let label = if editor_config.cmdline.style == CmdlineStyle::Bottom {
-            if self.prompt == "Cmdline" {
-                ":"
-            } else if self.prompt == "Search" {
-                "/"
-            } else {
-                &self.prompt
-            }
-        } else {
-            &self.prompt
-        };
+        let panel = crate::widgets::Panel::framed(
+            crate::widgets::PanelStyle::plain(self.theme.get("ui.help")),
+            self.rounded_corners,
+        );
+        let inner = panel.render(surface, *area);
+        let text_area = Rect::new(
+            inner.x.saturating_add(1),
+            inner.y,
+            inner.width.saturating_sub(2),
+            inner.height,
+        );
+        let text = tui::text::Text::from(documentation.as_ref());
+        crate::ui::text::paint_text(surface, text_area, &text);
+    }
+
+    fn paint_line(&self, surface: &mut crate::render::CellSurface) {
+        let background = self.theme.get("ui.background");
+        let line_area = self.area.clip_top(self.area.height.saturating_sub(1));
+        let ratatui_area = tui::ratatui::to_ratatui_rect(line_area);
+        tui::ratatui::widgets::Widget::render(tui::ratatui::widgets::Clear, ratatui_area, surface);
+        surface.set_style(ratatui_area, tui::ratatui::to_ratatui_style(background));
+        let text_style = self.theme.get("ui.text");
+        let label_style = self.theme.try_get("ui.text.focus").unwrap_or(text_style);
         surface.set_string(
-            area.x,
-            area.y + line,
-            label,
-            tui::ratatui::to_ratatui_style(prompt_label_color),
+            line_area.x,
+            line_area.y,
+            &self.label,
+            tui::ratatui::to_ratatui_style(label_style),
         );
 
-        let label_len = UnicodeWidthStr::width(label) as u16;
-        self.line_area = area.clip_left(label_len).clip_top(line).clip_right(2);
-
         if self.line.is_empty() {
-            self.anchor = 0;
-            // Show the most recently entered value as a suggestion.
-            if let Some(suggestion) = cx.first_register_value(self.history_register) {
+            if let Some(suggestion) = &self.suggestion {
                 surface.set_string(
                     self.line_area.x,
                     self.line_area.y,
-                    suggestion.as_ref(),
-                    tui::ratatui::to_ratatui_style(suggestion_color),
+                    suggestion,
+                    tui::ratatui::to_ratatui_style(self.theme.get("ui.text.inactive")),
                 );
             }
-            self.truncate_start = false;
-            self.truncate_end = false;
-            self.last_cursor_pos = (self.line_area.x, self.line_area.y);
-        } else if let Some((language, loader)) = self.language.as_ref() {
-            let mut text: ui::text::Text = crate::ui::markdown::highlighted_code_block(
+        } else if let Some((language, loader)) = &self.language {
+            let text: tui::text::Text<'static> = crate::ui::markdown::highlighted_code_block(
                 &self.line,
                 language,
-                Some(theme),
-                &loader.load(),
+                Some(&self.theme),
+                loader,
                 None,
             )
             .into();
-            render_text(&mut text, self.line_area, surface, cx);
-            let cursor_col = self.line[..self.cursor.min(self.line.len())].width() as u16;
-            self.truncate_start = false;
-            self.truncate_end = false;
-            self.last_cursor_pos = (self.line_area.x + cursor_col, self.line_area.y);
-        } else {
-            let state = crate::widgets::text_input(
+            crate::ui::text::paint_text(surface, self.line_area, &text);
+        } else if let Some(state) = &self.text_input {
+            crate::widgets::paint_text_input(
                 surface,
                 self.line_area,
                 &self.line,
-                self.cursor,
-                prompt_color,
-                prompt_color,
+                state,
+                text_style,
+                text_style,
             );
+        }
+    }
+}
+
+fn estimated_prompt_document_height(text: &str, width: u16, max_height: u16) -> u16 {
+    let width = width.max(1) as usize;
+    let mut height = 0u16;
+    for line in text.lines() {
+        let line_width = UnicodeWidthStr::width(line);
+        height = height
+            .saturating_add(line_width.max(1).div_ceil(width) as u16)
+            .min(max_height);
+        if height == max_height {
+            break;
+        }
+    }
+    height
+}
+
+impl Prompt {
+    fn prepare_render_snapshot(&mut self, area: Rect, cx: &RenderContext) -> PromptRenderSnapshot {
+        let max_width = self.completion_max_width;
+        let columns = std::cmp::max(1, area.width / max_width);
+        let column_width = area.width.saturating_sub(columns) / columns;
+        let height = (self.completion.len() as u16)
+            .div_ceil(columns)
+            .min(10)
+            .min(area.height.saturating_sub(1));
+        let completion_area = Rect::new(
+            area.x,
+            area.y
+                .saturating_add(area.height.saturating_sub(height).saturating_sub(1)),
+            area.width,
+            height,
+        );
+        let visible_items = height as usize * columns as usize;
+        let offset = self
+            .selection
+            .map(|selection| selection / visible_items.max(1) * visible_items.max(1))
+            .unwrap_or_default();
+        let completions = self
+            .completion
+            .iter()
+            .enumerate()
+            .skip(offset)
+            .take(visible_items)
+            .map(|(index, (_, completion))| PromptCompletionSnapshot {
+                content: Arc::from(completion.content.as_ref()),
+                style: completion.style,
+                selected: self.selection == Some(index),
+            })
+            .collect::<Vec<_>>();
+
+        let documentation = self
+            .documentation(cx.work(), cx.block(), cx.redraw.clone())
+            .map(|documentation| {
+                let max_width = (BASE_WIDTH * 3).min(area.width);
+                let max_height = completion_area.y.saturating_sub(area.y);
+                let height =
+                    estimated_prompt_document_height(&documentation, max_width, max_height);
+                let panel_height = height.saturating_add(2).min(max_height);
+                let doc_area = area.intersection(Rect::new(
+                    completion_area.x,
+                    completion_area.y.saturating_sub(panel_height),
+                    max_width,
+                    panel_height,
+                ));
+                (doc_area, documentation)
+            });
+
+        let label: Arc<str> = Arc::from(if cx.config().cmdline.style == CmdlineStyle::Bottom {
+            match self.prompt.as_ref() {
+                "Cmdline" => ":",
+                "Search" => "/",
+                prompt => prompt,
+            }
+        } else {
+            self.prompt.as_ref()
+        });
+        let line_row = area.height.saturating_sub(1);
+        let label_width = UnicodeWidthStr::width(label.as_ref()) as u16;
+        self.line_area = area.clip_left(label_width).clip_top(line_row).clip_right(2);
+
+        let line: Arc<str> = Arc::from(self.line.as_str());
+        let mut text_input = None;
+        let language = self
+            .language
+            .as_ref()
+            .map(|(language, loader)| (*language, loader.load_full()));
+        let suggestion = if self.line.is_empty() {
+            self.anchor = 0;
+            self.truncate_start = false;
+            self.truncate_end = false;
+            self.last_cursor_pos = (self.line_area.x, self.line_area.y);
+            cx.first_register_value(self.history_register)
+                .map(|value| Arc::from(value.as_ref()))
+        } else if language.is_some() {
+            let cursor_column = self.line[..self.cursor.min(self.line.len())].width() as u16;
+            self.anchor = 0;
+            self.truncate_start = false;
+            self.truncate_end = false;
+            self.last_cursor_pos = (
+                self.line_area.x.saturating_add(cursor_column),
+                self.line_area.y,
+            );
+            None
+        } else {
+            let state =
+                helix_view::layout::text_input_layout(self.line_area, &self.line, self.cursor);
+            self.anchor = state.anchor;
             self.truncate_start = state.truncated_start;
             self.truncate_end = state.truncated_end;
             self.last_cursor_pos = (state.cursor_x, state.cursor_y);
+            text_input = Some(state);
+            None
+        };
+
+        PromptRenderSnapshot {
+            area,
+            completion_area,
+            completion_columns: columns,
+            completion_column_width: column_width,
+            completions: Arc::from(completions),
+            documentation,
+            label,
+            line_area: self.line_area,
+            line,
+            text_input,
+            language,
+            suggestion,
+            theme: cx.theme_arc(),
+            rounded_corners: cx.config().rounded_corners,
         }
     }
 }
@@ -734,7 +948,8 @@ impl Component for Prompt {
         let event = match event {
             Event::Paste(data) => {
                 self.insert_str(data, cx.editor);
-                self.recalculate_completion(cx.editor);
+                (self.callback_fn)(cx, &self.line, PromptEvent::Update);
+                self.dispatch_completion_work(cx.editor.runtime(), cx.ingress.clone());
                 return EventResult::Consumed(None);
             }
             Event::Key(event) => *event,
@@ -750,6 +965,7 @@ impl Component for Prompt {
 
         match event {
             ctrl!('c') | key!(Esc) => {
+                self.invalidate_completion_work();
                 (self.callback_fn)(cx, &self.line, PromptEvent::Abort);
                 return close_fn;
             }
@@ -829,6 +1045,7 @@ impl Component for Prompt {
                     };
 
                     (self.callback_fn)(cx, input, PromptEvent::Validate);
+                    self.invalidate_completion_work();
 
                     return close_fn;
                 }
@@ -857,12 +1074,14 @@ impl Component for Prompt {
             }
             ctrl!('q') => self.exit_selection(),
             ctrl!('r') => {
-                self.completion = cx
+                let completion = cx
                     .editor
                     .registers
                     .iter_preview()
                     .map(|(ch, preview)| (0.., format!("{} {}", ch, &preview).into()))
                     .collect();
+                self.set_completions(completion);
+                self.invalidate_completion_work();
                 self.next_char_handler = Some(Box::new(|prompt, c, context| {
                     prompt.insert_str(
                         &context
@@ -887,17 +1106,21 @@ impl Component for Prompt {
             _ => (),
         };
 
+        self.dispatch_completion_work(cx.editor.runtime(), cx.ingress.clone());
         EventResult::Consumed(None)
     }
 
-    fn sync(&mut self, editor: &mut Editor) {
+    fn sync(&mut self, _viewport: Rect, editor: &mut Editor) {
         self.sync_to_model(editor);
     }
 
-    fn render(&mut self, area: Rect, surface: &mut crate::render::CellSurface, cx: &RenderContext) {
-        self.render_prompt_surface(area, surface, cx, |text, area, surface, cx| {
-            text.render(area, surface, cx);
-        });
+    fn prepare_render(&mut self, area: Rect, cx: &RenderContext) -> crate::render::PreparedRender {
+        let snapshot = self.prepare_render_snapshot(area, cx);
+        crate::render::PreparedRender::deferred(move |cancellation| {
+            let mut output = crate::render::RenderOutput::sparse(area);
+            snapshot.paint(output.surface_mut(), cancellation);
+            output
+        })
     }
 
     fn cursor(&self, _area: Rect, editor: &Editor) -> (Option<Position>, CursorKind) {
@@ -906,5 +1129,296 @@ impl Component for Prompt {
             Some(Position::new(cy as usize, cx as usize)),
             editor.config().cursor_shape.from_mode(Mode::Insert),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Condvar, Mutex,
+    };
+    use std::time::Duration;
+
+    use arc_swap::ArcSwap;
+    use helix_view::{
+        editor::Config,
+        graphics::Rect,
+        handlers::Handlers,
+        input::{KeyEvent, KeyModifiers},
+        keyboard::KeyCode,
+        theme,
+    };
+
+    use super::*;
+    use crate::runtime::{ui::PromptCommand, RuntimeDelivery, UiCommand};
+
+    fn test_editor(runtime: helix_runtime::Runtime) -> Editor {
+        let theme_loader = Arc::new(theme::Loader::new(&[]));
+        let syntax_loader = Arc::new(ArcSwap::from_pointee(helix_core::syntax::Loader::default()));
+        let config = Arc::new(ArcSwap::from_pointee(Config::default()));
+        Editor::new(
+            Rect::new(0, 0, 120, 40),
+            theme_loader,
+            syntax_loader,
+            config,
+            runtime,
+            Handlers::dummy(),
+        )
+    }
+
+    #[derive(Default)]
+    struct DeferredTestCompleter {
+        forbidden_thread: Option<std::thread::ThreadId>,
+    }
+
+    impl DeferredTestCompleter {
+        fn off_thread_from(thread: std::thread::ThreadId) -> Self {
+            Self {
+                forbidden_thread: Some(thread),
+            }
+        }
+    }
+
+    impl CompletionProvider for DeferredTestCompleter {
+        fn capture(&mut self, _editor: &Editor, input: Arc<str>) -> completion::CompletionRequest {
+            let forbidden_thread = self.forbidden_thread;
+            completion::CompletionRequest::new(move || {
+                if let Some(forbidden_thread) = forbidden_thread {
+                    assert_ne!(
+                        std::thread::current().id(),
+                        forbidden_thread,
+                        "completion evaluator ran on the input thread"
+                    );
+                }
+                completion::test_values(&input)
+                    .map(|values| {
+                        values
+                            .iter()
+                            .map(|value| (0.., value.clone().into()))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            })
+        }
+    }
+
+    async fn next_completion_result(
+        receiver: &mut crate::runtime::RuntimeIngressReceiver,
+    ) -> crate::runtime::ui::PromptCompletionResult {
+        loop {
+            match receiver.recv().await {
+                Some(RuntimeDelivery::Ui(UiCommand::Prompt(PromptCommand::CompletionReady(
+                    result,
+                )))) => return result,
+                Some(_) => continue,
+                None => panic!("runtime ingress closed before prompt completion"),
+            }
+        }
+    }
+
+    #[test]
+    fn input_returns_before_blocked_worker_and_newest_query_wins() {
+        let tokio = tokio::runtime::Runtime::new().expect("test runtime");
+        let _runtime_guard = tokio.enter();
+        let mut editor = test_editor(helix_runtime::Runtime::new(tokio.handle().clone()));
+        let (ingress, mut receiver) =
+            crate::runtime::RuntimeIngress::channel(editor.runtime().clone());
+        let (plugin_events, _plugin_events_rx) = helix_runtime::channel(16);
+        let idle_reset = crate::runtime::IdleResetGate::new().handle();
+        let mut exit_tasks = crate::runtime::ExitTaskSet::default();
+        let notifier = crate::handlers::local::Notifier {
+            redraw: editor.redraw_handle(),
+            plugin_events: plugin_events.into(),
+        };
+
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let started_tx = Arc::new(Mutex::new(Some(started_tx)));
+        let worker_finished = Arc::new(AtomicBool::new(false));
+        let input_thread = std::thread::current().id();
+        let loader_gate = gate.clone();
+        let loader_started = started_tx.clone();
+        let loader_finished = worker_finished.clone();
+        let loader: completion::CompletionLoader = Arc::new(move |key, cancellation| {
+            assert_ne!(
+                std::thread::current().id(),
+                input_thread,
+                "completion loader ran on the input thread"
+            );
+            let completion::CompletionWorkKey::Test(key) = key else {
+                panic!("unexpected completion work: {key:?}");
+            };
+            if key == "a" {
+                if let Some(started) = loader_started
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
+                {
+                    let _ = started.send(());
+                }
+                let (mutex, signal) = &*loader_gate;
+                let open = mutex
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let _ = signal
+                    .wait_timeout_while(open, Duration::from_secs(2), |open| !*open)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+            loader_finished.store(true, Ordering::Release);
+            if cancellation.is_cancelled() {
+                return None;
+            }
+            Some(completion::CompletionWorkOutput::Test {
+                key: key.clone(),
+                values: Arc::from([format!("{key}-result")]),
+            })
+        });
+
+        let mut prompt = Prompt::new(
+            "Cmdline".into(),
+            None,
+            DeferredTestCompleter::off_thread_from(input_thread),
+            |_, _, _| {},
+        );
+        prompt.set_completion_loader(loader);
+
+        let exit_task_work = editor.work();
+        let mut context = Context::new(
+            &mut editor,
+            &mut exit_tasks,
+            exit_task_work,
+            notifier,
+            ingress.clone(),
+            idle_reset,
+            crate::plugin_registry::PluginRuntime::default(),
+        );
+        let _ = prompt.handle_event(
+            &Event::Key(KeyEvent {
+                code: KeyCode::Char('a'),
+                modifiers: KeyModifiers::NONE,
+            }),
+            &mut context,
+        );
+        assert_eq!(prompt.line(), "a");
+        assert!(prompt.completions().is_empty());
+
+        tokio.block_on(async {
+            started_rx.await.expect("first worker started");
+        });
+        assert!(
+            !worker_finished.load(Ordering::Acquire),
+            "input handler did not return before the blocked worker finished"
+        );
+        let _ = prompt.handle_event(
+            &Event::Key(KeyEvent {
+                code: KeyCode::Char('b'),
+                modifiers: KeyModifiers::NONE,
+            }),
+            &mut context,
+        );
+        {
+            let (mutex, signal) = &*gate;
+            *mutex
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+            signal.notify_all();
+        }
+        drop(context);
+
+        let result = tokio.block_on(next_completion_result(&mut receiver));
+        assert_eq!(result.0.query.as_ref(), "ab");
+        assert!(prompt.apply_completion_result(result));
+        assert_eq!(prompt.completions().len(), 1);
+        assert_eq!(prompt.completions()[0].1.content, "ab-result");
+        assert!(
+            receiver.try_recv().is_err(),
+            "stale result was also emitted"
+        );
+    }
+
+    #[test]
+    fn stale_and_replaced_prompt_results_are_ignored() {
+        let tokio = tokio::runtime::Runtime::new().expect("test runtime");
+        let _runtime_guard = tokio.enter();
+        let editor = test_editor(helix_runtime::Runtime::new(tokio.handle().clone()));
+        let (_ingress, _receiver) =
+            crate::runtime::RuntimeIngress::channel(editor.runtime().clone());
+        let mut prompt = Prompt::new(
+            "Cmdline".into(),
+            None,
+            DeferredTestCompleter::default(),
+            |_, _, _| {},
+        );
+        prompt.set_line("old".into(), &editor);
+        let stale =
+            crate::runtime::ui::PromptCompletionResult(completion::PromptCompletionPayload {
+                prompt_id: prompt.completion_id,
+                generation: prompt.completion_generation,
+                query: Arc::from("old"),
+                completions: vec![(0.., "stale".into())],
+            });
+        let closed_id = prompt.completion_id;
+        prompt.set_line("new".into(), &editor);
+        assert!(!prompt.apply_completion_result(stale));
+        assert!(prompt.completions().is_empty());
+        drop(prompt);
+
+        let mut replacement = Prompt::new(
+            "Cmdline".into(),
+            None,
+            DeferredTestCompleter::default(),
+            |_, _, _| {},
+        );
+        let late =
+            crate::runtime::ui::PromptCompletionResult(completion::PromptCompletionPayload {
+                prompt_id: closed_id,
+                generation: 1,
+                query: Arc::from(""),
+                completions: Vec::new(),
+            });
+        assert!(!replacement.apply_completion_result(late));
+        assert!(replacement.completions().is_empty());
+    }
+
+    #[test]
+    fn async_replacement_keeps_selection_in_bounds() {
+        let tokio = tokio::runtime::Runtime::new().expect("test runtime");
+        let _runtime_guard = tokio.enter();
+        let editor = test_editor(helix_runtime::Runtime::new(tokio.handle().clone()));
+        let (_ingress, _receiver) =
+            crate::runtime::RuntimeIngress::channel(editor.runtime().clone());
+        let mut prompt = Prompt::new(
+            "Cmdline".into(),
+            None,
+            DeferredTestCompleter::default(),
+            |_, _, _| {},
+        );
+        prompt.set_line("query".into(), &editor);
+        let result =
+            crate::runtime::ui::PromptCompletionResult(completion::PromptCompletionPayload {
+                prompt_id: prompt.completion_id,
+                generation: prompt.completion_generation,
+                query: Arc::from("query"),
+                completions: vec![(0.., "first".into()), (0.., "second".into())],
+            });
+        assert!(prompt.apply_completion_result(result));
+        prompt.change_completion_selection(CompletionDirection::Forward);
+        assert_eq!(prompt.selection(), Some(0));
+
+        let result =
+            crate::runtime::ui::PromptCompletionResult(completion::PromptCompletionPayload {
+                prompt_id: prompt.completion_id,
+                generation: prompt.completion_generation,
+                query: Arc::from(prompt.line.as_str()),
+                completions: vec![(0.., "only".into())],
+            });
+        assert!(prompt.apply_completion_result(result));
+        assert!(
+            prompt
+                .selection()
+                .is_none_or(|selection| selection < prompt.completions().len()),
+            "selection escaped the replacement completion list"
+        );
     }
 }

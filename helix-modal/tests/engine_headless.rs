@@ -170,7 +170,7 @@ fn char_key(ch: char) -> KeyEvent {
 
 /// Create a minimal Editor for testing (requires tokio runtime for Handlers).
 fn test_editor() -> Editor {
-    let theme_loader = helix_view::theme::Loader::new(helix_loader::runtime_dirs());
+    let theme_loader = helix_view::theme::Loader::new(&[]);
     let syn_loader = helix_core::config::default_lang_loader();
     let config = Config::default();
     let config = Arc::new(ArcSwap::from_pointee(config));

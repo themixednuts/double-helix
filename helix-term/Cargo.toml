@@ -34,9 +34,10 @@ assets = [
 [features]
 default = ["git"]
 unicode-lines = ["helix-core/unicode-lines", "helix-view/unicode-lines"]
-integration = []
+integration = ["dep:fern"]
 git = ["helix-vcs/git"]
 storybook = []
+mock-acp = ["helix-view/mock-acp"]
 bench = [
   "helix-core/bench",
   "helix-view/bench",
@@ -66,7 +67,9 @@ helix-dap = { path = "../helix-dap" }
 helix-vcs = { path = "../helix-vcs" }
 helix-loader = { path = "../helix-loader" }
 helix-pkg = { path = "../helix-pkg" }
+helix-plugin-api = { path = "../helix-plugin-api" }
 helix-plugin = { path = "../helix-plugin" }
+helix-plugin-editor = { path = "../helix-plugin-editor" }
 helix-acp = { path = "../helix-acp" }
 helix-modal = { path = "../helix-modal" }
 helix-runtime = { path = "../helix-runtime" }
@@ -86,7 +89,7 @@ termini = "1"
 indexmap = "2.13"
 
 # Logging
-fern = "0.7"
+fern = { version = "0.7", optional = true }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 log = "0.4"
 

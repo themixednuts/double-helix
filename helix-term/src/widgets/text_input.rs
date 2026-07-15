@@ -27,9 +27,20 @@ pub fn text_input(
     cursor_style: Style,
 ) -> TextInputState {
     let state = helix_view::layout::text_input_layout(area, text, cursor);
+    paint_text_input(surface, area, text, &state, style, cursor_style);
+    state
+}
 
+pub fn paint_text_input(
+    surface: &mut crate::render::CellSurface,
+    area: Rect,
+    text: &str,
+    state: &TextInputState,
+    style: Style,
+    cursor_style: Style,
+) {
     if area.width == 0 || area.height == 0 {
-        return state;
+        return;
     }
 
     // Simple case: text fits entirely.
@@ -45,7 +56,7 @@ pub fn text_input(
             };
         }
 
-        return state;
+        return;
     }
 
     // Render with truncation indicators.
@@ -66,8 +77,6 @@ pub fn text_input(
             }
         };
     }
-
-    state
 }
 
 #[cfg(test)]

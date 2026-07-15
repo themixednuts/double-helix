@@ -1,4 +1,4 @@
-use super::{Action, Editor};
+use super::Editor;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AcceptedReviewApplyDecision {
@@ -34,8 +34,10 @@ impl Editor {
                     let _ = self.publish_location(participant, location);
                 }
                 crate::assistant::effect::Effect::RevealLocation { location } => {
-                    self.assistant_follow.suppress_pause = true;
-                    let _ = self.reveal_location(&location, Action::Replace);
+                    self.request_location_reveal(
+                        &location,
+                        crate::handlers::NavigationPurpose::AssistantFollow,
+                    );
                 }
                 crate::assistant::effect::Effect::SendBackendCommand { backend, command } => {
                     let Some(handle) = self.ensure_assistant_backend(&backend) else {

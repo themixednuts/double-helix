@@ -1,6 +1,10 @@
 # ACP event type validation
 
 Validation of all JSON-RPC messages sent and received between Helix (client) and the mock agent.
+The mock agent is a development fixture. Build/run from the repository root
+with `--features mock-acp` to add it to ACP discovery before running these
+checks. Builds without that feature, including default release builds, do not
+compile it in.
 
 ## Client → Agent (Helix sends)
 

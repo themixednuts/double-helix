@@ -696,6 +696,8 @@ impl PersistedRun {
 struct PersistedEntry {
     id: u64,
     turn: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stream: Option<PersistedStreamId>,
     kind: PersistedEntryKind,
     locations: Vec<PersistedLocation>,
 }
@@ -705,6 +707,7 @@ impl PersistedEntry {
         Self {
             id: entry.id.value().get(),
             turn: entry.turn.map(|turn| turn.value().get()),
+            stream: entry.stream.as_ref().map(PersistedStreamId::from),
             kind: PersistedEntryKind::from(&entry.kind),
             locations: entry
                 .locations
@@ -718,12 +721,64 @@ impl PersistedEntry {
         thread::Entry {
             id: entry_id(self.id),
             turn: self.turn.map(turn_id),
+            stream: self.stream.map(PersistedStreamId::into_domain),
             kind: self.kind.into_domain(),
             locations: self
                 .locations
                 .into_iter()
                 .map(PersistedLocation::into_domain)
                 .collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct PersistedStreamId {
+    kind: PersistedStreamKind,
+    id: String,
+}
+
+impl From<&thread::StreamId> for PersistedStreamId {
+    fn from(stream: &thread::StreamId) -> Self {
+        Self {
+            kind: PersistedStreamKind::from(stream.kind),
+            id: stream.id.clone(),
+        }
+    }
+}
+
+impl PersistedStreamId {
+    fn into_domain(self) -> thread::StreamId {
+        thread::StreamId {
+            kind: self.kind.into_domain(),
+            id: self.id,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+enum PersistedStreamKind {
+    UserPrompt,
+    AssistantText,
+    Thought,
+}
+
+impl From<thread::StreamKind> for PersistedStreamKind {
+    fn from(kind: thread::StreamKind) -> Self {
+        match kind {
+            thread::StreamKind::UserPrompt => Self::UserPrompt,
+            thread::StreamKind::AssistantText => Self::AssistantText,
+            thread::StreamKind::Thought => Self::Thought,
+        }
+    }
+}
+
+impl PersistedStreamKind {
+    fn into_domain(self) -> thread::StreamKind {
+        match self {
+            Self::UserPrompt => thread::StreamKind::UserPrompt,
+            Self::AssistantText => thread::StreamKind::AssistantText,
+            Self::Thought => thread::StreamKind::Thought,
         }
     }
 }
@@ -1592,6 +1647,7 @@ mod tests {
             entries: vec![thread::Entry {
                 id: thread::EntryId::new(NonZeroU64::new(1).unwrap()),
                 turn: None,
+                stream: Some(thread::StreamId::assistant_text("msg-agent")),
                 kind: thread::EntryKind::AssistantText {
                     text: "hello".to_string(),
                 },
@@ -1658,6 +1714,28 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let persisted = PersistedThread::from_domain(record).unwrap();
         std::fs::write(path, serde_json::to_vec_pretty(&persisted).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn history_path_never_uses_direct_launch_identity() {
+        let secret = "super-secret-token";
+        let direct_backend = crate::editor::AgentConfig::direct_backend_id(
+            "private-agent-launcher",
+            &["--token".to_owned(), secret.to_owned()],
+        );
+        let backend = LocalHistory {
+            root: PathBuf::from("assistant-history"),
+            store_paths: None,
+        };
+        let path = backend.path(thread_id(42));
+        assert_eq!(
+            path.file_name().and_then(|part| part.to_str()),
+            Some("42.json")
+        );
+        let path = path.to_string_lossy();
+
+        assert!(!path.contains(direct_backend.as_str()));
+        assert!(!path.contains(secret));
     }
 
     #[test]

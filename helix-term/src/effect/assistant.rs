@@ -1,27 +1,45 @@
 use crate::runtime::{send_task_event_with, RuntimeTaskEvent, UiCommand};
 use helix_view::{editor::Action, Editor};
 
+fn submit_ui(
+    editor: &mut Editor,
+    foreground: &crate::runtime::ForegroundEvents,
+    command: UiCommand,
+) {
+    if let Err(error) = foreground.ui(command) {
+        editor.set_error(error.to_string());
+    }
+}
+
 pub(crate) fn apply_restore_assistant_history_thread(
     editor: &mut Editor,
-    ingress: crate::runtime::RuntimeIngress,
+    foreground: &crate::runtime::ForegroundEvents,
     record: helix_view::assistant::history::Record,
     activation: helix_view::editor::Activation,
     panel: helix_view::editor::PanelBehavior,
 ) {
+    let mut record = record;
+    if let helix_view::assistant::thread::Origin::Backend { backend, .. } = &mut record.origin {
+        if let Some(resolved) = editor.resolve_legacy_assistant_history_backend(backend) {
+            *backend = resolved;
+        }
+    }
     let effects = editor.load_assistant_thread(record, activation);
     editor.apply_assistant_effects(effects);
     editor.persist_assistant_layout();
 
     if panel.should_open() {
-        ingress.ui(UiCommand::Assistant(
-            crate::runtime::ui::command::AssistantCommand::OpenPanel,
-        ));
+        submit_ui(
+            editor,
+            foreground,
+            UiCommand::Assistant(crate::runtime::ui::command::AssistantCommand::OpenPanel),
+        );
     }
 }
 
 pub(crate) fn apply_activate_assistant_thread(
     editor: &mut Editor,
-    ingress: crate::runtime::RuntimeIngress,
+    foreground: &crate::runtime::ForegroundEvents,
     thread: helix_view::assistant::thread::Id,
     panel: helix_view::editor::PanelBehavior,
 ) {
@@ -30,9 +48,11 @@ pub(crate) fn apply_activate_assistant_thread(
     editor.persist_assistant_layout();
 
     if panel.should_open() {
-        ingress.ui(UiCommand::Assistant(
-            crate::runtime::ui::command::AssistantCommand::OpenPanel,
-        ));
+        submit_ui(
+            editor,
+            foreground,
+            UiCommand::Assistant(crate::runtime::ui::command::AssistantCommand::OpenPanel),
+        );
     }
 
     editor.set_status("Activated assistant history thread");
@@ -73,36 +93,44 @@ pub(crate) fn apply_remove_assistant_panel(editor: &mut Editor) {
 
 pub(crate) fn apply_connect_assistant_backend(
     editor: &mut Editor,
-    ingress: crate::runtime::RuntimeIngress,
-    command: String,
-    args: Vec<String>,
-    mcp_servers: Vec<helix_acp::types::McpServer>,
-    profile: Option<helix_view::assistant::profile::Defaults>,
-    panel: helix_view::editor::PanelBehavior,
+    foreground: &crate::runtime::ForegroundEvents,
+    connection: crate::runtime::AssistantBackendConnection,
 ) {
-    let (_, effects) =
-        match editor.connect_assistant_backend(command.clone(), args, mcp_servers, profile) {
-            Ok(result) => result,
-            Err(err) => {
-                editor.set_error(format!("Agent failed: {err}"));
-                return;
-            }
-        };
+    let crate::runtime::AssistantBackendConnection {
+        launch,
+        profile,
+        panel,
+    } = connection;
+    let display_name = launch.display_name.clone();
+    let (_, effects) = match editor.connect_assistant_backend(launch, profile) {
+        Ok(result) => result,
+        Err(err) => {
+            editor.set_error(format!("Assistant agent {display_name} failed: {err}"));
+            return;
+        }
+    };
     editor.apply_assistant_effects(effects);
+    if let Ok(effects) =
+        editor.set_active_assistant_focus(helix_view::assistant::thread::Focus::Messages)
+    {
+        editor.apply_assistant_effects(effects);
+    }
     editor.persist_assistant_layout();
 
     if panel.should_open() {
-        ingress.ui(UiCommand::Assistant(
-            crate::runtime::ui::command::AssistantCommand::OpenPanel,
-        ));
+        submit_ui(
+            editor,
+            foreground,
+            UiCommand::Assistant(crate::runtime::ui::command::AssistantCommand::OpenPanel),
+        );
     }
 
-    editor.set_status(format!("Connecting assistant backend: {command}..."));
+    editor.set_status(format!("Connecting assistant agent {display_name}..."));
 }
 
 pub(crate) fn apply_cycle_assistant_thread(
     editor: &mut Editor,
-    ingress: crate::runtime::RuntimeIngress,
+    foreground: &crate::runtime::ForegroundEvents,
     delta: isize,
 ) {
     let effects = match editor.cycle_active_assistant_thread(delta) {
@@ -114,14 +142,16 @@ pub(crate) fn apply_cycle_assistant_thread(
     };
     editor.apply_assistant_effects(effects);
     editor.persist_assistant_layout();
-    ingress.ui(UiCommand::Assistant(
-        crate::runtime::ui::command::AssistantCommand::OpenPanel,
-    ));
+    submit_ui(
+        editor,
+        foreground,
+        UiCommand::Assistant(crate::runtime::ui::command::AssistantCommand::OpenPanel),
+    );
 }
 
 pub(crate) fn apply_close_active_assistant_thread(
     editor: &mut Editor,
-    ingress: crate::runtime::RuntimeIngress,
+    foreground: &crate::runtime::ForegroundEvents,
 ) {
     let effects = match editor.close_active_assistant_thread() {
         Ok(effects) => effects,
@@ -132,14 +162,16 @@ pub(crate) fn apply_close_active_assistant_thread(
     };
     editor.apply_assistant_effects(effects);
     editor.persist_assistant_layout();
-    ingress.ui(UiCommand::Assistant(
-        crate::runtime::ui::command::AssistantCommand::OpenPanel,
-    ));
+    submit_ui(
+        editor,
+        foreground,
+        UiCommand::Assistant(crate::runtime::ui::command::AssistantCommand::OpenPanel),
+    );
 }
 
 pub(crate) fn apply_new_assistant_thread_from_active_backend(
     editor: &mut Editor,
-    ingress: crate::runtime::RuntimeIngress,
+    foreground: &crate::runtime::ForegroundEvents,
 ) {
     let effects = match editor.new_assistant_thread_from_active_backend() {
         Ok(effects) => effects,
@@ -151,9 +183,11 @@ pub(crate) fn apply_new_assistant_thread_from_active_backend(
     editor.apply_assistant_effects(effects);
     editor.request_redraw();
     editor.persist_assistant_layout();
-    ingress.ui(UiCommand::Assistant(
-        crate::runtime::ui::command::AssistantCommand::OpenPanel,
-    ));
+    submit_ui(
+        editor,
+        foreground,
+        UiCommand::Assistant(crate::runtime::ui::command::AssistantCommand::OpenPanel),
+    );
 }
 
 pub(crate) fn apply_toggle_active_assistant_follow(editor: &mut Editor) {

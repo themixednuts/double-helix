@@ -144,6 +144,11 @@ impl Handle {
         Self { id, tx }
     }
 
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.tx.is_closed()
+    }
+
     pub async fn send(&self, cmd: Command) -> Result<(), helix_runtime::Closed<Command>> {
         self.tx.send(cmd).await
     }

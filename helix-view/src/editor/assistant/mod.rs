@@ -9,4 +9,6 @@ mod service;
 mod thread;
 mod update;
 
+pub use backend::AssistantBackendLaunch;
+
 use super::{Action, Editor};

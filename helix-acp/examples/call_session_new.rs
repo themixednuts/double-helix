@@ -1,7 +1,7 @@
 //! Run an ACP agent, call initialize + session/new, and print the response.
 //!
 //! Usage:
-//!   cargo run -p helix-acp --example call_session_new -- npm.cmd exec --yes @zed-industries/claude-agent-acp@0.20.2
+//!   cargo run -p helix-acp --example call_session_new -- npm.cmd exec --yes @agentclientprotocol/claude-agent-acp@0.56.0
 //!   cargo run -p helix-acp --example call_session_new -- claude-agent-acp
 //!   cargo run -p helix-acp --example call_session_new -- cursor agent acp
 
@@ -37,7 +37,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         while let Some((_aid, call)) = incoming_rx.recv().await {
             if let jsonrpc::Call::MethodCall(m) = call {
                 eprintln!("[agent request] {} -> reply null", m.method);
-                agent_drain.reply(m.id, json!(null));
+                if let Err(err) = agent_drain.reply(m.id, json!(null)).await {
+                    eprintln!("failed to reply to agent request: {err}");
+                    break;
+                }
             }
         }
     });

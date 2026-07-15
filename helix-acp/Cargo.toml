@@ -18,4 +18,4 @@ thiserror = { workspace = true }
 log = "0.4"
 anyhow = "1"
 helix-runtime = { path = "../helix-runtime" }
-agent-client-protocol = { version = "1.0.1", features = ["unstable"] }
+agent-client-protocol = { version = "1.2.0", features = ["unstable"] }

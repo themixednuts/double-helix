@@ -1,0 +1,45 @@
+name = "pi-acp"
+kind = "acp"
+description = "ACP adapter for pi coding agent"
+homepage = "https://github.com/svkozak/pi-acp"
+aliases = ["pi ACP"]
+categories = ["agent-client-protocol", "assistant"]
+
+[version]
+tag-source = "static:0.0.31"
+
+[[artifact]]
+os = "windows"
+arch = "x86_64"
+source = { npx = "pi-acp@0.0.31" }
+bin = "pi-acp"
+
+[[artifact]]
+os = "windows"
+arch = "aarch64"
+source = { npx = "pi-acp@0.0.31" }
+bin = "pi-acp"
+
+[[artifact]]
+os = "linux"
+arch = "x86_64"
+source = { npx = "pi-acp@0.0.31" }
+bin = "pi-acp"
+
+[[artifact]]
+os = "linux"
+arch = "aarch64"
+source = { npx = "pi-acp@0.0.31" }
+bin = "pi-acp"
+
+[[artifact]]
+os = "macos"
+arch = "aarch64"
+source = { npx = "pi-acp@0.0.31" }
+bin = "pi-acp"
+
+[[artifact]]
+os = "macos"
+arch = "x86_64"
+source = { npx = "pi-acp@0.0.31" }
+bin = "pi-acp"

@@ -2,15 +2,26 @@
 
 Helix can run an ACP-compatible agent in the assistant panel. ACP is the Agent Client Protocol used by Zed: JSON-RPC over stdio, with one JSON message per line.
 
-Configure agents in `config.toml`:
+Public ACP agents are available through the package manager. Open
+`:assistant-agents` to browse, install, update, remove, and connect ACP agents.
+The regular package manager also supports this through `:pkg` with
+`kind:acp`.
+
+Use `config.toml` for local agents, custom commands, or overrides:
 
 ```toml
 [[editor.agents]]
+id = "claude"
 name = "Claude"
-command = "npx"
-args = ["@zed-industries/claude-agent-acp"]
+command = "npm"
+args = ["exec", "--yes", "@agentclientprotocol/claude-agent-acp@0.56.0"]
 theme = "default"
 ```
+
+`id` is an optional stable logical identifier used for assistant history and backend
+connections. When omitted, `name` is used. Give agents explicit, distinct IDs when
+they share a launcher such as `node`, `npm`, or `npx`, and keep an ID unchanged when
+renaming its display name.
 
 Assistant completion notifications are enabled by default:
 
@@ -31,9 +42,9 @@ config = { thinking = "high" }
 mcp-servers = ["fs", "git"]
 ```
 
-`agent` selects a configured `[[editor.agents]]` entry by name. If omitted, Helix uses the current agent when switching an active thread, or the first configured agent when starting from `:assistant-profile`. `mode`, `model`, and `config` are applied through the normal ACP session mode/config paths. `mcp-servers` filters the selected agent's configured MCP servers by their `name`.
+`agent` selects an installed ACP package agent or configured `[[editor.agents]]` entry by name. If omitted, Helix uses the current agent when switching an active thread, or the first available agent when starting from `:assistant-profile`. `mode`, `model`, and `config` are applied through the normal ACP session mode/config paths. `mcp-servers` filters the selected agent's configured MCP servers by their `name`.
 
-Open or connect with `:assistant-open` and `:assistant-connect`. With no arguments, `:assistant-connect` shows configured agents. With arguments, it starts that command directly. Browse previous sessions with `:assistant-open-history`; press `d` on a selected session and then `d` again to confirm deletion.
+Open or connect with `:assistant-open` and `:assistant-connect`. With no arguments, `:assistant-connect` shows installed ACP package agents and configured agents; if none are available, Helix opens `:assistant-agents` so you can install one. In the ACP agents manager, press `Enter` or `i` to install and `c` to connect an installed agent. With arguments, `:assistant-connect` starts that command directly. Browse previous sessions with `:assistant-open-history`; press `d` on a selected session and then `d` again to confirm deletion.
 
 ## Panel Keys
 

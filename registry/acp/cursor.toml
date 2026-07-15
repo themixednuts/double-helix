@@ -1,0 +1,51 @@
+name = "cursor"
+kind = "acp"
+description = "Cursor's coding agent"
+homepage = "https://cursor.com/docs/cli/acp"
+aliases = ["Cursor"]
+categories = ["agent-client-protocol", "assistant"]
+
+[version]
+tag-source = "static:2026.07.01"
+
+[[artifact]]
+os = "macos"
+arch = "aarch64"
+source = { archive = "https://downloads.cursor.com/lab/2026.07.01-41b2de7/darwin/arm64/agent-cli-package.tar.gz" }
+bin = "dist-package/cursor-agent"
+args = ["acp"]
+
+[[artifact]]
+os = "macos"
+arch = "x86_64"
+source = { archive = "https://downloads.cursor.com/lab/2026.07.01-41b2de7/darwin/x64/agent-cli-package.tar.gz" }
+bin = "dist-package/cursor-agent"
+args = ["acp"]
+
+[[artifact]]
+os = "linux"
+arch = "aarch64"
+source = { archive = "https://downloads.cursor.com/lab/2026.07.01-41b2de7/linux/arm64/agent-cli-package.tar.gz" }
+bin = "dist-package/cursor-agent"
+args = ["acp"]
+
+[[artifact]]
+os = "linux"
+arch = "x86_64"
+source = { archive = "https://downloads.cursor.com/lab/2026.07.01-41b2de7/linux/x64/agent-cli-package.tar.gz" }
+bin = "dist-package/cursor-agent"
+args = ["acp"]
+
+[[artifact]]
+os = "windows"
+arch = "aarch64"
+source = { archive = "https://downloads.cursor.com/lab/2026.07.01-41b2de7/windows/arm64/agent-cli-package.zip" }
+bin = "dist-package/cursor-agent.cmd"
+args = ["acp"]
+
+[[artifact]]
+os = "windows"
+arch = "x86_64"
+source = { archive = "https://downloads.cursor.com/lab/2026.07.01-41b2de7/windows/x64/agent-cli-package.zip" }
+bin = "dist-package/cursor-agent.cmd"
+args = ["acp"]

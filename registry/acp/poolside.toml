@@ -1,0 +1,51 @@
+name = "poolside"
+kind = "acp"
+description = "Poolside's coding agent"
+homepage = "https://poolside.ai"
+aliases = ["Poolside", "https://github.com/poolsideai/pool"]
+categories = ["agent-client-protocol", "assistant"]
+
+[version]
+tag-source = "static:1.0.8"
+
+[[artifact]]
+os = "macos"
+arch = "aarch64"
+source = { archive = "https://downloads.poolside.ai/pool/v1.0.8/pool-darwin-arm64.tar.gz" }
+bin = "pool-darwin-arm64"
+args = ["acp"]
+
+[[artifact]]
+os = "macos"
+arch = "x86_64"
+source = { archive = "https://downloads.poolside.ai/pool/v1.0.8/pool-darwin-amd64.tar.gz" }
+bin = "pool-darwin-amd64"
+args = ["acp"]
+
+[[artifact]]
+os = "linux"
+arch = "aarch64"
+source = { archive = "https://downloads.poolside.ai/pool/v1.0.8/pool-linux-arm64.tar.gz" }
+bin = "pool-linux-arm64"
+args = ["acp"]
+
+[[artifact]]
+os = "linux"
+arch = "x86_64"
+source = { archive = "https://downloads.poolside.ai/pool/v1.0.8/pool-linux-amd64.tar.gz" }
+bin = "pool-linux-amd64"
+args = ["acp"]
+
+[[artifact]]
+os = "windows"
+arch = "aarch64"
+source = { archive = "https://downloads.poolside.ai/pool/v1.0.8/pool-windows-arm64.tar.gz" }
+bin = "pool-windows-arm64.exe"
+args = ["acp"]
+
+[[artifact]]
+os = "windows"
+arch = "x86_64"
+source = { archive = "https://downloads.poolside.ai/pool/v1.0.8/pool-windows-amd64.tar.gz" }
+bin = "pool-windows-amd64.exe"
+args = ["acp"]

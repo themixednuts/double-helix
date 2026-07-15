@@ -1,0 +1,51 @@
+name = "github-copilot-cli"
+kind = "acp"
+description = "GitHub's AI pair programmer"
+homepage = "https://github.com/features/copilot/cli/"
+aliases = ["GitHub Copilot", "https://github.com/github/copilot-cli"]
+categories = ["agent-client-protocol", "assistant"]
+
+[version]
+tag-source = "static:1.0.68"
+
+[[artifact]]
+os = "windows"
+arch = "x86_64"
+source = { npx = "@github/copilot@1.0.68" }
+bin = "github-copilot-cli"
+args = ["--acp"]
+
+[[artifact]]
+os = "windows"
+arch = "aarch64"
+source = { npx = "@github/copilot@1.0.68" }
+bin = "github-copilot-cli"
+args = ["--acp"]
+
+[[artifact]]
+os = "linux"
+arch = "x86_64"
+source = { npx = "@github/copilot@1.0.68" }
+bin = "github-copilot-cli"
+args = ["--acp"]
+
+[[artifact]]
+os = "linux"
+arch = "aarch64"
+source = { npx = "@github/copilot@1.0.68" }
+bin = "github-copilot-cli"
+args = ["--acp"]
+
+[[artifact]]
+os = "macos"
+arch = "aarch64"
+source = { npx = "@github/copilot@1.0.68" }
+bin = "github-copilot-cli"
+args = ["--acp"]
+
+[[artifact]]
+os = "macos"
+arch = "x86_64"
+source = { npx = "@github/copilot@1.0.68" }
+bin = "github-copilot-cli"
+args = ["--acp"]

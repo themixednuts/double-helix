@@ -1,0 +1,39 @@
+name = "mistral-vibe"
+kind = "acp"
+description = "Mistral's open-source coding assistant"
+homepage = "https://mistral.ai/products/vibe"
+aliases = ["Mistral Vibe", "https://github.com/mistralai/mistral-vibe"]
+categories = ["agent-client-protocol", "assistant"]
+
+[version]
+tag-source = "static:2.19.0"
+
+[[artifact]]
+os = "macos"
+arch = "aarch64"
+source = { archive = "https://github.com/mistralai/mistral-vibe/releases/download/v2.19.0/vibe-acp-darwin-aarch64-2.19.0.zip" }
+bin = "vibe-acp"
+
+[[artifact]]
+os = "macos"
+arch = "x86_64"
+source = { archive = "https://github.com/mistralai/mistral-vibe/releases/download/v2.19.0/vibe-acp-darwin-x86_64-2.19.0.zip" }
+bin = "vibe-acp"
+
+[[artifact]]
+os = "linux"
+arch = "aarch64"
+source = { archive = "https://github.com/mistralai/mistral-vibe/releases/download/v2.19.0/vibe-acp-linux-aarch64-2.19.0.zip" }
+bin = "vibe-acp"
+
+[[artifact]]
+os = "linux"
+arch = "x86_64"
+source = { archive = "https://github.com/mistralai/mistral-vibe/releases/download/v2.19.0/vibe-acp-linux-x86_64-2.19.0.zip" }
+bin = "vibe-acp"
+
+[[artifact]]
+os = "windows"
+arch = "x86_64"
+source = { archive = "https://github.com/mistralai/mistral-vibe/releases/download/v2.19.0/vibe-acp-windows-x86_64-2.19.0.zip" }
+bin = "vibe-acp.exe"

@@ -1,0 +1,51 @@
+name = "cline"
+kind = "acp"
+description = "Autonomous coding agent CLI - capable of creating/editing files, running commands, using the browser, and more"
+homepage = "https://cline.bot/cli"
+aliases = ["Cline", "https://github.com/cline/cline"]
+categories = ["agent-client-protocol", "assistant"]
+
+[version]
+tag-source = "static:3.0.38"
+
+[[artifact]]
+os = "windows"
+arch = "x86_64"
+source = { npx = "cline@3.0.38" }
+bin = "cline"
+args = ["--acp"]
+
+[[artifact]]
+os = "windows"
+arch = "aarch64"
+source = { npx = "cline@3.0.38" }
+bin = "cline"
+args = ["--acp"]
+
+[[artifact]]
+os = "linux"
+arch = "x86_64"
+source = { npx = "cline@3.0.38" }
+bin = "cline"
+args = ["--acp"]
+
+[[artifact]]
+os = "linux"
+arch = "aarch64"
+source = { npx = "cline@3.0.38" }
+bin = "cline"
+args = ["--acp"]
+
+[[artifact]]
+os = "macos"
+arch = "aarch64"
+source = { npx = "cline@3.0.38" }
+bin = "cline"
+args = ["--acp"]
+
+[[artifact]]
+os = "macos"
+arch = "x86_64"
+source = { npx = "cline@3.0.38" }
+bin = "cline"
+args = ["--acp"]

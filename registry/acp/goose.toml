@@ -1,0 +1,44 @@
+name = "goose"
+kind = "acp"
+description = "A local, extensible, open source AI agent that automates engineering tasks"
+homepage = "https://block.github.io/goose/"
+aliases = ["goose", "https://github.com/block/goose"]
+categories = ["agent-client-protocol", "assistant"]
+
+[version]
+tag-source = "static:1.41.0"
+
+[[artifact]]
+os = "macos"
+arch = "aarch64"
+source = { archive = "https://github.com/block/goose/releases/download/v1.41.0/goose-aarch64-apple-darwin.tar.bz2" }
+bin = "goose"
+args = ["acp"]
+
+[[artifact]]
+os = "macos"
+arch = "x86_64"
+source = { archive = "https://github.com/block/goose/releases/download/v1.41.0/goose-x86_64-apple-darwin.tar.bz2" }
+bin = "goose"
+args = ["acp"]
+
+[[artifact]]
+os = "linux"
+arch = "aarch64"
+source = { archive = "https://github.com/block/goose/releases/download/v1.41.0/goose-aarch64-unknown-linux-gnu.tar.bz2" }
+bin = "goose"
+args = ["acp"]
+
+[[artifact]]
+os = "linux"
+arch = "x86_64"
+source = { archive = "https://github.com/block/goose/releases/download/v1.41.0/goose-x86_64-unknown-linux-gnu.tar.bz2" }
+bin = "goose"
+args = ["acp"]
+
+[[artifact]]
+os = "windows"
+arch = "x86_64"
+source = { archive = "https://github.com/block/goose/releases/download/v1.41.0/goose-x86_64-pc-windows-msvc.zip" }
+bin = "goose-package/goose.exe"
+args = ["acp"]

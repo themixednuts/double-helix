@@ -1,0 +1,33 @@
+name = "corust-agent"
+kind = "acp"
+description = "Co-building with a seasoned Rust partner."
+homepage = "https://corust.ai/"
+aliases = ["Corust Agent", "https://github.com/Corust-ai/corust-agent-release"]
+categories = ["agent-client-protocol", "assistant"]
+
+[version]
+tag-source = "static:0.6.0"
+
+[[artifact]]
+os = "macos"
+arch = "aarch64"
+source = { archive = "https://github.com/Corust-ai/corust-agent-release/releases/download/v0.6.0/agent-darwin-arm64.tar.gz" }
+bin = "corust-agent-acp"
+
+[[artifact]]
+os = "macos"
+arch = "x86_64"
+source = { archive = "https://github.com/Corust-ai/corust-agent-release/releases/download/v0.6.0/agent-darwin-x64.tar.gz" }
+bin = "corust-agent-acp"
+
+[[artifact]]
+os = "linux"
+arch = "x86_64"
+source = { archive = "https://github.com/Corust-ai/corust-agent-release/releases/download/v0.6.0/agent-linux-x64.tar.gz" }
+bin = "corust-agent-acp"
+
+[[artifact]]
+os = "windows"
+arch = "x86_64"
+source = { archive = "https://github.com/Corust-ai/corust-agent-release/releases/download/v0.6.0/agent-windows-x64.zip" }
+bin = "corust-agent-acp.exe"

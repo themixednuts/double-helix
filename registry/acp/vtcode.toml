@@ -1,0 +1,41 @@
+name = "vtcode"
+kind = "acp"
+description = "An open-source coding agent with LLM-native code understanding and robust shell safety. Supports multiple LLM providers with automatic failover and efficient context management."
+homepage = "https://github.com/vinhnx/VTCode/blob/main/docs/guides/zed-acp.md"
+aliases = ["VT Code", "https://github.com/vinhnx/VTCode"]
+categories = ["agent-client-protocol", "assistant"]
+
+[version]
+tag-source = "static:0.96.14"
+
+[[artifact]]
+os = "macos"
+arch = "aarch64"
+source = { archive = "https://github.com/vinhnx/VTCode/releases/download/0.96.14/vtcode-0.96.14-aarch64-apple-darwin.tar.gz" }
+bin = "vtcode"
+args = ["acp"]
+env = { VT_ACP_ENABLED = "1", VT_ACP_ZED_ENABLED = "1" }
+
+[[artifact]]
+os = "macos"
+arch = "x86_64"
+source = { archive = "https://github.com/vinhnx/VTCode/releases/download/0.96.14/vtcode-0.96.14-x86_64-apple-darwin.tar.gz" }
+bin = "vtcode"
+args = ["acp"]
+env = { VT_ACP_ENABLED = "1", VT_ACP_ZED_ENABLED = "1" }
+
+[[artifact]]
+os = "linux"
+arch = "x86_64"
+source = { archive = "https://github.com/vinhnx/VTCode/releases/download/0.96.14/vtcode-0.96.14-x86_64-unknown-linux-gnu.tar.gz" }
+bin = "vtcode"
+args = ["acp"]
+env = { VT_ACP_ENABLED = "1", VT_ACP_ZED_ENABLED = "1" }
+
+[[artifact]]
+os = "windows"
+arch = "x86_64"
+source = { archive = "https://github.com/vinhnx/VTCode/releases/download/0.96.14/vtcode-0.96.14-x86_64-pc-windows-msvc.zip" }
+bin = "vtcode.exe"
+args = ["acp"]
+env = { VT_ACP_ENABLED = "1", VT_ACP_ZED_ENABLED = "1" }

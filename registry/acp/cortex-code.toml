@@ -1,0 +1,51 @@
+name = "cortex-code"
+kind = "acp"
+description = "Snowflake's Cortex Code coding agent"
+homepage = "https://docs.snowflake.com/en/user-guide/cortex-code/cortex-code"
+aliases = ["Cortex Code"]
+categories = ["agent-client-protocol", "assistant"]
+
+[version]
+tag-source = "static:1.0.73"
+
+[[artifact]]
+os = "macos"
+arch = "aarch64"
+source = { archive = "https://sfc-repo.snowflakecomputing.com/cortex-code-cli/a4643c4278/1.0.73%2B180523.e6179a031de9/coco-1.0.73%2B180523.e6179a031de9-darwin-arm64.tar.gz" }
+bin = "coco-1.0.73+180523.e6179a031de9-darwin-arm64/cortex"
+args = ["acp", "serve"]
+
+[[artifact]]
+os = "macos"
+arch = "x86_64"
+source = { archive = "https://sfc-repo.snowflakecomputing.com/cortex-code-cli/a4643c4278/1.0.73%2B180523.e6179a031de9/coco-1.0.73%2B180523.e6179a031de9-darwin-amd64.tar.gz" }
+bin = "coco-1.0.73+180523.e6179a031de9-darwin-amd64/cortex"
+args = ["acp", "serve"]
+
+[[artifact]]
+os = "linux"
+arch = "aarch64"
+source = { archive = "https://sfc-repo.snowflakecomputing.com/cortex-code-cli/a4643c4278/1.0.73%2B180523.e6179a031de9/coco-1.0.73%2B180523.e6179a031de9-linux-arm64.tar.gz" }
+bin = "coco-1.0.73+180523.e6179a031de9-linux-arm64/cortex"
+args = ["acp", "serve"]
+
+[[artifact]]
+os = "linux"
+arch = "x86_64"
+source = { archive = "https://sfc-repo.snowflakecomputing.com/cortex-code-cli/a4643c4278/1.0.73%2B180523.e6179a031de9/coco-1.0.73%2B180523.e6179a031de9-linux-amd64.tar.gz" }
+bin = "coco-1.0.73+180523.e6179a031de9-linux-amd64/cortex"
+args = ["acp", "serve"]
+
+[[artifact]]
+os = "windows"
+arch = "aarch64"
+source = { archive = "https://sfc-repo.snowflakecomputing.com/cortex-code-cli/a4643c4278/1.0.73%2B180523.e6179a031de9/coco-1.0.73%2B180523.e6179a031de9-windows-arm64.tar.gz" }
+bin = "coco-1.0.73+180523.e6179a031de9-windows-arm64/cortex.exe"
+args = ["acp", "serve"]
+
+[[artifact]]
+os = "windows"
+arch = "x86_64"
+source = { archive = "https://sfc-repo.snowflakecomputing.com/cortex-code-cli/a4643c4278/1.0.73%2B180523.e6179a031de9/coco-1.0.73%2B180523.e6179a031de9-windows-amd64.tar.gz" }
+bin = "coco-1.0.73+180523.e6179a031de9-windows-amd64/cortex.exe"
+args = ["acp", "serve"]

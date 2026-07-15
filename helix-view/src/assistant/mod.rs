@@ -103,6 +103,7 @@ mod tests {
         thread::Entry {
             id: thread::EntryId::new(NonZeroU64::new(value).unwrap()),
             turn: None,
+            stream: None,
             kind,
             locations: Vec::new(),
         }

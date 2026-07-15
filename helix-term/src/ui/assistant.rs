@@ -1,15 +1,12 @@
 use crate::component_traits;
-use crate::compositor::{Component, Context, Event, EventResult, RenderContext};
+use crate::compositor::{Component, Context, Event, EventResult, PostAction, RenderContext};
 use crate::ui::animation::{
     Animation, AnimationDirection, AnimationFillMode, AnimationIterationCount, AnimationSpec,
     AnimationTimingFunction,
 };
-use crate::widgets::{
-    message_list, Message, MessageAccessoryAlign, MessageAlign, MessageCorners, MessageCursor,
-    MessageListState, MessageStyle, Spinner,
-};
-use crate::widgets::{schedule_redraw_at, Marquee};
-use helix_core::unicode::width::UnicodeWidthStr;
+use crate::widgets::{Marquee, MarqueeFrame};
+use crate::widgets::{Message, MessageCorners, MessageCursor, MessageListState, Spinner};
+use helix_core::unicode::width::{UnicodeWidthChar, UnicodeWidthStr};
 use helix_core::Position;
 use helix_view::content_region::ContentRegion;
 use helix_view::document::Mode;
@@ -19,14 +16,28 @@ use helix_view::input::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent
 use helix_view::theme::{Modifier, Style};
 use helix_view::traits::{Bounded, Focusable, Identified, Modal, Scrollable};
 use helix_view::Editor;
-use std::cell::RefCell;
-use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+const ERROR_MARQUEE_FRAME: helix_runtime::FrameSource =
+    helix_runtime::FrameSource::new("assistant.error-marquee");
+const ACTIVITY_SPINNER_FRAME: helix_runtime::FrameSource =
+    helix_runtime::FrameSource::new("assistant.activity-spinner");
+const MESSAGE_FOCUS_FRAME: helix_runtime::FrameSource =
+    helix_runtime::FrameSource::new("assistant.message-focus");
 use tui::text::{Span, Spans};
 
-use crate::ui::markdown::{
-    fit_bubble_width, wrap_text, Doc as MarkdownDoc, MarkdownCache, MarkdownLineStyles,
+use crate::ui::markdown::MarkdownLineStyles;
+
+mod markdown_service;
+use markdown_service::{
+    MarkdownService, RenderStyle as MarkdownRenderStyle, RequestKey as MarkdownRequestKey,
+};
+mod presentation_service;
+use presentation_service::{
+    PresentationService, RequestKey as PresentationRequestKey, Snapshot as PresentationSnapshot,
+    Source as PresentationSource,
 };
 
 pub const ID: &str = "assistant-panel";
@@ -39,6 +50,260 @@ type ChatEntry = helix_view::model::AssistantEntry;
 #[cfg(test)]
 type ChatEntryKind = helix_view::model::AssistantEntryKind;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InputVisualLine {
+    text: String,
+    start: usize,
+    end: usize,
+}
+
+#[derive(Debug)]
+struct InputViewportLayout {
+    visible_lines: Arc<[String]>,
+    cursor_row: usize,
+    cursor_column: usize,
+    placeholder: bool,
+    #[cfg_attr(not(test), allow(dead_code))]
+    inspected_lines: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InputLayoutKey {
+    document_version: i32,
+    cursor: usize,
+    width: usize,
+    height: usize,
+}
+
+#[derive(Debug, Default)]
+struct InputLayoutCache {
+    key: Option<InputLayoutKey>,
+    layout: Option<Arc<InputViewportLayout>>,
+}
+
+impl InputLayoutCache {
+    fn layout(
+        &mut self,
+        key: InputLayoutKey,
+        text: helix_core::RopeSlice<'_>,
+    ) -> Arc<InputViewportLayout> {
+        if self.key == Some(key) {
+            if let Some(layout) = &self.layout {
+                return Arc::clone(layout);
+            }
+        }
+        let layout = Arc::new(layout_input_viewport(
+            text, key.cursor, key.width, key.height,
+        ));
+        self.key = Some(key);
+        self.layout = Some(Arc::clone(&layout));
+        layout
+    }
+}
+
+fn layout_input_viewport(
+    text: helix_core::RopeSlice<'_>,
+    cursor: usize,
+    width: usize,
+    height: usize,
+) -> InputViewportLayout {
+    let width = width.max(1);
+    let height = height.max(1);
+    let cursor = cursor.min(text.len_chars());
+    let cursor_line = text.char_to_line(cursor);
+    let mut inspected_lines = 1;
+    let current_line_start = text.line_to_char(cursor_line);
+    let mut visible = std::collections::VecDeque::with_capacity(height);
+    let mut current_after = Vec::with_capacity(height);
+    let mut found_cursor = false;
+    let mut cursor_visual_start = current_line_start;
+    for_each_input_rope_row(
+        text.line(cursor_line),
+        current_line_start,
+        width,
+        Some(cursor),
+        |row, is_last| {
+            if !found_cursor
+                && ((cursor >= row.start && cursor < row.end) || (is_last && cursor == row.end))
+            {
+                found_cursor = true;
+                cursor_visual_start = row.start;
+                if visible.len() == height {
+                    visible.pop_front();
+                }
+                visible.push_back(row);
+                return true;
+            }
+            if found_cursor {
+                if current_after.len() == height {
+                    return false;
+                }
+                current_after.push(row);
+            } else {
+                if visible.len() == height {
+                    visible.pop_front();
+                }
+                visible.push_back(row);
+            }
+            true
+        },
+    );
+    debug_assert!(found_cursor, "cursor must belong to an input visual row");
+
+    let mut previous_line = cursor_line;
+    while visible.len() < height && previous_line > 0 {
+        previous_line -= 1;
+        inspected_lines += 1;
+        let line_start = text.line_to_char(previous_line);
+        let remaining = height - visible.len();
+        let mut tail = std::collections::VecDeque::with_capacity(remaining);
+        for_each_input_rope_row(
+            text.line(previous_line),
+            line_start,
+            width,
+            None,
+            |row, _| {
+                if tail.len() == remaining {
+                    tail.pop_front();
+                }
+                tail.push_back(row);
+                true
+            },
+        );
+        while let Some(row) = tail.pop_back() {
+            visible.push_front(row);
+        }
+    }
+
+    if previous_line == 0 && visible.len() < height {
+        for row in current_after {
+            if visible.len() == height {
+                break;
+            }
+            visible.push_back(row);
+        }
+        let mut next_line = cursor_line + 1;
+        while visible.len() < height && next_line < text.len_lines() {
+            inspected_lines += 1;
+            let line_start = text.line_to_char(next_line);
+            for_each_input_rope_row(text.line(next_line), line_start, width, None, |row, _| {
+                if visible.len() == height {
+                    return false;
+                }
+                visible.push_back(row);
+                true
+            });
+            next_line += 1;
+        }
+    }
+
+    let cursor_row = visible
+        .iter()
+        .position(|row| row.start == cursor_visual_start)
+        .unwrap_or_default();
+    let cursor_start = visible
+        .get(cursor_row)
+        .map_or(cursor, |row| row.start.min(cursor));
+    let cursor_column = text
+        .slice(cursor_start..cursor)
+        .chars()
+        .map(|character| UnicodeWidthChar::width(character).unwrap_or(0))
+        .sum::<usize>()
+        .min(width.saturating_sub(1));
+
+    InputViewportLayout {
+        visible_lines: visible
+            .into_iter()
+            .map(|row| row.text)
+            .collect::<Vec<_>>()
+            .into(),
+        cursor_row,
+        cursor_column,
+        placeholder: text.len_chars() == text.len_lines().saturating_sub(1),
+        inspected_lines,
+    }
+}
+
+fn for_each_input_rope_row(
+    line: helix_core::RopeSlice<'_>,
+    line_start: usize,
+    width: usize,
+    trailing_cursor: Option<usize>,
+    mut visit: impl FnMut(InputVisualLine, bool) -> bool,
+) {
+    let mut content_len = line.len_chars();
+    if content_len > 0 && line.char(content_len - 1) == '\n' {
+        content_len -= 1;
+        if content_len > 0 && line.char(content_len - 1) == '\r' {
+            content_len -= 1;
+        }
+    }
+    if content_len == 0 {
+        visit(
+            InputVisualLine {
+                text: String::new(),
+                start: line_start,
+                end: line_start,
+            },
+            true,
+        );
+        return;
+    }
+
+    let mut row_text = String::new();
+    let mut row_start = line_start;
+    let mut row_width = 0usize;
+    for (offset, character) in line.slice(..content_len).chars().enumerate() {
+        let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
+        if !row_text.is_empty() && row_width.saturating_add(character_width) > width {
+            if !visit(
+                InputVisualLine {
+                    text: std::mem::take(&mut row_text),
+                    start: row_start,
+                    end: line_start + offset,
+                },
+                false,
+            ) {
+                return;
+            }
+            row_start = line_start + offset;
+            row_width = 0;
+        }
+        row_text.push(character);
+        row_width = row_width.saturating_add(character_width);
+    }
+    let line_end = line_start + content_len;
+    if row_width >= width && trailing_cursor == Some(line_end) {
+        if !visit(
+            InputVisualLine {
+                text: row_text,
+                start: row_start,
+                end: line_end,
+            },
+            false,
+        ) {
+            return;
+        }
+        visit(
+            InputVisualLine {
+                text: String::new(),
+                start: line_end,
+                end: line_end,
+            },
+            true,
+        );
+    } else {
+        visit(
+            InputVisualLine {
+                text: row_text,
+                start: row_start,
+                end: line_end,
+            },
+            true,
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Assistant Panel
 // ---------------------------------------------------------------------------
@@ -46,7 +311,9 @@ type ChatEntryKind = helix_view::model::AssistantEntryKind;
 pub struct AssistantPanel {
     focused: bool,
     /// Read-only chat/output area with component-owned scroll + viewport state.
-    output: ContentRegion<Vec<ChatEntry>>,
+    output: ContentRegion<Arc<[ChatEntry]>>,
+    /// Metadata snapshot captured during component sync. Entries live in `output`.
+    render_model: Arc<helix_view::model::AssistantModel>,
     /// Editable input area backed by a component-owned document.
     input: helix_view::edit_region::EditRegion,
     /// Last assistant/backend error message, shown below the status line.
@@ -55,6 +322,7 @@ pub struct AssistantPanel {
     error_marquee: Marquee,
     /// Last input cursor screen position (set during render, read by cursor()).
     last_input_cursor: Option<(u16, u16)>,
+    input_layout: InputLayoutCache,
     /// Model panel ID, set on first sync.
     model_panel_id: Option<helix_view::model::PanelId>,
     /// Latest chat-thread layout information for future chat-entry navigation.
@@ -64,7 +332,10 @@ pub struct AssistantPanel {
     /// Selection animation that replays when message focus moves back onto a row.
     message_focus_animation: Animation,
     pending_message_g: bool,
-    markdown_cache: RefCell<HashMap<helix_view::assistant::thread::EntryId, MarkdownCache>>,
+    markdown: Option<MarkdownService>,
+    presentation: Option<PresentationService>,
+    completed_presentation: Option<Arc<PresentationSnapshot>>,
+    visible_presentation: Option<Arc<PresentationSnapshot>>,
     mention: MentionPopup,
     elicitation_form: Option<helix_view::assistant::elicitation::FormState>,
     auth_selected: usize,
@@ -246,6 +517,12 @@ const INPUT_BINDINGS: &[AssistantBinding] = &[
         Some(("esc", "normal", 150)),
     ),
 ];
+
+const NORMAL_INPUT_BINDINGS: &[AssistantBinding] = &[AssistantBinding::new(
+    BindingKey::new(BindingCode::Char('?')),
+    AssistantAction::ToggleHelp,
+    Some(("?", "help", 10)),
+)];
 
 const MESSAGE_BINDINGS: &[AssistantBinding] = &[
     AssistantBinding::new(
@@ -571,6 +848,499 @@ enum MentionCandidateKind {
     Command,
 }
 
+#[derive(Clone, Copy)]
+struct AssistantRenderAreas {
+    border: Rect,
+    inner: Rect,
+    header: Rect,
+    content_raw: Rect,
+    content: Rect,
+    plan: Rect,
+    context: Rect,
+    input_raw: Rect,
+    status: Rect,
+    error: Rect,
+}
+
+struct AssistantInputSnapshot {
+    border_area: Rect,
+    text_area: Rect,
+    visible_lines: Arc<[String]>,
+    placeholder: bool,
+    rounded: bool,
+}
+
+struct AssistantMentionSnapshot {
+    area: Rect,
+    candidates: Arc<[MentionCandidate]>,
+    selected: usize,
+}
+
+struct AssistantRenderSnapshot {
+    areas: AssistantRenderAreas,
+    theme: Arc<helix_view::Theme>,
+    model: Arc<helix_view::model::AssistantModel>,
+    focused: bool,
+    badge: Arc<str>,
+    status: Arc<str>,
+    position: Option<Arc<str>>,
+    error: Option<MarqueeFrame>,
+    input: AssistantInputSnapshot,
+    mention: Option<AssistantMentionSnapshot>,
+    blocks: Arc<[Message]>,
+    chat_layout: MessageListState,
+    presentation_pending: bool,
+    animated_prefix: Option<(usize, Arc<str>)>,
+    selected_accent: Option<(GraphicsStyle, f32)>,
+}
+
+impl AssistantRenderSnapshot {
+    fn paint(
+        self,
+        surface: &mut crate::render::CellSurface,
+        cancellation: &crate::render::RenderCancellation,
+    ) {
+        if cancellation.is_cancelled() {
+            return;
+        }
+        self.paint_chrome(surface);
+        if cancellation.is_cancelled() {
+            return;
+        }
+        self.paint_plan_and_context(surface);
+        self.paint_input(surface);
+        self.paint_mention(surface);
+        if cancellation.is_cancelled() {
+            return;
+        }
+        self.paint_messages(surface);
+    }
+
+    fn paint_chrome(&self, surface: &mut crate::render::CellSurface) {
+        let background = self.theme.get("ui.background");
+        let inner = tui::ratatui::to_ratatui_rect(self.areas.inner);
+        tui::ratatui::widgets::Widget::render(tui::ratatui::widgets::Clear, inner, surface);
+        surface.set_style(inner, tui::ratatui::to_ratatui_style(background));
+        crate::widgets::vdivider(surface, self.areas.border, self.theme.get("ui.window"));
+
+        let bar_style = if self.focused {
+            self.theme.get("ui.statusline")
+        } else {
+            self.theme.get("ui.statusline.inactive")
+        };
+        for area in [self.areas.header, self.areas.status] {
+            surface.set_style(
+                tui::ratatui::to_ratatui_rect(area),
+                tui::ratatui::to_ratatui_style(bar_style),
+            );
+        }
+
+        let header = self.model.header();
+        let trailing_width = header
+            .trailing
+            .iter()
+            .enumerate()
+            .map(|(index, item)| {
+                UnicodeWidthStr::width(item.label.as_str()) + usize::from(index > 0) * 2
+            })
+            .sum::<usize>() as u16;
+        if !header.trailing.is_empty() {
+            let mut x = self
+                .areas
+                .header
+                .x
+                .saturating_add(self.areas.header.width.saturating_sub(trailing_width));
+            for (index, item) in header.trailing.iter().enumerate() {
+                if index > 0 {
+                    surface.set_stringn(
+                        x,
+                        self.areas.header.y,
+                        "  ",
+                        2,
+                        tui::ratatui::to_ratatui_style(bar_style),
+                    );
+                    x = x.saturating_add(2);
+                }
+                let style = AssistantPanel::header_item_style(&self.theme, bar_style, item.tone);
+                let width = UnicodeWidthStr::width(item.label.as_str());
+                surface.set_stringn(
+                    x,
+                    self.areas.header.y,
+                    &item.label,
+                    width,
+                    tui::ratatui::to_ratatui_style(style),
+                );
+                x = x.saturating_add(width as u16);
+            }
+        }
+        let mut x = self.areas.header.x.saturating_add(1);
+        let right_edge = if header.trailing.is_empty() {
+            self.areas.header.right()
+        } else {
+            self.areas
+                .header
+                .right()
+                .saturating_sub(trailing_width.saturating_add(1))
+        };
+        for item in &header.leading {
+            if x >= right_edge {
+                break;
+            }
+            let style = AssistantPanel::header_item_style(&self.theme, bar_style, item.tone);
+            let width = UnicodeWidthStr::width(item.label.as_str()) as u16;
+            surface.set_stringn(
+                x,
+                self.areas.header.y,
+                &item.label,
+                right_edge.saturating_sub(x) as usize,
+                tui::ratatui::to_ratatui_style(style),
+            );
+            x = x.saturating_add(width.min(right_edge.saturating_sub(x)).saturating_add(1));
+        }
+
+        let badge_style = if self.focused {
+            self.theme.get("ui.text.focus").add_modifier(Modifier::BOLD)
+        } else {
+            self.theme.get("ui.text.inactive")
+        };
+        surface.set_stringn(
+            self.areas.status.x.saturating_add(1),
+            self.areas.status.y,
+            &self.badge,
+            UnicodeWidthStr::width(self.badge.as_ref())
+                .min(self.areas.status.width.saturating_sub(2) as usize),
+            tui::ratatui::to_ratatui_style(badge_style.patch(bar_style)),
+        );
+        let position_width = self
+            .position
+            .as_deref()
+            .map(UnicodeWidthStr::width)
+            .unwrap_or_default() as u16;
+        let right_reserved = position_width.saturating_add(u16::from(position_width > 0) * 2);
+        let status_start = self
+            .areas
+            .status
+            .x
+            .saturating_add(UnicodeWidthStr::width(self.badge.as_ref()) as u16)
+            .saturating_add(3);
+        let status_end = self
+            .areas
+            .status
+            .right()
+            .saturating_sub(1)
+            .saturating_sub(right_reserved);
+        if !self.status.is_empty() && status_start < status_end {
+            surface.set_stringn(
+                status_start,
+                self.areas.status.y,
+                &self.status,
+                status_end.saturating_sub(status_start) as usize,
+                tui::ratatui::to_ratatui_style(self.theme.get("ui.text.inactive").patch(bar_style)),
+            );
+        }
+        if let Some(position) = &self.position {
+            if self.areas.status.width > position_width.saturating_add(2) {
+                surface.set_stringn(
+                    self.areas
+                        .status
+                        .right()
+                        .saturating_sub(position_width.saturating_add(1)),
+                    self.areas.status.y,
+                    position,
+                    position_width as usize,
+                    tui::ratatui::to_ratatui_style(
+                        self.theme.get("ui.text.inactive").patch(bar_style),
+                    ),
+                );
+            }
+        }
+
+        if let Some(error) = &self.error {
+            error.paint(
+                Rect::new(
+                    self.areas.error.x.saturating_add(1),
+                    self.areas.error.y,
+                    self.areas.error.width.saturating_sub(2),
+                    self.areas.error.height,
+                ),
+                surface,
+                self.theme.get("error"),
+            );
+        }
+    }
+
+    fn paint_plan_and_context(&self, surface: &mut crate::render::CellSurface) {
+        if let Some(section) = self.model.plan_section() {
+            if self.areas.plan.height > 0 {
+                let inset = Rect::new(
+                    self.areas.plan.x.saturating_add(1),
+                    self.areas.plan.y,
+                    self.areas.plan.width.saturating_sub(2),
+                    self.areas.plan.height,
+                );
+                let bar_width = (inset.width as usize).saturating_sub(14).min(24);
+                let filled = (section.done * bar_width)
+                    .checked_div(section.total)
+                    .unwrap_or(0);
+                let line = Spans::from(vec![
+                    Span::styled(
+                        format!("{} ", section.title),
+                        self.theme.get("ui.text.focus"),
+                    ),
+                    Span::styled(
+                        format!(
+                            "\u{2590}{}{}\u{258c} {}/{}",
+                            "\u{2588}".repeat(filled),
+                            "\u{2591}".repeat(bar_width.saturating_sub(filled)),
+                            section.done,
+                            section.total
+                        ),
+                        self.theme.get("warning"),
+                    ),
+                ]);
+                surface.set_line(
+                    inset.x,
+                    inset.y,
+                    &tui::ratatui::to_ratatui_line(&line),
+                    inset.width,
+                );
+                for (index, item) in section.rows.iter().take(5).enumerate() {
+                    let style = match item.tone {
+                        helix_view::model::AssistantPlanTone::Completed => {
+                            self.theme.get("diff.plus")
+                        }
+                        helix_view::model::AssistantPlanTone::InProgress => {
+                            self.theme.get("warning")
+                        }
+                        helix_view::model::AssistantPlanTone::Failed => self.theme.get("error"),
+                        helix_view::model::AssistantPlanTone::Pending => {
+                            self.theme.get("ui.text.inactive")
+                        }
+                    };
+                    let y = inset.y.saturating_add(1 + index as u16);
+                    if y >= inset.bottom() {
+                        break;
+                    }
+                    let line = Spans::from(vec![
+                        Span::styled(item.icon.to_string(), style),
+                        Span::styled(item.content.clone(), style),
+                    ]);
+                    surface.set_line(
+                        inset.x,
+                        y,
+                        &tui::ratatui::to_ratatui_line(&line),
+                        inset.width,
+                    );
+                }
+            }
+        }
+        if let Some(context) = self.model.context_line() {
+            if self.areas.context.height > 0 {
+                surface.set_stringn(
+                    self.areas.context.x.saturating_add(1),
+                    self.areas.context.y,
+                    context,
+                    self.areas.context.width.saturating_sub(2) as usize,
+                    tui::ratatui::to_ratatui_style(self.theme.get("ui.text.info")),
+                );
+            }
+        }
+    }
+
+    fn paint_input(&self, surface: &mut crate::render::CellSurface) {
+        let area = self.input.border_area;
+        let border_style = self
+            .theme
+            .try_get("ui.assistant.input.border")
+            .unwrap_or_else(|| self.theme.get("ui.window"));
+        if area.width >= 4 && area.height >= 3 {
+            let (top_left, top_right, bottom_left, bottom_right) = if self.input.rounded {
+                ("╭", "╮", "╰", "╯")
+            } else {
+                ("┌", "┐", "└", "┘")
+            };
+            let width = area.width as usize;
+            surface.set_stringn(
+                area.x,
+                area.y,
+                &format!(
+                    "{top_left}{}{top_right}",
+                    "─".repeat(width.saturating_sub(2))
+                ),
+                width,
+                tui::ratatui::to_ratatui_style(border_style),
+            );
+            for row in 1..area.height.saturating_sub(1) {
+                let y = area.y.saturating_add(row);
+                surface.set_stringn(
+                    area.x,
+                    y,
+                    "│",
+                    1,
+                    tui::ratatui::to_ratatui_style(border_style),
+                );
+                surface.set_stringn(
+                    area.right().saturating_sub(1),
+                    y,
+                    "│",
+                    1,
+                    tui::ratatui::to_ratatui_style(border_style),
+                );
+            }
+            surface.set_stringn(
+                area.x,
+                area.bottom().saturating_sub(1),
+                &format!(
+                    "{bottom_left}{}{bottom_right}",
+                    "─".repeat(width.saturating_sub(2))
+                ),
+                width,
+                tui::ratatui::to_ratatui_style(border_style),
+            );
+        }
+        for (row, line) in self.input.visible_lines.iter().enumerate() {
+            if row as u16 >= self.input.text_area.height {
+                break;
+            }
+            surface.set_stringn(
+                self.input.text_area.x,
+                self.input.text_area.y.saturating_add(row as u16),
+                line,
+                self.input.text_area.width as usize,
+                tui::ratatui::to_ratatui_style(self.theme.get("ui.text")),
+            );
+        }
+        if self.input.placeholder
+            && self.input.text_area.width > 0
+            && self.input.text_area.height > 0
+        {
+            surface.set_stringn(
+                self.input.text_area.x,
+                self.input.text_area.y,
+                "Ask anything...",
+                self.input.text_area.width as usize,
+                tui::ratatui::to_ratatui_style(self.theme.get("ui.text.inactive")),
+            );
+        }
+    }
+
+    fn paint_mention(&self, surface: &mut crate::render::CellSurface) {
+        let Some(mention) = &self.mention else {
+            return;
+        };
+        let area = tui::ratatui::to_ratatui_rect(mention.area);
+        tui::ratatui::widgets::Widget::render(tui::ratatui::widgets::Clear, area, surface);
+        let background = self.theme.get("ui.popup");
+        let selected = self.theme.get("ui.menu.selected");
+        surface.set_style(area, tui::ratatui::to_ratatui_style(background));
+        for (row, candidate) in mention.candidates.iter().enumerate() {
+            let y = mention.area.y.saturating_add(row as u16);
+            let is_selected = row == mention.selected;
+            let row_style = if is_selected { selected } else { background };
+            surface.set_stringn(
+                mention.area.x,
+                y,
+                " ".repeat(mention.area.width as usize),
+                mention.area.width as usize,
+                tui::ratatui::to_ratatui_style(row_style),
+            );
+            surface.set_stringn(
+                mention.area.x,
+                y,
+                &candidate.label,
+                mention.area.width as usize,
+                tui::ratatui::to_ratatui_style(if is_selected {
+                    selected
+                } else {
+                    self.theme.get("ui.text")
+                }),
+            );
+            let detail_x = mention
+                .area
+                .x
+                .saturating_add(UnicodeWidthStr::width(candidate.label.as_str()) as u16)
+                .saturating_add(2);
+            if detail_x < mention.area.right() {
+                surface.set_stringn(
+                    detail_x,
+                    y,
+                    &candidate.detail,
+                    mention.area.right().saturating_sub(detail_x) as usize,
+                    tui::ratatui::to_ratatui_style(if is_selected {
+                        selected
+                    } else {
+                        self.theme.get("ui.text.inactive")
+                    }),
+                );
+            }
+        }
+    }
+
+    fn paint_messages(&self, surface: &mut crate::render::CellSurface) {
+        if self.blocks.is_empty() {
+            let message = if self.presentation_pending {
+                "Preparing messages..."
+            } else {
+                "Space A for menu"
+            };
+            let x = self.areas.content.x.saturating_add(
+                self.areas
+                    .content
+                    .width
+                    .saturating_sub(UnicodeWidthStr::width(message) as u16)
+                    / 2,
+            );
+            let y = self
+                .areas
+                .content
+                .y
+                .saturating_add(self.areas.content.height / 2);
+            if y < self.areas.content.bottom() {
+                surface.set_stringn(
+                    x,
+                    y,
+                    message,
+                    self.areas.content.width as usize,
+                    tui::ratatui::to_ratatui_style(self.theme.get("ui.text.inactive")),
+                );
+            }
+            return;
+        }
+        self.chat_layout.paint_dynamic(
+            surface,
+            &self.blocks,
+            self.animated_prefix
+                .as_ref()
+                .map(|(index, prefix)| (*index, prefix.as_ref())),
+            self.selected_accent,
+        );
+        if self.chat_layout.total_height > self.areas.content.height as usize {
+            let scroll_style = self.theme.get("ui.menu.scroll");
+            crate::widgets::Scrollbar::new(
+                self.chat_layout.total_height,
+                self.chat_layout.scroll(),
+                self.areas.content.height as usize,
+            )
+            .thumb_style(
+                Style::default().fg(scroll_style.fg.unwrap_or(helix_view::theme::Color::Reset)),
+            )
+            .track(
+                "▐",
+                Style::default().fg(scroll_style.bg.unwrap_or(helix_view::theme::Color::Reset)),
+            )
+            .render(
+                Rect::new(
+                    self.areas.content_raw.right().saturating_sub(1),
+                    self.areas.content.y,
+                    1,
+                    self.areas.content.height,
+                ),
+                surface,
+            );
+        }
+    }
+}
+
 fn byte_index_at_char(text: &str, char_index: usize) -> usize {
     text.char_indices()
         .nth(char_index)
@@ -607,29 +1377,24 @@ impl AssistantPanel {
         editor.assistant_model(false)
     }
 
-    fn assistant_model_with_focus(
-        editor: &Editor,
-        focused: bool,
-    ) -> helix_view::model::AssistantModel {
-        editor.assistant_model(focused)
-    }
-
     fn sync_from_assistant(&mut self, editor: &mut Editor) {
         let model = Self::assistant_model(editor);
         if model.active_thread.is_none() {
-            self.output.set_content(Vec::new());
+            self.output.set_content(Arc::from([]));
             self.output.scroll_to(0);
+            self.render_model = Arc::new(model);
             return;
         }
 
         self.sync_input_from_assistant(editor, &model.input);
         let active_thread = model.active_thread;
         let entries_len = model.entries.len();
-        self.output.set_content(model.entries);
+        self.output.set_content(Arc::clone(&model.entries));
         if !self.output.is_following_end() {
             self.output.scroll_to(model.content_scroll);
         }
         self.consume_pending_subagent_jump(editor, active_thread, entries_len);
+        self.render_model = Arc::new(model);
     }
 
     fn consume_pending_subagent_jump(
@@ -668,7 +1433,10 @@ impl AssistantPanel {
         _editor: &Editor,
         index: usize,
     ) -> Option<helix_view::assistant::thread::EntryId> {
-        self.output.content().get(index).map(|entry| entry.id)
+        self.visible_presentation
+            .as_ref()
+            .and_then(|presentation| presentation.metadata().entry_id_at(index))
+            .or_else(|| self.output.content().get(index).map(|entry| entry.id))
     }
 
     fn apply(editor: &mut Editor, action: helix_view::assistant::Action) {
@@ -691,11 +1459,20 @@ impl AssistantPanel {
     }
 
     fn selected_index_in(&self, model: &helix_view::model::AssistantModel) -> Option<usize> {
-        let selected = model.selected_entry_id()?;
-        self.output
-            .content()
-            .iter()
-            .position(|entry| entry.id == selected)
+        self.visible_presentation
+            .as_ref()
+            .and_then(|presentation| {
+                presentation
+                    .metadata()
+                    .selected_index(model.selected_entry_id())
+            })
+            .or_else(|| {
+                let selected = model.selected_entry_id()?;
+                self.output
+                    .content()
+                    .iter()
+                    .position(|entry| entry.id == selected)
+            })
     }
 
     fn selected_index(&self, editor: &Editor) -> Option<usize> {
@@ -729,9 +1506,14 @@ impl AssistantPanel {
     }
 
     fn set_content_scroll(&mut self, editor: &mut Editor, content_scroll: usize) {
-        let Some(thread) = Self::assistant_model(editor).active_thread else {
+        let model = Self::assistant_model(editor);
+        let Some(thread) = model.active_thread else {
             return;
         };
+        if model.content_scroll() == content_scroll {
+            self.output.scroll_to(content_scroll);
+            return;
+        }
         Self::apply(
             editor,
             helix_view::assistant::Action::SetContentScroll {
@@ -765,13 +1547,54 @@ impl AssistantPanel {
         let model = Self::assistant_model(editor);
         MessageNavigationState {
             selected: self.selected_index_in(&model),
-            scroll: model.content_scroll(),
+            scroll: if self.output.is_following_end() {
+                Scrollable::scroll(&self.output)
+            } else {
+                model.content_scroll()
+            },
         }
     }
 
     fn navigation_cursor(&self, editor: &Editor) -> MessageCursor {
         let navigation = self.navigation_state(editor);
         MessageCursor::new(navigation.selected, navigation.scroll)
+    }
+
+    fn apply_message_navigation(
+        &mut self,
+        editor: &mut Editor,
+        before: MessageNavigationState,
+        cursor: MessageCursor,
+    ) -> Option<usize> {
+        let selected = cursor.selected();
+        if cursor.scroll() != before.scroll {
+            self.set_content_scroll(editor, cursor.scroll());
+        }
+        if selected != before.selected {
+            self.set_selected_entry(
+                editor,
+                selected.and_then(|index| self.entry_id_at(editor, index)),
+                true,
+            );
+        }
+        self.follow_end_if_last_message(editor, selected);
+        selected
+    }
+
+    fn follow_end_if_last_message(&mut self, editor: &mut Editor, selected: Option<usize>) {
+        let Some(selected) = selected else {
+            return;
+        };
+        if Some(selected) != self.chat_layout.len().checked_sub(1) {
+            return;
+        }
+
+        let max_scroll = self.output.max_scroll();
+        let before = self.navigation_state(editor);
+        self.output.scroll_to_end();
+        if before.scroll != max_scroll {
+            self.set_content_scroll(editor, max_scroll);
+        }
     }
 
     fn cycle_thread(&mut self, editor: &mut Editor, delta: isize) -> bool {
@@ -782,23 +1605,6 @@ impl AssistantPanel {
         Self::apply_assistant_effects(editor, effects);
         self.message_focus_animation.stop();
         true
-    }
-
-    fn accent_style(style: Style) -> Style {
-        let mut accent = Style::default();
-        if let Some(fg) = style.fg {
-            accent = accent.fg(fg);
-        }
-        if let Some(bg) = style.bg {
-            accent = accent.bg(bg);
-        }
-        if let Some(underline_color) = style.underline_color {
-            accent = accent.underline_color(underline_color);
-        }
-        if let Some(underline_style) = style.underline_style {
-            accent = accent.underline_style(underline_style);
-        }
-        accent
     }
 
     fn header_item_style(
@@ -813,62 +1619,59 @@ impl AssistantPanel {
         }
     }
 
-    fn entry_tone_style(
-        theme: &helix_view::Theme,
-        tone: helix_view::model::AssistantEntryTone,
-    ) -> Style {
-        match tone {
-            helix_view::model::AssistantEntryTone::Default => theme.get("ui.text"),
-            helix_view::model::AssistantEntryTone::Inactive => theme.get("ui.text.inactive"),
-            helix_view::model::AssistantEntryTone::Focus => theme.get("ui.text.focus"),
-            helix_view::model::AssistantEntryTone::Warning => theme.get("warning"),
-            helix_view::model::AssistantEntryTone::Success => theme.get("diff.plus"),
-            helix_view::model::AssistantEntryTone::Error => theme.get("error"),
+    fn status_bar_parts(&self, model: &helix_view::model::AssistantModel) -> Vec<String> {
+        let mut parts = model
+            .status_items()
+            .into_iter()
+            .map(|item| item.label)
+            .collect::<Vec<_>>();
+        if let Some(profile) = &model.active_profile {
+            parts.push(format!("profile {profile}"));
         }
+        if let Some(feedback) = model.feedback_label() {
+            parts.push(feedback);
+        }
+        if let Some(status) = &model.agent_status {
+            parts.push(status.clone());
+        } else if model.agent_busy {
+            parts.push("working".to_string());
+        }
+        if self.editing.is_some() {
+            parts.push("editing message".to_string());
+        }
+        parts
     }
 
-    fn bubble_message_align(side: helix_view::model::AssistantBubbleSide) -> MessageAlign {
-        match side {
-            helix_view::model::AssistantBubbleSide::Left => MessageAlign::Left,
-            helix_view::model::AssistantBubbleSide::Right => MessageAlign::Right,
-        }
-    }
-
-    fn bubble_accessory_align(
-        side: helix_view::model::AssistantBubbleSide,
-    ) -> MessageAccessoryAlign {
-        match side {
-            helix_view::model::AssistantBubbleSide::Left => MessageAccessoryAlign::Left,
-            helix_view::model::AssistantBubbleSide::Right => MessageAccessoryAlign::Right,
-        }
-    }
-
-    fn plain_accessory_align() -> MessageAccessoryAlign {
-        MessageAccessoryAlign::Right
+    fn should_drive_activity_spinner(model: &helix_view::model::AssistantModel) -> bool {
+        model.has_running_activity()
     }
 
     pub fn new() -> Self {
         Self {
             focused: true,
             output: ContentRegion::default(),
+            render_model: Arc::new(helix_view::model::AssistantModel::default()),
             input: helix_view::edit_region::EditRegion::default(),
             panel_error: None,
             error_marquee: Marquee::new(),
             last_input_cursor: None,
+            input_layout: InputLayoutCache::default(),
             model_panel_id: None,
             chat_layout: MessageListState::default(),
-            spinner: Spinner::default(),
+            spinner: Spinner::dots(Duration::from_millis(80)),
             message_focus_animation: Animation::new({
                 let mut spec = AnimationSpec::new(Duration::from_millis(220));
                 spec.timing_function = AnimationTimingFunction::EaseOut;
                 spec.iteration_count = AnimationIterationCount::Count(1);
                 spec.direction = AnimationDirection::Normal;
                 spec.fill_mode = AnimationFillMode::Forwards;
-                spec.frame_interval = Duration::from_millis(16);
                 spec
             }),
             pending_message_g: false,
-            markdown_cache: RefCell::new(HashMap::new()),
+            markdown: None,
+            presentation: None,
+            completed_presentation: None,
+            visible_presentation: None,
             mention: MentionPopup::default(),
             elicitation_form: None,
             auth_selected: 0,
@@ -958,10 +1761,25 @@ impl AssistantPanel {
         }
     }
 
-    fn binding_for_key(layer: AssistantLayer, key: &KeyEvent) -> Option<&'static AssistantBinding> {
-        Self::bindings_for_layer(layer)
+    fn bindings_for_context(
+        layer: AssistantLayer,
+        input_mode: Mode,
+    ) -> impl Iterator<Item = &'static AssistantBinding> {
+        let contextual = match (layer, input_mode) {
+            (AssistantLayer::Input, Mode::Normal) => NORMAL_INPUT_BINDINGS,
+            _ => &[],
+        };
+        contextual
             .iter()
-            .find(|binding| binding.key.matches(key))
+            .chain(Self::bindings_for_layer(layer).iter())
+    }
+
+    fn binding_for_key(
+        layer: AssistantLayer,
+        input_mode: Mode,
+        key: &KeyEvent,
+    ) -> Option<&'static AssistantBinding> {
+        Self::bindings_for_context(layer, input_mode).find(|binding| binding.key.matches(key))
     }
 
     /// Key help for a layer: (key, label) pairs, highest priority first.
@@ -971,8 +1789,7 @@ impl AssistantPanel {
         model: &helix_view::model::AssistantModel,
         layer: AssistantLayer,
     ) -> Vec<(&'static str, &'static str)> {
-        let mut entries = Self::bindings_for_layer(layer)
-            .iter()
+        let mut entries = Self::bindings_for_context(layer, self.input.mode())
             .filter_map(|binding| binding.hint)
             .collect::<Vec<_>>();
 
@@ -1051,6 +1868,26 @@ impl AssistantPanel {
         }
     }
 
+    fn release_focus_to_editor(&mut self, editor: &mut Editor) {
+        self.set_focused(false);
+        if self.shown_help.take().is_some() {
+            editor.autoinfo = None;
+        }
+    }
+
+    fn replay_key_to_editor(&mut self, key: KeyEvent, cx: &mut Context) -> EventResult {
+        self.release_focus_to_editor(cx.editor);
+        log::debug!(
+            "[assistant_event] released focus and replaying key={} to editor",
+            key.key_sequence_format()
+        );
+        EventResult::Consumed(Some(PostAction::ReplayKeys {
+            keys: vec![key],
+            count: 1,
+            pop_macro_replaying: false,
+        }))
+    }
+
     fn toggle_help(&mut self, editor: &mut Editor) {
         let layer = self.active_layer(editor);
         if self.shown_help == Some(layer) {
@@ -1076,6 +1913,7 @@ impl AssistantPanel {
         &self,
         model: &helix_view::model::AssistantModel,
         theme: &helix_view::Theme,
+        now: Instant,
     ) -> Option<(GraphicsStyle, f32)> {
         if model.focus() != helix_view::assistant::thread::Focus::Messages
             || model.selected_entry_id().is_none()
@@ -1083,227 +1921,13 @@ impl AssistantPanel {
             return None;
         }
 
-        let sample = self.message_focus_animation.sample();
+        let sample = self.message_focus_animation.sample_at(now);
         let accent = theme
             .try_get("ui.accent")
             .or_else(|| theme.try_get("ui.cursor.primary"))
             .unwrap_or_else(|| theme.get("ui.menu.selected"));
         let color = accent.bg.or(accent.fg).or(accent.underline_color)?;
         Some((GraphicsStyle::default().fg(color), sample.progress))
-    }
-
-    fn action_hints(
-        theme: &helix_view::Theme,
-        align: MessageAccessoryAlign,
-    ) -> (Vec<Spans<'static>>, MessageAccessoryAlign) {
-        let key_style = theme.get("ui.text.focus").add_modifier(Modifier::BOLD);
-        let text_style = theme.get("ui.text.inactive");
-        (
-            vec![Spans::from(vec![
-                Span::styled(" y", key_style),
-                Span::styled(" yank  ", text_style),
-                Span::styled("enter", key_style),
-                Span::styled(" open  ", text_style),
-                Span::styled("tab", key_style),
-                Span::styled(" fold  ", text_style),
-                Span::styled("t", key_style),
-                Span::styled(" follow", text_style),
-            ])],
-            align,
-        )
-    }
-
-    fn expanded_details(
-        &self,
-        entry: &ChatEntry,
-        theme: &helix_view::Theme,
-        agent_name: &str,
-    ) -> Vec<Spans<'static>> {
-        let heading = theme.get("ui.text.info").add_modifier(Modifier::BOLD);
-        let text = theme.get("ui.text.inactive");
-        let details = entry.details(agent_name);
-        let mut lines = vec![Spans::from(Span::styled(
-            format!(" {}", details.heading),
-            heading,
-        ))];
-        if let Some(body) = details.body {
-            lines.push(Spans::from(Span::styled(body, text)));
-        }
-        for line in details.lines {
-            lines.push(Spans::from(Span::styled(
-                format!(" {}: {}", line.label, line.value),
-                text,
-            )));
-        }
-        lines
-    }
-
-    fn decorate_selected_plain_message(
-        &self,
-        mut message: Message<'static>,
-        selected: bool,
-        entry: &ChatEntry,
-        theme: &helix_view::Theme,
-        agent_name: &str,
-    ) -> Message<'static> {
-        if selected {
-            message = message.with_details(self.expanded_details(entry, theme, agent_name));
-            message = Self::decorate_selected_message(
-                message,
-                true,
-                theme,
-                Self::plain_accessory_align(),
-            );
-        }
-        message
-    }
-
-    fn decorate_selected_message(
-        mut message: Message<'static>,
-        selected: bool,
-        theme: &helix_view::Theme,
-        align: MessageAccessoryAlign,
-    ) -> Message<'static> {
-        if selected {
-            let (lines, align) = Self::action_hints(theme, align);
-            message = message.with_selected_accessory(lines, align);
-        }
-        message
-    }
-
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "message styling helper keeps independent visual attributes explicit at call sites"
-    )]
-    fn tool_call_message(
-        &self,
-        name: &str,
-        status: &str,
-        output: &str,
-        expanded: bool,
-        selected: bool,
-        theme: &helix_view::Theme,
-        accent: Option<(GraphicsStyle, f32)>,
-    ) -> Message<'static> {
-        let icon = if status == "running" {
-            self.spinner.frame().to_string()
-        } else {
-            helix_view::model::AssistantEntry::status_icon(status).to_string()
-        };
-        let tone = helix_view::model::AssistantEntry::status_tone(status);
-        let icon_style = Self::entry_tone_style(theme, tone);
-        let title_style = theme.get("ui.text.focus").add_modifier(Modifier::BOLD);
-        let muted_style = theme.get("ui.text.inactive");
-        let summary = if output.is_empty() {
-            status.to_string()
-        } else {
-            Self::collapse_preview(output, 96)
-        };
-        let mut lines = vec![Spans::from(vec![
-            Span::styled(format!(" {icon} "), icon_style),
-            Span::styled(name.to_string(), title_style),
-            Span::styled(format!("  {summary}"), muted_style),
-        ])];
-
-        if expanded && !output.is_empty() {
-            let plus = theme.get("diff.plus");
-            let minus = theme.get("diff.minus");
-            let delta = theme.get("diff.delta");
-            let text = theme.get("ui.text");
-            for line in output.lines() {
-                let style = if line.starts_with('+') && !line.starts_with("+++") {
-                    plus
-                } else if line.starts_with('-') && !line.starts_with("---") {
-                    minus
-                } else if line.starts_with("@@") {
-                    delta
-                } else {
-                    text
-                };
-                lines.push(Spans::from(Span::styled(format!("   {line}"), style)));
-            }
-        }
-
-        let mut message = Message::plain(lines);
-        if let Some((style, _)) = accent {
-            message = message.with_selected_bar("▌", style);
-        }
-        if selected {
-            message = Self::decorate_selected_message(
-                message,
-                true,
-                theme,
-                Self::plain_accessory_align(),
-            );
-        }
-        message
-    }
-
-    fn review_message(
-        &self,
-        mode: helix_view::assistant::review::Mode,
-        files: &[(
-            &std::path::Path,
-            helix_view::assistant::review::Status,
-            &str,
-        )],
-        expanded: bool,
-        selected: bool,
-        theme: &helix_view::Theme,
-        accent: Option<(GraphicsStyle, f32)>,
-    ) -> Message<'static> {
-        let title_style = theme.get("ui.text.focus").add_modifier(Modifier::BOLD);
-        let muted_style = theme.get("ui.text.inactive");
-        let pending_style = theme.get("warning");
-        let diff_styles = crate::widgets::DiffStyles::from_theme(theme);
-        let pending = files
-            .iter()
-            .filter(|(_, status, _)| status.is_pending())
-            .count();
-        let mut lines = vec![Spans::from(vec![
-            Span::styled(" review ", title_style),
-            Span::styled(mode.label().to_string(), muted_style),
-            Span::styled(format!("  {} files", files.len()), muted_style),
-            Span::styled(format!("  {pending} pending"), pending_style),
-        ])];
-
-        for (path, status, diff) in files {
-            lines.push(Spans::from(vec![
-                Span::styled("   ", muted_style),
-                Span::styled(path.display().to_string(), title_style),
-                Span::styled(format!("  {}", status.label()), muted_style),
-            ]));
-            if expanded {
-                let doc = crate::widgets::DiffDocument::from_unified_diff(diff);
-                let diff_lines = doc.layout_lines(
-                    &diff_styles,
-                    crate::widgets::DiffOptions {
-                        context: 3,
-                        line_numbers: false,
-                    },
-                    &BTreeSet::new(),
-                );
-                for line in diff_lines {
-                    let mut spans = vec![Span::styled("     ".to_string(), muted_style)];
-                    spans.extend(line.0);
-                    lines.push(Spans::from(spans));
-                }
-            }
-        }
-
-        let mut message = Message::plain(lines);
-        if let Some((style, _)) = accent {
-            message = message.with_selected_bar("▌", style);
-        }
-        if selected {
-            message = Self::decorate_selected_message(
-                message,
-                true,
-                theme,
-                Self::plain_accessory_align(),
-            );
-        }
-        message
     }
 
     fn yank_selected_message(&mut self, editor: &mut Editor) -> bool {
@@ -1473,49 +2097,6 @@ impl AssistantPanel {
         }
         self.set_folded(editor, entry, !model.is_folded(entry));
         true
-    }
-
-    fn collapse_preview(text: &str, width: usize) -> String {
-        let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
-        let max = width.max(4);
-        if compact.chars().count() <= max {
-            return compact;
-        }
-
-        let mut preview = String::new();
-        for ch in compact.chars().take(max.saturating_sub(1)) {
-            preview.push(ch);
-        }
-        preview.push('…');
-        preview
-    }
-
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "markdown cache lookup needs entry identity plus render style context"
-    )]
-    fn render_markdown_cached(
-        &self,
-        entry: helix_view::assistant::thread::EntryId,
-        text: &str,
-        width: usize,
-        base_style: Style,
-        styles: &MarkdownLineStyles,
-        theme: &helix_view::Theme,
-        loader: &helix_core::syntax::Loader,
-    ) -> Vec<Spans<'static>> {
-        self.markdown_cache
-            .borrow_mut()
-            .entry(entry)
-            .or_default()
-            .layout(
-                &MarkdownDoc::new(text),
-                width,
-                base_style,
-                styles,
-                Some(theme),
-                loader,
-            )
     }
 
     fn apply_assistant_effects(
@@ -1848,88 +2429,6 @@ impl AssistantPanel {
         true
     }
 
-    fn render_mention_popup(&self, surface: &mut crate::render::CellSurface, cx: &RenderContext) {
-        if !self.mention.active || self.mention.candidates.is_empty() {
-            return;
-        }
-
-        let Some((cursor_x, cursor_y)) = self.last_input_cursor else {
-            return;
-        };
-
-        let input_area = self.input.area();
-        if input_area.width == 0 || input_area.height == 0 {
-            return;
-        }
-
-        let visible_len = self.mention.candidates.len().min(6);
-        let width = self
-            .mention
-            .candidates
-            .iter()
-            .take(visible_len)
-            .map(|candidate| {
-                UnicodeWidthStr::width(candidate.label.as_str())
-                    + 2
-                    + UnicodeWidthStr::width(candidate.detail.as_str())
-            })
-            .max()
-            .unwrap_or(18)
-            .clamp(18, 56) as u16;
-        let width = width.min(input_area.width.max(1));
-        let height = visible_len as u16;
-        let x = cursor_x.min(input_area.right().saturating_sub(width));
-        let y = if cursor_y >= height {
-            cursor_y.saturating_sub(height)
-        } else {
-            input_area.bottom()
-        };
-        let area = Rect::new(x, y, width, height);
-        let rat_area = tui::ratatui::to_ratatui_rect(area);
-        tui::ratatui::widgets::Widget::render(tui::ratatui::widgets::Clear, rat_area, surface);
-
-        let theme = cx.assistant_theme();
-        let background = theme.get("ui.popup");
-        let selected = theme.get("ui.menu.selected");
-        let text = theme.get("ui.text");
-        let inactive = theme.get("ui.text.inactive");
-        surface.set_style(rat_area, tui::ratatui::to_ratatui_style(background));
-
-        for (row, candidate) in self.mention.candidates.iter().take(visible_len).enumerate() {
-            let y = area.y + row as u16;
-            let is_selected = row == self.mention.selected;
-            let row_style = if is_selected { selected } else { background };
-            surface.set_stringn(
-                area.x,
-                y,
-                " ".repeat(area.width as usize),
-                area.width as usize,
-                tui::ratatui::to_ratatui_style(row_style),
-            );
-
-            let label_style = if is_selected { selected } else { text };
-            let label_width = UnicodeWidthStr::width(candidate.label.as_str()) as u16;
-            surface.set_stringn(
-                area.x,
-                y,
-                &candidate.label,
-                area.width as usize,
-                tui::ratatui::to_ratatui_style(label_style),
-            );
-
-            let detail_x = area.x + label_width.saturating_add(2);
-            if detail_x < area.right() {
-                surface.set_stringn(
-                    detail_x,
-                    y,
-                    &candidate.detail,
-                    area.right().saturating_sub(detail_x) as usize,
-                    tui::ratatui::to_ratatui_style(if is_selected { selected } else { inactive }),
-                );
-            }
-        }
-    }
-
     fn sync_input_from_assistant(&mut self, editor: &mut Editor, draft: &str) {
         let Some(doc) = self.input.document_mut(editor) else {
             return;
@@ -1983,7 +2482,7 @@ impl AssistantPanel {
             }
         };
 
-        let mut snapshot = Self::assistant_model_with_focus(editor, self.focused);
+        let mut snapshot = self.render_model.as_ref().clone();
 
         let Some(model) = editor.model.panel_model_mut::<AssistantModel>(panel_id) else {
             return;
@@ -2009,625 +2508,96 @@ impl AssistantPanel {
         }
     }
 
-    /// Build renderable blocks from chat entries.
-    fn build_blocks<'a>(
-        &self,
-        model: &helix_view::model::AssistantModel,
-        theme: &helix_view::Theme,
-        loader: &helix_core::syntax::Loader,
-        width: u16,
-        corners: MessageCorners,
-    ) -> Vec<Message<'a>> {
-        let border_style = Self::accent_style(theme.get("ui.window"));
-        let agent_style = theme.get("ui.text.info");
-        let user_label_style = theme.get("keyword").add_modifier(Modifier::BOLD);
-        let agent_label_style = theme
-            .try_get("ui.assistant.agent.label")
-            .unwrap_or_else(|| theme.get("ui.text.info").add_modifier(Modifier::BOLD));
-        let user_text_style = theme.get("ui.text");
-        let separator_style = theme.get("ui.statusline.separator");
-        let heading_style = theme.get("markup.heading.1");
-        let code_style = theme.get("markup.raw.inline");
-        let bold_style = agent_style.add_modifier(Modifier::BOLD);
-        let italic_style = agent_style.add_modifier(Modifier::ITALIC);
-        let strike_style = agent_style.add_modifier(Modifier::CROSSED_OUT);
-        let link_style = theme.get("markup.link.url");
-        let quote_style = theme.get("markup.quote");
-        let list_style = theme.get("markup.list.unnumbered");
-        let active_accent = self.current_message_accent(model, theme);
-        let agent_name = model.agent_name.as_str();
-
-        // Flex width: min 60%, max 90% of panel — but never panic on tiny sizes.
-        let max_bubble = ((width as u32 * 90 / 100) as u16).min(width).max(4);
-        let min_bubble = ((width as u32 * 60 / 100) as u16).max(20).min(max_bubble);
-
-        let mut blocks = Vec::new();
-        let selected = model.selected_entry_id();
-        let edit_target = self.editing.as_ref().map(|editing| editing.target);
-
-        for entry in self.output.content().iter() {
-            let entry_id = Some(entry.id);
-            let message_accent = if entry_id == selected {
-                active_accent
-            } else {
-                None
-            };
-            let selected = entry_id == selected || edit_target == Some(entry.id);
-            let collapsed = model.is_folded(entry.id);
-            if let helix_view::model::AssistantEntryKind::ToolCall {
-                name,
-                status,
-                output,
-                ..
-            } = &entry.kind
-            {
-                let expanded = status == "failed" || collapsed;
-                blocks.push(self.tool_call_message(
-                    name,
-                    status,
-                    output,
-                    expanded,
-                    selected,
-                    theme,
-                    message_accent,
-                ));
-                continue;
-            }
-            if let helix_view::model::AssistantEntryKind::ReviewSummary { mode, files } =
-                &entry.kind
-            {
-                let files = files
-                    .iter()
-                    .map(|(path, diff, status)| (path.as_path(), *status, diff.as_str()))
-                    .collect::<Vec<_>>();
-                blocks.push(self.review_message(
-                    *mode,
-                    &files,
-                    collapsed,
-                    selected,
-                    theme,
-                    message_accent,
-                ));
-                continue;
-            }
-
-            let display = entry.display(agent_name);
-            match &display {
-                helix_view::model::AssistantEntryDisplay::Bubble(display) => {
-                    let bubble_w =
-                        fit_bubble_width(&display.text, min_bubble as usize, max_bubble as usize)
-                            as u16;
-                    let inner_w = bubble_w.saturating_sub(4) as usize;
-                    let (label_style, content_lines) = match display.format {
-                        helix_view::model::AssistantTextFormat::Plain => {
-                            let wrapped = if collapsed {
-                                vec![Self::collapse_preview(&display.text, inner_w)]
-                            } else {
-                                wrap_text(&display.text, inner_w)
-                            };
-                            let lines = wrapped
-                                .iter()
-                                .map(|wl| Spans::from(Span::styled(wl.clone(), user_text_style)))
-                                .collect();
-                            (user_label_style, lines)
-                        }
-                        helix_view::model::AssistantTextFormat::Markdown => {
-                            let mut md_lines: Vec<Spans> = Vec::new();
-                            if collapsed {
-                                md_lines.push(Spans::from(Span::styled(
-                                    Self::collapse_preview(&display.text, inner_w),
-                                    agent_style,
-                                )));
-                            } else {
-                                md_lines = self.render_markdown_cached(
-                                    entry.id,
-                                    &display.text,
-                                    inner_w,
-                                    agent_style,
-                                    &MarkdownLineStyles {
-                                        heading: heading_style,
-                                        code: code_style,
-                                        bold: bold_style,
-                                        italic: italic_style,
-                                        strike: strike_style,
-                                        link: link_style,
-                                        quote: quote_style,
-                                        list: list_style,
-                                        separator: separator_style,
-                                    },
-                                    theme,
-                                    loader,
-                                );
-                            }
-                            (agent_label_style, md_lines)
-                        }
-                    };
-                    let mut message = Message::bubble(
-                        Some((display.meta.heading.clone(), label_style)),
-                        content_lines,
-                        bubble_w,
-                        Self::bubble_message_align(display.meta.side),
-                        MessageStyle {
-                            border: border_style,
-                            corners,
-                            accent: message_accent.map(|(style, _)| style),
-                            accent_progress: message_accent
-                                .map(|(_, progress)| progress)
-                                .unwrap_or(0.0),
-                        },
-                    );
-                    message = Self::decorate_selected_message(
-                        message,
-                        selected,
-                        theme,
-                        Self::bubble_accessory_align(display.meta.side),
-                    );
-                    blocks.push(message);
-                }
-                helix_view::model::AssistantEntryDisplay::Plain(row) => {
-                    let icon = if row.animate_leading {
-                        format!(" {} ", self.spinner.frame())
-                    } else {
-                        row.leading.clone()
-                    };
-                    let lines = if row.leading.is_empty() {
-                        vec![Spans::from(Span::styled(
-                            row.body.clone(),
-                            Self::entry_tone_style(theme, row.body_tone),
-                        ))]
-                    } else {
-                        vec![Spans::from(vec![
-                            Span::styled(icon, Self::entry_tone_style(theme, row.leading_tone)),
-                            Span::styled(
-                                row.body.clone(),
-                                Self::entry_tone_style(theme, row.body_tone),
-                            ),
-                        ])]
-                    };
-                    let mut message = Message::plain(lines);
-                    if let Some(accessory) = &row.accessory {
-                        message = message.with_accessory(
-                            vec![Spans::from(Span::styled(
-                                accessory.clone(),
-                                Self::entry_tone_style(theme, row.accessory_tone),
-                            ))],
-                            Self::plain_accessory_align(),
-                        );
-                    }
-                    message = self.decorate_selected_plain_message(
-                        message, selected, entry, theme, agent_name,
-                    );
-                    blocks.push(message);
-                }
-            }
+    fn markdown_render_style(theme: &helix_view::Theme) -> MarkdownRenderStyle {
+        let base = theme.get("ui.text.info");
+        MarkdownRenderStyle {
+            base,
+            lines: MarkdownLineStyles {
+                heading: theme.get("markup.heading.1"),
+                code: theme.get("markup.raw.inline"),
+                bold: base.add_modifier(Modifier::BOLD),
+                italic: base.add_modifier(Modifier::ITALIC),
+                strike: base.add_modifier(Modifier::CROSSED_OUT),
+                link: theme.get("markup.link.url"),
+                quote: theme.get("markup.quote"),
+                list: theme.get("markup.list.unnumbered"),
+                separator: theme.get("ui.statusline.separator"),
+            },
         }
-
-        for elicitation in model
-            .pending_elicitations
-            .iter()
-            .filter(|item| item.status == helix_view::assistant::thread::ElicitationStatus::Pending)
-        {
-            blocks.push(self.elicitation_message(elicitation, theme));
-        }
-
-        if let Some(message) = self.auth_message(model, theme) {
-            blocks.push(message);
-        }
-
-        for terminal in &model.terminals {
-            blocks.push(Self::terminal_message(terminal, theme));
-        }
-
-        blocks
     }
 
-    fn elicitation_message<'a>(
-        &self,
-        elicitation: &helix_view::assistant::thread::Elicitation,
-        theme: &helix_view::Theme,
-    ) -> Message<'a> {
-        let title_style = theme.get("ui.text.focus").add_modifier(Modifier::BOLD);
-        let muted_style = theme.get("ui.text.inactive");
-        let warning_style = theme.get("warning");
-        let mut lines = Vec::new();
-        match &elicitation.mode {
-            helix_view::assistant::thread::ElicitationMode::Form { message, fields } => {
-                lines.push(Spans::from(vec![
-                    Span::styled(" ? ", warning_style),
-                    Span::styled(message.clone(), title_style),
-                    Span::styled("  tab field  enter submit  esc cancel", muted_style),
-                ]));
-                let form = self
-                    .elicitation_form
-                    .as_ref()
-                    .filter(|form| form.request_id() == elicitation.id.as_str());
-                for (index, field) in fields.iter().enumerate() {
-                    let required = if field.required { " *" } else { "" };
-                    let marker = if form.is_some_and(|form| form.focused() == index) {
-                        " > "
-                    } else {
-                        "   "
-                    };
-                    let value = match (form.and_then(|form| form.value(index)), field.field_type) {
-                        (
-                            Some(helix_view::assistant::elicitation::FieldValue::Text(text)),
-                            helix_view::assistant::thread::ElicitationFieldType::Text
-                            | helix_view::assistant::thread::ElicitationFieldType::Textarea,
-                        ) => text.clone(),
-                        (
-                            Some(helix_view::assistant::elicitation::FieldValue::Select(selected)),
-                            helix_view::assistant::thread::ElicitationFieldType::Select,
-                        ) => field
-                            .options
-                            .get(*selected)
-                            .map(|option| option.label.clone())
-                            .unwrap_or_else(|| "<none>".to_string()),
-                        (
-                            Some(helix_view::assistant::elicitation::FieldValue::Bool(value)),
-                            helix_view::assistant::thread::ElicitationFieldType::Bool,
-                        ) => {
-                            if *value {
-                                "yes".to_string()
-                            } else {
-                                "no".to_string()
-                            }
-                        }
-                        _ => match field.field_type {
-                            helix_view::assistant::thread::ElicitationFieldType::Select => field
-                                .options
-                                .first()
-                                .map(|option| option.label.clone())
-                                .unwrap_or_else(|| "<none>".to_string()),
-                            helix_view::assistant::thread::ElicitationFieldType::Bool => {
-                                "no".to_string()
-                            }
-                            helix_view::assistant::thread::ElicitationFieldType::Text
-                            | helix_view::assistant::thread::ElicitationFieldType::Textarea => {
-                                String::new()
-                            }
-                        },
-                    };
-                    let label = field.label.as_deref().unwrap_or(&field.name);
-                    lines.push(Spans::from(Span::styled(
-                        format!("{marker}{label}{required}: {value}"),
-                        if marker.trim().is_empty() {
-                            muted_style
-                        } else {
-                            title_style
-                        },
-                    )));
-                }
-            }
-            helix_view::assistant::thread::ElicitationMode::Url { message, url } => {
-                lines.push(Spans::from(vec![
-                    Span::styled(" ? ", warning_style),
-                    Span::styled(message.clone(), title_style),
-                    Span::styled("  y copy  esc cancel", muted_style),
-                ]));
-                lines.push(Spans::from(Span::styled(format!("   {url}"), muted_style)));
-            }
-        }
-        Message::plain(lines)
-    }
-
-    fn terminal_message<'a>(
-        terminal: &helix_view::model::AssistantTerminal,
-        theme: &helix_view::Theme,
-    ) -> Message<'a> {
-        let title_style = theme.get("ui.text.focus").add_modifier(Modifier::BOLD);
-        let muted_style = theme.get("ui.text.inactive");
-        let status_style = match terminal.state.as_str() {
-            "running" => theme.get("warning"),
-            state if state.starts_with("exited:0") => theme.get("diff.plus"),
-            state if state.starts_with("failed:") || state.starts_with("exited:") => {
-                theme.get("error")
-            }
-            _ => muted_style,
-        };
-        let mut lines = vec![Spans::from(vec![
-            Span::styled(" $ ", status_style),
-            Span::styled(
-                terminal
-                    .title
-                    .clone()
-                    .unwrap_or_else(|| terminal.id.to_string()),
-                title_style,
-            ),
-            Span::styled(format!("  {}", terminal.state), status_style),
-        ])];
-        for line in terminal
-            .output
-            .lines()
-            .rev()
-            .take(8)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-        {
-            lines.push(Spans::from(Span::styled(format!("   {line}"), muted_style)));
-        }
-        Message::plain(lines)
-    }
-
-    fn auth_message<'a>(
-        &self,
-        model: &helix_view::model::AssistantModel,
-        theme: &helix_view::Theme,
-    ) -> Option<Message<'a>> {
-        let (methods, error, authenticating) = match &model.auth {
-            helix_view::assistant::auth::State::Required { methods, error, .. } => {
-                (methods.as_slice(), error.as_deref(), None)
-            }
-            helix_view::assistant::auth::State::Failed { methods, error, .. } => {
-                (methods.as_slice(), Some(error.as_str()), None)
-            }
-            helix_view::assistant::auth::State::Authenticating { method, .. } => {
-                (&[][..], None, Some(method.name.as_str()))
-            }
-            _ => return None,
-        };
-        let title_style = theme.get("ui.text.focus").add_modifier(Modifier::BOLD);
-        let muted_style = theme.get("ui.text.inactive");
-        let warning_style = theme.get("warning");
-        let mut lines = vec![Spans::from(vec![
-            Span::styled(" ! ", warning_style),
-            Span::styled("Authentication required", title_style),
-            Span::styled("  j/k select  enter authenticate", muted_style),
-        ])];
-        if let Some(name) = authenticating {
-            lines.push(Spans::from(Span::styled(
-                format!("   Authenticating with {name}..."),
-                muted_style,
-            )));
-        }
-        if let Some(error) = error {
-            lines.push(Spans::from(Span::styled(
-                format!("   {error}"),
-                theme.get("error"),
-            )));
-        }
-        for (index, method) in methods.iter().enumerate() {
-            let selected = index == self.auth_selected.min(methods.len().saturating_sub(1));
-            let marker = if selected { " > " } else { "   " };
-            let suffix = if method.terminal.is_some() {
-                " terminal"
-            } else {
-                ""
-            };
-            lines.push(Spans::from(Span::styled(
-                format!("{marker}{}{suffix}", method.name),
-                if selected { title_style } else { muted_style },
-            )));
-        }
-        Some(Message::plain(lines))
-    }
-
-    /// Render chat blocks directly to the surface with proper scroll.
-    fn render_content(
-        &mut self,
-        model: &helix_view::model::AssistantModel,
-        blocks: &[Message],
-        area: Rect,
-        surface: &mut crate::render::CellSurface,
-    ) {
-        if area.height == 0 || area.width == 0 {
-            self.chat_layout = MessageListState::default();
-            return;
-        }
-
-        let cursor = MessageCursor::new(self.selected_index_in(model), model.content_scroll());
-        self.chat_layout = message_list(surface, area, blocks, cursor.scroll(), cursor.selected());
-        let mut cursor = cursor;
-        cursor.clamp_selection(&self.chat_layout);
-        self.output.scroll_to(cursor.scroll());
-        self.output
-            .set_content_height(self.chat_layout.total_height);
-    }
-
-    fn render_surface(
+    fn prepare_render_snapshot(
         &mut self,
         area: Rect,
-        surface: &mut crate::render::CellSurface,
         cx: &RenderContext,
-    ) {
-        log::warn!(
-            "[assistant_panel] render area=({},{} {}x{})",
-            area.x,
-            area.y,
-            area.width,
-            area.height,
-        );
-        if area.width < 20 || area.height < 6 {
-            return;
-        }
-
+    ) -> Option<AssistantRenderSnapshot> {
         use helix_view::layout::{split_horizontal, split_vertical, Size};
 
-        // Layout: [1px border | content]
-        let h_areas = split_horizontal(area, &[Size::fixed(1), Size::Fill]);
-        let border_area = h_areas[0];
-        let inner = h_areas[1];
+        if area.width < 20 || area.height < 6 {
+            self.last_input_cursor = None;
+            self.chat_layout = MessageListState::default();
+            return None;
+        }
 
-        let error_rows = 1u16;
-        let input_rows = 5u16; // 1 top border + 3 content + 1 bottom border
-        let model = cx.assistant_model(false);
-        let plan = model.plan_section();
-        let context_items = &model.context_items;
-        let context_line = model.context_line();
-        let plan_rows = plan
+        let horizontal = split_horizontal(area, &[Size::fixed(1), Size::Fill]);
+        let border = horizontal[0];
+        let inner = horizontal[1];
+        let model = self.render_model.clone();
+        let plan_rows = model
+            .plan_section()
             .as_ref()
             .map(|section| (section.rows.len() + 1).min(6) as u16)
             .unwrap_or(0);
-        let context_rows = if context_items.is_empty() { 0 } else { 1 };
-
-        // Vertical layout: [header | chat | plan | context pills | input | status | error]
-        let v_areas = split_vertical(
+        let context_rows = u16::from(!model.context_items.is_empty());
+        let vertical = split_vertical(
             inner,
             &[
-                Size::fixed(1),         // header
-                Size::Fill,             // chat content
-                Size::fixed(plan_rows), // plan
+                Size::fixed(1),
+                Size::Fill,
+                Size::fixed(plan_rows),
                 Size::fixed(context_rows),
-                Size::fixed(input_rows), // input
-                Size::fixed(1),          // status bar
-                Size::fixed(error_rows), // error line
+                Size::fixed(5),
+                Size::fixed(1),
+                Size::fixed(1),
             ],
         );
-        let header_area = v_areas[0];
-        let content_area_raw = v_areas[1];
-        let plan_area = v_areas[2];
-        let context_area = v_areas[3];
-        let input_area_raw = v_areas[4];
-        let bar_area = v_areas[5];
-        let error_area = v_areas[6];
-
-        // Inset content/plan/input by 1px on each side for padding.
-        let content_area = Rect::new(
-            content_area_raw.x + 1,
-            content_area_raw.y,
-            content_area_raw.width.saturating_sub(2),
-            content_area_raw.height,
+        let content_raw = vertical[1];
+        let content = Rect::new(
+            content_raw.x.saturating_add(1),
+            content_raw.y,
+            content_raw.width.saturating_sub(2),
+            content_raw.height,
         );
-        {
-            let theme = cx.assistant_theme();
-            let bg_style = theme.get("ui.background");
-            {
-                let area = tui::ratatui::to_ratatui_rect(inner);
-                tui::ratatui::widgets::Widget::render(tui::ratatui::widgets::Clear, area, surface);
-                surface.set_style(area, tui::ratatui::to_ratatui_style(bg_style));
-            };
+        let areas = AssistantRenderAreas {
+            border,
+            inner,
+            header: vertical[0],
+            content_raw,
+            content,
+            plan: vertical[2],
+            context: vertical[3],
+            input_raw: vertical[4],
+            status: vertical[5],
+            error: vertical[6],
+        };
 
-            // Left border
-            let border_style = theme.get("ui.window");
-            crate::widgets::vdivider(surface, border_area, border_style);
-
-            let header_style = if self.focused {
-                theme.get("ui.statusline")
-            } else {
-                theme.get("ui.statusline.inactive")
-            };
-            surface.set_style(
-                tui::ratatui::to_ratatui_rect(header_area),
-                tui::ratatui::to_ratatui_style(header_style),
-            );
-            let mut header = model.header();
-            if self.editing.is_some() {
-                header.leading.push(helix_view::model::AssistantHeaderItem {
-                    label: "editing message · esc cancels".to_string(),
-                    tone: helix_view::model::AssistantHeaderTone::Warning,
-                });
+        let layer = self.active_layer_for_model(&model);
+        let badge: Arc<str> = Arc::from(if self.editing.is_some() {
+            "EDIT"
+        } else {
+            match layer {
+                AssistantLayer::Input => "INPUT",
+                AssistantLayer::Messages => "MESSAGES",
+                AssistantLayer::Elicitation => "FORM",
+                AssistantLayer::Auth => "AUTH",
             }
-            let agent_busy = model.agent_busy;
-            // Agent status indicator: filled circle when the agent is doing
-            // work (gets attention), middle-dot when idle (quiet, harmonises
-            // with the chrome's separator language). The state change itself
-            // is the cue — the glyph swaps, not just the colour.
-            let (dot_glyph, dot_style) = if agent_busy {
-                ("\u{25cf}", theme.get("warning"))
-            } else {
-                ("\u{00b7}", theme.get("hint"))
-            };
-            surface.set_stringn(
-                header_area.x + 1,
-                header_area.y,
-                dot_glyph,
-                1,
-                tui::ratatui::to_ratatui_style(dot_style),
-            );
-            let trailing_width = header
-                .trailing
-                .iter()
-                .enumerate()
-                .map(|(index, item)| {
-                    UnicodeWidthStr::width(item.label.as_str()) + usize::from(index > 0) * 2
-                })
-                .sum::<usize>() as u16;
-            if !header.trailing.is_empty() {
-                let mut rx = header_area.x + header_area.width.saturating_sub(trailing_width);
-                for (index, item) in header.trailing.iter().enumerate() {
-                    if index > 0 {
-                        surface.set_stringn(
-                            rx,
-                            header_area.y,
-                            "  ",
-                            2,
-                            tui::ratatui::to_ratatui_style(header_style),
-                        );
-                        rx += 2;
-                    }
-                    let style = Self::header_item_style(theme, header_style, item.tone);
-                    let width = UnicodeWidthStr::width(item.label.as_str());
-                    surface.set_stringn(
-                        rx,
-                        header_area.y,
-                        &item.label,
-                        width,
-                        tui::ratatui::to_ratatui_style(style),
-                    );
-                    rx += width as u16;
-                }
-            }
-            let mut x = header_area.x + 3;
-            let right_edge = if header.trailing.is_empty() {
-                header_area.x + header_area.width
-            } else {
-                header_area.x + header_area.width - trailing_width - 1
-            };
-            for item in &header.leading {
-                if x >= right_edge {
-                    break;
-                }
-                let style = Self::header_item_style(theme, header_style, item.tone);
-                let width = UnicodeWidthStr::width(item.label.as_str()) as u16;
-                let budget = right_edge.saturating_sub(x) as usize;
-                surface.set_stringn(
-                    x,
-                    header_area.y,
-                    &item.label,
-                    budget,
-                    tui::ratatui::to_ratatui_style(style),
-                );
-                x = x.saturating_add(width.min(right_edge.saturating_sub(x)) + 1);
-            }
-            let bar_style = if self.focused {
-                theme.get("ui.statusline")
-            } else {
-                theme.get("ui.statusline.inactive")
-            };
-            surface.set_style(
-                tui::ratatui::to_ratatui_rect(bar_area),
-                tui::ratatui::to_ratatui_style(bar_style),
-            );
-            // Status only — key help lives in the info popup (`?`), per the
-            // editor-wide rule that statuslines never list shortcuts.
-            let theme = cx.assistant_theme();
-            let layer = self.active_layer_for_model(&model);
-            let badge = if self.editing.is_some() {
-                "EDIT"
-            } else {
-                match layer {
-                    AssistantLayer::Input => "INPUT",
-                    AssistantLayer::Messages => "MESSAGES",
-                    AssistantLayer::Elicitation => "FORM",
-                    AssistantLayer::Auth => "AUTH",
-                }
-            };
-            let badge_style = if self.focused {
-                theme.get("ui.text.focus").add_modifier(Modifier::BOLD)
-            } else {
-                theme.get("ui.text.inactive")
-            };
-            surface.set_stringn(
-                bar_area.x + 1,
-                bar_area.y,
-                badge,
-                bar_area.width.saturating_sub(2) as usize,
-                tui::ratatui::to_ratatui_style(badge_style.patch(bar_style)),
-            );
-            if layer == AssistantLayer::Messages {
-                let total = self.output.content().len();
-                if total > 0 {
-                    let position = model
+        });
+        let status: Arc<str> = Arc::from(self.status_bar_parts(&model).join("  "));
+        let position = if layer == AssistantLayer::Messages {
+            let total = self.output.content().len();
+            (total > 0).then(|| {
+                Arc::<str>::from(
+                    model
                         .selected_entry_id()
                         .and_then(|id| {
                             self.output
@@ -2635,329 +2605,282 @@ impl AssistantPanel {
                                 .iter()
                                 .position(|entry| entry.id == id)
                         })
-                        .map(|idx| format!("{}/{}", idx + 1, total))
-                        .unwrap_or_else(|| total.to_string());
-                    let width = UnicodeWidthStr::width(position.as_str()) as u16;
-                    if bar_area.width > width + 2 {
-                        surface.set_stringn(
-                            bar_area.x + bar_area.width - width - 1,
-                            bar_area.y,
-                            &position,
-                            width as usize,
-                            tui::ratatui::to_ratatui_style(
-                                theme.get("ui.text.inactive").patch(bar_style),
-                            ),
-                        );
-                    }
-                }
-            }
-        }
+                        .map(|index| format!("{}/{}", index + 1, total))
+                        .unwrap_or_else(|| total.to_string()),
+                )
+            })
+        } else {
+            None
+        };
 
-        // ── Error line ──
-        if self.error_marquee.has_text() {
-            let error_inset = Rect::new(
-                error_area.x + 1,
-                error_area.y,
-                error_area.width.saturating_sub(2),
-                error_area.height,
-            );
-            let error_style = cx.assistant_theme().get("error");
-            if let Some(when) = self.error_marquee.render(error_inset, surface, error_style) {
-                schedule_redraw_at(cx.work(), when, cx.redraw.clone());
-            }
+        let now = cx.frame_time();
+        let error_width = areas.error.width.saturating_sub(2);
+        let error = self.error_marquee.sample(error_width, now);
+        if let Some(next) = error.as_ref().and_then(|frame| frame.next_redraw) {
+            cx.request_frame_at(ERROR_MARQUEE_FRAME, next);
         }
-
-        // ── Plan area ──
-        if plan_rows > 0 && plan_area.height > 0 {
-            let theme = cx.assistant_theme();
-            let plan_done_style = theme.get("diff.plus");
-            let plan_progress_style = theme.get("warning");
-            let plan_pending_style = theme.get("ui.text.inactive");
-            let plan_failed_style = theme.get("error");
-            let tool_name_style = theme.get("ui.text.focus");
-            let section = plan.as_ref().unwrap();
-            let done = section.done;
-            let total = section.total;
-            let plan_inset = Rect::new(
-                plan_area.x + 1,
-                plan_area.y,
-                plan_area.width.saturating_sub(2),
-                plan_area.height,
-            );
-            let bar_width = (plan_inset.width as usize).saturating_sub(14).min(24);
-            let filled = (done * bar_width).checked_div(total).unwrap_or(0);
-            let empty = bar_width.saturating_sub(filled);
-            let line = Spans::from(vec![
-                Span::styled(format!("{} ", section.title), tool_name_style),
-                Span::styled(
-                    format!(
-                        "\u{2590}{}{}\u{258c} {done}/{total}",
-                        "\u{2588}".repeat(filled),
-                        "\u{2591}".repeat(empty)
-                    ),
-                    plan_progress_style,
-                ),
-            ]);
-            let line = tui::ratatui::to_ratatui_line(&line);
-            surface.set_line(plan_inset.x, plan_inset.y, &line, plan_inset.width);
-            for (i, item) in section.rows.iter().take(5).enumerate() {
-                let style = match item.tone {
-                    helix_view::model::AssistantPlanTone::Completed => plan_done_style,
-                    helix_view::model::AssistantPlanTone::InProgress => plan_progress_style,
-                    helix_view::model::AssistantPlanTone::Failed => plan_failed_style,
-                    helix_view::model::AssistantPlanTone::Pending => plan_pending_style,
-                };
-                let y = plan_inset.y + 1 + i as u16;
-                if y < plan_inset.bottom() {
-                    let line = Spans::from(vec![
-                        Span::styled(item.icon.to_string(), style),
-                        Span::styled(item.content.clone(), style),
-                    ]);
-                    let line = tui::ratatui::to_ratatui_line(&line);
-                    surface.set_line(plan_inset.x, y, &line, plan_inset.width);
-                }
-            }
-        }
-
-        if model.has_running_activity() {
-            schedule_redraw_at(cx.work(), self.spinner.next_redraw(), cx.redraw.clone());
-        }
-
-        if let Some((_, progress)) = self.current_message_accent(&model, cx.assistant_theme()) {
+        let selected_accent = self.current_message_accent(&model, cx.assistant_theme(), now);
+        if let Some((_, progress)) = selected_accent {
             if progress < 1.0 {
-                if let Some(when) = self.message_focus_animation.sample().next_redraw {
-                    schedule_redraw_at(cx.work(), when, cx.redraw.clone());
+                if let Some(next) = self.message_focus_animation.sample_at(now).next_redraw {
+                    cx.request_frame_at(MESSAGE_FOCUS_FRAME, next);
                 }
             }
         }
 
-        if context_rows > 0 && context_area.height > 0 {
-            let style = cx.assistant_theme().get("ui.text.info");
-            surface.set_stringn(
-                context_area.x + 1,
-                context_area.y,
-                context_line.as_deref().unwrap_or_default(),
-                context_area.width.saturating_sub(2) as usize,
-                tui::ratatui::to_ratatui_style(style),
-            );
+        let input_border_area = Rect::new(
+            areas.input_raw.x.saturating_add(1),
+            areas.input_raw.y,
+            areas.input_raw.width.saturating_sub(2),
+            areas.input_raw.height,
+        );
+        let input_area = Rect::new(
+            input_border_area.x.saturating_add(2),
+            input_border_area.y.saturating_add(1),
+            input_border_area.width.saturating_sub(4),
+            input_border_area.height.saturating_sub(2),
+        );
+        self.input.set_area(input_area);
+        self.last_input_cursor = None;
+        let mut visible_lines: Arc<[String]> = Arc::from([]);
+        let mut placeholder = true;
+        if input_area.width > 0 && input_area.height > 0 {
+            if let Some(doc) = self
+                .input
+                .doc_id()
+                .and_then(|document| cx.component_document(document))
+            {
+                let text = doc.text();
+                let cursor = doc
+                    .selections()
+                    .get(&self.input.id())
+                    .map(|selection| selection.primary().cursor(text.slice(..)))
+                    .unwrap_or(0);
+                let layout = self.input_layout.layout(
+                    InputLayoutKey {
+                        document_version: doc.version(),
+                        cursor,
+                        width: input_area.width as usize,
+                        height: input_area.height as usize,
+                    },
+                    text.slice(..),
+                );
+                placeholder = layout.placeholder;
+                visible_lines = Arc::clone(&layout.visible_lines);
+                let cursor_x = input_area.x.saturating_add(layout.cursor_column as u16);
+                let cursor_y = input_area.y.saturating_add(layout.cursor_row as u16);
+                if cursor_x < input_area.right() && cursor_y < input_area.bottom() {
+                    self.last_input_cursor = Some((cursor_x, cursor_y));
+                }
+            }
         }
+        let input = AssistantInputSnapshot {
+            border_area: input_border_area,
+            text_area: input_area,
+            visible_lines,
+            placeholder,
+            rounded: cx.config().acp.bubble_corners_rounded(),
+        };
+        let mention = self.mention_render_snapshot(input_area);
 
-        if input_area_raw.height > 0 {
-            let inset = Rect::new(
-                input_area_raw.x + 1,
-                input_area_raw.y,
-                input_area_raw.width.saturating_sub(2),
-                input_area_raw.height,
-            );
-            let theme = cx.assistant_theme();
-            let text_style = theme.get("ui.text");
-            let placeholder_style = theme.get("ui.text.inactive");
-            let input_border_style = theme
-                .try_get("ui.assistant.input.border")
-                .unwrap_or_else(|| theme.get("ui.window"));
-
-            // Draw border around input area.
-            if inset.width >= 4 && inset.height >= 3 {
-                let bw = inset.width as usize;
-                let rounded = cx.config().acp.bubble_corners_rounded();
-                let (tl, tr, bl, br) = if rounded {
-                    ("╭", "╮", "╰", "╯")
-                } else {
-                    ("┌", "┐", "└", "┘")
+        self.output.set_area(content);
+        let mut presentation_pending = false;
+        let mut presented = None;
+        if content.width > 0 && content.height > 0 {
+            if let Some(thread) = model.active_thread {
+                let markdown_key = MarkdownRequestKey {
+                    thread,
+                    content_revision: model.content_revision,
+                    width: content.width,
+                    theme_generation: cx.theme_generation(),
                 };
-                let top = format!("{tl}{}{tr}", "─".repeat(bw.saturating_sub(2)));
-                surface.set_stringn(
-                    inset.x,
-                    inset.y,
-                    &top,
-                    bw,
-                    tui::ratatui::to_ratatui_style(input_border_style),
-                );
-                for row in 1..inset.height.saturating_sub(1) {
-                    let y = inset.y + row;
-                    surface.set_stringn(
-                        inset.x,
-                        y,
-                        "│",
-                        1,
-                        tui::ratatui::to_ratatui_style(input_border_style),
-                    );
-                    surface.set_stringn(
-                        inset.right() - 1,
-                        y,
-                        "│",
-                        1,
-                        tui::ratatui::to_ratatui_style(input_border_style),
-                    );
+                if self.markdown.is_none() {
+                    self.markdown = Some(MarkdownService::spawn(
+                        cx.work(),
+                        cx.block(),
+                        cx.redraw.clone(),
+                    ));
                 }
-                let bot = format!("{bl}{}{br}", "─".repeat(bw.saturating_sub(2)));
-                surface.set_stringn(
-                    inset.x,
-                    inset.y + inset.height - 1,
-                    &bot,
-                    bw,
-                    tui::ratatui::to_ratatui_style(input_border_style),
-                );
-            }
-
-            // Inner text area inside the border (1px border + 1px padding each side).
-            let input_area = Rect::new(
-                inset.x + 2,
-                inset.y + 1,
-                inset.width.saturating_sub(4),
-                inset.height.saturating_sub(2),
-            );
-            self.input.set_area(input_area);
-
-            // Render component document content in the input area.
-            let view_id = self.input.id();
-            let is_empty = if input_area.width > 0 && input_area.height > 0 {
-                if let Some(doc) = self
-                    .input
-                    .doc_id()
-                    .and_then(|doc_id| cx.component_document(doc_id))
+                if self
+                    .markdown
+                    .as_ref()
+                    .is_some_and(|service| service.needs(&markdown_key))
                 {
-                    let text = doc.text();
-                    let height = input_area.height as usize;
-                    let total_lines = text.len_lines();
-
-                    // Find cursor line to scroll around it.
-                    let cursor_line = doc
-                        .selections()
-                        .get(&view_id)
-                        .map(|sel| {
-                            let cursor = sel.primary().cursor(text.slice(..));
-                            text.char_to_line(cursor)
-                        })
-                        .unwrap_or(0);
-
-                    // Scroll so cursor is visible.
-                    let scroll = if cursor_line >= height {
-                        cursor_line + 1 - height
-                    } else {
-                        0
-                    };
-
-                    // Render visible lines.
-                    for row in 0..height {
-                        let line_idx = scroll + row;
-                        if line_idx >= total_lines {
-                            break;
-                        }
-                        let line = text.line(line_idx);
-                        let s: String = line
-                            .chars()
-                            .take_while(|c| *c != '\n')
-                            .take(input_area.width as usize)
-                            .collect();
-                        surface.set_stringn(
-                            input_area.x,
-                            input_area.y + row as u16,
-                            &s,
-                            input_area.width as usize,
-                            tui::ratatui::to_ratatui_style(text_style),
-                        );
-                    }
-
-                    // Cursor position relative to scroll.
-                    if let Some(sel) = doc.selections().get(&view_id) {
-                        let cursor = sel.primary().cursor(text.slice(..));
-                        let line_start = text.line_to_char(cursor_line);
-                        let col = cursor - line_start;
-                        let screen_row = cursor_line.saturating_sub(scroll);
-                        let cx_pos = input_area.x + col as u16;
-                        let cy_pos = input_area.y + screen_row as u16;
-                        if cy_pos < input_area.bottom() && cx_pos < input_area.right() {
-                            self.last_input_cursor = Some((cx_pos, cy_pos));
-                        }
-                    }
-                    // Empty = no content besides trailing line ending(s)
-                    !text.chars().any(|c| c != '\n' && c != '\r')
-                } else {
-                    true
+                    self.markdown.as_mut().unwrap().submit(
+                        markdown_key.clone(),
+                        Arc::clone(&model.entries),
+                        Self::markdown_render_style(cx.assistant_theme()),
+                        cx.assistant_theme(),
+                        cx.syntax_loader().load_full(),
+                    );
                 }
-            } else {
-                true
-            };
+                let markdown = self
+                    .markdown
+                    .as_ref()
+                    .and_then(MarkdownService::snapshot)
+                    .filter(|snapshot| snapshot.matches(&markdown_key));
+                let presentation_key = PresentationRequestKey::new(
+                    &model,
+                    content.width,
+                    cx.theme_generation(),
+                    self.editing.as_ref().map(|editing| editing.target),
+                    self.elicitation_form.as_ref(),
+                    self.auth_selected,
+                    MessageCorners::Squared,
+                    markdown.as_ref().map(|snapshot| snapshot.generation()),
+                )
+                .expect("active assistant thread");
+                if self.presentation.is_none() {
+                    self.presentation = Some(PresentationService::spawn(
+                        cx.work(),
+                        cx.block(),
+                        cx.redraw.clone(),
+                    ));
+                }
+                if self
+                    .presentation
+                    .as_ref()
+                    .is_some_and(|service| service.needs(&presentation_key))
+                {
+                    self.presentation.as_mut().unwrap().submit(
+                        PresentationSource {
+                            key: presentation_key.clone(),
+                            entries: Arc::clone(&model.entries),
+                            markdown_key,
+                            markdown,
+                        },
+                        cx.assistant_theme_arc(),
+                    );
+                }
 
-            if is_empty && input_area.width > 0 && input_area.height > 0 {
-                surface.set_stringn(
-                    input_area.x,
-                    input_area.y,
-                    "Ask anything...",
-                    input_area.width as usize,
-                    tui::ratatui::to_ratatui_style(placeholder_style),
-                );
+                let published = self
+                    .presentation
+                    .as_ref()
+                    .and_then(PresentationService::snapshot);
+                if let Some(snapshot) = published
+                    .as_ref()
+                    .filter(|snapshot| {
+                        snapshot.matches(&presentation_key)
+                            || snapshot.geometrically_compatible(&presentation_key)
+                    })
+                    .cloned()
+                {
+                    self.completed_presentation = Some(snapshot);
+                }
+                presented = published
+                    .filter(|snapshot| snapshot.matches(&presentation_key))
+                    .or_else(|| {
+                        self.completed_presentation
+                            .as_ref()
+                            .filter(|snapshot| snapshot.geometrically_compatible(&presentation_key))
+                            .cloned()
+                    });
+                presentation_pending = presented.is_none();
             }
         }
-        self.render_mention_popup(surface, cx);
 
-        // ── Content area (chat history) ──────────────────────
+        self.visible_presentation = presented.clone();
+        let blocks = presented
+            .as_ref()
+            .map(|snapshot| snapshot.messages())
+            .unwrap_or_else(|| Arc::from([]));
+        let selected = presented.as_ref().and_then(|snapshot| {
+            snapshot
+                .metadata()
+                .selected_index(model.selected_entry_id())
+        });
+        self.output.set_content_height(
+            presented
+                .as_ref()
+                .map_or(0, |snapshot| snapshot.metadata().total_height),
+        );
+        let scroll = if self.output.is_following_end() {
+            self.output.max_scroll()
+        } else {
+            model.content_scroll().min(self.output.max_scroll())
+        };
+        let mut cursor = MessageCursor::new(selected, scroll);
+        let chat_layout = MessageListState::layout(content, &blocks, scroll, selected);
+        cursor.clamp_selection(&chat_layout);
+        self.output.scroll_to(cursor.scroll());
+        self.output.set_content_height(chat_layout.total_height);
+        self.chat_layout = chat_layout.clone();
 
-        if content_area.height == 0 || content_area.width == 0 {
-            return;
-        }
-
-        self.output.set_area(content_area);
-
-        let theme = cx.assistant_theme();
-        // Empty state
-        if self.output.content().is_empty() {
-            let empty_style = theme.get("ui.text.inactive");
-            let center_y = content_area.y + content_area.height / 2;
-
-            let msg = "Space A for menu";
-            let mx = content_area.x
-                + content_area
-                    .width
-                    .saturating_sub(UnicodeWidthStr::width(msg) as u16)
-                    / 2;
-            if center_y >= content_area.y && center_y < content_area.y + content_area.height {
-                surface.set_stringn(
-                    mx,
-                    center_y,
-                    msg,
-                    content_area.width as usize,
-                    tui::ratatui::to_ratatui_style(empty_style),
-                );
-            }
-
-            return;
-        }
-
-        // Render chat content using message list primitives.
-        let corners = MessageCorners::Squared;
-        let loader = cx.syntax_loader().load();
-        let blocks = self.build_blocks(&model, theme, &loader, content_area.width, corners);
-        self.render_content(&model, &blocks, content_area, surface);
-
-        // Scrollbar
-        let total_height = self.output.content_height();
-        let scroll_from_top = Scrollable::scroll(&self.output);
-        if total_height > content_area.height as usize {
-            let scroll_style = theme.get("ui.menu.scroll");
-            crate::widgets::Scrollbar::new(
-                total_height,
-                scroll_from_top,
-                content_area.height as usize,
+        let animated_row = presented.as_ref().and_then(|snapshot| {
+            snapshot.metadata().active_animation(
+                model.active_thought,
+                Self::should_drive_activity_spinner(&model),
             )
-            .thumb_style(
-                Style::default().fg(scroll_style.fg.unwrap_or(helix_view::theme::Color::Reset)),
+        });
+        let animated_prefix = animated_row.map(|index| {
+            cx.request_frame_at(ACTIVITY_SPINNER_FRAME, self.spinner.next_redraw_at(now));
+            (
+                index,
+                Arc::<str>::from(format!(" {} ", self.spinner.frame_at(now))),
             )
-            .track(
-                "▐",
-                Style::default().fg(scroll_style.bg.unwrap_or(helix_view::theme::Color::Reset)),
-            )
-            .render(
-                Rect::new(
-                    content_area_raw.right() - 1,
-                    content_area.y,
-                    1,
-                    content_area.height,
-                ),
-                surface,
-            );
+        });
+
+        Some(AssistantRenderSnapshot {
+            areas,
+            theme: cx.assistant_theme_arc(),
+            model,
+            focused: self.focused,
+            badge,
+            status,
+            position,
+            error,
+            input,
+            mention,
+            blocks,
+            chat_layout,
+            presentation_pending,
+            animated_prefix,
+            selected_accent,
+        })
+    }
+
+    fn mention_render_snapshot(&self, input_area: Rect) -> Option<AssistantMentionSnapshot> {
+        if !self.mention.active || self.mention.candidates.is_empty() {
+            return None;
         }
+        let (cursor_x, cursor_y) = self.last_input_cursor?;
+        if input_area.width == 0 || input_area.height == 0 {
+            return None;
+        }
+        let visible = self.mention.candidates.len().min(6);
+        let width = self
+            .mention
+            .candidates
+            .iter()
+            .take(visible)
+            .map(|candidate| {
+                UnicodeWidthStr::width(candidate.label.as_str())
+                    + 2
+                    + UnicodeWidthStr::width(candidate.detail.as_str())
+            })
+            .max()
+            .unwrap_or(18)
+            .clamp(18, 56) as u16;
+        let width = width.min(input_area.width.max(1));
+        let height = visible as u16;
+        let x = cursor_x.min(input_area.right().saturating_sub(width));
+        let y = if cursor_y >= height {
+            cursor_y.saturating_sub(height)
+        } else {
+            input_area.bottom()
+        };
+        Some(AssistantMentionSnapshot {
+            area: Rect::new(x, y, width, height),
+            candidates: Arc::from(
+                self.mention
+                    .candidates
+                    .iter()
+                    .take(visible)
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            ),
+            selected: self.mention.selected,
+        })
     }
 
     pub fn selected_message(&self, editor: &Editor) -> Option<usize> {
@@ -2972,49 +2895,46 @@ impl AssistantPanel {
 
     pub fn select_message(&mut self, editor: &mut Editor, index: Option<usize>) -> Option<usize> {
         let viewport_height = self.output.area().height as usize;
+        let before = self.navigation_state(editor);
+        if index == before.selected {
+            if let Some(index) = index {
+                let scroll = self
+                    .chat_layout
+                    .scroll_to_item(index, before.scroll, viewport_height);
+                if scroll != before.scroll {
+                    self.set_content_scroll(editor, scroll);
+                }
+                self.follow_end_if_last_message(editor, Some(index));
+            }
+            return before.selected;
+        }
         let entry = index.and_then(|index| self.entry_id_at(editor, index));
         let selected = self.set_selected_entry(editor, entry, true);
-        if let Some(index) = selected.and_then(|entry| {
-            self.output
-                .content()
-                .iter()
-                .position(|item| item.id == entry)
-        }) {
+        if let Some(index) = selected.and_then(|_| self.selected_index(editor)) {
             let cursor = MessageCursor::new(Some(index), self.navigation_state(editor).scroll);
             let scroll = self
                 .chat_layout
                 .scroll_to_item(index, cursor.scroll(), viewport_height);
-            self.set_content_scroll(editor, scroll);
+            if scroll != before.scroll {
+                self.set_content_scroll(editor, scroll);
+            }
         }
+        self.follow_end_if_last_message(editor, self.selected_index(editor));
         self.selected_index(editor)
     }
 
     pub fn select_prev_message(&mut self, editor: &mut Editor) -> Option<usize> {
+        let before = self.navigation_state(editor);
         let mut cursor = self.navigation_cursor(editor);
-        let selected = cursor.move_prev(&self.chat_layout, self.output.area().height as usize);
-        if selected.is_some() {
-            self.set_content_scroll(editor, cursor.scroll());
-            self.set_selected_entry(
-                editor,
-                selected.and_then(|index| self.entry_id_at(editor, index)),
-                true,
-            );
-        }
-        selected
+        cursor.move_prev(&self.chat_layout, self.output.area().height as usize);
+        self.apply_message_navigation(editor, before, cursor)
     }
 
     pub fn select_next_message(&mut self, editor: &mut Editor) -> Option<usize> {
+        let before = self.navigation_state(editor);
         let mut cursor = self.navigation_cursor(editor);
-        let selected = cursor.move_next(&self.chat_layout, self.output.area().height as usize);
-        if selected.is_some() {
-            self.set_content_scroll(editor, cursor.scroll());
-            self.set_selected_entry(
-                editor,
-                selected.and_then(|index| self.entry_id_at(editor, index)),
-                true,
-            );
-        }
-        selected
+        cursor.move_next(&self.chat_layout, self.output.area().height as usize);
+        self.apply_message_navigation(editor, before, cursor)
     }
 
     pub fn select_message_at_offset(
@@ -3041,31 +2961,17 @@ impl AssistantPanel {
     }
 
     pub fn select_prev_message_page(&mut self, editor: &mut Editor) -> Option<usize> {
+        let before = self.navigation_state(editor);
         let mut cursor = self.navigation_cursor(editor);
-        let selected = cursor.move_prev_page(&self.chat_layout, self.output.area().height as usize);
-        if selected.is_some() {
-            self.set_content_scroll(editor, cursor.scroll());
-            self.set_selected_entry(
-                editor,
-                selected.and_then(|index| self.entry_id_at(editor, index)),
-                true,
-            );
-        }
-        selected
+        cursor.move_prev_page(&self.chat_layout, self.output.area().height as usize);
+        self.apply_message_navigation(editor, before, cursor)
     }
 
     pub fn select_next_message_page(&mut self, editor: &mut Editor) -> Option<usize> {
+        let before = self.navigation_state(editor);
         let mut cursor = self.navigation_cursor(editor);
-        let selected = cursor.move_next_page(&self.chat_layout, self.output.area().height as usize);
-        if selected.is_some() {
-            self.set_content_scroll(editor, cursor.scroll());
-            self.set_selected_entry(
-                editor,
-                selected.and_then(|index| self.entry_id_at(editor, index)),
-                true,
-            );
-        }
-        selected
+        cursor.move_next_page(&self.chat_layout, self.output.area().height as usize);
+        self.apply_message_navigation(editor, before, cursor)
     }
 
     pub fn selected_entry_ref(&self, editor: &Editor) -> Option<&ChatEntry> {
@@ -3138,7 +3044,7 @@ impl AssistantPanel {
             return false;
         };
 
-        log::warn!(
+        log::debug!(
             "[assistant_scratch] open entry={:?} index={} action={:?} existing_doc={:?} details_len={}",
             entry,
             index,
@@ -3154,9 +3060,9 @@ impl AssistantPanel {
             return false;
         };
         Self::apply_assistant_effects(editor, effects);
-        self.set_focused(false);
+        self.release_focus_to_editor(editor);
         self.message_focus_animation.stop();
-        log::warn!(
+        log::debug!(
             "[assistant_ui] released panel focus after opening scratch entry={:?} index={} focused={} focus={:?}",
             entry,
             index,
@@ -3243,6 +3149,7 @@ impl AssistantPanel {
             && x < output_area.right()
             && y >= output_area.top()
             && y < output_area.bottom();
+        let in_output_scroll = self.chat_layout.contains_scroll_target(x, y);
         let in_input = x >= input_area.left()
             && x < input_area.right()
             && y >= input_area.top()
@@ -3254,7 +3161,7 @@ impl AssistantPanel {
                 let offset = Scrollable::scroll(&self.output) + row_offset;
                 let selected = self.chat_layout.item_at_offset(offset);
                 let same_selection = selected == self.selected_index(editor);
-                log::warn!(
+                log::debug!(
                     "[assistant_ui] output click row_offset={} offset={} selected={:?} same_selection={}",
                     row_offset,
                     offset,
@@ -3276,14 +3183,14 @@ impl AssistantPanel {
                 }
                 EventResult::Consumed(None)
             }
-            MouseEventKind::ScrollUp if in_output => {
+            MouseEventKind::ScrollUp if in_output_scroll => {
                 let lines = editor.config().scroll_lines.unsigned_abs().max(1);
                 let scroll = Scrollable::scroll(&self.output).saturating_sub(lines);
                 Scrollable::scroll_to(&mut self.output, scroll);
                 self.set_content_scroll(editor, Scrollable::scroll(&self.output));
                 EventResult::Consumed(None)
             }
-            MouseEventKind::ScrollDown if in_output => {
+            MouseEventKind::ScrollDown if in_output_scroll => {
                 let lines = editor.config().scroll_lines.unsigned_abs().max(1);
                 let scroll = Scrollable::scroll(&self.output).saturating_add(lines);
                 Scrollable::scroll_to(&mut self.output, scroll);
@@ -3469,7 +3376,7 @@ impl AssistantPanel {
             );
         }
 
-        cx.ingress.ui(UiCommand::Assistant(
+        cx.submit_ui(UiCommand::Assistant(
             AssistantCommand::PushModeConfigPicker { thread, items },
         ));
         true
@@ -3496,7 +3403,7 @@ impl AssistantPanel {
         let mut prompt = crate::ui::Prompt::new(
             "assistant note:".into(),
             None,
-            |_editor, _input| Vec::new(),
+            crate::ui::completers::none,
             |cx: &mut Context, input: &str, event: crate::ui::PromptEvent| {
                 if event != crate::ui::PromptEvent::Validate {
                     return;
@@ -3536,7 +3443,6 @@ impl AssistantPanel {
     }
 
     fn execute_message_action(&mut self, action: AssistantAction, cx: &mut Context) -> EventResult {
-        let model = Self::assistant_model(cx.editor);
         match action {
             AssistantAction::FocusInput => {
                 self.focus_input_region(cx.editor);
@@ -3686,6 +3592,7 @@ impl AssistantPanel {
             self.pending_message_g = false;
         }
         if let Some(index) = self.selected_message(cx.editor) {
+            let model = Self::assistant_model(cx.editor);
             let viewport_height = self.output.area().height as usize;
             let mut cursor = MessageCursor::new(Some(index), model.content_scroll());
             cursor.sync(&self.chat_layout, viewport_height);
@@ -3793,7 +3700,8 @@ impl AssistantPanel {
                     self.input.exit_insert_mode();
                     Some(EventResult::Consumed(None))
                 } else {
-                    None
+                    self.release_focus_to_editor(cx.editor);
+                    Some(EventResult::Consumed(None))
                 }
             }
             AssistantAction::InsertInputChar(ch) => {
@@ -3811,6 +3719,10 @@ impl AssistantPanel {
             }
             AssistantAction::CancelRun => {
                 self.cancel_active_run(cx);
+                Some(EventResult::Consumed(None))
+            }
+            AssistantAction::ToggleHelp => {
+                self.toggle_help(cx.editor);
                 Some(EventResult::Consumed(None))
             }
             _ => None,
@@ -3861,7 +3773,7 @@ impl Scrollable for AssistantPanel {
 // ---------------------------------------------------------------------------
 
 impl Component for AssistantPanel {
-    fn sync(&mut self, editor: &mut Editor) {
+    fn sync(&mut self, _viewport: Rect, editor: &mut Editor) {
         self.output.ensure_init(editor);
         self.input.ensure_init(editor);
         if self.focused {
@@ -3871,8 +3783,15 @@ impl Component for AssistantPanel {
         self.sync_to_model(editor);
     }
 
-    fn render(&mut self, area: Rect, surface: &mut crate::render::CellSurface, cx: &RenderContext) {
-        self.render_surface(area, surface, cx);
+    fn prepare_render(&mut self, area: Rect, cx: &RenderContext) -> crate::render::PreparedRender {
+        let snapshot = self.prepare_render_snapshot(area, cx);
+        crate::render::PreparedRender::deferred(move |cancellation| {
+            let mut output = crate::render::RenderOutput::sparse(area);
+            if let Some(snapshot) = snapshot {
+                snapshot.paint(output.surface_mut(), cancellation);
+            }
+            output
+        })
     }
 
     fn handle_event(&mut self, event: &Event, cx: &mut Context) -> EventResult {
@@ -3913,7 +3832,7 @@ impl Component for AssistantPanel {
         }
 
         let layer = self.active_layer(cx.editor);
-        if let Some(binding) = Self::binding_for_key(layer, &key) {
+        if let Some(binding) = Self::binding_for_key(layer, self.input.mode(), &key) {
             match layer {
                 AssistantLayer::Input => {
                     if let Some(result) = self.execute_input_binding(binding.action, cx) {
@@ -3935,6 +3854,10 @@ impl Component for AssistantPanel {
         }
         self.sync_help(cx.editor);
 
+        if layer == AssistantLayer::Messages {
+            return self.replay_key_to_editor(key, cx);
+        }
+
         if layer == AssistantLayer::Elicitation {
             if let Some(form) = &mut self.elicitation_form {
                 if let KeyCode::Char(ch) = key.code {
@@ -3947,18 +3870,16 @@ impl Component for AssistantPanel {
             return EventResult::Consumed(None);
         }
 
-        let model = Self::assistant_model(cx.editor);
+        if layer == AssistantLayer::Auth {
+            return EventResult::Consumed(None);
+        }
 
         if layer == AssistantLayer::Input
             && matches!(key.code, KeyCode::Char(' '))
             && key.modifiers.is_empty()
+            && self.input.mode() != Mode::Insert
         {
-            log::warn!(
-                "[assistant_ui] bubbling plain space focus_target={:?} input_mode={:?}",
-                model.focus(),
-                self.input.mode()
-            );
-            return EventResult::Ignored(None);
+            return self.replay_key_to_editor(key, cx);
         }
 
         // ── Mode transitions ──
@@ -4127,23 +4048,34 @@ impl Component for AssistantPanel {
             }
         }
 
-        // Dispatch through the region's own engine + keymaps.
-        // If the engine says the key is unbound, let it bubble up to the editor
-        // (e.g. `:` for command mode, or any other user-bound Frontend command).
+        // Dispatch through the region's own engine + keymaps. If the engine
+        // says the key is unbound in Normal mode, explicitly hand focus back
+        // to the editor and replay the key through the global keymap. That
+        // keeps component focus and editor command dispatch in sync.
         if self.dispatch_input_key(key, cx) {
-            log::warn!(
+            log::debug!(
                 "[assistant_event] key={} mode={:?} → Consumed (engine handled)",
                 key.key_sequence_format(),
                 self.input.mode()
             );
             EventResult::Consumed(None)
+        } else if self.input.mode() == Mode::Normal {
+            self.replay_key_to_editor(key, cx)
         } else {
-            log::warn!(
-                "[assistant_event] key={} mode={:?} → Ignored (unbound, bubbling)",
+            if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT {
+                if let Some(ch) = key.char() {
+                    self.insert_char_into_input(ch, cx.editor);
+                    self.sync_draft_to_assistant(cx.editor);
+                    self.refresh_mention_popup(cx.editor);
+                    return EventResult::Consumed(None);
+                }
+            }
+            log::debug!(
+                "[assistant_event] key={} mode={:?} → Consumed (insert-mode unbound)",
                 key.key_sequence_format(),
                 self.input.mode()
             );
-            EventResult::Ignored(None)
+            EventResult::Consumed(None)
         }
     }
 
@@ -4181,7 +4113,6 @@ mod tests {
     use crate::handlers::Handlers;
     use arc_swap::ArcSwap;
     use helix_core::Rope;
-    use helix_loader::runtime_dirs;
     use helix_view::editor::Config;
     use helix_view::theme;
     use helix_view::Document;
@@ -4212,18 +4143,73 @@ mod tests {
     }
 
     #[test]
+    fn assistant_render_snapshot_is_send() {
+        fn assert_send<T: Send>() {}
+
+        assert_send::<AssistantRenderSnapshot>();
+    }
+
+    #[test]
+    fn assistant_input_viewport_wraps_and_tracks_cursor_cells() {
+        let text = helix_core::Rope::from("abcdef\ng");
+        let layout = layout_input_viewport(text.slice(..), 4, 3, 4);
+
+        assert_eq!(
+            layout.visible_lines.as_ref(),
+            &["abc".to_string(), "def".to_string(), "g".to_string()]
+        );
+        assert_eq!((layout.cursor_row, layout.cursor_column), (1, 1));
+    }
+
+    #[test]
+    fn assistant_input_viewport_uses_terminal_width() {
+        let text = helix_core::Rope::from("a界b");
+        let layout = layout_input_viewport(text.slice(..), 2, 3, 2);
+
+        assert_eq!(
+            layout.visible_lines.as_ref(),
+            &["a界".to_string(), "b".to_string()]
+        );
+        assert_eq!((layout.cursor_row, layout.cursor_column), (1, 0));
+    }
+
+    #[test]
+    fn assistant_input_viewport_wraps_cursor_after_a_full_row() {
+        let text = helix_core::Rope::from("abcdef");
+        let layout = layout_input_viewport(text.slice(..), text.len_chars(), 3, 3);
+
+        assert_eq!(
+            layout.visible_lines.as_ref(),
+            &["abc".to_string(), "def".to_string(), String::new()]
+        );
+        assert_eq!((layout.cursor_row, layout.cursor_column), (2, 0));
+    }
+
+    #[test]
+    fn assistant_large_input_layout_is_viewport_bounded() {
+        let draft = "line\n".repeat(200_000);
+        let text = helix_core::Rope::from(draft.as_str());
+        let layout = layout_input_viewport(text.slice(..), text.len_chars(), 80, 5);
+
+        assert_eq!(layout.visible_lines.len(), 5);
+        assert!(layout.inspected_lines <= 5);
+    }
+
+    #[test]
     fn assistant_bindings_have_no_layer_collisions() {
-        for layer in [
-            AssistantLayer::Input,
-            AssistantLayer::Messages,
-            AssistantLayer::Elicitation,
-            AssistantLayer::Auth,
+        for (layer, input_mode) in [
+            (AssistantLayer::Input, Mode::Normal),
+            (AssistantLayer::Input, Mode::Select),
+            (AssistantLayer::Input, Mode::Insert),
+            (AssistantLayer::Messages, Mode::Normal),
+            (AssistantLayer::Elicitation, Mode::Normal),
+            (AssistantLayer::Auth, Mode::Normal),
         ] {
             let mut keys = HashSet::new();
-            for binding in AssistantPanel::bindings_for_layer(layer) {
+            for binding in AssistantPanel::bindings_for_context(layer, input_mode) {
                 assert!(
                     keys.insert(binding.key),
-                    "duplicate assistant binding in {layer:?}: {:?}",
+                    "duplicate assistant binding in {layer:?}/{input_mode:?}: {:?}",
                     binding.key
                 );
             }
@@ -4232,18 +4218,19 @@ mod tests {
 
     #[test]
     fn assistant_hint_bindings_dispatch_to_same_action() {
-        for layer in [
-            AssistantLayer::Input,
-            AssistantLayer::Messages,
-            AssistantLayer::Elicitation,
-            AssistantLayer::Auth,
+        for (layer, input_mode) in [
+            (AssistantLayer::Input, Mode::Normal),
+            (AssistantLayer::Input, Mode::Select),
+            (AssistantLayer::Input, Mode::Insert),
+            (AssistantLayer::Messages, Mode::Normal),
+            (AssistantLayer::Elicitation, Mode::Normal),
+            (AssistantLayer::Auth, Mode::Normal),
         ] {
-            for binding in AssistantPanel::bindings_for_layer(layer)
-                .iter()
+            for binding in AssistantPanel::bindings_for_context(layer, input_mode)
                 .filter(|binding| binding.hint.is_some())
             {
                 let key = key_event_for_binding(binding.key);
-                let dispatched = AssistantPanel::binding_for_key(layer, &key)
+                let dispatched = AssistantPanel::binding_for_key(layer, input_mode, &key)
                     .expect("hinted binding must dispatch");
                 assert_eq!(dispatched.action, binding.action);
             }
@@ -4285,16 +4272,16 @@ mod tests {
 
     #[test]
     fn help_toggle_bound_where_typing_cannot_shadow_it() {
-        let has_toggle = |layer| {
-            AssistantPanel::bindings_for_layer(layer)
-                .iter()
+        let has_toggle = |layer, input_mode| {
+            AssistantPanel::bindings_for_context(layer, input_mode)
                 .any(|binding| binding.action == AssistantAction::ToggleHelp)
         };
-        assert!(has_toggle(AssistantLayer::Messages));
-        assert!(has_toggle(AssistantLayer::Auth));
-        // `?` must stay typable in form fields and the input box.
-        assert!(!has_toggle(AssistantLayer::Elicitation));
-        assert!(!has_toggle(AssistantLayer::Input));
+        assert!(has_toggle(AssistantLayer::Input, Mode::Normal));
+        assert!(has_toggle(AssistantLayer::Messages, Mode::Normal));
+        assert!(has_toggle(AssistantLayer::Auth, Mode::Normal));
+        // `?` stays typable in form fields and while editing the input box.
+        assert!(!has_toggle(AssistantLayer::Elicitation, Mode::Insert));
+        assert!(!has_toggle(AssistantLayer::Input, Mode::Insert));
     }
 
     #[test]
@@ -4319,7 +4306,7 @@ mod tests {
     }
 
     fn test_editor() -> Editor {
-        let theme_loader = theme::Loader::new(runtime_dirs());
+        let theme_loader = theme::Loader::new(&[]);
         let syn_loader = helix_core::config::default_lang_loader();
         let config = Arc::new(ArcSwap::from_pointee(Config::default()));
         Editor::new(
@@ -4348,6 +4335,52 @@ mod tests {
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
         let _guard = runtime.enter();
         f()
+    }
+
+    fn with_context<R>(editor: &mut Editor, f: impl FnOnce(&mut Context<'_>) -> R) -> R {
+        let (ingress, _ingress_rx) =
+            crate::runtime::RuntimeIngress::channel(editor.runtime().clone());
+        let (plugin_events, _plugin_events_rx) = helix_runtime::channel(16);
+        let idle_reset = crate::runtime::IdleResetGate::new().handle();
+        let mut exit_tasks = crate::runtime::ExitTaskSet::default();
+        let exit_task_work = editor.work();
+        let redraw = editor.redraw_handle();
+        let notifier = crate::handlers::local::Notifier {
+            redraw: redraw.clone(),
+            plugin_events: plugin_events.into(),
+        };
+        let mut cx = Context::new(
+            editor,
+            &mut exit_tasks,
+            exit_task_work,
+            notifier,
+            ingress,
+            idle_reset,
+            crate::plugin_registry::PluginRuntime::default(),
+        );
+        f(&mut cx)
+    }
+
+    fn plain_key(code: KeyCode) -> KeyEvent {
+        KeyEvent {
+            code,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    fn assert_replays_key(result: EventResult, expected: KeyEvent) {
+        match result {
+            EventResult::Consumed(Some(PostAction::ReplayKeys {
+                keys,
+                count,
+                pop_macro_replaying,
+            })) => {
+                assert_eq!(keys, vec![expected]);
+                assert_eq!(count, 1);
+                assert!(!pop_macro_replaying);
+            }
+            _ => panic!("expected replay callback"),
+        }
     }
 
     fn seed_assistant(
@@ -4434,6 +4467,7 @@ mod tests {
                         helix_view::assistant::thread::Content::Append(
                             helix_view::assistant::thread::NewEntry {
                                 turn: None,
+                                stream: None,
                                 kind,
                                 locations: Vec::new(),
                             },
@@ -4614,52 +4648,136 @@ mod tests {
     }
 
     #[test]
-    fn fold_toggle_collapses_agent_message_to_single_preview_line() {
+    fn assistant_input_normal_escape_releases_panel_focus() {
         with_test_runtime(|| {
             let mut editor = test_editor();
-            seed_assistant(
-                &mut editor,
-                vec![ChatEntry {
-                    id: helix_view::assistant::thread::EntryId::new(
-                        std::num::NonZeroU64::new(1).unwrap(),
-                    ),
-                    locations: 0,
-                    kind: ChatEntryKind::AgentText(
-                        "Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua."
-                            .into(),
-                    ),
-                }],
-            );
+            seed_default_thread(&mut editor);
             let mut panel = AssistantPanel::new();
-            panel.sync_from_assistant(&mut editor);
-            select_thread_entry(&mut editor, 0);
+            panel.sync(Rect::new(0, 0, 120, 40), &mut editor);
+            panel.focus_input_region(&mut editor);
 
-            let model = editor.assistant_model(false);
-            let loader = editor.syn_loader.load();
-            let expanded_blocks = panel.build_blocks(
-                &model,
-                editor.assistant_theme(),
-                &loader,
-                30,
-                MessageCorners::Squared,
+            let result = with_context(&mut editor, |cx| {
+                panel.handle_event(&Event::Key(plain_key(KeyCode::Esc)), cx)
+            });
+
+            assert!(matches!(result, EventResult::Consumed(None)));
+            assert!(!helix_view::traits::Focusable::is_focused(&panel));
+        });
+    }
+
+    #[test]
+    fn assistant_input_normal_space_releases_focus_and_replays_global_leader() {
+        with_test_runtime(|| {
+            let mut editor = test_editor();
+            seed_default_thread(&mut editor);
+            let mut panel = AssistantPanel::new();
+            panel.sync(Rect::new(0, 0, 120, 40), &mut editor);
+            panel.focus_input_region(&mut editor);
+            let key = plain_key(KeyCode::Char(' '));
+
+            let result = with_context(&mut editor, |cx| panel.handle_event(&Event::Key(key), cx));
+
+            assert_replays_key(result, key);
+            assert!(!helix_view::traits::Focusable::is_focused(&panel));
+        });
+    }
+
+    #[test]
+    fn assistant_input_normal_unbound_key_releases_focus_and_replays_to_editor() {
+        with_test_runtime(|| {
+            let mut editor = test_editor();
+            seed_default_thread(&mut editor);
+            let mut panel = AssistantPanel::new();
+            panel.sync(Rect::new(0, 0, 120, 40), &mut editor);
+            panel.focus_input_region(&mut editor);
+            let key = plain_key(KeyCode::Char(':'));
+
+            let result = with_context(&mut editor, |cx| panel.handle_event(&Event::Key(key), cx));
+
+            assert_replays_key(result, key);
+            assert!(!helix_view::traits::Focusable::is_focused(&panel));
+        });
+    }
+
+    #[test]
+    fn assistant_input_normal_question_mark_opens_local_help() {
+        with_test_runtime(|| {
+            let mut editor = test_editor();
+            seed_default_thread(&mut editor);
+            let mut panel = AssistantPanel::new();
+            panel.sync(Rect::new(0, 0, 120, 40), &mut editor);
+            panel.focus_input_region(&mut editor);
+
+            let result = with_context(&mut editor, |cx| {
+                panel.handle_event(&Event::Key(plain_key(KeyCode::Char('?'))), cx)
+            });
+
+            assert!(matches!(result, EventResult::Consumed(None)));
+            assert!(helix_view::traits::Focusable::is_focused(&panel));
+            assert_eq!(panel.shown_help, Some(AssistantLayer::Input));
+            assert_eq!(
+                editor.autoinfo.as_ref().map(|info| info.title.as_ref()),
+                Some("Assistant: input")
             );
-            let expanded_height = expanded_blocks[0].height(true);
+        });
+    }
 
-            assert!(panel.toggle_selected_message_fold(&mut editor));
+    #[test]
+    fn assistant_messages_unbound_key_releases_focus_and_replays_to_editor() {
+        with_test_runtime(|| {
+            let mut editor = test_editor();
+            seed_default_thread(&mut editor);
+            let mut panel = AssistantPanel::new();
+            panel.sync(Rect::new(0, 0, 120, 40), &mut editor);
+            panel.focus_messages(&mut editor);
+            let key = plain_key(KeyCode::Char(':'));
 
-            let model = editor.assistant_model(false);
-            let collapsed_blocks = panel.build_blocks(
-                &model,
-                editor.assistant_theme(),
-                &loader,
-                30,
-                MessageCorners::Squared,
-            );
-            let collapsed_height = collapsed_blocks[0].height(true);
+            let result = with_context(&mut editor, |cx| panel.handle_event(&Event::Key(key), cx));
 
-            assert!(expanded_height > collapsed_height);
-            let entry = editor.assistant_entry_id_at(false, 0).expect("entry");
-            assert!(editor.is_assistant_entry_folded(false, entry));
+            assert_replays_key(result, key);
+            assert!(!helix_view::traits::Focusable::is_focused(&panel));
+        });
+    }
+
+    #[test]
+    fn assistant_input_insert_space_stays_in_assistant_input() {
+        with_test_runtime(|| {
+            let mut editor = test_editor();
+            seed_default_thread(&mut editor);
+            let mut panel = AssistantPanel::new();
+            panel.sync(Rect::new(0, 0, 120, 40), &mut editor);
+            panel.focus_input_region(&mut editor);
+            panel.input.enter_insert_mode("insert_mode".into());
+
+            let result = with_context(&mut editor, |cx| {
+                panel.handle_event(&Event::Key(plain_key(KeyCode::Char(' '))), cx)
+            });
+
+            assert!(matches!(result, EventResult::Consumed(None)));
+            assert!(helix_view::traits::Focusable::is_focused(&panel));
+            assert_eq!(panel.input.text(&editor).as_deref(), Some(" "));
+        });
+    }
+
+    #[test]
+    fn assistant_input_insert_question_mark_inserts_text() {
+        with_test_runtime(|| {
+            let mut editor = test_editor();
+            seed_default_thread(&mut editor);
+            let mut panel = AssistantPanel::new();
+            panel.sync(Rect::new(0, 0, 120, 40), &mut editor);
+            panel.focus_input_region(&mut editor);
+            panel.input.enter_insert_mode("insert_mode".into());
+
+            let result = with_context(&mut editor, |cx| {
+                panel.handle_event(&Event::Key(plain_key(KeyCode::Char('?'))), cx)
+            });
+
+            assert!(matches!(result, EventResult::Consumed(None)));
+            assert!(helix_view::traits::Focusable::is_focused(&panel));
+            assert_eq!(panel.input.text(&editor).as_deref(), Some("?"));
+            assert_eq!(panel.shown_help, None);
+            assert!(editor.autoinfo.is_none());
         });
     }
 }

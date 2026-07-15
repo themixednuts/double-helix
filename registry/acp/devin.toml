@@ -1,0 +1,51 @@
+name = "devin"
+kind = "acp"
+description = "Devin CLI coding agent by Cognition"
+homepage = "https://docs.devin.ai/cli"
+aliases = ["Devin", "https://github.com/CognitionAI/devin-cli"]
+categories = ["agent-client-protocol", "assistant"]
+
+[version]
+tag-source = "static:3000.1.27"
+
+[[artifact]]
+os = "macos"
+arch = "aarch64"
+source = { archive = "https://static.devin.ai/cli/3000.1.27/devin-3000.1.27-aarch64-apple-darwin.tar.gz" }
+bin = "bin/devin"
+args = ["acp"]
+
+[[artifact]]
+os = "macos"
+arch = "x86_64"
+source = { archive = "https://static.devin.ai/cli/3000.1.27/devin-3000.1.27-x86_64-apple-darwin.tar.gz" }
+bin = "bin/devin"
+args = ["acp"]
+
+[[artifact]]
+os = "linux"
+arch = "aarch64"
+source = { archive = "https://static.devin.ai/cli/3000.1.27/devin-3000.1.27-aarch64-unknown-linux.tar.gz" }
+bin = "bin/devin"
+args = ["acp"]
+
+[[artifact]]
+os = "linux"
+arch = "x86_64"
+source = { archive = "https://static.devin.ai/cli/3000.1.27/devin-3000.1.27-x86_64-unknown-linux.tar.gz" }
+bin = "bin/devin"
+args = ["acp"]
+
+[[artifact]]
+os = "windows"
+arch = "aarch64"
+source = { archive = "https://static.devin.ai/cli/3000.1.27/devin-3000.1.27-aarch64-pc-windows.zip" }
+bin = "bin/devin.exe"
+args = ["acp"]
+
+[[artifact]]
+os = "windows"
+arch = "x86_64"
+source = { archive = "https://static.devin.ai/cli/3000.1.27/devin-3000.1.27-x86_64-pc-windows.zip" }
+bin = "bin/devin.exe"
+args = ["acp"]

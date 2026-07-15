@@ -1,0 +1,45 @@
+name = "glm-acp-agent"
+kind = "acp"
+description = "ACP agent powered by Zhipu AI's GLM Coding Plan models (glm-5.1, glm-5-turbo, glm-4.7, glm-4.5-air). Supports streaming, tool calls, mid-session model switching, image input via Z.AI Coding Plan Vision MCP, and session load/fork/resume with on-disk persistence."
+homepage = "https://github.com/stefandevo/glm-acp-agent"
+aliases = ["GLM Agent"]
+categories = ["agent-client-protocol", "assistant"]
+
+[version]
+tag-source = "static:1.1.4"
+
+[[artifact]]
+os = "windows"
+arch = "x86_64"
+source = { npx = "glm-acp-agent@1.1.4" }
+bin = "glm-acp-agent"
+
+[[artifact]]
+os = "windows"
+arch = "aarch64"
+source = { npx = "glm-acp-agent@1.1.4" }
+bin = "glm-acp-agent"
+
+[[artifact]]
+os = "linux"
+arch = "x86_64"
+source = { npx = "glm-acp-agent@1.1.4" }
+bin = "glm-acp-agent"
+
+[[artifact]]
+os = "linux"
+arch = "aarch64"
+source = { npx = "glm-acp-agent@1.1.4" }
+bin = "glm-acp-agent"
+
+[[artifact]]
+os = "macos"
+arch = "aarch64"
+source = { npx = "glm-acp-agent@1.1.4" }
+bin = "glm-acp-agent"
+
+[[artifact]]
+os = "macos"
+arch = "x86_64"
+source = { npx = "glm-acp-agent@1.1.4" }
+bin = "glm-acp-agent"

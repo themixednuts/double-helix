@@ -1,0 +1,51 @@
+name = "qoder"
+kind = "acp"
+description = "AI coding assistant with agentic capabilities"
+homepage = "https://qoder.com"
+aliases = ["Qoder CLI"]
+categories = ["agent-client-protocol", "assistant"]
+
+[version]
+tag-source = "static:0.2.14"
+
+[[artifact]]
+os = "windows"
+arch = "x86_64"
+source = { npx = "@qoder-ai/qodercli@0.2.14" }
+bin = "qoder"
+args = ["--acp"]
+
+[[artifact]]
+os = "windows"
+arch = "aarch64"
+source = { npx = "@qoder-ai/qodercli@0.2.14" }
+bin = "qoder"
+args = ["--acp"]
+
+[[artifact]]
+os = "linux"
+arch = "x86_64"
+source = { npx = "@qoder-ai/qodercli@0.2.14" }
+bin = "qoder"
+args = ["--acp"]
+
+[[artifact]]
+os = "linux"
+arch = "aarch64"
+source = { npx = "@qoder-ai/qodercli@0.2.14" }
+bin = "qoder"
+args = ["--acp"]
+
+[[artifact]]
+os = "macos"
+arch = "aarch64"
+source = { npx = "@qoder-ai/qodercli@0.2.14" }
+bin = "qoder"
+args = ["--acp"]
+
+[[artifact]]
+os = "macos"
+arch = "x86_64"
+source = { npx = "@qoder-ai/qodercli@0.2.14" }
+bin = "qoder"
+args = ["--acp"]

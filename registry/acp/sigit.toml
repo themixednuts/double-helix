@@ -1,0 +1,45 @@
+name = "sigit"
+kind = "acp"
+description = "Local-first coding agent. Runs entirely on your machine with optional on-device LLM inference via Onde."
+homepage = "https://github.com/getsigit/sigit"
+aliases = ["siGit Code"]
+categories = ["agent-client-protocol", "assistant"]
+
+[version]
+tag-source = "static:1.3.2"
+
+[[artifact]]
+os = "macos"
+arch = "aarch64"
+source = { archive = "https://github.com/getsigit/sigit/releases/download/v1.3.2/sigit-macos-arm64.tar.gz" }
+bin = "sigit"
+
+[[artifact]]
+os = "macos"
+arch = "x86_64"
+source = { archive = "https://github.com/getsigit/sigit/releases/download/v1.3.2/sigit-macos-amd64.tar.gz" }
+bin = "sigit"
+
+[[artifact]]
+os = "linux"
+arch = "aarch64"
+source = { archive = "https://github.com/getsigit/sigit/releases/download/v1.3.2/sigit-linux-arm64" }
+bin = "sigit-linux-arm64"
+
+[[artifact]]
+os = "linux"
+arch = "x86_64"
+source = { archive = "https://github.com/getsigit/sigit/releases/download/v1.3.2/sigit-linux-amd64" }
+bin = "sigit-linux-amd64"
+
+[[artifact]]
+os = "windows"
+arch = "aarch64"
+source = { archive = "https://github.com/getsigit/sigit/releases/download/v1.3.2/sigit-win-arm64.exe" }
+bin = "sigit-win-arm64.exe"
+
+[[artifact]]
+os = "windows"
+arch = "x86_64"
+source = { archive = "https://github.com/getsigit/sigit/releases/download/v1.3.2/sigit-win-amd64.exe" }
+bin = "sigit-win-amd64.exe"

@@ -1,0 +1,39 @@
+name = "amp-acp"
+kind = "acp"
+description = "ACP wrapper for Amp - the frontier coding agent"
+homepage = "https://github.com/tao12345666333/amp-acp"
+aliases = ["Amp"]
+categories = ["agent-client-protocol", "assistant"]
+
+[version]
+tag-source = "static:0.8.1"
+
+[[artifact]]
+os = "macos"
+arch = "aarch64"
+source = { archive = "https://github.com/tao12345666333/amp-acp/releases/download/v0.8.1/amp-acp-darwin-aarch64.tar.gz" }
+bin = "amp-acp"
+
+[[artifact]]
+os = "macos"
+arch = "x86_64"
+source = { archive = "https://github.com/tao12345666333/amp-acp/releases/download/v0.8.1/amp-acp-darwin-x86_64.tar.gz" }
+bin = "amp-acp"
+
+[[artifact]]
+os = "linux"
+arch = "aarch64"
+source = { archive = "https://github.com/tao12345666333/amp-acp/releases/download/v0.8.1/amp-acp-linux-aarch64.tar.gz" }
+bin = "amp-acp"
+
+[[artifact]]
+os = "linux"
+arch = "x86_64"
+source = { archive = "https://github.com/tao12345666333/amp-acp/releases/download/v0.8.1/amp-acp-linux-x86_64.tar.gz" }
+bin = "amp-acp"
+
+[[artifact]]
+os = "windows"
+arch = "x86_64"
+source = { archive = "https://github.com/tao12345666333/amp-acp/releases/download/v0.8.1/amp-acp-windows-x86_64.zip" }
+bin = "amp-acp.exe"

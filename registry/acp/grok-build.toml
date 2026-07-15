@@ -1,0 +1,51 @@
+name = "grok-build"
+kind = "acp"
+description = "xAI's coding agent and CLI"
+homepage = "https://x.ai/cli"
+aliases = ["Grok Build"]
+categories = ["agent-client-protocol", "assistant"]
+
+[version]
+tag-source = "static:0.2.89"
+
+[[artifact]]
+os = "windows"
+arch = "x86_64"
+source = { npx = "@xai-official/grok@0.2.89" }
+bin = "grok-build"
+args = ["agent", "stdio"]
+
+[[artifact]]
+os = "windows"
+arch = "aarch64"
+source = { npx = "@xai-official/grok@0.2.89" }
+bin = "grok-build"
+args = ["agent", "stdio"]
+
+[[artifact]]
+os = "linux"
+arch = "x86_64"
+source = { npx = "@xai-official/grok@0.2.89" }
+bin = "grok-build"
+args = ["agent", "stdio"]
+
+[[artifact]]
+os = "linux"
+arch = "aarch64"
+source = { npx = "@xai-official/grok@0.2.89" }
+bin = "grok-build"
+args = ["agent", "stdio"]
+
+[[artifact]]
+os = "macos"
+arch = "aarch64"
+source = { npx = "@xai-official/grok@0.2.89" }
+bin = "grok-build"
+args = ["agent", "stdio"]
+
+[[artifact]]
+os = "macos"
+arch = "x86_64"
+source = { npx = "@xai-official/grok@0.2.89" }
+bin = "grok-build"
+args = ["agent", "stdio"]

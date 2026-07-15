@@ -1,0 +1,45 @@
+name = "deepagents"
+kind = "acp"
+description = "Batteries-included AI coding and general purpose agent powered by LangChain."
+homepage = "https://docs.langchain.com/oss/javascript/deepagents/overview"
+aliases = ["DeepAgents", "https://github.com/langchain-ai/deepagentsjs"]
+categories = ["agent-client-protocol", "assistant"]
+
+[version]
+tag-source = "static:0.1.7"
+
+[[artifact]]
+os = "windows"
+arch = "x86_64"
+source = { npx = "deepagents-acp@0.1.7" }
+bin = "deepagents"
+
+[[artifact]]
+os = "windows"
+arch = "aarch64"
+source = { npx = "deepagents-acp@0.1.7" }
+bin = "deepagents"
+
+[[artifact]]
+os = "linux"
+arch = "x86_64"
+source = { npx = "deepagents-acp@0.1.7" }
+bin = "deepagents"
+
+[[artifact]]
+os = "linux"
+arch = "aarch64"
+source = { npx = "deepagents-acp@0.1.7" }
+bin = "deepagents"
+
+[[artifact]]
+os = "macos"
+arch = "aarch64"
+source = { npx = "deepagents-acp@0.1.7" }
+bin = "deepagents"
+
+[[artifact]]
+os = "macos"
+arch = "x86_64"
+source = { npx = "deepagents-acp@0.1.7" }
+bin = "deepagents"

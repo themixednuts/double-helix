@@ -1,0 +1,57 @@
+name = "factory-droid"
+kind = "acp"
+description = "Factory Droid - AI coding agent powered by Factory AI"
+homepage = "https://factory.ai/product/cli"
+aliases = ["Factory Droid"]
+categories = ["agent-client-protocol", "assistant"]
+
+[version]
+tag-source = "static:0.164.1"
+
+[[artifact]]
+os = "windows"
+arch = "x86_64"
+source = { npx = "droid@0.164.1" }
+bin = "factory-droid"
+args = ["exec", "--output-format", "acp-daemon"]
+env = { DROID_DISABLE_AUTO_UPDATE = "true", FACTORY_DROID_AUTO_UPDATE_ENABLED = "false" }
+
+[[artifact]]
+os = "windows"
+arch = "aarch64"
+source = { npx = "droid@0.164.1" }
+bin = "factory-droid"
+args = ["exec", "--output-format", "acp-daemon"]
+env = { DROID_DISABLE_AUTO_UPDATE = "true", FACTORY_DROID_AUTO_UPDATE_ENABLED = "false" }
+
+[[artifact]]
+os = "linux"
+arch = "x86_64"
+source = { npx = "droid@0.164.1" }
+bin = "factory-droid"
+args = ["exec", "--output-format", "acp-daemon"]
+env = { DROID_DISABLE_AUTO_UPDATE = "true", FACTORY_DROID_AUTO_UPDATE_ENABLED = "false" }
+
+[[artifact]]
+os = "linux"
+arch = "aarch64"
+source = { npx = "droid@0.164.1" }
+bin = "factory-droid"
+args = ["exec", "--output-format", "acp-daemon"]
+env = { DROID_DISABLE_AUTO_UPDATE = "true", FACTORY_DROID_AUTO_UPDATE_ENABLED = "false" }
+
+[[artifact]]
+os = "macos"
+arch = "aarch64"
+source = { npx = "droid@0.164.1" }
+bin = "factory-droid"
+args = ["exec", "--output-format", "acp-daemon"]
+env = { DROID_DISABLE_AUTO_UPDATE = "true", FACTORY_DROID_AUTO_UPDATE_ENABLED = "false" }
+
+[[artifact]]
+os = "macos"
+arch = "x86_64"
+source = { npx = "droid@0.164.1" }
+bin = "factory-droid"
+args = ["exec", "--output-format", "acp-daemon"]
+env = { DROID_DISABLE_AUTO_UPDATE = "true", FACTORY_DROID_AUTO_UPDATE_ENABLED = "false" }

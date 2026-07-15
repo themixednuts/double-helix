@@ -151,16 +151,16 @@ impl Provider {
         }
     }
 
-    pub async fn provide(
+    pub fn provide(
         self,
         editor: &Editor,
         thread: &thread::Snapshot,
         surface: Option<SurfaceId>,
     ) -> Result<Kind, Error> {
         match self {
-            Self::File => provide_file(editor, thread, surface).await,
-            Self::Diagnostics => provide_diagnostics(editor, thread, surface).await,
-            Self::Diff => provide_diff(editor, thread, surface).await,
+            Self::File => provide_file(editor, thread, surface),
+            Self::Diagnostics => provide_diagnostics(editor, thread, surface),
+            Self::Diff => provide_diff(editor, thread, surface),
         }
     }
 }
@@ -173,7 +173,7 @@ pub fn core_registry() -> Registry {
     registry
 }
 
-async fn provide_file(
+fn provide_file(
     editor: &Editor,
     _thread: &thread::Snapshot,
     _surface: Option<SurfaceId>,
@@ -185,7 +185,7 @@ async fn provide_file(
     Ok(Kind::File(File { path }))
 }
 
-async fn provide_diagnostics(
+fn provide_diagnostics(
     editor: &Editor,
     _thread: &thread::Snapshot,
     _surface: Option<SurfaceId>,
@@ -208,7 +208,7 @@ async fn provide_diagnostics(
     Ok(Kind::Diagnostics(Diagnostics { path, items }))
 }
 
-async fn provide_diff(
+fn provide_diff(
     editor: &Editor,
     _thread: &thread::Snapshot,
     _surface: Option<SurfaceId>,

@@ -97,23 +97,24 @@ pub fn mode_set(state: &acp::SessionModeState) -> Result<mode::Set, mode::Missin
     )
 }
 
-pub fn config_state(items: &[acp::ConfigOption]) -> Result<config::State, config::Missing> {
-    let mut out = Vec::with_capacity(items.len());
-    for item in items {
-        let (current, values) = config_values(&item.kind);
-        out.push(config::Item::new(
-            config::Id::new(item.id.to_string()),
-            item.name.clone(),
-            item.category.as_ref().map(config_category),
-            config::Selected::Current(current),
-            values,
-        )?);
-    }
-    Ok(config::State::new(out))
+pub fn config_state(items: &[acp::ConfigOption]) -> config::State {
+    config::State::new(items.iter().filter_map(config_item).collect())
 }
 
-pub fn config_event(data: acp::ConfigOptionUpdateData) -> Result<thread::Event, config::Missing> {
-    config_state(&data.config_options).map(thread::Event::Config)
+fn config_item(item: &acp::ConfigOption) -> Option<config::Item> {
+    let (current, values) = config_values(&item.kind)?;
+    config::Item::new(
+        config::Id::new(item.id.to_string()),
+        item.name.clone(),
+        item.category.as_ref().map(config_category),
+        config::Selected::Current(current),
+        values,
+    )
+    .ok()
+}
+
+pub fn config_event(data: acp::ConfigOptionUpdateData) -> thread::Event {
+    thread::Event::Config(config_state(&data.config_options))
 }
 
 pub fn mode_event(
@@ -127,12 +128,32 @@ pub fn mode_event(
     .map(thread::Event::Mode)
 }
 
-pub fn thread_event(update: acp::SessionUpdate) -> Option<thread::Event> {
+pub fn thread_event(
+    update: acp::SessionUpdate,
+    modes: Option<&[acp::SessionMode]>,
+) -> Option<thread::Event> {
     match update {
+        acp::SessionUpdate::UserMessageChunk(chunk) => Some(thread::Event::Content(
+            thread::Content::Stream(thread::NewEntry {
+                turn: None,
+                stream: chunk
+                    .message_id
+                    .as_ref()
+                    .map(|id| thread::StreamId::user_prompt(id.to_string())),
+                kind: thread::EntryKind::UserPrompt {
+                    text: content_text(chunk.content.clone()),
+                },
+                locations: content_locations(std::slice::from_ref(&chunk.content)),
+            }),
+        )),
         acp::SessionUpdate::Plan(plan) => Some(thread::Event::Plan(plan_event(plan))),
         acp::SessionUpdate::AgentMessageChunk(chunk) => Some(thread::Event::Content(
-            thread::Content::Append(thread::NewEntry {
+            thread::Content::Stream(thread::NewEntry {
                 turn: None,
+                stream: chunk
+                    .message_id
+                    .as_ref()
+                    .map(|id| thread::StreamId::assistant_text(id.to_string())),
                 kind: thread::EntryKind::AssistantText {
                     text: content_text(chunk.content.clone()),
                 },
@@ -140,8 +161,12 @@ pub fn thread_event(update: acp::SessionUpdate) -> Option<thread::Event> {
             }),
         )),
         acp::SessionUpdate::AgentThoughtChunk(chunk) => Some(thread::Event::Content(
-            thread::Content::Append(thread::NewEntry {
+            thread::Content::Stream(thread::NewEntry {
                 turn: None,
+                stream: chunk
+                    .message_id
+                    .as_ref()
+                    .map(|id| thread::StreamId::thought(id.to_string())),
                 kind: thread::EntryKind::Thought {
                     text: content_text(chunk.content.clone()),
                 },
@@ -151,6 +176,7 @@ pub fn thread_event(update: acp::SessionUpdate) -> Option<thread::Event> {
         acp::SessionUpdate::ToolCall(info) => Some(thread::Event::Content(
             thread::Content::Append(thread::NewEntry {
                 turn: None,
+                stream: None,
                 kind: thread::EntryKind::ToolCall(tool_call(info)),
                 locations: Vec::new(),
             }),
@@ -158,6 +184,7 @@ pub fn thread_event(update: acp::SessionUpdate) -> Option<thread::Event> {
         acp::SessionUpdate::ToolCallUpdate(update) => Some(thread::Event::Content(
             thread::Content::Append(thread::NewEntry {
                 turn: None,
+                stream: None,
                 kind: thread::EntryKind::ToolCall(tool_update(update.clone())),
                 locations: update
                     .fields
@@ -167,8 +194,10 @@ pub fn thread_event(update: acp::SessionUpdate) -> Option<thread::Event> {
                     .unwrap_or_default(),
             }),
         )),
-        acp::SessionUpdate::ConfigOptionUpdate(update) => config_event(update).ok(),
-        acp::SessionUpdate::CurrentModeUpdate(_) => None,
+        acp::SessionUpdate::ConfigOptionUpdate(update) => Some(config_event(update)),
+        acp::SessionUpdate::CurrentModeUpdate(update) => {
+            modes.and_then(|modes| mode_event(update, modes).ok())
+        }
         acp::SessionUpdate::AvailableCommandsUpdate(update) => {
             Some(thread::Event::Commands(commands(update)))
         }
@@ -176,20 +205,36 @@ pub fn thread_event(update: acp::SessionUpdate) -> Option<thread::Event> {
             Some(thread::Event::Usage(thread::UsageUpdate {
                 input_tokens: None,
                 output_tokens: None,
-                total_input_tokens: Some(update.used),
-                total_output_tokens: Some(update.size),
+                total_input_tokens: None,
+                total_output_tokens: None,
+                context_used_tokens: Some(update.used),
+                context_window_tokens: Some(update.size),
                 cache_creation_input_tokens: None,
                 cache_read_input_tokens: None,
             }))
         }
-        acp::SessionUpdate::SessionInfoUpdate(_) => None,
-        _ => None,
+        acp::SessionUpdate::SessionInfoUpdate(update) => session_info_event(update),
+        _ => {
+            log::warn!("[assistant_acp] unsupported session update variant");
+            None
+        }
     }
+}
+
+fn session_info_event(update: acp::SessionInfoUpdate) -> Option<thread::Event> {
+    let title = update.title.as_opt_ref()?;
+    let title = title.and_then(|title| {
+        let title = title.trim();
+        (!title.is_empty()).then(|| title.to_string())
+    });
+    Some(thread::Event::Meta(thread::Meta::Title(title)))
 }
 
 pub fn update_locations(update: &acp::SessionUpdate) -> Vec<crate::collab::Location> {
     match update {
-        acp::SessionUpdate::AgentMessageChunk(chunk) => {
+        acp::SessionUpdate::UserMessageChunk(chunk)
+        | acp::SessionUpdate::AgentMessageChunk(chunk)
+        | acp::SessionUpdate::AgentThoughtChunk(chunk) => {
             content_locations(std::slice::from_ref(&chunk.content))
         }
         acp::SessionUpdate::ToolCallUpdate(update) => update
@@ -212,7 +257,7 @@ fn plan_event(plan: acp::Plan) -> super::super::plan::Event {
                     acp::PlanEntryStatus::Pending => super::super::plan::Status::Pending,
                     acp::PlanEntryStatus::InProgress => super::super::plan::Status::InProgress,
                     acp::PlanEntryStatus::Completed => super::super::plan::Status::Completed,
-                    _ => super::super::plan::Status::Pending,
+                    _ => super::super::plan::Status::Failed,
                 },
             })
             .collect(),
@@ -244,7 +289,7 @@ fn tool_update(update: acp::ToolCallUpdate) -> tool::Call {
             .fields
             .status
             .map(tool_state)
-            .unwrap_or(tool::State::Pending),
+            .unwrap_or_else(|| tool::State::Unknown("unspecified".into())),
         output,
         subagent: subagent_info(update.meta.as_ref()),
         sandbox: sandbox_info(update.meta.as_ref()),
@@ -257,7 +302,7 @@ fn tool_state(state: acp::ToolCallStatus) -> tool::State {
         acp::ToolCallStatus::InProgress => tool::State::Running,
         acp::ToolCallStatus::Completed => tool::State::Completed,
         acp::ToolCallStatus::Failed => tool::State::Failed { message: None },
-        _ => tool::State::Pending,
+        _ => tool::State::Unknown("unknown".into()),
     }
 }
 
@@ -350,7 +395,7 @@ fn field_from_schema(
         }
         acp::ElicitationPropertySchema::Array(schema) => {
             let options = match schema.items {
-                acp::MultiSelectItems::Untitled(items) => items
+                acp::MultiSelectItems::String(items) => items
                     .values
                     .into_iter()
                     .map(|value| thread::ElicitationOption {
@@ -432,7 +477,7 @@ fn content_text(block: acp::ContentBlock) -> String {
             acp::EmbeddedResourceResource::BlobResourceContents(resource) => resource.uri,
             _ => "<resource>".to_string(),
         },
-        _ => String::new(),
+        _ => "<content>".to_string(),
     }
 }
 
@@ -450,7 +495,7 @@ fn tool_content_text(block: &acp::ToolCallContent) -> String {
         acp::ToolCallContent::Content(content) => content_text(content.content.clone()),
         acp::ToolCallContent::Diff(diff) => diff.new_text.clone(),
         acp::ToolCallContent::Terminal(term) => format!("terminal:{}", term.terminal_id),
-        _ => String::new(),
+        _ => "<tool output>".to_string(),
     }
 }
 
@@ -492,13 +537,13 @@ fn content_location(block: &acp::ContentBlock) -> Option<crate::collab::Location
     ))
 }
 
-fn config_values(kind: &acp::SessionConfigKind) -> (config::ValueId, Vec<config::Value>) {
+fn config_values(kind: &acp::SessionConfigKind) -> Option<(config::ValueId, Vec<config::Value>)> {
     match kind {
-        acp::SessionConfigKind::Select(select) => (
+        acp::SessionConfigKind::Select(select) => Some((
             config::ValueId::new(select.current_value.to_string()),
             select_options(&select.options),
-        ),
-        acp::SessionConfigKind::Boolean(boolean) => (
+        )),
+        acp::SessionConfigKind::Boolean(boolean) => Some((
             config::ValueId::new(boolean.current_value.to_string()),
             vec![
                 config::Value {
@@ -512,8 +557,8 @@ fn config_values(kind: &acp::SessionConfigKind) -> (config::ValueId, Vec<config:
                     description: None,
                 },
             ],
-        ),
-        _ => (config::ValueId::new(""), Vec::new()),
+        )),
+        _ => None,
     }
 }
 
@@ -543,7 +588,7 @@ fn config_category(category: &acp::SessionConfigOptionCategory) -> String {
         acp::SessionConfigOptionCategory::Mode => "mode".to_string(),
         acp::SessionConfigOptionCategory::Model => "model".to_string(),
         acp::SessionConfigOptionCategory::ModelConfig => "model_config".to_string(),
-        acp::SessionConfigOptionCategory::ThoughtLevel => "thought_level".to_string(),
+        acp::SessionConfigOptionCategory::ThoughtLevel => "thinking".to_string(),
         acp::SessionConfigOptionCategory::Other(value) => value.clone(),
         _ => "other".to_string(),
     }
@@ -696,7 +741,8 @@ mod tests {
             )),
         ));
 
-        let Some(thread::Event::Content(thread::Content::Append(entry))) = thread_event(update)
+        let Some(thread::Event::Content(thread::Content::Stream(entry))) =
+            thread_event(update, None)
         else {
             panic!("expected content append event");
         };
@@ -710,6 +756,64 @@ mod tests {
     }
 
     #[test]
+    fn thread_event_maps_agent_message_id_to_stream_id() {
+        let update = acp::SessionUpdate::AgentMessageChunk(
+            acp::ContentChunk::new(acp::ContentBlock::Text(acp::TextContent::new("hello")))
+                .message_id("msg-agent"),
+        );
+
+        let Some(thread::Event::Content(thread::Content::Stream(entry))) =
+            thread_event(update, None)
+        else {
+            panic!("expected content append event");
+        };
+
+        assert_eq!(
+            entry.stream,
+            Some(thread::StreamId::assistant_text("msg-agent"))
+        );
+    }
+
+    #[test]
+    fn thread_event_maps_user_message_id_to_stream_id() {
+        let update = acp::SessionUpdate::UserMessageChunk(
+            acp::ContentChunk::new(acp::ContentBlock::Text(acp::TextContent::new("hello")))
+                .message_id("msg-user"),
+        );
+
+        let Some(thread::Event::Content(thread::Content::Stream(entry))) =
+            thread_event(update, None)
+        else {
+            panic!("expected content append event");
+        };
+
+        assert_eq!(
+            entry.stream,
+            Some(thread::StreamId::user_prompt("msg-user"))
+        );
+        assert!(matches!(
+            entry.kind,
+            thread::EntryKind::UserPrompt { text } if text == "hello"
+        ));
+    }
+
+    #[test]
+    fn thread_event_maps_thought_message_id_to_stream_id() {
+        let update = acp::SessionUpdate::AgentThoughtChunk(
+            acp::ContentChunk::new(acp::ContentBlock::Text(acp::TextContent::new("thinking")))
+                .message_id("msg-thought"),
+        );
+
+        let Some(thread::Event::Content(thread::Content::Stream(entry))) =
+            thread_event(update, None)
+        else {
+            panic!("expected content append event");
+        };
+
+        assert_eq!(entry.stream, Some(thread::StreamId::thought("msg-thought")));
+    }
+
+    #[test]
     fn thread_event_synthesizes_out_of_order_tool_update() {
         let update = acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(
             "tool-1",
@@ -720,7 +824,8 @@ mod tests {
                 ))]),
         ));
 
-        let Some(thread::Event::Content(thread::Content::Append(entry))) = thread_event(update)
+        let Some(thread::Event::Content(thread::Content::Append(entry))) =
+            thread_event(update, None)
         else {
             panic!("expected content append event");
         };
@@ -732,5 +837,117 @@ mod tests {
         assert_eq!(call.name, "tool");
         assert_eq!(call.state, tool::State::Running);
         assert_eq!(call.output, "partial output");
+    }
+
+    #[test]
+    fn thread_event_keeps_missing_tool_update_status_unknown() {
+        let update = acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(
+            "tool-1",
+            acp::ToolCallUpdateFields::new().content(vec![acp::ToolCallContent::from(
+                acp::ContentBlock::Text(acp::TextContent::new("partial output")),
+            )]),
+        ));
+
+        let Some(thread::Event::Content(thread::Content::Append(entry))) =
+            thread_event(update, None)
+        else {
+            panic!("expected content append event");
+        };
+
+        let thread::EntryKind::ToolCall(call) = entry.kind else {
+            panic!("expected synthesized tool call");
+        };
+        assert!(matches!(call.state, tool::State::Unknown(_)));
+        assert_eq!(call.output, "partial output");
+    }
+
+    #[test]
+    fn thread_event_updates_current_mode_from_cached_modes() {
+        let modes = vec![
+            acp::SessionMode::new("ask", "Ask"),
+            acp::SessionMode::new("write", "Write"),
+        ];
+        let update = acp::SessionUpdate::CurrentModeUpdate(acp::CurrentModeUpdate::new("write"));
+
+        let Some(thread::Event::Mode(mode_set)) = thread_event(update, Some(&modes)) else {
+            panic!("expected mode event");
+        };
+
+        assert!(matches!(
+            mode_set.selected(),
+            mode::Selected::Current(id) if id.as_str() == "write"
+        ));
+    }
+
+    #[test]
+    fn thread_event_drops_current_mode_update_without_cached_modes() {
+        let update = acp::SessionUpdate::CurrentModeUpdate(acp::CurrentModeUpdate::new("write"));
+
+        assert!(thread_event(update, None).is_none());
+    }
+
+    #[test]
+    fn thread_event_maps_acp_usage_to_context_usage() {
+        let update = acp::SessionUpdate::UsageUpdate(acp::UsageUpdate::new(276, 1000));
+
+        let Some(thread::Event::Usage(update)) = thread_event(update, None) else {
+            panic!("expected usage event");
+        };
+
+        assert_eq!(update.context_used_tokens, Some(276));
+        assert_eq!(update.context_window_tokens, Some(1000));
+        assert_eq!(update.total_input_tokens, None);
+        assert_eq!(update.total_output_tokens, None);
+    }
+
+    #[test]
+    fn config_state_skips_invalid_option_without_dropping_valid_options() {
+        let invalid = acp::SessionConfigOption::select(
+            "model",
+            "Model",
+            "missing",
+            vec![acp::SessionConfigSelectOption::new("gpt-5", "GPT-5")],
+        );
+        let valid = acp::SessionConfigOption::boolean("approval", "Approval", true);
+
+        let state = config_state(&[invalid, valid]);
+
+        assert!(state.item(&config::Id::new("model")).is_none());
+        assert!(state.item(&config::Id::new("approval")).is_some());
+    }
+
+    #[test]
+    fn thread_event_updates_session_title() {
+        let update =
+            acp::SessionUpdate::SessionInfoUpdate(acp::SessionInfoUpdate::new().title("Search UI"));
+
+        let Some(thread::Event::Meta(thread::Meta::Title(title))) = thread_event(update, None)
+        else {
+            panic!("expected title metadata event");
+        };
+
+        assert_eq!(title.as_deref(), Some("Search UI"));
+    }
+
+    #[test]
+    fn thread_event_clears_session_title() {
+        let update = acp::SessionUpdate::SessionInfoUpdate(
+            acp::SessionInfoUpdate::new().title(Option::<String>::None),
+        );
+
+        let Some(thread::Event::Meta(thread::Meta::Title(title))) = thread_event(update, None)
+        else {
+            panic!("expected title metadata event");
+        };
+
+        assert_eq!(title, None);
+    }
+
+    #[test]
+    fn thought_level_config_category_maps_to_thinking() {
+        assert_eq!(
+            config_category(&acp::SessionConfigOptionCategory::ThoughtLevel),
+            "thinking"
+        );
     }
 }

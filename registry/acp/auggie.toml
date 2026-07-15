@@ -1,0 +1,57 @@
+name = "auggie"
+kind = "acp"
+description = "Augment Code's powerful software agent, backed by industry-leading context engine"
+homepage = "https://www.augmentcode.com/"
+aliases = ["Auggie CLI", "https://github.com/augmentcode/auggie"]
+categories = ["agent-client-protocol", "assistant"]
+
+[version]
+tag-source = "static:0.32.0"
+
+[[artifact]]
+os = "windows"
+arch = "x86_64"
+source = { npx = "@augmentcode/auggie@0.32.0" }
+bin = "auggie"
+args = ["--acp"]
+env = { AUGMENT_DISABLE_AUTO_UPDATE = "1" }
+
+[[artifact]]
+os = "windows"
+arch = "aarch64"
+source = { npx = "@augmentcode/auggie@0.32.0" }
+bin = "auggie"
+args = ["--acp"]
+env = { AUGMENT_DISABLE_AUTO_UPDATE = "1" }
+
+[[artifact]]
+os = "linux"
+arch = "x86_64"
+source = { npx = "@augmentcode/auggie@0.32.0" }
+bin = "auggie"
+args = ["--acp"]
+env = { AUGMENT_DISABLE_AUTO_UPDATE = "1" }
+
+[[artifact]]
+os = "linux"
+arch = "aarch64"
+source = { npx = "@augmentcode/auggie@0.32.0" }
+bin = "auggie"
+args = ["--acp"]
+env = { AUGMENT_DISABLE_AUTO_UPDATE = "1" }
+
+[[artifact]]
+os = "macos"
+arch = "aarch64"
+source = { npx = "@augmentcode/auggie@0.32.0" }
+bin = "auggie"
+args = ["--acp"]
+env = { AUGMENT_DISABLE_AUTO_UPDATE = "1" }
+
+[[artifact]]
+os = "macos"
+arch = "x86_64"
+source = { npx = "@augmentcode/auggie@0.32.0" }
+bin = "auggie"
+args = ["--acp"]
+env = { AUGMENT_DISABLE_AUTO_UPDATE = "1" }

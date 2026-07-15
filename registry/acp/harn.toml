@@ -1,0 +1,44 @@
+name = "harn"
+kind = "acp"
+description = "Harn runs .harn agent pipelines as a native ACP coding agent over stdio."
+homepage = "https://harnlang.com"
+aliases = ["Harn", "https://github.com/burin-labs/harn"]
+categories = ["agent-client-protocol", "assistant"]
+
+[version]
+tag-source = "static:0.9.22"
+
+[[artifact]]
+os = "macos"
+arch = "aarch64"
+source = { archive = "https://github.com/burin-labs/harn/releases/download/v0.9.22/harn-aarch64-apple-darwin.tar.gz" }
+bin = "harn"
+args = ["serve", "acp"]
+
+[[artifact]]
+os = "macos"
+arch = "x86_64"
+source = { archive = "https://github.com/burin-labs/harn/releases/download/v0.9.22/harn-x86_64-apple-darwin.tar.gz" }
+bin = "harn"
+args = ["serve", "acp"]
+
+[[artifact]]
+os = "linux"
+arch = "aarch64"
+source = { archive = "https://github.com/burin-labs/harn/releases/download/v0.9.22/harn-aarch64-unknown-linux-gnu.tar.gz" }
+bin = "harn"
+args = ["serve", "acp"]
+
+[[artifact]]
+os = "linux"
+arch = "x86_64"
+source = { archive = "https://github.com/burin-labs/harn/releases/download/v0.9.22/harn-x86_64-unknown-linux-gnu.tar.gz" }
+bin = "harn"
+args = ["serve", "acp"]
+
+[[artifact]]
+os = "windows"
+arch = "x86_64"
+source = { archive = "https://github.com/burin-labs/harn/releases/download/v0.9.22/harn-x86_64-pc-windows-msvc.zip" }
+bin = "harn.exe"
+args = ["serve", "acp"]

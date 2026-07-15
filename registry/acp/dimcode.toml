@@ -1,0 +1,51 @@
+name = "dimcode"
+kind = "acp"
+description = "A coding agent that puts leading models at your command."
+homepage = "https://dimcode.dev/docs/acp.html"
+aliases = ["DimCode"]
+categories = ["agent-client-protocol", "assistant"]
+
+[version]
+tag-source = "static:0.2.21"
+
+[[artifact]]
+os = "windows"
+arch = "x86_64"
+source = { npx = "dimcode@0.2.21" }
+bin = "dimcode"
+args = ["acp"]
+
+[[artifact]]
+os = "windows"
+arch = "aarch64"
+source = { npx = "dimcode@0.2.21" }
+bin = "dimcode"
+args = ["acp"]
+
+[[artifact]]
+os = "linux"
+arch = "x86_64"
+source = { npx = "dimcode@0.2.21" }
+bin = "dimcode"
+args = ["acp"]
+
+[[artifact]]
+os = "linux"
+arch = "aarch64"
+source = { npx = "dimcode@0.2.21" }
+bin = "dimcode"
+args = ["acp"]
+
+[[artifact]]
+os = "macos"
+arch = "aarch64"
+source = { npx = "dimcode@0.2.21" }
+bin = "dimcode"
+args = ["acp"]
+
+[[artifact]]
+os = "macos"
+arch = "x86_64"
+source = { npx = "dimcode@0.2.21" }
+bin = "dimcode"
+args = ["acp"]

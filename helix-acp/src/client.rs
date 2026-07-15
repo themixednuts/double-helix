@@ -4,27 +4,155 @@
 //! Follows the same patterns as `helix-lsp::Client`.
 
 use crate::{jsonrpc, methods, transport::Payload, types::*, AgentId, Error, Result};
-use helix_runtime::{channel, send_blocking, Receiver, Sender};
+use helix_runtime::{channel, Receiver};
 use log::warn;
 use serde::Serialize;
 use serde_json::Value;
 use slotmap::SlotMap;
 use std::future::Future;
+use std::io;
 use std::path::PathBuf;
+use std::process::ExitStatus;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::{
     io::{BufReader, BufWriter},
     process::{Child, Command},
-    sync::{Mutex, Notify, OnceCell},
+    sync::{mpsc, watch, Mutex, OnceCell},
     time::timeout,
 };
 
-use crate::transport::Transport;
+use crate::transport::{OutboundQueue, PendingRequests, Transport};
 
 /// Receiver for incoming agent requests/notifications from the transport.
 pub type IncomingReceiver = Receiver<(AgentId, jsonrpc::Call)>;
+
+#[derive(Clone, Debug)]
+enum ProcessOutcome {
+    Exited(ExitStatus),
+    Failed(ProcessFailure),
+}
+
+impl ProcessOutcome {
+    fn as_result(&self) -> io::Result<ExitStatus> {
+        match self {
+            Self::Exited(status) => Ok(*status),
+            Self::Failed(error) => Err(error.to_io_error()),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ProcessFailure {
+    kind: io::ErrorKind,
+    message: Arc<str>,
+}
+
+impl ProcessFailure {
+    fn new(error: io::Error) -> Self {
+        Self {
+            kind: error.kind(),
+            message: error.to_string().into(),
+        }
+    }
+
+    fn to_io_error(&self) -> io::Error {
+        io::Error::new(self.kind, self.message.to_string())
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct ProcessWaiter {
+    outcome_rx: watch::Receiver<Option<ProcessOutcome>>,
+}
+
+impl ProcessWaiter {
+    pub(crate) async fn wait(&self) -> io::Result<ExitStatus> {
+        let mut outcome_rx = self.outcome_rx.clone();
+        loop {
+            if let Some(outcome) = outcome_rx.borrow().clone() {
+                return outcome.as_result();
+            }
+
+            if outcome_rx.changed().await.is_err() {
+                if let Some(outcome) = outcome_rx.borrow().clone() {
+                    return outcome.as_result();
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "process controller stopped without publishing an exit result",
+                ));
+            }
+        }
+    }
+}
+
+pub(crate) struct ProcessHandle {
+    shutdown_tx: mpsc::Sender<()>,
+    waiter: ProcessWaiter,
+}
+
+impl ProcessHandle {
+    pub(crate) fn spawn(mut child: Child, description: String) -> Self {
+        let (shutdown_tx, mut shutdown_rx) = mpsc::channel(1);
+        let (outcome_tx, outcome_rx) = watch::channel(None);
+
+        tokio::spawn(async move {
+            let result = tokio::select! {
+                status = child.wait() => status,
+                _ = shutdown_rx.recv() => terminate_child(&mut child).await,
+            };
+
+            let outcome = match result {
+                Ok(status) => {
+                    warn!(
+                        "[acp_process] child exited process={} status={:?}",
+                        description, status
+                    );
+                    ProcessOutcome::Exited(status)
+                }
+                Err(error) => {
+                    warn!(
+                        "[acp_process] child wait failed process={} err={}",
+                        description, error
+                    );
+                    ProcessOutcome::Failed(ProcessFailure::new(error))
+                }
+            };
+            outcome_tx.send_replace(Some(outcome));
+        });
+
+        Self {
+            shutdown_tx,
+            waiter: ProcessWaiter { outcome_rx },
+        }
+    }
+
+    pub(crate) fn request_shutdown(&self) {
+        let _ = self.shutdown_tx.try_send(());
+    }
+
+    pub(crate) async fn shutdown(&self) -> io::Result<ExitStatus> {
+        self.request_shutdown();
+        self.waiter.wait().await
+    }
+
+    pub(crate) fn waiter(&self) -> ProcessWaiter {
+        self.waiter.clone()
+    }
+}
+
+async fn terminate_child(child: &mut Child) -> io::Result<ExitStatus> {
+    if let Err(kill_error) = child.start_kill() {
+        return match child.try_wait() {
+            Ok(Some(status)) => Ok(status),
+            _ => Err(kill_error),
+        };
+    }
+
+    child.wait().await
+}
 
 /// Configuration for launching an ACP agent.
 #[derive(Debug, Clone)]
@@ -60,12 +188,12 @@ impl Default for AgentConfig {
 pub struct AcpAgent {
     id: AgentId,
     name: String,
-    _process: Arc<Mutex<Child>>,
-    server_tx: Sender<Payload>,
+    process: ProcessHandle,
+    outbound: OutboundQueue,
+    pending_requests: Arc<PendingRequests>,
     request_counter: AtomicU64,
     capabilities: OnceCell<AgentCapabilities>,
     agent_info: OnceCell<Implementation>,
-    initialize_notify: Arc<Notify>,
     timeout_secs: u64,
     cwd: PathBuf,
     mcp_servers: Vec<McpServer>,
@@ -76,7 +204,7 @@ pub struct AcpAgent {
 impl AcpAgent {
     /// Spawn an agent process and set up the transport.
     ///
-    /// Returns `(agent, incoming_receiver, initialize_notify)`.
+    /// Returns the agent and its incoming request/notification receiver.
     /// The caller should poll `incoming_receiver` for agent requests/notifications.
     pub fn start(id: AgentId, config: &AgentConfig) -> Result<(Arc<Self>, IncomingReceiver)> {
         let mut cmd = Command::new(&config.command);
@@ -105,40 +233,27 @@ impl AcpAgent {
         let stdin = process.stdin.take().expect("stdin was piped");
         let stdout = process.stdout.take().expect("stdout was piped");
         let stderr = process.stderr.take().expect("stderr was piped");
-        let process = Arc::new(Mutex::new(process));
-        let process_waiter = process.clone();
-        let process_name = config.command.clone();
-        let process_id = id;
-        tokio::spawn(async move {
-            match process_waiter.lock().await.wait().await {
-                Ok(status) => warn!(
-                    "[acp_transport] child exited agent={} id={:?} status={:?}",
-                    process_name, process_id, status
-                ),
-                Err(err) => warn!(
-                    "[acp_transport] child wait failed agent={} id={:?} err={}",
-                    process_name, process_id, err
-                ),
-            }
-        });
+        let process = ProcessHandle::spawn(process, format!("agent={} id={id:?}", config.command));
 
-        let (incoming_rx, server_tx, initialize_notify) = Transport::start(
+        let pending_requests = Arc::new(PendingRequests::default());
+        let (incoming_rx, outbound) = Transport::start(
             BufReader::new(stdout),
             BufWriter::new(stdin),
             BufReader::new(stderr),
             id,
             config.command.clone(),
+            pending_requests.clone(),
         );
 
         let agent = Arc::new(Self {
             id,
             name: config.command.clone(),
-            _process: process,
-            server_tx,
+            process,
+            outbound,
+            pending_requests,
             request_counter: AtomicU64::new(0),
             capabilities: OnceCell::new(),
             agent_info: OnceCell::new(),
-            initialize_notify,
             timeout_secs: config.timeout_secs,
             cwd: config.cwd.clone(),
             mcp_servers: config.mcp_servers.clone(),
@@ -161,6 +276,24 @@ impl AcpAgent {
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Terminate and reap the agent process.
+    ///
+    /// This operation is idempotent. Calls made after natural exit or a prior
+    /// shutdown observe the original exit result.
+    pub async fn shutdown(&self) -> Result<()> {
+        self.process.shutdown().await?;
+        Ok(())
+    }
+
+    /// Wait for the agent process to exit without terminating it.
+    pub async fn wait(&self) -> Result<ExitStatus> {
+        self.process.waiter().wait().await.map_err(Into::into)
+    }
+
+    pub(crate) fn request_shutdown(&self) {
+        self.process.request_shutdown();
     }
 
     pub fn capabilities(&self) -> Option<&AgentCapabilities> {
@@ -196,7 +329,8 @@ impl AcpAgent {
         params: R,
         timeout_secs: u64,
     ) -> impl Future<Output = Result<T>> {
-        let server_tx = self.server_tx.clone();
+        let outbound = self.outbound.clone();
+        let pending_requests = self.pending_requests.clone();
         let id = self.next_request_id();
         let method_name = method.to_string();
 
@@ -209,13 +343,12 @@ impl AcpAgent {
                 params: Self::value_into_params(params),
             };
             let (tx, mut rx) = channel::<Result<Value>>(1);
-            server_tx
-                .send(Payload::Request {
-                    chan: tx,
-                    value: request,
-                })
-                .await
-                .map_err(|e| Error::Other(e.into()))?;
+            let Some(_pending_request) = pending_requests.register(jsonrpc::Id::Num(id), tx) else {
+                return Err(Error::StreamClosed);
+            };
+            outbound
+                .deliver(Payload::Request { value: request })
+                .await?;
             let response = match timeout(Duration::from_secs(timeout_secs), rx.recv()).await {
                 Ok(Some(response)) => response,
                 Ok(None) => {
@@ -248,14 +381,8 @@ impl AcpAgent {
     }
 
     /// Send a JSON-RPC notification (no response expected).
-    fn notify<R: Serialize>(&self, method: &str, params: R) {
-        let params = match serde_json::to_value(params) {
-            Ok(params) => params,
-            Err(err) => {
-                log::error!("Failed to serialize notification params: {err}");
-                return;
-            }
-        };
+    async fn notify<R: Serialize>(&self, method: &str, params: R) -> Result<()> {
+        let params = serde_json::to_value(params).map_err(|err| Error::Other(err.into()))?;
 
         let notification = jsonrpc::Notification {
             jsonrpc: Some(jsonrpc::Version::V2),
@@ -263,29 +390,31 @@ impl AcpAgent {
             params: Self::value_into_params(params),
         };
 
-        send_blocking(&self.server_tx, Payload::Notification(notification));
+        self.outbound
+            .deliver(Payload::Notification(notification))
+            .await
     }
 
     /// Send a JSON-RPC response to an agent request.
-    pub fn reply(&self, id: jsonrpc::Id, result: Value) {
+    pub async fn reply(&self, id: jsonrpc::Id, result: Value) -> Result<()> {
         let output = jsonrpc::Output::Success(jsonrpc::Success {
             jsonrpc: Some(jsonrpc::Version::V2),
             result,
             id,
         });
 
-        send_blocking(&self.server_tx, Payload::Response(output));
+        self.outbound.deliver(Payload::Response(output)).await
     }
 
     /// Send a JSON-RPC error response to an agent request.
-    pub fn reply_error(&self, id: jsonrpc::Id, error: jsonrpc::Error) {
+    pub async fn reply_error(&self, id: jsonrpc::Id, error: jsonrpc::Error) -> Result<()> {
         let output = jsonrpc::Output::Failure(jsonrpc::Failure {
             jsonrpc: Some(jsonrpc::Version::V2),
             error,
             id,
         });
 
-        send_blocking(&self.server_tx, Payload::Response(output));
+        self.outbound.deliver(Payload::Response(output)).await
     }
 
     // -----------------------------------------------------------------------
@@ -314,9 +443,6 @@ impl AcpAgent {
         if let Some(ref info) = response.agent_info {
             let _ = self.agent_info.set(info.clone());
         }
-
-        // Signal that initialization is complete — buffered messages will be sent
-        self.initialize_notify.notify_one();
 
         Ok(response)
     }
@@ -417,8 +543,9 @@ impl AcpAgent {
     }
 
     /// Cancel an ongoing prompt turn.
-    pub fn cancel(&self, session_id: SessionId) {
-        self.notify(methods::SESSION_CANCEL, CancelNotification::new(session_id));
+    pub async fn cancel(&self, session_id: SessionId) -> Result<()> {
+        self.notify(methods::SESSION_CANCEL, CancelNotification::new(session_id))
+            .await
     }
 
     /// Set the session mode.
@@ -442,10 +569,179 @@ impl AcpAgent {
         self.call(methods::SESSION_SET_CONFIG, params, self.timeout_secs)
     }
 
-    pub fn complete_elicitation(&self, elicitation_id: String) {
+    pub async fn complete_elicitation(&self, elicitation_id: String) -> Result<()> {
         self.notify(
             methods::ELICITATION_COMPLETE,
             CompleteElicitationNotification::new(elicitation_id),
+        )
+        .await
+    }
+}
+
+impl Drop for AcpAgent {
+    fn drop(&mut self) {
+        self.process.request_shutdown();
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use std::{
+        fs,
+        future::Future,
+        path::{Path, PathBuf},
+        sync::atomic::{AtomicU64, Ordering},
+        task::{Context, Poll},
+        thread,
+        time::Duration,
+    };
+
+    pub(crate) const CHILD_MODE_ENV: &str = "HELIX_ACP_TEST_CHILD_MODE";
+    pub(crate) const CHILD_STARTED_ENV: &str = "HELIX_ACP_TEST_CHILD_STARTED";
+    pub(crate) const CHILD_LATE_MARKER_ENV: &str = "HELIX_ACP_TEST_CHILD_LATE_MARKER";
+    pub(crate) const CHILD_TEST_NAME: &str = "client::tests::lifecycle_child_process";
+
+    static TEST_PATH_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    pub(crate) fn helper_args() -> Vec<String> {
+        vec![
+            "--exact".to_string(),
+            CHILD_TEST_NAME.to_string(),
+            "--nocapture".to_string(),
+        ]
+    }
+
+    pub(crate) fn unique_test_path(label: &str) -> PathBuf {
+        let id = TEST_PATH_COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("helix-acp-{label}-{}-{id}", std::process::id()))
+    }
+
+    pub(crate) fn child_agent_config(
+        mode: &str,
+        started: &Path,
+        late_marker: Option<&Path>,
+    ) -> AgentConfig {
+        let mut env = vec![
+            (CHILD_MODE_ENV.to_string(), mode.to_string()),
+            (CHILD_STARTED_ENV.to_string(), started.display().to_string()),
+        ];
+        if let Some(path) = late_marker {
+            env.push((
+                CHILD_LATE_MARKER_ENV.to_string(),
+                path.display().to_string(),
+            ));
+        }
+
+        AgentConfig {
+            command: std::env::current_exe()
+                .expect("current test executable")
+                .display()
+                .to_string(),
+            args: helper_args(),
+            env,
+            cwd: std::env::current_dir().expect("current directory"),
+            ..AgentConfig::default()
+        }
+    }
+
+    pub(crate) async fn wait_for_file(path: &Path) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !path.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {}", path.display()));
+    }
+
+    #[test]
+    fn lifecycle_child_process() {
+        let Some(mode) = std::env::var_os(CHILD_MODE_ENV) else {
+            return;
+        };
+
+        if let Some(path) = std::env::var_os(CHILD_STARTED_ENV) {
+            fs::write(path, b"started").expect("write child-started marker");
+        }
+
+        if mode == "exit" {
+            return;
+        }
+
+        if let Some(path) = std::env::var_os(CHILD_LATE_MARKER_ENV) {
+            thread::sleep(Duration::from_millis(750));
+            fs::write(path, b"still-running").expect("write late child marker");
+        }
+
+        loop {
+            thread::sleep(Duration::from_secs(60));
+        }
+    }
+
+    #[tokio::test]
+    async fn dropping_agent_terminates_its_process() {
+        let started = unique_test_path("agent-started");
+        let late_marker = unique_test_path("agent-late");
+        let config = child_agent_config("hang", &started, Some(&late_marker));
+
+        let (agent, incoming) = AcpAgent::start_standalone(&config).expect("start test agent");
+        wait_for_file(&started).await;
+
+        drop(agent);
+        drop(incoming);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        assert!(
+            !late_marker.exists(),
+            "agent process survived after its final owner was dropped"
         );
+        let _ = fs::remove_file(started);
+        let _ = fs::remove_file(late_marker);
+    }
+
+    #[tokio::test]
+    async fn agent_shutdown_is_idempotent() {
+        let started = unique_test_path("agent-shutdown-started");
+        let config = child_agent_config("hang", &started, None);
+        let (agent, incoming) = AcpAgent::start_standalone(&config).expect("start test agent");
+        wait_for_file(&started).await;
+
+        tokio::time::timeout(Duration::from_secs(2), agent.shutdown())
+            .await
+            .expect("agent shutdown timed out")
+            .expect("shut down agent");
+        tokio::time::timeout(Duration::from_millis(100), agent.shutdown())
+            .await
+            .expect("repeated shutdown did not reuse exit result")
+            .expect("repeat agent shutdown");
+        agent.wait().await.expect("wait for shut down agent");
+
+        drop(incoming);
+        let _ = fs::remove_file(started);
+    }
+
+    #[tokio::test]
+    async fn canceling_shutdown_wait_does_not_cancel_process_termination() {
+        let started = unique_test_path("agent-canceled-shutdown-started");
+        let config = child_agent_config("hang", &started, None);
+        let (agent, incoming) = AcpAgent::start_standalone(&config).expect("start test agent");
+        wait_for_file(&started).await;
+
+        let mut shutdown = Box::pin(agent.shutdown());
+        let mut context = Context::from_waker(futures_util::task::noop_waker_ref());
+        assert!(matches!(
+            shutdown.as_mut().poll(&mut context),
+            Poll::Pending
+        ));
+        drop(shutdown);
+
+        tokio::time::timeout(Duration::from_secs(2), agent.wait())
+            .await
+            .expect("canceled shutdown wait canceled process termination")
+            .expect("wait for terminated agent");
+
+        drop(incoming);
+        let _ = fs::remove_file(started);
     }
 }

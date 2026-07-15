@@ -1,0 +1,45 @@
+name = "codex-acp"
+kind = "acp"
+description = "ACP adapter for OpenAI's coding assistant"
+homepage = "https://github.com/agentclientprotocol/codex-acp"
+aliases = ["Codex"]
+categories = ["agent-client-protocol", "assistant"]
+
+[version]
+tag-source = "static:1.1.0"
+
+[[artifact]]
+os = "windows"
+arch = "x86_64"
+source = { npx = "@agentclientprotocol/codex-acp@1.1.0" }
+bin = "codex-acp"
+
+[[artifact]]
+os = "windows"
+arch = "aarch64"
+source = { npx = "@agentclientprotocol/codex-acp@1.1.0" }
+bin = "codex-acp"
+
+[[artifact]]
+os = "linux"
+arch = "x86_64"
+source = { npx = "@agentclientprotocol/codex-acp@1.1.0" }
+bin = "codex-acp"
+
+[[artifact]]
+os = "linux"
+arch = "aarch64"
+source = { npx = "@agentclientprotocol/codex-acp@1.1.0" }
+bin = "codex-acp"
+
+[[artifact]]
+os = "macos"
+arch = "aarch64"
+source = { npx = "@agentclientprotocol/codex-acp@1.1.0" }
+bin = "codex-acp"
+
+[[artifact]]
+os = "macos"
+arch = "x86_64"
+source = { npx = "@agentclientprotocol/codex-acp@1.1.0" }
+bin = "codex-acp"

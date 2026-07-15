@@ -1,0 +1,45 @@
+name = "claude-acp"
+kind = "acp"
+description = "ACP wrapper for Anthropic's Claude"
+homepage = "https://github.com/agentclientprotocol/claude-agent-acp"
+aliases = ["Claude Agent"]
+categories = ["agent-client-protocol", "assistant"]
+
+[version]
+tag-source = "static:0.56.0"
+
+[[artifact]]
+os = "windows"
+arch = "x86_64"
+source = { npx = "@agentclientprotocol/claude-agent-acp@0.56.0" }
+bin = "claude-acp"
+
+[[artifact]]
+os = "windows"
+arch = "aarch64"
+source = { npx = "@agentclientprotocol/claude-agent-acp@0.56.0" }
+bin = "claude-acp"
+
+[[artifact]]
+os = "linux"
+arch = "x86_64"
+source = { npx = "@agentclientprotocol/claude-agent-acp@0.56.0" }
+bin = "claude-acp"
+
+[[artifact]]
+os = "linux"
+arch = "aarch64"
+source = { npx = "@agentclientprotocol/claude-agent-acp@0.56.0" }
+bin = "claude-acp"
+
+[[artifact]]
+os = "macos"
+arch = "aarch64"
+source = { npx = "@agentclientprotocol/claude-agent-acp@0.56.0" }
+bin = "claude-acp"
+
+[[artifact]]
+os = "macos"
+arch = "x86_64"
+source = { npx = "@agentclientprotocol/claude-agent-acp@0.56.0" }
+bin = "claude-acp"

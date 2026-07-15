@@ -787,6 +787,7 @@ impl Store {
                     state.apply(thread::Event::Content(thread::Content::Append(
                         thread::NewEntry {
                             turn: None,
+                            stream: None,
                             kind: thread::EntryKind::UserPrompt { text },
                             locations: Vec::new(),
                         },
@@ -830,6 +831,7 @@ impl Store {
                     state.apply(thread::Event::Content(thread::Content::Append(
                         thread::NewEntry {
                             turn: None,
+                            stream: None,
                             kind: thread::EntryKind::UserPrompt { text },
                             locations: Vec::new(),
                         },
@@ -866,6 +868,7 @@ impl Store {
                 state.apply(thread::Event::Content(thread::Content::Append(
                     thread::NewEntry {
                         turn: None,
+                        stream: None,
                         kind: thread::EntryKind::Status {
                             text: "Canceling assistant run...".to_string(),
                         },
@@ -1290,6 +1293,7 @@ mod tests {
             thread,
             event: thread::Event::Content(thread::Content::Append(thread::NewEntry {
                 turn: None,
+                stream: None,
                 kind,
                 locations: Vec::new(),
             })),
@@ -1778,6 +1782,7 @@ mod tests {
             thread,
             event: thread::Event::Content(thread::Content::Append(thread::NewEntry {
                 turn: None,
+                stream: None,
                 kind: thread::EntryKind::AssistantText {
                     text: "partial".to_string(),
                 },

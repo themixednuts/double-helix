@@ -1,0 +1,44 @@
+name = "kimi"
+kind = "acp"
+description = "Moonshot AI's coding assistant"
+homepage = "https://moonshotai.github.io/kimi-cli/"
+aliases = ["Kimi CLI", "https://github.com/MoonshotAI/kimi-cli"]
+categories = ["agent-client-protocol", "assistant"]
+
+[version]
+tag-source = "static:1.48.0"
+
+[[artifact]]
+os = "macos"
+arch = "aarch64"
+source = { archive = "https://github.com/MoonshotAI/kimi-cli/releases/download/1.48.0/kimi-1.48.0-aarch64-apple-darwin.tar.gz" }
+bin = "kimi"
+args = ["acp"]
+
+[[artifact]]
+os = "linux"
+arch = "aarch64"
+source = { archive = "https://github.com/MoonshotAI/kimi-cli/releases/download/1.48.0/kimi-1.48.0-aarch64-unknown-linux-gnu.tar.gz" }
+bin = "kimi"
+args = ["acp"]
+
+[[artifact]]
+os = "linux"
+arch = "x86_64"
+source = { archive = "https://github.com/MoonshotAI/kimi-cli/releases/download/1.48.0/kimi-1.48.0-x86_64-unknown-linux-gnu.tar.gz" }
+bin = "kimi"
+args = ["acp"]
+
+[[artifact]]
+os = "windows"
+arch = "aarch64"
+source = { archive = "https://github.com/MoonshotAI/kimi-cli/releases/download/1.48.0/kimi-1.48.0-aarch64-pc-windows-msvc.zip" }
+bin = "kimi.exe"
+args = ["acp"]
+
+[[artifact]]
+os = "windows"
+arch = "x86_64"
+source = { archive = "https://github.com/MoonshotAI/kimi-cli/releases/download/1.48.0/kimi-1.48.0-x86_64-pc-windows-msvc.zip" }
+bin = "kimi.exe"
+args = ["acp"]

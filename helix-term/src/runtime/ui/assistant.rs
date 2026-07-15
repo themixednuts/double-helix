@@ -21,19 +21,92 @@ fn context_label(item: &helix_view::assistant::context::Item) -> String {
 }
 
 fn connect_assistant_backend(
-    ingress: &crate::runtime::RuntimeIngress,
-    command: String,
-    args: Vec<String>,
-    mcp_servers: Vec<helix_acp::types::McpServer>,
-    profile: Option<helix_view::assistant::profile::Defaults>,
+    editor: &mut helix_view::Editor,
+    foreground: &crate::runtime::ForegroundEvents,
+    connection: crate::runtime::AssistantBackendConnection,
 ) {
-    ingress.task(RuntimeTaskEvent::ConnectAssistantBackend {
-        command,
-        args,
-        mcp_servers,
-        profile,
-        panel: helix_view::editor::PanelBehavior::Open,
-    });
+    if let Err(error) = foreground.task(RuntimeTaskEvent::ConnectAssistantBackend(Box::new(
+        connection,
+    ))) {
+        editor.set_error(error.to_string());
+    }
+}
+
+fn push_acp_agents_manager(
+    editor: &mut helix_view::Editor,
+    compositor: &mut Compositor,
+    ingress: crate::runtime::RuntimeIngress,
+) {
+    editor.notify_info("No assistant agents installed; opening ACP Agents");
+    match crate::ui::pkg::acp_manager(editor, ingress) {
+        Ok(manager) => compositor.push(Box::new(crate::ui::overlay::overlaid(manager))),
+        Err(err) => editor.set_error(format!("Failed to open ACP agents manager: {err}")),
+    }
+}
+
+fn push_configured_agents_picker(
+    editor: &mut helix_view::Editor,
+    compositor: &mut Compositor,
+    ingress: crate::runtime::RuntimeIngress,
+    agents: Vec<helix_view::editor::AgentConfig>,
+) {
+    let columns = [
+        crate::ui::PickerColumn::new("name", |item: &helix_view::editor::AgentConfig, _: &()| {
+            item.name.as_str().into()
+        }),
+        crate::ui::PickerColumn::new(
+            "command",
+            |item: &helix_view::editor::AgentConfig, _: &()| {
+                let mut cmd = item.command.clone();
+                if !item.args.is_empty() {
+                    cmd.push(' ');
+                    cmd.push_str(&item.args.join(" "));
+                }
+                cmd.into()
+            },
+        ),
+    ];
+
+    let picker = crate::ui::Picker::new(
+        columns,
+        0,
+        agents,
+        (),
+        crate::ui::PickerRuntime::new(editor),
+        ingress,
+        move |cx: &mut crate::compositor::Context,
+              item: &helix_view::editor::AgentConfig,
+              _action| {
+            cx.editor
+                .notify_info(format!("Connecting assistant agent {}", item.name));
+            match crate::runtime::AssistantBackendConnection::from_agent(
+                item.clone(),
+                None,
+                helix_view::editor::PanelBehavior::Open,
+            ) {
+                Ok(connection) => connect_assistant_backend(cx.editor, &cx.foreground, connection),
+                Err(err) => cx.editor.set_error(format!(
+                    "Assistant agent {} has an invalid identity: {err}",
+                    item.name
+                )),
+            }
+        },
+    );
+
+    compositor.push(Box::new(crate::ui::overlay::overlaid(picker)));
+}
+
+fn push_agent_picker_or_manager(
+    editor: &mut helix_view::Editor,
+    compositor: &mut Compositor,
+    ingress: crate::runtime::RuntimeIngress,
+) {
+    let agents = editor.assistant_agents();
+    if agents.is_empty() {
+        push_acp_agents_manager(editor, compositor, ingress);
+    } else {
+        push_configured_agents_picker(editor, compositor, ingress, agents);
+    }
 }
 
 fn profile_agent(
@@ -42,24 +115,22 @@ fn profile_agent(
 ) -> Option<helix_view::editor::AgentConfig> {
     if let Some(agent_name) = &profile.agent {
         return editor
-            .config()
-            .agents
-            .iter()
-            .find(|agent| agent.name == *agent_name)
-            .cloned();
+            .assistant_agents()
+            .into_iter()
+            .find(|agent| agent.name == *agent_name);
     }
     editor
         .active_assistant_backend_id()
         .and_then(|backend| editor.assistant_agent(&backend))
-        .or_else(|| editor.config().agents.first().cloned())
+        .or_else(|| editor.assistant_agents().into_iter().next())
 }
 
 fn connect_profile(
     editor: &mut helix_view::Editor,
-    ingress: &crate::runtime::RuntimeIngress,
+    foreground: &crate::runtime::ForegroundEvents,
     profile: &helix_view::assistant::profile::Definition,
 ) {
-    let Some(agent) = profile_agent(editor, profile) else {
+    let Some(mut agent) = profile_agent(editor, profile) else {
         editor.set_error("No assistant agent available for profile");
         return;
     };
@@ -67,13 +138,21 @@ fn connect_profile(
         Some(profile),
         &agent.mcp_servers,
     );
-    connect_assistant_backend(
-        ingress,
-        agent.command,
-        agent.args,
-        defaults.mcp_servers,
+    agent.mcp_servers = defaults.mcp_servers;
+    let connection = match crate::runtime::AssistantBackendConnection::from_agent(
+        agent,
         defaults.profile,
-    );
+        helix_view::editor::PanelBehavior::Open,
+    ) {
+        Ok(connection) => connection,
+        Err(err) => {
+            editor.set_error(format!(
+                "Assistant profile agent has an invalid identity: {err}"
+            ));
+            return;
+        }
+    };
+    connect_assistant_backend(editor, foreground, connection);
 }
 
 #[derive(Debug, Clone)]
@@ -106,6 +185,7 @@ pub(crate) fn apply_assistant_command(
     editor: &mut helix_view::Editor,
     compositor: &mut Compositor,
     ingress: crate::runtime::RuntimeIngress,
+    foreground: crate::runtime::ForegroundEvents,
     cmd: AssistantCommand,
 ) {
     match cmd {
@@ -117,22 +197,16 @@ pub(crate) fn apply_assistant_command(
                 panel.toggle_focus();
             } else if editor.has_assistant_threads() {
                 compositor.push(Box::new(AssistantPanel::new()));
-            } else if let Some(agent) = editor.config().agents.first().cloned() {
-                connect_assistant_backend(
-                    &ingress,
-                    agent.command,
-                    agent.args,
-                    agent.mcp_servers,
-                    None,
-                );
             } else {
-                compositor.push(Box::new(AssistantPanel::new()));
+                push_agent_picker_or_manager(editor, compositor, ingress);
             }
         }
         AssistantCommand::ClosePanel => {
             use crate::ui::assistant::ID as ASSISTANT_PANEL_ID;
 
-            ingress.task(RuntimeTaskEvent::RemoveAssistantPanel);
+            if let Err(error) = foreground.task(RuntimeTaskEvent::RemoveAssistantPanel) {
+                editor.set_error(error.to_string());
+            }
             compositor.remove(ASSISTANT_PANEL_ID);
         }
         AssistantCommand::FocusPanelInput => {
@@ -144,18 +218,8 @@ pub(crate) fn apply_assistant_command(
                 let mut panel = AssistantPanel::new();
                 panel.activate_input(editor);
                 compositor.push(Box::new(panel));
-            } else if let Some(agent) = editor.config().agents.first().cloned() {
-                connect_assistant_backend(
-                    &ingress,
-                    agent.command,
-                    agent.args,
-                    agent.mcp_servers,
-                    None,
-                );
             } else {
-                let mut panel = AssistantPanel::new();
-                panel.activate_input(editor);
-                compositor.push(Box::new(panel));
+                push_agent_picker_or_manager(editor, compositor, ingress);
             }
         }
         AssistantCommand::FocusPanelEntries => {
@@ -170,18 +234,8 @@ pub(crate) fn apply_assistant_command(
                 let mut panel = AssistantPanel::new();
                 panel.focus_messages(editor);
                 compositor.push(Box::new(panel));
-            } else if let Some(agent) = editor.config().agents.first().cloned() {
-                connect_assistant_backend(
-                    &ingress,
-                    agent.command,
-                    agent.args,
-                    agent.mcp_servers,
-                    None,
-                );
             } else {
-                let mut panel = AssistantPanel::new();
-                panel.focus_messages(editor);
-                compositor.push(Box::new(panel));
+                push_agent_picker_or_manager(editor, compositor, ingress);
             }
         }
         AssistantCommand::OpenPanel => {
@@ -224,11 +278,13 @@ pub(crate) fn apply_assistant_command(
                 crate::ui::PickerRuntime::new(editor),
                 ingress.clone(),
                 move |cx: &mut crate::compositor::Context, item: &PermissionPickerItem, _action| {
-                    cx.ingress.assistant_permission_resolved(
+                    if let Err(error) = cx.foreground.assistant_permission_resolved(
                         thread,
                         request_id.clone(),
                         helix_view::assistant::permission::Decision::Choose(item.id.clone()),
-                    );
+                    ) {
+                        cx.editor.set_error(error.to_string());
+                    }
                 },
             );
 
@@ -321,11 +377,10 @@ pub(crate) fn apply_assistant_command(
                                     item.origin.as_ref(),
                                     caps.as_ref(),
                                 );
-                                cx.ingress
-                                    .task(RuntimeTaskEvent::DeleteAssistantHistoryThread {
-                                        thread: item.id,
-                                        delete_remote,
-                                    });
+                                cx.submit_task(RuntimeTaskEvent::DeleteAssistantHistoryThread {
+                                    thread: item.id,
+                                    delete_remote,
+                                });
                                 *pending = None;
                             } else {
                                 *pending = Some(item.id);
@@ -334,7 +389,7 @@ pub(crate) fn apply_assistant_command(
                                     ToString::to_string,
                                 );
                                 cx.editor
-                                    .set_status(format!("Press d again to delete {title}"));
+                                    .notify_warning(format!("Press d again to delete {title}"));
                             }
                         },
                     ),
@@ -352,19 +407,18 @@ pub(crate) fn apply_assistant_command(
                       item: &helix_view::assistant::history::Stub,
                       _action| {
                     if cx.editor.assistant_thread_exists(item.id) {
-                        cx.ingress.task(RuntimeTaskEvent::ActivateAssistantThread {
+                        cx.submit_task(RuntimeTaskEvent::ActivateAssistantThread {
                             thread: item.id,
                             panel: helix_view::editor::PanelBehavior::Open,
                         });
                         return;
                     }
 
-                    cx.ingress
-                        .task(RuntimeTaskEvent::LoadAssistantHistoryThread {
-                            thread: item.id,
-                            activation: helix_view::editor::Activation::Activate,
-                            panel: helix_view::editor::PanelBehavior::Open,
-                        });
+                    cx.submit_task(RuntimeTaskEvent::LoadAssistantHistoryThread {
+                        thread: item.id,
+                        activation: helix_view::editor::Activation::Activate,
+                        panel: helix_view::editor::PanelBehavior::Open,
+                    });
                 },
             )
             .with_key_handlers(delete_handlers)
@@ -388,11 +442,10 @@ pub(crate) fn apply_assistant_command(
                         return;
                     }
                     *requested = Some(cursor.clone());
-                    cx.ingress
-                        .task(RuntimeTaskEvent::FetchAssistantHistoryPage {
-                            scope: scope.clone(),
-                            cursor: Some(cursor),
-                        });
+                    cx.submit_task(RuntimeTaskEvent::FetchAssistantHistoryPage {
+                        scope: scope.clone(),
+                        cursor: Some(cursor),
+                    });
                     cx.editor.set_status("Loading more assistant sessions...");
                 },
             ));
@@ -443,7 +496,7 @@ pub(crate) fn apply_assistant_command(
                         cx.editor
                             .set_status(format!("Assistant profile: {}", item.name));
                     } else {
-                        connect_profile(cx.editor, &cx.ingress, item);
+                        connect_profile(cx.editor, &cx.foreground, item);
                     }
                 },
             );
@@ -466,7 +519,7 @@ pub(crate) fn apply_assistant_command(
                 move |cx: &mut crate::compositor::Context,
                       item: &helix_view::assistant::context::Item,
                       _action| {
-                    cx.ingress.task(RuntimeTaskEvent::DetachAssistantContext {
+                    cx.submit_task(RuntimeTaskEvent::DetachAssistantContext {
                         item: item.id.clone(),
                     });
                 },
@@ -553,45 +606,7 @@ pub(crate) fn apply_assistant_command(
             compositor.push(Box::new(crate::ui::overlay::overlaid(picker)));
         }
         AssistantCommand::PushConfiguredAgentsPicker { agents } => {
-            let columns = [
-                crate::ui::PickerColumn::new(
-                    "name",
-                    |item: &helix_view::editor::AgentConfig, _: &()| item.name.as_str().into(),
-                ),
-                crate::ui::PickerColumn::new(
-                    "command",
-                    |item: &helix_view::editor::AgentConfig, _: &()| {
-                        let mut cmd = item.command.clone();
-                        if !item.args.is_empty() {
-                            cmd.push(' ');
-                            cmd.push_str(&item.args.join(" "));
-                        }
-                        cmd.into()
-                    },
-                ),
-            ];
-
-            let picker = crate::ui::Picker::new(
-                columns,
-                0,
-                agents,
-                (),
-                crate::ui::PickerRuntime::new(editor),
-                ingress.clone(),
-                move |cx: &mut crate::compositor::Context,
-                      item: &helix_view::editor::AgentConfig,
-                      _action| {
-                    connect_assistant_backend(
-                        &cx.ingress,
-                        item.command.clone(),
-                        item.args.clone(),
-                        item.mcp_servers.clone(),
-                        None,
-                    );
-                },
-            );
-
-            compositor.push(Box::new(crate::ui::overlay::overlaid(picker)));
+            push_configured_agents_picker(editor, compositor, ingress, agents);
         }
     }
 }
@@ -599,6 +614,41 @@ pub(crate) fn apply_assistant_command(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn agent(id: &str, name: &str) -> helix_view::editor::AgentConfig {
+        helix_view::editor::AgentConfig {
+            id: Some(id.to_owned()),
+            name: name.to_owned(),
+            command: "node".to_owned(),
+            args: vec!["agent.js".to_owned()],
+            env: Default::default(),
+            mcp_servers: Vec::new(),
+            theme: None,
+        }
+    }
+
+    #[test]
+    fn selected_agent_connection_keeps_identity_and_display_name() {
+        let first = crate::runtime::AssistantBackendConnection::from_agent(
+            agent("first", "First Agent"),
+            None,
+            helix_view::editor::PanelBehavior::Open,
+        )
+        .unwrap();
+        let second = crate::runtime::AssistantBackendConnection::from_agent(
+            agent("second", "Second Agent"),
+            None,
+            helix_view::editor::PanelBehavior::Open,
+        )
+        .unwrap();
+
+        assert_eq!(first.launch.backend_id.as_str(), "acp:agent:first");
+        assert_eq!(first.launch.display_name, "First Agent");
+        assert_eq!(second.launch.backend_id.as_str(), "acp:agent:second");
+        assert_eq!(second.launch.display_name, "Second Agent");
+        assert_eq!(first.launch.command, second.launch.command);
+        assert_ne!(first.launch.backend_id, second.launch.backend_id);
+    }
 
     #[test]
     fn assistant_history_delete_remote_requires_backend_origin_and_cap() {

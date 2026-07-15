@@ -94,6 +94,7 @@ pub struct Thread {
     origin: Origin,
     title: Option<String>,
     entries: Vec<Entry>,
+    content_revision: u64,
     turns: Vec<Turn>,
     plan: Vec<plan::Item>,
     draft: String,
@@ -158,6 +159,7 @@ pub enum Focus {
 pub struct Entry {
     pub id: EntryId,
     pub turn: Option<TurnId>,
+    pub stream: Option<StreamId>,
     pub kind: EntryKind,
     pub locations: Vec<Location>,
 }
@@ -165,8 +167,48 @@ pub struct Entry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewEntry {
     pub turn: Option<TurnId>,
+    pub stream: Option<StreamId>,
     pub kind: EntryKind,
     pub locations: Vec<Location>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct StreamId {
+    pub kind: StreamKind,
+    pub id: String,
+}
+
+impl StreamId {
+    #[must_use]
+    pub fn user_prompt(id: impl Into<String>) -> Self {
+        Self {
+            kind: StreamKind::UserPrompt,
+            id: id.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn assistant_text(id: impl Into<String>) -> Self {
+        Self {
+            kind: StreamKind::AssistantText,
+            id: id.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn thought(id: impl Into<String>) -> Self {
+        Self {
+            kind: StreamKind::Thought,
+            id: id.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum StreamKind {
+    UserPrompt,
+    AssistantText,
+    Thought,
 }
 
 #[allow(
@@ -215,6 +257,8 @@ pub struct Usage {
     pub output_tokens: u64,
     pub total_input_tokens: u64,
     pub total_output_tokens: u64,
+    pub context_used_tokens: u64,
+    pub context_window_tokens: u64,
     pub cache_creation_input_tokens: u64,
     pub cache_read_input_tokens: u64,
 }
@@ -225,6 +269,8 @@ pub struct UsageUpdate {
     pub output_tokens: Option<u64>,
     pub total_input_tokens: Option<u64>,
     pub total_output_tokens: Option<u64>,
+    pub context_used_tokens: Option<u64>,
+    pub context_window_tokens: Option<u64>,
     pub cache_creation_input_tokens: Option<u64>,
     pub cache_read_input_tokens: Option<u64>,
 }
@@ -328,6 +374,7 @@ pub enum ElicitationResponse {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Content {
     Append(NewEntry),
+    Stream(NewEntry),
     Replace { id: EntryId, entry: NewEntry },
     Remove { id: EntryId },
 }
@@ -345,6 +392,7 @@ impl Thread {
             origin,
             title: None,
             entries: Vec::new(),
+            content_revision: 0,
             turns: Vec::new(),
             plan: Vec::new(),
             draft: String::new(),
@@ -608,6 +656,7 @@ impl Thread {
     pub fn restore_persisted_state(&mut self, state: PersistedState) {
         self.title = state.title;
         self.entries = state.entries;
+        self.content_revision = self.content_revision.wrapping_add(1);
         self.turns = state.turns;
         self.plan = state.plan;
         self.draft = state.draft;
@@ -654,6 +703,11 @@ impl Thread {
     #[must_use]
     pub fn selected_entry(&self) -> Option<EntryId> {
         self.view.selected
+    }
+
+    #[must_use]
+    pub fn content_revision(&self) -> u64 {
+        self.content_revision
     }
 
     #[must_use]
@@ -758,6 +812,7 @@ impl Thread {
         {
             self.view.selected = self.entries.last().map(|entry| entry.id);
         }
+        self.content_revision = self.content_revision.wrapping_add(1);
         true
     }
 
@@ -785,7 +840,10 @@ impl Thread {
 
     pub fn apply(&mut self, event: Event) {
         match event {
-            Event::Content(content) => self.apply_content(content),
+            Event::Content(content) => {
+                self.apply_content(content);
+                self.content_revision = self.content_revision.wrapping_add(1);
+            }
             Event::Plan(plan::Event::Replace(items)) => self.set_plan(items),
             Event::Meta(Meta::Title(title)) => self.set_title(title),
             Event::Mode(mode) => self.set_mode(Some(mode)),
@@ -814,47 +872,116 @@ impl Thread {
 
     fn apply_content(&mut self, content: Content) {
         match content {
-            Content::Append(entry) => match entry.kind {
-                EntryKind::AssistantText { text } => {
-                    if let Some(Entry {
-                        id,
-                        kind: EntryKind::AssistantText { text: existing },
-                        locations,
-                        ..
-                    }) = self.entries.last_mut()
-                    {
-                        existing.push_str(&text);
-                        locations.extend(normalize_locations(*id, entry.locations));
-                    } else {
-                        let id = self.next_entry_id();
-                        self.entries.push(Entry {
-                            id,
-                            turn: entry.turn,
-                            kind: EntryKind::AssistantText { text },
-                            locations: normalize_locations(id, entry.locations),
-                        });
+            Content::Stream(entry) => {
+                if entry.stream.is_none() {
+                    if let Some(existing) = self.entries.last_mut() {
+                        let merged = match (&mut existing.kind, &entry.kind) {
+                            (
+                                EntryKind::UserPrompt { text: existing },
+                                EntryKind::UserPrompt { text },
+                            )
+                            | (
+                                EntryKind::AssistantText { text: existing },
+                                EntryKind::AssistantText { text },
+                            )
+                            | (
+                                EntryKind::Thought { text: existing },
+                                EntryKind::Thought { text },
+                            ) => {
+                                existing.push_str(text);
+                                true
+                            }
+                            _ => false,
+                        };
+                        if merged {
+                            existing.turn = entry.turn;
+                            existing.locations.extend(normalize_locations(
+                                existing.id,
+                                entry.locations,
+                            ));
+                            return;
+                        }
                     }
                 }
-                EntryKind::Thought { text } => {
-                    if let Some(Entry {
-                        id,
-                        kind: EntryKind::Thought { text: existing },
-                        locations,
-                        ..
-                    }) = self.entries.last_mut()
+                self.apply_content(Content::Append(entry));
+            }
+            Content::Append(entry) => match entry.kind {
+                EntryKind::UserPrompt { text } => {
+                    if let Some(existing) = entry
+                        .stream
+                        .as_ref()
+                        .and_then(|stream| self.stream_entry_mut(stream))
                     {
-                        existing.push_str(&text);
-                        locations.extend(normalize_locations(*id, entry.locations));
-                    } else {
-                        let id = self.next_entry_id();
-                        self.entries.push(Entry {
-                            id,
-                            turn: entry.turn,
-                            kind: EntryKind::Thought { text },
-                            locations: normalize_locations(id, entry.locations),
-                        });
-                        self.view.folded.insert(id);
+                        if let EntryKind::UserPrompt {
+                            text: existing_text,
+                        } = &mut existing.kind
+                        {
+                            existing_text.push_str(&text);
+                            existing.turn = entry.turn;
+                            existing
+                                .locations
+                                .extend(normalize_locations(existing.id, entry.locations));
+                            return;
+                        }
                     }
+                    let id = self.next_entry_id();
+                    self.entries.push(Entry {
+                        id,
+                        turn: entry.turn,
+                        stream: entry.stream,
+                        kind: EntryKind::UserPrompt { text },
+                        locations: normalize_locations(id, entry.locations),
+                    });
+                }
+                EntryKind::AssistantText { text } => {
+                    if let Some(existing) = entry
+                        .stream
+                        .as_ref()
+                        .and_then(|stream| self.stream_entry_mut(stream))
+                    {
+                        if let EntryKind::AssistantText { text: existing_text } = &mut existing.kind
+                        {
+                            existing_text.push_str(&text);
+                            existing.turn = entry.turn;
+                            existing
+                                .locations
+                                .extend(normalize_locations(existing.id, entry.locations));
+                            return;
+                        }
+                    }
+                    let id = self.next_entry_id();
+                    self.entries.push(Entry {
+                        id,
+                        turn: entry.turn,
+                        stream: entry.stream,
+                        kind: EntryKind::AssistantText { text },
+                        locations: normalize_locations(id, entry.locations),
+                    });
+                }
+                EntryKind::Thought { text } => {
+                    if let Some(existing) = entry
+                        .stream
+                        .as_ref()
+                        .and_then(|stream| self.stream_entry_mut(stream))
+                    {
+                        if let EntryKind::Thought { text: existing_text } = &mut existing.kind {
+                            existing_text.push_str(&text);
+                            existing.turn = entry.turn;
+                            existing
+                                .locations
+                                .extend(normalize_locations(existing.id, entry.locations));
+                            return;
+                        }
+                    }
+                    let id = self.next_entry_id();
+                    self.entries.push(Entry {
+                        id,
+                        turn: entry.turn,
+                        stream: entry.stream,
+                        kind: EntryKind::Thought { text },
+                        locations: normalize_locations(id, entry.locations),
+                    });
+                    self.view.folded.insert(id);
                 }
                 EntryKind::ToolCall(call) => {
                     if let Some(existing) = self.entries.iter_mut().rev().find(|entry| {
@@ -865,6 +992,7 @@ impl Thread {
                             _ => call,
                         };
                         existing.turn = entry.turn;
+                        existing.stream = entry.stream;
                         existing.kind = EntryKind::ToolCall(call);
                         existing.locations = normalize_locations(existing.id, entry.locations);
                     } else {
@@ -872,6 +1000,7 @@ impl Thread {
                         self.entries.push(Entry {
                             id,
                             turn: entry.turn,
+                            stream: entry.stream,
                             kind: EntryKind::ToolCall(call),
                             locations: normalize_locations(id, entry.locations),
                         });
@@ -886,6 +1015,7 @@ impl Thread {
                         )
                     }) {
                         existing.turn = entry.turn;
+                        existing.stream = entry.stream;
                         existing.kind = EntryKind::ChangeSummary(summary);
                         existing.locations = normalize_locations(existing.id, entry.locations);
                     } else {
@@ -893,6 +1023,7 @@ impl Thread {
                         self.entries.push(Entry {
                             id,
                             turn: entry.turn,
+                            stream: entry.stream,
                             kind: EntryKind::ChangeSummary(summary),
                             locations: normalize_locations(id, entry.locations),
                         });
@@ -903,6 +1034,7 @@ impl Thread {
                     self.entries.push(Entry {
                         id,
                         turn: entry.turn,
+                        stream: entry.stream,
                         kind,
                         locations: normalize_locations(id, entry.locations),
                     });
@@ -911,6 +1043,7 @@ impl Thread {
             Content::Replace { id, entry } => {
                 if let Some(existing) = self.entries.iter_mut().find(|existing| existing.id == id) {
                     existing.turn = entry.turn;
+                    existing.stream = entry.stream;
                     existing.kind = entry.kind;
                     existing.locations = normalize_locations(existing.id, entry.locations);
                 }
@@ -937,6 +1070,7 @@ impl Thread {
                 )];
                 self.apply_content(Content::Append(NewEntry {
                     turn: None,
+                    stream: None,
                     kind: EntryKind::ChangeSummary(change::Summary {
                         files: vec![change::File {
                             path: file.path.clone(),
@@ -983,6 +1117,12 @@ impl Thread {
         }
         if let Some(value) = update.total_output_tokens {
             self.usage.total_output_tokens = value;
+        }
+        if let Some(value) = update.context_used_tokens {
+            self.usage.context_used_tokens = value;
+        }
+        if let Some(value) = update.context_window_tokens {
+            self.usage.context_window_tokens = value;
         }
         if let Some(value) = update.cache_creation_input_tokens {
             self.usage.cache_creation_input_tokens = value;
@@ -1061,6 +1201,12 @@ impl Thread {
         EntryId::new(NonZeroU64::new(self.entries.len() as u64 + 1).unwrap())
     }
 
+    fn stream_entry_mut(&mut self, stream: &StreamId) -> Option<&mut Entry> {
+        self.entries
+            .iter_mut()
+            .find(|entry| entry.stream.as_ref() == Some(stream))
+    }
+
     #[must_use]
     pub fn change_summary(&self) -> Option<change::Summary> {
         collect_change_summaries(self.entries.iter().filter_map(Entry::change_summary))
@@ -1102,6 +1248,9 @@ fn merge_tool_call(current: &tool::Call, mut next: tool::Call) -> tool::Call {
     if next.name == "tool" && current.name != "tool" {
         next.name.clone_from(&current.name);
     }
+    if is_unspecified_tool_state(&next.state) {
+        next.state.clone_from(&current.state);
+    }
     if next.output.is_empty() {
         next.output.clone_from(&current.output);
     } else if !current.output.is_empty() {
@@ -1119,6 +1268,10 @@ fn merge_tool_call(current: &tool::Call, mut next: tool::Call) -> tool::Call {
         next.sandbox.clone_from(&current.sandbox);
     }
     next
+}
+
+fn is_unspecified_tool_state(state: &tool::State) -> bool {
+    matches!(state, tool::State::Unknown(value) if value.as_ref() == "unspecified")
 }
 
 fn normalize_locations(entry: EntryId, locations: Vec<Location>) -> Vec<Location> {
@@ -1161,10 +1314,51 @@ mod tests {
     fn append(thread: &mut Thread, kind: EntryKind) -> EntryId {
         thread.apply(Event::Content(Content::Append(NewEntry {
             turn: None,
+            stream: None,
             kind,
             locations: Vec::new(),
         })));
         thread.entries().last().expect("entry").id
+    }
+
+    fn append_stream(thread: &mut Thread, stream: StreamId, kind: EntryKind) -> EntryId {
+        thread.apply(Event::Content(Content::Append(NewEntry {
+            turn: None,
+            stream: Some(stream),
+            kind,
+            locations: Vec::new(),
+        })));
+        thread.entries().last().expect("entry").id
+    }
+
+    fn append_legacy_stream(thread: &mut Thread, kind: EntryKind) -> EntryId {
+        thread.apply(Event::Content(Content::Stream(NewEntry {
+            turn: None,
+            stream: None,
+            kind,
+            locations: Vec::new(),
+        })));
+        thread.entries().last().expect("entry").id
+    }
+
+    #[test]
+    fn content_revision_changes_only_with_transcript_content() {
+        let mut thread = thread();
+        assert_eq!(thread.content_revision(), 0);
+
+        let first = append(
+            &mut thread,
+            EntryKind::AssistantText {
+                text: "first".into(),
+            },
+        );
+        assert_eq!(thread.content_revision(), 1);
+
+        thread.apply(Event::Meta(Meta::Title(Some("title".into()))));
+        assert_eq!(thread.content_revision(), 1);
+
+        assert!(thread.fork_before(first));
+        assert_eq!(thread.content_revision(), 2);
     }
 
     #[test]
@@ -1187,5 +1381,173 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(texts, vec!["U0", "A0"]);
+    }
+
+    #[test]
+    fn streamed_assistant_text_chunks_merge_by_stream_id() {
+        let mut thread = thread();
+        let stream = StreamId::assistant_text("msg-agent");
+        let first = append_stream(
+            &mut thread,
+            stream.clone(),
+            EntryKind::AssistantText {
+                text: "Rece".into(),
+            },
+        );
+        append(
+            &mut thread,
+            EntryKind::Status {
+                text: "between".into(),
+            },
+        );
+        append_stream(
+            &mut thread,
+            stream,
+            EntryKind::AssistantText {
+                text: "ived.".into(),
+            },
+        );
+
+        assert_eq!(thread.entries().len(), 2);
+        assert_eq!(thread.entries()[0].id, first);
+        assert!(matches!(
+            &thread.entries()[0].kind,
+            EntryKind::AssistantText { text } if text == "Received."
+        ));
+    }
+
+    #[test]
+    fn streamed_user_prompt_chunks_merge_by_stream_id() {
+        let mut thread = thread();
+        let stream = StreamId::user_prompt("msg-user");
+        let first = append_stream(
+            &mut thread,
+            stream.clone(),
+            EntryKind::UserPrompt { text: "hel".into() },
+        );
+        append_stream(
+            &mut thread,
+            stream,
+            EntryKind::UserPrompt { text: "lo".into() },
+        );
+
+        assert_eq!(thread.entries().len(), 1);
+        assert_eq!(thread.entries()[0].id, first);
+        assert!(matches!(
+            &thread.entries()[0].kind,
+            EntryKind::UserPrompt { text } if text == "hello"
+        ));
+    }
+
+    #[test]
+    fn streamed_thought_chunks_merge_by_stream_id() {
+        let mut thread = thread();
+        let stream = StreamId::thought("msg-thought");
+        append_stream(
+            &mut thread,
+            stream.clone(),
+            EntryKind::Thought {
+                text: "think".into(),
+            },
+        );
+        append_stream(
+            &mut thread,
+            stream,
+            EntryKind::Thought { text: "ing".into() },
+        );
+
+        assert_eq!(thread.entries().len(), 1);
+        assert!(matches!(
+            &thread.entries()[0].kind,
+            EntryKind::Thought { text } if text == "thinking"
+        ));
+    }
+
+    #[test]
+    fn different_assistant_text_streams_create_distinct_entries() {
+        let mut thread = thread();
+        append_stream(
+            &mut thread,
+            StreamId::assistant_text("msg-a"),
+            EntryKind::AssistantText {
+                text: "Received.".into(),
+            },
+        );
+        append_stream(
+            &mut thread,
+            StreamId::assistant_text("msg-b"),
+            EntryKind::AssistantText {
+                text: "Received.".into(),
+            },
+        );
+
+        assert_eq!(thread.entries().len(), 2);
+        assert_eq!(
+            thread.entries()[0].stream,
+            Some(StreamId::assistant_text("msg-a"))
+        );
+        assert_eq!(
+            thread.entries()[1].stream,
+            Some(StreamId::assistant_text("msg-b"))
+        );
+    }
+
+    #[test]
+    fn unstreamed_assistant_text_chunks_still_append_adjacently() {
+        let mut thread = thread();
+        append_legacy_stream(
+            &mut thread,
+            EntryKind::AssistantText {
+                text: "Rece".into(),
+            },
+        );
+        append_legacy_stream(
+            &mut thread,
+            EntryKind::AssistantText {
+                text: "ived.".into(),
+            },
+        );
+
+        assert_eq!(thread.entries().len(), 1);
+        assert!(matches!(
+            &thread.entries()[0].kind,
+            EntryKind::AssistantText { text } if text == "Received."
+        ));
+    }
+
+    #[test]
+    fn tool_update_without_status_preserves_current_state() {
+        let mut thread = thread();
+        append(
+            &mut thread,
+            EntryKind::ToolCall(tool::Call {
+                id: tool::Id::new("tool-1"),
+                name: "Search".to_string(),
+                state: tool::State::Running,
+                output: String::new(),
+                subagent: None,
+                sandbox: None,
+            }),
+        );
+        append(
+            &mut thread,
+            EntryKind::ToolCall(tool::Call {
+                id: tool::Id::new("tool-1"),
+                name: "tool".to_string(),
+                state: tool::State::Unknown("unspecified".into()),
+                output: "partial".to_string(),
+                subagent: None,
+                sandbox: None,
+            }),
+        );
+
+        assert_eq!(thread.entries().len(), 1);
+        assert!(matches!(
+            &thread.entries()[0].kind,
+            EntryKind::ToolCall(call)
+                if call.name == "Search"
+                    && call.state == tool::State::Running
+                    && call.output == "partial"
+        ));
     }
 }

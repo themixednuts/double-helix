@@ -1,0 +1,51 @@
+name = "qwen-code"
+kind = "acp"
+description = "Alibaba's Qwen coding assistant"
+homepage = "https://qwenlm.github.io/qwen-code-docs/en/users/overview"
+aliases = ["Qwen Code", "https://github.com/QwenLM/qwen-code"]
+categories = ["agent-client-protocol", "assistant"]
+
+[version]
+tag-source = "static:0.19.6"
+
+[[artifact]]
+os = "windows"
+arch = "x86_64"
+source = { npx = "@qwen-code/qwen-code@0.19.6" }
+bin = "qwen-code"
+args = ["--acp", "--experimental-skills"]
+
+[[artifact]]
+os = "windows"
+arch = "aarch64"
+source = { npx = "@qwen-code/qwen-code@0.19.6" }
+bin = "qwen-code"
+args = ["--acp", "--experimental-skills"]
+
+[[artifact]]
+os = "linux"
+arch = "x86_64"
+source = { npx = "@qwen-code/qwen-code@0.19.6" }
+bin = "qwen-code"
+args = ["--acp", "--experimental-skills"]
+
+[[artifact]]
+os = "linux"
+arch = "aarch64"
+source = { npx = "@qwen-code/qwen-code@0.19.6" }
+bin = "qwen-code"
+args = ["--acp", "--experimental-skills"]
+
+[[artifact]]
+os = "macos"
+arch = "aarch64"
+source = { npx = "@qwen-code/qwen-code@0.19.6" }
+bin = "qwen-code"
+args = ["--acp", "--experimental-skills"]
+
+[[artifact]]
+os = "macos"
+arch = "x86_64"
+source = { npx = "@qwen-code/qwen-code@0.19.6" }
+bin = "qwen-code"
+args = ["--acp", "--experimental-skills"]

@@ -1,0 +1,51 @@
+name = "opencode"
+kind = "acp"
+description = "The open source coding agent"
+homepage = "https://opencode.ai"
+aliases = ["OpenCode", "https://github.com/anomalyco/opencode"]
+categories = ["agent-client-protocol", "assistant"]
+
+[version]
+tag-source = "static:1.17.14"
+
+[[artifact]]
+os = "macos"
+arch = "aarch64"
+source = { archive = "https://github.com/anomalyco/opencode/releases/download/v1.17.14/opencode-darwin-arm64.zip" }
+bin = "opencode"
+args = ["acp"]
+
+[[artifact]]
+os = "macos"
+arch = "x86_64"
+source = { archive = "https://github.com/anomalyco/opencode/releases/download/v1.17.14/opencode-darwin-x64.zip" }
+bin = "opencode"
+args = ["acp"]
+
+[[artifact]]
+os = "linux"
+arch = "aarch64"
+source = { archive = "https://github.com/anomalyco/opencode/releases/download/v1.17.14/opencode-linux-arm64.tar.gz" }
+bin = "opencode"
+args = ["acp"]
+
+[[artifact]]
+os = "linux"
+arch = "x86_64"
+source = { archive = "https://github.com/anomalyco/opencode/releases/download/v1.17.14/opencode-linux-x64.tar.gz" }
+bin = "opencode"
+args = ["acp"]
+
+[[artifact]]
+os = "windows"
+arch = "aarch64"
+source = { archive = "https://github.com/anomalyco/opencode/releases/download/v1.17.14/opencode-windows-arm64.zip" }
+bin = "opencode"
+args = ["acp"]
+
+[[artifact]]
+os = "windows"
+arch = "x86_64"
+source = { archive = "https://github.com/anomalyco/opencode/releases/download/v1.17.14/opencode-windows-x64.zip" }
+bin = "opencode.exe"
+args = ["acp"]

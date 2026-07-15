@@ -1,0 +1,45 @@
+name = "autohand"
+kind = "acp"
+description = "Autohand Code - AI coding agent powered by Autohand AI"
+homepage = "https://www.autohand.ai/cli/"
+aliases = ["Autohand Code", "https://github.com/autohandai/autohand-acp"]
+categories = ["agent-client-protocol", "assistant"]
+
+[version]
+tag-source = "static:0.2.1"
+
+[[artifact]]
+os = "windows"
+arch = "x86_64"
+source = { npx = "@autohandai/autohand-acp@0.2.1" }
+bin = "autohand"
+
+[[artifact]]
+os = "windows"
+arch = "aarch64"
+source = { npx = "@autohandai/autohand-acp@0.2.1" }
+bin = "autohand"
+
+[[artifact]]
+os = "linux"
+arch = "x86_64"
+source = { npx = "@autohandai/autohand-acp@0.2.1" }
+bin = "autohand"
+
+[[artifact]]
+os = "linux"
+arch = "aarch64"
+source = { npx = "@autohandai/autohand-acp@0.2.1" }
+bin = "autohand"
+
+[[artifact]]
+os = "macos"
+arch = "aarch64"
+source = { npx = "@autohandai/autohand-acp@0.2.1" }
+bin = "autohand"
+
+[[artifact]]
+os = "macos"
+arch = "x86_64"
+source = { npx = "@autohandai/autohand-acp@0.2.1" }
+bin = "autohand"

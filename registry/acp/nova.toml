@@ -1,0 +1,51 @@
+name = "nova"
+kind = "acp"
+description = "Nova by Compass AI - a fully-fledged software engineer at your command"
+homepage = "https://www.compassap.ai/portfolio/nova.html"
+aliases = ["Nova", "https://github.com/Compass-Agentic-Platform/nova"]
+categories = ["agent-client-protocol", "assistant"]
+
+[version]
+tag-source = "static:1.1.24"
+
+[[artifact]]
+os = "windows"
+arch = "x86_64"
+source = { npx = "@compass-ai/nova@1.1.24" }
+bin = "nova"
+args = ["acp"]
+
+[[artifact]]
+os = "windows"
+arch = "aarch64"
+source = { npx = "@compass-ai/nova@1.1.24" }
+bin = "nova"
+args = ["acp"]
+
+[[artifact]]
+os = "linux"
+arch = "x86_64"
+source = { npx = "@compass-ai/nova@1.1.24" }
+bin = "nova"
+args = ["acp"]
+
+[[artifact]]
+os = "linux"
+arch = "aarch64"
+source = { npx = "@compass-ai/nova@1.1.24" }
+bin = "nova"
+args = ["acp"]
+
+[[artifact]]
+os = "macos"
+arch = "aarch64"
+source = { npx = "@compass-ai/nova@1.1.24" }
+bin = "nova"
+args = ["acp"]
+
+[[artifact]]
+os = "macos"
+arch = "x86_64"
+source = { npx = "@compass-ai/nova@1.1.24" }
+bin = "nova"
+args = ["acp"]

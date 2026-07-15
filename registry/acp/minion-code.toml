@@ -1,0 +1,51 @@
+name = "minion-code"
+kind = "acp"
+description = "An enhanced AI code assistant built on the Minion framework with rich development tools"
+homepage = "https://github.com/femto/minion-code"
+aliases = ["Minion Code"]
+categories = ["agent-client-protocol", "assistant"]
+
+[version]
+tag-source = "static:0.1.44"
+
+[[artifact]]
+os = "windows"
+arch = "x86_64"
+source = { uvx = "minion-code@0.1.44" }
+bin = "minion-code"
+args = ["acp"]
+
+[[artifact]]
+os = "windows"
+arch = "aarch64"
+source = { uvx = "minion-code@0.1.44" }
+bin = "minion-code"
+args = ["acp"]
+
+[[artifact]]
+os = "linux"
+arch = "x86_64"
+source = { uvx = "minion-code@0.1.44" }
+bin = "minion-code"
+args = ["acp"]
+
+[[artifact]]
+os = "linux"
+arch = "aarch64"
+source = { uvx = "minion-code@0.1.44" }
+bin = "minion-code"
+args = ["acp"]
+
+[[artifact]]
+os = "macos"
+arch = "aarch64"
+source = { uvx = "minion-code@0.1.44" }
+bin = "minion-code"
+args = ["acp"]
+
+[[artifact]]
+os = "macos"
+arch = "x86_64"
+source = { uvx = "minion-code@0.1.44" }
+bin = "minion-code"
+args = ["acp"]

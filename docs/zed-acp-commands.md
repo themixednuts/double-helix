@@ -39,7 +39,7 @@ Example (e.g. cmd-alt-c for Claude):
 
 - **Registry:** Agents are listed in the [ACP Registry](https://agentclientprotocol.com/registry). Zed fetches `https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json` and uses each entry’s `distribution.binary` (per-platform `cmd` + `args`) or `distribution.npx` (`package` + `args`).
 - **NPX agents:** Zed runs `npm exec --yes <package> [-- args...]` (see `agent_server_store.rs`).
-- **Claude Agent:** Zed installs `@zed-industries/claude-agent-acp`; that adapter runs the Claude Code CLI (vendored or overridden via `CLAUDE_CODE_EXECUTABLE` in settings).
+- **Claude Agent:** Current ACP registry entries use `@agentclientprotocol/claude-agent-acp`; that adapter runs the Claude Code CLI.
 - **Settings override:** Under `agent_servers` you can set `"type": "registry"` and use registry names `claude-acp`, `codex-acp`, `gemini` plus custom `env` (e.g. `CLAUDE_CODE_EXECUTABLE`).
 
 ## Custom agent (settings)

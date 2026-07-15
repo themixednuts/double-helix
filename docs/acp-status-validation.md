@@ -5,16 +5,10 @@ status line (agent, thinking, mode, etc.).
 
 ## Testing with mock agent
 
-To test the ACP flow without API keys or network, use the mock echo agent.
-Add to your `config.toml` (e.g. `~/.config/helix/config.toml` or project root):
-
-```toml
-[[editor.agents]]
-name = "Mock Echo"
-command = "node"
-args = ["scripts/mock-acp-agent.js"]
-# Use a path that resolves from your working directory, or an absolute path on your machine.
-```
+To test the ACP flow without API keys or network, build/run from the repository
+root with `--features mock-acp`. That feature adds the mock echo agent to ACP
+discovery. Builds without that feature, including default release builds, do
+not compile it in.
 
 Then run `hx`, press **Space A c** to connect, choose "Mock Echo", **Space A i** to
 chat. Try these inputs:
@@ -47,7 +41,7 @@ Use `RUST_LOG=debug` for more detail.
 **Windows (npm.cmd):**
 
 ```bash
-cargo run -p helix-acp --example call_session_new -- npm.cmd exec --yes @zed-industries/claude-agent-acp@0.20.2
+cargo run -p helix-acp --example call_session_new -- npm.cmd exec --yes @agentclientprotocol/claude-agent-acp@0.56.0
 ```
 
 **With CLI installed globally:**
@@ -178,7 +172,7 @@ Each agent can have a theme that applies when connected:
 [[editor.agents]]
 name = "Claude Agent"
 command = "npm.cmd"
-args = ["exec", "--yes", "@zed-industries/claude-agent-acp@0.20.2"]
+args = ["exec", "--yes", "@agentclientprotocol/claude-agent-acp@0.56.0"]
 theme = "claude"   # optional: theme name to apply when this agent is connected
 
 [[editor.agents]]

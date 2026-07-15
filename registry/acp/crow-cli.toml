@@ -1,0 +1,44 @@
+name = "crow-cli"
+kind = "acp"
+description = "Minimal ACP Native Coding Agent"
+homepage = "https://crow-ai.dev"
+aliases = ["crow-cli", "https://github.com/crow-cli/crow-cli"]
+categories = ["agent-client-protocol", "assistant"]
+
+[version]
+tag-source = "static:0.1.24"
+
+[[artifact]]
+os = "macos"
+arch = "aarch64"
+source = { archive = "https://github.com/crow-cli/crow-cli/releases/download/v0.1.24/crow-cli-darwin-aarch64.tar.gz" }
+bin = "crow-cli"
+args = ["acp"]
+
+[[artifact]]
+os = "macos"
+arch = "x86_64"
+source = { archive = "https://github.com/crow-cli/crow-cli/releases/download/v0.1.24/crow-cli-darwin-x86_64.tar.gz" }
+bin = "crow-cli"
+args = ["acp"]
+
+[[artifact]]
+os = "linux"
+arch = "aarch64"
+source = { archive = "https://github.com/crow-cli/crow-cli/releases/download/v0.1.24/crow-cli-linux-aarch64.tar.gz" }
+bin = "crow-cli"
+args = ["acp"]
+
+[[artifact]]
+os = "linux"
+arch = "x86_64"
+source = { archive = "https://github.com/crow-cli/crow-cli/releases/download/v0.1.24/crow-cli-linux-x86_64.tar.gz" }
+bin = "crow-cli"
+args = ["acp"]
+
+[[artifact]]
+os = "windows"
+arch = "x86_64"
+source = { archive = "https://github.com/crow-cli/crow-cli/releases/download/v0.1.24/crow-cli-windows-x86_64.zip" }
+bin = "crow-cli.exe"
+args = ["acp"]

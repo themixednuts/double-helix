@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use super::{auth, context, history, mode, plan, review, terminal, thread, Store};
 use crate::collab::Location;
@@ -33,6 +34,8 @@ pub struct ThreadView {
     pub title: Option<String>,
     pub is_remote: bool,
     pub entries: Vec<EntryView>,
+    pub content_revision: u64,
+    pub active_thought: Option<thread::EntryId>,
     pub draft: String,
     pub context: Vec<Pill>,
     pub run: thread::Run,
@@ -42,6 +45,7 @@ pub struct ThreadView {
     pub follow: Follow,
     pub mode_name: Option<String>,
     pub model_label: Option<String>,
+    pub thinking_label: Option<String>,
     pub profile_name: Option<String>,
     pub feedback: thread::Feedback,
     pub plan: Vec<plan::Item>,
@@ -340,7 +344,10 @@ impl Store {
                     .entries
                     .into_iter()
                     .map(EntryView::to_model)
-                    .collect(),
+                    .collect::<Vec<_>>()
+                    .into(),
+                content_revision: active.content_revision,
+                active_thought: active.active_thought,
                 agent_busy: matches!(active.run, thread::Run::Running | thread::Run::Waiting),
                 agent_status: match &active.run {
                     thread::Run::Running => Some("working".to_string()),
@@ -385,6 +392,7 @@ impl Store {
                 content_scroll: active.content_scroll,
                 mode_name: active.mode_name,
                 model_label: active.model_label,
+                thinking_label: active.thinking_label,
                 active_profile: active.profile_name,
                 feedback: active.feedback,
                 follow: Some(active.follow.to_model()),
@@ -413,7 +421,9 @@ impl Store {
                 tabs,
                 history,
                 active_thread: None,
-                entries: Vec::new(),
+                entries: Arc::from([]),
+                content_revision: 0,
+                active_thought: None,
                 viewport_scroll: 0,
                 viewport_max_scroll: 0,
                 selected_entry: None,
@@ -423,6 +433,7 @@ impl Store {
                 content_scroll: 0,
                 mode_name: None,
                 model_label: None,
+                thinking_label: None,
                 active_profile: None,
                 feedback: thread::Feedback::default(),
                 follow: None,
@@ -496,9 +507,13 @@ impl Store {
                 title: thread.title().map(ToOwned::to_owned),
                 is_remote: matches!(thread.origin(), thread::Origin::Backend { .. }),
                 review_mode: thread.review_mode(),
+                active_thought: active_thought_entry_id(thread.entries(), thread.run()),
                 entries: thread
                     .entries()
                     .iter()
+                    .enumerate()
+                    .filter(|(index, _)| !is_redundant_ack_after_thought(thread.entries(), *index))
+                    .map(|(_, entry)| entry)
                     .map(|entry| EntryView {
                         id: entry.id,
                         locations: {
@@ -532,6 +547,11 @@ impl Store {
                                     super::tool::State::Completed => "completed".to_string(),
                                     super::tool::State::Failed { .. } => "failed".to_string(),
                                     super::tool::State::Canceled => "cancelled".to_string(),
+                                    super::tool::State::Unknown(value)
+                                        if value.as_ref() == "unspecified" =>
+                                    {
+                                        "unknown".to_string()
+                                    }
                                     super::tool::State::Unknown(value) => value.to_string(),
                                 },
                                 output: call.output.clone(),
@@ -566,6 +586,7 @@ impl Store {
                         },
                     })
                     .collect(),
+                content_revision: thread.content_revision(),
                 draft: thread.draft().to_string(),
                 context: thread
                     .context_items()
@@ -591,17 +612,21 @@ impl Store {
                     crate::collab::FollowState::On { .. } => Follow::On,
                     crate::collab::FollowState::Paused { .. } => Follow::Paused,
                 },
-                mode_name: thread.mode().map(|mode| match mode.selected() {
-                    mode::Selected::Current(id) => mode
-                        .item(id)
-                        .map(|item| item.name.clone())
-                        .unwrap_or_else(|| id.to_string()),
-                    mode::Selected::Pending { next, .. } => mode
-                        .item(next)
-                        .map(|item| item.name.clone())
-                        .unwrap_or_else(|| next.to_string()),
-                }),
+                mode_name: thread
+                    .mode()
+                    .map(|mode| match mode.selected() {
+                        mode::Selected::Current(id) => mode
+                            .item(id)
+                            .map(|item| item.name.clone())
+                            .unwrap_or_else(|| id.to_string()),
+                        mode::Selected::Pending { next, .. } => mode
+                            .item(next)
+                            .map(|item| item.name.clone())
+                            .unwrap_or_else(|| next.to_string()),
+                    })
+                    .or_else(|| thread.config().selected_value_label("mode")),
                 model_label: thread.config().selected_value_label("model"),
+                thinking_label: thread.config().selected_value_label("thinking"),
                 profile_name: thread.profile_name().map(ToOwned::to_owned),
                 feedback: thread.feedback().clone(),
                 plan: thread.plan().to_vec(),
@@ -637,5 +662,172 @@ impl Store {
             active,
             focused,
         }
+    }
+}
+
+fn is_redundant_ack_after_thought(entries: &[thread::Entry], index: usize) -> bool {
+    let Some(entry) = entries.get(index) else {
+        return false;
+    };
+    let thread::EntryKind::AssistantText { text } = &entry.kind else {
+        return false;
+    };
+    if !is_trivial_ack(text) {
+        return false;
+    }
+    entries[..index]
+        .iter()
+        .rev()
+        .take_while(|entry| !matches!(entry.kind, thread::EntryKind::UserPrompt { .. }))
+        .any(|entry| matches!(entry.kind, thread::EntryKind::Thought { .. }))
+}
+
+fn active_thought_entry_id(
+    entries: &[thread::Entry],
+    run: &thread::Run,
+) -> Option<thread::EntryId> {
+    if !matches!(run, thread::Run::Running) {
+        return None;
+    }
+
+    entries
+        .iter()
+        .rev()
+        .take_while(|entry| !matches!(entry.kind, thread::EntryKind::UserPrompt { .. }))
+        .next()
+        .and_then(|entry| {
+            matches!(entry.kind, thread::EntryKind::Thought { .. }).then_some(entry.id)
+        })
+}
+
+fn is_trivial_ack(text: &str) -> bool {
+    let text = text.trim();
+    text.eq_ignore_ascii_case("received") || text.eq_ignore_ascii_case("received.")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::num::NonZeroU64;
+
+    use super::*;
+
+    fn entry(index: u64, kind: thread::EntryKind) -> thread::Entry {
+        thread::Entry {
+            id: thread::EntryId::new(NonZeroU64::new(index).unwrap()),
+            turn: None,
+            stream: None,
+            kind,
+            locations: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn redundant_ack_filter_hides_received_after_thought() {
+        let entries = vec![
+            entry(
+                1,
+                thread::EntryKind::UserPrompt {
+                    text: "test".to_string(),
+                },
+            ),
+            entry(
+                2,
+                thread::EntryKind::Thought {
+                    text: "**Acknowledging**".to_string(),
+                },
+            ),
+            entry(
+                3,
+                thread::EntryKind::AssistantText {
+                    text: "Received.".to_string(),
+                },
+            ),
+        ];
+
+        assert!(is_redundant_ack_after_thought(&entries, 2));
+    }
+
+    #[test]
+    fn redundant_ack_filter_keeps_normal_short_reply() {
+        let entries = vec![
+            entry(
+                1,
+                thread::EntryKind::UserPrompt {
+                    text: "test".to_string(),
+                },
+            ),
+            entry(
+                2,
+                thread::EntryKind::AssistantText {
+                    text: "Received.".to_string(),
+                },
+            ),
+        ];
+
+        assert!(!is_redundant_ack_after_thought(&entries, 1));
+    }
+
+    #[test]
+    fn active_thought_entry_is_latest_running_thought() {
+        let entries = vec![
+            entry(
+                1,
+                thread::EntryKind::UserPrompt {
+                    text: "test".to_string(),
+                },
+            ),
+            entry(
+                2,
+                thread::EntryKind::Thought {
+                    text: "thinking".to_string(),
+                },
+            ),
+        ];
+
+        assert_eq!(
+            active_thought_entry_id(&entries, &thread::Run::Running),
+            Some(entries[1].id)
+        );
+    }
+
+    #[test]
+    fn active_thought_entry_stops_after_agent_text_arrives() {
+        let entries = vec![
+            entry(
+                1,
+                thread::EntryKind::UserPrompt {
+                    text: "test".to_string(),
+                },
+            ),
+            entry(
+                2,
+                thread::EntryKind::Thought {
+                    text: "thinking".to_string(),
+                },
+            ),
+            entry(
+                3,
+                thread::EntryKind::AssistantText {
+                    text: "Received.".to_string(),
+                },
+            ),
+        ];
+
+        assert_eq!(
+            active_thought_entry_id(&entries, &thread::Run::Running),
+            None
+        );
+    }
+
+    #[test]
+    fn active_thought_entry_is_none_when_run_is_idle() {
+        let entries = vec![entry(
+            1,
+            thread::EntryKind::Thought {
+                text: "done".to_string(),
+            },
+        )];
+
+        assert_eq!(active_thought_entry_id(&entries, &thread::Run::Idle), None);
     }
 }

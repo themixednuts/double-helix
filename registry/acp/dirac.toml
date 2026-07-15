@@ -1,0 +1,51 @@
+name = "dirac"
+kind = "acp"
+description = "Reduces API costs by more than 50%, produces better and faster work. Uses Hash anchored parallel edits, AST manipulation and a whole lot of neat optimizations. Fully Open Source."
+homepage = "https://dirac.run"
+aliases = ["Dirac", "https://github.com/dirac-run/dirac"]
+categories = ["agent-client-protocol", "assistant"]
+
+[version]
+tag-source = "static:0.4.13"
+
+[[artifact]]
+os = "windows"
+arch = "x86_64"
+source = { npx = "dirac-cli@0.4.13" }
+bin = "dirac"
+args = ["--acp"]
+
+[[artifact]]
+os = "windows"
+arch = "aarch64"
+source = { npx = "dirac-cli@0.4.13" }
+bin = "dirac"
+args = ["--acp"]
+
+[[artifact]]
+os = "linux"
+arch = "x86_64"
+source = { npx = "dirac-cli@0.4.13" }
+bin = "dirac"
+args = ["--acp"]
+
+[[artifact]]
+os = "linux"
+arch = "aarch64"
+source = { npx = "dirac-cli@0.4.13" }
+bin = "dirac"
+args = ["--acp"]
+
+[[artifact]]
+os = "macos"
+arch = "aarch64"
+source = { npx = "dirac-cli@0.4.13" }
+bin = "dirac"
+args = ["--acp"]
+
+[[artifact]]
+os = "macos"
+arch = "x86_64"
+source = { npx = "dirac-cli@0.4.13" }
+bin = "dirac"
+args = ["--acp"]

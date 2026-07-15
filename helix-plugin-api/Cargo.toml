@@ -1,0 +1,17 @@
+[package]
+name = "helix-plugin-api"
+description = "Host-agnostic Helix plugin contract and wire types"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+categories.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+rmp-serde = "1"
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

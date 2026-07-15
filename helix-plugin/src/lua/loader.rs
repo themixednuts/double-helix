@@ -2,24 +2,44 @@ use crate::contract::metadata::{Capability, API_VERSION};
 use crate::error::{PluginError, Result};
 use crate::types::{Plugin, PluginMetadata};
 use log::{debug, info, warn};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 /// Plugin loader responsible for discovering and loading plugins
 pub struct PluginLoader {
-    /// Directories to search for plugins
+    /// Directories whose children are plugin roots.
     plugin_dirs: Vec<PathBuf>,
+    /// Exact plugin roots selected by the package activation snapshot.
+    plugin_roots: Vec<PathBuf>,
 }
 
 impl PluginLoader {
     /// Create a new plugin loader with the given plugin directories
     pub fn new(plugin_dirs: Vec<PathBuf>) -> Self {
-        Self { plugin_dirs }
+        Self {
+            plugin_dirs,
+            plugin_roots: Vec::new(),
+        }
+    }
+
+    /// Add exact plugin roots. Unlike `plugin_dirs`, these paths are loaded directly.
+    pub fn with_plugin_roots(mut self, plugin_roots: Vec<PathBuf>) -> Self {
+        self.plugin_roots = plugin_roots;
+        self
+    }
+
+    /// Read the exact managed plugin roots from the active runtime snapshot.
+    pub fn active_plugin_roots() -> Result<Vec<PathBuf>> {
+        let assets = helix_loader::runtime_assets()
+            .map_err(|error| PluginError::InitializationFailed(error.to_string()))?;
+        Ok(assets.plugin_roots())
     }
 
     /// Discover all plugins in the configured directories
     pub fn discover_plugins(&self) -> Result<Vec<Plugin>> {
         let mut plugins = Vec::new();
+        let mut seen = HashSet::new();
 
         for dir in &self.plugin_dirs {
             if !dir.exists() {
@@ -40,20 +60,40 @@ impl PluginLoader {
                 let path = entry.path();
 
                 if path.is_dir() {
-                    match self.load_plugin_metadata(&path) {
-                        Ok(plugin) => {
-                            info!("Discovered plugin: {} at {:?}", plugin.metadata.name, path);
-                            plugins.push(plugin);
-                        }
-                        Err(e) => {
-                            warn!("Failed to load plugin at {:?}: {}", path, e);
-                        }
-                    }
+                    self.discover_plugin_root(&path, &mut seen, &mut plugins);
                 }
             }
         }
 
+        for root in &self.plugin_roots {
+            if !root.is_dir() {
+                warn!("Activated plugin root is not a directory: {:?}", root);
+                continue;
+            }
+            self.discover_plugin_root(root, &mut seen, &mut plugins);
+        }
+
         Ok(plugins)
+    }
+
+    fn discover_plugin_root(
+        &self,
+        path: &Path,
+        seen: &mut HashSet<PathBuf>,
+        plugins: &mut Vec<Plugin>,
+    ) {
+        let identity = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        if !seen.insert(identity) {
+            return;
+        }
+
+        match self.load_plugin_metadata(path) {
+            Ok(plugin) => {
+                info!("Discovered plugin: {} at {:?}", plugin.metadata.name, path);
+                plugins.push(plugin);
+            }
+            Err(error) => warn!("Failed to load plugin at {:?}: {}", path, error),
+        }
     }
 
     /// Load plugin metadata from a directory
@@ -92,12 +132,11 @@ impl PluginLoader {
             )));
         }
 
-        if let Some(min_api_version) = metadata.min_api_version {
-            if min_api_version > API_VERSION {
-                return Err(PluginError::InvalidPluginStructure(format!(
-                    "plugin requires API version {min_api_version}, host supports {API_VERSION}"
-                )));
-            }
+        if metadata.api_version != API_VERSION {
+            return Err(PluginError::InvalidPluginStructure(format!(
+                "plugin targets API version {}, host requires exactly {API_VERSION}",
+                metadata.api_version
+            )));
         }
 
         for capability in &metadata.capabilities {
@@ -162,6 +201,7 @@ mod tests {
             description = "A test plugin"
             author = "Test Author"
             entry = "init.lua"
+            api_version = 1
         "#;
         std::fs::write(plugin_dir.join("plugin.toml"), metadata).unwrap();
 
@@ -194,6 +234,22 @@ mod tests {
     }
 
     #[test]
+    fn activated_plugin_root_is_loaded_directly_and_deduplicated() {
+        let temp_dir = TempDir::new().unwrap();
+        let plugin_dir = temp_dir.path().join("managed-plugin");
+        std::fs::create_dir(&plugin_dir).unwrap();
+        std::fs::write(plugin_dir.join("init.lua"), "-- managed plugin").unwrap();
+
+        let loader = PluginLoader::new(vec![temp_dir.path().to_path_buf()])
+            .with_plugin_roots(vec![plugin_dir.clone()]);
+        let plugins = loader.discover_plugins().unwrap();
+
+        assert_eq!(plugins.len(), 1);
+        assert_eq!(plugins[0].metadata.name, "managed-plugin");
+        assert_eq!(plugins[0].path, plugin_dir);
+    }
+
+    #[test]
     fn test_missing_entry_point() {
         let temp_dir = TempDir::new().unwrap();
         let plugin_dir = temp_dir.path().join("broken-plugin");
@@ -203,6 +259,7 @@ mod tests {
         let metadata = r#"
             name = "broken-plugin"
             version = "1.0.0"
+            api_version = 1
         "#;
         std::fs::write(plugin_dir.join("plugin.toml"), metadata).unwrap();
 
@@ -214,7 +271,7 @@ mod tests {
     }
 
     #[test]
-    fn test_min_api_version_too_high_refuses_plugin() {
+    fn test_mismatched_api_version_refuses_plugin() {
         let temp_dir = TempDir::new().unwrap();
         let plugin_dir = temp_dir.path().join("future-plugin");
         std::fs::create_dir(&plugin_dir).unwrap();
@@ -222,7 +279,7 @@ mod tests {
         let metadata = r#"
             name = "future-plugin"
             version = "1.0.0"
-            min_api_version = 999
+            api_version = 999
         "#;
         std::fs::write(plugin_dir.join("plugin.toml"), metadata).unwrap();
         std::fs::write(plugin_dir.join("init.lua"), "-- future plugin").unwrap();

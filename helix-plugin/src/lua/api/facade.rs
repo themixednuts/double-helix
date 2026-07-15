@@ -14,7 +14,6 @@
 //! - `helix.tabs`       — per-view tab groups (open, close, focus, cycle, list)
 //! - `helix.floats`     — floating windows (create, update, close, list)
 //! - `helix.lsp`        — LSP client queries
-//! - `helix.pkg`        — package-manager backend registration
 //! - `helix.layout`     — layout combinators
 //! - `helix.log`        — logging
 //! - `helix.async(fn)`  — launch a coroutine from synchronous context
@@ -26,24 +25,25 @@
 //! - `panel:close()`, `panel:toggle()`, `panel:focus()`, `panel:resize()`
 
 use mlua::prelude::*;
-use std::num::NonZeroU64;
 
-use crate::contract::bridge::{EditorMutationBridge, EditorQueryBridge};
 use crate::contract::handles::{
-    CommandHandle, DocumentHandle, FloatHandle, PanelHandle, RenderCallbackHandle,
-    SubscriptionHandle, ThreadHandle, ViewHandle,
+    CommandHandle, DocumentHandle, FloatHandle, PanelHandle, SubscriptionHandle, ThreadHandle,
+    ViewHandle,
 };
-use crate::contract::host::{PluginFacadeMutationHost, PluginFacadeQueryHost, UiCallbackToken};
+use crate::contract::host::{PluginFacadeMutationHost, PluginFacadeQueryHost};
 use crate::contract::requests;
 use crate::contract::snapshots;
+use crate::contract::UiCallbackToken;
 use crate::error::Result;
-use crate::types::SurfaceRenderOp;
+#[cfg(test)]
+use helix_plugin_editor::bridge::{EditorMutationBridge, EditorQueryBridge};
 
 mod documents;
 mod host;
 mod layout;
 mod logging;
 mod lsp;
+mod syntax;
 mod views;
 mod workspace;
 pub use documents::register as register_documents_module;
@@ -51,32 +51,29 @@ pub use host::register as register_host_module;
 pub use layout::register as register_layout_module;
 pub use logging::register as register_log_module;
 pub use lsp::register as register_lsp_module;
+pub use syntax::register as register_syntax_module;
 pub use views::register as register_views_module;
 pub use workspace::register as register_workspace_module;
-
-fn with_editor<T>(f: impl FnOnce(&helix_view::Editor) -> LuaResult<T>) -> LuaResult<T> {
-    crate::lua::with_current_editor(f)?
-}
-
-fn with_editor_mut<T>(f: impl FnOnce(&mut helix_view::Editor) -> LuaResult<T>) -> LuaResult<T> {
-    crate::lua::with_current_editor_mut(f)?
-}
 
 fn with_query_bridge<T>(
     lua: &Lua,
     f: impl FnOnce(&dyn PluginFacadeQueryHost) -> LuaResult<T>,
 ) -> LuaResult<T> {
     if let Some(host) = lua
-        .app_data_ref::<crate::lua::RemoteFacadeHostWrapper>()
+        .app_data_ref::<crate::lua::FacadeHostWrapper>()
         .map(|host| std::sync::Arc::clone(&host.0))
     {
         let host = host.lock();
         return f(host.query());
     }
-    with_editor(|editor| {
-        let bridge = EditorQueryBridge::new(editor);
-        f(&bridge)
-    })
+    #[cfg(test)]
+    {
+        return crate::lua::with_current_editor(|editor| f(&EditorQueryBridge::new(editor)))?;
+    }
+    #[cfg(not(test))]
+    Err(LuaError::RuntimeError(
+        "plugin facade host unavailable".into(),
+    ))
 }
 
 fn with_mutation_bridge<T>(
@@ -84,32 +81,135 @@ fn with_mutation_bridge<T>(
     f: impl FnOnce(&mut dyn PluginFacadeMutationHost) -> LuaResult<T>,
 ) -> LuaResult<T> {
     if let Some(host) = lua
-        .app_data_ref::<crate::lua::RemoteFacadeHostWrapper>()
+        .app_data_ref::<crate::lua::FacadeHostWrapper>()
         .map(|host| std::sync::Arc::clone(&host.0))
     {
         let mut host = host.lock();
         return f(host.mutation());
     }
-    with_editor_mut(|editor| {
-        let mut bridge = EditorMutationBridge::new(editor);
-        f(&mut bridge)
-    })
+    #[cfg(test)]
+    {
+        return crate::lua::with_current_editor_mut(|editor| {
+            let mut bridge = EditorMutationBridge::new(editor);
+            f(&mut bridge)
+        })?;
+    }
+    #[cfg(not(test))]
+    Err(LuaError::RuntimeError(
+        "plugin facade host unavailable".into(),
+    ))
 }
 
 fn contract_error(err: crate::contract::ContractError) -> LuaError {
+    LuaError::RuntimeError(contract_error_payload(&err))
+}
+
+pub(super) fn start_task(
+    lua: &Lua,
+    request: crate::contract::PluginTaskRequest,
+) -> LuaResult<LuaValue> {
+    let host = lua
+        .app_data_ref::<crate::lua::TaskHostWrapper>()
+        .map(|host| std::sync::Arc::clone(&host.0))
+        .ok_or_else(|| LuaError::RuntimeError("plugin task host unavailable".into()))?;
+    let plugin_name = current_plugin_name(lua)?;
+    let operation = host
+        .lock()
+        .start(current_plugin_id(lua)?, request)
+        .map_err(contract_error)?;
+    lua.app_data_ref::<crate::lua::PendingOperationRegistry>()
+        .ok_or_else(|| LuaError::RuntimeError("pending operation registry unavailable".into()))?
+        .0
+        .write()
+        .insert(operation, plugin_name);
+    lua.create_userdata(crate::lua::LuaPluginOperationToken::from(operation))?
+        .into_lua(lua)
+}
+
+pub(super) fn dynamic_value_from_lua(value: LuaValue) -> LuaResult<crate::contract::DynamicValue> {
+    fn convert(value: LuaValue, depth: usize) -> LuaResult<crate::contract::DynamicValue> {
+        use crate::contract::DynamicValue;
+
+        if depth >= 64 {
+            return Err(LuaError::RuntimeError(
+                "dynamic value exceeds the maximum nesting depth of 64".into(),
+            ));
+        }
+        Ok(match value {
+            LuaValue::Nil => DynamicValue::Nil,
+            LuaValue::Boolean(value) => DynamicValue::Bool(value),
+            LuaValue::Integer(value) => DynamicValue::Int(value),
+            LuaValue::Number(value) if value.is_finite() => DynamicValue::Float(value),
+            LuaValue::Number(_) => {
+                return Err(LuaError::RuntimeError(
+                    "dynamic values cannot contain non-finite numbers".into(),
+                ))
+            }
+            LuaValue::String(value) => DynamicValue::String(value.to_str()?.to_owned()),
+            LuaValue::Table(table) => {
+                let mut entries = Vec::new();
+                for pair in table.pairs::<LuaValue, LuaValue>() {
+                    entries.push(pair?);
+                }
+
+                let is_array = entries
+                    .iter()
+                    .all(|(key, _)| matches!(key, LuaValue::Integer(index) if *index > 0));
+                if is_array {
+                    entries.sort_unstable_by_key(|(key, _)| match key {
+                        LuaValue::Integer(index) => *index,
+                        _ => unreachable!(),
+                    });
+                    for (offset, (key, _)) in entries.iter().enumerate() {
+                        let LuaValue::Integer(index) = key else {
+                            unreachable!();
+                        };
+                        if *index != offset as i64 + 1 {
+                            return Err(LuaError::RuntimeError(
+                                "dynamic value arrays must use contiguous 1-based indexes".into(),
+                            ));
+                        }
+                    }
+                    DynamicValue::Array(
+                        entries
+                            .into_iter()
+                            .map(|(_, value)| convert(value, depth + 1))
+                            .collect::<LuaResult<_>>()?,
+                    )
+                } else {
+                    let mut values = std::collections::BTreeMap::new();
+                    for (key, value) in entries {
+                        let LuaValue::String(key) = key else {
+                            return Err(LuaError::RuntimeError(
+                                "dynamic value objects must use string keys".into(),
+                            ));
+                        };
+                        values.insert(key.to_str()?.to_owned(), convert(value, depth + 1)?);
+                    }
+                    DynamicValue::Object(values)
+                }
+            }
+            other => {
+                return Err(LuaError::FromLuaConversionError {
+                    from: other.type_name(),
+                    to: "DynamicValue".into(),
+                    message: Some("expected nil, boolean, number, string, array, or object".into()),
+                })
+            }
+        })
+    }
+
+    convert(value, 0)
+}
+
+pub(crate) fn contract_error_payload(err: &crate::contract::ContractError) -> String {
     let entity = err.entity().unwrap_or("");
-    LuaError::RuntimeError(format!(
+    format!(
         "__helix_contract_error__\ncode={}\nmessage={}\nentity={}",
         err.code(),
         err,
         entity
-    ))
-}
-
-fn with_surface<T>(
-    f: impl FnOnce(&mut crate::types::SurfaceRenderOps, &helix_view::Theme) -> LuaResult<T>,
-) -> LuaResult<T> {
-    crate::lua::with_current_render_context(f)?
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -240,42 +340,10 @@ impl LuaUserData for LuaDocumentHandle {
         });
 
         // doc:select_all() — select all text in the document
-        methods.add_method("select_all", |_lua, this, ()| {
-            with_editor_mut(|editor| {
-                let doc_id = crate::contract::adapt::resolve_document(editor, this.0)
-                    .map_err(contract_error)?;
-                let view_id = editor
-                    .tree
-                    .try_get(editor.tree.focus)
-                    .filter(|view| view.doc == doc_id)
-                    .map(|view| view.id)
-                    .or_else(|| {
-                        editor
-                            .tree
-                            .views()
-                            .find_map(|(view, _)| (view.doc == doc_id).then_some(view.id))
-                    })
-                    .or_else(|| editor.tree.views().next().map(|(view, _)| view.id))
-                    .ok_or_else(|| LuaError::RuntimeError("view not found".into()))?;
-                let doc = editor
-                    .documents
-                    .get(&doc_id)
-                    .ok_or_else(|| LuaError::RuntimeError("document not found".into()))?;
-                let text = doc.text();
-                let len = text.len_chars();
-                if len == 0 {
-                    Ok(())
-                } else {
-                    let selection = helix_core::Selection::single(0, len);
-                    let doc = editor.documents.get_mut(&doc_id).ok_or_else(|| {
-                        contract_error(crate::contract::ContractError::stale_handle(
-                            this.0.to_string(),
-                        ))
-                    })?;
-                    doc.ensure_view_init(view_id);
-                    doc.set_selection(view_id, selection);
-                    Ok(())
-                }
+        methods.add_method("select_all", |lua, this, ()| {
+            with_mutation_bridge(lua, |host| {
+                host.select_all(requests::SelectAllRequest { document: this.0 })
+                    .map_err(contract_error)
             })
         });
 
@@ -285,58 +353,18 @@ impl LuaUserData for LuaDocumentHandle {
         methods.add_method(
             "set_annotations",
             |lua, this, annotations: Vec<LuaTable>| {
-                let plugin_name = current_plugin_name(lua)?;
-
-                // Parse first (before borrowing editor) so errors surface cleanly.
-                let parsed: Vec<ParsedAnnotation> = annotations
+                let parsed: Vec<requests::Annotation> = annotations
                     .iter()
                     .map(parse_annotation)
                     .collect::<LuaResult<_>>()?;
-
-                with_editor_mut(|editor| {
-                    let doc_id = crate::contract::adapt::resolve_document(editor, this.0)
-                        .map_err(contract_error)?;
-
-                    // Resolve positions against the document text.
-                    let doc = editor.documents.get(&doc_id).ok_or_else(|| {
-                        contract_error(crate::contract::ContractError::stale_handle(
-                            this.0.to_string(),
-                        ))
-                    })?;
-                    let text = doc.text();
-                    let converted: Vec<helix_view::document::PluginAnnotation> = parsed
-                        .into_iter()
-                        .map(|p| helix_view::document::PluginAnnotation {
-                            char_idx: crate::contract::adapt::position_to_char(text, p.position),
-                            ..p.annot
-                        })
-                        .collect();
-
-                    // Find all views showing this document.
-                    let view_ids: Vec<helix_view::ViewId> = editor
-                        .tree
-                        .views()
-                        .filter_map(|(view, _)| (view.doc == doc_id).then_some(view.id))
-                        .collect();
-
-                    if view_ids.is_empty() {
-                        return Ok(());
-                    }
-
-                    let doc = editor.documents.get_mut(&doc_id).ok_or_else(|| {
-                        contract_error(crate::contract::ContractError::stale_handle(
-                            this.0.to_string(),
-                        ))
-                    })?;
-                    let mut iter = view_ids.into_iter();
-                    let Some(first) = iter.next() else {
-                        return Ok(());
-                    };
-                    for view_id in iter {
-                        doc.set_plugin_annotations(view_id, plugin_name.clone(), converted.clone());
-                    }
-                    doc.set_plugin_annotations(first, plugin_name, converted);
-                    Ok(())
+                let plugin = current_plugin_id(lua)?;
+                with_mutation_bridge(lua, |host| {
+                    host.set_annotations(requests::SetAnnotationsRequest {
+                        document: this.0,
+                        plugin,
+                        annotations: parsed,
+                    })
+                    .map_err(contract_error)
                 })
             },
         );
@@ -344,17 +372,14 @@ impl LuaUserData for LuaDocumentHandle {
         // doc:clear_annotations() — remove all annotations registered by the
         // calling plugin on this document.
         methods.add_method("clear_annotations", |lua, this, ()| {
-            let plugin_name = current_plugin_name(lua)?;
-            with_editor_mut(|editor| {
-                let doc_id = crate::contract::adapt::resolve_document(editor, this.0)
-                    .map_err(contract_error)?;
-                let doc = editor.documents.get_mut(&doc_id).ok_or_else(|| {
-                    contract_error(crate::contract::ContractError::stale_handle(
-                        this.0.to_string(),
-                    ))
-                })?;
-                doc.clear_plugin_annotations(&plugin_name);
-                Ok(())
+            let plugin = current_plugin_id(lua)?;
+            with_mutation_bridge(lua, |host| {
+                host.set_annotations(requests::SetAnnotationsRequest {
+                    document: this.0,
+                    plugin,
+                    annotations: Vec::new(),
+                })
+                .map_err(contract_error)
             })
         });
     }
@@ -502,6 +527,27 @@ impl LuaUserData for LuaPanelHandle {
                 .map_err(contract_error)?;
             Ok(())
         });
+
+        methods.add_method("update", |lua, this, options: LuaTable| {
+            ensure_panel_owner(lua, this.0)?;
+            let title = options.get::<Option<String>>("title")?;
+            let content = options
+                .contains_key("content")?
+                .then(|| parse_panel_content(&options))
+                .transpose()?;
+            panel_host(lua)?
+                .0
+                .lock()
+                .update_panel(
+                    current_plugin_id(lua)?,
+                    requests::PanelUpdateRequest {
+                        panel: this.0,
+                        title,
+                        content,
+                    },
+                )
+                .map_err(contract_error)
+        });
     }
 
     fn add_fields<F: LuaUserDataFields<Self>>(fields: &mut F) {
@@ -523,6 +569,36 @@ impl FromLua for LuaCommandHandle {
                 message: Some("expected a CommandHandle userdata".into()),
             }),
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LuaKeymapHandle(crate::contract::KeymapHandle);
+
+impl FromLua for LuaKeymapHandle {
+    fn from_lua(value: LuaValue, _lua: &Lua) -> LuaResult<Self> {
+        match value {
+            LuaValue::UserData(ud) => ud.borrow::<Self>().map(|handle| *handle),
+            _ => Err(LuaError::FromLuaConversionError {
+                from: value.type_name(),
+                to: "KeymapHandle".to_string(),
+                message: Some("expected a KeymapHandle userdata".into()),
+            }),
+        }
+    }
+}
+
+impl LuaUserData for LuaKeymapHandle {
+    fn add_methods<M: LuaUserDataMethods<Self>>(methods: &mut M) {
+        methods.add_method("id", |_lua, this, ()| Ok(this.0.raw().get()));
+        methods.add_method("update", |lua, this, definition: LuaTable| {
+            update_lua_keymap(lua, this.0, definition)
+        });
+        methods.add_method("remove", |lua, this, ()| remove_lua_keymap(lua, this.0));
+    }
+
+    fn add_fields<F: LuaUserDataFields<Self>>(fields: &mut F) {
+        fields.add_field_method_get("handle", |_lua, this| Ok(this.0.raw().get()));
     }
 }
 
@@ -630,6 +706,18 @@ fn command_host(lua: &Lua) -> LuaResult<mlua::AppDataRef<'_, crate::lua::Command
         .ok_or_else(|| LuaError::RuntimeError("command host not available".into()))
 }
 
+fn keymap_host(lua: &Lua) -> LuaResult<mlua::AppDataRef<'_, crate::lua::KeymapHostWrapper>> {
+    lua.app_data_ref::<crate::lua::KeymapHostWrapper>()
+        .ok_or_else(|| LuaError::RuntimeError("keymap host not available".into()))
+}
+
+fn keymap_registry(
+    lua: &Lua,
+) -> LuaResult<mlua::AppDataRef<'_, crate::lua::KeymapRegistryWrapper>> {
+    lua.app_data_ref::<crate::lua::KeymapRegistryWrapper>()
+        .ok_or_else(|| LuaError::RuntimeError("keymap registry not available".into()))
+}
+
 fn command_registry(
     lua: &Lua,
 ) -> LuaResult<mlua::AppDataRef<'_, crate::lua::CommandRegistryWrapper>> {
@@ -723,79 +811,10 @@ fn clear_panel_callbacks(lua: &Lua, panel: PanelHandle) -> LuaResult<()> {
         return Ok(());
     };
 
-    remove_ui_callback(
-        lua,
-        callbacks.plugin_name.clone(),
-        callbacks.render_callback_id,
-    )?;
     if let Some(event_id) = callbacks.event_callback_id {
         remove_ui_callback(lua, callbacks.plugin_name, event_id)?;
     }
     Ok(())
-}
-
-fn float_render_callback(
-    float: FloatHandle,
-) -> LuaResult<Option<(String, crate::types::UiCallbackId)>> {
-    with_editor(|editor| {
-        let float_id =
-            crate::contract::adapt::resolve_float(&editor.model, float).map_err(contract_error)?;
-        Ok(editor.model.float(float_id).and_then(|entry| {
-            entry
-                .content
-                .downcast_ref::<helix_view::model::PluginFloatModel>()
-                .and_then(|model| {
-                    crate::types::UiCallbackId::new(model.render_callback_id)
-                        .map(|id| (model.plugin_name.clone(), id))
-                })
-        }))
-    })
-}
-
-fn remove_float_render_callback(lua: &Lua, float: FloatHandle) -> LuaResult<()> {
-    if let Some((plugin_name, callback_id)) = float_render_callback(float)? {
-        remove_ui_callback(lua, plugin_name, callback_id)?;
-    }
-    Ok(())
-}
-
-fn set_lua_float_owner(float: FloatHandle, plugin_name: &str) -> LuaResult<()> {
-    with_editor_mut(|editor| {
-        let float_id =
-            crate::contract::adapt::resolve_float(&editor.model, float).map_err(contract_error)?;
-        let entry = editor
-            .model
-            .float_mut(float_id)
-            .ok_or_else(|| stale_handle_error(float))?;
-        entry.owner = Some(plugin_name.to_string());
-        if let Some(model) = entry
-            .content
-            .downcast_mut::<helix_view::model::PluginFloatModel>()
-        {
-            model.plugin_name = plugin_name.to_string();
-        }
-        Ok(())
-    })
-}
-
-fn ensure_float_owner(lua: &Lua, float: FloatHandle) -> LuaResult<()> {
-    let plugin_name = current_plugin_name(lua)?;
-    let owner = with_editor(|editor| {
-        let float_id =
-            crate::contract::adapt::resolve_float(&editor.model, float).map_err(contract_error)?;
-        Ok(editor
-            .model
-            .float(float_id)
-            .map(|entry| entry.owner.clone()))
-    })?;
-
-    match owner {
-        Some(Some(owner)) if owner == plugin_name => Ok(()),
-        Some(_) => Err(permission_denied_error(format!(
-            "plugin '{plugin_name}' does not own float"
-        ))),
-        None => Err(stale_handle_error(float)),
-    }
 }
 
 fn clear_event_subscription(lua: &Lua, handle: SubscriptionHandle) -> LuaResult<()> {
@@ -1102,39 +1121,7 @@ fn store_suspended_command_thread(
     plugin_name: &str,
     yielded: LuaMultiValue,
 ) -> LuaResult<()> {
-    if thread.status() != LuaThreadStatus::Resumable {
-        return Ok(());
-    }
-
-    let id_val = yielded.into_iter().next().ok_or_else(|| {
-        LuaError::RuntimeError("command coroutine yielded without a UI callback token".into())
-    })?;
-    let token: UiCallbackToken = lua.unpack(id_val)?;
-    let callback_id = crate::types::UiCallbackId::new(token.raw().get()).ok_or_else(|| {
-        LuaError::RuntimeError("command coroutine yielded zero UI callback token".into())
-    })?;
-    crate::lua::claim_pending_ui_callback(lua, plugin_name, callback_id)?;
-    let registry = lua
-        .app_data_ref::<crate::lua::SuspendedCoroutineRegistry>()
-        .ok_or_else(|| {
-            LuaError::RuntimeError("suspended coroutine registry not available".into())
-        })?;
-    let thread_key = lua.create_registry_value(thread.clone())?;
-    let mut suspended = registry.0.write();
-    if suspended.contains_key(&callback_id) {
-        return Err(LuaError::RuntimeError(format!(
-            "UI callback {} is already bound to a coroutine",
-            callback_id.get()
-        )));
-    }
-    suspended.insert(
-        callback_id,
-        crate::lua::SuspendedCoroutine {
-            thread_key,
-            plugin_name: plugin_name.to_string(),
-        },
-    );
-    Ok(())
+    crate::lua::suspend_coroutine_yield(lua, thread, plugin_name, yielded)
 }
 
 fn execute_registered_lua_command(lua: &Lua, name: &str, args: &[String]) -> LuaResult<bool> {
@@ -1160,6 +1147,60 @@ fn execute_registered_lua_command(lua: &Lua, name: &str, args: &[String]) -> Lua
     Ok(true)
 }
 
+fn command_descriptor_to_table(
+    lua: &Lua,
+    command: &crate::contract::CommandDescriptor,
+) -> LuaResult<LuaTable> {
+    let table = lua.create_table()?;
+    table.set("name", command.name.as_str())?;
+    table.set(
+        "aliases",
+        lua.create_sequence_from(command.aliases.clone())?,
+    )?;
+    table.set("doc", command.doc.as_str())?;
+    table.set(
+        "arguments",
+        lua.create_sequence_from(command.arguments.clone())?,
+    )?;
+    table.set(
+        "kind",
+        match command.kind {
+            crate::contract::CommandKind::Typable => "typable",
+            crate::contract::CommandKind::Static => "static",
+            crate::contract::CommandKind::Plugin => "plugin",
+        },
+    )?;
+    table.set(
+        "scope",
+        match command.scope {
+            crate::contract::CommandScope::Viewport => "viewport",
+            crate::contract::CommandScope::Tree => "tree",
+            crate::contract::CommandScope::Frontend => "frontend",
+        },
+    )?;
+
+    if let Some(signature) = &command.signature {
+        let signature_table = lua.create_table()?;
+        signature_table.set("min_positionals", signature.min_positionals)?;
+        signature_table.set("max_positionals", signature.max_positionals)?;
+        signature_table.set("raw_after", signature.raw_after)?;
+        let flags = lua.create_table()?;
+        for (index, flag) in signature.flags.iter().enumerate() {
+            let flag_table = lua.create_table()?;
+            flag_table.set("name", flag.name.as_str())?;
+            flag_table.set("alias", flag.alias.map(|alias| alias.to_string()))?;
+            flag_table.set("doc", flag.doc.as_str())?;
+            flag_table.set("takes_value", flag.takes_value)?;
+            flag_table.set("values", lua.create_sequence_from(flag.values.clone())?)?;
+            flags.set(index + 1, flag_table)?;
+        }
+        signature_table.set("flags", flags)?;
+        table.set("signature", signature_table)?;
+    }
+
+    Ok(table)
+}
+
 fn register_commands_module(
     lua: &Lua,
     helix_table: &LuaTable,
@@ -1167,6 +1208,7 @@ fn register_commands_module(
 ) -> Result<()> {
     lua.set_app_data(crate::lua::CommandRegistryWrapper(commands.clone()));
     let m = lua.create_table()?;
+    let raw = lua.create_table()?;
 
     // helix.commands.register({ name=, doc=, handler= }) -> CommandHandle
     let cmds = commands.clone();
@@ -1218,6 +1260,38 @@ fn register_commands_module(
         })?,
     )?;
 
+    // helix.commands.list() -> [{ name, aliases, doc, arguments, signature, kind, scope }]
+    m.set(
+        "list",
+        lua.create_function(|lua, ()| {
+            let catalog = command_host(lua)?.0.lock().command_catalog();
+            let result = lua.create_table()?;
+            for (index, command) in catalog.iter().enumerate() {
+                result.set(index + 1, command_descriptor_to_table(lua, command)?)?;
+            }
+            Ok(result)
+        })?,
+    )?;
+
+    // helix.commands.get(name) -> command metadata or nil
+    m.set(
+        "get",
+        lua.create_function(|lua, name: String| {
+            let command = command_host(lua)?
+                .0
+                .lock()
+                .command_catalog()
+                .into_iter()
+                .find(|command| {
+                    command.name == name || command.aliases.iter().any(|alias| alias == &name)
+                });
+            command
+                .as_ref()
+                .map(|command| command_descriptor_to_table(lua, command))
+                .transpose()
+        })?,
+    )?;
+
     // helix.commands.update(handle, { name?, doc?, args?, handler? })
     m.set(
         "update",
@@ -1232,37 +1306,160 @@ fn register_commands_module(
         lua.create_function(|lua, handle: LuaCommandHandle| remove_lua_command(lua, handle.0))?,
     )?;
 
-    // helix.commands.execute(name, args?)
-    m.set(
-        "execute",
+    raw.set(
+        "execute_local",
         lua.create_function(|lua, (cmd, args): (String, Option<Vec<String>>)| {
             let args = args.unwrap_or_default();
-            let result = command_host(lua)?
-                .0
-                .lock()
-                .run_command(requests::RunCommandRequest {
-                    name: cmd.clone(),
-                    args: args.clone(),
-                });
-            match result {
-                Ok(()) => Ok(()),
-                Err(err @ crate::contract::ContractError::NotFound { .. }) => {
-                    if execute_registered_lua_command(lua, &cmd, &args)? {
-                        Ok(())
-                    } else {
-                        Err(LuaError::RuntimeError(format!(
-                            "Command '{cmd}' failed: {err}"
-                        )))
-                    }
-                }
-                Err(err) => Err(LuaError::RuntimeError(format!(
-                    "Command '{cmd}' failed: {err}"
-                ))),
-            }
+            execute_registered_lua_command(lua, &cmd, &args)
         })?,
     )?;
+    raw.set(
+        "execute_host",
+        lua.create_function(|lua, (name, args): (String, Option<Vec<String>>)| {
+            start_task(
+                lua,
+                crate::contract::PluginTaskRequest::RunCommand(requests::RunCommandRequest {
+                    name,
+                    args: args.unwrap_or_default(),
+                }),
+            )
+        })?,
+    )?;
+    m.set("_raw", raw.clone())?;
 
     helix_table.set("commands", m)?;
+    Ok(())
+}
+
+fn keymap_definition_from_table(table: LuaTable) -> LuaResult<crate::contract::KeymapDefinition> {
+    let mode = match table
+        .get::<Option<String>>("mode")?
+        .as_deref()
+        .unwrap_or("normal")
+    {
+        "normal" => crate::contract::KeymapMode::Normal,
+        "insert" => crate::contract::KeymapMode::Insert,
+        "select" => crate::contract::KeymapMode::Select,
+        mode => {
+            return Err(LuaError::RuntimeError(format!(
+                "unknown keymap mode: {mode}"
+            )))
+        }
+    };
+    let scope = match table.get::<Option<LuaTable>>("scope")? {
+        Some(scope) => {
+            if scope.contains_key("component")? {
+                return Err(LuaError::RuntimeError(
+                    "plugin keymaps target the editor; `scope.component` is not supported".into(),
+                ));
+            }
+            crate::contract::KeymapScope {
+                language: scope.get("language")?,
+                path_prefix: scope.get("path_prefix")?,
+            }
+        }
+        None => crate::contract::KeymapScope::default(),
+    };
+    let mut bindings = Vec::new();
+    let binding_tables: LuaTable = table.get("bindings")?;
+    for binding in binding_tables.sequence_values::<LuaTable>() {
+        let binding = binding?;
+        let keys = binding
+            .get::<LuaTable>("keys")?
+            .sequence_values::<String>()
+            .collect::<LuaResult<Vec<_>>>()?;
+        let commands = match binding.get::<LuaValue>("commands")? {
+            LuaValue::Nil => vec![binding.get::<String>("command")?],
+            LuaValue::String(command) => vec![command.to_str()?.to_string()],
+            LuaValue::Table(commands) => commands
+                .sequence_values::<String>()
+                .collect::<LuaResult<Vec<_>>>()?,
+            value => {
+                return Err(LuaError::FromLuaConversionError {
+                    from: value.type_name(),
+                    to: "command string or array".into(),
+                    message: None,
+                })
+            }
+        };
+        bindings.push(crate::contract::KeymapBinding { keys, commands });
+    }
+    Ok(crate::contract::KeymapDefinition {
+        mode,
+        scope,
+        bindings,
+    })
+}
+
+fn ensure_keymap_owner(lua: &Lua, keymap: crate::contract::KeymapHandle) -> LuaResult<()> {
+    let plugin_name = current_plugin_name(lua)?;
+    match keymap_registry(lua)?.0.read().get(&keymap) {
+        Some(owner) if owner == &plugin_name => Ok(()),
+        Some(_) => Err(permission_denied_error(format!(
+            "plugin '{plugin_name}' does not own {keymap}"
+        ))),
+        None => Err(stale_handle_error(keymap)),
+    }
+}
+
+fn update_lua_keymap(
+    lua: &Lua,
+    keymap: crate::contract::KeymapHandle,
+    table: LuaTable,
+) -> LuaResult<()> {
+    ensure_keymap_owner(lua, keymap)?;
+    let plugin = current_plugin_id(lua)?;
+    let definition = keymap_definition_from_table(table)?;
+    keymap_host(lua)?
+        .0
+        .lock()
+        .update_keymap(
+            plugin,
+            crate::contract::KeymapUpdateRequest { keymap, definition },
+        )
+        .map_err(contract_error)
+}
+
+fn remove_lua_keymap(lua: &Lua, keymap: crate::contract::KeymapHandle) -> LuaResult<()> {
+    ensure_keymap_owner(lua, keymap)?;
+    let plugin = current_plugin_id(lua)?;
+    keymap_host(lua)?
+        .0
+        .lock()
+        .remove_keymap(plugin, crate::contract::KeymapRemoveRequest { keymap })
+        .map_err(contract_error)?;
+    keymap_registry(lua)?.0.write().remove(&keymap);
+    Ok(())
+}
+
+fn register_keymaps_module(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
+    let module = lua.create_table()?;
+    module.set(
+        "register",
+        lua.create_function(|lua, table: LuaTable| {
+            let plugin_name = current_plugin_name(lua)?;
+            let plugin = current_plugin_id(lua)?;
+            let definition = keymap_definition_from_table(table)?;
+            let keymap = keymap_host(lua)?
+                .0
+                .lock()
+                .register_keymap(plugin, definition)
+                .map_err(contract_error)?;
+            keymap_registry(lua)?.0.write().insert(keymap, plugin_name);
+            lua.create_userdata(LuaKeymapHandle(keymap))
+        })?,
+    )?;
+    module.set(
+        "update",
+        lua.create_function(|lua, (keymap, table): (LuaKeymapHandle, LuaTable)| {
+            update_lua_keymap(lua, keymap.0, table)
+        })?,
+    )?;
+    module.set(
+        "remove",
+        lua.create_function(|lua, keymap: LuaKeymapHandle| remove_lua_keymap(lua, keymap.0))?,
+    )?;
+    helix_table.set("keymaps", module)?;
     Ok(())
 }
 
@@ -1277,15 +1474,18 @@ fn register_registers_module(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
     m.set(
         "get",
         lua.create_function(|lua, name_str: String| {
-            let name = name_str.chars().next().ok_or_else(|| {
-                LuaError::RuntimeError("Register name must be a single character".into())
-            })?;
+            let mut chars = name_str.chars();
+            let name = chars
+                .next()
+                .filter(|_| chars.next().is_none())
+                .ok_or_else(|| {
+                    LuaError::RuntimeError("Register name must be exactly one character".into())
+                })?;
             let table = lua.create_table()?;
-            with_editor(|editor| {
-                if let Some(values) = editor.read_register(name) {
-                    for (i, val) in values.enumerate() {
-                        table.set(i + 1, val.to_string())?;
-                    }
+            with_query_bridge(lua, |host| {
+                let values = host.read_register(name).map_err(contract_error)?;
+                for (i, value) in values.into_iter().enumerate() {
+                    table.set(i + 1, value)?;
                 }
                 Ok(table)
             })
@@ -1295,14 +1495,16 @@ fn register_registers_module(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
     // helix.registers.set(name, values)
     m.set(
         "set",
-        lua.create_function(|_lua, (name_str, values): (String, Vec<String>)| {
-            let name = name_str.chars().next().ok_or_else(|| {
-                LuaError::RuntimeError("Register name must be a single character".into())
-            })?;
-            with_editor_mut(|editor| {
-                editor.write_register(name, values).map_err(|e| {
-                    LuaError::RuntimeError(format!("Failed to write to register {name}: {e}"))
-                })
+        lua.create_function(|lua, (name_str, values): (String, Vec<String>)| {
+            let mut chars = name_str.chars();
+            let name = chars
+                .next()
+                .filter(|_| chars.next().is_none())
+                .ok_or_else(|| {
+                    LuaError::RuntimeError("Register name must be exactly one character".into())
+                })?;
+            with_mutation_bridge(lua, |host| {
+                host.write_register(name, values).map_err(contract_error)
             })
         })?,
     )?;
@@ -1338,7 +1540,9 @@ fn register_pending_ui_callback(
     let callback_id = crate::types::UiCallbackId::new(raw)
         .ok_or_else(|| LuaError::RuntimeError("invalid UI callback token (zero)".into()))?;
     crate::lua::remember_pending_ui_callback(lua, plugin_name.to_string(), callback_id)?;
-    Ok(LuaValue::UserData(lua.create_userdata(token)?))
+    Ok(LuaValue::UserData(lua.create_userdata(
+        crate::lua::LuaUiCallbackToken::from(token),
+    )?))
 }
 
 // ---------------------------------------------------------------------------
@@ -1475,7 +1679,7 @@ pub fn register_ui_module(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
         })?,
     )?;
 
-    m.set("_raw", raw)?;
+    m.set("_raw", raw.clone())?;
 
     // -- Panel --
 
@@ -1487,35 +1691,30 @@ pub fn register_ui_module(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
                 .get::<Option<String>>("side")?
                 .unwrap_or_else(|| "right".into());
             let width: u16 = opts.get::<Option<u16>>("width")?.unwrap_or(30);
-            let render_fn: LuaFunction = opts.get("render")?;
+            if opts.contains_key("render")? {
+                return Err(LuaError::RuntimeError(
+                    "panel render callbacks are unsupported; use retained content nodes".into(),
+                ));
+            }
+            let content = parse_panel_content(&opts)?;
             let event_fn: Option<LuaFunction> = opts.get("on_event").ok();
 
             let plugin_name = current_plugin_name(lua)?;
             let plugin_id = current_plugin_id(lua)?;
             let handler = panel_host(lua)?;
-            let Some(callback_reg) = lua.app_data_ref::<crate::types::UiCallbackRegistry>() else {
-                return Ok(LuaNil);
-            };
-            let Some(counter) = lua.app_data_ref::<crate::types::UiCallbackCounter>() else {
-                return Ok(LuaNil);
-            };
-
-            let render_id = counter.next();
-            let render_ref = lua.create_registry_value(render_fn)?;
-            callback_reg.0.write().insert(
-                crate::types::PluginCallbackKey::new(plugin_name.clone(), render_id),
-                render_ref,
-            );
-
             let event_id = if let Some(ef) = event_fn {
+                let callback_reg = lua
+                    .app_data_ref::<crate::types::UiCallbackRegistry>()
+                    .ok_or_else(|| {
+                        LuaError::RuntimeError("UI callback registry unavailable".into())
+                    })?;
+                let counter = lua
+                    .app_data_ref::<crate::types::UiCallbackCounter>()
+                    .ok_or_else(|| {
+                        LuaError::RuntimeError("UI callback counter unavailable".into())
+                    })?;
                 let eid = counter.next();
-                let event_ref = match lua.create_registry_value(ef) {
-                    Ok(event_ref) => event_ref,
-                    Err(err) => {
-                        remove_ui_callback(lua, plugin_name.clone(), render_id)?;
-                        return Err(err);
-                    }
-                };
+                let event_ref = lua.create_registry_value(ef)?;
                 callback_reg.0.write().insert(
                     crate::types::PluginCallbackKey::new(plugin_name.clone(), eid),
                     event_ref,
@@ -1532,11 +1731,11 @@ pub fn register_ui_module(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
                     side: parse_panel_side(&side)?,
                     size: Some(requests::PanelSizeSpec::Fixed(width)),
                     hidden: false,
+                    content,
                 },
             ) {
                 Ok(panel) => panel,
                 Err(err) => {
-                    remove_ui_callback(lua, plugin_name.clone(), render_id)?;
                     if let Some(event_id) = event_id {
                         remove_ui_callback(lua, plugin_name.clone(), event_id)?;
                     }
@@ -1545,7 +1744,6 @@ pub fn register_ui_module(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
             };
             let Some(panel_callbacks) = lua.app_data_ref::<crate::lua::PanelCallbackRegistry>()
             else {
-                remove_ui_callback(lua, plugin_name.clone(), render_id)?;
                 if let Some(event_id) = event_id {
                     remove_ui_callback(lua, plugin_name.clone(), event_id)?;
                 }
@@ -1561,7 +1759,6 @@ pub fn register_ui_module(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
                 panel,
                 crate::lua::RegisteredPanelCallbacks {
                     plugin_name,
-                    render_callback_id: render_id,
                     event_callback_id: event_id,
                 },
             );
@@ -1663,21 +1860,15 @@ pub fn register_ui_module(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
 
     m.set(
         "get_theme",
-        lua.create_function(|_lua, ()| with_editor(|editor| Ok(editor.theme.name().to_string())))?,
+        lua.create_function(|lua, ()| {
+            with_query_bridge(lua, |host| Ok(host.theme_snapshot().name))
+        })?,
     )?;
 
-    m.set(
+    raw.set(
         "set_theme",
-        lua.create_function(|_lua, name: String| {
-            with_editor_mut(|editor| match editor.theme_loader.load(&name) {
-                Ok(theme) => {
-                    editor.set_theme(theme);
-                    Ok(())
-                }
-                Err(e) => Err(LuaError::RuntimeError(format!(
-                    "Failed to load theme {name}: {e}"
-                ))),
-            })
+        lua.create_function(|lua, name: String| {
+            start_task(lua, crate::contract::PluginTaskRequest::SetTheme(name))
         })?,
     )?;
 
@@ -1686,13 +1877,12 @@ pub fn register_ui_module(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
     m.set(
         "terminal_size",
         lua.create_function(|lua, ()| {
+            let snapshot =
+                with_query_bridge(lua, |host| host.terminal_size().map_err(contract_error))?;
             let size = lua.create_table()?;
-            with_editor(|editor| {
-                let area = editor.tree.area();
-                size.set("width", area.width)?;
-                size.set("height", area.height)?;
-                Ok(size)
-            })
+            size.set("width", snapshot.width)?;
+            size.set("height", snapshot.height)?;
+            Ok(size)
         })?,
     )?;
 
@@ -1700,9 +1890,9 @@ pub fn register_ui_module(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
 
     m.set(
         "redraw",
-        lua.create_function(|_lua, ()| {
-            with_editor_mut(|editor| {
-                editor.request_redraw();
+        lua.create_function(|lua, ()| {
+            with_mutation_bridge(lua, |host| {
+                host.request_redraw();
                 Ok(())
             })
         })?,
@@ -1725,6 +1915,110 @@ fn parse_panel_side(s: &str) -> LuaResult<requests::PanelSide> {
     }
 }
 
+fn parse_panel_content(options: &LuaTable) -> LuaResult<Vec<requests::UiRenderNode>> {
+    let parse_node = |table: LuaTable| parse_ui_render_node(&table);
+
+    match options.get::<LuaValue>("content")? {
+        LuaValue::Nil => Ok(Vec::new()),
+        LuaValue::String(text) => Ok(vec![requests::UiRenderNode::text(
+            text.to_str()?.to_owned(),
+        )]),
+        LuaValue::Table(table) if table.contains_key("text")? => Ok(vec![parse_node(table)?]),
+        LuaValue::Table(table) => table
+            .sequence_values::<LuaTable>()
+            .map(|node| parse_node(node?))
+            .collect(),
+        value => Err(LuaError::FromLuaConversionError {
+            from: value.type_name(),
+            to: "PanelContent".into(),
+            message: Some("expected a string, text node, or array of text nodes".into()),
+        }),
+    }
+}
+
+fn parse_ui_render_node(table: &LuaTable) -> LuaResult<requests::UiRenderNode> {
+    let kind = table
+        .get::<Option<String>>("kind")?
+        .unwrap_or_else(|| "text".into());
+    let style = |default: &str| -> LuaResult<String> {
+        Ok(table
+            .get::<Option<String>>("style")?
+            .unwrap_or_else(|| default.into()))
+    };
+
+    match kind.as_str() {
+        "text" => Ok(requests::UiRenderNode::Text {
+            x: table.get::<Option<u16>>("x")?.unwrap_or(0),
+            y: table.get::<Option<u16>>("y")?.unwrap_or(0),
+            text: table.get("text")?,
+            style: style("ui.text")?,
+            max_width: table.get("max_width")?,
+        }),
+        "fill" => Ok(requests::UiRenderNode::Fill {
+            area: parse_ui_rect(&table.get::<LuaTable>("area")?)?,
+            style: style("ui.text")?,
+        }),
+        "header" => {
+            let current = table.get::<Option<usize>>("current")?;
+            let total = table.get::<Option<usize>>("total")?;
+            if current.is_some() != total.is_some() {
+                return Err(LuaError::RuntimeError(
+                    "header current and total must be provided together".into(),
+                ));
+            }
+            Ok(requests::UiRenderNode::Header {
+                area: parse_ui_rect(&table.get::<LuaTable>("area")?)?,
+                title: table.get("title")?,
+                current,
+                total,
+                style: style("ui.text")?,
+            })
+        }
+        "horizontal_divider" => Ok(requests::UiRenderNode::HorizontalDivider {
+            area: parse_ui_rect(&table.get::<LuaTable>("area")?)?,
+            style: style("ui.text")?,
+        }),
+        "vertical_divider" => Ok(requests::UiRenderNode::VerticalDivider {
+            area: parse_ui_rect(&table.get::<LuaTable>("area")?)?,
+            style: style("ui.text")?,
+        }),
+        "text_input" => Ok(requests::UiRenderNode::TextInput {
+            area: parse_ui_rect(&table.get::<LuaTable>("area")?)?,
+            text: table.get("text")?,
+            cursor: table.get("cursor")?,
+            style: style("ui.text")?,
+            cursor_style: table
+                .get::<Option<String>>("cursor_style")?
+                .unwrap_or_else(|| "ui.cursor".into()),
+        }),
+        "scrollbar" => Ok(requests::UiRenderNode::Scrollbar {
+            area: parse_ui_rect(&table.get::<LuaTable>("area")?)?,
+            total: table.get("total")?,
+            offset: table.get("offset")?,
+            visible: table.get("visible")?,
+            thumb_style: table
+                .get::<Option<String>>("thumb_style")?
+                .unwrap_or_else(|| "ui.menu.scroll".into()),
+            track_symbol: table.get("track_symbol")?,
+            track_style: table
+                .get::<Option<String>>("track_style")?
+                .unwrap_or_else(|| "ui.background".into()),
+        }),
+        _ => Err(LuaError::RuntimeError(format!(
+            "invalid retained UI node kind: {kind}"
+        ))),
+    }
+}
+
+fn parse_ui_rect(table: &LuaTable) -> LuaResult<requests::UiRect> {
+    Ok(requests::UiRect {
+        x: table.get::<Option<u16>>("x")?.unwrap_or(0),
+        y: table.get::<Option<u16>>("y")?.unwrap_or(0),
+        width: table.get("width")?,
+        height: table.get("height")?,
+    })
+}
+
 fn parse_panel_size_spec(s: &str) -> LuaResult<requests::PanelSizeSpec> {
     if let Some(n) = s.strip_prefix("fixed:") {
         let value: u16 = n
@@ -1744,198 +2038,21 @@ fn parse_panel_size_spec(s: &str) -> LuaResult<requests::PanelSizeSpec> {
 }
 
 // ---------------------------------------------------------------------------
-// helix.surface — render surface userdata
-// ---------------------------------------------------------------------------
-
-/// Lua userdata handle to the current render surface.
-pub struct LuaSurface;
-
-impl LuaUserData for LuaSurface {
-    fn add_methods<M: LuaUserDataMethods<Self>>(methods: &mut M) {
-        methods.add_method(
-            "set_string",
-            |_lua, _this, (x, y, text, scope): (u16, u16, String, String)| {
-                with_surface(|ops, theme| {
-                    let style = theme.get(&scope);
-                    ops.push(SurfaceRenderOp::SetString { x, y, text, style });
-                    Ok(())
-                })
-            },
-        );
-
-        methods.add_method(
-            "set_stringn",
-            |_lua, _this, (x, y, text, max_width, scope): (u16, u16, String, usize, String)| {
-                with_surface(|ops, theme| {
-                    let style = theme.get(&scope);
-                    ops.push(SurfaceRenderOp::SetStringN {
-                        x,
-                        y,
-                        text,
-                        max_width,
-                        style,
-                    });
-                    Ok(())
-                })
-            },
-        );
-
-        methods.add_method("clear", |_lua, _this, (area, scope): (LuaTable, String)| {
-            let area = table_to_rect(&area)?;
-            with_surface(|ops, theme| {
-                let style = theme.get(&scope);
-                ops.push(SurfaceRenderOp::Clear { area, style });
-                Ok(())
-            })
-        });
-
-        methods.add_method(
-            "set_style",
-            |_lua, _this, (area, scope): (LuaTable, String)| {
-                let area = table_to_rect(&area)?;
-                with_surface(|ops, theme| {
-                    let style = theme.get(&scope);
-                    ops.push(SurfaceRenderOp::SetStyle { area, style });
-                    Ok(())
-                })
-            },
-        );
-
-        methods.add_method(
-            "header",
-            |_lua, _this, (area, title, scope): (LuaTable, String, String)| {
-                let area = table_to_rect(&area)?;
-                with_surface(|ops, theme| {
-                    let style = theme.get(&scope);
-                    ops.push(SurfaceRenderOp::Header { area, title, style });
-                    Ok(())
-                })
-            },
-        );
-
-        methods.add_method(
-            "header_with_counts",
-            |_lua,
-             _this,
-             (area, title, current, total, scope): (LuaTable, String, usize, usize, String)| {
-                let area = table_to_rect(&area)?;
-                with_surface(|ops, theme| {
-                    let style = theme.get(&scope);
-                    ops.push(SurfaceRenderOp::HeaderWithCounts {
-                        area,
-                        title,
-                        current,
-                        total,
-                        style,
-                    });
-                    Ok(())
-                })
-            },
-        );
-
-        methods.add_method(
-            "hdivider",
-            |_lua, _this, (area, scope): (LuaTable, String)| {
-                let area = table_to_rect(&area)?;
-                with_surface(|ops, theme| {
-                    let style = theme.get(&scope);
-                    ops.push(SurfaceRenderOp::HDivider { area, style });
-                    Ok(())
-                })
-            },
-        );
-
-        methods.add_method(
-            "vdivider",
-            |_lua, _this, (area, scope): (LuaTable, String)| {
-                let area = table_to_rect(&area)?;
-                with_surface(|ops, theme| {
-                    let style = theme.get(&scope);
-                    ops.push(SurfaceRenderOp::VDivider { area, style });
-                    Ok(())
-                })
-            },
-        );
-
-        methods.add_method(
-            "text_input",
-            |lua,
-             _this,
-             (area, text, cursor, scope, cursor_scope): (
-                LuaTable,
-                String,
-                usize,
-                String,
-                String,
-            )| {
-                let area = table_to_rect(&area)?;
-                let state = helix_view::layout::text_input_layout(area, &text, cursor);
-                with_surface(|ops, theme| {
-                    let style = theme.get(&scope);
-                    let cursor_style = theme.get(&cursor_scope);
-                    ops.push(SurfaceRenderOp::TextInput {
-                        area,
-                        text,
-                        cursor,
-                        style,
-                        cursor_style,
-                    });
-                    let result = lua.create_table()?;
-                    result.set("cursor_x", state.cursor_x)?;
-                    result.set("cursor_y", state.cursor_y)?;
-                    Ok(result)
-                })
-            },
-        );
-
-        methods.add_method(
-            "scrollbar",
-            |_lua, _this, (area, opts): (LuaTable, LuaTable)| {
-                let area = table_to_rect(&area)?;
-                let total: usize = opts.get("total")?;
-                let offset: usize = opts.get("offset")?;
-                let visible: usize = opts.get("visible")?;
-                let thumb_scope: String = opts.get("thumb_style")?;
-                let track_scope: Option<String> = opts.get("track_style").ok();
-                let track_symbol: Option<String> = opts.get("track_symbol").ok();
-                with_surface(|ops, theme| {
-                    let thumb_style = theme.get(&thumb_scope);
-                    let track_style = track_scope
-                        .as_deref()
-                        .map(|scope| theme.get(scope))
-                        .unwrap_or_default();
-                    ops.push(SurfaceRenderOp::Scrollbar {
-                        area,
-                        total,
-                        offset,
-                        visible,
-                        thumb_style,
-                        track_symbol,
-                        track_style,
-                    });
-                    Ok(())
-                })
-            },
-        );
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Rect helpers (for layout/surface)
 // ---------------------------------------------------------------------------
 
-/// Convert a Lua table {x, y, width, height} to a Rect.
-pub fn table_to_rect(t: &LuaTable) -> LuaResult<helix_view::graphics::Rect> {
-    Ok(helix_view::graphics::Rect::new(
-        t.get("x")?,
-        t.get("y")?,
-        t.get("width")?,
-        t.get("height")?,
-    ))
+/// Convert a Lua table {x, y, width, height} to contract geometry.
+pub fn table_to_rect(t: &LuaTable) -> LuaResult<requests::UiRect> {
+    Ok(requests::UiRect {
+        x: t.get("x")?,
+        y: t.get("y")?,
+        width: t.get("width")?,
+        height: t.get("height")?,
+    })
 }
 
-/// Convert a Rect to a Lua table.
-pub fn rect_to_table(lua: &Lua, r: helix_view::graphics::Rect) -> LuaResult<LuaTable> {
+/// Convert contract geometry to a Lua table.
+pub fn rect_to_table(lua: &Lua, r: requests::UiRect) -> LuaResult<LuaTable> {
     let t = lua.create_table()?;
     t.set("x", r.x)?;
     t.set("y", r.y)?;
@@ -2296,12 +2413,11 @@ fn register_floats_module(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
             let title: Option<String> = opts.get("title").ok();
             let dismissible: bool = opts.get::<Option<bool>>("dismissible")?.unwrap_or(false);
             let focus: bool = opts.get::<Option<bool>>("focus")?.unwrap_or(true);
-            let plugin_name = current_plugin_name(lua)?;
             let plugin_id = current_plugin_id(lua)?;
 
             let placement = parse_float_placement(&opts.get::<LuaTable>("placement")?)?;
-            let (content, render_callback) = parse_float_content(lua, &opts, &plugin_name)?;
-            let float = match with_mutation_bridge(lua, |bridge| {
+            let content = parse_float_content(&opts)?;
+            let float = with_mutation_bridge(lua, |bridge| {
                 bridge
                     .create_float(
                         plugin_id,
@@ -2314,28 +2430,7 @@ fn register_floats_module(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
                         },
                     )
                     .map_err(contract_error)
-            }) {
-                Ok(float) => float,
-                Err(err) => {
-                    if let Some(callback_id) = render_callback {
-                        remove_ui_callback(lua, plugin_name, callback_id)?;
-                    }
-                    return Err(err);
-                }
-            };
-
-            if let Err(err) = set_lua_float_owner(float, &plugin_name) {
-                if let Some(callback_id) = render_callback {
-                    remove_ui_callback(lua, plugin_name, callback_id)?;
-                }
-                let _ = with_mutation_bridge(lua, |bridge| {
-                    bridge
-                        .close_float(requests::CloseFloatRequest { float })
-                        .map_err(contract_error)?;
-                    Ok(())
-                });
-                return Err(err);
-            }
+            })?;
 
             Ok(LuaFloatHandle(float))
         })?,
@@ -2345,11 +2440,10 @@ fn register_floats_module(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
     m.set(
         "close",
         lua.create_function(|lua, float: LuaFloatHandle| {
-            ensure_float_owner(lua, float.0)?;
-            remove_float_render_callback(lua, float.0)?;
+            let plugin = current_plugin_id(lua)?;
             with_mutation_bridge(lua, |bridge| {
                 bridge
-                    .close_float(requests::CloseFloatRequest { float: float.0 })
+                    .close_float(plugin, requests::CloseFloatRequest { float: float.0 })
                     .map_err(contract_error)?;
                 Ok(())
             })
@@ -2360,24 +2454,14 @@ fn register_floats_module(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
     m.set(
         "list",
         lua.create_function(|lua, ()| {
-            let plugin_name = current_plugin_name(lua)?;
+            let plugin = current_plugin_id(lua)?;
             let result = lua.create_table()?;
-            with_editor(|editor| {
-                for (i, (id, entry)) in editor
-                    .model
-                    .floats
-                    .iter()
-                    .filter(|(_, entry)| entry.owner.as_deref() == Some(plugin_name.as_str()))
-                    .enumerate()
-                {
+            with_mutation_bridge(lua, |bridge| {
+                for (i, entry) in bridge.list_floats(plugin).into_iter().enumerate() {
                     let t = lua.create_table()?;
-                    let handle = crate::contract::adapt::float_handle(id);
-                    t.set("handle", LuaFloatHandle(handle))?;
-                    t.set("title", entry.title.clone())?;
-                    t.set(
-                        "is_focused",
-                        editor.model.focus == helix_view::model::FocusTarget::Float(id),
-                    )?;
+                    t.set("handle", LuaFloatHandle(entry.handle))?;
+                    t.set("title", entry.title)?;
+                    t.set("is_focused", entry.is_focused)?;
                     result.set(i + 1, t)?;
                 }
                 Ok(result)
@@ -2412,11 +2496,10 @@ impl LuaUserData for LuaFloatHandle {
 
         // float:close()
         methods.add_method("close", |lua, this, ()| {
-            ensure_float_owner(lua, this.0)?;
-            remove_float_render_callback(lua, this.0)?;
+            let plugin = current_plugin_id(lua)?;
             with_mutation_bridge(lua, |bridge| {
                 bridge
-                    .close_float(requests::CloseFloatRequest { float: this.0 })
+                    .close_float(plugin, requests::CloseFloatRequest { float: this.0 })
                     .map_err(contract_error)?;
                 Ok(())
             })
@@ -2424,8 +2507,7 @@ impl LuaUserData for LuaFloatHandle {
 
         // float:update(opts) — update title, placement
         methods.add_method("update", |lua, this, opts: LuaTable| {
-            ensure_float_owner(lua, this.0)?;
-            let plugin_name = current_plugin_name(lua)?;
+            let plugin = current_plugin_id(lua)?;
             let title = if opts.contains_key("title")? {
                 Some(opts.get::<Option<String>>("title")?)
             } else {
@@ -2436,39 +2518,25 @@ impl LuaUserData for LuaFloatHandle {
             } else {
                 None
             };
-            let (content, new_render_callback) =
-                if opts.contains_key("render")? || opts.contains_key("content")? {
-                    let (content, callback) = parse_float_content(lua, &opts, &plugin_name)?;
-                    (Some(content), callback)
-                } else {
-                    (None, None)
-                };
-            let old_render_callback = if content.is_some() {
-                float_render_callback(this.0)?
+            let content = if opts.contains_key("content")? {
+                Some(parse_float_content(&opts)?)
             } else {
                 None
             };
 
-            if let Err(err) = with_mutation_bridge(lua, |bridge| {
+            with_mutation_bridge(lua, |bridge| {
                 bridge
-                    .update_float(requests::UpdateFloatRequest {
-                        float: this.0,
-                        title,
-                        placement,
-                        content,
-                    })
+                    .update_float(
+                        plugin,
+                        requests::UpdateFloatRequest {
+                            float: this.0,
+                            title,
+                            placement,
+                            content,
+                        },
+                    )
                     .map_err(contract_error)
-            }) {
-                if let Some(callback_id) = new_render_callback {
-                    remove_ui_callback(lua, plugin_name, callback_id)?;
-                }
-                return Err(err);
-            }
-
-            if let Some((plugin_name, callback_id)) = old_render_callback {
-                remove_ui_callback(lua, plugin_name, callback_id)?;
-            }
-            Ok(())
+            })
         });
     }
 
@@ -2530,83 +2598,40 @@ fn parse_float_placement(t: &LuaTable) -> LuaResult<requests::FloatPlacement> {
     }
 }
 
-fn parse_float_content(
-    lua: &Lua,
-    opts: &LuaTable,
-    plugin_name: &str,
-) -> LuaResult<(requests::FloatContent, Option<crate::types::UiCallbackId>)> {
-    if let Some(render_fn) = opts.get::<Option<LuaFunction>>("render")? {
-        let callback_reg = lua
-            .app_data_ref::<crate::types::UiCallbackRegistry>()
-            .ok_or_else(|| LuaError::RuntimeError("UI callback registry not available".into()))?;
-        let counter = lua
-            .app_data_ref::<crate::types::UiCallbackCounter>()
-            .ok_or_else(|| LuaError::RuntimeError("UI callback counter not available".into()))?;
-
-        let render_id = counter.next();
-        let render_ref = lua.create_registry_value(render_fn)?;
-        callback_reg.0.write().insert(
-            crate::types::PluginCallbackKey::new(plugin_name.to_string(), render_id),
-            render_ref,
-        );
-
-        let callback = RenderCallbackHandle::from_raw(
-            NonZeroU64::new(render_id.get()).expect("UI callback IDs are non-zero"),
-        );
-        return Ok((
-            requests::FloatContent::PluginRender { callback },
-            Some(render_id),
+fn parse_float_content(opts: &LuaTable) -> LuaResult<requests::FloatContent> {
+    if opts.contains_key("render")? {
+        return Err(LuaError::RuntimeError(
+            "float render callbacks are not supported; provide retained `content`".into(),
         ));
     }
 
-    // Check for content as array of blocks (default)
-    if let Ok(content_table) = opts.get::<Vec<LuaTable>>("content") {
-        let blocks: Vec<requests::FloatBlock> = content_table
-            .iter()
-            .map(|block| {
-                let text: String = block.get("text")?;
-                let style = block.get::<Option<String>>("style")?;
-                Ok(requests::FloatBlock { text, style })
-            })
-            .collect::<LuaResult<Vec<_>>>()?;
-        Ok((requests::FloatContent::Blocks(blocks), None))
-    } else {
-        // Default: empty text float
-        Ok((requests::FloatContent::Blocks(Vec::new()), None))
-    }
-}
+    let parse_block = |table: LuaTable| {
+        Ok(requests::FloatBlock {
+            text: table.get("text")?,
+            style: table.get("style")?,
+        })
+    };
 
-// ---------------------------------------------------------------------------
-// helix.pkg — package-manager backend registration
-// ---------------------------------------------------------------------------
-
-fn register_pkg_module(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
-    let m = lua.create_table()?;
-    let backends = lua.create_table()?;
-    m.set("_backends", backends.clone())?;
-    m.set(
-        "register_backend",
-        lua.create_function(move |_lua, spec: LuaTable| {
-            let name: String = spec.get("name")?;
-            if name.trim().is_empty() {
-                return Err(LuaError::RuntimeError(
-                    "package backend name must not be empty".into(),
-                ));
-            }
-            for key in ["probe", "resolve", "install", "remove", "doctor"] {
-                let value: LuaValue = spec.get(key)?;
-                if !matches!(value, LuaValue::Function(_)) {
-                    return Err(LuaError::RuntimeError(format!(
-                        "package backend {name} requires function field {key}"
-                    )));
-                }
-            }
-            backends.set(name, spec)?;
-            Ok(())
-        })?,
-    )?;
-    helix_table.set("pkg", m)?;
-    Ok(())
+    let blocks = match opts.get::<LuaValue>("content")? {
+        LuaValue::Nil => Vec::new(),
+        LuaValue::String(text) => vec![requests::FloatBlock {
+            text: text.to_str()?.to_owned(),
+            style: None,
+        }],
+        LuaValue::Table(table) if table.contains_key("text")? => vec![parse_block(table)?],
+        LuaValue::Table(table) => table
+            .sequence_values::<LuaTable>()
+            .map(|block| parse_block(block?))
+            .collect::<LuaResult<Vec<_>>>()?,
+        value => {
+            return Err(LuaError::FromLuaConversionError {
+                from: value.type_name(),
+                to: "FloatContent".into(),
+                message: Some("expected a string, text block, or array of text blocks".into()),
+            });
+        }
+    };
+    Ok(requests::FloatContent::Blocks(blocks))
 }
 
 // ---------------------------------------------------------------------------
@@ -2704,19 +2729,17 @@ fn register_assistant_module(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
     // helix.assistant.is_ready() -> bool
     m.set(
         "is_ready",
-        lua.create_function(|_lua, ()| with_editor(|editor| Ok(!editor.assistant.is_empty())))?,
+        lua.create_function(|lua, ()| {
+            with_query_bridge(lua, |host| Ok(host.assistant_snapshot().is_ready))
+        })?,
     )?;
 
     // helix.assistant.active_thread() -> ThreadHandle?
     m.set(
         "active_thread",
-        lua.create_function(|_lua, ()| {
-            with_editor(|editor| {
-                Ok(editor
-                    .assistant
-                    .active()
-                    .map(crate::contract::adapt::thread_handle)
-                    .map(LuaThreadHandle))
+        lua.create_function(|lua, ()| {
+            with_query_bridge(lua, |host| {
+                Ok(host.assistant_snapshot().active_thread.map(LuaThreadHandle))
             })
         })?,
     )?;
@@ -2724,8 +2747,8 @@ fn register_assistant_module(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
     // helix.assistant.thread_count() -> number
     m.set(
         "thread_count",
-        lua.create_function(|_lua, ()| {
-            with_editor(|editor| Ok(editor.assistant.threads().count()))
+        lua.create_function(|lua, ()| {
+            with_query_bridge(lua, |host| Ok(host.assistant_snapshot().threads.len()))
         })?,
     )?;
 
@@ -2773,14 +2796,15 @@ pub(crate) fn register_facade(
     register_host_module(lua, helix_table)?;
     register_events_module(lua, helix_table)?;
     register_commands_module(lua, helix_table, commands)?;
+    register_keymaps_module(lua, helix_table)?;
     register_registers_module(lua, helix_table)?;
     register_ui_module(lua, helix_table)?;
     register_splits_module(lua, helix_table)?;
     register_tabs_module(lua, helix_table)?;
     register_floats_module(lua, helix_table)?;
-    register_pkg_module(lua, helix_table)?;
     register_assistant_module(lua, helix_table)?;
     register_lsp_module(lua, helix_table)?;
+    register_syntax_module(lua, helix_table)?;
     register_layout_module(lua, helix_table)?;
     register_log_module(lua, helix_table)?;
     register_config_api(lua, helix_table)?;
@@ -2827,41 +2851,15 @@ fn register_config_api(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
 // helix.async(fn) — launch a coroutine from synchronous context
 // ---------------------------------------------------------------------------
 
-/// Register the `_raw.store_suspended` Rust function on the `helix.ui._raw` table.
+/// Register the typed `_raw.store_suspended` bridge used by `helix.async`.
 /// Must be called before the Lua wrappers are injected.
 fn register_store_suspended(lua: &Lua, raw_table: &LuaTable) -> Result<()> {
     raw_table.set(
         "store_suspended",
-        lua.create_function(|lua, (thread, token): (LuaThread, UiCallbackToken)| {
+        lua.create_function(|lua, (thread, token): (LuaThread, LuaValue)| {
             let plugin_name = current_plugin_name(lua)?;
-
-            let cb_id = crate::types::UiCallbackId::new(token.raw().get())
-                .ok_or_else(|| LuaError::RuntimeError("invalid UI callback token (zero)".into()))?;
-            crate::lua::claim_pending_ui_callback(lua, &plugin_name, cb_id)?;
-
-            let registry = lua
-                .app_data_ref::<crate::lua::SuspendedCoroutineRegistry>()
-                .ok_or_else(|| {
-                    LuaError::RuntimeError("suspended coroutine registry not available".into())
-                })?;
-
-            let thread_key = lua.create_registry_value(thread)?;
-            let mut suspended = registry.0.write();
-            if suspended.contains_key(&cb_id) {
-                return Err(LuaError::RuntimeError(format!(
-                    "UI callback {} is already bound to a coroutine",
-                    cb_id.get()
-                )));
-            }
-            suspended.insert(
-                cb_id,
-                crate::lua::SuspendedCoroutine {
-                    thread_key,
-                    plugin_name,
-                },
-            );
-
-            Ok(())
+            let key = crate::lua::await_key_from_lua(token)?;
+            crate::lua::suspend_coroutine(lua, &thread, &plugin_name, key)
         })?,
     )?;
     Ok(())
@@ -2932,6 +2930,65 @@ end
 
 -- Coroutine-yielding UI wrappers.
 -- Must be called from a coroutine context (command handler or helix.async).
+
+function helix.documents.open(path, opts)
+    if not coroutine.isyieldable() then
+        error("helix.documents.open() must be called from a coroutine when document loading is asynchronous", 2)
+    end
+    local operation = helix.documents._raw.open(path, opts)
+    local ok, result = coroutine.yield(operation)
+    if not ok then
+        error(result, 2)
+    end
+    return result
+end
+
+function helix.syntax.query(document, query, opts)
+    if not coroutine.isyieldable() then
+        error("helix.syntax.query() must be called from a coroutine", 2)
+    end
+    local operation = helix.syntax._raw.query(document, query, opts)
+    local ok, result = coroutine.yield(operation)
+    if not ok then
+        error(result, 2)
+    end
+    return result
+end
+
+function helix.lsp.call(document, method, params, opts)
+    local running, is_main = coroutine.running()
+    if not running or is_main then
+        error("helix.lsp.call() must be called from a coroutine (command handler or helix.async())", 2)
+    end
+    local operation = helix.lsp._raw.call(document, method, params, opts)
+    local ok, result = coroutine.yield(operation)
+    if not ok then error(result, 2) end
+    return result
+end
+
+function helix.commands.execute(name, args)
+    args = args or {}
+    if helix.commands._raw.execute_local(name, args) then return end
+    local running, is_main = coroutine.running()
+    if not running or is_main then
+        error("helix.commands.execute() must be called from a coroutine (command handler or helix.async())", 2)
+    end
+    local operation = helix.commands._raw.execute_host(name, args)
+    local ok, result = coroutine.yield(operation)
+    if not ok then error(result, 2) end
+    return result
+end
+
+function helix.ui.set_theme(name)
+    local running, is_main = coroutine.running()
+    if not running or is_main then
+        error("helix.ui.set_theme() must be called from a coroutine (command handler or helix.async())", 2)
+    end
+    local operation = helix.ui._raw.set_theme(name)
+    local ok, result = coroutine.yield(operation)
+    if not ok then error(result, 2) end
+    return result
+end
 
 function helix.ui.prompt(message, default)
     if not coroutine.isyieldable() then
@@ -3106,14 +3163,33 @@ fn parse_selection_range(table: &LuaTable) -> LuaResult<snapshots::SelectionRang
 
 /// Parse a color expressed as `"#rrggbb"` hex, `{r, g, b}` integer array,
 /// or `{r = .., g = .., b = ..}` keyed table.
-fn parse_color(value: LuaValue) -> LuaResult<String> {
+fn parse_color(value: LuaValue) -> LuaResult<snapshots::Color> {
     match value {
-        LuaValue::String(s) => Ok(s.to_str()?.to_string()),
+        LuaValue::String(s) => {
+            let value = s.to_str()?;
+            let hex = value
+                .strip_prefix('#')
+                .ok_or_else(|| LuaError::RuntimeError("colors must use #rrggbb syntax".into()))?;
+            if hex.len() != 6 {
+                return Err(LuaError::RuntimeError(
+                    "colors must use #rrggbb syntax".into(),
+                ));
+            }
+            let channel = |range: std::ops::Range<usize>| {
+                u8::from_str_radix(&hex[range], 16)
+                    .map_err(|_| LuaError::RuntimeError("invalid hex color".into()))
+            };
+            Ok(snapshots::Color {
+                r: channel(0..2)?,
+                g: channel(2..4)?,
+                b: channel(4..6)?,
+            })
+        }
         LuaValue::Table(t) => {
             let r: u8 = t.get("r").or_else(|_| t.get(1))?;
             let g: u8 = t.get("g").or_else(|_| t.get(2))?;
             let b: u8 = t.get("b").or_else(|_| t.get(3))?;
-            Ok(format!("#{r:02x}{g:02x}{b:02x}"))
+            Ok(snapshots::Color { r, g, b })
         }
         other => Err(LuaError::FromLuaConversionError {
             from: other.type_name(),
@@ -3123,19 +3199,13 @@ fn parse_color(value: LuaValue) -> LuaResult<String> {
     }
 }
 
-/// Parsed annotation from Lua before char-index resolution.
-struct ParsedAnnotation {
-    position: snapshots::Position,
-    annot: helix_view::document::PluginAnnotation,
-}
-
 /// Parse a single annotation from a Lua table.
 ///
 /// Expected shape:
 /// ```lua
 /// { line = 0, column = 0, text = "...", fg = "#rrggbb", bg = {r,g,b}, is_line = false }
 /// ```
-fn parse_annotation(table: &LuaTable) -> LuaResult<ParsedAnnotation> {
+fn parse_annotation(table: &LuaTable) -> LuaResult<requests::Annotation> {
     let line: usize = table.get("line")?;
     let column: usize = table.get::<Option<usize>>("column")?.unwrap_or(0);
     let text: String = table.get("text")?;
@@ -3150,19 +3220,14 @@ fn parse_annotation(table: &LuaTable) -> LuaResult<ParsedAnnotation> {
         v => Some(parse_color(v)?),
     };
 
-    Ok(ParsedAnnotation {
+    Ok(requests::Annotation {
         position: snapshots::Position { line, column },
-        annot: helix_view::document::PluginAnnotation {
-            char_idx: 0, // resolved at apply time against document text
-            text,
-            style: None,
-            fg,
-            bg,
-            offset,
-            is_line,
-            virt_line_idx: table.get::<Option<u16>>("virt_line_idx")?,
-            dropped_text: table.get::<Option<String>>("dropped_text")?,
-        },
+        text,
+        style: requests::AnnotationStyle { fg, bg },
+        offset,
+        is_line,
+        virtual_line: table.get::<Option<u16>>("virt_line_idx")?,
+        dropped_text: table.get::<Option<String>>("dropped_text")?,
     })
 }
 
@@ -3295,25 +3360,8 @@ fn snake_to_pascal(s: &str) -> String {
     s.to_pascal_case()
 }
 
-/// Parse an event kind string into an `EventKind`.
-///
-/// Accepts the canonical underscore form (e.g. `"document_opened"`) as well as
-/// the PascalCase constant name (e.g. `"DocumentOpened"`).
 fn parse_event_kind(s: &str) -> std::result::Result<crate::contract::events::EventKind, ()> {
-    use crate::contract::events::EventKind;
-    // Try canonical underscore form first, then PascalCase.
-    for &kind in EventKind::ALL {
-        if kind.as_str() == s {
-            return Ok(kind);
-        }
-    }
-    // PascalCase fallback
-    for &kind in EventKind::ALL {
-        if snake_to_pascal(kind.as_str()) == s {
-            return Ok(kind);
-        }
-    }
-    Err(())
+    crate::contract::events::EventKind::from_id(s).ok_or(())
 }
 
 #[cfg(test)]
@@ -3339,18 +3387,9 @@ mod tests {
     }
 
     #[test]
-    fn parse_event_kind_pascal() {
-        use crate::contract::events::EventKind;
-        assert_eq!(
-            parse_event_kind("DocumentOpened"),
-            Ok(EventKind::DocumentOpened)
-        );
-        assert_eq!(parse_event_kind("KeyPressed"), Ok(EventKind::KeyPressed));
-    }
-
-    #[test]
     fn parse_event_kind_unknown() {
         assert!(parse_event_kind("nonexistent_event").is_err());
+        assert!(parse_event_kind("DocumentOpened").is_err());
     }
 
     #[test]
@@ -3399,14 +3438,15 @@ mod tests {
     }
 
     #[test]
-    fn documents_module_structure() {
+    fn documents_raw_module_structure() {
         let lua = Lua::new();
         let helix_table = lua.create_table().unwrap();
         register_documents_module(&lua, &helix_table).unwrap();
 
         let docs: LuaTable = helix_table.get("documents").unwrap();
         assert!(docs.contains_key("list").unwrap());
-        assert!(docs.contains_key("open").unwrap());
+        let raw: LuaTable = docs.get("_raw").unwrap();
+        assert!(raw.contains_key("open").unwrap());
     }
 
     #[test]
@@ -3432,7 +3472,9 @@ mod tests {
         assert!(cmds.contains_key("register").unwrap());
         assert!(cmds.contains_key("update").unwrap());
         assert!(cmds.contains_key("remove").unwrap());
-        assert!(cmds.contains_key("execute").unwrap());
+        let raw: LuaTable = cmds.get("_raw").unwrap();
+        assert!(raw.contains_key("execute_local").unwrap());
+        assert!(raw.contains_key("execute_host").unwrap());
     }
 
     #[test]
@@ -3513,34 +3555,6 @@ mod tests {
     }
 
     #[test]
-    fn pkg_module_registers_backend() {
-        let lua = Lua::new();
-        let helix_table = lua.create_table().unwrap();
-        register_pkg_module(&lua, &helix_table).unwrap();
-        lua.globals().set("helix", helix_table).unwrap();
-
-        lua.load(
-            r#"
-            helix.pkg.register_backend({
-                name = "fixture",
-                probe = function() return true end,
-                resolve = function() return { version = "1" } end,
-                install = function(_staging, _progress) return true end,
-                remove = function() return true end,
-                doctor = function() return true end,
-            })
-            "#,
-        )
-        .exec()
-        .unwrap();
-
-        let helix: LuaTable = lua.globals().get("helix").unwrap();
-        let pkg: LuaTable = helix.get("pkg").unwrap();
-        let backends: LuaTable = pkg.get("_backends").unwrap();
-        assert!(backends.contains_key("fixture").unwrap());
-    }
-
-    #[test]
     fn ui_module_has_enhanced_panel_api() {
         let lua = Lua::new();
         let helix_table = lua.create_table().unwrap();
@@ -3555,7 +3569,8 @@ mod tests {
         assert!(ui.contains_key("set_status").unwrap());
         assert!(ui.contains_key("panel").unwrap());
         assert!(ui.contains_key("get_theme").unwrap());
-        assert!(ui.contains_key("set_theme").unwrap());
+        let raw: LuaTable = ui.get("_raw").unwrap();
+        assert!(raw.contains_key("set_theme").unwrap());
         assert!(ui.contains_key("terminal_size").unwrap());
         assert!(ui.contains_key("redraw").unwrap());
         // Enhanced panel API

@@ -10,17 +10,17 @@ use std::time::Duration;
 
 pub use backend::{Backend, SqliteValue};
 pub use dto::{
-    AssistantLayout, AssistantPermission, AssistantThread, FrecencyEntry, PkgReceipt, QueryHistory,
+    ActivationHistory, ActivePackage, AssistantLayout, AssistantPermission, AssistantThread,
+    FrecencyEntry, PackageActivation, PackageState, PackageStateCommit, PkgReceipt, QueryHistory,
+    RegistryHead, RuntimeAsset, RuntimeAssetKind, RuntimeAssetSpec, RuntimeSnapshot,
 };
 pub use error::{Error, Result};
 pub use repos::{
     AssistantLayoutRepo, AssistantPermissionsRepo, AssistantThreadsRepo, FrecencyRepo,
-    PkgReceiptsRepo, QueryHistoryRepo,
+    PackageStateRepo, PkgReceiptsRepo, QueryHistoryRepo, RegistryHeadsRepo, RuntimeAssetsRepo,
 };
 
 use backend::DrizzleBackend;
-
-const PRODUCT_CONFIG_DIR: &str = "double-helix";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StorePaths {
@@ -32,8 +32,8 @@ impl StorePaths {
     #[must_use]
     pub fn default_paths() -> Self {
         Self {
-            state: data_dir().join("state.sqlite3"),
-            cache: helix_loader::cache_dir().join("cache.sqlite3"),
+            state: helix_stdx::paths::data_dir().join("state.sqlite3"),
+            cache: helix_stdx::paths::cache_dir().join("cache.sqlite3"),
         }
     }
 
@@ -106,6 +106,21 @@ impl Store {
         PkgReceiptsRepo::new(&mut self.state)
     }
 
+    #[must_use]
+    pub fn package_state(&mut self) -> PackageStateRepo<'_> {
+        PackageStateRepo::new(&mut self.state)
+    }
+
+    #[must_use]
+    pub fn runtime_assets(&mut self) -> RuntimeAssetsRepo<'_> {
+        RuntimeAssetsRepo::new(&mut self.state)
+    }
+
+    #[must_use]
+    pub fn registry_heads(&mut self) -> RegistryHeadsRepo<'_> {
+        RegistryHeadsRepo::new(&mut self.state)
+    }
+
     /// Returns the SQLite journal mode currently reported by the durable state database.
     ///
     /// # Errors
@@ -172,15 +187,6 @@ impl CacheStore {
 pub(crate) enum DatabaseKind {
     State,
     Cache,
-}
-
-fn data_dir() -> PathBuf {
-    use etcetera::base_strategy::{choose_base_strategy, BaseStrategy};
-
-    choose_base_strategy()
-        .expect("Unable to find the data directory!")
-        .data_dir()
-        .join(PRODUCT_CONFIG_DIR)
 }
 
 pub(crate) const BUSY_TIMEOUT: Duration = Duration::from_secs(5);

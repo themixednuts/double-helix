@@ -69,7 +69,6 @@ pub fn general() -> std::io::Result<()> {
     let config_file = helix_loader::config_file();
     let lang_file = helix_loader::lang_config_file();
     let log_file = helix_loader::log_file();
-    let rt_dirs = helix_loader::runtime_dirs();
 
     if config_file.exists() {
         writeln!(stdout, "Config file: {}", config_file.display())?;
@@ -82,33 +81,64 @@ pub fn general() -> std::io::Result<()> {
         writeln!(stdout, "Language file: default")?;
     }
     writeln!(stdout, "Log file: {}", log_file.display())?;
-    writeln!(
-        stdout,
-        "Runtime directories: {}",
-        rt_dirs
-            .iter()
-            .map(|d| d.to_string_lossy())
-            .collect::<Vec<_>>()
-            .join(";")
-    )?;
-    for rt_dir in rt_dirs.iter() {
-        if let Ok(path) = std::fs::read_link(rt_dir) {
-            let msg = format!(
-                "Runtime directory {} is symlinked to: {}",
-                rt_dir.display(),
-                path.display()
-            );
-            writeln!(stdout, "{}", msg.yellow())?;
+    match runtime_assets_for_health() {
+        Ok(assets) => {
+            let snapshot = assets.snapshot();
+            writeln!(stdout, "Runtime generation: {}", snapshot.generation())?;
+            for root in snapshot.runtime_overrides() {
+                write_runtime_root_health(&mut stdout, "override", root)?;
+            }
+            for root in snapshot.bundled_runtime() {
+                write_runtime_root_health(&mut stdout, "bundled", root)?;
+            }
+            let packages = assets.active_packages();
+            if packages.is_empty() {
+                writeln!(stdout, "Active runtime packages: none")?;
+            } else {
+                writeln!(stdout, "Active runtime packages:")?;
+                for package in packages {
+                    writeln!(
+                        stdout,
+                        "  {} {} {}",
+                        package.kind, package.name, package.version
+                    )?;
+                }
+            }
         }
-        if !rt_dir.exists() {
-            let msg = format!("Runtime directory does not exist: {}", rt_dir.display());
-            writeln!(stdout, "{}", msg.yellow())?;
-        } else if rt_dir.read_dir().ok().map(|it| it.count()) == Some(0) {
-            let msg = format!("Runtime directory is empty: {}", rt_dir.display());
-            writeln!(stdout, "{}", msg.yellow())?;
+        Err(error) => {
+            writeln!(stdout, "{}", format!("Runtime state: {error}").red())?;
         }
     }
 
+    Ok(())
+}
+
+fn write_runtime_root_health(
+    stdout: &mut impl Write,
+    kind: &str,
+    root: &std::path::Path,
+) -> std::io::Result<()> {
+    writeln!(stdout, "Runtime {kind}: {}", root.display())?;
+    if let Ok(target) = std::fs::read_link(root) {
+        writeln!(
+            stdout,
+            "{}",
+            format!("Runtime {kind} is symlinked to: {}", target.display()).yellow()
+        )?;
+    }
+    if !root.exists() {
+        writeln!(
+            stdout,
+            "{}",
+            format!("Runtime {kind} does not exist: {}", root.display()).yellow()
+        )?;
+    } else if root.read_dir().ok().map(|entries| entries.count()) == Some(0) {
+        writeln!(
+            stdout,
+            "{}",
+            format!("Runtime {kind} is empty: {}", root.display()).yellow()
+        )?;
+    }
     Ok(())
 }
 
@@ -214,10 +244,19 @@ fn languages(selection: Option<HashSet<String>>) -> std::io::Result<()> {
         .language
         .sort_unstable_by_key(|l| l.language_id.clone());
 
+    let runtime_assets = runtime_assets_for_health()
+        .inspect_err(|error| log::warn!("failed to load runtime assets for health check: {error}"))
+        .ok();
     let check_binary_with_name = |cmd: Option<(&str, &str)>| match cmd {
-        Some((name, cmd)) => match helix_stdx::env::which(cmd) {
-            Ok(_) => color(fit(&format!("✓ {}", name)), ColorSpec::BRIGHT_GREEN),
-            Err(_) => color(fit(&format!("✘ {}", name)), ColorSpec::BRIGHT_RED),
+        Some((name, cmd)) => match runtime_assets.and_then(|assets| {
+            assets
+                .resolve_command(cmd)
+                .inspect_err(|error| log::warn!("failed to resolve command {cmd}: {error}"))
+                .ok()
+                .flatten()
+        }) {
+            Some(_) => color(fit(&format!("✓ {}", name)), ColorSpec::BRIGHT_GREEN),
+            None => color(fit(&format!("✘ {}", name)), ColorSpec::BRIGHT_RED),
         },
         None => color(fit("None"), ColorSpec::BRIGHT_YELLOW),
     };
@@ -378,6 +417,7 @@ fn probe_protocols<'a, I: Iterator<Item = (&'a str, &'a str)> + 'a>(
     let stdout = std::io::stdout();
     let mut stdout = stdout.lock();
     let mut server_cmds = server_cmds.peekable();
+    let runtime_assets = runtime_assets_for_health();
 
     write!(stdout, "Configured {}s:", protocol_name)?;
     if server_cmds.peek().is_none() {
@@ -387,9 +427,29 @@ fn probe_protocols<'a, I: Iterator<Item = (&'a str, &'a str)> + 'a>(
     writeln!(stdout)?;
 
     for (name, cmd) in server_cmds {
-        let (diag, icon) = match helix_stdx::env::which(cmd) {
-            Ok(path) => (path.display().to_string().green(), "✓".green()),
-            Err(_) => (format!("'{}' not found in $PATH", cmd).red(), "✘".red()),
+        let resolved = runtime_assets
+            .as_ref()
+            .map_err(ToString::to_string)
+            .and_then(|assets| {
+                assets
+                    .resolve_command(cmd)
+                    .map_err(|error| error.to_string())
+            });
+        let (diag, icon) = match resolved {
+            Ok(Some(resolved)) => (
+                format!(
+                    "{} ({})",
+                    resolved.program.display(),
+                    origin_label(&resolved.origin)
+                )
+                .green(),
+                "✓".green(),
+            ),
+            Ok(None) => (
+                format!("'{}' not found in runtime assets or $PATH", cmd).red(),
+                "✘".red(),
+            ),
+            Err(error) => (error.red(), "✘".red()),
         };
         writeln!(stdout, "  {} {}: {}", icon, name, diag)?;
     }
@@ -409,13 +469,55 @@ fn probe_protocol(protocol_name: &str, server_cmd: Option<String>) -> std::io::R
     };
     writeln!(stdout)?;
 
-    let (diag, icon) = match helix_stdx::env::which(&cmd) {
-        Ok(path) => (path.display().to_string().green(), "✓".green()),
-        Err(_) => (format!("'{}' not found in $PATH", cmd).red(), "✘".red()),
+    let resolved = runtime_assets_for_health().and_then(|assets| {
+        assets
+            .resolve_command(&cmd)
+            .map_err(|error| error.to_string())
+    });
+    let (diag, icon) = match resolved {
+        Ok(Some(resolved)) => (
+            format!(
+                "{} ({})",
+                resolved.program.display(),
+                origin_label(&resolved.origin)
+            )
+            .green(),
+            "✓".green(),
+        ),
+        Ok(None) => (
+            format!("'{}' not found in runtime assets or $PATH", cmd).red(),
+            "✘".red(),
+        ),
+        Err(error) => (error.red(), "✘".red()),
     };
     writeln!(stdout, "  {} {}", icon, diag)?;
 
     Ok(())
+}
+
+fn origin_label(origin: &helix_loader::Origin) -> String {
+    match origin {
+        helix_loader::Origin::Explicit => "explicit path".into(),
+        helix_loader::Origin::Managed { package } => {
+            format!("pkg {} {}", package.name, package.version)
+        }
+        helix_loader::Origin::Path => "$PATH".into(),
+        helix_loader::Origin::RuntimeOverride { root } => {
+            format!("runtime override {}", root.display())
+        }
+        helix_loader::Origin::BundledRuntime { root } => {
+            format!("bundled runtime {}", root.display())
+        }
+    }
+}
+
+fn runtime_assets_for_health() -> Result<&'static helix_loader::RuntimeAssets, String> {
+    helix_pkg::Store::open_default()
+        .receipts()
+        .map_err(|error| error.to_string())?;
+    let assets = helix_loader::runtime_assets().map_err(|error| error.to_string())?;
+    assets.refresh().map_err(|error| error.to_string())?;
+    Ok(assets)
 }
 
 /// Display diagnostics about a feature that requires tree-sitter

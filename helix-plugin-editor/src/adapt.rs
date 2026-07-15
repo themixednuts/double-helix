@@ -1,11 +1,7 @@
-//! Adapters that convert `helix-view` / `helix-core` internal types into
-//! host-agnostic contract types.
+//! Convert `helix-view` / `helix-core` types into host-agnostic contract types.
 //!
-//! These adapters live inside `helix-plugin` (which already depends on
-//! `helix-view` and `helix-core`) and form the bridge between editor internals
-//! and the public contract. The Lua facade and any future language host call
-//! through the contract types; these adapters are the only place that knows
-//! about the internal representations.
+//! This module is the only conversion layer that knows both the editor's
+//! internal representations and the plugin wire contract.
 
 use std::num::NonZeroU64;
 
@@ -13,9 +9,11 @@ use helix_core::diagnostic::Severity;
 use helix_view::{DocumentId, Editor, ViewId};
 use slotmap::Key as _;
 
-use super::errors::ContractError;
-use super::handles::{DocumentHandle, FloatHandle, PanelHandle, ThreadHandle, ViewHandle};
-use super::snapshots;
+use helix_plugin_api::errors::ContractError;
+use helix_plugin_api::handles::{
+    DocumentHandle, FloatHandle, PanelHandle, ThreadHandle, ViewHandle,
+};
+use helix_plugin_api::{requests::PanelSide, snapshots};
 
 // ---------------------------------------------------------------------------
 // Handle conversion
@@ -112,11 +110,11 @@ pub fn resolve_panel(
 }
 
 /// Convert internal `PanelSide` to contract `PanelSide`.
-pub fn panel_side_to_contract(side: helix_view::model::PanelSide) -> super::requests::PanelSide {
+pub fn panel_side_to_contract(side: helix_view::model::PanelSide) -> PanelSide {
     match side {
-        helix_view::model::PanelSide::Left => super::requests::PanelSide::Left,
-        helix_view::model::PanelSide::Right => super::requests::PanelSide::Right,
-        helix_view::model::PanelSide::Bottom => super::requests::PanelSide::Bottom,
+        helix_view::model::PanelSide::Left => PanelSide::Left,
+        helix_view::model::PanelSide::Right => PanelSide::Right,
+        helix_view::model::PanelSide::Bottom => PanelSide::Bottom,
     }
 }
 

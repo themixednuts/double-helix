@@ -7,6 +7,36 @@
 
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LanguageServerSnapshot {
+    pub id: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LineNumberMode {
+    Absolute,
+    Relative,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EditorConfigSnapshot {
+    pub scrolloff: usize,
+    pub mouse: bool,
+    pub cursorline: bool,
+    pub cursorcolumn: bool,
+    pub auto_format: bool,
+    pub auto_completion: bool,
+    pub auto_info: bool,
+    pub line_number: LineNumberMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalSizeSnapshot {
+    pub width: u16,
+    pub height: u16,
+}
+
 use super::handles::{DocumentHandle, FloatHandle, PanelHandle, ThreadHandle, ViewHandle};
 use super::requests::PanelSide;
 

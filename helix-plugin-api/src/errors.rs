@@ -1,8 +1,8 @@
 //! Structured error types for the host-agnostic plugin contract.
 //!
 //! These errors are returned by capability trait methods and are designed to
-//! be serializable for future transport compatibility. They are separate from
-//! the runtime [`crate::error::PluginError`] which covers Lua/loading concerns.
+//! be serializable across host boundaries. They are separate from language
+//! runtime and plugin-loading failures.
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;

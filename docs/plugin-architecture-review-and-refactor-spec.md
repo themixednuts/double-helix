@@ -1,6 +1,13 @@
 # Plugin Architecture Review and Refactor Spec
 
-Status: updated after initial implementation pass
+Status: historical migration record. The current supervised host architecture is
+documented in `book/src/plugins.md`, `docs/runtime-architecture.md`, and
+`docs/responsive-application-architecture.md`.
+
+Current code has moved the host-agnostic contract into `helix-plugin-api` and
+`adapt.rs` / `bridge.rs` into the dedicated `helix-plugin-editor` integration
+crate. References below to those modules under `helix-plugin/src/contract/`
+describe the pre-migration layout.
 
 This document turns the current `helix-plugin` review into a concrete target architecture and implementation sequence.
 
@@ -14,7 +21,8 @@ The goal is not to make the plugin system more abstract in the abstract. The goa
 
 ## Summary
 
-The current plugin system still uses an embedded Lua bridge, but the highest-risk API and safety problems have already been reduced materially.
+At the time of this review, the plugin system still used an embedded Lua bridge.
+That implementation has since been removed from the editor process.
 
 The biggest remaining problems are:
 
@@ -50,7 +58,7 @@ Note: old per-module files (`editor.rs`, `buffer.rs`, `ui.rs`, `window.rs`, `lsp
 
 Current strengths:
 
-- `PluginManager` is a clear owner for plugin load, event fire, command lookup, and UI callback delivery
+- the former `PluginManager` owned plugin load, event fire, command lookup, and UI callback delivery
 - `PluginEvent` (contract) is the single typed Rust event enum with 20 event kinds and structured payloads
 - `DrawSurface` keeps `helix-plugin` independent of `helix-tui`
 - plugin panels use a lightweight model/compositor split via `ContentModel` trait

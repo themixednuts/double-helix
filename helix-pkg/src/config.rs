@@ -384,6 +384,8 @@ mod tests {
             arch: std::env::consts::ARCH.to_owned(),
             source,
             bin: "demo".to_owned(),
+            args: Vec::new(),
+            env: Default::default(),
         };
         let package = PackageSpec {
             name: "demo".to_owned(),

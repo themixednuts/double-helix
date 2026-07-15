@@ -6,22 +6,25 @@ pub fn register(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
     m.set(
         "api_metadata",
         lua.create_function(|lua, ()| {
-            let meta = with_query_bridge(lua, |bridge| Ok(bridge.api_metadata()))?;
+            let meta = lua
+                .app_data_ref::<crate::lua::HostApiMetadata>()
+                .ok_or_else(|| LuaError::RuntimeError("host metadata unavailable".into()))?
+                .0
+                .clone();
 
             let table = lua.create_table()?;
             table.set("version", meta.version)?;
-            table.set("min_compatible_version", meta.min_compatible_version)?;
 
             let caps = lua.create_table()?;
             for (i, cap) in meta.capabilities.iter().enumerate() {
-                caps.set(i + 1, format!("{cap:?}").to_lowercase())?;
+                caps.set(i + 1, cap.as_str())?;
             }
             table.set("capabilities", caps)?;
 
             let caps_clone: Vec<String> = meta
                 .capabilities
                 .iter()
-                .map(|c| format!("{c:?}").to_lowercase())
+                .map(|capability| capability.as_str().to_owned())
                 .collect();
             table.set(
                 "has_capability",
@@ -35,7 +38,6 @@ pub fn register(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
                 let entry = lua.create_table()?;
                 entry.set("kind", info.kind.as_str())?;
                 entry.set("description", info.description.as_str())?;
-                entry.set("since_version", info.since_version)?;
                 catalog.set(i + 1, entry)?;
             }
             table.set("event_catalog", catalog)?;

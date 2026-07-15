@@ -4,28 +4,33 @@ use helix_core::doc_formatter::{FormattedGrapheme, TextFormat};
 use helix_core::text_annotations::{LineAnnotation, PlainViewportSupport};
 use helix_core::{softwrapped_dimensions, Position};
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
-pub struct PluginLineAnnotations<'a> {
-    doc: &'a Document,
-    view_id: ViewId,
+pub struct PluginLineAnnotations {
+    text: helix_core::Rope,
+    annotations: Arc<[crate::document::PluginAnnotation]>,
+    tab_width: u16,
     width: u16,
 }
 
-impl<'a> PluginLineAnnotations<'a> {
-    pub fn new(doc: &'a Document, view_id: ViewId, width: u16) -> Self {
+impl PluginLineAnnotations {
+    pub fn new(doc: &Document, view_id: ViewId, width: u16) -> Self {
         Self {
-            doc,
-            view_id,
+            text: doc.text().clone(),
+            annotations: doc
+                .visual_annotations(view_id)
+                .unwrap_or_else(|| Arc::from([])),
+            tab_width: doc.tab_width() as u16,
             width,
         }
     }
 
     fn plain_viewport_support(&self, top_line: usize, cursor_line: usize) -> PlainViewportSupport {
-        let Some(annotations) = self.doc.visual_annotations(self.view_id) else {
+        if self.annotations.is_empty() {
             return PlainViewportSupport::Supported;
-        };
+        }
 
-        plugin_plain_viewport_support(&annotations, self.doc.text(), top_line, cursor_line)
+        plugin_plain_viewport_support(&self.annotations, &self.text, top_line, cursor_line)
     }
 }
 
@@ -53,7 +58,7 @@ fn plugin_plain_viewport_support(
     }
 }
 
-impl LineAnnotation for PluginLineAnnotations<'_> {
+impl LineAnnotation for PluginLineAnnotations {
     fn plain_viewport_support(&self, top_line: usize, cursor_line: usize) -> PlainViewportSupport {
         self.plain_viewport_support(top_line, cursor_line)
     }
@@ -80,11 +85,12 @@ impl LineAnnotation for PluginLineAnnotations<'_> {
         let mut max_virt_idx: i32 = -1;
         let mut next_auto_idx: u16 = 0;
 
-        if let Some(annots) = self.doc.visual_annotations(self.view_id) {
-            let line_start = self.doc.text().line_to_char(doc_line);
-            let line_end = self.doc.text().line_to_char(doc_line + 1);
+        if !self.annotations.is_empty() {
+            let line_start = self.text.line_to_char(doc_line);
+            let line_end = self.text.line_to_char(doc_line + 1);
 
-            let line_annots: Vec<_> = annots
+            let line_annots: Vec<_> = self
+                .annotations
                 .iter()
                 .filter(|a| a.char_idx >= line_start && a.char_idx < line_end)
                 .collect();
@@ -139,7 +145,7 @@ impl LineAnnotation for PluginLineAnnotations<'_> {
                 if available_width > 0 {
                     let text_fmt = TextFormat {
                         soft_wrap: true,
-                        tab_width: self.doc.tab_width() as u16,
+                        tab_width: self.tab_width,
                         max_wrap: available_width.saturating_div(4).max(20),
                         max_indent_retain: 0,
                         wrap_indicator_highlight: None,
@@ -198,7 +204,7 @@ impl LineAnnotation for PluginLineAnnotations<'_> {
                     if available_width > 0 {
                         let text_fmt = TextFormat {
                             soft_wrap: true,
-                            tab_width: self.doc.tab_width() as u16,
+                            tab_width: self.tab_width,
                             max_wrap: available_width.saturating_div(4).max(20),
                             max_indent_retain: 0,
                             wrap_indicator_highlight: None,

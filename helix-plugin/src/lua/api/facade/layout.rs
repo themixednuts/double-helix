@@ -1,7 +1,7 @@
 use super::*;
+use crate::contract::layout::{center, split_horizontal, split_vertical, Size};
 
-fn parse_size(s: &str) -> LuaResult<helix_view::layout::Size> {
-    use helix_view::layout::Size;
+fn parse_size(s: &str) -> LuaResult<Size> {
     if s == "fill" {
         return Ok(Size::Fill);
     }
@@ -9,7 +9,7 @@ fn parse_size(s: &str) -> LuaResult<helix_view::layout::Size> {
         let v: u16 = n
             .parse()
             .map_err(|_| LuaError::RuntimeError(format!("invalid fixed size: {s}")))?;
-        return Ok(Size::fixed(v));
+        return Ok(Size::Fixed(v));
     }
     if let Some(n) = s.strip_prefix("percent:") {
         let v: u8 = n
@@ -30,17 +30,23 @@ fn parse_size(s: &str) -> LuaResult<helix_view::layout::Size> {
         let max: u16 = parts[1]
             .parse()
             .map_err(|_| LuaError::RuntimeError(format!("invalid constrained max: {s}")))?;
-        return Ok(Size::constrained(min, max));
+        let max = max.max(1);
+        if min > max {
+            return Err(LuaError::RuntimeError(format!(
+                "constrained size minimum exceeds maximum: {s}"
+            )));
+        }
+        return Ok(Size::Constrained { min, max });
     }
     if let Ok(v) = s.parse::<u16>() {
-        return Ok(Size::fixed(v));
+        return Ok(Size::Fixed(v));
     }
     Err(LuaError::RuntimeError(format!(
         "unknown size format: {s}. Expected: \"fill\", \"fixed:N\", \"percent:N\", \"constrained:MIN:MAX\", or a number"
     )))
 }
 
-fn parse_sizes(list: &[String]) -> LuaResult<Vec<helix_view::layout::Size>> {
+fn parse_sizes(list: &[String]) -> LuaResult<Vec<Size>> {
     list.iter().map(|s| parse_size(s)).collect()
 }
 
@@ -52,7 +58,7 @@ pub fn register(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
         lua.create_function(|lua, (area_table, sizes_list): (LuaTable, Vec<String>)| {
             let area = table_to_rect(&area_table)?;
             let sizes = parse_sizes(&sizes_list)?;
-            let rects = helix_view::layout::split_vertical(area, &sizes);
+            let rects = split_vertical(area, &sizes);
             let result = lua.create_table()?;
             for (i, r) in rects.iter().enumerate() {
                 result.set(i + 1, rect_to_table(lua, *r)?)?;
@@ -66,7 +72,7 @@ pub fn register(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
         lua.create_function(|lua, (area_table, sizes_list): (LuaTable, Vec<String>)| {
             let area = table_to_rect(&area_table)?;
             let sizes = parse_sizes(&sizes_list)?;
-            let rects = helix_view::layout::split_horizontal(area, &sizes);
+            let rects = split_horizontal(area, &sizes);
             let result = lua.create_table()?;
             for (i, r) in rects.iter().enumerate() {
                 result.set(i + 1, rect_to_table(lua, *r)?)?;
@@ -79,7 +85,7 @@ pub fn register(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
         "center",
         lua.create_function(|lua, (area_table, width, height): (LuaTable, u16, u16)| {
             let area = table_to_rect(&area_table)?;
-            let r = helix_view::layout::center(area, width, height);
+            let r = center(area, width, height);
             rect_to_table(lua, r)
         })?,
     )?;

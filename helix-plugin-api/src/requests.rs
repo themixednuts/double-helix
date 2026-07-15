@@ -4,15 +4,12 @@
 //! with explicit fields — no positional protocols, no stringly-typed bags.
 //! All requests are serializable for future transport compatibility.
 //!
-//! Runtime concerns like plugin names are NOT part of these types. Callback
-//! identities are represented as opaque typed handles when a request needs
-//! host-driven rendering.
+//! Runtime concerns like plugin names are NOT part of these types.
 
 use serde::{Deserialize, Serialize};
 
 use super::handles::{
-    CommandHandle, DocumentHandle, FloatHandle, PanelHandle, PluginId, RenderCallbackHandle,
-    ViewHandle,
+    CommandHandle, DocumentHandle, FloatHandle, PanelHandle, PluginId, ViewHandle,
 };
 use super::snapshots::{Color, Position, SelectionRange};
 
@@ -85,6 +82,10 @@ pub struct Annotation {
     /// If true, renders as a virtual line instead of inline.
     #[serde(default)]
     pub is_line: bool,
+    #[serde(default)]
+    pub offset: u16,
+    pub virtual_line: Option<u16>,
+    pub dropped_text: Option<String>,
 }
 
 /// Style for an annotation's text.
@@ -107,6 +108,11 @@ pub struct UndoRequest {
 /// Request to redo the last undone change in a document.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RedoRequest {
+    pub document: DocumentHandle,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct SelectAllRequest {
     pub document: DocumentHandle,
 }
 
@@ -330,8 +336,6 @@ pub enum FloatContent {
     Document(DocumentHandle),
     /// Styled text blocks rendered by the host.
     Blocks(Vec<FloatBlock>),
-    /// Plugin-rendered content via callback.
-    PluginRender { callback: RenderCallbackHandle },
 }
 
 /// A styled text block for float content.
@@ -404,6 +408,106 @@ pub struct PanelRegistration {
     /// If true, the panel starts hidden.
     #[serde(default)]
     pub hidden: bool,
+    #[serde(default)]
+    pub content: Vec<UiRenderNode>,
+}
+
+/// A rectangle positioned relative to a retained UI container.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UiRect {
+    #[serde(default)]
+    pub x: u16,
+    #[serde(default)]
+    pub y: u16,
+    pub width: u16,
+    pub height: u16,
+}
+
+/// A retained, serializable UI primitive rendered by the host.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum UiRenderNode {
+    Text {
+        #[serde(default)]
+        x: u16,
+        #[serde(default)]
+        y: u16,
+        text: String,
+        #[serde(default = "default_panel_text_style")]
+        style: String,
+        max_width: Option<u16>,
+    },
+    Fill {
+        area: UiRect,
+        #[serde(default = "default_panel_text_style")]
+        style: String,
+    },
+    Header {
+        area: UiRect,
+        title: String,
+        current: Option<usize>,
+        total: Option<usize>,
+        #[serde(default = "default_panel_text_style")]
+        style: String,
+    },
+    HorizontalDivider {
+        area: UiRect,
+        #[serde(default = "default_panel_text_style")]
+        style: String,
+    },
+    VerticalDivider {
+        area: UiRect,
+        #[serde(default = "default_panel_text_style")]
+        style: String,
+    },
+    TextInput {
+        area: UiRect,
+        text: String,
+        cursor: usize,
+        #[serde(default = "default_panel_text_style")]
+        style: String,
+        #[serde(default = "default_cursor_style")]
+        cursor_style: String,
+    },
+    Scrollbar {
+        area: UiRect,
+        total: usize,
+        offset: usize,
+        visible: usize,
+        #[serde(default = "default_scrollbar_style")]
+        thumb_style: String,
+        track_symbol: Option<String>,
+        #[serde(default = "default_scrollbar_track_style")]
+        track_style: String,
+    },
+}
+
+impl UiRenderNode {
+    pub fn text(text: impl Into<String>) -> Self {
+        Self::Text {
+            x: 0,
+            y: 0,
+            text: text.into(),
+            style: default_panel_text_style(),
+            max_width: None,
+        }
+    }
+}
+
+fn default_cursor_style() -> String {
+    "ui.cursor".into()
+}
+
+fn default_scrollbar_style() -> String {
+    "ui.menu.scroll".into()
+}
+
+fn default_scrollbar_track_style() -> String {
+    "ui.background".into()
+}
+
+fn default_panel_text_style() -> String {
+    "ui.text".into()
 }
 
 /// Request to update an existing panel's properties.
@@ -411,6 +515,7 @@ pub struct PanelRegistration {
 pub struct PanelUpdateRequest {
     pub panel: PanelHandle,
     pub title: Option<String>,
+    pub content: Option<Vec<UiRenderNode>>,
 }
 
 /// Request to close a panel.
@@ -532,6 +637,7 @@ mod tests {
             side: PanelSide::default(),
             size: Some(PanelSizeSpec::Fixed(30)),
             hidden: false,
+            content: Vec::new(),
         };
         let bytes = super::super::codec::encode(&reg).unwrap();
         let reg2: PanelRegistration = super::super::codec::decode(&bytes).unwrap();

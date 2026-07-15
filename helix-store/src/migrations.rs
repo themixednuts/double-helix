@@ -79,6 +79,60 @@ CREATE INDEX IF NOT EXISTS idx_assistant_threads_scope_rating_feedback_updated
     ON assistant_threads(scope, rating, has_feedback, updated_at DESC);
 "#,
     },
+    Migration {
+        version: 4,
+        name: "pkg_runtime_assets",
+        sql: r#"
+CREATE TABLE IF NOT EXISTS pkg_runtime_assets (
+    asset_kind TEXT NOT NULL,
+    asset_key TEXT NOT NULL,
+    package_kind TEXT NOT NULL,
+    package_name TEXT NOT NULL,
+    package_version TEXT NOT NULL,
+    path TEXT NOT NULL,
+    prefix_args_json TEXT NOT NULL DEFAULT '[]',
+    default_args_json TEXT NOT NULL DEFAULT '[]',
+    env_json TEXT NOT NULL DEFAULT '{}',
+    PRIMARY KEY(asset_kind, asset_key),
+    CHECK(asset_kind IN ('command', 'file', 'grammar', 'plugin-root'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_pkg_runtime_assets_package
+    ON pkg_runtime_assets(package_kind, package_name);
+
+CREATE TABLE IF NOT EXISTS pkg_activation_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    package_kind TEXT NOT NULL,
+    package_name TEXT NOT NULL,
+    package_version TEXT NOT NULL,
+    operation TEXT NOT NULL,
+    previous_assets_json TEXT NOT NULL,
+    activated_assets_json TEXT NOT NULL,
+    generation INTEGER NOT NULL,
+    rolled_back_generation INTEGER,
+    created_at INTEGER NOT NULL DEFAULT (unixepoch())
+);
+
+CREATE INDEX IF NOT EXISTS idx_pkg_activation_history_package
+    ON pkg_activation_history(package_kind, package_name, id DESC);
+
+CREATE TABLE IF NOT EXISTS pkg_runtime_meta (
+    singleton INTEGER PRIMARY KEY NOT NULL CHECK(singleton = 1),
+    runtime_generation INTEGER NOT NULL
+);
+
+INSERT INTO pkg_runtime_meta(singleton, runtime_generation)
+VALUES (1, 0)
+ON CONFLICT(singleton) DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS pkg_registry_heads (
+    registry TEXT PRIMARY KEY NOT NULL,
+    source TEXT NOT NULL,
+    revision TEXT NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+"#,
+    },
 ];
 
 const CACHE_MIGRATIONS: &[Migration] = &[Migration {

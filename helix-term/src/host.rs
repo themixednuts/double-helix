@@ -33,6 +33,7 @@ pub struct TermHost<'a> {
     runtime: &'a Runtime,
     ingress: crate::runtime::RuntimeIngress,
     redraw: FrameHandle,
+    timers: std::collections::HashMap<TimerId, helix_runtime::Task<()>>,
 }
 
 impl<'a> TermHost<'a> {
@@ -47,6 +48,7 @@ impl<'a> TermHost<'a> {
             runtime,
             ingress,
             redraw,
+            timers: std::collections::HashMap::new(),
         }
     }
 }
@@ -70,13 +72,11 @@ impl UiHost for TermHost<'_> {
     fn request_timer(&mut self, id: TimerId, after: Duration) {
         let ingress = self.ingress.clone();
         let timer_task = self.runtime.clock().timer(after);
-        self.runtime
-            .work()
-            .spawn(async move {
-                if timer_task.await.is_ok() {
-                    ingress.send_timer(id).await;
-                }
-            })
-            .detach();
+        let task = self.runtime.work().spawn(async move {
+            if timer_task.await.is_ok() {
+                ingress.send_timer(id).await;
+            }
+        });
+        self.timers.insert(id, task);
     }
 }

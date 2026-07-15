@@ -1,9 +1,10 @@
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::io::ErrorKind;
 use std::time::SystemTime;
 use std::{
-    collections::HashSet,
+    collections::{BTreeSet, HashSet},
     path::{Path, PathBuf},
     process::Command,
     sync::mpsc::channel,
@@ -11,17 +12,7 @@ use std::{
 use tempfile::TempPath;
 use tree_house::tree_sitter::Grammar;
 
-#[cfg(target_os = "macos")]
-const DYLIB_EXTENSION: &str = "dylib";
-
-#[cfg(all(unix, not(target_os = "macos")))]
-const DYLIB_EXTENSION: &str = "so";
-
-#[cfg(windows)]
-const DYLIB_EXTENSION: &str = "dll";
-
-#[cfg(target_arch = "wasm32")]
-const DYLIB_EXTENSION: &str = "wasm";
+use crate::assets::DYLIB_EXTENSION;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Configuration {
@@ -70,80 +61,27 @@ pub fn get_language(name: &str) -> Result<Option<Grammar>> {
 
 #[cfg(not(target_arch = "wasm32"))]
 pub fn get_language(name: &str) -> Result<Option<Grammar>> {
-    let mut rel_library_path = PathBuf::new().join("grammars").join(name);
-    rel_library_path.set_extension(DYLIB_EXTENSION);
-    let library_path = crate::runtime_file(&rel_library_path);
-    let library_path = if library_path.exists() {
-        library_path
-    } else if let Some(path) = pkg_grammar_library_path(name) {
-        path
-    } else {
+    let Some(library_path) = grammar_library_path(name, crate::runtime_assets()?)? else {
         return Ok(None);
     };
-    if !library_path.exists() {
-        return Ok(None);
-    }
 
     let grammar = unsafe { Grammar::new(name, &library_path) }?;
     Ok(Some(grammar))
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+fn grammar_library_path(
+    name: &str,
+    runtime_assets: &crate::RuntimeAssets,
+) -> Result<Option<PathBuf>> {
+    Ok(runtime_assets
+        .resolve_grammar(name)?
+        .map(|resolved| resolved.path))
+}
+
 fn ensure_git_is_available() -> Result<()> {
     helix_stdx::env::which("git")?;
     Ok(())
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-pub fn pkg_grammar_library_path(name: &str) -> Option<PathBuf> {
-    use etcetera::base_strategy::BaseStrategy;
-
-    let strategy = etcetera::base_strategy::choose_base_strategy().ok()?;
-    let pkg = strategy
-        .data_dir()
-        .join(crate::PRODUCT_CONFIG_DIR)
-        .join("pkg");
-    pkg_grammar_library_path_from(&pkg, name)
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn pkg_grammar_library_path_from(pkg: &Path, name: &str) -> Option<PathBuf> {
-    #[derive(Deserialize)]
-    struct Receipt {
-        version: String,
-    }
-
-    let version = pkg_grammar_receipt_version_from_db(pkg, name).or_else(|| {
-        let receipt_path = pkg.join("receipts").join(format!("grammar-{name}.toml"));
-        let receipt: Receipt = toml::from_str(&std::fs::read_to_string(receipt_path).ok()?).ok()?;
-        Some(receipt.version)
-    })?;
-    let mut library_path = pkg
-        .join("store")
-        .join("grammar")
-        .join(name)
-        .join(version)
-        .join(name);
-    library_path.set_extension(DYLIB_EXTENSION);
-    library_path.exists().then_some(library_path)
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn pkg_grammar_receipt_version_from_db(pkg: &Path, name: &str) -> Option<String> {
-    use rusqlite::{params, OpenFlags, OptionalExtension};
-
-    let db = pkg.parent()?.join("state.sqlite3");
-    if !db.exists() {
-        return None;
-    }
-    let conn = rusqlite::Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
-    conn.query_row(
-        "SELECT version FROM pkg_receipts WHERE kind = 'grammar' AND name = ?1",
-        params![name],
-        |row| row.get(0),
-    )
-    .optional()
-    .ok()
-    .flatten()
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -300,6 +238,14 @@ fn get_grammar_configs() -> Result<Vec<GrammarConfiguration>> {
     Ok(grammars)
 }
 
+/// Returns grammar identities enabled by the merged `languages.toml` selection.
+pub fn configured_grammar_names() -> Result<BTreeSet<String>> {
+    Ok(get_grammar_configs()?
+        .into_iter()
+        .map(|grammar| grammar.grammar_id)
+        .collect())
+}
+
 pub fn get_grammar_names() -> Result<Option<HashSet<String>>> {
     let config: Configuration = crate::config::user_lang_config()
         .context("Could not parse languages.toml")?
@@ -357,9 +303,7 @@ struct VendoredGrammar {
 
 impl VendoredGrammar {
     fn new(grammar: &str) -> Self {
-        let dir = crate::runtime_dirs()
-            .first()
-            .expect("No runtime directories provided") // guaranteed by post-condition
+        let dir = crate::runtime_write_dir()
             .join("grammars")
             .join("sources")
             .join(grammar);
@@ -377,16 +321,32 @@ impl VendoredGrammar {
     }
 
     /// Fetches grammar at the given revision.
-    ///
-    /// To ensure clean state, existing grammar directory is removed and re-inited
-    /// before fetch operation.
     fn fetch(&self, remote: &str, rev: &str) -> Result<()> {
-        self.reinit(remote)?;
+        let staging_dir = self.prepare_update()?;
+        let staged = Self::at(staging_dir.clone());
+        let result = (|| {
+            staged.init(remote)?;
+            git(&staging_dir, ["fetch", "--depth", "1", REMOTE_NAME, rev])?;
+            git(&staging_dir, ["checkout", rev])?;
+            self.promote(&staging_dir)
+        })();
 
-        git(&self.dir, ["fetch", "--depth", "1", REMOTE_NAME, rev])?;
-        git(&self.dir, ["checkout", rev])?;
-
-        Ok(())
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let message = format!(
+                    "Failed to update grammar checkout {:?} from {remote:?} at revision {rev:?}: {error:#}",
+                    self.dir
+                );
+                match remove_path_if_exists(&staging_dir) {
+                    Ok(()) => Err(anyhow!(message)),
+                    Err(cleanup_error) => Err(anyhow!(
+                        "{message}\nAdditionally failed to remove staged checkout {:?}: {cleanup_error}",
+                        staging_dir
+                    )),
+                }
+            }
+        }
     }
 
     /// Initializes the grammar directory.
@@ -394,10 +354,12 @@ impl VendoredGrammar {
     /// Creates directory and sets it up as a git repo, with remote set correctly.
     fn init(&self, remote: &str) -> Result<()> {
         // Create the grammar directory if needed.
-        fs::create_dir_all(&self.dir).context(format!(
-            "Could not create grammar directory {:?}",
-            &self.dir
-        ))?;
+        fs::create_dir_all(&self.dir).map_err(|error| {
+            anyhow!(
+                "Could not create grammar directory {:?}: {error}",
+                &self.dir
+            )
+        })?;
 
         // Ensure directory is git initialized.
         if !self.dir.join(".git").exists() {
@@ -412,11 +374,111 @@ impl VendoredGrammar {
         Ok(())
     }
 
-    /// Removes the grammar directory before initializing again.
-    fn reinit(&self, remote: &str) -> Result<()> {
-        fs::remove_dir_all(&self.dir)?;
-        self.init(remote)?;
+    fn prepare_update(&self) -> Result<PathBuf> {
+        let staging_dir = self.staging_dir()?;
+        let backup_dir = self.backup_dir()?;
+        let live_exists = path_exists(&self.dir)?;
+        let backup_exists = path_exists(&backup_dir)?;
+
+        if !live_exists && backup_exists {
+            fs::rename(&backup_dir, &self.dir).map_err(|error| {
+                anyhow!(
+                    "Could not restore grammar checkout {:?} from backup {:?} after an interrupted update: {error}",
+                    self.dir,
+                    backup_dir
+                )
+            })?;
+        } else if live_exists && backup_exists {
+            remove_path_if_exists(&backup_dir).map_err(|error| {
+                anyhow!(
+                    "Could not remove stale grammar backup {:?}: {error}",
+                    backup_dir
+                )
+            })?;
+        }
+
+        remove_path_if_exists(&staging_dir).map_err(|error| {
+            anyhow!(
+                "Could not remove stale staged grammar checkout {:?}: {error}",
+                staging_dir
+            )
+        })?;
+        Ok(staging_dir)
+    }
+
+    fn promote(&self, staging_dir: &Path) -> Result<()> {
+        let backup_dir = self.backup_dir()?;
+
+        if !path_exists(&self.dir)? {
+            return fs::rename(staging_dir, &self.dir).map_err(|error| {
+                anyhow!(
+                    "Could not promote staged grammar checkout {:?} to {:?}: {error}",
+                    staging_dir,
+                    self.dir
+                )
+            });
+        }
+
+        if path_exists(&backup_dir)? {
+            bail!(
+                "Could not promote staged grammar checkout {:?}: backup path {:?} already exists",
+                staging_dir,
+                backup_dir
+            );
+        }
+
+        fs::rename(&self.dir, &backup_dir).map_err(|error| {
+            anyhow!(
+                "Could not move current grammar checkout {:?} to backup {:?}: {error}",
+                self.dir,
+                backup_dir
+            )
+        })?;
+
+        if let Err(promote_error) = fs::rename(staging_dir, &self.dir) {
+            return match fs::rename(&backup_dir, &self.dir) {
+                Ok(()) => Err(anyhow!(
+                    "Could not promote staged grammar checkout {:?} to {:?}: {promote_error}; the previous checkout was restored",
+                    staging_dir,
+                    self.dir
+                )),
+                Err(rollback_error) => Err(anyhow!(
+                    "Could not promote staged grammar checkout {:?} to {:?}: {promote_error}; also failed to restore backup {:?}: {rollback_error}",
+                    staging_dir,
+                    self.dir,
+                    backup_dir
+                )),
+            };
+        }
+
+        if let Err(error) = remove_path_if_exists(&backup_dir) {
+            log::warn!(
+                "Grammar checkout {:?} was updated, but stale backup {:?} could not be removed: {error}",
+                self.dir,
+                backup_dir
+            );
+        }
         Ok(())
+    }
+
+    fn staging_dir(&self) -> Result<PathBuf> {
+        self.sibling_dir(".staging")
+    }
+
+    fn backup_dir(&self) -> Result<PathBuf> {
+        self.sibling_dir(".backup")
+    }
+
+    fn sibling_dir(&self, suffix: &str) -> Result<PathBuf> {
+        let name = self.dir.file_name().ok_or_else(|| {
+            anyhow!(
+                "Grammar checkout path {:?} has no final component",
+                self.dir
+            )
+        })?;
+        let mut sibling_name = name.to_os_string();
+        sibling_name.push(suffix);
+        Ok(self.dir.with_file_name(sibling_name))
     }
 
     /// Gets remote URL of grammar repo.
@@ -442,10 +504,9 @@ fn fetch_grammar(grammar: GrammarConfiguration) -> Result<FetchStatus> {
 
     let repo = VendoredGrammar::new(&grammar.grammar_id);
 
-    // WARN: Must init before other operations are done.
-    repo.init(&remote)?;
-
-    if repo.revision().is_some_and(|rev| rev == revision) {
+    if repo.revision().is_some_and(|rev| rev == revision)
+        && repo.remote().as_deref() == Some(remote.as_str())
+    {
         return Ok(FetchStatus::GitUpToDate);
     }
 
@@ -462,22 +523,62 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<std::ffi::OsStr>,
 {
+    let args = args
+        .into_iter()
+        .map(|arg| arg.as_ref().to_os_string())
+        .collect::<Vec<_>>();
+    let command_args = args
+        .iter()
+        .map(|arg| arg.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join(" ");
     let output = Command::new("git")
-        .args(args)
+        .args(&args)
         .current_dir(repository_dir)
-        .output()?;
+        .output()
+        .map_err(|error| {
+            anyhow!(
+                "Failed to execute `git {command_args}` in {:?}: {error}",
+                repository_dir
+            )
+        })?;
 
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout)
             .trim_end()
             .to_owned())
     } else {
-        // TODO: figure out how to display the git command using `args`
         Err(anyhow!(
-            "Git command failed.\nStdout: {}\nStderr: {}",
+            "`git {command_args}` failed in {:?} with status {}.\nStdout: {}\nStderr: {}",
+            repository_dir,
+            output.status,
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         ))
+    }
+}
+
+fn path_exists(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(anyhow!(
+            "Could not inspect grammar path {:?}: {error}",
+            path
+        )),
+    }
+}
+
+fn remove_path_if_exists(path: &Path) -> std::io::Result<()> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if metadata.is_dir() {
+        fs::remove_dir_all(path)
+    } else {
+        fs::remove_file(path)
     }
 }
 
@@ -487,10 +588,7 @@ enum BuildStatus {
 }
 
 fn build_grammar(grammar: GrammarConfiguration, target: Option<&str>) -> Result<BuildStatus> {
-    let parser_lib_path = crate::runtime_dirs()
-        .first()
-        .expect("No runtime directories provided") // guaranteed by post-condition
-        .join("grammars");
+    let parser_lib_path = crate::runtime_write_dir().join("grammars");
     build_grammar_to(grammar, target, &parser_lib_path)
 }
 
@@ -742,73 +840,186 @@ fn mtime(path: &Path) -> Result<SystemTime> {
 /// Gives the contents of a file from a language's `runtime/queries/<lang>`
 /// directory
 pub fn load_runtime_file(language: &str, filename: &str) -> Result<String, std::io::Error> {
-    let path = crate::runtime_file(PathBuf::new().join("queries").join(language).join(filename));
-    std::fs::read_to_string(path)
+    let logical_path = PathBuf::new().join("queries").join(language).join(filename);
+    let path = crate::runtime_assets()
+        .and_then(|assets| assets.require_file(&logical_path))
+        .map_err(std::io::Error::other)?;
+    std::fs::read_to_string(path.path)
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
-    use std::fs;
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+    };
 
     use tempfile::TempDir;
 
-    use super::{pkg_grammar_library_path_from, DYLIB_EXTENSION};
+    use super::{git, grammar_library_path, install_pkg_grammar, VendoredGrammar, DYLIB_EXTENSION};
+    use crate::{RuntimeAssets, RuntimeAssetsSnapshot};
+    use helix_store::{ActivePackage, RuntimeAsset, RuntimeAssetSpec, RuntimeSnapshot};
 
-    #[test]
-    fn pkg_grammar_path_uses_active_receipt_version() {
-        let dir = TempDir::new().unwrap();
-        let pkg = dir.path();
-        fs::create_dir_all(pkg.join("receipts")).unwrap();
-        fs::write(
-            pkg.join("receipts").join("grammar-rust.toml"),
-            r#"version = "rev1""#,
+    fn create_grammar_remote(dir: &TempDir) -> (PathBuf, String) {
+        let remote = dir.path().join("remote");
+        fs::create_dir_all(remote.join("src")).unwrap();
+        git(&remote, ["init"]).unwrap();
+        git(
+            &remote,
+            ["config", "user.email", "grammar-test@example.com"],
         )
         .unwrap();
-        let mut library = pkg
-            .join("store")
-            .join("grammar")
-            .join("rust")
-            .join("rev1")
-            .join("rust");
-        library.set_extension(DYLIB_EXTENSION);
-        fs::create_dir_all(library.parent().unwrap()).unwrap();
-        fs::write(&library, b"").unwrap();
+        git(&remote, ["config", "user.name", "Grammar Test"]).unwrap();
+        let revision = commit_grammar_change(&remote, "initial grammar");
+        (remote, revision)
+    }
 
-        assert_eq!(
-            pkg_grammar_library_path_from(pkg, "rust").as_deref(),
-            Some(library.as_path())
-        );
+    fn commit_grammar_change(remote: &Path, message: &str) -> String {
+        fs::write(
+            remote.join("src").join("parser.c"),
+            format!(
+                r#"
+#ifdef _WIN32
+__declspec(dllexport)
+#endif
+void *tree_sitter_test(void) {{ return 0; }}
+/* {message} */
+"#
+            ),
+        )
+        .unwrap();
+        git(remote, ["add", "."]).unwrap();
+        git(remote, ["commit", "-m", message]).unwrap();
+        git(remote, ["rev-parse", "HEAD"]).unwrap()
     }
 
     #[test]
-    fn pkg_grammar_path_uses_sqlite_receipt_version() {
+    fn pkg_grammar_fresh_install_fetches_and_builds() {
         let dir = TempDir::new().unwrap();
-        let pkg = dir.path().join("pkg");
-        fs::create_dir_all(&pkg).unwrap();
-        let conn = rusqlite::Connection::open(dir.path().join("state.sqlite3")).unwrap();
-        conn.execute_batch(
-            r#"
-CREATE TABLE pkg_receipts (
-    kind TEXT NOT NULL,
-    name TEXT NOT NULL,
-    version TEXT NOT NULL
-);
-INSERT INTO pkg_receipts(kind, name, version) VALUES ('grammar', 'rust', 'rev2');
-"#,
+        let (remote, revision) = create_grammar_remote(&dir);
+        let install_dir = dir.path().join("install");
+        fs::create_dir(&install_dir).unwrap();
+
+        install_pkg_grammar(
+            "test",
+            remote.to_str().unwrap(),
+            &revision,
+            None,
+            &install_dir,
         )
         .unwrap();
-        let mut library = pkg
-            .join("store")
-            .join("grammar")
-            .join("rust")
-            .join("rev2")
-            .join("rust");
+
+        let source = install_dir.join("sources").join("test");
+        assert_eq!(
+            VendoredGrammar::at(source).revision().as_deref(),
+            Some(revision.as_str())
+        );
+        let mut library = install_dir.join("test");
         library.set_extension(DYLIB_EXTENSION);
-        fs::create_dir_all(library.parent().unwrap()).unwrap();
+        assert!(library.is_file());
+    }
+
+    #[test]
+    fn failed_fetch_retains_last_good_grammar() {
+        let dir = TempDir::new().unwrap();
+        let (remote, revision) = create_grammar_remote(&dir);
+        let source = dir.path().join("sources").join("test");
+        let repo = VendoredGrammar::at(source);
+        repo.init(remote.to_str().unwrap()).unwrap();
+        repo.fetch(remote.to_str().unwrap(), &revision).unwrap();
+
+        let missing_revision = "missing-grammar-revision";
+        let error = repo
+            .fetch(remote.to_str().unwrap(), missing_revision)
+            .unwrap_err();
+
+        let error = format!("{error:#}");
+        assert!(error.contains(missing_revision));
+        assert!(error.contains("git fetch --depth 1 origin"));
+        assert_eq!(repo.revision().as_deref(), Some(revision.as_str()));
+        assert!(!repo.staging_dir().unwrap().exists());
+    }
+
+    #[test]
+    fn stale_staging_is_replaced_on_next_fetch() {
+        let dir = TempDir::new().unwrap();
+        let (remote, revision) = create_grammar_remote(&dir);
+        let source = dir.path().join("sources").join("test");
+        let repo = VendoredGrammar::at(source);
+        repo.fetch(remote.to_str().unwrap(), &revision).unwrap();
+
+        let next_revision = commit_grammar_change(&remote, "updated grammar");
+        let staging = repo.staging_dir().unwrap();
+        fs::create_dir_all(staging.join("abandoned")).unwrap();
+        fs::write(staging.join("abandoned").join("partial"), b"stale").unwrap();
+
+        repo.fetch(remote.to_str().unwrap(), &next_revision)
+            .unwrap();
+
+        assert_eq!(repo.revision().as_deref(), Some(next_revision.as_str()));
+        assert!(!staging.exists());
+        assert!(!repo.backup_dir().unwrap().exists());
+    }
+
+    #[test]
+    fn interrupted_promotion_restores_backup_before_fetching() {
+        let dir = TempDir::new().unwrap();
+        let (remote, revision) = create_grammar_remote(&dir);
+        let source = dir.path().join("sources").join("test");
+        let repo = VendoredGrammar::at(source);
+        repo.fetch(remote.to_str().unwrap(), &revision).unwrap();
+
+        let staging = repo.staging_dir().unwrap();
+        let backup = repo.backup_dir().unwrap();
+        fs::rename(&repo.dir, &backup).unwrap();
+        fs::create_dir_all(&staging).unwrap();
+        fs::write(staging.join("partial"), b"stale").unwrap();
+
+        repo.fetch(remote.to_str().unwrap(), "missing-after-interruption")
+            .unwrap_err();
+
+        assert_eq!(repo.revision().as_deref(), Some(revision.as_str()));
+        assert!(!staging.exists());
+        assert!(!backup.exists());
+    }
+
+    #[test]
+    fn promotion_failure_restores_previous_checkout() {
+        let dir = TempDir::new().unwrap();
+        let source = dir.path().join("sources").join("test");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("last-good"), b"grammar").unwrap();
+        let repo = VendoredGrammar::at(source);
+        let missing_staging = repo.staging_dir().unwrap();
+
+        let error = repo.promote(&missing_staging).unwrap_err();
+
+        assert!(format!("{error:#}").contains("previous checkout was restored"));
+        assert_eq!(fs::read(repo.dir.join("last-good")).unwrap(), b"grammar");
+        assert!(!repo.backup_dir().unwrap().exists());
+    }
+
+    #[test]
+    fn managed_grammar_discovery_uses_runtime_assets_snapshot() {
+        let dir = TempDir::new().unwrap();
+        let mut library = dir.path().join("managed-rust");
+        library.set_extension(DYLIB_EXTENSION);
         fs::write(&library, b"").unwrap();
+        let package = ActivePackage::new("grammar", "rust", "rev1");
+        let assets = RuntimeAssets::from_snapshot(RuntimeAssetsSnapshot::new(
+            RuntimeSnapshot {
+                generation: 1,
+                assets: vec![RuntimeAsset::from_spec(
+                    package,
+                    RuntimeAssetSpec::grammar("rust", &library),
+                )],
+            },
+            Vec::new(),
+            Vec::new(),
+        ));
 
         assert_eq!(
-            pkg_grammar_library_path_from(&pkg, "rust").as_deref(),
+            grammar_library_path("rust", &assets).unwrap().as_deref(),
             Some(library.as_path())
         );
     }

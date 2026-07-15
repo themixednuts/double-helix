@@ -62,6 +62,11 @@ define_handle!(
 );
 
 define_handle!(
+    /// Identifies an owned plugin keymap contribution.
+    KeymapHandle
+);
+
+define_handle!(
     /// Identifies an active event subscription.
     SubscriptionHandle
 );
@@ -77,13 +82,18 @@ define_handle!(
 );
 
 define_handle!(
-    /// Identifies a plugin render callback registered with the language host.
-    RenderCallbackHandle
+    /// Identifies an assistant thread.
+    ThreadHandle
 );
 
 define_handle!(
-    /// Identifies an assistant thread.
-    ThreadHandle
+    /// Correlates a frontend UI response with the originating plugin coroutine.
+    UiCallbackToken
+);
+
+define_handle!(
+    /// Identifies a cancellable asynchronous plugin operation.
+    PluginOperationToken
 );
 
 #[cfg(test)]

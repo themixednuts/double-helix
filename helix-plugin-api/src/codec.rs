@@ -62,9 +62,9 @@ impl std::error::Error for DecodeError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::contract::handles::DocumentHandle;
-    use crate::contract::requests::*;
-    use crate::contract::snapshots::*;
+    use crate::handles::DocumentHandle;
+    use crate::requests::*;
+    use crate::snapshots::*;
     use std::num::NonZeroU64;
 
     fn doc(id: u64) -> DocumentHandle {
@@ -130,7 +130,7 @@ mod tests {
 
     #[test]
     fn round_trip_events() {
-        use crate::contract::events::*;
+        use crate::events::*;
         let event = PluginEvent::DocumentOpened(DocumentOpenedEvent {
             document: doc(7),
             path: Some("/test.txt".into()),
@@ -143,7 +143,7 @@ mod tests {
 
     #[test]
     fn round_trip_errors() {
-        use crate::contract::errors::ContractError;
+        use crate::errors::ContractError;
         let err = ContractError::stale_handle("doc:42");
         let bytes = encode(&err).unwrap();
         let err2: ContractError = decode(&bytes).unwrap();
@@ -152,7 +152,7 @@ mod tests {
 
     #[test]
     fn round_trip_metadata() {
-        use crate::contract::metadata::ApiMetadata;
+        use crate::metadata::ApiMetadata;
         let meta = ApiMetadata::default();
         let bytes = encode(&meta).unwrap();
         let meta2: ApiMetadata = decode(&bytes).unwrap();
@@ -161,13 +161,18 @@ mod tests {
 
     #[test]
     fn round_trip_dynamic_value() {
-        use crate::contract::value::DynamicValue;
+        use crate::value::DynamicValue;
         for val in [
             DynamicValue::Nil,
             DynamicValue::Bool(true),
             DynamicValue::Int(42),
             DynamicValue::Float(1.5),
             DynamicValue::String("hello".into()),
+            DynamicValue::Array(vec![DynamicValue::Int(1), DynamicValue::Bool(true)]),
+            DynamicValue::Object(std::collections::BTreeMap::from([(
+                "key".into(),
+                DynamicValue::String("value".into()),
+            )])),
         ] {
             let bytes = encode(&val).unwrap();
             let val2: DynamicValue = decode(&bytes).unwrap();
@@ -177,6 +182,8 @@ mod tests {
                 (DynamicValue::Int(a), DynamicValue::Int(b)) => assert_eq!(a, b),
                 (DynamicValue::String(a), DynamicValue::String(b)) => assert_eq!(a, b),
                 (DynamicValue::Float(_), DynamicValue::Float(_)) => {} // float comparison is fragile
+                (DynamicValue::Array(a), DynamicValue::Array(b)) => assert_eq!(a, b),
+                (DynamicValue::Object(a), DynamicValue::Object(b)) => assert_eq!(a, b),
                 _ => panic!("mismatch: {val:?} != {val2:?}"),
             }
         }

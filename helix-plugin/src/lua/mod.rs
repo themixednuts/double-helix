@@ -1,6 +1,10 @@
-use crate::contract::{CommandHandle, PanelHandle, PluginId, SubscriptionHandle, UiCallbackToken};
+use crate::contract::{
+    CommandHandle, KeymapHandle, PanelHandle, PluginId, PluginOperationToken, SubscriptionHandle,
+    UiCallbackToken,
+};
 use crate::error::{PluginError, Result};
 use crate::types::{PluginCallbackKey, UiCallbackId};
+#[cfg(test)]
 use helix_view::Editor;
 use log::{error, warn};
 use mlua::prelude::*;
@@ -11,10 +15,11 @@ use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+#[cfg(test)]
 mod context;
+#[cfg(test)]
 pub use context::{
-    with_current_editor, with_current_editor_mut, with_current_render_context, with_editor_context,
-    with_editor_context_ref, with_render_context,
+    with_current_editor, with_current_editor_mut, with_editor_context, with_editor_context_ref,
 };
 
 pub(crate) struct CurrentPluginName(pub Arc<RwLock<Option<String>>>);
@@ -68,13 +73,73 @@ fn dynamic_value_to_lua(
         DynamicValue::String(s) => {
             LuaValue::String(lua.create_string(s).map_err(PluginError::LuaError)?)
         }
+        DynamicValue::Array(values) => {
+            let table = lua.create_table().map_err(PluginError::LuaError)?;
+            for (index, value) in values.iter().enumerate() {
+                table
+                    .set(index + 1, dynamic_value_to_lua(lua, value)?)
+                    .map_err(PluginError::LuaError)?;
+            }
+            LuaValue::Table(table)
+        }
+        DynamicValue::Object(values) => {
+            let table = lua.create_table().map_err(PluginError::LuaError)?;
+            for (key, value) in values {
+                table
+                    .set(key.as_str(), dynamic_value_to_lua(lua, value)?)
+                    .map_err(PluginError::LuaError)?;
+            }
+            LuaValue::Table(table)
+        }
+    })
+}
+
+fn task_result_to_lua(lua: &Lua, result: crate::contract::PluginTaskResult) -> Result<LuaValue> {
+    Ok(match result {
+        crate::contract::PluginTaskResult::Unit => LuaValue::Nil,
+        crate::contract::PluginTaskResult::Document(handle) => LuaValue::UserData(
+            lua.create_userdata(api::facade::LuaDocumentHandle(handle))
+                .map_err(PluginError::LuaError)?,
+        ),
+        crate::contract::PluginTaskResult::Value(value) => dynamic_value_to_lua(lua, &value)?,
+        crate::contract::PluginTaskResult::SyntaxCaptures(captures) => {
+            let table = lua.create_table().map_err(PluginError::LuaError)?;
+            for (index, capture) in captures.into_iter().enumerate() {
+                let item = lua.create_table().map_err(PluginError::LuaError)?;
+                item.set("name", capture.name)
+                    .map_err(PluginError::LuaError)?;
+                item.set("kind", capture.kind)
+                    .map_err(PluginError::LuaError)?;
+                for (field, position) in [("start", capture.start), ("end", capture.end)] {
+                    let value = lua.create_table().map_err(PluginError::LuaError)?;
+                    value
+                        .set("line", position.line)
+                        .map_err(PluginError::LuaError)?;
+                    value
+                        .set("column", position.column)
+                        .map_err(PluginError::LuaError)?;
+                    item.set(field, value).map_err(PluginError::LuaError)?;
+                }
+                table.set(index + 1, item).map_err(PluginError::LuaError)?;
+            }
+            LuaValue::Table(table)
+        }
     })
 }
 
 pub mod api;
 pub mod loader;
 
-impl FromLua for UiCallbackToken {
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct LuaUiCallbackToken(UiCallbackToken);
+
+impl From<UiCallbackToken> for LuaUiCallbackToken {
+    fn from(token: UiCallbackToken) -> Self {
+        Self(token)
+    }
+}
+
+impl FromLua for LuaUiCallbackToken {
     fn from_lua(value: LuaValue, _lua: &Lua) -> LuaResult<Self> {
         match value {
             LuaValue::UserData(ud) => ud.borrow::<Self>().map(|h| *h),
@@ -87,13 +152,41 @@ impl FromLua for UiCallbackToken {
     }
 }
 
-impl LuaUserData for UiCallbackToken {
+impl LuaUserData for LuaUiCallbackToken {
     fn add_methods<M: LuaUserDataMethods<Self>>(methods: &mut M) {
-        methods.add_method("id", |_lua, this, ()| Ok(this.raw().get()));
+        methods.add_method("id", |_lua, this, ()| Ok(this.0.raw().get()));
     }
 
     fn add_fields<F: LuaUserDataFields<Self>>(fields: &mut F) {
-        fields.add_field_method_get("handle", |_lua, this| Ok(this.raw().get()));
+        fields.add_field_method_get("handle", |_lua, this| Ok(this.0.raw().get()));
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct LuaPluginOperationToken(PluginOperationToken);
+
+impl From<PluginOperationToken> for LuaPluginOperationToken {
+    fn from(token: PluginOperationToken) -> Self {
+        Self(token)
+    }
+}
+
+impl FromLua for LuaPluginOperationToken {
+    fn from_lua(value: LuaValue, _lua: &Lua) -> LuaResult<Self> {
+        match value {
+            LuaValue::UserData(ud) => ud.borrow::<Self>().map(|token| *token),
+            _ => Err(mlua::Error::FromLuaConversionError {
+                from: value.type_name(),
+                to: "PluginOperationToken".to_string(),
+                message: Some("expected a PluginOperationToken userdata".into()),
+            }),
+        }
+    }
+}
+
+impl LuaUserData for LuaPluginOperationToken {
+    fn add_methods<M: LuaUserDataMethods<Self>>(methods: &mut M) {
+        methods.add_method("id", |_lua, this, ()| Ok(this.0.raw().get()));
     }
 }
 
@@ -101,9 +194,7 @@ impl LuaUserData for UiCallbackToken {
 // Suspended coroutine tracking — for coroutine-based async UI
 // ---------------------------------------------------------------------------
 
-/// A Lua thread (coroutine) that yielded a `UiCallbackToken` and is waiting
-/// for the host to deliver a response. The engine stores these keyed by the
-/// token's internal identity and resumes them when the UI response arrives.
+/// A Lua thread waiting for a typed host response.
 pub(crate) struct SuspendedCoroutine {
     /// Registry key for the `mlua::Thread` so it survives GC.
     pub(crate) thread_key: RegistryKey,
@@ -111,10 +202,17 @@ pub(crate) struct SuspendedCoroutine {
     pub(crate) plugin_name: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum AwaitKey {
+    Ui(UiCallbackId),
+    Operation(PluginOperationToken),
+}
+
 /// UI callback tokens issued by the frontend but not yet bound to a coroutine.
 /// A token must be consumed by the same plugin before a suspended coroutine is
 /// stored under it.
 pub(crate) struct PendingUiCallbackRegistry(pub Arc<RwLock<HashMap<UiCallbackId, String>>>);
+pub(crate) struct PendingOperationRegistry(pub Arc<RwLock<HashMap<PluginOperationToken, String>>>);
 
 pub(crate) struct RegisteredCommand {
     pub(crate) handle: CommandHandle,
@@ -126,7 +224,6 @@ pub(crate) struct RegisteredCommand {
 #[derive(Debug, Clone)]
 pub struct RegisteredPanelCallbacks {
     pub plugin_name: String,
-    pub render_callback_id: UiCallbackId,
     pub event_callback_id: Option<UiCallbackId>,
 }
 
@@ -187,6 +284,10 @@ impl CommandRegistry {
         self.by_name
             .get(name)
             .and_then(|handle| self.by_handle.get(handle))
+    }
+
+    pub(crate) fn get_by_handle(&self, handle: CommandHandle) -> Option<&RegisteredCommand> {
+        self.by_handle.get(&handle)
     }
 
     pub(crate) fn owner_for_handle(&self, handle: CommandHandle) -> Option<&str> {
@@ -295,8 +396,96 @@ impl PluginHandleCounter {
 
 /// App-data wrapper so Lua callbacks can store suspended coroutines.
 pub(crate) struct SuspendedCoroutineRegistry(
-    pub Arc<RwLock<HashMap<UiCallbackId, SuspendedCoroutine>>>,
+    pub Arc<RwLock<HashMap<AwaitKey, SuspendedCoroutine>>>,
 );
+
+pub(crate) fn await_key_from_lua(value: LuaValue) -> LuaResult<AwaitKey> {
+    if let LuaValue::UserData(userdata) = &value {
+        if let Ok(token) = userdata.borrow::<LuaUiCallbackToken>() {
+            let callback = UiCallbackId::new(token.0.raw().get()).ok_or_else(|| {
+                LuaError::RuntimeError("coroutine yielded a zero await token".into())
+            })?;
+            return Ok(AwaitKey::Ui(callback));
+        }
+        if let Ok(token) = userdata.borrow::<LuaPluginOperationToken>() {
+            return Ok(AwaitKey::Operation(token.0));
+        }
+    }
+    Err(LuaError::RuntimeError(
+        "coroutine yielded an invalid await token".into(),
+    ))
+}
+
+pub(crate) fn suspend_coroutine(
+    lua: &Lua,
+    thread: &LuaThread,
+    plugin_name: &str,
+    key: AwaitKey,
+) -> LuaResult<()> {
+    let registry = lua
+        .app_data_ref::<SuspendedCoroutineRegistry>()
+        .ok_or_else(|| LuaError::RuntimeError("suspended coroutine registry unavailable".into()))?;
+    if registry.0.read().contains_key(&key) {
+        return Err(LuaError::RuntimeError(format!(
+            "await token {key:?} is already bound to a coroutine"
+        )));
+    }
+    let thread_key = lua.create_registry_value(thread.clone())?;
+
+    match key {
+        AwaitKey::Ui(callback) => claim_pending_ui_callback(lua, plugin_name, callback)?,
+        AwaitKey::Operation(operation) => {
+            let registry = lua
+                .app_data_ref::<PendingOperationRegistry>()
+                .ok_or_else(|| {
+                    LuaError::RuntimeError("pending operation registry unavailable".into())
+                })?;
+            let mut pending = registry.0.write();
+            match pending.get(&operation) {
+                Some(owner) if owner == plugin_name => {
+                    pending.remove(&operation);
+                }
+                Some(owner) => {
+                    return Err(LuaError::RuntimeError(format!(
+                        "permission denied: plugin '{plugin_name}' does not own operation {} (owner: '{owner}')",
+                        operation.raw()
+                    )))
+                }
+                None => {
+                    return Err(LuaError::RuntimeError(format!(
+                        "invalid request: operation {} was not issued to plugin '{plugin_name}'",
+                        operation.raw()
+                    )))
+                }
+            }
+        }
+    }
+    registry.0.write().insert(
+        key,
+        SuspendedCoroutine {
+            thread_key,
+            plugin_name: plugin_name.to_owned(),
+        },
+    );
+    Ok(())
+}
+
+pub(crate) fn suspend_coroutine_yield(
+    lua: &Lua,
+    thread: &LuaThread,
+    plugin_name: &str,
+    yielded: LuaMultiValue,
+) -> LuaResult<()> {
+    if thread.status() != LuaThreadStatus::Resumable {
+        return Ok(());
+    }
+    let value = yielded
+        .into_iter()
+        .next()
+        .ok_or_else(|| LuaError::RuntimeError("coroutine yielded without an await token".into()))?;
+    let key = await_key_from_lua(value)?;
+    suspend_coroutine(lua, thread, plugin_name, key)
+}
 
 pub(crate) fn remember_pending_ui_callback(
     lua: &Lua,
@@ -372,24 +561,33 @@ pub(crate) struct UiHostWrapper(
     pub Arc<Mutex<Box<dyn crate::contract::host::PluginUiHost + Send + Sync>>>,
 );
 
+pub(crate) struct TaskHostWrapper(
+    pub Arc<Mutex<Box<dyn crate::contract::host::PluginTaskHost + Send + Sync>>>,
+);
+
 pub(crate) struct PanelHostWrapper(
     pub Arc<Mutex<Box<dyn crate::contract::host::PluginPanelHost + Send + Sync>>>,
 );
-
 pub(crate) struct CommandHostWrapper(
     pub Arc<Mutex<Box<dyn crate::contract::host::PluginCommandHost + Send + Sync>>>,
 );
+
+pub(crate) struct KeymapHostWrapper(
+    pub Arc<Mutex<Box<dyn crate::contract::host::PluginKeymapHost + Send + Sync>>>,
+);
+
+pub(crate) struct KeymapRegistryWrapper(pub Arc<RwLock<HashMap<KeymapHandle, String>>>);
 
 pub(crate) struct EventHostWrapper(
     pub Arc<Mutex<Box<dyn crate::contract::host::PluginEventHost + Send + Sync>>>,
 );
 
-pub(crate) trait RemoteFacadeHost: Send + Sync {
+pub(crate) trait FacadeHost: Send + Sync {
     fn query(&self) -> &dyn crate::contract::host::PluginFacadeQueryHost;
     fn mutation(&mut self) -> &mut dyn crate::contract::host::PluginFacadeMutationHost;
 }
 
-impl<T> RemoteFacadeHost for T
+impl<T> FacadeHost for T
 where
     T: crate::contract::host::PluginFacadeQueryHost
         + crate::contract::host::PluginFacadeMutationHost
@@ -406,7 +604,9 @@ where
     }
 }
 
-pub(crate) struct RemoteFacadeHostWrapper(pub Arc<Mutex<Box<dyn RemoteFacadeHost>>>);
+pub(crate) struct FacadeHostWrapper(pub Arc<Mutex<Box<dyn FacadeHost>>>);
+
+pub(crate) struct HostApiMetadata(pub crate::contract::metadata::ApiMetadata);
 
 pub(crate) struct CommandRegistryWrapper(pub Arc<RwLock<CommandRegistry>>);
 
@@ -415,7 +615,6 @@ pub(crate) struct LoadedPluginRegistryWrapper(pub Arc<RwLock<LoadedPluginRegistr
 pub(crate) struct PanelCallbackRegistry(
     pub Arc<RwLock<HashMap<PanelHandle, RegisteredPanelCallbacks>>>,
 );
-
 const WATCHDOG_STEP: u32 = 10_000;
 const EVENT_FAILURE_LIMIT: u32 = 10;
 
@@ -513,6 +712,7 @@ pub struct LuaEngine {
     plugins: HashMap<String, crate::types::Plugin>,
     /// Registered commands keyed by typed command handles.
     commands: Arc<RwLock<CommandRegistry>>,
+    keymaps: Arc<RwLock<HashMap<KeymapHandle, String>>>,
     /// Loaded plugin handles keyed by plugin name and reverse lookup by id.
     plugin_registry: Arc<RwLock<LoadedPluginRegistry>>,
     /// Next available plugin handle.
@@ -529,17 +729,23 @@ pub struct LuaEngine {
     next_ui_callback_id: Arc<std::sync::atomic::AtomicU64>,
     /// Frontend UI host.
     ui_host: Option<Arc<Mutex<Box<dyn crate::contract::host::PluginUiHost + Send + Sync>>>>,
+    task_host: Option<Arc<Mutex<Box<dyn crate::contract::host::PluginTaskHost + Send + Sync>>>>,
     /// Frontend panel host.
     panel_host: Option<Arc<Mutex<Box<dyn crate::contract::host::PluginPanelHost + Send + Sync>>>>,
+    resource_host:
+        Option<Arc<Mutex<Box<dyn crate::contract::host::PluginResourceHost + Send + Sync>>>>,
     /// Frontend command host.
     command_host:
         Option<Arc<Mutex<Box<dyn crate::contract::host::PluginCommandHost + Send + Sync>>>>,
+    keymap_host: Option<Arc<Mutex<Box<dyn crate::contract::host::PluginKeymapHost + Send + Sync>>>>,
     /// Frontend event host.
     event_host: Option<Arc<Mutex<Box<dyn crate::contract::host::PluginEventHost + Send + Sync>>>>,
     /// Suspended coroutines waiting for UI responses, keyed by callback token identity.
-    suspended_coroutines: Arc<RwLock<HashMap<UiCallbackId, SuspendedCoroutine>>>,
+    suspended_coroutines: Arc<RwLock<HashMap<AwaitKey, SuspendedCoroutine>>>,
     /// UI callback tokens issued by the frontend and awaiting coroutine binding.
     pending_ui_callbacks: Arc<RwLock<HashMap<UiCallbackId, String>>>,
+    pending_operations: Arc<RwLock<HashMap<PluginOperationToken, String>>>,
+    api_metadata_override: Option<crate::contract::metadata::ApiMetadata>,
 }
 
 impl LuaEngine {
@@ -549,6 +755,7 @@ impl LuaEngine {
 
         let contract_event_handlers = Arc::new(RwLock::new(HashMap::new()));
         let commands = Arc::new(RwLock::new(CommandRegistry::default()));
+        let keymaps = Arc::new(RwLock::new(HashMap::new()));
         let plugin_registry = Arc::new(RwLock::new(LoadedPluginRegistry::default()));
         let next_plugin_handle = Arc::new(std::sync::atomic::AtomicU64::new(1));
         let current_plugin_name = Arc::new(RwLock::new(None));
@@ -564,13 +771,16 @@ impl LuaEngine {
         let next_ui_callback_id = Arc::new(std::sync::atomic::AtomicU64::new(1));
         let suspended_coroutines = Arc::new(RwLock::new(HashMap::new()));
         let pending_ui_callbacks = Arc::new(RwLock::new(HashMap::new()));
+        let pending_operations = Arc::new(RwLock::new(HashMap::new()));
         lua.set_app_data(PendingUiCallbackRegistry(Arc::clone(&pending_ui_callbacks)));
+        lua.set_app_data(PendingOperationRegistry(Arc::clone(&pending_operations)));
 
         Ok(Self {
             lua,
             contract_event_handlers,
             plugins: HashMap::new(),
             commands,
+            keymaps,
             plugin_registry,
             next_plugin_handle,
             current_plugin_name,
@@ -579,11 +789,16 @@ impl LuaEngine {
             panel_callbacks,
             next_ui_callback_id,
             ui_host: None,
+            task_host: None,
             panel_host: None,
+            resource_host: None,
             command_host: None,
+            keymap_host: None,
             event_host: None,
             suspended_coroutines,
             pending_ui_callbacks,
+            pending_operations,
+            api_metadata_override: None,
         })
     }
 
@@ -591,12 +806,16 @@ impl LuaEngine {
     pub fn reset(&mut self) -> Result<()> {
         let lua = Lua::new();
 
+        self.cancel_pending_operations();
         self.clear_event_subscriptions()?;
         self.clear_command_registrations()?;
+        self.clear_keymap_registrations()?;
+        self.release_plugin_resources()?;
         self.ui_callbacks.write().clear();
         self.panel_callbacks.write().clear();
         self.suspended_coroutines.write().clear();
         self.pending_ui_callbacks.write().clear();
+        self.pending_operations.write().clear();
         self.current_plugin_name.write().take();
         self.lua = lua;
         self.lua
@@ -609,11 +828,42 @@ impl LuaEngine {
         self.lua.set_app_data(PendingUiCallbackRegistry(Arc::clone(
             &self.pending_ui_callbacks,
         )));
+        self.lua.set_app_data(PendingOperationRegistry(Arc::clone(
+            &self.pending_operations,
+        )));
         self.plugins.clear();
         self.plugin_registry.write().clear();
         self.plugin_roots.write().clear();
 
         Ok(())
+    }
+
+    fn cancel_pending_operations(&self) {
+        let mut operations = self.pending_operations.read().clone();
+        for (key, entry) in self.suspended_coroutines.read().iter() {
+            if let AwaitKey::Operation(operation) = key {
+                operations
+                    .entry(*operation)
+                    .or_insert_with(|| entry.plugin_name.clone());
+            }
+        }
+
+        let Some(host) = &self.task_host else {
+            return;
+        };
+        let registry = self.plugin_registry.read();
+        let mut host = host.lock();
+        for (operation, plugin_name) in operations {
+            let Some(plugin) = registry.id_for_name(&plugin_name) else {
+                warn!(
+                    "cannot cancel plugin operation {}: plugin '{}' is no longer registered",
+                    operation.raw(),
+                    plugin_name
+                );
+                continue;
+            };
+            host.cancel(plugin, operation);
+        }
     }
 
     fn clear_event_subscriptions(&self) -> Result<()> {
@@ -670,6 +920,59 @@ impl LuaEngine {
         Ok(())
     }
 
+    fn clear_keymap_registrations(&self) -> Result<()> {
+        let handles = self
+            .keymaps
+            .read()
+            .iter()
+            .map(|(handle, plugin)| (*handle, plugin.clone()))
+            .collect::<Vec<_>>();
+        if let Some(host) = &self.keymap_host {
+            let mut host = host.lock();
+            for (keymap, plugin_name) in handles {
+                let plugin = self.plugin_id_for_name(&plugin_name)?;
+                match host.remove_keymap(plugin, crate::contract::KeymapRemoveRequest { keymap }) {
+                    Ok(()) | Err(crate::contract::ContractError::StaleHandle { .. }) => {}
+                    Err(error) => {
+                        return Err(PluginError::InitializationFailed(format!(
+                            "Failed to clear keymap contribution {keymap}: {error}"
+                        )));
+                    }
+                }
+            }
+        }
+        self.keymaps.write().clear();
+        Ok(())
+    }
+
+    fn release_plugin_resources(&self) -> Result<()> {
+        let Some(host) = &self.resource_host else {
+            return Ok(());
+        };
+        let plugins = self
+            .plugin_registry
+            .read()
+            .by_id
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        let mut host = host.lock();
+        let mut failures = Vec::new();
+        for plugin in plugins {
+            if let Err(error) = host.release_plugin_resources(plugin) {
+                failures.push(format!("{plugin}: {error}"));
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(PluginError::InitializationFailed(format!(
+                "Failed to release plugin resources: {}",
+                failures.join("; ")
+            )))
+        }
+    }
+
     fn plugin_id_for_name(&self, plugin_name: &str) -> Result<PluginId> {
         self.plugin_registry
             .read()
@@ -679,7 +982,7 @@ impl LuaEngine {
             })
     }
 
-    fn with_remote_facade_host<H, T>(&self, host: &H, f: impl FnOnce() -> Result<T>) -> Result<T>
+    fn with_facade_host<H, T>(&self, host: &H, f: impl FnOnce() -> Result<T>) -> Result<T>
     where
         H: crate::contract::host::PluginFacadeQueryHost
             + crate::contract::host::PluginFacadeMutationHost
@@ -690,7 +993,7 @@ impl LuaEngine {
     {
         struct Guard<'lua> {
             lua: &'lua Lua,
-            previous: Option<RemoteFacadeHostWrapper>,
+            previous: Option<FacadeHostWrapper>,
         }
 
         impl Drop for Guard<'_> {
@@ -700,14 +1003,14 @@ impl LuaEngine {
                         self.lua.set_app_data(previous);
                     }
                     None => {
-                        self.lua.remove_app_data::<RemoteFacadeHostWrapper>();
+                        self.lua.remove_app_data::<FacadeHostWrapper>();
                     }
                 }
             }
         }
 
-        let wrapper = RemoteFacadeHostWrapper(Arc::new(Mutex::new(
-            Box::new(host.clone()) as Box<dyn RemoteFacadeHost>
+        let wrapper = FacadeHostWrapper(Arc::new(Mutex::new(
+            Box::new(host.clone()) as Box<dyn FacadeHost>
         )));
         let previous = self.lua.set_app_data(wrapper);
         let _guard = Guard {
@@ -758,6 +1061,17 @@ impl LuaEngine {
         let host = Arc::new(Mutex::new(host));
         self.lua.set_app_data(UiHostWrapper(Arc::clone(&host)));
         self.ui_host = Some(host);
+        self.publish_api_metadata();
+    }
+
+    pub fn set_task_host(
+        &mut self,
+        host: Box<dyn crate::contract::host::PluginTaskHost + Send + Sync>,
+    ) {
+        let host = Arc::new(Mutex::new(host));
+        self.lua.set_app_data(TaskHostWrapper(Arc::clone(&host)));
+        self.task_host = Some(host);
+        self.publish_api_metadata();
     }
 
     pub fn set_panel_host(
@@ -767,6 +1081,15 @@ impl LuaEngine {
         let host = Arc::new(Mutex::new(host));
         self.lua.set_app_data(PanelHostWrapper(Arc::clone(&host)));
         self.panel_host = Some(host);
+        self.publish_api_metadata();
+    }
+
+    pub fn set_resource_host(
+        &mut self,
+        host: Box<dyn crate::contract::host::PluginResourceHost + Send + Sync>,
+    ) {
+        let host = Arc::new(Mutex::new(host));
+        self.resource_host = Some(host);
     }
 
     pub fn set_command_host(
@@ -776,6 +1099,17 @@ impl LuaEngine {
         let host = Arc::new(Mutex::new(host));
         self.lua.set_app_data(CommandHostWrapper(Arc::clone(&host)));
         self.command_host = Some(host);
+        self.publish_api_metadata();
+    }
+
+    pub fn set_keymap_host(
+        &mut self,
+        host: Box<dyn crate::contract::host::PluginKeymapHost + Send + Sync>,
+    ) {
+        let host = Arc::new(Mutex::new(host));
+        self.lua.set_app_data(KeymapHostWrapper(Arc::clone(&host)));
+        self.keymap_host = Some(host);
+        self.publish_api_metadata();
     }
 
     pub fn set_event_host(
@@ -785,6 +1119,74 @@ impl LuaEngine {
         let host = Arc::new(Mutex::new(host));
         self.lua.set_app_data(EventHostWrapper(Arc::clone(&host)));
         self.event_host = Some(host);
+        self.publish_api_metadata();
+    }
+
+    pub fn set_api_metadata(&mut self, metadata: crate::contract::metadata::ApiMetadata) {
+        self.api_metadata_override = Some(metadata);
+        self.publish_api_metadata();
+    }
+
+    fn api_metadata(&self) -> crate::contract::metadata::ApiMetadata {
+        use crate::contract::metadata::{ApiMetadata, Capability};
+
+        if let Some(metadata) = &self.api_metadata_override {
+            return metadata.clone();
+        }
+
+        let mut capabilities = vec![
+            Capability::Query,
+            Capability::Mutation,
+            Capability::Splits,
+            Capability::Tabs,
+            Capability::Floats,
+            Capability::Assistant,
+        ];
+        if self.ui_host.is_some() {
+            capabilities.push(Capability::Ui);
+        }
+        if self.panel_host.is_some() {
+            capabilities.push(Capability::Panels);
+        }
+        if self.command_host.is_some() {
+            capabilities.push(Capability::Commands);
+        }
+        if self.keymap_host.is_some() {
+            capabilities.push(Capability::Keymaps);
+        }
+        if self.event_host.is_some() {
+            capabilities.push(Capability::Events);
+        }
+        if self.task_host.is_some() {
+            capabilities.extend([
+                Capability::Tasks,
+                Capability::Syntax,
+                Capability::Lsp,
+                Capability::Themes,
+            ]);
+        }
+        ApiMetadata::from_capabilities(capabilities)
+    }
+
+    fn publish_api_metadata(&self) {
+        self.lua.set_app_data(HostApiMetadata(self.api_metadata()));
+    }
+
+    fn validate_plugin_capabilities(&self, plugin: &crate::types::Plugin) -> Result<()> {
+        use crate::contract::metadata::Capability;
+        use std::str::FromStr;
+
+        let metadata = self.api_metadata();
+        for name in &plugin.metadata.capabilities {
+            let capability = Capability::from_str(name).map_err(PluginError::ConfigError)?;
+            if !metadata.has_capability(capability) {
+                return Err(PluginError::ConfigError(format!(
+                    "plugin '{}' requires unavailable host capability '{name}'",
+                    plugin.metadata.name
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Register the Helix API with Lua
@@ -798,6 +1200,10 @@ impl LuaEngine {
             self.lua.set_app_data(UiHostWrapper(Arc::clone(host)));
         }
 
+        if let Some(ref host) = self.task_host {
+            self.lua.set_app_data(TaskHostWrapper(Arc::clone(host)));
+        }
+
         if let Some(ref host) = self.panel_host {
             self.lua.set_app_data(PanelHostWrapper(Arc::clone(host)));
         }
@@ -805,6 +1211,12 @@ impl LuaEngine {
         if let Some(ref host) = self.command_host {
             self.lua.set_app_data(CommandHostWrapper(Arc::clone(host)));
         }
+
+        if let Some(ref host) = self.keymap_host {
+            self.lua.set_app_data(KeymapHostWrapper(Arc::clone(host)));
+        }
+        self.lua
+            .set_app_data(KeymapRegistryWrapper(Arc::clone(&self.keymaps)));
 
         if let Some(ref host) = self.event_host {
             self.lua.set_app_data(EventHostWrapper(Arc::clone(host)));
@@ -840,7 +1252,11 @@ impl LuaEngine {
         self.lua.set_app_data(PendingUiCallbackRegistry(Arc::clone(
             &self.pending_ui_callbacks,
         )));
+        self.lua.set_app_data(PendingOperationRegistry(Arc::clone(
+            &self.pending_operations,
+        )));
         self.lua.set_app_data(config);
+        self.publish_api_metadata();
 
         // Create the main helix table
         let helix = self.lua.create_table()?;
@@ -867,7 +1283,8 @@ impl LuaEngine {
     /// for `helix.ui.prompt()`). If the coroutine yields a `UiCallbackToken`, it is
     /// stored in `suspended_coroutines` and will be resumed by
     /// [`handle_ui_callback`].
-    pub fn execute_command(
+    #[cfg(test)]
+    pub fn execute_command_with_editor(
         &self,
         editor: &mut Editor,
         name: &str,
@@ -910,12 +1327,7 @@ impl LuaEngine {
         Ok(())
     }
 
-    pub fn execute_command_remote<H>(
-        &self,
-        host: &mut H,
-        name: &str,
-        args: Vec<String>,
-    ) -> Result<()>
+    pub fn execute_command<H>(&self, host: &mut H, name: &str, args: Vec<String>) -> Result<()>
     where
         H: crate::contract::host::PluginFacadeQueryHost
             + crate::contract::host::PluginFacadeMutationHost
@@ -947,11 +1359,64 @@ impl LuaEngine {
             .create_sequence_from(args)
             .map_err(PluginError::LuaError)?;
 
-        self.with_remote_facade_host(host, || {
+        self.with_facade_host(host, || {
             with_current_plugin_name(&self.lua, &plugin_name, || {
                 self.with_watchdog(|| {
                     let result: LuaMultiValue = thread.resume(lua_args).map_err(|e| {
                         PluginError::CommandExecutionFailed(format!("Execution failed: {}", e))
+                    })?;
+                    self.handle_coroutine_yield(&thread, &plugin_name, result)
+                })
+            })
+        })?;
+
+        Ok(())
+    }
+
+    /// Execute a command by the exact handle returned at registration.
+    pub fn execute_command_handle<H>(
+        &self,
+        host: &mut H,
+        command: CommandHandle,
+        args: Vec<String>,
+    ) -> Result<()>
+    where
+        H: crate::contract::host::PluginFacadeQueryHost
+            + crate::contract::host::PluginFacadeMutationHost
+            + Clone
+            + Send
+            + Sync
+            + 'static,
+    {
+        let (plugin_name, callback) = {
+            let commands = self.commands.read();
+            let command = commands.get_by_handle(command).ok_or_else(|| {
+                PluginError::CommandExecutionFailed(format!("Command not found: {command}"))
+            })?;
+            let callback = self
+                .lua
+                .registry_value(&command.callback_ref)
+                .map_err(|error| {
+                    PluginError::CommandExecutionFailed(format!(
+                        "Failed to retrieve callback: {error}"
+                    ))
+                })?;
+            (command.plugin_name.clone(), callback)
+        };
+
+        let thread = self.lua.create_thread(callback).map_err(|error| {
+            PluginError::CommandExecutionFailed(format!("Failed to create coroutine: {error}"))
+        })?;
+        let lua_args = self
+            .lua
+            .create_sequence_from(args)
+            .map_err(PluginError::LuaError)?;
+
+        self.with_facade_host(host, || {
+            with_current_plugin_name(&self.lua, &plugin_name, || {
+                self.with_watchdog(|| {
+                    let result: LuaMultiValue = thread.resume(lua_args).map_err(|error| {
+                        PluginError::CommandExecutionFailed(format!("Execution failed: {error}"))
                     })?;
                     self.handle_coroutine_yield(&thread, &plugin_name, result)
                 })
@@ -969,50 +1434,8 @@ impl LuaEngine {
         plugin_name: &str,
         yielded: LuaMultiValue,
     ) -> Result<()> {
-        if thread.status() != LuaThreadStatus::Resumable {
-            return Ok(());
-        }
-
-        // The coroutine yielded — expect a single typed UI callback token.
-        let id_val = yielded.into_iter().next().ok_or_else(|| {
-            PluginError::CommandExecutionFailed(
-                "coroutine yielded without a UI callback token".into(),
-            )
-        })?;
-
-        let token: UiCallbackToken = self.lua.unpack(id_val).map_err(|e| {
-            PluginError::CommandExecutionFailed(format!(
-                "coroutine yielded non-UiCallbackToken value: {e}"
-            ))
-        })?;
-
-        let callback_id = UiCallbackId::new(token.raw().get()).ok_or_else(|| {
-            PluginError::CommandExecutionFailed("coroutine yielded zero UI callback token".into())
-        })?;
-
-        if self.suspended_coroutines.read().contains_key(&callback_id) {
-            return Err(PluginError::CommandExecutionFailed(format!(
-                "UI callback {} is already bound to a coroutine",
-                callback_id.get()
-            )));
-        }
-        claim_pending_ui_callback_from(&self.pending_ui_callbacks, plugin_name, callback_id)
-            .map_err(PluginError::CommandExecutionFailed)?;
-
-        let thread_key = self
-            .lua
-            .create_registry_value(thread.clone())
-            .map_err(PluginError::LuaError)?;
-
-        self.suspended_coroutines.write().insert(
-            callback_id,
-            SuspendedCoroutine {
-                thread_key,
-                plugin_name: plugin_name.to_string(),
-            },
-        );
-
-        Ok(())
+        suspend_coroutine_yield(&self.lua, thread, plugin_name, yielded)
+            .map_err(PluginError::LuaError)
     }
 
     /// Get all registered commands metadata
@@ -1022,18 +1445,22 @@ impl LuaEngine {
     /// Handle a UI callback from the editor (prompt response, picker selection, etc.).
     ///
     /// If a coroutine yielded this callback token, resume it with the response value.
-    /// Unknown callback tokens are ignored; persistent render callbacks are keyed in a
+    /// Unknown callback tokens are ignored; persistent panel event callbacks use a
     /// separate registry and must not be consumed by UI responses.
     ///
     /// If the resumed coroutine yields *again* (chained async ops), it is re-stored
     /// under the new callback token identity.
-    pub fn handle_ui_callback(
+    #[cfg(test)]
+    pub fn handle_ui_callback_with_editor(
         &self,
         editor: &mut Editor,
         callback_id: UiCallbackId,
         value: crate::contract::value::DynamicValue,
     ) -> Result<()> {
-        let suspended = self.suspended_coroutines.write().remove(&callback_id);
+        let suspended = self
+            .suspended_coroutines
+            .write()
+            .remove(&AwaitKey::Ui(callback_id));
         if let Some(entry) = suspended {
             let thread: LuaThread = self
                 .lua
@@ -1063,6 +1490,117 @@ impl LuaEngine {
         Ok(())
     }
 
+    /// Resume a UI coroutine against the facade host.
+    pub fn handle_ui_callback<H>(
+        &self,
+        host: &mut H,
+        callback_id: UiCallbackId,
+        value: crate::contract::value::DynamicValue,
+    ) -> Result<()>
+    where
+        H: crate::contract::host::PluginFacadeQueryHost
+            + crate::contract::host::PluginFacadeMutationHost
+            + Clone
+            + Send
+            + Sync
+            + 'static,
+    {
+        let suspended = self
+            .suspended_coroutines
+            .write()
+            .remove(&AwaitKey::Ui(callback_id));
+        if let Some(entry) = suspended {
+            let thread: LuaThread = self
+                .lua
+                .registry_value(&entry.thread_key)
+                .map_err(PluginError::LuaError)?;
+            let lua_value = dynamic_value_to_lua(&self.lua, &value)?;
+
+            self.with_facade_host(host, || {
+                with_current_plugin_name(&self.lua, &entry.plugin_name, || {
+                    self.with_watchdog(|| {
+                        let result: LuaMultiValue = thread.resume(lua_value).map_err(|error| {
+                            PluginError::CommandExecutionFailed(format!(
+                                "coroutine resume failed (plugin: {}): {error}",
+                                entry.plugin_name
+                            ))
+                        })?;
+                        self.handle_coroutine_yield(&thread, &entry.plugin_name, result)
+                    })
+                })
+            })?;
+            return Ok(());
+        }
+
+        self.pending_ui_callbacks.write().remove(&callback_id);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn handle_task_completion_with_editor(
+        &self,
+        editor: &mut Editor,
+        operation: PluginOperationToken,
+        result: crate::contract::ContractResult<crate::contract::PluginTaskResult>,
+    ) -> Result<()> {
+        with_editor_context(editor, || self.resume_task_completion(operation, result))?;
+        Ok(())
+    }
+
+    pub fn handle_task_completion<H>(
+        &self,
+        host: &mut H,
+        operation: PluginOperationToken,
+        result: crate::contract::ContractResult<crate::contract::PluginTaskResult>,
+    ) -> Result<()>
+    where
+        H: crate::contract::host::PluginFacadeQueryHost
+            + crate::contract::host::PluginFacadeMutationHost
+            + Clone
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.with_facade_host(host, || self.resume_task_completion(operation, result))
+    }
+
+    fn resume_task_completion(
+        &self,
+        operation: PluginOperationToken,
+        result: crate::contract::ContractResult<crate::contract::PluginTaskResult>,
+    ) -> Result<()> {
+        let suspended = self
+            .suspended_coroutines
+            .write()
+            .remove(&AwaitKey::Operation(operation));
+        let Some(entry) = suspended else {
+            self.pending_operations.write().remove(&operation);
+            return Ok(());
+        };
+        let thread: LuaThread = self
+            .lua
+            .registry_value(&entry.thread_key)
+            .map_err(PluginError::LuaError)?;
+
+        with_current_plugin_name(&self.lua, &entry.plugin_name, || {
+            self.with_watchdog(|| {
+                let resumed: LuaMultiValue = match result {
+                    Ok(result) => thread.resume((true, task_result_to_lua(&self.lua, result)?)),
+                    Err(error) => {
+                        thread.resume((false, api::facade::contract_error_payload(&error)))
+                    }
+                }
+                .map_err(|error| {
+                    PluginError::CommandExecutionFailed(format!(
+                        "task coroutine resume failed (plugin: {}): {error}",
+                        entry.plugin_name
+                    ))
+                })?;
+                self.handle_coroutine_yield(&thread, &entry.plugin_name, resumed)
+            })
+        })
+    }
+
     fn ensure_plugin_id(&self, plugin_name: &str) -> PluginId {
         if let Some(handle) = self.plugin_registry.read().id_for_name(plugin_name) {
             return handle;
@@ -1075,7 +1613,13 @@ impl LuaEngine {
         handle
     }
 
-    pub fn load_plugin(&mut self, editor: &mut Editor, plugin: crate::types::Plugin) -> Result<()> {
+    #[cfg(test)]
+    pub fn load_plugin_with_editor(
+        &mut self,
+        editor: &mut Editor,
+        plugin: crate::types::Plugin,
+    ) -> Result<()> {
+        self.validate_plugin_capabilities(&plugin)?;
         let entry_file = plugin
             .path
             .join(plugin.metadata.entry.as_deref().unwrap_or("init.lua"));
@@ -1111,12 +1655,8 @@ impl LuaEngine {
         Ok(())
     }
 
-    /// Load a plugin while running in an out-of-process host.
-    pub fn load_plugin_remote<H>(
-        &mut self,
-        host: &mut H,
-        plugin: crate::types::Plugin,
-    ) -> Result<()>
+    /// Load a plugin into this host process.
+    pub fn load_plugin<H>(&mut self, host: &mut H, plugin: crate::types::Plugin) -> Result<()>
     where
         H: crate::contract::host::PluginFacadeQueryHost
             + crate::contract::host::PluginFacadeMutationHost
@@ -1125,6 +1665,7 @@ impl LuaEngine {
             + Sync
             + 'static,
     {
+        self.validate_plugin_capabilities(&plugin)?;
         let entry_file = plugin
             .path
             .join(plugin.metadata.entry.as_deref().unwrap_or("init.lua"));
@@ -1142,7 +1683,7 @@ impl LuaEngine {
         self.plugin_roots
             .write()
             .insert(plugin.metadata.name.clone(), root);
-        self.with_remote_facade_host(host, || {
+        self.with_facade_host(host, || {
             with_current_plugin_name(&self.lua, &plugin.metadata.name, || {
                 self.with_watchdog(|| {
                     self.lua
@@ -1160,7 +1701,8 @@ impl LuaEngine {
     }
 
     /// Dispatch a contract event to all subscribed plugin handlers.
-    pub fn call_event_handlers(
+    #[cfg(test)]
+    pub fn call_event_handlers_with_editor(
         &self,
         editor: &mut Editor,
         event: &crate::contract::events::PluginEvent,
@@ -1232,8 +1774,8 @@ impl LuaEngine {
         Ok(())
     }
 
-    /// Dispatch a contract event while running in an out-of-process host.
-    pub fn call_event_handlers_remote<H>(
+    /// Dispatch a contract event through the facade host.
+    pub fn call_event_handlers<H>(
         &self,
         host: &mut H,
         event: &crate::contract::events::PluginEvent,
@@ -1285,7 +1827,7 @@ impl LuaEngine {
             };
 
             let result = match callback {
-                Ok(callback) => self.with_remote_facade_host(host, || {
+                Ok(callback) => self.with_facade_host(host, || {
                     with_current_plugin_name(&self.lua, &plugin_name, || {
                         self.with_watchdog(|| {
                             callback
@@ -1398,6 +1940,51 @@ impl LuaEngine {
         &self.panel_callbacks
     }
 
+    pub fn has_panel_event_callback(&self, panel: PanelHandle) -> bool {
+        self.panel_callbacks
+            .read()
+            .get(&panel)
+            .is_some_and(|callbacks| callbacks.event_callback_id.is_some())
+    }
+
+    /// Run a retained panel key callback without borrowing frontend state.
+    ///
+    /// Panel callbacks must use the configured contract hosts for editor
+    /// queries and mutations. Legacy direct-editor access is intentionally not
+    /// available here so the callback can execute outside the UI foreground.
+    pub fn handle_panel_key(&self, panel: PanelHandle, key_text: &str) -> Result<bool> {
+        let (plugin_name, callback_id) = {
+            let callbacks = self.panel_callbacks.read();
+            let Some(callbacks) = callbacks.get(&panel) else {
+                return Ok(false);
+            };
+            let Some(callback_id) = callbacks.event_callback_id else {
+                return Ok(false);
+            };
+            (callbacks.plugin_name.clone(), callback_id)
+        };
+        let callback_key = PluginCallbackKey::new(plugin_name.clone(), callback_id);
+        let callback = {
+            let callbacks = self.ui_callbacks.read();
+            let Some(callback_ref) = callbacks.get(&callback_key) else {
+                return Ok(false);
+            };
+            self.lua
+                .registry_value::<LuaFunction>(callback_ref)
+                .map_err(PluginError::LuaError)?
+        };
+        let event = self.lua.create_table().map_err(PluginError::LuaError)?;
+        event.set("key", key_text).map_err(PluginError::LuaError)?;
+        with_current_plugin_name(&self.lua, &plugin_name, || {
+            self.with_watchdog(|| {
+                callback
+                    .call::<Option<bool>>(event)
+                    .map(|consumed| consumed.unwrap_or(false))
+                    .map_err(PluginError::LuaError)
+            })
+        })
+    }
+
     /// Get the loaded plugin registry.
     pub fn plugin_registry(&self) -> &Arc<RwLock<LoadedPluginRegistry>> {
         &self.plugin_registry
@@ -1445,6 +2032,34 @@ mod tests {
         )
     }
 
+    #[test]
+    fn plugin_requirements_are_checked_against_active_host_metadata() {
+        let mut engine = LuaEngine::new().unwrap();
+        let plugin = |capability: &str| crate::types::Plugin {
+            metadata: crate::types::PluginMetadata {
+                name: format!("requires-{capability}"),
+                capabilities: vec![capability.to_owned()],
+                ..Default::default()
+            },
+            path: PathBuf::new(),
+            enabled: true,
+        };
+
+        assert!(engine
+            .validate_plugin_capabilities(&plugin("query"))
+            .is_ok());
+        assert!(engine.validate_plugin_capabilities(&plugin("ui")).is_err());
+
+        engine.set_api_metadata(crate::contract::metadata::ApiMetadata::from_capabilities([
+            crate::contract::metadata::Capability::Query,
+            crate::contract::metadata::Capability::Ui,
+        ]));
+        assert!(engine.validate_plugin_capabilities(&plugin("ui")).is_ok());
+        assert!(engine
+            .validate_plugin_capabilities(&plugin("mutation"))
+            .is_err());
+    }
+
     fn register_loaded_plugin(engine: &LuaEngine, name: &str, id: u64) {
         engine.plugin_registry.write().insert(
             name.into(),
@@ -1464,15 +2079,39 @@ mod tests {
         with_current_plugin_name(&engine.lua, plugin_name, || engine.lua.load(code).exec())
     }
 
+    #[derive(Clone)]
+    struct TestTaskHost {
+        operation: PluginOperationToken,
+        opened: Arc<Mutex<Vec<(PluginId, crate::contract::requests::OpenDocumentRequest)>>>,
+        canceled: Arc<Mutex<Vec<(PluginId, PluginOperationToken)>>>,
+    }
+
+    impl crate::contract::host::PluginTaskHost for TestTaskHost {
+        fn start(
+            &mut self,
+            plugin: PluginId,
+            request: crate::contract::PluginTaskRequest,
+        ) -> crate::contract::ContractResult<PluginOperationToken> {
+            let crate::contract::PluginTaskRequest::OpenDocument(request) = request else {
+                return Err(crate::contract::ContractError::unsupported("test task"));
+            };
+            self.opened.lock().push((plugin, request));
+            Ok(self.operation)
+        }
+
+        fn cancel(&mut self, plugin: PluginId, operation: PluginOperationToken) {
+            self.canceled.lock().push((plugin, operation));
+        }
+    }
+
     struct TestUiHost {
         next: u64,
     }
 
     impl TestUiHost {
-        fn next_token(&mut self) -> crate::contract::host::UiCallbackToken {
-            let token = crate::contract::host::UiCallbackToken::from_raw(
-                NonZeroU64::new(self.next).unwrap(),
-            );
+        fn next_token(&mut self) -> crate::contract::UiCallbackToken {
+            let token =
+                crate::contract::UiCallbackToken::from_raw(NonZeroU64::new(self.next).unwrap());
             self.next += 1;
             token
         }
@@ -1490,7 +2129,7 @@ mod tests {
             &mut self,
             _plugin: crate::contract::PluginId,
             _req: crate::contract::requests::PromptRequest,
-        ) -> crate::contract::ContractResult<crate::contract::host::UiCallbackToken> {
+        ) -> crate::contract::ContractResult<crate::contract::UiCallbackToken> {
             Ok(self.next_token())
         }
 
@@ -1498,7 +2137,7 @@ mod tests {
             &mut self,
             _plugin: crate::contract::PluginId,
             _req: crate::contract::requests::ConfirmRequest,
-        ) -> crate::contract::ContractResult<crate::contract::host::UiCallbackToken> {
+        ) -> crate::contract::ContractResult<crate::contract::UiCallbackToken> {
             Ok(self.next_token())
         }
 
@@ -1506,7 +2145,7 @@ mod tests {
             &mut self,
             _plugin: crate::contract::PluginId,
             _req: crate::contract::requests::PickerRequest,
-        ) -> crate::contract::ContractResult<crate::contract::host::UiCallbackToken> {
+        ) -> crate::contract::ContractResult<crate::contract::UiCallbackToken> {
             Ok(self.next_token())
         }
     }
@@ -1587,7 +2226,7 @@ mod tests {
             enabled: true,
         };
 
-        engine.load_plugin(&mut editor, plugin).unwrap();
+        engine.load_plugin_with_editor(&mut editor, plugin).unwrap();
 
         let mode_at_load: String = engine.lua.globals().get("mode_at_load").unwrap();
         assert_eq!(mode_at_load, "normal");
@@ -1628,7 +2267,7 @@ mod tests {
     }
 
     #[test]
-    fn test_panel_registration_failure_clears_render_callbacks() {
+    fn test_panel_registration_failure_clears_event_callbacks() {
         struct FailingPanelHost;
 
         impl crate::contract::host::PluginPanelHost for FailingPanelHost {
@@ -1704,7 +2343,7 @@ mod tests {
                 r#"
                 helix.ui.panel({
                     title = "Rejected",
-                    render = function() end,
+                    content = "Rejected",
                     on_event = function() end,
                 })
                 "#,
@@ -1803,7 +2442,9 @@ mod tests {
             r#"
             panel = helix.ui.panel({
                 title = "Owned",
-                render = function() end,
+                content = {
+                    { x = 1, y = 2, text = "Owned", style = "ui.text.focus" },
+                },
             })
             assert(#helix.ui.panels() == 1)
             "#,
@@ -1826,7 +2467,7 @@ mod tests {
     }
 
     #[test]
-    fn test_plugin_float_close_clears_render_callback() {
+    fn test_plugin_float_rejects_render_callbacks() {
         let engine = LuaEngine::new().unwrap();
         engine.plugin_registry.write().insert(
             "test-plugin".into(),
@@ -1838,23 +2479,24 @@ mod tests {
             .unwrap();
         let mut editor = test_editor();
 
-        with_editor_context(&mut editor, || {
+        let result = with_editor_context(&mut editor, || {
             engine
                 .lua
                 .load(
                     r#"
-                    local float = helix.floats.create({
+                    helix.floats.create({
                         placement = { type = "centered", width = 20, height = 5 },
                         render = function() end,
                     })
-                    float:close()
                     "#,
                 )
                 .exec()
-        })
-        .unwrap();
+        });
 
+        let err = result.expect_err("render callbacks must be rejected");
+        assert!(err.to_string().contains("retained `content`"));
         assert!(engine.ui_callbacks.read().is_empty());
+        assert!(editor.model.floats.is_empty());
     }
 
     #[test]
@@ -1957,7 +2599,7 @@ mod tests {
     }
 
     #[test]
-    fn test_plugin_float_create_without_editor_context_does_not_store_callback() {
+    fn test_plugin_float_create_without_editor_context_leaves_no_state() {
         let engine = LuaEngine::new().unwrap();
         engine.plugin_registry.write().insert(
             "test-plugin".into(),
@@ -2319,6 +2961,10 @@ mod tests {
         }
 
         impl crate::contract::host::PluginCommandHost for TestCommandHost {
+            fn command_catalog(&self) -> Vec<crate::contract::CommandDescriptor> {
+                Vec::new()
+            }
+
             fn register_command(
                 &mut self,
                 _plugin: crate::contract::PluginId,
@@ -2345,13 +2991,6 @@ mod tests {
                 req: crate::contract::requests::CommandRemoveRequest,
             ) -> crate::contract::ContractResult<()> {
                 self.removed.lock().push(req);
-                Ok(())
-            }
-
-            fn run_command(
-                &mut self,
-                _req: crate::contract::requests::RunCommandRequest,
-            ) -> crate::contract::ContractResult<()> {
                 Ok(())
             }
         }
@@ -2421,6 +3060,10 @@ mod tests {
         }
 
         impl crate::contract::host::PluginCommandHost for TestCommandHost {
+            fn command_catalog(&self) -> Vec<crate::contract::CommandDescriptor> {
+                Vec::new()
+            }
+
             fn register_command(
                 &mut self,
                 _plugin: crate::contract::PluginId,
@@ -2446,13 +3089,6 @@ mod tests {
                 req: crate::contract::requests::CommandRemoveRequest,
             ) -> crate::contract::ContractResult<()> {
                 self.removed.lock().push(req);
-                Ok(())
-            }
-
-            fn run_command(
-                &mut self,
-                _req: crate::contract::requests::RunCommandRequest,
-            ) -> crate::contract::ContractResult<()> {
                 Ok(())
             }
         }
@@ -2538,14 +3174,36 @@ mod tests {
     }
 
     #[test]
-    fn test_command_execute_falls_back_to_registered_lua_command() {
+    fn test_command_discovery_and_local_execution() {
         #[derive(Clone)]
         struct TestCommandHost {
             registered: Arc<Mutex<Vec<crate::contract::requests::CommandDefinition>>>,
-            run: Arc<Mutex<Vec<crate::contract::requests::RunCommandRequest>>>,
         }
 
         impl crate::contract::host::PluginCommandHost for TestCommandHost {
+            fn command_catalog(&self) -> Vec<crate::contract::CommandDescriptor> {
+                vec![crate::contract::CommandDescriptor {
+                    name: "write".into(),
+                    aliases: vec!["w".into()],
+                    doc: "Write the current document".into(),
+                    arguments: Vec::new(),
+                    signature: Some(crate::contract::CommandSignatureDescriptor {
+                        min_positionals: 0,
+                        max_positionals: Some(1),
+                        raw_after: None,
+                        flags: vec![crate::contract::CommandFlagDescriptor {
+                            name: "force".into(),
+                            alias: Some('f'),
+                            doc: "Force the write".into(),
+                            takes_value: false,
+                            values: Vec::new(),
+                        }],
+                    }),
+                    kind: crate::contract::CommandKind::Typable,
+                    scope: crate::contract::CommandScope::Frontend,
+                }]
+            }
+
             fn register_command(
                 &mut self,
                 _plugin: crate::contract::PluginId,
@@ -2572,18 +3230,9 @@ mod tests {
             ) -> crate::contract::ContractResult<()> {
                 Ok(())
             }
-
-            fn run_command(
-                &mut self,
-                req: crate::contract::requests::RunCommandRequest,
-            ) -> crate::contract::ContractResult<()> {
-                self.run.lock().push(req);
-                Err(crate::contract::ContractError::not_found("command"))
-            }
         }
 
         let registered = Arc::new(Mutex::new(Vec::new()));
-        let run = Arc::new(Mutex::new(Vec::new()));
         let mut engine = LuaEngine::new().unwrap();
         engine.plugin_registry.write().insert(
             "owner-plugin".into(),
@@ -2595,11 +3244,27 @@ mod tests {
         );
         engine.set_command_host(Box::new(TestCommandHost {
             registered: Arc::clone(&registered),
-            run: Arc::clone(&run),
         }));
         engine
             .register_api(crate::types::PluginConfig::default())
             .unwrap();
+
+        exec_as(
+            &engine,
+            "caller-plugin",
+            r#"
+            local commands = helix.commands.list()
+            assert(#commands == 1)
+            assert(commands[1].name == "write")
+            assert(commands[1].kind == "typable")
+            assert(commands[1].scope == "frontend")
+            assert(commands[1].signature.max_positionals == 1)
+            assert(commands[1].signature.flags[1].alias == "f")
+            assert(helix.commands.get("w").name == "write")
+            assert(helix.commands.get("missing") == nil)
+            "#,
+        )
+        .unwrap();
 
         exec_as(
             &engine,
@@ -2625,9 +3290,6 @@ mod tests {
         .unwrap();
 
         assert_eq!(registered.lock().len(), 1);
-        assert_eq!(run.lock().len(), 1);
-        assert_eq!(run.lock()[0].name, "owned_command");
-        assert_eq!(run.lock()[0].args, vec!["one", "two"]);
 
         let executed_args: String = engine.lua.globals().get("executed_args").unwrap();
         assert_eq!(executed_args, "one,two");
@@ -2649,7 +3311,7 @@ mod tests {
 
         let mut editor = test_editor();
         engine
-            .handle_ui_callback(
+            .handle_ui_callback_with_editor(
                 &mut editor,
                 callback_id,
                 crate::contract::value::DynamicValue::Nil,
@@ -2764,7 +3426,9 @@ mod tests {
             },
         );
         for _ in 0..EVENT_FAILURE_LIMIT {
-            engine.call_event_handlers(&mut editor, &event).unwrap();
+            engine
+                .call_event_handlers_with_editor(&mut editor, &event)
+                .unwrap();
         }
 
         let second_runs: u32 = engine.lua.globals().get("second_handler_runs").unwrap();
@@ -2806,7 +3470,7 @@ mod tests {
             .unwrap();
         let mut editor = test_editor();
         engine
-            .load_plugin(
+            .load_plugin_with_editor(
                 &mut editor,
                 crate::types::Plugin {
                     metadata: crate::types::PluginMetadata {
@@ -2843,7 +3507,7 @@ mod tests {
             })
             .unwrap();
         let mut editor = test_editor();
-        let result = engine.load_plugin(
+        let result = engine.load_plugin_with_editor(
             &mut editor,
             crate::types::Plugin {
                 metadata: crate::types::PluginMetadata {
@@ -2917,7 +3581,9 @@ mod tests {
             .unwrap();
         let unissued = engine
             .lua
-            .create_userdata(UiCallbackToken::from_raw(NonZeroU64::new(999).unwrap()))
+            .create_userdata(LuaUiCallbackToken::from(UiCallbackToken::from_raw(
+                NonZeroU64::new(999).unwrap(),
+            )))
             .unwrap();
         engine
             .lua
@@ -2946,6 +3612,10 @@ mod tests {
         }
 
         impl crate::contract::host::PluginCommandHost for TestCommandHost {
+            fn command_catalog(&self) -> Vec<crate::contract::CommandDescriptor> {
+                Vec::new()
+            }
+
             fn register_command(
                 &mut self,
                 _plugin: crate::contract::PluginId,
@@ -2970,13 +3640,6 @@ mod tests {
                 req: crate::contract::requests::CommandRemoveRequest,
             ) -> crate::contract::ContractResult<()> {
                 self.removed.lock().push(req);
-                Ok(())
-            }
-
-            fn run_command(
-                &mut self,
-                _req: crate::contract::requests::RunCommandRequest,
-            ) -> crate::contract::ContractResult<()> {
                 Ok(())
             }
         }
@@ -3012,6 +3675,255 @@ mod tests {
 
         assert!(engine.get_commands().is_empty());
         assert_eq!(removed.lock().len(), 1);
+    }
+
+    #[test]
+    fn keymap_lifecycle_is_owned_and_reset_removes_contribution() {
+        #[derive(Clone)]
+        struct TestKeymapHost {
+            registered: Arc<Mutex<Vec<crate::contract::KeymapDefinition>>>,
+            updated: Arc<Mutex<Vec<crate::contract::KeymapUpdateRequest>>>,
+            removed: Arc<Mutex<Vec<crate::contract::KeymapRemoveRequest>>>,
+        }
+
+        impl crate::contract::host::PluginKeymapHost for TestKeymapHost {
+            fn register_keymap(
+                &mut self,
+                _plugin: PluginId,
+                definition: crate::contract::KeymapDefinition,
+            ) -> crate::contract::ContractResult<crate::contract::KeymapHandle> {
+                self.registered.lock().push(definition);
+                Ok(crate::contract::KeymapHandle::from_raw(
+                    NonZeroU64::new(1).unwrap(),
+                ))
+            }
+
+            fn update_keymap(
+                &mut self,
+                _plugin: PluginId,
+                request: crate::contract::KeymapUpdateRequest,
+            ) -> crate::contract::ContractResult<()> {
+                self.updated.lock().push(request);
+                Ok(())
+            }
+
+            fn remove_keymap(
+                &mut self,
+                _plugin: PluginId,
+                request: crate::contract::KeymapRemoveRequest,
+            ) -> crate::contract::ContractResult<()> {
+                self.removed.lock().push(request);
+                Ok(())
+            }
+        }
+
+        let registered = Arc::new(Mutex::new(Vec::new()));
+        let updated = Arc::new(Mutex::new(Vec::new()));
+        let removed = Arc::new(Mutex::new(Vec::new()));
+        let mut engine = LuaEngine::new().unwrap();
+        register_loaded_plugin(&engine, "test-plugin", 1);
+        set_current_plugin(&engine, "test-plugin");
+        engine.set_keymap_host(Box::new(TestKeymapHost {
+            registered: Arc::clone(&registered),
+            updated: Arc::clone(&updated),
+            removed: Arc::clone(&removed),
+        }));
+        engine
+            .register_api(crate::types::PluginConfig::default())
+            .unwrap();
+        engine
+            .lua
+            .load(
+                r#"
+                keymap = helix.keymaps.register({
+                    mode = "normal",
+                    scope = { language = "rust" },
+                    bindings = {
+                        { keys = { "space", "t" }, command = ":write" },
+                    },
+                })
+                keymap:update({
+                    mode = "normal",
+                    bindings = {
+                        { keys = { "F24" }, commands = { ":write", ":reload" } },
+                    },
+                })
+                "#,
+            )
+            .exec()
+            .unwrap();
+
+        assert_eq!(registered.lock().len(), 1);
+        assert_eq!(updated.lock().len(), 1);
+        assert_eq!(registered.lock()[0].scope.language.as_deref(), Some("rust"));
+        assert_eq!(updated.lock()[0].definition.bindings[0].commands.len(), 2);
+
+        engine.reset().unwrap();
+        assert_eq!(removed.lock().len(), 1);
+    }
+
+    #[test]
+    fn reset_cancels_pending_plugin_operations() {
+        let mut engine = LuaEngine::new().unwrap();
+        let plugin = PluginId::from_raw(NonZeroU64::new(1).unwrap());
+        let pending_operation = PluginOperationToken::from_raw(NonZeroU64::new(7).unwrap());
+        let suspended_operation = PluginOperationToken::from_raw(NonZeroU64::new(8).unwrap());
+        engine
+            .plugin_registry
+            .write()
+            .insert("test-plugin".into(), plugin);
+        engine
+            .pending_operations
+            .write()
+            .insert(pending_operation, "test-plugin".into());
+        let thread = engine
+            .lua
+            .create_thread(engine.lua.create_function(|_, ()| Ok(())).unwrap())
+            .unwrap();
+        let thread_key = engine.lua.create_registry_value(thread).unwrap();
+        engine.suspended_coroutines.write().insert(
+            AwaitKey::Operation(suspended_operation),
+            SuspendedCoroutine {
+                thread_key,
+                plugin_name: "test-plugin".into(),
+            },
+        );
+        let canceled = Arc::new(Mutex::new(Vec::new()));
+        engine.set_task_host(Box::new(TestTaskHost {
+            operation: pending_operation,
+            opened: Arc::new(Mutex::new(Vec::new())),
+            canceled: Arc::clone(&canceled),
+        }));
+
+        engine.reset().unwrap();
+
+        let mut canceled = canceled.lock().clone();
+        canceled.sort_by_key(|(_, operation)| operation.raw());
+        assert_eq!(
+            canceled,
+            vec![(plugin, pending_operation), (plugin, suspended_operation),]
+        );
+        assert!(engine.pending_operations.read().is_empty());
+        assert!(engine.suspended_coroutines.read().is_empty());
+    }
+
+    #[test]
+    fn reset_releases_resources_for_every_loaded_plugin() {
+        struct TestResourceHost {
+            released: Arc<Mutex<Vec<PluginId>>>,
+        }
+
+        impl crate::contract::host::PluginResourceHost for TestResourceHost {
+            fn release_plugin_resources(
+                &mut self,
+                plugin: PluginId,
+            ) -> crate::contract::ContractResult<()> {
+                self.released.lock().push(plugin);
+                Ok(())
+            }
+        }
+
+        let mut engine = LuaEngine::new().unwrap();
+        let first = PluginId::from_raw(NonZeroU64::new(1).unwrap());
+        let second = PluginId::from_raw(NonZeroU64::new(2).unwrap());
+        engine.plugin_registry.write().insert("first".into(), first);
+        engine
+            .plugin_registry
+            .write()
+            .insert("second".into(), second);
+        let released = Arc::new(Mutex::new(Vec::new()));
+        engine.set_resource_host(Box::new(TestResourceHost {
+            released: Arc::clone(&released),
+        }));
+
+        engine.reset().unwrap();
+
+        let mut released = released.lock().clone();
+        released.sort_by_key(|plugin| plugin.raw());
+        assert_eq!(released, vec![first, second]);
+    }
+
+    #[test]
+    fn async_document_open_resumes_with_real_document_handle() {
+        let mut engine = LuaEngine::new().unwrap();
+        let plugin = PluginId::from_raw(NonZeroU64::new(1).unwrap());
+        let operation = PluginOperationToken::from_raw(NonZeroU64::new(7).unwrap());
+        register_loaded_plugin(&engine, "test-plugin", 1);
+        let opened = Arc::new(Mutex::new(Vec::new()));
+        engine.set_task_host(Box::new(TestTaskHost {
+            operation,
+            opened: Arc::clone(&opened),
+            canceled: Arc::new(Mutex::new(Vec::new())),
+        }));
+        engine
+            .register_api(crate::types::PluginConfig::default())
+            .unwrap();
+
+        exec_as(
+            &engine,
+            "test-plugin",
+            r#"
+            helix.async(function()
+                local document = helix.documents.open("target.txt", { focus = true })
+                _G.opened_document_id = document:id()
+            end)
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(opened.lock().len(), 1);
+        assert_eq!(opened.lock()[0].0, plugin);
+        assert_eq!(opened.lock()[0].1.path, "target.txt");
+        assert!(opened.lock()[0].1.focus);
+        assert!(engine.pending_operations.read().is_empty());
+        assert!(engine
+            .suspended_coroutines
+            .read()
+            .contains_key(&AwaitKey::Operation(operation)));
+
+        let mut editor = test_editor();
+        editor.new_file(Action::VerticalSplit);
+        let handle = helix_plugin_editor::adapt::document_handle(editor.focused_document_id());
+        engine
+            .handle_task_completion_with_editor(
+                &mut editor,
+                operation,
+                Ok(crate::contract::PluginTaskResult::Document(handle)),
+            )
+            .unwrap();
+
+        let opened_document_id: u64 = engine.lua.globals().get("opened_document_id").unwrap();
+        assert_eq!(opened_document_id, handle.raw().get());
+        assert!(engine.suspended_coroutines.read().is_empty());
+    }
+
+    #[test]
+    fn synchronous_document_open_is_rejected_before_host_work_is_issued() {
+        let mut engine = LuaEngine::new().unwrap();
+        let operation = PluginOperationToken::from_raw(NonZeroU64::new(7).unwrap());
+        register_loaded_plugin(&engine, "test-plugin", 1);
+        let opened = Arc::new(Mutex::new(Vec::new()));
+        engine.set_task_host(Box::new(TestTaskHost {
+            operation,
+            opened: Arc::clone(&opened),
+            canceled: Arc::new(Mutex::new(Vec::new())),
+        }));
+        engine
+            .register_api(crate::types::PluginConfig::default())
+            .unwrap();
+
+        let error = exec_as(
+            &engine,
+            "test-plugin",
+            r#"helix.documents.open("target.txt", { focus = true })"#,
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("must be called from a coroutine"));
+        assert!(opened.lock().is_empty());
+        assert!(engine.pending_operations.read().is_empty());
     }
 
     #[test]

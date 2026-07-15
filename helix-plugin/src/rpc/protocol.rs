@@ -2,7 +2,6 @@ use crate::contract::errors::ContractError;
 use crate::contract::events::{EventKind, PluginEvent};
 use crate::contract::handles::*;
 use crate::contract::metadata::{ApiMetadata, EventKindInfo};
-use crate::contract::pkg::{PkgBackendRequest, PkgBackendResponse};
 use crate::contract::requests::*;
 use crate::contract::snapshots::*;
 use crate::contract::value::DynamicValue;
@@ -31,22 +30,30 @@ pub enum HostRequest {
     },
     Event(PluginEvent),
     CommandInvoke {
-        name: String,
+        command: CommandHandle,
         args: Vec<String>,
     },
     UiCallback {
-        callback_id: u64,
+        callback: UiCallbackToken,
         value: DynamicValue,
     },
-    PkgBackend(PkgBackendRequest),
+    PanelKey {
+        panel: PanelHandle,
+        key: String,
+    },
+    Reload,
+    TaskCompleted {
+        operation: PluginOperationToken,
+        result: Result<crate::contract::PluginTaskResult, ContractError>,
+    },
     Shutdown,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum PluginResponse {
     Unit,
+    Bool(bool),
     Commands(Vec<crate::types::CommandMetadata>),
-    PkgBackend(PkgBackendResponse),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -65,6 +72,15 @@ pub enum PluginRequest {
     FocusedView,
     ListDocuments,
     ListViews,
+    LanguageServers,
+    EditorConfig,
+    TerminalSize,
+    ReadRegister(char),
+    WriteRegister {
+        name: char,
+        values: Vec<String>,
+    },
+    RequestRedraw,
     DocumentSnapshot(DocumentHandle),
     ViewSnapshot(ViewHandle),
     WorkspaceSnapshot,
@@ -75,7 +91,15 @@ pub enum PluginRequest {
         document: DocumentHandle,
         line: usize,
     },
-    OpenDocument(OpenDocumentRequest),
+    StartTask {
+        plugin: PluginId,
+        operation: PluginOperationToken,
+        request: crate::contract::PluginTaskRequest,
+    },
+    CancelTask {
+        plugin: PluginId,
+        operation: PluginOperationToken,
+    },
     ApplyEdit(ApplyEditRequest),
     SetSelection(SetSelectionRequest),
     SaveDocument(SaveDocumentRequest),
@@ -84,6 +108,7 @@ pub enum PluginRequest {
     SetStatus(SetStatusRequest),
     Undo(UndoRequest),
     Redo(RedoRequest),
+    SelectAll(SelectAllRequest),
     SetMode(SetModeRequest),
     CloseView(CloseViewRequest),
     Notify(NotifyRequest),
@@ -124,6 +149,7 @@ pub enum PluginRequest {
         request: ResizePanelRequest,
     },
     ListPanels,
+    CommandCatalog,
     RegisterCommand {
         plugin: PluginId,
         definition: CommandDefinition,
@@ -136,7 +162,21 @@ pub enum PluginRequest {
         plugin: PluginId,
         request: CommandRemoveRequest,
     },
-    RunCommand(RunCommandRequest),
+    ReleaseResources {
+        plugin: PluginId,
+    },
+    RegisterKeymap {
+        plugin: PluginId,
+        definition: crate::contract::KeymapDefinition,
+    },
+    UpdateKeymap {
+        plugin: PluginId,
+        request: crate::contract::KeymapUpdateRequest,
+    },
+    RemoveKeymap {
+        plugin: PluginId,
+        request: crate::contract::KeymapRemoveRequest,
+    },
     Subscribe {
         plugin: PluginId,
         kind: EventKind,
@@ -161,9 +201,15 @@ pub enum PluginRequest {
         plugin: PluginId,
         request: CreateFloatRequest,
     },
-    UpdateFloat(UpdateFloatRequest),
-    CloseFloat(CloseFloatRequest),
-    ListFloats,
+    UpdateFloat {
+        plugin: PluginId,
+        request: UpdateFloatRequest,
+    },
+    CloseFloat {
+        plugin: PluginId,
+        request: CloseFloatRequest,
+    },
+    ListFloats(PluginId),
     AssistantSnapshot,
     ThreadSnapshot(ThreadHandle),
     ThreadEntries(ThreadHandle),
@@ -191,13 +237,19 @@ pub enum HostResponse {
     FloatHandle(FloatHandle),
     PanelHandle(PanelHandle),
     CommandHandle(CommandHandle),
+    KeymapHandle(KeymapHandle),
+    CommandCatalog(Vec<crate::contract::commands::CommandDescriptor>),
     SubscriptionHandle(SubscriptionHandle),
-    UiCallback(u64),
+    UiCallback(UiCallbackToken),
     OptionDocumentHandle(Option<DocumentHandle>),
     OptionViewHandle(Option<ViewHandle>),
     OptionViewHandleResult(Option<ViewHandle>),
     DocumentHandles(Vec<DocumentHandle>),
     ViewHandles(Vec<ViewHandle>),
+    LanguageServers(Vec<LanguageServerSnapshot>),
+    EditorConfig(EditorConfigSnapshot),
+    TerminalSize(TerminalSizeSnapshot),
+    Strings(Vec<String>),
     DocumentSnapshot(DocumentSnapshot),
     ViewSnapshot(ViewSnapshot),
     WorkspaceSnapshot(WorkspaceSnapshot),

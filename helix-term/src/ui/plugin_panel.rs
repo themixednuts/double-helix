@@ -1,13 +1,8 @@
-//! Plugin panel — a Component that delegates rendering to a Lua callback.
-//!
-//! Lua render callbacks emit typed render operations. The terminal frontend
-//! applies those operations to the active Ratatui buffer after Lua returns.
+//! Plugin panel backed by retained, host-owned render nodes.
 
-use crate::compositor::{Component, Context, Event, EventResult, RenderContext};
-use crate::ui::plugin_render::apply_plugin_render_ops;
-use helix_plugin::contract::{adapt, PanelHandle};
-use helix_plugin::mlua;
-use helix_plugin::types::SurfaceRenderOps;
+use crate::compositor::{Component, RenderContext};
+use helix_plugin_api::PanelHandle;
+use helix_plugin_editor::adapt;
 use helix_view::graphics::Rect;
 use helix_view::model::{FocusTarget, PanelId};
 use helix_view::traits::Focusable;
@@ -18,100 +13,40 @@ pub(crate) fn component_id(panel: PanelHandle) -> String {
 
 /// Component that bridges Lua plugin rendering with the compositor.
 pub struct PluginPanel {
-    panel: PanelHandle,
     model_panel_id: PanelId,
     focused: bool,
     component_id: String,
+    content: std::sync::Arc<[helix_plugin_api::requests::UiRenderNode]>,
 }
 
 impl PluginPanel {
-    pub fn new(panel: PanelHandle, model_panel_id: PanelId) -> Self {
+    pub fn new(
+        panel: PanelHandle,
+        model_panel_id: PanelId,
+        content: std::sync::Arc<[helix_plugin_api::requests::UiRenderNode]>,
+    ) -> Self {
         Self {
-            panel,
             model_panel_id,
             focused: false,
             component_id: component_id(panel),
+            content,
         }
     }
 
-    pub fn from_editor(editor: &helix_view::Editor, panel: PanelHandle) -> Option<Self> {
+    pub fn from_editor(
+        editor: &helix_view::Editor,
+        panel: PanelHandle,
+        content: std::sync::Arc<[helix_plugin_api::requests::UiRenderNode]>,
+    ) -> Option<Self> {
         let model_panel_id = adapt::resolve_panel(&editor.model, panel).ok()?;
-        Some(Self::new(panel, model_panel_id))
+        Some(Self::new(panel, model_panel_id, content))
     }
 
-    fn render_surface(
+    pub fn set_content(
         &mut self,
-        area: Rect,
-        surface: &mut crate::render::CellSurface,
-        cx: &RenderContext,
+        content: std::sync::Arc<[helix_plugin_api::requests::UiRenderNode]>,
     ) {
-        if area.width == 0 || area.height == 0 {
-            return;
-        }
-        let Some(ref pm) = cx.plugin_manager else {
-            return;
-        };
-
-        let engine = pm.engine();
-        let engine = engine.read();
-        let lua = engine.lua();
-
-        let panel_callbacks = engine.panel_callbacks();
-        let panel_callbacks = panel_callbacks.read();
-        let Some(callbacks) = panel_callbacks.get(&self.panel) else {
-            let style = cx.theme().get("error");
-            surface.set_stringn(
-                area.x,
-                area.y,
-                "Plugin render error",
-                area.width as usize,
-                tui::ratatui::to_ratatui_style(style),
-            );
-            return;
-        };
-
-        let ui_callbacks = engine.ui_callbacks();
-        let ui_callbacks = ui_callbacks.read();
-        let key = helix_plugin::types::PluginCallbackKey::new(
-            callbacks.plugin_name.clone(),
-            callbacks.render_callback_id,
-        );
-        let Some(callback_ref) = ui_callbacks.get(&key) else {
-            let style = cx.theme().get("error");
-            surface.set_stringn(
-                area.x,
-                area.y,
-                "Plugin render error",
-                area.width as usize,
-                tui::ratatui::to_ratatui_style(style),
-            );
-            return;
-        };
-
-        let Ok(callback) = lua.registry_value::<mlua::Function>(callback_ref) else {
-            return;
-        };
-
-        let Ok(area_table) = helix_plugin::lua::api::facade::rect_to_table(lua, area) else {
-            return;
-        };
-        let Ok(lua_surface) = lua.create_userdata(helix_plugin::lua::api::facade::LuaSurface)
-        else {
-            return;
-        };
-
-        let theme = cx.theme();
-        let mut render_ops = SurfaceRenderOps::default();
-        helix_plugin::lua::with_render_context(&mut render_ops, theme, || {
-            if let Err(e) =
-                helix_plugin::lua::with_current_plugin_name(lua, &callbacks.plugin_name, || {
-                    callback.call::<()>((area_table, lua_surface))
-                })
-            {
-                log::error!("Plugin panel render error ({}): {}", self.panel, e);
-            }
-        });
-        apply_plugin_render_ops(surface, render_ops);
+        self.content = content;
     }
 }
 
@@ -126,7 +61,7 @@ impl Focusable for PluginPanel {
 }
 
 impl Component for PluginPanel {
-    fn sync(&mut self, editor: &mut helix_view::Editor) {
+    fn sync(&mut self, _viewport: Rect, editor: &mut helix_view::Editor) {
         let visible = editor
             .model
             .panels
@@ -148,74 +83,16 @@ impl Component for PluginPanel {
         }
     }
 
-    fn render(&mut self, area: Rect, surface: &mut crate::render::CellSurface, cx: &RenderContext) {
-        self.render_surface(area, surface, cx);
-    }
-
-    fn handle_event(&mut self, event: &Event, cx: &mut Context) -> EventResult {
-        if !self.focused {
-            return EventResult::Ignored(None);
-        }
-
-        let Some(ref pm) = cx.plugin_manager else {
-            return EventResult::Ignored(None);
-        };
-
-        let Event::Key(key_event) = event else {
-            return EventResult::Ignored(None);
-        };
-
-        let engine = pm.engine();
-        let engine = engine.read();
-        let panel_callbacks = engine.panel_callbacks();
-        let panel_callbacks = panel_callbacks.read();
-        let Some(callbacks) = panel_callbacks.get(&self.panel) else {
-            return EventResult::Ignored(None);
-        };
-        let Some(event_callback_id) = callbacks.event_callback_id else {
-            return EventResult::Ignored(None);
-        };
-
-        let lua = engine.lua();
-
-        let ui_callbacks = engine.ui_callbacks();
-        let ui_callbacks = ui_callbacks.read();
-        let key = helix_plugin::types::PluginCallbackKey::new(
-            callbacks.plugin_name.clone(),
-            event_callback_id,
-        );
-        let Some(callback_ref) = ui_callbacks.get(&key) else {
-            return EventResult::Ignored(None);
-        };
-
-        let Ok(callback) = lua.registry_value::<mlua::Function>(callback_ref) else {
-            return EventResult::Ignored(None);
-        };
-
-        // Build event table.
-        let Ok(event_table) = lua.create_table() else {
-            return EventResult::Ignored(None);
-        };
-        let _ = event_table.set("key", format!("{key_event}"));
-
-        let consumed = helix_plugin::lua::with_editor_context(cx.editor, || {
-            match helix_plugin::lua::with_current_plugin_name(lua, &callbacks.plugin_name, || {
-                callback.call::<Option<bool>>(event_table)
-            }) {
-                Ok(Some(true)) => true,
-                Ok(_) => false,
-                Err(err) => {
-                    log::error!("Plugin panel event error ({}): {}", self.panel, err);
-                    false
-                }
+    fn prepare_render(&mut self, area: Rect, cx: &RenderContext) -> crate::render::PreparedRender {
+        let content = std::sync::Arc::clone(&self.content);
+        let theme = cx.theme_arc();
+        crate::render::PreparedRender::deferred(move |cancellation| {
+            let mut output = crate::render::RenderOutput::sparse(area);
+            if !cancellation.is_cancelled() {
+                paint_plugin_panel(output.surface_mut(), area, &content, &theme);
             }
-        });
-
-        if consumed {
-            EventResult::Consumed(None)
-        } else {
-            EventResult::Ignored(None)
-        }
+            output
+        })
     }
 
     fn id(&self) -> Option<&str> {
@@ -233,6 +110,17 @@ impl Component for PluginPanel {
     crate::component_traits!(focusable);
 }
 
+fn paint_plugin_panel(
+    surface: &mut crate::render::CellSurface,
+    area: Rect,
+    content: &[helix_plugin_api::requests::UiRenderNode],
+    theme: &helix_view::Theme,
+) {
+    crate::ui::plugin_render::render_retained_nodes(surface, area, content, |scope| {
+        theme.get(scope)
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -242,7 +130,7 @@ mod tests {
     use std::sync::Arc;
 
     fn test_editor(width: u16, height: u16) -> helix_view::Editor {
-        let theme_loader = helix_view::theme::Loader::new(helix_loader::runtime_dirs());
+        let theme_loader = helix_view::theme::Loader::new(&[]);
         let syn_loader = helix_core::config::default_lang_loader();
         let config = helix_view::editor::Config::default();
         let config = Arc::new(ArcSwap::from_pointee(config));
@@ -269,7 +157,11 @@ mod tests {
             PanelSide::Right,
             PanelSize::Percent(35),
         );
-        let panel = PluginPanel::new(PanelHandle::from_raw(NonZeroU64::new(1).unwrap()), panel_id);
+        let panel = PluginPanel::new(
+            PanelHandle::from_raw(NonZeroU64::new(1).unwrap()),
+            panel_id,
+            Arc::from([]),
+        );
 
         assert_eq!(panel.layout_role(), crate::compositor::LayoutRole::Docked);
         assert_eq!(panel.panel_id(), Some(panel_id));
@@ -284,11 +176,11 @@ mod tests {
             PanelSide::Right,
             PanelSize::Percent(35),
         );
-        let panel_handle = helix_plugin::contract::adapt::panel_handle(panel_id);
+        let panel_handle = adapt::panel_handle(panel_id);
 
-        let panel = PluginPanel::from_editor(&editor, panel_handle).expect("panel component");
+        let panel = PluginPanel::from_editor(&editor, panel_handle, Arc::from([]))
+            .expect("panel component");
 
-        assert_eq!(panel.panel, panel_handle);
         assert_eq!(panel.panel_id(), Some(panel_id));
     }
 
@@ -301,11 +193,14 @@ mod tests {
             PanelSide::Right,
             PanelSize::Percent(35),
         );
-        let mut panel =
-            PluginPanel::new(PanelHandle::from_raw(NonZeroU64::new(1).unwrap()), panel_id);
+        let mut panel = PluginPanel::new(
+            PanelHandle::from_raw(NonZeroU64::new(1).unwrap()),
+            panel_id,
+            Arc::from([]),
+        );
 
         editor.model.focus_panel(panel_id);
-        panel.sync(&mut editor);
+        panel.sync(Rect::new(0, 0, 120, 40), &mut editor);
         assert!(Focusable::is_focused(&panel));
 
         let float_id = editor.model.create_float(
@@ -319,16 +214,16 @@ mod tests {
             true,
         );
         assert_eq!(editor.model.focus, FocusTarget::Float(float_id));
-        panel.sync(&mut editor);
+        panel.sync(Rect::new(0, 0, 120, 40), &mut editor);
         assert!(!Focusable::is_focused(&panel));
 
         panel.set_focused(true);
         editor.model.focus = FocusTarget::Editor;
-        panel.sync(&mut editor);
+        panel.sync(Rect::new(0, 0, 120, 40), &mut editor);
         assert!(Focusable::is_focused(&panel));
 
         assert_eq!(editor.model.toggle_panel(panel_id), Some(false));
-        panel.sync(&mut editor);
+        panel.sync(Rect::new(0, 0, 120, 40), &mut editor);
         assert!(!Focusable::is_focused(&panel));
     }
 }

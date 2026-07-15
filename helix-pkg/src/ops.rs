@@ -10,7 +10,9 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use bzip2::read::BzDecoder;
 use flate2::read::GzDecoder;
+use helix_store::{ActivePackage, PackageActivation, RuntimeAssetSpec};
 use serde::Deserialize;
 use tempfile::TempDir;
 use xz2::read::XzDecoder;
@@ -20,7 +22,6 @@ use crate::{
     io as pkg_io,
     lock::{Lock, LockedPackage, Manifest},
     registry::Registry,
-    resolve,
     spec::{Artifact, NativeManager, NativeSource, PackageSpec, PkgKind, Source},
     store::{hash_tree, Receipt, Store},
     Error, Result,
@@ -168,6 +169,13 @@ impl Ops {
     pub fn open_default() -> Result<Self> {
         let config_dir = config_dir();
         let config = read_pkg_config(&config_dir)?;
+        Self::open_with_config(config)
+    }
+
+    /// Opens package operations against an already merged configuration snapshot.
+    /// Resolution and mutation callers should share this exact value for one operation.
+    pub fn open_with_config(config: PkgConfig) -> Result<Self> {
+        let config_dir = config_dir();
         let store = Store::open_default();
         Ok(
             Self::new(Registry::from_config(&config, &store)?, store, config_dir)
@@ -224,7 +232,10 @@ impl Ops {
             let _package_lock = self
                 .store
                 .acquire_package_lock(package.kind, &package.name)?;
-            if let Some(receipt) = self.active_receipt(package.kind, &package.name)? {
+            if let Some(receipt) = self
+                .store
+                .receipt_for_mutation(package.kind, &package.name)?
+            {
                 if let (Some(manager), Some(id)) = (
                     receipt.native_manager.as_deref(),
                     receipt.native_id.as_deref(),
@@ -241,7 +252,7 @@ impl Ops {
                     }
                 }
             }
-            self.store.remove(package.kind, &package.name)?;
+            self.store.deactivate(package.kind, &package.name)?;
         }
         Ok(())
     }
@@ -362,31 +373,33 @@ impl Ops {
     pub fn doctor(&self) -> Result<DoctorReport> {
         let mut report = DoctorReport::default();
         for receipt in self.store.receipts()? {
-            let result = if let (Some(manager), Some(id)) = (
-                receipt.native_manager.as_deref(),
-                receipt.native_id.as_deref(),
-            ) {
-                native_doctor(parse_native_manager(manager)?, id)
-            } else if let Some(package) = self.registry.get(receipt.kind, &receipt.name) {
-                if let Some(artifact) = package
-                    .artifacts_for(std::env::consts::OS, std::env::consts::ARCH)
-                    .find(|artifact| artifact.source.plugin.is_some())
-                {
-                    artifact
-                        .source
-                        .plugin
-                        .as_ref()
-                        .and_then(|name| self.plugin_backends.get(name))
-                        .map_or_else(
-                            || self.store.verify(&receipt),
-                            |backend| backend.doctor(&receipt),
-                        )
+            let result = self.store.verify_activation(&receipt).and_then(|()| {
+                if let (Some(manager), Some(id)) = (
+                    receipt.native_manager.as_deref(),
+                    receipt.native_id.as_deref(),
+                ) {
+                    native_doctor(parse_native_manager(manager)?, id)
+                } else if let Some(package) = self.registry.get(receipt.kind, &receipt.name) {
+                    if let Some(artifact) = package
+                        .artifacts_for(std::env::consts::OS, std::env::consts::ARCH)
+                        .find(|artifact| artifact.source.plugin.is_some())
+                    {
+                        artifact
+                            .source
+                            .plugin
+                            .as_ref()
+                            .and_then(|name| self.plugin_backends.get(name))
+                            .map_or_else(
+                                || self.store.verify(&receipt),
+                                |backend| backend.doctor(&receipt),
+                            )
+                    } else {
+                        self.store.verify(&receipt)
+                    }
                 } else {
                     self.store.verify(&receipt)
                 }
-            } else {
-                self.store.verify(&receipt)
-            };
+            });
             match result {
                 Ok(()) => report.ok.push(receipt.name),
                 Err(err) => report.bad.push((receipt.name, err.to_string())),
@@ -563,38 +576,47 @@ impl Ops {
             .store
             .acquire_package_lock(package.kind, &package.name)?;
         let current = self
-            .active_receipt(package.kind, &package.name)?
-            .ok_or_else(|| Error::Message(format!("{name} is not installed")))?;
-        let previous = current
-            .previous_version
-            .clone()
-            .ok_or_else(|| Error::Message(format!("{name} has no previous version to rollback")))?;
-        let install_dir = self
             .store
-            .install_dir(package.kind, &package.name, &previous);
-        if !install_dir.exists() {
+            .receipt_for_mutation(package.kind, &package.name)?
+            .ok_or_else(|| Error::Message(format!("{name} is not installed")))?;
+        let previous = self
+            .store
+            .rollback_target(package.kind, &package.name)?
+            .ok_or_else(|| Error::Message(format!("{name} has no previous version to rollback")))?;
+        if previous.kind != package.kind.as_str() || previous.name != package.name {
             return Err(Error::Message(format!(
-                "previous version {previous} for {name} is no longer present"
+                "activation history for {name} belongs to a different package"
             )));
         }
-        let artifact = self.artifact_for_host(package)?;
-        let mut receipt = Receipt {
+        let install_dir = self
+            .store
+            .install_dir(package.kind, &package.name, &previous.version);
+        if current.native_manager.is_none() && !install_dir.exists() {
+            return Err(Error::Message(format!(
+                "previous version {} for {name} is no longer present",
+                previous.version
+            )));
+        }
+        let receipt = Receipt {
             name: package.name.clone(),
             kind: package.kind,
-            version: previous,
+            version: previous.version,
             source: current.source.clone(),
             url: current.url.clone(),
             archive_sha256: current.archive_sha256.clone(),
             bin: current.bin.clone(),
             shim: String::new(),
             previous_version: Some(current.version),
-            files: hash_tree(&install_dir)?,
+            files: if install_dir.is_dir() {
+                hash_tree(&install_dir)?
+            } else {
+                BTreeMap::new()
+            },
             installed_at: timestamp(),
             native_manager: current.native_manager.clone(),
             native_id: current.native_id.clone(),
         };
-        self.activate_installed(package, artifact, &install_dir, &mut receipt)?;
-        self.store.write_receipt(&receipt)?;
+        self.store.rollback(&receipt)?;
 
         let locked = LockedPackage {
             name: receipt.name,
@@ -768,13 +790,16 @@ impl Ops {
             .store
             .acquire_package_lock(package.kind, &package.name)?;
         let artifact = self.artifact_for_host(package)?;
-        let previous_version = self
-            .active_receipt(package.kind, &package.name)?
-            .map(|receipt| receipt.version);
+        let previous_receipt = self
+            .store
+            .receipt_for_mutation(package.kind, &package.name)?;
+        let previous_version = previous_receipt
+            .as_ref()
+            .map(|receipt| receipt.version.clone());
 
         if let Some(command) = &artifact.source.system {
-            let path = resolve::system_binary(command)?;
-            let mut receipt = Receipt {
+            let path = system_binary(command)?;
+            let receipt = Receipt {
                 name: package.name.clone(),
                 kind: package.kind,
                 version: "system".to_owned(),
@@ -789,8 +814,9 @@ impl Ops {
                 native_manager: None,
                 native_id: None,
             };
-            self.store.activate(&mut receipt, &path)?;
-            self.store.write_receipt(&receipt)?;
+            let activation =
+                command_activation(package, artifact, &receipt.version, path, Vec::new());
+            self.store.commit_activation(&receipt, activation)?;
             return Ok(lock_from_receipt(receipt));
         }
 
@@ -829,9 +855,13 @@ impl Ops {
             .ok_or_else(|| Error::Message("invalid store path".to_owned()))?;
         fs::create_dir_all(install_parent)
             .map_err(|source| pkg_io(install_parent.display(), source))?;
+        recover_tree_backup(&install_dir)?;
 
         let mut installed_archive_sha256 = None;
-        if !install_dir.exists() {
+        let active_tree_is_corrupt = previous_receipt.as_ref().is_some_and(|receipt| {
+            receipt.version == resolved.version && self.store.verify(receipt).is_err()
+        });
+        let replacement = if !install_dir.exists() || active_tree_is_corrupt {
             let tmp = TempDir::new_in(install_parent)
                 .map_err(|source| pkg_io(install_dir.display(), source))?;
             installed_archive_sha256 = install_into(
@@ -843,31 +873,62 @@ impl Ops {
                 &self.plugin_backends,
                 progress,
             )?;
-            fs::rename(tmp.path(), &install_dir)
-                .map_err(|source| pkg_io(install_dir.display(), source))?;
-        }
-
-        let mut receipt = Receipt {
-            name: package.name.clone(),
-            kind: package.kind,
-            version: resolved.version.clone(),
-            source: resolved.source.clone(),
-            url: resolved.url.clone(),
-            archive_sha256: installed_archive_sha256
-                .or_else(|| resolved.sha256.clone())
-                .unwrap_or_default(),
-            bin: artifact.bin.clone(),
-            shim: String::new(),
-            previous_version,
-            files: hash_tree(&install_dir)?,
-            installed_at: timestamp(),
-            native_manager: None,
-            native_id: None,
+            Some(TreeReplacement::promote(tmp.path(), &install_dir)?)
+        } else {
+            None
         };
-        self.activate_installed(package, artifact, &install_dir, &mut receipt)?;
-        self.store.write_receipt(&receipt)?;
 
-        Ok(lock_from_receipt(receipt))
+        let result = (|| {
+            let receipt = Receipt {
+                name: package.name.clone(),
+                kind: package.kind,
+                version: resolved.version.clone(),
+                source: resolved.source.clone(),
+                url: resolved.url.clone(),
+                archive_sha256: installed_archive_sha256
+                    .or_else(|| resolved.sha256.clone())
+                    .or_else(|| {
+                        previous_receipt.as_ref().and_then(|receipt| {
+                            (receipt.version == resolved.version
+                                && !receipt.archive_sha256.is_empty())
+                            .then(|| receipt.archive_sha256.clone())
+                        })
+                    })
+                    .unwrap_or_default(),
+                bin: artifact.bin.clone(),
+                shim: String::new(),
+                previous_version,
+                files: hash_tree(&install_dir)?,
+                installed_at: timestamp(),
+                native_manager: None,
+                native_id: None,
+            };
+            let activation =
+                self.installed_activation(package, artifact, &receipt.version, &install_dir)?;
+            self.store.commit_activation(&receipt, activation)?;
+            Ok(lock_from_receipt(receipt))
+        })();
+
+        match (result, replacement) {
+            (Ok(locked), Some(replacement)) => {
+                if let Err(error) = replacement.finish() {
+                    progress(OpEvent::Progress {
+                        name: package.name.clone(),
+                        message: format!("warning: {error}"),
+                        percent: None,
+                    });
+                }
+                Ok(locked)
+            }
+            (Ok(locked), None) => Ok(locked),
+            (Err(error), Some(replacement)) => match replacement.rollback() {
+                Ok(()) => Err(error),
+                Err(rollback_error) => Err(Error::Message(format!(
+                    "{error}; failed to restore the previous install tree: {rollback_error}"
+                ))),
+            },
+            (Err(error), None) => Err(error),
+        }
     }
 
     fn active_receipt(&self, kind: PkgKind, name: &str) -> Result<Option<Receipt>> {
@@ -890,7 +951,7 @@ impl Ops {
             return detect_native_manager(native).is_some();
         }
         if let Some(command) = &source.system {
-            return resolve::system_binary(command).is_ok();
+            return system_binary(command).is_ok();
         }
         if let Some(name) = &source.plugin {
             return self
@@ -959,6 +1020,8 @@ impl Ops {
         native_install(selected.manager, &selected.id)?;
         let version = native_installed_version(selected.manager, &selected.id)
             .unwrap_or_else(|_| resolved.version.clone());
+        let command = artifact.source.bin.as_deref().unwrap_or(&artifact.bin);
+        let path = system_binary(command)?;
         let receipt = Receipt {
             name: package.name.clone(),
             kind: package.kind,
@@ -974,42 +1037,131 @@ impl Ops {
             native_manager: Some(selected.manager.to_string()),
             native_id: Some(selected.id),
         };
-        self.store.write_receipt(&receipt)?;
+        let activation = command_activation(package, artifact, &receipt.version, path, Vec::new());
+        self.store.commit_activation(&receipt, activation)?;
         Ok(lock_from_receipt(receipt))
     }
 
-    fn activate_installed(
+    fn installed_activation(
         &self,
-        _package: &PackageSpec,
+        package: &PackageSpec,
         artifact: &Artifact,
+        version: &str,
         install_dir: &Path,
-        receipt: &mut Receipt,
-    ) -> Result<()> {
+    ) -> Result<PackageActivation> {
         let source = &artifact.source;
-        if source.git.is_some() {
-            return Ok(());
+        if package.kind == PkgKind::Grammar {
+            let mut path = install_dir.join(&package.name);
+            path.set_extension(std::env::consts::DLL_EXTENSION);
+            return Ok(PackageActivation::new(
+                active_package(package, version),
+                vec![RuntimeAssetSpec::grammar(&package.name, path)],
+            ));
         }
-        if source.npm.is_some() {
+        if package.kind == PkgKind::Plugin {
+            return Ok(PackageActivation::new(
+                active_package(package, version),
+                vec![RuntimeAssetSpec::plugin_root(&package.name, install_dir)],
+            ));
+        }
+        let (program, prefix_args) = if source.npm.is_some() {
             if let Some(bin_js) = &source.bin_js {
                 let node = required_tool("node", "Node.js is required for npm packages")?;
                 let package_dir = npm_package_dir(install_dir, source.npm.as_deref().unwrap());
-                return self
-                    .store
-                    .activate_command(receipt, &node, &package_dir.join(bin_js));
+                (node, vec![package_dir.join(bin_js).display().to_string()])
+            } else {
+                let bin = source.bin.as_deref().unwrap_or(&artifact.bin);
+                (
+                    with_windows_cmd(&install_dir.join("node_modules").join(".bin").join(bin)),
+                    Vec::new(),
+                )
             }
-            let bin = source.bin.as_deref().unwrap_or(&artifact.bin);
-            return self.store.activate(
-                receipt,
-                &with_windows_cmd(&install_dir.join("node_modules").join(".bin").join(bin)),
-            );
-        }
-        if source.pip.is_some() {
-            let target = python_venv_bin(install_dir, &artifact.bin);
-            return self.store.activate(receipt, &target);
-        }
-        let target = produced_bin(install_dir, &artifact.bin, source);
-        self.store.activate(receipt, &target)
+        } else if let Some(package_name) = &source.npx {
+            let npm = required_tool("npm", "npm is required for npx packages")?;
+            (
+                npm,
+                vec![
+                    "exec".to_owned(),
+                    "--yes".to_owned(),
+                    package_name.clone(),
+                    "--".to_owned(),
+                ],
+            )
+        } else if let Some(package_name) = &source.uvx {
+            let uvx = required_tool("uvx", "uvx is required for uvx packages")?;
+            (uvx, vec![package_name.clone()])
+        } else if source.pip.is_some() {
+            (python_venv_bin(install_dir, &artifact.bin), Vec::new())
+        } else {
+            (produced_bin(install_dir, &artifact.bin, source), Vec::new())
+        };
+        Ok(command_activation(
+            package,
+            artifact,
+            version,
+            program,
+            prefix_args,
+        ))
     }
+}
+
+fn active_package(package: &PackageSpec, version: &str) -> ActivePackage {
+    ActivePackage::new(package.kind.as_str(), &package.name, version)
+}
+
+fn command_activation(
+    package: &PackageSpec,
+    artifact: &Artifact,
+    version: &str,
+    program: PathBuf,
+    prefix_args: Vec<String>,
+) -> PackageActivation {
+    let keys = command_activation_keys(package, artifact);
+    let commands = keys
+        .into_iter()
+        .map(|key| {
+            RuntimeAssetSpec::command(key, program.clone())
+                .with_prefix_args(prefix_args.clone())
+                .with_default_args(artifact.args.clone())
+                .with_env(artifact.env.clone())
+        })
+        .collect();
+    PackageActivation::new(active_package(package, version), commands)
+}
+
+fn command_activation_keys(
+    package: &PackageSpec,
+    artifact: &Artifact,
+) -> std::collections::BTreeSet<String> {
+    let mut keys = std::collections::BTreeSet::new();
+    for command in [
+        Some(package.name.as_str()),
+        Some(artifact.bin.as_str()),
+        artifact.source.bin.as_deref(),
+        artifact.source.system.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|command| !command.is_empty())
+    {
+        let path = Path::new(command);
+        if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
+            keys.insert(name.to_owned());
+            if matches!(
+                path.extension().and_then(|extension| extension.to_str()),
+                Some(extension)
+                    if extension.eq_ignore_ascii_case("exe")
+                        || extension.eq_ignore_ascii_case("cmd")
+                        || extension.eq_ignore_ascii_case("bat")
+                        || extension.eq_ignore_ascii_case("ps1")
+            ) {
+                if let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) {
+                    keys.insert(stem.to_owned());
+                }
+            }
+        }
+    }
+    keys
 }
 
 #[derive(Debug, Default)]
@@ -1251,6 +1403,10 @@ fn install_into(
         return Ok(None);
     }
 
+    if source.npx.is_some() || source.uvx.is_some() {
+        return Ok(None);
+    }
+
     if let Some(package_name) = &source.pip {
         progress(OpEvent::Progress {
             name: package.name.clone(),
@@ -1390,6 +1546,10 @@ fn latest_version(package: &PackageSpec, artifact: &Artifact) -> Result<String> 
     let source = &artifact.source;
     if let Some(package_name) = &source.npm {
         npm_latest(package_name)
+    } else if source.npx.is_some() {
+        Ok("npx".to_owned())
+    } else if source.uvx.is_some() {
+        Ok("uvx".to_owned())
     } else if let Some(package_name) = &source.pip {
         pip_latest(package_name)
     } else if let Some(crate_name) = &source.cargo {
@@ -1634,7 +1794,7 @@ fn git_output(cwd: &Path, args: &[&str]) -> Result<String> {
 }
 
 fn required_tool(name: &str, context: &str) -> Result<PathBuf> {
-    resolve::system_binary(name).map_err(|_| {
+    system_binary(name).map_err(|_| {
         Error::Message(format!(
             "{context}; install `{name}` and ensure it is available on PATH"
         ))
@@ -1642,8 +1802,8 @@ fn required_tool(name: &str, context: &str) -> Result<PathBuf> {
 }
 
 fn python_tool() -> Result<PathBuf> {
-    resolve::system_binary(if cfg!(windows) { "python" } else { "python3" })
-        .or_else(|_| resolve::system_binary("python"))
+    system_binary(if cfg!(windows) { "python" } else { "python3" })
+        .or_else(|_| system_binary("python"))
         .map_err(|_| {
             Error::Message(
                 "Python is required for pip packages; install python and ensure it is available on PATH"
@@ -1683,6 +1843,89 @@ fn command_stdout(program: &Path, args: &[String]) -> Result<String> {
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         })
+    }
+}
+
+struct TreeReplacement {
+    live: PathBuf,
+    backup: Option<PathBuf>,
+}
+
+impl TreeReplacement {
+    fn promote(staged: &Path, live: &Path) -> Result<Self> {
+        let backup = tree_backup_path(live)?;
+        let had_live = path_exists(live)?;
+        if had_live {
+            fs::rename(live, &backup).map_err(|source| pkg_io(backup.display(), source))?;
+        }
+        if let Err(source) = fs::rename(staged, live) {
+            if had_live {
+                let _ = fs::rename(&backup, live);
+            }
+            return Err(pkg_io(live.display(), source));
+        }
+        Ok(Self {
+            live: live.to_path_buf(),
+            backup: had_live.then_some(backup),
+        })
+    }
+
+    fn finish(self) -> Result<()> {
+        if let Some(backup) = self.backup {
+            remove_path(&backup)?;
+        }
+        Ok(())
+    }
+
+    fn rollback(self) -> Result<()> {
+        remove_path(&self.live)?;
+        if let Some(backup) = self.backup {
+            fs::rename(&backup, &self.live)
+                .map_err(|source| pkg_io(self.live.display(), source))?;
+        }
+        Ok(())
+    }
+}
+
+fn recover_tree_backup(live: &Path) -> Result<()> {
+    let backup = tree_backup_path(live)?;
+    match (path_exists(live)?, path_exists(&backup)?) {
+        (false, true) => {
+            fs::rename(&backup, live).map_err(|source| pkg_io(live.display(), source))?;
+        }
+        (true, true) => remove_path(&backup)?,
+        (_, false) => {}
+    }
+    Ok(())
+}
+
+fn tree_backup_path(live: &Path) -> Result<PathBuf> {
+    let name = live
+        .file_name()
+        .ok_or_else(|| Error::Message(format!("invalid install path {}", live.display())))?;
+    let mut backup_name = name.to_os_string();
+    backup_name.push(".pkg-backup");
+    Ok(live.with_file_name(backup_name))
+}
+
+fn path_exists(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(pkg_io(path.display(), source)),
+    }
+}
+
+fn remove_path(path: &Path) -> Result<()> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => return Err(pkg_io(path.display(), source)),
+    };
+    if metadata.is_dir() {
+        fs::remove_dir_all(path).map_err(|source| pkg_io(path.display(), source))
+    } else {
+        fs::remove_file(path).map_err(|source| pkg_io(path.display(), source))
     }
 }
 
@@ -1970,6 +2213,11 @@ fn which_in_paths(name: &str, paths: Option<OsString>) -> Option<PathBuf> {
         }
         None
     })
+}
+
+fn system_binary(name: &str) -> Result<PathBuf> {
+    which_in_paths(name, std::env::var_os("PATH"))
+        .ok_or_else(|| Error::SystemMissing(name.to_owned()))
 }
 
 fn native_install(manager: NativeManager, id: &str) -> Result<()> {
@@ -2266,6 +2514,12 @@ fn unpack(url: &str, bytes: &[u8], dest: &Path, bin: &str) -> Result<()> {
         archive
             .unpack(dest)
             .map_err(|source| pkg_io(dest.display(), source))
+    } else if url.ends_with(".tar.bz2") || url.ends_with(".tbz2") {
+        let decoder = BzDecoder::new(Cursor::new(bytes));
+        let mut archive = tar::Archive::new(decoder);
+        archive
+            .unpack(dest)
+            .map_err(|source| pkg_io(dest.display(), source))
     } else if url.ends_with(".gz") {
         let mut decoder = GzDecoder::new(Cursor::new(bytes));
         write_single_file(&mut decoder, &dest.join(bin))
@@ -2332,11 +2586,7 @@ fn timestamp() -> String {
 }
 
 fn config_dir() -> PathBuf {
-    use etcetera::base_strategy::{choose_base_strategy, BaseStrategy};
-    choose_base_strategy()
-        .expect("Unable to find the config directory!")
-        .config_dir()
-        .join("double-helix")
+    helix_loader::config_dir()
 }
 
 fn read_pkg_config(config_dir: &Path) -> Result<PkgConfig> {
@@ -2373,7 +2623,7 @@ mod tests {
     use assert_fs::TempDir;
     use zip::{write::SimpleFileOptions, ZipWriter};
 
-    use helix_store::{Store as SqliteStore, StorePaths};
+    use helix_store::{RuntimeAssetKind, Store as SqliteStore, StorePaths};
 
     use crate::{lock::Manifest, registry::Registry, spec::PkgKind, Store};
 
@@ -2453,14 +2703,28 @@ bin = "bin/demo.exe"
         ))
         .unwrap();
         assert!(sqlite.receipts().get("lsp", "demo").unwrap().is_some());
-        let shim = store.bin_dir().join(&receipts[0].shim);
-        assert!(shim.exists());
-        if cfg!(windows) {
-            assert_eq!(fs::read(&shim).unwrap(), b"demo");
-        }
+        let snapshot = sqlite.runtime_assets().snapshot().unwrap();
+        assert_eq!(snapshot.assets.len(), 2);
+        assert_eq!(
+            snapshot
+                .assets
+                .iter()
+                .map(|asset| asset.key.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["demo", "demo.exe"])
+        );
+        assert!(snapshot.assets.iter().all(|asset| {
+            asset.kind == RuntimeAssetKind::Command && asset.path.ends_with("bin/demo.exe")
+        }));
+        assert!(receipts[0].shim.is_empty());
         ops.remove(&["demo".to_owned()]).unwrap();
         assert!(sqlite.receipts().all().unwrap().is_empty());
-        assert!(!store.receipt_path(PkgKind::Lsp, "demo").exists());
+        assert!(sqlite
+            .runtime_assets()
+            .snapshot()
+            .unwrap()
+            .assets
+            .is_empty());
     }
 
     #[test]
@@ -2739,6 +3003,18 @@ bin = "demo.exe"
         .unwrap();
         let report = ops.doctor().unwrap();
         assert_eq!(report.bad.len(), 1);
+
+        ops.install(&["demo".to_owned()], &mut |_| {}).unwrap();
+        assert_eq!(
+            fs::read(
+                store
+                    .install_dir(PkgKind::Lsp, "demo", "1")
+                    .join("demo.exe")
+            )
+            .unwrap(),
+            b"demo"
+        );
+        assert!(ops.doctor().unwrap().bad.is_empty());
     }
 
     #[test]
@@ -2993,7 +3269,26 @@ bin = "demo.exe"
         assert_eq!(lock.packages[0].source, "plugin:fixture");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         let receipt = ops.store().receipts().unwrap().pop().unwrap();
-        assert!(ops.store().bin_dir().join(receipt.shim).exists());
+        assert!(receipt.shim.is_empty());
+        let mut sqlite = SqliteStore::open(StorePaths::new(
+            dir.path().join("state.sqlite3"),
+            dir.path().join("cache.sqlite3"),
+        ))
+        .unwrap();
+        let snapshot = sqlite.runtime_assets().snapshot().unwrap();
+        assert_eq!(snapshot.assets.len(), 2);
+        assert_eq!(
+            snapshot
+                .assets
+                .iter()
+                .map(|asset| asset.key.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["demo", "demo.exe"])
+        );
+        assert!(snapshot
+            .assets
+            .iter()
+            .all(|asset| asset.path.ends_with("demo.exe")));
     }
 
     #[test]
@@ -3067,7 +3362,7 @@ bin = "demo.exe"
     }
 
     #[test]
-    fn node_bin_js_activation_writes_runtime_wrapper() {
+    fn node_bin_js_activation_records_runtime_launch_metadata() {
         let dir = TempDir::new().unwrap();
         let store = Store::open(dir.path().join("pkg"));
         store.prepare().unwrap();
@@ -3086,6 +3381,8 @@ os = "windows"
 arch = "x86_64"
 source = { npm = "demo", bin-js = "bin/server.js" }
 bin = "demo"
+args = ["--stdio"]
+env = { DEMO_MODE = "test" }
 "#,
         );
         let ops = Ops::new(
@@ -3093,31 +3390,21 @@ bin = "demo"
             store.clone(),
             dir.path().join("config"),
         );
-        let mut receipt = Receipt {
-            name: "demo".to_owned(),
-            kind: PkgKind::Lsp,
-            version: "1".to_owned(),
-            source: "npm".to_owned(),
-            url: "npm:1".to_owned(),
-            archive_sha256: String::new(),
-            bin: "demo".to_owned(),
-            shim: String::new(),
-            previous_version: None,
-            files: Default::default(),
-            installed_at: "now".to_owned(),
-            native_manager: None,
-            native_id: None,
-        };
-        let result = ops.activate_installed(
+        let result = ops.installed_activation(
             &package,
             package.artifact_for("windows", "x86_64").unwrap(),
+            "1",
             &install,
-            &mut receipt,
         );
-        if resolve::system_binary("node").is_ok() {
-            result.unwrap();
-            let shim = fs::read_to_string(store.bin_dir().join(receipt.shim)).unwrap();
-            assert!(shim.contains("server.js"));
+        if system_binary("node").is_ok() {
+            let activation = result.unwrap();
+            let asset = &activation.assets[0];
+            assert_eq!(asset.kind, RuntimeAssetKind::Command);
+            assert_eq!(asset.key, "demo");
+            assert!(Path::new(&asset.prefix_args[0])
+                .ends_with(Path::new("node_modules/demo/bin/server.js")));
+            assert_eq!(asset.default_args, ["--stdio"]);
+            assert_eq!(asset.env.get("DEMO_MODE").map(String::as_str), Some("test"));
         } else {
             assert!(result.is_err());
         }
@@ -3151,29 +3438,27 @@ bin = "debugpy-adapter"
             store.clone(),
             dir.path().join("config"),
         );
-        let mut receipt = Receipt {
-            name: "debugpy".to_owned(),
-            kind: PkgKind::Dap,
-            version: "1".to_owned(),
-            source: "pip".to_owned(),
-            url: "pip:1".to_owned(),
-            archive_sha256: String::new(),
-            bin: "debugpy-adapter".to_owned(),
-            shim: String::new(),
-            previous_version: None,
-            files: Default::default(),
-            installed_at: "now".to_owned(),
-            native_manager: None,
-            native_id: None,
-        };
-        ops.activate_installed(
-            &package,
-            package.artifact_for("windows", "x86_64").unwrap(),
-            &install,
-            &mut receipt,
-        )
-        .unwrap();
-        assert!(store.bin_dir().join(receipt.shim).exists());
+        let activation = ops
+            .installed_activation(
+                &package,
+                package.artifact_for("windows", "x86_64").unwrap(),
+                "1",
+                &install,
+            )
+            .unwrap();
+        assert_eq!(activation.assets.len(), 2);
+        assert_eq!(
+            activation
+                .assets
+                .iter()
+                .map(|asset| asset.key.as_str())
+                .collect::<Vec<_>>(),
+            ["debugpy", "debugpy-adapter"]
+        );
+        assert!(activation
+            .assets
+            .iter()
+            .all(|asset| asset.kind == RuntimeAssetKind::Command && asset.path == target));
     }
 
     #[test]

@@ -40,7 +40,7 @@ it?").
 - Sandboxed execution of installed tools (they already run unsandboxed as
   LSP/DAP servers today).
 - Auto-provisioning remote plugin hosts over SSH (documented manual path;
-  the transport already works once the remote side has `helix-plugin-host`).
+  the transport already works once the remote side has `dhx --plugin-host`).
 
 ## Architecture
 
@@ -294,7 +294,7 @@ engine changes.
 
 Plugins install from registry entries (`kind = "plugin"`, git or archive
 source) into a pkg-managed plugin dir that is appended to `plugin_dirs`.
-The existing manifest validation (min_api_version, capabilities) runs at
+The existing manifest validation (exact api_version, capabilities) runs at
 load exactly as today. Remote hosts: v1 documents `dhx pkg sync` run on the
 remote side against the same lockfile; no editor-driven remote provisioning.
 

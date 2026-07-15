@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
 };
@@ -38,6 +38,44 @@ const BUILTIN: &[&str] = &[
     include_str!("../../registry/grammar/typescript.toml"),
     include_str!("../../registry/grammar/go.toml"),
     include_str!("../../registry/grammar/markdown.toml"),
+    include_str!("../../registry/acp/agoragentic-acp.toml"),
+    include_str!("../../registry/acp/amp-acp.toml"),
+    include_str!("../../registry/acp/auggie.toml"),
+    include_str!("../../registry/acp/autohand.toml"),
+    include_str!("../../registry/acp/claude-acp.toml"),
+    include_str!("../../registry/acp/cline.toml"),
+    include_str!("../../registry/acp/codebuddy-code.toml"),
+    include_str!("../../registry/acp/codex-acp.toml"),
+    include_str!("../../registry/acp/cortex-code.toml"),
+    include_str!("../../registry/acp/corust-agent.toml"),
+    include_str!("../../registry/acp/crow-cli.toml"),
+    include_str!("../../registry/acp/cursor.toml"),
+    include_str!("../../registry/acp/deepagents.toml"),
+    include_str!("../../registry/acp/devin.toml"),
+    include_str!("../../registry/acp/dimcode.toml"),
+    include_str!("../../registry/acp/dirac.toml"),
+    include_str!("../../registry/acp/factory-droid.toml"),
+    include_str!("../../registry/acp/fast-agent.toml"),
+    include_str!("../../registry/acp/gemini.toml"),
+    include_str!("../../registry/acp/github-copilot-cli.toml"),
+    include_str!("../../registry/acp/glm-acp-agent.toml"),
+    include_str!("../../registry/acp/goose.toml"),
+    include_str!("../../registry/acp/grok-build.toml"),
+    include_str!("../../registry/acp/harn.toml"),
+    include_str!("../../registry/acp/junie.toml"),
+    include_str!("../../registry/acp/kilo.toml"),
+    include_str!("../../registry/acp/kimi.toml"),
+    include_str!("../../registry/acp/minion-code.toml"),
+    include_str!("../../registry/acp/mistral-vibe.toml"),
+    include_str!("../../registry/acp/nova.toml"),
+    include_str!("../../registry/acp/opencode.toml"),
+    include_str!("../../registry/acp/pi-acp.toml"),
+    include_str!("../../registry/acp/poolside.toml"),
+    include_str!("../../registry/acp/qoder.toml"),
+    include_str!("../../registry/acp/qwen-code.toml"),
+    include_str!("../../registry/acp/sigit.toml"),
+    include_str!("../../registry/acp/stakpak.toml"),
+    include_str!("../../registry/acp/vtcode.toml"),
 ];
 
 #[derive(Debug, Clone, Default)]
@@ -118,6 +156,44 @@ impl Registry {
             .collect()
     }
 
+    pub fn package_for_command(
+        &self,
+        kind: PkgKind,
+        language: Option<&str>,
+        command: &str,
+    ) -> Option<&PackageSpec> {
+        let requested = command_candidates(command);
+        self.packages
+            .values()
+            .filter(|package| package.kind == kind && !package.is_system_only())
+            .find(|package| {
+                package
+                    .artifacts
+                    .iter()
+                    .flat_map(|artifact| {
+                        [
+                            artifact.bin.as_str(),
+                            artifact.source.bin.as_deref().unwrap_or_default(),
+                            artifact.source.system.as_deref().unwrap_or_default(),
+                        ]
+                    })
+                    .flat_map(command_candidates)
+                    .any(|candidate| requested.contains(&candidate))
+            })
+            .or_else(|| {
+                let language = language?;
+                self.packages
+                    .values()
+                    .filter(|package| package.kind == kind && !package.is_system_only())
+                    .find(|package| {
+                        package
+                            .languages
+                            .iter()
+                            .any(|candidate| candidate == language)
+                    })
+            })
+    }
+
     pub fn lint(package: &PackageSpec) -> Result<()> {
         if package.name.trim().is_empty() {
             return Err(Error::InvalidPackage {
@@ -167,6 +243,33 @@ impl Registry {
         }
         Ok(())
     }
+}
+
+fn command_candidates(command: &str) -> BTreeSet<String> {
+    let mut candidates = BTreeSet::new();
+    let command = command.trim();
+    if command.is_empty() {
+        return candidates;
+    }
+    candidates.insert(command.to_owned());
+
+    let path = Path::new(command);
+    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        return candidates;
+    };
+    candidates.insert(file_name.to_owned());
+    if matches!(
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("exe" | "cmd" | "bat")
+    ) {
+        if let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) {
+            candidates.insert(stem.to_owned());
+        }
+    }
+    candidates
 }
 
 fn lint_non_empty_list(package: &PackageSpec, field: &str, values: &[String]) -> Result<()> {
@@ -270,6 +373,63 @@ bin = "rust-analyzer"
         assert_eq!(registry.search("ra")[0].name, "rust-analyzer");
         assert_eq!(registry.search("language-server")[0].name, "rust-analyzer");
         assert_eq!(registry.search("schema")[0].name, "rust-analyzer");
+    }
+
+    #[test]
+    fn package_for_command_matches_executable_names_then_language() {
+        let mut registry = Registry::default();
+        registry
+            .insert_str(
+                "managed",
+                r#"
+name = "rust-analyzer"
+kind = "lsp"
+description = "managed"
+languages = ["rust"]
+
+[[artifact]]
+os = "windows"
+arch = "x86_64"
+source = { archive = "file:///rust-analyzer.zip" }
+bin = "bin/rust-analyzer.exe"
+"#,
+            )
+            .unwrap();
+        registry
+            .insert_str(
+                "system",
+                r#"
+name = "clangd"
+kind = "lsp"
+description = "system only"
+languages = ["c"]
+
+[[artifact]]
+os = "windows"
+arch = "x86_64"
+source = { system = "clangd" }
+bin = "clangd"
+"#,
+            )
+            .unwrap();
+
+        assert_eq!(
+            registry
+                .package_for_command(PkgKind::Lsp, None, "rust-analyzer")
+                .unwrap()
+                .name,
+            "rust-analyzer"
+        );
+        assert_eq!(
+            registry
+                .package_for_command(PkgKind::Lsp, Some("rust"), "unknown")
+                .unwrap()
+                .name,
+            "rust-analyzer"
+        );
+        assert!(registry
+            .package_for_command(PkgKind::Lsp, Some("c"), "clangd")
+            .is_none());
     }
 
     #[test]

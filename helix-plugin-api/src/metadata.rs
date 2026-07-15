@@ -8,11 +8,8 @@ use serde::{Deserialize, Serialize};
 
 use super::events::EventKind;
 
-/// The current contract API version. Bump when the contract changes.
-pub const API_VERSION: u32 = 2;
-
-/// The minimum API version that plugins must target for compatibility.
-pub const MIN_COMPATIBLE_VERSION: u32 = 2;
+/// Exact version of the unreleased plugin contract.
+pub const API_VERSION: u32 = 1;
 
 /// Host capability families.
 ///
@@ -30,18 +27,26 @@ pub enum Capability {
     Panels,
     /// Command registration and invocation.
     Commands,
+    /// Owned declarative keymap contributions.
+    Keymaps,
     /// Event subscription.
     Events,
-    /// Panel render surface access.
-    Render,
     /// Split/view topology management.
     Splits,
     /// Per-view tab groups.
     Tabs,
     /// Floating window overlays.
     Floats,
-    /// Package-manager backend registration.
-    PkgBackend,
+    /// Cancellable host-owned asynchronous operations.
+    Tasks,
+    /// Immutable syntax snapshots and background queries.
+    Syntax,
+    /// Language-server discovery and custom requests.
+    Lsp,
+    /// Theme snapshots and asynchronous activation.
+    Themes,
+    /// Assistant thread queries and mutations.
+    Assistant,
 }
 
 /// Description of a single event kind in the host's catalog.
@@ -49,8 +54,6 @@ pub enum Capability {
 pub struct EventKindInfo {
     pub kind: EventKind,
     pub description: String,
-    /// API version when this event was introduced.
-    pub since_version: u32,
 }
 
 /// Full API metadata returned by the host.
@@ -58,8 +61,6 @@ pub struct EventKindInfo {
 pub struct ApiMetadata {
     /// Current API version of this host.
     pub version: u32,
-    /// Minimum plugin API version the host can serve.
-    pub min_compatible_version: u32,
     /// Supported capability families.
     pub capabilities: Vec<Capability>,
     /// Catalog of subscribable event kinds.
@@ -67,6 +68,27 @@ pub struct ApiMetadata {
 }
 
 impl ApiMetadata {
+    #[must_use]
+    pub fn from_capabilities(capabilities: impl IntoIterator<Item = Capability>) -> Self {
+        let requested = capabilities
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>();
+        let capabilities = Capability::ALL
+            .iter()
+            .copied()
+            .filter(|capability| requested.contains(capability))
+            .collect::<Vec<_>>();
+        let event_catalog = capabilities
+            .contains(&Capability::Events)
+            .then(default_event_catalog)
+            .unwrap_or_default();
+        Self {
+            version: API_VERSION,
+            capabilities,
+            event_catalog,
+        }
+    }
+
     /// Check whether the host supports a given capability.
     pub fn has_capability(&self, cap: Capability) -> bool {
         self.capabilities.contains(&cap)
@@ -80,12 +102,16 @@ impl Capability {
         Capability::Ui,
         Capability::Panels,
         Capability::Commands,
+        Capability::Keymaps,
         Capability::Events,
-        Capability::Render,
         Capability::Splits,
         Capability::Tabs,
         Capability::Floats,
-        Capability::PkgBackend,
+        Capability::Tasks,
+        Capability::Syntax,
+        Capability::Lsp,
+        Capability::Themes,
+        Capability::Assistant,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -95,12 +121,16 @@ impl Capability {
             Capability::Ui => "ui",
             Capability::Panels => "panels",
             Capability::Commands => "commands",
+            Capability::Keymaps => "keymaps",
             Capability::Events => "events",
-            Capability::Render => "render",
             Capability::Splits => "splits",
             Capability::Tabs => "tabs",
             Capability::Floats => "floats",
-            Capability::PkgBackend => "pkg-backend",
+            Capability::Tasks => "tasks",
+            Capability::Syntax => "syntax",
+            Capability::Lsp => "lsp",
+            Capability::Themes => "themes",
+            Capability::Assistant => "assistant",
         }
     }
 }
@@ -125,23 +155,17 @@ impl std::str::FromStr for Capability {
 
 impl Default for ApiMetadata {
     fn default() -> Self {
-        Self {
-            version: API_VERSION,
-            min_compatible_version: MIN_COMPATIBLE_VERSION,
-            capabilities: Capability::ALL.to_vec(),
-            event_catalog: default_event_catalog(),
-        }
+        Self::from_capabilities(Capability::ALL.iter().copied())
     }
 }
 
 /// Build the default event catalog from all known event kinds.
 fn default_event_catalog() -> Vec<EventKindInfo> {
-    EventKind::ALL
+    EventKind::SUPPORTED
         .iter()
         .map(|&kind| EventKindInfo {
             kind,
             description: default_event_description(kind).into(),
-            since_version: 1,
         })
         .collect()
 }
@@ -188,16 +212,23 @@ mod tests {
         let meta = ApiMetadata::default();
         assert!(meta.has_capability(Capability::Query));
         assert!(meta.has_capability(Capability::Panels));
-        assert!(meta.has_capability(Capability::Render));
         assert!(meta.has_capability(Capability::Splits));
         assert!(meta.has_capability(Capability::Tabs));
         assert!(meta.has_capability(Capability::Floats));
     }
 
     #[test]
-    fn default_catalog_covers_all_events() {
+    fn default_catalog_contains_only_supported_events() {
         let meta = ApiMetadata::default();
-        assert_eq!(meta.event_catalog.len(), EventKind::ALL.len());
+        assert_eq!(meta.event_catalog.len(), EventKind::SUPPORTED.len());
+        assert!(meta
+            .event_catalog
+            .iter()
+            .all(|event| event.kind.is_supported()));
+        assert!(!meta
+            .event_catalog
+            .iter()
+            .any(|event| event.kind == EventKind::DocumentPreSave));
     }
 
     #[test]
@@ -205,7 +236,7 @@ mod tests {
         let meta = ApiMetadata::default();
         let bytes = super::super::codec::encode(&meta).unwrap();
         let meta2: ApiMetadata = super::super::codec::decode(&bytes).unwrap();
-        assert_eq!(meta2.version, 2);
+        assert_eq!(meta2.version, 1);
         assert_eq!(meta2.capabilities.len(), meta.capabilities.len());
     }
 }

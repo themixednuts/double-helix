@@ -1,69 +1,98 @@
 //! Plugin/model floats rendered from the frontend-agnostic UI model.
 
 use crate::compositor::RenderContext;
-use crate::ui::plugin_render::apply_plugin_render_ops;
 use helix_core::Position;
-use helix_plugin::mlua;
-use helix_plugin::types::SurfaceRenderOps;
 use helix_view::graphics::{Rect, Style};
 use helix_view::layout::{anchor_near, center};
-use helix_view::model::{
-    DocumentFloatModel, FloatEntry, Placement, PluginFloatModel, RenderBlock, TextFloatModel,
-};
+use helix_view::model::{DocumentFloatModel, Placement, RenderBlock, TextFloatModel};
+use std::sync::Arc;
 use tui::text::{Span, Spans};
 
-pub(crate) fn render_model_floats(
-    viewport: Rect,
-    surface: &mut crate::render::CellSurface,
-    cx: &RenderContext,
-) {
-    for entry in cx.model_float_entries() {
-        let Some(area) = resolve_float_area(cx, viewport, &entry.placement) else {
-            continue;
-        };
-        if area.width == 0 || area.height == 0 {
-            continue;
+enum FloatRenderContent {
+    Text(TextFloatModel),
+    Document(Option<helix_core::Rope>),
+}
+
+struct FloatRenderEntry {
+    title: Option<Arc<str>>,
+    area: Rect,
+    content: FloatRenderContent,
+}
+
+pub(crate) struct ModelFloatsRenderSnapshot {
+    entries: Box<[FloatRenderEntry]>,
+    popup_style: Style,
+    text_style: Style,
+    error_style: Style,
+    rounded_corners: bool,
+}
+
+impl ModelFloatsRenderSnapshot {
+    pub(crate) fn collect(viewport: Rect, cx: &RenderContext) -> Self {
+        let entries = cx
+            .model_float_entries()
+            .filter_map(|entry| {
+                let area = resolve_float_area(cx, viewport, &entry.placement)?;
+                if area.width == 0 || area.height == 0 {
+                    return None;
+                }
+                let content = if let Some(model) = entry.content.downcast_ref::<TextFloatModel>() {
+                    FloatRenderContent::Text(model.clone())
+                } else if let Some(model) = entry.content.downcast_ref::<DocumentFloatModel>() {
+                    FloatRenderContent::Document(
+                        cx.document(model.document)
+                            .map(|document| document.text().clone()),
+                    )
+                } else {
+                    return None;
+                };
+                Some(FloatRenderEntry {
+                    title: entry.title.as_deref().map(Arc::from),
+                    area,
+                    content,
+                })
+            })
+            .collect();
+        Self {
+            entries,
+            popup_style: cx.style("ui.popup"),
+            text_style: cx.style("ui.text"),
+            error_style: cx.style("error"),
+            rounded_corners: cx.config().rounded_corners,
         }
-
-        render_float_entry(entry, area, surface, cx);
-    }
-}
-
-fn render_float_entry(
-    entry: &FloatEntry,
-    area: Rect,
-    surface: &mut crate::render::CellSurface,
-    cx: &RenderContext,
-) {
-    if let Some(model) = entry.content.downcast_ref::<TextFloatModel>() {
-        render_text_float(entry.title.as_deref(), model, area, surface, cx);
-    } else if let Some(model) = entry.content.downcast_ref::<DocumentFloatModel>() {
-        render_document_float(entry.title.as_deref(), model, area, surface, cx);
-    } else if let Some(model) = entry.content.downcast_ref::<PluginFloatModel>() {
-        render_plugin_float(entry.title.as_deref(), model, area, surface, cx);
-    }
-}
-
-fn render_text_float(
-    title: Option<&str>,
-    model: &TextFloatModel,
-    area: Rect,
-    surface: &mut crate::render::CellSurface,
-    cx: &RenderContext,
-) {
-    let inner = render_float_frame(
-        title,
-        area,
-        surface,
-        cx.style("ui.popup"),
-        cx.config().rounded_corners,
-    );
-    if inner.width == 0 || inner.height == 0 {
-        return;
     }
 
-    let text_style = cx.style("ui.text");
-    render_text_float_content(model, inner, surface, text_style);
+    pub(crate) fn paint(self, surface: &mut crate::render::CellSurface) {
+        for entry in self.entries {
+            let inner = render_float_frame(
+                entry.title.as_deref(),
+                entry.area,
+                surface,
+                self.popup_style,
+                self.rounded_corners,
+            );
+            if inner.width == 0 || inner.height == 0 {
+                continue;
+            }
+            match entry.content {
+                FloatRenderContent::Text(model) => {
+                    render_text_float_content(&model, inner, surface, self.text_style)
+                }
+                FloatRenderContent::Document(Some(text)) => {
+                    render_rope_float_content(&text, inner, surface, self.text_style)
+                }
+                FloatRenderContent::Document(None) => {
+                    surface.set_stringn(
+                        inner.x,
+                        inner.y,
+                        "Document unavailable",
+                        inner.width as usize,
+                        tui::ratatui::to_ratatui_style(self.error_style),
+                    );
+                }
+            }
+        }
+    }
 }
 
 fn render_text_float_content(
@@ -80,47 +109,22 @@ fn render_text_float_content(
     render_spans_lines(surface, inner, &lines);
 }
 
-fn render_document_float(
-    title: Option<&str>,
-    model: &DocumentFloatModel,
-    area: Rect,
-    surface: &mut crate::render::CellSurface,
-    cx: &RenderContext,
-) {
-    let inner = render_float_frame(
-        title,
-        area,
-        surface,
-        cx.style("ui.popup"),
-        cx.config().rounded_corners,
-    );
-    if inner.width == 0 || inner.height == 0 {
-        return;
-    }
-
-    let text_style = cx.style("ui.text");
-    let error_style = cx.style("error");
-    let Some(doc) = cx.document(model.document) else {
-        surface.set_stringn(
-            inner.x,
-            inner.y,
-            "Document unavailable",
-            inner.width as usize,
-            tui::ratatui::to_ratatui_style(error_style),
-        );
-        return;
-    };
-
-    render_document_float_content(doc, inner, surface, text_style);
-}
-
+#[cfg(test)]
 fn render_document_float_content(
     doc: &helix_view::Document,
     inner: Rect,
     surface: &mut crate::render::CellSurface,
     text_style: Style,
 ) {
-    let text = doc.text();
+    render_rope_float_content(doc.text(), inner, surface, text_style);
+}
+
+fn render_rope_float_content(
+    text: &helix_core::Rope,
+    inner: Rect,
+    surface: &mut crate::render::CellSurface,
+    text_style: Style,
+) {
     let lines = (0..text.len_lines())
         .take(inner.height as usize)
         .map(|line| {
@@ -130,75 +134,6 @@ fn render_document_float_content(
         })
         .collect::<Vec<_>>();
     render_spans_lines(surface, inner, &lines);
-}
-
-fn render_plugin_float(
-    title: Option<&str>,
-    model: &PluginFloatModel,
-    area: Rect,
-    surface: &mut crate::render::CellSurface,
-    cx: &RenderContext,
-) {
-    let inner = render_float_frame(
-        title,
-        area,
-        surface,
-        cx.style("ui.popup"),
-        cx.config().rounded_corners,
-    );
-    if inner.width == 0 || inner.height == 0 {
-        return;
-    }
-
-    let Some(ref pm) = cx.plugin_manager else {
-        return;
-    };
-
-    let engine = pm.engine();
-    let engine = engine.read();
-    let lua = engine.lua();
-
-    let ui_callbacks = engine.ui_callbacks();
-    let ui_callbacks = ui_callbacks.read();
-    let Some(callback_id) = helix_plugin::types::UiCallbackId::new(model.render_callback_id) else {
-        render_plugin_error(inner, surface, cx.style("error"));
-        return;
-    };
-    let key = helix_plugin::types::PluginCallbackKey::new(model.plugin_name.clone(), callback_id);
-    let Some(callback_ref) = ui_callbacks.get(&key) else {
-        render_plugin_error(inner, surface, cx.style("error"));
-        return;
-    };
-
-    let Ok(callback) = lua.registry_value::<mlua::Function>(callback_ref) else {
-        return;
-    };
-    let Ok(area_table) = helix_plugin::lua::api::facade::rect_to_table(lua, inner) else {
-        return;
-    };
-    let Ok(lua_surface) = lua.create_userdata(helix_plugin::lua::api::facade::LuaSurface) else {
-        return;
-    };
-
-    // LuaSurface methods record typed render operations. Rendering is
-    // single-threaded for plugin callbacks.
-    let theme = cx.theme();
-    let mut render_ops = SurfaceRenderOps::default();
-    helix_plugin::lua::with_render_context(&mut render_ops, theme, || {
-        if let Err(err) =
-            helix_plugin::lua::with_current_plugin_name(lua, &model.plugin_name, || {
-                callback.call::<()>((area_table, lua_surface))
-            })
-        {
-            log::error!(
-                "Plugin float render error ({}:{}): {}",
-                model.plugin_name,
-                model.render_callback_id,
-                err
-            );
-        }
-    });
-    apply_plugin_render_ops(surface, render_ops);
 }
 
 fn render_float_frame(
@@ -221,16 +156,6 @@ fn render_float_frame(
         inner.width.saturating_sub(2),
         inner.height,
     )
-}
-
-fn render_plugin_error(area: Rect, surface: &mut crate::render::CellSurface, error_style: Style) {
-    surface.set_stringn(
-        area.x,
-        area.y,
-        "Plugin render error",
-        area.width as usize,
-        tui::ratatui::to_ratatui_style(error_style),
-    );
 }
 
 fn render_spans_lines(surface: &mut crate::render::CellSurface, area: Rect, lines: &[Spans<'_>]) {
@@ -338,7 +263,7 @@ mod tests {
     use tui::ratatui::{buffer::Buffer as Surface, layout::Rect as SurfaceRect};
 
     fn test_editor(width: u16, height: u16) -> Editor {
-        let theme_loader = helix_view::theme::Loader::new(helix_loader::runtime_dirs());
+        let theme_loader = helix_view::theme::Loader::new(&[]);
         let syn_loader = helix_core::config::default_lang_loader();
         let config = helix_view::editor::Config::default();
         let config = Arc::new(ArcSwap::from_pointee(config));
@@ -427,7 +352,8 @@ mod tests {
             blocks: vec![RenderBlock {
                 text: "hello".into(),
                 style: None,
-            }],
+            }]
+            .into(),
         };
 
         let inner = render_float_frame(
@@ -453,7 +379,8 @@ mod tests {
             blocks: vec![RenderBlock {
                 text: "hello".into(),
                 style: None,
-            }],
+            }]
+            .into(),
         };
 
         let inner = render_float_frame(

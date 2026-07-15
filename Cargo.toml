@@ -16,7 +16,9 @@ members = [
   "helix-vcs",
   "helix-parsec",
   "helix-stdx",
+  "helix-plugin-api",
   "helix-plugin",
+  "helix-plugin-editor",
   "helix-acp",
   "helix-modal",
   "vendor/tree-house",
@@ -73,6 +75,7 @@ sha2 = "0.10"
 zip = { version = "6.0", default-features = false, features = ["deflate"] }
 tar = "0.4"
 flate2 = "1.1"
+bzip2 = "0.6.1"
 xz2 = "0.1"
 ureq = { version = "2.12", default-features = true }
 arc-swap = "1.8"

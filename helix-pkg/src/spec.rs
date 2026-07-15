@@ -13,16 +13,18 @@ pub enum PkgKind {
     Linter,
     Grammar,
     Plugin,
+    Acp,
 }
 
 impl PkgKind {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Lsp,
         Self::Dap,
         Self::Formatter,
         Self::Linter,
         Self::Grammar,
         Self::Plugin,
+        Self::Acp,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -33,6 +35,7 @@ impl PkgKind {
             Self::Linter => "linter",
             Self::Grammar => "grammar",
             Self::Plugin => "plugin",
+            Self::Acp => "acp",
         }
     }
 
@@ -44,6 +47,7 @@ impl PkgKind {
             Self::Linter => "linter",
             Self::Grammar => "tree-sitter-grammar",
             Self::Plugin => "plugin",
+            Self::Acp => "agent-client-protocol",
         }
     }
 }
@@ -65,6 +69,7 @@ impl FromStr for PkgKind {
             "linter" => Ok(Self::Linter),
             "grammar" => Ok(Self::Grammar),
             "plugin" => Ok(Self::Plugin),
+            "acp" => Ok(Self::Acp),
             other => Err(Error::Message(format!("unknown package kind: {other}"))),
         }
     }
@@ -168,6 +173,10 @@ pub struct Artifact {
     pub source: Source,
     #[serde(default)]
     pub bin: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
 }
 
 impl Artifact {
@@ -185,6 +194,10 @@ pub struct Source {
     pub archive: Option<String>,
     #[serde(default)]
     pub npm: Option<String>,
+    #[serde(default)]
+    pub npx: Option<String>,
+    #[serde(default)]
+    pub uvx: Option<String>,
     #[serde(default)]
     pub pip: Option<String>,
     #[serde(default)]
@@ -225,6 +238,10 @@ impl Source {
             "archive"
         } else if self.npm.is_some() {
             "npm"
+        } else if self.npx.is_some() {
+            "npx"
+        } else if self.uvx.is_some() {
+            "uvx"
         } else if self.pip.is_some() {
             "pip"
         } else if self.cargo.is_some() {
@@ -248,6 +265,8 @@ impl Source {
         let count = self.github_release.is_some() as usize
             + self.archive.is_some() as usize
             + self.npm.is_some() as usize
+            + self.npx.is_some() as usize
+            + self.uvx.is_some() as usize
             + self.pip.is_some() as usize
             + self.cargo.is_some() as usize
             + self.go.is_some() as usize
@@ -277,6 +296,18 @@ impl Source {
             return Err(Error::InvalidPackage {
                 name: package.to_owned(),
                 message: "npm source accepts either bin or bin-js, not both".to_owned(),
+            });
+        }
+        if self.npx.is_some() && (self.bin.is_some() || self.bin_js.is_some()) {
+            return Err(Error::InvalidPackage {
+                name: package.to_owned(),
+                message: "npx source does not accept bin or bin-js".to_owned(),
+            });
+        }
+        if self.uvx.is_some() && (self.bin.is_some() || self.bin_js.is_some()) {
+            return Err(Error::InvalidPackage {
+                name: package.to_owned(),
+                message: "uvx source does not accept bin or bin-js".to_owned(),
             });
         }
         if self.plugin.is_some() && self.plugin_ref.is_none() {

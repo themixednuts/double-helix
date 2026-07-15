@@ -12,10 +12,12 @@ homepage.workspace = true
 
 [dependencies]
 helix-loader = { path = "../helix-loader" }
+log = "0.4"
 helix-store = { path = "../helix-store" }
 
 etcetera.workspace = true
 flate2.workspace = true
+bzip2.workspace = true
 fs4 = "1.1.0"
 serde.workspace = true
 serde_json.workspace = true

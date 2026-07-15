@@ -10,16 +10,17 @@
 use helix_core::Tendril;
 use helix_view::Editor;
 
-use super::adapt;
-use super::errors::{ContractError, ContractResult};
-use super::handles::{DocumentHandle, ViewHandle};
-use super::host::{
-    PluginFacadeMutationHost, PluginFacadeQueryHost, PluginFloatHost, PluginMutationHost,
-    PluginQueryHost, PluginSplitHost, PluginTabHost, PluginWorkspaceQueryHost,
+use crate::adapt;
+use helix_plugin_api::errors::{ContractError, ContractResult};
+use helix_plugin_api::handles::{DocumentHandle, FloatHandle, PluginId, ThreadHandle, ViewHandle};
+use helix_plugin_api::host::{
+    PluginAssistantMutationHost, PluginAssistantQueryHost, PluginFacadeMutationHost,
+    PluginFacadeQueryHost, PluginFloatHost, PluginMutationHost, PluginQueryHost, PluginSplitHost,
+    PluginTabHost, PluginWorkspaceQueryHost,
 };
-use super::metadata::ApiMetadata;
-use super::requests::*;
-use super::snapshots::*;
+use helix_plugin_api::metadata::ApiMetadata;
+use helix_plugin_api::requests::*;
+use helix_plugin_api::snapshots::*;
 
 // ---------------------------------------------------------------------------
 // Query bridge
@@ -58,10 +59,7 @@ impl EditorQueryBridge<'_> {
     }
 
     /// List tabs in a view's tab group (read-only).
-    pub fn list_tabs(
-        &self,
-        view: Option<super::handles::ViewHandle>,
-    ) -> ContractResult<TabGroupSnapshot> {
+    pub fn list_tabs(&self, view: Option<ViewHandle>) -> ContractResult<TabGroupSnapshot> {
         list_tabs_impl(self.editor, view)
     }
 }
@@ -95,6 +93,18 @@ impl PluginQueryHost for EditorQueryBridge<'_> {
             .views()
             .map(|(view, _)| adapt::view_handle(view.id))
             .collect()
+    }
+
+    fn language_servers(&self) -> ContractResult<Vec<LanguageServerSnapshot>> {
+        Ok(self
+            .editor
+            .language_server_client_names()
+            .zip(self.editor.language_server_client_ids())
+            .map(|(name, id)| LanguageServerSnapshot {
+                id,
+                name: name.to_owned(),
+            })
+            .collect())
     }
 
     fn document_snapshot(&self, handle: DocumentHandle) -> ContractResult<DocumentSnapshot> {
@@ -160,6 +170,51 @@ impl PluginFacadeQueryHost for EditorQueryBridge<'_> {
     fn list_tabs(&self, view: Option<ViewHandle>) -> ContractResult<TabGroupSnapshot> {
         EditorQueryBridge::list_tabs(self, view)
     }
+
+    fn editor_config(&self) -> ContractResult<EditorConfigSnapshot> {
+        let config = self.editor.config();
+        Ok(EditorConfigSnapshot {
+            scrolloff: config.scrolloff,
+            mouse: config.mouse,
+            cursorline: config.cursorline,
+            cursorcolumn: config.cursorcolumn,
+            auto_format: config.auto_format,
+            auto_completion: config.auto_completion,
+            auto_info: config.auto_info,
+            line_number: match config.line_number {
+                helix_view::editor::LineNumber::Absolute => LineNumberMode::Absolute,
+                helix_view::editor::LineNumber::Relative => LineNumberMode::Relative,
+            },
+        })
+    }
+
+    fn terminal_size(&self) -> ContractResult<TerminalSizeSnapshot> {
+        let area = self.editor.tree.area();
+        Ok(TerminalSizeSnapshot {
+            width: area.width,
+            height: area.height,
+        })
+    }
+
+    fn read_register(&self, name: char) -> ContractResult<Vec<String>> {
+        Ok(self
+            .editor
+            .read_register(name)
+            .map(|values| values.map(|value| value.into_owned()).collect())
+            .unwrap_or_default())
+    }
+}
+
+impl PluginFacadeMutationHost for EditorMutationBridge<'_> {
+    fn write_register(&mut self, name: char, values: Vec<String>) -> ContractResult<()> {
+        self.editor
+            .write_register(name, values)
+            .map_err(|error| ContractError::internal(error.to_string()))
+    }
+
+    fn request_redraw(&mut self) {
+        self.editor.request_redraw();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -178,22 +233,6 @@ impl<'a> EditorMutationBridge<'a> {
 }
 
 impl PluginMutationHost for EditorMutationBridge<'_> {
-    fn open_document(&mut self, req: OpenDocumentRequest) -> ContractResult<DocumentHandle> {
-        let path = std::path::Path::new(&req.path);
-        let action = if req.focus {
-            helix_view::editor::Action::Replace
-        } else {
-            helix_view::editor::Action::Load
-        };
-        let doc_id = self
-            .editor
-            .open(path, action)
-            .map_err(|e| ContractError::InternalError {
-                message: e.to_string(),
-            })?;
-        Ok(adapt::document_handle(doc_id))
-    }
-
     fn apply_edit(&mut self, req: ApplyEditRequest) -> ContractResult<()> {
         let doc_id = adapt::resolve_document(self.editor, req.document)?;
 
@@ -361,10 +400,10 @@ impl PluginMutationHost for EditorMutationBridge<'_> {
                 style: None,
                 fg: annot.style.fg.map(adapt::color_to_hex),
                 bg: annot.style.bg.map(adapt::color_to_hex),
-                offset: 0,
+                offset: annot.offset,
                 is_line: annot.is_line,
-                virt_line_idx: None,
-                dropped_text: None,
+                virt_line_idx: annot.virtual_line,
+                dropped_text: annot.dropped_text,
             })
             .collect();
 
@@ -433,8 +472,31 @@ impl PluginMutationHost for EditorMutationBridge<'_> {
             .with_view_doc_mut(view_id, doc_id, |view, doc| doc.redo(view)))
     }
 
+    fn select_all(&mut self, req: SelectAllRequest) -> ContractResult<()> {
+        let doc_id = adapt::resolve_document(self.editor, req.document)?;
+        let view_id = self
+            .editor
+            .tree
+            .views()
+            .find_map(|(view, _)| (view.doc == doc_id).then_some(view.id))
+            .ok_or_else(|| ContractError::not_found("view displaying document"))?;
+        let len = self
+            .editor
+            .document(doc_id)
+            .ok_or_else(|| ContractError::stale_handle(req.document.to_string()))?
+            .text()
+            .len_chars();
+        let document = self
+            .editor
+            .document_mut(doc_id)
+            .ok_or_else(|| ContractError::stale_handle(req.document.to_string()))?;
+        document.ensure_view_init(view_id);
+        document.set_selection(view_id, helix_core::Selection::single(0, len));
+        Ok(())
+    }
+
     fn set_mode(&mut self, req: SetModeRequest) -> ContractResult<()> {
-        use super::snapshots::EditMode;
+        use helix_plugin_api::snapshots::EditMode;
         match req.mode {
             EditMode::Normal => self.editor.enter_normal_mode(),
             EditMode::Insert => self.editor.enter_insert_mode(),
@@ -449,8 +511,6 @@ impl PluginMutationHost for EditorMutationBridge<'_> {
         Ok(())
     }
 }
-
-impl PluginFacadeMutationHost for EditorMutationBridge<'_> {}
 
 // ---------------------------------------------------------------------------
 // Split bridge
@@ -642,12 +702,12 @@ impl PluginTabHost for EditorMutationBridge<'_> {
 impl PluginFloatHost for EditorMutationBridge<'_> {
     fn create_float(
         &mut self,
-        plugin: super::handles::PluginId,
+        plugin: PluginId,
         req: CreateFloatRequest,
-    ) -> ContractResult<super::handles::FloatHandle> {
+    ) -> ContractResult<FloatHandle> {
         let placement = contract_to_model_placement(self.editor, &req.placement)?;
         let plugin_owner = plugin_owner_key(plugin);
-        let content = contract_to_model_content(self.editor, Some(&plugin_owner), req.content)?;
+        let content = contract_to_model_content(self.editor, req.content)?;
 
         let float_id = self.editor.model.create_float(
             content,
@@ -663,23 +723,30 @@ impl PluginFloatHost for EditorMutationBridge<'_> {
         Ok(adapt::float_handle(float_id))
     }
 
-    fn update_float(&mut self, req: UpdateFloatRequest) -> ContractResult<()> {
+    fn update_float(&mut self, plugin: PluginId, req: UpdateFloatRequest) -> ContractResult<()> {
         let placement = req
             .placement
             .as_ref()
             .map(|placement| contract_to_model_placement(self.editor, placement))
             .transpose()?;
         let float_id = adapt::resolve_float(&self.editor.model, req.float)?;
-        let plugin_owner = self
+        let plugin_owner = plugin_owner_key(plugin);
+        let owner = self
             .editor
             .model
             .float(float_id)
             .ok_or_else(|| ContractError::stale_handle(req.float.to_string()))?
             .owner
-            .clone();
+            .as_deref();
+        if owner != Some(plugin_owner.as_str()) {
+            return Err(ContractError::permission_denied(format!(
+                "plugin {plugin} does not own {}",
+                req.float
+            )));
+        }
         let content = req
             .content
-            .map(|content| contract_to_model_content(self.editor, plugin_owner.as_deref(), content))
+            .map(|content| contract_to_model_content(self.editor, content))
             .transpose()?;
         let entry = self
             .editor
@@ -699,17 +766,31 @@ impl PluginFloatHost for EditorMutationBridge<'_> {
         Ok(())
     }
 
-    fn close_float(&mut self, req: CloseFloatRequest) -> ContractResult<()> {
+    fn close_float(&mut self, plugin: PluginId, req: CloseFloatRequest) -> ContractResult<()> {
         let float_id = adapt::resolve_float(&self.editor.model, req.float)?;
+        let plugin_owner = plugin_owner_key(plugin);
+        let entry = self
+            .editor
+            .model
+            .float(float_id)
+            .ok_or_else(|| ContractError::stale_handle(req.float.to_string()))?;
+        if entry.owner.as_deref() != Some(plugin_owner.as_str()) {
+            return Err(ContractError::permission_denied(format!(
+                "plugin {plugin} does not own {}",
+                req.float
+            )));
+        }
         self.editor.model.close_float(float_id);
         Ok(())
     }
 
-    fn list_floats(&self) -> Vec<FloatSnapshot> {
+    fn list_floats(&self, plugin: PluginId) -> Vec<FloatSnapshot> {
+        let plugin_owner = plugin_owner_key(plugin);
         self.editor
             .model
             .floats
             .iter()
+            .filter(|(_, entry)| entry.owner.as_deref() == Some(plugin_owner.as_str()))
             .map(|(id, entry)| FloatSnapshot {
                 handle: adapt::float_handle(id),
                 title: entry.title.clone(),
@@ -795,15 +876,12 @@ impl PluginWorkspaceQueryHost for EditorQueryBridge<'_> {
 // Assistant query bridge
 // ---------------------------------------------------------------------------
 
-impl super::host::PluginAssistantQueryHost for EditorQueryBridge<'_> {
+impl PluginAssistantQueryHost for EditorQueryBridge<'_> {
     fn assistant_snapshot(&self) -> AssistantSnapshot {
         adapt::assistant_snapshot(self.editor)
     }
 
-    fn thread_snapshot(
-        &self,
-        thread: super::handles::ThreadHandle,
-    ) -> ContractResult<AssistantThreadSnapshot> {
+    fn thread_snapshot(&self, thread: ThreadHandle) -> ContractResult<AssistantThreadSnapshot> {
         let id = adapt::resolve_thread(thread);
         let thread = self
             .editor
@@ -814,10 +892,7 @@ impl super::host::PluginAssistantQueryHost for EditorQueryBridge<'_> {
         Ok(adapt::assistant_thread_snapshot(thread, active == Some(id)))
     }
 
-    fn thread_entries(
-        &self,
-        thread: super::handles::ThreadHandle,
-    ) -> ContractResult<Vec<AssistantEntrySnapshot>> {
+    fn thread_entries(&self, thread: ThreadHandle) -> ContractResult<Vec<AssistantEntrySnapshot>> {
         let id = adapt::resolve_thread(thread);
         let thread = self
             .editor
@@ -829,7 +904,7 @@ impl super::host::PluginAssistantQueryHost for EditorQueryBridge<'_> {
 
     fn thread_context(
         &self,
-        thread: super::handles::ThreadHandle,
+        thread: ThreadHandle,
     ) -> ContractResult<Vec<AssistantContextSnapshot>> {
         let id = adapt::resolve_thread(thread);
         let thread = self
@@ -841,22 +916,15 @@ impl super::host::PluginAssistantQueryHost for EditorQueryBridge<'_> {
     }
 }
 
-impl super::host::PluginAssistantMutationHost for EditorMutationBridge<'_> {
-    fn submit_prompt(
-        &mut self,
-        thread: Option<super::handles::ThreadHandle>,
-        text: String,
-    ) -> ContractResult<()> {
+impl PluginAssistantMutationHost for EditorMutationBridge<'_> {
+    fn submit_prompt(&mut self, thread: Option<ThreadHandle>, text: String) -> ContractResult<()> {
         let id = resolve_thread_or_active(self.editor, thread)?;
         let effects = self.editor.submit_assistant_prompt(id, text);
         self.editor.apply_assistant_effects(effects);
         Ok(())
     }
 
-    fn cancel_thread(
-        &mut self,
-        thread: Option<super::handles::ThreadHandle>,
-    ) -> ContractResult<()> {
+    fn cancel_thread(&mut self, thread: Option<ThreadHandle>) -> ContractResult<()> {
         let id = resolve_thread_or_active(self.editor, thread)?;
         let effects = self.editor.cancel_assistant_thread(id);
         self.editor.apply_assistant_effects(effects);
@@ -871,7 +939,7 @@ impl super::host::PluginAssistantMutationHost for EditorMutationBridge<'_> {
 /// Resolve a thread ID or fall back to the active thread.
 fn resolve_thread_or_active(
     editor: &Editor,
-    thread: Option<super::handles::ThreadHandle>,
+    thread: Option<ThreadHandle>,
 ) -> ContractResult<helix_view::assistant::thread::Id> {
     match thread {
         Some(handle) => Ok(adapt::resolve_thread(handle)),
@@ -1073,16 +1141,15 @@ fn contract_to_anchor_bias(prefer: AnchorPreference) -> helix_view::layout::Anch
     }
 }
 
-fn plugin_owner_key(plugin: super::handles::PluginId) -> String {
+fn plugin_owner_key(plugin: PluginId) -> String {
     plugin.raw().get().to_string()
 }
 
 fn contract_to_model_content(
     editor: &Editor,
-    plugin_owner: Option<&str>,
     content: FloatContent,
 ) -> ContractResult<Box<dyn helix_view::model::ContentModel>> {
-    use helix_view::model::{DocumentFloatModel, PluginFloatModel, RenderBlock, TextFloatModel};
+    use helix_view::model::{DocumentFloatModel, RenderBlock, TextFloatModel};
 
     Ok(match content {
         FloatContent::Blocks(blocks) => {
@@ -1090,27 +1157,15 @@ fn contract_to_model_content(
                 .into_iter()
                 .map(|b| RenderBlock {
                     text: b.text,
-                    style: None,
+                    style: b.style.map(|scope| editor.theme.get(&scope)),
                 })
-                .collect();
+                .collect::<Vec<_>>()
+                .into();
             Box::new(TextFloatModel { blocks })
         }
         FloatContent::Document(handle) => Box::new(DocumentFloatModel {
             document: adapt::resolve_document(editor, handle)?,
         }),
-        FloatContent::PluginRender { callback } => {
-            let plugin_name = plugin_owner
-                .ok_or_else(|| {
-                    ContractError::invalid_request(
-                        "plugin-rendered float content requires a plugin owner",
-                    )
-                })?
-                .to_string();
-            Box::new(PluginFloatModel {
-                plugin_name,
-                render_callback_id: callback.raw().get(),
-            })
-        }
     })
 }
 
@@ -1126,10 +1181,7 @@ fn contract_to_tree_direction(dir: SplitDirection) -> helix_view::tree::Directio
 
 /// Convert a contract `Position` (0-based line + column) to a char index in
 /// the rope. Returns an error if the position is out of bounds.
-fn position_to_char(
-    text: &helix_core::Rope,
-    pos: &super::snapshots::Position,
-) -> ContractResult<usize> {
+fn position_to_char(text: &helix_core::Rope, pos: &Position) -> ContractResult<usize> {
     if pos.line >= text.len_lines() {
         return Err(ContractError::invalid_request(format!(
             "line {} out of range (document has {} lines)",
@@ -1535,7 +1587,7 @@ mod tests {
         let mut bridge = EditorMutationBridge::new(&mut editor);
         let handle = bridge
             .create_float(
-                crate::contract::handles::PluginId::from_raw(std::num::NonZeroU64::new(1).unwrap()),
+                PluginId::from_raw(std::num::NonZeroU64::new(1).unwrap()),
                 CreateFloatRequest {
                     title: Some("hint".into()),
                     placement: FloatPlacement::Anchored {
@@ -1577,9 +1629,7 @@ mod tests {
             let mut bridge = EditorMutationBridge::new(&mut editor);
             bridge
                 .create_float(
-                    crate::contract::handles::PluginId::from_raw(
-                        std::num::NonZeroU64::new(1).unwrap(),
-                    ),
+                    PluginId::from_raw(std::num::NonZeroU64::new(1).unwrap()),
                     CreateFloatRequest {
                         title: None,
                         placement: FloatPlacement::Centered {
@@ -1596,19 +1646,22 @@ mod tests {
 
         let mut bridge = EditorMutationBridge::new(&mut editor);
         bridge
-            .update_float(UpdateFloatRequest {
-                float: handle,
-                title: None,
-                placement: Some(FloatPlacement::Anchored {
-                    view: None,
-                    line: 3,
-                    column: 7,
-                    width: 24,
-                    height: 8,
-                    prefer: AnchorPreference::Below,
-                }),
-                content: None,
-            })
+            .update_float(
+                PluginId::from_raw(std::num::NonZeroU64::new(1).unwrap()),
+                UpdateFloatRequest {
+                    float: handle,
+                    title: None,
+                    placement: Some(FloatPlacement::Anchored {
+                        view: None,
+                        line: 3,
+                        column: 7,
+                        width: 24,
+                        height: 8,
+                        prefer: AnchorPreference::Below,
+                    }),
+                    content: None,
+                },
+            )
             .expect("update float");
 
         let float_id = adapt::resolve_float(&editor.model, handle).expect("float handle");
@@ -1633,9 +1686,7 @@ mod tests {
             let mut bridge = EditorMutationBridge::new(&mut editor);
             bridge
                 .create_float(
-                    crate::contract::handles::PluginId::from_raw(
-                        std::num::NonZeroU64::new(1).unwrap(),
-                    ),
+                    PluginId::from_raw(std::num::NonZeroU64::new(1).unwrap()),
                     CreateFloatRequest {
                         title: None,
                         placement: FloatPlacement::Centered {
@@ -1655,15 +1706,18 @@ mod tests {
 
         let mut bridge = EditorMutationBridge::new(&mut editor);
         bridge
-            .update_float(UpdateFloatRequest {
-                float: handle,
-                title: None,
-                placement: None,
-                content: Some(FloatContent::Blocks(vec![FloatBlock {
-                    text: "new".into(),
-                    style: None,
-                }])),
-            })
+            .update_float(
+                PluginId::from_raw(std::num::NonZeroU64::new(1).unwrap()),
+                UpdateFloatRequest {
+                    float: handle,
+                    title: None,
+                    placement: None,
+                    content: Some(FloatContent::Blocks(vec![FloatBlock {
+                        text: "new".into(),
+                        style: None,
+                    }])),
+                },
+            )
             .expect("update float");
 
         let float_id = adapt::resolve_float(&editor.model, handle).expect("float handle");
@@ -1686,7 +1740,7 @@ mod tests {
         let mut bridge = EditorMutationBridge::new(&mut editor);
         let handle = bridge
             .create_float(
-                crate::contract::handles::PluginId::from_raw(std::num::NonZeroU64::new(1).unwrap()),
+                PluginId::from_raw(std::num::NonZeroU64::new(1).unwrap()),
                 CreateFloatRequest {
                     title: None,
                     placement: FloatPlacement::Centered {
@@ -1709,44 +1763,5 @@ mod tests {
             .downcast_ref::<helix_view::model::DocumentFloatModel>()
             .expect("document float model");
         assert_eq!(model.document, doc);
-    }
-
-    #[test]
-    fn create_float_preserves_plugin_render_content_model() {
-        let mut editor = test_editor();
-        let _doc = open_scratch(&mut editor, Action::VerticalSplit, "one");
-        let plugin =
-            crate::contract::handles::PluginId::from_raw(std::num::NonZeroU64::new(9).unwrap());
-
-        let mut bridge = EditorMutationBridge::new(&mut editor);
-        let handle = bridge
-            .create_float(
-                plugin,
-                CreateFloatRequest {
-                    title: None,
-                    placement: FloatPlacement::Centered {
-                        width: 20,
-                        height: 5,
-                    },
-                    content: FloatContent::PluginRender {
-                        callback: crate::contract::handles::RenderCallbackHandle::from_raw(
-                            std::num::NonZeroU64::new(42).unwrap(),
-                        ),
-                    },
-                    dismissible: true,
-                    focus: false,
-                },
-            )
-            .expect("create float");
-
-        let float_id = adapt::resolve_float(&editor.model, handle).expect("float handle");
-        let entry = editor.model.float(float_id).expect("float");
-        assert_eq!(entry.owner.as_deref(), Some("9"));
-        let model = entry
-            .content
-            .downcast_ref::<helix_view::model::PluginFloatModel>()
-            .expect("plugin float model");
-        assert_eq!(model.plugin_name, "9");
-        assert_eq!(model.render_callback_id, 42);
     }
 }

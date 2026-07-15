@@ -6,45 +6,67 @@ use helix_core::unicode::width::UnicodeWidthStr;
 use helix_core::Position;
 use helix_view::{Document, Theme, ViewId};
 use std::collections::BTreeMap;
+use std::ops::Deref;
 
-pub struct PluginDecoration<'a> {
-    doc: &'a Document,
-    theme: &'a Theme,
-    view_id: ViewId,
+struct RenderAnnotation {
+    source: helix_view::document::PluginAnnotation,
+    resolved_style: helix_view::theme::Style,
+}
+
+impl Deref for RenderAnnotation {
+    type Target = helix_view::document::PluginAnnotation;
+
+    fn deref(&self) -> &Self::Target {
+        &self.source
+    }
+}
+
+pub struct PluginDecoration {
+    text: helix_core::Rope,
+    annotations: Vec<RenderAnnotation>,
+    tab_width: u16,
     anchor_idx: usize,
     anchors: Vec<usize>,
 }
 
-impl<'a> PluginDecoration<'a> {
-    pub fn new(doc: &'a Document, theme: &'a Theme, view_id: ViewId) -> Self {
+impl PluginDecoration {
+    pub fn new(doc: &Document, theme: &Theme, view_id: ViewId) -> Self {
+        let sources = doc
+            .visual_annotations(view_id)
+            .unwrap_or_else(|| std::sync::Arc::from([]));
+        let annotations = sources
+            .iter()
+            .map(|source| RenderAnnotation {
+                resolved_style: Self::resolve_style(theme, &source),
+                source: source.clone(),
+            })
+            .collect::<Vec<_>>();
         let mut anchors = Vec::new();
-        if let Some(annots) = doc.visual_annotations(view_id) {
-            for annot in annots {
-                if annot.is_line {
-                    anchors.push(annot.char_idx);
-                }
+        for annot in &annotations {
+            if annot.is_line {
+                anchors.push(annot.char_idx);
             }
         }
         anchors.sort_unstable();
         anchors.dedup();
 
         Self {
-            doc,
-            theme,
-            view_id,
+            text: doc.text().clone(),
+            annotations,
+            tab_width: doc.tab_width() as u16,
             anchor_idx: 0,
             anchors,
         }
     }
 
-    fn build_style(
-        &self,
+    fn resolve_style(
+        theme: &Theme,
         annot: &helix_view::document::PluginAnnotation,
     ) -> helix_view::theme::Style {
         let mut style = annot
             .style
             .as_deref()
-            .and_then(|s| self.theme.try_get(s))
+            .and_then(|s| theme.try_get(s))
             .unwrap_or_default();
 
         if let Some(fg) = &annot.fg {
@@ -61,9 +83,13 @@ impl<'a> PluginDecoration<'a> {
 
         style
     }
+
+    fn build_style(&self, annot: &RenderAnnotation) -> helix_view::theme::Style {
+        annot.resolved_style
+    }
 }
 
-impl Decoration for PluginDecoration<'_> {
+impl Decoration for PluginDecoration {
     fn render_virt_lines(
         &mut self,
         renderer: &mut TextRenderer,
@@ -79,11 +105,12 @@ impl Decoration for PluginDecoration<'_> {
         let mut virt_lines_drawn = 0;
         let mut inline_col_used: u16 = 0;
 
-        if let Some(annots) = self.doc.visual_annotations(self.view_id) {
-            let line_start = self.doc.text().line_to_char(pos.doc_line);
-            let line_end = self.doc.text().line_to_char(pos.doc_line + 1);
+        if !self.annotations.is_empty() {
+            let line_start = self.text.line_to_char(pos.doc_line);
+            let line_end = self.text.line_to_char(pos.doc_line + 1);
 
-            let line_annots: Vec<_> = annots
+            let line_annots: Vec<_> = self
+                .annotations
                 .iter()
                 .filter(|a| a.char_idx >= line_start && a.char_idx < line_end)
                 .collect();
@@ -162,7 +189,7 @@ impl Decoration for PluginDecoration<'_> {
                 // TextFormat must match space reservation for consistent height calculation
                 let text_fmt = TextFormat {
                     soft_wrap: true,
-                    tab_width: self.doc.tab_width() as u16,
+                    tab_width: self.tab_width,
                     max_wrap: available_width.saturating_div(4).max(20),
                     max_indent_retain: 0,
                     wrap_indicator_highlight: None,
@@ -216,10 +243,7 @@ impl Decoration for PluginDecoration<'_> {
 
             // Second pass: draw virtual lines (is_line = true)
             // Group by logical row so multiple annotations can share the same starting row
-            let mut virt_annots_by_row: BTreeMap<
-                u16,
-                Vec<&helix_view::document::PluginAnnotation>,
-            > = BTreeMap::new();
+            let mut virt_annots_by_row: BTreeMap<u16, Vec<&RenderAnnotation>> = BTreeMap::new();
             let mut max_virt_idx: i32 = -1;
             let mut next_auto_idx: u16 = 0;
 
@@ -265,7 +289,7 @@ impl Decoration for PluginDecoration<'_> {
 
                     let text_fmt = TextFormat {
                         soft_wrap: true,
-                        tab_width: self.doc.tab_width() as u16,
+                        tab_width: self.tab_width,
                         max_wrap: available_width.saturating_div(4).max(20), // Match space reservation
                         max_indent_retain: 0,
                         wrap_indicator_highlight: None,

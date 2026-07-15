@@ -1,34 +1,7 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::num::NonZeroU64;
 use std::path::PathBuf;
-
-/// Lightweight notification signal for the plugin event channel.
-///
-/// Produced by editor hooks and sent through the async channel. The application
-/// event loop converts these to full [`crate::contract::events::PluginEvent`]
-/// payloads (with editor context) before dispatching to plugin handlers.
-#[derive(Debug, Clone)]
-pub enum PluginNotification {
-    BufferOpen {
-        document_id: helix_view::DocumentId,
-        path: Option<PathBuf>,
-    },
-    SelectionChange {
-        document_id: helix_view::DocumentId,
-        path: Option<PathBuf>,
-    },
-    ModeChange {
-        old_mode: String,
-        new_mode: String,
-    },
-    KeyPress {
-        key: String,
-    },
-    LspDiagnostic {
-        document_id: helix_view::DocumentId,
-        diagnostic_count: usize,
-    },
-}
 
 /// Plugin metadata
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -43,8 +16,8 @@ pub struct PluginMetadata {
     pub author: Option<String>,
     /// Plugin entry point (default: init.lua)
     pub entry: Option<String>,
-    /// Minimum host API version required by this plugin.
-    pub min_api_version: Option<u32>,
+    /// Exact host contract version this plugin targets.
+    pub api_version: u32,
     /// Required host capability names.
     #[serde(default)]
     pub capabilities: Vec<String>,
@@ -58,7 +31,7 @@ impl Default for PluginMetadata {
             description: None,
             author: None,
             entry: Some("init.lua".to_string()),
-            min_api_version: None,
+            api_version: crate::contract::metadata::API_VERSION,
             capabilities: Vec::new(),
         }
     }
@@ -76,7 +49,8 @@ pub struct Plugin {
 }
 
 /// Plugin configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PluginConfig {
     /// Whether plugins are enabled globally
     #[serde(default = "default_true")]
@@ -123,13 +97,62 @@ impl Default for PluginConfig {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum PluginConfigError {
+    #[error("plugin host at index {index} has an empty name")]
+    EmptyHostName { index: usize },
+    #[error("plugin host '{host}' has an empty command")]
+    EmptyHostCommand { host: String },
+    #[error("plugin host name '{name}' is configured more than once")]
+    DuplicateHostName { name: String },
+    #[error("plugin entry at index {index} has an empty name")]
+    EmptyPluginName { index: usize },
+    #[error("plugin name '{name}' is configured more than once")]
+    DuplicatePluginName { name: String },
+}
+
+impl PluginConfig {
+    pub fn validate(&self) -> Result<(), PluginConfigError> {
+        let mut host_names = HashSet::with_capacity(self.hosts.len());
+        for (index, host) in self.hosts.iter().enumerate() {
+            if host.name.trim().is_empty() {
+                return Err(PluginConfigError::EmptyHostName { index });
+            }
+            if host.command.as_os_str().is_empty() {
+                return Err(PluginConfigError::EmptyHostCommand {
+                    host: host.name.clone(),
+                });
+            }
+            if !host_names.insert(host.name.as_str()) {
+                return Err(PluginConfigError::DuplicateHostName {
+                    name: host.name.clone(),
+                });
+            }
+        }
+
+        let mut plugin_names = HashSet::with_capacity(self.plugins.len());
+        for (index, plugin) in self.plugins.iter().enumerate() {
+            if plugin.name.trim().is_empty() {
+                return Err(PluginConfigError::EmptyPluginName { index });
+            }
+            if !plugin_names.insert(plugin.name.as_str()) {
+                return Err(PluginConfigError::DuplicatePluginName {
+                    name: plugin.name.clone(),
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Configuration for an out-of-process plugin runtime.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PluginHostConfig {
     /// Stable name used in logs and diagnostics.
     pub name: String,
-    /// Executable to spawn, e.g. `helix-plugin-host` or `ssh`.
-    pub command: String,
+    /// Executable to spawn, e.g. `dhx` or `ssh`.
+    pub command: PathBuf,
     /// Command-line arguments passed as-is.
     #[serde(default)]
     pub args: Vec<String>,
@@ -139,7 +162,8 @@ pub struct PluginHostConfig {
 }
 
 /// Configuration for an individual plugin
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IndividualPluginConfig {
     /// Plugin name
     pub name: String,
@@ -217,100 +241,67 @@ impl UiCallbackCounter {
     }
 }
 
-/// A typed rendering command emitted by the plugin ABI.
-///
-/// Plugins record commands during Lua render callbacks. The terminal frontend
-/// owns the actual Ratatui buffer and applies these commands after Lua returns.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SurfaceRenderOp {
-    SetString {
-        x: u16,
-        y: u16,
-        text: String,
-        style: helix_view::graphics::Style,
-    },
-    SetStringN {
-        x: u16,
-        y: u16,
-        text: String,
-        max_width: usize,
-        style: helix_view::graphics::Style,
-    },
-    Clear {
-        area: helix_view::graphics::Rect,
-        style: helix_view::graphics::Style,
-    },
-    SetStyle {
-        area: helix_view::graphics::Rect,
-        style: helix_view::graphics::Style,
-    },
-    Header {
-        area: helix_view::graphics::Rect,
-        title: String,
-        style: helix_view::graphics::Style,
-    },
-    HeaderWithCounts {
-        area: helix_view::graphics::Rect,
-        title: String,
-        current: usize,
-        total: usize,
-        style: helix_view::graphics::Style,
-    },
-    HDivider {
-        area: helix_view::graphics::Rect,
-        style: helix_view::graphics::Style,
-    },
-    VDivider {
-        area: helix_view::graphics::Rect,
-        style: helix_view::graphics::Style,
-    },
-    TextInput {
-        area: helix_view::graphics::Rect,
-        text: String,
-        cursor: usize,
-        style: helix_view::graphics::Style,
-        cursor_style: helix_view::graphics::Style,
-    },
-    Scrollbar {
-        area: helix_view::graphics::Rect,
-        total: usize,
-        offset: usize,
-        visible: usize,
-        thumb_style: helix_view::graphics::Style,
-        track_symbol: Option<String>,
-        track_style: helix_view::graphics::Style,
-    },
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-/// Ordered render commands emitted by one plugin render callback.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct SurfaceRenderOps {
-    ops: Vec<SurfaceRenderOp>,
-}
+    #[test]
+    fn plugin_config_rejects_ambiguous_names() {
+        let config = PluginConfig {
+            hosts: vec![
+                PluginHostConfig {
+                    name: "host".into(),
+                    command: "dhx".into(),
+                    args: Vec::new(),
+                    plugin_dirs: Vec::new(),
+                },
+                PluginHostConfig {
+                    name: "host".into(),
+                    command: "ssh".into(),
+                    args: Vec::new(),
+                    plugin_dirs: Vec::new(),
+                },
+            ],
+            ..PluginConfig::default()
+        };
 
-impl SurfaceRenderOps {
-    pub fn push(&mut self, op: SurfaceRenderOp) {
-        self.ops.push(op);
+        assert_eq!(
+            config.validate(),
+            Err(PluginConfigError::DuplicateHostName {
+                name: "host".into()
+            })
+        );
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.ops.is_empty()
-    }
+    #[test]
+    fn plugin_config_rejects_empty_commands_and_plugin_names() {
+        let config = PluginConfig {
+            hosts: vec![PluginHostConfig {
+                name: "host".into(),
+                command: PathBuf::new(),
+                args: Vec::new(),
+                plugin_dirs: Vec::new(),
+            }],
+            ..PluginConfig::default()
+        };
+        assert_eq!(
+            config.validate(),
+            Err(PluginConfigError::EmptyHostCommand {
+                host: "host".into()
+            })
+        );
 
-    pub fn len(&self) -> usize {
-        self.ops.len()
-    }
-
-    pub fn as_slice(&self) -> &[SurfaceRenderOp] {
-        &self.ops
-    }
-}
-
-impl IntoIterator for SurfaceRenderOps {
-    type Item = SurfaceRenderOp;
-    type IntoIter = std::vec::IntoIter<SurfaceRenderOp>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.ops.into_iter()
+        let config = PluginConfig {
+            plugins: vec![IndividualPluginConfig {
+                name: " ".into(),
+                enabled: true,
+                config: serde_json::Value::Null,
+            }],
+            ..PluginConfig::default()
+        };
+        assert_eq!(
+            config.validate(),
+            Err(PluginConfigError::EmptyPluginName { index: 0 })
+        );
     }
 }

@@ -1,0 +1,22 @@
+[package]
+name = "helix-plugin-editor"
+description = "Helix editor adapters for the host-agnostic plugin contract"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+categories.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+helix-core = { path = "../helix-core" }
+helix-plugin-api = { path = "../helix-plugin-api" }
+helix-view = { path = "../helix-view" }
+slotmap.workspace = true
+
+[dev-dependencies]
+arc-swap.workspace = true
+helix-runtime = { path = "../helix-runtime" }
+tokio = { version = "1", features = ["rt"] }

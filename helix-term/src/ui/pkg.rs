@@ -1,12 +1,17 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
-    sync::{Mutex, OnceLock},
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
     time::{Duration, SystemTime},
 };
 
+use helix_core::{
+    config::{default_lang_config, user_lang_config},
+    syntax::config::Configuration as LanguageConfigurationSet,
+};
 use helix_pkg::{
-    release_age_label, OpEvent, Ops, PackageChange, PackageSpec, PkgKind, Receipt, RegistrySource,
-    Source,
+    release_age_label, CapabilityCatalog, CapabilityProvider, CapabilityProviderSource,
+    CapabilityStatus, ConfiguredCapability, OpEvent, Ops, PackageChange, PackageSpec, PkgKind,
+    Receipt, RegistrySource, Source,
 };
 use helix_view::{
     graphics::{CursorKind, Rect, Style},
@@ -30,18 +35,12 @@ pub struct PkgStatusline {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct PkgProgressState {
     active: BTreeMap<String, PkgStatusline>,
+    finished_revision: u64,
 }
-
-static PKG_PROGRESS_SNAPSHOT: OnceLock<Mutex<PkgProgressState>> = OnceLock::new();
 
 impl PkgProgressState {
     pub fn apply(&mut self, event: &OpEvent) {
         self.apply_inner(event);
-        let snapshot =
-            PKG_PROGRESS_SNAPSHOT.get_or_init(|| Mutex::new(PkgProgressState::default()));
-        if let Ok(mut snapshot) = snapshot.lock() {
-            snapshot.apply_inner(event);
-        }
     }
 
     fn apply_inner(&mut self, event: &OpEvent) {
@@ -70,6 +69,7 @@ impl PkgProgressState {
             }
             OpEvent::Done { name } | OpEvent::Failed { name, .. } => {
                 self.active.remove(name);
+                self.finished_revision = self.finished_revision.saturating_add(1);
             }
         }
     }
@@ -83,15 +83,7 @@ impl PkgProgressState {
     }
 }
 
-fn progress_snapshot() -> PkgProgressState {
-    PKG_PROGRESS_SNAPSHOT
-        .get_or_init(|| Mutex::new(PkgProgressState::default()))
-        .lock()
-        .map(|state| state.clone())
-        .unwrap_or_default()
-}
-
-const ID: &str = "pkg-manager";
+pub(crate) const ID: &str = "pkg-manager";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PkgManagerTab {
@@ -108,6 +100,7 @@ impl PkgManagerTab {
         Self::Updates,
         Self::Registries,
     ];
+    const ACP: [Self; 3] = [Self::Browse, Self::Installed, Self::Updates];
 
     const fn label(self) -> &'static str {
         match self {
@@ -118,12 +111,60 @@ impl PkgManagerTab {
         }
     }
 
-    fn index(self) -> usize {
-        Self::ALL.iter().position(|tab| *tab == self).unwrap_or(0)
+    fn index_in(self, tabs: &[Self]) -> usize {
+        tabs.iter().position(|tab| *tab == self).unwrap_or(0)
     }
 
-    fn from_index(index: usize) -> Option<Self> {
-        Self::ALL.get(index).copied()
+    fn from_index_in(index: usize, tabs: &[Self]) -> Option<Self> {
+        tabs.get(index).copied()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PkgManagerProfile {
+    Packages,
+    AcpAgents,
+}
+
+impl PkgManagerProfile {
+    const fn title(self) -> &'static str {
+        match self {
+            Self::Packages => "Package Manager",
+            Self::AcpAgents => "ACP Agents",
+        }
+    }
+
+    const fn tabs(self) -> &'static [PkgManagerTab] {
+        match self {
+            Self::Packages => &PkgManagerTab::ALL,
+            Self::AcpAgents => &PkgManagerTab::ACP,
+        }
+    }
+
+    const fn initial_kind_filter(self) -> Option<PkgKind> {
+        match self {
+            Self::Packages => None,
+            Self::AcpAgents => Some(PkgKind::Acp),
+        }
+    }
+
+    const fn allows_kind_filter(self) -> bool {
+        matches!(self, Self::Packages)
+    }
+
+    const fn search_placeholder(self, kind_filter: Option<PkgKind>) -> &'static str {
+        match self {
+            Self::AcpAgents => "search agents",
+            Self::Packages if kind_filter.is_some() => "search filtered packages",
+            Self::Packages => "search packages",
+        }
+    }
+
+    const fn status_legend(self) -> &'static str {
+        match self {
+            Self::Packages => " ● installed  ○ available  ↑ update  ◍ working  ⚠ problem ",
+            Self::AcpAgents => " ● installed  ○ available  ↑ update  ◍ working ",
+        }
     }
 }
 
@@ -153,6 +194,7 @@ pub struct PkgManagerItem {
     pub name: String,
     pub kind: PkgKind,
     pub installed: Option<String>,
+    pub provider: CapabilityProvider,
     pub latest: String,
     pub description: String,
     pub homepage: Option<String>,
@@ -164,7 +206,26 @@ pub struct PkgManagerItem {
     pub receipt: Option<Receipt>,
     pub doctor: String,
     pub problem: Option<String>,
+    installable: bool,
     search_blob: String,
+}
+
+impl PkgManagerItem {
+    fn is_pkg_managed(&self) -> bool {
+        self.installed.is_some()
+    }
+
+    fn is_usable(&self) -> bool {
+        self.provider.is_usable()
+    }
+
+    fn is_installable(&self) -> bool {
+        self.installable
+    }
+
+    fn can_install(&self) -> bool {
+        self.is_installable() && (!self.is_pkg_managed() || !self.is_usable())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -176,8 +237,8 @@ struct RegistryItem {
     problem: Option<String>,
 }
 
-#[derive(Debug, Clone)]
-struct PkgManagerData {
+#[derive(Debug, Clone, Default)]
+pub struct PkgManagerData {
     entries: Vec<PkgManagerItem>,
     updates: Vec<PackageChange>,
     registries: Vec<RegistryItem>,
@@ -254,6 +315,38 @@ struct PkgManagerLayout {
     status: Rect,
 }
 
+#[derive(Debug)]
+struct PkgRenderConfig {
+    rounded_corners: bool,
+}
+
+struct PkgRenderSnapshot {
+    area: Rect,
+    layout: PkgManagerLayout,
+    entries: Arc<[PkgManagerItem]>,
+    updates: Arc<[PackageChange]>,
+    registries: Arc<[RegistryItem]>,
+    rows: Arc<[PkgRow]>,
+    tabs: Arc<[crate::widgets::Tab<'static>]>,
+    title: Arc<str>,
+    search_query: Arc<str>,
+    search_placeholder: Arc<str>,
+    empty_state: &'static str,
+    status_legend: &'static str,
+    marked: Arc<BTreeSet<String>>,
+    accepted_updates: Arc<BTreeSet<String>>,
+    progress: Arc<PkgProgressState>,
+    theme: Arc<helix_view::Theme>,
+    config: Arc<PkgRenderConfig>,
+    selection: usize,
+    scroll: usize,
+    active_tab: usize,
+    tab_scroll: u16,
+    search_active: bool,
+    refresh_active: bool,
+    now: SystemTime,
+}
+
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct FilterQuery {
     text: String,
@@ -284,8 +377,37 @@ enum PkgAction {
     Rollback,
     Doctor,
     RegistryUpdate,
+    Connect,
     Help,
     Escape,
+}
+
+impl PkgManagerProfile {
+    const fn allows_action(self, action: PkgAction) -> bool {
+        match self {
+            Self::Packages => !matches!(action, PkgAction::Connect),
+            Self::AcpAgents => matches!(
+                action,
+                PkgAction::MoveDown
+                    | PkgAction::MoveUp
+                    | PkgAction::Last
+                    | PkgAction::Search
+                    | PkgAction::ToggleMark
+                    | PkgAction::Tab1
+                    | PkgAction::Tab2
+                    | PkgAction::Tab3
+                    | PkgAction::NextTab
+                    | PkgAction::PreviousTab
+                    | PkgAction::ToggleDetail
+                    | PkgAction::Install
+                    | PkgAction::Remove
+                    | PkgAction::UpdateSelected
+                    | PkgAction::Connect
+                    | PkgAction::Help
+                    | PkgAction::Escape
+            ),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -300,6 +422,10 @@ impl BindingKey {
             code,
             modifiers: KeyModifiers::NONE,
         }
+    }
+
+    const fn modified(code: KeyCode, modifiers: KeyModifiers) -> Self {
+        Self { code, modifiers }
     }
 
     fn matches(self, key: &KeyEvent) -> bool {
@@ -361,14 +487,34 @@ const PKG_BINDINGS: &[PkgBinding] = &[
     PkgBinding::new(BindingKey::new(KeyCode::Char('3')), PkgAction::Tab3, None),
     PkgBinding::new(BindingKey::new(KeyCode::Char('4')), PkgAction::Tab4, None),
     PkgBinding::new(
+        BindingKey::new(KeyCode::Tab),
+        PkgAction::NextTab,
+        Some(("tab/L", "next tab", 250)),
+    ),
+    PkgBinding::new(
+        BindingKey::new(KeyCode::Char('L')),
+        PkgAction::NextTab,
+        None,
+    ),
+    PkgBinding::new(
         BindingKey::new(KeyCode::Char(']')),
         PkgAction::NextTab,
-        Some(("]", "next tab", 250)),
+        None,
+    ),
+    PkgBinding::new(
+        BindingKey::modified(KeyCode::Tab, KeyModifiers::SHIFT),
+        PkgAction::PreviousTab,
+        Some(("S-tab/H", "prev tab", 249)),
+    ),
+    PkgBinding::new(
+        BindingKey::new(KeyCode::Char('H')),
+        PkgAction::PreviousTab,
+        None,
     ),
     PkgBinding::new(
         BindingKey::new(KeyCode::Char('[')),
         PkgAction::PreviousTab,
-        Some(("[", "previous tab", 249)),
+        None,
     ),
     PkgBinding::new(
         BindingKey::new(KeyCode::Char('f')),
@@ -421,6 +567,11 @@ const PKG_BINDINGS: &[PkgBinding] = &[
         Some(("R", "update registry", 170)),
     ),
     PkgBinding::new(
+        BindingKey::new(KeyCode::Char('c')),
+        PkgAction::Connect,
+        Some(("c", "connect agent", 165)),
+    ),
+    PkgBinding::new(
         BindingKey::new(KeyCode::Char('?')),
         PkgAction::Help,
         Some(("?", "help", 160)),
@@ -433,10 +584,12 @@ const PKG_BINDINGS: &[PkgBinding] = &[
 ];
 
 pub struct PkgManager {
-    entries: Vec<PkgManagerItem>,
-    updates: Vec<PackageChange>,
-    registries: Vec<RegistryItem>,
-    rows: Vec<PkgRow>,
+    profile: PkgManagerProfile,
+    title: String,
+    entries: Arc<[PkgManagerItem]>,
+    updates: Arc<[PackageChange]>,
+    registries: Arc<[RegistryItem]>,
+    rows: Arc<[PkgRow]>,
     tab: PkgManagerTab,
     selection: usize,
     scroll: usize,
@@ -446,8 +599,15 @@ pub struct PkgManager {
     search_query: String,
     search_active: bool,
     kind_filter: Option<PkgKind>,
-    marked: BTreeSet<String>,
-    accepted_updates: BTreeSet<String>,
+    marked: Arc<BTreeSet<String>>,
+    accepted_updates: Arc<BTreeSet<String>>,
+    progress: Arc<PkgProgressState>,
+    seen_finished_revision: u64,
+    next_refresh_request: u64,
+    active_refresh_request: Option<u64>,
+    active_refresh_revision: u64,
+    pending_refresh_revision: Option<u64>,
+    catalog_loaded: bool,
     detail_zoom: bool,
     g_pending: bool,
     shown_help: bool,
@@ -455,27 +615,79 @@ pub struct PkgManager {
 }
 
 pub fn manager(
-    _editor: &helix_view::Editor,
+    editor: &helix_view::Editor,
     ingress: crate::runtime::RuntimeIngress,
 ) -> anyhow::Result<PkgManager> {
-    let ops = Ops::open_default()?;
-    let data = load_data(&ops)?;
-    Ok(PkgManager::new(data, ingress))
+    manager_with_kind(editor, ingress, "Package Manager", None)
+}
+
+pub fn acp_manager(
+    editor: &helix_view::Editor,
+    ingress: crate::runtime::RuntimeIngress,
+) -> anyhow::Result<PkgManager> {
+    manager_with_kind(editor, ingress, "ACP Agents", Some(PkgKind::Acp))
+}
+
+fn manager_with_kind(
+    editor: &helix_view::Editor,
+    ingress: crate::runtime::RuntimeIngress,
+    title: &'static str,
+    kind_filter: Option<PkgKind>,
+) -> anyhow::Result<PkgManager> {
+    let profile = if kind_filter == Some(PkgKind::Acp) {
+        PkgManagerProfile::AcpAgents
+    } else {
+        PkgManagerProfile::Packages
+    };
+    let mut manager = if profile == PkgManagerProfile::Packages
+        && kind_filter.is_none()
+        && title == PkgManagerProfile::Packages.title()
+    {
+        PkgManager::new(PkgManagerData::default(), ingress)
+    } else {
+        PkgManager::new_with_options(PkgManagerData::default(), ingress, title, kind_filter)
+    };
+    manager.begin_reload(editor.runtime(), editor.config().pkg.clone(), 0);
+    Ok(manager)
+}
+
+fn load_catalog_data(ops: &Ops) -> anyhow::Result<PkgManagerData> {
+    let receipts = ops.store().receipts()?;
+    let runtime_assets = helix_loader::runtime_assets()?;
+    let config = user_lang_config().unwrap_or_else(|_| default_lang_config());
+    let grammars = helix_loader::grammar::configured_grammar_names()?;
+    let mut entries: Vec<_> = CapabilityCatalog::new(ops.registry(), runtime_assets)
+        .receipts(receipts)
+        .configured(configured_tools(&config, &grammars))
+        .statuses()?
+        .into_iter()
+        .map(|status| item_from_status(status, None))
+        .collect();
+    entries.sort_by(|left, right| {
+        left.kind
+            .cmp(&right.kind)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    Ok(PkgManagerData {
+        entries,
+        updates: Vec::new(),
+        registries: registry_items(ops, None),
+    })
 }
 
 fn load_data(ops: &Ops) -> anyhow::Result<PkgManagerData> {
-    let receipts: HashMap<(PkgKind, String), Receipt> = ops
-        .store()
-        .receipts()?
-        .into_iter()
-        .map(|receipt| ((receipt.kind, receipt.name.clone()), receipt))
-        .collect();
+    let receipts = ops.store().receipts()?;
     let doctor = ops.doctor().ok();
+    let runtime_assets = helix_loader::runtime_assets()?;
 
-    let mut entries: Vec<_> = ops
-        .registry()
-        .iter()
-        .map(|package| item_from_package(package, &receipts, doctor.as_ref()))
+    let config = user_lang_config().unwrap_or_else(|_| default_lang_config());
+    let grammars = helix_loader::grammar::configured_grammar_names()?;
+    let mut entries: Vec<_> = CapabilityCatalog::new(ops.registry(), runtime_assets)
+        .receipts(receipts)
+        .configured(configured_tools(&config, &grammars))
+        .statuses()?
+        .into_iter()
+        .map(|status| item_from_status(status, doctor.as_ref()))
         .collect();
     entries.sort_by(|left, right| {
         left.kind
@@ -490,6 +702,74 @@ fn load_data(ops: &Ops) -> anyhow::Result<PkgManagerData> {
         updates,
         registries,
     })
+}
+
+fn spawn_data_refresh(
+    work: helix_runtime::Work,
+    block: helix_runtime::Block,
+    ingress: crate::runtime::RuntimeIngress,
+    config: helix_pkg::PkgConfig,
+    request_id: u64,
+    finished_revision: u64,
+) {
+    let result = block.spawn(move || {
+        let ops = match Ops::open_with_config(config) {
+            Ok(ops) => ops,
+            Err(error) => {
+                return vec![(
+                    crate::runtime::PkgRefreshStage::Catalog,
+                    Err(error.to_string()),
+                )];
+            }
+        };
+
+        let catalog = match load_catalog_data(&ops) {
+            Ok(data) => data,
+            Err(error) => {
+                return vec![(
+                    crate::runtime::PkgRefreshStage::Catalog,
+                    Err(error.to_string()),
+                )];
+            }
+        };
+
+        vec![
+            (crate::runtime::PkgRefreshStage::Catalog, Ok(catalog)),
+            (
+                crate::runtime::PkgRefreshStage::Enrichment,
+                load_data(&ops).map_err(|error| error.to_string()),
+            ),
+        ]
+    });
+    work.spawn(async move {
+        let result = result.await;
+
+        let updates = match result {
+            Ok(updates) => updates,
+            Err(error) => vec![(
+                crate::runtime::PkgRefreshStage::Catalog,
+                Err(format!("package data task failed: {error}")),
+            )],
+        };
+
+        for (stage, result) in updates {
+            if ingress
+                .send_ui(crate::runtime::UiCommand::Pkg(
+                    crate::runtime::PkgCommand::Refresh {
+                        request_id,
+                        finished_revision,
+                        stage,
+                        result,
+                    },
+                ))
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    })
+    .detach();
 }
 
 fn registry_items(ops: &Ops, report: Option<&helix_pkg::DoctorReport>) -> Vec<RegistryItem> {
@@ -554,53 +834,82 @@ fn cache_age_label(modified: SystemTime) -> String {
     }
 }
 
-fn item_from_package(
-    package: &PackageSpec,
-    receipts: &HashMap<(PkgKind, String), Receipt>,
+fn item_from_status(
+    status: CapabilityStatus,
     report: Option<&helix_pkg::DoctorReport>,
 ) -> PkgManagerItem {
-    let receipt = receipts.get(&(package.kind, package.name.clone())).cloned();
-    let installed = receipt.as_ref().map(|receipt| receipt.version.clone());
+    let package = status.package.as_ref();
+    let receipt = status.receipt.clone();
+    let installed = status
+        .active
+        .as_ref()
+        .map(|package| package.version.clone());
     let latest = package
-        .version
-        .tag_source
-        .as_deref()
-        .unwrap_or("registry")
+        .and_then(|package| package.version.tag_source.as_deref())
+        .unwrap_or("-")
         .to_owned();
-    let aliases = package.aliases.join(", ");
-    let categories = package.categories.join(", ");
-    let languages = package.languages.join(", ");
-    let schemas = package
-        .schemas
-        .keys()
-        .map(String::as_str)
+    let aliases = package
+        .map(|package| package.aliases.join(", "))
+        .or_else(|| configured_aliases(&status))
+        .unwrap_or_default();
+    let categories = package
+        .map(|package| package.categories.join(", "))
+        .unwrap_or_else(|| "configured".to_owned());
+    let languages = status
+        .languages
+        .iter()
+        .cloned()
         .collect::<Vec<_>>()
         .join(", ");
-    let source = source_label(package);
-    let search_blob = package.search_terms().collect::<Vec<_>>().join("\n");
-    let problem = report.and_then(|report| {
-        report
-            .bad
-            .iter()
-            .find(|(name, _)| name == &package.name)
-            .map(|(_, message)| message.clone())
-    });
+    let schemas = package
+        .map(|package| {
+            package
+                .schemas
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_default();
+    let source = package
+        .map(source_label)
+        .unwrap_or_else(|| "languages.toml".to_owned());
+    let description = package
+        .map(|package| package.description.clone())
+        .unwrap_or_else(|| configured_description(&status));
+    let homepage = package.and_then(|package| package.homepage.clone());
+    let search_blob = search_blob_for_status(&status, &description, &aliases, &categories);
+    let problem = match &status.provider {
+        CapabilityProvider::BrokenManaged { message, .. } => Some(message.clone()),
+        _ => report.and_then(|report| {
+            report
+                .bad
+                .iter()
+                .find(|(name, _)| name == &status.name)
+                .map(|(_, message)| message.clone())
+        }),
+    };
     let doctor = if problem.is_some() {
         "problem".to_owned()
-    } else if report.is_some_and(|report| report.ok.iter().any(|name| name == &package.name)) {
+    } else if report.is_some_and(|report| report.ok.iter().any(|name| name == &status.name)) {
         "ok".to_owned()
-    } else if installed.is_some() {
+    } else if status.is_pkg_managed() {
         "unknown".to_owned()
+    } else if let Some(source) = status.provider.source_label() {
+        format!("available via {source}")
+    } else if !status.is_installable() {
+        "not found".to_owned()
     } else {
         "not installed".to_owned()
     };
     PkgManagerItem {
-        name: package.name.clone(),
-        kind: package.kind,
+        name: status.name,
+        kind: status.kind,
         installed,
+        provider: status.provider,
         latest,
-        description: package.description.clone(),
-        homepage: package.homepage.clone(),
+        description,
+        homepage,
         aliases,
         categories,
         languages,
@@ -609,8 +918,142 @@ fn item_from_package(
         receipt,
         doctor,
         problem,
+        installable: status.installable,
         search_blob,
     }
+}
+
+fn configured_aliases(status: &CapabilityStatus) -> Option<String> {
+    let aliases = status
+        .configured
+        .iter()
+        .filter_map(|configured| {
+            (configured.name != configured.command).then_some(configured.command.as_str())
+        })
+        .collect::<Vec<_>>();
+    (!aliases.is_empty()).then(|| aliases.join(", "))
+}
+
+fn configured_description(status: &CapabilityStatus) -> String {
+    let command = status
+        .configured
+        .first()
+        .map(|configured| configured.command.as_str())
+        .or_else(|| status.provider.command())
+        .unwrap_or(status.name.as_str());
+    match status.kind {
+        PkgKind::Lsp => format!("Configured language server command '{command}'"),
+        PkgKind::Dap => format!("Configured debug adapter command '{command}'"),
+        PkgKind::Formatter => format!("Configured formatter command '{command}'"),
+        _ => format!("Configured command '{command}'"),
+    }
+}
+
+fn search_blob_for_status(
+    status: &CapabilityStatus,
+    description: &str,
+    aliases: &str,
+    categories: &str,
+) -> String {
+    let mut terms = vec![
+        status.name.as_str(),
+        status.kind.as_str(),
+        description,
+        aliases,
+        categories,
+    ];
+    if status.package.is_none() {
+        terms.push("configured");
+        terms.push("languages.toml");
+    }
+    for configured in &status.configured {
+        terms.push(configured.command.as_str());
+    }
+    let languages = status.languages.iter().map(String::as_str);
+    terms.extend(languages);
+    if let Some(package) = &status.package {
+        terms.extend(package.search_terms());
+    }
+    terms.join("\n")
+}
+
+fn configured_tools(
+    config: &LanguageConfigurationSet,
+    configured_grammars: &BTreeSet<String>,
+) -> Vec<ConfiguredCapability> {
+    let mut tools: BTreeMap<(PkgKind, String), (String, BTreeSet<String>)> = BTreeMap::new();
+    for language in &config.language {
+        let grammar = language.grammar.as_deref().unwrap_or(&language.language_id);
+        if configured_grammars.contains(grammar) {
+            record_configured_tool(
+                &mut tools,
+                PkgKind::Grammar,
+                grammar,
+                grammar,
+                &language.language_id,
+            );
+        }
+        for server in &language.language_servers {
+            let Some(server_config) = config.language_server.get(&server.name) else {
+                continue;
+            };
+            record_configured_tool(
+                &mut tools,
+                PkgKind::Lsp,
+                &server.name,
+                &server_config.command,
+                &language.language_id,
+            );
+        }
+        if let Some(debugger) = &language.debugger {
+            let name = if debugger.name.trim().is_empty() {
+                debugger.command.as_str()
+            } else {
+                debugger.name.as_str()
+            };
+            record_configured_tool(
+                &mut tools,
+                PkgKind::Dap,
+                name,
+                &debugger.command,
+                &language.language_id,
+            );
+        }
+        if let Some(formatter) = &language.formatter {
+            record_configured_tool(
+                &mut tools,
+                PkgKind::Formatter,
+                &formatter.command,
+                &formatter.command,
+                &language.language_id,
+            );
+        }
+    }
+
+    tools
+        .into_iter()
+        .filter_map(|((kind, name), (command, languages))| {
+            ConfiguredCapability::new(kind, name, command, languages)
+        })
+        .collect()
+}
+
+fn record_configured_tool(
+    tools: &mut BTreeMap<(PkgKind, String), (String, BTreeSet<String>)>,
+    kind: PkgKind,
+    name: &str,
+    command: &str,
+    language: &str,
+) {
+    let name = name.trim();
+    let command = command.trim();
+    if name.is_empty() || command.is_empty() {
+        return;
+    }
+    let (_, languages) = tools
+        .entry((kind, name.to_owned()))
+        .or_insert_with(|| (command.to_owned(), BTreeSet::new()));
+    languages.insert(language.to_owned());
 }
 
 fn source_label(package: &PackageSpec) -> String {
@@ -643,11 +1086,45 @@ fn source_kind(source: &Source) -> Option<String> {
 
 impl PkgManager {
     fn new(data: PkgManagerData, ingress: crate::runtime::RuntimeIngress) -> Self {
+        Self::new_with_profile(
+            data,
+            ingress,
+            PkgManagerProfile::Packages.title(),
+            PkgManagerProfile::Packages,
+            None,
+        )
+    }
+
+    fn new_with_options(
+        data: PkgManagerData,
+        ingress: crate::runtime::RuntimeIngress,
+        title: &'static str,
+        kind_filter: Option<PkgKind>,
+    ) -> Self {
+        let profile = if kind_filter == Some(PkgKind::Acp) {
+            PkgManagerProfile::AcpAgents
+        } else {
+            PkgManagerProfile::Packages
+        };
+        Self::new_with_profile(data, ingress, title, profile, kind_filter)
+    }
+
+    fn new_with_profile(
+        data: PkgManagerData,
+        ingress: crate::runtime::RuntimeIngress,
+        title: &'static str,
+        profile: PkgManagerProfile,
+        kind_filter: Option<PkgKind>,
+    ) -> Self {
+        let catalog_loaded =
+            !data.entries.is_empty() || !data.updates.is_empty() || !data.registries.is_empty();
         let mut manager = Self {
-            entries: data.entries,
-            updates: data.updates,
-            registries: data.registries,
-            rows: Vec::new(),
+            profile,
+            title: title.to_owned(),
+            entries: data.entries.into(),
+            updates: data.updates.into(),
+            registries: data.registries.into(),
+            rows: Arc::from([]),
             tab: PkgManagerTab::Browse,
             selection: 0,
             scroll: 0,
@@ -656,20 +1133,29 @@ impl PkgManager {
             tab_area: Rect::default(),
             search_query: String::new(),
             search_active: false,
-            kind_filter: None,
-            marked: BTreeSet::new(),
-            accepted_updates: BTreeSet::new(),
+            kind_filter: kind_filter.or_else(|| profile.initial_kind_filter()),
+            marked: Arc::new(BTreeSet::new()),
+            accepted_updates: Arc::new(BTreeSet::new()),
+            progress: Arc::new(PkgProgressState::default()),
+            seen_finished_revision: 0,
+            next_refresh_request: 0,
+            active_refresh_request: None,
+            active_refresh_revision: 0,
+            pending_refresh_revision: None,
+            catalog_loaded,
             detail_zoom: false,
             g_pending: false,
             shown_help: false,
             ingress,
         };
-        manager.accepted_updates = manager
-            .updates
-            .iter()
-            .filter(|change| change.needs_apply())
-            .map(|change| change.name.clone())
-            .collect();
+        manager.accepted_updates = Arc::new(
+            manager
+                .updates
+                .iter()
+                .filter(|change| change.needs_apply())
+                .map(|change| change.name.clone())
+                .collect(),
+        );
         manager.rebuild_filter();
         manager
     }
@@ -715,11 +1201,12 @@ impl PkgManager {
     fn rebuild_filter(&mut self) {
         let selected = self.selected_identity();
         let query = parse_filter_query(&self.search_query);
-        self.rows = match self.tab {
+        let rows = match self.tab {
             PkgManagerTab::Browse | PkgManagerTab::Installed => self.package_rows(&query),
             PkgManagerTab::Updates => self.update_rows(&query),
             PkgManagerTab::Registries => (0..self.registries.len()).map(PkgRow::Registry).collect(),
         };
+        self.rows = rows.into();
 
         if self.rows.is_empty() {
             self.selection = 0;
@@ -756,7 +1243,7 @@ impl PkgManager {
         });
 
         for (index, item) in self.entries.iter().enumerate() {
-            if self.tab == PkgManagerTab::Installed && item.installed.is_none() {
+            if self.tab == PkgManagerTab::Installed && !item.is_usable() && !item.is_pkg_managed() {
                 continue;
             }
             if !filter_item(item, query, self.kind_filter) {
@@ -795,6 +1282,9 @@ impl PkgManager {
     }
 
     fn set_tab(&mut self, tab: PkgManagerTab) {
+        if !self.profile.tabs().contains(&tab) {
+            return;
+        }
         self.tab = tab;
         self.selection = 0;
         self.scroll = 0;
@@ -803,16 +1293,17 @@ impl PkgManager {
     }
 
     fn set_tab_index(&mut self, index: usize) {
-        if let Some(tab) = PkgManagerTab::from_index(index) {
+        if let Some(tab) = PkgManagerTab::from_index_in(index, self.profile.tabs()) {
             self.set_tab(tab);
         }
     }
 
     fn cycle_tab(&mut self, delta: isize) {
-        let current = self.tab.index() as isize;
-        let len = PkgManagerTab::ALL.len() as isize;
+        let tabs = self.profile.tabs();
+        let current = self.tab.index_in(tabs) as isize;
+        let len = tabs.len() as isize;
         let next = (current + delta).rem_euclid(len) as usize;
-        self.set_tab(PkgManagerTab::ALL[next]);
+        self.set_tab(tabs[next]);
     }
 
     fn move_selection(&mut self, delta: isize) {
@@ -895,7 +1386,12 @@ impl PkgManager {
     }
 
     fn start_operation(&self, cx: &mut Context, operation: crate::runtime::PkgOperation) {
-        crate::runtime::spawn_pkg_operation(operation, cx.editor.work(), self.ingress.clone());
+        if let Err(error) = self
+            .ingress
+            .package(operation, cx.editor.config().pkg.clone())
+        {
+            cx.editor.notify_error(error.to_string());
+        }
     }
 
     fn selected_names_for_op(&self) -> Vec<String> {
@@ -911,11 +1407,86 @@ impl PkgManager {
             .unwrap_or_default()
     }
 
-    fn install_selected(&self, cx: &mut Context) {
-        let names = self.selected_names_for_op();
-        if !names.is_empty() {
-            self.start_operation(cx, crate::runtime::PkgOperation::Install(names));
+    fn selected_items_for_op(&self) -> Vec<&PkgManagerItem> {
+        if !self.marked.is_empty() {
+            return self
+                .marked
+                .iter()
+                .filter_map(|name| self.entries.iter().find(|item| item.name == *name))
+                .collect();
         }
+        self.selected_item().into_iter().collect()
+    }
+
+    fn install_selected(&mut self, cx: &mut Context) {
+        let selected_items = self.selected_items_for_op();
+        if selected_items.is_empty() {
+            cx.editor.notify_warning("No package selected");
+            return;
+        }
+
+        let skipped_uninstallable = selected_items
+            .iter()
+            .filter(|item| !item.is_installable())
+            .count();
+        let names = selected_items
+            .iter()
+            .filter(|item| item.can_install())
+            .map(|item| item.name.clone())
+            .collect::<Vec<_>>();
+        if !names.is_empty() {
+            for name in &names {
+                Arc::make_mut(&mut self.marked).remove(name);
+            }
+            let label = names.join(", ");
+            cx.editor.notify_info(format!("Installing {label}"));
+            self.start_operation(cx, crate::runtime::PkgOperation::Install(names));
+            if skipped_uninstallable > 0 {
+                let noun = if skipped_uninstallable == 1 {
+                    "row"
+                } else {
+                    "rows"
+                };
+                cx.editor.notify_info(format!(
+                    "Skipped {skipped_uninstallable} configured {noun} without package recipes"
+                ));
+            }
+        } else if skipped_uninstallable > 0 {
+            cx.editor
+                .notify_warning("No package recipe for selected configured tool");
+        } else {
+            cx.editor
+                .notify_info("Selected package is already installed");
+        }
+    }
+
+    fn activate_selected(&mut self, cx: &mut Context) -> Option<PostAction> {
+        if self.profile == PkgManagerProfile::AcpAgents {
+            if let Some(PkgRow::Update(index)) = self.selected_row() {
+                let Some(change) = self.updates.get(*index) else {
+                    cx.editor.notify_warning("No agent update selected");
+                    return None;
+                };
+                if change.needs_apply() {
+                    let name = change.name.clone();
+                    cx.editor.notify_info(format!("Updating {name}"));
+                    self.start_operation(cx, crate::runtime::PkgOperation::Update(vec![name]));
+                } else {
+                    cx.editor.notify_info("Selected agent is already current");
+                }
+                return None;
+            }
+
+            if self
+                .selected_item()
+                .is_some_and(|item| item.kind == PkgKind::Acp && item.is_usable())
+            {
+                return self.connect_selected_agent(cx);
+            }
+        }
+
+        self.install_selected(cx);
+        None
     }
 
     fn update_selected(&mut self, cx: &mut Context) {
@@ -925,7 +1496,12 @@ impl PkgManager {
         }
         let names = self.selected_names_for_op();
         if !names.is_empty() {
-            self.start_operation(cx, crate::runtime::PkgOperation::Update(names));
+            let managed = self.pkg_managed_names(names);
+            if managed.is_empty() {
+                cx.editor.notify_warning("No pkg-managed package selected");
+            } else {
+                self.start_operation(cx, crate::runtime::PkgOperation::Update(managed));
+            }
         }
     }
 
@@ -945,7 +1521,12 @@ impl PkgManager {
     }
 
     fn rollback_selected(&self, cx: &mut Context) {
-        for name in self.selected_names_for_op() {
+        let managed = self.pkg_managed_names(self.selected_names_for_op());
+        if managed.is_empty() {
+            cx.editor.notify_warning("No pkg-managed package selected");
+            return;
+        }
+        for name in managed {
             self.start_operation(cx, crate::runtime::PkgOperation::Rollback(name));
         }
     }
@@ -955,7 +1536,22 @@ impl PkgManager {
         if names.is_empty() {
             self.start_operation(cx, crate::runtime::PkgOperation::Doctor);
         } else {
-            for name in names {
+            let selected_count = names.len();
+            let managed = self.pkg_managed_names(names);
+            if managed.is_empty() {
+                cx.editor.notify_info(
+                    "Selected package is available externally; use --health for resolver diagnostics",
+                );
+                return;
+            }
+            let skipped = selected_count.saturating_sub(managed.len());
+            if skipped > 0 {
+                let noun = if skipped == 1 { "package" } else { "packages" };
+                cx.editor.notify_info(format!(
+                    "Skipping {skipped} selected {noun} that are not pkg-managed"
+                ));
+            }
+            for name in managed {
                 self.start_operation(cx, crate::runtime::PkgOperation::DoctorPackage(name));
             }
         }
@@ -969,59 +1565,228 @@ impl PkgManager {
         self.start_operation(cx, crate::runtime::PkgOperation::UpdateRegistries(names));
     }
 
-    fn remove_selected(&self, cx: &mut Context) -> EventResult {
+    fn connect_selected_agent(&self, cx: &mut Context) -> Option<PostAction> {
+        let Some(item) = self.selected_item() else {
+            cx.editor.notify_warning("No package selected");
+            return None;
+        };
+        if item.kind != PkgKind::Acp {
+            cx.editor
+                .notify_warning("Select an installed ACP agent package to connect");
+            return None;
+        }
+        if !item.is_usable() {
+            cx.editor
+                .notify_warning(format!("Install {} with pkg before connecting", item.name));
+            return None;
+        }
+
+        let package_name = item.name.clone();
+        match cx.editor.assistant_acp_package_agent(&package_name) {
+            Ok(Some(agent)) => {
+                let agent_name = agent.name.clone();
+                let connection = match crate::runtime::AssistantBackendConnection::from_agent(
+                    agent,
+                    None,
+                    helix_view::editor::PanelBehavior::Open,
+                ) {
+                    Ok(connection) => connection,
+                    Err(err) => {
+                        cx.editor.notify_error(format!(
+                            "Failed to connect assistant agent {agent_name}: {err}"
+                        ));
+                        return None;
+                    }
+                };
+                cx.submit_task(crate::runtime::RuntimeTaskEvent::ConnectAssistantBackend(
+                    Box::new(connection),
+                ));
+                cx.editor
+                    .notify_info(format!("Connecting assistant agent {agent_name}"));
+                Some(PostAction::PopLayer {
+                    model_layer: None,
+                    remember_picker: false,
+                })
+            }
+            Ok(None) => {
+                cx.editor.notify_warning(format!(
+                    "{} is not installed for this platform",
+                    package_name
+                ));
+                None
+            }
+            Err(err) => {
+                cx.editor.notify_error(format!(
+                    "Failed to load assistant agent {}: {err}",
+                    package_name
+                ));
+                None
+            }
+        }
+    }
+
+    fn remove_selected(&mut self, cx: &mut Context) -> EventResult {
         let names = self.selected_names_for_op();
+        let selected_count = names.len();
         let installed = names
             .into_iter()
             .filter(|name| {
                 self.entries
                     .iter()
-                    .any(|item| item.name == *name && item.installed.is_some())
+                    .any(|item| item.name == *name && item.is_pkg_managed())
             })
             .collect::<Vec<_>>();
         if installed.is_empty() {
-            cx.editor.set_status("No installed package selected");
+            cx.editor.notify_warning("No pkg-managed package selected");
             return EventResult::Consumed(None);
         }
 
-        let label = if installed.len() == 1 {
-            format!("Remove package {}?", installed[0])
-        } else {
-            format!("Remove {} packages?", installed.len())
-        };
+        let skipped = selected_count.saturating_sub(installed.len());
+        let label = remove_confirmation_label(&installed, skipped);
+        cx.editor
+            .notify_warning(format!("Package manager: {label} Type y to confirm."));
+        for name in &installed {
+            Arc::make_mut(&mut self.marked).remove(name);
+        }
         let ingress = self.ingress.clone();
-        let confirmation = crate::ui::picker::PickerConfirmation::new(label, move |cx| {
-            crate::runtime::spawn_pkg_operation(
+        let confirmation = crate::ui::Confirmation::new(label, move |cx| {
+            if let Err(error) = ingress.package(
                 crate::runtime::PkgOperation::Remove(installed.clone()),
-                cx.editor.work(),
-                ingress.clone(),
-            );
+                cx.editor.config().pkg.clone(),
+            ) {
+                cx.editor.notify_error(error.to_string());
+            }
         });
         EventResult::Consumed(Some(confirmation.into_post_action()))
     }
 
-    fn reload(&mut self, cx: &mut Context) {
-        let result: anyhow::Result<PkgManagerData> = (|| {
-            let ops = Ops::open_default()?;
-            load_data(&ops)
-        })();
-        match result {
-            Ok(data) => {
-                self.entries = data.entries;
-                self.updates = data.updates;
-                self.registries = data.registries;
-                self.accepted_updates = self
-                    .updates
+    fn pkg_managed_names(&self, names: Vec<String>) -> Vec<String> {
+        names
+            .into_iter()
+            .filter(|name| {
+                self.entries
                     .iter()
-                    .filter(|change| change.needs_apply())
-                    .map(|change| change.name.clone())
-                    .collect();
-                self.rebuild_filter();
-                cx.editor.set_status("Package data refreshed");
+                    .any(|item| item.name == *name && item.is_pkg_managed())
+            })
+            .collect()
+    }
+
+    fn reload(&mut self, cx: &mut Context) {
+        self.begin_reload(
+            cx.editor.runtime(),
+            cx.editor.config().pkg.clone(),
+            self.seen_finished_revision,
+        );
+        cx.editor.set_status("Refreshing package data");
+    }
+
+    pub(crate) fn apply_progress_event(&mut self, event: &OpEvent) {
+        Arc::make_mut(&mut self.progress).apply(event);
+    }
+
+    pub(crate) fn apply_operation_outcome(
+        &mut self,
+        editor: &helix_view::Editor,
+        outcome: &crate::runtime::PkgOperationOutcome,
+    ) {
+        if !outcome.is_success() && !outcome.runtime_changed {
+            return;
+        }
+        let latest_revision = self
+            .pending_refresh_revision
+            .unwrap_or_default()
+            .max(self.active_refresh_revision)
+            .max(self.seen_finished_revision);
+        self.begin_reload(
+            editor.runtime(),
+            editor.config().pkg.clone(),
+            latest_revision.saturating_add(1),
+        );
+    }
+
+    fn begin_reload(
+        &mut self,
+        runtime: &helix_runtime::Runtime,
+        config: helix_pkg::PkgConfig,
+        finished_revision: u64,
+    ) {
+        if self.active_refresh_request.is_some() {
+            self.pending_refresh_revision = Some(
+                self.pending_refresh_revision
+                    .map_or(finished_revision, |pending| pending.max(finished_revision)),
+            );
+            return;
+        }
+
+        self.next_refresh_request = self.next_refresh_request.wrapping_add(1).max(1);
+        let request_id = self.next_refresh_request;
+        self.active_refresh_request = Some(request_id);
+        self.active_refresh_revision = finished_revision;
+        spawn_data_refresh(
+            runtime.work().clone(),
+            runtime.block().clone(),
+            self.ingress.clone(),
+            config,
+            request_id,
+            finished_revision,
+        );
+    }
+
+    fn replace_data(&mut self, data: PkgManagerData) {
+        self.entries = data.entries.into();
+        self.updates = data.updates.into();
+        self.registries = data.registries.into();
+        self.accepted_updates = Arc::new(
+            self.updates
+                .iter()
+                .filter(|change| change.needs_apply())
+                .map(|change| change.name.clone())
+                .collect(),
+        );
+        self.catalog_loaded = true;
+        self.rebuild_filter();
+    }
+
+    fn finish_reload(&mut self, editor: &helix_view::Editor, finished_revision: u64) {
+        self.active_refresh_request = None;
+        self.seen_finished_revision = self.seen_finished_revision.max(finished_revision);
+        if let Some(pending_revision) = self.pending_refresh_revision.take() {
+            self.begin_reload(
+                editor.runtime(),
+                editor.config().pkg.clone(),
+                pending_revision,
+            );
+        }
+    }
+
+    pub(crate) fn apply_refresh_result(
+        &mut self,
+        editor: &mut helix_view::Editor,
+        request_id: u64,
+        finished_revision: u64,
+        stage: crate::runtime::PkgRefreshStage,
+        result: Result<PkgManagerData, String>,
+    ) {
+        if self.active_refresh_request != Some(request_id) {
+            return;
+        }
+
+        match (stage, result) {
+            (crate::runtime::PkgRefreshStage::Catalog, Ok(data)) => {
+                self.replace_data(data);
             }
-            Err(err) => cx
-                .editor
-                .set_error(format!("Failed to refresh package data: {err}")),
+            (crate::runtime::PkgRefreshStage::Catalog, Err(err)) => {
+                editor.notify_error(format!("Failed to refresh package data: {err}"));
+                self.finish_reload(editor, finished_revision);
+            }
+            (crate::runtime::PkgRefreshStage::Enrichment, Ok(data)) => {
+                self.replace_data(data);
+                self.finish_reload(editor, finished_revision);
+            }
+            (crate::runtime::PkgRefreshStage::Enrichment, Err(err)) => {
+                editor.notify_warning(format!("Package checks did not finish: {err}"));
+                self.finish_reload(editor, finished_revision);
+            }
         }
     }
 
@@ -1029,14 +1794,16 @@ impl PkgManager {
         match self.selected_row() {
             Some(PkgRow::Package(index)) => {
                 let name = self.entries[*index].name.clone();
-                if !self.marked.remove(&name) {
-                    self.marked.insert(name);
+                let marked = Arc::make_mut(&mut self.marked);
+                if !marked.remove(&name) {
+                    marked.insert(name);
                 }
             }
             Some(PkgRow::Update(index)) => {
                 let name = self.updates[*index].name.clone();
-                if !self.accepted_updates.remove(&name) {
-                    self.accepted_updates.insert(name);
+                let accepted_updates = Arc::make_mut(&mut self.accepted_updates);
+                if !accepted_updates.remove(&name) {
+                    accepted_updates.insert(name);
                 }
             }
             _ => {}
@@ -1044,6 +1811,9 @@ impl PkgManager {
     }
 
     fn cycle_kind_filter(&mut self) {
+        if !self.profile.allows_kind_filter() {
+            return;
+        }
         self.kind_filter = match self.kind_filter {
             None => Some(PkgKind::ALL[0]),
             Some(kind) => PkgKind::ALL
@@ -1089,14 +1859,41 @@ impl PkgManager {
         false
     }
 
-    fn binding_for_key(key: &KeyEvent) -> Option<&'static PkgBinding> {
-        PKG_BINDINGS.iter().find(|binding| binding.key.matches(key))
+    fn binding_for_key(&self, key: &KeyEvent) -> Option<&'static PkgBinding> {
+        PKG_BINDINGS
+            .iter()
+            .find(|binding| binding.key.matches(key) && self.profile.allows_action(binding.action))
+    }
+
+    fn help_hint(&self, binding: &PkgBinding) -> Option<(&'static str, &'static str, u16)> {
+        let (key, label, rank) = binding.hint?;
+        if matches!(
+            binding.action,
+            PkgAction::MoveDown
+                | PkgAction::MoveUp
+                | PkgAction::Last
+                | PkgAction::ToggleMark
+                | PkgAction::Tab1
+                | PkgAction::NextTab
+                | PkgAction::PreviousTab
+        ) {
+            return None;
+        }
+        if self.profile == PkgManagerProfile::AcpAgents {
+            return match binding.action {
+                PkgAction::Install => Some(("enter", "install / connect", rank)),
+                PkgAction::UpdateSelected => Some((key, "refresh / update", rank)),
+                _ => Some((key, label, rank)),
+            };
+        }
+        Some((key, label, rank))
     }
 
     fn help_entries(&self) -> Vec<(&'static str, &'static str)> {
         let mut entries = PKG_BINDINGS
             .iter()
-            .filter_map(|binding| binding.hint)
+            .filter(|binding| self.profile.allows_action(binding.action))
+            .filter_map(|binding| self.help_hint(binding))
             .collect::<Vec<_>>();
         entries.sort_by_key(|entry| std::cmp::Reverse(entry.2));
         entries
@@ -1106,7 +1903,7 @@ impl PkgManager {
     }
 
     fn info(&self) -> helix_view::info::Info {
-        helix_view::info::Info::new("Package manager", &self.help_entries())
+        helix_view::info::Info::new(self.profile.title(), &self.help_entries())
     }
 
     fn toggle_help(&mut self, editor: &mut Editor) {
@@ -1126,286 +1923,87 @@ impl PkgManager {
         }
     }
 
-    fn render_surface(
-        &mut self,
-        area: Rect,
-        surface: &mut crate::render::CellSurface,
-        cx: &RenderContext,
-    ) {
-        if area.width == 0 || area.height == 0 {
-            return;
-        }
-
-        let theme = cx.theme();
-        let styles = PkgManagerStyles::from_theme(theme);
+    fn prepare_render_snapshot(&mut self, area: Rect, cx: &RenderContext) -> PkgRenderSnapshot {
         let layout = Self::layout(area, self.detail_zoom);
-        let panel_style =
-            crate::widgets::PanelStyle::new(styles.background, styles.border, styles.title);
-        crate::widgets::Panel::framed(panel_style, cx.config().rounded_corners)
-            .title(" Package Manager ")
-            .render(surface, area);
-
-        self.render_tabs(surface, layout.tabs, styles);
-        self.render_search(surface, layout.search, layout.search_input, styles);
-        self.render_list(surface, layout.list, styles);
-        self.render_detail(surface, layout.detail, styles);
-        self.render_status(surface, layout.status, styles);
-    }
-
-    fn render_tabs(
-        &mut self,
-        surface: &mut crate::render::CellSurface,
-        area: Rect,
-        styles: PkgManagerStyles,
-    ) {
         let update_count = self
             .updates
             .iter()
             .filter(|change| change.needs_apply())
             .count();
-        let tabs = PkgManagerTab::ALL
-            .iter()
-            .copied()
-            .map(|tab| {
-                let tab = crate::widgets::Tab::new(tab.label());
-                if tab.label.as_ref() == "Updates" {
-                    tab.badge(update_count.to_string())
-                } else {
-                    tab
-                }
-            })
-            .collect::<Vec<_>>();
-        let state = crate::widgets::tabs_with_options(
-            surface,
-            area,
-            &tabs,
-            crate::widgets::TabsOptions::new(self.tab.index())
-                .scroll(self.tab_scroll)
-                .separator(" "),
-            crate::widgets::TabsStyle {
-                background: styles.background,
-                active: styles.title,
-                inactive: styles.inactive,
-                badge: styles.warning,
-                separator: styles.background,
-                overflow: styles.inactive,
-                hover: styles.selection,
-            },
-        );
-        self.tab_scroll = state.scroll;
-        self.tab_state = state;
-        self.tab_area = area;
-    }
-
-    fn render_search(
-        &self,
-        surface: &mut crate::render::CellSurface,
-        area: Rect,
-        input_area: Rect,
-        styles: PkgManagerStyles,
-    ) {
-        surface.set_style(
-            tui::ratatui::to_ratatui_rect(area),
-            tui::ratatui::to_ratatui_style(styles.background),
-        );
-        let marker_style = if self.search_active {
-            styles.title
-        } else {
-            styles.inactive
-        };
-        if area.width > 1 {
-            surface.set_stringn(
-                area.x.saturating_add(1),
-                area.y,
-                "/",
-                1,
-                tui::ratatui::to_ratatui_style(marker_style),
-            );
-        }
-        let placeholder = self
-            .kind_filter
-            .map_or("search packages".to_owned(), |kind| format!("kind:{kind}"));
-        if self.search_query.is_empty() && !self.search_active {
-            surface.set_stringn(
-                input_area.x,
-                input_area.y,
-                &placeholder,
-                input_area.width as usize,
-                tui::ratatui::to_ratatui_style(styles.inactive),
-            );
-        } else {
-            crate::widgets::text_input(
-                surface,
-                input_area,
-                &self.search_query,
-                self.search_query.len(),
-                styles.text,
-                styles.selection,
-            );
-        }
-    }
-
-    fn render_list(
-        &mut self,
-        surface: &mut crate::render::CellSurface,
-        area: Rect,
-        styles: PkgManagerStyles,
-    ) {
-        let list_styles = crate::widgets::ListStyles {
-            normal: styles.background,
-            selected: styles.selection,
-            scrollbar_thumb: styles.inactive,
-            scrollbar_track: styles.background,
-        };
-        let marks = self
-            .rows
-            .iter()
-            .enumerate()
-            .filter_map(|(row_index, row)| match row {
-                PkgRow::Package(index) if self.marked.contains(&self.entries[*index].name) => {
-                    Some(row_index)
-                }
-                PkgRow::Update(index)
-                    if self.accepted_updates.contains(&self.updates[*index].name) =>
-                {
-                    Some(row_index)
-                }
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        let sticky_rows = self
-            .rows
-            .iter()
-            .enumerate()
-            .filter_map(|(index, row)| matches!(row, PkgRow::Section(_)).then_some(index))
-            .collect::<Vec<_>>();
-        let state = crate::widgets::item_list_with_marks_and_sticky(
-            surface,
-            area,
+        let tabs: Arc<[crate::widgets::Tab<'static>]> =
+            package_tabs(self.profile, update_count).into();
+        let active_tab = self.tab.index_in(self.profile.tabs());
+        let tab_options = crate::widgets::TabsOptions::new(active_tab)
+            .scroll(self.tab_scroll)
+            .separator(" ");
+        let tab_state =
+            crate::widgets::tabs_layout_with_options(&tabs, layout.tabs.width, &tab_options);
+        self.tab_scroll = tab_state.scroll;
+        self.tab_state = tab_state;
+        self.tab_area = layout.tabs;
+        self.scroll = clamp_list_scroll(
+            layout.list,
             self.rows.len(),
             (!self.rows.is_empty()).then_some(self.selection),
             self.scroll,
-            Some(crate::widgets::MarkedItems::new(&marks, "✓")),
-            Some(crate::widgets::StickyRows::new(&sticky_rows)),
-            &list_styles,
-            |row_index, row_area, surface, selected, _marked| {
-                self.render_row(surface, row_area, row_index, selected, styles);
-            },
         );
-        self.scroll = state.scroll;
-        if self.rows.is_empty() {
-            render_empty_state(surface, area, self.empty_state(), styles);
-        }
-    }
 
-    fn render_row(
-        &self,
-        surface: &mut crate::render::CellSurface,
-        area: Rect,
-        row_index: usize,
-        selected: bool,
-        styles: PkgManagerStyles,
-    ) {
-        let Some(row) = self.rows.get(row_index) else {
-            return;
-        };
-        match row {
-            PkgRow::Section(kind) => render_section_row(surface, area, *kind, styles),
-            PkgRow::Package(index) => {
-                let item = &self.entries[*index];
-                let progress = progress_snapshot().active.get(&item.name).cloned();
-                render_package_row(surface, area, item, progress.as_ref(), selected, styles);
-            }
-            PkgRow::Update(index) => {
-                let change = &self.updates[*index];
-                render_update_row(surface, area, change, selected, styles);
-            }
-            PkgRow::Registry(index) => {
-                let registry = &self.registries[*index];
-                render_registry_row(surface, area, registry, selected, styles);
-            }
+        let search_placeholder = self
+            .kind_filter
+            .filter(|_| self.profile.allows_kind_filter())
+            .map_or_else(
+                || self.profile.search_placeholder(self.kind_filter).to_owned(),
+                |kind| format!("kind:{kind}"),
+            );
+
+        PkgRenderSnapshot {
+            area,
+            layout,
+            entries: Arc::clone(&self.entries),
+            updates: Arc::clone(&self.updates),
+            registries: Arc::clone(&self.registries),
+            rows: Arc::clone(&self.rows),
+            tabs,
+            title: Arc::from(self.title.as_str()),
+            search_query: Arc::from(self.search_query.as_str()),
+            search_placeholder: Arc::from(search_placeholder),
+            empty_state: self.empty_state(),
+            status_legend: self.profile.status_legend(),
+            marked: Arc::clone(&self.marked),
+            accepted_updates: Arc::clone(&self.accepted_updates),
+            progress: Arc::clone(&self.progress),
+            theme: cx.theme_arc(),
+            config: Arc::new(PkgRenderConfig {
+                rounded_corners: cx.config().rounded_corners,
+            }),
+            selection: self.selection,
+            scroll: self.scroll,
+            active_tab,
+            tab_scroll: self.tab_scroll,
+            search_active: self.search_active,
+            refresh_active: self.active_refresh_request.is_some(),
+            now: SystemTime::now(),
         }
     }
 
     fn empty_state(&self) -> &'static str {
+        if !self.catalog_loaded {
+            return "loading package catalog";
+        }
+        if self.kind_filter == Some(PkgKind::Acp) {
+            return match self.tab {
+                PkgManagerTab::Browse => "no ACP agents match the filter",
+                PkgManagerTab::Installed => "no installed ACP agents",
+                PkgManagerTab::Updates => "no ACP agent updates - u to refresh",
+                PkgManagerTab::Registries => "no registry sources configured",
+            };
+        }
         match self.tab {
             PkgManagerTab::Browse => "no packages match the filter",
             PkgManagerTab::Installed => "no installed packages",
             PkgManagerTab::Updates => "no updates - u to refresh",
             PkgManagerTab::Registries => "no registry sources configured",
         }
-    }
-
-    fn render_detail(
-        &self,
-        surface: &mut crate::render::CellSurface,
-        area: Rect,
-        styles: PkgManagerStyles,
-    ) {
-        if area.width == 0 || area.height == 0 {
-            return;
-        }
-        surface.set_style(
-            tui::ratatui::to_ratatui_rect(area),
-            tui::ratatui::to_ratatui_style(styles.background),
-        );
-        match self.selected_row() {
-            Some(PkgRow::Package(index)) => {
-                render_package_detail(surface, area, &self.entries[*index], styles)
-            }
-            Some(PkgRow::Update(index)) => render_update_detail(
-                surface,
-                area,
-                &self.updates[*index],
-                self.accepted_updates.contains(&self.updates[*index].name),
-                styles,
-            ),
-            Some(PkgRow::Registry(index)) => {
-                render_registry_detail(surface, area, &self.registries[*index], styles)
-            }
-            _ => render_empty_state(surface, area, self.empty_state(), styles),
-        }
-    }
-
-    fn render_status(
-        &self,
-        surface: &mut crate::render::CellSurface,
-        area: Rect,
-        styles: PkgManagerStyles,
-    ) {
-        surface.set_style(
-            tui::ratatui::to_ratatui_rect(area),
-            tui::ratatui::to_ratatui_style(styles.title),
-        );
-        let progress = progress_snapshot();
-        let Some(status) = progress.statusline() else {
-            surface.set_stringn(
-                area.x,
-                area.y,
-                " pkg idle ",
-                area.width as usize,
-                tui::ratatui::to_ratatui_style(styles.inactive),
-            );
-            return;
-        };
-        let queue = progress.active_count().saturating_sub(1);
-        let label = if queue > 0 {
-            format!("{} ({queue} queued)", status.label)
-        } else {
-            status.label
-        };
-        let ratio = status.percent.map_or(0.0, |percent| percent as f32 / 100.0);
-        crate::widgets::progress_bar(
-            surface,
-            area,
-            ratio,
-            Some(&label),
-            crate::widgets::ProgressStyle {
-                track: styles.title,
-                fill: styles.warning,
-                label: styles.text,
-            },
-        );
     }
 
     #[cfg(feature = "storybook")]
@@ -1439,6 +2037,338 @@ impl PkgManager {
     }
 }
 
+fn package_tabs(
+    profile: PkgManagerProfile,
+    update_count: usize,
+) -> Vec<crate::widgets::Tab<'static>> {
+    profile
+        .tabs()
+        .iter()
+        .copied()
+        .map(|tab| {
+            let model = crate::widgets::Tab::new(tab.label());
+            if tab == PkgManagerTab::Updates {
+                model.badge(update_count.to_string())
+            } else {
+                model
+            }
+        })
+        .collect()
+}
+
+fn clamp_list_scroll(
+    area: Rect,
+    item_count: usize,
+    selection: Option<usize>,
+    scroll: usize,
+) -> usize {
+    if area.width == 0 || area.height == 0 {
+        return 0;
+    }
+    helix_view::list_nav::ListViewport::new(item_count, selection, area.height as usize, scroll)
+        .selected_visible_range()
+        .start
+}
+
+impl PkgRenderSnapshot {
+    fn render(
+        self,
+        cancellation: &crate::render::RenderCancellation,
+    ) -> crate::render::RenderOutput {
+        let mut output = crate::render::RenderOutput::sparse(self.area);
+        paint_pkg_manager(output.surface_mut(), &self, cancellation);
+        output
+    }
+}
+
+fn paint_pkg_manager(
+    surface: &mut crate::render::CellSurface,
+    snapshot: &PkgRenderSnapshot,
+    cancellation: &crate::render::RenderCancellation,
+) {
+    if cancellation.is_cancelled() || snapshot.area.width == 0 || snapshot.area.height == 0 {
+        return;
+    }
+
+    let styles = PkgManagerStyles::from_theme(&snapshot.theme);
+    let panel_style =
+        crate::widgets::PanelStyle::new(styles.background, styles.border, styles.title);
+    let title = format!(" {} ", snapshot.title);
+    crate::widgets::Panel::framed(panel_style, snapshot.config.rounded_corners)
+        .title(&title)
+        .render(surface, snapshot.area);
+
+    if cancellation.is_cancelled() {
+        return;
+    }
+    paint_pkg_tabs(surface, snapshot, styles);
+    if cancellation.is_cancelled() {
+        return;
+    }
+    paint_pkg_search(surface, snapshot, styles);
+    if cancellation.is_cancelled() {
+        return;
+    }
+    paint_pkg_list(surface, snapshot, styles, cancellation);
+    if cancellation.is_cancelled() {
+        return;
+    }
+    paint_pkg_detail(surface, snapshot, styles, cancellation);
+    if cancellation.is_cancelled() {
+        return;
+    }
+    paint_pkg_status(surface, snapshot, styles);
+}
+
+fn paint_pkg_tabs(
+    surface: &mut crate::render::CellSurface,
+    snapshot: &PkgRenderSnapshot,
+    styles: PkgManagerStyles,
+) {
+    let state = crate::widgets::tabs_with_options(
+        surface,
+        snapshot.layout.tabs,
+        &snapshot.tabs,
+        crate::widgets::TabsOptions::new(snapshot.active_tab)
+            .scroll(snapshot.tab_scroll)
+            .separator(" "),
+        crate::widgets::TabsStyle {
+            background: styles.background,
+            active: styles.title,
+            inactive: styles.inactive,
+            badge: styles.warning,
+            separator: styles.background,
+            overflow: styles.inactive,
+            hover: styles.selection,
+        },
+    );
+    debug_assert_eq!(state.scroll, snapshot.tab_scroll);
+}
+
+fn paint_pkg_search(
+    surface: &mut crate::render::CellSurface,
+    snapshot: &PkgRenderSnapshot,
+    styles: PkgManagerStyles,
+) {
+    let area = snapshot.layout.search;
+    let input_area = snapshot.layout.search_input;
+    surface.set_style(
+        tui::ratatui::to_ratatui_rect(area),
+        tui::ratatui::to_ratatui_style(styles.background),
+    );
+    let marker_style = if snapshot.search_active {
+        styles.title
+    } else {
+        styles.inactive
+    };
+    if area.width > 1 {
+        surface.set_stringn(
+            area.x.saturating_add(1),
+            area.y,
+            "/",
+            1,
+            tui::ratatui::to_ratatui_style(marker_style),
+        );
+    }
+    if snapshot.search_query.is_empty() && !snapshot.search_active {
+        surface.set_stringn(
+            input_area.x,
+            input_area.y,
+            &snapshot.search_placeholder,
+            input_area.width as usize,
+            tui::ratatui::to_ratatui_style(styles.inactive),
+        );
+    } else {
+        crate::widgets::text_input(
+            surface,
+            input_area,
+            &snapshot.search_query,
+            snapshot.search_query.len(),
+            styles.text,
+            styles.selection,
+        );
+    }
+}
+
+fn paint_pkg_list(
+    surface: &mut crate::render::CellSurface,
+    snapshot: &PkgRenderSnapshot,
+    styles: PkgManagerStyles,
+    cancellation: &crate::render::RenderCancellation,
+) {
+    let list_styles = crate::widgets::ListStyles {
+        normal: styles.background,
+        selected: styles.selection,
+        scrollbar_thumb: styles.inactive,
+        scrollbar_track: styles.background,
+    };
+    let sticky_rows = snapshot
+        .rows
+        .iter()
+        .enumerate()
+        .filter_map(|(index, row)| matches!(row, PkgRow::Section(_)).then_some(index))
+        .collect::<Vec<_>>();
+    let state = crate::widgets::item_list_with_marks_and_sticky(
+        surface,
+        snapshot.layout.list,
+        snapshot.rows.len(),
+        (!snapshot.rows.is_empty()).then_some(snapshot.selection),
+        snapshot.scroll,
+        None,
+        Some(crate::widgets::StickyRows::new(&sticky_rows)),
+        &list_styles,
+        |row_index, row_area, surface, selected, _marked| {
+            if !cancellation.is_cancelled() {
+                paint_pkg_row(surface, row_area, row_index, selected, snapshot, styles);
+            }
+        },
+    );
+    debug_assert_eq!(state.scroll, snapshot.scroll);
+    if snapshot.rows.is_empty() && !cancellation.is_cancelled() {
+        render_empty_state(surface, snapshot.layout.list, snapshot.empty_state, styles);
+    }
+}
+
+fn paint_pkg_row(
+    surface: &mut crate::render::CellSurface,
+    area: Rect,
+    row_index: usize,
+    selected: bool,
+    snapshot: &PkgRenderSnapshot,
+    styles: PkgManagerStyles,
+) {
+    let Some(row) = snapshot.rows.get(row_index) else {
+        return;
+    };
+    match row {
+        PkgRow::Section(kind) => render_section_row(surface, area, *kind, styles),
+        PkgRow::Package(index) => {
+            let Some(item) = snapshot.entries.get(*index) else {
+                return;
+            };
+            let progress = snapshot.progress.active.get(&item.name);
+            render_package_row(
+                surface,
+                area,
+                item,
+                progress,
+                selected,
+                snapshot.marked.contains(&item.name),
+                styles,
+            );
+        }
+        PkgRow::Update(index) => {
+            let Some(change) = snapshot.updates.get(*index) else {
+                return;
+            };
+            render_update_row(
+                surface,
+                area,
+                change,
+                selected,
+                snapshot.accepted_updates.contains(&change.name),
+                styles,
+            );
+        }
+        PkgRow::Registry(index) => {
+            if let Some(registry) = snapshot.registries.get(*index) {
+                render_registry_row(surface, area, registry, selected, styles);
+            }
+        }
+    }
+}
+
+fn paint_pkg_detail(
+    surface: &mut crate::render::CellSurface,
+    snapshot: &PkgRenderSnapshot,
+    styles: PkgManagerStyles,
+    cancellation: &crate::render::RenderCancellation,
+) {
+    let area = snapshot.layout.detail;
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    surface.set_style(
+        tui::ratatui::to_ratatui_rect(area),
+        tui::ratatui::to_ratatui_style(styles.background),
+    );
+    match snapshot.rows.get(snapshot.selection) {
+        Some(PkgRow::Package(index)) => {
+            if let Some(item) = snapshot.entries.get(*index) {
+                render_package_detail(surface, area, item, styles);
+            }
+        }
+        Some(PkgRow::Update(index)) => {
+            if let Some(change) = snapshot.updates.get(*index) {
+                render_update_detail(
+                    surface,
+                    area,
+                    change,
+                    snapshot.accepted_updates.contains(&change.name),
+                    styles,
+                    snapshot.now,
+                    cancellation,
+                );
+            }
+        }
+        Some(PkgRow::Registry(index)) => {
+            if let Some(registry) = snapshot.registries.get(*index) {
+                render_registry_detail(surface, area, registry, styles);
+            }
+        }
+        _ => render_empty_state(surface, area, snapshot.empty_state, styles),
+    }
+}
+
+fn paint_pkg_status(
+    surface: &mut crate::render::CellSurface,
+    snapshot: &PkgRenderSnapshot,
+    styles: PkgManagerStyles,
+) {
+    let area = snapshot.layout.status;
+    surface.set_style(
+        tui::ratatui::to_ratatui_rect(area),
+        tui::ratatui::to_ratatui_style(styles.title),
+    );
+    let Some(status) = snapshot.progress.statusline() else {
+        if snapshot.refresh_active {
+            surface.set_stringn(
+                area.x,
+                area.y,
+                " ◍ Loading package data ",
+                area.width as usize,
+                tui::ratatui::to_ratatui_style(styles.warning),
+            );
+            return;
+        }
+        surface.set_stringn(
+            area.x,
+            area.y,
+            snapshot.status_legend,
+            area.width as usize,
+            tui::ratatui::to_ratatui_style(styles.inactive),
+        );
+        return;
+    };
+    let queue = snapshot.progress.active_count().saturating_sub(1);
+    let label = if queue > 0 {
+        format!("{} ({queue} queued)", status.label)
+    } else {
+        status.label
+    };
+    let label = status.percent.map_or_else(
+        || format!(" ◍ {label} "),
+        |percent| format!(" ◍ {label} {percent:>3}% "),
+    );
+    surface.set_stringn(
+        area.x,
+        area.y,
+        &label,
+        area.width as usize,
+        tui::ratatui::to_ratatui_style(styles.warning),
+    );
+}
+
 #[cfg(feature = "storybook")]
 fn story_item(
     name: &str,
@@ -1447,10 +2377,17 @@ fn story_item(
     languages: &str,
 ) -> PkgManagerItem {
     let installed = receipt.as_ref().map(|receipt| receipt.version.clone());
+    let provider = installed
+        .as_ref()
+        .map(|version| CapabilityProvider::Managed {
+            version: version.clone(),
+        })
+        .unwrap_or(CapabilityProvider::Missing);
     PkgManagerItem {
         name: name.to_owned(),
         kind,
         installed,
+        provider,
         latest: "registry".to_owned(),
         description: format!("{name} package for {languages} development."),
         homepage: Some(format!("https://example.invalid/{name}")),
@@ -1462,6 +2399,7 @@ fn story_item(
         receipt,
         doctor: "ok".to_owned(),
         problem: None,
+        installable: true,
         search_blob: format!("{name}\n{kind}\n{languages}"),
     }
 }
@@ -1551,7 +2489,7 @@ fn row_state(
         RowState::Problem
     } else if progress.is_some() {
         RowState::Working
-    } else if item.installed.is_some() {
+    } else if item.is_usable() {
         RowState::Installed
     } else {
         RowState::Available
@@ -1592,6 +2530,7 @@ fn section_label(kind: PkgKind) -> &'static str {
         PkgKind::Linter => "Linters",
         PkgKind::Grammar => "Grammars",
         PkgKind::Plugin => "Plugins",
+        PkgKind::Acp => "ACP agents",
     }
 }
 
@@ -1601,6 +2540,7 @@ fn render_package_row(
     item: &PkgManagerItem,
     progress: Option<&PkgStatusline>,
     selected: bool,
+    marked: bool,
     styles: PkgManagerStyles,
 ) {
     let state = row_state(item, progress, item.problem.as_deref());
@@ -1610,8 +2550,12 @@ fn render_package_row(
                 .percent
                 .map(|percent| format!("installing {percent}%"))
         })
-        .unwrap_or_else(|| status_label(item).to_owned());
-    let version = item.installed.as_deref().unwrap_or(&item.latest);
+        .unwrap_or_else(|| status_label(item));
+    let version = item
+        .installed
+        .as_deref()
+        .or_else(|| item.provider.command())
+        .unwrap_or(&item.latest);
     render_columns(
         surface,
         area,
@@ -1621,6 +2565,7 @@ fn render_package_row(
         item.problem.as_deref().unwrap_or(&status),
         &item.languages,
         selected,
+        marked,
         styles,
     );
 }
@@ -1630,6 +2575,7 @@ fn render_update_row(
     area: Rect,
     change: &PackageChange,
     selected: bool,
+    marked: bool,
     styles: PkgManagerStyles,
 ) {
     let state = update_row_state(change);
@@ -1653,6 +2599,7 @@ fn render_update_row(
         status,
         change.kind.default_category(),
         selected,
+        marked,
         styles,
     );
 }
@@ -1678,6 +2625,7 @@ fn render_registry_row(
         &registry.doctor,
         &registry.source,
         selected,
+        false,
         styles,
     );
 }
@@ -1695,6 +2643,7 @@ fn render_columns(
     status: &str,
     chips: &str,
     selected: bool,
+    marked: bool,
     styles: PkgManagerStyles,
 ) {
     if area.width == 0 {
@@ -1710,12 +2659,13 @@ fn render_columns(
         tui::ratatui::to_ratatui_style(base),
     );
     let state_style = styles.row_state(state, selected);
+    let glyph_style = row_glyph_style(styles, state, marked);
     surface.set_stringn(
         area.x,
         area.y,
-        state.glyph(),
+        row_glyph(state, marked),
         1,
-        tui::ratatui::to_ratatui_style(state_style),
+        tui::ratatui::to_ratatui_style(glyph_style),
     );
 
     let width = area.width as usize;
@@ -1750,11 +2700,55 @@ fn write_cell(
     surface.set_stringn(x, y, &text, width, tui::ratatui::to_ratatui_style(style));
 }
 
-fn status_label(item: &PkgManagerItem) -> &'static str {
-    if item.installed.is_some() {
-        "installed"
+fn status_label(item: &PkgManagerItem) -> String {
+    match &item.provider {
+        CapabilityProvider::Managed { version } => format!("installed {version}"),
+        CapabilityProvider::Command { source, .. } => match source {
+            CapabilityProviderSource::Path => "on PATH".to_owned(),
+            other => other.label().to_owned(),
+        },
+        CapabilityProvider::RuntimeGrammar { .. } => {
+            CapabilityProviderSource::Runtime.label().to_owned()
+        }
+        CapabilityProvider::BrokenManaged { version, .. } => {
+            format!("broken pkg {version}")
+        }
+        CapabilityProvider::Missing => {
+            if !item.is_installable() {
+                "unpackaged".to_owned()
+            } else {
+                "available".to_owned()
+            }
+        }
+    }
+}
+
+fn remove_confirmation_label(names: &[String], skipped: usize) -> String {
+    let mut label = if names.len() == 1 {
+        format!("Remove package {}?", names[0])
     } else {
-        "available"
+        format!("Remove {} selected packages?", names.len())
+    };
+    if skipped > 0 {
+        let noun = if skipped == 1 { "package" } else { "packages" };
+        label.push_str(&format!(" ({skipped} selected {noun} not pkg-managed)"));
+    }
+    label
+}
+
+const fn row_glyph(state: RowState, marked: bool) -> &'static str {
+    if marked && !matches!(state, RowState::Working | RowState::Problem) {
+        "●"
+    } else {
+        state.glyph()
+    }
+}
+
+fn row_glyph_style(styles: PkgManagerStyles, state: RowState, marked: bool) -> Style {
+    if marked && !matches!(state, RowState::Working | RowState::Problem) {
+        styles.warning
+    } else {
+        styles.row_state(state, false)
     }
 }
 
@@ -1781,20 +2775,35 @@ fn render_package_detail(
         styles.title,
     );
     let receipt = item.receipt.as_ref();
-    let receipt_line = receipt.map_or_else(
-        || "not installed".to_owned(),
-        |receipt| {
-            let verified = if receipt.archive_sha256.is_empty() {
-                "sha256 -"
-            } else {
-                "sha256 ok"
-            };
-            format!(
-                "installed {} ({}, {})",
-                receipt.version, receipt.source, verified
-            )
-        },
-    );
+    let receipt_line = if let Some(receipt) = receipt {
+        let verified = if receipt.archive_sha256.is_empty() {
+            "sha256 -"
+        } else {
+            "sha256 ok"
+        };
+        format!(
+            "installed {} ({}, {})",
+            receipt.version, receipt.source, verified
+        )
+    } else if let CapabilityProvider::Command {
+        command,
+        path,
+        source,
+    } = &item.provider
+    {
+        format!(
+            "usable via {}: {} ({})",
+            source.label(),
+            command,
+            path.display()
+        )
+    } else if let CapabilityProvider::RuntimeGrammar { grammar } = &item.provider {
+        format!("usable via runtime: {grammar} (runtime grammar)")
+    } else if !item.is_installable() {
+        "configured in languages.toml; no package recipe".to_owned()
+    } else {
+        "not installed".to_owned()
+    };
     write_line(
         surface,
         area,
@@ -1842,6 +2851,14 @@ fn render_package_detail(
         ),
         styles.inactive,
     );
+    if item.kind == PkgKind::Acp {
+        let action = if item.is_usable() {
+            "action: enter/c connect"
+        } else {
+            "action: enter/i install"
+        };
+        write_line(surface, area, &mut y, action, styles.text);
+    }
     if let Some(homepage) = &item.homepage {
         write_line(
             surface,
@@ -1859,6 +2876,8 @@ fn render_update_detail(
     change: &PackageChange,
     accepted: bool,
     styles: PkgManagerStyles,
+    now: SystemTime,
+    cancellation: &crate::render::RenderCancellation,
 ) {
     let mut y = area.y;
     let candidate = change.candidate_version().unwrap_or("-");
@@ -1885,11 +2904,7 @@ fn render_update_detail(
         styles.text,
     );
     if let Some(candidate) = &change.candidate {
-        let release = release_age_label(
-            candidate.published_at.as_deref(),
-            &candidate.version,
-            SystemTime::now(),
-        );
+        let release = release_age_label(candidate.published_at.as_deref(), &candidate.version, now);
         write_line(
             surface,
             area,
@@ -1902,6 +2917,9 @@ fn render_update_detail(
         }
     }
     for warning in &change.warnings {
+        if cancellation.is_cancelled() {
+            return;
+        }
         write_text_layout(
             surface,
             area,
@@ -1909,6 +2927,9 @@ fn render_update_detail(
             &format!("warning: {warning}"),
             styles.warning,
         );
+    }
+    if cancellation.is_cancelled() {
+        return;
     }
     if let Some(error) = &change.error {
         write_text_layout(
@@ -2016,8 +3037,9 @@ fn write_text_layout(
 }
 
 impl Component for PkgManager {
-    fn render(&mut self, area: Rect, surface: &mut crate::render::CellSurface, cx: &RenderContext) {
-        self.render_surface(area, surface, cx);
+    fn prepare_render(&mut self, area: Rect, cx: &RenderContext) -> crate::render::PreparedRender {
+        let snapshot = self.prepare_render_snapshot(area, cx);
+        crate::render::PreparedRender::deferred(move |cancellation| snapshot.render(cancellation))
     }
 
     fn handle_event(&mut self, event: &Event, cx: &mut Context) -> EventResult {
@@ -2049,7 +3071,8 @@ impl Component for PkgManager {
                 return EventResult::Consumed(None);
             }
             Event::Paste(_) => return EventResult::Consumed(None),
-            Event::IdleTimeout | Event::FocusGained | Event::FocusLost => {
+            Event::IdleTimeout | Event::FocusGained => return EventResult::Ignored(None),
+            Event::FocusLost => {
                 return EventResult::Ignored(None);
             }
         };
@@ -2082,7 +3105,7 @@ impl Component for PkgManager {
             return EventResult::Consumed(None);
         }
 
-        let Some(binding) = Self::binding_for_key(&key) else {
+        let Some(binding) = self.binding_for_key(&key) else {
             return EventResult::Consumed(None);
         };
 
@@ -2100,13 +3123,22 @@ impl Component for PkgManager {
             PkgAction::PreviousTab => self.cycle_tab(-1),
             PkgAction::CycleKind => self.cycle_kind_filter(),
             PkgAction::ToggleDetail => self.detail_zoom = !self.detail_zoom,
-            PkgAction::Install => self.install_selected(cx),
+            PkgAction::Install => {
+                if let Some(action) = self.activate_selected(cx) {
+                    return EventResult::Consumed(Some(action));
+                }
+            }
             PkgAction::Remove => return self.remove_selected(cx),
             PkgAction::UpdateSelected => self.update_selected(cx),
             PkgAction::ApplyUpdates => self.apply_updates(cx),
             PkgAction::Rollback => self.rollback_selected(cx),
             PkgAction::Doctor => self.doctor_selected(cx),
             PkgAction::RegistryUpdate => self.registry_update_selected(cx),
+            PkgAction::Connect => {
+                if let Some(action) = self.connect_selected_agent(cx) {
+                    return EventResult::Consumed(Some(action));
+                }
+            }
             PkgAction::Help => self.toggle_help(cx.editor),
             PkgAction::Escape => {
                 self.clear_help(cx.editor);
@@ -2116,7 +3148,7 @@ impl Component for PkgManager {
                     self.search_query.clear();
                     self.rebuild_filter();
                 } else if !self.marked.is_empty() {
-                    self.marked.clear();
+                    Arc::make_mut(&mut self.marked).clear();
                 } else {
                     return EventResult::Consumed(Some(PostAction::PopLayer {
                         model_layer: None,
@@ -2189,6 +3221,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn pkg_render_snapshot_and_prepared_render_are_send() {
+        fn assert_send<T: Send>() {}
+
+        assert_send::<PkgRenderSnapshot>();
+        assert_send::<crate::render::PreparedRender>();
+    }
+
+    #[test]
     fn pkg_manager_constructs_headlessly() {
         let tokio_runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -2201,16 +3241,166 @@ mod tests {
                 runtime.clone(),
             )
             .build();
-            let (ingress, _rx) = crate::runtime::RuntimeIngress::channel(runtime.work().clone());
+            let (ingress, _rx) = crate::runtime::RuntimeIngress::channel(runtime.clone());
 
             let _manager = manager(&editor, ingress).expect("pkg manager opens");
         });
     }
 
     #[test]
+    fn prepare_render_updates_interaction_state_without_changing_cursor() {
+        let area = Rect::new(0, 0, 18, 24);
+        let runtime = helix_runtime::test::runtime();
+        let editor = helix_view::editor::EditorBuilder::new(area, runtime.clone()).build();
+        let (ingress, _rx) = crate::runtime::RuntimeIngress::channel(runtime.clone());
+        let render_context = RenderContext::new(&editor, ingress.clone(), editor.redraw_handle());
+        let entries = (0..24)
+            .map(|index| test_item(&format!("pkg-{index:02}"), PkgKind::Lsp, None, "rust"))
+            .collect();
+        let updates = (0..24)
+            .map(|index| {
+                test_change(
+                    &format!("pkg-{index:02}"),
+                    PkgKind::Lsp,
+                    Some("1"),
+                    Some("2"),
+                    None,
+                )
+            })
+            .collect();
+        let mut manager = PkgManager::new(
+            PkgManagerData {
+                entries,
+                updates,
+                registries: Vec::new(),
+            },
+            ingress,
+        );
+        manager.set_tab(PkgManagerTab::Updates);
+        manager.move_last();
+        manager.scroll = usize::MAX;
+        manager.search_active = true;
+        manager.search_query = "a long package search".to_owned();
+        let cursor_before = manager.cursor(area, &editor);
+        let layout = PkgManager::layout(area, manager.detail_zoom);
+        let expected_scroll = clamp_list_scroll(
+            layout.list,
+            manager.rows.len(),
+            Some(manager.selection),
+            manager.scroll,
+        );
+
+        let _prepared = manager.prepare_render(area, &render_context);
+
+        assert_eq!(manager.tab_area, layout.tabs);
+        assert_eq!(manager.scroll, expected_scroll);
+        assert!(manager.tab_scroll > 0);
+        let active_range = manager
+            .tab_state
+            .tab_ranges
+            .iter()
+            .find(|range| range.index == PkgManagerTab::Updates.index_in(manager.profile.tabs()))
+            .expect("active tab is visible");
+        assert_eq!(
+            manager.tab_state.tab_at(active_range.visible.start),
+            Some(PkgManagerTab::Updates.index_in(manager.profile.tabs()))
+        );
+        assert_eq!(manager.cursor(area, &editor), cursor_before);
+        assert!(matches!(cursor_before, (Some(_), CursorKind::Bar)));
+    }
+
+    #[test]
+    fn equivalent_package_manager_snapshots_render_match() {
+        let area = Rect::new(0, 0, 80, 24);
+        let runtime = helix_runtime::test::runtime();
+        let editor = helix_view::editor::EditorBuilder::new(area, runtime.clone()).build();
+        let (ingress, _rx) = crate::runtime::RuntimeIngress::channel(runtime.clone());
+        let render_context = RenderContext::new(&editor, ingress.clone(), editor.redraw_handle());
+        let data = PkgManagerData {
+            entries: (0..24)
+                .map(|index| {
+                    test_item(
+                        &format!("pkg-{index:02}"),
+                        PkgKind::Lsp,
+                        (index % 2 == 0).then_some("1"),
+                        "rust",
+                    )
+                })
+                .collect(),
+            updates: vec![test_change(
+                "pkg-00",
+                PkgKind::Lsp,
+                Some("1"),
+                Some("2"),
+                None,
+            )],
+            registries: Vec::new(),
+        };
+        let mut direct_manager = PkgManager::new(data.clone(), ingress.clone());
+        let mut deferred_manager = PkgManager::new(data, ingress);
+        for manager in [&mut direct_manager, &mut deferred_manager] {
+            manager.search_active = true;
+            manager.search_query = "pkg".to_owned();
+            manager.rebuild_filter();
+            manager.move_last();
+            manager.scroll = usize::MAX;
+            Arc::make_mut(&mut manager.marked).insert("pkg-02".to_owned());
+            manager.apply_progress_event(&OpEvent::Progress {
+                name: "pkg-04".to_owned(),
+                message: "download".to_owned(),
+                percent: Some(42),
+            });
+        }
+        let mut direct_surface =
+            crate::render::CellSurface::empty(tui::ratatui::to_ratatui_rect(area));
+        let mut deferred_surface =
+            crate::render::CellSurface::empty(tui::ratatui::to_ratatui_rect(area));
+
+        let prepared = direct_manager.prepare_render(area, &render_context);
+        crate::render::CacheStore::default().compose(prepared, &mut direct_surface);
+        let prepared = deferred_manager.prepare_render(area, &render_context);
+        crate::render::CacheStore::default().compose(prepared, &mut deferred_surface);
+
+        assert_eq!(direct_surface, deferred_surface);
+        assert_eq!(direct_manager.scroll, deferred_manager.scroll);
+        assert_eq!(direct_manager.tab_state, deferred_manager.tab_state);
+        assert_eq!(direct_manager.tab_area, deferred_manager.tab_area);
+    }
+
+    #[test]
+    fn cancelled_package_render_snapshot_does_not_paint() {
+        use std::sync::atomic::AtomicU64;
+
+        let area = Rect::new(0, 0, 40, 12);
+        let runtime = helix_runtime::test::runtime();
+        let editor = helix_view::editor::EditorBuilder::new(area, runtime.clone()).build();
+        let (ingress, _rx) = crate::runtime::RuntimeIngress::channel(runtime.clone());
+        let render_context = RenderContext::new(&editor, ingress.clone(), editor.redraw_handle());
+        let mut manager = PkgManager::new(
+            PkgManagerData {
+                entries: vec![test_item("demo", PkgKind::Lsp, None, "rust")],
+                updates: Vec::new(),
+                registries: Vec::new(),
+            },
+            ingress,
+        );
+        let snapshot = manager.prepare_render_snapshot(area, &render_context);
+        let cancellation =
+            crate::render::RenderCancellation::for_sequence(Arc::new(AtomicU64::new(2)), 1);
+
+        let output = snapshot.render(&cancellation);
+
+        for y in area.top()..area.bottom() {
+            for x in area.left()..area.right() {
+                assert_eq!(output.surface()[(x, y)].symbol(), " ");
+            }
+        }
+    }
+
+    #[test]
     fn tab_model_uses_update_badge_count_from_plan() {
         let runtime = helix_runtime::test::runtime();
-        let (ingress, _rx) = crate::runtime::RuntimeIngress::channel(runtime.work().clone());
+        let (ingress, _rx) = crate::runtime::RuntimeIngress::channel(runtime.clone());
         let mut manager = PkgManager::new(
             PkgManagerData {
                 entries: vec![test_item("rust-analyzer", PkgKind::Lsp, Some("1"), "rust")],
@@ -2226,7 +3416,10 @@ mod tests {
             ingress,
         );
 
-        assert_eq!(PkgManagerTab::from_index(2), Some(PkgManagerTab::Updates));
+        assert_eq!(
+            PkgManagerTab::from_index_in(2, manager.profile.tabs()),
+            Some(PkgManagerTab::Updates)
+        );
         manager.set_tab(PkgManagerTab::Updates);
         assert!(matches!(manager.rows[0], PkgRow::Section(PkgKind::Lsp)));
         assert_eq!(
@@ -2240,15 +3433,91 @@ mod tests {
     }
 
     #[test]
+    fn acp_manager_defaults_to_acp_packages() {
+        let runtime = helix_runtime::test::runtime();
+        let (ingress, _rx) = crate::runtime::RuntimeIngress::channel(runtime.clone());
+        let manager = PkgManager::new_with_options(
+            PkgManagerData {
+                entries: vec![
+                    test_item("rust-analyzer", PkgKind::Lsp, Some("1"), "rust"),
+                    test_item("claude-agent", PkgKind::Acp, None, ""),
+                ],
+                updates: Vec::new(),
+                registries: Vec::new(),
+            },
+            ingress,
+            "ACP Agents",
+            Some(PkgKind::Acp),
+        );
+
+        assert_eq!(manager.title, "ACP Agents");
+        assert_eq!(manager.profile, PkgManagerProfile::AcpAgents);
+        assert_eq!(manager.kind_filter, Some(PkgKind::Acp));
+        assert_eq!(
+            manager.profile.tabs(),
+            &[
+                PkgManagerTab::Browse,
+                PkgManagerTab::Installed,
+                PkgManagerTab::Updates
+            ]
+        );
+        assert!(manager
+            .rows
+            .iter()
+            .all(|row| matches!(row, PkgRow::Section(PkgKind::Acp) | PkgRow::Package(1))));
+    }
+
+    #[test]
+    fn acp_manager_hides_package_only_actions() {
+        let runtime = helix_runtime::test::runtime();
+        let (ingress, _rx) = crate::runtime::RuntimeIngress::channel(runtime.clone());
+        let mut manager = PkgManager::new_with_options(
+            PkgManagerData {
+                entries: Vec::new(),
+                updates: Vec::new(),
+                registries: Vec::new(),
+            },
+            ingress,
+            "ACP Agents",
+            Some(PkgKind::Acp),
+        );
+
+        assert!(manager
+            .binding_for_key(&KeyEvent {
+                code: KeyCode::Char('c'),
+                modifiers: KeyModifiers::NONE,
+            })
+            .is_some());
+        assert!(manager
+            .binding_for_key(&KeyEvent {
+                code: KeyCode::Char('f'),
+                modifiers: KeyModifiers::NONE,
+            })
+            .is_none());
+        assert!(manager
+            .binding_for_key(&KeyEvent {
+                code: KeyCode::Char('R'),
+                modifiers: KeyModifiers::NONE,
+            })
+            .is_none());
+
+        manager.set_tab_index(3);
+        assert_eq!(manager.tab, PkgManagerTab::Browse);
+    }
+
+    #[test]
     fn row_state_maps_installed_available_working_problem() {
         let installed = test_item("installed", PkgKind::Lsp, Some("1"), "rust");
         let available = test_item("available", PkgKind::Lsp, None, "rust");
+        let mut external = test_item("external", PkgKind::Lsp, None, "rust");
+        external.provider = test_external_provider("external");
         let progress = PkgStatusline {
             label: "pkg available".to_owned(),
             percent: Some(42),
         };
         assert_eq!(row_state(&installed, None, None), RowState::Installed);
         assert_eq!(row_state(&available, None, None), RowState::Available);
+        assert_eq!(row_state(&external, None, None), RowState::Installed);
         assert_eq!(
             row_state(&available, Some(&progress), None),
             RowState::Working
@@ -2267,9 +3536,185 @@ mod tests {
     }
 
     #[test]
+    fn row_glyph_uses_inline_mark_without_hiding_progress_or_errors() {
+        assert_eq!(row_glyph(RowState::Available, false), "○");
+        assert_eq!(row_glyph(RowState::Available, true), "●");
+        assert_eq!(row_glyph(RowState::Update, true), "●");
+        assert_eq!(row_glyph(RowState::Installed, true), "●");
+        assert_eq!(row_glyph(RowState::Working, true), "◍");
+        assert_eq!(row_glyph(RowState::Problem, true), "⚠");
+    }
+
+    #[test]
+    fn package_rows_label_installed_state_explicitly() {
+        let installed = test_item("installed", PkgKind::Lsp, Some("1.2.3"), "rust");
+        let available = test_item("available", PkgKind::Lsp, None, "rust");
+        let mut external = test_item("external", PkgKind::Lsp, None, "rust");
+        external.provider = test_external_provider("external");
+
+        assert_eq!(status_label(&installed), "installed 1.2.3");
+        assert_eq!(status_label(&external), "on PATH");
+        assert_eq!(status_label(&available), "available");
+    }
+
+    #[test]
+    fn config_only_rows_are_not_installable() {
+        let mut configured = test_item("demo-ls", PkgKind::Lsp, None, "demo");
+        configured.installable = false;
+
+        assert!(!configured.is_installable());
+        assert_eq!(status_label(&configured), "unpackaged");
+    }
+
+    #[test]
+    fn configured_tools_include_default_health_commands() {
+        let grammars = helix_loader::grammar::configured_grammar_names().unwrap();
+        let tools = configured_tools(&default_lang_config(), &grammars);
+
+        assert!(tools.iter().any(|tool| {
+            tool.kind == PkgKind::Lsp
+                && tool.name == "rust-analyzer"
+                && tool.command == "rust-analyzer"
+                && tool.languages.contains("rust")
+        }));
+        assert!(tools.iter().any(|tool| {
+            tool.kind == PkgKind::Grammar && tool.name == "rust" && tool.languages.contains("rust")
+        }));
+        assert!(
+            tools
+                .iter()
+                .filter(|tool| tool.kind == PkgKind::Grammar)
+                .count()
+                > 250
+        );
+    }
+
+    #[test]
+    fn installed_tab_includes_external_tools_without_pkg_receipts() {
+        let runtime = helix_runtime::test::runtime();
+        let (ingress, _rx) = crate::runtime::RuntimeIngress::channel(runtime.clone());
+        let available = test_item("available", PkgKind::Lsp, None, "rust");
+        let mut external = test_item("external", PkgKind::Lsp, None, "rust");
+        external.provider = test_external_provider("external");
+        let mut manager = PkgManager::new(
+            PkgManagerData {
+                entries: vec![available, external],
+                updates: Vec::new(),
+                registries: Vec::new(),
+            },
+            ingress,
+        );
+
+        manager.set_tab(PkgManagerTab::Installed);
+
+        assert!(manager.rows.contains(&PkgRow::Package(1)));
+        assert!(!manager.rows.contains(&PkgRow::Package(0)));
+    }
+
+    #[test]
+    fn broken_managed_package_stays_installed_and_can_be_repaired() {
+        let runtime = helix_runtime::test::runtime();
+        let (ingress, _rx) = crate::runtime::RuntimeIngress::channel(runtime.clone());
+        let mut broken = test_item("broken", PkgKind::Lsp, Some("1.2.3"), "rust");
+        broken.provider = CapabilityProvider::BrokenManaged {
+            package: "broken".to_owned(),
+            version: "1.2.3".to_owned(),
+            message: "managed command is missing".to_owned(),
+        };
+        let mut manager = PkgManager::new(
+            PkgManagerData {
+                entries: vec![broken],
+                updates: Vec::new(),
+                registries: Vec::new(),
+            },
+            ingress,
+        );
+
+        manager.set_tab(PkgManagerTab::Installed);
+
+        assert!(manager.rows.contains(&PkgRow::Package(0)));
+        assert!(manager.entries[0].is_pkg_managed());
+        assert!(!manager.entries[0].is_usable());
+        assert!(manager.entries[0].can_install());
+        assert_eq!(status_label(&manager.entries[0]), "broken pkg 1.2.3");
+    }
+
+    #[test]
+    fn installability_distinguishes_managed_external_and_broken_providers() {
+        let managed = test_item("managed", PkgKind::Lsp, Some("1"), "rust");
+        let mut external = test_item("external", PkgKind::Lsp, None, "rust");
+        external.provider = test_external_provider("external");
+        let mut broken = test_item("broken", PkgKind::Lsp, Some("1"), "rust");
+        broken.provider = CapabilityProvider::BrokenManaged {
+            package: "broken".to_owned(),
+            version: "1".to_owned(),
+            message: "missing".to_owned(),
+        };
+
+        assert!(!managed.can_install());
+        assert!(external.can_install());
+        assert!(broken.can_install());
+    }
+
+    #[test]
+    fn tab_keys_switch_package_manager_tabs() {
+        let runtime = helix_runtime::test::runtime();
+        let (ingress, _rx) = crate::runtime::RuntimeIngress::channel(runtime.clone());
+        let manager = PkgManager::new(
+            PkgManagerData {
+                entries: Vec::new(),
+                updates: Vec::new(),
+                registries: Vec::new(),
+            },
+            ingress,
+        );
+        let next = manager
+            .binding_for_key(&KeyEvent {
+                code: KeyCode::Tab,
+                modifiers: KeyModifiers::NONE,
+            })
+            .expect("tab binding");
+        let next_vim = manager
+            .binding_for_key(&KeyEvent {
+                code: KeyCode::Char('L'),
+                modifiers: KeyModifiers::NONE,
+            })
+            .expect("shift-l binding");
+        let previous = manager
+            .binding_for_key(&KeyEvent {
+                code: KeyCode::Tab,
+                modifiers: KeyModifiers::SHIFT,
+            })
+            .expect("shift-tab binding");
+        let previous_vim = manager
+            .binding_for_key(&KeyEvent {
+                code: KeyCode::Char('H'),
+                modifiers: KeyModifiers::NONE,
+            })
+            .expect("shift-h binding");
+
+        assert!(matches!(next.action, PkgAction::NextTab));
+        assert!(matches!(next_vim.action, PkgAction::NextTab));
+        assert!(matches!(previous.action, PkgAction::PreviousTab));
+        assert!(matches!(previous_vim.action, PkgAction::PreviousTab));
+    }
+
+    #[test]
+    fn remove_confirmation_label_reports_selected_installed_subset() {
+        assert_eq!(
+            remove_confirmation_label(&["amp".to_owned()], 0),
+            "Remove package amp?"
+        );
+        assert_eq!(
+            remove_confirmation_label(&["amp".to_owned(), "zed".to_owned()], 1),
+            "Remove 2 selected packages? (1 selected package not pkg-managed)"
+        );
+    }
+
+    #[test]
     fn binding_help_entries_have_dispatch_bindings() {
         let runtime = helix_runtime::test::runtime();
-        let (ingress, _rx) = crate::runtime::RuntimeIngress::channel(runtime.work().clone());
+        let (ingress, _rx) = crate::runtime::RuntimeIngress::channel(runtime.clone());
         let manager = PkgManager::new(
             PkgManagerData {
                 entries: Vec::new(),
@@ -2318,6 +3763,7 @@ mod tests {
                     | PkgAction::Rollback
                     | PkgAction::Doctor
                     | PkgAction::RegistryUpdate
+                    | PkgAction::Connect
                     | PkgAction::Help
                     | PkgAction::Escape
             )
@@ -2360,16 +3806,56 @@ mod tests {
         assert_eq!(state.statusline(), None);
     }
 
+    #[test]
+    fn pkg_progress_finished_revision_changes_only_when_operation_finishes() {
+        let mut state = PkgProgressState::default();
+        assert_eq!(state.finished_revision, 0);
+
+        state.apply_inner(&OpEvent::Started {
+            name: "rust-analyzer".into(),
+        });
+        state.apply_inner(&OpEvent::Progress {
+            name: "rust-analyzer".into(),
+            message: "download".into(),
+            percent: Some(42),
+        });
+        assert_eq!(state.finished_revision, 0);
+
+        state.apply_inner(&OpEvent::Done {
+            name: "rust-analyzer".into(),
+        });
+        assert_eq!(state.finished_revision, 1);
+
+        state.apply_inner(&OpEvent::Failed {
+            name: "rust-analyzer".into(),
+            message: "network".into(),
+        });
+        assert_eq!(state.finished_revision, 2);
+    }
+
     fn test_item(
         name: &str,
         kind: PkgKind,
         installed: Option<&str>,
         language: &str,
     ) -> PkgManagerItem {
+        let installed = installed.map(str::to_owned);
+        let provider = installed
+            .as_ref()
+            .map(|version| CapabilityProvider::Managed {
+                version: version.clone(),
+            })
+            .unwrap_or(CapabilityProvider::Missing);
+        let doctor = if installed.is_some() {
+            "ok".to_owned()
+        } else {
+            "not installed".to_owned()
+        };
         PkgManagerItem {
             name: name.to_owned(),
             kind,
-            installed: installed.map(str::to_owned),
+            installed,
+            provider,
             latest: "registry".to_owned(),
             description: format!("{name} package"),
             homepage: None,
@@ -2379,9 +3865,18 @@ mod tests {
             schemas: String::new(),
             source: "test".to_owned(),
             receipt: None,
-            doctor: installed.map_or_else(|| "not installed".to_owned(), |_| "ok".to_owned()),
+            doctor,
             problem: None,
+            installable: true,
             search_blob: format!("{name}\n{kind}\n{language}"),
+        }
+    }
+
+    fn test_external_provider(command: &str) -> CapabilityProvider {
+        CapabilityProvider::Command {
+            command: command.to_owned(),
+            path: format!("/usr/bin/{command}").into(),
+            source: CapabilityProviderSource::Path,
         }
     }
 

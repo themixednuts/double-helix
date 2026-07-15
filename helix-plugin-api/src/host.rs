@@ -1,24 +1,26 @@
 //! Capability traits defining the host boundary.
 //!
-//! `helix-plugin` defines these traits; host implementations (e.g., `helix-term`
-//! for the terminal frontend) provide concrete implementations. The traits are
+//! `helix-plugin-api` defines these traits; frontend hosts provide concrete
+//! implementations. The traits are
 //! split by concern — there is no single monolithic `PluginHost`.
 //!
 //! Language-host adapters (Lua, future wasm/RPC) call through these traits
 //! instead of reaching into editor internals directly.
 
-use std::num::NonZeroU64;
-
+use super::commands::CommandDescriptor;
 use super::errors::ContractResult;
 use super::events::EventKind;
 use super::handles::*;
+use super::keymaps::{KeymapDefinition, KeymapRemoveRequest, KeymapUpdateRequest};
 use super::metadata::{ApiMetadata, EventKindInfo};
 use super::requests::*;
 use super::snapshots::{
     AssistantContextSnapshot, AssistantEntrySnapshot, AssistantSnapshot, AssistantThreadSnapshot,
-    DiagnosticSnapshot, DocumentSnapshot, FloatSnapshot, PanelSnapshot, SplitTreeSnapshot,
-    TabGroupSnapshot, ThemeSnapshot, ViewSnapshot, WorkspaceDetailSnapshot, WorkspaceSnapshot,
+    DiagnosticSnapshot, DocumentSnapshot, EditorConfigSnapshot, FloatSnapshot,
+    LanguageServerSnapshot, PanelSnapshot, SplitTreeSnapshot, TabGroupSnapshot,
+    TerminalSizeSnapshot, ThemeSnapshot, ViewSnapshot, WorkspaceDetailSnapshot, WorkspaceSnapshot,
 };
+use super::tasks::PluginTaskRequest;
 
 // ---------------------------------------------------------------------------
 // Query
@@ -45,6 +47,9 @@ pub trait PluginQueryHost {
 
     /// All open view handles.
     fn list_views(&self) -> Vec<ViewHandle>;
+
+    /// Snapshot all currently running language-server clients.
+    fn language_servers(&self) -> ContractResult<Vec<LanguageServerSnapshot>>;
 
     // -- Snapshots --
 
@@ -82,9 +87,6 @@ pub trait PluginQueryHost {
 /// All mutations are request-based — the host validates and applies them.
 /// Plugins never get direct mutable references to editor internals.
 pub trait PluginMutationHost {
-    /// Open a document by path and optionally focus it.
-    fn open_document(&mut self, req: OpenDocumentRequest) -> ContractResult<DocumentHandle>;
-
     /// Apply text edits to a document.
     fn apply_edit(&mut self, req: ApplyEditRequest) -> ContractResult<()>;
 
@@ -109,6 +111,9 @@ pub trait PluginMutationHost {
     /// Redo the last undone change in a document.
     fn redo(&mut self, req: RedoRequest) -> ContractResult<bool>;
 
+    /// Select the complete contents of a document in a view displaying it.
+    fn select_all(&mut self, req: SelectAllRequest) -> ContractResult<()>;
+
     /// Change the editor's mode (normal, insert, select).
     fn set_mode(&mut self, req: SetModeRequest) -> ContractResult<()>;
 
@@ -120,24 +125,15 @@ pub trait PluginMutationHost {
 // UI
 // ---------------------------------------------------------------------------
 
-/// Opaque token for an in-flight UI callback (prompt, confirm, picker).
-///
-/// The host returns this when a UI request is queued. The language-host adapter
-/// uses it to correlate the response back to the originating plugin callback.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[repr(transparent)]
-pub struct UiCallbackToken(NonZeroU64);
+/// Frontend-owned operations that complete asynchronously on the editor thread.
+pub trait PluginTaskHost {
+    fn start(
+        &mut self,
+        plugin: PluginId,
+        request: PluginTaskRequest,
+    ) -> ContractResult<PluginOperationToken>;
 
-impl UiCallbackToken {
-    /// Wrap a raw non-zero callback identity value.
-    pub const fn from_raw(id: NonZeroU64) -> Self {
-        Self(id)
-    }
-
-    /// Extract the raw callback identity value.
-    pub const fn raw(self) -> NonZeroU64 {
-        self.0
-    }
+    fn cancel(&mut self, plugin: PluginId, operation: PluginOperationToken);
 }
 
 /// Frontend-dependent UI operations.
@@ -195,12 +191,23 @@ pub trait PluginPanelHost {
     fn list_panels(&self) -> Vec<PanelSnapshot>;
 }
 
+/// Releases every persistent UI resource owned by a plugin.
+///
+/// Implementations must be idempotent so cleanup can be retried after a
+/// partial host failure or transport disconnect.
+pub trait PluginResourceHost {
+    fn release_plugin_resources(&mut self, plugin: PluginId) -> ContractResult<()>;
+}
+
 // ---------------------------------------------------------------------------
 // Commands
 // ---------------------------------------------------------------------------
 
 /// Command registration and invocation.
 pub trait PluginCommandHost {
+    /// Discover all commands currently available to the editor.
+    fn command_catalog(&self) -> Vec<CommandDescriptor>;
+
     /// Register a plugin command and get its handle.
     fn register_command(
         &mut self,
@@ -215,9 +222,27 @@ pub trait PluginCommandHost {
     /// Remove a plugin command registration.
     fn remove_command(&mut self, plugin: PluginId, req: CommandRemoveRequest)
         -> ContractResult<()>;
+}
 
-    /// Run a command by name with arguments.
-    fn run_command(&mut self, req: RunCommandRequest) -> ContractResult<()>;
+/// Owned declarative keymap contributions.
+pub trait PluginKeymapHost {
+    fn register_keymap(
+        &mut self,
+        plugin: PluginId,
+        definition: KeymapDefinition,
+    ) -> ContractResult<KeymapHandle>;
+
+    fn update_keymap(
+        &mut self,
+        plugin: PluginId,
+        request: KeymapUpdateRequest,
+    ) -> ContractResult<()>;
+
+    fn remove_keymap(
+        &mut self,
+        plugin: PluginId,
+        request: KeymapRemoveRequest,
+    ) -> ContractResult<()>;
 }
 
 // ---------------------------------------------------------------------------
@@ -312,13 +337,13 @@ pub trait PluginFloatHost {
     ) -> ContractResult<FloatHandle>;
 
     /// Update a floating window's properties.
-    fn update_float(&mut self, req: UpdateFloatRequest) -> ContractResult<()>;
+    fn update_float(&mut self, plugin: PluginId, req: UpdateFloatRequest) -> ContractResult<()>;
 
     /// Close a floating window.
-    fn close_float(&mut self, req: CloseFloatRequest) -> ContractResult<()>;
+    fn close_float(&mut self, plugin: PluginId, req: CloseFloatRequest) -> ContractResult<()>;
 
     /// List all floating windows.
-    fn list_floats(&self) -> Vec<FloatSnapshot>;
+    fn list_floats(&self, plugin: PluginId) -> Vec<FloatSnapshot>;
 }
 
 // ---------------------------------------------------------------------------
@@ -376,10 +401,15 @@ pub trait PluginFacadeQueryHost:
 {
     fn split_tree(&self) -> SplitTreeSnapshot;
     fn list_tabs(&self, view: Option<ViewHandle>) -> ContractResult<TabGroupSnapshot>;
+    fn editor_config(&self) -> ContractResult<EditorConfigSnapshot>;
+    fn terminal_size(&self) -> ContractResult<TerminalSizeSnapshot>;
+    fn read_register(&self, name: char) -> ContractResult<Vec<String>>;
 }
 
 /// Mutable facade surface used by language runtimes.
 pub trait PluginFacadeMutationHost:
     PluginMutationHost + PluginSplitHost + PluginTabHost + PluginFloatHost + PluginAssistantMutationHost
 {
+    fn write_register(&mut self, name: char, values: Vec<String>) -> ContractResult<()>;
+    fn request_redraw(&mut self);
 }

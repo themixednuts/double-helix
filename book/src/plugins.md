@@ -1,6 +1,6 @@
 # Plugins
 
-Helix plugins are Lua 5.4 scripts loaded from plugin directories. The host API version is `2`.
+Helix plugins are Lua 5.4 scripts loaded from plugin directories. The host API version is `1`.
 
 ## Layout
 
@@ -20,11 +20,11 @@ version = "0.1.0"
 description = "Optional"
 author = "Optional"
 entry = "init.lua"
-min_api_version = 2
+api_version = 1
 capabilities = ["query", "mutation", "ui", "events"]
 ```
 
-`min_api_version` and `capabilities` are optional. Loading is refused if `min_api_version` is greater than the host API version or if a capability name is unknown. Capability names are `query`, `mutation`, `ui`, `panels`, `commands`, `events`, `render`, `splits`, `tabs`, `floats`, and `pkg-backend`.
+`api_version` is exact. Loading is refused if it differs from the host contract or if a capability name is unknown. Capability names are `query`, `mutation`, `ui`, `panels`, `commands`, `keymaps`, `events`, `splits`, `tabs`, `floats`, `tasks`, `syntax`, `lsp`, `themes`, and `assistant`.
 
 ## Errors
 
@@ -42,67 +42,39 @@ end
 
 The table fields are `code`, `message`, and optional `entity`. Treat `code` as stable and `message` as diagnostic.
 
-## Remote Hosts
+## Plugin Hosts
 
-Plugins can run out of process in `helix-plugin-host`. The editor and child process communicate over stdout/stdin using length-prefixed msgpack `helix_plugin::rpc::Frame` messages that carry the same contract as the in-process Lua facade. The child process discovers plugins on its own filesystem.
+Plugins always run outside the editor process. When plugins are enabled, the editor starts and supervises its private `dhx --plugin-host` mode, using length-prefixed msgpack `helix_plugin::rpc::Frame` messages over stdin/stdout. A crash or protocol failure releases that host generation's editor resources and restarts the process with bounded exponential backoff.
+
+The local host discovers plugins from `plugin_dirs`, or from the default plugin directories when the list is empty:
 
 ```toml
-[[plugins.hosts]]
-name = "local"
-command = "helix-plugin-host"
+[plugins]
+enabled = true
 plugin_dirs = ["/home/me/.config/helix/plugins"]
+max_memory = 268435456
+max_instructions = 5000000
 ```
 
-Remote execution over SSH uses the same host binary and needs no SSH-specific Helix code:
+Additional hosts use the same protocol. For example, remote execution over SSH needs only a remote `dhx` binary:
 
 ```toml
 [[plugins.hosts]]
 name = "remote-box"
 command = "ssh"
-args = ["box", "helix-plugin-host"]
+args = ["box", "dhx", "--plugin-host"]
 plugin_dirs = ["/srv/helix/plugins"]
 ```
 
-Remote mode supports contract calls that can be represented as synchronous query/mutation requests. Capabilities that depend on editor-local rendering or callbacks may be reported as unsupported by a remote host until that transport path is implemented. Plugins should check `helix.host.api_metadata().has_capability(name)` before using optional capability families.
+Every host uses the same typed contract, retained rendering, task completion, generation routing, and ownership cleanup. Contract types have one independent owner in `helix-plugin-api`; Rust consumers import that crate directly. The framed protocol and Lua runtime live in `helix-plugin`; editor conversions live separately in `helix-plugin-editor` and execute only on the editor thread. Foreground host requests use nonblocking admission, and generation cleanup returns through runtime ingress. A config refresh replaces hosts only when `[plugins]` changes. Plugins should check `helix.host.api_metadata().has_capability(name)` before using optional capability families.
 
-Security follows the configured command. `command = "ssh"` grants the plugin host whatever access that SSH account has on the remote machine. Editor-side contract bridges still enforce the same handle ownership, permissions, and capability checks as local plugins.
+Security follows the configured command. `command = "ssh"` grants the plugin host whatever access that SSH account has on the remote machine. Editor-side contract bridges enforce handle ownership, permissions, generation validity, and capability checks for every host.
 
 ## Sandbox
 
 The Lua sandbox removes `os.execute`, `os.exit`, `io`, `package`, `load`, `loadstring`, `loadfile`, and `dofile`. `require(name)` is scoped to the current plugin directory only. Module names cannot be absolute, contain path separators, contain `:`, or contain `..`.
 
 Default limits are `max_memory = 268435456` bytes and `max_instructions = 5000000` VM instructions per plugin dispatch. Setting either value to `0` disables that limit.
-
-## Package Backends
-
-Plugins can register package-manager backends for registry entries such as:
-
-```toml
-source = { plugin = "corp-tool-cache", ref = "rust-analyzer" }
-```
-
-Lua registration uses `helix.pkg.register_backend`:
-
-```lua
-helix.pkg.register_backend({
-  name = "corp-tool-cache",
-  probe = function() return true end,
-  resolve = function(ref) return { version = "1.2.3" } end,
-  install = function(staging_dir, progress)
-    progress("installing")
-  end,
-  remove = function(ref) return true end,
-  doctor = function(ref) return true end,
-})
-```
-
-Package backends execute plugin code during package operations. They are denied
-unless package policy explicitly allows the backend name:
-
-```toml
-[pkg.policy]
-allowed-plugin-backends = ["corp-tool-cache"]
-```
 
 ## API
 
@@ -120,9 +92,11 @@ allowed-plugin-backends = ["corp-tool-cache"]
 
 `helix.events`: `kind`, `subscribe(kind, handler)`, `unsubscribe(handle)`.
 
-Event kinds are `host_ready`, `document_opened`, `document_changed`, `document_pre_save`, `document_saved`, `document_closed`, `selection_changed`, `mode_changed`, `view_focused`, `diagnostics_updated`, `lsp_attached`, `key_pressed`, `split_created`, `split_closed`, `tab_opened`, `tab_closed`, `tab_focused`, `float_created`, `float_closed`, `panel_toggled`, `assistant_thread_created`, `assistant_thread_closed`, `assistant_run_started`, `assistant_run_completed`, `assistant_message_received`, and `assistant_context_changed`.
+Event kinds are `host_ready`, `document_opened`, `document_changed`, `document_saved`, `document_closed`, `selection_changed`, `mode_changed`, `view_focused`, `diagnostics_updated`, `key_pressed`, `assistant_thread_created`, `assistant_thread_closed`, `assistant_run_started`, `assistant_run_completed`, `assistant_message_received`, and `assistant_context_changed`.
 
 `helix.commands`: `register(spec)`, `update(handle, spec)`, `remove(handle)`, `execute(name, args?)`. `CommandHandle` has `id()`, `update(spec)`, and `remove()`.
+
+`helix.keymaps`: `register(definition)`, `update(handle, definition)`, `remove(handle)`.
 
 `helix.registers`: `get(name)`, `set(name, values)`.
 
@@ -138,9 +112,9 @@ Event kinds are `host_ready`, `document_opened`, `document_changed`, `document_p
 
 `helix.assistant`: `snapshot()`, `thread(thread)`, `entries(thread)`, `context(thread)`, `is_ready()`, `active_thread()`, `thread_count()`, `submit(thread_or_nil, text)`, `cancel(thread_or_nil)`.
 
-`helix.lsp`: `get_clients()`.
+`helix.lsp`: `get_clients()`, `_raw.call(document, method, params, options?)`.
 
-`helix.pkg`: `register_backend(spec)`.
+`helix.syntax`: `_raw.query(document, query, options?)`.
 
 `helix.layout`: `split_vertical(area, constraints)`, `split_horizontal(area, constraints)`, `center(area, width, height)`.
 

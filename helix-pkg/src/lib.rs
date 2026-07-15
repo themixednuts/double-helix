@@ -1,13 +1,17 @@
-//! Package manager engine for LSP servers, DAP adapters, grammars, and plugins.
+//! Package manager engine for LSP servers, DAP adapters, grammars, plugins, and ACP agents.
 
+pub mod catalog;
 pub mod config;
 pub mod lock;
 pub mod ops;
 pub mod registry;
-pub mod resolve;
 pub mod spec;
 pub mod store;
 
+pub use catalog::{
+    CapabilityCatalog, CapabilityProvider, CapabilityProviderSource, CapabilityStatus,
+    ConfiguredCapability,
+};
 pub use config::{NativeInstallPolicy, PkgConfig, Policy, RegistrySource};
 pub use lock::{Lock, LockedPackage, Manifest};
 pub use ops::{
@@ -79,6 +83,8 @@ pub enum Error {
     },
     #[error("system command not found on PATH: {0}")]
     SystemMissing(String),
+    #[error("package operation already running for {kind} {name}")]
+    PackageBusy { kind: String, name: String },
     #[error("command failed: {program} {args}\nstdout: {stdout}\nstderr: {stderr}")]
     CommandFailed {
         program: String,

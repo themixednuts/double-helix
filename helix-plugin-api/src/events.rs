@@ -19,6 +19,7 @@ use super::snapshots::{EditMode, Position};
 /// [`PluginEvent`] variant when it fires. This replaces string-based
 /// registration with a typed catalog.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum EventKind {
     HostReady,
     DocumentOpened,
@@ -79,6 +80,34 @@ impl EventKind {
         Self::AssistantContextChanged,
     ];
 
+    /// Events with complete editor emitters in the current host.
+    pub const SUPPORTED: &[EventKind] = &[
+        Self::HostReady,
+        Self::DocumentOpened,
+        Self::DocumentChanged,
+        Self::DocumentSaved,
+        Self::DocumentClosed,
+        Self::SelectionChanged,
+        Self::ModeChanged,
+        Self::ViewFocused,
+        Self::DiagnosticsUpdated,
+        Self::KeyPressed,
+        Self::AssistantThreadCreated,
+        Self::AssistantThreadClosed,
+        Self::AssistantRunStarted,
+        Self::AssistantRunCompleted,
+        Self::AssistantMessageReceived,
+        Self::AssistantContextChanged,
+    ];
+
+    pub fn is_supported(self) -> bool {
+        Self::SUPPORTED.contains(&self)
+    }
+
+    pub fn from_id(id: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|kind| kind.as_str() == id)
+    }
+
     /// Human-readable name for this event kind.
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -115,6 +144,26 @@ impl EventKind {
 impl std::fmt::Display for EventKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
+    }
+}
+
+#[cfg(test)]
+mod event_kind_tests {
+    use super::EventKind;
+
+    #[test]
+    fn stable_id_round_trips_through_json() {
+        let encoded = serde_json::to_string(&EventKind::DocumentOpened).unwrap();
+        assert_eq!(encoded, "\"document_opened\"");
+        assert_eq!(
+            serde_json::from_str::<EventKind>(&encoded).unwrap(),
+            EventKind::DocumentOpened
+        );
+        assert_eq!(
+            EventKind::from_id("document_opened"),
+            Some(EventKind::DocumentOpened)
+        );
+        assert_eq!(EventKind::from_id("DocumentOpened"), None);
     }
 }
 

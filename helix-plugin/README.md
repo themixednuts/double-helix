@@ -9,8 +9,18 @@ A Lua-based plugin system for the Helix text editor, enabling users to extend fu
 - **Coroutine-based async**: UI prompts/pickers suspend with `coroutine.yield`, no callbacks
 - **Custom commands**: Register new commands accessible from the command palette
 - **UI integration**: Panels, prompts, pickers, notifications
-- **Host-agnostic contract**: Serializable types for future WASM/RPC transport
+- **Framed host contract**: Serializable requests, responses, handles, and retained UI models
+- **Process isolation**: Lua runs in supervised plugin-host generations, never on the editor thread
 - **Safe sandboxing**: Plugins run in a sandboxed Lua 5.4 environment
+
+`helix-plugin-api` is the independent owner of contract and wire types.
+`helix-plugin` owns the framed Lua host and has no production dependency on
+`helix-view`. The reusable `helix-plugin-editor` crate owns the explicit editor
+snapshot and mutation adapters used by frontends.
+
+Rust hosts and adapters depend on `helix-plugin-api` directly. `helix-plugin`
+does not re-export the contract namespace; this keeps the wire contract usable
+without coupling consumers to the Lua runtime or process host.
 
 ## Quick Start
 
@@ -21,7 +31,7 @@ Add to your `~/.config/helix/config.toml`:
 ```toml
 [plugins]
 enabled = true
-plugin-dir = "~/.config/helix/plugins"
+plugin_dirs = ["~/.config/helix/plugins"]
 ```
 
 ### 2. Create Your First Plugin
@@ -39,7 +49,7 @@ name = "my-plugin"
 version = "0.1.0"
 description = "My first Helix plugin"
 author = "Your Name"
-min_api_version = 2
+api_version = 1
 capabilities = ["query", "mutation", "ui", "events"]
 ```
 
@@ -130,8 +140,10 @@ view:close()                    -- close this view
 
 ```lua
 local docs = helix.documents.list()                     -- [DocumentHandle]
-local doc = helix.documents.open("path/to/file.rs")     -- open, don't focus
-local doc = helix.documents.open("file.rs", { focus = true })
+helix.async(function()
+    local doc = helix.documents.open("path/to/file.rs") -- yields; open, don't focus
+    local focused = helix.documents.open("file.rs", { focus = true })
+end)
 ```
 
 ### `helix.events` — Event subscription
@@ -144,11 +156,9 @@ end)
 helix.events.unsubscribe(subscription)
 
 -- Available event kinds (also as constants on helix.events.kind):
--- document_opened, document_changed, document_pre_save, document_saved,
--- document_closed, selection_changed, mode_changed, view_focused,
--- diagnostics_updated, lsp_attached, key_pressed, split_created,
--- split_closed, tab_opened, tab_closed, tab_focused, float_created,
--- float_closed, panel_toggled, assistant_thread_created,
+-- document_opened, document_changed, document_saved, document_closed,
+-- selection_changed, mode_changed, view_focused, diagnostics_updated,
+-- key_pressed, assistant_thread_created,
 -- assistant_thread_closed, assistant_run_started, assistant_run_completed,
 -- assistant_message_received, assistant_context_changed, host_ready
 ```
@@ -173,6 +183,15 @@ helix.commands.remove(command)
 -- Execute a built-in editor command
 helix.commands.execute("write")
 helix.commands.execute("open", { "path/to/file.rs" })
+
+-- Discover built-in and plugin commands from the host-owned catalog
+local commands = helix.commands.list()
+local write = helix.commands.get("w") -- aliases resolve to the canonical command
+print(write.name, write.doc, write.kind, write.scope)
+print(write.signature.min_positionals, write.signature.max_positionals)
+for _, flag in ipairs(write.signature.flags) do
+    print(flag.name, flag.alias, flag.doc, flag.takes_value)
+end
 ```
 
 ### `helix.registers` — Read/write editor registers
@@ -181,6 +200,32 @@ helix.commands.execute("open", { "path/to/file.rs" })
 local values = helix.registers.get("a")       -- [string]
 helix.registers.set("a", { "hello", "world" })
 ```
+
+### `helix.keymaps` — Owned declarative keymaps
+
+```lua
+local keys = helix.keymaps.register({
+    mode = "normal", -- "normal" | "insert" | "select"
+    scope = {
+        language = "rust",
+        path_prefix = "src",
+    },
+    bindings = {
+        { keys = { "space", "t" }, command = ":my_command" },
+        { keys = { "F24" }, commands = { ":write", ":reload" } },
+    },
+})
+
+keys:update({
+    mode = "normal",
+    bindings = { { keys = { "F24" }, command = ":my_command" } },
+})
+keys:remove()
+```
+
+Definitions are parsed and validated once at registration. All populated scope
+fields must match. Contributions are removed automatically when their plugin
+unloads or reloads.
 
 ### `helix.ui` — UI operations
 
@@ -203,11 +248,14 @@ local panel = helix.ui.panel({
     title = "My Panel",
     side = "right",    -- "left" | "right"
     width = 30,
-    render = function(surface, area)
-        surface:set_string(area.x, area.y, "Hello", "ui.text")
-    end,
+    content = {
+        { kind = "header", area = { x = 0, y = 0, width = 30, height = 1 },
+          title = "Results", current = 1, total = 4, style = "ui.text.focus" },
+        { x = 1, y = 2, text = "Hello", style = "ui.text" },
+    },
     on_event = function(event) end,  -- optional
 })
+panel:update({ content = "Updated content" })
 panel:focus()
 panel:resize("fixed:40")    -- also "percent:30"
 panel:toggle()
@@ -219,7 +267,9 @@ end
 
 -- Theme
 local name = helix.ui.get_theme()
-helix.ui.set_theme("gruvbox")
+helix.async(function()
+    helix.ui.set_theme("gruvbox") -- loads off the UI thread and yields
+end)
 
 -- Terminal
 local size = helix.ui.terminal_size()  -- { width, height }
@@ -335,6 +385,29 @@ helix.log.trace("message")
 
 ```lua
 local clients = helix.lsp.get_clients()  -- [{ name, id }]
+helix.async(function()
+    local result = helix.lsp.call(
+        helix.workspace.focused_document(),
+        "workspace/executeCommand",
+        { command = "example.run", arguments = { 1, true } },
+        { server = "example-lsp" }
+    )
+end)
+```
+
+### `helix.syntax` — Immutable background queries
+
+```lua
+helix.async(function()
+    local captures = helix.syntax.query(
+        helix.workspace.focused_document(),
+        "(function_item name: (identifier) @name)",
+        { start = { line = 0, column = 0 }, max_captures = 256 }
+    )
+    for _, capture in ipairs(captures) do
+        print(capture.name, capture.start.line, capture.end.line)
+    end
+end)
 ```
 
 ### `helix.layout` — Layout combinators
@@ -352,13 +425,13 @@ local rect = helix.layout.center(area, 40, 10)
 ```toml
 [plugins]
 enabled = true
-plugin-dir = "~/.config/helix/plugins"
+plugin_dirs = ["~/.config/helix/plugins"]
 
-[[plugins.plugin]]
+[[plugins.plugins]]
 name = "auto-save"
 enabled = true
 
-[plugins.plugin.config]
+[plugins.plugins.config]
 delay = 1000
 auto_format = true
 ```
@@ -374,7 +447,7 @@ end
 
 ## Security
 
-Plugins run in a sandboxed Lua environment:
+Plugins run in a sandboxed Lua environment inside a supervised child process:
 
 - **Disabled**: `os.execute`, `os.exit`, `io`, `package`, `load`, `loadstring`, `loadfile`, `dofile`
 - **Scoped modules**: `require("name")` resolves only to `name.lua` inside the current plugin directory. Absolute paths, path separators, `:`, and `..` are rejected.
@@ -383,7 +456,7 @@ Plugins run in a sandboxed Lua environment:
 
 ## Versioning and errors
 
-`plugin.toml` may set `min_api_version` and `capabilities`. Loading is refused when `min_api_version` is greater than the host API version or a capability name is unknown. Capability names are `query`, `mutation`, `ui`, `panels`, `commands`, `events`, `render`, `splits`, `tabs`, and `floats`.
+`plugin.toml` declares the exact `api_version` and requested `capabilities`. Loading is refused when the version differs from the host contract or a capability name is unknown. Capability names are `query`, `mutation`, `ui`, `panels`, `commands`, `keymaps`, `events`, `splits`, `tabs`, `floats`, `tasks`, `syntax`, `lsp`, `themes`, and `assistant`.
 
 Host contract failures carry stable codes: `not_found`, `stale_handle`, `invalid_request`, `permission_denied`, `unsupported_capability`, `busy`, and `internal_error`. Error text remains human-readable and includes the code for plugin-side handling.
 
@@ -392,7 +465,7 @@ Host contract failures carry stable codes: `not_found`, `stale_handle`, `invalid
 ```bash
 cargo build --release          # Build
 cargo test -p helix-plugin     # Test
-RUST_LOG=helix_plugin=debug hx # Debug logging
+RUST_LOG=helix_plugin=debug dhx # Debug logging
 ```
 
 ## License

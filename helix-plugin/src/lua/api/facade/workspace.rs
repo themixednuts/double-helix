@@ -111,7 +111,8 @@ pub fn register(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
     m.set(
         "editor_config",
         lua.create_function(|lua, ()| {
-            let config = with_editor(|editor| Ok(editor.config()))?;
+            let config =
+                with_query_bridge(lua, |host| host.editor_config().map_err(contract_error))?;
             let table = lua.create_table()?;
             table.set("scrolloff", config.scrolloff)?;
             table.set("mouse", config.mouse)?;
@@ -123,8 +124,8 @@ pub fn register(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
             table.set(
                 "line_number",
                 match config.line_number {
-                    helix_view::editor::LineNumber::Absolute => "absolute",
-                    helix_view::editor::LineNumber::Relative => "relative",
+                    snapshots::LineNumberMode::Absolute => "absolute",
+                    snapshots::LineNumberMode::Relative => "relative",
                 },
             )?;
             Ok(table)

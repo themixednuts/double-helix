@@ -5,10 +5,8 @@
 
 use std::{borrow::Cow, sync::Arc};
 
-use anyhow::Context as _;
 use arc_swap::{access::Map, ArcSwap};
 use helix_core::syntax;
-use helix_plugin::{PluginConfig, PluginManager, PluginNotification};
 use helix_runtime::{Receiver, Runtime, Sender, Work};
 use helix_view::{editor::EditorBuilder, graphics::Rect, theme, Editor};
 
@@ -32,32 +30,24 @@ pub struct EmbeddedEditorBuilder {
     runtime: Runtime,
     config: Config,
     language_loader: syntax::Loader,
-    theme_loader: Arc<theme::Loader>,
+    theme_loader: Option<Arc<theme::Loader>>,
     terminal_true_color: bool,
     theme_mode: Option<theme::Mode>,
     modal_factory: Arc<ModalEngineFactory>,
-    plugin_config: PluginConfig,
 }
 
 impl EmbeddedEditorBuilder {
     #[must_use]
     pub fn new(area: Rect, runtime: Runtime) -> Self {
-        let mut theme_parent_dirs = vec![helix_loader::config_dir()];
-        theme_parent_dirs.extend(helix_loader::runtime_dirs().iter().cloned());
-
         Self {
             area,
             runtime,
             config: Config::default(),
             language_loader: helix_core::config::default_lang_loader(),
-            theme_loader: Arc::new(theme::Loader::new(&theme_parent_dirs)),
+            theme_loader: None,
             terminal_true_color: false,
             theme_mode: None,
             modal_factory: Arc::new(ModalEngineFactory::with_builtins()),
-            plugin_config: PluginConfig {
-                enabled: false,
-                ..PluginConfig::default()
-            },
         }
     }
 
@@ -75,7 +65,7 @@ impl EmbeddedEditorBuilder {
 
     #[must_use]
     pub fn theme_loader(mut self, theme_loader: Arc<theme::Loader>) -> Self {
-        self.theme_loader = theme_loader;
+        self.theme_loader = Some(theme_loader);
         self
     }
 
@@ -97,18 +87,20 @@ impl EmbeddedEditorBuilder {
         self
     }
 
-    #[must_use]
-    pub fn plugin_config(mut self, plugin_config: PluginConfig) -> Self {
-        self.plugin_config = plugin_config;
-        self
-    }
-
     pub fn build(self) -> anyhow::Result<EmbeddedEditor> {
+        let theme_loader = match self.theme_loader {
+            Some(theme_loader) => theme_loader,
+            None => Arc::new(
+                theme::Loader::new(&[helix_loader::config_dir()])
+                    .with_runtime_assets(helix_loader::runtime_assets()?.clone()),
+            ),
+        };
         let config = Arc::new(ArcSwap::from_pointee(self.config));
-        let (ingress, ingress_rx) = RuntimeIngress::channel(self.runtime.work().clone());
+        let (ingress, ingress_rx) = RuntimeIngress::channel(self.runtime.clone());
+        let foreground = crate::runtime::ForegroundEvents::new();
         let handlers = handlers::setup(config.clone(), ingress.clone(), self.runtime.clone());
         let mut editor = EditorBuilder::new(self.area, self.runtime.clone())
-            .theme_loader(self.theme_loader)
+            .theme_loader(theme_loader)
             .language_loader(self.language_loader)
             .config_access(Arc::new(Map::new(
                 Arc::clone(&config),
@@ -120,7 +112,12 @@ impl EmbeddedEditorBuilder {
         editor
             .lifecycle()
             .set_error_reporter(crate::runtime::status_error_reporter(ingress.clone()));
-        handlers::attach(&editor, &editor.handlers, ingress.clone());
+        handlers::attach(
+            &editor,
+            &editor.handlers,
+            ingress.clone(),
+            foreground.clone(),
+        );
         editor.set_assistant_history_backend(helix_view::assistant::history::local_backend());
         editor.set_assistant_context_registry(helix_view::assistant::context::core_registry());
 
@@ -131,9 +128,7 @@ impl EmbeddedEditorBuilder {
             self.theme_mode,
         );
 
-        let keys = Box::new(Map::new(Arc::clone(&config), |config: &Config| {
-            &config.keys
-        }));
+        let keys = config.load().keys.clone();
         editor.set_modal_keymaps(crate::keymap::to_component_modal_keymaps(
             &config.load().keys,
         ));
@@ -153,21 +148,12 @@ impl EmbeddedEditorBuilder {
         let idle_reset = idle_reset_gate.handle();
         let idle_reset_rx = idle_reset_gate.take_receiver();
         let (plugin_events, plugin_event_rx) = helix_runtime::channel(256);
-        let plugin_manager = PluginManager::new(self.plugin_config)
-            .context("failed to create embedded plugin manager")?;
-        {
-            let engine = plugin_manager.engine();
-            let mut engine = engine.write();
-            engine.set_ui_host(crate::plugin_registry::get_ui_host(ingress.clone()));
-            engine.set_panel_host(crate::plugin_registry::get_panel_host(ingress.clone()));
-            engine.set_command_host(crate::plugin_registry::get_command_host(ingress.clone()));
-            engine.set_event_host(crate::plugin_registry::get_event_host());
-        }
-        if plugin_manager.is_enabled() {
-            plugin_manager
-                .initialize(&mut editor)
-                .context("failed to initialize embedded plugin manager")?;
-        }
+        let plugin_runtime = crate::plugin_registry::spawn_plugin_runtime(
+            &config.load().plugins,
+            ingress.clone(),
+            foreground.clone(),
+            self.runtime.work().clone(),
+        )?;
 
         Ok(EmbeddedEditor {
             editor,
@@ -175,13 +161,14 @@ impl EmbeddedEditorBuilder {
             config,
             ingress,
             ingress_rx,
+            foreground,
             exit_tasks: crate::runtime::ExitTaskSet::new(),
             exit_task_work: self.runtime.work().clone(),
             idle_reset,
             idle_reset_rx,
             plugin_events,
             plugin_event_rx,
-            plugin_manager: Arc::new(plugin_manager),
+            plugin_runtime,
         })
     }
 }
@@ -193,13 +180,14 @@ pub struct EmbeddedEditor {
     config: Arc<ArcSwap<Config>>,
     ingress: RuntimeIngress,
     ingress_rx: RuntimeIngressReceiver,
+    foreground: crate::runtime::ForegroundEvents,
     exit_tasks: crate::runtime::ExitTaskSet,
     exit_task_work: Work,
     idle_reset: IdleResetHandle,
     idle_reset_rx: IdleResetReceiver,
-    plugin_events: Sender<PluginNotification>,
-    plugin_event_rx: Receiver<PluginNotification>,
-    plugin_manager: Arc<PluginManager>,
+    plugin_events: Sender<crate::runtime::PluginNotification>,
+    plugin_event_rx: Receiver<crate::runtime::PluginNotification>,
+    plugin_runtime: crate::plugin_registry::PluginRuntime,
 }
 
 impl EmbeddedEditor {
@@ -235,15 +223,13 @@ impl EmbeddedEditor {
         &mut self.idle_reset_rx
     }
 
-    pub fn plugin_notifications_mut(&mut self) -> &mut Receiver<PluginNotification> {
+    pub fn plugin_notifications_mut(
+        &mut self,
+    ) -> &mut Receiver<crate::runtime::PluginNotification> {
         &mut self.plugin_event_rx
     }
 
-    pub fn plugin_manager(&self) -> &PluginManager {
-        self.plugin_manager.as_ref()
-    }
-
-    pub fn apply_delivery(&mut self, delivery: RuntimeDelivery) {
+    fn apply_delivery_inner(&mut self, delivery: RuntimeDelivery) {
         match delivery {
             RuntimeDelivery::Status { message, severity } => {
                 self.editor.status_msg = Some((Cow::Owned(message), severity));
@@ -256,8 +242,9 @@ impl EmbeddedEditor {
                 crate::effect::apply_runtime_task_event(
                     &mut self.editor,
                     self.ingress.clone(),
-                    self.plugin_manager.clone(),
-                    task,
+                    self.foreground.clone(),
+                    self.plugin_runtime.clone(),
+                    *task,
                 );
             }
             RuntimeDelivery::AssistantPermissionResolved {
@@ -271,14 +258,25 @@ impl EmbeddedEditor {
                 self.editor.apply_assistant_effects(effects);
             }
             RuntimeDelivery::Ui(cmd) => {
-                crate::runtime::apply_ui_command(
-                    &mut self.editor,
-                    &mut self.compositor,
-                    self.ingress.clone(),
-                    self.plugin_manager.clone(),
-                    cmd,
-                );
+                self.with_context(|compositor, context| {
+                    crate::runtime::apply_ui_command(compositor, context, cmd)
+                });
             }
+            RuntimeDelivery::Plugin(notification) => {
+                if let Some(event) =
+                    crate::effect::plugin::notification_to_event(&notification, &self.editor)
+                {
+                    self.plugin_runtime.notify_event(event);
+                }
+                let _ = self.plugin_events.try_send(notification);
+            }
+        }
+    }
+
+    pub fn apply_delivery(&mut self, delivery: RuntimeDelivery) {
+        self.apply_delivery_inner(delivery);
+        while let Some(delivery) = self.foreground.pop() {
+            self.apply_delivery_inner(delivery);
         }
     }
 
@@ -323,13 +321,13 @@ impl EmbeddedEditor {
         }
     }
 
-    pub async fn recv_plugin_notification(&mut self) -> Option<PluginNotification> {
+    pub async fn recv_plugin_notification(&mut self) -> Option<crate::runtime::PluginNotification> {
         self.plugin_event_rx.recv().await
     }
 
     pub fn try_recv_plugin_notification(
         &mut self,
-    ) -> Result<Option<PluginNotification>, helix_runtime::TryRecvError> {
+    ) -> Result<Option<crate::runtime::PluginNotification>, helix_runtime::TryRecvError> {
         match self.plugin_event_rx.try_recv() {
             Ok(notification) => Ok(Some(notification)),
             Err(helix_runtime::TryRecvError::Empty) => Ok(None),
@@ -347,18 +345,24 @@ impl EmbeddedEditor {
     pub fn with_context<R>(&mut self, f: impl FnOnce(&mut Compositor, &mut Context<'_>) -> R) -> R {
         let notifier = handlers::local::Notifier {
             redraw: self.editor.redraw_handle(),
-            plugin_events: self.plugin_events.clone(),
+            plugin_events: self.plugin_events.clone().into(),
         };
-        let mut context = Context::new(
+        let mut context = Context::with_foreground(
             &mut self.editor,
             &mut self.exit_tasks,
             self.exit_task_work.clone(),
             notifier,
             self.ingress.clone(),
             self.idle_reset.clone(),
-            Some(self.plugin_manager.clone()),
+            self.plugin_runtime.clone(),
+            self.foreground.clone(),
         );
-        f(&mut self.compositor, &mut context)
+        let result = f(&mut self.compositor, &mut context);
+        drop(context);
+        while let Some(delivery) = self.foreground.pop() {
+            self.apply_delivery_inner(delivery);
+        }
+        result
     }
 
     pub fn handle_event(&mut self, event: &Event) -> bool {

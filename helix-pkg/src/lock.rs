@@ -18,6 +18,8 @@ pub struct Manifest {
     pub grammar: Vec<String>,
     #[serde(default)]
     pub plugin: Vec<String>,
+    #[serde(default)]
+    pub acp: Vec<String>,
 }
 
 impl Manifest {
@@ -61,6 +63,7 @@ impl Manifest {
                     .iter()
                     .map(|name| (PkgKind::Plugin, name.as_str())),
             )
+            .chain(self.acp.iter().map(|name| (PkgKind::Acp, name.as_str())))
     }
 
     pub fn contains(&self, kind: PkgKind, name: &str) -> bool {
@@ -71,6 +74,7 @@ impl Manifest {
             PkgKind::Linter => self.linter.iter().any(|package| package == name),
             PkgKind::Grammar => self.grammar.iter().any(|package| package == name),
             PkgKind::Plugin => self.plugin.iter().any(|package| package == name),
+            PkgKind::Acp => self.acp.iter().any(|package| package == name),
         }
     }
 
@@ -82,6 +86,7 @@ impl Manifest {
             linter: merge_package_names(&self.linter, &overlay.linter),
             grammar: merge_package_names(&self.grammar, &overlay.grammar),
             plugin: merge_package_names(&self.plugin, &overlay.plugin),
+            acp: merge_package_names(&self.acp, &overlay.acp),
         }
     }
 }

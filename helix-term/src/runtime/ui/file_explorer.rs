@@ -1,5 +1,9 @@
 use std::{
     path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     time::Instant,
 };
 
@@ -10,30 +14,651 @@ use crate::{
         ui::snapshot::UiSnapshotRequest,
         UiCommand,
     },
-    ui::{FileExplorerPanel, Prompt, PromptEvent, FILE_EXPLORER_ID},
+    ui::{
+        Confirmation, FileExplorerPanel, FileExplorerTreeWork, PreparedFileExplorerTree, Prompt,
+        PromptEvent, FILE_EXPLORER_ID,
+    },
 };
-use helix_view::{editor::SavePolicy, DocumentId, Editor};
+use helix_view::{
+    editor::{DocumentOpenRole, DocumentOpenWork, PreparedDocumentOpen, SavePolicy},
+    DocumentId, Editor,
+};
 
-struct FileExplorerApplyContext<'a> {
-    editor: &'a mut Editor,
-    compositor: &'a mut Compositor,
+struct FileExplorerTreeJob {
+    work: FileExplorerTreeWork,
     ingress: crate::runtime::RuntimeIngress,
 }
 
-fn is_directory_input(input: &str) -> bool {
-    input.ends_with(std::path::MAIN_SEPARATOR) || input.ends_with('/')
+#[derive(Default)]
+struct FileExplorerTreeQueueState {
+    pending: Option<FileExplorerTreeJob>,
+    prepared: Option<PreparedFileExplorerTree>,
 }
 
-fn path_exists_for_prompt(path: &Path) -> std::io::Result<bool> {
-    match std::fs::symlink_metadata(path) {
-        Ok(_) => Ok(true),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(err) => Err(err),
+#[derive(Debug)]
+enum FileExplorerTreePulse {}
+
+#[derive(Clone)]
+pub(crate) struct FileExplorerTreeQueue {
+    state: Arc<Mutex<FileExplorerTreeQueueState>>,
+    wake: helix_runtime::PulseHandle<FileExplorerTreePulse>,
+}
+
+impl std::fmt::Debug for FileExplorerTreeQueue {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        formatter
+            .debug_struct("FileExplorerTreeQueue")
+            .field("pending", &state.pending.is_some())
+            .field("prepared", &state.prepared.is_some())
+            .finish()
+    }
+}
+
+impl FileExplorerTreeQueue {
+    pub(crate) fn spawn(work: helix_runtime::Work, block: helix_runtime::Block) -> Self {
+        let state = Arc::new(Mutex::new(FileExplorerTreeQueueState::default()));
+        let mut gate = helix_runtime::PulseGate::<FileExplorerTreePulse>::new();
+        let wake = gate.handle();
+        let mut wake_rx = gate.take_receiver();
+        let actor_state = state.clone();
+        work.spawn(async move {
+            while wake_rx.recv().await.is_some() {
+                loop {
+                    let Some(job) = actor_state
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .pending
+                        .take()
+                    else {
+                        break;
+                    };
+                    let FileExplorerTreeJob { work, ingress } = job;
+                    let generation = work.generation();
+                    let root = work.root().to_path_buf();
+                    let result = block.spawn(move || work.execute()).await;
+                    let outcome = {
+                        let mut state = actor_state
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if state.pending.is_some() {
+                            continue;
+                        }
+                        match result {
+                            Ok(Ok(prepared)) => {
+                                state.prepared = Some(prepared);
+                                Ok(())
+                            }
+                            Ok(Err(error)) => {
+                                Err(format!("Failed to refresh file explorer: {error}"))
+                            }
+                            Err(error) => {
+                                Err(format!("File explorer refresh worker failed: {error}"))
+                            }
+                        }
+                    };
+                    match outcome {
+                        Ok(()) => {
+                            let _ = ingress
+                                .send_ui(UiCommand::FileExplorer(FileExplorerCommand::ApplyTree {
+                                    root,
+                                    generation,
+                                }))
+                                .await;
+                        }
+                        Err(error) => ingress.status(anyhow::anyhow!(error)),
+                    }
+                }
+            }
+        })
+        .detach();
+        Self { state, wake }
+    }
+
+    pub(crate) fn submit(
+        &self,
+        work: FileExplorerTreeWork,
+        ingress: crate::runtime::RuntimeIngress,
+    ) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.pending = Some(FileExplorerTreeJob { work, ingress });
+        state.prepared = None;
+        drop(state);
+        self.wake.request();
+    }
+
+    pub(crate) fn take(&self, root: &Path, generation: u64) -> Option<PreparedFileExplorerTree> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state
+            .prepared
+            .as_ref()
+            .is_some_and(|prepared| prepared.root == root && prepared.generation == generation)
+        {
+            state.prepared.take()
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FileExplorerPreviewRequest {
+    pub(crate) root: PathBuf,
+    pub(crate) path: PathBuf,
+    pub(crate) cursor: u32,
+    pub(crate) generation: u64,
+}
+
+pub(crate) struct PreparedFileExplorerPreview {
+    pub(crate) request: FileExplorerPreviewRequest,
+    pub(crate) result: Result<PreparedDocumentOpen, String>,
+}
+
+pub(crate) struct FileExplorerPreviewLoadRequest {
+    request: FileExplorerPreviewRequest,
+    work: DocumentOpenWork,
+}
+
+struct FileExplorerPreviewJob {
+    load: FileExplorerPreviewLoadRequest,
+    ingress: crate::runtime::RuntimeIngress,
+}
+
+#[derive(Default)]
+struct FileExplorerPreviewQueueState {
+    generation: Option<u64>,
+    pending: Option<FileExplorerPreviewJob>,
+    active: Option<(u64, helix_runtime::Token)>,
+    prepared: Option<PreparedFileExplorerPreview>,
+}
+
+#[derive(Debug)]
+enum FileExplorerPreviewPulse {}
+
+#[derive(Clone)]
+pub(crate) struct FileExplorerPreviewQueue {
+    state: Arc<Mutex<FileExplorerPreviewQueueState>>,
+    wake: helix_runtime::PulseHandle<FileExplorerPreviewPulse>,
+}
+
+impl std::fmt::Debug for FileExplorerPreviewQueue {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        formatter
+            .debug_struct("FileExplorerPreviewQueue")
+            .field("generation", &state.generation)
+            .field("running", &state.active.is_some())
+            .field("pending", &state.pending.is_some())
+            .field("prepared", &state.prepared.is_some())
+            .finish()
+    }
+}
+
+impl FileExplorerPreviewQueue {
+    pub(crate) fn new(work: helix_runtime::Work, block: helix_runtime::Block) -> Self {
+        let state = Arc::new(Mutex::new(FileExplorerPreviewQueueState::default()));
+        let mut gate = helix_runtime::PulseGate::<FileExplorerPreviewPulse>::new();
+        let wake = gate.handle();
+        let mut wake_rx = gate.take_receiver();
+        let actor_state = state.clone();
+
+        work.spawn(async move {
+            while wake_rx.recv().await.is_some() {
+                loop {
+                    let Some(job) = actor_state
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .pending
+                        .take()
+                    else {
+                        break;
+                    };
+                    let request = job.load.request.clone();
+                    let generation = request.generation;
+                    let token = helix_runtime::Token::new();
+                    {
+                        let mut queue = actor_state
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        queue.active = Some((generation, token.clone()));
+                    }
+
+                    let worker_token = token.clone();
+                    let result = block
+                        .spawn(move || prepare_file_explorer_preview(job.load, &worker_token))
+                        .await
+                        .unwrap_or_else(|error| Err(format!("preview worker failed: {error}")));
+
+                    let should_notify = {
+                        let mut queue = actor_state
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        queue.active = None;
+                        let current = !token.is_canceled()
+                            && queue.generation == Some(generation)
+                            && queue.pending.is_none();
+                        if current {
+                            queue.prepared = Some(PreparedFileExplorerPreview {
+                                request: request.clone(),
+                                result,
+                            });
+                        }
+                        current
+                    };
+
+                    if should_notify {
+                        let _ = job
+                            .ingress
+                            .send_ui(UiCommand::FileExplorer(FileExplorerCommand::ApplyPreview {
+                                root: request.root,
+                                path: request.path,
+                                cursor: request.cursor,
+                                generation: request.generation,
+                            }))
+                            .await;
+                    }
+                }
+            }
+        })
+        .detach();
+
+        Self { state, wake }
+    }
+
+    pub(crate) fn submit(
+        &self,
+        load: FileExplorerPreviewLoadRequest,
+        ingress: crate::runtime::RuntimeIngress,
+    ) {
+        let generation = load.request.generation;
+        let mut queue = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((_, token)) = &queue.active {
+            token.cancel();
+        }
+        queue.generation = Some(generation);
+        queue.prepared = None;
+        queue.pending = Some(FileExplorerPreviewJob { load, ingress });
+        drop(queue);
+        self.wake.request();
+    }
+
+    pub(crate) fn cancel(&self) {
+        let mut queue = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        queue.generation = None;
+        queue.pending = None;
+        queue.prepared = None;
+        if let Some((_, token)) = queue.active.take() {
+            token.cancel();
+        }
+    }
+
+    pub(crate) fn take(
+        &self,
+        request: &FileExplorerPreviewRequest,
+    ) -> Option<PreparedFileExplorerPreview> {
+        let mut queue = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if queue
+            .prepared
+            .as_ref()
+            .is_some_and(|prepared| prepared.request == *request)
+        {
+            queue.prepared.take()
+        } else {
+            None
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn store_prepared(&self, prepared: PreparedFileExplorerPreview) {
+        let mut queue = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        queue.pending = None;
+        if let Some((_, token)) = queue.active.take() {
+            token.cancel();
+        }
+        queue.generation = Some(prepared.request.generation);
+        queue.prepared = Some(prepared);
+    }
+}
+
+fn prepare_file_explorer_preview(
+    load: FileExplorerPreviewLoadRequest,
+    token: &helix_runtime::Token,
+) -> Result<PreparedDocumentOpen, String> {
+    let start = Instant::now();
+    let prepared = load.work.execute().map_err(|error| error.to_string())?;
+    if token.is_canceled() {
+        return Err(String::from("preview request canceled"));
+    }
+    log::info!(
+        "[file_explorer] preview prepared path={} generation={} elapsed_us={}",
+        prepared.path().display(),
+        load.request.generation,
+        start.elapsed().as_micros(),
+    );
+    Ok(prepared)
+}
+
+pub(crate) fn queue_file_explorer_preview(
+    editor: &Editor,
+    ingress: crate::runtime::RuntimeIngress,
+    request: FileExplorerPreviewRequest,
+) {
+    let work = editor.prepare_document_open(&request.path, DocumentOpenRole::Preview);
+    ingress.file_explorer_preview(FileExplorerPreviewLoadRequest { request, work });
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct FileExplorerSearchRequest {
+    root: PathBuf,
+    query: String,
+    generation: u64,
+    config: helix_view::editor::FileExplorerConfig,
+}
+
+struct FileExplorerSearchJob {
+    request: FileExplorerSearchRequest,
+    ingress: crate::runtime::RuntimeIngress,
+    abort: Arc<AtomicBool>,
+}
+
+#[derive(Default)]
+struct FileExplorerSearchState {
+    pending: Option<FileExplorerSearchJob>,
+    active_abort: Option<Arc<AtomicBool>>,
+}
+
+impl FileExplorerSearchState {
+    fn replace(&mut self, job: FileExplorerSearchJob) {
+        if let Some(active) = &self.active_abort {
+            active.store(true, Ordering::Release);
+        }
+        if let Some(pending) = &self.pending {
+            pending.abort.store(true, Ordering::Release);
+        }
+        self.pending = Some(job);
+    }
+
+    fn take(&mut self) -> Option<FileExplorerSearchJob> {
+        let job = self.pending.take()?;
+        self.active_abort = Some(job.abort.clone());
+        Some(job)
+    }
+
+    fn is_pending(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    fn finish(&mut self, abort: &Arc<AtomicBool>) -> bool {
+        if self
+            .active_abort
+            .as_ref()
+            .is_some_and(|active| Arc::ptr_eq(active, abort))
+        {
+            self.active_abort = None;
+        }
+        abort.load(Ordering::Acquire) || self.is_pending()
+    }
+}
+
+#[derive(Debug)]
+enum FileExplorerSearchPulse {}
+
+#[derive(Clone)]
+pub(crate) struct FileExplorerSearchQueue {
+    state: Arc<Mutex<FileExplorerSearchState>>,
+    wake: helix_runtime::PulseHandle<FileExplorerSearchPulse>,
+}
+
+impl std::fmt::Debug for FileExplorerSearchQueue {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("FileExplorerSearchQueue")
+            .field(
+                "pending",
+                &self
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .is_pending(),
+            )
+            .finish()
+    }
+}
+
+impl FileExplorerSearchQueue {
+    pub(crate) fn spawn(work: helix_runtime::Work, block: helix_runtime::Block) -> Self {
+        let state = Arc::new(Mutex::new(FileExplorerSearchState::default()));
+        let mut gate = helix_runtime::PulseGate::<FileExplorerSearchPulse>::new();
+        let wake = gate.handle();
+        let mut wake_rx = gate.take_receiver();
+        let actor_state = state.clone();
+
+        work.spawn(async move {
+            while wake_rx.recv().await.is_some() {
+                loop {
+                    let Some(job) = actor_state
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .take()
+                    else {
+                        break;
+                    };
+                    let request = job.request.clone();
+                    let abort = job.abort.clone();
+                    let worker_abort = abort.clone();
+                    let result = block
+                        .spawn(move || execute_file_explorer_search(request, &worker_abort))
+                        .await;
+                    let superseded = actor_state
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .finish(&abort);
+                    if superseded {
+                        continue;
+                    }
+                    match result {
+                        Ok(matches) => {
+                            let _ = job
+                                .ingress
+                                .send_ui(UiCommand::FileExplorer(
+                                    FileExplorerCommand::ApplySearchResults {
+                                        root: job.request.root,
+                                        query: job.request.query,
+                                        generation: job.request.generation,
+                                        matches,
+                                    },
+                                ))
+                                .await;
+                        }
+                        Err(error) => log::warn!(
+                            "[file_explorer] search worker failed generation={}: {error}",
+                            job.request.generation
+                        ),
+                    }
+                }
+            }
+        })
+        .detach();
+
+        Self { state, wake }
+    }
+
+    pub(crate) fn submit(
+        &self,
+        request: FileExplorerSearchRequest,
+        ingress: crate::runtime::RuntimeIngress,
+    ) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .replace(FileExplorerSearchJob {
+                request,
+                ingress,
+                abort: Arc::new(AtomicBool::new(false)),
+            });
+        self.wake.request();
+    }
+}
+
+fn execute_file_explorer_search(
+    request: FileExplorerSearchRequest,
+    abort: &AtomicBool,
+) -> Vec<PathBuf> {
+    let start = Instant::now();
+    match crate::fff::search_file_explorer_available_cancellable(
+        &request.root,
+        &request.query,
+        &request.config,
+        Some(abort),
+    ) {
+        Ok(matches) => {
+            log::info!(
+                "[file_explorer] search_load_done root={} query={:?} generation={} cancelled={} matches={} first_match={} elapsed_us={}",
+                request.root.display(),
+                request.query,
+                request.generation,
+                abort.load(Ordering::Acquire),
+                matches.len(),
+                matches
+                    .first()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| String::from("<none>")),
+                start.elapsed().as_micros(),
+            );
+            matches
+        }
+        Err(error) => {
+            log::debug!(
+                "failed to query FFF file explorer search for {} query={:?}: {error:#}",
+                request.root.display(),
+                request.query
+            );
+            Vec::new()
+        }
+    }
+}
+
+struct FileExplorerApplyContext<'a> {
+    editor: &'a mut Editor,
+    ingress: crate::runtime::RuntimeIngress,
+}
+
+fn file_explorer_command_name(cmd: &FileExplorerCommand) -> &'static str {
+    match cmd {
+        FileExplorerCommand::ToggleSourceOption { .. } => "ToggleSourceOption",
+        FileExplorerCommand::FileOperationCompleted { .. } => "FileOperationCompleted",
+        FileExplorerCommand::ApplyTree { .. } => "ApplyTree",
+        FileExplorerCommand::PreviewSelection { .. } => "PreviewSelection",
+        FileExplorerCommand::ApplyPreview { .. } => "ApplyPreview",
+        FileExplorerCommand::ApplyVcsSnapshot { .. } => "ApplyVcsSnapshot",
+        FileExplorerCommand::StartSearch { .. } => "StartSearch",
+        FileExplorerCommand::ApplySearchResults { .. } => "ApplySearchResults",
+        FileExplorerCommand::ApplyCreate { .. } => "ApplyCreate",
+        FileExplorerCommand::ApplyMove { .. } => "ApplyMove",
+        FileExplorerCommand::PromptDelete { .. } => "PromptDelete",
+        FileExplorerCommand::ApplyConfirmedDelete { .. } => "ApplyConfirmedDelete",
+        FileExplorerCommand::PromptCopy { .. } => "PromptCopy",
+        FileExplorerCommand::ApplyCopy { .. } => "ApplyCopy",
+        FileExplorerCommand::PromptSaveBefore { .. } => "PromptSaveBefore",
     }
 }
 
 fn spawn_file_explorer_command(cx: &mut crate::compositor::Context, command: FileExplorerCommand) {
     cx.spawn_ui(async move { Ok(UiCommand::FileExplorer(command)) });
+}
+
+fn notify_file_explorer_confirmation(editor: &mut Editor, message: impl Into<String>) {
+    editor.notify_warning(format!("File explorer: {}", message.into()));
+}
+
+fn notify_file_explorer_info(editor: &mut Editor, message: impl Into<String>) {
+    editor.notify_info(format!("File explorer: {}", message.into()));
+}
+
+fn notify_file_explorer_error(editor: &mut Editor, message: impl Into<String>) {
+    editor.notify_error(format!("File explorer: {}", message.into()));
+}
+
+fn notify_file_explorer_result(editor: &mut Editor, result: Result<String, String>) {
+    match result {
+        Ok(message) => notify_file_explorer_info(editor, message),
+        Err(message) => notify_file_explorer_error(editor, message),
+    }
+}
+
+fn validate_explorer_descendant(
+    root: &Path,
+    path: &Path,
+    operation: &str,
+    allow_root: bool,
+) -> Result<(), String> {
+    let root = helix_stdx::path::canonicalize(root);
+    let path = helix_stdx::path::canonicalize(path);
+    if !path.starts_with(&root) {
+        return Err(format!(
+            "Refusing to {operation} {} because it is outside explorer root {}",
+            path.display(),
+            root.display()
+        ));
+    }
+    if !allow_root && path == root {
+        return Err(format!(
+            "Refusing to {operation} the explorer root {}",
+            root.display()
+        ));
+    }
+    Ok(())
+}
+
+fn validate_explorer_destination(
+    root: &Path,
+    destination: &helix_view::editor::FileOperationDestination,
+    operation: &str,
+) -> Result<(), String> {
+    let (path, allow_root) = match destination {
+        helix_view::editor::FileOperationDestination::Exact(path) => (path, false),
+        helix_view::editor::FileOperationDestination::PathOrDirectory(path)
+        | helix_view::editor::FileOperationDestination::UniqueInDirectory(path) => (path, true),
+    };
+    validate_explorer_descendant(root, path, operation, allow_root)
+}
+
+fn exact_destination(
+    destination: &helix_view::editor::FileOperationDestination,
+) -> Option<PathBuf> {
+    match destination {
+        helix_view::editor::FileOperationDestination::Exact(path) => Some(path.clone()),
+        helix_view::editor::FileOperationDestination::PathOrDirectory(_)
+        | helix_view::editor::FileOperationDestination::UniqueInDirectory(_) => None,
+    }
+}
+
+fn same_explorer_root(left: &Path, right: &Path) -> bool {
+    helix_stdx::path::canonicalize(left) == helix_stdx::path::canonicalize(right)
 }
 
 fn queue_file_explorer_command(
@@ -58,14 +683,65 @@ pub(crate) fn queue_file_explorer_vcs_snapshot(
         return;
     }
 
-    let root = helix_stdx::path::normalize(root);
     let diff_providers = editor.diff_providers.clone();
     UiSnapshotRequest::new("[file_explorer] vcs_snapshot", root)
-        .load_with(move |root| diff_providers.changed_files(&root))
-        .apply_with(|root, changes| {
-            UiCommand::FileExplorer(FileExplorerCommand::ApplyVcsSnapshot { root, changes })
+        .load_with(move |root| {
+            diff_providers
+                .changed_files(&root)
+                .map(|changes| crate::ui::VcsSnapshot::from_changes(&root, changes))
         })
-        .spawn(editor.work(), ingress);
+        .apply_with(|root, snapshot| {
+            UiCommand::FileExplorer(FileExplorerCommand::ApplyVcsSnapshot { root, snapshot })
+        })
+        .spawn(editor.work(), editor.runtime().block().clone(), ingress);
+}
+
+fn queue_file_explorer_search(
+    ingress: crate::runtime::RuntimeIngress,
+    root: PathBuf,
+    query: String,
+    generation: u64,
+    config: helix_view::editor::FileExplorerConfig,
+) {
+    log::info!(
+        "[file_explorer] search_enqueue root={} query={query:?} generation={} hidden={} ignore={} git_ignore={} git_global={} git_exclude={} follow_symlinks={}",
+        root.display(),
+        generation,
+        config.hidden,
+        config.ignore,
+        config.git_ignore,
+        config.git_global,
+        config.git_exclude,
+        config.follow_symlinks,
+    );
+    let request = FileExplorerSearchRequest {
+        root,
+        query,
+        generation,
+        config,
+    };
+    ingress.file_explorer_search(request);
+}
+
+pub(crate) fn queue_file_explorer_tree_refresh(
+    panel: &mut FileExplorerPanel,
+    editor: &Editor,
+    ingress: crate::runtime::RuntimeIngress,
+    root: Option<PathBuf>,
+    cursor: Option<usize>,
+    select_path: Option<PathBuf>,
+    follow_current_file: bool,
+    clear_cache: bool,
+) {
+    let work = panel.prepare_tree_refresh(
+        editor,
+        root,
+        cursor,
+        select_path,
+        follow_current_file,
+        clear_cache,
+    );
+    ingress.file_explorer_tree(work);
 }
 
 fn refresh_file_explorer_panel(
@@ -79,9 +755,16 @@ fn refresh_file_explorer_panel(
     let requested_root = root.clone();
     let cursor = usize::try_from(cursor).unwrap_or(usize::MAX);
     if let Some(panel) = compositor.find_id::<FileExplorerPanel>(FILE_EXPLORER_ID) {
-        if let Err(err) = panel.refresh(editor, Some(root), Some(cursor)) {
-            editor.set_error(format!("{err}"));
-        }
+        queue_file_explorer_tree_refresh(
+            panel,
+            editor,
+            ingress.clone(),
+            Some(root),
+            Some(cursor),
+            None,
+            false,
+            true,
+        );
         log::info!(
             "[file_explorer] runtime_refresh existing_panel=true root={} cursor={} elapsed_us={}",
             requested_root.display(),
@@ -90,28 +773,25 @@ fn refresh_file_explorer_panel(
         );
         queue_file_explorer_vcs_snapshot(editor, ingress, requested_root);
     } else {
-        match FileExplorerPanel::new_with_cursor(root, editor, Some(cursor)) {
-            Ok(panel) => {
-                compositor.push(Box::new(panel));
-                log::info!(
-                    "[file_explorer] runtime_refresh existing_panel=false root={} cursor={} elapsed_us={}",
-                    requested_root.display(),
-                    cursor,
-                    start.elapsed().as_micros()
-                );
-                queue_file_explorer_vcs_snapshot(editor, ingress, requested_root);
-            }
-            Err(err) => {
-                log::info!(
-                    "[file_explorer] runtime_refresh existing_panel=false root={} cursor={} error={} elapsed_us={}",
-                    requested_root.display(),
-                    cursor,
-                    err,
-                    start.elapsed().as_micros()
-                );
-                editor.set_error(format!("{err}"));
-            }
-        }
+        let mut panel = FileExplorerPanel::new_deferred(root, editor);
+        queue_file_explorer_tree_refresh(
+            &mut panel,
+            editor,
+            ingress.clone(),
+            None,
+            Some(cursor),
+            None,
+            false,
+            false,
+        );
+        compositor.push(Box::new(panel));
+        log::info!(
+            "[file_explorer] runtime_refresh existing_panel=false root={} cursor={} elapsed_us={}",
+            requested_root.display(),
+            cursor,
+            start.elapsed().as_micros()
+        );
+        queue_file_explorer_vcs_snapshot(editor, ingress, requested_root);
     }
 }
 
@@ -128,10 +808,16 @@ fn refresh_file_explorer_panel_selecting_path(
     let requested_path = path.clone();
     let cursor = usize::try_from(cursor).unwrap_or(usize::MAX);
     if let Some(panel) = compositor.find_id::<FileExplorerPanel>(FILE_EXPLORER_ID) {
-        if let Err(err) = panel.refresh_selecting_path(editor, Some(root), &path, cursor) {
-            editor.set_error(format!("{err}"));
-        }
-        panel.queue_selected_preview(editor, ingress.clone());
+        queue_file_explorer_tree_refresh(
+            panel,
+            editor,
+            ingress.clone(),
+            Some(root),
+            Some(cursor),
+            Some(path),
+            false,
+            true,
+        );
         log::info!(
             "[file_explorer] runtime_refresh existing_panel=true root={} select_path={} fallback_cursor={} elapsed_us={}",
             requested_root.display(),
@@ -141,38 +827,31 @@ fn refresh_file_explorer_panel_selecting_path(
         );
         queue_file_explorer_vcs_snapshot(editor, ingress, requested_root);
     } else {
-        match FileExplorerPanel::new_with_cursor(root, editor, Some(cursor)) {
-            Ok(mut panel) => {
-                panel.queue_selected_preview(editor, ingress.clone());
-                compositor.push(Box::new(panel));
-                log::info!(
-                    "[file_explorer] runtime_refresh existing_panel=false root={} select_path={} fallback_cursor={} elapsed_us={}",
-                    requested_root.display(),
-                    requested_path.display(),
-                    cursor,
-                    start.elapsed().as_micros()
-                );
-                queue_file_explorer_vcs_snapshot(editor, ingress, requested_root);
-            }
-            Err(err) => {
-                log::info!(
-                    "[file_explorer] runtime_refresh existing_panel=false root={} select_path={} fallback_cursor={} error={} elapsed_us={}",
-                    requested_root.display(),
-                    requested_path.display(),
-                    cursor,
-                    err,
-                    start.elapsed().as_micros()
-                );
-                editor.set_error(format!("{err}"));
-            }
-        }
+        let mut panel = FileExplorerPanel::new_deferred(root, editor);
+        queue_file_explorer_tree_refresh(
+            &mut panel,
+            editor,
+            ingress.clone(),
+            None,
+            Some(cursor),
+            Some(path),
+            false,
+            false,
+        );
+        compositor.push(Box::new(panel));
+        log::info!(
+            "[file_explorer] runtime_refresh existing_panel=false root={} select_path={} fallback_cursor={} elapsed_us={}",
+            requested_root.display(),
+            requested_path.display(),
+            cursor,
+            start.elapsed().as_micros()
+        );
+        queue_file_explorer_vcs_snapshot(editor, ingress, requested_root);
     }
 }
 
 fn path_affects_document(path: &Path, document_path: &Path) -> bool {
-    let path = helix_stdx::path::canonicalize(path);
-    let document_path = helix_stdx::path::canonicalize(document_path);
-    document_path == path || path.is_dir() && document_path.starts_with(path)
+    document_path == path || document_path.starts_with(path)
 }
 
 fn modified_documents_for_paths(editor: &Editor, paths: &[PathBuf]) -> Vec<DocumentId> {
@@ -210,7 +889,6 @@ fn save_modified_documents(
         append_document_changes_to_history(cx.editor, doc_id);
         cx.editor.save(doc_id, None::<PathBuf>, SavePolicy::Safe)?;
     }
-    tokio::task::block_in_place(|| helix_lsp::block_on(cx.editor.flush_writes()))?;
     Ok(())
 }
 
@@ -244,7 +922,7 @@ fn without_modified_buffer_check(mut command: FileExplorerCommand) -> FileExplor
             modified_buffer_check,
             ..
         }
-        | FileExplorerCommand::ApplyDelete {
+        | FileExplorerCommand::ApplyConfirmedDelete {
             modified_buffer_check,
             ..
         }
@@ -285,17 +963,21 @@ fn apply_create(
     cx: &mut FileExplorerApplyContext<'_>,
     root: PathBuf,
     cursor: u32,
-    input: String,
+    is_dir: bool,
     target: PathBuf,
     modified_buffer_check: ModifiedBufferCheck,
 ) {
     let command = FileExplorerCommand::ApplyCreate {
         root: root.clone(),
         cursor,
-        input: input.clone(),
+        is_dir,
         target: target.clone(),
         modified_buffer_check,
     };
+    if let Err(error) = validate_explorer_descendant(&root, &target, "create", false) {
+        notify_file_explorer_error(cx.editor, error);
+        return;
+    }
     if modified_buffer_check == ModifiedBufferCheck::Prompt
         && prompt_save_before_modified_documents(
             cx.editor,
@@ -308,48 +990,19 @@ fn apply_create(
         return;
     }
 
-    let is_dir = is_directory_input(&input);
-    let result = if is_dir {
-        match cx
-            .editor
-            .create_path_with_history(&target, true)
-            .map_err(|err| format!("Unable to create directory {}: {err}", target.display()))
-        {
-            Ok(()) => {
-                refresh_file_explorer_panel_selecting_path(
-                    cx.editor,
-                    cx.compositor,
-                    cx.ingress.clone(),
-                    root,
-                    target.clone(),
-                    cursor,
-                );
-                Ok(format!("Created directory: {}", target.display()))
-            }
-            Err(err) => Err(err),
-        }
-    } else {
-        match cx
-            .editor
-            .create_path_with_history(&target, false)
-            .map_err(|err| format!("Unable to create file {}: {err}", target.display()))
-        {
-            Ok(()) => {
-                refresh_file_explorer_panel_selecting_path(
-                    cx.editor,
-                    cx.compositor,
-                    cx.ingress.clone(),
-                    root,
-                    target.clone(),
-                    cursor,
-                );
-                Ok(format!("Created file: {}", target.display()))
-            }
-            Err(err) => Err(err),
-        }
-    };
-
-    cx.editor.set_result(result);
+    crate::effect::file_operation::submit(
+        cx.editor,
+        cx.ingress.clone(),
+        helix_view::editor::FileOperationRequest::create(
+            helix_view::editor::FileOperationOrigin::Explorer {
+                root,
+                cursor,
+                select_path: Some(target.clone()),
+            },
+            target,
+            is_dir,
+        ),
+    );
 }
 
 fn apply_move(
@@ -357,68 +1010,62 @@ fn apply_move(
     source: PathBuf,
     root: PathBuf,
     cursor: u32,
-    input: String,
-    destination: PathBuf,
+    destination: helix_view::editor::FileOperationDestination,
     modified_buffer_check: ModifiedBufferCheck,
 ) {
     let command = FileExplorerCommand::ApplyMove {
         source: source.clone(),
         root: root.clone(),
         cursor,
-        input: input.clone(),
         destination: destination.clone(),
         modified_buffer_check,
     };
+    if let Err(error) = validate_explorer_descendant(&root, &source, "move", false)
+        .and_then(|()| validate_explorer_destination(&root, &destination, "move to"))
+    {
+        notify_file_explorer_error(cx.editor, error);
+        return;
+    }
     if modified_buffer_check == ModifiedBufferCheck::Prompt
         && prompt_save_before_modified_documents(
             cx.editor,
             cx.ingress.clone(),
             format!("moving {}", source.display()),
-            &[source.clone(), destination.clone()],
+            std::slice::from_ref(&source),
             command,
         )
     {
         return;
     }
 
-    match cx
-        .editor
-        .move_path_with_history(&source, &destination)
-        .map_err(|err| {
-            format!(
-                "Unable to move {} {} -> {}: {err}",
-                if is_directory_input(&input) {
-                    "directory"
-                } else {
-                    "file"
-                },
-                source.display(),
-                destination.display()
-            )
-        }) {
-        Ok(()) => {
-            refresh_file_explorer_panel_selecting_path(
-                cx.editor,
-                cx.compositor,
-                cx.ingress.clone(),
+    crate::effect::file_operation::submit(
+        cx.editor,
+        cx.ingress.clone(),
+        helix_view::editor::FileOperationRequest::move_to_destination(
+            helix_view::editor::FileOperationOrigin::Explorer {
                 root,
-                destination,
                 cursor,
-            );
-            cx.editor.clear_status();
-        }
-        Err(err) => cx.editor.set_result(Err(err)),
-    }
+                select_path: exact_destination(&destination),
+            },
+            source,
+            destination,
+            true,
+        ),
+    );
 }
 
-fn apply_delete(
+fn apply_confirmed_delete(
     cx: &mut FileExplorerApplyContext<'_>,
     target: PathBuf,
     root: PathBuf,
     cursor: u32,
     modified_buffer_check: ModifiedBufferCheck,
 ) {
-    let command = FileExplorerCommand::ApplyDelete {
+    if let Err(error) = validate_explorer_descendant(&root, &target, "move to trash", false) {
+        notify_file_explorer_error(cx.editor, error);
+        return;
+    }
+    let command = FileExplorerCommand::ApplyConfirmedDelete {
         target: target.clone(),
         root: root.clone(),
         cursor,
@@ -436,50 +1083,18 @@ fn apply_delete(
         return;
     }
 
-    let result = if target.is_dir() {
-        match cx
-            .editor
-            .trash_path_with_history(&target)
-            .map_err(|err| format!("Unable to trash directory {}: {err}", target.display()))
-        {
-            Ok(()) => {
-                refresh_file_explorer_panel(
-                    cx.editor,
-                    cx.compositor,
-                    cx.ingress.clone(),
-                    root,
-                    cursor,
-                );
-                Some(Ok(format!(
-                    "Moved directory to trash: {}",
-                    target.display()
-                )))
-            }
-            Err(err) => Some(Err(err)),
-        }
-    } else {
-        match cx
-            .editor
-            .trash_path_with_history(&target)
-            .map_err(|err| format!("Unable to trash file {}: {err}", target.display()))
-        {
-            Ok(()) => {
-                refresh_file_explorer_panel(
-                    cx.editor,
-                    cx.compositor,
-                    cx.ingress.clone(),
-                    root,
-                    cursor,
-                );
-                Some(Ok(format!("Moved file to trash: {}", target.display())))
-            }
-            Err(err) => Some(Err(err)),
-        }
-    };
-
-    if let Some(result) = result {
-        cx.editor.set_result(result);
-    }
+    crate::effect::file_operation::submit(
+        cx.editor,
+        cx.ingress.clone(),
+        helix_view::editor::FileOperationRequest::trash(
+            helix_view::editor::FileOperationOrigin::Explorer {
+                root,
+                cursor,
+                select_path: None,
+            },
+            target,
+        ),
+    );
 }
 
 fn apply_copy(
@@ -487,7 +1102,7 @@ fn apply_copy(
     source: PathBuf,
     root: PathBuf,
     cursor: u32,
-    destination: PathBuf,
+    destination: helix_view::editor::FileOperationDestination,
     modified_buffer_check: ModifiedBufferCheck,
 ) {
     let command = FileExplorerCommand::ApplyCopy {
@@ -497,45 +1112,44 @@ fn apply_copy(
         destination: destination.clone(),
         modified_buffer_check,
     };
+    if let Err(error) = validate_explorer_descendant(&root, &source, "copy", false) {
+        notify_file_explorer_error(cx.editor, error);
+        return;
+    }
+    if matches!(
+        &destination,
+        helix_view::editor::FileOperationDestination::UniqueInDirectory(_)
+    ) {
+        if let Err(error) = validate_explorer_destination(&root, &destination, "copy to") {
+            notify_file_explorer_error(cx.editor, error);
+            return;
+        }
+    }
     if modified_buffer_check == ModifiedBufferCheck::Prompt
         && prompt_save_before_modified_documents(
             cx.editor,
             cx.ingress.clone(),
             format!("copying {}", source.display()),
-            &[source.clone(), destination.clone()],
+            std::slice::from_ref(&source),
             command,
         )
     {
         return;
     }
 
-    match cx
-        .editor
-        .copy_path_with_history(&source, &destination)
-        .map_err(|err| {
-            format!(
-                "Unable to copy from file {} to {}: {err}",
-                source.display(),
-                destination.display()
-            )
-        }) {
-        Ok(_) => {
-            refresh_file_explorer_panel_selecting_path(
-                cx.editor,
-                cx.compositor,
-                cx.ingress.clone(),
+    crate::effect::file_operation::submit(
+        cx.editor,
+        cx.ingress.clone(),
+        helix_view::editor::FileOperationRequest::copy_path(
+            helix_view::editor::FileOperationOrigin::Explorer {
                 root,
-                destination.clone(),
                 cursor,
-            );
-            cx.editor.set_result(Ok(format!(
-                "Copied contents of file {} to {}",
-                source.display(),
-                destination.display()
-            )));
-        }
-        Err(err) => cx.editor.set_result(Err(err)),
-    }
+                select_path: exact_destination(&destination),
+            },
+            source,
+            destination,
+        ),
+    );
 }
 
 pub(crate) fn apply_file_explorer_command(
@@ -544,20 +1158,180 @@ pub(crate) fn apply_file_explorer_command(
     ingress: crate::runtime::RuntimeIngress,
     cmd: FileExplorerCommand,
 ) {
+    let command_name = file_explorer_command_name(&cmd);
+    let command_start = Instant::now();
+    log::info!("[file_explorer] command_apply_start command={command_name}");
     match cmd {
-        FileExplorerCommand::RefreshPanel { root, cursor } => {
-            refresh_file_explorer_panel(editor, compositor, ingress.clone(), root, cursor);
-        }
-        FileExplorerCommand::PreviewSelection { root, path, cursor } => {
+        FileExplorerCommand::ToggleSourceOption { option } => {
             if let Some(panel) = compositor.find_id::<FileExplorerPanel>(FILE_EXPLORER_ID) {
-                panel.apply_preview_request(editor, ingress.clone(), root, path, cursor);
+                panel.toggle_source_option(option);
+                let cursor = panel.selection_for_log();
+                queue_file_explorer_tree_refresh(
+                    panel,
+                    editor,
+                    ingress.clone(),
+                    None,
+                    Some(cursor),
+                    None,
+                    false,
+                    true,
+                );
+                panel.queue_current_search(editor, ingress);
             }
         }
-        FileExplorerCommand::ApplyVcsSnapshot { root, changes } => {
-            if let Some(panel) = compositor.find_id::<FileExplorerPanel>(FILE_EXPLORER_ID) {
-                if let Err(err) = panel.apply_vcs_snapshot(editor, root, changes) {
-                    editor.set_error(format!("{err}"));
+        FileExplorerCommand::FileOperationCompleted {
+            root,
+            cursor,
+            select_path,
+            result,
+        } => {
+            let matching_panel = compositor
+                .find_id::<FileExplorerPanel>(FILE_EXPLORER_ID)
+                .is_some_and(|panel| same_explorer_root(panel.root_for_context(), &root));
+            if result.is_ok() && matching_panel {
+                if let Some(path) = select_path {
+                    refresh_file_explorer_panel_selecting_path(
+                        editor,
+                        compositor,
+                        ingress.clone(),
+                        root,
+                        path,
+                        cursor,
+                    );
+                } else {
+                    refresh_file_explorer_panel(editor, compositor, ingress.clone(), root, cursor);
                 }
+            } else if result.is_ok() {
+                log::info!(
+                    "[file_explorer] operation_refresh_skip root={} reason=stale_or_closed_panel",
+                    root.display()
+                );
+            }
+            notify_file_explorer_result(editor, result);
+        }
+        FileExplorerCommand::ApplyTree { root, generation } => {
+            let Some(prepared) = ingress.take_file_explorer_tree(&root, generation) else {
+                log::info!(
+                    "[file_explorer] tree_apply_skip root={} generation={} reason=missing_prepared",
+                    root.display(),
+                    generation,
+                );
+                return;
+            };
+            if let Some(panel) = compositor.find_id::<FileExplorerPanel>(FILE_EXPLORER_ID) {
+                if panel.apply_prepared_tree(editor, prepared) {
+                    panel.queue_selected_preview(editor, ingress.clone());
+                }
+            }
+        }
+        FileExplorerCommand::PreviewSelection {
+            root,
+            path,
+            cursor,
+            generation,
+        } => {
+            if let Some(panel) = compositor.find_id::<FileExplorerPanel>(FILE_EXPLORER_ID) {
+                panel.apply_preview_request(
+                    editor,
+                    ingress.clone(),
+                    FileExplorerPreviewRequest {
+                        root,
+                        path,
+                        cursor,
+                        generation,
+                    },
+                );
+            }
+        }
+        FileExplorerCommand::ApplyPreview {
+            root,
+            path,
+            cursor,
+            generation,
+        } => {
+            if let Some(panel) = compositor.find_id::<FileExplorerPanel>(FILE_EXPLORER_ID) {
+                panel.apply_prepared_preview(
+                    editor,
+                    ingress.clone(),
+                    FileExplorerPreviewRequest {
+                        root,
+                        path,
+                        cursor,
+                        generation,
+                    },
+                );
+            }
+        }
+        FileExplorerCommand::ApplyVcsSnapshot { root, snapshot } => {
+            if let Some(panel) = compositor.find_id::<FileExplorerPanel>(FILE_EXPLORER_ID) {
+                if panel.apply_vcs_snapshot_state(editor, root, snapshot) {
+                    let cursor = panel.selection_for_log();
+                    queue_file_explorer_tree_refresh(
+                        panel,
+                        editor,
+                        ingress.clone(),
+                        None,
+                        Some(cursor),
+                        None,
+                        false,
+                        false,
+                    );
+                }
+            }
+        }
+        FileExplorerCommand::StartSearch {
+            root,
+            query,
+            generation,
+            config,
+        } => {
+            if let Some(panel) = compositor.find_id::<FileExplorerPanel>(FILE_EXPLORER_ID) {
+                let accepted = panel.accepts_search_request(&root, &query, generation);
+                log::info!(
+                    "[file_explorer] search_start_request root={} query={query:?} generation={} accepted={} panel_query={:?} panel_generation={} panel_pending={} rows={} selection={} selected={}",
+                    root.display(),
+                    generation,
+                    accepted,
+                    panel.search_query_for_log(),
+                    panel.search_generation_for_log(),
+                    panel.search_pending_for_log(),
+                    panel.row_count_for_log(),
+                    panel.selection_for_log(),
+                    panel.selected_path_for_log(),
+                );
+                if accepted {
+                    queue_file_explorer_search(ingress, root, query, generation, config);
+                }
+            } else {
+                log::info!(
+                    "[file_explorer] search_start_request root={} query={query:?} generation={} accepted=false reason=no_panel",
+                    root.display(),
+                    generation,
+                );
+            }
+        }
+        FileExplorerCommand::ApplySearchResults {
+            root,
+            query,
+            generation,
+            matches,
+        } => {
+            if let Some(panel) = compositor.find_id::<FileExplorerPanel>(FILE_EXPLORER_ID) {
+                let applied = panel.apply_search_results(editor, root, query, generation, matches);
+                log::info!(
+                    "[file_explorer] search_results_command applied={} rows={} selection={} selected={} pending={} generation={}",
+                    applied,
+                    panel.row_count_for_log(),
+                    panel.selection_for_log(),
+                    panel.selected_path_for_log(),
+                    panel.search_pending_for_log(),
+                    panel.search_generation_for_log(),
+                );
+                if applied {
+                    panel.queue_selected_preview(editor, ingress.clone());
+                }
+            } else {
+                log::info!("[file_explorer] search_results_command applied=false reason=no_panel");
             }
         }
         FileExplorerCommand::PromptDelete {
@@ -565,33 +1339,33 @@ pub(crate) fn apply_file_explorer_command(
             root,
             cursor,
         } => {
-            let prompt = Prompt::new(
-                format!("Move {} to trash? (y/n): ", target.display()).into(),
-                None,
-                crate::ui::completers::none,
-                move |cx, input: &str, event: PromptEvent| {
-                    if event != PromptEvent::Validate {
-                        return;
-                    }
+            if let Err(error) = validate_explorer_descendant(&root, &target, "move to trash", false)
+            {
+                notify_file_explorer_error(editor, error);
+                return;
+            }
+            let message = format!("Move {} to trash?", target.display());
+            notify_file_explorer_confirmation(editor, format!("{message} Enter y to confirm."));
+            let cancelled_target = target.clone();
+            let confirmation = Confirmation::new(message, move |cx| {
+                spawn_file_explorer_command(
+                    cx,
+                    FileExplorerCommand::ApplyConfirmedDelete {
+                        target: target.clone(),
+                        root: root.clone(),
+                        cursor,
+                        modified_buffer_check: ModifiedBufferCheck::Prompt,
+                    },
+                );
+            })
+            .on_cancel(move |cx| {
+                notify_file_explorer_info(
+                    cx.editor,
+                    format!("Cancelled trash: {}", cancelled_target.display()),
+                );
+            });
 
-                    if input != "y" {
-                        cx.editor.clear_status();
-                        return;
-                    }
-
-                    spawn_file_explorer_command(
-                        cx,
-                        FileExplorerCommand::ApplyDelete {
-                            target: target.clone(),
-                            root: root.clone(),
-                            cursor,
-                            modified_buffer_check: ModifiedBufferCheck::Prompt,
-                        },
-                    );
-                },
-            );
-
-            compositor.push(Box::new(prompt));
+            compositor.push(Box::new(confirmation.into_prompt()));
         }
         FileExplorerCommand::PromptCopy {
             source,
@@ -611,48 +1385,15 @@ pub(crate) fn apply_file_explorer_command(
                     let copy_to_string = input.to_owned();
                     let copy_to = helix_stdx::path::expand_tilde(PathBuf::from(&copy_to_string));
 
-                    if source.is_dir() || is_directory_input(&copy_to_string) {
-                        cx.editor.set_result(Err(format!(
-                            "Copying directories is not supported: {} is a directory",
-                            source.display()
-                        )));
-                        return;
-                    }
-
-                    let copy_to_str = copy_to_string.to_string();
-                    let target_exists = match path_exists_for_prompt(&copy_to) {
-                        Ok(exists) => exists,
-                        Err(err) => {
-                            cx.editor.set_result(Err(format!(
-                                "Unable to inspect {}: {err}",
-                                copy_to.display()
-                            )));
-                            return;
-                        }
-                    };
-                    if target_exists {
-                        let source = source.clone();
-                        let root = root.clone();
-                        spawn_file_explorer_command(
-                            cx,
-                            FileExplorerCommand::ConfirmCopy {
-                                source,
-                                root,
-                                cursor,
-                                input: copy_to_str,
-                                destination: copy_to.to_path_buf(),
-                            },
-                        );
-                        return;
-                    }
-
                     spawn_file_explorer_command(
                         cx,
                         FileExplorerCommand::ApplyCopy {
                             source: source.clone(),
                             root: root.clone(),
                             cursor,
-                            destination: copy_to.to_path_buf(),
+                            destination: helix_view::editor::FileOperationDestination::Exact(
+                                copy_to.to_path_buf(),
+                            ),
                             modified_buffer_check: ModifiedBufferCheck::Prompt,
                         },
                     );
@@ -662,157 +1403,41 @@ pub(crate) fn apply_file_explorer_command(
 
             compositor.push(Box::new(prompt));
         }
-        FileExplorerCommand::ConfirmCreate {
-            root,
-            cursor,
-            input,
-            target,
-        } => {
-            let prompt = Prompt::new(
-                format!(
-                    "Path {} already exists. Overwrite? (y/n):",
-                    target.display()
-                )
-                .into(),
-                None,
-                crate::ui::completers::none,
-                move |cx, answer: &str, event: PromptEvent| {
-                    if event != PromptEvent::Validate || answer != "y" {
-                        return;
-                    }
-
-                    spawn_file_explorer_command(
-                        cx,
-                        FileExplorerCommand::ApplyCreate {
-                            root: root.clone(),
-                            cursor,
-                            input: input.clone(),
-                            target: target.clone(),
-                            modified_buffer_check: ModifiedBufferCheck::Prompt,
-                        },
-                    );
-                },
-            );
-            compositor.push(Box::new(prompt));
-        }
-        FileExplorerCommand::ConfirmMove {
-            source,
-            root,
-            cursor,
-            input,
-            destination,
-        } => {
-            let prompt = Prompt::new(
-                format!(
-                    "Path {} already exists. Overwrite? (y/n):",
-                    destination.display()
-                )
-                .into(),
-                None,
-                crate::ui::completers::none,
-                move |cx, answer: &str, event: PromptEvent| {
-                    if event != PromptEvent::Validate || answer != "y" {
-                        return;
-                    }
-
-                    spawn_file_explorer_command(
-                        cx,
-                        FileExplorerCommand::ApplyMove {
-                            source: source.clone(),
-                            root: root.clone(),
-                            cursor,
-                            input: input.clone(),
-                            destination: destination.clone(),
-                            modified_buffer_check: ModifiedBufferCheck::Prompt,
-                        },
-                    );
-                },
-            );
-            compositor.push(Box::new(prompt));
-        }
-        FileExplorerCommand::ConfirmCopy {
-            source,
-            root,
-            cursor,
-            input: _,
-            destination,
-        } => {
-            let prompt = Prompt::new(
-                format!(
-                    "Path {} already exists. Overwrite? (y/n):",
-                    destination.display()
-                )
-                .into(),
-                None,
-                crate::ui::completers::none,
-                move |cx, answer: &str, event: PromptEvent| {
-                    if event != PromptEvent::Validate || answer != "y" {
-                        return;
-                    }
-
-                    spawn_file_explorer_command(
-                        cx,
-                        FileExplorerCommand::ApplyCopy {
-                            source: source.clone(),
-                            root: root.clone(),
-                            cursor,
-                            destination: destination.clone(),
-                            modified_buffer_check: ModifiedBufferCheck::Prompt,
-                        },
-                    );
-                },
-            );
-            compositor.push(Box::new(prompt));
-        }
         FileExplorerCommand::ApplyCreate {
             root,
             cursor,
-            input,
+            is_dir,
             target,
             modified_buffer_check,
         } => {
-            let mut cx = FileExplorerApplyContext {
-                editor,
-                compositor,
-                ingress,
-            };
-            apply_create(&mut cx, root, cursor, input, target, modified_buffer_check);
+            let mut cx = FileExplorerApplyContext { editor, ingress };
+            apply_create(&mut cx, root, cursor, is_dir, target, modified_buffer_check);
         }
         FileExplorerCommand::ApplyMove {
             source,
             root,
             cursor,
-            input,
             destination,
             modified_buffer_check,
         } => {
-            let mut cx = FileExplorerApplyContext {
-                editor,
-                compositor,
-                ingress,
-            };
+            let mut cx = FileExplorerApplyContext { editor, ingress };
             apply_move(
                 &mut cx,
                 source,
                 root,
                 cursor,
-                input,
                 destination,
                 modified_buffer_check,
             );
         }
-        FileExplorerCommand::ApplyDelete {
+        FileExplorerCommand::ApplyConfirmedDelete {
             target,
             root,
             cursor,
             modified_buffer_check,
         } => {
-            let mut cx = FileExplorerApplyContext {
-                editor,
-                compositor,
-                ingress,
-            };
-            apply_delete(&mut cx, target, root, cursor, modified_buffer_check);
+            let mut cx = FileExplorerApplyContext { editor, ingress };
+            apply_confirmed_delete(&mut cx, target, root, cursor, modified_buffer_check);
         }
         FileExplorerCommand::ApplyCopy {
             source,
@@ -821,11 +1446,7 @@ pub(crate) fn apply_file_explorer_command(
             destination,
             modified_buffer_check,
         } => {
-            let mut cx = FileExplorerApplyContext {
-                editor,
-                compositor,
-                ingress,
-            };
+            let mut cx = FileExplorerApplyContext { editor, ingress };
             apply_copy(
                 &mut cx,
                 source,
@@ -840,6 +1461,14 @@ pub(crate) fn apply_file_explorer_command(
             documents,
             continuation,
         } => {
+            notify_file_explorer_confirmation(
+                editor,
+                format!(
+                    "{} modified buffer(s) affected while {}. Type y to save, n to continue, c to cancel.",
+                    documents.len(),
+                    operation
+                ),
+            );
             let prompt = Prompt::new(
                 format!(
                     "{} modified buffer(s) affected while {}. Save first? (y/n/c): ",
@@ -857,24 +1486,36 @@ pub(crate) fn apply_file_explorer_command(
                     match answer {
                         "y" => match save_modified_documents(cx, &documents) {
                             Ok(()) => {
-                                spawn_file_explorer_command(
-                                    cx,
-                                    without_modified_buffer_check((*continuation).clone()),
-                                );
+                                cx.submit_ui(crate::runtime::UiCommand::AfterWrites {
+                                    documents: documents.clone(),
+                                    command: Box::new(crate::runtime::UiCommand::FileExplorer(
+                                        without_modified_buffer_check((*continuation).clone()),
+                                    )),
+                                });
                             }
-                            Err(err) => cx.editor.set_error(format!("{err}")),
+                            Err(err) => notify_file_explorer_error(cx.editor, format!("{err}")),
                         },
                         "n" => spawn_file_explorer_command(
                             cx,
                             without_modified_buffer_check((*continuation).clone()),
                         ),
-                        _ => cx.editor.clear_status(),
+                        _ => {
+                            notify_file_explorer_info(cx.editor, format!("Cancelled {}", operation))
+                        }
                     }
                 },
             );
             compositor.push(Box::new(prompt));
         }
     }
+    log::info!(
+        "[file_explorer] command_apply_done command={} elapsed_us={} focused_view={:?} focused_doc={:?} documents={}",
+        command_name,
+        command_start.elapsed().as_micros(),
+        editor.focused_view_id(),
+        editor.focused_document_id(),
+        editor.document_count(),
+    );
 }
 
 #[cfg(test)]
@@ -884,12 +1525,77 @@ mod tests {
     use helix_core::Transaction;
     use helix_view::{
         doc_mut,
-        editor::{Action, Config},
+        editor::{Action, Config, Severity},
         graphics::Rect,
         handlers::Handlers,
         theme, Editor,
     };
     use std::sync::Arc;
+
+    #[test]
+    fn latest_search_slot_replaces_every_intermediate_query() {
+        let runtime = helix_runtime::test::RuntimeTest::default();
+        let (ingress, _receiver) =
+            crate::runtime::RuntimeIngress::channel(runtime.runtime().clone());
+        let request = |generation, query: &str| FileExplorerSearchRequest {
+            root: PathBuf::from("workspace"),
+            query: query.to_owned(),
+            generation,
+            config: helix_view::editor::FileExplorerConfig::default(),
+        };
+        let mut latest = FileExplorerSearchState::default();
+
+        latest.replace(FileExplorerSearchJob {
+            request: request(1, "s"),
+            ingress: ingress.clone(),
+            abort: Arc::new(AtomicBool::new(false)),
+        });
+        latest.replace(FileExplorerSearchJob {
+            request: request(2, "sr"),
+            ingress: ingress.clone(),
+            abort: Arc::new(AtomicBool::new(false)),
+        });
+        latest.replace(FileExplorerSearchJob {
+            request: request(3, "src"),
+            ingress,
+            abort: Arc::new(AtomicBool::new(false)),
+        });
+
+        let job = latest.take().expect("latest search");
+        assert_eq!(job.request.generation, 3);
+        assert_eq!(job.request.query, "src");
+        assert!(!latest.is_pending());
+    }
+
+    #[test]
+    fn replacing_search_cancels_active_generation() {
+        let runtime = helix_runtime::test::RuntimeTest::default();
+        let (ingress, _receiver) =
+            crate::runtime::RuntimeIngress::channel(runtime.runtime().clone());
+        let request = |generation, query: &str| FileExplorerSearchRequest {
+            root: PathBuf::from("workspace"),
+            query: query.to_owned(),
+            generation,
+            config: helix_view::editor::FileExplorerConfig::default(),
+        };
+        let mut latest = FileExplorerSearchState::default();
+        latest.replace(FileExplorerSearchJob {
+            request: request(1, "s"),
+            ingress: ingress.clone(),
+            abort: Arc::new(AtomicBool::new(false)),
+        });
+        let active = latest.take().expect("active search");
+
+        latest.replace(FileExplorerSearchJob {
+            request: request(2, "src"),
+            ingress,
+            abort: Arc::new(AtomicBool::new(false)),
+        });
+
+        assert!(active.abort.load(Ordering::Acquire));
+        assert!(latest.is_pending());
+        assert!(latest.finish(&active.abort));
+    }
 
     #[test]
     fn path_affects_documents_under_existing_directory() {
@@ -915,15 +1621,41 @@ mod tests {
     }
 
     #[test]
+    fn explorer_mutation_context_protects_root_and_rejects_outside_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("workspace");
+        let child = root.join("src/main.rs");
+        let outside = temp.path().join("outside.rs");
+
+        assert!(validate_explorer_descendant(&root, &child, "delete", false).is_ok());
+        assert!(validate_explorer_descendant(&root, &root, "delete", false).is_err());
+        assert!(validate_explorer_descendant(&root, &outside, "delete", false).is_err());
+        assert!(validate_explorer_descendant(&root, &root, "copy to", true).is_ok());
+        assert!(validate_explorer_destination(
+            &root,
+            &helix_view::editor::FileOperationDestination::UniqueInDirectory(root.clone()),
+            "move to",
+        )
+        .is_ok());
+        assert!(validate_explorer_destination(
+            &root,
+            &helix_view::editor::FileOperationDestination::Exact(outside),
+            "move to",
+        )
+        .is_err());
+        assert!(same_explorer_root(&root, &root.join(".")));
+    }
+
+    #[test]
     fn save_prompt_continuation_skips_second_prompt() {
-        let command = FileExplorerCommand::ApplyDelete {
+        let command = FileExplorerCommand::ApplyConfirmedDelete {
             target: PathBuf::from("target"),
             root: PathBuf::from("."),
             cursor: 0,
             modified_buffer_check: ModifiedBufferCheck::Prompt,
         };
 
-        let FileExplorerCommand::ApplyDelete {
+        let FileExplorerCommand::ApplyConfirmedDelete {
             modified_buffer_check,
             ..
         } = without_modified_buffer_check(command)
@@ -934,8 +1666,26 @@ mod tests {
         assert_eq!(modified_buffer_check, ModifiedBufferCheck::Skip);
     }
 
+    #[tokio::test]
+    async fn file_explorer_confirmation_uses_notification_toast() {
+        let runtime = helix_runtime::Runtime::new(tokio::runtime::Handle::current());
+        let mut editor = test_editor(runtime);
+
+        notify_file_explorer_confirmation(&mut editor, "Overwrite src/main.rs? Type y to confirm.");
+
+        let notification = editor
+            .get_notification_history()
+            .last()
+            .expect("confirmation should add notification");
+        assert_eq!(notification.severity, Severity::Warning);
+        assert_eq!(
+            notification.message.as_ref(),
+            "File explorer: Overwrite src/main.rs? Type y to confirm."
+        );
+    }
+
     fn test_editor(runtime: helix_runtime::Runtime) -> Editor {
-        let theme_loader = theme::Loader::new(helix_loader::runtime_dirs());
+        let theme_loader = theme::Loader::new(&[]);
         let syn_loader = helix_core::config::default_lang_loader();
         let config = Arc::new(ArcSwap::from_pointee(Config::default()));
         Editor::new(
@@ -949,7 +1699,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn save_modified_documents_flushes_to_disk() {
+    async fn save_modified_documents_schedules_disk_write() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("main.rs");
         std::fs::write(&path, "old").unwrap();
@@ -966,8 +1716,7 @@ mod tests {
         doc.apply(&transaction, view_id);
         assert!(doc.is_modified());
 
-        let (ingress, _ingress_rx) =
-            crate::runtime::RuntimeIngress::channel(runtime.work().clone());
+        let (ingress, _ingress_rx) = crate::runtime::RuntimeIngress::channel(runtime.clone());
         let (plugin_events, _plugin_events_rx) = helix_runtime::channel(16);
         let idle_reset = crate::runtime::IdleResetGate::new().handle();
         let mut exit_tasks = crate::runtime::ExitTaskSet::default();
@@ -975,7 +1724,7 @@ mod tests {
         let redraw = editor.redraw_handle();
         let notifier = crate::handlers::local::Notifier {
             redraw: redraw.clone(),
-            plugin_events,
+            plugin_events: plugin_events.into(),
         };
         let mut cx = crate::compositor::Context::new(
             &mut editor,
@@ -984,10 +1733,11 @@ mod tests {
             notifier,
             ingress,
             idle_reset,
-            None,
+            crate::plugin_registry::PluginRuntime::default(),
         );
 
         save_modified_documents(&mut cx, &[doc_id]).unwrap();
+        cx.editor.flush_writes().await.unwrap();
 
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
         assert!(!cx.editor.document(doc_id).unwrap().is_modified());

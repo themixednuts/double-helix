@@ -88,6 +88,10 @@ impl FFFMode {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct FuzzySearchOptions<'a> {
     pub max_threads: usize,
+    /// Per-invocation cancellation. This is separate from the picker's
+    /// lifecycle signal so superseded queries can stop without shutting down
+    /// the shared file index.
+    pub abort_signal: Option<&'a AtomicBool>,
     pub current_file: Option<&'a str>,
     pub project_path: Option<&'a Path>,
     pub combo_boost_score_multiplier: i32,
@@ -990,6 +994,7 @@ impl FilePicker {
 
         let context = ScoringContext {
             query,
+            abort_signal: options.abort_signal,
             max_typos,
             max_threads,
             project_path: options.project_path,
@@ -1060,6 +1065,7 @@ impl FilePicker {
 
         let context = ScoringContext {
             query,
+            abort_signal: options.abort_signal,
             max_typos,
             max_threads,
             project_path: options.project_path,

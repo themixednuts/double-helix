@@ -32,7 +32,7 @@ use crate::{
     },
 };
 
-use super::Context;
+use super::{queue_picker_document_open, Context};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TagKind {
@@ -286,7 +286,8 @@ pub fn syntax_workspace_symbol_picker(cx: &mut Context) {
                     editor: &mut Editor,
                     state: Arc<SearchState>,
                     injector: &Injector<_, _>,
-                    work: helix_runtime::Work| {
+                    work: helix_runtime::Work,
+                    block: helix_runtime::Block| {
         if query.len() < 3 {
             return work.spawn(async { Ok(()) });
         }
@@ -295,25 +296,6 @@ pub fn syntax_workspace_symbol_picker(cx: &mut Context) {
             Ok(pattern) => pattern,
             Err(err) => return work.spawn(async move { Err(anyhow::anyhow!(err)) }),
         };
-        let loader = editor.syn_loader.load();
-        for doc in editor.documents() {
-            let uri_or_id = doc
-                .uri()
-                .map(UriOrDocumentId::Uri)
-                .unwrap_or_else(|| UriOrDocumentId::Id(doc.id()));
-            let Some(tags) = document_tags_iter(doc, &loader, uri_or_id, Some(&pattern)) else {
-                continue;
-            };
-            for tag in tags {
-                if injector.push(tag).is_err() {
-                    return work.spawn(async { Ok(()) });
-                }
-            }
-        }
-        if !state.search_root.exists() {
-            return work
-                .spawn(async { Err(anyhow::anyhow!("Current working directory does not exist")) });
-        }
         let matcher = match state.regex_matcher_builder.build(query) {
             Ok(matcher) => {
                 // Clear any "Failed to compile regex" errors out of the statusline.
@@ -330,13 +312,38 @@ pub fn syntax_workspace_symbol_picker(cx: &mut Context) {
         };
         let pattern = Arc::new(pattern);
         let injector = injector.clone();
-        let loader = editor.syn_loader.load();
+        let loader = editor.syn_loader.load_full();
+        let open_documents: Vec<_> = editor
+            .documents()
+            .filter_map(|doc| {
+                let language_name = doc.language_name()?.to_owned();
+                let doc_ref = doc
+                    .uri()
+                    .map(UriOrDocumentId::Uri)
+                    .unwrap_or_else(|| UriOrDocumentId::Id(doc.id()));
+                Some((doc_ref, doc.text().clone(), language_name))
+            })
+            .collect();
         let documents: HashSet<_> = editor
             .documents()
             .filter_map(Document::path)
             .cloned()
             .collect();
-        work.spawn(async move {
+        let search = block.spawn(move || -> anyhow::Result<()> {
+            for (doc_ref, text, language_name) in open_documents {
+                let Some(language) = loader.language_for_name(language_name) else {
+                    continue;
+                };
+                let Ok(syntax) = Syntax::new(text.slice(..), language, &loader) else {
+                    continue;
+                };
+                for tag in tags_iter(&syntax, &loader, text.slice(..), doc_ref, Some(&pattern)) {
+                    if injector.push(tag).is_err() {
+                        return Ok(());
+                    }
+                }
+            }
+
             let searcher = state.searcher_builder.build();
             state.walk_builder.build_parallel().run(|| {
                 let mut searcher = searcher.clone();
@@ -402,6 +409,10 @@ pub fn syntax_workspace_symbol_picker(cx: &mut Context) {
                 })
             });
             Ok(())
+        });
+        work.spawn(async move {
+            search.await??;
+            Ok(())
         })
     };
     let picker = Picker::new(
@@ -414,13 +425,23 @@ pub fn syntax_workspace_symbol_picker(cx: &mut Context) {
         move |cx: &mut crate::compositor::Context, tag: &Tag, action| {
             let doc_id = match &tag.doc {
                 UriOrDocumentId::Id(id) => *id,
-                UriOrDocumentId::Uri(uri) => match cx.editor.open(uri.as_path().expect(""), action) {
-                    Ok(id) => id,
-                    Err(e) => {
+                UriOrDocumentId::Uri(uri) => {
+                    let Some(path) = uri.as_path() else {
                         cx.editor
-                            .set_error(format!("Failed to open file '{uri:?}': {e}"));
+                            .set_error(format!("Cannot open non-file syntax tag URI '{uri}'"));
                         return;
-                    }
+                    };
+                    queue_picker_document_open(
+                        cx,
+                        path.to_path_buf(),
+                        action,
+                        crate::runtime::DocumentOpenSelection::CharRange {
+                            start: tag.start,
+                            end: tag.end,
+                        },
+                        crate::runtime::DocumentOpenAlignment::CenterIfAction,
+                    );
+                    return;
                 }
             };
             let doc = doc_mut!(cx.editor, &doc_id);
@@ -436,7 +457,10 @@ pub fn syntax_workspace_symbol_picker(cx: &mut Context) {
             }
         },
     )
-    .with_dynamic_query(get_tags, Some(275))
+    .with_dynamic_query(
+        get_tags,
+        crate::ui::picker::DynamicQuerySchedule::debounced_ms(275),
+    )
     .with_preview(move |_editor, tag| {
         Some((
             tag.doc.path_or_id()?,

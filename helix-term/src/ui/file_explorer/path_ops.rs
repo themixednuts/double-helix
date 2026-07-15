@@ -49,6 +49,60 @@ pub(super) enum LabelRenameError {
     MissingParent,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum EntryPathError {
+    Empty,
+    Absolute,
+    Traversal,
+}
+
+impl std::fmt::Display for EntryPathError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Empty => f.write_str("path cannot be empty"),
+            Self::Absolute => f.write_str("path must be relative to the selected directory"),
+            Self::Traversal => f.write_str("path cannot contain . or .. segments"),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct EntryPath {
+    pub(super) relative: PathBuf,
+    pub(super) is_dir: bool,
+}
+
+pub(super) fn parse_entry_path(input: &str) -> Result<EntryPath, EntryPathError> {
+    let normalized = input.replace('\\', "/");
+    let is_dir = normalized.ends_with('/');
+    let normalized = normalized.trim_end_matches('/');
+    if normalized.is_empty() {
+        return Err(EntryPathError::Empty);
+    }
+
+    let bytes = normalized.as_bytes();
+    if normalized.starts_with('/') || bytes.get(1).is_some_and(|separator| *separator == b':') {
+        return Err(EntryPathError::Absolute);
+    }
+
+    let mut relative = PathBuf::new();
+    for component in Path::new(normalized).components() {
+        match component {
+            std::path::Component::Normal(segment) => relative.push(segment),
+            std::path::Component::CurDir | std::path::Component::ParentDir => {
+                return Err(EntryPathError::Traversal)
+            }
+            std::path::Component::Prefix(_) | std::path::Component::RootDir => {
+                return Err(EntryPathError::Absolute)
+            }
+        }
+    }
+    if relative.as_os_str().is_empty() {
+        return Err(EntryPathError::Empty);
+    }
+    Ok(EntryPath { relative, is_dir })
+}
+
 impl std::fmt::Display for LabelRenameError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -93,51 +147,6 @@ pub(super) fn display_name(path: &Path) -> String {
 
 pub(super) fn display_path(path: &Path) -> String {
     path.display().to_string().replace('\\', "/")
-}
-
-fn path_is_missing(path: &Path) -> std::io::Result<bool> {
-    match std::fs::symlink_metadata(path) {
-        Ok(_) => Ok(false),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(true),
-        Err(err) => Err(err),
-    }
-}
-
-pub(super) fn unique_destination(
-    destination_dir: &Path,
-    source: &Path,
-) -> std::io::Result<PathBuf> {
-    let file_name = source
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("untitled");
-    let candidate = destination_dir.join(file_name);
-    if path_is_missing(&candidate)? {
-        return Ok(candidate);
-    }
-
-    let stem = source
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .unwrap_or(file_name);
-    let extension = source.extension().and_then(|extension| extension.to_str());
-    for index in 1.. {
-        let suffix = if index == 1 {
-            String::from(" copy")
-        } else {
-            format!(" copy {index}")
-        };
-        let name = match extension {
-            Some(extension) if !extension.is_empty() => format!("{stem}{suffix}.{extension}"),
-            _ => format!("{stem}{suffix}"),
-        };
-        let candidate = destination_dir.join(name);
-        if path_is_missing(&candidate)? {
-            return Ok(candidate);
-        }
-    }
-
-    unreachable!("unbounded copy suffix search should always find a destination")
 }
 
 pub(super) fn relative_display(base: &Path, path: &Path) -> String {

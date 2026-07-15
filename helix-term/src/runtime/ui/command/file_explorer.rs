@@ -1,7 +1,6 @@
 use std::path::PathBuf;
 
-use helix_vcs::FileChange;
-use helix_view::DocumentId;
+use helix_view::{editor::FileExplorerConfig, DocumentId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModifiedBufferCheck {
@@ -11,45 +10,61 @@ pub enum ModifiedBufferCheck {
 
 #[derive(Debug, Clone)]
 pub enum FileExplorerCommand {
-    RefreshPanel {
+    ToggleSourceOption {
+        option: crate::ui::file_options::FileSourceOption,
+    },
+    /// A queued file operation reached its terminal state. Refreshing and
+    /// notifying happen only here, never at submission time.
+    FileOperationCompleted {
         root: PathBuf,
         cursor: u32,
+        select_path: Option<PathBuf>,
+        result: Result<String, String>,
+    },
+    ApplyTree {
+        root: PathBuf,
+        generation: u64,
     },
     PreviewSelection {
         root: PathBuf,
         path: PathBuf,
         cursor: u32,
+        generation: u64,
+    },
+    ApplyPreview {
+        root: PathBuf,
+        path: PathBuf,
+        cursor: u32,
+        generation: u64,
     },
     ApplyVcsSnapshot {
         root: PathBuf,
-        changes: Vec<FileChange>,
+        snapshot: crate::ui::VcsSnapshot,
     },
-    ConfirmCreate {
+    StartSearch {
         root: PathBuf,
-        cursor: u32,
-        input: String,
-        target: PathBuf,
+        query: String,
+        generation: u64,
+        config: FileExplorerConfig,
+    },
+    ApplySearchResults {
+        root: PathBuf,
+        query: String,
+        generation: u64,
+        matches: Vec<PathBuf>,
     },
     ApplyCreate {
         root: PathBuf,
         cursor: u32,
-        input: String,
+        is_dir: bool,
         target: PathBuf,
         modified_buffer_check: ModifiedBufferCheck,
-    },
-    ConfirmMove {
-        source: PathBuf,
-        root: PathBuf,
-        cursor: u32,
-        input: String,
-        destination: PathBuf,
     },
     ApplyMove {
         source: PathBuf,
         root: PathBuf,
         cursor: u32,
-        input: String,
-        destination: PathBuf,
+        destination: helix_view::editor::FileOperationDestination,
         modified_buffer_check: ModifiedBufferCheck,
     },
     PromptDelete {
@@ -57,7 +72,7 @@ pub enum FileExplorerCommand {
         root: PathBuf,
         cursor: u32,
     },
-    ApplyDelete {
+    ApplyConfirmedDelete {
         target: PathBuf,
         root: PathBuf,
         cursor: u32,
@@ -69,18 +84,11 @@ pub enum FileExplorerCommand {
         cursor: u32,
         prefill: String,
     },
-    ConfirmCopy {
-        source: PathBuf,
-        root: PathBuf,
-        cursor: u32,
-        input: String,
-        destination: PathBuf,
-    },
     ApplyCopy {
         source: PathBuf,
         root: PathBuf,
         cursor: u32,
-        destination: PathBuf,
+        destination: helix_view::editor::FileOperationDestination,
         modified_buffer_check: ModifiedBufferCheck,
     },
     PromptSaveBefore {

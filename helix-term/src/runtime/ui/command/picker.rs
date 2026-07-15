@@ -10,6 +10,7 @@ pub enum PickerCommand {
     },
     ApplyPreview {
         picker: PickerInstanceId,
+        generation: u64,
         path: PathBuf,
         preview: CachedPreview,
     },
@@ -19,7 +20,11 @@ pub enum PickerCommand {
         syntax: Syntax,
     },
     RunDynamicQuery {
+        picker: PickerInstanceId,
         query: Arc<str>,
+    },
+    RefreshDynamicQuery {
+        picker: PickerInstanceId,
     },
 }
 
@@ -31,9 +36,15 @@ impl std::fmt::Debug for PickerCommand {
                 .field("picker", picker)
                 .field("path", path)
                 .finish(),
-            Self::ApplyPreview { picker, path, .. } => f
+            Self::ApplyPreview {
+                picker,
+                generation,
+                path,
+                ..
+            } => f
                 .debug_struct("ApplyPreview")
                 .field("picker", picker)
+                .field("generation", generation)
                 .field("path", path)
                 .finish_non_exhaustive(),
             Self::ApplyPreviewSyntax { picker, path, .. } => f
@@ -41,9 +52,14 @@ impl std::fmt::Debug for PickerCommand {
                 .field("picker", picker)
                 .field("path", path)
                 .finish_non_exhaustive(),
-            Self::RunDynamicQuery { query } => f
+            Self::RunDynamicQuery { picker, query } => f
                 .debug_struct("RunDynamicQuery")
+                .field("picker", picker)
                 .field("query", query)
+                .finish(),
+            Self::RefreshDynamicQuery { picker } => f
+                .debug_struct("RefreshDynamicQuery")
+                .field("picker", picker)
                 .finish(),
         }
     }

@@ -25,6 +25,7 @@ pub(crate) fn apply_picker_command(
         }
         PickerCommand::ApplyPreview {
             picker: picker_id,
+            generation,
             path,
             preview,
         } => {
@@ -35,7 +36,7 @@ pub(crate) fn apply_picker_command(
             if picker.instance_id() != picker_id {
                 return;
             }
-            picker.apply_preview(editor, path, preview);
+            picker.apply_preview(editor, generation, path, preview);
         }
         PickerCommand::ApplyPreviewSyntax {
             picker: picker_id,
@@ -51,11 +52,26 @@ pub(crate) fn apply_picker_command(
             }
             picker.apply_preview_syntax(editor, path, syntax);
         }
-        PickerCommand::RunDynamicQuery { query } => {
+        PickerCommand::RunDynamicQuery {
+            picker: picker_id,
+            query,
+        } => {
             let Some(picker) = compositor.find_picker() else {
                 return;
             };
+            if picker.instance_id() != picker_id {
+                return;
+            }
             picker.run_dynamic_query(editor, query);
+        }
+        PickerCommand::RefreshDynamicQuery { picker: picker_id } => {
+            let Some(picker) = compositor.find_picker() else {
+                return;
+            };
+            if picker.instance_id() != picker_id {
+                return;
+            }
+            picker.refresh_dynamic_query(editor);
         }
     }
 }

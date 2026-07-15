@@ -24,7 +24,7 @@ impl<'a> DirectoryScanner<'a> {
     pub(super) fn new(explorer: &'a FileExplorerConfig) -> Self {
         Self {
             explorer,
-            excluded_types: super::super::get_excluded_types(),
+            excluded_types: crate::ui::file_scan::excluded_types(),
             config_ignore: helix_loader::config_dir().join("ignore"),
             workspace_ignore: helix_loader::workspace_ignore_file_name(),
         }
@@ -58,7 +58,7 @@ impl<'a> DirectoryScanner<'a> {
                         let mut path = path.to_path_buf();
                         if is_dir && path != root && self.explorer.flatten_dirs {
                             while let Some(single_child_directory) =
-                                super::super::get_child_if_single_dir(&path)
+                                crate::ui::file_scan::single_child_directory(&path)
                             {
                                 path = single_child_directory;
                             }

@@ -104,10 +104,9 @@ impl BackgroundWatcher {
 
         // debouncer is shared with the owner thread, once it's dropped the thread is closed
         let debouncer = Arc::new(Mutex::new(Some(debouncer)));
-        // Linux and Windows need explicit runtime watches for newly-created
-        // directories. Linux has no kernel-level recursion; Windows recursive
-        // notifications can miss follow-up events in fresh subdirectories.
-        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        // Only Linux needs per-directory runtime watches. Windows and macOS already watch the
+        // base path recursively; adding overlapping watches duplicates and reorders events.
+        #[cfg(target_os = "linux")]
         let owner_debouncer = Arc::clone(&debouncer);
 
         let owner_span = trace_span.clone();
@@ -121,11 +120,9 @@ impl BackgroundWatcher {
                         break;
                     };
 
-                    // Linux has no kernel-level recursion. Windows recursive
-                    // watches can still miss follow-up events in directories
-                    // created after watcher startup, so both platforms add
-                    // explicit runtime watches for new directories.
-                    #[cfg(any(target_os = "linux", target_os = "windows"))]
+                    // inotify has no kernel-level recursion. Windows and macOS already receive
+                    // new-directory events through the recursive base-path watch.
+                    #[cfg(target_os = "linux")]
                     {
                         // Register the new directory with the debouncer, then
                         // drop the mutex BEFORE doing picker-side work — see

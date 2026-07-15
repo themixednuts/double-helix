@@ -14,6 +14,7 @@ use heed::types::{Bytes, SerdeBincode};
 use heed::{Database, EnvOpenOptions};
 use helix_store::{CacheStore, FrecencyEntry, QueryHistory};
 use helix_view::editor::{FileExplorerConfig, FilePickerConfig};
+use once_cell::sync::OnceCell;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 
@@ -25,8 +26,9 @@ const GREP_SEARCH_LIMIT: usize = 2_000;
 const GREP_SCAN_WAIT: Duration = Duration::from_millis(250);
 const PICKER_TRACE_TARGET: &str = crate::ui::picker::PICKER_TRACE_TARGET;
 const FFF_CACHE_IMPORT_MARKER: &str = "fff-cache-v1";
+const WORKSPACE_CACHE_CAPACITY: usize = 4;
 
-static ACTIVE_WORKSPACE: OnceLock<Mutex<Option<Arc<FffWorkspace>>>> = OnceLock::new();
+static WORKSPACES: OnceLock<Mutex<FffWorkspaceCache>> = OnceLock::new();
 
 #[derive(Debug, Clone)]
 pub(crate) struct FileMatch {
@@ -43,10 +45,83 @@ pub(crate) struct GrepMatch {
 #[derive(Debug)]
 struct FffWorkspace {
     root: PathBuf,
-    config: FilePickerConfig,
     picker: SharedPicker,
     frecency: SharedFrecency,
     query_tracker: SharedQueryTracker,
+}
+
+#[derive(Default)]
+struct FffWorkspaceCache {
+    slots: VecDeque<Arc<FffWorkspaceSlot>>,
+}
+
+struct FffWorkspaceSlot {
+    root: PathBuf,
+    config: FilePickerConfig,
+    workspace: OnceCell<Arc<FffWorkspace>>,
+}
+
+impl FffWorkspaceSlot {
+    fn new(root: PathBuf, config: FilePickerConfig) -> Self {
+        Self {
+            root,
+            config,
+            workspace: OnceCell::new(),
+        }
+    }
+}
+
+impl FffWorkspaceCache {
+    fn slot_for(
+        &mut self,
+        root: PathBuf,
+        config: &FilePickerConfig,
+    ) -> (Arc<FffWorkspaceSlot>, bool) {
+        if let Some(index) = self
+            .slots
+            .iter()
+            .position(|slot| slot.root == root && same_file_index_config(&slot.config, config))
+        {
+            let slot = self
+                .slots
+                .remove(index)
+                .expect("workspace slot index came from this cache");
+            self.slots.push_back(slot.clone());
+            return (slot, true);
+        }
+
+        let slot = Arc::new(FffWorkspaceSlot::new(root, config.clone()));
+        self.slots.push_back(slot.clone());
+        self.trim();
+        (slot, false)
+    }
+
+    fn ready(&mut self, root: &Path, config: &FilePickerConfig) -> Option<Arc<FffWorkspace>> {
+        let index = self
+            .slots
+            .iter()
+            .position(|slot| slot.root == root && same_file_index_config(&slot.config, config))?;
+        let slot = self
+            .slots
+            .remove(index)
+            .expect("workspace slot index came from this cache");
+        let workspace = slot.workspace.get().cloned();
+        self.slots.push_back(slot);
+        workspace
+    }
+
+    fn trim(&mut self) {
+        while self.slots.len() > WORKSPACE_CACHE_CAPACITY {
+            let Some(index) = self
+                .slots
+                .iter()
+                .position(|slot| Arc::strong_count(slot) == 1)
+            else {
+                break;
+            };
+            self.slots.remove(index);
+        }
+    }
 }
 
 pub(crate) fn search_files(
@@ -64,16 +139,31 @@ pub(crate) fn search_files_available(
     current_file: Option<&Path>,
     config: &FilePickerConfig,
 ) -> anyhow::Result<Vec<FileMatch>> {
-    search_files_with_scan_wait(root, query, current_file, config, Duration::ZERO)
+    let total_start = std::time::Instant::now();
+    let Some(workspace) = workspace_if_ready(root, config)? else {
+        return Ok(Vec::new());
+    };
+    search_workspace_files(&workspace, query, current_file, Duration::ZERO, total_start)
 }
 
-pub(crate) fn search_file_explorer_available(
+pub(crate) fn search_file_explorer_available_cancellable(
     root: &Path,
     query: &str,
     config: &FileExplorerConfig,
+    abort_signal: Option<&std::sync::atomic::AtomicBool>,
 ) -> anyhow::Result<Vec<PathBuf>> {
     let config = file_explorer_picker_config(config);
-    search_files_with_scan_wait(root, query, None, &config, Duration::ZERO).map(|matches| {
+    let total_start = std::time::Instant::now();
+    let workspace = workspace_for_root(root, &config)?;
+    search_workspace_files_cancellable(
+        &workspace,
+        query,
+        None,
+        Duration::ZERO,
+        total_start,
+        abort_signal,
+    )
+    .map(|matches| {
         matches
             .into_iter()
             .map(|file_match| file_match.path)
@@ -141,6 +231,27 @@ fn search_files_with_scan_wait(
 ) -> anyhow::Result<Vec<FileMatch>> {
     let total_start = std::time::Instant::now();
     let workspace = workspace_for_root(root, config)?;
+    search_workspace_files(&workspace, query, current_file, scan_wait, total_start)
+}
+
+fn search_workspace_files(
+    workspace: &FffWorkspace,
+    query: &str,
+    current_file: Option<&Path>,
+    scan_wait: Duration,
+    total_start: std::time::Instant,
+) -> anyhow::Result<Vec<FileMatch>> {
+    search_workspace_files_cancellable(workspace, query, current_file, scan_wait, total_start, None)
+}
+
+fn search_workspace_files_cancellable(
+    workspace: &FffWorkspace,
+    query: &str,
+    current_file: Option<&Path>,
+    scan_wait: Duration,
+    total_start: std::time::Instant,
+    abort_signal: Option<&std::sync::atomic::AtomicBool>,
+) -> anyhow::Result<Vec<FileMatch>> {
     let wait_start = std::time::Instant::now();
     let scan_ready = workspace.picker.wait_for_scan(scan_wait);
     let wait_elapsed = wait_start.elapsed();
@@ -155,7 +266,11 @@ fn search_files_with_scan_wait(
         let matches = picker
             .get_files()
             .iter()
-            .filter(|file| !file.is_deleted())
+            .filter(|file| {
+                !file.is_deleted()
+                    && !abort_signal
+                        .is_some_and(|signal| signal.load(std::sync::atomic::Ordering::Relaxed))
+            })
             .take(FILE_SEARCH_LIMIT)
             .map(|file| FileMatch {
                 path: file.absolute_path(picker, picker.base_path()),
@@ -181,13 +296,15 @@ fn search_files_with_scan_wait(
     let parser: QueryParser<FileSearchConfig> = QueryParser::default();
     let parsed = parser.parse(query);
     let current_file = current_file.and_then(|path| relative_path(&workspace.root, path));
+    let search_threads = responsive_search_threads();
 
     let search_start = std::time::Instant::now();
     let results = picker.fuzzy_search(
         &parsed,
         query_tracker,
         FuzzySearchOptions {
-            max_threads: 0,
+            max_threads: search_threads,
+            abort_signal,
             current_file: current_file.as_deref(),
             project_path: Some(&workspace.root),
             combo_boost_score_multiplier: 20_000,
@@ -215,7 +332,7 @@ fn search_files_with_scan_wait(
 
     log::info!(
         target: PICKER_TRACE_TARGET,
-        "FFF file search query={query:?} scan_ready={scan_ready} wait={wait_elapsed:?} search={search_elapsed:?} total={:?} results={} matched={} files={}",
+        "FFF file search query={query:?} scan_ready={scan_ready} threads={search_threads} wait={wait_elapsed:?} search={search_elapsed:?} total={:?} results={} matched={} files={}",
         total_start.elapsed(),
         matches.len(),
         results.total_matched,
@@ -223,6 +340,15 @@ fn search_files_with_scan_wait(
     );
 
     Ok(matches)
+}
+
+fn responsive_search_threads() -> usize {
+    let available = std::thread::available_parallelism().map_or(1, usize::from);
+    responsive_search_threads_for(available)
+}
+
+fn responsive_search_threads_for(available: usize) -> usize {
+    available.saturating_sub((available / 4).max(1)).max(1)
 }
 
 pub(crate) fn grep_files(
@@ -315,37 +441,63 @@ pub(crate) fn record_file_open(root: &Path, config: &FilePickerConfig, query: &s
 fn workspace_for_root(root: &Path, config: &FilePickerConfig) -> anyhow::Result<Arc<FffWorkspace>> {
     let start = std::time::Instant::now();
     let root = helix_stdx::path::normalize(root);
-    let active = ACTIVE_WORKSPACE.get_or_init(|| Mutex::new(None));
-    let mut guard = active
-        .lock()
-        .map_err(|_| anyhow::anyhow!("FFF workspace lock was poisoned"))?;
+    let (slot, cached) = {
+        let cache = WORKSPACES.get_or_init(|| Mutex::new(FffWorkspaceCache::default()));
+        let mut cache = cache
+            .lock()
+            .map_err(|_| anyhow::anyhow!("FFF workspace cache lock was poisoned"))?;
+        cache.slot_for(root, config)
+    };
 
-    if let Some(workspace) = guard.as_ref() {
-        if workspace.root == root && same_file_index_config(&workspace.config, config) {
-            log::info!(
-                target: PICKER_TRACE_TARGET,
-                "phase=fff_workspace root={} state=reused elapsed_us={}",
-                root.display(),
-                start.elapsed().as_micros(),
-            );
-            return Ok(workspace.clone());
-        }
+    if let Some(workspace) = slot.workspace.get() {
+        log::info!(
+            target: PICKER_TRACE_TARGET,
+            "phase=fff_workspace root={} state=reused elapsed_us={}",
+            workspace.root.display(),
+            start.elapsed().as_micros(),
+        );
+        return Ok(workspace.clone());
     }
 
     log::info!(
         target: PICKER_TRACE_TARGET,
-        "phase=fff_workspace root={} state=create_start",
-        root.display(),
+        "phase=fff_workspace root={} state={}create_start",
+        slot.root.display(),
+        if cached { "wait_or_" } else { "" },
     );
-    let workspace = Arc::new(FffWorkspace::new(root, config.clone())?);
+    let workspace = slot
+        .workspace
+        .get_or_try_init(|| {
+            FffWorkspace::new(slot.root.clone(), slot.config.clone()).map(Arc::new)
+        })?
+        .clone();
+    if let Some(cache) = WORKSPACES.get() {
+        cache
+            .lock()
+            .map_err(|_| anyhow::anyhow!("FFF workspace cache lock was poisoned"))?
+            .trim();
+    }
     log::info!(
         target: PICKER_TRACE_TARGET,
         "phase=fff_workspace root={} state=create_done elapsed_us={}",
         workspace.root.display(),
         start.elapsed().as_micros(),
     );
-    *guard = Some(workspace.clone());
     Ok(workspace)
+}
+
+fn workspace_if_ready(
+    root: &Path,
+    config: &FilePickerConfig,
+) -> anyhow::Result<Option<Arc<FffWorkspace>>> {
+    let root = helix_stdx::path::normalize(root);
+    let Some(cache) = WORKSPACES.get() else {
+        return Ok(None);
+    };
+    let mut cache = cache
+        .lock()
+        .map_err(|_| anyhow::anyhow!("FFF workspace cache lock was poisoned"))?;
+    Ok(cache.ready(&root, config))
 }
 
 impl FffWorkspace {
@@ -388,7 +540,6 @@ impl FffWorkspace {
 
         Ok(Self {
             root,
-            config,
             picker,
             frecency,
             query_tracker,
@@ -991,6 +1142,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn responsive_search_threads_reserve_capacity_without_disabling_parallelism() {
+        assert_eq!(responsive_search_threads_for(1), 1);
+        assert_eq!(responsive_search_threads_for(2), 1);
+        assert_eq!(responsive_search_threads_for(4), 3);
+        assert_eq!(responsive_search_threads_for(8), 6);
+        assert_eq!(responsive_search_threads_for(16), 12);
+    }
+
+    #[test]
     fn stable_path_hash_is_deterministic() {
         let path = PathBuf::from("workspace").join("src");
 
@@ -1035,6 +1195,41 @@ mod tests {
         assert_eq!(scan.git_global, config.git_global);
         assert_eq!(scan.git_exclude, config.git_exclude);
         assert_eq!(scan.max_depth, None);
+    }
+
+    #[test]
+    fn workspace_cache_keeps_picker_and_explorer_indexes_separate_and_reusable() {
+        let root = PathBuf::from("workspace");
+        let picker_config = FilePickerConfig::default();
+        let explorer_config = file_explorer_picker_config(&FileExplorerConfig::default());
+        assert!(!same_file_index_config(&picker_config, &explorer_config));
+
+        let mut cache = FffWorkspaceCache::default();
+        let (picker, picker_cached) = cache.slot_for(root.clone(), &picker_config);
+        let (explorer, explorer_cached) = cache.slot_for(root.clone(), &explorer_config);
+        let (picker_again, picker_again_cached) = cache.slot_for(root, &picker_config);
+
+        assert!(!picker_cached);
+        assert!(!explorer_cached);
+        assert!(picker_again_cached);
+        assert!(Arc::ptr_eq(&picker, &picker_again));
+        assert!(!Arc::ptr_eq(&picker, &explorer));
+        assert_eq!(cache.slots.len(), 2);
+    }
+
+    #[test]
+    fn workspace_cache_bounds_live_indexes_and_evicts_least_recently_used() {
+        let config = FilePickerConfig::default();
+        let mut cache = FffWorkspaceCache::default();
+        let oldest_root = PathBuf::from("workspace-0");
+        cache.slot_for(oldest_root.clone(), &config);
+
+        for index in 1..=WORKSPACE_CACHE_CAPACITY {
+            cache.slot_for(PathBuf::from(format!("workspace-{index}")), &config);
+        }
+
+        assert_eq!(cache.slots.len(), WORKSPACE_CACHE_CAPACITY);
+        assert!(cache.slots.iter().all(|slot| slot.root != oldest_root));
     }
 
     #[test]

@@ -5,9 +5,8 @@ use std::{
 };
 
 use helix_core::diagnostic::Severity as DiagnosticSeverity;
-use helix_lsp::lsp::DiagnosticSeverity as LspDiagnosticSeverity;
 use helix_vcs::FileChange;
-use helix_view::{icons::Icons, theme::Style, Editor};
+use helix_view::{editor::WorkspaceDiagnosticCounts, icons::Icons, theme::Style, Editor};
 
 use super::{
     path_ops::display_path,
@@ -103,22 +102,22 @@ impl VcsStatus {
 }
 
 #[derive(Clone, Debug, Default)]
-pub(super) struct VcsSnapshot {
+pub struct VcsSnapshot {
     root: PathBuf,
     enabled: bool,
     statuses: HashMap<PathBuf, VcsStatus>,
 }
 
 impl VcsSnapshot {
-    pub(super) fn empty(root: &Path, enabled: bool) -> Self {
+    pub(crate) fn empty(root: &Path, enabled: bool) -> Self {
         Self {
-            root: helix_stdx::path::normalize(root),
+            root: root.to_path_buf(),
             enabled,
             statuses: HashMap::new(),
         }
     }
 
-    pub(super) fn from_changes(root: &Path, changes: impl IntoIterator<Item = FileChange>) -> Self {
+    pub(crate) fn from_changes(root: &Path, changes: impl IntoIterator<Item = FileChange>) -> Self {
         let root = helix_stdx::path::normalize(root);
         let mut snapshot = Self {
             root: root.clone(),
@@ -147,9 +146,8 @@ impl VcsSnapshot {
         self.statuses.get(path).copied()
     }
 
-    pub(super) fn is_current(&self, editor: &Editor, root: &Path) -> bool {
-        self.root == helix_stdx::path::normalize(root)
-            && self.enabled == editor.config().file_explorer.vcs
+    pub(crate) fn is_current_for(&self, root: &Path, enabled: bool) -> bool {
+        self.root == root && self.enabled == enabled
     }
 
     pub(super) fn len(&self) -> usize {
@@ -189,22 +187,22 @@ pub(super) struct DiagnosticStatus {
 }
 
 impl DiagnosticStatus {
-    fn from_lsp(severity: Option<LspDiagnosticSeverity>) -> Self {
-        let severity = match severity {
-            Some(LspDiagnosticSeverity::ERROR) => DiagnosticSeverity::Error,
-            Some(LspDiagnosticSeverity::WARNING) => DiagnosticSeverity::Warning,
-            Some(LspDiagnosticSeverity::INFORMATION) => DiagnosticSeverity::Info,
-            Some(LspDiagnosticSeverity::HINT) | None => DiagnosticSeverity::Hint,
-            Some(_) => DiagnosticSeverity::Hint,
+    fn from_counts(counts: WorkspaceDiagnosticCounts) -> Option<Self> {
+        let severity = if counts.errors != 0 {
+            DiagnosticSeverity::Error
+        } else if counts.warnings != 0 {
+            DiagnosticSeverity::Warning
+        } else if counts.info != 0 {
+            DiagnosticSeverity::Info
+        } else if counts.hints != 0 {
+            DiagnosticSeverity::Hint
+        } else {
+            return None;
         };
-        Self { severity, count: 1 }
-    }
-
-    fn merge(self, other: Self) -> Self {
-        Self {
-            severity: self.severity.max(other.severity),
-            count: self.count.saturating_add(other.count),
-        }
+        Some(Self {
+            severity,
+            count: counts.total() as usize,
+        })
     }
 
     pub(super) fn icon(self, icons: &Icons) -> &str {
@@ -242,44 +240,34 @@ pub(super) struct DiagnosticSnapshot {
 impl DiagnosticSnapshot {
     pub(super) fn empty(root: &Path, enabled: bool) -> Self {
         Self {
-            root: helix_stdx::path::normalize(root),
+            root: root.to_path_buf(),
             enabled,
             statuses: HashMap::new(),
         }
     }
 
-    pub(super) fn from_editor(root: &Path, editor: &Editor) -> Self {
-        let enabled = editor.config().file_explorer.diagnostics;
+    pub(super) fn from_editor(root: &Path, editor: &Editor, enabled: bool) -> Self {
         if !enabled {
             return Self::empty(root, false);
         }
 
-        let root = helix_stdx::path::normalize(root);
         let mut snapshot = Self {
-            root: root.clone(),
+            root: root.to_path_buf(),
             enabled,
             statuses: HashMap::new(),
         };
 
-        for (uri, diagnostics) in editor.diagnostics_snapshot() {
-            let Some(path) = uri.as_path() else {
-                continue;
-            };
-            let path = helix_stdx::path::normalize(path);
-            if !path.starts_with(&root) {
-                continue;
-            }
-
-            for (diagnostic, _) in diagnostics {
-                snapshot.insert_path_and_ancestors(
-                    &root,
-                    &path,
-                    DiagnosticStatus::from_lsp(diagnostic.severity),
-                );
+        for (path, summary) in editor.workspace_diagnostic_path_summaries_under(root) {
+            if let Some(status) = DiagnosticStatus::from_counts(summary) {
+                snapshot.statuses.insert(path.to_path_buf(), status);
             }
         }
 
         snapshot
+    }
+
+    pub(super) fn is_current(&self, root: &Path, enabled: bool) -> bool {
+        self.root == root && self.enabled == enabled
     }
 
     pub(super) fn status(&self, path: &Path) -> Option<DiagnosticStatus> {
@@ -291,31 +279,6 @@ impl DiagnosticSnapshot {
 
     pub(super) fn len(&self) -> usize {
         self.statuses.len()
-    }
-
-    fn insert_path_and_ancestors(&mut self, root: &Path, path: &Path, status: DiagnosticStatus) {
-        let path = helix_stdx::path::normalize(path);
-        if !path.starts_with(root) {
-            return;
-        }
-
-        let mut cursor = Some(path.as_path());
-        while let Some(path) = cursor {
-            if path.starts_with(root) {
-                self.insert_status(path, status);
-            }
-            if path == root {
-                break;
-            }
-            cursor = path.parent();
-        }
-    }
-
-    fn insert_status(&mut self, path: &Path, status: DiagnosticStatus) {
-        self.statuses
-            .entry(path.to_path_buf())
-            .and_modify(|existing| *existing = existing.merge(status))
-            .or_insert(status);
     }
 }
 

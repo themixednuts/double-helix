@@ -3,20 +3,21 @@
 //! # Custom key handlers and the confirmation seam
 //!
 //! Pickers can register component-local key bindings via [`PickerKeyHandlers`]
-//! and [`Picker::with_key_handlers`]. Two kinds of actions are supported:
+//! and [`Picker::with_key_handlers`]. Three kinds of actions are supported:
 //!
 //! - [`PickerKeyHandlers::insert`] registers an action that runs immediately
 //!   on the key press (with the currently selected item).
 //! - [`PickerKeyHandlers::insert_confirmed`] registers an action that requires
 //!   user confirmation. The handler runs at keypress time with the selected
-//!   item and returns an optional [`PickerConfirmation`]: the message to show
+//!   item and returns an optional [`Confirmation`]: the message to show
 //!   and the deferred action to run once the user confirms. Returning `None`
 //!   skips the prompt entirely (e.g. the action does not apply to the selected
 //!   item); the handler may set a status message itself in that case.
+//! - [`PickerKeyHandlers::insert_layer`] opens a picker-level component and
+//!   does not require a selected result.
 //!
-//! Confirmation reuses the standard [`Prompt`] y/n affordance — the same
-//! interaction as the file explorer delete prompt: the picker pushes a prompt
-//! reading `"<message> (y/n): "`, typing `y` and pressing Enter executes the
+//! Confirmation reuses the standard y/n prompt affordance. The picker pushes a prompt
+//! reading `"<message> (y/n): "`; typing `y` and pressing Enter executes the
 //! deferred action, any other input (or Esc) cancels it. Because the deferred
 //! action is built at keypress time, handlers clone exactly the item state
 //! they need and no `Clone` bound is imposed on picker items.
@@ -31,7 +32,7 @@ use crate::{
     compositor::{self, Component, Context, Event, EventResult, PickerComponent, RenderContext},
     ui::{
         self,
-        document::{render_document, HighlighterInput, LinePos, TextRenderer},
+        document::{render_document, LinePos, SyntaxRenderSnapshot, TextRenderer},
         gradient_border::GradientBorder,
         menu::{Cell, Row},
         picker::query::PickerQuery,
@@ -40,8 +41,9 @@ use crate::{
     widgets::PickerTable,
 };
 use helix_core::unicode::width::UnicodeWidthStr;
+use helix_runtime::{LatestAdmissionError, LatestByKeySender};
 use nucleo::pattern::{CaseMatching, Normalization};
-use nucleo::{Config, Nucleo};
+use nucleo::{Config, Matcher, Nucleo};
 use thiserror::Error;
 use tui::{
     ratatui::layout::Constraint,
@@ -55,20 +57,22 @@ use std::{
     io::Read,
     path::{Path, PathBuf},
     sync::{
-        atomic::{self, AtomicU64, AtomicUsize},
+        atomic::{self, AtomicBool, AtomicU64, AtomicUsize},
         Arc,
     },
     time::Duration,
 };
 
-use crate::ui::{Prompt, PromptEvent};
+use crate::ui::{Confirmation, Prompt, PromptEvent};
 use helix_core::{
-    char_idx_at_visual_offset, fuzzy::MATCHER, movement::Direction,
-    text_annotations::TextAnnotations, unicode::segmentation::UnicodeSegmentation, Position,
+    char_idx_at_visual_offset, movement::Direction, text_annotations::TextAnnotations,
+    unicode::segmentation::UnicodeSegmentation, Position,
 };
 use helix_view::{
     content_region::ContentRegion,
-    editor::Action,
+    editor::{
+        Action, DocumentOpenRole, DocumentOpenWork, FileExplorerConfig, PreparedDocumentOpen,
+    },
     graphics::{CursorKind, Margin, Modifier, Rect},
     input::KeyEvent,
     keyboard::{KeyCode, KeyModifiers},
@@ -86,6 +90,52 @@ type SharedRedraw = Arc<helix_runtime::FrameHandle>;
 pub(crate) const PICKER_TRACE_TARGET: &str = "dhx_picker";
 
 static NEXT_PICKER_TRACE_ID: AtomicU64 = AtomicU64::new(1);
+
+fn directory_preview(
+    root: &Path,
+    config: &FileExplorerConfig,
+) -> Result<Vec<(PathBuf, bool)>, std::io::Error> {
+    let mut content = ignore::WalkBuilder::new(root)
+        .hidden(config.hidden)
+        .parents(config.parents)
+        .ignore(config.ignore)
+        .follow_links(config.follow_symlinks)
+        .git_ignore(config.git_ignore)
+        .git_global(config.git_global)
+        .git_exclude(config.git_exclude)
+        .max_depth(Some(1))
+        .add_custom_ignore_filename(helix_loader::config_dir().join("ignore"))
+        .add_custom_ignore_filename(helix_loader::workspace_ignore_file_name())
+        .types(crate::ui::file_scan::excluded_types())
+        .build()
+        .filter_map(|entry| {
+            entry
+                .map(|entry| {
+                    let path = entry.path();
+                    let is_dir = path.is_dir();
+                    let mut path = path.to_path_buf();
+                    if is_dir && path != root && config.flatten_dirs {
+                        while let Some(child) = crate::ui::file_scan::single_child_directory(&path)
+                        {
+                            path = child;
+                        }
+                    }
+                    (path, is_dir)
+                })
+                .ok()
+                .filter(|entry| entry.0 != root)
+        })
+        .collect::<Vec<_>>();
+
+    content.sort_by(|(left, left_is_dir), (right, right_is_dir)| {
+        (!left_is_dir, left).cmp(&(!right_is_dir, right))
+    });
+    if root.parent().is_some() {
+        content.insert(0, (root.join(".."), true));
+    }
+    Ok(content)
+}
+
 static NEXT_PICKER_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
 // Picker keys are component-local hardcoded bindings, not user keymap entries,
@@ -439,11 +489,168 @@ pub type FileLocation<'a> = (PathOrId<'a>, Option<(usize, usize)>);
 
 pub enum CachedPreview {
     Loading,
-    Document(Box<Document>),
-    Directory(Vec<(String, bool)>),
+    Document(Box<PreparedDocumentOpen>),
+    Directory(Arc<[(String, bool)]>),
     Binary,
     LargeFile,
     NotFound,
+}
+
+struct PreviewLoadRequest {
+    generation: u64,
+    picker: PickerInstanceId,
+    path: PathBuf,
+    open: DocumentOpenWork,
+    config: FileExplorerConfig,
+}
+
+struct PreviewLoadService {
+    tx: LatestByKeySender<(), PreviewLoadRequest>,
+    latest_generation: Arc<AtomicU64>,
+    next_generation: u64,
+}
+
+impl PreviewLoadService {
+    fn spawn(
+        work: helix_runtime::Work,
+        block: helix_runtime::Block,
+        ingress: SharedIngress,
+    ) -> Self {
+        let (tx, mut rx) = helix_runtime::latest_by_key::<(), PreviewLoadRequest>(1);
+        let latest_generation = Arc::new(AtomicU64::new(0));
+        let actor_latest = Arc::clone(&latest_generation);
+        work.spawn(async move {
+            while let Some(((), request)) = rx.recv().await {
+                let generation = request.generation;
+                let picker = request.picker;
+                let path = request.path.clone();
+                let started = std::time::Instant::now();
+                let preview = match block.spawn(move || load_preview(request)).await {
+                    Ok(preview) => preview,
+                    Err(error) => {
+                        log::error!(
+                            "picker preview worker failed picker={picker:?} generation={generation} error={error}"
+                        );
+                        CachedPreview::NotFound
+                    }
+                };
+                let stale = actor_latest.load(atomic::Ordering::Acquire) != generation;
+                log::info!(
+                    target: PICKER_TRACE_TARGET,
+                    "phase=preview_load picker={picker:?} generation={generation} path={} kind={} stale={} elapsed_us={}",
+                    path.display(),
+                    cached_preview_kind(&preview),
+                    stale,
+                    started.elapsed().as_micros(),
+                );
+                if stale {
+                    continue;
+                }
+                let _ = ingress
+                    .send_ui(crate::runtime::UiCommand::Picker(
+                        crate::runtime::ui::command::PickerCommand::ApplyPreview {
+                            picker,
+                            generation,
+                            path,
+                            preview,
+                        },
+                    ))
+                    .await;
+            }
+        })
+        .detach();
+
+        Self {
+            tx,
+            latest_generation,
+            next_generation: 1,
+        }
+    }
+
+    fn submit(&mut self, mut request: PreviewLoadRequest) -> Option<u64> {
+        let generation = self.next_generation;
+        self.next_generation = self.next_generation.wrapping_add(1).max(1);
+        request.generation = generation;
+        let previous = self
+            .latest_generation
+            .swap(generation, atomic::Ordering::AcqRel);
+        match self.tx.try_send((), request) {
+            Ok(_) => Some(generation),
+            Err(LatestAdmissionError::Full((), _)) => {
+                let _ = self.latest_generation.compare_exchange(
+                    generation,
+                    previous,
+                    atomic::Ordering::AcqRel,
+                    atomic::Ordering::Acquire,
+                );
+                log::error!("picker preview admission invariant was violated");
+                None
+            }
+            Err(LatestAdmissionError::Closed((), _)) => {
+                let _ = self.latest_generation.compare_exchange(
+                    generation,
+                    previous,
+                    atomic::Ordering::AcqRel,
+                    atomic::Ordering::Acquire,
+                );
+                log::error!("picker preview service is closed");
+                None
+            }
+        }
+    }
+
+    fn cancel(&self) {
+        self.latest_generation.store(0, atomic::Ordering::Release);
+    }
+}
+
+fn load_preview(request: PreviewLoadRequest) -> CachedPreview {
+    let path = request.path;
+    (|| -> Result<CachedPreview, std::io::Error> {
+        let metadata = std::fs::metadata(&path)?;
+        if metadata.is_dir() {
+            let files = directory_preview(&path, &request.config)?;
+            let names = files
+                .iter()
+                .filter_map(|(path, is_dir)| {
+                    let name = path.file_name()?.to_string_lossy();
+                    Some(if *is_dir {
+                        (format!("{name}/"), true)
+                    } else {
+                        (name.into_owned(), false)
+                    })
+                })
+                .collect::<Vec<_>>();
+            return Ok(CachedPreview::Directory(names.into()));
+        }
+        if !metadata.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "neither a directory nor a file",
+            ));
+        }
+        if metadata.len() > MAX_FILE_SIZE_FOR_PREVIEW {
+            return Ok(CachedPreview::LargeFile);
+        }
+
+        let mut buffer = Vec::with_capacity(1024);
+        let content_type = std::fs::File::open(&path).and_then(|file| {
+            let length = file.take(1024).read_to_end(&mut buffer)?;
+            Ok(content_inspector::inspect(&buffer[..length]))
+        })?;
+        if content_type.is_binary() {
+            return Ok(CachedPreview::Binary);
+        }
+
+        request.open.execute().map_or(
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "cannot open document",
+            )),
+            |prepared| Ok(CachedPreview::Document(Box::new(prepared))),
+        )
+    })()
+    .unwrap_or(CachedPreview::NotFound)
 }
 
 fn cached_preview_kind(preview: &CachedPreview) -> &'static str {
@@ -496,12 +703,12 @@ impl RenderPreview<'_> {
     fn document(&self) -> Option<&Document> {
         match self {
             Self::Document(doc) => Some(doc),
-            Self::Cached(CachedPreview::Document(doc)) => Some(doc),
+            Self::Cached(CachedPreview::Document(prepared)) => Some(prepared.document()),
             _ => None,
         }
     }
 
-    fn dir_content(&self) -> Option<&Vec<(String, bool)>> {
+    fn dir_content(&self) -> Option<&Arc<[(String, bool)]>> {
         match self {
             Self::Cached(CachedPreview::Directory(dir_content)) => Some(dir_content),
             _ => None,
@@ -543,6 +750,7 @@ pub struct Injector<T, D> {
     editor_data: Arc<D>,
     version: usize,
     picker_version: Arc<AtomicUsize>,
+    alive: Arc<AtomicBool>,
     ingress: SharedIngress,
     redraw: SharedRedraw,
     trace: Option<PickerTrace>,
@@ -556,15 +764,28 @@ pub struct Injector<T, D> {
 
 struct RuntimeRedrawOnDrop {
     redraw: SharedRedraw,
+    version: usize,
+    picker_version: Arc<AtomicUsize>,
+    alive: Arc<AtomicBool>,
     trace: Option<PickerTrace>,
 }
 
 impl Drop for RuntimeRedrawOnDrop {
     fn drop(&mut self) {
+        let current = self.picker_version.load(atomic::Ordering::Acquire);
+        let should_redraw = self.alive.load(atomic::Ordering::Acquire) && current == self.version;
         if let Some(trace) = self.trace {
-            trace.log("injector_drop_redraw", format_args!("request_redraw=true"));
+            trace.log(
+                "injector_drop_redraw",
+                format_args!(
+                    "request_redraw={should_redraw} generation={} current_generation={current}",
+                    self.version
+                ),
+            );
         }
-        self.redraw.request_redraw();
+        if should_redraw {
+            self.redraw.request_redraw();
+        }
     }
 }
 
@@ -576,11 +797,15 @@ impl<I, D> Clone for Injector<I, D> {
             editor_data: self.editor_data.clone(),
             version: self.version,
             picker_version: self.picker_version.clone(),
+            alive: self.alive.clone(),
             ingress: self.ingress.clone(),
             redraw: self.redraw.clone(),
             trace: self.trace,
             _redraw: RuntimeRedrawOnDrop {
                 redraw: self.redraw.clone(),
+                version: self.version,
+                picker_version: self.picker_version.clone(),
+                alive: self.alive.clone(),
                 trace: self.trace,
             },
         }
@@ -659,25 +884,404 @@ type DynQueryCallback<T, D> = fn(
     Arc<D>,
     &Injector<T, D>,
     helix_runtime::Work,
+    helix_runtime::Block,
 ) -> helix_runtime::Task<anyhow::Result<()>>;
 
 enum DynamicQuery<T: 'static + Send + Sync, D: 'static> {
     Disabled,
     Debounced {
         debouncer: crate::runtime::RuntimeUiDebouncer,
+        schedule: DynamicQuerySchedule,
         last_query: Arc<str>,
         callback: DynQueryCallback<T, D>,
     },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DynamicQuerySchedule {
+    Immediate,
+    Debounced(Duration),
+}
+
+impl DynamicQuerySchedule {
+    pub const fn debounced_ms(milliseconds: u64) -> Self {
+        Self::Debounced(Duration::from_millis(milliseconds))
+    }
+
+    const fn delay(self) -> Duration {
+        match self {
+            Self::Immediate => Duration::ZERO,
+            Self::Debounced(delay) => delay,
+        }
+    }
+
+    const fn is_immediate(self) -> bool {
+        matches!(self, Self::Immediate)
+    }
+}
+
 type PickerItemDataFn<T> = Box<dyn Fn(&T) -> helix_view::model::PickerItemData + Send + Sync>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PickerRowsKey {
+    matcher_revision: u64,
+    mark_revision: u64,
+    offset: u32,
+    end: u32,
+}
+
+struct PickerTableRenderSnapshot {
+    model: Arc<helix_view::model::PickerModel>,
+    area: Rect,
+    text_style: Style,
+    placeholder_style: Style,
+    selected_style: Style,
+    highlight_style: Style,
+    header_style: Style,
+    header_column_style: Style,
+    active_header_style: Style,
+    highlight_symbol: Arc<str>,
+}
+
+struct PickerChromeRenderSnapshot {
+    area: Rect,
+    background: Style,
+    rounded_corners: bool,
+    gradient_border: Option<GradientBorder>,
+    prompt_row: Rect,
+    separator_row: Rect,
+    hint_row: Rect,
+    count: Arc<str>,
+    count_width: u16,
+    selected_style: Style,
+    muted_style: Style,
+    separator_style: Style,
+    hints: Arc<[crate::widgets::Hint<'static>]>,
+}
+
+impl PickerChromeRenderSnapshot {
+    fn paint(self, surface: &mut crate::render::CellSurface) {
+        let area = tui::ratatui::to_ratatui_rect(self.area);
+        tui::ratatui::widgets::Widget::render(tui::ratatui::widgets::Clear, area, surface);
+        surface.set_style(area, tui::ratatui::to_ratatui_style(self.background));
+        if let Some(border) = self.gradient_border {
+            border.render_no_theme(self.area, surface, self.rounded_corners);
+        } else {
+            crate::widgets::Panel::framed(
+                crate::widgets::PanelStyle::plain(self.background),
+                self.rounded_corners,
+            )
+            .render(surface, self.area);
+        }
+
+        if self.prompt_row.width >= 2 {
+            surface.set_stringn(
+                self.prompt_row.x,
+                self.prompt_row.y,
+                "›",
+                1,
+                tui::ratatui::to_ratatui_style(self.selected_style),
+            );
+        }
+        let prompt_area = self.prompt_row.clip_left(2);
+        surface.set_stringn(
+            (prompt_area.x + prompt_area.width).saturating_sub(self.count_width + 1),
+            prompt_area.y,
+            self.count.as_ref(),
+            self.count_width.min(prompt_area.width) as usize,
+            tui::ratatui::to_ratatui_style(self.muted_style),
+        );
+        crate::widgets::hdivider(surface, self.separator_row, self.separator_style);
+        crate::widgets::hint_bar(
+            surface,
+            self.hint_row,
+            self.hints.as_ref(),
+            crate::widgets::HintBarStyle {
+                background: self.background,
+                key: self.selected_style,
+                label: self.muted_style,
+                separator: self.muted_style,
+            },
+        );
+    }
+}
+
+struct PickerPreviewChromeRenderSnapshot {
+    area: Rect,
+    background: Style,
+    border: Style,
+    rounded_corners: bool,
+    gradient_border: Option<GradientBorder>,
+}
+
+impl PickerPreviewChromeRenderSnapshot {
+    fn paint(self, surface: &mut crate::render::CellSurface) {
+        let area = tui::ratatui::to_ratatui_rect(self.area);
+        tui::ratatui::widgets::Widget::render(tui::ratatui::widgets::Clear, area, surface);
+        surface.set_style(area, tui::ratatui::to_ratatui_style(self.background));
+        if let Some(border) = self.gradient_border {
+            border.render_no_theme(self.area, surface, self.rounded_corners);
+        } else {
+            crate::widgets::Panel::framed(
+                crate::widgets::PanelStyle::new(self.background, self.border, self.background),
+                self.rounded_corners,
+            )
+            .render(surface, self.area);
+        }
+    }
+}
+
+impl PickerTableRenderSnapshot {
+    fn render(
+        &self,
+        surface: &mut crate::render::CellSurface,
+        cancellation: &crate::render::RenderCancellation,
+    ) {
+        if cancellation.is_cancelled() {
+            return;
+        }
+
+        let mut rows = Vec::with_capacity(self.model.visible_items.len());
+        for (index, row) in self.model.visible_items.iter().enumerate() {
+            if index % 8 == 0 && cancellation.is_cancelled() {
+                return;
+            }
+
+            let marked = row.marked;
+            let cells = row
+                .cells
+                .iter()
+                .map(|cell| picker_cell(cell, self.highlight_style));
+            let row = Row::new(cells);
+            if self.model.markable {
+                let mut cells = Vec::with_capacity(row.cells.len() + 1);
+                cells.push(Cell::from(if marked { "✓" } else { " " }));
+                cells.extend(row.cells);
+                rows.push(Row::new(cells));
+            } else {
+                rows.push(row);
+            }
+        }
+
+        let header = (!self.model.headers.is_empty()).then(|| {
+            let row = Row::new(
+                self.model
+                    .headers
+                    .iter()
+                    .enumerate()
+                    .map(|(index, header)| {
+                        let style = if self.model.active_column == Some(index) {
+                            self.active_header_style
+                        } else {
+                            self.header_column_style
+                        };
+                        Cell::from(Span::styled(Cow::Borrowed(header.name.as_ref()), style))
+                    }),
+            )
+            .style(self.header_style);
+
+            if self.model.markable {
+                let mut cells = Vec::with_capacity(row.cells.len() + 1);
+                cells.push(Cell::default());
+                cells.extend(row.cells);
+                Row::new(cells).style(self.header_style)
+            } else {
+                row
+            }
+        });
+
+        let mut widths =
+            Vec::with_capacity(self.model.widths.len() + usize::from(self.model.markable));
+        if self.model.markable {
+            widths.push(Constraint::Length(1));
+        }
+        widths.extend(self.model.widths.iter().copied().map(Constraint::Length));
+
+        if cancellation.is_cancelled() {
+            return;
+        }
+
+        PickerTable {
+            rows,
+            header,
+            widths: &widths,
+            text_style: self.text_style,
+            placeholder_style: self.placeholder_style,
+            selected_style: self.selected_style,
+            header_style: self.header_style,
+            highlight_symbol: self.highlight_symbol.as_ref(),
+            selected_row: (self.model.cursor < self.model.visible_items.len())
+                .then_some(self.model.cursor),
+            truncate_start: self.model.truncate_start,
+        }
+        .render(self.area, surface);
+    }
+}
+
+fn picker_cell(cell: &helix_view::model::PickerCell, highlight_style: Style) -> Cell<'_> {
+    let mut rendered = Vec::with_capacity(cell.spans.len() + cell.highlight_indices.len() * 2);
+    let mut highlights = cell.highlight_indices.iter().copied();
+    let mut next_highlight = highlights.next().unwrap_or(u32::MAX);
+    let mut grapheme_index = 0u32;
+
+    for span in cell.spans.iter() {
+        let text = span.text.as_str();
+        let mut run_start = 0;
+        let mut run_style = None;
+
+        for (byte_index, _) in text.grapheme_indices(true) {
+            let style = if grapheme_index == next_highlight {
+                next_highlight = highlights.next().unwrap_or(u32::MAX);
+                span.style.patch(highlight_style)
+            } else {
+                span.style
+            };
+
+            if let Some(current_style) = run_style {
+                if current_style != style {
+                    rendered.push(Span::styled(
+                        Cow::Borrowed(&text[run_start..byte_index]),
+                        current_style,
+                    ));
+                    run_start = byte_index;
+                }
+            }
+            run_style = Some(style);
+            grapheme_index = grapheme_index.saturating_add(1);
+        }
+
+        if let Some(style) = run_style {
+            rendered.push(Span::styled(Cow::Borrowed(&text[run_start..]), style));
+        } else if !text.is_empty() {
+            rendered.push(Span::styled(Cow::Borrowed(text), span.style));
+        }
+    }
+
+    Cell::from(Spans::from(rendered))
+}
+
+enum PickerPreviewContentSnapshot {
+    Document {
+        document: crate::ui::document::DocumentRenderSnapshot,
+        offset: ViewPosition,
+        syntax: SyntaxRenderSnapshot,
+        overlays: Vec<helix_core::syntax::OverlayHighlights>,
+        theme: Arc<helix_view::Theme>,
+        highlighted_lines: Option<(usize, usize, Style)>,
+    },
+    Directory(Arc<[(String, bool)]>),
+    Placeholder(Arc<str>),
+}
+
+struct PickerPreviewRenderSnapshot {
+    inner: Rect,
+    text_style: Style,
+    directory_style: Style,
+    content: PickerPreviewContentSnapshot,
+}
+
+impl PickerPreviewRenderSnapshot {
+    fn render(
+        self,
+        surface: &mut crate::render::CellSurface,
+        cancellation: &crate::render::RenderCancellation,
+    ) {
+        if cancellation.is_cancelled() {
+            return;
+        }
+
+        match self.content {
+            PickerPreviewContentSnapshot::Document {
+                document,
+                offset,
+                syntax,
+                overlays,
+                theme,
+                highlighted_lines,
+            } => {
+                let annotations = TextAnnotations::default();
+                let mut decorations = DecorationManager::default();
+                if let Some((start, end, style)) = highlighted_lines {
+                    let inner = self.inner;
+                    decorations.add_decoration(move |renderer: &mut TextRenderer, pos: LinePos| {
+                        if (start..=end).contains(&pos.doc_line) {
+                            renderer.set_style(
+                                Rect::new(inner.x, pos.visual_line, inner.width, 1),
+                                style,
+                            );
+                        }
+                    });
+                }
+
+                render_document(
+                    surface,
+                    self.inner,
+                    &document,
+                    offset,
+                    &annotations,
+                    syntax,
+                    overlays,
+                    theme.as_ref(),
+                    decorations,
+                    None,
+                    None,
+                    None,
+                    cancellation,
+                );
+            }
+            PickerPreviewContentSnapshot::Directory(entries) => {
+                for (index, (path, is_dir)) in
+                    entries.iter().take(self.inner.height as usize).enumerate()
+                {
+                    if index % 16 == 0 && cancellation.is_cancelled() {
+                        return;
+                    }
+                    let style = if *is_dir {
+                        self.directory_style
+                    } else {
+                        self.text_style
+                    };
+                    surface.set_stringn(
+                        self.inner.x,
+                        self.inner.y + index as u16,
+                        path,
+                        self.inner.width as usize,
+                        tui::ratatui::to_ratatui_style(style),
+                    );
+                }
+            }
+            PickerPreviewContentSnapshot::Placeholder(text) => {
+                let x = self.inner.x
+                    + self
+                        .inner
+                        .width
+                        .saturating_sub(UnicodeWidthStr::width(text.as_ref()) as u16)
+                        / 2;
+                let y = self.inner.y + self.inner.height / 2;
+                surface.set_stringn(
+                    x,
+                    y,
+                    text.as_ref(),
+                    self.inner.width as usize,
+                    tui::ratatui::to_ratatui_style(self.text_style),
+                );
+            }
+        }
+    }
+}
 
 pub struct Picker<T: 'static + Send + Sync, D: 'static> {
     columns: Arc<[Column<T, D>]>,
     primary_column: usize,
     editor_data: Arc<D>,
     version: Arc<AtomicUsize>,
+    alive: Arc<AtomicBool>,
     matcher: Nucleo<T>,
+    highlight_matcher: Matcher,
+    matcher_running: bool,
+    matcher_revision: u64,
+    mark_revision: u64,
+    rendered_rows_key: Option<PickerRowsKey>,
 
     /// Current height of the completions box
     completion_height: u16,
@@ -691,7 +1295,7 @@ pub struct Picker<T: 'static + Send + Sync, D: 'static> {
     /// When true, the picker source is responsible for query filtering and result ordering.
     external_filtering: bool,
     /// Constraints for tabular formatting
-    widths: Vec<Constraint>,
+    widths: Vec<u16>,
     /// Read-only results viewport state.
     list_region: ContentRegion<()>,
     /// Cursor + wrap-arithmetic state machine shared with the file
@@ -712,6 +1316,8 @@ pub struct Picker<T: 'static + Send + Sync, D: 'static> {
     pub truncate_start: bool,
     /// Caches paths to documents
     preview_cache: HashMap<Arc<Path>, CachedPreview>,
+    preview_load_service: PreviewLoadService,
+    pending_preview_load: Option<(u64, Arc<Path>)>,
     /// Given an item in the picker, return the file path and line number to display.
     file_fn: Option<FileCallback<T>>,
     /// An event handler for syntax highlighting the currently previewed file.
@@ -731,6 +1337,7 @@ pub struct Picker<T: 'static + Send + Sync, D: 'static> {
     /// Layer ID in `Editor.model` for this picker. Set when the picker is first
     /// pushed to the compositor; used to sync render state to the shared UI model.
     model_layer_id: Option<helix_view::model::LayerId>,
+    render_model: Arc<helix_view::model::PickerModel>,
     /// Optional callback to convert a picker item `T` into `PickerItemData` for the UI model.
     /// If `None`, items are stored as `PickerItemData::Plain`.
     item_data_fn: Option<PickerItemDataFn<T>>,
@@ -756,11 +1363,18 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
         assert!(matcher_columns > 0);
         let ingress = Arc::new(ingress);
         let redraw = Arc::new(runtime.redraw);
+        let picker_version = Arc::new(AtomicUsize::new(0));
+        let alive = Arc::new(AtomicBool::new(true));
         let matcher = Nucleo::new(
             Config::DEFAULT,
             Arc::new({
                 let redraw = redraw.clone();
-                move || redraw.request_redraw()
+                let alive = alive.clone();
+                move || {
+                    if alive.load(atomic::Ordering::Acquire) {
+                        redraw.request_redraw();
+                    }
+                }
             }),
             None,
             matcher_columns,
@@ -770,12 +1384,16 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             columns,
             editor_data: Arc::new(editor_data),
             version: 0,
-            picker_version: Arc::new(AtomicUsize::new(0)),
+            picker_version: picker_version.clone(),
+            alive: alive.clone(),
             ingress: ingress.clone(),
             redraw: redraw.clone(),
             trace: None,
             _redraw: RuntimeRedrawOnDrop {
                 redraw,
+                version: 0,
+                picker_version,
+                alive,
                 trace: None,
             },
         };
@@ -801,11 +1419,18 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
         assert!(matcher_columns > 0);
         let ingress = Arc::new(ingress);
         let redraw = Arc::new(runtime.redraw.clone());
+        let picker_version = Arc::new(AtomicUsize::new(0));
+        let alive = Arc::new(AtomicBool::new(true));
         let matcher = Nucleo::new(
             Config::DEFAULT,
             Arc::new({
                 let redraw = redraw.clone();
-                move || redraw.request_redraw()
+                let alive = alive.clone();
+                move || {
+                    if alive.load(atomic::Ordering::Acquire) {
+                        redraw.request_redraw();
+                    }
+                }
             }),
             None,
             matcher_columns,
@@ -819,12 +1444,16 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             columns: columns.clone(),
             editor_data: Arc::new(editor_data),
             version: 0,
-            picker_version: Arc::new(AtomicUsize::new(0)),
+            picker_version: picker_version.clone(),
+            alive: alive.clone(),
             ingress: ingress.clone(),
             redraw: redraw.clone(),
             trace: None,
             _redraw: RuntimeRedrawOnDrop {
                 redraw: redraw.clone(),
+                version: 0,
+                picker_version,
+                alive,
                 trace: None,
             },
         };
@@ -852,6 +1481,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             columns,
             editor_data,
             picker_version: version,
+            alive,
             ingress,
             redraw,
             ..
@@ -867,7 +1497,8 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
 
         let widths = columns
             .iter()
-            .map(|column| Constraint::Length(column.name.chars().count() as u16))
+            .filter(|column| !column.hidden)
+            .map(|column| column.name.chars().count() as u16)
             .collect();
 
         let query = PickerQuery::new(columns.iter().map(|col| &col.name).cloned(), default_column);
@@ -875,13 +1506,21 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             work, clock, block, ..
         } = runtime;
         let instance_id = PickerInstanceId::next();
+        let preview_load_service =
+            PreviewLoadService::spawn(work.clone(), block.clone(), ingress.clone());
 
         Self {
             columns,
             primary_column: default_column,
             matcher,
+            highlight_matcher: Matcher::default(),
+            matcher_running: false,
+            matcher_revision: 0,
+            mark_revision: 0,
+            rendered_rows_key: None,
             editor_data,
             version,
+            alive,
             cursor: 0,
             prompt,
             query,
@@ -894,6 +1533,8 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             list_region: ContentRegion::default(),
             nav: helix_view::list_nav::ListNav::new(),
             preview_cache: HashMap::new(),
+            preview_load_service,
+            pending_preview_load: None,
             custom_key_handlers: PickerKeyHandlers::new(),
             file_fn: None,
             preview_highlight_handler: PreviewHighlightHandler::new(
@@ -911,6 +1552,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             render_count: 0,
             instance_id,
             model_layer_id: None,
+            render_model: Arc::new(helix_view::model::PickerModel::default()),
             item_data_fn: None,
             selection_changed_handler: None,
             custom_hints: Vec::new(),
@@ -948,14 +1590,22 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             editor_data: self.editor_data.clone(),
             version: self.version.load(atomic::Ordering::Relaxed),
             picker_version: self.version.clone(),
+            alive: self.alive.clone(),
             ingress: self.ingress.clone(),
             redraw: self.redraw.clone(),
             trace: self.trace,
             _redraw: RuntimeRedrawOnDrop {
                 redraw: self.redraw.clone(),
+                version: self.version.load(atomic::Ordering::Acquire),
+                picker_version: self.version.clone(),
+                alive: self.alive.clone(),
                 trace: self.trace,
             },
         }
+    }
+
+    pub fn instance_id(&self) -> PickerInstanceId {
+        self.instance_id
     }
 
     pub(crate) fn with_trace(mut self, trace: PickerTrace) -> Self {
@@ -1010,23 +1660,24 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
     pub fn with_dynamic_query(
         mut self,
         callback: DynQueryCallback<T, D>,
-        debounce_ms: Option<u64>,
+        schedule: DynamicQuerySchedule,
     ) -> Self {
         let debouncer = crate::runtime::RuntimeUiDebouncer::new(
-            Duration::from_millis(debounce_ms.unwrap_or(100)),
+            schedule.delay(),
             self.work.clone(),
             self.clock.clone(),
             (*self.ingress).clone(),
         );
         self.dynamic_query = DynamicQuery::Debounced {
             debouncer,
+            schedule,
             last_query: "".into(),
             callback,
         };
         if let Some(trace) = self.trace {
             trace.log(
                 "dynamic_query_enabled",
-                format_args!("debounce_ms={}", debounce_ms.unwrap_or(100)),
+                format_args!("schedule={schedule:?}"),
             );
         }
         self.request_debounced_dynamic_query(self.primary_query(), true, false);
@@ -1041,6 +1692,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
     fn request_debounced_dynamic_query(&mut self, query: Arc<str>, is_paste: bool, force: bool) {
         let DynamicQuery::Debounced {
             debouncer,
+            schedule,
             last_query,
             ..
         } = &mut self.dynamic_query
@@ -1069,9 +1721,12 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             );
         }
         let event = crate::runtime::UiCommand::Picker(
-            crate::runtime::ui::command::PickerCommand::RunDynamicQuery { query },
+            crate::runtime::ui::command::PickerCommand::RunDynamicQuery {
+                picker: self.instance_id,
+                query,
+            },
         );
-        if is_paste {
+        if is_paste || schedule.is_immediate() {
             debouncer.send_now(event);
         } else {
             debouncer.send(event);
@@ -1084,50 +1739,61 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             return;
         };
 
-        if doc.has_syntax() {
+        if doc.document().has_syntax() {
             return;
         }
 
-        let Some(language) = doc.language_config().map(|config| config.language()) else {
+        let Some(language) = doc
+            .document()
+            .language_config()
+            .map(|config| config.language())
+        else {
             return;
         };
 
         let loader = editor.syn_loader.load();
-        let text = doc.text().clone();
+        let text = doc.document().text().clone();
         let ingress = (*self.ingress).clone();
         let picker = self.instance_id;
         let path = path.to_path_buf();
 
-        self.block
+        let blocking = self.block.clone().spawn(move || {
+            let syntax = match helix_core::Syntax::new_with_timeout(
+                text.slice(..),
+                language,
+                &loader,
+                helix_core::syntax::BACKGROUND_PARSE_TIMEOUT,
+            ) {
+                Ok(syntax) => syntax,
+                Err(err) => {
+                    log::info!("highlighting picker preview failed: {err}");
+                    return None;
+                }
+            };
+            Some((path, syntax))
+        });
+        self.work
             .clone()
-            .spawn(move || {
-                let syntax = match helix_core::Syntax::new_with_timeout(
-                    text.slice(..),
-                    language,
-                    &loader,
-                    helix_core::syntax::BACKGROUND_PARSE_TIMEOUT,
-                ) {
-                    Ok(syntax) => syntax,
-                    Err(err) => {
-                        log::info!("highlighting picker preview failed: {err}");
-                        return;
-                    }
+            .spawn(async move {
+                let Ok(Some((path, syntax))) = blocking.await else {
+                    return;
                 };
-
-                ingress.ui(crate::runtime::UiCommand::Picker(
-                    crate::runtime::ui::command::PickerCommand::ApplyPreviewSyntax {
-                        picker,
-                        path,
-                        syntax,
-                    },
-                ));
+                let _ = ingress
+                    .send_ui(crate::runtime::UiCommand::Picker(
+                        crate::runtime::ui::command::PickerCommand::ApplyPreviewSyntax {
+                            picker,
+                            path,
+                            syntax,
+                        },
+                    ))
+                    .await;
             })
             .detach();
     }
 
     fn apply_preview_syntax(
         &mut self,
-        editor: &mut Editor,
+        _editor: &mut Editor,
         path: PathBuf,
         syntax: helix_core::Syntax,
     ) {
@@ -1135,95 +1801,67 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
         let Some(CachedPreview::Document(ref mut doc)) = self.preview_cache.get_mut(&path) else {
             return;
         };
-        let diagnostics =
-            helix_view::Editor::doc_diagnostics(&editor.language_servers, &editor.diagnostics, doc);
-        doc.replace_diagnostics(diagnostics, &[], None);
-        doc.set_syntax(Some(syntax));
+        doc.document_mut().set_syntax(Some(syntax));
     }
 
-    fn queue_preview_load(&self, editor: &Editor, path: Arc<Path>) {
-        let key = path.to_path_buf();
-        let config = editor.config.clone();
-        let syn_loader = editor.syn_loader.clone();
-        let file_explorer_config = editor.config().file_explorer.clone();
-        let picker = self.instance_id;
-
-        crate::runtime::ui::snapshot::UiSnapshotRequest::new("[picker] preview_snapshot", key)
-            .load_with(move |path| {
-                let preview = (|| -> Result<CachedPreview, std::io::Error> {
-                    let metadata = std::fs::metadata(&path)?;
-                    if metadata.is_dir() {
-                        let files =
-                            ui::directory_content_with_config(&path, &file_explorer_config)?;
-                        let file_names = files
-                            .iter()
-                            .filter_map(|(path, is_dir)| {
-                                let name = path.file_name()?.to_string_lossy();
-                                if *is_dir {
-                                    Some((format!("{}/", name), true))
-                                } else {
-                                    Some((name.into_owned(), false))
-                                }
-                            })
-                            .collect();
-                        return Ok(CachedPreview::Directory(file_names));
-                    }
-
-                    if !metadata.is_file() {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::NotFound,
-                            "neither a directory nor a file",
-                        ));
-                    }
-
-                    if metadata.len() > MAX_FILE_SIZE_FOR_PREVIEW {
-                        return Ok(CachedPreview::LargeFile);
-                    }
-
-                    let mut read_buffer = Vec::with_capacity(1024);
-                    let content_type = std::fs::File::open(&path).and_then(|file| {
-                        let n = file.take(1024).read_to_end(&mut read_buffer)?;
-                        Ok(content_inspector::inspect(&read_buffer[..n]))
-                    })?;
-                    if content_type.is_binary() {
-                        return Ok(CachedPreview::Binary);
-                    }
-
-                    Document::open(
-                        &path,
-                        None,
-                        helix_view::document::LanguageInitialization::MetadataOnly,
-                        config,
-                        syn_loader.clone(),
-                    )
-                    .map_or(
-                        Err(std::io::Error::new(
-                            std::io::ErrorKind::NotFound,
-                            "cannot open document",
-                        )),
-                        |doc| Ok(CachedPreview::Document(Box::new(doc))),
-                    )
-                })()
-                .unwrap_or(CachedPreview::NotFound);
-                Ok(preview)
-            })
-            .apply_with(move |path, preview| {
-                crate::runtime::UiCommand::Picker(
-                    crate::runtime::ui::command::PickerCommand::ApplyPreview {
-                        picker,
-                        path,
-                        preview,
-                    },
-                )
-            })
-            .spawn(self.work.clone(), (*self.ingress).clone());
+    fn queue_preview_load(&mut self, editor: &Editor, path: Arc<Path>) {
+        self.cancel_pending_preview_except(Some(path.as_ref()));
+        let request = PreviewLoadRequest {
+            generation: 0,
+            picker: self.instance_id,
+            path: path.to_path_buf(),
+            open: editor.prepare_document_open(&path, DocumentOpenRole::Preview),
+            config: editor.config().file_explorer.clone(),
+        };
+        if let Some(generation) = self.preview_load_service.submit(request) {
+            self.preview_cache
+                .insert(path.clone(), CachedPreview::Loading);
+            self.pending_preview_load = Some((generation, path));
+        } else {
+            self.preview_cache.insert(path, CachedPreview::NotFound);
+        }
     }
 
-    fn apply_preview(&mut self, editor: &mut Editor, path: PathBuf, preview: CachedPreview) {
+    fn cancel_pending_preview_except(&mut self, keep: Option<&Path>) {
+        let Some((generation, pending)) = self.pending_preview_load.take() else {
+            return;
+        };
+        if keep.is_some_and(|keep| keep == pending.as_ref()) {
+            self.pending_preview_load = Some((generation, pending));
+            return;
+        }
+        self.preview_load_service.cancel();
+        if matches!(
+            self.preview_cache.get(pending.as_ref()),
+            Some(CachedPreview::Loading)
+        ) {
+            self.preview_cache.remove(pending.as_ref());
+        }
+    }
+
+    fn apply_preview(
+        &mut self,
+        editor: &mut Editor,
+        generation: u64,
+        path: PathBuf,
+        preview: CachedPreview,
+    ) {
         let path: Arc<Path> = Arc::from(path);
+        if self
+            .pending_preview_load
+            .as_ref()
+            .is_none_or(|(pending_generation, pending_path)| {
+                *pending_generation != generation || pending_path.as_ref() != path.as_ref()
+            })
+        {
+            return;
+        }
+        self.pending_preview_load = None;
         let should_highlight = matches!(
             &preview,
-            CachedPreview::Document(doc) if doc.language_config().is_some() && !doc.has_syntax()
+            CachedPreview::Document(prepared)
+                if prepared.document().language_config().is_some()
+                    && !prepared.document().has_syntax()
         );
         if let Some(trace) = self.trace {
             trace.log(
@@ -1279,6 +1917,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             self.editor_data.clone(),
             &injector,
             self.work.clone(),
+            self.block.clone(),
         );
         self.work
             .clone()
@@ -1393,9 +2032,8 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
     /// wait, not a polling loop.
     ///
     /// Used by storybook fixtures and snapshot tests where a deterministic
-    /// post-query result is required. The interactive picker uses the short
-    /// `tick` inside `render` because it can afford to redraw on the next
-    /// notify.
+    /// post-query result is required. Interactive sync only polls with a zero
+    /// timeout and publishes whichever complete matcher generation is ready.
     pub fn drain_matcher(&mut self) {
         // 5s is generously longer than any realistic in-process match — even
         // hundreds of thousands of items finish in tens of milliseconds.
@@ -1405,8 +2043,10 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
     }
 
     fn sync_matcher_for_current_selection(&mut self) {
-        let status = self.matcher.tick(10);
+        let status = self.matcher.tick(0);
+        self.matcher_running = status.running;
         if status.changed {
+            self.matcher_revision = self.matcher_revision.wrapping_add(1);
             let snapshot = self.matcher.snapshot();
             self.cursor = self
                 .cursor
@@ -1421,12 +2061,30 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             .map(|item| item.data)
     }
 
-    fn activate_selection(&self, ctx: &mut Context, action: Action) {
+    fn activate_single_selection(&mut self, ctx: &mut Context, action: Action) {
+        let preview_path = self.selection().and_then(|option| {
+            let (path, _) = self.file_fn.as_ref()?(ctx.editor, option)?;
+            match path {
+                PathOrId::Path(path) => Some(path.to_path_buf()),
+                PathOrId::Id(_) => None,
+            }
+        });
+        if let Some(path) = preview_path {
+            if let Some(CachedPreview::Document(prepared)) =
+                self.preview_cache.remove(path.as_path())
+            {
+                ctx.editor.cache_prepared_document_open(*prepared);
+            }
+        }
+        if let Some(option) = self.selection() {
+            (self.callback_fn)(ctx, option, action);
+        }
+    }
+
+    fn activate_selection(&mut self, ctx: &mut Context, action: Action) {
         let marked = self.marked_indices();
         if marked.is_empty() {
-            if let Some(option) = self.selection() {
-                (self.callback_fn)(ctx, option, action);
-            }
+            self.activate_single_selection(ctx, action);
             return;
         }
 
@@ -1446,7 +2104,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
     }
 
     fn header_height(&self) -> u16 {
-        if self.columns.len() > 1 {
+        if self.columns.iter().filter(|column| !column.hidden).count() > 1 {
             1
         } else {
             0
@@ -1499,6 +2157,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
         if !marked.insert(self.cursor) {
             marked.remove(&self.cursor);
         }
+        self.mark_revision = self.mark_revision.wrapping_add(1);
     }
 
     pub fn marked_indices(&self) -> Vec<u32> {
@@ -1512,20 +2171,19 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
 
     /// Write a render-ready snapshot to `editor.model`.
     ///
-    /// Called on each render frame. The snapshot contains the visible window of items
-    /// with text and fuzzy-match highlight indices, plus metadata. Frontends (terminal,
-    /// GUI, headless tests) can render or assert against this model without access to
-    /// Nucleo, Column<T,D>, or the theme.
+    /// Called during component sync. The snapshot contains the visible window of
+    /// styled items and fuzzy-match indices so paint never re-enters Nucleo or the
+    /// generic column formatters.
     pub fn sync_to_model(&mut self, editor: &mut Editor) {
-        use helix_core::fuzzy::MATCHER;
         use helix_view::model::{
-            PickerCell, PickerColumnHeader, PickerItemData, PickerModel, PickerRow, Placement,
+            PickerCell, PickerColumnHeader, PickerItemData, PickerModel, PickerRow, PickerSpan,
+            Placement,
         };
 
         let snapshot = self.matcher.snapshot();
         let matched_count = snapshot.matched_item_count() as usize;
         let total_count = snapshot.item_count() as usize;
-        let is_running = self.matcher.active_injectors() > 0;
+        let is_running = self.matcher_running || self.matcher.active_injectors() > 0;
 
         // Visible window pagination — mirrors render_picker logic.
         let rows = self.completion_height.max(1) as u32;
@@ -1534,66 +2192,100 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             .saturating_add(rows)
             .min(snapshot.matched_item_count());
 
-        // Build visible items. Lock MATCHER briefly per-row to avoid holding it
-        // across the entire iteration (it's a global lock shared with render_picker).
-        let match_paths = self.file_fn.is_some();
-        let mut indices = Vec::new();
+        let rows_key = PickerRowsKey {
+            matcher_revision: self.matcher_revision,
+            mark_revision: self.mark_revision,
+            offset,
+            end,
+        };
+        let visible_items: Arc<[PickerRow]> = if self.rendered_rows_key == Some(rows_key) {
+            Arc::clone(&self.render_model.visible_items)
+        } else {
+            // Build each visible row once. The picker owns this matcher so
+            // highlighting cannot contend with completion rendering.
+            self.highlight_matcher.config = Config::DEFAULT;
+            if self.file_fn.is_some() {
+                self.highlight_matcher.config.set_match_paths();
+            }
 
-        let visible_items: Box<[PickerRow]> = snapshot
-            .matched_items(offset..end)
-            .map(|item| {
+            let mut widths = self.widths.clone();
+            let mut indices = Vec::new();
+            let mut visible_items = Vec::with_capacity(end.saturating_sub(offset) as usize);
+
+            for (visible_index, item) in snapshot.matched_items(offset..end).enumerate() {
+                let item_index = offset.saturating_add(visible_index as u32);
                 let mut matcher_index = 0;
-                let cells: Box<[PickerCell]> = self
-                    .columns
-                    .iter()
-                    .filter(|c| !c.hidden)
-                    .map(|column| {
-                        let cell = column.format(item.data, &self.editor_data);
-                        let text: String = cell.content.into();
+                let mut visible_column_index = 0;
+                let mut cells = Vec::with_capacity(widths.len());
 
-                        let highlight_indices: Box<[u32]> = if column.filter {
-                            // Acquire lock only for the indices() call, release immediately.
-                            let mut matcher = MATCHER.lock();
-                            matcher.config = nucleo::Config::DEFAULT;
-                            if match_paths {
-                                matcher.config.set_match_paths();
-                            }
-                            indices.clear();
-                            snapshot.pattern().column_pattern(matcher_index).indices(
-                                item.matcher_columns[matcher_index].slice(..),
-                                &mut matcher,
-                                &mut indices,
-                            );
-                            drop(matcher);
+                for column in self.columns.iter() {
+                    if column.hidden {
+                        continue;
+                    }
 
-                            indices.sort_unstable();
-                            indices.dedup();
-                            matcher_index += 1;
-                            // Move the vec out; a new empty vec is left for reuse on next iter.
-                            std::mem::take(&mut indices).into_boxed_slice()
-                        } else {
-                            Box::default()
-                        };
+                    let cell = column.format(item.data, &self.editor_data);
+                    let line = cell.content.lines.first();
+                    let width = line.map_or(0, |line| line.width());
+                    widths[visible_column_index] =
+                        widths[visible_column_index].max(u16::try_from(width).unwrap_or(u16::MAX));
+                    visible_column_index += 1;
 
-                        PickerCell {
-                            text,
-                            highlight_indices,
-                        }
-                    })
-                    .collect();
+                    let spans = line
+                        .map(|line| {
+                            line.0
+                                .iter()
+                                .map(|span| PickerSpan {
+                                    text: span.content.to_string(),
+                                    style: span.style,
+                                })
+                                .collect::<Vec<_>>()
+                                .into()
+                        })
+                        .unwrap_or_else(|| Arc::from([]));
+
+                    let highlight_indices = if column.filter {
+                        indices.clear();
+                        snapshot.pattern().column_pattern(matcher_index).indices(
+                            item.matcher_columns[matcher_index].slice(..),
+                            &mut self.highlight_matcher,
+                            &mut indices,
+                        );
+                        indices.sort_unstable();
+                        indices.dedup();
+                        matcher_index += 1;
+                        Arc::from(indices.as_slice())
+                    } else {
+                        Arc::from([])
+                    };
+
+                    cells.push(PickerCell {
+                        spans,
+                        highlight_indices,
+                    });
+                }
 
                 let data = self
                     .item_data_fn
                     .as_ref()
                     .map(|f| f(item.data))
                     .unwrap_or(PickerItemData::Plain);
-
-                PickerRow { cells, data }
-            })
-            .collect();
+                let marked = self
+                    .marked
+                    .as_ref()
+                    .is_some_and(|marked| marked.contains(&item_index));
+                visible_items.push(PickerRow {
+                    cells: cells.into(),
+                    marked,
+                    data,
+                });
+            }
+            self.widths = widths;
+            self.rendered_rows_key = Some(rows_key);
+            visible_items.into()
+        };
 
         // Column headers (stable across frames — only rebuilt if multi-column).
-        let headers: Box<[PickerColumnHeader]> = if self.columns.len() > 1 {
+        let headers: Arc<[PickerColumnHeader]> = if self.header_height() > 0 {
             self.columns
                 .iter()
                 .filter(|c| !c.hidden)
@@ -1602,7 +2294,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
                 })
                 .collect()
         } else {
-            Box::default()
+            Arc::from([])
         };
 
         let active_column = self
@@ -1634,12 +2326,16 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             total_matched: matched_count,
             total_items: total_count,
             is_running,
+            markable: self.marked.is_some(),
             headers,
             active_column,
+            widths: self.widths.clone().into(),
+            truncate_start: self.truncate_start,
             visible_items,
             preview,
             show_preview: self.show_preview && self.file_fn.is_some(),
         };
+        self.render_model = Arc::new(model.clone());
 
         if let Some(trace) = self.trace {
             trace.log(
@@ -1699,6 +2395,10 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
         }
 
         match (self.custom_key_handlers.get(event), self.selection()) {
+            (Some(PickerKeyAction::Layer(handler)), _) => {
+                let layer = handler(cx, Arc::clone(&self.editor_data), self.instance_id);
+                EventResult::Consumed(Some(compositor::PostAction::PushLayer(layer)))
+            }
             (Some(PickerKeyAction::Immediate(callback)), Some(selected)) => {
                 callback(cx, selected, Arc::clone(&self.editor_data), self.cursor);
                 EventResult::Consumed(None)
@@ -1709,7 +2409,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
                 // compositor. See the module docs.
                 let confirmation =
                     handler(cx, selected, Arc::clone(&self.editor_data), self.cursor);
-                EventResult::Consumed(confirmation.map(PickerConfirmation::into_post_action))
+                EventResult::Consumed(confirmation.map(Confirmation::into_post_action))
             }
             _ => EventResult::Ignored(None),
         }
@@ -1805,13 +2505,16 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
         let preview_start = std::time::Instant::now();
         let Some(current) = self.selection() else {
             self.last_preview_selection = None;
+            self.cancel_pending_preview_except(None);
             return;
         };
         let Some(file_fn) = self.file_fn.as_ref() else {
+            self.cancel_pending_preview_except(None);
             return;
         };
         let Some((path_or_id, range)) = file_fn(editor, current) else {
             self.last_preview_selection = None;
+            self.cancel_pending_preview_except(None);
             return;
         };
 
@@ -1822,6 +2525,9 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
                     &mut self.last_preview_selection,
                     PreviewSelectionKey::Path(path.clone()),
                 );
+                if selection_changed {
+                    self.cancel_pending_preview_except(Some(path.as_ref()));
+                }
 
                 if let Some(doc) = editor.document_by_path(path.as_ref()) {
                     if let Some(trace) = self.trace {
@@ -1847,7 +2553,11 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
                     // preview highlight handler.
                     let (path, preview) = self.preview_cache.get_key_value(path.as_ref()).unwrap();
                     if selection_changed
-                        && matches!(preview, CachedPreview::Document(doc) if doc.language_config().is_none())
+                        && matches!(
+                            preview,
+                            CachedPreview::Document(prepared)
+                                if prepared.document().language_config().is_none()
+                        )
                     {
                         self.preview_highlight_handler.request(path.clone());
                     }
@@ -1881,7 +2591,6 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
                         ),
                     );
                 }
-                self.preview_cache.insert(path.clone(), preview);
                 self.queue_preview_load(editor, path.clone());
                 self.prepared_preview = Some(PreparedPreview {
                     source: PreparedPreviewSource::CachedPath(path),
@@ -1889,10 +2598,12 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
                 });
             }
             PathOrId::Id(id) => {
-                should_request_preview_for_current_selection(
+                if should_request_preview_for_current_selection(
                     &mut self.last_preview_selection,
                     PreviewSelectionKey::Document(id),
-                );
+                ) {
+                    self.cancel_pending_preview_except(None);
+                }
                 if !editor.documents.contains_key(&id) {
                     return;
                 }
@@ -1913,319 +2624,63 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
         }
     }
 
-    fn render_picker<F>(
-        &mut self,
-        area: Rect,
-        surface: &mut crate::render::CellSurface,
-        cx: &RenderContext,
-        render_prompt: F,
-    ) where
-        F: FnOnce(&mut Prompt, Rect, &mut crate::render::CellSurface, &RenderContext),
-    {
+    fn prepare_picker_render(&mut self, area: Rect, cx: &RenderContext) {
         let render_start = std::time::Instant::now();
-        let tick_start = std::time::Instant::now();
-        let status = self.matcher.tick(10);
-        let tick_elapsed = tick_start.elapsed();
-        let matched_count = {
-            let snapshot = self.matcher.snapshot();
-            if status.changed {
-                self.cursor = self
-                    .cursor
-                    .min(snapshot.matched_item_count().saturating_sub(1));
-            }
-            snapshot.matched_item_count()
-        };
+        let model = Arc::clone(&self.render_model);
+        let matched_count = model.total_matched as u32;
         let theme = cx.theme();
         let config = cx.config();
         let text_style = theme.get("ui.text");
         let selected = theme.get("ui.text.focus");
-        // Picker match highlight: prefer a dedicated `ui.picker.match`
-        // scope so themes can tune it (e.g. saturate the fg without
-        // dragging other "special" syntax along), fall back to the
-        // existing `special` syntax scope + bold so themes that
-        // haven't been updated continue to work. The fallback chain
-        // matches the chrome (`ui.text.inactive` → `comment` → base)
-        // pattern used elsewhere in the picker.
         let highlight_style = theme
             .try_get("ui.picker.match")
             .unwrap_or_else(|| theme.get("special").add_modifier(Modifier::BOLD));
-        // Muted variant for low-importance chrome: the count, separators,
-        // header column labels. Falls back through common theme keys so any
-        // theme yields a sensible dim colour without a dedicated picker.muted
-        // scope.
         let muted_style = theme
             .try_get("ui.text.inactive")
             .or_else(|| theme.try_get("comment"))
             .unwrap_or(text_style);
-
-        // -- Render the frame:
-        // clear area
         let background = theme.get("ui.background");
-        {
-            let area = tui::ratatui::to_ratatui_rect(area);
-            tui::ratatui::widgets::Widget::render(tui::ratatui::widgets::Clear, area, surface);
-            surface.set_style(area, tui::ratatui::to_ratatui_style(background));
-        };
-
-        // calculate the inner area inside the box (respect gradient border thickness)
-        let inner = if config.gradient_borders.enable {
-            if self.gradient_border.is_none() {
-                self.gradient_border =
-                    Some(GradientBorder::from_theme(theme, &config.gradient_borders));
-            }
-
-            if let Some(ref mut gradient_border) = self.gradient_border {
-                gradient_border.render(area, surface, theme, config.rounded_corners);
-            }
-
-            let t: u16 = config.gradient_borders.thickness as u16;
+        let gradient_border = config
+            .gradient_borders
+            .enable
+            .then(|| self.gradient_border.clone())
+            .flatten();
+        let inner = if gradient_border.is_some() {
+            let thickness = config.gradient_borders.thickness as u16;
             Rect {
-                x: area.x + t,
-                y: area.y + t,
-                width: area.width.saturating_sub(t * 2),
-                height: area.height.saturating_sub(t * 2),
+                x: area.x.saturating_add(thickness),
+                y: area.y.saturating_add(thickness),
+                width: area.width.saturating_sub(thickness.saturating_mul(2)),
+                height: area.height.saturating_sub(thickness.saturating_mul(2)),
             }
         } else {
             crate::widgets::Panel::framed(
                 crate::widgets::PanelStyle::plain(background),
                 config.rounded_corners,
             )
-            .render(surface, area)
+            .content_area(area)
         };
 
-        // -- Layout: [prompt(1) | separator(1) | content(fill) | hints(1)]
         use helix_view::layout::{split_vertical, Size};
-        let v_areas = split_vertical(
+        let vertical = split_vertical(
             inner,
-            &[
-                Size::fixed(1), // prompt
-                Size::fixed(1), // separator
-                Size::Fill,     // content
-                Size::fixed(1), // hints
-            ],
+            &[Size::fixed(1), Size::fixed(1), Size::Fill, Size::fixed(1)],
         );
-        let prompt_row = v_areas[0];
-        let separator_row = v_areas[1];
-        let inner = v_areas[2]; // content area (reuse name for minimal diff below)
-        let hint_row = v_areas[3];
+        let prompt_row = vertical[0];
+        let separator_row = vertical[1];
+        let table_area = vertical[2];
+        let hint_row = vertical[3];
 
-        let list_area = inner.clip_top(self.header_height());
-        self.sync_list_region_view(list_area, matched_count);
-
-        let snapshot = self.matcher.snapshot();
-
-        // -- Render the input bar:
-        // Count uses a middle-dot separator and muted styling so it sits in
-        // the background and the eye lands on the query itself.
-        let count = format!(
+        let count: Arc<str> = Arc::from(format!(
             "{}{} · {}",
-            if status.running || self.matcher.active_injectors() > 0 {
-                "(running) "
-            } else {
-                ""
-            },
-            snapshot.matched_item_count(),
-            snapshot.item_count(),
-        );
-
-        // Single accent chevron at the very left of the prompt row — a small
-        // signature that gives every picker a consistent search affordance
-        // without changing the prompt component's behaviour.
-        if prompt_row.width >= 2 {
-            surface.set_stringn(
-                prompt_row.x,
-                prompt_row.y,
-                "›",
-                1,
-                tui::ratatui::to_ratatui_style(selected),
-            );
-        }
-
-        // Reserve 2 cols (chevron + space) on the left and count+padding on
-        // the right; the prompt component renders into the middle.
+            if model.is_running { "(running) " } else { "" },
+            model.total_matched,
+            model.total_items,
+        ));
         let prompt_area = prompt_row.clip_left(2);
-        let count_width = UnicodeWidthStr::width(count.as_str()) as u16;
-        let line_area = prompt_area.clip_right(count_width + 1);
-
-        // render the prompt first since it will clear its background
-        render_prompt(&mut self.prompt, line_area, surface, cx);
-
-        surface.set_stringn(
-            (prompt_area.x + prompt_area.width).saturating_sub(count_width + 1),
-            prompt_area.y,
-            &count,
-            count_width.min(prompt_area.width) as usize,
-            tui::ratatui::to_ratatui_style(muted_style),
-        );
-
-        // -- Separator
-        let sep_style = theme.get("ui.background.separator");
-        crate::widgets::hdivider(surface, separator_row, sep_style);
-        let rows = inner.height.saturating_sub(self.header_height()) as u32;
-        let offset = ViewScrollable::scroll(&self.list_region) as u32;
-        let cursor = self.cursor.saturating_sub(offset);
-        let end = offset.saturating_add(rows).min(matched_count);
-        let mut indices = Vec::new();
-        let mut matcher = MATCHER.lock();
-        matcher.config = Config::DEFAULT;
-        if self.file_fn.is_some() {
-            matcher.config.set_match_paths()
-        }
-
-        let options: Vec<_> = snapshot
-            .matched_items(offset..end)
-            .enumerate()
-            .map(|(visible_index, item)| {
-                let item_index = offset.saturating_add(visible_index as u32);
-                let mut widths = self.widths.iter_mut();
-                let mut matcher_index = 0;
-
-                let row = Row::new(self.columns.iter().map(|column| {
-                    if column.hidden {
-                        return Cell::default();
-                    }
-
-                    let Some(Constraint::Length(max_width)) = widths.next() else {
-                        unreachable!();
-                    };
-                    let mut cell = column.format(item.data, &self.editor_data);
-                    let width = if column.filter {
-                        snapshot.pattern().column_pattern(matcher_index).indices(
-                            item.matcher_columns[matcher_index].slice(..),
-                            &mut matcher,
-                            &mut indices,
-                        );
-                        indices.sort_unstable();
-                        indices.dedup();
-                        let mut indices = indices.drain(..);
-                        let mut next_highlight_idx = indices.next().unwrap_or(u32::MAX);
-                        let mut span_list = Vec::new();
-                        let mut current_span = String::new();
-                        let mut current_style = Style::default();
-                        let mut grapheme_idx = 0u32;
-                        let mut width = 0;
-
-                        let spans: &[Span] =
-                            cell.content.lines.first().map_or(&[], |it| it.0.as_slice());
-                        for span in spans {
-                            // this looks like a bug on first glance, we are iterating
-                            // graphemes but treating them as char indices. The reason that
-                            // this is correct is that nucleo will only ever consider the first char
-                            // of a grapheme (and discard the rest of the grapheme) so the indices
-                            // returned by nucleo are essentially grapheme indecies
-                            for grapheme in span.content.graphemes(true) {
-                                let style = if grapheme_idx == next_highlight_idx {
-                                    next_highlight_idx = indices.next().unwrap_or(u32::MAX);
-                                    span.style.patch(highlight_style)
-                                } else {
-                                    span.style
-                                };
-                                if style != current_style {
-                                    if !current_span.is_empty() {
-                                        span_list.push(Span::styled(current_span, current_style))
-                                    }
-                                    current_span = String::new();
-                                    current_style = style;
-                                }
-                                current_span.push_str(grapheme);
-                                grapheme_idx += 1;
-                            }
-                            width += span.width();
-                        }
-
-                        span_list.push(Span::styled(current_span, current_style));
-                        cell = Cell::from(Spans::from(span_list));
-                        matcher_index += 1;
-                        width
-                    } else {
-                        cell.content
-                            .lines
-                            .first()
-                            .map(|line| line.width())
-                            .unwrap_or_default()
-                    };
-
-                    if width as u16 > *max_width {
-                        *max_width = width as u16;
-                    }
-
-                    cell
-                }));
-
-                if self.marked.is_some() {
-                    let marked = self
-                        .marked
-                        .as_ref()
-                        .is_some_and(|marked| marked.contains(&item_index));
-                    let mut cells = Vec::with_capacity(row.cells.len() + 1);
-                    cells.push(Cell::from(if marked { "✓" } else { " " }));
-                    cells.extend(row.cells);
-                    Row::new(cells)
-                } else {
-                    row
-                }
-            })
-            .collect();
-
-        let picker_symbol = config.picker_symbol.as_str();
-
-        // -- Header
-        let mut header = None;
-        let mut header_style = Style::default();
-        if self.columns.len() > 1 {
-            let active_column = self.query.active_column(self.prompt.position());
-            header_style = theme.get("ui.picker.header");
-            let header_column_style = theme.get("ui.picker.header.column");
-
-            let row = Row::new(self.columns.iter().map(|column| {
-                if column.hidden {
-                    Cell::default()
-                } else {
-                    let style = if active_column.is_some_and(|name| Arc::ptr_eq(name, &column.name))
-                    {
-                        theme.get("ui.picker.header.column.active")
-                    } else {
-                        header_column_style
-                    };
-
-                    Cell::from(Span::styled(Cow::from(&*column.name), style))
-                }
-            }))
-            .style(header_style);
-            header = Some(if self.marked.is_some() {
-                let mut cells = Vec::with_capacity(row.cells.len() + 1);
-                cells.push(Cell::default());
-                cells.extend(row.cells);
-                Row::new(cells).style(header_style)
-            } else {
-                row
-            });
-        }
-
-        let mut table_widths = Vec::new();
-        let table_widths = if self.marked.is_some() {
-            table_widths.push(Constraint::Length(1));
-            table_widths.extend(self.widths.iter().copied());
-            table_widths.as_slice()
-        } else {
-            self.widths.as_slice()
-        };
-
-        PickerTable {
-            rows: options,
-            header,
-            widths: table_widths,
-            text_style,
-            placeholder_style: theme.get("ui.text.inactive"),
-            selected_style: selected,
-            header_style,
-            highlight_symbol: picker_symbol,
-            selected_row: Some(cursor as usize),
-            truncate_start: self.truncate_start,
-        }
-        .render(inner, surface);
-
-        let mut hints: Vec<_> = PICKER_BINDINGS
+        let count_width = UnicodeWidthStr::width(count.as_ref()) as u16;
+        let line_area = prompt_area.clip_right(count_width.saturating_add(1));
+        let hints: Arc<[crate::widgets::Hint<'static>]> = PICKER_BINDINGS
             .iter()
             .filter_map(|binding| match binding.hint {
                 PickerHintPolicy::Visible(hint)
@@ -2236,102 +2691,120 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
                 }
                 _ => None,
             })
-            .collect();
-        hints.extend(self.custom_hints.iter().cloned());
-        crate::widgets::hint_bar(
-            surface,
+            .chain(self.custom_hints.iter().cloned())
+            .collect::<Vec<_>>()
+            .into();
+
+        let chrome = PickerChromeRenderSnapshot {
+            area,
+            background,
+            rounded_corners: config.rounded_corners,
+            gradient_border,
+            prompt_row,
+            separator_row,
             hint_row,
-            hints.as_slice(),
-            crate::widgets::HintBarStyle {
-                background,
-                key: selected,
-                label: muted_style,
-                separator: muted_style,
-            },
-        );
+            count,
+            count_width,
+            selected_style: selected,
+            muted_style,
+            separator_style: theme.get("ui.background.separator"),
+            hints,
+        };
+        cx.defer_paint("picker_chrome", move |surface, cancellation| {
+            if !cancellation.is_cancelled() {
+                chrome.paint(surface);
+            }
+        });
+
+        let prompt = self.prompt.prepare_render(line_area, cx);
+        cx.defer_prepared("picker_prompt", vec![prompt]);
+
+        let table = PickerTableRenderSnapshot {
+            model,
+            area: table_area,
+            text_style,
+            placeholder_style: theme.get("ui.text.inactive"),
+            selected_style: selected,
+            highlight_style,
+            header_style: theme.get("ui.picker.header"),
+            header_column_style: theme.get("ui.picker.header.column"),
+            active_header_style: theme.get("ui.picker.header.column.active"),
+            highlight_symbol: Arc::from(config.picker_symbol.as_str()),
+        };
+        cx.defer_paint("picker_table", move |surface, cancellation| {
+            table.render(surface, cancellation);
+        });
 
         if let Some(trace) = self.trace {
+            let offset = ViewScrollable::scroll(&self.list_region) as u32;
+            let end = offset.saturating_add(self.render_model.visible_items.len() as u32);
             trace.log(
                 "render_picker",
                 format_args!(
-                    "frame={} area={}x{}+{},{} total_elapsed_us={} tick_us={} status_changed={} status_running={} active_injectors={} matched={} total={} rows={} offset={} end={} cursor={} relative_cursor={} scroll={}",
+                    "frame={} area={}x{}+{},{} total_elapsed_us={} status_running={} matched={} total={} rows={} offset={} end={} cursor={} relative_cursor={} scroll={}",
                     self.render_count,
                     area.width,
                     area.height,
                     area.x,
                     area.y,
                     render_start.elapsed().as_micros(),
-                    tick_elapsed.as_micros(),
-                    status.changed,
-                    status.running,
-                    self.matcher.active_injectors(),
+                    self.render_model.is_running,
                     matched_count,
-                    snapshot.item_count(),
-                    rows,
+                    self.render_model.total_items,
+                    self.render_model.visible_items.len(),
                     offset,
                     end,
                     self.cursor,
-                    cursor,
+                    self.render_model.cursor,
                     ViewScrollable::scroll(&self.list_region),
                 ),
             );
         }
     }
 
-    fn render_preview(
-        &mut self,
-        area: Rect,
-        surface: &mut crate::render::CellSurface,
-        cx: &RenderContext,
-    ) {
-        // -- Render the frame:
-        // clear area
+    fn prepare_preview_render(&mut self, area: Rect, cx: &RenderContext) {
         let theme = cx.theme();
         let config = cx.config();
         let background = theme.get("ui.background");
         let text = theme.get("ui.text");
         let directory = theme.get("ui.text.directory");
-        {
-            let area = tui::ratatui::to_ratatui_rect(area);
-            tui::ratatui::widgets::Widget::render(tui::ratatui::widgets::Clear, area, surface);
-            surface.set_style(area, tui::ratatui::to_ratatui_style(background));
-        };
-
-        // calculate the inner area inside the box (respect gradient border thickness)
-        let base_inner = if config.gradient_borders.enable {
-            if self.gradient_border.is_none() {
-                self.gradient_border =
-                    Some(GradientBorder::from_theme(theme, &config.gradient_borders));
-            }
-            if let Some(ref mut gradient_border) = self.gradient_border {
-                gradient_border.render(area, surface, theme, config.rounded_corners);
-            }
-            let t: u16 = config.gradient_borders.thickness as u16;
+        let gradient_border = config
+            .gradient_borders
+            .enable
+            .then(|| self.gradient_border.clone())
+            .flatten();
+        let border = theme
+            .try_get("ui.window")
+            .or_else(|| theme.try_get("comment"))
+            .unwrap_or(background);
+        let base_inner = if gradient_border.is_some() {
+            let t = config.gradient_borders.thickness as u16;
             Rect {
-                x: area.x + t,
-                y: area.y + t,
-                width: area.width.saturating_sub(t * 2),
-                height: area.height.saturating_sub(t * 2),
+                x: area.x.saturating_add(t),
+                y: area.y.saturating_add(t),
+                width: area.width.saturating_sub(t.saturating_mul(2)),
+                height: area.height.saturating_sub(t.saturating_mul(2)),
             }
         } else {
-            // Preview pane gets a subtly visible border (theme
-            // `ui.window` → `comment` → background as fallback). This
-            // distinguishes the preview from the picker list to its
-            // left — previously both used `plain(background)` which
-            // rendered border glyphs in the background color
-            // (i.e. invisible), so the two panes blurred together
-            // visually.
-            let border_color = theme
-                .try_get("ui.window")
-                .or_else(|| theme.try_get("comment"))
-                .unwrap_or(background);
             crate::widgets::Panel::framed(
-                crate::widgets::PanelStyle::new(background, border_color, background),
+                crate::widgets::PanelStyle::new(background, border, background),
                 config.rounded_corners,
             )
-            .render(surface, area)
+            .content_area(area)
         };
-        // 1 column gap on either side
+        let chrome = PickerPreviewChromeRenderSnapshot {
+            area,
+            background,
+            border,
+            rounded_corners: config.rounded_corners,
+            gradient_border,
+        };
+        cx.defer_paint("picker_preview_chrome", move |surface, cancellation| {
+            if !cancellation.is_cancelled() {
+                chrome.paint(surface);
+            }
+        });
+
         let margin = Margin::horizontal(1);
         let inner = base_inner.inner(margin);
 
@@ -2345,66 +2818,34 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             Some((render, preview.range))
         });
 
-        if let Some((preview, range)) = preview {
-            let doc = match preview.document() {
-                Some(doc)
-                    if range.is_none_or(|(start, end)| {
-                        start <= end && end <= doc.text().len_lines()
-                    }) =>
-                {
-                    doc
-                }
-                _ => {
-                    if let Some(dir_content) = preview.dir_content() {
-                        for (i, (path, is_dir)) in
-                            dir_content.iter().take(inner.height as usize).enumerate()
-                        {
-                            let style = if *is_dir { directory } else { text };
-                            surface.set_stringn(
-                                inner.x,
-                                inner.y + i as u16,
-                                path,
-                                inner.width as usize,
-                                tui::ratatui::to_ratatui_style(style),
-                            );
-                        }
-                        return;
-                    }
+        let prepared = preview.map(|(preview, range)| {
+            let document = preview.document().filter(|doc| {
+                range.is_none_or(|(start, end)| start <= end && end <= doc.text().len_lines())
+            });
 
-                    let alt_text = preview.placeholder();
-                    let x = inner.x
-                        + inner
-                            .width
-                            .saturating_sub(UnicodeWidthStr::width(alt_text) as u16)
-                            / 2;
-                    let y = inner.y + inner.height / 2;
-                    surface.set_stringn(
-                        x,
-                        y,
-                        alt_text,
-                        inner.width as usize,
-                        tui::ratatui::to_ratatui_style(text),
-                    );
-                    return;
-                }
+            let Some(doc) = document else {
+                let content = preview.dir_content().map_or_else(
+                    || PickerPreviewContentSnapshot::Placeholder(Arc::from(preview.placeholder())),
+                    |entries| PickerPreviewContentSnapshot::Directory(Arc::clone(entries)),
+                );
+                return (content, None);
             };
 
             let mut offset = ViewPosition::default();
             if let Some((start_line, end_line)) = range {
                 let height = end_line - start_line;
-                let text = doc.text().slice(..);
-                let start = text.line_to_char(start_line);
-                let middle = text.line_to_char(start_line + height / 2);
+                let doc_text = doc.text().slice(..);
+                let start = doc_text.line_to_char(start_line);
+                let middle = doc_text.line_to_char(start_line + height / 2);
                 if height < inner.height as usize {
-                    let text_fmt = doc.text_format(inner.width, None);
+                    let text_format = doc.text_format(inner.width, None);
                     let annotations = TextAnnotations::default();
                     (offset.anchor, offset.vertical_offset) = char_idx_at_visual_offset(
-                        text,
+                        doc_text,
                         middle,
-                        // align to middle
                         -(inner.height as isize / 2),
                         0,
-                        &text_fmt,
+                        &text_format,
                         &annotations,
                     );
                     if start < offset.anchor {
@@ -2416,12 +2857,16 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
                 }
             }
 
-            let loader = cx.syntax_loader().load();
-
+            let theme = cx.theme_arc();
+            let loader = cx.syntax_loader().load_full();
             let annotations = TextAnnotations::default();
-            let syntax_highlighter =
-                doc.viewport_syntax_highlighter(&loader, &annotations, offset.anchor, area.height);
-            let mut overlay_highlights = Vec::new();
+            let viewport_range = doc.viewport_byte_range(&annotations, offset.anchor, inner.height);
+            let syntax = SyntaxRenderSnapshot::live(
+                doc.syntax_arc(),
+                Arc::clone(&loader),
+                viewport_range.clone(),
+            );
+            let mut overlays = Vec::new();
             if doc
                 .language_config()
                 .and_then(|config| config.rainbow_brackets)
@@ -2430,65 +2875,56 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
                 if let Some(overlay) = doc.viewport_rainbow_highlights(
                     &annotations,
                     offset.anchor,
-                    area.height,
-                    theme,
+                    inner.height,
+                    theme.as_ref(),
                     &loader,
                 ) {
-                    overlay_highlights.push(overlay);
+                    overlays.push(overlay);
                 }
             }
+            overlays.extend(doc.diagnostic_highlights(theme.as_ref(), Some(viewport_range)));
 
-            overlay_highlights.extend(doc.diagnostic_highlights(theme, None));
-
-            let mut decorations = DecorationManager::default();
-
-            if let Some((start, end)) = range {
+            let highlighted_lines = range.map(|(start, end)| {
                 let style = theme
                     .try_get("ui.highlight")
                     .unwrap_or_else(|| theme.get("ui.selection"));
-                let draw_highlight = move |renderer: &mut TextRenderer, pos: LinePos| {
-                    if (start..=end).contains(&pos.doc_line) {
-                        let area = Rect::new(
-                            renderer.viewport.x,
-                            pos.visual_line,
-                            renderer.viewport.width,
-                            1,
-                        );
-                        renderer.set_style(area, style)
-                    }
-                };
-                decorations.add_decoration(draw_highlight);
-            }
-
-            render_document(
-                surface,
-                inner,
+                (start, end, style)
+            });
+            let document = crate::ui::document::DocumentRenderSnapshot::new(
                 doc,
-                offset,
-                // TODO: compute text annotations asynchronously here (like inlay hints)
-                &TextAnnotations::default(),
-                HighlighterInput::Live(syntax_highlighter),
-                overlay_highlights,
-                theme,
-                decorations,
-                None, // no dirty-row filtering for picker preview
-                None,
-                None,
+                inner.width,
+                Some(theme.as_ref()),
             );
+            (
+                PickerPreviewContentSnapshot::Document {
+                    document,
+                    offset,
+                    syntax,
+                    overlays,
+                    theme,
+                    highlighted_lines,
+                },
+                Some(offset),
+            )
+        });
 
-            self.preview_region.set_offset(offset);
+        if let Some((content, offset)) = prepared {
+            if let Some(offset) = offset {
+                self.preview_region.set_offset(offset);
+            }
+            let snapshot = PickerPreviewRenderSnapshot {
+                inner,
+                text_style: text,
+                directory_style: directory,
+                content,
+            };
+            cx.defer_paint("picker_preview", move |surface, cancellation| {
+                snapshot.render(surface, cancellation);
+            });
         }
     }
 
-    fn render_surface<F>(
-        &mut self,
-        area: Rect,
-        surface: &mut crate::render::CellSurface,
-        cx: &RenderContext,
-        render_prompt: F,
-    ) where
-        F: FnOnce(&mut Prompt, Rect, &mut crate::render::CellSurface, &RenderContext),
-    {
+    fn prepare_render_steps(&mut self, area: Rect, cx: &RenderContext) {
         use helix_view::layout::{split_horizontal, split_vertical, Size};
 
         let preview_layout = picker_preview_layout(self.show_preview, self.file_fn.is_some(), area);
@@ -2505,11 +2941,6 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             PickerPreviewLayout::Hidden => (area, None),
         };
 
-        // Update completion_height from the actual picker area BEFORE syncing
-        // to ensure the visible window calculation uses the correct row count.
-        // (required_size may not have been called yet on the first frame.)
-        self.completion_height = picker_area.height.saturating_sub(4 + self.header_height());
-        self.render_count = self.render_count.saturating_add(1);
         if let Some(trace) = self.trace {
             trace.log(
                 "render_layout",
@@ -2534,11 +2965,11 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             );
         }
 
-        self.render_picker(picker_area, surface, cx, render_prompt);
+        self.prepare_picker_render(picker_area, cx);
 
         if let Some(preview_area) = preview_area {
             self.preview_region.set_area(preview_area);
-            self.render_preview(preview_area, surface, cx);
+            self.prepare_preview_render(preview_area, cx);
         }
     }
 }
@@ -2548,18 +2979,59 @@ impl<I: 'static + Send + Sync, D: 'static + Send + Sync> Component for Picker<I,
         Some(self)
     }
 
-    fn sync(&mut self, editor: &mut Editor) {
+    fn sync(&mut self, viewport: Rect, editor: &mut Editor) {
+        let picker_area =
+            match picker_preview_layout(self.show_preview, self.file_fn.is_some(), viewport) {
+                PickerPreviewLayout::Stacked => {
+                    use helix_view::layout::{split_vertical, Size};
+                    split_vertical(viewport, &[Size::Percent(33), Size::Fill])[0]
+                }
+                PickerPreviewLayout::SideBySide | PickerPreviewLayout::Hidden => viewport,
+            };
+        self.completion_height = picker_area.height.saturating_sub(4 + self.header_height());
+        self.render_count = self.render_count.saturating_add(1);
         self.list_region.ensure_init(editor);
         self.preview_region.ensure_init(editor);
         self.sync_matcher_for_current_selection();
+        let matched_count = self.matcher.snapshot().matched_item_count();
+        self.sync_list_region_view(
+            Rect {
+                height: self.completion_height,
+                ..picker_area
+            },
+            matched_count,
+        );
         self.prepare_preview(editor);
         self.sync_to_model(editor);
     }
 
-    fn render(&mut self, area: Rect, surface: &mut crate::render::CellSurface, cx: &RenderContext) {
-        self.render_surface(area, surface, cx, |prompt, area, surface, cx| {
-            prompt.render(area, surface, cx);
-        });
+    fn prepare_render(&mut self, area: Rect, cx: &RenderContext) -> crate::render::PreparedRender {
+        let config = cx.config();
+        if config.gradient_borders.enable
+            && self
+                .gradient_border
+                .as_ref()
+                .is_none_or(|border| !border.matches_config(&config.gradient_borders))
+        {
+            self.gradient_border = Some(GradientBorder::from_theme(
+                cx.theme(),
+                &config.gradient_borders,
+            ));
+        } else if !config.gradient_borders.enable {
+            self.gradient_border = None;
+        }
+        if self
+            .gradient_border
+            .as_ref()
+            .is_some_and(GradientBorder::is_animated)
+        {
+            cx.request_frame_at(
+                helix_runtime::FrameSource::new("picker.gradient-border"),
+                cx.clock().now(),
+            );
+        }
+        self.prepare_render_steps(area, cx);
+        crate::render::PreparedRender::ready(crate::render::RenderOutput::sparse(area))
     }
 
     fn handle_event(&mut self, event: &Event, ctx: &mut Context) -> EventResult {
@@ -2677,15 +3149,11 @@ impl<I: 'static + Send + Sync, D: 'static + Send + Sync> Component for Picker<I,
                 }
             }
             PickerBindingAction::HorizontalSplit => {
-                if let Some(option) = self.selection() {
-                    (self.callback_fn)(ctx, option, Action::HorizontalSplit);
-                }
+                self.activate_single_selection(ctx, Action::HorizontalSplit);
                 return close_fn(self);
             }
             PickerBindingAction::VerticalSplit => {
-                if let Some(option) = self.selection() {
-                    (self.callback_fn)(ctx, option, Action::VerticalSplit);
-                }
+                self.activate_single_selection(ctx, Action::VerticalSplit);
                 return close_fn(self);
             }
             PickerBindingAction::TogglePreview => {
@@ -2739,8 +3207,14 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> PickerComponent for Pic
         Self::request_preview_highlight(self, editor, path);
     }
 
-    fn apply_preview(&mut self, editor: &mut Editor, path: PathBuf, preview: CachedPreview) {
-        Self::apply_preview(self, editor, path, preview);
+    fn apply_preview(
+        &mut self,
+        editor: &mut Editor,
+        generation: u64,
+        path: PathBuf,
+        preview: CachedPreview,
+    ) {
+        Self::apply_preview(self, editor, generation, path, preview);
     }
 
     fn apply_preview_syntax(
@@ -2755,10 +3229,16 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> PickerComponent for Pic
     fn run_dynamic_query(&mut self, editor: &mut Editor, query: Arc<str>) {
         Self::run_dynamic_query(self, editor, query);
     }
+
+    fn refresh_dynamic_query(&mut self, editor: &mut Editor) {
+        let query = self.primary_query();
+        Self::run_dynamic_query(self, editor, query);
+    }
 }
 impl<T: 'static + Send + Sync, D> Drop for Picker<T, D> {
     fn drop(&mut self) {
         // ensure we cancel any ongoing background threads streaming into the picker
+        self.alive.store(false, atomic::Ordering::Release);
         self.version.fetch_add(1, atomic::Ordering::Relaxed);
         if let DynamicQuery::Debounced { debouncer, .. } = &self.dynamic_query {
             debouncer.cancel();
@@ -2773,65 +3253,12 @@ pub type PickerKeyHandler<T, D> = Box<dyn Fn(&mut Context, &T, Arc<D>, u32) + Se
 /// with the selected item; returns the confirmation to show, or `None` to skip
 /// the prompt (the handler may set a status message itself in that case).
 pub type PickerConfirmHandler<T, D> =
-    Box<dyn Fn(&mut Context, &T, Arc<D>, u32) -> Option<PickerConfirmation> + Send + 'static>;
-
-/// A pending confirmed picker action: the message rendered in the standard
-/// y/n prompt plus the deferred action to run when the user confirms.
-///
-/// Built by [`PickerConfirmHandler`]s at keypress time so the deferred action
-/// captures exactly the (cloned) item state it needs; see the module docs for
-/// the full seam contract.
-pub struct PickerConfirmation {
-    message: String,
-    on_confirm: Box<dyn FnOnce(&mut Context) + Send>,
-}
-
-impl PickerConfirmation {
-    pub fn new(
-        message: impl Into<String>,
-        on_confirm: impl FnOnce(&mut Context) + Send + 'static,
-    ) -> Self {
-        Self {
-            message: message.into(),
-            on_confirm: Box::new(on_confirm),
-        }
-    }
-
-    /// Render the confirmation as the standard y/n [`Prompt`] affordance,
-    /// matching the file explorer delete interaction: `y` + Enter executes
-    /// the deferred action, any other input (or Esc) cancels.
-    pub(crate) fn into_post_action(self) -> compositor::PostAction {
-        let Self {
-            message,
-            on_confirm,
-        } = self;
-        let mut on_confirm = Some(on_confirm);
-        let prompt = Prompt::new(
-            format!("{message} (y/n): ").into(),
-            None,
-            ui::completers::none,
-            move |cx: &mut Context, input: &str, event: PromptEvent| {
-                if event != PromptEvent::Validate {
-                    return;
-                }
-
-                if input != "y" {
-                    cx.editor.clear_status();
-                    return;
-                }
-
-                if let Some(action) = on_confirm.take() {
-                    action(cx);
-                }
-            },
-        );
-        compositor::PostAction::PushLayer(Box::new(prompt))
-    }
-}
+    Box<dyn Fn(&mut Context, &T, Arc<D>, u32) -> Option<Confirmation> + Send + 'static>;
 
 enum PickerKeyAction<T, D> {
     Immediate(PickerKeyHandler<T, D>),
     Confirmed(PickerConfirmHandler<T, D>),
+    Layer(PickerLayerHandler<D>),
 }
 
 /// Component-local key bindings for picker actions (see module docs).
@@ -2852,6 +3279,12 @@ impl<T, D> PickerKeyHandlers<T, D> {
         self.0.insert(key, PickerKeyAction::Confirmed(handler));
     }
 
+    /// Register an action that opens a component layer using picker-level
+    /// data. Unlike row actions, this remains available for an empty picker.
+    pub fn insert_layer(&mut self, key: KeyEvent, handler: PickerLayerHandler<D>) {
+        self.0.insert(key, PickerKeyAction::Layer(handler));
+    }
+
     fn get(&self, key: &KeyEvent) -> Option<&PickerKeyAction<T, D>> {
         self.0.get(key)
     }
@@ -2864,6 +3297,8 @@ impl<T, D> Default for PickerKeyHandlers<T, D> {
 }
 pub type PickerSelectionHandler<T, D> =
     Box<dyn Fn(&mut Context, Option<&T>, Arc<D>, u32) + Send + 'static>;
+pub type PickerLayerHandler<D> =
+    Box<dyn Fn(&mut Context, Arc<D>, PickerInstanceId) -> Box<dyn Component> + Send + 'static>;
 
 #[cfg(test)]
 mod tests {
@@ -2878,13 +3313,13 @@ mod tests {
             runtime.clone(),
         )
         .build();
-        let (ingress, _rx) = crate::runtime::RuntimeIngress::channel(runtime.work().clone());
+        let (ingress, _rx) = crate::runtime::RuntimeIngress::channel(runtime.clone());
         let (plugin_events, _plugin_events_rx) = helix_runtime::channel(1);
         let idle_reset = crate::runtime::IdleResetGate::new().handle();
         let redraw = editor.redraw_handle();
         let notifier = crate::handlers::local::Notifier {
             redraw: redraw.clone(),
-            plugin_events,
+            plugin_events: plugin_events.into(),
         };
         let mut exit_tasks = crate::runtime::ExitTaskSet::default();
         let exit_task_work = editor.work();
@@ -2895,7 +3330,7 @@ mod tests {
             notifier,
             ingress,
             idle_reset,
-            None,
+            crate::plugin_registry::PluginRuntime::default(),
         );
         test(&mut cx);
     }
@@ -2907,11 +3342,55 @@ mod tests {
         })
     }
 
+    #[test]
+    fn stale_picker_injector_drop_does_not_request_frame() {
+        let mut gate = helix_runtime::FrameGate::new();
+        let redraw = Arc::new(gate.handle());
+        let mut redraws = gate.take_receiver();
+        let picker_version = Arc::new(AtomicUsize::new(2));
+        let alive = Arc::new(AtomicBool::new(true));
+
+        drop(RuntimeRedrawOnDrop {
+            redraw,
+            version: 1,
+            picker_version,
+            alive,
+            trace: None,
+        });
+
+        assert!(matches!(
+            redraws.try_recv(),
+            Err(helix_runtime::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn closed_picker_matcher_does_not_request_frame() {
+        let mut gate = helix_runtime::FrameGate::new();
+        let redraw = Arc::new(gate.handle());
+        let mut redraws = gate.take_receiver();
+        let picker_version = Arc::new(AtomicUsize::new(1));
+        let alive = Arc::new(AtomicBool::new(false));
+
+        drop(RuntimeRedrawOnDrop {
+            redraw,
+            version: 1,
+            picker_version,
+            alive,
+            trace: None,
+        });
+
+        assert!(matches!(
+            redraws.try_recv(),
+            Err(helix_runtime::TryRecvError::Empty)
+        ));
+    }
+
     #[tokio::test]
     async fn picker_confirmation_confirm_runs_deferred_action() {
         let ran = Arc::new(AtomicBool::new(false));
         let ran_for_action = ran.clone();
-        let confirmation = PickerConfirmation::new("Run action?", move |_cx| {
+        let confirmation = Confirmation::new("Run action?", move |_cx| {
             ran_for_action.store(true, Ordering::Relaxed);
         });
 
@@ -2932,7 +3411,7 @@ mod tests {
     async fn picker_confirmation_cancel_skips_deferred_action() {
         let ran = Arc::new(AtomicBool::new(false));
         let ran_for_action = ran.clone();
-        let confirmation = PickerConfirmation::new("Run action?", move |_cx| {
+        let confirmation = Confirmation::new("Run action?", move |_cx| {
             ran_for_action.store(true, Ordering::Relaxed);
         });
 
@@ -2969,6 +3448,21 @@ mod tests {
     }
 
     #[test]
+    fn picker_layer_handlers_do_not_require_a_result_action() {
+        let mut handlers = PickerKeyHandlers::<String, ()>::new();
+        let key = KeyEvent {
+            code: KeyCode::Char('o'),
+            modifiers: KeyModifiers::ALT,
+        };
+        handlers.insert_layer(key, Box::new(|_, _, _| unreachable!()));
+
+        assert!(matches!(
+            handlers.get(&key),
+            Some(PickerKeyAction::Layer(_))
+        ));
+    }
+
+    #[test]
     fn picker_preview_request_decision_triggers_initial_populate_and_dedupes() {
         let first: Arc<Path> = Arc::from(std::path::Path::new("first.rs"));
         let second: Arc<Path> = Arc::from(std::path::Path::new("second.rs"));
@@ -2995,11 +3489,55 @@ mod tests {
     }
 
     #[test]
-    fn picker_sync_prepares_preview_for_initial_first_result() {
-        fn path_cell(item: &PathBuf, _: &()) -> Cell<'static> {
-            Cell::from(item.display().to_string())
-        }
+    fn picker_preview_rejects_stale_generation_before_cache_mutation() {
+        let rt = helix_runtime::test::RuntimeTest::default();
+        rt.block_on(async {
+            let runtime = rt.runtime();
+            let mut editor = helix_view::editor::EditorBuilder::new(
+                helix_view::graphics::Rect::new(0, 0, 80, 24),
+                runtime.clone(),
+            )
+            .build();
+            let (ingress, _receiver) = crate::runtime::RuntimeIngress::channel(runtime);
+            let path = PathBuf::from("preview.rs");
+            let key: Arc<Path> = Arc::from(path.clone());
+            let mut picker = Picker::new(
+                [Column::new("path", |item: &PathBuf, _: &()| {
+                    Cell::from(item.display().to_string())
+                })],
+                0,
+                [path.clone()],
+                (),
+                PickerRuntime::new(&editor),
+                ingress,
+                |_cx, _item, _action| {},
+            );
+            picker
+                .preview_cache
+                .insert(key.clone(), CachedPreview::Loading);
+            picker.pending_preview_load = Some((2, key));
 
+            picker.apply_preview(&mut editor, 1, path.clone(), CachedPreview::NotFound);
+            assert!(matches!(
+                picker.preview_cache.get(path.as_path()),
+                Some(CachedPreview::Loading)
+            ));
+            assert_eq!(
+                picker.pending_preview_load.as_ref().map(|(id, _)| *id),
+                Some(2)
+            );
+
+            picker.apply_preview(&mut editor, 2, path.clone(), CachedPreview::NotFound);
+            assert!(matches!(
+                picker.preview_cache.get(path.as_path()),
+                Some(CachedPreview::NotFound)
+            ));
+            assert!(picker.pending_preview_load.is_none());
+        });
+    }
+
+    #[test]
+    fn picker_sync_prepares_preview_for_initial_first_result() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("first.rs");
         std::fs::write(&path, "fn main() {}\n").unwrap();
@@ -3011,9 +3549,11 @@ mod tests {
                 runtime.clone(),
             )
             .build();
-            let (ingress, _rx) = crate::runtime::RuntimeIngress::channel(runtime.work().clone());
+            let (ingress, _rx) = crate::runtime::RuntimeIngress::channel(runtime.clone());
             let mut picker = Picker::new(
-                [Column::new("path", path_cell)],
+                [Column::new("path", |item: &PathBuf, _: &()| {
+                    Cell::from(item.display().to_string())
+                })],
                 0,
                 [path.clone()],
                 (),
@@ -3023,7 +3563,11 @@ mod tests {
             )
             .with_preview(|_editor, item| Some((PathOrId::Path(item.as_path()), None)));
 
-            <Picker<PathBuf, ()> as Component>::sync(&mut picker, &mut editor);
+            <Picker<PathBuf, ()> as Component>::sync(
+                &mut picker,
+                Rect::new(0, 0, 120, 40),
+                &mut editor,
+            );
 
             assert!(picker.preview_cache.contains_key(path.as_path()));
             assert!(matches!(
@@ -3033,6 +3577,52 @@ mod tests {
                     ..
                 }) if preview_path.as_ref() == path.as_path()
             ));
+        });
+    }
+
+    #[tokio::test]
+    async fn picker_activation_promotes_prepared_preview_without_rereading() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("preview.txt");
+        std::fs::write(&path, "prepared\n").unwrap();
+
+        with_test_context(|cx| {
+            cx.editor.new_file(Action::VerticalSplit);
+            let prepared = cx
+                .editor
+                .prepare_document_open(&path, DocumentOpenRole::Preview)
+                .execute()
+                .unwrap();
+            let mut picker = Picker::new(
+                [Column::new("path", |item: &PathBuf, _: &()| {
+                    Cell::from(item.display().to_string())
+                })],
+                0,
+                [path.clone()],
+                (),
+                PickerRuntime::new(cx.editor),
+                cx.ingress.clone(),
+                |cx, item, action| {
+                    cx.editor.open(item, action).unwrap();
+                },
+            )
+            .with_preview(|_editor, item| Some((PathOrId::Path(item.as_path()), None)));
+            picker.drain_matcher();
+            picker.preview_cache.insert(
+                Arc::from(path.clone()),
+                CachedPreview::Document(Box::new(prepared)),
+            );
+            std::fs::write(&path, "changed after preview\n").unwrap();
+
+            picker.activate_single_selection(cx, Action::Replace);
+
+            let document = cx.editor.focused_document().unwrap();
+            assert_eq!(
+                document.path(),
+                Some(&helix_stdx::path::canonicalize(&path))
+            );
+            assert_eq!(document.text().to_string(), "prepared\n");
+            assert!(!document.is_preview());
         });
     }
 

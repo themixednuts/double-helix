@@ -20,6 +20,7 @@ on these local extension points:
 - `FilePickerScanOptions` and `FilePickerOptions::scan` for preserving Helix file-picker ignore/hidden/depth/link semantics.
 - `ContentOverlay`, `OwnedGrepMatch`, `OwnedGrepResult`, `FilePicker::grep_owned`, and `grep_bytes` for searching unsaved editor buffers without writing them to disk.
 - `FrecencyStore` and `QueryTrackerStore` for keeping fff-search storage-agnostic; `helix-term` supplies the SQLite-backed `helix-store` implementations. Do not add `heed`/LMDB back to `vendor/fff-search`.
+- Per-query `FuzzySearchOptions::abort_signal`, which cancels superseded UI queries without stopping the shared picker or its watcher.
 
 If upstream gains equivalent APIs, delete the local extension and migrate the
 adapter. If upstream does not, keep the patch small and isolated so it can be

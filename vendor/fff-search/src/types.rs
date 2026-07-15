@@ -2,7 +2,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 #[cfg(not(target_os = "windows"))]
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicI32, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 
 #[cfg(not(target_os = "windows"))]
 use crate::constants::{FRESH_MMAP_THRESHOLD, MMAP_THRESHOLD};
@@ -802,6 +802,7 @@ impl Default for PaginationArgs {
 #[derive(Debug, Clone)]
 pub struct ScoringContext<'a> {
     pub query: &'a FFFQuery<'a>,
+    pub abort_signal: Option<&'a AtomicBool>,
     pub project_path: Option<&'a Path>,
     pub current_file: Option<&'a str>,
     pub max_typos: u16,

@@ -29,7 +29,7 @@ use tree_house::{
     Error, InjectionLanguageMarker, LanguageConfig as SyntaxConfig, Layer,
 };
 
-use crate::{indent::IndentQuery, tree_sitter, ChangeSet, Language};
+use crate::{indent::IndentQuery, tree_sitter, ChangeSet, Language, Rope};
 
 pub use tree_house::{
     highlighter::{Highlight, HighlightEvent},
@@ -46,6 +46,60 @@ pub struct LanguageData {
     textobject_query: OnceCell<Option<TextObjectQuery>>,
     tag_query: OnceCell<Option<TagQuery>>,
     rainbow_query: OnceCell<Option<RainbowQuery>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SyntaxQuerySnapshot {
+    text: Rope,
+    tree: Tree,
+    grammar: Grammar,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyntaxQueryCapture {
+    pub name: String,
+    pub kind: String,
+    pub start_byte: usize,
+    pub end_byte: usize,
+}
+
+impl SyntaxQuerySnapshot {
+    pub fn execute(
+        &self,
+        source: &str,
+        byte_range: std::ops::Range<u32>,
+        max_captures: usize,
+    ) -> Result<Vec<SyntaxQueryCapture>> {
+        let query = Query::new(self.grammar, source, |_, _| Ok(()))?;
+        let mut cursor = InactiveQueryCursor::new(byte_range, TREE_SITTER_MATCH_LIMIT)
+            .execute_query(
+                &query,
+                &self.tree.root_node(),
+                RopeInput::new(self.text.slice(..)),
+            );
+        let mut captures = Vec::new();
+        while captures.len() < max_captures {
+            let Some(query_match) = cursor.next_match() else {
+                break;
+            };
+            for matched in query_match.matched_nodes() {
+                captures.push(SyntaxQueryCapture {
+                    name: query.capture_name(matched.capture).into(),
+                    kind: matched.node.kind().into(),
+                    start_byte: matched.node.start_byte() as usize,
+                    end_byte: matched.node.end_byte() as usize,
+                });
+                if captures.len() == max_captures {
+                    break;
+                }
+            }
+        }
+        Ok(captures)
+    }
+
+    pub fn text(&self) -> &Rope {
+        &self.text
+    }
 }
 
 impl LanguageData {
@@ -338,6 +392,13 @@ impl Loader {
         &self.languages[lang.idx()]
     }
 
+    /// Load the grammar for a configured language without exposing loader internals.
+    pub fn grammar(&self, language: Language) -> Option<Grammar> {
+        self.language(language)
+            .syntax_config(self)
+            .map(|config| config.grammar)
+    }
+
     pub fn language_for_name(&self, name: impl PartialEq<String>) -> Option<Language> {
         self.languages.iter().enumerate().find_map(|(idx, config)| {
             (name == config.config.language_id).then_some(Language(idx as u32))
@@ -611,6 +672,14 @@ impl Syntax {
 
     pub fn root_language(&self) -> Language {
         self.layer(self.root_layer()).language
+    }
+
+    pub fn query_snapshot(&self, text: &Rope, loader: &Loader) -> Option<SyntaxQuerySnapshot> {
+        Some(SyntaxQuerySnapshot {
+            text: text.clone(),
+            tree: self.tree().clone(),
+            grammar: loader.grammar(self.root_language())?,
+        })
     }
 
     pub fn complexity(&self) -> SyntaxComplexity {
@@ -1346,6 +1415,25 @@ mod test {
         // The query used in this test case only captures the first line_comment node.
         // Determine if this behavior is intentional in tree-sitter.
         // test("multiple_nodes_grouped", 1..37);
+    }
+
+    #[test]
+    fn immutable_query_snapshot_executes_with_capture_limit() {
+        let source = Rope::from_str("// one\n// two\n");
+        let language = LOADER.language_for_name("rust").unwrap();
+        let syntax = Syntax::new(source.slice(..), language, &LOADER).unwrap();
+        let snapshot = syntax.query_snapshot(&source, &LOADER).unwrap();
+
+        let captures = snapshot
+            .execute("(line_comment) @comment", 0..source.len_bytes() as u32, 1)
+            .unwrap();
+        assert_eq!(captures.len(), 1);
+        assert_eq!(captures[0].name, "comment");
+        assert_eq!(captures[0].kind, "line_comment");
+        assert_eq!(
+            &source.byte_slice(captures[0].start_byte..captures[0].end_byte),
+            "// one"
+        );
     }
 
     #[test]

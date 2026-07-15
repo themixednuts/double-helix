@@ -1,16 +1,17 @@
 use std::{
     collections::{HashMap, HashSet},
-    error::Error as _,
     num::NonZeroUsize,
     path::{Path, PathBuf},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
-use helix_core::{
-    movement::Movement as CoreMovement, syntax, unicode::width::UnicodeWidthStr, Position,
-};
+#[cfg(test)]
+use std::error::Error as _;
+
+use helix_core::{movement::Movement as CoreMovement, unicode::width::UnicodeWidthStr, Position};
 use helix_view::{
-    editor::{Action, CloseError, ClosePolicy},
+    editor::{Action, CloseError, ClosePolicy, FileExplorerConfig},
     graphics::{CursorKind, Rect},
     icons::{Icon, ICONS},
     input::{KeyEvent, MouseButton, MouseEvent, MouseEventKind},
@@ -27,7 +28,10 @@ use helix_view::{
 use crate::{
     component_traits,
     compositor::{Component, Context, Event, EventResult, PostAction, RenderContext},
-    runtime::{ui::command::FileExplorerCommand, UiCommand},
+    runtime::{
+        ui::{command::FileExplorerCommand, file_explorer::FileExplorerPreviewRequest},
+        UiCommand,
+    },
 };
 
 mod actions;
@@ -48,11 +52,13 @@ use input::{ExplorerAction, ExplorerInput, ExplorerInputEngine};
 use input::{ExplorerFileOperation, ExplorerOperator, ExplorerPastePlacement};
 #[cfg(test)]
 use model::DiagnosticStatus;
-use model::{DiagnosticSnapshot, ExplorerRow, VcsSnapshot, VcsStatus};
+pub use model::VcsSnapshot;
+use model::{DiagnosticSnapshot, ExplorerRow, VcsStatus};
 #[cfg(test)]
 use path_ops::LabelRenameError;
-use path_ops::{display_path, selected_cursor, LabelEditRange};
+use path_ops::{display_name, display_path, selected_cursor, LabelEditRange};
 use preview::{ExplorerPreview, PreviewDocumentCache};
+pub(crate) use refresh::{FileExplorerTreeWork, PreparedFileExplorerTree};
 #[cfg(test)]
 use render::{ExplorerStatusStyles, ExplorerTreeItemStyles};
 use scan::ExplorerChild;
@@ -67,7 +73,7 @@ const SEARCH_ROWS: u16 = 1;
 /// need to duplicate them here.
 const FOOTER_ROWS: u16 = 1;
 pub(crate) const PANEL_WIDTH: u16 = 34;
-const EXPLORER_SEARCH_DEBOUNCE: Duration = Duration::from_millis(80);
+const SYNC_SLOW_LOG_THRESHOLD: Duration = Duration::from_millis(4);
 const FALLBACK_FOLDER_ICON: &str = "";
 const FALLBACK_FOLDER_OPEN_ICON: &str = "󰝰";
 const FALLBACK_FILE_ICON: &str = "󰈔";
@@ -77,20 +83,26 @@ const VCS_DELETED_ICON: &str = "";
 const VCS_RENAMED_ICON: &str = "";
 const VCS_CONFLICT_ICON: &str = "";
 const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(500);
-// Preview requests fire synchronously — `apply_preview_request` filters
-// stale ones on arrival, so no debounce is needed to coalesce navigation.
-
 pub struct FileExplorerPanel {
     root: PathBuf,
-    all_rows: Vec<ExplorerRow>,
-    rows: Vec<ExplorerRow>,
+    /// Session-local source options. Config reloads seed new panels; explicit
+    /// panel toggles remain local and are used by both tree scans and FFF.
+    config: FileExplorerConfig,
+    all_rows: Arc<[ExplorerRow]>,
+    rows: Arc<[ExplorerRow]>,
     search_query: String,
     search_active: bool,
+    search_pending: bool,
+    search_generation: u64,
+    search_results: Option<ExplorerSearchResults>,
+    tree_generation: u64,
+    tree_pending: bool,
     expanded_dirs: HashSet<PathBuf>,
     search_saved_expanded_dirs: Option<HashSet<PathBuf>>,
     children_cache: HashMap<PathBuf, Vec<ExplorerChild>>,
     vcs_snapshot: VcsSnapshot,
     diagnostic_snapshot: DiagnosticSnapshot,
+    diagnostic_snapshot_revision: u64,
     input: ExplorerInputEngine,
     file_clipboard: Option<ExplorerFileClipboard>,
     /// Cached row-selection index. Read-only mirror of `self.nav.selection()`;
@@ -115,9 +127,9 @@ pub struct FileExplorerPanel {
     focused: bool,
     preview: ExplorerPreview,
     preview_cache: PreviewDocumentCache,
-    preview_debouncer: Option<crate::runtime::RuntimeUiDebouncer>,
-    search_debouncer: Option<crate::runtime::RuntimeUiDebouncer>,
-    search_due_at: Option<Instant>,
+    preview_generation: u64,
+    preview_request: Option<FileExplorerPreviewRequest>,
+    preview_promotion: Option<ExplorerPreviewPromotion>,
     model_panel_id: Option<PanelId>,
     last_click: Option<ExplorerClick>,
     /// In-place edit state for the currently-selected row.
@@ -156,6 +168,18 @@ struct ExplorerClick {
     at: Instant,
 }
 
+#[derive(Clone, Debug)]
+struct ExplorerPreviewPromotion {
+    request: FileExplorerPreviewRequest,
+    action: Action,
+}
+
+#[derive(Clone, Debug)]
+struct ExplorerSearchResults {
+    query: String,
+    paths: Vec<PathBuf>,
+}
+
 /// Windows reserved device names — files named these can't be created or
 /// renamed because the OS routes them to a device handle.
 const WINDOWS_RESERVED_NAMES: &[&str] = &[
@@ -180,6 +204,13 @@ fn windows_reserved_basename(path: &Path) -> Option<&'static str> {
     path.file_name()
         .and_then(|name| name.to_str())
         .and_then(windows_reserved_label)
+}
+
+fn windows_reserved_path(path: &Path) -> Option<&'static str> {
+    path.components().find_map(|component| match component {
+        std::path::Component::Normal(label) => label.to_str().and_then(windows_reserved_label),
+        _ => None,
+    })
 }
 
 /// For a label motion, returns the direction it would "wrap" if it
@@ -273,33 +304,6 @@ fn explorer_row_matches(row: &ExplorerRow, query: &str) -> bool {
             .contains(query)
 }
 
-fn file_explorer_search_paths(
-    root: &Path,
-    query: &str,
-    config: &helix_view::editor::FileExplorerConfig,
-) -> anyhow::Result<Vec<PathBuf>> {
-    #[cfg(test)]
-    if let Some(paths) = test_file_explorer_search_paths() {
-        return Ok(paths);
-    }
-
-    crate::fff::search_file_explorer_available(root, query, config)
-}
-
-#[cfg(test)]
-thread_local! {
-    static TEST_FILE_EXPLORER_SEARCH_PATHS: std::cell::RefCell<Option<Vec<PathBuf>>> =
-        const { std::cell::RefCell::new(None) };
-    static TEST_FILE_EXPLORER_SEARCH_CALLS: std::cell::Cell<usize> =
-        const { std::cell::Cell::new(0) };
-}
-
-#[cfg(test)]
-fn test_file_explorer_search_paths() -> Option<Vec<PathBuf>> {
-    TEST_FILE_EXPLORER_SEARCH_CALLS.with(|calls| calls.set(calls.get().saturating_add(1)));
-    TEST_FILE_EXPLORER_SEARCH_PATHS.with(|paths| paths.borrow().clone())
-}
-
 fn row_status_width(row: &ExplorerRow) -> u16 {
     let icons = ICONS.load();
     let mut width = 0u16;
@@ -317,30 +321,44 @@ fn status_icon_width(icon: &str) -> u16 {
 }
 
 impl FileExplorerPanel {
+    #[cfg(test)]
     pub fn new(root: PathBuf, editor: &Editor) -> Result<Self, std::io::Error> {
         Self::new_with_cursor(root, editor, None)
     }
 
+    #[cfg(any(test, feature = "storybook"))]
     pub fn new_with_cursor(
         root: PathBuf,
         editor: &Editor,
         cursor: Option<usize>,
     ) -> Result<Self, std::io::Error> {
-        let root = helix_stdx::path::normalize(&root);
-        let mut panel = Self {
+        let root = helix_stdx::path::normalize(root);
+        let mut panel = Self::new_deferred(root, editor);
+        panel.refresh(editor, None, cursor)?;
+        Ok(panel)
+    }
+
+    /// Constructs a panel from an explorer root normalized at the command boundary.
+    pub(crate) fn new_deferred(root: PathBuf, editor: &Editor) -> Self {
+        let config = editor.config().file_explorer.clone();
+        let panel = Self {
             root: root.clone(),
-            all_rows: Vec::new(),
-            rows: Vec::new(),
+            config: config.clone(),
+            all_rows: Arc::from([]),
+            rows: Arc::from([]),
             search_query: String::new(),
             search_active: false,
+            search_pending: false,
+            search_generation: 0,
+            search_results: None,
+            tree_generation: 0,
+            tree_pending: false,
             expanded_dirs: HashSet::from([root.clone()]),
             search_saved_expanded_dirs: None,
             children_cache: HashMap::new(),
-            vcs_snapshot: VcsSnapshot::empty(&root, editor.config().file_explorer.vcs),
-            diagnostic_snapshot: DiagnosticSnapshot::empty(
-                &root,
-                editor.config().file_explorer.diagnostics,
-            ),
+            vcs_snapshot: VcsSnapshot::empty(&root, config.vcs),
+            diagnostic_snapshot: DiagnosticSnapshot::empty(&root, config.diagnostics),
+            diagnostic_snapshot_revision: u64::MAX,
             input: ExplorerInputEngine::default(),
             file_clipboard: None,
             selection: 0,
@@ -350,9 +368,9 @@ impl FileExplorerPanel {
             focused: true,
             preview: ExplorerPreview::None,
             preview_cache: PreviewDocumentCache::default(),
-            preview_debouncer: None,
-            search_debouncer: None,
-            search_due_at: None,
+            preview_generation: 0,
+            preview_request: None,
+            preview_promotion: None,
             model_panel_id: None,
             last_click: None,
             label_edit: None,
@@ -361,8 +379,7 @@ impl FileExplorerPanel {
             nav: helix_view::list_nav::ListNav::new(),
         };
         panel.prewarm_search_index(editor);
-        panel.refresh(editor, None, cursor)?;
-        Ok(panel)
+        panel
     }
 
     fn visible_height(&self) -> usize {
@@ -399,11 +416,74 @@ impl FileExplorerPanel {
         self.scroll = self.nav.scroll();
     }
 
+    #[cfg(test)]
     fn ensure_selection_visible(&mut self) {
         self.prime_nav();
         self.nav.ensure_visible();
         self.selection = self.nav.selection();
         self.scroll = self.nav.scroll();
+    }
+
+    /// Refresh viewport constraints without pulling an off-screen selection
+    /// back into view. Mouse scrolling owns the viewport until a selection
+    /// command explicitly asks `ListNav` to reveal the cursor again.
+    fn clamp_viewport(&mut self) {
+        let scroll = helix_view::list_nav::ListViewport::new(
+            self.rows.len(),
+            None,
+            self.visible_height(),
+            self.scroll,
+        )
+        .clamped_scroll();
+        self.nav.set_item_count(self.rows.len());
+        self.nav.set_viewport_height(self.visible_height());
+        self.nav.set_scroll(scroll);
+        self.selection = self.nav.selection();
+        self.scroll = self.nav.scroll();
+    }
+
+    fn center_selection(&mut self) {
+        let start = Instant::now();
+        self.prime_nav();
+        if self.rows.is_empty() {
+            self.sync_nav_to_cache();
+            log::info!(
+                "[file_explorer] center_selection rows=0 selection={} scroll={} visible_height={} elapsed_us={}",
+                self.selection,
+                self.scroll,
+                self.visible_height(),
+                start.elapsed().as_micros(),
+            );
+            return;
+        }
+
+        let visible_height = self.visible_height();
+        if visible_height == 0 {
+            self.sync_nav_to_cache();
+            log::info!(
+                "[file_explorer] center_selection rows={} selection={} scroll={} visible_height=0 elapsed_us={}",
+                self.rows.len(),
+                self.selection,
+                self.scroll,
+                start.elapsed().as_micros(),
+            );
+            return;
+        }
+
+        let target_scroll = self.selection.saturating_sub(visible_height / 2);
+        self.nav.set_scroll(target_scroll);
+        self.selection = self.nav.selection();
+        self.scroll = self.nav.scroll();
+        log::info!(
+            "[file_explorer] center_selection rows={} selection={} scroll={} target_scroll={} visible_height={} selected={} elapsed_us={}",
+            self.rows.len(),
+            self.selection,
+            self.scroll,
+            target_scroll,
+            visible_height,
+            selected_path_for_log(&self.rows, self.selection),
+            start.elapsed().as_micros(),
+        );
     }
 
     /// Set the row selection to a specific index, routing through
@@ -423,61 +503,264 @@ impl FileExplorerPanel {
         self.rows.get(self.selection)
     }
 
-    fn expand_fff_search_matches(&mut self, matches: impl IntoIterator<Item = PathBuf>) {
-        for path in matches {
-            self.expand_to_path(&path);
+    fn normalized_search_query(&self) -> String {
+        self.search_query.trim().to_ascii_lowercase()
+    }
+
+    fn bump_search_generation(&mut self) -> u64 {
+        self.search_generation = self.search_generation.wrapping_add(1);
+        self.search_generation
+    }
+
+    fn search_count_text(&self) -> Option<String> {
+        if self.search_query.is_empty() {
+            return self.tree_pending.then(|| "loading".to_owned());
+        }
+
+        if self.search_pending {
+            Some("searching".to_string())
+        } else {
+            Some(format!("{} results", self.rows.len()))
         }
     }
 
-    fn apply_search_filter(&mut self, editor: &Editor) {
-        self.search_due_at = None;
-        let selected_path = self.selected().map(|row| row.path.clone());
-        let query = self.search_query.trim().to_ascii_lowercase();
-        if query.is_empty() {
-            if let Some(expanded_dirs) = self.search_saved_expanded_dirs.take() {
-                self.expanded_dirs = expanded_dirs;
-                if let Err(err) = self.rebuild_visible_rows(editor) {
-                    log::debug!(
-                        "failed to rebuild file explorer rows after emptying search: {err}"
-                    );
-                }
-            }
-            self.rows = filter_explorer_rows(&self.all_rows, &self.search_query);
-        } else {
-            if self.search_saved_expanded_dirs.is_none() {
-                self.search_saved_expanded_dirs = Some(self.expanded_dirs.clone());
-            }
-            match file_explorer_search_paths(&self.root, &query, &editor.config().file_explorer) {
-                Ok(matches) => self.expand_fff_search_matches(matches),
-                Err(err) => log::debug!("failed to query FFF file explorer search: {err:#}"),
-            }
-            if let Err(err) = self.rebuild_visible_rows(editor) {
-                log::debug!("failed to rebuild file explorer rows after search expansion: {err}");
-            }
-            self.rows = filter_explorer_rows(&self.all_rows, &self.search_query);
-        }
+    pub(crate) fn search_query_for_log(&self) -> &str {
+        &self.search_query
+    }
 
+    pub(crate) fn search_generation_for_log(&self) -> u64 {
+        self.search_generation
+    }
+
+    pub(crate) fn search_pending_for_log(&self) -> bool {
+        self.search_pending
+    }
+
+    pub(crate) fn row_count_for_log(&self) -> usize {
+        self.rows.len()
+    }
+
+    pub(crate) fn selection_for_log(&self) -> usize {
+        self.selection
+    }
+
+    pub(crate) fn root_for_context(&self) -> &Path {
+        &self.root
+    }
+
+    pub(crate) fn selected_path_for_log(&self) -> String {
+        selected_path_for_log(&self.rows, self.selection)
+    }
+
+    fn search_result_rows(&self, matches: &[PathBuf]) -> Vec<ExplorerRow> {
+        let start = Instant::now();
+        let mut seen = HashSet::with_capacity(matches.len());
+        let rows = matches
+            .iter()
+            .filter_map(|path| {
+                let path = if path.is_absolute() {
+                    path.clone()
+                } else {
+                    self.root.join(path)
+                };
+                if !path.starts_with(&self.root) || !seen.insert(path.clone()) {
+                    return None;
+                }
+
+                Some(ExplorerRow {
+                    label: path
+                        .strip_prefix(&self.root)
+                        .ok()
+                        .filter(|path| !path.as_os_str().is_empty())
+                        .map(display_path)
+                        .unwrap_or_else(|| display_name(&path)),
+                    path: path.clone(),
+                    is_dir: false,
+                    depth: 0,
+                    expanded: false,
+                    is_last: true,
+                    ancestor_last: Vec::new(),
+                    vcs_status: self.vcs_snapshot.status(&path),
+                    diagnostic_status: self.diagnostic_snapshot.status(&path),
+                })
+            })
+            .collect::<Vec<_>>();
+        log::info!(
+            "[file_explorer] search_rows_built root={} query={:?} matches={} rows={} rejected_or_deduped={} first_row={} elapsed_us={}",
+            display_path(&self.root),
+            self.search_query,
+            matches.len(),
+            rows.len(),
+            matches.len().saturating_sub(rows.len()),
+            rows.first()
+                .map(|row| display_path(&row.path))
+                .unwrap_or_else(|| String::from("<none>")),
+            start.elapsed().as_micros(),
+        );
+        rows
+    }
+
+    fn restore_selection_after_row_update(&mut self, selected_path: Option<PathBuf>) {
+        let before = self.selection;
         if self.rows.is_empty() {
             self.label_selection = LabelSelection::default();
             self.seek_to(0);
+            log::info!(
+                "[file_explorer] selection_restore rows=0 selection_before={} selection_after={} selected_before={} selected_after={}",
+                before,
+                self.selection,
+                selected_path
+                    .as_deref()
+                    .map(display_path)
+                    .unwrap_or_else(|| String::from("<none>")),
+                selected_path_for_log(&self.rows, self.selection),
+            );
             return;
         }
 
         let target = selected_path
-            .and_then(|path| self.rows.iter().position(|row| row.path == path))
+            .as_ref()
+            .and_then(|path| self.rows.iter().position(|row| row.path == *path))
             .unwrap_or_else(|| self.selection.min(self.rows.len() - 1));
         self.seek_to(target);
         self.clamp_label_selection();
         self.collapse_label_selection_to_cursor();
+        log::info!(
+            "[file_explorer] selection_restore rows={} selection_before={} selection_after={} selected_before={} selected_after={}",
+            self.rows.len(),
+            before,
+            self.selection,
+            selected_path
+                .as_deref()
+                .map(display_path)
+                .unwrap_or_else(|| String::from("<none>")),
+            selected_path_for_log(&self.rows, self.selection),
+        );
+    }
+
+    fn apply_search_filter(&mut self, _editor: &Editor) {
+        let start = Instant::now();
+        let selected_path = self.selected().map(|row| row.path.clone());
+        let query = self.normalized_search_query();
+        let mode;
+        if query.is_empty() {
+            mode = "empty";
+            self.search_pending = false;
+            self.search_results = None;
+            if let Some(expanded_dirs) = self.search_saved_expanded_dirs.take() {
+                self.expanded_dirs = expanded_dirs;
+            }
+            self.rows = filter_explorer_rows(&self.all_rows, &self.search_query).into();
+        } else if let Some(results) = self
+            .search_results
+            .as_ref()
+            .filter(|results| results.query == query)
+        {
+            mode = "fff_results";
+            self.rows = self.search_result_rows(&results.paths).into();
+        } else if self.search_pending {
+            mode = "pending";
+            self.rows = Arc::from([]);
+        } else {
+            mode = "visible_tree_filter";
+            if self.search_saved_expanded_dirs.is_none() {
+                self.search_saved_expanded_dirs = Some(self.expanded_dirs.clone());
+            }
+            self.rows = filter_explorer_rows(&self.all_rows, &self.search_query).into();
+        }
+
+        self.restore_selection_after_row_update(selected_path);
+        log::info!(
+            "[file_explorer] search_filter_applied mode={} root={} query={:?} generation={} pending={} results_cached={} rows={} all_rows={} expanded_dirs={} selected={} elapsed_us={}",
+            mode,
+            display_path(&self.root),
+            self.search_query,
+            self.search_generation,
+            self.search_pending,
+            self.search_results
+                .as_ref()
+                .map_or(0, |results| results.paths.len()),
+            self.rows.len(),
+            self.all_rows.len(),
+            self.expanded_dirs.len(),
+            selected_path_for_log(&self.rows, self.selection),
+            start.elapsed().as_micros(),
+        );
+    }
+
+    pub(crate) fn accepts_search_request(&self, root: &Path, query: &str, generation: u64) -> bool {
+        self.root == root
+            && self.search_query.trim().eq_ignore_ascii_case(query)
+            && self.search_generation == generation
+            && !query.is_empty()
+    }
+
+    pub(crate) fn apply_search_results(
+        &mut self,
+        editor: &Editor,
+        root: PathBuf,
+        query: String,
+        generation: u64,
+        matches: Vec<PathBuf>,
+    ) -> bool {
+        let start = Instant::now();
+        let match_count = matches.len();
+        let first_match = matches
+            .first()
+            .map(|path| display_path(path))
+            .unwrap_or_else(|| String::from("<none>"));
+        if !self.accepts_search_request(&root, &query, generation) {
+            log::info!(
+                "[file_explorer] search_results_skip root={} current_root={} query={query:?} current_query={:?} generation={} current_generation={} matches={} first_match={} pending={} elapsed_us={}",
+                display_path(&root),
+                display_path(&self.root),
+                self.search_query,
+                generation,
+                self.search_generation,
+                match_count,
+                first_match,
+                self.search_pending,
+                start.elapsed().as_micros(),
+            );
+            return false;
+        }
+
+        self.search_pending = false;
+        self.search_results = Some(ExplorerSearchResults {
+            query,
+            paths: matches,
+        });
+        self.apply_search_filter(editor);
+        log::info!(
+            "[file_explorer] search_results_applied root={} query={:?} generation={} matches={} first_match={} rows={} selection={} selected={} elapsed_us={}",
+            display_path(&self.root),
+            self.search_query,
+            self.search_generation,
+            match_count,
+            first_match,
+            self.rows.len(),
+            self.selection,
+            selected_path_for_log(&self.rows, self.selection),
+            start.elapsed().as_micros(),
+        );
+        true
     }
 
     fn start_search(&mut self) {
+        log::info!(
+            "[file_explorer] search_start root={} rows={} selection={} selected={} query_before={:?}",
+            display_path(&self.root),
+            self.rows.len(),
+            self.selection,
+            selected_path_for_log(&self.rows, self.selection),
+            self.search_query,
+        );
         self.search_active = true;
     }
 
     fn prewarm_search_index(&self, editor: &Editor) {
         let root = self.root.clone();
-        let config = editor.config().file_explorer.clone();
+        let config = self.config.clone();
         editor
             .runtime()
             .block()
@@ -485,46 +768,122 @@ impl FileExplorerPanel {
             .detach();
     }
 
+    pub(crate) fn toggle_source_option(
+        &mut self,
+        option: crate::ui::file_options::FileSourceOption,
+    ) {
+        option.toggle_explorer(&mut self.config);
+        self.search_results = None;
+        log::info!(
+            "[file_explorer] source_option_toggled option={option:?} hidden={} ignore={} git_ignore={} git_global={} git_exclude={} parents={} follow_symlinks={} flatten_dirs={}",
+            self.config.hidden,
+            self.config.ignore,
+            self.config.git_ignore,
+            self.config.git_global,
+            self.config.git_exclude,
+            self.config.parents,
+            self.config.follow_symlinks,
+            self.config.flatten_dirs,
+        );
+    }
+
+    pub(crate) fn queue_current_search(
+        &mut self,
+        editor: &Editor,
+        ingress: crate::runtime::RuntimeIngress,
+    ) {
+        self.prewarm_search_index(editor);
+        let query = self.normalized_search_query();
+        if query.is_empty() {
+            return;
+        }
+        let generation = self.bump_search_generation();
+        self.search_pending = true;
+        if let Err(error) = ingress.ui(UiCommand::FileExplorer(FileExplorerCommand::StartSearch {
+            root: self.root.clone(),
+            query,
+            generation,
+            config: self.config.clone(),
+        })) {
+            log::error!("file explorer search admission failed: {error}");
+            self.search_pending = false;
+        }
+    }
+
     fn clear_search(&mut self, editor: &Editor) {
         if self.search_query.is_empty() {
             return;
         }
+        let start = Instant::now();
+        let query_before = self.search_query.clone();
+        let generation_before = self.search_generation;
+        self.bump_search_generation();
         self.search_query.clear();
-        self.search_due_at = None;
-        if let Some(debouncer) = &self.search_debouncer {
-            debouncer.cancel();
-        }
+        self.search_pending = false;
+        self.search_results = None;
         if let Some(expanded_dirs) = self.search_saved_expanded_dirs.take() {
             self.expanded_dirs = expanded_dirs;
-            if let Err(err) = self.rebuild_visible_rows(editor) {
-                log::debug!("failed to rebuild file explorer rows after clearing search: {err}");
-            }
         }
         self.apply_search_filter(editor);
+        log::info!(
+            "[file_explorer] search_clear root={} query_before={query_before:?} generation_before={} generation_after={} rows={} selection={} selected={} expanded_dirs={} elapsed_us={}",
+            display_path(&self.root),
+            generation_before,
+            self.search_generation,
+            self.rows.len(),
+            self.selection,
+            selected_path_for_log(&self.rows, self.selection),
+            self.expanded_dirs.len(),
+            start.elapsed().as_micros(),
+        );
     }
 
     fn schedule_search_filter(&mut self, cx: &mut Context) {
-        self.search_due_at = Some(Instant::now() + EXPLORER_SEARCH_DEBOUNCE);
-        if self.search_debouncer.is_none() {
-            self.search_debouncer = Some(crate::runtime::RuntimeUiDebouncer::new(
-                EXPLORER_SEARCH_DEBOUNCE,
-                cx.editor.work(),
-                cx.editor.runtime().clock().clone(),
-                cx.ingress.clone(),
-            ));
-        }
-        if let Some(debouncer) = &self.search_debouncer {
-            debouncer.send(UiCommand::NeedFullRedraw);
-        }
-    }
+        let start = Instant::now();
+        let query_before = self.search_query.clone();
+        let rows_before = self.rows.len();
+        let generation = self.bump_search_generation();
+        let query = self.normalized_search_query();
+        self.search_results = None;
 
-    fn apply_due_search_filter(&mut self, editor: &Editor) {
-        if self
-            .search_due_at
-            .is_some_and(|due_at| Instant::now() >= due_at)
-        {
-            self.apply_search_filter(editor);
+        if query.is_empty() {
+            self.search_pending = false;
+            self.apply_search_filter(cx.editor);
+            log::info!(
+                "[file_explorer] search_schedule_empty root={} query_before={query_before:?} generation={} rows={} elapsed_us={}",
+                display_path(&self.root),
+                generation,
+                self.rows.len(),
+                start.elapsed().as_micros(),
+            );
+            return;
         }
+
+        if self.search_saved_expanded_dirs.is_none() {
+            self.search_saved_expanded_dirs = Some(self.expanded_dirs.clone());
+        }
+        self.search_pending = true;
+        self.rows = Arc::from([]);
+        self.label_selection = LabelSelection::default();
+        self.seek_to(0);
+
+        cx.submit_ui(UiCommand::FileExplorer(FileExplorerCommand::StartSearch {
+            root: self.root.clone(),
+            query,
+            generation,
+            config: self.config.clone(),
+        }));
+        log::info!(
+            "[file_explorer] search_queued root={} query={:?} generation={} dispatch=immediate rows_before_clear={} rows_after_clear={} all_rows={} selected={} elapsed_us={}",
+            display_path(&self.root),
+            query_before,
+            generation,
+            rows_before,
+            self.rows.len(),
+            self.all_rows.len(),
+            selected_path_for_log(&self.rows, self.selection),
+            start.elapsed().as_micros(),
+        );
     }
 
     fn handle_search_key(&mut self, key: KeyEvent, cx: &mut Context) -> Option<EventResult> {
@@ -832,20 +1191,118 @@ impl FileExplorerPanel {
         LabelEditRange::from_selection(self.label_selection, label)
     }
 
-    fn toggle_selected_dir(&mut self, editor: &Editor) {
+    fn toggle_selected_dir_state(&mut self) -> bool {
         let Some(row) = self.selected().filter(|row| row.is_dir).cloned() else {
-            return;
+            return false;
         };
         if row.expanded {
             self.collapse_dir_preserving_descendant_state(&row.path);
         } else {
             self.expanded_dirs.insert(row.path);
         }
+        true
+    }
+
+    #[cfg(test)]
+    fn toggle_selected_dir(&mut self, editor: &Editor) {
+        if !self.toggle_selected_dir_state() {
+            return;
+        }
         if let Err(err) = self.refresh_preserving_tree(editor, None, Some(self.selection)) {
             log::error!("failed to refresh file explorer: {err}");
         }
     }
 
+    fn queue_toggle_selected_dir(&mut self, cx: &mut Context) {
+        if !self.toggle_selected_dir_state() {
+            return;
+        }
+        crate::runtime::ui::file_explorer::queue_file_explorer_tree_refresh(
+            self,
+            cx.editor,
+            cx.ingress.clone(),
+            None,
+            Some(self.selection),
+            None,
+            false,
+            false,
+        );
+    }
+
+    fn replace_expanded_dirs(&mut self, dirs: HashSet<PathBuf>) {
+        self.expanded_dirs = dirs.clone();
+        if let Some(saved_dirs) = self.search_saved_expanded_dirs.as_mut() {
+            *saved_dirs = dirs;
+        }
+    }
+
+    #[cfg(test)]
+    fn collapse_all_dirs(&mut self, editor: &Editor) {
+        let expanded_dirs = HashSet::from([self.root.clone()]);
+        self.replace_expanded_dirs(expanded_dirs);
+        if let Err(err) = self.refresh_preserving_tree(editor, None, None) {
+            log::error!("failed to refresh file explorer: {err}");
+        }
+    }
+
+    fn queue_collapse_all_dirs(&mut self, cx: &mut Context) {
+        let expanded_dirs = HashSet::from([self.root.clone()]);
+        self.replace_expanded_dirs(expanded_dirs);
+        crate::runtime::ui::file_explorer::queue_file_explorer_tree_refresh(
+            self,
+            cx.editor,
+            cx.ingress.clone(),
+            None,
+            None,
+            None,
+            false,
+            false,
+        );
+    }
+
+    #[cfg(test)]
+    fn expand_loaded_dirs(&mut self, editor: &Editor) {
+        self.expand_loaded_dirs_state();
+        if let Err(err) = self.refresh_preserving_tree(editor, None, None) {
+            log::error!("failed to refresh file explorer: {err}");
+        }
+    }
+
+    fn expand_loaded_dirs_state(&mut self) {
+        let mut expanded_dirs = HashSet::from([self.root.clone()]);
+        expanded_dirs.extend(
+            self.all_rows
+                .iter()
+                .filter(|row| row.is_dir)
+                .map(|row| row.path.clone()),
+        );
+        for (parent, children) in &self.children_cache {
+            expanded_dirs.insert(parent.clone());
+            expanded_dirs.extend(
+                children
+                    .iter()
+                    .filter(|child| child.is_dir)
+                    .map(|child| child.path.clone()),
+            );
+        }
+        self.replace_expanded_dirs(expanded_dirs);
+    }
+
+    fn queue_expand_loaded_dirs(&mut self, cx: &mut Context) {
+        self.expand_loaded_dirs_state();
+        crate::runtime::ui::file_explorer::queue_file_explorer_tree_refresh(
+            self,
+            cx.editor,
+            cx.ingress.clone(),
+            None,
+            None,
+            None,
+            false,
+            false,
+        );
+    }
+
+    #[cfg(test)]
     fn collapse_or_select_parent(&mut self, editor: &Editor) {
         let Some(row) = self.selected().cloned() else {
             return;
@@ -872,47 +1329,275 @@ impl FileExplorerPanel {
         }
     }
 
-    fn root_parent(&mut self, editor: &Editor) {
-        let Some(parent) = self.root.parent().map(Path::to_path_buf) else {
-            return;
-        };
-        if let Err(err) = self.refresh_preserving_tree(editor, Some(parent), Some(0)) {
-            log::error!("failed to refresh file explorer: {err}");
-        }
-    }
-
-    fn go_workspace_root(&mut self, editor: &Editor) {
-        let root = helix_loader::find_workspace().0;
-        if let Err(err) = self.refresh_preserving_tree(editor, Some(root), Some(0)) {
-            log::error!("failed to refresh file explorer: {err}");
-        }
-    }
-
-    fn open_selected(&mut self, cx: &mut Context, action: Action) {
+    fn queue_collapse_or_select_parent(&mut self, cx: &mut Context) {
         let Some(row) = self.selected().cloned() else {
             return;
         };
-
-        if row.is_dir {
-            self.toggle_selected_dir(cx.editor);
+        if row.is_dir && row.expanded {
+            self.collapse_dir_preserving_descendant_state(&row.path);
+            crate::runtime::ui::file_explorer::queue_file_explorer_tree_refresh(
+                self,
+                cx.editor,
+                cx.ingress.clone(),
+                None,
+                Some(self.selection),
+                None,
+                false,
+                false,
+            );
             return;
         }
-
-        match cx.editor.open(&row.path, action) {
-            Ok(_) => {
-                self.preview = ExplorerPreview::None;
-                self.focused = false;
-            }
-            Err(err) => {
-                let message = err
-                    .source()
-                    .map(ToString::to_string)
-                    .unwrap_or_else(|| format!("unable to open \"{}\"", row.path.display()));
-                cx.editor.set_error(message);
-            }
+        if row.depth == 0 {
+            return;
+        }
+        if let Some(parent_index) = self.rows[..self.selection]
+            .iter()
+            .rposition(|candidate| candidate.depth + 1 == row.depth)
+        {
+            self.seek_to(parent_index);
+            self.clamp_label_selection();
+            self.collapse_label_selection_to_cursor();
         }
     }
 
+    fn queue_root_parent(&mut self, cx: &mut Context) {
+        let Some(parent) = self.root.parent().map(Path::to_path_buf) else {
+            return;
+        };
+        crate::runtime::ui::file_explorer::queue_file_explorer_tree_refresh(
+            self,
+            cx.editor,
+            cx.ingress.clone(),
+            Some(parent),
+            Some(0),
+            None,
+            false,
+            false,
+        );
+    }
+
+    fn queue_go_workspace_root(&mut self, cx: &mut Context) {
+        let root = helix_loader::find_workspace().0;
+        crate::runtime::ui::file_explorer::queue_file_explorer_tree_refresh(
+            self,
+            cx.editor,
+            cx.ingress.clone(),
+            Some(root),
+            Some(0),
+            None,
+            false,
+            false,
+        );
+    }
+
+    fn queue_restore_tree_after_search_open(
+        &mut self,
+        editor: &Editor,
+        ingress: crate::runtime::RuntimeIngress,
+        opened_path: &Path,
+    ) {
+        if self.search_query.is_empty()
+            && !self.search_pending
+            && self.search_results.is_none()
+            && self.search_saved_expanded_dirs.is_none()
+        {
+            return;
+        }
+
+        let query_before = self.search_query.clone();
+        let generation_before = self.search_generation;
+        self.bump_search_generation();
+        self.search_query.clear();
+        self.search_active = false;
+        self.search_pending = false;
+        self.search_results = None;
+        if let Some(expanded_dirs) = self.search_saved_expanded_dirs.take() {
+            self.expanded_dirs = expanded_dirs;
+        }
+        self.expand_to_path(opened_path);
+        crate::runtime::ui::file_explorer::queue_file_explorer_tree_refresh(
+            self,
+            editor,
+            ingress,
+            None,
+            None,
+            Some(opened_path.to_path_buf()),
+            false,
+            false,
+        );
+        log::info!(
+            "[file_explorer] search_open_tree_restore_queued path={} query_before={query_before:?} generation_before={} generation_after={} expanded_dirs={}",
+            display_path(opened_path),
+            generation_before,
+            self.search_generation,
+            self.expanded_dirs.len(),
+        );
+    }
+
+    fn open_selected(&mut self, cx: &mut Context, action: Action) -> bool {
+        let start = Instant::now();
+        let Some(row) = self.selected().cloned() else {
+            log::info!(
+                "[file_explorer] open_skip reason=no_selection rows={} selection={} query={:?} pending={}",
+                self.rows.len(),
+                self.selection,
+                self.search_query,
+                self.search_pending,
+            );
+            return false;
+        };
+
+        log::info!(
+            "[file_explorer] open_start path={} is_dir={} action={:?} selection={} rows={} query={:?} pending={} generation={} focused_view_before={:?} focused_doc_before={:?}",
+            display_path(&row.path),
+            row.is_dir,
+            action,
+            self.selection,
+            self.rows.len(),
+            self.search_query,
+            self.search_pending,
+            self.search_generation,
+            cx.editor.focused_view_id(),
+            cx.editor.focused_document_id(),
+        );
+
+        if row.is_dir {
+            self.queue_toggle_selected_dir(cx);
+            log::info!(
+                "[file_explorer] open_done kind=directory path={} rows={} selection={} selected={} elapsed_us={}",
+                display_path(&row.path),
+                self.rows.len(),
+                self.selection,
+                selected_path_for_log(&self.rows, self.selection),
+                start.elapsed().as_micros(),
+            );
+            return false;
+        }
+
+        self.center_selection();
+
+        let path = row.path.clone();
+        if let Some(doc_id) = self.promote_available_preview(cx.editor, &path, action) {
+            self.finish_opened_file(cx.editor, cx.ingress.clone(), &row.path, doc_id, start);
+            return false;
+        }
+
+        let request = self
+            .preview_request
+            .as_ref()
+            .filter(|request| self.preview_request_matches_selection(request))
+            .cloned()
+            .or_else(|| self.queue_selected_preview_request(cx.editor, cx.ingress.clone()));
+        let Some(request) = request else {
+            return false;
+        };
+
+        if let Some(prepared) = cx.ingress.take_file_explorer_preview(&request) {
+            match prepared.result {
+                Ok(document) => {
+                    let doc_id = self.promote_prepared_preview(cx.editor, &path, action, document);
+                    self.finish_opened_file(
+                        cx.editor,
+                        cx.ingress.clone(),
+                        &row.path,
+                        doc_id,
+                        start,
+                    );
+                }
+                Err(error) => {
+                    cx.editor.set_error(error.clone());
+                    log::info!(
+                        "[file_explorer] open_error path={} generation={} error={} rows={} selection={} elapsed_us={}",
+                        display_path(&row.path),
+                        request.generation,
+                        error,
+                        self.rows.len(),
+                        self.selection,
+                        start.elapsed().as_micros(),
+                    );
+                }
+            }
+            return false;
+        }
+
+        self.preview_promotion = Some(ExplorerPreviewPromotion {
+            request: request.clone(),
+            action,
+        });
+        log::info!(
+            "[file_explorer] open_waiting_for_preview path={} generation={} elapsed_us={}",
+            display_path(&row.path),
+            request.generation,
+            start.elapsed().as_micros(),
+        );
+        true
+    }
+
+    fn finish_opened_file(
+        &mut self,
+        editor: &mut Editor,
+        ingress: crate::runtime::RuntimeIngress,
+        path: &Path,
+        doc_id: DocumentId,
+        start: Instant,
+    ) {
+        self.queue_restore_tree_after_search_open(editor, ingress, path);
+        self.center_selection();
+        self.focused = false;
+        log::info!(
+            "[file_explorer] open_done kind=file path={} doc={:?} preview_cache_entries={} rows={} selection={} scroll={} selected={} focused={} focused_view_after={:?} focused_doc_after={:?} documents={} elapsed_us={}",
+            display_path(path),
+            doc_id,
+            self.preview_cache.len(),
+            self.rows.len(),
+            self.selection,
+            self.scroll,
+            selected_path_for_log(&self.rows, self.selection),
+            self.focused,
+            editor.focused_view_id(),
+            editor.focused_document_id(),
+            editor.document_count(),
+            start.elapsed().as_micros(),
+        );
+    }
+
+    fn promote_available_preview(
+        &mut self,
+        editor: &mut Editor,
+        path: &Path,
+        action: Action,
+    ) -> Option<DocumentId> {
+        let doc_id = if let Some(doc_id) = editor.document_id_by_path(path) {
+            editor.promote_preview_document(doc_id);
+            editor.switch(doc_id, action);
+            doc_id
+        } else {
+            let cached = self.preview_cache.take(path)?;
+            editor.restore_and_promote_preview_document(cached, action)
+        };
+        self.replace_preview_document(editor, doc_id, false);
+        Some(doc_id)
+    }
+
+    fn promote_prepared_preview(
+        &mut self,
+        editor: &mut Editor,
+        path: &Path,
+        action: Action,
+        prepared: helix_view::editor::PreparedDocumentOpen,
+    ) -> DocumentId {
+        if let Some(doc_id) = self.promote_available_preview(editor, path, action) {
+            return doc_id;
+        }
+
+        let doc_id = editor.apply_prepared_document_open(prepared, action);
+        self.replace_preview_document(editor, doc_id, true);
+        editor.promote_preview_document(doc_id);
+        self.replace_preview_document(editor, doc_id, false);
+        doc_id
+    }
+
+    #[cfg(test)]
     pub fn preview_selected_file(&mut self, editor: &mut Editor) {
         let preview_start = Instant::now();
         let documents_before = editor.document_count();
@@ -921,9 +1606,12 @@ impl FileExplorerPanel {
         let focused_view_before = editor.focused_view_id();
         let Some(row) = self.selected().filter(|row| !row.is_dir).cloned() else {
             log::info!(
-                "[file_explorer] preview_skip reason=no_selected_file selection={} selected={} preview={:?} documents={} component_documents={} elapsed_us={}",
+                "[file_explorer] preview_skip reason=no_selected_file selection={} selected={} query={:?} pending={} generation={} preview={:?} documents={} component_documents={} elapsed_us={}",
                 self.selection,
                 selected_path_for_log(&self.rows, self.selection),
+                self.search_query,
+                self.search_pending,
+                self.search_generation,
                 self.preview,
                 documents_before,
                 component_documents_before,
@@ -931,18 +1619,21 @@ impl FileExplorerPanel {
             );
             return;
         };
-        let path = helix_stdx::path::canonicalize(&row.path);
+        let path = row.path.clone();
         let current_path = editor
             .tree
             .try_get(editor.tree.focus)
             .and_then(|view| editor.document(view.doc))
             .and_then(|doc| doc.path())
-            .map(helix_stdx::path::canonicalize);
+            .cloned();
         if current_path.as_deref() == Some(path.as_path()) {
             log::info!(
-                "[file_explorer] preview_skip reason=already_current selection={} path={} focused_view={:?} focused_doc={:?} preview={:?} documents={} component_documents={} elapsed_us={}",
+                "[file_explorer] preview_skip reason=already_current selection={} path={} query={:?} pending={} generation={} focused_view={:?} focused_doc={:?} preview={:?} documents={} component_documents={} elapsed_us={}",
                 self.selection,
                 display_path(&path),
+                self.search_query,
+                self.search_pending,
+                self.search_generation,
                 focused_view_before,
                 focused_doc_before,
                 self.preview,
@@ -956,13 +1647,16 @@ impl FileExplorerPanel {
         let focus = editor.model.focus;
         let existing_doc = editor.document_id_by_path(&path);
         log::info!(
-            "[file_explorer] preview_open_start selection={} path={} current_path={} focused_view={:?} focused_doc={:?} existing_doc={:?} preview_before={:?} preview_cache_entries={} documents_before={} component_documents_before={}",
+            "[file_explorer] preview_open_start selection={} path={} current_path={} query={:?} pending={} generation={} focused_view={:?} focused_doc={:?} existing_doc={:?} preview_before={:?} preview_cache_entries={} documents_before={} component_documents_before={}",
             self.selection,
             display_path(&path),
             current_path
                 .as_deref()
                 .map(display_path)
                 .unwrap_or_else(|| String::from("<scratch>")),
+            self.search_query,
+            self.search_pending,
+            self.search_generation,
             focused_view_before,
             focused_doc_before,
             existing_doc,
@@ -1001,9 +1695,11 @@ impl FileExplorerPanel {
                 editor.model.focus = focus;
                 self.focused = true;
                 log::info!(
-                    "[file_explorer] preview_done path={} doc={:?} restored_from_cache={} preview_after={:?} preview_cache_entries={} restored_focus={:?} focused_view_before={:?} focused_doc_before={:?} focused_view_after={:?} focused_doc_after={:?} documents_after={} component_documents_after={} total_us={}",
+                    "[file_explorer] preview_done path={} doc={:?} query={:?} generation={} restored_from_cache={} preview_after={:?} preview_cache_entries={} restored_focus={:?} focused_view_before={:?} focused_doc_before={:?} focused_view_after={:?} focused_doc_after={:?} documents_after={} component_documents_after={} total_us={}",
                     display_path(&path),
                     doc_id,
+                    self.search_query,
+                    self.search_generation,
                     restored_from_cache,
                     self.preview,
                     self.preview_cache.len(),
@@ -1038,78 +1734,6 @@ impl FileExplorerPanel {
         }
     }
 
-    fn queue_preview_syntax_refresh(
-        &self,
-        editor: &Editor,
-        ingress: crate::runtime::RuntimeIngress,
-        doc_id: DocumentId,
-        path: PathBuf,
-    ) {
-        let Some(doc) = editor.document(doc_id) else {
-            return;
-        };
-        if doc.has_syntax() {
-            return;
-        }
-        let Some(language) = doc.language_config().map(|config| config.language()) else {
-            return;
-        };
-
-        let version = doc.version();
-        let text = doc.text().clone();
-        let loader = editor.syn_loader.load();
-        let block = editor.runtime().block().clone();
-        let path = helix_stdx::path::canonicalize(path);
-        log::info!(
-            "[file_explorer] preview_syntax_queued doc={:?} path={} version={} bytes={}",
-            doc_id,
-            display_path(&path),
-            version,
-            text.len_bytes(),
-        );
-
-        block
-            .spawn(move || {
-                let start = Instant::now();
-                let syntax = match helix_core::Syntax::new_with_timeout(
-                    text.slice(..),
-                    language,
-                    &loader,
-                    syntax::BACKGROUND_PARSE_TIMEOUT,
-                ) {
-                    Ok(syntax) => syntax,
-                    Err(err) => {
-                        log::info!(
-                            "[file_explorer] preview_syntax_failed doc={:?} path={} version={} error={} elapsed_us={}",
-                            doc_id,
-                            display_path(&path),
-                            version,
-                            err,
-                            start.elapsed().as_micros(),
-                        );
-                        return;
-                    }
-                };
-
-                log::info!(
-                    "[file_explorer] preview_syntax_done doc={:?} path={} version={} elapsed_us={}",
-                    doc_id,
-                    display_path(&path),
-                    version,
-                    start.elapsed().as_micros(),
-                );
-                ingress.ui(UiCommand::Document(
-                    crate::runtime::ui::command::DocumentCommand::ApplySyntax {
-                        document: doc_id,
-                        path,
-                        version,
-                        syntax,
-                    },
-                ));
-            })
-            .detach();
-    }
-
     fn replace_preview_document(
         &mut self,
         editor: &mut Editor,
@@ -1131,8 +1755,7 @@ impl FileExplorerPanel {
                 let close_start = Instant::now();
                 if let Some(doc) = editor.take_preview_document(previous_preview) {
                     if let Some(path) = doc.path().map(Path::to_path_buf) {
-                        self.preview_cache
-                            .insert(helix_stdx::path::canonicalize(&path), doc);
+                        self.preview_cache.insert(path, doc);
                         log::info!(
                             "[file_explorer] preview_close_done previous={:?} result=cached elapsed_us={} preview_cache_entries={} documents_after={} component_documents_after={}",
                             previous_preview,
@@ -1262,7 +1885,7 @@ impl FileExplorerPanel {
     }
 
     fn close(&mut self, cx: &mut Context) -> EventResult {
-        self.cancel_preview_request();
+        self.cancel_preview_request(&cx.ingress);
         if let ExplorerPreview::Owned(doc_id) = self.preview {
             cx.editor.promote_preview_document(doc_id);
         }
@@ -1273,109 +1896,277 @@ impl FileExplorerPanel {
         EventResult::Consumed(Some(PostAction::RemoveById(ID)))
     }
 
-    fn cancel_preview_request(&mut self) {
-        if let Some(debouncer) = &self.preview_debouncer {
-            debouncer.cancel();
-        }
+    fn cancel_preview_request(&mut self, ingress: &crate::runtime::RuntimeIngress) {
+        self.preview_generation = self.preview_generation.wrapping_add(1);
+        self.preview_request = None;
+        self.preview_promotion = None;
+        ingress.cancel_file_explorer_preview();
     }
 
     pub fn queue_selected_preview(
         &mut self,
-        _editor: &Editor,
+        editor: &Editor,
         ingress: crate::runtime::RuntimeIngress,
     ) {
+        let _ = self.queue_selected_preview_request(editor, ingress);
+    }
+
+    fn queue_selected_preview_request(
+        &mut self,
+        _editor: &Editor,
+        ingress: crate::runtime::RuntimeIngress,
+    ) -> Option<FileExplorerPreviewRequest> {
         let Some(row) = self.selected().filter(|row| !row.is_dir).cloned() else {
-            self.cancel_preview_request();
+            self.cancel_preview_request(&ingress);
             log::info!(
                 "[file_explorer] preview_queue_skip reason=no_selected_file selection={} selected={}",
                 self.selection,
                 selected_path_for_log(&self.rows, self.selection),
             );
-            return;
+            return None;
         };
-        let root = self.root.clone();
+
         let path = row.path.clone();
         let cursor = selected_cursor(self.selection);
-        // Preview requests fire synchronously now — tree navigation should
-        // feel instant. `apply_preview_request` performs a staleness check
-        // against the current selection on the receiving side, so older
-        // requests that arrive after the user has moved on are skipped
-        // there instead of being coalesced here.
-        log::info!(
-            "[file_explorer] preview_queued root={} path={} cursor={}",
-            display_path(&root),
-            display_path(&path),
+        if let Some(request) = self.preview_request.as_ref().filter(|request| {
+            request.generation == self.preview_generation
+                && request.root == self.root
+                && request.path == path
+                && request.cursor == cursor
+        }) {
+            return Some(request.clone());
+        }
+
+        ingress.cancel_file_explorer_preview();
+        self.preview_generation = self.preview_generation.wrapping_add(1);
+        self.preview_promotion = None;
+        let request = FileExplorerPreviewRequest {
+            root: self.root.clone(),
+            path,
             cursor,
+            generation: self.preview_generation,
+        };
+        self.preview_request = Some(request.clone());
+        log::info!(
+            "[file_explorer] preview_queued root={} path={} cursor={} preview_generation={} query={:?} search_pending={} search_generation={} rows={} focused={}",
+            display_path(&request.root),
+            display_path(&request.path),
+            request.cursor,
+            request.generation,
+            self.search_query,
+            self.search_pending,
+            self.search_generation,
+            self.rows.len(),
+            self.focused,
         );
-        ingress.ui(UiCommand::FileExplorer(
-            FileExplorerCommand::PreviewSelection { root, path, cursor },
-        ));
+        if let Err(error) = ingress.ui(UiCommand::FileExplorer(
+            FileExplorerCommand::PreviewSelection {
+                root: request.root.clone(),
+                path: request.path.clone(),
+                cursor: request.cursor,
+                generation: request.generation,
+            },
+        )) {
+            log::error!("file explorer preview admission failed: {error}");
+            self.preview_request = None;
+            return None;
+        }
+        Some(request)
     }
 
-    pub fn apply_preview_request(
-        &mut self,
-        editor: &mut Editor,
-        ingress: crate::runtime::RuntimeIngress,
-        root: PathBuf,
-        path: PathBuf,
-        cursor: u32,
-    ) {
-        let start = Instant::now();
-        let requested_root = helix_stdx::path::normalize(root);
-        let requested_path = helix_stdx::path::normalize(path);
-        let cursor = usize::try_from(cursor).unwrap_or(usize::MAX);
-        let selected_path = self
-            .selected()
-            .map(|row| helix_stdx::path::normalize(&row.path));
-        if requested_root != self.root {
-            log::info!(
-                "[file_explorer] preview_request_skip reason=root_mismatch requested_root={} current_root={} path={} cursor={} elapsed_us={}",
-                display_path(&requested_root),
-                display_path(&self.root),
-                display_path(&requested_path),
-                cursor,
-                start.elapsed().as_micros(),
-            );
-            return;
-        }
-        if self.selection != cursor || selected_path.as_deref() != Some(requested_path.as_path()) {
-            log::info!(
-                "[file_explorer] preview_request_skip reason=stale requested_path={} current_selected={} requested_cursor={} current_cursor={} elapsed_us={}",
-                display_path(&requested_path),
-                selected_path
-                    .as_deref()
-                    .map(display_path)
-                    .unwrap_or_else(|| String::from("<none>")),
-                cursor,
-                self.selection,
-                start.elapsed().as_micros(),
-            );
-            return;
+    fn preview_request_matches_selection(&self, request: &FileExplorerPreviewRequest) -> bool {
+        self.preview_request.as_ref() == Some(request)
+            && request.generation == self.preview_generation
+            && request.root == self.root
+            && usize::try_from(request.cursor).ok() == Some(self.selection)
+            && self
+                .selected()
+                .is_some_and(|row| !row.is_dir && row.path == request.path)
+    }
+
+    fn preview_promotion_action(&self, request: &FileExplorerPreviewRequest) -> Option<Action> {
+        self.preview_promotion
+            .as_ref()
+            .filter(|promotion| promotion.request == *request)
+            .map(|promotion| promotion.action)
+    }
+
+    fn preview_result_is_focused(
+        &self,
+        editor: &Editor,
+        request: &FileExplorerPreviewRequest,
+    ) -> bool {
+        if self.preview_promotion_action(request).is_some() {
+            return true;
         }
         let panel_focused = self.model_panel_id.map_or(self.focused, |panel_id| {
             editor.model.focus == FocusTarget::Panel(panel_id)
         });
-        if !self.focused || !panel_focused {
+        self.focused && panel_focused
+    }
+
+    pub(crate) fn apply_preview_request(
+        &mut self,
+        editor: &mut Editor,
+        ingress: crate::runtime::RuntimeIngress,
+        request: FileExplorerPreviewRequest,
+    ) {
+        let start = Instant::now();
+        if !self.preview_request_matches_selection(&request) {
             log::info!(
-                "[file_explorer] preview_request_skip reason=not_focused path={} cursor={} panel_id={:?} focus={:?} elapsed_us={}",
-                display_path(&requested_path),
-                cursor,
+                "[file_explorer] preview_request_skip reason=stale requested_root={} current_root={} requested_path={} current_selected={} requested_cursor={} current_cursor={} requested_generation={} current_generation={} elapsed_us={}",
+                display_path(&request.root),
+                display_path(&self.root),
+                display_path(&request.path),
+                selected_path_for_log(&self.rows, self.selection),
+                request.cursor,
+                self.selection,
+                request.generation,
+                self.preview_generation,
+                start.elapsed().as_micros(),
+            );
+            return;
+        }
+        if !self.preview_result_is_focused(editor, &request) {
+            log::info!(
+                "[file_explorer] preview_request_skip reason=not_focused path={} generation={} panel_id={:?} focus={:?} elapsed_us={}",
+                display_path(&request.path),
+                request.generation,
                 self.model_panel_id,
                 editor.model.focus,
                 start.elapsed().as_micros(),
             );
             return;
         }
+
+        if let Some(action) = self.preview_promotion_action(&request) {
+            if let Some(doc_id) = self.promote_available_preview(editor, &request.path, action) {
+                self.finish_opened_file(editor, ingress.clone(), &request.path, doc_id, start);
+                self.cancel_preview_request(&ingress);
+                return;
+            }
+        } else if self
+            .show_existing_or_cached_preview(editor, &request.path)
+            .is_some()
+        {
+            return;
+        }
+
         log::info!(
-            "[file_explorer] preview_request_apply path={} cursor={} elapsed_us={}",
-            display_path(&requested_path),
-            cursor,
+            "[file_explorer] preview_request_start path={} cursor={} generation={} elapsed_us={}",
+            display_path(&request.path),
+            request.cursor,
+            request.generation,
             start.elapsed().as_micros(),
         );
-        self.preview_selected_file(editor);
-        if let ExplorerPreview::Owned(doc_id) = self.preview {
-            self.queue_preview_syntax_refresh(editor, ingress, doc_id, requested_path);
+        crate::runtime::ui::file_explorer::queue_file_explorer_preview(editor, ingress, request);
+    }
+
+    pub(crate) fn apply_prepared_preview(
+        &mut self,
+        editor: &mut Editor,
+        ingress: crate::runtime::RuntimeIngress,
+        request: FileExplorerPreviewRequest,
+    ) {
+        let start = Instant::now();
+        if !self.preview_request_matches_selection(&request)
+            || !self.preview_result_is_focused(editor, &request)
+        {
+            log::info!(
+                "[file_explorer] preview_result_skip path={} requested_generation={} current_generation={} selected={} elapsed_us={}",
+                display_path(&request.path),
+                request.generation,
+                self.preview_generation,
+                selected_path_for_log(&self.rows, self.selection),
+                start.elapsed().as_micros(),
+            );
+            return;
         }
+        let Some(prepared) = ingress.take_file_explorer_preview(&request) else {
+            log::info!(
+                "[file_explorer] preview_result_skip path={} generation={} reason=not_available elapsed_us={}",
+                display_path(&request.path),
+                request.generation,
+                start.elapsed().as_micros(),
+            );
+            return;
+        };
+        debug_assert_eq!(prepared.request, request);
+
+        match prepared.result {
+            Ok(document) => {
+                if let Some(action) = self.preview_promotion_action(&request) {
+                    let doc_id =
+                        self.promote_prepared_preview(editor, &request.path, action, document);
+                    self.finish_opened_file(editor, ingress.clone(), &request.path, doc_id, start);
+                    self.cancel_preview_request(&ingress);
+                } else {
+                    let doc_id = self.install_prepared_preview(editor, &request.path, document);
+                    log::info!(
+                        "[file_explorer] preview_result_apply path={} generation={} doc={:?} elapsed_us={}",
+                        display_path(&request.path),
+                        request.generation,
+                        doc_id,
+                        start.elapsed().as_micros(),
+                    );
+                }
+            }
+            Err(error) => {
+                editor.set_error(error.clone());
+                log::info!(
+                    "[file_explorer] preview_result_error path={} generation={} error={} elapsed_us={}",
+                    display_path(&request.path),
+                    request.generation,
+                    error,
+                    start.elapsed().as_micros(),
+                );
+                self.cancel_preview_request(&ingress);
+            }
+        }
+    }
+
+    fn show_existing_or_cached_preview(
+        &mut self,
+        editor: &mut Editor,
+        path: &Path,
+    ) -> Option<DocumentId> {
+        let focus = editor.model.focus;
+        let (doc_id, owned) = if let Some(doc_id) = editor.document_id_by_path(path) {
+            if editor.focused_document_id() != doc_id {
+                editor.switch(doc_id, Action::Replace);
+            }
+            (
+                doc_id,
+                matches!(self.preview, ExplorerPreview::Owned(owned) if owned == doc_id),
+            )
+        } else {
+            let cached = self.preview_cache.take(path)?;
+            (
+                editor.restore_preview_document(cached, Action::Replace),
+                true,
+            )
+        };
+        self.replace_preview_document(editor, doc_id, owned);
+        editor.model.focus = focus;
+        self.focused = true;
+        Some(doc_id)
+    }
+
+    fn install_prepared_preview(
+        &mut self,
+        editor: &mut Editor,
+        path: &Path,
+        prepared: helix_view::editor::PreparedDocumentOpen,
+    ) -> DocumentId {
+        if let Some(doc_id) = self.show_existing_or_cached_preview(editor, path) {
+            return doc_id;
+        }
+        let focus = editor.model.focus;
+        let doc_id = editor.apply_prepared_document_open(prepared, Action::Replace);
+        self.replace_preview_document(editor, doc_id, true);
+        editor.model.focus = focus;
+        self.focused = true;
+        doc_id
     }
 
     fn execute_action(&mut self, action: ExplorerAction, cx: &mut Context) -> EventResult {
@@ -1385,6 +2176,10 @@ impl FileExplorerPanel {
         let selected_before = selected_path_for_log(&self.rows, self.selection);
         let cache_before = self.children_cache.len();
         let expanded_before = self.expanded_dirs.len();
+        let query_before = self.search_query.clone();
+        let pending_before = self.search_pending;
+        let generation_before = self.search_generation;
+        let mut retain_preview_request = false;
 
         match action {
             ExplorerAction::Close => return self.close(cx),
@@ -1392,16 +2187,34 @@ impl FileExplorerPanel {
             ExplorerAction::Page(delta) => self.page_by(delta),
             ExplorerAction::SelectFirst => self.select_first(),
             ExplorerAction::SelectLast => self.select_last(),
-            ExplorerAction::Open(action) => self.open_selected(cx, action),
-            ExplorerAction::ToggleDirectory => self.toggle_selected_dir(cx.editor),
-            ExplorerAction::CollapseOrSelectParent => self.collapse_or_select_parent(cx.editor),
-            ExplorerAction::RootParent => self.root_parent(cx.editor),
-            ExplorerAction::GoWorkspaceRoot => self.go_workspace_root(cx.editor),
+            ExplorerAction::Open(action) => retain_preview_request = self.open_selected(cx, action),
+            ExplorerAction::ToggleDirectory => self.queue_toggle_selected_dir(cx),
+            ExplorerAction::CollapseAll => self.queue_collapse_all_dirs(cx),
+            ExplorerAction::ExpandAll => self.queue_expand_loaded_dirs(cx),
+            ExplorerAction::CollapseOrSelectParent => self.queue_collapse_or_select_parent(cx),
+            ExplorerAction::RootParent => self.queue_root_parent(cx),
+            ExplorerAction::GoWorkspaceRoot => self.queue_go_workspace_root(cx),
             ExplorerAction::UndoFileOperation => self.undo_file_operation(cx),
             ExplorerAction::RedoFileOperation => self.redo_file_operation(cx),
             ExplorerAction::Refresh => {
-                self.refresh_current(cx.editor);
+                self.queue_refresh_current(cx);
                 self.queue_vcs_refresh(cx);
+            }
+            ExplorerAction::ShowOptions => {
+                let items = crate::ui::file_options::FileSourceOption::explorer_items(&self.config);
+                let ingress = cx.ingress.clone();
+                let popup = crate::ui::file_options::popup(
+                    "file-explorer-source-options",
+                    items,
+                    move |editor, option| {
+                        if let Err(error) = ingress.ui(UiCommand::FileExplorer(
+                            FileExplorerCommand::ToggleSourceOption { option },
+                        )) {
+                            editor.set_error(error.to_string());
+                        }
+                    },
+                );
+                return EventResult::Consumed(Some(PostAction::PushLayer(Box::new(popup))));
             }
             ExplorerAction::ShowHelp => {
                 cx.editor.autoinfo = self.input.root_infobox();
@@ -1455,13 +2268,15 @@ impl FileExplorerPanel {
         }
 
         if matches!(action, ExplorerAction::Open(_)) {
-            self.cancel_preview_request();
+            if !retain_preview_request {
+                self.cancel_preview_request(&cx.ingress);
+            }
         } else {
             self.queue_selected_preview(cx.editor, cx.ingress.clone());
         }
 
         log::info!(
-            "[file_explorer] action action={:?} elapsed_us={} rows_before={} rows_after={} selection_before={} selection_after={} selected_before={} selected_after={} cache_before={} cache_after={} expanded_before={} expanded_after={}",
+            "[file_explorer] action action={:?} elapsed_us={} rows_before={} rows_after={} selection_before={} selection_after={} selected_before={} selected_after={} query_before={query_before:?} query_after={:?} pending_before={} pending_after={} generation_before={} generation_after={} cache_before={} cache_after={} expanded_before={} expanded_after={}",
             action,
             start.elapsed().as_micros(),
             rows_before,
@@ -1470,6 +2285,11 @@ impl FileExplorerPanel {
             self.selection,
             selected_before,
             selected_path_for_log(&self.rows, self.selection),
+            self.search_query,
+            pending_before,
+            self.search_pending,
+            generation_before,
+            self.search_generation,
             cache_before,
             self.children_cache.len(),
             expanded_before,
@@ -1630,8 +2450,7 @@ impl FileExplorerPanel {
 
     fn search_cursor_area(&self, area: Rect) -> Option<Rect> {
         let mut input = Self::search_input_area(area)?;
-        if !self.search_query.is_empty() {
-            let count = format!("{} / {}", self.rows.len(), self.all_rows.len());
+        if let Some(count) = self.search_count_text() {
             let width = text_width(&count);
             if input.width > width.saturating_add(1) {
                 input = input.clip_right(width.saturating_add(2));
@@ -1641,7 +2460,10 @@ impl FileExplorerPanel {
     }
 
     fn row_index_at_mouse(&self, event: &MouseEvent) -> Option<usize> {
-        let list = Self::list_area(self.area)?;
+        let mut list = Self::list_area(self.area)?;
+        if self.rows.len() > list.height as usize {
+            list = list.clip_right(1);
+        }
         if !list.contains(event.column, event.row) {
             return None;
         }
@@ -1671,13 +2493,12 @@ impl FileExplorerPanel {
         ) && self.area.contains(event.column, event.row)
         {
             let lines = cx.editor.config().scroll_lines.unsigned_abs().max(1);
-            let delta = match event.kind {
-                MouseEventKind::ScrollUp => -(lines as isize),
-                MouseEventKind::ScrollDown => lines as isize,
+            let (target, delta) = match event.kind {
+                MouseEventKind::ScrollUp => (self.scroll.saturating_sub(lines), -(lines as isize)),
+                MouseEventKind::ScrollDown => (self.scroll.saturating_add(lines), lines as isize),
                 _ => unreachable!(),
             };
-            self.move_selection_by(delta);
-            self.queue_selected_preview(cx.editor, cx.ingress.clone());
+            self.scroll_to(target);
             log::info!(
                 "[file_explorer] mouse_scroll delta={} scroll={} selection={} selected={} elapsed_us={}",
                 delta,
@@ -1705,7 +2526,7 @@ impl FileExplorerPanel {
 
             if double_click {
                 self.last_click = None;
-                self.cancel_preview_request();
+                self.cancel_preview_request(&cx.ingress);
                 self.open_selected(cx, Action::Replace);
             } else {
                 self.last_click = Some(ExplorerClick { path, at: now });
@@ -1783,7 +2604,7 @@ impl FileExplorerPanel {
         crate::widgets::tree_list_label_offset(row.ancestor_last.len(), row.depth, icon_width)
     }
 
-    fn cursor_position(&self, area: Rect, editor: &Editor) -> Option<Position> {
+    fn cursor_position(&self, area: Rect, _editor: &Editor) -> Option<Position> {
         if !self.focused {
             return None;
         }
@@ -1808,7 +2629,10 @@ impl FileExplorerPanel {
             return None;
         }
 
-        let list = Self::list_area(area)?;
+        let mut list = Self::list_area(area)?;
+        if self.rows.len() > list.height as usize {
+            list = list.clip_right(1);
+        }
         if self.selection < self.scroll {
             return None;
         }
@@ -1821,7 +2645,7 @@ impl FileExplorerPanel {
         let row = self.rows.get(self.selection)?;
         let status_width = row_status_width(row);
         let content_width = list.width.saturating_sub(status_width);
-        let label_offset = self.row_label_offset(row, editor.config().file_explorer.icons);
+        let label_offset = self.row_label_offset(row, self.config.icons);
         if label_offset >= content_width {
             return None;
         }
@@ -1876,6 +2700,7 @@ impl Scrollable for FileExplorerPanel {
         self.nav.set_item_count(self.rows.len());
         self.nav.set_viewport_height(self.visible_height());
         self.nav.set_scroll(offset);
+        self.selection = self.nav.selection();
         self.scroll = self.nav.scroll();
     }
 
@@ -1885,30 +2710,54 @@ impl Scrollable for FileExplorerPanel {
 }
 
 impl Component for FileExplorerPanel {
-    fn sync(&mut self, editor: &mut Editor) {
+    fn sync(&mut self, _viewport: Rect, editor: &mut Editor) {
         let start = Instant::now();
-        self.apply_due_search_filter(editor);
         if self.refresh_diagnostic_snapshot(editor) {
-            let selection = Some(self.selection);
-            if let Err(err) = self.refresh_preserving_tree(editor, None, selection) {
-                log::error!("failed to refresh file explorer diagnostics: {err}");
-            }
+            self.sync_row_diagnostics();
         }
         self.sync_to_model(editor);
-        log::info!(
-            "[file_explorer] sync rows={} selection={} selected={} focused={} preview={:?} focused_view={:?} focused_doc={:?} documents={} component_documents={} diagnostic_entries={} elapsed_us={}",
-            self.rows.len(),
-            self.selection,
-            selected_path_for_log(&self.rows, self.selection),
-            self.focused,
-            self.preview,
-            editor.focused_view_id(),
-            editor.focused_document_id(),
-            editor.document_count(),
-            editor.component_docs.len(),
-            self.diagnostic_snapshot.len(),
-            start.elapsed().as_micros()
-        );
+        let elapsed = start.elapsed();
+        if elapsed >= SYNC_SLOW_LOG_THRESHOLD {
+            log::info!(
+                "[file_explorer] sync_slow rows={} all_rows={} selection={} selected={} focused={} query={:?} search_active={} search_pending={} search_generation={} preview={:?} focused_view={:?} focused_doc={:?} documents={} component_documents={} diagnostic_entries={} elapsed_us={}",
+                self.rows.len(),
+                self.all_rows.len(),
+                self.selection,
+                selected_path_for_log(&self.rows, self.selection),
+                self.focused,
+                self.search_query,
+                self.search_active,
+                self.search_pending,
+                self.search_generation,
+                self.preview,
+                editor.focused_view_id(),
+                editor.focused_document_id(),
+                editor.document_count(),
+                editor.component_docs.len(),
+                self.diagnostic_snapshot.len(),
+                elapsed.as_micros()
+            );
+        } else {
+            log::trace!(
+                "[file_explorer] sync rows={} all_rows={} selection={} selected={} focused={} query={:?} search_active={} search_pending={} search_generation={} preview={:?} focused_view={:?} focused_doc={:?} documents={} component_documents={} diagnostic_entries={} elapsed_us={}",
+                self.rows.len(),
+                self.all_rows.len(),
+                self.selection,
+                selected_path_for_log(&self.rows, self.selection),
+                self.focused,
+                self.search_query,
+                self.search_active,
+                self.search_pending,
+                self.search_generation,
+                self.preview,
+                editor.focused_view_id(),
+                editor.focused_document_id(),
+                editor.document_count(),
+                editor.component_docs.len(),
+                self.diagnostic_snapshot.len(),
+                elapsed.as_micros()
+            );
+        }
     }
 
     fn handle_event(&mut self, event: &Event, cx: &mut Context) -> EventResult {
@@ -1941,7 +2790,7 @@ impl Component for FileExplorerPanel {
             } else {
                 CursorKind::Block
             };
-            log::info!(
+            log::trace!(
                 "[file_explorer] cursor pos={},{} kind={:?} area={}x{}+{},{} selection={} selected={} focused={} preview={:?} label_cursor={} input_mode={:?} editing={} documents={} elapsed_us={}",
                 position.col,
                 position.row,
@@ -1964,7 +2813,7 @@ impl Component for FileExplorerPanel {
         }
 
         if self.focused {
-            log::info!(
+            log::trace!(
                 "[file_explorer] cursor pos={},{} kind={:?} reason=focused_without_visible_label area={}x{}+{},{} selection={} selected={} preview={:?} documents={} elapsed_us={}",
                 area.x,
                 area.y,
@@ -1985,7 +2834,7 @@ impl Component for FileExplorerPanel {
             );
         }
 
-        log::info!(
+        log::trace!(
             "[file_explorer] cursor pos=<none> kind={:?} reason=not_focused area={}x{}+{},{} selection={} selected={} preview={:?} documents={} elapsed_us={}",
             CursorKind::Hidden,
             area.width,
@@ -2001,8 +2850,13 @@ impl Component for FileExplorerPanel {
         (None, CursorKind::Hidden)
     }
 
-    fn render(&mut self, area: Rect, surface: &mut crate::render::CellSurface, cx: &RenderContext) {
-        self.render_surface(area, surface, cx);
+    fn prepare_render(&mut self, area: Rect, cx: &RenderContext) -> crate::render::PreparedRender {
+        let snapshot = self.render_snapshot(area, cx);
+        crate::render::PreparedRender::deferred(move |cancellation| {
+            let mut output = crate::render::RenderOutput::sparse(area);
+            snapshot.render_surface(area, output.surface_mut(), cancellation);
+            output
+        })
     }
 
     fn id(&self) -> Option<&str> {
@@ -2022,7 +2876,9 @@ impl Component for FileExplorerPanel {
 
 #[cfg(test)]
 mod tests {
-    use super::path_ops::{display_name, relative_display, sibling_path_with_label};
+    use super::path_ops::{
+        display_name, parse_entry_path, relative_display, sibling_path_with_label, EntryPathError,
+    };
     use super::*;
     use crate::test_support::fs::TempFs;
     use crate::{alt, ctrl, key};
@@ -2045,19 +2901,6 @@ mod tests {
     use std::{fs, sync::Arc};
     use tui::ratatui::{buffer::Buffer, layout::Rect as RatatuiRect};
 
-    fn set_test_file_explorer_search_paths(paths: Vec<PathBuf>) {
-        TEST_FILE_EXPLORER_SEARCH_PATHS.with(|slot| *slot.borrow_mut() = Some(paths));
-        TEST_FILE_EXPLORER_SEARCH_CALLS.with(|calls| calls.set(0));
-    }
-
-    fn clear_test_file_explorer_search_paths() {
-        TEST_FILE_EXPLORER_SEARCH_PATHS.with(|slot| *slot.borrow_mut() = None);
-    }
-
-    fn test_file_explorer_search_call_count() -> usize {
-        TEST_FILE_EXPLORER_SEARCH_CALLS.with(std::cell::Cell::get)
-    }
-
     fn test_editor(width: u16, height: u16, runtime: helix_runtime::Runtime) -> Editor {
         test_editor_with_engine(width, height, runtime, EditingEngineConfig::Helix)
     }
@@ -2068,7 +2911,7 @@ mod tests {
         runtime: helix_runtime::Runtime,
         editing_engine: EditingEngineConfig,
     ) -> Editor {
-        let theme_loader = helix_view::theme::Loader::new(helix_loader::runtime_dirs());
+        let theme_loader = helix_view::theme::Loader::new(&[]);
         let syn_loader = helix_core::config::default_lang_loader();
         let config = helix_view::editor::Config {
             editing_engine,
@@ -2104,7 +2947,15 @@ mod tests {
         f: impl FnOnce(&mut Context<'_>) -> R,
     ) -> R {
         let (ingress, _ingress_rx) =
-            crate::runtime::RuntimeIngress::channel(runtime.runtime().work().clone());
+            crate::runtime::RuntimeIngress::channel(runtime.runtime().clone());
+        with_context_and_ingress(editor, ingress, f)
+    }
+
+    fn with_context_and_ingress<R>(
+        editor: &mut Editor,
+        ingress: crate::runtime::RuntimeIngress,
+        f: impl FnOnce(&mut Context<'_>) -> R,
+    ) -> R {
         let (plugin_events, _plugin_events_rx) = helix_runtime::channel(16);
         let idle_reset = crate::runtime::IdleResetGate::new().handle();
         let mut exit_tasks = crate::runtime::ExitTaskSet::default();
@@ -2112,7 +2963,7 @@ mod tests {
         let redraw = editor.redraw_handle();
         let notifier = crate::handlers::local::Notifier {
             redraw: redraw.clone(),
-            plugin_events,
+            plugin_events: plugin_events.into(),
         };
         let mut cx = Context::new(
             editor,
@@ -2121,9 +2972,47 @@ mod tests {
             notifier,
             ingress,
             idle_reset,
-            None,
+            crate::plugin_registry::PluginRuntime::default(),
         );
         f(&mut cx)
+    }
+
+    async fn apply_next_tree_refresh(
+        panel: &mut FileExplorerPanel,
+        editor: &Editor,
+        ingress: &crate::runtime::RuntimeIngress,
+        receiver: &mut crate::runtime::RuntimeIngressReceiver,
+    ) {
+        let (root, generation) = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match receiver.recv().await {
+                    Some(crate::runtime::ingress::RuntimeDelivery::Ui(
+                        UiCommand::FileExplorer(FileExplorerCommand::ApplyTree {
+                            root,
+                            generation,
+                        }),
+                    )) => break (root, generation),
+                    Some(_) => {}
+                    None => panic!("runtime ingress closed before tree refresh completed"),
+                }
+            }
+        })
+        .await
+        .expect("tree refresh completion");
+        let prepared = ingress
+            .take_file_explorer_tree(&root, generation)
+            .expect("prepared tree refresh");
+        assert!(panel.apply_prepared_tree(editor, prepared));
+    }
+
+    fn prepared_preview_document(
+        editor: &Editor,
+        path: &Path,
+    ) -> helix_view::editor::PreparedDocumentOpen {
+        editor
+            .prepare_document_open(path, helix_view::editor::DocumentOpenRole::Preview)
+            .execute()
+            .expect("prepare preview document")
     }
 
     fn row_index_by_name(panel: &FileExplorerPanel, name: &str) -> usize {
@@ -2143,6 +3032,15 @@ mod tests {
         }
     }
 
+    fn mouse_scroll_down(column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column,
+            row,
+            modifiers: helix_view::input::KeyModifiers::NONE,
+        }
+    }
+
     fn press_key(
         panel: &mut FileExplorerPanel,
         editor: &mut Editor,
@@ -2155,13 +3053,6 @@ mod tests {
                 EventResult::Consumed(_)
             ));
         });
-    }
-
-    fn redo_key(editing_engine: EditingEngineConfig) -> KeyEvent {
-        match editing_engine {
-            EditingEngineConfig::Helix => key!('U'),
-            EditingEngineConfig::Vim => ctrl!('r'),
-        }
     }
 
     fn lsp_diagnostic(severity: LspDiagnosticSeverity) -> lsp::Diagnostic {
@@ -2187,11 +3078,15 @@ mod tests {
 
     fn add_diagnostic(editor: &mut Editor, path: &Path, severity: LspDiagnosticSeverity) {
         let path = helix_stdx::path::normalize(path);
-        editor
-            .diagnostics
-            .entry(Uri::from(path))
-            .or_default()
-            .push((lsp_diagnostic(severity), diagnostic_provider()));
+        let uri = Uri::from(path);
+        let mut diagnostics = editor
+            .document_diagnostics(&uri)
+            .into_iter()
+            .map(|(diagnostic, _)| diagnostic)
+            .collect::<Vec<_>>();
+        diagnostics.push(lsp_diagnostic(severity));
+        let provider = diagnostic_provider();
+        editor.handle_lsp_diagnostics(&provider, uri, None, diagnostics);
     }
 
     fn row_tree_item_styles(
@@ -2244,6 +3139,59 @@ mod tests {
             text.push_str(surface[(x, 0)].symbol());
         }
         (surface, text)
+    }
+
+    #[test]
+    fn deferred_tree_refresh_applies_worker_result() {
+        let fs = TempFs::new();
+        fs.dir("src").file("src/main.rs", "fn main() {}");
+        let runtime = helix_runtime::test::RuntimeTest::default();
+        runtime.block_on(async {
+            let editor = test_editor(100, 30, runtime.runtime());
+            let mut panel = FileExplorerPanel::new_deferred(fs.root().to_path_buf(), &editor);
+
+            assert!(panel.rows.is_empty());
+            assert!(!panel.tree_pending);
+
+            let prepared = panel
+                .prepare_tree_refresh(&editor, None, None, None, false, false)
+                .execute()
+                .unwrap();
+
+            assert!(panel.tree_pending);
+            assert!(panel.apply_prepared_tree(&editor, prepared));
+            assert!(!panel.tree_pending);
+            assert!(panel
+                .rows
+                .iter()
+                .any(|row| row.path == fs.root().join("src")));
+        });
+    }
+
+    #[test]
+    fn stale_tree_refresh_cannot_replace_newer_generation() {
+        let fs = TempFs::new();
+        fs.file("first.rs", "").file("second.rs", "");
+        let runtime = helix_runtime::test::RuntimeTest::default();
+        runtime.block_on(async {
+            let editor = test_editor(100, 30, runtime.runtime());
+            let mut panel = FileExplorerPanel::new_deferred(fs.root().to_path_buf(), &editor);
+
+            let stale = panel
+                .prepare_tree_refresh(&editor, None, None, None, false, false)
+                .execute()
+                .unwrap();
+            let current = panel
+                .prepare_tree_refresh(&editor, None, Some(1), None, false, false)
+                .execute()
+                .unwrap();
+
+            assert!(!panel.apply_prepared_tree(&editor, stale));
+            assert!(panel.tree_pending);
+            assert!(panel.apply_prepared_tree(&editor, current));
+            assert_eq!(panel.selection, 1);
+            assert!(!panel.tree_pending);
+        });
     }
 
     #[test]
@@ -2322,6 +3270,44 @@ mod tests {
             input.translate(key!(Tab)),
             ExplorerInput::Execute(ExplorerAction::ToggleDirectory)
         );
+    }
+
+    #[test]
+    fn explorer_local_keymap_exposes_source_options() {
+        let mut input = ExplorerInputEngine::default();
+        input.prepare_test_keymaps(EditingEngineConfig::Helix);
+
+        assert_eq!(
+            input.translate(alt!('o')),
+            ExplorerInput::Execute(ExplorerAction::ShowOptions)
+        );
+    }
+
+    #[test]
+    fn explorer_local_keymap_has_expand_collapse_all_aliases() {
+        let mut input = ExplorerInputEngine::default();
+        input.prepare_test_keymaps(EditingEngineConfig::Helix);
+
+        assert!(matches!(
+            input.translate(key!('z')),
+            ExplorerInput::Pending(Some(_))
+        ));
+        assert_eq!(
+            input.translate(key!('M')),
+            ExplorerInput::Execute(ExplorerAction::CollapseAll)
+        );
+        assert!(matches!(
+            input.translate(key!('z')),
+            ExplorerInput::Pending(Some(_))
+        ));
+        assert_eq!(
+            input.translate(key!('R')),
+            ExplorerInput::Execute(ExplorerAction::ExpandAll)
+        );
+
+        let info = input.root_infobox().expect("explorer keymap has help");
+        assert!(info.text.contains("Collapse all directories"));
+        assert!(info.text.contains("Expand loaded directories"));
     }
 
     #[test]
@@ -2852,12 +3838,15 @@ mod tests {
             );
 
             panel.selection = row_index_by_name(&panel, "docs");
-            press_key(&mut panel, &mut editor, &rt, key!('p'));
-            fs.assert_exists("docs/alpha-beta.rs");
 
-            editor
-                .create_path_with_history(&fs.path("created.rs"), false)
-                .unwrap();
+            run_file_operation(
+                &mut editor,
+                helix_view::editor::FileOperationRequest::create(
+                    helix_view::editor::FileOperationOrigin::Command,
+                    fs.path("created.rs"),
+                    false,
+                ),
+            );
             panel.refresh_current(&editor);
             fs.assert_exists("created.rs");
             assert!(panel
@@ -2865,9 +3854,15 @@ mod tests {
                 .iter()
                 .any(|row| display_name(&row.path) == "created.rs"));
 
-            editor
-                .move_path_with_history(&fs.path("created.rs"), &fs.path("docs/moved.rs"))
-                .unwrap();
+            run_file_operation(
+                &mut editor,
+                helix_view::editor::FileOperationRequest::move_path(
+                    helix_view::editor::FileOperationOrigin::Command,
+                    fs.path("created.rs"),
+                    fs.path("docs/moved.rs"),
+                    true,
+                ),
+            );
             panel.refresh_current(&editor);
             fs.assert_missing("created.rs");
             fs.assert_exists("docs/moved.rs");
@@ -2878,9 +3873,14 @@ mod tests {
                 .iter()
                 .any(|row| display_name(&row.path) == "moved.rs"));
 
-            editor
-                .copy_path_with_history(&fs.path("docs/moved.rs"), &fs.path("docs/copy.rs"))
-                .unwrap();
+            run_file_operation(
+                &mut editor,
+                helix_view::editor::FileOperationRequest::copy_path(
+                    helix_view::editor::FileOperationOrigin::Command,
+                    fs.path("docs/moved.rs"),
+                    helix_view::editor::FileOperationDestination::Exact(fs.path("docs/copy.rs")),
+                ),
+            );
             panel.refresh_current(&editor);
             fs.assert_exists("docs/copy.rs");
             assert!(panel
@@ -2888,14 +3888,26 @@ mod tests {
                 .iter()
                 .any(|row| display_name(&row.path) == "copy.rs"));
 
-            press_key(&mut panel, &mut editor, &rt, key!('u'));
+            run_file_operation(
+                &mut editor,
+                helix_view::editor::FileOperationRequest::undo(
+                    helix_view::editor::FileOperationOrigin::Command,
+                ),
+            );
+            panel.refresh_current(&editor);
             fs.assert_missing("docs/copy.rs");
             assert!(!panel
                 .rows
                 .iter()
                 .any(|row| display_name(&row.path) == "copy.rs"));
 
-            press_key(&mut panel, &mut editor, &rt, redo_key(editing_engine));
+            run_file_operation(
+                &mut editor,
+                helix_view::editor::FileOperationRequest::redo(
+                    helix_view::editor::FileOperationOrigin::Command,
+                ),
+            );
+            panel.refresh_current(&editor);
             fs.assert_exists("docs/copy.rs");
             assert!(panel
                 .rows
@@ -2968,7 +3980,7 @@ mod tests {
     }
 
     #[test]
-    fn file_explorer_search_expands_collapsed_ancestors_and_restores_on_clear() {
+    fn file_explorer_search_uses_fff_result_rows_and_restores_tree_on_clear() {
         let temp = tempfile::tempdir().unwrap();
         fs::create_dir_all(temp.path().join("src").join("nested").join("deep")).unwrap();
         fs::write(temp.path().join("src").join("keep.txt"), "").unwrap();
@@ -2992,30 +4004,23 @@ mod tests {
             assert!(!panel.expanded_dirs.contains(&src));
             assert!(!panel.rows.iter().any(|row| row.path == target));
 
-            set_test_file_explorer_search_paths(vec![target.clone()]);
             panel.search_query = "needle".to_string();
-            panel.apply_search_filter(&editor);
+            panel.apply_search_results(
+                &editor,
+                helix_stdx::path::normalize(temp.path()),
+                "needle".to_string(),
+                panel.search_generation,
+                vec![target.clone()],
+            );
 
-            assert_eq!(test_file_explorer_search_call_count(), 1);
-            assert!(panel.expanded_dirs.contains(&src));
-            assert!(panel.expanded_dirs.contains(&nested));
-            assert!(panel.expanded_dirs.contains(&deep));
+            assert_eq!(panel.rows.len(), 1);
             assert!(panel.rows.iter().any(|row| row.path == target));
-            assert!(panel
-                .rows
-                .iter()
-                .any(|row| row.path == src && row.is_dir && row.expanded));
-            assert!(panel
-                .rows
-                .iter()
-                .any(|row| row.path == nested && row.is_dir && row.expanded));
-            assert!(panel
-                .rows
-                .iter()
-                .any(|row| row.path == deep && row.is_dir && row.expanded));
+            assert_eq!(panel.rows[0].label, "src/nested/deep/needle.rs");
+            assert!(!panel.expanded_dirs.contains(&src));
+            assert!(!panel.expanded_dirs.contains(&nested));
+            assert!(!panel.expanded_dirs.contains(&deep));
 
             panel.clear_search(&editor);
-            clear_test_file_explorer_search_paths();
 
             assert!(!panel.expanded_dirs.contains(&src));
             assert!(!panel.expanded_dirs.contains(&nested));
@@ -3054,8 +4059,15 @@ mod tests {
                 );
             }
             assert_eq!(panel.search_query, "alpha");
-            panel.search_due_at = Some(Instant::now());
-            panel.sync(&mut editor);
+            assert!(panel.search_pending);
+            panel.apply_search_results(
+                &editor,
+                helix_stdx::path::normalize(temp.path()),
+                "alpha".to_string(),
+                panel.search_generation,
+                vec![helix_stdx::path::normalize(temp.path().join("alpha.rs"))],
+            );
+            assert!(!panel.search_pending);
             assert!(panel
                 .rows
                 .iter()
@@ -3072,6 +4084,174 @@ mod tests {
             press_key(&mut panel, &mut editor, &rt, key!(Esc));
             assert!(panel.search_query.is_empty());
             assert_eq!(panel.rows.len(), all_rows);
+        });
+    }
+
+    #[test]
+    fn opening_search_result_restores_tree_to_opened_file() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path().join("src").join("nested")).unwrap();
+        let target = temp.path().join("src").join("nested").join("needle.rs");
+        fs::write(&target, "fn needle() {}\n").unwrap();
+        let rt = helix_runtime::test::RuntimeTest::default();
+        rt.block_on(async {
+            let mut editor = test_editor(100, 30, rt.runtime());
+            let mut panel = FileExplorerPanel::new(temp.path().to_path_buf(), &editor).unwrap();
+            let root = helix_stdx::path::normalize(temp.path());
+            let target = helix_stdx::path::normalize(&target);
+            let src = root.join("src");
+            let nested = src.join("nested");
+
+            panel.search_query = "needle".to_string();
+            assert!(panel.apply_search_results(
+                &editor,
+                root.clone(),
+                "needle".to_string(),
+                panel.search_generation,
+                vec![target.clone()],
+            ));
+            assert_eq!(panel.rows.len(), 1);
+
+            let (ingress, mut receiver) =
+                crate::runtime::RuntimeIngress::channel(rt.runtime().clone());
+            let request = panel
+                .queue_selected_preview_request(&editor, ingress.clone())
+                .expect("search result preview request");
+            ingress.store_file_explorer_preview(
+                crate::runtime::ui::file_explorer::PreparedFileExplorerPreview {
+                    request,
+                    result: Ok(prepared_preview_document(&editor, &target)),
+                },
+            );
+            with_context_and_ingress(&mut editor, ingress.clone(), |cx| {
+                panel.open_selected(cx, Action::Replace);
+            });
+            apply_next_tree_refresh(&mut panel, &editor, &ingress, &mut receiver).await;
+
+            assert!(panel.search_query.is_empty());
+            assert!(!panel.search_pending);
+            assert!(panel.expanded_dirs.contains(&src));
+            assert!(panel.expanded_dirs.contains(&nested));
+            assert_eq!(
+                panel.selected().map(|row| row.path.as_path()),
+                Some(target.as_path())
+            );
+        });
+    }
+
+    #[test]
+    fn opening_search_result_centers_opened_file_in_restored_tree() {
+        let temp = tempfile::tempdir().unwrap();
+        for index in 0..12 {
+            fs::create_dir(temp.path().join(format!("d{index:02}"))).unwrap();
+            fs::create_dir(temp.path().join(format!("z{index:02}"))).unwrap();
+        }
+        fs::create_dir_all(temp.path().join("src").join("nested")).unwrap();
+        let target = temp.path().join("src").join("nested").join("needle.rs");
+        fs::write(&target, "fn needle() {}\n").unwrap();
+        let rt = helix_runtime::test::RuntimeTest::default();
+        rt.block_on(async {
+            let mut editor = test_editor(100, 30, rt.runtime());
+            let mut panel = FileExplorerPanel::new(temp.path().to_path_buf(), &editor).unwrap();
+            panel.area = Rect::new(0, 0, 40, 9);
+            let root = helix_stdx::path::normalize(temp.path());
+            let target = helix_stdx::path::normalize(&target);
+
+            panel.search_query = "needle".to_string();
+            assert!(panel.apply_search_results(
+                &editor,
+                root,
+                "needle".to_string(),
+                panel.search_generation,
+                vec![target.clone()],
+            ));
+
+            let (ingress, mut receiver) =
+                crate::runtime::RuntimeIngress::channel(rt.runtime().clone());
+            let request = panel
+                .queue_selected_preview_request(&editor, ingress.clone())
+                .expect("search result preview request");
+            ingress.store_file_explorer_preview(
+                crate::runtime::ui::file_explorer::PreparedFileExplorerPreview {
+                    request,
+                    result: Ok(prepared_preview_document(&editor, &target)),
+                },
+            );
+            with_context_and_ingress(&mut editor, ingress.clone(), |cx| {
+                panel.open_selected(cx, Action::Replace);
+            });
+            apply_next_tree_refresh(&mut panel, &editor, &ingress, &mut receiver).await;
+
+            assert_eq!(
+                panel.selected().map(|row| row.path.as_path()),
+                Some(target.as_path())
+            );
+            let visible_height = panel.visible_height();
+            assert_eq!(visible_height, 6);
+            assert!(panel.selection >= panel.scroll);
+            assert!(panel.selection < panel.scroll + visible_height);
+            assert_eq!(panel.selection - panel.scroll, visible_height / 2);
+        });
+    }
+
+    #[test]
+    fn file_explorer_search_input_enqueues_async_search_immediately() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("alpha.rs"), "").unwrap();
+        let rt = helix_runtime::test::RuntimeTest::new_paused();
+        rt.block_on(async {
+            let mut editor = test_editor(100, 30, rt.runtime());
+            let mut panel = FileExplorerPanel::new(temp.path().to_path_buf(), &editor).unwrap();
+            let (ingress, mut rx) = crate::runtime::RuntimeIngress::channel(rt.runtime().clone());
+            let (plugin_events, _plugin_events_rx) = helix_runtime::channel(16);
+            let idle_reset = crate::runtime::IdleResetGate::new().handle();
+            let mut exit_tasks = crate::runtime::ExitTaskSet::default();
+            let exit_task_work = editor.work();
+            let redraw = editor.redraw_handle();
+            let notifier = crate::handlers::local::Notifier {
+                redraw: redraw.clone(),
+                plugin_events: plugin_events.into(),
+            };
+
+            {
+                let mut cx = Context::new(
+                    &mut editor,
+                    &mut exit_tasks,
+                    exit_task_work,
+                    notifier,
+                    ingress,
+                    idle_reset,
+                    crate::plugin_registry::PluginRuntime::default(),
+                );
+                assert!(matches!(
+                    panel.handle_event(&Event::Key(key!('/')), &mut cx),
+                    EventResult::Consumed(_)
+                ));
+                assert!(matches!(
+                    panel.handle_event(&Event::Key(key!('a')), &mut cx),
+                    EventResult::Consumed(_)
+                ));
+            }
+
+            assert_eq!(panel.search_query, "a");
+            assert!(panel.search_pending);
+            assert!(panel.rows.is_empty());
+
+            let delivery = rx.try_recv().expect("immediate search command");
+            let crate::runtime::ingress::RuntimeDelivery::Ui(UiCommand::FileExplorer(
+                FileExplorerCommand::StartSearch {
+                    root,
+                    query,
+                    generation,
+                    ..
+                },
+            )) = delivery
+            else {
+                panic!("expected file explorer search command");
+            };
+            assert_eq!(root, helix_stdx::path::normalize(temp.path()));
+            assert_eq!(query, "a");
+            assert_eq!(generation, panel.search_generation);
         });
     }
 
@@ -3194,7 +4374,78 @@ mod tests {
     }
 
     #[test]
-    fn queued_preview_fires_synchronously_for_each_selection() {
+    fn opening_current_preview_promotes_existing_preview_document() {
+        let temp = tempfile::tempdir().unwrap();
+        let main = temp.path().join("main.rs");
+        fs::write(&main, "fn main() {}\n").unwrap();
+        let rt = helix_runtime::test::RuntimeTest::default();
+        rt.block_on(async {
+            let mut editor = test_editor(100, 30, rt.runtime());
+            let mut panel = FileExplorerPanel::new(temp.path().to_path_buf(), &editor).unwrap();
+
+            panel.selection = row_index_by_name(&panel, "main.rs");
+            panel.preview_selected_file(&mut editor);
+            let preview_doc = editor.focused_document_id();
+            assert!(editor
+                .document(preview_doc)
+                .is_some_and(|doc| doc.is_preview()));
+
+            with_context(&mut editor, &rt, |cx| {
+                panel.open_selected(cx, Action::Replace);
+            });
+
+            assert_eq!(editor.focused_document_id(), preview_doc);
+            assert!(editor
+                .document(preview_doc)
+                .is_some_and(|doc| !doc.is_preview()));
+            assert_eq!(panel.preview, ExplorerPreview::None);
+            assert_eq!(editor.document_count(), 1);
+        });
+    }
+
+    #[test]
+    fn opening_cached_preview_restores_and_promotes_cached_document() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("alpha.rs");
+        let second = temp.path().join("beta.rs");
+        fs::write(&first, "fn alpha() {}\n").unwrap();
+        fs::write(&second, "fn beta() {}\n").unwrap();
+        let rt = helix_runtime::test::RuntimeTest::default();
+        rt.block_on(async {
+            let mut editor = test_editor(100, 30, rt.runtime());
+            let mut panel = FileExplorerPanel::new(temp.path().to_path_buf(), &editor).unwrap();
+
+            panel.selection = row_index_by_name(&panel, "alpha.rs");
+            panel.preview_selected_file(&mut editor);
+            let first_doc = editor.focused_document_id();
+
+            panel.selection = row_index_by_name(&panel, "beta.rs");
+            panel.preview_selected_file(&mut editor);
+            let second_doc = editor.focused_document_id();
+            assert_ne!(first_doc, second_doc);
+            assert!(panel.preview_cache.contains_path(&first));
+            assert!(matches!(panel.preview, ExplorerPreview::Owned(id) if id == second_doc));
+
+            panel.selection = row_index_by_name(&panel, "alpha.rs");
+            with_context(&mut editor, &rt, |cx| {
+                panel.open_selected(cx, Action::Replace);
+            });
+
+            assert_eq!(editor.focused_document_id(), first_doc);
+            assert!(editor.contains_document(first_doc));
+            assert!(!editor.contains_document(second_doc));
+            assert!(editor
+                .document(first_doc)
+                .is_some_and(|doc| !doc.is_preview()));
+            assert_eq!(panel.preview, ExplorerPreview::None);
+            assert!(!panel.preview_cache.contains_path(&first));
+            assert!(panel.preview_cache.contains_path(&second));
+            assert_eq!(editor.document_count(), 1);
+        });
+    }
+
+    #[test]
+    fn rapid_selection_churn_dispatches_immediately_and_keeps_latest_generation() {
         let temp = tempfile::tempdir().unwrap();
         let first = temp.path().join("alpha.rs");
         let second = temp.path().join("beta.rs");
@@ -3204,44 +4455,49 @@ mod tests {
         rt.block_on(async {
             let editor = test_editor(100, 30, rt.runtime());
             let mut panel = FileExplorerPanel::new(temp.path().to_path_buf(), &editor).unwrap();
-            let (ingress, mut rx) =
-                crate::runtime::RuntimeIngress::channel(rt.runtime().work().clone());
+            let (ingress, mut rx) = crate::runtime::RuntimeIngress::channel(rt.runtime().clone());
 
-            // Each `queue_selected_preview` now sends immediately — no
-            // debounce/coalesce. Staleness is filtered on the receiving
-            // side (`apply_preview_request`) against the panel's current
-            // selection, so the user-visible behaviour is still "only the
-            // latest preview opens" — but it opens with zero added latency.
             panel.selection = row_index_by_name(&panel, "alpha.rs");
-            panel.queue_selected_preview(&editor, ingress.clone());
+            let first_request = panel
+                .queue_selected_preview_request(&editor, ingress.clone())
+                .expect("first request");
             panel.selection = row_index_by_name(&panel, "beta.rs");
-            panel.queue_selected_preview(&editor, ingress);
-
-            tokio::task::yield_now().await;
+            let second_request = panel
+                .queue_selected_preview_request(&editor, ingress)
+                .expect("second request");
 
             let mut seen = Vec::new();
             while let Ok(delivery) = rx.try_recv() {
                 if let crate::runtime::ingress::RuntimeDelivery::Ui(UiCommand::FileExplorer(
-                    FileExplorerCommand::PreviewSelection { path, cursor, .. },
+                    FileExplorerCommand::PreviewSelection {
+                        path,
+                        cursor,
+                        generation,
+                        ..
+                    },
                 )) = delivery
                 {
-                    seen.push((helix_stdx::path::normalize(path), cursor));
+                    seen.push((path, cursor, generation));
                 }
             }
             assert_eq!(
                 seen,
                 vec![
                     (
-                        helix_stdx::path::normalize(&first),
-                        u32::try_from(row_index_by_name(&panel, "alpha.rs")).unwrap()
+                        helix_stdx::path::canonicalize(&first),
+                        u32::try_from(row_index_by_name(&panel, "alpha.rs")).unwrap(),
+                        first_request.generation,
                     ),
                     (
-                        helix_stdx::path::normalize(&second),
-                        u32::try_from(row_index_by_name(&panel, "beta.rs")).unwrap()
+                        helix_stdx::path::canonicalize(&second),
+                        u32::try_from(row_index_by_name(&panel, "beta.rs")).unwrap(),
+                        second_request.generation,
                     ),
                 ],
-                "both preview requests should fire in order; staleness is filtered on the receiving side"
+                "selection changes should not be delayed"
             );
+            assert!(second_request.generation > first_request.generation);
+            assert_eq!(panel.preview_request.as_ref(), Some(&second_request));
         });
     }
 
@@ -3257,16 +4513,17 @@ mod tests {
             let mut editor = test_editor(100, 30, rt.runtime());
             let mut panel = FileExplorerPanel::new(temp.path().to_path_buf(), &editor).unwrap();
             let (ingress, _ingress_rx) =
-                crate::runtime::RuntimeIngress::channel(rt.runtime().work().clone());
+                crate::runtime::RuntimeIngress::channel(rt.runtime().clone());
             panel.selection = row_index_by_name(&panel, "alpha.rs");
+            let active = panel
+                .queue_selected_preview_request(&editor, ingress.clone())
+                .expect("active preview request");
+            let stale = FileExplorerPreviewRequest {
+                path: helix_stdx::path::canonicalize(&second),
+                ..active
+            };
 
-            panel.apply_preview_request(
-                &mut editor,
-                ingress,
-                temp.path().to_path_buf(),
-                second.clone(),
-                selected_cursor(panel.selection),
-            );
+            panel.apply_preview_request(&mut editor, ingress, stale);
 
             assert_ne!(
                 editor
@@ -3275,6 +4532,153 @@ mod tests {
                     .map(PathBuf::as_path),
                 Some(second.as_path())
             );
+        });
+    }
+
+    #[test]
+    fn stale_prepared_preview_result_is_rejected_without_consuming_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("alpha.rs");
+        let second = temp.path().join("beta.rs");
+        fs::write(&first, "fn alpha() {}\n").unwrap();
+        fs::write(&second, "fn beta() {}\n").unwrap();
+        let rt = helix_runtime::test::RuntimeTest::default();
+        rt.block_on(async {
+            let mut editor = test_editor(100, 30, rt.runtime());
+            let mut panel = FileExplorerPanel::new(temp.path().to_path_buf(), &editor).unwrap();
+            let (ingress, _receiver) =
+                crate::runtime::RuntimeIngress::channel(rt.runtime().clone());
+            panel.selection = row_index_by_name(&panel, "alpha.rs");
+            let request = panel
+                .queue_selected_preview_request(&editor, ingress.clone())
+                .expect("preview request");
+            panel.selection = row_index_by_name(&panel, "beta.rs");
+            let current_request = panel
+                .queue_selected_preview_request(&editor, ingress.clone())
+                .expect("newer preview request");
+            ingress.store_file_explorer_preview(
+                crate::runtime::ui::file_explorer::PreparedFileExplorerPreview {
+                    request: request.clone(),
+                    result: Ok(prepared_preview_document(&editor, &first)),
+                },
+            );
+
+            panel.apply_prepared_preview(&mut editor, ingress.clone(), request.clone());
+
+            assert_ne!(
+                editor
+                    .focused_document()
+                    .and_then(|document| document.path())
+                    .map(PathBuf::as_path),
+                Some(first.as_path())
+            );
+            assert_eq!(panel.preview_request.as_ref(), Some(&current_request));
+            assert!(ingress.take_file_explorer_preview(&request).is_some());
+        });
+    }
+
+    #[test]
+    fn cancel_preview_request_clears_matching_prepared_result() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("main.rs");
+        fs::write(&path, "fn main() {}\n").unwrap();
+        let rt = helix_runtime::test::RuntimeTest::default();
+        rt.block_on(async {
+            let editor = test_editor(100, 30, rt.runtime());
+            let mut panel = FileExplorerPanel::new(temp.path().to_path_buf(), &editor).unwrap();
+            let (ingress, _receiver) =
+                crate::runtime::RuntimeIngress::channel(rt.runtime().clone());
+            panel.seek_to(row_index_by_name(&panel, "main.rs"));
+            let request = panel
+                .queue_selected_preview_request(&editor, ingress.clone())
+                .expect("preview request");
+            ingress.store_file_explorer_preview(
+                crate::runtime::ui::file_explorer::PreparedFileExplorerPreview {
+                    request: request.clone(),
+                    result: Ok(prepared_preview_document(&editor, &path)),
+                },
+            );
+
+            panel.cancel_preview_request(&ingress);
+
+            assert!(panel.preview_request.is_none());
+            assert!(panel.preview_generation > request.generation);
+            assert!(ingress.take_file_explorer_preview(&request).is_none());
+        });
+    }
+
+    #[test]
+    fn first_search_result_queues_preview_immediately() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("alpha.rs");
+        fs::write(&first, "fn alpha() {}\n").unwrap();
+        let rt = helix_runtime::test::RuntimeTest::new_paused();
+        rt.block_on(async {
+            let editor = test_editor(100, 30, rt.runtime());
+            let mut panel = FileExplorerPanel::new(temp.path().to_path_buf(), &editor).unwrap();
+            let (ingress, mut receiver) =
+                crate::runtime::RuntimeIngress::channel(rt.runtime().clone());
+            panel.search_query = String::from("alpha");
+            let generation = panel.search_generation;
+            assert!(panel.apply_search_results(
+                &editor,
+                helix_stdx::path::normalize(temp.path()),
+                String::from("alpha"),
+                generation,
+                vec![first.clone()],
+            ));
+
+            panel.queue_selected_preview(&editor, ingress);
+
+            let crate::runtime::ingress::RuntimeDelivery::Ui(UiCommand::FileExplorer(
+                FileExplorerCommand::PreviewSelection { path, .. },
+            )) = receiver
+                .try_recv()
+                .expect("preview command without timer advance")
+            else {
+                panic!("expected immediate first-result preview");
+            };
+            assert_eq!(path, helix_stdx::path::canonicalize(first));
+        });
+    }
+
+    #[test]
+    fn enter_promotes_matching_prepared_preview_without_reopening_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("main.rs");
+        fs::write(&path, "prepared\n").unwrap();
+        let rt = helix_runtime::test::RuntimeTest::default();
+        rt.block_on(async {
+            let mut editor = test_editor(100, 30, rt.runtime());
+            let mut panel = FileExplorerPanel::new(temp.path().to_path_buf(), &editor).unwrap();
+            let (ingress, _receiver) =
+                crate::runtime::RuntimeIngress::channel(rt.runtime().clone());
+            panel.seek_to(row_index_by_name(&panel, "main.rs"));
+            let request = panel
+                .queue_selected_preview_request(&editor, ingress.clone())
+                .expect("preview request");
+            let prepared = prepared_preview_document(&editor, &path);
+            assert_eq!(prepared.document().text().to_string(), "prepared\n");
+            ingress.store_file_explorer_preview(
+                crate::runtime::ui::file_explorer::PreparedFileExplorerPreview {
+                    request,
+                    result: Ok(prepared),
+                },
+            );
+            fs::write(&path, "changed after preparation\n").unwrap();
+
+            with_context_and_ingress(&mut editor, ingress, |cx| {
+                assert!(!panel.open_selected(cx, Action::Replace));
+            });
+
+            let promoted_id = editor
+                .document_id_by_path(&path)
+                .expect("promoted document path");
+            assert_eq!(editor.focused_document_id(), promoted_id);
+            let document = editor.document(promoted_id).expect("promoted document");
+            assert_eq!(document.text().to_string(), "prepared\n");
+            assert!(!document.is_preview());
+            assert_eq!(panel.preview, ExplorerPreview::None);
         });
     }
 
@@ -3429,6 +4833,83 @@ mod tests {
     }
 
     #[test]
+    fn collapse_and_expand_all_update_loaded_tree_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let src = temp.path().join("src");
+        let nested = src.join("nested");
+        let deep = nested.join("deep");
+        fs::create_dir_all(&deep).unwrap();
+        fs::write(src.join("lib.rs"), "").unwrap();
+        fs::write(nested.join("side.rs"), "").unwrap();
+        fs::write(deep.join("main.rs"), "").unwrap();
+        fs::write(temp.path().join("README.md"), "").unwrap();
+        let rt = helix_runtime::test::RuntimeTest::default();
+        rt.block_on(async {
+            let editor = test_editor(100, 30, rt.runtime());
+            let mut panel = FileExplorerPanel::new(temp.path().to_path_buf(), &editor).unwrap();
+
+            panel.selection = row_index_by_name(&panel, "src");
+            panel.toggle_selected_dir(&editor);
+            panel.selection = row_index_by_name(&panel, "nested");
+            panel.toggle_selected_dir(&editor);
+
+            let src = helix_stdx::path::normalize(&src);
+            let nested = helix_stdx::path::normalize(&nested);
+            let deep = helix_stdx::path::normalize(&deep);
+            assert!(panel.expanded_dirs.contains(&src));
+            assert!(panel.expanded_dirs.contains(&nested));
+            assert!(panel.rows.iter().any(|row| row.path == deep));
+
+            panel.collapse_all_dirs(&editor);
+            assert!(panel.expanded_dirs.contains(&panel.root));
+            assert!(!panel.expanded_dirs.contains(&src));
+            assert!(!panel.expanded_dirs.contains(&nested));
+            assert!(!panel.rows.iter().any(|row| row.path == deep));
+
+            panel.expand_loaded_dirs(&editor);
+            assert!(panel.expanded_dirs.contains(&src));
+            assert!(panel.expanded_dirs.contains(&nested));
+            assert!(panel.rows.iter().any(|row| row.path == deep));
+        });
+    }
+
+    #[test]
+    fn mouse_wheel_scrolls_viewport_without_moving_selection() {
+        let temp = tempfile::tempdir().unwrap();
+        for index in 0..20 {
+            fs::write(temp.path().join(format!("file-{index:02}.txt")), "").unwrap();
+        }
+        let rt = helix_runtime::test::RuntimeTest::default();
+        rt.block_on(async {
+            let mut editor = test_editor(100, 30, rt.runtime());
+            let mut panel = FileExplorerPanel::new(temp.path().to_path_buf(), &editor).unwrap();
+            panel.area = Rect::new(0, 0, 40, 9);
+            let list = FileExplorerPanel::list_area(panel.area).unwrap();
+            let selection = panel.selection;
+
+            let event = mouse_scroll_down(list.x, list.y);
+            with_context(&mut editor, &rt, |cx| {
+                assert!(matches!(
+                    panel.handle_mouse_at(&event, cx, Instant::now()),
+                    EventResult::Consumed(None)
+                ));
+            });
+
+            assert_eq!(panel.selection, selection);
+            assert!(panel.scroll > 0);
+            let scroll = panel.scroll;
+            panel.clamp_viewport();
+            assert_eq!(
+                panel.scroll, scroll,
+                "render sync must preserve wheel scroll"
+            );
+
+            let gutter = mouse_down(list.right().saturating_sub(1), list.y);
+            assert_eq!(panel.row_index_at_mouse(&gutter), None);
+        });
+    }
+
+    #[test]
     fn double_click_toggles_directory() {
         let temp = tempfile::tempdir().unwrap();
         fs::create_dir(temp.path().join("src")).unwrap();
@@ -3450,8 +4931,8 @@ mod tests {
             let event = mouse_down(list.x, click_row);
             let first_click = Instant::now();
 
-            let (ingress, _ingress_rx) =
-                crate::runtime::RuntimeIngress::channel(rt.runtime().work().clone());
+            let (ingress, mut ingress_rx) =
+                crate::runtime::RuntimeIngress::channel(rt.runtime().clone());
             let (plugin_events, _plugin_events_rx) = helix_runtime::channel(16);
             let idle_reset = crate::runtime::IdleResetGate::new().handle();
             let mut exit_tasks = crate::runtime::ExitTaskSet::default();
@@ -3459,16 +4940,16 @@ mod tests {
             let redraw = editor.redraw_handle();
             let notifier = crate::handlers::local::Notifier {
                 redraw: redraw.clone(),
-                plugin_events,
+                plugin_events: plugin_events.into(),
             };
             let mut cx = Context::new(
                 &mut editor,
                 &mut exit_tasks,
                 exit_task_work,
                 notifier,
-                ingress,
+                ingress.clone(),
                 idle_reset,
-                None,
+                crate::plugin_registry::PluginRuntime::default(),
             );
 
             assert!(matches!(
@@ -3479,6 +4960,8 @@ mod tests {
                 panel.handle_mouse_at(&event, &mut cx, first_click + Duration::from_millis(100)),
                 EventResult::Consumed(None)
             ));
+            drop(cx);
+            apply_next_tree_refresh(&mut panel, &editor, &ingress, &mut ingress_rx).await;
             assert!(panel
                 .rows
                 .iter()
@@ -3539,7 +5022,7 @@ mod tests {
             // the real wiring.
             let cursor_cfg: helix_view::editor::Config =
                 toml::from_str("[cursor-shape]\ninsert = \"bar\"\n").unwrap();
-            let theme_loader = helix_view::theme::Loader::new(helix_loader::runtime_dirs());
+            let theme_loader = helix_view::theme::Loader::new(&[]);
             let syn_loader = helix_core::config::default_lang_loader();
             let config = helix_view::editor::Config {
                 cursor_shape: cursor_cfg.cursor_shape,
@@ -3867,7 +5350,7 @@ mod tests {
                 jump_label_alphabet: vec!['j', 'k', 'l'],
                 ..helix_view::editor::Config::default()
             };
-            let theme_loader = helix_view::theme::Loader::new(helix_loader::runtime_dirs());
+            let theme_loader = helix_view::theme::Loader::new(&[]);
             let syn_loader = helix_core::config::default_lang_loader();
             let arc_cfg = Arc::new(ArcSwap::from_pointee(new_cfg));
             let handlers = helix_view::handlers::Handlers::dummy();
@@ -3990,6 +5473,34 @@ mod tests {
     }
 
     #[test]
+    fn inline_entry_paths_are_relative_and_cannot_traverse() {
+        assert_eq!(
+            parse_entry_path("../outside.rs"),
+            Err(EntryPathError::Traversal)
+        );
+        assert_eq!(
+            parse_entry_path("nested/../outside.rs"),
+            Err(EntryPathError::Traversal)
+        );
+        assert_eq!(
+            parse_entry_path("/absolute.rs"),
+            Err(EntryPathError::Absolute)
+        );
+        assert_eq!(
+            parse_entry_path("C:\\absolute.rs"),
+            Err(EntryPathError::Absolute)
+        );
+
+        let entry = parse_entry_path("nested/source/").unwrap();
+        assert_eq!(entry.relative, PathBuf::from("nested").join("source"));
+        assert!(entry.is_dir);
+        assert_eq!(
+            windows_reserved_path(&PathBuf::from("nested").join("NUL.txt")),
+            Some("NUL")
+        );
+    }
+
+    #[test]
     fn focused_panel_consumes_unmapped_keys() {
         let temp = tempfile::tempdir().unwrap();
         fs::write(temp.path().join("main.rs"), "").unwrap();
@@ -3998,7 +5509,7 @@ mod tests {
             let mut editor = test_editor(100, 30, rt.runtime());
             let mut panel = FileExplorerPanel::new(temp.path().to_path_buf(), &editor).unwrap();
             let (ingress, _ingress_rx) =
-                crate::runtime::RuntimeIngress::channel(rt.runtime().work().clone());
+                crate::runtime::RuntimeIngress::channel(rt.runtime().clone());
             let (plugin_events, _plugin_events_rx) = helix_runtime::channel(16);
             let idle_reset = crate::runtime::IdleResetGate::new().handle();
             let mut exit_tasks = crate::runtime::ExitTaskSet::default();
@@ -4006,7 +5517,7 @@ mod tests {
             let redraw = editor.redraw_handle();
             let notifier = crate::handlers::local::Notifier {
                 redraw: redraw.clone(),
-                plugin_events,
+                plugin_events: plugin_events.into(),
             };
             let mut cx = Context::new(
                 &mut editor,
@@ -4015,7 +5526,7 @@ mod tests {
                 notifier,
                 ingress,
                 idle_reset,
-                None,
+                crate::plugin_registry::PluginRuntime::default(),
             );
 
             assert!(matches!(
@@ -4058,15 +5569,22 @@ mod tests {
         };
         let panel = FileExplorerPanel {
             root: PathBuf::from("workspace"),
-            all_rows: Vec::new(),
-            rows: Vec::new(),
+            config: FileExplorerConfig::default(),
+            all_rows: Arc::from([]),
+            rows: Arc::from([]),
             search_query: String::new(),
             search_active: false,
+            search_pending: false,
+            search_generation: 0,
+            search_results: None,
+            tree_generation: 0,
+            tree_pending: false,
             expanded_dirs: HashSet::new(),
             search_saved_expanded_dirs: None,
             children_cache: HashMap::new(),
             vcs_snapshot: VcsSnapshot::default(),
             diagnostic_snapshot: DiagnosticSnapshot::default(),
+            diagnostic_snapshot_revision: 0,
             input: ExplorerInputEngine::default(),
             file_clipboard: None,
             selection: 0,
@@ -4076,9 +5594,9 @@ mod tests {
             focused: true,
             preview: ExplorerPreview::None,
             preview_cache: PreviewDocumentCache::default(),
-            preview_debouncer: None,
-            search_debouncer: None,
-            search_due_at: None,
+            preview_generation: 0,
+            preview_request: None,
+            preview_promotion: None,
             model_panel_id: None,
             last_click: None,
             label_edit: None,
@@ -4112,15 +5630,22 @@ mod tests {
         };
         let panel = FileExplorerPanel {
             root: PathBuf::from("workspace"),
-            all_rows: Vec::new(),
-            rows: Vec::new(),
+            config: FileExplorerConfig::default(),
+            all_rows: Arc::from([]),
+            rows: Arc::from([]),
             search_query: String::new(),
             search_active: false,
+            search_pending: false,
+            search_generation: 0,
+            search_results: None,
+            tree_generation: 0,
+            tree_pending: false,
             expanded_dirs: HashSet::new(),
             search_saved_expanded_dirs: None,
             children_cache: HashMap::new(),
             vcs_snapshot: VcsSnapshot::default(),
             diagnostic_snapshot: DiagnosticSnapshot::default(),
+            diagnostic_snapshot_revision: 0,
             input: ExplorerInputEngine::default(),
             file_clipboard: None,
             selection: 0,
@@ -4130,9 +5655,9 @@ mod tests {
             focused: true,
             preview: ExplorerPreview::None,
             preview_cache: PreviewDocumentCache::default(),
-            preview_debouncer: None,
-            search_debouncer: None,
-            search_due_at: None,
+            preview_generation: 0,
+            preview_request: None,
+            preview_promotion: None,
             model_panel_id: None,
             last_click: None,
             label_edit: None,
@@ -4176,15 +5701,22 @@ mod tests {
         };
         let panel = FileExplorerPanel {
             root: PathBuf::from("workspace"),
-            all_rows: Vec::new(),
-            rows: Vec::new(),
+            config: FileExplorerConfig::default(),
+            all_rows: Arc::from([]),
+            rows: Arc::from([]),
             search_query: String::new(),
             search_active: false,
+            search_pending: false,
+            search_generation: 0,
+            search_results: None,
+            tree_generation: 0,
+            tree_pending: false,
             expanded_dirs: HashSet::new(),
             search_saved_expanded_dirs: None,
             children_cache: HashMap::new(),
             vcs_snapshot: VcsSnapshot::default(),
             diagnostic_snapshot: DiagnosticSnapshot::default(),
+            diagnostic_snapshot_revision: 0,
             input: ExplorerInputEngine::default(),
             file_clipboard: None,
             selection: 0,
@@ -4194,9 +5726,9 @@ mod tests {
             focused: true,
             preview: ExplorerPreview::None,
             preview_cache: PreviewDocumentCache::default(),
-            preview_debouncer: None,
-            search_debouncer: None,
-            search_due_at: None,
+            preview_generation: 0,
+            preview_request: None,
+            preview_promotion: None,
             model_panel_id: None,
             last_click: None,
             label_edit: None,
@@ -4222,15 +5754,22 @@ mod tests {
     fn tree_item_uses_distinct_folder_icons_for_open_and_closed_dirs() {
         let panel = FileExplorerPanel {
             root: PathBuf::from("workspace"),
-            all_rows: Vec::new(),
-            rows: Vec::new(),
+            config: FileExplorerConfig::default(),
+            all_rows: Arc::from([]),
+            rows: Arc::from([]),
             search_query: String::new(),
             search_active: false,
+            search_pending: false,
+            search_generation: 0,
+            search_results: None,
+            tree_generation: 0,
+            tree_pending: false,
             expanded_dirs: HashSet::new(),
             search_saved_expanded_dirs: None,
             children_cache: HashMap::new(),
             vcs_snapshot: VcsSnapshot::default(),
             diagnostic_snapshot: DiagnosticSnapshot::default(),
+            diagnostic_snapshot_revision: 0,
             input: ExplorerInputEngine::default(),
             file_clipboard: None,
             selection: 0,
@@ -4240,9 +5779,9 @@ mod tests {
             focused: true,
             preview: ExplorerPreview::None,
             preview_cache: PreviewDocumentCache::default(),
-            preview_debouncer: None,
-            search_debouncer: None,
-            search_due_at: None,
+            preview_generation: 0,
+            preview_request: None,
+            preview_promotion: None,
             model_panel_id: None,
             last_click: None,
             label_edit: None,
@@ -4322,7 +5861,7 @@ mod tests {
             let root = helix_stdx::path::normalize(temp.path());
             let src = helix_stdx::path::normalize(src);
             let main = helix_stdx::path::normalize(main);
-            let snapshot = DiagnosticSnapshot::from_editor(&root, &editor);
+            let snapshot = DiagnosticSnapshot::from_editor(&root, &editor, true);
             let expected = Some(DiagnosticStatus {
                 severity: DiagnosticSeverity::Error,
                 count: 2,
@@ -4346,8 +5885,14 @@ mod tests {
             let index = row_index_by_name(&panel, "main.rs");
             assert_eq!(panel.rows[index].diagnostic_status, None);
 
+            let unrelated = temp.path().join("unrelated.rs");
+            fs::write(&unrelated, "").unwrap();
+            panel
+                .children_cache
+                .remove(&helix_stdx::path::normalize(temp.path()));
+
             add_diagnostic(&mut editor, &file, LspDiagnosticSeverity::WARNING);
-            panel.sync(&mut editor);
+            panel.sync(Rect::new(0, 0, 120, 40), &mut editor);
 
             let index = row_index_by_name(&panel, "main.rs");
             assert_eq!(
@@ -4357,6 +5902,36 @@ mod tests {
                     count: 1,
                 })
             );
+            assert!(
+                panel.rows.iter().all(|row| row.path != unrelated),
+                "diagnostic-only sync rebuilt the file tree"
+            );
+        });
+    }
+
+    #[test]
+    fn diagnostic_snapshot_refresh_is_revision_gated() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("main.rs");
+        fs::write(&file, "").unwrap();
+        let rt = helix_runtime::test::RuntimeTest::default();
+        rt.block_on(async {
+            let mut editor = test_editor(100, 30, rt.runtime());
+            let mut panel = FileExplorerPanel::new(temp.path().to_path_buf(), &editor).unwrap();
+
+            assert_eq!(
+                panel.diagnostic_snapshot_revision,
+                editor.diagnostics_revision()
+            );
+            assert!(!panel.refresh_diagnostic_snapshot(&editor));
+
+            add_diagnostic(&mut editor, &file, LspDiagnosticSeverity::WARNING);
+            assert!(panel.refresh_diagnostic_snapshot(&editor));
+            assert_eq!(
+                panel.diagnostic_snapshot_revision,
+                editor.diagnostics_revision()
+            );
+            assert!(!panel.refresh_diagnostic_snapshot(&editor));
         });
     }
 
@@ -4402,7 +5977,7 @@ mod tests {
             let mut editor = test_editor(100, 30, rt.runtime());
             let mut panel = FileExplorerPanel::new(temp.path().to_path_buf(), &editor).unwrap();
 
-            panel.sync(&mut editor);
+            panel.sync(Rect::new(0, 0, 120, 40), &mut editor);
 
             let panel_id = panel.panel_id().expect("panel id");
             let entry = editor.model.panels.get(panel_id).expect("model panel");
@@ -4829,7 +6404,7 @@ mod tests {
     }
 
     #[test]
-    fn enter_commits_inline_rename_synchronously_to_disk() {
+    fn inline_rename_submission_does_not_mutate_disk_on_the_ui_thread() {
         let temp = tempfile::tempdir().unwrap();
         let alpha = temp.path().join("alpha.rs");
         let beta = temp.path().join("beta.rs");
@@ -4854,17 +6429,17 @@ mod tests {
 
             with_context(&mut editor, &rt, |cx| panel.commit_label_edit(cx));
 
-            // The rename runs synchronously inside commit_label_edit —
-            // disk state should reflect the new name immediately.
-            assert!(!alpha.exists(), "old path should be gone");
-            assert!(beta.exists(), "new path should exist");
+            // Committing the edit submits the operation. The terminal FIFO
+            // owns inspection, LSP will*, and mutation after this point.
+            assert!(alpha.exists(), "old path remains until worker completion");
+            assert!(!beta.exists(), "new path is not created on the UI thread");
             assert!(panel.label_edit.is_none());
             assert_eq!(panel.input.mode, Mode::Normal);
         });
     }
 
     #[test]
-    fn inline_rename_with_slash_creates_intermediate_directories() {
+    fn inline_rename_with_slash_defers_parent_creation_to_the_worker() {
         let temp = tempfile::tempdir().unwrap();
         let alpha = temp.path().join("alpha.rs");
         fs::write(&alpha, "fn alpha() {}\n").unwrap();
@@ -4885,16 +6460,15 @@ mod tests {
 
             with_context(&mut editor, &rt, |cx| panel.commit_label_edit(cx));
 
-            // Typing `nested/inner/beta.rs` should create the directory
-            // chain and put the file in its leaf — same intent as typing
-            // a path into a save-as dialog in any modern editor.
+            // Parent inspection and creation are part of the blocking
+            // operation, so this UI-only path must not touch the filesystem.
             let nested = temp.path().join("nested");
             let inner = nested.join("inner");
             let beta = inner.join("beta.rs");
-            assert!(nested.is_dir(), "intermediate dir nested/ created");
-            assert!(inner.is_dir(), "intermediate dir nested/inner/ created");
-            assert!(beta.exists(), "leaf file moved into nested/inner/");
-            assert!(!alpha.exists(), "old path is gone");
+            assert!(!nested.exists(), "intermediate dir nested/ deferred");
+            assert!(!inner.exists(), "intermediate dir nested/inner/ deferred");
+            assert!(!beta.exists(), "leaf file move is deferred");
+            assert!(alpha.exists(), "old path remains until worker completion");
         });
     }
 
@@ -4923,8 +6497,8 @@ mod tests {
 
             assert!(panel.label_edit.is_none());
             assert_eq!(panel.input.mode, Mode::Normal);
-            assert!(!alpha.exists());
-            assert!(xalpha.exists());
+            assert!(alpha.exists());
+            assert!(!xalpha.exists());
         });
     }
 
@@ -5057,6 +6631,35 @@ mod tests {
         assert_eq!(windows_reserved_label("commander.py"), None);
     }
 
+    fn run_file_operation(editor: &mut Editor, request: helix_view::editor::FileOperationRequest) {
+        let id = editor.enqueue_file_operation(request);
+        let helix_view::editor::FileOperationDispatch::Inspect(inspection) = editor
+            .next_file_operation_dispatch()
+            .expect("operation starts")
+        else {
+            panic!("operation should begin with inspection");
+        };
+        assert_eq!(inspection.id(), id);
+        let prepared = inspection.execute().expect("operation inspection succeeds");
+        editor
+            .accept_file_operation_preparation(prepared)
+            .expect("prepared operation accepted");
+        let work = editor
+            .begin_file_operation_mutation(id)
+            .expect("operation mutation starts");
+        let completion = editor
+            .finish_file_operation(work.execute())
+            .expect("operation completion accepted")
+            .into_iter()
+            .next()
+            .expect("operation completion present");
+        assert!(
+            completion.result.is_ok(),
+            "operation failed: {:?}",
+            completion.result
+        );
+    }
+
     #[test]
     fn inline_rename_round_trips_through_file_operation_undo() {
         let temp = tempfile::tempdir().unwrap();
@@ -5066,33 +6669,31 @@ mod tests {
         let rt = helix_runtime::test::RuntimeTest::default();
         rt.block_on(async {
             let mut editor = test_editor(100, 30, rt.runtime());
-            // Drive the rename through the editor's file-operation history
-            // directly — that's exactly the pipeline ApplyMove uses on the
-            // receiving side, so this test verifies undo/redo coverage
-            // without needing the full runtime dispatch.
-            editor
-                .move_path_with_history(&alpha, &beta)
-                .expect("rename succeeds");
+            run_file_operation(
+                &mut editor,
+                helix_view::editor::FileOperationRequest::move_path(
+                    helix_view::editor::FileOperationOrigin::Command,
+                    alpha.clone(),
+                    beta.clone(),
+                    true,
+                ),
+            );
             assert!(beta.exists() && !alpha.exists());
 
-            // `u` (undo_file_operation) reverts the rename. Helix's status
-            // message reads "Undid move <src> -> <dst>".
-            let message = editor
-                .undo_file_operation()
-                .expect("undo succeeds")
-                .expect("returns a status message");
-            let lowered = message.to_lowercase();
-            assert!(
-                lowered.contains("undid") || lowered.contains("undo") || lowered.contains("revert"),
-                "expected undo status, got: {message}"
+            run_file_operation(
+                &mut editor,
+                helix_view::editor::FileOperationRequest::undo(
+                    helix_view::editor::FileOperationOrigin::Command,
+                ),
             );
             assert!(alpha.exists() && !beta.exists());
 
-            // `U` (redo_file_operation) reapplies it.
-            editor
-                .redo_file_operation()
-                .expect("redo succeeds")
-                .expect("returns a status message");
+            run_file_operation(
+                &mut editor,
+                helix_view::editor::FileOperationRequest::redo(
+                    helix_view::editor::FileOperationOrigin::Command,
+                ),
+            );
             assert!(beta.exists() && !alpha.exists());
         });
     }

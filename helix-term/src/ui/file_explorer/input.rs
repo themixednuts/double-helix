@@ -30,13 +30,6 @@ impl ExplorerFileOperation {
             Self::Move => "Cut",
         }
     }
-
-    pub(super) const fn paste_verb(self) -> &'static str {
-        match self {
-            Self::Copy => "Copied",
-            Self::Move => "Moved",
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -177,12 +170,15 @@ pub(super) enum ExplorerAction {
     SelectLast,
     Open(Action),
     ToggleDirectory,
+    CollapseAll,
+    ExpandAll,
     CollapseOrSelectParent,
     RootParent,
     GoWorkspaceRoot,
     UndoFileOperation,
     RedoFileOperation,
     Refresh,
+    ShowOptions,
     ShowHelp,
     SelectFirstDiagnostic,
     SelectLastDiagnostic,
@@ -240,17 +236,20 @@ enum ExplorerCommand {
     SelectLast,
     Open,
     ToggleDirectory,
+    CollapseAll,
+    ExpandAll,
     CollapseOrSelectParent,
     RootParent,
     GoWorkspaceRoot,
     UndoFileOperation,
     RedoFileOperation,
     Refresh,
+    ShowOptions,
     ShowHelp,
 }
 
 impl ExplorerCommand {
-    const ALL: [Self; 16] = [
+    const ALL: [Self; 19] = [
         Self::Close,
         Self::SelectPrevious,
         Self::SelectNext,
@@ -260,12 +259,15 @@ impl ExplorerCommand {
         Self::SelectLast,
         Self::Open,
         Self::ToggleDirectory,
+        Self::CollapseAll,
+        Self::ExpandAll,
         Self::CollapseOrSelectParent,
         Self::RootParent,
         Self::GoWorkspaceRoot,
         Self::UndoFileOperation,
         Self::RedoFileOperation,
         Self::Refresh,
+        Self::ShowOptions,
         Self::ShowHelp,
     ];
 
@@ -280,12 +282,15 @@ impl ExplorerCommand {
             Self::SelectLast => "file_explorer.select_last",
             Self::Open => "file_explorer.open",
             Self::ToggleDirectory => "file_explorer.toggle_directory",
+            Self::CollapseAll => "file_explorer.collapse_all",
+            Self::ExpandAll => "file_explorer.expand_all",
             Self::CollapseOrSelectParent => "file_explorer.collapse_or_select_parent",
             Self::RootParent => "file_explorer.root_parent",
             Self::GoWorkspaceRoot => "file_explorer.go_workspace_root",
             Self::UndoFileOperation => "file_explorer.undo_file_operation",
             Self::RedoFileOperation => "file_explorer.redo_file_operation",
             Self::Refresh => "file_explorer.refresh",
+            Self::ShowOptions => "file_explorer.show_options",
             Self::ShowHelp => "file_explorer.show_help",
         })
     }
@@ -305,12 +310,15 @@ impl ExplorerCommand {
             Self::SelectLast => "Select last item",
             Self::Open => "Open file or toggle directory",
             Self::ToggleDirectory => "Toggle directory",
+            Self::CollapseAll => "Collapse all directories",
+            Self::ExpandAll => "Expand loaded directories",
             Self::CollapseOrSelectParent => "Collapse directory or select parent",
             Self::RootParent => "Open parent directory",
             Self::GoWorkspaceRoot => "Go to workspace root",
             Self::UndoFileOperation => "Undo file operation",
             Self::RedoFileOperation => "Redo file operation",
             Self::Refresh => "Refresh tree",
+            Self::ShowOptions => "Configure file source",
             Self::ShowHelp => "Show explorer key bindings",
         }
     }
@@ -330,12 +338,15 @@ impl ExplorerCommand {
             Self::SelectLast => ExplorerAction::SelectLast,
             Self::Open => ExplorerAction::Open(Action::Replace),
             Self::ToggleDirectory => ExplorerAction::ToggleDirectory,
+            Self::CollapseAll => ExplorerAction::CollapseAll,
+            Self::ExpandAll => ExplorerAction::ExpandAll,
             Self::CollapseOrSelectParent => ExplorerAction::CollapseOrSelectParent,
             Self::RootParent => ExplorerAction::RootParent,
             Self::GoWorkspaceRoot => ExplorerAction::GoWorkspaceRoot,
             Self::UndoFileOperation => ExplorerAction::UndoFileOperation,
             Self::RedoFileOperation => ExplorerAction::RedoFileOperation,
             Self::Refresh => ExplorerAction::Refresh,
+            Self::ShowOptions => ExplorerAction::ShowOptions,
             Self::ShowHelp => ExplorerAction::ShowHelp,
         }
     }
@@ -411,6 +422,7 @@ pub(super) fn explorer_local_keymap(editing_engine: EditingEngineConfig) -> Moda
     root.command(ctrl!('c'), ExplorerCommand::Close);
     root.command(key!('q'), ExplorerCommand::Close);
     root.command(key!('?'), ExplorerCommand::ShowHelp);
+    root.command(alt!('o'), ExplorerCommand::ShowOptions);
     root.command(ctrl!('p'), ExplorerCommand::SelectPrevious);
     root.command(ctrl!('n'), ExplorerCommand::SelectNext);
 
@@ -420,6 +432,11 @@ pub(super) fn explorer_local_keymap(editing_engine: EditingEngineConfig) -> Moda
     root.command(key!(' '), ExplorerCommand::ToggleDirectory);
     root.command(key!(Left), ExplorerCommand::CollapseOrSelectParent);
     root.command(key!(Backspace), ExplorerCommand::RootParent);
+
+    let mut folds = ExplorerKeymapBuilder::new("Explorer folds");
+    folds.command(key!('M'), ExplorerCommand::CollapseAll);
+    folds.command(key!('R'), ExplorerCommand::ExpandAll);
+    root.node(key!('z'), folds);
 
     if editing_engine == EditingEngineConfig::Vim {
         root.command(ctrl!('r'), ExplorerCommand::RedoFileOperation);

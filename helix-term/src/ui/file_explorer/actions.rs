@@ -22,8 +22,8 @@ use crate::{
 use super::{
     input::{ExplorerFileOperation, ExplorerOperator, ExplorerPastePlacement},
     model::ExplorerRow,
-    path_ops::{display_path, selected_cursor, sibling_path_with_label, unique_destination},
-    windows_reserved_basename, windows_reserved_label, FileExplorerPanel,
+    path_ops::{parse_entry_path, selected_cursor, sibling_path_with_label},
+    windows_reserved_basename, windows_reserved_path, FileExplorerPanel,
 };
 #[derive(Clone, Debug)]
 pub(super) struct LabelEdit {
@@ -92,34 +92,34 @@ impl FileExplorerPanel {
     /// explorer. The editor maintains a deep file-operation history that
     /// covers everything routed through `ApplyMove` (renames triggered from
     /// `i`/`a`/`I`/`A` and from the `c` change-selection operator),
-    /// `ApplyCreate`, `ApplyDelete`, and the clipboard paste operations —
+    /// `ApplyCreate`, confirmed deletes, and the clipboard paste operations —
     /// so a single binding (`u` by default) reverts any of them.
     pub(super) fn undo_file_operation(&mut self, cx: &mut Context) {
-        match cx.editor.undo_file_operation() {
-            Ok(Some(message)) => {
-                self.refresh_current(cx.editor);
-                self.queue_vcs_refresh(cx);
-                cx.editor.set_status(message);
-            }
-            Ok(None) => cx.editor.set_status("No file operation to undo"),
-            Err(err) => cx
-                .editor
-                .set_error(format!("Unable to undo file operation: {err}")),
-        }
+        crate::effect::file_operation::submit(
+            cx.editor,
+            cx.ingress.clone(),
+            helix_view::editor::FileOperationRequest::undo(
+                helix_view::editor::FileOperationOrigin::Explorer {
+                    root: self.root.clone(),
+                    cursor: selected_cursor(self.selection),
+                    select_path: None,
+                },
+            ),
+        );
     }
 
     pub(super) fn redo_file_operation(&mut self, cx: &mut Context) {
-        match cx.editor.redo_file_operation() {
-            Ok(Some(message)) => {
-                self.refresh_current(cx.editor);
-                self.queue_vcs_refresh(cx);
-                cx.editor.set_status(message);
-            }
-            Ok(None) => cx.editor.set_status("No file operation to redo"),
-            Err(err) => cx
-                .editor
-                .set_error(format!("Unable to redo file operation: {err}")),
-        }
+        crate::effect::file_operation::submit(
+            cx.editor,
+            cx.ingress.clone(),
+            helix_view::editor::FileOperationRequest::redo(
+                helix_view::editor::FileOperationOrigin::Explorer {
+                    root: self.root.clone(),
+                    cursor: selected_cursor(self.selection),
+                    select_path: None,
+                },
+            ),
+        );
     }
 
     fn selected_register(&self, editor: &Editor) -> char {
@@ -292,7 +292,7 @@ impl FileExplorerPanel {
     ///
     /// The buffer starts empty so the user types the name directly. `/`
     /// in the name commits as nested directories (handled downstream by
-    /// `apply_create`'s `is_directory_input`).
+    /// the parsed entry path's directory marker).
     pub(super) fn enter_label_edit_create(&mut self, cx: &mut Context) {
         let Some(row) = self.selected().cloned() else {
             return;
@@ -396,84 +396,67 @@ impl FileExplorerPanel {
                     cx.editor.set_error("Cannot rename root");
                     return;
                 };
-                // Windows treats names like `NUL`, `CON`, `PRN`, `AUX`,
-                // `COM1`-`COM9`, `LPT1`-`LPT9` as device shortcuts —
-                // `fs::rename` on either side surfaces as a cryptic
-                // "Incorrect function" OS error. Catch it explicitly.
-                if let Some(reserved) =
-                    windows_reserved_basename(source).or_else(|| windows_reserved_label(buffer))
+                let entry = match parse_entry_path(buffer) {
+                    Ok(entry) => entry,
+                    Err(error) => {
+                        cx.editor.set_error(error.to_string());
+                        return;
+                    }
+                };
+                // Windows treats these names as device handles in every path
+                // component, including nested create/rename input.
+                if let Some(reserved) = windows_reserved_basename(source)
+                    .or_else(|| windows_reserved_path(&entry.relative))
                 {
                     cx.editor.set_error(format!(
                         "Cannot rename: '{reserved}' is a reserved Windows device name"
                     ));
                     return;
                 }
-                // Construct the destination through `Path::new` so the OS
-                // sorts out separator style consistently. `parent.join` on
-                // Windows yields the native form regardless of slashes in
-                // the typed buffer.
-                let destination = parent.join(Path::new(buffer));
+                let destination = parent.join(entry.relative);
 
-                // If the user typed sub-paths (`foo/bar.rs` style),
-                // ensure all intermediate directories exist before the
-                // rename. Each create is its own undo entry, so an undo
-                // sequence walks back through dirs as well as the rename.
-                if let Some(dest_parent) = destination.parent() {
-                    if !dest_parent.exists() {
-                        if let Err(err) = cx.editor.create_path_with_history(dest_parent, true) {
-                            cx.editor.set_error(format!(
-                                "Unable to create directory {}: {err}",
-                                dest_parent.display()
-                            ));
-                            return;
-                        }
-                    }
-                }
-
-                match cx.editor.move_path_with_history(source, &destination) {
-                    Ok(()) => {
-                        self.refresh_current(cx.editor);
-                        self.queue_vcs_refresh(cx);
-                        let new_name = destination
-                            .file_name()
-                            .and_then(|n| n.to_str())
-                            .unwrap_or(buffer);
-                        cx.editor
-                            .set_status(format!("Renamed {original_label} → {new_name}"));
-                    }
-                    Err(err) => {
-                        cx.editor.set_error(format!(
-                            "Unable to rename {} → {}: {err}",
-                            source.display(),
-                            destination.display()
-                        ));
-                    }
-                }
+                let root = self.root.clone();
+                let cursor = selected_cursor(self.selection);
+                let source = source.clone();
+                cx.spawn_ui(async move {
+                    Ok(UiCommand::FileExplorer(FileExplorerCommand::ApplyMove {
+                        source,
+                        root,
+                        cursor,
+                        destination: helix_view::editor::FileOperationDestination::Exact(
+                            destination,
+                        ),
+                        modified_buffer_check: ModifiedBufferCheck::Prompt,
+                    }))
+                });
             }
             LabelEditKind::Create { parent } => {
-                if let Some(reserved) = windows_reserved_label(buffer) {
+                let entry = match parse_entry_path(buffer) {
+                    Ok(entry) => entry,
+                    Err(error) => {
+                        cx.editor.set_error(error.to_string());
+                        return;
+                    }
+                };
+                if let Some(reserved) = windows_reserved_path(&entry.relative) {
                     cx.editor.set_error(format!(
                         "Cannot create: '{reserved}' is a reserved Windows device name"
                     ));
                     return;
                 }
-                let target = parent.join(Path::new(buffer));
-                let is_dir = buffer.ends_with('/') || buffer.ends_with('\\');
-                match cx.editor.create_path_with_history(&target, is_dir) {
-                    Ok(()) => {
-                        self.refresh_current(cx.editor);
-                        self.queue_vcs_refresh(cx);
-                        cx.editor.set_status(format!(
-                            "Created {} {}",
-                            if is_dir { "directory" } else { "file" },
-                            target.display()
-                        ));
-                    }
-                    Err(err) => {
-                        cx.editor
-                            .set_error(format!("Unable to create {}: {err}", target.display()));
-                    }
-                }
+                let target = parent.join(&entry.relative);
+                let root = self.root.clone();
+                let cursor = selected_cursor(self.selection);
+                let is_dir = entry.is_dir;
+                cx.spawn_ui(async move {
+                    Ok(UiCommand::FileExplorer(FileExplorerCommand::ApplyCreate {
+                        root,
+                        cursor,
+                        is_dir,
+                        target,
+                        modified_buffer_check: ModifiedBufferCheck::Prompt,
+                    }))
+                });
             }
         }
     }
@@ -527,14 +510,12 @@ impl FileExplorerPanel {
         let source = row.path.clone();
         let root = self.root.clone();
         let cursor = selected_cursor(self.selection);
-        let input = display_path(&destination);
         cx.spawn_ui(async move {
             Ok(UiCommand::FileExplorer(FileExplorerCommand::ApplyMove {
                 source,
                 root,
                 cursor,
-                input,
-                destination,
+                destination: helix_view::editor::FileOperationDestination::Exact(destination),
                 modified_buffer_check: ModifiedBufferCheck::Prompt,
             }))
         });
@@ -550,74 +531,34 @@ impl FileExplorerPanel {
             return;
         };
         let destination_dir = self.selected_base_dir();
-        if let Err(err) = std::fs::create_dir_all(&destination_dir) {
-            cx.editor.set_error(format!(
-                "Unable to create destination directory {}: {err}",
-                destination_dir.display()
-            ));
-            return;
-        }
-
-        let mut changed = 0usize;
+        let root = self.root.clone();
+        let cursor = selected_cursor(self.selection);
         for source in clipboard.paths.iter() {
-            if clipboard.operation == ExplorerFileOperation::Copy && source.is_dir() {
-                cx.editor.set_error(format!(
-                    "Copying directories is not supported: {} is a directory",
-                    source.display()
-                ));
-                return;
-            }
-
-            if clipboard.operation == ExplorerFileOperation::Move
-                && source.parent() == Some(destination_dir.as_path())
-            {
-                continue;
-            }
-
-            let destination = match unique_destination(&destination_dir, source) {
-                Ok(destination) => destination,
-                Err(err) => {
-                    cx.editor.set_error(format!(
-                        "Unable to choose destination in {}: {err}",
-                        destination_dir.display()
-                    ));
-                    return;
-                }
+            let destination = helix_view::editor::FileOperationDestination::UniqueInDirectory(
+                destination_dir.clone(),
+            );
+            let command = match clipboard.operation {
+                ExplorerFileOperation::Copy => FileExplorerCommand::ApplyCopy {
+                    source: source.clone(),
+                    root: root.clone(),
+                    cursor,
+                    destination,
+                    modified_buffer_check: ModifiedBufferCheck::Prompt,
+                },
+                ExplorerFileOperation::Move => FileExplorerCommand::ApplyMove {
+                    source: source.clone(),
+                    root: root.clone(),
+                    cursor,
+                    destination,
+                    modified_buffer_check: ModifiedBufferCheck::Prompt,
+                },
             };
-            let result = match clipboard.operation {
-                ExplorerFileOperation::Copy => cx
-                    .editor
-                    .copy_path_with_history(source, &destination)
-                    .map(|_| ()),
-                ExplorerFileOperation::Move => {
-                    cx.editor.move_path_with_history(source, &destination)
-                }
-            };
-
-            if let Err(err) = result {
-                cx.editor.set_error(format!(
-                    "Unable to {} {} -> {}: {err}",
-                    clipboard.operation.paste_verb().to_ascii_lowercase(),
-                    source.display(),
-                    destination.display()
-                ));
-                return;
-            }
-            changed = changed.saturating_add(1);
+            cx.submit_ui(UiCommand::FileExplorer(command));
         }
 
         if clipboard.operation == ExplorerFileOperation::Move {
             self.file_clipboard = None;
         }
-        self.refresh_current(cx.editor);
-        self.queue_vcs_refresh(cx);
-        cx.editor.set_status(format!(
-            "{} {} path{} into {}",
-            clipboard.operation.paste_verb(),
-            changed,
-            if changed == 1 { "" } else { "s" },
-            destination_dir.display()
-        ));
     }
 
     fn prompt_delete(&self, cx: &mut Context) {

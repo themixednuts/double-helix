@@ -9,7 +9,11 @@ use crate::{
 use fff_query_parser::FuzzyQuery;
 use neo_frizbee::Scoring;
 use rayon::prelude::*;
-use std::{borrow::Cow, path::MAIN_SEPARATOR};
+use std::{
+    borrow::Cow,
+    path::MAIN_SEPARATOR,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 enum FileItems<'a> {
     All(&'a [FileItem]),
@@ -32,9 +36,10 @@ impl<'a> FileItems<'a> {
 fn resolve_file_chunks(
     file: &FileItem,
     arena: ArenaPtr,
+    abort_signal: Option<&AtomicBool>,
     buf: &mut [*const u8; 32],
 ) -> Option<(usize, u16)> {
-    if file.is_deleted() {
+    if file.is_deleted() || abort_signal.is_some_and(|signal| signal.load(Ordering::Relaxed)) {
         return None;
     }
     let ptrs = file.path.resolve_ptrs(arena, buf);
@@ -48,6 +53,7 @@ fn match_fuzzy_parts(
     options: &neo_frizbee::Config,
     max_threads: usize,
     arena: ArenaPtr,
+    abort_signal: Option<&AtomicBool>,
 ) -> Vec<neo_frizbee::Match> {
     let valid_parts: Vec<&str> = fuzzy_parts
         .iter()
@@ -61,13 +67,13 @@ fn match_fuzzy_parts(
     }
 
     let resolve = |file: &FileItem, buf: &mut [*const u8; 32]| -> Option<(usize, u16)> {
-        resolve_file_chunks(file, arena, buf)
+        resolve_file_chunks(file, arena, abort_signal, buf)
     };
 
     // because we reassemble the vec of reference we have to use a different type
     // to narrow down the [&FileItem] which would be resolved by frizbee as &&
     let resolve_ref = |file: &&FileItem, buf: &mut [*const u8; 32]| -> Option<(usize, u16)> {
-        resolve_file_chunks(file, arena, buf)
+        resolve_file_chunks(file, arena, abort_signal, buf)
     };
 
     let first_part_matches = match working_files {
@@ -145,6 +151,9 @@ pub(crate) fn fuzzy_match_and_score_files<'a>(
     base_arena: ArenaPtr,
     overflow_arena: ArenaPtr,
 ) -> (Vec<&'a FileItem>, Vec<Score>, usize) {
+    if search_cancelled(context) {
+        return (Vec::new(), Vec::new(), 0);
+    }
     // Process overflow files first: newly added files (created after the
     // initial scan) live in the overflow arena and are more likely to be
     // relevant to the current search.
@@ -165,7 +174,11 @@ pub(crate) fn fuzzy_match_and_score_files<'a>(
         match_and_score_in_arena(files, context, base_arena)
     };
 
-    sort_and_paginate(results, context)
+    if search_cancelled(context) {
+        (Vec::new(), Vec::new(), 0)
+    } else {
+        sort_and_paginate(results, context)
+    }
 }
 
 /// Resolve a DirItem's chunked path into frizbee's pointer buffer.
@@ -173,8 +186,12 @@ pub(crate) fn fuzzy_match_and_score_files<'a>(
 fn resolve_dir_chunks(
     dir: &DirItem,
     arena: ArenaPtr,
+    abort_signal: Option<&AtomicBool>,
     buf: &mut [*const u8; 32],
 ) -> Option<(usize, u16)> {
+    if abort_signal.is_some_and(|signal| signal.load(Ordering::Relaxed)) {
+        return None;
+    }
     let ptrs = dir.path.resolve_ptrs(arena, buf);
     Some((ptrs.len(), dir.path.byte_len))
 }
@@ -187,6 +204,7 @@ fn match_fuzzy_parts_dirs(
     options: &neo_frizbee::Config,
     max_threads: usize,
     arena: ArenaPtr,
+    abort_signal: Option<&AtomicBool>,
 ) -> Vec<neo_frizbee::Match> {
     let valid_parts: Vec<&str> = fuzzy_parts
         .iter()
@@ -200,7 +218,7 @@ fn match_fuzzy_parts_dirs(
 
     let resolve_chunks_for_frizbee =
         |dir: &&DirItem, buf: &mut [*const u8; 32]| -> Option<(usize, u16)> {
-            resolve_dir_chunks(dir, arena, buf)
+            resolve_dir_chunks(dir, arena, abort_signal, buf)
         };
 
     let first_part_matches = neo_frizbee::match_list_parallel_resolved(
@@ -268,7 +286,7 @@ pub(crate) fn fuzzy_match_and_score_dirs<'a>(
     context: &ScoringContext,
     arena: ArenaPtr,
 ) -> (Vec<&'a DirItem>, Vec<Score>, usize) {
-    if dirs.is_empty() {
+    if dirs.is_empty() || search_cancelled(context) {
         return (vec![], vec![], 0);
     }
 
@@ -335,6 +353,7 @@ pub(crate) fn fuzzy_match_and_score_dirs<'a>(
         &options,
         context.max_threads,
         arena,
+        context.abort_signal,
     );
 
     let main_needle = valid_parts[0].as_bytes();
@@ -547,6 +566,7 @@ fn match_and_score_in_arena<'a>(
         &options,
         context.max_threads,
         arena,
+        context.abort_signal,
     );
 
     let main_needle = fuzzy_parts[0].as_bytes(); // safe
@@ -842,18 +862,25 @@ fn score_filtered_by_frecency<'a>(
         FileItems::All(s) => s
             .par_iter()
             .filter_map(|f| {
-                let live = !f.is_deleted();
+                let live = !f.is_deleted() && !search_cancelled(context);
                 live.then_some(score_file(f))
             })
             .collect(),
         FileItems::Filtered(v) => v
             .iter()
             .filter_map(|f| {
-                let live = !f.is_deleted();
+                let live = !f.is_deleted() && !search_cancelled(context);
                 live.then_some(score_file(f))
             })
             .collect(),
     }
+}
+
+#[inline]
+fn search_cancelled(context: &ScoringContext<'_>) -> bool {
+    context
+        .abort_signal
+        .is_some_and(|signal| signal.load(Ordering::Relaxed))
 }
 
 #[inline]
@@ -882,6 +909,9 @@ fn sort_and_paginate<'a>(
     mut results: Vec<(&'a FileItem, Score)>,
     context: &ScoringContext,
 ) -> (Vec<&'a FileItem>, Vec<Score>, usize) {
+    if search_cancelled(context) {
+        return (Vec::new(), Vec::new(), 0);
+    }
     let total_matched = results.len();
 
     if total_matched == 0 {
@@ -1017,6 +1047,7 @@ mod tests {
         let query = parser.parse(query_str);
         let context = ScoringContext {
             query: &query,
+            abort_signal: None,
             max_threads: 1,
             max_typos: 2,
             current_file: None,
@@ -1068,6 +1099,7 @@ mod tests {
         let query = parser.parse(query_str);
         let context = ScoringContext {
             query: &query,
+            abort_signal: None,
             max_threads: 1,
             max_typos: 2,
             current_file: None,
@@ -1117,6 +1149,7 @@ mod tests {
         let query = parser.parse(query_str);
         let context = ScoringContext {
             query: &query,
+            abort_signal: None,
             max_threads: 1,
             max_typos: 2,
             current_file: None,
@@ -1141,6 +1174,43 @@ mod tests {
         assert_eq!(items[0].relative_path(arena), "file2.rs");
         assert_eq!(items[1].relative_path(arena), "file1.rs");
         assert_eq!(items[2].relative_path(arena), "file3.rs");
+    }
+
+    #[test]
+    fn pre_cancelled_search_skips_matching_and_ranking() {
+        let (test_data, arena) = make_test_files(&[
+            ("src/alpha.rs", 100, 1000),
+            ("src/beta.rs", 200, 2000),
+        ]);
+        let files = test_data
+            .iter()
+            .map(|(file, _)| file.clone())
+            .collect::<Vec<_>>();
+        let parser = QueryParser::default();
+        let query = parser.parse("src");
+        let abort = AtomicBool::new(true);
+        let context = ScoringContext {
+            query: &query,
+            abort_signal: Some(&abort),
+            max_threads: 1,
+            max_typos: 2,
+            current_file: None,
+            last_same_query_match: None,
+            project_path: None,
+            combo_boost_score_multiplier: 100,
+            min_combo_count: 3,
+            pagination: PaginationArgs {
+                offset: 0,
+                limit: 100,
+            },
+        };
+
+        let (items, scores, total) =
+            fuzzy_match_and_score_files(&files, &context, files.len(), arena, arena);
+
+        assert!(items.is_empty());
+        assert!(scores.is_empty());
+        assert_eq!(total, 0);
     }
 }
 
@@ -1204,6 +1274,7 @@ mod filename_bonus_tests {
 
         let ctx = ScoringContext {
             query: &parsed,
+            abort_signal: None,
             max_threads: 1,
             max_typos,
             current_file: None,
@@ -1426,6 +1497,7 @@ mod typo_resistance_tests {
         let parsed = parser.parse(query);
         let ctx = ScoringContext {
             query: &parsed,
+            abort_signal: None,
             max_threads: 1,
             max_typos,
             current_file: None,
@@ -1534,6 +1606,7 @@ mod constraint_only_query_tests {
 
         let ctx = ScoringContext {
             query: &parsed,
+            abort_signal: None,
             max_threads: 1,
             max_typos: 2,
             current_file: None,
@@ -1585,6 +1658,7 @@ mod constraint_only_query_tests {
 
         let ctx = ScoringContext {
             query: &parsed,
+            abort_signal: None,
             max_threads: 1,
             max_typos: 2,
             current_file: None,

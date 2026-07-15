@@ -766,6 +766,30 @@ impl<'a> Args<'a> {
         }
     }
 
+    /// Build arguments from values that have already been tokenized by a typed caller.
+    ///
+    /// Unlike [`Self::parse`], this path performs no quoting, splitting, or expansion.
+    /// Each input value is one argument and is validated against the command signature.
+    pub fn from_values(
+        values: impl IntoIterator<Item = Cow<'a, str>>,
+        signature: Signature,
+        validate: bool,
+    ) -> Result<Self, ParseArgsError<'a>> {
+        let mut args = Self::new(signature, validate);
+        for value in values {
+            if args
+                .signature
+                .raw_after
+                .is_some_and(|max| args.len() >= max as usize)
+            {
+                args.only_positionals = true;
+            }
+            args.push(value)?;
+        }
+        args.finish()?;
+        Ok(args)
+    }
+
     /// Reads the next token out of the given parser.
     ///
     /// If the command's signature sets a maximum number of positionals (via `raw_after`) then
@@ -1279,5 +1303,24 @@ mod test {
         assert_eq!(args.len(), 2);
         assert_eq!(&args[0], "gutters");
         assert_eq!(&args[1], r#"["diff"] ["diff", "diagnostics"]"#);
+    }
+
+    #[test]
+    fn structured_values_preserve_argument_boundaries() {
+        let signature = Signature {
+            positionals: (1, Some(2)),
+            raw_after: Some(1),
+            ..Signature::DEFAULT
+        };
+        let args = Args::from_values(
+            [Cow::Borrowed("output file.rs"), Cow::Borrowed("--literal")],
+            signature,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(args.len(), 2);
+        assert_eq!(&args[0], "output file.rs");
+        assert_eq!(&args[1], "--literal");
     }
 }

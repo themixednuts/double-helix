@@ -6,7 +6,7 @@ use std::cell::UnsafeCell;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
 
-use crate::FileItem;
+use crate::{FileItem, constants};
 
 /// Maximum number of distinct bigrams tracked in the inverted index.
 /// 95 printable ASCII chars (32..=126) after lowercasing → ~70 distinct → 4900 possible.
@@ -913,7 +913,7 @@ pub(crate) fn sniff_binary_for_non_indexable(
     let mut chunk = vec![0u8; crate::types::BINARY_CLASSIFICATION_CHUNK_SIZE];
 
     for file in files {
-        if file.size == 0 {
+        if file.size == 0 || file.size > constants::MAX_FFFILE_SIZE {
             continue;
         }
 

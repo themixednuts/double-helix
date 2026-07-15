@@ -110,7 +110,7 @@ impl FrameSelection {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Breakpoint {
     pub id: Option<usize>,
     pub verified: bool,
@@ -123,7 +123,7 @@ pub struct Breakpoint {
     pub log_message: Option<String>,
 }
 
-pub(super) type Diagnostics = BTreeMap<Uri, Vec<(lsp::Diagnostic, DiagnosticProvider)>>;
+pub(super) type Diagnostics = BTreeMap<Uri, Arc<Vec<(lsp::Diagnostic, DiagnosticProvider)>>>;
 
 #[derive(Clone, Copy, Debug)]
 pub struct EditTarget {

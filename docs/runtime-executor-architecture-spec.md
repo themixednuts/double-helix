@@ -617,6 +617,11 @@ That keeps:
 
 ## Frame Coordination
 
+The complete target for foreground scheduling, immutable frame production, and
+nonblocking terminal presentation is specified in
+`responsive-application-architecture.md`. This section defines only the runtime
+frame invalidation primitive.
+
 The current redraw/render-lock mechanism in `helix-event/src/redraw.rs` is runtime-global.
 That should become an explicit UI-facing primitive instead of a hidden side channel.
 
@@ -1328,7 +1333,16 @@ UI-affine async contexts directly mutate app state across awaits.
 
 ## Unified Event Ingress
 
-Long term, `Application` should own one main inbox for runtime-originated events.
+The single public ingress facade and its multiple private semantic stores are
+specified in `responsive-application-architecture.md`. In particular, one source
+of truth does not require one physical FIFO; reliable, latest, fold, pulse, and
+telemetry traffic have different backpressure semantics.
+
+Long term, `Application` should own one semantic ingress facade for
+runtime-originated events. As specified in
+`responsive-application-architecture.md`, that facade uses multiple private
+stores with explicit reliable/latest/fold/pulse/ring behavior rather than one
+head-of-line-blocking FIFO.
 
 Example shape:
 

@@ -1,58 +1,19 @@
 use helix_core::diagnostic::DiagnosticProvider;
-use helix_core::syntax::{
-    self,
-    config::{LanguageConfiguration, LanguageServerFeature},
-};
+use helix_core::syntax::config::{LanguageConfiguration, LanguageServerFeature};
 use helix_core::{Assoc, ChangeSet, Diagnostic, RopeSlice, Syntax};
 use helix_lsp::{Client, LanguageServerId, LanguageServerName};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::bench::log_run_event;
 use crate::revision::Revision;
 
 #[derive(Debug, Default)]
 pub struct SyntaxAwareState {
     syntax_snapshot: SyntaxSnapshotState,
     language: Option<Arc<LanguageConfiguration>>,
-    diagnostics: Vec<Diagnostic>,
+    diagnostics: Arc<Vec<Diagnostic>>,
     diagnostics_gen: u64,
     language_servers: HashMap<LanguageServerName, Arc<Client>>,
-}
-
-const DEFERRED_SYNTAX_LAYER_THRESHOLD: usize = 32;
-const DEFERRED_SYNTAX_ROOT_INJECTION_THRESHOLD: usize = 16;
-const DEFERRED_SYNTAX_GIANT_LINE_BYTE_THRESHOLD: usize = 256 * 1024;
-const DEFERRED_SYNTAX_AVG_BYTES_PER_LINE_THRESHOLD: usize = 8 * 1024;
-
-#[derive(Debug, Clone, Copy)]
-struct DocumentShape {
-    line_count: usize,
-    byte_count: usize,
-}
-
-impl DocumentShape {
-    fn from_text(text: RopeSlice<'_>) -> Self {
-        Self {
-            line_count: text.len_lines(),
-            byte_count: text.len_bytes(),
-        }
-    }
-
-    fn average_bytes_per_line(self) -> usize {
-        self.byte_count / self.line_count.max(1)
-    }
-
-    fn has_giant_lines(self) -> bool {
-        self.byte_count >= DEFERRED_SYNTAX_GIANT_LINE_BYTE_THRESHOLD
-            && self.average_bytes_per_line() >= DEFERRED_SYNTAX_AVG_BYTES_PER_LINE_THRESHOLD
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SyntaxBudget {
-    Idle,
-    Interactive(InteractiveSyntaxReason),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -91,26 +52,7 @@ impl SyntaxSnapshot {
 struct SyntaxSnapshotState {
     revision: Revision,
     status: SyntaxStatus,
-    tree: Option<Syntax>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum InteractiveSyntaxReason {
-    Stale,
-    GiantLines,
-    LayerFanout,
-    RootInjections,
-}
-
-impl InteractiveSyntaxReason {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Stale => "stale",
-            Self::GiantLines => "giant_lines",
-            Self::LayerFanout => "layer_fanout",
-            Self::RootInjections => "root_injections",
-        }
-    }
+    tree: Option<Arc<Syntax>>,
 }
 
 impl SyntaxSnapshotState {
@@ -119,19 +61,15 @@ impl SyntaxSnapshotState {
     }
 
     fn syntax(&self) -> Option<&Syntax> {
-        self.tree.as_ref()
+        self.tree.as_deref()
     }
 
-    fn syntax_mut(&mut self) -> Option<&mut Syntax> {
-        self.tree.as_mut()
-    }
-
-    fn status(&self) -> SyntaxStatus {
-        self.status
+    fn syntax_arc(&self) -> Option<Arc<Syntax>> {
+        self.tree.clone()
     }
 
     fn set_tree(&mut self, tree: Option<Syntax>) {
-        self.tree = tree;
+        self.tree = tree.map(Arc::new);
         self.status = if self.tree.is_some() {
             SyntaxStatus::Fresh
         } else {
@@ -148,125 +86,22 @@ impl SyntaxSnapshotState {
         }
     }
 
-    fn mark_updated(&mut self) {
-        if self.tree.is_some() {
-            self.status = SyntaxStatus::Fresh;
-            self.revision.advance();
-        } else {
-            self.mark_disabled();
-        }
-    }
-
     fn mark_stale(&mut self) {
         if self.tree.is_some() && self.status != SyntaxStatus::StalePendingRefresh {
             self.status = SyntaxStatus::StalePendingRefresh;
             self.revision.advance();
         }
     }
-
-    fn mark_disabled(&mut self) {
-        if self.tree.is_some() || self.status != SyntaxStatus::Disabled {
-            self.tree = None;
-            self.status = SyntaxStatus::Disabled;
-            self.revision.advance();
-        }
-    }
-}
-
-fn syntax_budget(
-    syntax_status: SyntaxStatus,
-    shape: DocumentShape,
-    complexity: syntax::SyntaxComplexity,
-) -> SyntaxBudget {
-    if matches!(syntax_status, SyntaxStatus::StalePendingRefresh) {
-        return SyntaxBudget::Interactive(InteractiveSyntaxReason::Stale);
-    }
-
-    if shape.has_giant_lines() {
-        return SyntaxBudget::Interactive(InteractiveSyntaxReason::GiantLines);
-    }
-
-    if complexity.total_layers >= DEFERRED_SYNTAX_LAYER_THRESHOLD {
-        return SyntaxBudget::Interactive(InteractiveSyntaxReason::LayerFanout);
-    }
-
-    if complexity.root_injections >= DEFERRED_SYNTAX_ROOT_INJECTION_THRESHOLD {
-        return SyntaxBudget::Interactive(InteractiveSyntaxReason::RootInjections);
-    }
-
-    SyntaxBudget::Idle
-}
-
-fn initial_syntax_budget(shape: DocumentShape) -> SyntaxBudget {
-    if shape.has_giant_lines() {
-        SyntaxBudget::Interactive(InteractiveSyntaxReason::GiantLines)
-    } else {
-        SyntaxBudget::Idle
-    }
 }
 
 impl SyntaxAwareState {
-    pub fn set_language(
-        &mut self,
-        language_config: Option<Arc<LanguageConfiguration>>,
-        text: RopeSlice<'_>,
-        loader: &syntax::Loader,
-        display_name: &str,
-    ) {
+    pub fn set_language(&mut self, language_config: Option<Arc<LanguageConfiguration>>) {
         self.language = language_config;
-        let Some(config) = self.language.as_ref() else {
+        if self.language.is_none() {
             self.syntax_snapshot.set_tree(None);
             return;
-        };
-
-        let shape = DocumentShape::from_text(text);
-        let budget = initial_syntax_budget(shape);
-        let timeout = match budget {
-            SyntaxBudget::Idle => syntax::IDLE_PARSE_TIMEOUT,
-            SyntaxBudget::Interactive(_) => syntax::INTERACTIVE_PARSE_TIMEOUT,
-        };
-
-        match Syntax::new_with_timeout(text, config.language(), loader, timeout) {
-            Ok(syntax) => {
-                self.syntax_snapshot.set_tree(Some(syntax));
-                log_run_event("syntax_initial_parse_ok", || {
-                    format!(
-                        "display_name={} lines={} bytes={} use_interactive_budget={} reason={}",
-                        display_name,
-                        shape.line_count,
-                        shape.byte_count,
-                        matches!(budget, SyntaxBudget::Interactive(_)),
-                        match budget {
-                            SyntaxBudget::Idle => "idle",
-                            SyntaxBudget::Interactive(reason) => reason.label(),
-                        }
-                    )
-                });
-            }
-            Err(syntax::HighlighterError::Timeout) => {
-                self.syntax_snapshot.mark_pending_initial_parse();
-                log_run_event("syntax_initial_parse_timeout", || {
-                    format!(
-                        "display_name={} lines={} bytes={} avg_bytes_per_line={} use_interactive_budget={} reason={}",
-                        display_name,
-                        shape.line_count,
-                        shape.byte_count,
-                        shape.average_bytes_per_line(),
-                        matches!(budget, SyntaxBudget::Interactive(_)),
-                        match budget {
-                            SyntaxBudget::Idle => "idle",
-                            SyntaxBudget::Interactive(reason) => reason.label(),
-                        }
-                    )
-                });
-            }
-            Err(err) => {
-                if err != syntax::HighlighterError::NoRootConfig {
-                    log::warn!("Error building syntax for '{}': {err}", display_name);
-                }
-                self.syntax_snapshot.set_tree(None);
-            }
         }
+        self.syntax_snapshot.mark_pending_initial_parse();
     }
 
     pub fn set_language_configuration(
@@ -308,7 +143,16 @@ impl SyntaxAwareState {
     }
 
     pub fn diagnostics(&self) -> &[Diagnostic] {
-        &self.diagnostics
+        self.diagnostics.as_slice()
+    }
+
+    pub fn diagnostics_arc(&self) -> Arc<Vec<Diagnostic>> {
+        self.diagnostics.clone()
+    }
+
+    pub fn swap_diagnostics(&mut self, diagnostics: Vec<Diagnostic>) -> Arc<Vec<Diagnostic>> {
+        self.diagnostics_gen = self.diagnostics_gen.wrapping_add(1);
+        std::mem::replace(&mut self.diagnostics, Arc::new(diagnostics))
     }
 
     pub fn replace_diagnostics(
@@ -317,15 +161,15 @@ impl SyntaxAwareState {
         unchanged_sources: &[String],
         provider: Option<&DiagnosticProvider>,
     ) {
+        let current = Arc::make_mut(&mut self.diagnostics);
         if unchanged_sources.is_empty() {
             if let Some(provider) = provider {
-                self.diagnostics
-                    .retain(|diagnostic| &diagnostic.provider != provider);
+                current.retain(|diagnostic| &diagnostic.provider != provider);
             } else {
-                self.diagnostics.clear();
+                current.clear();
             }
         } else {
-            self.diagnostics.retain(|diagnostic| {
+            current.retain(|diagnostic| {
                 if provider.is_some_and(|provider| provider != &diagnostic.provider) {
                     return true;
                 }
@@ -337,19 +181,20 @@ impl SyntaxAwareState {
                 }
             });
         }
-        self.diagnostics.extend(diagnostics);
+        current.extend(diagnostics);
         self.sort_diagnostics();
         self.diagnostics_gen = self.diagnostics_gen.wrapping_add(1);
     }
 
     pub fn clear_diagnostics_for_language_server(&mut self, id: LanguageServerId) {
-        self.diagnostics
+        Arc::make_mut(&mut self.diagnostics)
             .retain(|diagnostic| diagnostic.provider.language_server_id() != Some(id));
         self.diagnostics_gen = self.diagnostics_gen.wrapping_add(1);
     }
 
     pub fn remap_diagnostics(&mut self, changes: &ChangeSet, text: RopeSlice<'_>) {
-        changes.update_positions(self.diagnostics.iter_mut().map(|diagnostic| {
+        let diagnostics = Arc::make_mut(&mut self.diagnostics);
+        changes.update_positions(diagnostics.iter_mut().map(|diagnostic| {
             let assoc = if diagnostic.starts_at_word {
                 Assoc::BeforeWord
             } else {
@@ -357,7 +202,7 @@ impl SyntaxAwareState {
             };
             (&mut diagnostic.range.start, assoc)
         }));
-        changes.update_positions(self.diagnostics.iter_mut().filter_map(|diagnostic| {
+        changes.update_positions(diagnostics.iter_mut().filter_map(|diagnostic| {
             if diagnostic.zero_width {
                 return None;
             }
@@ -368,7 +213,7 @@ impl SyntaxAwareState {
             };
             Some((&mut diagnostic.range.end, assoc))
         }));
-        self.diagnostics.retain_mut(|diagnostic| {
+        diagnostics.retain_mut(|diagnostic| {
             if diagnostic.zero_width {
                 diagnostic.range.end = diagnostic.range.start;
             } else if diagnostic.range.start >= diagnostic.range.end {
@@ -416,6 +261,14 @@ impl SyntaxAwareState {
         self.language_servers = language_servers;
     }
 
+    pub fn insert_language_server(
+        &mut self,
+        name: LanguageServerName,
+        client: Arc<Client>,
+    ) -> Option<Arc<Client>> {
+        self.language_servers.insert(name, client)
+    }
+
     pub fn remove_language_server_by_name(&mut self, name: &str) -> Option<Arc<Client>> {
         self.language_servers.remove(name)
     }
@@ -448,6 +301,10 @@ impl SyntaxAwareState {
         self.syntax_snapshot.syntax()
     }
 
+    pub fn syntax_arc(&self) -> Option<Arc<Syntax>> {
+        self.syntax_snapshot.syntax_arc()
+    }
+
     pub fn set_syntax(&mut self, syntax: Option<Syntax>) {
         self.syntax_snapshot.set_tree(syntax);
     }
@@ -456,288 +313,17 @@ impl SyntaxAwareState {
         self.syntax_snapshot.snapshot()
     }
 
-    pub fn update_syntax(
-        &mut self,
-        old_doc: RopeSlice<'_>,
-        current_doc: RopeSlice<'_>,
-        changes: &ChangeSet,
-        loader: &syntax::Loader,
-    ) {
-        let syntax_status = self.syntax_snapshot.status();
-        if self.syntax_snapshot.syntax().is_some() {
-            let shape = DocumentShape::from_text(current_doc);
-            let complexity = self
-                .syntax_snapshot
-                .syntax()
-                .expect("syntax presence checked above")
-                .complexity();
-            let budget = syntax_budget(syntax_status, shape, complexity);
-            let result = if matches!(budget, SyntaxBudget::Interactive(_)) {
-                let syntax = self
-                    .syntax_snapshot
-                    .syntax_mut()
-                    .expect("syntax presence checked above");
-                syntax.update_with_timeout(
-                    old_doc,
-                    current_doc,
-                    changes,
-                    loader,
-                    syntax::INTERACTIVE_PARSE_TIMEOUT,
-                )
-            } else {
-                let syntax = self
-                    .syntax_snapshot
-                    .syntax_mut()
-                    .expect("syntax presence checked above");
-                syntax.update(old_doc, current_doc, changes, loader)
-            };
-
-            match result {
-                Ok(()) => {
-                    self.syntax_snapshot.mark_updated();
-                }
-                Err(syntax::HighlighterError::Timeout) => {
-                    self.syntax_snapshot.mark_stale();
-                    log_run_event("syntax_timeout_stale", || {
-                        format!(
-                            "lines={} bytes={} avg_bytes_per_line={} giant_lines={} use_interactive_budget={} reason={} changes={} total_layers={} root_injections={}",
-                            shape.line_count,
-                            shape.byte_count,
-                            shape.average_bytes_per_line(),
-                            shape.has_giant_lines(),
-                            matches!(budget, SyntaxBudget::Interactive(_)),
-                            match budget {
-                                SyntaxBudget::Idle => "idle",
-                                SyntaxBudget::Interactive(reason) => reason.label(),
-                            },
-                            changes.len(),
-                            complexity.total_layers,
-                            complexity.root_injections
-                        )
-                    });
-                }
-                Err(err) => {
-                    log::error!("TS parser failed, disabling TS for the current buffer: {err}");
-                    log_run_event("syntax_disabled", || {
-                        format!(
-                            "phase=update lines={} bytes={} error={err}",
-                            current_doc.len_lines(),
-                            current_doc.len_bytes()
-                        )
-                    });
-                    self.syntax_snapshot.mark_disabled();
-                }
-            }
-        }
-    }
-
-    pub fn refresh_stale_syntax(
-        &mut self,
-        current_doc: RopeSlice<'_>,
-        loader: &syntax::Loader,
-    ) -> bool {
-        if !matches!(
-            self.syntax_snapshot.status(),
-            SyntaxStatus::StalePendingRefresh
-        ) {
-            return false;
-        }
-
-        if self.syntax_snapshot.syntax().is_none() {
-            let Some(language) = self.language.as_ref() else {
-                self.syntax_snapshot.mark_disabled();
-                return true;
-            };
-            let shape = DocumentShape::from_text(current_doc);
-            return match Syntax::new(current_doc, language.language(), loader) {
-                Ok(syntax) => {
-                    self.syntax_snapshot.set_tree(Some(syntax));
-                    log_run_event("syntax_initial_idle_parse_ok", || {
-                        format!("lines={} bytes={}", shape.line_count, shape.byte_count)
-                    });
-                    true
-                }
-                Err(syntax::HighlighterError::Timeout) => {
-                    log_run_event("syntax_initial_idle_parse_timeout", || {
-                        format!("lines={} bytes={}", shape.line_count, shape.byte_count)
-                    });
-                    false
-                }
-                Err(err) => {
-                    log::error!(
-                        "TS parser failed during initial idle parse, disabling TS for the current buffer: {err}"
-                    );
-                    log_run_event("syntax_disabled", || {
-                        format!(
-                            "phase=initial_idle_parse lines={} bytes={} error={err}",
-                            shape.line_count, shape.byte_count
-                        )
-                    });
-                    self.syntax_snapshot.mark_disabled();
-                    true
-                }
-            };
-        }
-
-        let result = {
-            let syntax = self
-                .syntax_snapshot
-                .syntax_mut()
-                .expect("syntax presence checked above");
-            syntax.refresh_with_timeout(current_doc, loader, syntax::IDLE_PARSE_TIMEOUT)
-        };
-
-        match result {
-            Ok(()) => {
-                self.syntax_snapshot.mark_updated();
-                log_run_event("syntax_idle_refresh_ok", || {
-                    format!(
-                        "lines={} bytes={}",
-                        current_doc.len_lines(),
-                        current_doc.len_bytes()
-                    )
-                });
-                true
-            }
-            Err(syntax::HighlighterError::Timeout) => {
-                log_run_event("syntax_idle_refresh_timeout", || {
-                    format!(
-                        "lines={} bytes={}",
-                        current_doc.len_lines(),
-                        current_doc.len_bytes()
-                    )
-                });
-                false
-            }
-            Err(err) => {
-                log::error!("TS parser failed during idle refresh, disabling TS for the current buffer: {err}");
-                log_run_event("syntax_disabled", || {
-                    format!(
-                        "phase=idle_refresh lines={} bytes={} error={err}",
-                        current_doc.len_lines(),
-                        current_doc.len_bytes()
-                    )
-                });
-                self.syntax_snapshot.mark_disabled();
-                true
-            }
-        }
+    pub fn mark_syntax_stale(&mut self) {
+        self.syntax_snapshot.mark_stale();
     }
 
     fn sort_diagnostics(&mut self) {
-        self.diagnostics.sort_by_key(|diagnostic| {
+        Arc::make_mut(&mut self.diagnostics).sort_by_key(|diagnostic| {
             (
                 diagnostic.range,
                 diagnostic.severity,
                 diagnostic.provider.clone(),
             )
         });
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{
-        initial_syntax_budget, syntax_budget, DocumentShape, InteractiveSyntaxReason, SyntaxBudget,
-        SyntaxStatus,
-    };
-    use helix_core::syntax::SyntaxComplexity;
-
-    #[test]
-    fn syntax_budget_uses_idle_for_plain_large_document() {
-        let shape = DocumentShape {
-            line_count: 4_000,
-            byte_count: 128 * 1024,
-        };
-        let complexity = SyntaxComplexity {
-            total_layers: 4,
-            root_injections: 1,
-        };
-
-        assert_eq!(
-            syntax_budget(SyntaxStatus::Fresh, shape, complexity),
-            SyntaxBudget::Idle
-        );
-    }
-
-    #[test]
-    fn syntax_budget_uses_interactive_for_stale_syntax() {
-        let shape = DocumentShape {
-            line_count: 10,
-            byte_count: 1_024,
-        };
-        let complexity = SyntaxComplexity {
-            total_layers: 1,
-            root_injections: 0,
-        };
-
-        assert_eq!(
-            syntax_budget(SyntaxStatus::StalePendingRefresh, shape, complexity),
-            SyntaxBudget::Interactive(InteractiveSyntaxReason::Stale)
-        );
-    }
-
-    #[test]
-    fn syntax_budget_uses_interactive_for_giant_lines() {
-        let shape = DocumentShape {
-            line_count: 2,
-            byte_count: 512 * 1024,
-        };
-        let complexity = SyntaxComplexity {
-            total_layers: 2,
-            root_injections: 0,
-        };
-
-        assert_eq!(
-            syntax_budget(SyntaxStatus::Fresh, shape, complexity),
-            SyntaxBudget::Interactive(InteractiveSyntaxReason::GiantLines)
-        );
-    }
-
-    #[test]
-    fn initial_syntax_budget_uses_interactive_for_giant_lines() {
-        let shape = DocumentShape {
-            line_count: 2,
-            byte_count: 512 * 1024,
-        };
-
-        assert_eq!(
-            initial_syntax_budget(shape),
-            SyntaxBudget::Interactive(InteractiveSyntaxReason::GiantLines)
-        );
-    }
-
-    #[test]
-    fn syntax_budget_uses_interactive_for_layer_fanout() {
-        let shape = DocumentShape {
-            line_count: 500,
-            byte_count: 32 * 1024,
-        };
-        let complexity = SyntaxComplexity {
-            total_layers: 40,
-            root_injections: 4,
-        };
-
-        assert_eq!(
-            syntax_budget(SyntaxStatus::Fresh, shape, complexity),
-            SyntaxBudget::Interactive(InteractiveSyntaxReason::LayerFanout)
-        );
-    }
-
-    #[test]
-    fn syntax_budget_uses_interactive_for_root_injections() {
-        let shape = DocumentShape {
-            line_count: 500,
-            byte_count: 32 * 1024,
-        };
-        let complexity = SyntaxComplexity {
-            total_layers: 12,
-            root_injections: 20,
-        };
-
-        assert_eq!(
-            syntax_budget(SyntaxStatus::Fresh, shape, complexity),
-            SyntaxBudget::Interactive(InteractiveSyntaxReason::RootInjections)
-        );
     }
 }

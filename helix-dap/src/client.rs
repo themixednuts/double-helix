@@ -1,7 +1,7 @@
 use crate::{
     registry::DebugAdapterId,
     requests::{DisconnectArguments, TerminateArguments},
-    transport::{Payload, Request, Response, Transport},
+    transport::{Payload, Request, Response, ServerEvent, Transport},
     Error, Result,
 };
 use helix_core::syntax::config::{DebugAdapterConfig, DebuggerQuirks};
@@ -173,6 +173,29 @@ impl RequestHandle {
         })
         .await
     }
+
+    pub async fn set_breakpoints(
+        &self,
+        file: PathBuf,
+        breakpoints: Vec<SourceBreakpoint>,
+    ) -> Result<Option<Vec<Breakpoint>>> {
+        let args = requests::SetBreakpointsArguments {
+            source: Source {
+                path: Some(file),
+                name: None,
+                source_reference: None,
+                presentation_hint: None,
+                origin: None,
+                sources: None,
+                adapter_data: None,
+                checksums: None,
+            },
+            breakpoints: Some(breakpoints),
+            source_modified: Some(false),
+        };
+        let response = self.request::<requests::SetBreakpoints>(args).await?;
+        Ok(response.breakpoints)
+    }
 }
 
 impl Client {
@@ -184,7 +207,7 @@ impl Client {
         args: Vec<&str>,
         port_arg: Option<&str>,
         id: DebugAdapterId,
-    ) -> Result<(Self, Receiver<(DebugAdapterId, Payload)>)> {
+    ) -> Result<(Self, Receiver<(DebugAdapterId, ServerEvent)>)> {
         if command.is_empty() {
             return Result::Err(Error::Other(anyhow!("Command not provided")));
         }
@@ -201,7 +224,7 @@ impl Client {
         err: Option<Box<dyn AsyncBufRead + Unpin + Send>>,
         id: DebugAdapterId,
         process: Option<Child>,
-    ) -> Result<(Self, Receiver<(DebugAdapterId, Payload)>)> {
+    ) -> Result<(Self, Receiver<(DebugAdapterId, ServerEvent)>)> {
         let (server_rx, server_tx) = Transport::start(rx, tx, err, id);
         let (client_tx, client_rx) = channel(256);
 
@@ -231,7 +254,7 @@ impl Client {
     pub async fn tcp(
         addr: std::net::SocketAddr,
         id: DebugAdapterId,
-    ) -> Result<(Self, Receiver<(DebugAdapterId, Payload)>)> {
+    ) -> Result<(Self, Receiver<(DebugAdapterId, ServerEvent)>)> {
         let stream = TcpStream::connect(addr).await?;
         let (rx, tx) = stream.into_split();
         Self::streams(Box::new(BufReader::new(rx)), Box::new(tx), None, id, None)
@@ -241,11 +264,8 @@ impl Client {
         cmd: &str,
         args: Vec<&str>,
         id: DebugAdapterId,
-    ) -> Result<(Self, Receiver<(DebugAdapterId, Payload)>)> {
-        let cmd = resolve_adapter_command(cmd)?;
-
-        let process = Command::new(cmd)
-            .args(args)
+    ) -> Result<(Self, Receiver<(DebugAdapterId, ServerEvent)>)> {
+        let process = adapter_command(cmd, args)?
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -292,12 +312,9 @@ impl Client {
         args: Vec<&str>,
         port_format: &str,
         id: DebugAdapterId,
-    ) -> Result<(Self, Receiver<(DebugAdapterId, Payload)>)> {
+    ) -> Result<(Self, Receiver<(DebugAdapterId, ServerEvent)>)> {
         let port = Self::get_port().await.unwrap();
-        let cmd = resolve_adapter_command(cmd)?;
-
-        let process = Command::new(cmd)
-            .args(args)
+        let process = adapter_command(cmd, args)?
             .args(port_format.replace("{}", &port.to_string()).split(' '))
             // silence messages
             .stdin(Stdio::null())
@@ -330,19 +347,11 @@ impl Client {
 
     async fn recv(
         id: DebugAdapterId,
-        mut server_rx: Receiver<Payload>,
-        client_tx: Sender<(DebugAdapterId, Payload)>,
+        mut server_rx: Receiver<ServerEvent>,
+        client_tx: Sender<(DebugAdapterId, ServerEvent)>,
     ) {
         while let Some(msg) = server_rx.recv().await {
-            match msg {
-                Payload::Event(ev) => {
-                    let _ = client_tx.send((id, Payload::Event(ev))).await;
-                }
-                Payload::Response(_) => unreachable!(),
-                Payload::Request(req) => {
-                    let _ = client_tx.send((id, Payload::Request(req))).await;
-                }
-            }
+            let _ = client_tx.send((id, msg)).await;
         }
     }
 
@@ -540,24 +549,9 @@ impl Client {
         file: PathBuf,
         breakpoints: Vec<SourceBreakpoint>,
     ) -> Result<Option<Vec<Breakpoint>>> {
-        let args = requests::SetBreakpointsArguments {
-            source: Source {
-                path: Some(file),
-                name: None,
-                source_reference: None,
-                presentation_hint: None,
-                origin: None,
-                sources: None,
-                adapter_data: None,
-                checksums: None,
-            },
-            breakpoints: Some(breakpoints),
-            source_modified: Some(false),
-        };
-
-        let response = self.request::<requests::SetBreakpoints>(args).await?;
-
-        Ok(response.breakpoints)
+        self.request_handle()
+            .set_breakpoints(file, breakpoints)
+            .await
     }
 
     pub async fn configuration_done(&self) -> Result<()> {
@@ -728,11 +722,17 @@ impl Client {
     }
 }
 
-fn resolve_adapter_command(cmd: &str) -> Result<std::path::PathBuf> {
-    match helix_pkg::resolve::command(&helix_pkg::Store::open_default(), cmd) {
-        Some(resolved) => Ok(resolved.path),
-        None => Ok(helix_stdx::env::which(cmd)?),
-    }
+fn adapter_command(cmd: &str, args: Vec<&str>) -> anyhow::Result<Command> {
+    let launch = helix_loader::runtime_assets()?
+        .resolve_command(cmd)?
+        .ok_or_else(|| anyhow!("debug adapter command not found: {cmd}"))?;
+    let mut command = Command::new(launch.program);
+    command
+        .args(launch.prefix_args)
+        .args(launch.default_args)
+        .args(args)
+        .envs(launch.env);
+    Ok(command)
 }
 
 #[cfg(test)]

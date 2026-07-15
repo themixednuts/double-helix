@@ -199,7 +199,7 @@ Do not issue a SQLite query per candidate while the user types. The retained des
 
 Date: 2026-07-04
 
-The file explorer search path no longer recursively walks the whole tree on each query edit. Opening the explorer and changing its root prewarms an explorer-scoped fff-search `FilePicker` using `config.file_explorer` scan semantics. Search key input is debounced, and the due query uses the fff zero-wait path so the UI thread only consumes already-indexed results and never performs an unbounded cold scan.
+The file explorer search path no longer recursively walks the whole tree on each query edit. Opening the explorer and changing its root prewarms an explorer-scoped fff-search `FilePicker` using `config.file_explorer` scan semantics. Every query edit dispatches immediately to a serialized latest-query worker. Pending input is coalesced, and the UI thread only consumes typed results from an already-initialized workspace; it never waits for a cold scan or an in-flight query.
 
 Matched fff paths still expand their ancestor directories before the existing visible-row rebuild/filter pass runs, so files under collapsed directories remain discoverable while clearing search restores the saved expansion set.
 
@@ -235,7 +235,7 @@ Direct `dhx.exe --health clipboard` timing after build: 188.9 ms. The health pat
 
 ### Rejected / Audited
 
-- Explorer search does not issue an fff query on every sync tick: `apply_due_search_filter` clears `search_due_at` after applying, so there was no repeated per-frame query to cache. No query-result cache was kept.
-- `EXPLORER_SEARCH_DEBOUNCE` stayed at 80 ms. The zero-wait FFF query path is already bounded, and no probe showed debounce spam after the due-search guard audit.
+- Explorer search does not issue an fff query on every sync tick. Query edits enqueue once into the serialized worker, which replaces any not-yet-started request with the newest generation. No query-result cache or debounce timer is needed.
+- Search has no debounce. Immediate dispatch preserves per-keystroke feedback while serialized execution prevents overlapping FFF searches from competing for CPU; stale generations are rejected at typed result ingress.
 - Assistant/pkg state lazy-open at app startup was not changed. Package state is only opened by `pkg` commands or package-resolution nudges; assistant bootstrap also restores previously open assistant layout, so deferring it would change startup-visible behavior.
 - Package receipt queries already use primary-key lookup for `(kind, name)`, a bounded `ORDER BY kind, name` full list, and one transaction for legacy receipt import. No measured low-risk package receipt change was kept.

@@ -1,8 +1,8 @@
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use helix_lsp::lsp;
-use helix_runtime::{send_blocking, DebouncedSender, Token, Work};
+use helix_runtime::{PulseGate, PulseHandle, Token, Work};
 
 use helix_view::Editor;
 
@@ -39,7 +39,7 @@ impl ResolveRuntime {
 /// > The returned completion item should have the documentation property filled in.
 pub struct ResolveHandler {
     last_request: Option<Arc<LspCompletionItem>>,
-    resolver: helix_runtime::Sender<ResolveRequest>,
+    resolver: ResolveSender,
 }
 
 impl ResolveHandler {
@@ -98,7 +98,7 @@ impl ResolveHandler {
         ) {
             let item = Arc::new(item.clone());
             self.last_request = Some(item.clone());
-            send_blocking(&self.resolver, ResolveRequest::Resolve { item, ls })
+            self.resolver.resolve(PendingResolve { item, ls });
         } else {
             item.resolved = true;
         }
@@ -107,31 +107,78 @@ impl ResolveHandler {
 
 impl Drop for ResolveHandler {
     fn drop(&mut self) {
-        let _ = self.resolver.try_send(ResolveRequest::Cancel);
+        self.resolver.cancel();
     }
-}
-
-enum ResolveRequest {
-    Resolve {
-        item: Arc<LspCompletionItem>,
-        ls: Arc<helix_lsp::Client>,
-    },
-    Start,
-    Cancel,
 }
 
 struct PendingResolve {
     item: Arc<LspCompletionItem>,
     ls: Arc<helix_lsp::Client>,
-    ingress: crate::runtime::RuntimeIngress,
+}
+
+struct LatestRequest<T> {
+    value: Option<T>,
+    cancel_requested: bool,
+}
+
+impl<T> Default for LatestRequest<T> {
+    fn default() -> Self {
+        Self {
+            value: None,
+            cancel_requested: false,
+        }
+    }
+}
+
+impl<T> LatestRequest<T> {
+    fn replace(&mut self, value: T) {
+        self.value = Some(value);
+    }
+
+    fn cancel(&mut self) {
+        self.value = None;
+        self.cancel_requested = true;
+    }
+
+    fn take(&mut self) -> (bool, Option<T>) {
+        let cancel_requested = std::mem::take(&mut self.cancel_requested);
+        (cancel_requested, self.value.take())
+    }
+}
+
+enum ResolveWake {}
+
+#[derive(Clone)]
+struct ResolveSender {
+    latest: Arc<Mutex<LatestRequest<PendingResolve>>>,
+    wake: PulseHandle<ResolveWake>,
+}
+
+impl ResolveSender {
+    fn resolve(&self, request: PendingResolve) {
+        self.latest
+            .lock()
+            .expect("completion resolve inbox lock poisoned")
+            .replace(request);
+        self.wake.request();
+    }
+
+    fn cancel(&self) {
+        self.latest
+            .lock()
+            .expect("completion resolve inbox lock poisoned")
+            .cancel();
+        self.wake.request();
+    }
 }
 
 struct ResolveTimeout {
     next_request: Option<PendingResolve>,
     in_flight: Option<Arc<LspCompletionItem>>,
     cancel: Option<Token>,
-    debouncer: DebouncedSender<ResolveRequest>,
+    deadline: Option<Instant>,
     work: Work,
+    clock: helix_runtime::Clock,
     ingress: crate::runtime::RuntimeIngress,
 }
 
@@ -140,43 +187,70 @@ impl ResolveTimeout {
         work: Work,
         clock: helix_runtime::Clock,
         ingress: crate::runtime::RuntimeIngress,
-    ) -> helix_runtime::Sender<ResolveRequest> {
-        let (tx, mut rx) = helix_runtime::channel(128);
+    ) -> ResolveSender {
+        let mut gate = PulseGate::<ResolveWake>::new();
+        let wake = gate.handle();
+        let mut wake_rx = gate.take_receiver();
+        let latest = Arc::new(Mutex::new(LatestRequest::default()));
+        let inbox = latest.clone();
         let mut timeout = Self {
             next_request: None,
             in_flight: None,
             cancel: None,
-            debouncer: DebouncedSender::new(
-                Duration::from_millis(150),
-                work.clone(),
-                clock,
-                tx.clone(),
-            ),
+            deadline: None,
             work,
+            clock,
             ingress,
         };
         timeout
             .work
             .clone()
             .spawn(async move {
-                while let Some(request) = rx.recv().await {
-                    timeout.event(request);
-                }
+                timeout.run(&mut wake_rx, inbox).await;
                 timeout.cancel();
             })
             .detach();
-        tx
+        ResolveSender { latest, wake }
     }
 
-    fn event(&mut self, request: ResolveRequest) {
-        match request {
-            ResolveRequest::Resolve { item, ls } => self.handle_resolve(PendingResolve {
-                item,
-                ls,
-                ingress: self.ingress.clone(),
-            }),
-            ResolveRequest::Start => self.start(),
-            ResolveRequest::Cancel => self.cancel(),
+    async fn run(
+        &mut self,
+        wake_rx: &mut helix_runtime::PulseReceiver<ResolveWake>,
+        inbox: Arc<Mutex<LatestRequest<PendingResolve>>>,
+    ) {
+        loop {
+            if let Some(deadline) = self.deadline {
+                let mut timer = self.clock.timer_at(deadline);
+                tokio::select! {
+                    biased;
+                    wake = wake_rx.recv() => {
+                        if wake.is_none() { break; }
+                        self.drain_inbox(&inbox);
+                    }
+                    _ = &mut timer => {
+                        self.deadline = None;
+                        self.start();
+                    }
+                }
+            } else {
+                if wake_rx.recv().await.is_none() {
+                    break;
+                }
+                self.drain_inbox(&inbox);
+            }
+        }
+    }
+
+    fn drain_inbox(&mut self, inbox: &Mutex<LatestRequest<PendingResolve>>) {
+        let (cancel_requested, request) = inbox
+            .lock()
+            .expect("completion resolve inbox lock poisoned")
+            .take();
+        if cancel_requested {
+            self.cancel();
+        }
+        if let Some(request) = request {
+            self.handle_resolve(request);
         }
     }
 
@@ -194,12 +268,12 @@ impl ResolveTimeout {
             .is_some_and(|old_request| old_request == &request.item)
         {
             self.next_request = None;
-            self.debouncer.cancel();
+            self.deadline = None;
             return;
         }
 
         self.next_request = Some(request);
-        self.debouncer.send(ResolveRequest::Start);
+        self.deadline = Some(self.clock.deadline_after(Duration::from_millis(150)));
     }
 
     fn start(&mut self) {
@@ -212,12 +286,14 @@ impl ResolveTimeout {
             current.cancel();
         }
         self.in_flight = Some(request.item.clone());
-        self.work.spawn(request.execute(cancel)).detach();
+        self.work
+            .spawn(request.execute(cancel, self.ingress.clone()))
+            .detach();
     }
 
     fn cancel(&mut self) {
         self.next_request = None;
-        self.debouncer.cancel();
+        self.deadline = None;
         if let Some(cancel) = self.cancel.take() {
             cancel.cancel();
         }
@@ -226,7 +302,7 @@ impl ResolveTimeout {
 }
 
 impl PendingResolve {
-    async fn execute(self, cancel: Token) {
+    async fn execute(self, cancel: Token, ingress: crate::runtime::RuntimeIngress) {
         let future = self.ls.resolve_completion_item(&self.item.item);
         let resolved_item = tokio::select! {
             _ = cancel.canceled() => return,
@@ -253,8 +329,31 @@ impl PendingResolve {
                 previous,
                 resolved: Box::new(resolved_item),
             })),
-            self.ingress,
+            ingress,
         )
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LatestRequest;
+
+    #[test]
+    fn resolve_inbox_keeps_only_the_latest_request() {
+        let mut inbox = LatestRequest::default();
+        inbox.replace(1);
+        inbox.replace(2);
+
+        assert_eq!(inbox.take(), (false, Some(2)));
+    }
+
+    #[test]
+    fn cancellation_clears_pending_resolve() {
+        let mut inbox = LatestRequest::default();
+        inbox.replace(1);
+        inbox.cancel();
+
+        assert_eq!(inbox.take(), (true, None));
     }
 }

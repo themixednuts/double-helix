@@ -1,5 +1,10 @@
 # Runtime Architecture
 
+The target admission, foreground scheduling, render, and terminal presentation
+model is specified in `responsive-application-architecture.md`. This document
+describes the currently implemented runtime flow while that clean-break migration
+is in progress.
+
 Helix terminal UI events are split into two paths:
 
 ```text
@@ -62,12 +67,27 @@ layer. This keeps async producers from mutating UI state directly.
 Plugin-originated terminal UI requests enter through `UiCommand::Plugin`.
 Prompt, confirm, picker, notification, and panel display mutations use the
 same ingress/apply path as other UI requests. Plugin UI callback results are
-converted to `RuntimeTaskEvent::DeliverPluginUiCallback` so the plugin engine
-receives them on the editor side.
+converted to `RuntimeTaskEvent::DeliverPluginUiCallback`, then routed back to
+the exact supervised host generation that owns the callback token. Plugin code
+never executes on the editor thread.
 
-Panel registration still allocates a model panel synchronously because the
-plugin host contract returns a panel handle immediately. Panel component
-creation is then sent as `UiCommand::Plugin(PluginCommand::PushPanel)`.
+Panel registration allocates retained editor-side state while servicing the
+typed host request because the protocol returns an owned panel handle. Panel
+component creation is queued as `UiCommand::Plugin(PluginCommand::PushPanel)`;
+rendering reads retained nodes and never calls into a plugin process.
+
+## Prompt Completion
+
+Prompt input handling never evaluates a completer. A typed completion provider
+captures only the immutable editor state needed by that prompt and produces an
+owned `CompletionRequest`. A latest-generation worker performs command parsing,
+fuzzy matching, filesystem/theme/program index loading, and cache re-evaluation.
+Results carry the prompt identity, input generation, and exact query; stale
+results are rejected before replacing the visible completion list.
+
+Cancellation is keyed by `(PromptId, generation)`, not by the cache keys a job
+happens to request. This distinction matters when consecutive queries both need
+the same file or program index. No debounce or frame-rate timer is involved.
 
 ## PostAction
 

@@ -1,12 +1,10 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::DocumentId;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use parking_lot::Mutex;
-use tokio::sync::mpsc;
-
-use crate::DocumentId;
 
 /// Tracks which directories are being watched and which files map to which documents.
 ///
@@ -27,6 +25,16 @@ impl WatchState {
             dir_refcounts: HashMap::new(),
         }
     }
+
+    fn all_documents(&self) -> Vec<DocumentId> {
+        self.file_to_docs
+            .values()
+            .flatten()
+            .copied()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
 }
 
 pub struct FileWatcher {
@@ -42,26 +50,41 @@ impl std::fmt::Debug for FileWatcher {
     }
 }
 
-/// Events produced by the file watcher for the auto-reload handler.
+/// Semantically reduced events produced by the native watcher.
 #[derive(Debug)]
-pub struct FileChangedEvent {
-    pub path: PathBuf,
-    pub doc_ids: Vec<DocumentId>,
+pub enum FileWatcherEvent {
+    Changed {
+        path: PathBuf,
+        doc_ids: Vec<DocumentId>,
+    },
+    /// Native watcher overflow or failure invalidates every watched document.
+    Rescan { doc_ids: Vec<DocumentId> },
 }
 
 impl FileWatcher {
-    /// Create a new file watcher. Returns the watcher and a receiver for change events.
+    /// Create a new file watcher and publish reduced events directly to its owner.
     ///
     /// The watcher uses OS-native mechanisms (ReadDirectoryChangesW on Windows,
     /// inotify on Linux, kqueue on macOS).
-    pub fn new() -> anyhow::Result<(Self, mpsc::UnboundedReceiver<FileChangedEvent>)> {
-        let (event_tx, event_rx) = mpsc::unbounded_channel();
+    pub fn new(publish: impl Fn(FileWatcherEvent) + Send + Sync + 'static) -> anyhow::Result<Self> {
         let state = Arc::new(Mutex::new(WatchState::new()));
         let callback_state = Arc::clone(&state);
 
         let watcher =
             notify::recommended_watcher(move |result: Result<notify::Event, notify::Error>| {
-                let Ok(event) = result else { return };
+                let event = match result {
+                    Ok(event) => event,
+                    Err(error) => {
+                        log::warn!(
+                            "native file watcher invalidated; scheduling full rescan: {error}"
+                        );
+                        let doc_ids = callback_state.lock().all_documents();
+                        if !doc_ids.is_empty() {
+                            publish(FileWatcherEvent::Rescan { doc_ids });
+                        }
+                        return;
+                    }
+                };
 
                 // We only care about modifications and creates (for atomic saves).
                 use notify::EventKind;
@@ -70,29 +93,26 @@ impl FileWatcher {
                     _ => return,
                 }
 
-                let state = callback_state.lock();
                 for path in &event.paths {
                     // Canonicalize to handle symlinks and path normalization
                     let canonical = match path.canonicalize() {
                         Ok(p) => p,
                         Err(_) => path.clone(),
                     };
-                    if let Some(doc_ids) = state.file_to_docs.get(&canonical) {
-                        let _ = event_tx.send(FileChangedEvent {
+                    let doc_ids = callback_state.lock().file_to_docs.get(&canonical).cloned();
+                    if let Some(doc_ids) = doc_ids {
+                        publish(FileWatcherEvent::Changed {
                             path: canonical,
-                            doc_ids: doc_ids.clone(),
+                            doc_ids,
                         });
                     }
                 }
             })?;
 
-        Ok((
-            Self {
-                _watcher: watcher,
-                state,
-            },
-            event_rx,
-        ))
+        Ok(Self {
+            _watcher: watcher,
+            state,
+        })
     }
 
     /// Start watching a file for changes. Associates it with the given document ID.

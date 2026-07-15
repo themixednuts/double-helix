@@ -1,16 +1,37 @@
-use std::collections::HashMap;
-use std::fmt::Display;
+use std::{
+    collections::{HashMap, HashSet},
+    fmt::Display,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
-use crate::editor::Action;
-use crate::{DocumentId, Editor};
-use helix_core::{Rope, Transaction, Uri};
+use arc_swap::{access::DynAccess, ArcSwap};
+use helix_core::{syntax, Rope, Transaction, Uri};
 use helix_lsp::util::generate_transaction_from_edits;
 use helix_lsp::{lsp, OffsetEncoding};
+
+use crate::{
+    document::LanguageInitialization,
+    editor::{
+        Action, Config, FileOperation, FileOperationDeleteMode, FileOperationDestination,
+        FileOperationOrigin, FileOperationRequest,
+    },
+    Document, DocumentId, Editor,
+};
 
 #[derive(Debug)]
 pub struct ApplyEditError {
     pub kind: ApplyEditErrorKind,
     pub failed_change_idx: usize,
+}
+
+impl ApplyEditError {
+    pub fn worker_failed(message: String) -> Self {
+        Self {
+            kind: ApplyEditErrorKind::IoError(std::io::Error::other(message)),
+            failed_change_idx: 0,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -20,6 +41,22 @@ pub enum ApplyEditErrorKind {
     InvalidEdit,
     InvalidUrl(helix_core::uri::UrlConversionError),
     IoError(std::io::Error),
+}
+
+/// Text edits are applied on the editor main loop. Resource operations are
+/// deliberately returned to the terminal FIFO, where filesystem work and LSP
+/// file-operation notifications can be serialized asynchronously.
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub struct WorkspaceEditResult {
+    pub file_operations: Vec<WorkspaceEditFileOperation>,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+pub struct WorkspaceEditFileOperation {
+    pub request: FileOperationRequest,
+    pub failed_change_idx: usize,
 }
 
 impl From<std::io::Error> for ApplyEditErrorKind {
@@ -46,16 +83,48 @@ impl Display for ApplyEditErrorKind {
     }
 }
 
-struct PreparedTextDocumentEdit {
-    doc_id: Option<DocumentId>,
-    path: std::path::PathBuf,
-    transaction: Transaction,
+/// Immutable UI-thread snapshot handed to one blocking workspace-edit planner.
+/// Closed files are opened only by [`WorkspaceEditPreparation::execute`].
+pub struct WorkspaceEditPreparation {
+    workspace_edit: lsp::WorkspaceEdit,
+    offset_encoding: OffsetEncoding,
+    documents: HashMap<PathBuf, WorkspaceEditDocumentSnapshot>,
+    config: Arc<dyn DynAccess<Config> + Send + Sync>,
+    syn_loader: Arc<ArcSwap<syntax::Loader>>,
 }
 
-#[derive(Clone)]
+impl WorkspaceEditPreparation {
+    pub fn execute(self) -> Result<WorkspaceEditPlan, ApplyEditError> {
+        WorkspaceEditPlanner {
+            documents: self.documents,
+            config: self.config,
+            syn_loader: self.syn_loader,
+        }
+        .plan(self.workspace_edit, self.offset_encoding)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct WorkspaceEditDocumentSnapshot {
+    doc_id: DocumentId,
+    text: Rope,
+    version: i32,
+}
+
+#[derive(Debug)]
+struct PreparedTextDocumentEdit {
+    doc_id: Option<DocumentId>,
+    path: PathBuf,
+    initial_text: Rope,
+    transaction: Transaction,
+    snapshot_version: Option<i32>,
+}
+
+#[derive(Clone, Debug)]
 struct PlannedDocumentState {
     doc_id: Option<DocumentId>,
     text: Rope,
+    snapshot_version: Option<i32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,19 +137,44 @@ enum PlannedPathKind {
 #[derive(Debug, Clone)]
 struct PlannedPathState {
     kind: PlannedPathKind,
-    source_path: Option<std::path::PathBuf>,
+    source_path: Option<PathBuf>,
 }
 
+#[derive(Debug)]
 enum PreparedWorkspaceOperation {
     TextEdit(PreparedTextDocumentEdit),
     ResourceOp(lsp::ResourceOp),
 }
 
-#[derive(Default)]
-struct WorkspaceEditPlan {
-    planned_docs: HashMap<std::path::PathBuf, PlannedDocumentState>,
-    planned_paths: HashMap<std::path::PathBuf, PlannedPathState>,
+/// A worker-produced, validated WorkspaceEdit plan. It contains no filesystem
+/// work; applying it only validates the captured document versions and applies
+/// transactions on the editor main loop.
+#[derive(Debug, Default)]
+pub struct WorkspaceEditPlan {
+    planned_docs: HashMap<PathBuf, PlannedDocumentState>,
+    planned_paths: HashMap<PathBuf, PlannedPathState>,
     operations: Vec<(usize, PreparedWorkspaceOperation)>,
+}
+
+/// Main-thread execution cursor for a worker-prepared workspace edit. It
+/// retains the original `documentChanges` order and records document versions
+/// created by earlier steps so later steps accept only the execution's own
+/// edits.
+#[derive(Debug)]
+pub struct WorkspaceEditExecution {
+    operations: Vec<(usize, PreparedWorkspaceOperation)>,
+    cursor: usize,
+    expected_versions: HashMap<DocumentId, i32>,
+}
+
+#[derive(Debug)]
+pub enum WorkspaceEditExecutionStep {
+    Resource {
+        member: usize,
+        failed_change_idx: usize,
+        request: FileOperationRequest,
+    },
+    Complete,
 }
 
 impl WorkspaceEditPlan {
@@ -94,24 +188,54 @@ impl WorkspaceEditPlan {
             .push((index, PreparedWorkspaceOperation::ResourceOp(op)));
     }
 
+    #[cfg(test)]
     fn into_operations(self) -> Vec<(usize, PreparedWorkspaceOperation)> {
         self.operations
     }
+
+    pub fn into_execution(self) -> WorkspaceEditExecution {
+        WorkspaceEditExecution {
+            operations: self.operations,
+            cursor: 0,
+            expected_versions: HashMap::new(),
+        }
+    }
 }
 
-impl Editor {
-    fn workspace_edit_path(
-        &self,
-        url: &helix_lsp::Url,
-    ) -> Result<std::path::PathBuf, ApplyEditErrorKind> {
-        let uri = match Uri::try_from(url) {
-            Ok(uri) => uri,
-            Err(err) => {
-                log::error!("{err}");
-                return Err(err.into());
-            }
-        };
+struct WorkspaceEditPlanner {
+    documents: HashMap<PathBuf, WorkspaceEditDocumentSnapshot>,
+    config: Arc<dyn DynAccess<Config> + Send + Sync>,
+    syn_loader: Arc<ArcSwap<syntax::Loader>>,
+}
 
+impl WorkspaceEditPlanner {
+    fn plan(
+        &self,
+        workspace_edit: lsp::WorkspaceEdit,
+        offset_encoding: OffsetEncoding,
+    ) -> Result<WorkspaceEditPlan, ApplyEditError> {
+        if let Some(document_changes) = workspace_edit.document_changes {
+            return match document_changes {
+                lsp::DocumentChanges::Edits(document_edits) => {
+                    self.plan_document_change_edits(&document_edits, offset_encoding)
+                }
+                lsp::DocumentChanges::Operations(operations) => {
+                    log::debug!("document changes - operations: {:?}", operations);
+                    self.plan_document_operations(&operations, offset_encoding)
+                }
+            };
+        }
+
+        if let Some(changes) = workspace_edit.changes {
+            log::debug!("workspace changes: {:?}", changes);
+            return self.plan_workspace_changes(&changes, offset_encoding);
+        }
+
+        Ok(WorkspaceEditPlan::default())
+    }
+
+    fn workspace_edit_path(url: &helix_lsp::Url) -> Result<PathBuf, ApplyEditErrorKind> {
+        let uri = Uri::try_from(url).map_err(ApplyEditErrorKind::InvalidUrl)?;
         Ok(helix_stdx::path::canonicalize(
             uri.as_path().expect("URIs are valid paths"),
         ))
@@ -119,64 +243,64 @@ impl Editor {
 
     fn load_workspace_edit_snapshot(
         &self,
-        path: &std::path::Path,
+        path: &Path,
     ) -> Result<PlannedDocumentState, ApplyEditErrorKind> {
-        if let Some(doc_id) = self.document_id_by_path(path) {
-            let doc = self
-                .document(doc_id)
-                .expect("document id returned from path lookup should exist");
+        if let Some(snapshot) = self.documents.get(path) {
             return Ok(PlannedDocumentState {
-                doc_id: Some(doc_id),
-                text: doc.text().clone(),
+                doc_id: Some(snapshot.doc_id),
+                text: snapshot.text.clone(),
+                snapshot_version: Some(snapshot.version),
             });
         }
 
-        let doc = crate::Document::open(
+        let document = Document::open(
             path,
             None,
-            crate::document::LanguageInitialization::Full,
+            LanguageInitialization::Full,
             self.config.clone(),
             self.syn_loader.clone(),
         )
         .map_err(|err| {
-            log::error!(
-                "failed to open document: {}: {}",
-                path.to_string_lossy(),
-                err
-            );
+            log::error!("failed to open document: {}: {}", path.display(), err);
             ApplyEditErrorKind::FileNotFound
         })?;
 
         Ok(PlannedDocumentState {
             doc_id: None,
-            text: doc.text().clone(),
+            text: document.text().clone(),
+            snapshot_version: None,
         })
     }
 
-    fn current_path_state(&self, path: &std::path::Path) -> PlannedPathState {
+    fn current_path_state(&self, path: &Path) -> PlannedPathState {
         let path = helix_stdx::path::canonicalize(path);
-        if self.document_id_by_path(&path).is_some() || path.is_file() {
-            PlannedPathState {
+        if self.documents.contains_key(&path) {
+            return PlannedPathState {
                 kind: PlannedPathKind::File,
                 source_path: Some(path),
-            }
-        } else if path.is_dir() {
-            PlannedPathState {
+            };
+        }
+
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_file() => PlannedPathState {
+                kind: PlannedPathKind::File,
+                source_path: Some(path),
+            },
+            Ok(metadata) if metadata.is_dir() => PlannedPathState {
                 kind: PlannedPathKind::Directory,
                 source_path: None,
-            }
-        } else {
-            PlannedPathState {
+            },
+            _ => PlannedPathState {
                 kind: PlannedPathKind::Missing,
                 source_path: None,
-            }
+            },
         }
     }
 
     fn planned_path_state(
         &self,
-        planned_paths: &HashMap<std::path::PathBuf, PlannedPathState>,
-        path: &std::path::Path,
+        planned_paths: &HashMap<PathBuf, PlannedPathState>,
+        path: &Path,
     ) -> PlannedPathState {
         if let Some(state) = planned_paths.get(path) {
             return state.clone();
@@ -226,9 +350,9 @@ impl Editor {
     }
 
     fn remap_planned_document_subtree(
-        planned_docs: &mut HashMap<std::path::PathBuf, PlannedDocumentState>,
-        from: &std::path::Path,
-        to: &std::path::Path,
+        planned_docs: &mut HashMap<PathBuf, PlannedDocumentState>,
+        from: &Path,
+        to: &Path,
     ) {
         let moved = planned_docs
             .drain()
@@ -241,16 +365,16 @@ impl Editor {
     }
 
     fn remove_planned_document_subtree(
-        planned_docs: &mut HashMap<std::path::PathBuf, PlannedDocumentState>,
-        root: &std::path::Path,
+        planned_docs: &mut HashMap<PathBuf, PlannedDocumentState>,
+        root: &Path,
     ) {
         planned_docs.retain(|path, _| !path.starts_with(root));
     }
 
     fn remap_planned_path_subtree(
-        planned_paths: &mut HashMap<std::path::PathBuf, PlannedPathState>,
-        from: &std::path::Path,
-        to: &std::path::Path,
+        planned_paths: &mut HashMap<PathBuf, PlannedPathState>,
+        from: &Path,
+        to: &Path,
     ) {
         let moved = planned_paths
             .drain()
@@ -263,24 +387,23 @@ impl Editor {
     }
 
     fn remove_planned_path_subtree(
-        planned_paths: &mut HashMap<std::path::PathBuf, PlannedPathState>,
-        root: &std::path::Path,
+        planned_paths: &mut HashMap<PathBuf, PlannedPathState>,
+        root: &Path,
     ) {
         planned_paths.retain(|path, _| !path.starts_with(root));
     }
 
     fn ensure_planned_document_state(
         &self,
-        planned_docs: &mut HashMap<std::path::PathBuf, PlannedDocumentState>,
-        planned_paths: &HashMap<std::path::PathBuf, PlannedPathState>,
-        path: &std::path::Path,
+        planned_docs: &mut HashMap<PathBuf, PlannedDocumentState>,
+        planned_paths: &HashMap<PathBuf, PlannedPathState>,
+        path: &Path,
     ) -> Result<(), ApplyEditErrorKind> {
         if planned_docs.contains_key(path) {
             return Ok(());
         }
 
         self.validate_file_parent(planned_paths, path)?;
-
         if Self::path_blocked_by_plan(planned_paths, path) {
             return Err(ApplyEditErrorKind::InvalidEdit);
         }
@@ -290,10 +413,7 @@ impl Editor {
             return Err(ApplyEditErrorKind::InvalidEdit);
         }
 
-        let source_path = path_state
-            .source_path
-            .clone()
-            .unwrap_or_else(|| path.to_path_buf());
+        let source_path = path_state.source_path.unwrap_or_else(|| path.to_path_buf());
         let planned_doc = self.load_workspace_edit_snapshot(&source_path)?;
         planned_docs.insert(path.to_path_buf(), planned_doc);
         Ok(())
@@ -301,22 +421,20 @@ impl Editor {
 
     fn validate_file_parent(
         &self,
-        planned_paths: &HashMap<std::path::PathBuf, PlannedPathState>,
-        path: &std::path::Path,
+        planned_paths: &HashMap<PathBuf, PlannedPathState>,
+        path: &Path,
     ) -> Result<(), ApplyEditErrorKind> {
         if let Some(parent) = path.parent() {
-            let parent_state = self.planned_path_state(planned_paths, parent);
-            if parent_state.kind == PlannedPathKind::File {
+            if self.planned_path_state(planned_paths, parent).kind == PlannedPathKind::File {
                 return Err(ApplyEditErrorKind::InvalidEdit);
             }
         }
-
         Ok(())
     }
 
     fn path_blocked_by_plan(
-        planned_paths: &HashMap<std::path::PathBuf, PlannedPathState>,
-        path: &std::path::Path,
+        planned_paths: &HashMap<PathBuf, PlannedPathState>,
+        path: &Path,
     ) -> bool {
         planned_paths.iter().any(|(planned_root, state)| {
             state.kind == PlannedPathKind::Missing && path.starts_with(planned_root)
@@ -325,15 +443,15 @@ impl Editor {
 
     fn plan_document_resource_op(
         &self,
-        planned_docs: &mut HashMap<std::path::PathBuf, PlannedDocumentState>,
-        planned_paths: &mut HashMap<std::path::PathBuf, PlannedPathState>,
+        planned_docs: &mut HashMap<PathBuf, PlannedDocumentState>,
+        planned_paths: &mut HashMap<PathBuf, PlannedPathState>,
         op: &lsp::ResourceOp,
     ) -> Result<(), ApplyEditErrorKind> {
         use lsp::ResourceOp;
 
         match op {
             ResourceOp::Create(op) => {
-                let path = self.workspace_edit_path(&op.uri)?;
+                let path = Self::workspace_edit_path(&op.uri)?;
                 let ignore_if_exists = op.options.as_ref().is_some_and(|options| {
                     !options.overwrite.unwrap_or(false) && options.ignore_if_exists.unwrap_or(false)
                 });
@@ -355,11 +473,12 @@ impl Editor {
                     PlannedDocumentState {
                         doc_id: None,
                         text: Rope::new(),
+                        snapshot_version: None,
                     },
                 );
             }
             ResourceOp::Delete(op) => {
-                let path = self.workspace_edit_path(&op.uri)?;
+                let path = Self::workspace_edit_path(&op.uri)?;
                 let path_state = self.planned_path_state(planned_paths, &path);
                 if path_state.kind == PlannedPathKind::Directory {
                     Self::remove_planned_document_subtree(planned_docs, &path);
@@ -368,7 +487,7 @@ impl Editor {
                     planned_docs.remove(&path);
                 }
                 planned_paths.insert(
-                    path.clone(),
+                    path,
                     PlannedPathState {
                         kind: PlannedPathKind::Missing,
                         source_path: None,
@@ -376,14 +495,13 @@ impl Editor {
                 );
             }
             ResourceOp::Rename(op) => {
-                let from = self.workspace_edit_path(&op.old_uri)?;
-                let to = self.workspace_edit_path(&op.new_uri)?;
+                let from = Self::workspace_edit_path(&op.old_uri)?;
+                let to = Self::workspace_edit_path(&op.new_uri)?;
                 let ignore_if_exists = op.options.as_ref().is_some_and(|options| {
                     !options.overwrite.unwrap_or(false) && options.ignore_if_exists.unwrap_or(false)
                 });
                 let from_state = self.planned_path_state(planned_paths, &from);
                 let to_state = self.planned_path_state(planned_paths, &to);
-
                 if ignore_if_exists && to_state.kind != PlannedPathKind::Missing {
                     return Ok(());
                 }
@@ -403,13 +521,10 @@ impl Editor {
                     },
                 );
                 planned_paths.insert(
-                    to.clone(),
+                    to,
                     PlannedPathState {
                         kind: from_state.kind,
-                        source_path: from_state
-                            .source_path
-                            .clone()
-                            .or_else(|| Some(from.clone())),
+                        source_path: from_state.source_path.or(Some(from)),
                     },
                 );
             }
@@ -419,42 +534,33 @@ impl Editor {
     }
 
     fn plan_text_edits(
-        &mut self,
-        planned_docs: &mut HashMap<std::path::PathBuf, PlannedDocumentState>,
-        planned_paths: &HashMap<std::path::PathBuf, PlannedPathState>,
+        &self,
+        planned_docs: &mut HashMap<PathBuf, PlannedDocumentState>,
+        planned_paths: &HashMap<PathBuf, PlannedPathState>,
         url: &helix_lsp::Url,
         version: Option<i32>,
         text_edits: Vec<lsp::TextEdit>,
         offset_encoding: OffsetEncoding,
     ) -> Result<PreparedTextDocumentEdit, ApplyEditErrorKind> {
-        let path = self.workspace_edit_path(url)?;
+        let path = Self::workspace_edit_path(url)?;
         self.ensure_planned_document_state(planned_docs, planned_paths, &path)?;
-
-        let current_doc_id = planned_docs.get(&path).and_then(|doc| doc.doc_id);
-        if let Some(version) = version {
-            if let Some(doc_id) = current_doc_id {
-                let current_doc = self
-                    .document(doc_id)
-                    .expect("workspace edit document should exist during planning");
-                if version != current_doc.version() {
-                    let err = format!("outdated workspace edit for {path:?}");
-                    log::error!(
-                        "{err}, expected {} but got {version}",
-                        current_doc.version()
-                    );
-                    self.set_error(err);
-                    return Err(ApplyEditErrorKind::DocumentChanged);
-                }
-            }
-        }
 
         let planned_state = planned_docs
             .get_mut(&path)
             .expect("planned document state should be loaded");
-        let transaction =
-            generate_transaction_from_edits(&planned_state.text, text_edits, offset_encoding);
+        if let Some(version) = version {
+            if planned_state
+                .snapshot_version
+                .is_some_and(|expected| expected != version)
+            {
+                return Err(ApplyEditErrorKind::DocumentChanged);
+            }
+        }
 
-        let mut next_text = planned_state.text.clone();
+        let initial_text = planned_state.text.clone();
+        let transaction =
+            generate_transaction_from_edits(&initial_text, text_edits, offset_encoding);
+        let mut next_text = initial_text.clone();
         if !transaction.apply(&mut next_text) {
             return Err(ApplyEditErrorKind::InvalidEdit);
         }
@@ -463,65 +569,19 @@ impl Editor {
         Ok(PreparedTextDocumentEdit {
             doc_id: planned_state.doc_id,
             path,
+            initial_text,
             transaction,
+            snapshot_version: planned_state.snapshot_version,
         })
     }
 
-    fn open_workspace_edit_document(
-        &mut self,
-        path: &std::path::Path,
-    ) -> Result<DocumentId, ApplyEditErrorKind> {
-        match self.open(path, Action::Load) {
-            Ok(doc_id) => Ok(doc_id),
-            Err(err) => {
-                let err = format!(
-                    "failed to open document: {}: {}",
-                    path.to_string_lossy(),
-                    err
-                );
-                log::error!("{}", err);
-                self.set_error(err);
-                Err(ApplyEditErrorKind::FileNotFound)
-            }
-        }
-    }
-
-    fn apply_prepared_text_edit(
-        &mut self,
-        prepared_edit: PreparedTextDocumentEdit,
-    ) -> Result<(), ApplyEditErrorKind> {
-        let doc_id = match prepared_edit
-            .doc_id
-            .or_else(|| self.document_id_by_path(&prepared_edit.path))
-        {
-            Some(doc_id) => doc_id,
-            None => self.open_workspace_edit_document(&prepared_edit.path)?,
-        };
-
-        let view_id = self.get_synced_view_id(doc_id);
-        {
-            let doc = self
-                .document_mut(doc_id)
-                .expect("workspace edit document should still be open");
-            if !doc.apply(&prepared_edit.transaction, view_id) {
-                return Err(ApplyEditErrorKind::InvalidEdit);
-            }
-        }
-
-        let view = view_mut!(self, view_id);
-        let doc = doc_mut!(self, &doc_id);
-        doc.append_changes_to_history(view);
-        Ok(())
-    }
-
     fn plan_document_change_edits(
-        &mut self,
+        &self,
         document_edits: &[lsp::TextDocumentEdit],
         offset_encoding: OffsetEncoding,
     ) -> Result<WorkspaceEditPlan, ApplyEditError> {
         let mut plan = WorkspaceEditPlan::default();
-
-        for (i, document_edit) in document_edits.iter().enumerate() {
+        for (index, document_edit) in document_edits.iter().enumerate() {
             let edits = document_edit
                 .edits
                 .iter()
@@ -531,7 +591,6 @@ impl Editor {
                 })
                 .cloned()
                 .collect();
-
             let prepared_edit = self
                 .plan_text_edits(
                     &mut plan.planned_docs,
@@ -543,23 +602,20 @@ impl Editor {
                 )
                 .map_err(|kind| ApplyEditError {
                     kind,
-                    failed_change_idx: i,
+                    failed_change_idx: index,
                 })?;
-
-            plan.push_text_edit(i, prepared_edit);
+            plan.push_text_edit(index, prepared_edit);
         }
-
         Ok(plan)
     }
 
     fn plan_workspace_changes(
-        &mut self,
-        changes: &std::collections::HashMap<helix_lsp::Url, Vec<lsp::TextEdit>>,
+        &self,
+        changes: &HashMap<helix_lsp::Url, Vec<lsp::TextEdit>>,
         offset_encoding: OffsetEncoding,
     ) -> Result<WorkspaceEditPlan, ApplyEditError> {
         let mut plan = WorkspaceEditPlan::default();
-
-        for (i, (uri, text_edits)) in changes.iter().enumerate() {
+        for (index, (uri, text_edits)) in changes.iter().enumerate() {
             let prepared_edit = self
                 .plan_text_edits(
                     &mut plan.planned_docs,
@@ -571,23 +627,20 @@ impl Editor {
                 )
                 .map_err(|kind| ApplyEditError {
                     kind,
-                    failed_change_idx: i,
+                    failed_change_idx: index,
                 })?;
-
-            plan.push_text_edit(i, prepared_edit);
+            plan.push_text_edit(index, prepared_edit);
         }
-
         Ok(plan)
     }
 
     fn plan_document_operations(
-        &mut self,
+        &self,
         operations: &[lsp::DocumentChangeOperation],
         offset_encoding: OffsetEncoding,
     ) -> Result<WorkspaceEditPlan, ApplyEditError> {
         let mut plan = WorkspaceEditPlan::default();
-
-        for (i, operation) in operations.iter().enumerate() {
+        for (index, operation) in operations.iter().enumerate() {
             match operation {
                 lsp::DocumentChangeOperation::Op(op) => {
                     self.plan_document_resource_op(
@@ -597,9 +650,9 @@ impl Editor {
                     )
                     .map_err(|kind| ApplyEditError {
                         kind,
-                        failed_change_idx: i,
+                        failed_change_idx: index,
                     })?;
-                    plan.push_resource_op(i, op.clone());
+                    plan.push_resource_op(index, op.clone());
                 }
                 lsp::DocumentChangeOperation::Edit(document_edit) => {
                     let edits = document_edit
@@ -624,20 +677,288 @@ impl Editor {
                         )
                         .map_err(|kind| ApplyEditError {
                             kind,
-                            failed_change_idx: i,
+                            failed_change_idx: index,
                         })?;
-                    plan.push_text_edit(i, prepared_edit);
+                    plan.push_text_edit(index, prepared_edit);
                 }
             }
         }
-
         Ok(plan)
     }
+}
 
-    fn apply_prepared_workspace_operations(
+fn file_operation_request_from_resource_op(
+    op: &lsp::ResourceOp,
+) -> Result<FileOperationRequest, ApplyEditErrorKind> {
+    use lsp::ResourceOp;
+
+    match op {
+        ResourceOp::Create(op) => {
+            let path = WorkspaceEditPlanner::workspace_edit_path(&op.uri)?;
+            let options = op.options.as_ref();
+            Ok(FileOperationRequest {
+                origin: FileOperationOrigin::workspace_edit(),
+                operation: FileOperation::Create {
+                    path,
+                    is_dir: false,
+                    overwrite: options
+                        .and_then(|options| options.overwrite)
+                        .unwrap_or(false),
+                    ignore_if_exists: options
+                        .and_then(|options| options.ignore_if_exists)
+                        .unwrap_or(false),
+                },
+            })
+        }
+        ResourceOp::Delete(op) => {
+            let path = WorkspaceEditPlanner::workspace_edit_path(&op.uri)?;
+            Ok(FileOperationRequest {
+                origin: FileOperationOrigin::workspace_edit(),
+                operation: FileOperation::Delete {
+                    path,
+                    mode: FileOperationDeleteMode::Permanent,
+                    recursive: op
+                        .options
+                        .as_ref()
+                        .and_then(|options| options.recursive)
+                        .unwrap_or(false),
+                    ignore_missing: true,
+                },
+            })
+        }
+        ResourceOp::Rename(op) => {
+            let source = WorkspaceEditPlanner::workspace_edit_path(&op.old_uri)?;
+            let destination = WorkspaceEditPlanner::workspace_edit_path(&op.new_uri)?;
+            Ok(FileOperationRequest {
+                origin: FileOperationOrigin::workspace_edit(),
+                operation: FileOperation::Move {
+                    source,
+                    destination: FileOperationDestination::Exact(destination),
+                    overwrite: op
+                        .options
+                        .as_ref()
+                        .and_then(|options| options.overwrite)
+                        .unwrap_or(false),
+                    ignore_if_exists: op
+                        .options
+                        .as_ref()
+                        .and_then(|options| options.ignore_if_exists)
+                        .unwrap_or(false),
+                    create_parents: true,
+                },
+            })
+        }
+    }
+}
+
+impl Editor {
+    /// Capture only editor-owned state on the UI thread. The returned request is
+    /// intentionally executed by the terminal runtime's blocking task ingress.
+    pub fn prepare_workspace_edit(
+        &self,
+        offset_encoding: OffsetEncoding,
+        workspace_edit: lsp::WorkspaceEdit,
+    ) -> WorkspaceEditPreparation {
+        let documents = self
+            .documents()
+            .filter_map(|document| {
+                let path = document.path()?;
+                Some((
+                    helix_stdx::path::canonicalize(path),
+                    WorkspaceEditDocumentSnapshot {
+                        doc_id: document.id(),
+                        text: document.text().clone(),
+                        version: document.version(),
+                    },
+                ))
+            })
+            .collect();
+        WorkspaceEditPreparation {
+            workspace_edit,
+            offset_encoding,
+            documents,
+            config: self.config.clone(),
+            syn_loader: self.syn_loader.clone(),
+        }
+    }
+
+    pub(crate) fn validate_workspace_edit_plan(
+        &self,
+        plan: &WorkspaceEditPlan,
+    ) -> Result<(), ApplyEditError> {
+        let mut checked = HashSet::new();
+        for (failed_change_idx, operation) in &plan.operations {
+            let PreparedWorkspaceOperation::TextEdit(edit) = operation else {
+                continue;
+            };
+            let Some(doc_id) = edit.doc_id else {
+                continue;
+            };
+            if !checked.insert(doc_id) {
+                continue;
+            }
+            if self.document(doc_id).is_none_or(|document| {
+                document.version() != edit.snapshot_version.unwrap_or_default()
+            }) {
+                return Err(ApplyEditError {
+                    kind: ApplyEditErrorKind::DocumentChanged,
+                    failed_change_idx: *failed_change_idx,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn open_prepared_workspace_edit_document(
+        &mut self,
+        path: &Path,
+        initial_text: Rope,
+    ) -> DocumentId {
+        let mut document = Document::from(
+            initial_text,
+            None,
+            self.config.clone(),
+            self.syn_loader.clone(),
+        );
+        document.set_path(Some(path));
+        let doc_id = self.new_file_from_document(Action::Load, document);
+        self.refresh_doc_language(doc_id);
+        doc_id
+    }
+
+    fn apply_workspace_edit_execution_text(
+        &mut self,
+        prepared_edit: &PreparedTextDocumentEdit,
+        expected_versions: &mut HashMap<DocumentId, i32>,
+    ) -> Result<(), ApplyEditErrorKind> {
+        let existing_doc_id = prepared_edit
+            .doc_id
+            .or_else(|| self.document_id_by_path(&prepared_edit.path));
+        let doc_id = match existing_doc_id {
+            Some(doc_id) => {
+                let document = self
+                    .document(doc_id)
+                    .ok_or(ApplyEditErrorKind::DocumentChanged)?;
+                if let Some(expected_version) = expected_versions.get(&doc_id) {
+                    if document.version() != *expected_version {
+                        return Err(ApplyEditErrorKind::DocumentChanged);
+                    }
+                } else if let Some(snapshot_version) = prepared_edit.snapshot_version {
+                    if document.version() != snapshot_version {
+                        return Err(ApplyEditErrorKind::DocumentChanged);
+                    }
+                } else if document.text() != &prepared_edit.initial_text {
+                    // A document that was closed during worker planning appeared or
+                    // changed before this step became due.
+                    return Err(ApplyEditErrorKind::DocumentChanged);
+                }
+                doc_id
+            }
+            None if prepared_edit.doc_id.is_some() => {
+                return Err(ApplyEditErrorKind::DocumentChanged);
+            }
+            None => self.open_prepared_workspace_edit_document(
+                &prepared_edit.path,
+                prepared_edit.initial_text.clone(),
+            ),
+        };
+
+        let view_id = self.get_synced_view_id(doc_id);
+        {
+            let document = self
+                .document_mut(doc_id)
+                .expect("workspace edit document should still be open");
+            if !document.apply(&prepared_edit.transaction, view_id) {
+                return Err(ApplyEditErrorKind::InvalidEdit);
+            }
+            expected_versions.insert(doc_id, document.version());
+        }
+
+        let view = view_mut!(self, view_id);
+        let document = doc_mut!(self, &doc_id);
+        document.append_changes_to_history(view);
+        Ok(())
+    }
+
+    /// Advance all consecutive text changes due at this point, then return the
+    /// next resource operation. Resource completion resumes this same cursor.
+    pub fn advance_workspace_edit_execution(
+        &mut self,
+        execution: &mut WorkspaceEditExecution,
+    ) -> Result<WorkspaceEditExecutionStep, ApplyEditError> {
+        while execution.cursor < execution.operations.len() {
+            let member = execution.cursor;
+            let (failed_change_idx, operation) = &execution.operations[member];
+            match operation {
+                PreparedWorkspaceOperation::TextEdit(prepared_edit) => {
+                    self.apply_workspace_edit_execution_text(
+                        prepared_edit,
+                        &mut execution.expected_versions,
+                    )
+                    .map_err(|kind| ApplyEditError {
+                        kind,
+                        failed_change_idx: *failed_change_idx,
+                    })?;
+                    execution.cursor += 1;
+                }
+                PreparedWorkspaceOperation::ResourceOp(op) => {
+                    let request = file_operation_request_from_resource_op(op).map_err(|kind| {
+                        ApplyEditError {
+                            kind,
+                            failed_change_idx: *failed_change_idx,
+                        }
+                    })?;
+                    execution.cursor += 1;
+                    return Ok(WorkspaceEditExecutionStep::Resource {
+                        member,
+                        failed_change_idx: *failed_change_idx,
+                        request,
+                    });
+                }
+            }
+        }
+        Ok(WorkspaceEditExecutionStep::Complete)
+    }
+
+    #[cfg(test)]
+    fn apply_prepared_text_edit(
+        &mut self,
+        prepared_edit: PreparedTextDocumentEdit,
+    ) -> Result<(), ApplyEditErrorKind> {
+        let doc_id = match prepared_edit
+            .doc_id
+            .or_else(|| self.document_id_by_path(&prepared_edit.path))
+        {
+            Some(doc_id) => doc_id,
+            None => self.open_prepared_workspace_edit_document(
+                &prepared_edit.path,
+                prepared_edit.initial_text.clone(),
+            ),
+        };
+
+        let view_id = self.get_synced_view_id(doc_id);
+        {
+            let document = self
+                .document_mut(doc_id)
+                .expect("workspace edit document should still be open");
+            if !document.apply(&prepared_edit.transaction, view_id) {
+                return Err(ApplyEditErrorKind::InvalidEdit);
+            }
+        }
+
+        let view = view_mut!(self, view_id);
+        let document = doc_mut!(self, &doc_id);
+        document.append_changes_to_history(view);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn apply_prepared_workspace_edit(
         &mut self,
         plan: WorkspaceEditPlan,
-    ) -> Result<(), ApplyEditError> {
+    ) -> Result<WorkspaceEditResult, ApplyEditError> {
+        self.validate_workspace_edit_plan(&plan)?;
+        let mut result = WorkspaceEditResult::default();
         for (failed_change_idx, operation) in plan.into_operations() {
             match operation {
                 PreparedWorkspaceOperation::TextEdit(prepared_edit) => {
@@ -648,110 +969,30 @@ impl Editor {
                         })?;
                 }
                 PreparedWorkspaceOperation::ResourceOp(op) => {
-                    self.apply_document_resource_op(&op)
-                        .map_err(|kind| ApplyEditError {
-                            kind,
-                            failed_change_idx,
-                        })?;
+                    result.file_operations.push(WorkspaceEditFileOperation {
+                        request: file_operation_request_from_resource_op(&op).map_err(|kind| {
+                            ApplyEditError {
+                                kind,
+                                failed_change_idx,
+                            }
+                        })?,
+                        failed_change_idx,
+                    });
                 }
             }
         }
-
-        Ok(())
+        Ok(result)
     }
 
+    #[cfg(test)]
     pub fn apply_workspace_edit(
         &mut self,
         offset_encoding: OffsetEncoding,
         workspace_edit: &lsp::WorkspaceEdit,
-    ) -> Result<(), ApplyEditError> {
-        if let Some(ref document_changes) = workspace_edit.document_changes {
-            match document_changes {
-                lsp::DocumentChanges::Edits(document_edits) => {
-                    let plan = self.plan_document_change_edits(document_edits, offset_encoding)?;
-                    self.apply_prepared_workspace_operations(plan)?;
-                }
-                lsp::DocumentChanges::Operations(operations) => {
-                    log::debug!("document changes - operations: {:?}", operations);
-                    let plan = self.plan_document_operations(operations, offset_encoding)?;
-                    self.apply_prepared_workspace_operations(plan)?;
-                }
-            }
-
-            return Ok(());
-        }
-
-        if let Some(ref changes) = workspace_edit.changes {
-            log::debug!("workspace changes: {:?}", changes);
-            let plan = self.plan_workspace_changes(changes, offset_encoding)?;
-            self.apply_prepared_workspace_operations(plan)?;
-        }
-
-        Ok(())
-    }
-
-    fn apply_document_resource_op(
-        &mut self,
-        op: &lsp::ResourceOp,
-    ) -> Result<(), ApplyEditErrorKind> {
-        use lsp::ResourceOp;
-        use std::fs;
-
-        match op {
-            ResourceOp::Create(op) => {
-                let uri = Uri::try_from(&op.uri)?;
-                let path = uri.as_path().expect("URIs are valid paths");
-                let ignore_if_exists = op.options.as_ref().is_some_and(|options| {
-                    !options.overwrite.unwrap_or(false) && options.ignore_if_exists.unwrap_or(false)
-                });
-                if !ignore_if_exists || !path.exists() {
-                    if let Some(dir) = path.parent() {
-                        if !dir.is_dir() {
-                            fs::create_dir_all(dir)?;
-                        }
-                    }
-
-                    fs::write(path, [])?;
-                    self.language_servers
-                        .file_event_handler
-                        .file_changed(path.to_path_buf());
-                }
-            }
-            ResourceOp::Delete(op) => {
-                let uri = Uri::try_from(&op.uri)?;
-                let path = uri.as_path().expect("URIs are valid paths");
-                if path.is_dir() {
-                    let recursive = op
-                        .options
-                        .as_ref()
-                        .and_then(|options| options.recursive)
-                        .unwrap_or(false);
-
-                    if recursive {
-                        fs::remove_dir_all(path)?
-                    } else {
-                        fs::remove_dir(path)?
-                    }
-                    self.language_servers
-                        .file_event_handler
-                        .file_changed(path.to_path_buf());
-                } else if path.is_file() {
-                    fs::remove_file(path)?;
-                }
-            }
-            ResourceOp::Rename(op) => {
-                let from_uri = Uri::try_from(&op.old_uri)?;
-                let from = from_uri.as_path().expect("URIs are valid paths");
-                let to_uri = Uri::try_from(&op.new_uri)?;
-                let to = to_uri.as_path().expect("URIs are valid paths");
-                let ignore_if_exists = op.options.as_ref().is_some_and(|options| {
-                    !options.overwrite.unwrap_or(false) && options.ignore_if_exists.unwrap_or(false)
-                });
-                if !ignore_if_exists || !to.exists() {
-                    self.move_path(from, to)?;
-                }
-            }
-        }
-        Ok(())
+    ) -> Result<WorkspaceEditResult, ApplyEditError> {
+        let plan = self
+            .prepare_workspace_edit(offset_encoding, workspace_edit.clone())
+            .execute()?;
+        self.apply_prepared_workspace_edit(plan)
     }
 }

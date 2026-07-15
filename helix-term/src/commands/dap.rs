@@ -1,15 +1,16 @@
-use super::{Context, Editor};
+use super::Context;
 use crate::{
     compositor,
-    runtime::{ui::command::DapThreadAction, DapCommand, RuntimeTaskEvent, UiCommand},
-    ui::{self, overlay::overlaid, Picker, Popup, Prompt, PromptEvent, Text},
+    runtime::{
+        ingress::DapSessionRequest, ui::command::DapThreadAction, DapCommand, RuntimeTaskEvent,
+        UiCommand,
+    },
+    ui::{self, overlay::overlaid, Picker, Prompt, PromptEvent},
 };
 use helix_core::syntax::config::{DebugConfigCompletion, DebugTemplate};
 use helix_dap::{self as dap, requests::TerminateArguments};
-use helix_lsp::block_on;
 
 use serde_json::{to_value, Value};
-use tui::text::Spans;
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -63,13 +64,8 @@ pub fn dap_start_impl(
     let config = doc
         .language_config()
         .and_then(|config| config.debugger.as_ref())
+        .cloned()
         .ok_or_else(|| anyhow!("No debug adapter available for language"))?;
-
-    let id = cx
-        .editor
-        .debug_adapters
-        .start_client(socket, config)
-        .map_err(|e| anyhow!("Failed to start debug client: {}", e))?;
 
     // TODO: avoid refetching all of this... pass a config in
     let template = match name {
@@ -97,42 +93,22 @@ pub fn dap_start_impl(
 
     let args = to_value(args).unwrap();
 
-    let debugger = match cx.editor.debug_adapters.get_client_mut(id) {
-        Some(child) => child,
-        None => {
-            bail!("Failed to get child debugger.");
-        }
-    };
-
-    match &template.request[..] {
-        "launch" => {
-            let call = debugger.launch(args);
-            let callback = Box::pin(async move {
-                let json = call.await?;
-                let _response: Value = serde_json::from_value(json)?;
-                Ok(UiCommand::Nop)
-            });
-            crate::runtime::ingress::spawn_ui_command_with_future(
-                cx.editor.work(),
-                callback,
-                cx.ingress.clone(),
-            );
-        }
-        "attach" => {
-            let call = debugger.attach(args);
-            let callback = Box::pin(async move {
-                let json = call.await?;
-                let _response: Value = serde_json::from_value(json)?;
-                Ok(UiCommand::Nop)
-            });
-            crate::runtime::ingress::spawn_ui_command_with_future(
-                cx.editor.work(),
-                callback,
-                cx.ingress.clone(),
-            );
-        }
+    let connection_type = match template.request.as_str() {
+        "launch" => dap::ConnectionType::Launch,
+        "attach" => dap::ConnectionType::Attach,
         request => bail!("Unsupported request '{}'", request),
     };
+    crate::effect::dap::start_client(
+        cx.editor,
+        cx.ingress.clone(),
+        socket,
+        config,
+        DapSessionRequest {
+            connection_type,
+            arguments: args,
+            parent: None,
+        },
+    );
 
     // TODO: either await "initialized" or buffer commands until event is received
     Ok(())
@@ -185,7 +161,9 @@ fn map_value(value: &Value, params: &[String]) -> Value {
 
 pub fn dap_launch(cx: &mut Context) {
     // TODO: Now that we support multiple Clients, we could run multiple debuggers at once but for now keep this as is
-    if cx.editor.debug_adapters.get_active_client().is_some() {
+    if cx.editor.debug_adapters.get_active_client().is_some()
+        || cx.editor.debug_adapters.has_pending_clients()
+    {
         cx.editor.set_error("Debugger is already running");
         return;
     }
@@ -292,12 +270,8 @@ pub(crate) fn debug_parameter_prompt(
     .to_owned();
 
     let completer = match field_type {
-        "filename" => |editor: &Editor, input: &str| {
-            ui::completers::filename_with_git_ignore(editor, input, false)
-        },
-        "directory" => |editor: &Editor, input: &str| {
-            ui::completers::directory_with_git_ignore(editor, input, false)
-        },
+        "filename" => ui::completers::filename_with_git_ignore(false),
+        "directory" => ui::completers::directory_with_git_ignore(false),
         _ => ui::completers::none,
     };
 
@@ -356,8 +330,7 @@ pub fn dap_toggle_breakpoint(cx: &mut Context) {
 }
 
 pub fn dap_toggle_breakpoint_impl(cx: &mut Context, path: PathBuf, line: usize) {
-    cx.ingress
-        .task(crate::runtime::RuntimeTaskEvent::ToggleBreakpoint { path, line });
+    cx.submit_task(crate::runtime::RuntimeTaskEvent::ToggleBreakpoint { path, line });
 }
 
 pub fn dap_continue(cx: &mut Context) {
@@ -472,55 +445,37 @@ pub fn dap_variables(cx: &mut Context) {
     };
 
     let frame_id = stack_frame.id;
-    let scopes = match block_on(debugger.scopes(frame_id)) {
-        Ok(s) => s,
-        Err(e) => {
-            cx.editor.set_error(format!("Failed to get scopes: {}", e));
-            return;
-        }
-    };
-
-    // TODO: allow expanding variables into sub-fields
-    let mut variables = Vec::new();
-
-    let theme = &cx.editor.theme;
-    let scope_style = theme.get("ui.linenr.selected");
-    let type_style = theme.get("ui.text");
-    let text_style = theme.get("ui.text.focus");
-
-    for scope in scopes.iter() {
-        // use helix_view::graphics::Style;
-        use tui::text::Span;
-        let response = block_on(debugger.variables(scope.variables_reference));
-
-        variables.push(Spans::from(Span::styled(
-            format!("▸ {}", scope.name),
-            scope_style,
-        )));
-
-        if let Ok(vars) = response {
-            variables.reserve(vars.len());
-            for var in vars {
-                let mut spans = Vec::with_capacity(5);
-
-                spans.push(Span::styled(var.name.to_owned(), text_style));
-                if let Some(ty) = var.ty {
-                    spans.push(Span::raw(": "));
-                    spans.push(Span::styled(ty.to_owned(), type_style));
-                }
-                spans.push(Span::raw(" = "));
-                spans.push(Span::styled(var.value.to_owned(), text_style));
-                variables.push(Spans::from(spans));
+    let request = debugger.request_handle();
+    cx.editor.set_status("Loading debugger variables...");
+    cx.spawn_ui(async move {
+        let scopes = request.scopes(frame_id).await?;
+        let groups = futures_util::future::try_join_all(scopes.into_iter().map(|scope| {
+            let request = request.clone();
+            async move {
+                let variables = request.variables(scope.variables_reference).await?;
+                Ok::<_, helix_dap::Error>(crate::runtime::ui::command::DapScopeVariables {
+                    name: scope.name,
+                    variables,
+                })
             }
-        }
-    }
-
-    let contents = Text::from(tui::text::Text::from(variables));
-    let popup = Popup::new("dap-variables", contents);
-    cx.replace_or_push_layer("dap-variables", popup);
+        }))
+        .await?;
+        Ok(UiCommand::Dap(DapCommand::VariablesPopup {
+            scopes: groups,
+        }))
+    });
 }
 
 pub fn dap_terminate(cx: &mut Context) {
+    let cancelled = cx.editor.debug_adapters.cancel_pending_clients();
+    if cx.editor.debug_adapters.get_active_client().is_none() {
+        if cancelled > 0 {
+            cx.editor.set_status("Debugger startup cancelled");
+        } else {
+            cx.editor.set_status("Terminating debug session...");
+        }
+        return;
+    }
     cx.editor.set_status("Terminating debug session...");
     let debugger = debugger!(cx.editor);
 

@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::ops::Range as StdRange;
+use std::sync::Arc;
 
 use crate::ViewId;
 use helix_core::syntax::{self, OverlayHighlights};
@@ -10,9 +11,9 @@ use helix_runtime::Token;
 
 #[derive(Debug, Clone, Default)]
 pub struct DocumentColorSwatches {
-    pub color_swatches: Vec<InlineAnnotation>,
-    pub colors: Vec<syntax::Highlight>,
-    pub color_swatches_padding: Vec<InlineAnnotation>,
+    pub color_swatches: Arc<[InlineAnnotation]>,
+    pub colors: Arc<[syntax::Highlight]>,
+    pub color_swatches_padding: Arc<[InlineAnnotation]>,
 }
 
 #[derive(Debug, Clone)]
@@ -105,19 +106,20 @@ pub struct InlineCompletionGhost {
 
 #[derive(Debug, Clone, Default)]
 pub struct DocumentInlineValues {
-    pub annotations: Vec<InlineAnnotation>,
+    pub annotations: Arc<[InlineAnnotation]>,
 }
 
 #[derive(Debug, Default)]
 pub struct DocumentLspState {
-    previous_diagnostic_id: Option<String>,
-    color_swatches: Option<DocumentColorSwatches>,
+    previous_diagnostic_ids: HashMap<LanguageServerId, String>,
+    pull_diagnostic_generations: HashMap<LanguageServerId, u64>,
+    color_swatches: Option<Arc<DocumentColorSwatches>>,
     code_lenses: Option<DocumentCodeLenses>,
     document_links: Option<DocumentLinks>,
     semantic_tokens: HashMap<LanguageServerId, DocumentSemanticTokens>,
     semantic_token_delta_states: HashMap<LanguageServerId, DocumentSemanticTokenDeltaState>,
-    inline_completion: Option<InlineCompletionGhost>,
-    inline_values: Option<DocumentInlineValues>,
+    inline_completion: Option<Arc<InlineCompletionGhost>>,
+    inline_values: Option<Arc<DocumentInlineValues>>,
     color_swatch_cancel: Option<Token>,
     code_lens_cancel: Option<Token>,
     document_link_cancel: Option<Token>,
@@ -126,32 +128,62 @@ pub struct DocumentLspState {
     inline_completion_cancel: Option<Token>,
     inline_value_cancel: Option<Token>,
     lsp_fold_views: HashSet<ViewId>,
-    pull_diagnostic_cancel: Option<Token>,
 }
 
 impl DocumentLspState {
-    pub fn restart_pull_diagnostics(&mut self) -> Token {
-        self.cancel_pull_diagnostics();
-        let token = Token::new();
-        self.pull_diagnostic_cancel = Some(token.clone());
-        token
+    fn is_current_request(current: &Option<Token>, request: &Token) -> bool {
+        !request.is_canceled()
+            && current
+                .as_ref()
+                .is_some_and(|current| current.same_token(request))
     }
 
-    pub fn cancel_pull_diagnostics(&mut self) -> bool {
-        let Some(token) = self.pull_diagnostic_cancel.take() else {
-            return false;
-        };
-        let was_active = !token.is_canceled();
-        token.cancel();
-        was_active
+    pub fn next_pull_diagnostics_generation(&mut self, server_id: LanguageServerId) -> u64 {
+        let generation = self
+            .pull_diagnostic_generations
+            .entry(server_id)
+            .or_default();
+        *generation = generation.saturating_add(1).max(1);
+        *generation
     }
 
-    pub fn previous_diagnostic_id(&self) -> Option<&str> {
-        self.previous_diagnostic_id.as_deref()
+    pub fn pull_diagnostics_generation(&self, server_id: LanguageServerId) -> Option<u64> {
+        self.pull_diagnostic_generations.get(&server_id).copied()
     }
 
-    pub fn set_previous_diagnostic_id(&mut self, previous_diagnostic_id: Option<String>) {
-        self.previous_diagnostic_id = previous_diagnostic_id;
+    pub fn is_current_pull_diagnostics(
+        &self,
+        server_id: LanguageServerId,
+        generation: u64,
+    ) -> bool {
+        self.pull_diagnostics_generation(server_id) == Some(generation)
+    }
+
+    pub fn previous_diagnostic_id(&self, server_id: LanguageServerId) -> Option<&str> {
+        self.previous_diagnostic_ids
+            .get(&server_id)
+            .map(String::as_str)
+    }
+
+    pub fn set_previous_diagnostic_id(
+        &mut self,
+        server_id: LanguageServerId,
+        previous_diagnostic_id: Option<String>,
+    ) {
+        match previous_diagnostic_id {
+            Some(previous_diagnostic_id) => {
+                self.previous_diagnostic_ids
+                    .insert(server_id, previous_diagnostic_id);
+            }
+            None => {
+                self.previous_diagnostic_ids.remove(&server_id);
+            }
+        }
+    }
+
+    pub fn clear_pull_diagnostics_server(&mut self, server_id: LanguageServerId) {
+        self.previous_diagnostic_ids.remove(&server_id);
+        self.pull_diagnostic_generations.remove(&server_id);
     }
 
     pub fn restart_color_swatches(&mut self) -> Token {
@@ -170,8 +202,16 @@ impl DocumentLspState {
         was_active
     }
 
+    pub fn is_current_color_swatches(&self, request: &Token) -> bool {
+        Self::is_current_request(&self.color_swatch_cancel, request)
+    }
+
     pub fn color_swatches(&self) -> Option<&DocumentColorSwatches> {
-        self.color_swatches.as_ref()
+        self.color_swatches.as_deref()
+    }
+
+    pub fn color_swatches_snapshot(&self) -> Option<Arc<DocumentColorSwatches>> {
+        self.color_swatches.clone()
     }
 
     pub fn clear_color_swatches(&mut self) {
@@ -179,13 +219,13 @@ impl DocumentLspState {
     }
 
     pub fn set_color_swatches(&mut self, color_swatches: DocumentColorSwatches) {
-        self.color_swatches = Some(color_swatches);
+        self.color_swatches = Some(Arc::new(color_swatches));
     }
 
     pub fn update_color_swatches(&mut self, changes: &ChangeSet) {
-        let apply_color_swatch_changes = |annotations: &mut Vec<InlineAnnotation>| {
+        let apply_color_swatch_changes = |annotations: &mut Arc<[InlineAnnotation]>| {
             changes.update_positions(
-                annotations
+                Arc::make_mut(annotations)
                     .iter_mut()
                     .map(|annotation| (&mut annotation.char_idx, Assoc::After)),
             );
@@ -195,7 +235,7 @@ impl DocumentLspState {
             color_swatches,
             colors: _,
             color_swatches_padding,
-        }) = &mut self.color_swatches
+        }) = self.color_swatches.as_mut().map(Arc::make_mut)
         {
             apply_color_swatch_changes(color_swatches);
             apply_color_swatch_changes(color_swatches_padding);
@@ -216,6 +256,10 @@ impl DocumentLspState {
         let was_active = !token.is_canceled();
         token.cancel();
         was_active
+    }
+
+    pub fn is_current_code_lenses(&self, request: &Token) -> bool {
+        Self::is_current_request(&self.code_lens_cancel, request)
     }
 
     pub fn code_lenses(&self) -> Option<&DocumentCodeLenses> {
@@ -264,6 +308,10 @@ impl DocumentLspState {
         was_active
     }
 
+    pub fn is_current_document_links(&self, request: &Token) -> bool {
+        Self::is_current_request(&self.document_link_cancel, request)
+    }
+
     pub fn document_links(&self) -> Option<&DocumentLinks> {
         self.document_links.as_ref()
     }
@@ -304,6 +352,10 @@ impl DocumentLspState {
         let was_active = !token.is_canceled();
         token.cancel();
         was_active
+    }
+
+    pub fn is_current_semantic_tokens(&self, request: &Token) -> bool {
+        Self::is_current_request(&self.semantic_token_cancel, request)
     }
 
     pub fn semantic_tokens(&self) -> &HashMap<LanguageServerId, DocumentSemanticTokens> {
@@ -354,7 +406,7 @@ impl DocumentLspState {
     pub fn update_semantic_tokens(&mut self, changes: &ChangeSet) {
         self.semantic_tokens.clear();
         self.semantic_token_delta_states.clear();
-        if let Some(ghost) = &mut self.inline_completion {
+        if let Some(ghost) = self.inline_completion.as_mut().map(Arc::make_mut) {
             changes.update_positions([(&mut ghost.cursor, Assoc::After)].into_iter());
             changes.update_positions([(&mut ghost.annotation.char_idx, Assoc::After)].into_iter());
             if let Some(range) = &mut ghost.replace_range {
@@ -367,10 +419,9 @@ impl DocumentLspState {
                 );
             }
         }
-        if let Some(inline_values) = &mut self.inline_values {
+        if let Some(inline_values) = self.inline_values.as_mut().map(Arc::make_mut) {
             changes.update_positions(
-                inline_values
-                    .annotations
+                Arc::make_mut(&mut inline_values.annotations)
                     .iter_mut()
                     .map(|annotation| (&mut annotation.char_idx, Assoc::After)),
             );
@@ -395,12 +446,20 @@ impl DocumentLspState {
         was_active
     }
 
+    pub fn is_current_inline_completion(&self, request: &Token) -> bool {
+        Self::is_current_request(&self.inline_completion_cancel, request)
+    }
+
     pub fn inline_completion(&self) -> Option<&InlineCompletionGhost> {
-        self.inline_completion.as_ref()
+        self.inline_completion.as_deref()
+    }
+
+    pub fn inline_completion_snapshot(&self) -> Option<Arc<InlineCompletionGhost>> {
+        self.inline_completion.clone()
     }
 
     pub fn set_inline_completion(&mut self, completion: InlineCompletionGhost) {
-        self.inline_completion = Some(completion);
+        self.inline_completion = Some(Arc::new(completion));
     }
 
     pub fn clear_inline_completion(&mut self) {
@@ -425,12 +484,20 @@ impl DocumentLspState {
         was_active
     }
 
+    pub fn is_current_inline_values(&self, request: &Token) -> bool {
+        Self::is_current_request(&self.inline_value_cancel, request)
+    }
+
     pub fn inline_values(&self) -> Option<&DocumentInlineValues> {
-        self.inline_values.as_ref()
+        self.inline_values.as_deref()
+    }
+
+    pub fn inline_values_snapshot(&self) -> Option<Arc<DocumentInlineValues>> {
+        self.inline_values.clone()
     }
 
     pub fn set_inline_values(&mut self, values: DocumentInlineValues) {
-        self.inline_values = Some(values);
+        self.inline_values = Some(Arc::new(values));
     }
 
     pub fn clear_inline_values(&mut self) {
@@ -451,6 +518,10 @@ impl DocumentLspState {
         let was_active = !token.is_canceled();
         token.cancel();
         was_active
+    }
+
+    pub fn is_current_folding_ranges(&self, request: &Token) -> bool {
+        Self::is_current_request(&self.folding_range_cancel, request)
     }
 
     pub fn mark_lsp_fold_container(&mut self, view_id: ViewId) {
@@ -891,7 +962,7 @@ mod tests {
         let mut state = DocumentLspState::default();
         let first = state.restart_inline_values();
         state.set_inline_values(DocumentInlineValues {
-            annotations: vec![InlineAnnotation::new(3, " = 1")],
+            annotations: vec![InlineAnnotation::new(3, " = 1")].into(),
         });
 
         let second = state.restart_inline_values();
@@ -899,5 +970,61 @@ mod tests {
         assert!(first.is_canceled());
         assert!(!second.is_canceled());
         assert!(state.inline_values().is_none());
+    }
+
+    #[test]
+    fn feature_results_only_match_the_current_request_ticket() {
+        let mut state = DocumentLspState::default();
+        let first = state.restart_code_lenses();
+        let second = state.restart_code_lenses();
+
+        assert!(first.is_canceled());
+        assert!(!state.is_current_code_lenses(&first));
+        assert!(state.is_current_code_lenses(&second));
+
+        state.cancel_code_lenses();
+        assert!(!state.is_current_code_lenses(&second));
+    }
+
+    #[test]
+    fn pull_diagnostic_generations_and_result_ids_are_server_scoped() {
+        let mut server_ids = slotmap::SlotMap::<LanguageServerId, ()>::with_key();
+        let first_server = server_ids.insert(());
+        let second_server = server_ids.insert(());
+        let mut state = DocumentLspState::default();
+
+        let first_generation = state.next_pull_diagnostics_generation(first_server);
+        let second_generation = state.next_pull_diagnostics_generation(second_server);
+        state.set_previous_diagnostic_id(first_server, Some("first-result".to_string()));
+        state.set_previous_diagnostic_id(second_server, Some("second-result".to_string()));
+
+        assert_eq!(first_generation, 1);
+        assert_eq!(second_generation, 1);
+        assert!(state.is_current_pull_diagnostics(first_server, first_generation));
+        assert!(state.is_current_pull_diagnostics(second_server, second_generation));
+        assert_eq!(
+            state.previous_diagnostic_id(first_server),
+            Some("first-result")
+        );
+        assert_eq!(
+            state.previous_diagnostic_id(second_server),
+            Some("second-result")
+        );
+
+        state.next_pull_diagnostics_generation(first_server);
+        state.set_previous_diagnostic_id(first_server, Some("first-result-2".to_string()));
+        assert!(!state.is_current_pull_diagnostics(first_server, first_generation));
+        assert_eq!(
+            state.previous_diagnostic_id(second_server),
+            Some("second-result")
+        );
+
+        state.clear_pull_diagnostics_server(first_server);
+        assert_eq!(state.pull_diagnostics_generation(first_server), None);
+        assert_eq!(state.previous_diagnostic_id(first_server), None);
+        assert_eq!(
+            state.previous_diagnostic_id(second_server),
+            Some("second-result")
+        );
     }
 }

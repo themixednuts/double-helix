@@ -1,6 +1,5 @@
 use futures_util::stream::FuturesOrdered;
 use helix_lsp::{
-    block_on,
     lsp::{
         self, CodeAction, CodeActionOrCommand, CodeActionTriggerKind, DiagnosticSeverity,
         NumberOrString,
@@ -25,7 +24,7 @@ use helix_view::{
     handlers::lsp::SignatureHelpInvoked,
     icons::ICONS,
     theme::Style,
-    Document, View,
+    Document, DocumentId, View,
 };
 
 use crate::{
@@ -46,14 +45,17 @@ use std::{cmp::Ordering, collections::HashSet, fmt::Display, future::Future};
 
 #[derive(Clone)]
 struct LspCodeLensPickerItem {
+    doc_id: DocumentId,
+    expected_version: i32,
     server_id: LanguageServerId,
     lens: lsp::CodeLens,
 }
 
 #[derive(Clone)]
 struct LspDocumentLinkPickerItem {
+    doc_id: DocumentId,
+    expected_version: i32,
     server_id: LanguageServerId,
-    offset_encoding: OffsetEncoding,
     link: lsp::DocumentLink,
     text: String,
 }
@@ -210,7 +212,13 @@ fn diag_picker(
         crate::ui::PickerRuntime::new(cx.editor),
         cx.ingress.clone(),
         move |cx: &mut crate::compositor::Context, diag: &PickerDiagnostic, action| {
-            navigation::jump_to_location(cx.editor, &diag.location, action);
+            navigation::jump_to_location(
+                cx.editor,
+                &cx.ingress,
+                &cx.foreground,
+                &diag.location,
+                action,
+            );
             let (view_id, doc) = focused!(cx.editor);
             let view = view_mut!(cx.editor, view_id);
             view.diagnostics_handler
@@ -338,7 +346,8 @@ pub fn workspace_symbol_picker(cx: &mut Context) {
                        editor: &mut Editor,
                        _data,
                        injector: &Injector<_, _>,
-                       work: helix_runtime::Work| {
+                       work: helix_runtime::Work,
+                       _block: helix_runtime::Block| {
         let (_, doc) = focused_ref!(editor);
         let mut seen_language_servers = HashSet::new();
         let mut futures: FuturesOrdered<_> = doc
@@ -453,11 +462,17 @@ pub fn workspace_symbol_picker(cx: &mut Context) {
         crate::ui::PickerRuntime::new(cx.editor),
         cx.ingress.clone(),
         move |cx: &mut crate::compositor::Context, item: &DocumentSymbolPickerItem, action| {
-            navigation::jump_to_location(cx.editor, &item.location, action);
+            navigation::jump_to_location(
+                cx.editor,
+                &cx.ingress,
+                &cx.foreground,
+                &item.location,
+                action,
+            );
         },
     )
     .with_preview(|_editor, item| navigation::location_to_file_location(&item.location))
-    .with_dynamic_query(get_symbols, None)
+    .with_dynamic_query(get_symbols, ui::picker::DynamicQuerySchedule::Immediate)
     .truncate_start(false);
 
     cx.push_layer(Box::new(overlaid(picker)));
@@ -556,6 +571,8 @@ pub fn code_action_picker(cx: &mut Context) {
 
 pub fn code_lens(cx: &mut Context) {
     let (view_id, doc) = focused_ref!(cx.editor);
+    let doc_id = doc.id();
+    let expected_version = doc.version();
     let text = doc.text();
     let selection_lines: HashSet<_> = doc
         .selection(view_id)
@@ -579,6 +596,8 @@ pub fn code_lens(cx: &mut Context) {
             selection_lines.contains(&line)
         })
         .map(|lens| LspCodeLensPickerItem {
+            doc_id,
+            expected_version,
             server_id: lens.server_id,
             lens: lens.lens.clone(),
         })
@@ -589,6 +608,8 @@ pub fn code_lens(cx: &mut Context) {
             .lenses
             .iter()
             .map(|lens| LspCodeLensPickerItem {
+                doc_id,
+                expected_version,
                 server_id: lens.server_id,
                 lens: lens.lens.clone(),
             })
@@ -623,41 +644,32 @@ pub fn code_lens(cx: &mut Context) {
                 cx.editor.set_error("Language Server disappeared");
                 return;
             };
-            let mut lens = item.lens.clone();
-            if lens.command.is_none() {
-                if let Some(resolve) = language_server.resolve_code_lens(&lens) {
-                    match block_on(resolve) {
-                        Ok(resolved) => {
-                            for doc in cx.editor.documents_mut() {
-                                let Some(code_lenses) = doc.code_lenses_mut() else {
-                                    continue;
-                                };
-                                if let Some(stored) = code_lenses.lenses.iter_mut().find(|stored| {
-                                    stored.server_id == item.server_id && stored.lens == item.lens
-                                }) {
-                                    stored.lens = resolved.clone();
-                                    stored.resolved = true;
-                                    break;
-                                }
-                            }
-                            lens = resolved;
-                        }
-                        Err(err) => {
-                            cx.editor
-                                .set_error(format!("Failed to resolve code lens: {err}"));
-                            return;
-                        }
-                    }
-                }
+            if let Some(command) = item.lens.command.clone() {
+                cx.submit_task(RuntimeTaskEvent::ExecuteLspCommand {
+                    command,
+                    server_id: item.server_id,
+                });
+                return;
             }
-            let Some(command) = lens.command else {
+            let Some(resolve) = language_server.resolve_code_lens(&item.lens) else {
                 cx.editor
                     .set_error("Code lens did not resolve to a command");
                 return;
             };
-            cx.ingress.task(RuntimeTaskEvent::ExecuteLspCommand {
-                command,
-                server_id: item.server_id,
+            let doc_id = item.doc_id;
+            let expected_version = item.expected_version;
+            let server_id = item.server_id;
+            let original = item.lens.clone();
+            cx.editor.set_status("Resolving code lens...");
+            cx.spawn_task_event(async move {
+                let resolved = resolve.await?;
+                Ok(RuntimeTaskEvent::ApplyResolvedCodeLens {
+                    doc_id,
+                    expected_version,
+                    server_id,
+                    original,
+                    resolved,
+                })
             });
         },
     );
@@ -666,6 +678,8 @@ pub fn code_lens(cx: &mut Context) {
 
 pub fn document_links(cx: &mut Context) {
     let (_, doc) = focused_ref!(cx.editor);
+    let doc_id = doc.id();
+    let expected_version = doc.version();
     let Some(document_links) = doc.document_links() else {
         cx.editor.set_status("No document links available");
         return;
@@ -675,8 +689,9 @@ pub fn document_links(cx: &mut Context) {
         .links
         .iter()
         .map(|link| LspDocumentLinkPickerItem {
+            doc_id,
+            expected_version,
             server_id: link.server_id,
-            offset_encoding: link.offset_encoding,
             text: link.range.fragment(text).into(),
             link: link.link.clone(),
         })
@@ -707,7 +722,13 @@ pub fn document_links(cx: &mut Context) {
         crate::ui::PickerRuntime::new(cx.editor),
         cx.ingress.clone(),
         move |cx: &mut compositor::Context, item: &LspDocumentLinkPickerItem, action| {
-            open_document_link(cx.editor, cx.ingress.clone(), item.clone(), action);
+            open_document_link(
+                cx.editor,
+                &cx.foreground,
+                cx.ingress.clone(),
+                item.clone(),
+                action,
+            );
         },
     )
     .truncate_start(false);
@@ -716,6 +737,7 @@ pub fn document_links(cx: &mut Context) {
 
 fn open_document_link(
     editor: &mut Editor,
+    foreground: &crate::runtime::ForegroundEvents,
     ingress: crate::runtime::RuntimeIngress,
     item: LspDocumentLinkPickerItem,
     action: Action,
@@ -724,47 +746,40 @@ fn open_document_link(
         editor.set_error("Language Server disappeared");
         return;
     };
-    let mut link = item.link;
-    if link.target.is_none() {
-        if let Some(resolve) = language_server.resolve_document_link(&link) {
-            match block_on(resolve) {
-                Ok(resolved) => link = resolved,
-                Err(err) => {
-                    editor.set_error(format!("Failed to resolve document link: {err}"));
-                    return;
-                }
-            }
+    let doc_id = item.doc_id;
+    let expected_version = item.expected_version;
+    if let Some(target) = item.link.target {
+        if let Err(error) = foreground.task(RuntimeTaskEvent::OpenResolvedDocumentLink {
+            doc_id,
+            expected_version,
+            target,
+            action,
+        }) {
+            editor.set_error(error.to_string());
         }
+        return;
     }
-    let Some(target) = link.target else {
+    let Some(resolve) = language_server.resolve_document_link(&item.link) else {
         editor.set_error("Document link did not resolve to a target");
         return;
     };
-    if target.scheme() == "file" {
-        let Ok(uri) = Uri::try_from(target) else {
-            editor.set_error("Document link target is not a valid file URI");
-            return;
-        };
-        let Some(path) = uri.as_path() else {
-            editor.set_error("Document link target is not a local path");
-            return;
-        };
-        let result = editor.show_document(helix_view::editor::ShowDocumentRequest {
-            path: path.to_path_buf(),
-            action,
-            selection: None,
-            offset_encoding: item.offset_encoding,
-        });
-        if let Err(err) = result {
-            editor.set_error(format!("Failed to open document link: {err}"));
-        }
-    } else {
-        crate::runtime::ingress::spawn_task_event_with_future(
-            editor.work(),
-            crate::open_external_url_task_event(target),
-            ingress,
-        );
-    }
+    editor.set_status("Resolving document link...");
+    crate::runtime::ingress::spawn_task_event_with_future(
+        editor.work(),
+        async move {
+            let resolved = resolve.await?;
+            let target = resolved
+                .target
+                .ok_or_else(|| anyhow::anyhow!("Document link did not resolve to a target"))?;
+            Ok(RuntimeTaskEvent::OpenResolvedDocumentLink {
+                doc_id,
+                expected_version,
+                target,
+                action,
+            })
+        },
+        ingress,
+    );
 }
 
 pub(crate) fn try_open_document_link_at_cursor(cx: &mut Context, action: Action) -> bool {
@@ -783,10 +798,12 @@ pub(crate) fn try_open_document_link_at_cursor(cx: &mut Context, action: Action)
     };
     open_document_link(
         cx.editor,
+        &cx.foreground,
         cx.ingress.clone(),
         LspDocumentLinkPickerItem {
+            doc_id: doc.id(),
+            expected_version: doc.version(),
             server_id: link.server_id,
-            offset_encoding: link.offset_encoding,
             link: link.link.clone(),
             text: String::new(),
         },
@@ -1558,37 +1575,7 @@ pub(crate) fn create_rename_prompt(
                     if event != PromptEvent::Validate {
                         return;
                     }
-                    let (view_id, doc) = focused!(cx.editor);
-
-                    let Some(language_server) = doc
-                        .language_servers_with_feature(LanguageServerFeature::RenameSymbol)
-                        .find(|ls| language_server_id.is_none_or(|id| id == ls.id()))
-                    else {
-                        cx.editor
-                            .set_error("No configured language server supports symbol renaming");
-                        return;
-                    };
-
-                    let offset_encoding = language_server.offset_encoding();
-                    let pos = doc.position(view_id, offset_encoding);
-                    let future = language_server
-                        .rename_symbol(doc.identifier(), pos, input.to_string())
-                        .unwrap();
-
-                    match block_on(future) {
-                        Ok(edits) => {
-                            if let Err(err) = cx
-                                .editor
-                                .apply_workspace_edit(offset_encoding, &edits.unwrap_or_default())
-                            {
-                                cx.editor.set_error(format!(
-                                    "Failed to apply rename edits: {}",
-                                    err.kind
-                                ));
-                            }
-                        }
-                        Err(err) => cx.editor.set_error(err.to_string()),
-                    }
+                    submit_rename(cx, input, language_server_id);
                 },
                 helix_view::editor::CmdlineStyle::Popup,
             )
@@ -1605,37 +1592,7 @@ pub(crate) fn create_rename_prompt(
                     if event != PromptEvent::Validate {
                         return;
                     }
-                    let (view_id, doc) = focused!(cx.editor);
-
-                    let Some(language_server) = doc
-                        .language_servers_with_feature(LanguageServerFeature::RenameSymbol)
-                        .find(|ls| language_server_id.is_none_or(|id| id == ls.id()))
-                    else {
-                        cx.editor
-                            .set_error("No configured language server supports symbol renaming");
-                        return;
-                    };
-
-                    let offset_encoding = language_server.offset_encoding();
-                    let pos = doc.position(view_id, offset_encoding);
-                    let future = language_server
-                        .rename_symbol(doc.identifier(), pos, input.to_string())
-                        .unwrap();
-
-                    match block_on(future) {
-                        Ok(edits) => {
-                            if let Err(err) = cx
-                                .editor
-                                .apply_workspace_edit(offset_encoding, &edits.unwrap_or_default())
-                            {
-                                cx.editor.set_error(format!(
-                                    "Failed to apply rename edits: {}",
-                                    err.kind
-                                ));
-                            }
-                        }
-                        Err(err) => cx.editor.set_error(err.to_string()),
-                    }
+                    submit_rename(cx, input, language_server_id);
                 },
             )
             .with_line(prefill, editor);
@@ -1643,6 +1600,43 @@ pub(crate) fn create_rename_prompt(
             Box::new(prompt)
         }
     }
+}
+
+fn submit_rename(
+    cx: &mut compositor::Context,
+    input: &str,
+    language_server_id: Option<LanguageServerId>,
+) {
+    let (view_id, doc) = focused!(cx.editor);
+    let Some(language_server) = doc
+        .language_servers_with_feature(LanguageServerFeature::RenameSymbol)
+        .find(|server| language_server_id.is_none_or(|id| id == server.id()))
+    else {
+        cx.editor
+            .set_error("No configured language server supports symbol renaming");
+        return;
+    };
+
+    let doc_id = doc.id();
+    let expected_version = doc.version();
+    let offset_encoding = language_server.offset_encoding();
+    let position = doc.position(view_id, offset_encoding);
+    let Some(request) = language_server.rename_symbol(doc.identifier(), position, input.to_owned())
+    else {
+        cx.editor
+            .set_error("Language server does not support symbol renaming");
+        return;
+    };
+    cx.editor.set_status("Renaming symbol...");
+    cx.spawn_task_event(async move {
+        let workspace_edit = request.await?;
+        Ok(RuntimeTaskEvent::ApplyRenameEdit {
+            doc_id,
+            expected_version,
+            offset_encoding,
+            workspace_edit,
+        })
+    });
 }
 
 pub fn rename_symbol(cx: &mut Context) {

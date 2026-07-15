@@ -1,7 +1,4 @@
 use helix_stdx::path::get_relative_path;
-use tokio::time::Instant;
-use tui::backend::Backend;
-
 use helix_view::document::DocumentSavedEventResult;
 
 use super::Application;
@@ -13,7 +10,7 @@ impl Application {
         let redraw = self.editor.redraw_handle();
         let notifier = crate::handlers::local::Notifier {
             redraw: redraw.clone(),
-            plugin_events: self.ingress().plugin_event_tx.clone(),
+            plugin_events: self.ingress().tx.clone().into(),
         };
         let mut cx = Self::make_compositor_context(
             &mut self.editor,
@@ -22,31 +19,17 @@ impl Application {
             notifier,
             ingress,
             idle_reset,
-            self.plugin_manager.clone(),
+            self.plugin_runtime.clone(),
+            self.foreground.clone(),
         );
         let should_render = self
             .compositor
             .handle_event(&super::Event::IdleTimeout, &mut cx);
-        let syntax_refreshed = self.editor.refresh_one_stale_syntax();
-        if self.editor.has_stale_syntax() {
-            let timeout = self.editor.config().idle_timeout;
-            self.timers.idle.as_mut().reset(Instant::now() + timeout);
-        }
-        if syntax_refreshed || self.editor.has_stale_syntax() {
-            helix_view::bench::log_run_event("bench_idle_service", || {
-                format!(
-                    "syntax_refreshed={} stale_remaining={} render_immediately={} needs_redraw={}",
-                    syntax_refreshed,
-                    self.editor.has_stale_syntax(),
-                    render.should_render_immediately(),
-                    self.editor.is_redraw_pending()
-                )
-            });
-        }
-        if render.should_render_immediately()
-            && (should_render || syntax_refreshed || self.editor.is_redraw_pending())
+        drop(cx);
+        self.drain_foreground();
+        if render.should_render_immediately() && (should_render || self.editor.is_redraw_pending())
         {
-            self.render().await;
+            self.invalidate(super::FRAME_TIMER);
         }
     }
 
@@ -78,19 +61,18 @@ impl Application {
         ));
 
         {
-            use helix_plugin::contract::{adapt, events};
+            use helix_plugin_api::events;
+            use helix_plugin_editor::adapt;
             let event = events::PluginEvent::DocumentSaved(events::DocumentSavedEvent {
                 document: adapt::document_handle(report.doc_id),
                 path: Some(report.path.to_string_lossy().into_owned()),
                 success: true,
             });
-            if let Err(err) = self.plugin_manager.fire_event(&mut self.editor, &event) {
-                log::error!("Failed to fire plugin event: {}", err);
-            }
+            self.plugin_runtime.notify_event(event);
         }
     }
 
-    pub(crate) async fn handle_assistant_update(
+    pub(crate) fn handle_assistant_update(
         &mut self,
         update: helix_view::assistant::backend::Update,
     ) {
@@ -114,6 +96,7 @@ impl Application {
                 &mut self.editor,
                 &mut self.compositor,
                 ingress,
+                self.foreground.clone(),
                 crate::runtime::AssistantCommand::ShowPermissionRequest { thread, request },
             );
         }
@@ -134,19 +117,18 @@ impl Application {
 
         // Dispatch assistant plugin events after state is settled.
         for event in plugin_events {
-            if let Err(err) = self.plugin_manager.fire_event(&mut self.editor, &event) {
-                log::error!("Failed to fire assistant plugin event: {err}");
-            }
+            self.plugin_runtime.notify_event(event);
         }
     }
 
-    pub fn restore_term(&mut self) -> std::io::Result<()> {
-        use helix_view::graphics::CursorKind;
-        self.terminal
-            .backend_mut()
-            .show_cursor(CursorKind::Block)
-            .ok();
-        self.terminal.restore()
+    pub async fn restore_term(&mut self) -> std::io::Result<()> {
+        if let Some(presenter) = &self.presenter {
+            presenter.restore().await
+        } else if let Some(terminal) = &mut self.terminal {
+            terminal.restore()
+        } else {
+            Ok(())
+        }
     }
 
     pub async fn close(&mut self) -> Vec<anyhow::Error> {
@@ -157,7 +139,8 @@ impl Application {
                 &mut self.editor,
                 &mut self.exit.tasks,
                 ingress,
-                self.plugin_manager.clone(),
+                self.foreground.clone(),
+                self.plugin_runtime.clone(),
             )
             .await,
         );
@@ -169,7 +152,7 @@ impl Application {
 
         errs.extend(self.editor.flush_assistant_persistence().await);
 
-        if let Err(err) = self.restore_term() {
+        if let Err(err) = self.restore_term().await {
             log::error!("Error restoring terminal: {}", err);
             errs.push(err.into());
         }
@@ -235,8 +218,9 @@ fn assistant_completion_toast_for_update(
 /// Called before the update is consumed by `apply_assistant_update`.
 fn assistant_update_plugin_events(
     update: &helix_view::assistant::backend::Update,
-) -> Vec<helix_plugin::contract::events::PluginEvent> {
-    use helix_plugin::contract::{adapt, events};
+) -> Vec<helix_plugin_api::events::PluginEvent> {
+    use helix_plugin_api::events;
+    use helix_plugin_editor::adapt;
     use helix_view::assistant::{backend, thread};
 
     match update {

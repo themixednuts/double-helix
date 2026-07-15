@@ -1,3 +1,4 @@
+pub mod admission;
 pub mod block;
 pub mod cancel;
 pub mod clock;
@@ -14,11 +15,18 @@ pub mod ui;
 pub mod wait;
 pub mod work;
 
+pub use admission::{
+    latest_by_key, latest_by_key_for, ring, ring_for, LatestAdmission, LatestAdmissionError,
+    LatestByKeyReceiver, LatestByKeySender, RingClosed, RingReceiver, RingSender,
+};
 pub use block::Block;
 pub use cancel::Token;
 pub use clock::{Clock, TimerId};
 pub use debounce::{Debounce, DebouncedSender};
-pub use frame::{FrameGate, FrameHandle, FrameReceiver, FrameRequest};
+pub use frame::{
+    FrameGate, FrameGeneration, FrameHandle, FrameReceiver, FrameRequest, FrameScheduler,
+    FrameSource,
+};
 pub use gate::{Gate, Push};
 pub use group::{Group, Scope, SpawnError};
 pub use latest::Latest;
@@ -83,19 +91,4 @@ impl Runtime {
 
 pub(crate) fn current_thread_id() -> ThreadId {
     std::thread::current().id()
-}
-
-pub fn send_blocking<T>(tx: &Sender<T>, data: T) {
-    use std::time::Duration;
-
-    if let Err(TrySend::Full(data)) = tx.try_send(data) {
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async move {
-                tokio::select! {
-                    _ = tokio::time::sleep(Duration::from_millis(10)) => {}
-                    _ = tx.send(data) => {}
-                }
-            });
-        });
-    }
 }

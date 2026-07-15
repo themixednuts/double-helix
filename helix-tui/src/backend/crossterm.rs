@@ -20,7 +20,7 @@ use once_cell::sync::OnceCell;
 use ratatui::buffer::Cell;
 use std::{
     fmt,
-    io::{self, Write},
+    io::{self, BufWriter, Write},
 };
 use termini::TermInfo;
 
@@ -108,7 +108,7 @@ impl Capabilities {
 
 /// Terminal backend supporting a wide variety of terminals
 pub struct CrosstermBackend<W: Write> {
-    buffer: W,
+    buffer: BufWriter<W>,
     config: Config,
     capabilities: Capabilities,
     supports_keyboard_enhancement_protocol: OnceCell<bool>,
@@ -120,13 +120,15 @@ impl<W> CrosstermBackend<W>
 where
     W: Write,
 {
+    const OUTPUT_BUFFER_CAPACITY: usize = 256 * 1024;
+
     pub fn new(buffer: W, config: Config) -> CrosstermBackend<W> {
         // helix is not usable without colors, but crossterm will disable
         // them by default if NO_COLOR is set in the environment. Override
         // this behaviour.
         crossterm::style::force_color_output(true);
         CrosstermBackend {
-            buffer,
+            buffer: BufWriter::with_capacity(Self::OUTPUT_BUFFER_CAPACITY, buffer),
             capabilities: Capabilities::from_env_or_default(&config),
             config,
             supports_keyboard_enhancement_protocol: OnceCell::new(),
@@ -662,7 +664,7 @@ mod tests {
 
         RatatuiBackend::draw(&mut backend, [(3, 2, &cell)].into_iter()).unwrap();
 
-        let output = String::from_utf8(backend.buffer).unwrap();
+        let output = String::from_utf8(backend.buffer.into_inner().unwrap()).unwrap();
         assert!(output.contains("\x1b[?2026h"));
         assert!(output.contains("\x1b[3;4H"));
         assert!(output.contains("x"));
@@ -675,9 +677,54 @@ mod tests {
 
         RatatuiBackend::scroll_region_up(&mut backend, 1..3, 2).unwrap();
 
-        let output = String::from_utf8(backend.buffer).unwrap();
+        let output = String::from_utf8(backend.buffer.into_inner().unwrap()).unwrap();
         assert!(output.contains("\x1b[2;3r"));
         assert!(output.contains("\x1b[2S"));
         assert!(output.ends_with("\x1b[r"));
+    }
+
+    #[derive(Default)]
+    struct CountingWriter {
+        writes: usize,
+        bytes: usize,
+    }
+
+    impl Write for CountingWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.writes += 1;
+            self.bytes += buf.len();
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn draw_batches_terminal_output_until_flush() {
+        let mut backend = CrosstermBackend::new(
+            CountingWriter::default(),
+            Config {
+                enable_mouse_capture: false,
+                force_enable_extended_underlines: true,
+                kitty_keyboard_protocol: Default::default(),
+            },
+        );
+        let cells: Vec<_> = (0..80).map(|_| ratatui::buffer::Cell::new("x")).collect();
+
+        RatatuiBackend::draw(
+            &mut backend,
+            cells
+                .iter()
+                .enumerate()
+                .map(|(x, cell)| (x as u16, 0, cell)),
+        )
+        .unwrap();
+        assert_eq!(backend.buffer.get_ref().writes, 0);
+
+        RatatuiBackend::flush(&mut backend).unwrap();
+        assert_eq!(backend.buffer.get_ref().writes, 1);
+        assert!(backend.buffer.get_ref().bytes > cells.len());
     }
 }

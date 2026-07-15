@@ -3,6 +3,7 @@ use helix_core::doc_formatter::{FormattedGrapheme, TextFormat};
 use helix_core::text_annotations::{LineAnnotation, PlainViewportSupport};
 use helix_core::{softwrapped_dimensions, Diagnostic, Position};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 use crate::Document;
 
@@ -118,20 +119,27 @@ impl Default for InlineDiagnosticsConfig {
     }
 }
 
-pub struct InlineDiagnosticAccumulator<'a> {
+pub struct InlineDiagnosticAccumulator {
     idx: usize,
-    doc: &'a Document,
-    pub stack: Vec<(&'a Diagnostic, u16)>,
+    text: helix_core::Rope,
+    diagnostics: Arc<Vec<Diagnostic>>,
+    pub stack: Vec<(usize, u16)>,
     pub config: InlineDiagnosticsConfig,
     cursor: usize,
     cursor_line: bool,
 }
 
-impl<'a> InlineDiagnosticAccumulator<'a> {
-    pub fn new(cursor: usize, doc: &'a Document, config: InlineDiagnosticsConfig) -> Self {
+impl InlineDiagnosticAccumulator {
+    pub fn new(
+        cursor: usize,
+        text: helix_core::Rope,
+        diagnostics: Arc<Vec<Diagnostic>>,
+        config: InlineDiagnosticsConfig,
+    ) -> Self {
         InlineDiagnosticAccumulator {
             idx: 0,
-            doc,
+            text,
+            diagnostics,
             stack: Vec::new(),
             config,
             cursor,
@@ -146,7 +154,7 @@ impl<'a> InlineDiagnosticAccumulator<'a> {
     }
 
     pub fn skip_concealed(&mut self, conceal_end_char_idx: usize) -> usize {
-        let diagnostics = &self.doc.diagnostics()[self.idx..];
+        let diagnostics = &self.diagnostics[self.idx..];
         let idx = diagnostics.partition_point(|diag| diag.range.start < conceal_end_char_idx);
         self.idx += idx;
         self.next_anchor(conceal_end_char_idx)
@@ -154,8 +162,7 @@ impl<'a> InlineDiagnosticAccumulator<'a> {
 
     pub fn next_anchor(&self, current_char_idx: usize) -> usize {
         let next_diag_start = self
-            .doc
-            .diagnostics()
+            .diagnostics
             .get(self.idx)
             .map_or(usize::MAX, |diag| diag.range.start);
         if (current_char_idx..next_diag_start).contains(&self.cursor) {
@@ -182,8 +189,7 @@ impl<'a> InlineDiagnosticAccumulator<'a> {
         if grapheme.char_idx == self.cursor {
             self.cursor_line = true;
             if self
-                .doc
-                .diagnostics()
+                .diagnostics
                 .get(self.idx)
                 .is_none_or(|diag| diag.range.start != grapheme.char_idx)
             {
@@ -198,11 +204,12 @@ impl<'a> InlineDiagnosticAccumulator<'a> {
             return true;
         }
 
-        for diag in &self.doc.diagnostics()[self.idx..] {
+        let start_idx = self.idx;
+        for (offset, diag) in self.diagnostics[start_idx..].iter().enumerate() {
             if diag.range.start != grapheme.char_idx {
                 break;
             }
-            self.stack.push((diag, anchor_col as u16));
+            self.stack.push((start_idx + offset, anchor_col as u16));
             self.idx += 1;
         }
         false
@@ -215,7 +222,7 @@ impl<'a> InlineDiagnosticAccumulator<'a> {
         horizontal_off: usize,
     ) -> usize {
         if self.process_anchor_impl(grapheme, width, horizontal_off) {
-            self.idx += self.doc.diagnostics()[self.idx..]
+            self.idx += self.diagnostics[self.idx..]
                 .iter()
                 .take_while(|diag| diag.range.start == grapheme.char_idx)
                 .count();
@@ -224,12 +231,12 @@ impl<'a> InlineDiagnosticAccumulator<'a> {
     }
 
     pub fn fast_forward_to_char(&mut self, char_idx: usize, doc_line: usize) -> usize {
-        let cursor = self.cursor.min(self.doc.text().len_chars());
-        if self.doc.text().char_to_line(cursor) == doc_line && cursor < char_idx {
+        let cursor = self.cursor.min(self.text.len_chars());
+        if self.text.char_to_line(cursor) == doc_line && cursor < char_idx {
             self.cursor_line = true;
         }
 
-        let diagnostics = &self.doc.diagnostics()[self.idx..];
+        let diagnostics = &self.diagnostics[self.idx..];
         let idx = diagnostics.partition_point(|diag| diag.range.start < char_idx);
         self.idx += idx;
         self.next_anchor(char_idx)
@@ -254,7 +261,8 @@ impl<'a> InlineDiagnosticAccumulator<'a> {
             self.stack.clear();
             return;
         };
-        self.stack.retain(|(diag, _)| diag.severity() >= filter);
+        self.stack
+            .retain(|(diagnostic, _)| self.diagnostics[*diagnostic].severity() >= filter);
         self.stack.truncate(self.config.max_diagnostics)
     }
 
@@ -263,25 +271,38 @@ impl<'a> InlineDiagnosticAccumulator<'a> {
             .last()
             .is_some_and(|&(_, anchor)| anchor > self.config.max_diagnostic_start(width))
     }
+
+    pub fn diagnostics(&self) -> &[Diagnostic] {
+        &self.diagnostics
+    }
+
+    pub fn diagnostics_arc(&self) -> Arc<Vec<Diagnostic>> {
+        Arc::clone(&self.diagnostics)
+    }
 }
 
-pub(crate) struct InlineDiagnostics<'a> {
-    state: InlineDiagnosticAccumulator<'a>,
+pub(crate) struct InlineDiagnostics {
+    state: InlineDiagnosticAccumulator,
     width: u16,
     horizontal_off: usize,
 }
 
-impl<'a> InlineDiagnostics<'a> {
+impl InlineDiagnostics {
     #[allow(clippy::new_ret_no_self)]
     pub(crate) fn new(
-        doc: &'a Document,
+        doc: &Document,
         cursor: usize,
         width: u16,
         horizontal_off: usize,
         config: InlineDiagnosticsConfig,
-    ) -> Box<dyn LineAnnotation + 'a> {
+    ) -> Box<dyn LineAnnotation> {
         Box::new(InlineDiagnostics {
-            state: InlineDiagnosticAccumulator::new(cursor, doc, config),
+            state: InlineDiagnosticAccumulator::new(
+                cursor,
+                doc.text().clone(),
+                doc.diagnostics_arc(),
+                config,
+            ),
             width,
             horizontal_off,
         })
@@ -292,11 +313,11 @@ impl<'a> InlineDiagnostics<'a> {
             return PlainViewportSupport::Supported;
         }
 
-        let text = self.state.doc.text();
+        let text = &self.state.text;
         let cursor_char = self.state.cursor.min(text.len_chars());
         inline_diagnostics_plain_viewport_support(
             text,
-            self.state.doc.diagnostics(),
+            self.state.diagnostics(),
             self.state.config.clone(),
             top_line,
             cursor_line,
@@ -343,7 +364,7 @@ fn inline_diagnostics_plain_viewport_support(
     PlainViewportSupport::Supported
 }
 
-impl LineAnnotation for InlineDiagnostics<'_> {
+impl LineAnnotation for InlineDiagnostics {
     fn plain_viewport_support(&self, top_line: usize, cursor_line: usize) -> PlainViewportSupport {
         self.plain_viewport_support(top_line, cursor_line)
     }
@@ -369,12 +390,15 @@ impl LineAnnotation for InlineDiagnostics<'_> {
     ) -> Position {
         self.state.compute_line_diagnostics();
         let multi = self.state.has_multi(self.width);
+        let diagnostics = self.state.diagnostics_arc();
+        let config = self.state.config.clone();
         let diagostic_height: usize = self
             .state
             .stack
             .drain(..)
-            .map(|(diag, anchor)| {
-                let text_fmt = self.state.config.text_fmt(anchor, self.width);
+            .map(|(diagnostic, anchor)| {
+                let diag = &diagnostics[diagnostic];
+                let text_fmt = config.text_fmt(anchor, self.width);
                 softwrapped_dimensions(diag.message.as_str().trim().into(), &text_fmt).0
             })
             .sum();

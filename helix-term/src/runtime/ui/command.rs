@@ -12,12 +12,18 @@ mod file_explorer;
 mod layer;
 mod lsp;
 mod picker;
+mod pkg;
 mod plugin;
+mod prompt;
 
 pub use assistant::{AssistantCommand, ModeConfigPickerItem};
 pub use completion::CompletionCommand;
-pub use dap::{DapCommand, DapThreadAction};
-pub use document::DocumentCommand;
+pub use dap::{DapCommand, DapScopeVariables, DapThreadAction};
+pub use document::{
+    DocumentCommand, DocumentOpenAlignment, DocumentOpenCompletion, DocumentOpenCompletionTarget,
+    DocumentOpenLane, DocumentOpenPostAction, DocumentOpenRequest, DocumentOpenSelection,
+    DocumentOpenTarget, DocumentReloadOrigin, FffOpenRecord,
+};
 pub use file_explorer::{FileExplorerCommand, ModifiedBufferCheck};
 pub use layer::LayerCommand;
 pub use lsp::{
@@ -26,13 +32,22 @@ pub use lsp::{
     LspHoverDisplay, LspLocation, LspTypeHierarchyDirection,
 };
 pub use picker::PickerCommand;
+pub use pkg::{PkgCommand, PkgRefreshStage};
 pub use plugin::PluginCommand;
+pub use prompt::{PromptCommand, PromptCompletionResult};
 
 /// Top-level UI command delivered on the main thread via typed runtime ingress.
 pub enum UiCommand {
+    /// Run a UI command after all currently pending document writes succeed.
+    AfterWrites {
+        documents: Vec<helix_view::DocumentId>,
+        command: Box<UiCommand>,
+    },
     Layer(LayerCommand),
     Completion(Box<CompletionCommand>),
     Picker(PickerCommand),
+    /// Prompt-local completion/index work.
+    Prompt(PromptCommand),
     /// Document-local async apply operations.
     Document(DocumentCommand),
     /// LSP navigation / overlays.
@@ -47,6 +62,8 @@ pub enum UiCommand {
     Assistant(AssistantCommand),
     /// File explorer prompts / confirmations.
     FileExplorer(FileExplorerCommand),
+    /// Package manager async apply operations.
+    Pkg(PkgCommand),
     /// Plugin-originated typed UI requests.
     Plugin(PluginCommand),
 }
@@ -54,9 +71,15 @@ pub enum UiCommand {
 impl std::fmt::Debug for UiCommand {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::AfterWrites { documents, command } => f
+                .debug_struct("AfterWrites")
+                .field("documents", documents)
+                .field("command", command)
+                .finish(),
             Self::Layer(c) => f.debug_tuple("Layer").field(c).finish(),
             Self::Completion(c) => f.debug_tuple("Completion").field(c).finish(),
             Self::Picker(c) => f.debug_tuple("Picker").field(c).finish(),
+            Self::Prompt(c) => f.debug_tuple("Prompt").field(c).finish(),
             Self::Document(c) => f.debug_tuple("Document").field(c).finish(),
             Self::Lsp(c) => match c {
                 LspCommand::Goto { .. } => f.write_str("Lsp(Goto(..))"),
@@ -73,6 +96,7 @@ impl std::fmt::Debug for UiCommand {
             Self::Dap(c) => f.debug_tuple("Dap").field(c).finish(),
             Self::Assistant(c) => f.debug_tuple("Acp").field(c).finish(),
             Self::FileExplorer(c) => f.debug_tuple("FileExplorer").field(c).finish(),
+            Self::Pkg(c) => f.debug_tuple("Pkg").field(c).finish(),
             Self::Plugin(c) => f.debug_tuple("Plugin").field(c).finish(),
         }
     }

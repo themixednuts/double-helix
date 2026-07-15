@@ -28,6 +28,10 @@ pub(crate) fn apply_layer_command(
             Ok(manager) => compositor.push(Box::new(crate::ui::overlay::overlaid(manager))),
             Err(err) => editor.set_error(format!("Failed to open package manager: {err}")),
         },
+        LayerCommand::AcpAgentsManager => match crate::ui::pkg::acp_manager(editor, ingress) {
+            Ok(manager) => compositor.push(Box::new(crate::ui::overlay::overlaid(manager))),
+            Err(err) => editor.set_error(format!("Failed to open ACP agents manager: {err}")),
+        },
         LayerCommand::LspCommandPicker { commands } => {
             let columns = [crate::ui::PickerColumn::new(
                 "title",
@@ -41,11 +45,10 @@ pub(crate) fn apply_layer_command(
                 crate::ui::PickerRuntime::new(editor),
                 ingress,
                 move |cx, (ls_id, command), _action| {
-                    cx.ingress
-                        .task(crate::runtime::RuntimeTaskEvent::ExecuteLspCommand {
-                            command: command.clone(),
-                            server_id: *ls_id,
-                        });
+                    cx.submit_task(crate::runtime::RuntimeTaskEvent::ExecuteLspCommand {
+                        command: command.clone(),
+                        server_id: *ls_id,
+                    });
                 },
             );
             compositor.push(Box::new(crate::ui::overlay::overlaid(picker)));

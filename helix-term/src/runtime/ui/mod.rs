@@ -14,11 +14,15 @@ pub(crate) mod file_explorer;
 pub(crate) mod layer;
 pub(crate) mod lsp;
 pub(crate) mod picker;
+pub(crate) mod pkg;
 pub(crate) mod plugin;
+pub(crate) mod prompt;
 pub(crate) mod snapshot;
 
-pub use apply::{apply_ui_command, apply_ui_command_opt};
+pub use apply::apply_ui_command;
 pub use command::{
-    AssistantCommand, CompletionCommand, DapCommand, DocumentCommand, LayerCommand, PickerCommand,
-    UiCommand,
+    AssistantCommand, CompletionCommand, DapCommand, DocumentCommand, DocumentOpenAlignment,
+    DocumentOpenCompletionTarget, DocumentOpenLane, DocumentOpenPostAction, DocumentOpenRequest,
+    DocumentOpenSelection, DocumentOpenTarget, DocumentReloadOrigin, FffOpenRecord, LayerCommand,
+    PickerCommand, PkgCommand, PkgRefreshStage, PromptCommand, PromptCompletionResult, UiCommand,
 };

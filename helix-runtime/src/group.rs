@@ -44,6 +44,8 @@ struct Inner {
     token: Token,
     state: Mutex<State>,
     notify: Notify,
+    #[cfg(test)]
+    before_join_wait: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 struct Guard {
@@ -65,6 +67,8 @@ impl Group {
                     parent,
                 }),
                 notify: Notify::new(),
+                #[cfg(test)]
+                before_join_wait: Mutex::new(None),
             }),
         }
     }
@@ -91,10 +95,23 @@ impl Group {
     pub async fn join(self) {
         close(&self.inner, false);
         loop {
+            let notified = self.inner.notify.notified();
             if is_settled(&self.inner) {
                 break;
             }
-            self.inner.notify.notified().await;
+            #[cfg(test)]
+            self.inner.run_before_join_wait();
+            notified.await;
+        }
+    }
+}
+
+#[cfg(test)]
+impl Inner {
+    fn run_before_join_wait(&self) {
+        let hook = self.before_join_wait.lock().take();
+        if let Some(hook) = hook {
+            hook();
         }
     }
 }
@@ -246,6 +263,24 @@ mod tests {
                 .unwrap();
             tokio::time::advance(Duration::from_millis(10)).await;
             group.join().await;
+        });
+    }
+
+    #[test]
+    fn join_does_not_lose_final_guard_notification() {
+        let rt = RuntimeTest::new_paused();
+        let group = Group::new();
+        let guard = track(&group.inner).unwrap();
+        group
+            .inner
+            .before_join_wait
+            .lock()
+            .replace(Box::new(move || drop(guard)));
+
+        rt.block_on(async {
+            tokio::time::timeout(Duration::from_secs(1), group.join())
+                .await
+                .expect("join lost the final guard notification");
         });
     }
 }

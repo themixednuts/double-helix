@@ -28,12 +28,12 @@ impl Clock {
     }
 
     pub fn now(&self) -> Instant {
-        Instant::now()
+        let _guard = self.handle.enter();
+        tokio::time::Instant::now().into_std()
     }
 
-    pub(crate) fn deadline_after(&self, after: Duration) -> tokio::time::Instant {
-        let _guard = self.handle.enter();
-        tokio::time::Instant::now() + after
+    pub fn deadline_after(&self, after: Duration) -> Instant {
+        self.now() + after
     }
 
     pub fn next_id(&self) -> TimerId {
@@ -46,9 +46,9 @@ impl Clock {
         }))
     }
 
-    pub(crate) fn timer_at(&self, deadline: tokio::time::Instant) -> Task<()> {
+    pub fn timer_at(&self, deadline: Instant) -> Task<()> {
         Task::new(self.handle.spawn(async move {
-            tokio::time::sleep_until(deadline).await;
+            tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
         }))
     }
 }
@@ -63,6 +63,22 @@ mod tests {
         let rt = RuntimeTest::new_paused();
         let runtime = rt.runtime();
         let task = runtime.clock().timer(Duration::from_secs(5));
+
+        rt.advance(Duration::from_secs(4));
+        assert!(!task.is_finished());
+
+        rt.advance(Duration::from_secs(1));
+        rt.block_on(async {
+            assert_eq!(task.await, Ok(()));
+        });
+    }
+
+    #[test]
+    fn absolute_deadline_progresses_under_fake_time() {
+        let rt = RuntimeTest::new_paused();
+        let runtime = rt.runtime();
+        let deadline = runtime.clock().deadline_after(Duration::from_secs(5));
+        let task = runtime.clock().timer_at(deadline);
 
         rt.advance(Duration::from_secs(4));
         assert!(!task.is_finished());

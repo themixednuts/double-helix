@@ -2,7 +2,7 @@ use std::path::Path;
 
 use futures_util::future;
 
-use crate::{bench::log_run_event, graphics::CursorKind, Document, View};
+use crate::{graphics::CursorKind, Document, View};
 use helix_core::Position;
 
 use helix_core::{diagnostic::DiagnosticProvider, syntax::config::LanguageServerFeature, Range};
@@ -70,70 +70,6 @@ impl CursorCache {
 }
 
 impl Editor {
-    pub fn has_stale_syntax(&self) -> bool {
-        self.documents
-            .values()
-            .any(|doc| doc.syntax_snapshot().is_stale())
-            || self
-                .component_docs
-                .values()
-                .any(|doc| doc.syntax_snapshot().is_stale())
-    }
-
-    pub fn refresh_one_stale_syntax(&mut self) -> bool {
-        let focused_doc_id = self.tree.get(self.tree.focus).doc;
-        let loader = self.syn_loader.load();
-
-        if let Some(doc) = self.documents.get_mut(&focused_doc_id) {
-            if doc.syntax_snapshot().is_stale() {
-                let refreshed = doc.refresh_stale_syntax(&loader);
-                log_run_event("syntax_refresh_attempt", || {
-                    format!(
-                        "target=focused doc_id={} refreshed={}",
-                        focused_doc_id, refreshed
-                    )
-                });
-                if refreshed {
-                    self.needs_redraw = true;
-                }
-                return refreshed;
-            }
-        }
-
-        for (doc_id, doc) in &mut self.documents {
-            if *doc_id == focused_doc_id || !doc.syntax_snapshot().is_stale() {
-                continue;
-            }
-            let refreshed = doc.refresh_stale_syntax(&loader);
-            log_run_event("syntax_refresh_attempt", || {
-                format!(
-                    "target=background doc_id={} refreshed={}",
-                    doc_id, refreshed
-                )
-            });
-            if refreshed {
-                self.needs_redraw = true;
-            }
-            return refreshed;
-        }
-
-        for doc in self.component_docs.values_mut() {
-            if !doc.syntax_snapshot().is_stale() {
-                continue;
-            }
-            let refreshed = doc.refresh_stale_syntax(&loader);
-            log_run_event("syntax_refresh_attempt", || {
-                format!("target=component refreshed={}", refreshed)
-            });
-            if refreshed {
-                self.needs_redraw = true;
-            }
-            return refreshed;
-        }
-
-        false
-    }
-
     /// Returns all supported diagnostics for the document
     pub fn doc_diagnostics<'a>(
         language_servers: &'a helix_lsp::Registry,

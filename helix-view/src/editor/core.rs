@@ -16,6 +16,11 @@ use crate::{
     view::ComponentViewState,
     Document, DocumentId, ViewId,
 };
+
+pub(crate) struct PendingDocumentSave {
+    pub doc_id: DocumentId,
+    pub task: DocumentSavedTask,
+}
 use helix_core::{auto_pairs::AutoPairs, syntax, Range, Selection};
 use helix_dap::{self as dap};
 use helix_runtime::{Receiver as RuntimeReceiver, Runtime, Sender as RuntimeSender};
@@ -42,6 +47,12 @@ pub(crate) struct AssistantRuntimeState {
     pub(crate) updates_rx: RuntimeReceiver<crate::assistant::backend::Update>,
 }
 
+#[derive(Default)]
+pub(crate) struct PackagedAssistantAgentCache {
+    pub(crate) generation: u64,
+    pub(crate) agents: Arc<BTreeMap<String, crate::editor::AgentConfig>>,
+}
+
 pub(crate) struct AssistantPersistenceState {
     pub(crate) saves: BTreeMap<crate::assistant::thread::Id, helix_runtime::Debounce>,
     pub(crate) layout_save: helix_runtime::Debounce,
@@ -54,7 +65,7 @@ pub(crate) struct AssistantFollowState {
 
 pub struct FrontendState {
     pub focused_modal_input: crate::engine::ModalInputState,
-    pub assistant_panel_theme: Option<Theme>,
+    pub assistant_panel_theme: Option<Arc<Theme>>,
     pub engine_factory: std::sync::Arc<dyn crate::engine::EditingEngineFactory>,
     pub modal_keymaps: std::sync::Arc<
         arc_swap::ArcSwap<std::collections::HashMap<Mode, crate::keymap::ModalKeyTrie>>,
@@ -74,14 +85,21 @@ pub struct Editor {
     pub component_views: BTreeMap<ViewId, ComponentViewState>,
 
     pub(crate) save_locks: HashMap<DocumentId, DocumentSaveLock>,
-    pub(crate) save_queue: VecDeque<DocumentSavedTask>,
+    pub(crate) save_queue: VecDeque<PendingDocumentSave>,
     pub(crate) write_count: usize,
 
     pub registers: Registers,
     pub macro_recording: Option<(char, Vec<KeyEvent>)>,
     pub macro_replaying: Vec<char>,
     pub language_servers: helix_lsp::Registry,
+    pub(crate) language_server_supervisor:
+        super::language_server_supervisor::LanguageServerSupervisor,
     pub diagnostics: Diagnostics,
+    pub(crate) diagnostics_revision: u64,
+    pub(crate) diagnostic_summaries:
+        std::collections::BTreeMap<helix_core::Uri, WorkspaceDiagnosticCounts>,
+    pub(crate) diagnostic_path_summaries:
+        std::collections::BTreeMap<PathBuf, WorkspaceDiagnosticCounts>,
     pub workspace_diagnostic_counts: WorkspaceDiagnosticCounts,
     pub diff_providers: DiffProviderRegistry,
 
@@ -92,8 +110,9 @@ pub struct Editor {
 
     pub syn_loader: Arc<ArcSwap<syntax::Loader>>,
     pub theme_loader: Arc<theme::Loader>,
-    pub last_theme: Option<Theme>,
-    pub theme: Theme,
+    pub last_theme: Option<Arc<Theme>>,
+    pub theme: Arc<Theme>,
+    pub theme_generation: u64,
 
     pub last_selection: Option<Selection>,
 
@@ -119,6 +138,7 @@ pub struct Editor {
 
     pub file_watcher: Option<crate::file_watcher::FileWatcher>,
     pub(crate) file_operations: super::file_operation::FileOperationJournal,
+    pub(crate) prepared_document_opens: super::document_io::PreparedDocumentOpenCache,
 
     pub mouse_down_range: Option<Range>,
     pub cursor_cache: CursorCache,
@@ -131,6 +151,7 @@ pub struct Editor {
     pub(crate) assistant_services: AssistantServices,
     pub(crate) assistant_persistence: AssistantPersistenceState,
     pub(crate) assistant_runtime: AssistantRuntimeState,
+    pub(crate) assistant_packaged_agents: PackagedAssistantAgentCache,
     pub(crate) assistant_follow: AssistantFollowState,
 
     pub bench: Option<crate::bench::BenchState>,

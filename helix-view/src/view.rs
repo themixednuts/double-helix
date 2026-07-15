@@ -1069,16 +1069,16 @@ impl View {
     }
 
     /// Get the text annotations to display in the current view for the given document and theme.
-    pub fn text_annotations<'a>(
+    pub fn text_annotations(
         &self,
-        doc: &'a Document,
+        doc: &Document,
         theme: Option<&Theme>,
-    ) -> TextAnnotations<'a> {
+    ) -> TextAnnotations<'static> {
         let mut text_annotations = TextAnnotations::default();
 
-        if let Some(labels) = doc.jump_labels(self.id) {
+        if let Some(labels) = doc.jump_labels_snapshot(self.id) {
             let style = theme.and_then(|t| t.find_highlight("ui.virtual.jump-label"));
-            text_annotations.add_overlay(labels, style);
+            text_annotations.add_shared_overlay(labels, style);
         }
 
         if let Some(DocumentInlayHints {
@@ -1089,7 +1089,7 @@ impl View {
             padding_before_inlay_hints,
             padding_after_inlay_hints,
             lsp_hints: _,
-        }) = doc.inlay_hints(self.id)
+        }) = doc.inlay_hints_snapshot(self.id).as_deref()
         {
             let type_style = theme.and_then(|t| t.find_highlight("ui.virtual.inlay-hint.type"));
             let parameter_style =
@@ -1100,31 +1100,34 @@ impl View {
             // types -> parameters -> others should hopefully be the "correct" order for most use cases,
             // with the padding coming before and after as expected.
             text_annotations
-                .add_inline_annotations(padding_before_inlay_hints, None)
-                .add_inline_annotations(type_inlay_hints, type_style)
-                .add_inline_annotations(parameter_inlay_hints, parameter_style)
-                .add_inline_annotations(other_inlay_hints, other_style)
-                .add_inline_annotations(padding_after_inlay_hints, None);
+                .add_shared_inline_annotations(Arc::clone(padding_before_inlay_hints), None)
+                .add_shared_inline_annotations(Arc::clone(type_inlay_hints), type_style)
+                .add_shared_inline_annotations(Arc::clone(parameter_inlay_hints), parameter_style)
+                .add_shared_inline_annotations(Arc::clone(other_inlay_hints), other_style)
+                .add_shared_inline_annotations(Arc::clone(padding_after_inlay_hints), None);
         };
         let config = doc.config.load();
 
         if config.lsp.inline_completion {
-            if let Some(completion) = doc.inline_completion().filter(|completion| {
+            if let Some(completion) = doc.inline_completion_snapshot().filter(|completion| {
                 completion.view_id == self.id && completion.version == doc.version()
             }) {
                 let style = theme.and_then(|t| t.find_highlight("ui.virtual.inline-completion"));
-                text_annotations
-                    .add_inline_annotations(std::slice::from_ref(&completion.annotation), style);
+                text_annotations.add_shared_inline_annotations(
+                    Arc::from([completion.annotation.clone()]),
+                    style,
+                );
             }
         }
 
         if config.lsp.inline_values {
-            if let Some(values) = doc.inline_values() {
+            if let Some(values) = doc.inline_values_snapshot() {
                 let style = theme.and_then(|t| {
                     t.find_highlight("ui.virtual.inline-value")
                         .or_else(|| t.find_highlight("ui.virtual"))
                 });
-                text_annotations.add_inline_annotations(&values.annotations, style);
+                text_annotations
+                    .add_shared_inline_annotations(Arc::clone(&values.annotations), style);
             }
         }
 
@@ -1133,14 +1136,18 @@ impl View {
                 color_swatches,
                 colors,
                 color_swatches_padding,
-            }) = doc.color_swatches()
+            }) = doc.color_swatches_snapshot().as_deref()
             {
-                for (color_swatch, color) in color_swatches.iter().zip(colors) {
-                    text_annotations
-                        .add_inline_annotations(std::slice::from_ref(color_swatch), Some(*color));
+                for (index, color) in colors.iter().copied().enumerate() {
+                    text_annotations.add_shared_inline_annotation(
+                        Arc::clone(color_swatches),
+                        index,
+                        Some(color),
+                    );
                 }
 
-                text_annotations.add_inline_annotations(color_swatches_padding, None);
+                text_annotations
+                    .add_shared_inline_annotations(Arc::clone(color_swatches_padding), None);
             }
         }
 
@@ -1188,8 +1195,8 @@ impl View {
         text_annotations
             .add_line_annotation(Box::new(PluginLineAnnotations::new(doc, self.id, width)));
 
-        if let Some(fold_container) = doc.fold_container(self.id) {
-            text_annotations.add_folds(fold_container);
+        if let Some(fold_container) = doc.fold_container_snapshot(self.id) {
+            text_annotations.add_shared_folds(fold_container);
         }
 
         text_annotations

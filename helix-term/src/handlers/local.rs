@@ -1,4 +1,3 @@
-use helix_runtime::send_blocking;
 use helix_view::document::Mode;
 use helix_view::handlers::completion::CompletionEvent;
 use helix_view::handlers::lsp::SignatureHelpEvent;
@@ -11,7 +10,42 @@ use crate::ui::lsp::signature_help::SignatureHelp;
 #[derive(Clone)]
 pub struct Notifier {
     pub redraw: helix_runtime::FrameHandle,
-    pub plugin_events: helix_runtime::Sender<helix_plugin::PluginNotification>,
+    pub plugin_events: PluginEventSender,
+}
+
+#[derive(Clone)]
+pub enum PluginEventSender {
+    Ingress(crate::runtime::RuntimeIngress),
+    Mailbox(helix_runtime::Sender<crate::runtime::PluginNotification>),
+}
+
+impl PluginEventSender {
+    pub fn notify(&self, notification: crate::runtime::PluginNotification) {
+        match self {
+            Self::Ingress(ingress) => {
+                if let Err(error) = ingress.plugin(notification) {
+                    log::warn!("plugin notification admission failed: {error}");
+                }
+            }
+            Self::Mailbox(sender) => {
+                if let Err(error) = sender.try_send(notification) {
+                    log::debug!("embedded plugin notification dropped: {error}");
+                }
+            }
+        }
+    }
+}
+
+impl From<crate::runtime::RuntimeIngress> for PluginEventSender {
+    fn from(ingress: crate::runtime::RuntimeIngress) -> Self {
+        Self::Ingress(ingress)
+    }
+}
+
+impl From<helix_runtime::Sender<crate::runtime::PluginNotification>> for PluginEventSender {
+    fn from(sender: helix_runtime::Sender<crate::runtime::PluginNotification>) -> Self {
+        Self::Mailbox(sender)
+    }
 }
 
 pub struct ModeSwitch<'a, 'cx> {
@@ -24,10 +58,8 @@ impl Notifier {
     pub fn mode_switch(&self, old_mode: Mode, new_mode: Mode) {
         let old_mode = format!("{old_mode:?}");
         let new_mode = format!("{new_mode:?}");
-        send_blocking(
-            &self.plugin_events,
-            helix_plugin::PluginNotification::ModeChange { old_mode, new_mode },
-        );
+        self.plugin_events
+            .notify(crate::runtime::PluginNotification::ModeChange { old_mode, new_mode });
         self.redraw.request_redraw();
     }
 }
@@ -118,18 +150,21 @@ pub fn mode_switch(event: &mut ModeSwitch<'_, '_>) {
             .editor
             .send_completion_event(CompletionEvent::Cancel);
         clear_completions(event.cx);
-        send_blocking(
-            event.cx.editor.auto_save_sender(),
-            AutoSaveEvent::LeftInsertMode,
-        );
-        send_blocking(
-            event.cx.editor.auto_reload_sender(),
-            AutoReloadEvent::LeftInsertMode,
-        );
-        send_blocking(
-            event.cx.editor.signature_help_sender(),
-            SignatureHelpEvent::Cancel,
-        );
+        event
+            .cx
+            .editor
+            .auto_save_sender()
+            .send(AutoSaveEvent::LeftInsertMode);
+        event
+            .cx
+            .editor
+            .auto_reload_sender()
+            .send(AutoReloadEvent::LeftInsertMode);
+        event
+            .cx
+            .editor
+            .signature_help_sender()
+            .send(SignatureHelpEvent::Cancel);
         event
             .cx
             .callback
@@ -137,10 +172,11 @@ pub fn mode_switch(event: &mut ModeSwitch<'_, '_>) {
     } else if event.new_mode == Mode::Insert {
         trigger_auto_completion(event.cx.editor, false);
         if event.cx.editor.config().lsp.auto_signature_help {
-            send_blocking(
-                event.cx.editor.signature_help_sender(),
-                SignatureHelpEvent::Trigger,
-            );
+            event
+                .cx
+                .editor
+                .signature_help_sender()
+                .send(SignatureHelpEvent::Trigger);
         }
     }
 

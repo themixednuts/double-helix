@@ -8,6 +8,22 @@ use std::path::PathBuf;
 )]
 pub struct ThreadId(isize);
 
+impl ThreadId {
+    pub const fn new(id: isize) -> Self {
+        Self(id)
+    }
+
+    pub const fn get(self) -> isize {
+        self.0
+    }
+}
+
+impl From<isize> for ThreadId {
+    fn from(id: isize) -> Self {
+        Self::new(id)
+    }
+}
+
 impl std::fmt::Display for ThreadId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.0.fmt(f)

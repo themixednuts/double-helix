@@ -2,17 +2,62 @@ use helix_core::{diagnostic::DiagnosticProvider, Uri};
 use helix_lsp::{
     self,
     lsp::{self, notification::Notification as LspNotification},
-    Call, LanguageServerId, MethodCall, Notification,
+    LanguageServerId, MethodCall, Notification, ServerEvent, ServerRequest, ServerRequestError,
 };
 use serde_json::json;
 
 use super::Application;
 use crate::ui;
 
+struct SlowLspUiCall<'a> {
+    server_id: LanguageServerId,
+    kind: &'static str,
+    method: &'a str,
+    started_at: std::time::Instant,
+}
+
+fn notification_method(notification: &Notification) -> &'static str {
+    match notification {
+        Notification::Initialized => "initialized",
+        Notification::Exit => "exit",
+        Notification::PublishDiagnostics(_) => lsp::notification::PublishDiagnostics::METHOD,
+        Notification::ShowMessage(_) => lsp::notification::ShowMessage::METHOD,
+        Notification::LogMessage(_) => lsp::notification::LogMessage::METHOD,
+        Notification::ProgressMessage(_) => lsp::notification::Progress::METHOD,
+    }
+}
+
+impl<'a> SlowLspUiCall<'a> {
+    fn new(server_id: LanguageServerId, kind: &'static str, method: &'a str) -> Self {
+        Self {
+            server_id,
+            kind,
+            method,
+            started_at: std::time::Instant::now(),
+        }
+    }
+}
+
+impl Drop for SlowLspUiCall<'_> {
+    fn drop(&mut self) {
+        let elapsed = self.started_at.elapsed();
+        if elapsed >= super::SLOW_LSP_EVENT_THRESHOLD {
+            log::info!(
+                target: crate::ui::picker::PICKER_TRACE_TARGET,
+                "phase=lsp_ui_slow server_id={} kind={} method={} elapsed_us={}",
+                self.server_id,
+                self.kind,
+                self.method,
+                elapsed.as_micros(),
+            );
+        }
+    }
+}
+
 impl Application {
-    pub async fn handle_language_server_message(
+    pub fn handle_language_server_message(
         &mut self,
-        call: helix_lsp::Call,
+        call: ServerEvent,
         server_id: LanguageServerId,
     ) {
         macro_rules! language_server {
@@ -28,24 +73,23 @@ impl Application {
         }
 
         match call {
-            Call::Notification(helix_lsp::jsonrpc::Notification { method, params, .. }) => {
-                let notification = match Notification::parse(&method, params) {
-                    Ok(notification) => notification,
-                    Err(helix_lsp::Error::Unhandled) => {
-                        log::info!("Ignoring Unhandled notification from Language Server");
-                        return;
-                    }
-                    Err(err) => {
-                        log::error!(
-                            "Ignoring unknown notification from Language Server: {}",
-                            err
-                        );
-                        return;
-                    }
-                };
-
+            ServerEvent::Notification(notification) => {
+                let _slow_call = SlowLspUiCall::new(
+                    server_id,
+                    "notification",
+                    notification_method(&notification),
+                );
                 match notification {
                     Notification::Initialized => {
+                        if !self
+                            .editor
+                            .mark_language_server_initialization_dispatched(server_id)
+                        {
+                            log::debug!(
+                                "ignoring duplicate initialization completion from language server {server_id}"
+                            );
+                            return;
+                        }
                         let language_server = language_server!();
 
                         if let Some(config) = language_server.config() {
@@ -55,31 +99,7 @@ impl Application {
                         self.editor.dispatch_language_server_initialized(server_id);
                     }
                     Notification::PublishDiagnostics(params) => {
-                        let uri = match Uri::try_from(params.uri) {
-                            Ok(uri) => uri,
-                            Err(err) => {
-                                log::error!("{err}");
-                                return;
-                            }
-                        };
-                        let language_server = language_server!();
-                        if !language_server.is_initialized() {
-                            log::error!(
-                                "Discarding publishDiagnostic notification sent by an uninitialized server: {}",
-                                language_server.name()
-                            );
-                            return;
-                        }
-                        let provider = DiagnosticProvider::Lsp {
-                            server_id,
-                            identifier: None,
-                        };
-                        self.editor.handle_lsp_diagnostics(
-                            &provider,
-                            uri,
-                            params.version,
-                            params.diagnostics,
-                        );
+                        self.queue_lsp_diagnostics(server_id, params);
                     }
                     Notification::ShowMessage(params) => {
                         self.handle_show_message(params.typ, params.message);
@@ -194,18 +214,29 @@ impl Application {
                         self.editor.remove_language_server_diagnostics(server_id);
                         self.editor
                             .clear_language_server_document_diagnostics(server_id);
+                        for doc in self.editor.documents_mut() {
+                            doc.clear_pull_diagnostics_server(server_id);
+                        }
+                        self.ingress().tx.pull_diagnostics_server_exited(server_id);
 
                         self.editor.dispatch_language_server_exited(server_id);
+
+                        self.language
+                            .diagnostics_generations
+                            .retain(|(id, _), _| *id != server_id);
 
                         self.editor.remove_language_server(server_id);
                     }
                 }
             }
-            Call::MethodCall(helix_lsp::jsonrpc::MethodCall {
-                method, params, id, ..
+            ServerEvent::Request(ServerRequest {
+                method,
+                request,
+                id,
             }) => {
-                let reply = match MethodCall::parse(&method, params) {
-                    Err(helix_lsp::Error::Unhandled) => {
+                let _slow_call = SlowLspUiCall::new(server_id, "request", method.as_str());
+                let reply = match request {
+                    Err(ServerRequestError::MethodNotFound) => {
                         log::error!(
                             "Language Server: Method {} not found in request {}",
                             method,
@@ -217,7 +248,7 @@ impl Application {
                             data: None,
                         })
                     }
-                    Err(err) => {
+                    Err(ServerRequestError::Malformed(err)) => {
                         log::error!(
                             "Language Server: Received malformed method call {} in request {}: {}",
                             method,
@@ -248,18 +279,20 @@ impl Application {
                         let language_server = language_server!();
                         if language_server.is_initialized() {
                             let offset_encoding = language_server.offset_encoding();
-                            let res = self
-                                .editor
-                                .apply_workspace_edit(offset_encoding, &params.edit);
-
-                            Ok(json!(lsp::ApplyWorkspaceEditResponse {
-                                applied: res.is_ok(),
-                                failure_reason: res.as_ref().err().map(|err| err.kind.to_string()),
-                                failed_change: res
-                                    .as_ref()
-                                    .err()
-                                    .map(|err| err.failed_change_idx as u32),
-                            }))
+                            let ingress = self.ingress_sender();
+                            let _ = crate::effect::file_operation::apply_workspace_edit(
+                                &mut self.editor,
+                                ingress,
+                                offset_encoding,
+                                &params.edit,
+                                Some(
+                                    helix_view::editor::WorkspaceEditContinuation::ApplyEditReply {
+                                        server_id,
+                                        request_id: id.clone(),
+                                    },
+                                ),
+                            );
+                            return;
                         } else {
                             Err(helix_lsp::jsonrpc::Error {
                                 code: helix_lsp::jsonrpc::ErrorCode::InvalidRequest,
@@ -270,7 +303,7 @@ impl Application {
                         }
                     }
                     Ok(MethodCall::WorkspaceFolders) => {
-                        Ok(json!(&*language_server!().workspace_folders().await))
+                        Ok(json!(&*language_server!().workspace_folders()))
                     }
                     Ok(MethodCall::WorkspaceConfiguration(params)) => {
                         let language_server = language_server!();
@@ -304,7 +337,9 @@ impl Application {
                                             match serde_json::from_value(options) {
                                                 Ok(ops) => ops,
                                                 Err(err) => {
-                                                    log::warn!("Failed to deserialize DidChangeWatchedFilesRegistrationOptions: {err}");
+                                                    log::warn!(
+                                                        "Failed to deserialize DidChangeWatchedFilesRegistrationOptions: {err}"
+                                                    );
                                                     continue;
                                                 }
                                             };
@@ -316,7 +351,9 @@ impl Application {
                                         )
                                     }
                                     _ => {
-                                        log::warn!("Ignoring a client/registerCapability request because dynamic capability registration is not enabled. Please report this upstream to the language server");
+                                        log::warn!(
+                                            "Ignoring a client/registerCapability request because dynamic capability registration is not enabled. Please report this upstream to the language server"
+                                        );
                                     }
                                 }
                             }
@@ -354,14 +391,13 @@ impl Application {
                             .editor
                             .documents_supporting_language_server(language_server);
                         let ingress = self.ingress().tx.clone();
-
-                        for document in documents {
-                            crate::effect::language_server::request_document_diagnostics(
-                                &mut self.editor,
-                                document,
-                                ingress.clone(),
-                            );
-                        }
+                        let language_servers = std::collections::HashSet::from([language_server]);
+                        crate::effect::language_server::queue_document_diagnostics_for_language_servers(
+                            &mut self.editor,
+                            documents,
+                            &language_servers,
+                            ingress,
+                        );
 
                         Ok(serde_json::Value::Null)
                     }
@@ -472,7 +508,151 @@ impl Application {
                     );
                 }
             }
-            Call::Invalid { id } => log::error!("LSP invalid method call id={:?}", id),
+            ServerEvent::Invalid { id } => {
+                let _slow_call = SlowLspUiCall::new(server_id, "invalid", "<invalid>");
+                log::error!("LSP invalid method call id={:?}", id);
+            }
+        }
+    }
+
+    fn queue_lsp_diagnostics(
+        &mut self,
+        server_id: LanguageServerId,
+        params: lsp::PublishDiagnosticsParams,
+    ) {
+        let uri = match Uri::try_from(params.uri) {
+            Ok(uri) => uri,
+            Err(error) => {
+                log::error!("{error}");
+                return;
+            }
+        };
+        let Some(language_server) = self.editor.language_server_by_id(server_id) else {
+            log::warn!("can't find language server with id `{server_id}`");
+            return;
+        };
+        if !language_server.is_initialized() {
+            log::error!(
+                "discarding diagnostics from uninitialized language server '{}'",
+                language_server.name()
+            );
+            return;
+        }
+
+        let provider = DiagnosticProvider::Lsp {
+            server_id,
+            identifier: None,
+        };
+        let Some(work) = self.editor.prepare_lsp_diagnostics(
+            provider,
+            uri.clone(),
+            params.version,
+            params.diagnostics,
+        ) else {
+            return;
+        };
+        let generation = self
+            .language
+            .diagnostics_generations
+            .entry((server_id, uri.clone()))
+            .and_modify(|generation| *generation = generation.wrapping_add(1))
+            .or_insert(1)
+            .to_owned();
+        self.spawn_lsp_diagnostics_work(server_id, uri, generation, work);
+    }
+
+    fn spawn_lsp_diagnostics_work(
+        &self,
+        server_id: LanguageServerId,
+        uri: Uri,
+        generation: u64,
+        work: helix_view::handlers::lsp::LspDiagnosticsWork,
+    ) {
+        let blocking = self.runtime.block().spawn(move || work.execute());
+        let ingress = self.ingress_sender();
+        self.runtime
+            .work()
+            .spawn(async move {
+                let started_at = std::time::Instant::now();
+                let prepared = match blocking.await {
+                    Ok(prepared) => prepared,
+                    Err(error) => {
+                        log::error!(
+                            "language-server diagnostics preparation failed for {uri:?}: {error}"
+                        );
+                        return;
+                    }
+                };
+                let elapsed = started_at.elapsed();
+                if elapsed >= std::time::Duration::from_millis(4) {
+                    log::info!(
+                        target: crate::ui::picker::PICKER_TRACE_TARGET,
+                        "phase=lsp_diagnostics_prepare_slow server_id={} elapsed_us={}",
+                        server_id,
+                        elapsed.as_micros(),
+                    );
+                }
+                let _ = ingress
+                    .send_task(
+                        crate::runtime::RuntimeTaskEvent::ApplyPreparedLspDiagnostics {
+                            server_id,
+                            uri,
+                            generation,
+                            prepared,
+                        },
+                    )
+                    .await;
+            })
+            .detach();
+    }
+
+    pub(super) fn apply_prepared_lsp_diagnostics(
+        &mut self,
+        server_id: LanguageServerId,
+        uri: Uri,
+        generation: u64,
+        prepared: helix_view::handlers::lsp::PreparedLspDiagnostics,
+    ) {
+        if self
+            .language
+            .diagnostics_generations
+            .get(&(server_id, uri.clone()))
+            .copied()
+            != Some(generation)
+        {
+            return;
+        }
+
+        let started_at = std::time::Instant::now();
+        let result = self.editor.apply_prepared_lsp_diagnostics(prepared);
+        let elapsed = started_at.elapsed();
+        if elapsed >= std::time::Duration::from_millis(4) {
+            log::info!(
+                target: crate::ui::picker::PICKER_TRACE_TARGET,
+                "phase=lsp_diagnostics_commit_slow server_id={} elapsed_us={}",
+                server_id,
+                elapsed.as_micros(),
+            );
+        }
+        match result {
+            helix_view::handlers::lsp::LspDiagnosticsApply::Done {
+                retired_document_diagnostics,
+                retired_workspace_diagnostics,
+            } => {
+                if retired_document_diagnostics.is_some() || retired_workspace_diagnostics.is_some()
+                {
+                    self.runtime
+                        .block()
+                        .spawn(move || {
+                            drop(retired_document_diagnostics);
+                            drop(retired_workspace_diagnostics);
+                        })
+                        .detach();
+                }
+            }
+            helix_view::handlers::lsp::LspDiagnosticsApply::Retry(work) => {
+                self.spawn_lsp_diagnostics_work(server_id, uri, generation, work);
+            }
         }
     }
 
@@ -519,26 +699,40 @@ impl Application {
                 return lsp::ShowDocumentResult { success: false };
             }
         };
-        let path = uri.as_path().expect("URIs are valid paths");
+        let Some(path) = uri.as_path() else {
+            log::error!("language server requested a non-file URI: {uri:?}");
+            return lsp::ShowDocumentResult { success: false };
+        };
 
         let action = match take_focus {
             Some(true) => helix_view::editor::Action::Replace,
             _ => helix_view::editor::Action::VerticalSplit,
         };
 
-        match self
-            .editor
-            .show_document(helix_view::editor::ShowDocumentRequest {
+        let target = self.editor.focused_view_id();
+        crate::runtime::ui::document::queue_document_open(
+            &mut self.editor,
+            &self.ingress.tx,
+            &self.foreground,
+            crate::runtime::DocumentOpenRequest {
                 path: path.to_path_buf(),
                 action,
-                selection,
-                offset_encoding,
-            }) {
-            Ok(()) => lsp::ShowDocumentResult { success: true },
-            Err(err) => {
-                log::error!("failed to open path: {:?}: {:?}", uri, err);
-                lsp::ShowDocumentResult { success: false }
-            }
-        }
+                lane: crate::runtime::DocumentOpenLane::Navigation,
+                target: crate::runtime::DocumentOpenTarget::View(target),
+                selection: selection.map_or(crate::runtime::DocumentOpenSelection::None, |range| {
+                    crate::runtime::DocumentOpenSelection::LspRange {
+                        range,
+                        offset_encoding,
+                    }
+                }),
+                alignment: crate::runtime::DocumentOpenAlignment::CenterIfAction,
+                default_folding_if_new: false,
+                fff_record: None,
+                external_if_binary: None,
+                post_action: crate::runtime::DocumentOpenPostAction::None,
+                completion: crate::runtime::DocumentOpenCompletionTarget::Editor,
+            },
+        );
+        lsp::ShowDocumentResult { success: true }
     }
 }

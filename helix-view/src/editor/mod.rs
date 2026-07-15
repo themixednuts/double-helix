@@ -5,6 +5,7 @@ mod component;
 mod config;
 mod core;
 mod document;
+mod document_io;
 mod embed;
 mod file_operation;
 mod focus;
@@ -12,6 +13,7 @@ mod hooks;
 mod jump;
 mod label;
 mod language;
+mod language_server_supervisor;
 mod navigation;
 mod refresh;
 mod runtime;
@@ -29,6 +31,7 @@ mod workspace;
 use crate::document::Mode;
 
 pub use crate::bench::{BenchSnapshot, BenchState};
+pub use assistant::AssistantBackendLaunch;
 pub use config::{
     get_terminal_provider, AcpConfig, AgentConfig, AutoSave, AutoSaveAfterDelay, BufferLineConfig,
     BufferLineRenderMode, BufferPickerConfig, CmdlineConfig, CmdlineIcons, CmdlineStyle,
@@ -44,12 +47,26 @@ pub use config::{
     WordCompletion,
 };
 pub use core::Editor;
+pub use document_io::{
+    DocumentOpenRole, DocumentOpenWork, DocumentReloadApply, DocumentReloadError,
+    DocumentReloadStale, DocumentReloadWork, PreparedDocumentOpen, PreparedDocumentReload,
+};
 pub use embed::{
     DocumentSnapshot, EditorSession, EditorSessionBuilder, EditorSessionEvent, EditorSnapshot,
     FocusedSnapshot, InsertPlacement, StatusSnapshot, ViewSnapshot,
 };
+pub use file_operation::{
+    FileOperation, FileOperationApplied, FileOperationChange, FileOperationCompletion,
+    FileOperationDeleteMode, FileOperationDestination, FileOperationDispatch, FileOperationError,
+    FileOperationId, FileOperationInspection, FileOperationOrigin, FileOperationOutcome,
+    FileOperationPrepared, FileOperationRequest, FileOperationState, FileOperationWork,
+    FileOperationWorkspaceEditAction, WorkspaceEditBatchCompletion, WorkspaceEditBatchError,
+    WorkspaceEditBatchId, WorkspaceEditContinuation, WorkspaceEditExecutionDispatch,
+    WorkspaceEditExecutionUpdate,
+};
 pub use helix_core::diagnostic::Severity;
 pub use hooks::LifecycleBus;
+pub use language_server_supervisor::LanguageServerSupervisorEvent;
 pub use navigation::{Action, CloseError};
 pub use runtime::DocumentSaveReport;
 pub use session::BenchOverlay;

@@ -1,4 +1,10 @@
-use std::sync::Arc;
+use std::{
+    hash::{Hash, Hasher},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+};
 
 use arc_swap::ArcSwap;
 use helix_core::{syntax, Rope};
@@ -13,12 +19,17 @@ use crate::runtime::ui::command::LspHoverDisplay;
 use crate::ui::Popup;
 
 use crate::alt;
+use crate::ui::markdown::MarkdownRenderSource;
 use crate::ui::Markdown;
 
 pub struct Hover {
     active_index: usize,
     contents: Vec<(Option<Markdown>, Markdown)>,
+    render_cache_id: crate::render::CacheId,
+    content_revision: u64,
 }
+
+static NEXT_HOVER_RENDER_CACHE: AtomicU64 = AtomicU64::new(1);
 
 impl Hover {
     pub const ID: &'static str = "hover";
@@ -28,7 +39,7 @@ impl Hover {
         config_loader: Arc<ArcSwap<syntax::Loader>>,
     ) -> Self {
         let n_hovers = hovers.len();
-        let contents = hovers
+        let contents: Vec<(Option<Markdown>, Markdown)> = hovers
             .into_iter()
             .enumerate()
             .map(|(idx, (server_name, hover))| {
@@ -45,9 +56,22 @@ impl Hover {
             })
             .collect();
 
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        for (header, body) in &contents {
+            header
+                .as_ref()
+                .map(|header| &header.contents)
+                .hash(&mut hasher);
+            body.contents.hash(&mut hasher);
+        }
         Self {
             active_index: usize::default(),
             contents,
+            render_cache_id: crate::render::CacheId::hashed(&(
+                "hover",
+                NEXT_HOVER_RENDER_CACHE.fetch_add(1, Ordering::Relaxed),
+            )),
+            content_revision: hasher.finish(),
         }
     }
 
@@ -61,7 +85,7 @@ impl Hover {
             .map(|(header, body)| {
                 let header: String = header
                     .iter()
-                    .map(|header| header.contents.clone())
+                    .map(|header| header.contents.as_ref())
                     .collect();
 
                 format!("{}{}", header, body.contents)
@@ -83,36 +107,39 @@ const PADDING_BOTTOM: u16 = 1;
 const HEADER_HEIGHT: u16 = 1;
 const SEPARATOR_HEIGHT: u16 = 1;
 
-impl Component for Hover {
-    fn render(&mut self, area: Rect, surface: &mut crate::render::CellSurface, cx: &RenderContext) {
+struct HoverPaintSnapshot {
+    area: Rect,
+    header: Option<MarkdownRenderSource>,
+    contents: MarkdownRenderSource,
+    has_header: bool,
+    theme: Arc<helix_view::Theme>,
+    scroll: usize,
+}
+
+impl HoverPaintSnapshot {
+    fn render(
+        self,
+        cancellation: &crate::render::RenderCancellation,
+    ) -> crate::render::RenderOutput {
         use tui::ratatui::widgets::{Paragraph, Widget, Wrap};
 
-        let margin = Margin::all(1);
-        let area = area.inner(margin);
+        let mut output = crate::render::RenderOutput::sparse(self.area);
+        let surface = output.surface_mut();
+        let area = self.area.inner(Margin::all(1));
+        if cancellation.is_cancelled() || area.width == 0 || area.height == 0 {
+            return output;
+        }
 
-        let theme = cx.theme();
-        let has_header = self.has_header();
-        let active_index = self.active_index;
-        let (header, contents) = &mut self.contents[active_index];
-
-        if let Some(header) = header {
-            let header = header.layout(area.width as usize, Some(theme));
-            let header = tui::ratatui::to_ratatui_text(&header);
-            let header = Paragraph::new(header);
-            header.render(
+        if let Some(header) = self.header {
+            let header = header.layout(area.width as usize, &self.theme);
+            Paragraph::new(tui::ratatui::to_ratatui_text(&header)).render(
                 tui::ratatui::to_ratatui_rect(area.with_height(HEADER_HEIGHT)),
                 surface,
             );
-
-            // Theme the divider between the LSP-name header (e.g.
-            // "[1/3] rust-analyzer") and the hover body. `Style::default()`
-            // was uncolored, making the line look like a stray character
-            // when the popup background was tinted. `comment` (or
-            // `ui.window`) gives a subtle visual separator that matches
-            // the rest of the chrome.
-            let divider_style = theme
+            let divider_style = self
+                .theme
                 .try_get("ui.window")
-                .or_else(|| theme.try_get("comment"))
+                .or_else(|| self.theme.try_get("comment"))
                 .unwrap_or_default();
             for x in area.left()..area.right() {
                 if let Some(cell) = surface.cell_mut((x, area.top() + HEADER_HEIGHT)) {
@@ -122,57 +149,84 @@ impl Component for Hover {
             }
         }
 
-        let contents_area = area.clip_top(if has_header {
+        if cancellation.is_cancelled() {
+            return output;
+        }
+        let contents_area = area.clip_top(if self.has_header {
             HEADER_HEIGHT + SEPARATOR_HEIGHT
         } else {
             0
         });
-        let contents_parsed = contents.layout(contents_area.width as usize, Some(theme));
-        // Re-measure the content height so we can decide whether to
-        // draw a scrollbar. The `Paragraph` widget itself doesn't
-        // expose this — we use the same `required_size` helper the
-        // hover's `required_size()` uses to lay out the popup. The
-        // popup's actual area may be smaller than the requested
-        // size (clamped to viewport), so a scrollbar appears when
-        // the content was clipped.
-        let (_, content_height) =
-            crate::ui::text::required_size(&contents_parsed, contents_area.width);
-        let scroll_pos = cx.scroll().unwrap_or_default();
+        let contents = self
+            .contents
+            .layout(contents_area.width as usize, &self.theme);
+        let (_, content_height) = crate::ui::text::required_size(&contents, contents_area.width);
         let needs_scrollbar = content_height > contents_area.height;
-        // Reserve the rightmost column for the scrollbar when needed
-        // so content doesn't render under it.
         let body_area = if needs_scrollbar {
             contents_area.clip_right(1)
         } else {
             contents_area
         };
-
-        let contents_text = tui::ratatui::to_ratatui_text(&contents_parsed);
-        let contents_para = Paragraph::new(contents_text)
+        Paragraph::new(tui::ratatui::to_ratatui_text(&contents))
             .wrap(Wrap { trim: false })
-            .scroll((scroll_pos as u16, 0));
-        contents_para.render(tui::ratatui::to_ratatui_rect(body_area), surface);
+            .scroll((self.scroll as u16, 0))
+            .render(tui::ratatui::to_ratatui_rect(body_area), surface);
 
-        // Render the scrollbar. Uses `ui.menu.scroll` (the same scope
-        // the picker uses) so the visual language stays consistent.
-        // Falls back through `ui.text.inactive` → default style so
-        // even an unconfigured theme yields something visible.
-        if needs_scrollbar && contents_area.height > 0 {
-            let thumb_style = theme
+        if needs_scrollbar && contents_area.height > 0 && contents_area.width > 0 {
+            let thumb_style = self
+                .theme
                 .try_get("ui.menu.scroll")
-                .or_else(|| theme.try_get("ui.text.inactive"))
+                .or_else(|| self.theme.try_get("ui.text.inactive"))
                 .unwrap_or_default();
-            let scrollbar_x = contents_area.right().saturating_sub(1);
-            let scrollbar_area = Rect::new(scrollbar_x, contents_area.y, 1, contents_area.height);
             crate::widgets::Scrollbar::new(
                 content_height as usize,
-                scroll_pos,
+                self.scroll,
                 contents_area.height as usize,
             )
             .symbol("▌")
             .thumb_style(thumb_style)
-            .render(scrollbar_area, surface);
+            .render(
+                Rect::new(
+                    contents_area.right().saturating_sub(1),
+                    contents_area.y,
+                    1,
+                    contents_area.height,
+                ),
+                surface,
+            );
         }
+        output
+    }
+}
+
+impl Component for Hover {
+    fn prepare_render(&mut self, area: Rect, cx: &RenderContext) -> crate::render::PreparedRender {
+        let (header, contents) = &self.contents[self.active_index];
+        let snapshot = HoverPaintSnapshot {
+            area,
+            header: header.as_ref().map(Markdown::render_source),
+            contents: contents.render_source(),
+            has_header: self.has_header(),
+            theme: cx.theme_arc(),
+            scroll: cx.scroll().unwrap_or_default(),
+        };
+        let tag = crate::render::CacheTag {
+            id: self.render_cache_id,
+            key: crate::render::CacheKey::hashed(&(
+                self.content_revision,
+                self.active_index,
+                area.x,
+                area.y,
+                area.width,
+                area.height,
+                cx.theme_generation(),
+                snapshot.scroll,
+            )),
+            area,
+        };
+        crate::render::PreparedRender::snapshot(tag, snapshot, |snapshot, cancellation| {
+            snapshot.render(cancellation)
+        })
     }
 
     fn required_size(&mut self, viewport: (u16, u16)) -> Option<(u16, u16)> {
@@ -180,20 +234,14 @@ impl Component for Hover {
 
         let has_header = self.has_header();
         let active_index = self.active_index;
-        let (header, contents) = &mut self.contents[active_index];
+        let (header, contents) = &self.contents[active_index];
 
         let header_width = header
-            .as_mut()
-            .map(|header| {
-                let header = header.layout(max_text_width as usize, None);
-                let (width, _height) = crate::ui::text::required_size(&header, max_text_width);
-                width
-            })
+            .as_ref()
+            .map(|header| header.estimated_size(max_text_width, viewport.1).0)
             .unwrap_or_default();
 
-        let contents = contents.layout(max_text_width as usize, None);
-        let (content_width, content_height) =
-            crate::ui::text::required_size(&contents, max_text_width);
+        let (content_width, content_height) = contents.estimated_size(max_text_width, viewport.1);
 
         let width = PADDING_HORIZONTAL + header_width.max(content_width);
         let height = if has_header {

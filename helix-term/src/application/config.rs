@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use anyhow::Error;
-use tui::backend::Backend;
 
 use helix_view::{editor::ConfigEvent, theme, Editor};
 
@@ -9,16 +8,40 @@ use super::Application;
 use crate::config::Config;
 
 impl Application {
+    fn reconfigure_terminal(&mut self, config: tui::terminal::Config) -> std::io::Result<()> {
+        if let Some(presenter) = &self.presenter {
+            presenter.reconfigure(config)
+        } else {
+            self.terminal
+                .as_mut()
+                .expect("startup terminal must exist before presenter handoff")
+                .reconfigure(config)
+        }
+    }
+
+    fn refresh_keymaps(&mut self) {
+        let keys = self.config.load().keys.clone();
+        if let Some(editor_view) = self.compositor.find::<crate::ui::EditorView>() {
+            editor_view.keymaps.replace_base(keys.clone());
+        }
+        self.editor
+            .set_modal_keymaps(crate::keymap::to_component_modal_keymaps(&keys));
+        self.editor
+            .set_semantic_modal_keymaps(crate::keymap::to_semantic_modal_keymaps(&keys));
+    }
+
     pub fn handle_config_events(&mut self, config_event: ConfigEvent) {
         self.editor.bump_config_generation();
-        let old_editor_config = self.editor.config();
 
         match config_event {
-            ConfigEvent::Refresh => self.refresh_config(),
+            ConfigEvent::Refresh => {
+                self.queue_config_reload(self.editor.config_gen);
+            }
             ConfigEvent::Update(editor_config) => {
+                let old_editor_config = self.editor.config();
                 let mut app_config = (*self.config.load().clone()).clone();
                 app_config.editor = *editor_config;
-                if let Err(err) = self.terminal.reconfigure((&app_config.editor).into()) {
+                if let Err(err) = self.reconfigure_terminal((&app_config.editor).into()) {
                     self.editor.set_error(err.to_string());
                 };
                 self.editor.diff_providers =
@@ -26,55 +49,112 @@ impl Application {
                 self.config.store(Arc::new(app_config));
                 self.editor
                     .dispatch_editor_config_change(&old_editor_config);
-                self.editor
-                    .set_modal_keymaps(crate::keymap::to_component_modal_keymaps(
-                        &self.config.load().keys,
-                    ));
-                self.editor
-                    .set_semantic_modal_keymaps(crate::keymap::to_semantic_modal_keymaps(
-                        &self.config.load().keys,
-                    ));
+                self.refresh_keymaps();
+
+                self.editor.refresh_config(&old_editor_config);
+                self.editor.refresh_all_language_servers();
+                crate::effect::refresh_assistant_agent_cache(&self.editor, self.ingress_sender());
+                self.editor.ensure_all_cursors_in_view();
             }
         }
-
-        self.editor.refresh_config(&old_editor_config);
-        self.editor.ensure_all_cursors_in_view();
     }
 
-    fn refresh_config(&mut self) {
-        let mut refresh_config = || -> Result<(), Error> {
-            let default_config = Config::load_default()
-                .map_err(|err| anyhow::anyhow!("Failed to load config: {}", err))?;
+    fn queue_config_reload(&mut self, request: u64) {
+        self.editor.set_status("Refreshing config...");
+        let ingress = self.ingress_sender();
+        let block = self.runtime.block().clone();
+        self.runtime
+            .work()
+            .spawn(async move {
+                let loaded = block
+                    .spawn(move || -> Result<_, Error> {
+                        let config = Config::load_default()
+                            .map_err(|error| anyhow::anyhow!("Failed to load config: {error}"))?;
+                        let language_loader = helix_core::config::user_lang_loader()?;
+                        Ok((config, language_loader))
+                    })
+                    .await;
+                let task = match loaded {
+                    Ok(Ok((config, language_loader))) => {
+                        crate::runtime::RuntimeTaskEvent::ApplyConfigReload(
+                            crate::runtime::PreparedConfigReload {
+                                request,
+                                config: Box::new(config),
+                                language_loader,
+                            },
+                        )
+                    }
+                    Ok(Err(error)) => crate::runtime::RuntimeTaskEvent::ConfigReloadFailed {
+                        request,
+                        message: error.to_string(),
+                    },
+                    Err(error) => crate::runtime::RuntimeTaskEvent::ConfigReloadFailed {
+                        request,
+                        message: format!("Config reload worker failed: {error}"),
+                    },
+                };
+                let _ = ingress.send_task(task).await;
+            })
+            .detach();
+    }
 
-            let lang_loader = helix_core::config::user_lang_loader()?;
-            self.editor.replace_language_loader(lang_loader);
-            Self::load_configured_theme(
-                &mut self.editor,
-                &default_config,
-                self.terminal.backend().supports_true_color(),
-                self.terminal_state.theme_mode,
+    pub(super) fn apply_prepared_config_reload(
+        &mut self,
+        prepared: crate::runtime::PreparedConfigReload,
+    ) {
+        if prepared.request != self.editor.config_gen {
+            log::debug!(
+                "discarding stale config reload request={} current={}",
+                prepared.request,
+                self.editor.config_gen
             );
-            self.editor.refresh_document_languages();
-
-            self.terminal.reconfigure((&default_config.editor).into())?;
-            self.editor.diff_providers =
-                helix_vcs::DiffProviderRegistry::new(default_config.editor.vcs.provider.into());
-            self.config.store(Arc::new(default_config));
-            self.editor
-                .set_modal_keymaps(crate::keymap::to_component_modal_keymaps(
-                    &self.config.load().keys,
-                ));
-            self.editor
-                .set_semantic_modal_keymaps(crate::keymap::to_semantic_modal_keymaps(
-                    &self.config.load().keys,
-                ));
-            Ok(())
-        };
-
-        match refresh_config() {
-            Ok(_) => self.editor.set_status("Config refreshed"),
-            Err(err) => self.editor.set_error(err.to_string()),
+            return;
         }
+
+        let config = *prepared.config;
+        if let Err(error) = self.reconfigure_terminal((&config.editor).into()) {
+            self.editor
+                .set_error(format!("Failed to apply terminal config: {error}"));
+            return;
+        }
+
+        let old_editor_config = self.editor.config();
+        match super::plugin_config(&config) {
+            Ok(plugins) => {
+                if let Err(error) = self.plugin_runtime.reconfigure(
+                    &plugins,
+                    self.ingress.tx.clone(),
+                    self.foreground.clone(),
+                    self.runtime.work().clone(),
+                ) {
+                    self.editor
+                        .set_error(format!("Failed to refresh plugin runtime: {error}"));
+                }
+            }
+            Err(error) => self
+                .editor
+                .set_error(format!("Failed to refresh plugin runtime: {error}")),
+        }
+        self.config.store(Arc::new(config));
+        self.editor
+            .replace_language_loader(prepared.language_loader);
+        Self::load_configured_theme(
+            &mut self.editor,
+            &self.config.load(),
+            self.terminal_state.supports_true_color,
+            self.terminal_state.theme_mode,
+        );
+        self.editor.diff_providers =
+            helix_vcs::DiffProviderRegistry::new(self.config.load().editor.vcs.provider.into());
+        self.editor.refresh_document_languages();
+        self.editor
+            .dispatch_editor_config_change(&old_editor_config);
+        self.refresh_keymaps();
+        self.editor.refresh_config(&old_editor_config);
+        self.editor.refresh_all_language_servers();
+        crate::effect::refresh_assistant_agent_cache(&self.editor, self.ingress_sender());
+        self.editor.ensure_all_cursors_in_view();
+        self.editor.set_status("Config refreshed");
     }
 
     pub fn load_configured_theme(

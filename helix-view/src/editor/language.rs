@@ -1,14 +1,11 @@
 use std::{
-    collections::{HashMap, HashSet},
-    sync::{Arc, LazyLock, Mutex},
+    collections::{BTreeSet, HashSet},
+    sync::Arc,
 };
 
 use crate::DocumentId;
 
-use super::Editor;
-
-static PKG_NUDGED_SERVERS: LazyLock<Mutex<HashSet<String>>> =
-    LazyLock::new(|| Mutex::new(HashSet::new()));
+use super::{language_server_supervisor::LaunchOrigin, Editor};
 
 impl Editor {
     #[inline]
@@ -25,12 +22,57 @@ impl Editor {
         self.launch_language_servers(doc_id)
     }
 
+    pub fn refresh_all_language_servers(&mut self) {
+        let documents = self.documents.keys().copied().collect::<Vec<_>>();
+        for document in documents {
+            self.launch_language_servers(document);
+        }
+    }
+
+    /// Reconciles open documents against one newly published runtime activation generation.
+    pub fn reconcile_runtime_asset_change(&mut self, change: &helix_loader::RuntimeAssetsChange) {
+        let changed_commands = change
+            .changed_asset_keys
+            .iter()
+            .filter(|asset| asset.kind == helix_loader::RuntimeAssetKind::Command)
+            .map(|asset| asset.key.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        if changed_commands.is_empty() {
+            return;
+        }
+
+        let loader = self.syn_loader.load();
+        let affected = loader
+            .language_server_configs()
+            .iter()
+            .filter(|(_, config)| changed_commands.contains(config.command.as_str()))
+            .map(|(name, _)| name.clone())
+            .collect::<HashSet<_>>();
+        drop(loader);
+        if affected.is_empty() {
+            return;
+        }
+        self.restart_language_server_demands(&affected, LaunchOrigin::RuntimeChange);
+    }
+
     pub fn remove_language_server(&mut self, language_server_id: helix_lsp::LanguageServerId) {
-        self.language_servers.remove_by_id(language_server_id);
+        self.handle_language_server_exit(language_server_id);
     }
 
     pub fn stop_language_server(&mut self, name: &str) {
-        self.language_servers.stop(name);
+        self.stop_language_server_demands(name);
+    }
+
+    pub fn restart_language_servers(&mut self, names: &HashSet<String>) {
+        self.restart_language_server_demands(names, LaunchOrigin::ExplicitRestart);
+    }
+
+    pub fn mark_language_server_initialization_dispatched(
+        &mut self,
+        language_server_id: helix_lsp::LanguageServerId,
+    ) -> bool {
+        self.language_servers
+            .mark_initialization_dispatched(language_server_id)
     }
 
     pub fn notify_file_changed(&self, path: std::path::PathBuf) {
@@ -38,7 +80,7 @@ impl Editor {
     }
 
     pub fn request_blame(&self, event: crate::handlers::BlameEvent) {
-        helix_runtime::send_blocking(&self.handlers.blame, event);
+        self.handlers.blame.send(event);
     }
 
     pub fn clear_language_server_document_diagnostics(
@@ -97,6 +139,34 @@ impl Editor {
         self.syn_loader.store(Arc::new(loader));
     }
 
+    /// Installs a prepared loader and clears syntax only for documents backed by changed grammars.
+    pub fn apply_runtime_language_loader(
+        &mut self,
+        loader: helix_core::syntax::Loader,
+        changed_grammars: &BTreeSet<String>,
+    ) -> Vec<DocumentId> {
+        let affected = self
+            .documents
+            .iter()
+            .filter_map(|(document_id, document)| {
+                let language = document.language_configuration()?;
+                let grammar = language.grammar.as_deref().unwrap_or(&language.language_id);
+                changed_grammars.contains(grammar).then_some(*document_id)
+            })
+            .collect::<Vec<_>>();
+        self.replace_language_loader(loader);
+        let loader = self.syn_loader.load();
+        for document_id in &affected {
+            let Some(document) = self.documents.get_mut(document_id) else {
+                continue;
+            };
+            let language = document.detect_language_config(&loader);
+            document.set_language_configuration(language);
+            document.set_syntax(None);
+        }
+        affected
+    }
+
     pub fn refresh_document_languages(&mut self) {
         let loader = self.syn_loader.load();
         for document in self.documents.values_mut() {
@@ -122,139 +192,31 @@ impl Editor {
     }
 
     pub(super) fn launch_language_servers(&mut self, doc_id: DocumentId) {
-        if !self.config().lsp.enable {
-            return;
-        }
-        let Some(doc) = self.documents.get(&doc_id) else {
-            return;
-        };
-        let Some(doc_url) = doc.url() else {
-            return;
-        };
-        let (lang, path) = (doc.language_configuration().cloned(), doc.path().cloned());
-        let had_language_servers = doc.has_language_servers();
-        let config = doc.config.load();
-        let root_dirs = &config.workspace_lsp_roots;
-
-        let mut missing_servers = Vec::new();
-        let language_servers = lang.as_ref().map_or_else(HashMap::default, |language| {
-            self.language_servers
-                .get(language, path.as_ref(), root_dirs, config.lsp.snippets)
-                .filter_map(|(lang, client)| match client {
-                    Ok(client) => Some((lang, client)),
-                    Err(err) => {
-                        if let helix_lsp::Error::ExecutableNotFound(err) = err {
-                            log::debug!(
-                                "Language server not found for `{}` {} {}",
-                                language.scope,
-                                lang,
-                                err,
-                            );
-                            missing_servers.push(lang);
-                        } else {
-                            log::error!(
-                                "Failed to initialize the language servers for `{}` - `{}` {{ {} }}",
-                                language.scope,
-                                lang,
-                                err
-                            );
-                        }
-                        None
-                    }
-                })
-                .collect::<HashMap<_, _>>()
-        });
-        if let Some(language) = lang.as_ref() {
-            for server in missing_servers {
-                self.handle_missing_language_server(language, &server);
-            }
-        }
-
-        if language_servers.is_empty() && !had_language_servers {
-            return;
-        }
-
-        let Some(doc) = self.documents.get_mut(&doc_id) else {
-            return;
-        };
-
-        let language_id = doc.language_id().map(ToOwned::to_owned).unwrap_or_default();
-
-        let doc_language_servers_not_in_registry = doc.all_language_servers().filter(|doc_ls| {
-            language_servers
-                .get(doc_ls.name())
-                .is_none_or(|language_server| language_server.id() != doc_ls.id())
-        });
-
-        for language_server in doc_language_servers_not_in_registry {
-            language_server.text_document_did_close(doc.identifier());
-        }
-
-        let language_servers_not_in_doc =
-            language_servers.iter().filter(|(name, language_server)| {
-                doc.language_server_by_name(name)
-                    .is_none_or(|doc_ls| language_server.id() != doc_ls.id())
-            });
-
-        for (_, language_server) in language_servers_not_in_doc {
-            language_server.text_document_did_open(
-                doc_url.clone(),
-                doc.version(),
-                doc.text(),
-                language_id.clone(),
-            );
-        }
-
-        doc.set_language_servers(language_servers);
+        self.reconcile_language_server_demands(doc_id, LaunchOrigin::Automatic, None);
     }
 
-    fn handle_missing_language_server(
+    pub(super) fn handle_missing_language_server(
         &mut self,
+        document: DocumentId,
         language: &helix_core::syntax::config::LanguageConfiguration,
         server: &str,
+        runtime_generation: u64,
     ) {
         let loader = self.syn_loader.load();
         let Some(server_config) = loader.language_server_configs().get(server) else {
             return;
         };
         let config = self.config();
-        let registry = match helix_pkg::Registry::from_config(
-            &config.pkg,
-            &helix_pkg::Store::open_default(),
-        ) {
-            Ok(registry) => registry,
-            Err(err) => {
-                log::warn!("failed to load package registries for missing-server nudge: {err}");
-                return;
-            }
-        };
-        let Some(package) = helix_pkg::resolve::package_for_missing_command(
-            &registry,
-            helix_pkg::PkgKind::Lsp,
-            Some(&language.language_id),
-            &server_config.command,
-        ) else {
-            return;
-        };
-        let key = format!("{}:{}", server, package.name);
-        {
-            let mut nudged = PKG_NUDGED_SERVERS.lock().expect("pkg nudge state");
-            if !nudged.insert(key) {
-                return;
-            }
-        }
-
-        if config.pkg.auto_install {
-            let package = package.name.clone();
-            helix_runtime::send_blocking(
-                self.pkg_sender(),
-                crate::handlers::PkgEvent::AutoInstall { name: package },
-            );
-        } else {
-            self.set_status(format!(
-                "{} not installed - :pkg-install {}",
-                server_config.command, package.name
-            ));
-        }
+        self.handlers
+            .pkg
+            .send(crate::handlers::PkgEvent::MissingLanguageServer {
+                documents: std::collections::BTreeSet::from([document]),
+                server: server.to_owned(),
+                language: language.language_id.clone(),
+                command: server_config.command.clone(),
+                config: config.pkg.clone(),
+                config_generation: self.config_gen,
+                runtime_generation,
+            });
     }
 }

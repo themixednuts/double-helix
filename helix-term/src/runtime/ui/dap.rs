@@ -1,10 +1,11 @@
 use crate::{
     compositor::Compositor,
     runtime::{ui::command::DapThreadAction, DapCommand, RuntimeTaskEvent},
-    ui::{self, Picker, Prompt, PromptEvent},
+    ui::{self, Picker, Popup, Prompt, PromptEvent, Text},
 };
 use helix_dap::{StackFrame, Thread, ThreadStates};
 use helix_view::editor::Breakpoint;
+use tui::text::{Span, Spans};
 
 pub(crate) fn apply_dap_command(
     editor: &mut helix_view::Editor,
@@ -35,15 +36,14 @@ pub(crate) fn apply_dap_command(
                     if event != PromptEvent::Validate {
                         return;
                     }
-                    cx.ingress
-                        .task(crate::runtime::RuntimeTaskEvent::SetBreakpointCondition {
-                            path: path.clone(),
-                            index,
-                            condition: match input {
-                                "" => None,
-                                input => Some(input.to_owned()),
-                            },
-                        });
+                    cx.submit_task(crate::runtime::RuntimeTaskEvent::SetBreakpointCondition {
+                        path: path.clone(),
+                        index,
+                        condition: match input {
+                            "" => None,
+                            input => Some(input.to_owned()),
+                        },
+                    });
                 },
             );
             if let Some(condition) = initial {
@@ -64,15 +64,14 @@ pub(crate) fn apply_dap_command(
                     if event != PromptEvent::Validate {
                         return;
                     }
-                    cx.ingress
-                        .task(crate::runtime::RuntimeTaskEvent::SetBreakpointLogMessage {
-                            path: path.clone(),
-                            index,
-                            log_message: match input {
-                                "" => None,
-                                input => Some(input.to_owned()),
-                            },
-                        });
+                    cx.submit_task(crate::runtime::RuntimeTaskEvent::SetBreakpointLogMessage {
+                        path: path.clone(),
+                        index,
+                        log_message: match input {
+                            "" => None,
+                            input => Some(input.to_owned()),
+                        },
+                    });
                 },
             );
             if let Some(log_message) = initial {
@@ -90,7 +89,9 @@ pub(crate) fn apply_dap_command(
                     },
                     DapThreadAction::Pause => RuntimeTaskEvent::PauseDebugThread { thread_id },
                 };
-                ingress.task(event);
+                if let Err(error) = ingress.task(event) {
+                    log::warn!("debugger foreground admission failed: {error}");
+                }
                 return;
             }
             let Some(debugger) = editor.debug_adapters.get_active_client_mut() else {
@@ -125,7 +126,7 @@ pub(crate) fn apply_dap_command(
                             thread_id: thread.id,
                         },
                     };
-                    cx.ingress.task(event);
+                    cx.submit_task(event);
                 },
             )
             .with_preview(move |editor, thread| {
@@ -157,7 +158,7 @@ pub(crate) fn apply_dap_command(
                 crate::ui::PickerRuntime::new(editor),
                 ingress.clone(),
                 move |cx: &mut crate::compositor::Context, frame: &StackFrame, _action| {
-                    cx.ingress.task(RuntimeTaskEvent::SelectStackFrame {
+                    cx.submit_task(RuntimeTaskEvent::SelectStackFrame {
                         thread_id,
                         frame_id: frame.id,
                     });
@@ -179,6 +180,34 @@ pub(crate) fn apply_dap_command(
                     })
             });
             compositor.push(Box::new(picker));
+        }
+        DapCommand::VariablesPopup { scopes } => {
+            let scope_style = editor.theme.get("ui.linenr.selected");
+            let type_style = editor.theme.get("ui.text");
+            let text_style = editor.theme.get("ui.text.focus");
+            let mut rows = Vec::new();
+            for scope in scopes {
+                rows.push(Spans::from(Span::styled(
+                    format!("▸ {}", scope.name),
+                    scope_style,
+                )));
+                rows.reserve(scope.variables.len());
+                for variable in scope.variables {
+                    let mut spans = Vec::with_capacity(5);
+                    spans.push(Span::styled(variable.name, text_style));
+                    if let Some(ty) = variable.ty {
+                        spans.push(Span::raw(": "));
+                        spans.push(Span::styled(ty, type_style));
+                    }
+                    spans.push(Span::raw(" = "));
+                    spans.push(Span::styled(variable.value, text_style));
+                    rows.push(Spans::from(spans));
+                }
+            }
+            compositor.replace_or_push(
+                "dap-variables",
+                Popup::new("dap-variables", Text::from(tui::text::Text::from(rows))),
+            );
         }
     }
 }

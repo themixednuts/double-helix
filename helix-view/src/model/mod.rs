@@ -18,13 +18,15 @@ pub use models::{
     AssistantModel, AssistantPlanItem, AssistantPlanRow, AssistantPlanSection, AssistantPlanStatus,
     AssistantPlanTone, AssistantStatusItem, AssistantStatusItemKind, AssistantTab,
     AssistantTerminal, AssistantTextFormat, CompletionItem, CompletionModel, PickerCell,
-    PickerColumnHeader, PickerItemData, PickerModel, PickerPreview, PickerRow, PromptModel,
+    PickerColumnHeader, PickerItemData, PickerModel, PickerPreview, PickerRow, PickerSpan,
+    PromptModel,
 };
 // Re-export PluginPanelModel (defined here, not in `models` submodule)
 
 use std::any::Any;
 use std::fmt::Debug;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use helix_core::Position;
 use slotmap::SlotMap;
@@ -119,7 +121,6 @@ crate::impl_content_model!(PluginPanelModel, "plugin_panel");
 // Floats
 crate::impl_content_model!(TextFloatModel, "text");
 crate::impl_content_model!(DocumentFloatModel, "document");
-crate::impl_content_model!(PluginFloatModel, "plugin_render");
 
 // ─── Model ────────────────────────────────────────────────────────────
 
@@ -135,9 +136,6 @@ pub struct Model {
 
     /// Persistent floating windows. Rendered above panels, below modal layers.
     pub floats: SlotMap<FloatId, FloatEntry>,
-
-    /// Status line / transient notifications.
-    pub status: Option<StatusMessage>,
 
     /// What currently has input focus.
     pub focus: FocusTarget,
@@ -155,7 +153,6 @@ impl Default for Model {
             layers: Vec::new(),
             panels: SlotMap::default(),
             floats: SlotMap::default(),
-            status: None,
             focus: FocusTarget::Editor,
             focus_history: Vec::new(),
             next_layer_id: 0,
@@ -376,13 +373,6 @@ impl Model {
         self.focus = self.focus_history.pop().unwrap_or(FocusTarget::Editor);
     }
 
-    // ─── Status & queries ──────────────────────────────────────────────
-
-    /// Set the status message. Pass `None` to clear.
-    pub fn set_status(&mut self, msg: Option<StatusMessage>) {
-        self.status = msg;
-    }
-
     /// Find the first layer matching a predicate.
     pub fn find_layer(&self, predicate: impl Fn(&LayerEntry) -> bool) -> Option<&LayerEntry> {
         self.layers.iter().find(|l| predicate(l))
@@ -579,28 +569,13 @@ impl Debug for FloatEntry {
 /// Float model for styled text blocks.
 #[derive(Debug, Clone, Default)]
 pub struct TextFloatModel {
-    pub blocks: Vec<RenderBlock>,
+    pub blocks: Arc<[RenderBlock]>,
 }
 
 /// Float model for rendering a live document snapshot in an overlay.
 #[derive(Debug, Clone, Copy)]
 pub struct DocumentFloatModel {
     pub document: crate::DocumentId,
-}
-
-/// Float model for plugin-rendered content.
-#[derive(Debug, Clone)]
-pub struct PluginFloatModel {
-    pub plugin_name: String,
-    pub render_callback_id: u64,
-}
-
-// ─── Status ────────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone)]
-pub struct StatusMessage {
-    pub text: String,
-    pub timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -761,21 +736,6 @@ mod tests {
         );
     }
 
-    // ─── Status ─────────────────────────────────────────────────────
-
-    #[test]
-    fn set_and_clear_status() {
-        let mut ui = Model::default();
-        assert!(ui.status.is_none());
-        ui.set_status(Some(StatusMessage {
-            text: "hello".into(),
-            timeout_ms: Some(3000),
-        }));
-        assert_eq!(ui.status.as_ref().unwrap().text, "hello");
-        ui.set_status(None);
-        assert!(ui.status.is_none());
-    }
-
     // ─── Multiple layers + panels coexist ───────────────────────────
 
     #[test]
@@ -876,7 +836,8 @@ mod tests {
                 blocks: vec![RenderBlock {
                     text: "hello".into(),
                     style: None,
-                }],
+                }]
+                .into(),
             }),
             Placement::Centered {
                 width: 40,

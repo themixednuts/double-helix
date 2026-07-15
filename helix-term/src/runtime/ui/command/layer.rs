@@ -20,6 +20,8 @@ pub enum LayerCommand {
     PushFilePicker { root: PathBuf },
     /// Push the runtime package manager.
     PkgManager,
+    /// Push the package manager focused on Agent Client Protocol agents.
+    AcpAgentsManager,
     /// Picker to run an LSP command when multiple servers advertise the same command list.
     LspCommandPicker {
         commands: Vec<(LanguageServerId, lsp::Command)>,

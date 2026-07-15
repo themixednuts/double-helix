@@ -8,6 +8,7 @@ pub(crate) fn apply_lsp_command(
     editor: &mut Editor,
     compositor: &mut Compositor,
     ingress: crate::runtime::RuntimeIngress,
+    foreground: crate::runtime::ForegroundEvents,
     cmd: LspCommand,
 ) {
     match cmd {
@@ -18,7 +19,13 @@ pub(crate) fn apply_lsp_command(
             if locations.is_empty() {
                 editor.set_error(empty_message);
             } else {
-                crate::ui::lsp::navigation::goto_locations(editor, compositor, ingress, locations);
+                crate::ui::lsp::navigation::goto_locations(
+                    editor,
+                    compositor,
+                    ingress,
+                    &foreground,
+                    locations,
+                );
             }
         }
         LspCommand::Hover { hovers, display } => {
@@ -34,12 +41,12 @@ pub(crate) fn apply_lsp_command(
                 match presentation {
                     LspCodeActionPresentation::Menu => {
                         crate::ui::lsp::code_actions::show_code_action_menu(
-                            editor, compositor, ingress, items,
+                            editor, compositor, ingress, foreground, items,
                         );
                     }
                     LspCodeActionPresentation::Picker => {
                         crate::ui::lsp::code_actions::show_code_action_picker(
-                            editor, compositor, ingress, items,
+                            editor, compositor, ingress, foreground, items,
                         );
                     }
                 }

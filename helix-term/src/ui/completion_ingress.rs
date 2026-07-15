@@ -3,7 +3,6 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
 
 use helix_core::chars::char_is_word;
 use helix_core::completion::CompletionProvider;
@@ -15,7 +14,6 @@ use helix_view::document::{Mode, SavePoint};
 use helix_view::handlers::completion::{CompletionEvent, RequestId, ResponseContext};
 use helix_view::Editor;
 use tokio::task::JoinSet;
-use tokio::time::{timeout_at, Instant};
 
 use crate::compositor::Compositor;
 use crate::handlers::completion::path_completion;
@@ -28,6 +26,18 @@ use crate::runtime::send_ui_command_with;
 use crate::runtime::ui::{CompletionCommand, UiCommand};
 use crate::ui::lsp::signature_help::SignatureHelp;
 use crate::ui::{self, Popup};
+
+fn spawn_blocking_completion(
+    requests: &mut JoinSet<CompletionResponse>,
+    block: &helix_runtime::Block,
+    request: impl FnOnce() -> CompletionResponse + Send + 'static,
+) {
+    let task = block.spawn(request);
+    requests.spawn(async move {
+        task.await
+            .expect("blocking completion provider task failed")
+    });
+}
 
 /// Apply incremental LSP completion list updates while the completion menu is open.
 pub(crate) fn apply_provider_completion_response(
@@ -128,6 +138,7 @@ pub(crate) fn request_completions(
     }
     trigger.pos = cursor;
     let (request, cancel) = editor.begin_completion_request();
+    let block = editor.runtime().block().clone();
     let view = view!(editor, view_id);
     let doc = doc_mut!(editor, &doc_id);
     let savepoint = doc.savepoint(view);
@@ -186,12 +197,12 @@ pub(crate) fn request_completions(
         cancel.clone(),
         savepoint.clone(),
     ) {
-        requests.spawn_blocking(path_completion_request);
+        spawn_blocking_completion(&mut requests, &block, path_completion_request);
     }
     if let Some(word_completion_request) =
         word_completion(editor, trigger, cancel.clone(), savepoint)
     {
-        requests.spawn_blocking(word_completion_request);
+        spawn_blocking_completion(&mut requests, &block, word_completion_request);
     }
 
     let replace_cancel = cancel.clone();
@@ -208,18 +219,6 @@ pub(crate) fn request_completions(
         let mut items: Vec<_> = Vec::new();
         response.take_items(&mut items);
         context.insert(response.provider, response.context);
-        let deadline = Instant::now() + Duration::from_millis(100);
-        loop {
-            let Some(mut response) = timeout_at(deadline, handle_response(&mut requests, false))
-                .await
-                .ok()
-                .flatten()
-            else {
-                break;
-            };
-            response.take_items(&mut items);
-            context.insert(response.provider, response.context);
-        }
         send_ui_command_with(
             UiCommand::Completion(Box::new(CompletionCommand::Show {
                 request,

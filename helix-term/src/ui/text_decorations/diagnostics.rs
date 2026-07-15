@@ -44,22 +44,27 @@ impl Styles {
     }
 }
 
-pub struct InlineDiagnostics<'a> {
-    state: InlineDiagnosticAccumulator<'a>,
+pub struct InlineDiagnostics {
+    state: InlineDiagnosticAccumulator,
     eol_diagnostics: DiagnosticFilter,
     styles: Styles,
 }
 
-impl<'a> InlineDiagnostics<'a> {
+impl InlineDiagnostics {
     pub fn new(
-        doc: &'a Document,
+        doc: &Document,
         theme: &Theme,
         cursor: usize,
         config: InlineDiagnosticsConfig,
         eol_diagnostics: DiagnosticFilter,
     ) -> Self {
         InlineDiagnostics {
-            state: InlineDiagnosticAccumulator::new(cursor, doc, config),
+            state: InlineDiagnosticAccumulator::new(
+                cursor,
+                doc.text().clone(),
+                doc.diagnostics_arc(),
+                config,
+            ),
             styles: Styles::new(theme),
             eol_diagnostics,
         }
@@ -262,7 +267,7 @@ impl Renderer<'_, '_> {
     }
 }
 
-impl Decoration for InlineDiagnostics<'_> {
+impl Decoration for InlineDiagnostics {
     fn render_virt_lines(
         &mut self,
         renderer: &mut TextRenderer,
@@ -271,20 +276,21 @@ impl Decoration for InlineDiagnostics<'_> {
     ) -> Position {
         let mut col_off = 0;
         let filter = self.state.filter();
+        let diagnostics = self.state.diagnostics_arc();
         let eol_diagnostic = match self.eol_diagnostics {
             DiagnosticFilter::Enable(eol_filter) => {
-                let eol_diganogistcs = self
-                    .state
-                    .stack
-                    .iter()
-                    .filter(|(diag, _)| eol_filter <= diag.severity());
+                let eol_diganogistcs =
+                    self.state.stack.iter().filter(|(diagnostic, _)| {
+                        eol_filter <= diagnostics[*diagnostic].severity()
+                    });
                 match filter {
                     DiagnosticFilter::Enable(filter) => eol_diganogistcs
-                        .filter(|(diag, _)| filter > diag.severity())
-                        .max_by_key(|(diagnostic, _)| diagnostic.severity),
-                    DiagnosticFilter::Disable => {
-                        eol_diganogistcs.max_by_key(|(diagnostic, _)| diagnostic.severity)
-                    }
+                        .filter(|(diagnostic, _)| filter > diagnostics[*diagnostic].severity())
+                        .max_by_key(|(diagnostic, _)| diagnostics[*diagnostic].severity())
+                        .map(|(diagnostic, anchor)| (*diagnostic, *anchor)),
+                    DiagnosticFilter::Disable => eol_diganogistcs
+                        .max_by_key(|(diagnostic, _)| diagnostics[*diagnostic].severity())
+                        .map(|(diagnostic, anchor)| (*diagnostic, *anchor)),
                 }
             }
             DiagnosticFilter::Disable => None,
@@ -297,10 +303,20 @@ impl Decoration for InlineDiagnostics<'_> {
                 config: &self.state.config,
                 styles: &self.styles,
             };
-            col_off = renderer.draw_eol_diagnostic(eol_diagnostic, pos.visual_line, virt_off.col);
+            col_off = renderer.draw_eol_diagnostic(
+                &diagnostics[eol_diagnostic],
+                pos.visual_line,
+                virt_off.col,
+            );
         }
 
         self.state.compute_line_diagnostics();
+        let mut stack = self
+            .state
+            .stack
+            .drain(..)
+            .map(|(diagnostic, anchor)| (&diagnostics[diagnostic], anchor))
+            .collect();
         let mut renderer = Renderer {
             renderer,
             first_row: pos.visual_line + virt_off.row as u16,
@@ -308,8 +324,8 @@ impl Decoration for InlineDiagnostics<'_> {
             config: &self.state.config,
             styles: &self.styles,
         };
-        renderer.draw_multi_diagnostics(&mut self.state.stack);
-        renderer.draw_diagnostics(&mut self.state.stack);
+        renderer.draw_multi_diagnostics(&mut stack);
+        renderer.draw_diagnostics(&mut stack);
         let horizontal_off = renderer.row - renderer.first_row;
         Position::new(horizontal_off as usize, col_off as usize)
     }

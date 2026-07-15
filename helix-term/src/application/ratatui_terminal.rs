@@ -51,6 +51,7 @@ where
     }
 
     pub(super) fn restore(&mut self) -> io::Result<()> {
+        HelixBackend::show_cursor(self.inner.backend_mut(), CursorKind::Block).ok();
         HelixBackend::restore(self.inner.backend_mut())
     }
 
@@ -68,26 +69,12 @@ where
         Ok(())
     }
 
-    pub(super) fn autoresize(&mut self) -> io::Result<Rect> {
-        self.inner.autoresize()?;
-        self.viewport_area = HelixBackend::size(self.inner.backend()).unwrap_or(self.viewport_area);
-        Ok(self.viewport_area)
-    }
-
-    pub(super) fn viewport_area(&self) -> Rect {
-        self.viewport_area
-    }
-
     pub(super) fn current_buffer_mut(&mut self) -> &mut Buffer {
         self.inner.current_buffer_mut()
     }
 
     pub(super) fn backend(&self) -> &B {
         self.inner.backend()
-    }
-
-    pub(super) fn backend_mut(&mut self) -> &mut B {
-        self.inner.backend_mut()
     }
 
     pub(super) fn draw(
@@ -109,6 +96,25 @@ where
 
         self.inner.swap_buffers();
         HelixBackend::flush(self.inner.backend_mut())
+    }
+
+    pub(super) fn present(
+        &mut self,
+        area: Rect,
+        surface: Buffer,
+        cursor_position: Option<(u16, u16)>,
+        cursor_kind: CursorKind,
+        full_redraw: bool,
+    ) -> io::Result<Buffer> {
+        if area != self.viewport_area {
+            self.resize(area)?;
+        }
+        if full_redraw {
+            self.clear()?;
+        }
+        let retired = std::mem::replace(self.current_buffer_mut(), surface);
+        self.draw(cursor_position, cursor_kind)?;
+        Ok(retired)
     }
 }
 
@@ -132,5 +138,20 @@ mod tests {
         terminal.draw(None, CursorKind::Hidden).unwrap();
 
         assert_eq!(terminal.backend().buffer()[(1, 0)].symbol(), "x");
+    }
+
+    #[test]
+    fn app_terminal_presents_an_owned_frame() {
+        let mut terminal = AppTerminal::new(TestBackend::new(4, 2)).unwrap();
+        terminal.claim().unwrap();
+        let area = Rect::new(0, 0, 4, 2);
+        let mut surface = Buffer::empty(tui::ratatui::to_ratatui_rect(area));
+        surface.set_string(2, 1, "y", ratatui::style::Style::default());
+
+        terminal
+            .present(area, surface, None, CursorKind::Hidden, false)
+            .unwrap();
+
+        assert_eq!(terminal.backend().buffer()[(2, 1)].symbol(), "y");
     }
 }

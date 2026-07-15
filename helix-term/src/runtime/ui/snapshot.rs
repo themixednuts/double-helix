@@ -78,23 +78,29 @@ where
     Load: FnOnce(K) -> anyhow::Result<O> + Send + 'static,
     Apply: FnOnce(K, O) -> UiCommand + Send + 'static,
 {
-    pub(crate) fn spawn(self, work: helix_runtime::Work, ingress: RuntimeIngress) {
+    pub(crate) fn spawn(
+        self,
+        work: helix_runtime::Work,
+        block: helix_runtime::Block,
+        ingress: RuntimeIngress,
+    ) {
         let label = self.label;
         let load_key = self.key.clone();
         let apply_key = self.key;
         let load = self.load.0;
         let apply = self.apply.0;
 
+        let start = Instant::now();
+        log::info!("{label} phase=load_start key={load_key:?}");
+        let loaded = block.spawn(move || load(load_key));
         work.spawn(async move {
-            let start = Instant::now();
-            log::info!("{label} phase=load_start key={load_key:?}");
-            match tokio::task::spawn_blocking(move || load(load_key)).await {
+            match loaded.await {
                 Ok(Ok(output)) => {
                     log::info!(
                         "{label} phase=load_done key={apply_key:?} elapsed_us={}",
                         start.elapsed().as_micros()
                     );
-                    ingress.ui(apply(apply_key, output));
+                    let _ = ingress.send_ui(apply(apply_key, output)).await;
                 }
                 Ok(Err(err)) => {
                     log::warn!(

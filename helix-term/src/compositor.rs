@@ -38,7 +38,7 @@ macro_rules! component_traits {
 
 use crate::render::{CacheStore, CellSurface, PreparedRender, RenderOutput};
 use helix_core::Position;
-use helix_runtime::FrameHandle;
+use helix_runtime::{FrameHandle, FrameSource};
 use helix_view::bench::log_run_phase;
 use helix_view::graphics::{CursorKind, Rect};
 use helix_view::input::{MouseButton, MouseEvent, MouseEventKind};
@@ -47,7 +47,14 @@ use helix_view::Editor;
 use std::sync::Arc;
 
 mod render_frame;
-pub use render_frame::{RenderContext, RenderSnapshot};
+pub use render_frame::RenderContext;
+
+pub type FrameDeadlines = std::collections::HashMap<FrameSource, std::time::Instant>;
+
+pub(crate) struct FramePreparation {
+    pub deadlines: FrameDeadlines,
+    pub render_steps: Vec<crate::render::RenderStep>,
+}
 
 /// Typed requests emitted by components after handling an event.
 pub enum PostAction {
@@ -132,8 +139,6 @@ pub enum EventResult {
 
 use crate::runtime::ExitTaskSet;
 use crate::ui::picker;
-
-use helix_plugin::PluginManager;
 
 /// Layout computed from `Model.panels`. Describes how the editor area is
 /// split to accommodate docked panels.
@@ -297,46 +302,100 @@ fn side_panel_underlaps_global_status_row(panel: &PanelEntry) -> bool {
     !(panel.title == "Files" && panel.content.is::<TreePanelModel>())
 }
 
-/// Render the global status row at the bottom of the terminal.
-///
-/// Shows the editor's `status_msg` — set by `editor.set_status()`,
-/// `editor.set_error()`, etc. — full terminal width, regardless of which
-/// panel has focus. Empty (background fill) when there's no message, so the
-/// row's baseline is always present and visible.
-fn render_global_status_row(
+struct GlobalStatusRowRender {
     area: Rect,
-    surface: &mut crate::render::CellSurface,
-    ctx: &RenderContext,
-) {
-    if area.width == 0 || area.height == 0 {
-        return;
-    }
-    let theme = ctx.theme();
-    let bg_style = theme.get("ui.background");
-    surface.set_style(
-        tui::ratatui::to_ratatui_rect(area),
-        tui::ratatui::to_ratatui_style(bg_style),
-    );
+    background: helix_view::graphics::Style,
+    message: Option<(Arc<str>, helix_view::graphics::Style)>,
+}
 
-    let Some((msg, severity)) = ctx.status_msg() else {
-        return;
-    };
-    use helix_view::editor::Severity;
-    let style = match severity {
-        Severity::Error => theme.get("error"),
-        Severity::Warning => theme.get("warning"),
-        Severity::Info | Severity::Hint => theme
-            .try_get("ui.text.inactive")
-            .or_else(|| theme.try_get("comment"))
-            .unwrap_or_else(|| theme.get("ui.text")),
-    };
-    surface.set_stringn(
-        area.x.saturating_add(1),
-        area.y,
-        msg,
-        area.width.saturating_sub(1) as usize,
-        tui::ratatui::to_ratatui_style(bg_style.patch(style)),
-    );
+impl GlobalStatusRowRender {
+    fn collect(area: Rect, ctx: &RenderContext) -> Self {
+        use helix_view::editor::Severity;
+
+        let theme = ctx.theme();
+        let background = theme.get("ui.background");
+        let message = ctx.status_msg().map(|(message, severity)| {
+            let style = match severity {
+                Severity::Error => theme.get("error"),
+                Severity::Warning => theme.get("warning"),
+                Severity::Info | Severity::Hint => theme
+                    .try_get("ui.text.inactive")
+                    .or_else(|| theme.try_get("comment"))
+                    .unwrap_or_else(|| theme.get("ui.text")),
+            };
+            (Arc::from(message), background.patch(style))
+        });
+        Self {
+            area,
+            background,
+            message,
+        }
+    }
+
+    fn paint(self, surface: &mut crate::render::CellSurface) {
+        if self.area.width == 0 || self.area.height == 0 {
+            return;
+        }
+        surface.set_style(
+            tui::ratatui::to_ratatui_rect(self.area),
+            tui::ratatui::to_ratatui_style(self.background),
+        );
+
+        let Some((message, style)) = self.message else {
+            return;
+        };
+        surface.set_stringn(
+            self.area.x.saturating_add(1),
+            self.area.y,
+            message.as_ref(),
+            self.area.width.saturating_sub(1) as usize,
+            tui::ratatui::to_ratatui_style(style),
+        );
+    }
+}
+
+struct SidePanelDividersRender {
+    areas: Box<[Rect]>,
+    style: helix_view::graphics::Style,
+}
+
+impl SidePanelDividersRender {
+    fn collect(layout: &PanelLayout, ctx: &RenderContext) -> Self {
+        let areas = layout
+            .panel_areas
+            .iter()
+            .filter_map(|(panel_id, rect)| {
+                if rect.width == 0 || rect.height == 0 {
+                    return None;
+                }
+                let panel = ctx.panel_entry(*panel_id)?;
+                if !panel.visible {
+                    return None;
+                }
+                let x = match panel.side {
+                    PanelSide::Right => rect.x,
+                    PanelSide::Left => rect.right().saturating_sub(1),
+                    PanelSide::Bottom => return None,
+                };
+                Some(Rect {
+                    x,
+                    y: rect.y,
+                    width: 1,
+                    height: rect.height,
+                })
+            })
+            .collect();
+        Self {
+            areas,
+            style: ctx.theme().get("ui.window"),
+        }
+    }
+
+    fn paint(self, surface: &mut crate::render::CellSurface) {
+        for area in self.areas {
+            crate::widgets::vdivider(surface, area, self.style);
+        }
+    }
 }
 
 /// Resolve the area for a component based on its layout role.
@@ -380,9 +439,11 @@ pub struct Context<'a> {
     pub notifier: crate::handlers::local::Notifier,
     /// Typed ingress for async work that needs to return to the application loop.
     pub ingress: crate::runtime::RuntimeIngress,
+    /// Thread-affine effects applied after the current foreground transaction.
+    pub foreground: crate::runtime::ForegroundEvents,
     pub redraw: FrameHandle,
     pub idle_reset: crate::runtime::IdleResetHandle,
-    pub plugin_manager: Option<Arc<PluginManager>>,
+    pub(crate) plugin_runtime: crate::plugin_registry::PluginRuntime,
 }
 
 impl<'a> Context<'a> {
@@ -393,7 +454,29 @@ impl<'a> Context<'a> {
         notifier: crate::handlers::local::Notifier,
         ingress: crate::runtime::RuntimeIngress,
         idle_reset: crate::runtime::IdleResetHandle,
-        plugin_manager: Option<Arc<PluginManager>>,
+        plugin_runtime: crate::plugin_registry::PluginRuntime,
+    ) -> Self {
+        Self::with_foreground(
+            editor,
+            exit_tasks,
+            exit_task_work,
+            notifier,
+            ingress,
+            idle_reset,
+            plugin_runtime,
+            crate::runtime::ForegroundEvents::new(),
+        )
+    }
+
+    pub fn with_foreground(
+        editor: &'a mut Editor,
+        exit_tasks: &'a mut ExitTaskSet,
+        exit_task_work: helix_runtime::Work,
+        notifier: crate::handlers::local::Notifier,
+        ingress: crate::runtime::RuntimeIngress,
+        idle_reset: crate::runtime::IdleResetHandle,
+        plugin_runtime: crate::plugin_registry::PluginRuntime,
+        foreground: crate::runtime::ForegroundEvents,
     ) -> Self {
         let redraw = editor.redraw_handle();
         Self {
@@ -403,9 +486,22 @@ impl<'a> Context<'a> {
             exit_task_work,
             notifier,
             ingress,
+            foreground,
             redraw,
             idle_reset,
-            plugin_manager,
+            plugin_runtime,
+        }
+    }
+
+    pub fn submit_task(&mut self, task: crate::runtime::RuntimeTaskEvent) {
+        if let Err(error) = self.foreground.task(task) {
+            self.editor.set_error(error.to_string());
+        }
+    }
+
+    pub fn submit_ui(&mut self, command: crate::runtime::UiCommand) {
+        if let Err(error) = self.foreground.ui(command) {
+            self.editor.set_error(error.to_string());
         }
     }
 
@@ -455,9 +551,8 @@ impl<'a> Context<'a> {
             self.editor,
             self.exit_tasks,
             self.ingress.clone(),
-            self.plugin_manager
-                .clone()
-                .expect("plugin manager must be available when flushing exit tasks"),
+            self.foreground.clone(),
+            self.plugin_runtime.clone(),
         )?;
         tokio::task::block_in_place(|| helix_lsp::block_on(self.editor.flush_writes()))?;
         Ok(())
@@ -477,17 +572,10 @@ pub trait Component: Any + Send {
     ///
     /// Components that participate in Model (panels, layers) should override
     /// this to push/update their state. The default does nothing.
-    fn sync(&mut self, _editor: &mut Editor) {}
+    fn sync(&mut self, _viewport: Rect, _editor: &mut Editor) {}
 
-    /// Render the component onto a terminal-style cell surface.
-    fn render(&mut self, area: Rect, frame: &mut CellSurface, ctx: &RenderContext);
-
-    /// Prepare a native Ratatui render artifact for later composition.
-    fn prepare_render(&mut self, area: Rect, ctx: &RenderContext) -> PreparedRender {
-        let mut output = RenderOutput::new(area);
-        self.render(area, output.surface_mut(), ctx);
-        PreparedRender::ready(output)
-    }
+    /// Capture owned frame data and defer all cell painting to the render actor.
+    fn prepare_render(&mut self, area: Rect, ctx: &RenderContext) -> PreparedRender;
 
     /// Get cursor position and cursor kind.
     fn cursor(&self, _area: Rect, _ctx: &Editor) -> (Option<Position>, CursorKind) {
@@ -553,6 +641,7 @@ pub trait PickerComponent {
     fn apply_preview(
         &mut self,
         editor: &mut Editor,
+        generation: u64,
         path: std::path::PathBuf,
         preview: picker::CachedPreview,
     );
@@ -565,6 +654,7 @@ pub trait PickerComponent {
     );
 
     fn run_dynamic_query(&mut self, editor: &mut Editor, query: std::sync::Arc<str>);
+    fn refresh_dynamic_query(&mut self, editor: &mut Editor);
 }
 
 pub struct Compositor {
@@ -573,7 +663,7 @@ pub struct Compositor {
 
     pub(crate) last_picker: Option<Box<dyn Component>>,
     pub(crate) full_redraw: bool,
-    pending_timers: Vec<(crate::host::TimerId, std::time::Duration)>,
+    pending_timers: std::collections::HashMap<crate::host::TimerId, std::time::Duration>,
     /// Cached from the most recent render pass so mouse events can do hit-testing.
     last_layout: Option<PanelLayout>,
     render_cache: CacheStore,
@@ -586,7 +676,7 @@ impl Compositor {
             area,
             last_picker: None,
             full_redraw: false,
-            pending_timers: Vec::new(),
+            pending_timers: std::collections::HashMap::new(),
             last_layout: None,
             render_cache: CacheStore::default(),
         }
@@ -665,7 +755,8 @@ impl Compositor {
             }
         }
 
-        // Mouse-panel interaction: click to focus, scroll to scroll.
+        // Mouse-panel interaction: click to focus, and let autoinfo keep its
+        // overlay-specific scroll handling ahead of component dispatch.
         if let Event::Mouse(mouse) = event {
             match mouse.kind {
                 MouseEventKind::Down(MouseButton::Left) => {
@@ -673,11 +764,6 @@ impl Compositor {
                 }
                 MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
                     if self.handle_autoinfo_scroll(mouse, cx) =>
-                {
-                    return true;
-                }
-                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
-                    if self.handle_mouse_panel_scroll(mouse) =>
                 {
                     return true;
                 }
@@ -764,6 +850,18 @@ impl Compositor {
                 }
                 EventResult::Ignored(None) => {}
             };
+        }
+
+        if !consumed {
+            if let Event::Mouse(mouse) = event {
+                if matches!(
+                    mouse.kind,
+                    MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+                ) && self.handle_mouse_panel_scroll(mouse)
+                {
+                    consumed = true;
+                }
+            }
         }
 
         for action in post_actions {
@@ -867,12 +965,16 @@ impl Compositor {
                     match mouse.kind {
                         MouseEventKind::ScrollUp => {
                             let new = current.saturating_sub(3);
-                            log::debug!("[panel_scroll] UP current={current} new={new} max={max} content_h={content_h} viewport_h={viewport_h}");
+                            log::debug!(
+                                "[panel_scroll] UP current={current} new={new} max={max} content_h={content_h} viewport_h={viewport_h}"
+                            );
                             scrollable.scroll_to(new);
                         }
                         MouseEventKind::ScrollDown => {
                             let new = (current + 3).min(max);
-                            log::debug!("[panel_scroll] DOWN current={current} new={new} max={max} content_h={content_h} viewport_h={viewport_h}");
+                            log::debug!(
+                                "[panel_scroll] DOWN current={current} new={new} max={max} content_h={content_h} viewport_h={viewport_h}"
+                            );
                             scrollable.scroll_to(new);
                         }
                         _ => {}
@@ -908,22 +1010,32 @@ impl Compositor {
         true
     }
 
-    pub fn render(&mut self, area: Rect, surface: &mut CellSurface, cx: &mut Context) {
-        self.render_to_cells(area, surface, cx);
+    pub(crate) fn prepare_frame(&mut self, area: Rect, cx: &mut Context) -> FramePreparation {
+        self.collect_frame(area, cx)
     }
 
     pub fn render_frame(&mut self, area: Rect, cx: &mut Context) -> RenderOutput {
-        let mut output = RenderOutput::new(area);
-        self.render(area, output.surface_mut(), cx);
-        output
+        let preparation = self.prepare_frame(area, cx);
+        let surface = CellSurface::empty(tui::ratatui::to_ratatui_rect(area));
+        let mut plan = crate::render::RenderPlan::seeded(area, surface);
+        plan.extend(preparation.render_steps);
+        let surface = plan
+            .take_seed()
+            .unwrap_or_else(|| CellSurface::empty(tui::ratatui::to_ratatui_rect(area)));
+        let result = plan.execute(
+            surface,
+            &mut self.render_cache,
+            &crate::render::RenderCancellation::never(),
+        );
+        RenderOutput::from_surface(area, result.surface)
     }
 
-    fn render_to_cells(&mut self, area: Rect, surface: &mut CellSurface, cx: &mut Context) {
+    fn collect_frame(&mut self, area: Rect, cx: &mut Context) -> FramePreparation {
         // Phase 1: Sync — all components push state to Model before layout.
         // This is the ONLY phase with `&mut Editor` — mutations happen here.
         for layer in &mut self.layers {
             let sync_start = std::time::Instant::now();
-            layer.sync(cx.editor);
+            layer.sync(area, cx.editor);
             log_run_phase(
                 "compositor_sync",
                 layer.type_name(),
@@ -1003,7 +1115,7 @@ impl Compositor {
             cx.scroll,
             cx.ingress.clone(),
             cx.redraw.clone(),
-            cx.plugin_manager.clone(),
+            area,
         );
 
         // Set prompt_active on EditorView before render.
@@ -1013,7 +1125,7 @@ impl Compositor {
             }
         }
 
-        // Phase 3: Render — Fill and Docked layers.
+        // Phase 3: Prepare Fill and Docked layers in exact z-order.
         // Find where overlays begin.
         let overlay_start = self
             .layers
@@ -1021,18 +1133,20 @@ impl Compositor {
             .position(|l| l.layout_role() == LayoutRole::Overlay)
             .unwrap_or(self.layers.len());
 
+        let mut render_steps = Vec::new();
         {
             let base_start = std::time::Instant::now();
             let base_layers = &mut self.layers[..overlay_start];
             let count = base_layers.len();
             for layer in base_layers.iter_mut() {
                 let layer_area = resolve_area(layer.as_ref(), area, &layout);
-                if layer.layout_role() == LayoutRole::Fill {
-                    layer.render(layer_area, surface, &render_ctx);
-                } else {
-                    let prepared = layer.prepare_render(layer_area, &render_ctx);
-                    self.render_cache.compose(prepared, surface);
+                let prepared = layer.prepare_render(layer_area, &render_ctx);
+                if let Some(step) =
+                    crate::render::RenderStep::prepared(layer.type_name(), vec![prepared])
+                {
+                    render_steps.push(step);
                 }
+                render_steps.extend(render_ctx.take_render_steps());
             }
             log_run_phase(
                 "compositor_layer",
@@ -1042,26 +1156,62 @@ impl Compositor {
             );
         }
 
-        // Phase 4: Info popup — on top of panels but below overlays.
-        if render_ctx.config().auto_info {
-            if let Some(info) = render_ctx.autoinfo() {
-                let info_start = std::time::Instant::now();
-                let mut info_copy = info.clone();
-                info_copy.render(area, surface, &render_ctx);
-                log_run_phase("compositor_layer", "autoinfo", info_start.elapsed(), || {
-                    format!(
-                        "id=autoinfo role=overlay area={}x{}+{},{}",
-                        area.width, area.height, area.x, area.y
-                    )
-                });
+        // Phase 4: Global status row and side-panel dividers. This is
+        // rendered before popups so framed/help surfaces can cover panel
+        // boundaries instead of being split by them.
+        if layout.global_status_row.height > 0 {
+            let row = GlobalStatusRowRender::collect(layout.global_status_row, &render_ctx);
+            render_steps.push(crate::render::RenderStep::paint(
+                "global_status_row",
+                move |surface, cancellation| {
+                    if !cancellation.is_cancelled() {
+                        row.paint(surface);
+                    }
+                },
+            ));
+        }
+        {
+            let dividers = SidePanelDividersRender::collect(&layout, &render_ctx);
+            render_steps.push(crate::render::RenderStep::paint(
+                "side_panel_dividers",
+                move |surface, cancellation| {
+                    if !cancellation.is_cancelled() {
+                        dividers.paint(surface);
+                    }
+                },
+            ));
+        }
+
+        // Phase 5: Info popup — on top of panels/dividers but below model
+        // floats and modal overlays.
+        {
+            if render_ctx.config().auto_info {
+                if let Some(mut info) = render_ctx.autoinfo().cloned() {
+                    let prepared = info.prepare_render(area, &render_ctx);
+                    if let Some(step) =
+                        crate::render::RenderStep::prepared("autoinfo_popup", vec![prepared])
+                    {
+                        render_steps.push(step);
+                    }
+                    render_steps.extend(render_ctx.take_render_steps());
+                }
             }
         }
 
-        // Phase 5: Model floats — above editor/panels/autoinfo, below modal overlays.
+        // Phase 5.5: Model floats — above editor/panels/autoinfo, below modal overlays.
         let float_count = render_ctx.model_float_count();
         if float_count > 0 {
             let floats_start = std::time::Instant::now();
-            crate::ui::plugin_float::render_model_floats(area, surface, &render_ctx);
+            let floats =
+                crate::ui::plugin_float::ModelFloatsRenderSnapshot::collect(area, &render_ctx);
+            render_steps.push(crate::render::RenderStep::paint(
+                "model_floats",
+                move |surface, cancellation| {
+                    if !cancellation.is_cancelled() {
+                        floats.paint(surface);
+                    }
+                },
+            ));
             log_run_phase(
                 "compositor_layer",
                 "model_floats",
@@ -1070,26 +1220,22 @@ impl Compositor {
             );
         }
 
-        // Phase 5.5: Global status row — the reserved bottom row, rendered
-        // BEFORE overlays so an active cmdline / picker / popup paints
-        // over it. When there's no overlay, status_msg from anywhere in
-        // the app lands here, full terminal width, regardless of which
-        // panel has focus.
-        if layout.global_status_row.height > 0 {
-            render_global_status_row(layout.global_status_row, surface, &render_ctx);
-        }
-
         // Phase 6: Overlay layers (pickers, popups, prompts) on top of everything.
-        // Overlays render directly to the main surface (not through prepare_render/blit)
-        // because they only paint a small region — blitting a full-area surface would
-        // overwrite the editor content underneath with empty cells.
+        // Sparse component outputs preserve untouched cells, so overlays can use
+        // the same ordered preparation path without erasing lower layers.
         {
             let overlay_start_time = std::time::Instant::now();
             let overlay_layers = &mut self.layers[overlay_start..];
             let count = overlay_layers.len();
             for layer in overlay_layers.iter_mut() {
                 let layer_area = resolve_area(layer.as_ref(), area, &layout);
-                layer.render(layer_area, surface, &render_ctx);
+                let prepared = layer.prepare_render(layer_area, &render_ctx);
+                if let Some(step) =
+                    crate::render::RenderStep::prepared(layer.type_name(), vec![prepared])
+                {
+                    render_steps.push(step);
+                }
+                render_steps.extend(render_ctx.take_render_steps());
             }
             log_run_phase(
                 "compositor_layer",
@@ -1097,6 +1243,11 @@ impl Compositor {
                 overlay_start_time.elapsed(),
                 || format!("count={count} phase=overlay_direct"),
             );
+        }
+
+        FramePreparation {
+            deadlines: render_ctx.take_frame_deadlines(),
+            render_steps,
         }
     }
 
@@ -1113,7 +1264,7 @@ impl Compositor {
                 let layer_cursor_start = std::time::Instant::now();
                 let (position, kind) = layer.cursor(layer_area, editor);
                 if let Some(pos) = position {
-                    log::info!(
+                    log::trace!(
                         target: crate::ui::picker::PICKER_TRACE_TARGET,
                         "phase=cursor_source source_type={} source_id={} role={:?} focused={} layer_area={}x{}+{},{} pos={},{} kind={:?} checked={} elapsed_us={}",
                         layer.type_name(),
@@ -1135,7 +1286,7 @@ impl Compositor {
                 }
             }
             if result.0.is_none() {
-                log::info!(
+                log::trace!(
                     target: crate::ui::picker::PICKER_TRACE_TARGET,
                     "phase=cursor_source source_type=<none> checked={} area={}x{} elapsed_us={}",
                     checked,
@@ -1153,7 +1304,7 @@ impl Compositor {
                 if let Some(ref info) = editor.autoinfo {
                     let info_area = info.screen_area(area);
                     if info_area.contains(pos.col as u16, pos.row as u16) {
-                        log::info!(
+                        log::trace!(
                             target: crate::ui::picker::PICKER_TRACE_TARGET,
                             "phase=cursor_hidden_by_autoinfo pos={},{} info_area={}x{}+{},{} elapsed_us={}",
                             pos.col,
@@ -1187,7 +1338,7 @@ impl Compositor {
             .and_then(|component| component.downcast_mut())
     }
 
-    pub fn find_id<T: 'static>(&mut self, id: &'static str) -> Option<&mut T> {
+    pub fn find_id<T: 'static>(&mut self, id: &str) -> Option<&mut T> {
         self.layers
             .iter_mut()
             .find(|component| component.id() == Some(id))
@@ -1207,7 +1358,7 @@ impl Compositor {
 
     /// Drain pending timer requests (for the event loop to schedule).
     pub fn take_pending_timers(&mut self) -> Vec<(crate::host::TimerId, std::time::Duration)> {
-        std::mem::take(&mut self.pending_timers)
+        self.pending_timers.drain().collect()
     }
 }
 
@@ -1225,7 +1376,7 @@ impl crate::host::UiHost for Compositor {
     }
 
     fn request_timer(&mut self, id: crate::host::TimerId, after: std::time::Duration) {
-        self.pending_timers.push((id, after));
+        self.pending_timers.insert(id, after);
     }
 }
 
@@ -1359,7 +1510,7 @@ mod tests {
     use std::sync::Arc;
 
     fn test_editor(width: u16, height: u16) -> Editor {
-        let theme_loader = helix_view::theme::Loader::new(helix_loader::runtime_dirs());
+        let theme_loader = helix_view::theme::Loader::new(&[]);
         let syn_loader = helix_core::config::default_lang_loader();
         let config = helix_view::editor::Config::default();
         let config = Arc::new(ArcSwap::from_pointee(config));
@@ -1377,6 +1528,27 @@ mod tests {
         )
     }
 
+    fn render_component(
+        component: &mut dyn Component,
+        area: Rect,
+        render_ctx: &RenderContext,
+    ) -> crate::render::CellSurface {
+        let surface = crate::render::CellSurface::empty(tui::ratatui::to_ratatui_rect(area));
+        let prepared = component.prepare_render(area, render_ctx);
+        let mut plan = crate::render::RenderPlan::seeded(area, surface);
+        plan.extend(
+            crate::render::RenderStep::prepared("test_component", vec![prepared]).into_iter(),
+        );
+        plan.extend(render_ctx.take_render_steps());
+        let seed = plan.take_seed().expect("test render plan seed");
+        plan.execute(
+            seed,
+            &mut crate::render::CacheStore::default(),
+            &crate::render::RenderCancellation::never(),
+        )
+        .surface
+    }
+
     #[tokio::test]
     async fn file_picker_renders_workspace_root() {
         let mut editor = test_editor(151, 43);
@@ -1385,17 +1557,16 @@ mod tests {
             .expect("helix-term has workspace parent")
             .to_path_buf();
         let runtime = helix_runtime::test::runtime();
-        let (ingress, _rx) = crate::runtime::RuntimeIngress::channel(runtime.work().clone());
+        let (ingress, _rx) = crate::runtime::RuntimeIngress::channel(runtime.clone());
         let mut picker = crate::ui::file_picker(&editor, root, ingress.clone());
         picker.required_size((151, 43));
-        picker.sync(&mut editor);
+        picker.sync(Rect::new(0, 0, 151, 43), &mut editor);
 
         let area = Rect::new(0, 0, 151, 43);
-        let render_ctx = RenderContext::new(&editor, ingress, editor.redraw_handle(), None);
+        let render_ctx = RenderContext::new(&editor, ingress, editor.redraw_handle());
 
-        let mut ratatui_surface =
-            crate::render::CellSurface::empty(tui::ratatui::to_ratatui_rect(area));
-        picker.render(area, &mut ratatui_surface, &render_ctx);
+        let ratatui_surface = render_component(&mut picker, area, &render_ctx);
+        assert_eq!(*ratatui_surface.area(), tui::ratatui::to_ratatui_rect(area));
     }
 
     #[tokio::test]
@@ -1403,25 +1574,26 @@ mod tests {
         struct Probe;
 
         impl Component for Probe {
-            fn render(
-                &mut self,
-                area: Rect,
-                surface: &mut crate::render::CellSurface,
-                _cx: &RenderContext,
-            ) {
-                surface.set_string(area.x, area.y, "r", tui::ratatui::style::Style::default());
+            fn prepare_render(&mut self, area: Rect, _cx: &RenderContext) -> PreparedRender {
+                let mut output = RenderOutput::sparse(area);
+                output.surface_mut().set_string(
+                    area.x,
+                    area.y,
+                    "r",
+                    tui::ratatui::style::Style::default(),
+                );
+                PreparedRender::ready(output)
             }
         }
 
         let editor = test_editor(4, 2);
         let runtime = helix_runtime::test::runtime();
-        let (ingress, _rx) = crate::runtime::RuntimeIngress::channel(runtime.work().clone());
-        let render_ctx = RenderContext::new(&editor, ingress, editor.redraw_handle(), None);
+        let (ingress, _rx) = crate::runtime::RuntimeIngress::channel(runtime.clone());
+        let render_ctx = RenderContext::new(&editor, ingress, editor.redraw_handle());
         let area = Rect::new(0, 0, 4, 2);
-        let mut surface = crate::render::CellSurface::empty(tui::ratatui::to_ratatui_rect(area));
         let mut probe = Probe;
 
-        probe.render(area, &mut surface, &render_ctx);
+        let surface = render_component(&mut probe, area, &render_ctx);
 
         assert_eq!(surface[(0, 0)].symbol(), "r");
     }
@@ -1431,15 +1603,6 @@ mod tests {
         struct Probe;
 
         impl Component for Probe {
-            fn render(
-                &mut self,
-                area: Rect,
-                surface: &mut crate::render::CellSurface,
-                _cx: &RenderContext,
-            ) {
-                surface.set_string(area.x, area.y, "r", tui::ratatui::style::Style::default());
-            }
-
             fn prepare_render(&mut self, area: Rect, _ctx: &RenderContext) -> PreparedRender {
                 let mut output = RenderOutput::new(area);
                 output.surface_mut().set_string(
@@ -1454,8 +1617,8 @@ mod tests {
 
         let editor = test_editor(4, 2);
         let runtime = helix_runtime::test::runtime();
-        let (ingress, _rx) = crate::runtime::RuntimeIngress::channel(runtime.work().clone());
-        let render_ctx = RenderContext::new(&editor, ingress, editor.redraw_handle(), None);
+        let (ingress, _rx) = crate::runtime::RuntimeIngress::channel(runtime.clone());
+        let render_ctx = RenderContext::new(&editor, ingress, editor.redraw_handle());
         let area = Rect::new(0, 0, 4, 2);
         let mut surface = crate::render::CellSurface::empty(tui::ratatui::to_ratatui_rect(area));
         let mut compositor = Compositor::new(area);
@@ -1474,25 +1637,27 @@ mod tests {
         struct Probe;
 
         impl Component for Probe {
-            fn render(
-                &mut self,
-                area: Rect,
-                surface: &mut crate::render::CellSurface,
-                _cx: &RenderContext,
-            ) {
-                surface.set_string(area.x, area.y, "f", tui::ratatui::style::Style::default());
+            fn prepare_render(&mut self, area: Rect, _cx: &RenderContext) -> PreparedRender {
+                let mut output = RenderOutput::sparse(area);
+                output.surface_mut().set_string(
+                    area.x,
+                    area.y,
+                    "f",
+                    tui::ratatui::style::Style::default(),
+                );
+                PreparedRender::ready(output)
             }
         }
 
         let mut editor = test_editor(4, 2);
         let runtime = helix_runtime::test::runtime();
-        let (ingress, _rx) = crate::runtime::RuntimeIngress::channel(runtime.work().clone());
+        let (ingress, _rx) = crate::runtime::RuntimeIngress::channel(runtime.clone());
         let (plugin_events, _plugin_events_rx) = helix_runtime::channel(1);
         let idle_reset = crate::runtime::IdleResetGate::new().handle();
         let redraw = editor.redraw_handle();
         let notifier = crate::handlers::local::Notifier {
             redraw: redraw.clone(),
-            plugin_events,
+            plugin_events: plugin_events.into(),
         };
         let mut exit_tasks = crate::runtime::ExitTaskSet::default();
         let exit_task_work = editor.work();
@@ -1507,7 +1672,7 @@ mod tests {
             notifier,
             ingress,
             idle_reset,
-            None,
+            crate::plugin_registry::PluginRuntime::default(),
         );
 
         let output = compositor.render_frame(area, &mut cx);
@@ -1525,25 +1690,21 @@ mod tests {
                 Some(self.0)
             }
 
-            fn render(
-                &mut self,
-                _area: Rect,
-                _surface: &mut crate::render::CellSurface,
-                _cx: &RenderContext,
-            ) {
+            fn prepare_render(&mut self, area: Rect, _cx: &RenderContext) -> PreparedRender {
+                PreparedRender::ready(RenderOutput::sparse(area))
             }
         }
 
         let mut editor = test_editor(20, 10);
         editor.macro_replaying.push('@');
         let runtime = helix_runtime::test::runtime();
-        let (ingress, _rx) = crate::runtime::RuntimeIngress::channel(runtime.work().clone());
+        let (ingress, _rx) = crate::runtime::RuntimeIngress::channel(runtime.clone());
         let (plugin_events, _plugin_events_rx) = helix_runtime::channel(1);
         let idle_reset = crate::runtime::IdleResetGate::new().handle();
         let redraw = editor.redraw_handle();
         let notifier = crate::handlers::local::Notifier {
             redraw: redraw.clone(),
-            plugin_events,
+            plugin_events: plugin_events.into(),
         };
         let mut exit_tasks = crate::runtime::ExitTaskSet::default();
         let exit_task_work = editor.work();
@@ -1556,7 +1717,7 @@ mod tests {
             notifier,
             ingress,
             idle_reset,
-            None,
+            crate::plugin_registry::PluginRuntime::default(),
         );
 
         apply_post_action(
@@ -1594,6 +1755,132 @@ mod tests {
 
         apply_post_action(&mut compositor, &mut cx, PostAction::RestoreLastPicker);
         assert!(compositor.find_id::<Probe>("new").is_some());
+    }
+
+    #[tokio::test]
+    async fn mouse_scroll_reaches_component_before_generic_panel_fallback() {
+        struct ScrollProbe {
+            panel_id: PanelId,
+            area: Rect,
+            handled_scroll: bool,
+            fallback_scroll: usize,
+        }
+
+        impl helix_view::traits::Bounded for ScrollProbe {
+            fn area(&self) -> Rect {
+                self.area
+            }
+
+            fn set_area(&mut self, area: Rect) {
+                self.area = area;
+            }
+        }
+
+        impl helix_view::traits::Scrollable for ScrollProbe {
+            fn scroll(&self) -> usize {
+                self.fallback_scroll
+            }
+
+            fn scroll_to(&mut self, offset: usize) {
+                self.fallback_scroll = offset;
+            }
+
+            fn content_height(&self) -> usize {
+                100
+            }
+        }
+
+        impl Component for ScrollProbe {
+            fn handle_event(&mut self, event: &Event, _ctx: &mut Context) -> EventResult {
+                if matches!(
+                    event,
+                    Event::Mouse(MouseEvent {
+                        kind: MouseEventKind::ScrollDown | MouseEventKind::ScrollUp,
+                        ..
+                    })
+                ) {
+                    self.handled_scroll = true;
+                    EventResult::Consumed(None)
+                } else {
+                    EventResult::Ignored(None)
+                }
+            }
+
+            fn prepare_render(&mut self, area: Rect, _cx: &RenderContext) -> PreparedRender {
+                PreparedRender::ready(RenderOutput::sparse(area))
+            }
+
+            fn layout_role(&self) -> LayoutRole {
+                LayoutRole::Docked
+            }
+
+            fn panel_id(&self) -> Option<PanelId> {
+                Some(self.panel_id)
+            }
+
+            fn as_scrollable(&mut self) -> Option<&mut dyn helix_view::traits::Scrollable> {
+                Some(self)
+            }
+        }
+
+        let mut editor = test_editor(120, 20);
+        let panel_id = editor.model.insert_panel(
+            "Probe",
+            Box::new(AssistantModel::default()),
+            PanelSide::Right,
+            PanelSize::fixed(30),
+        );
+        let area = Rect::new(0, 0, 120, 20);
+        let layout = compute_panel_layout(area, &editor);
+        let panel_area = layout
+            .panel_areas
+            .iter()
+            .find_map(|(id, rect)| (*id == panel_id).then_some(*rect))
+            .expect("probe panel area");
+
+        let runtime = helix_runtime::test::runtime();
+        let (ingress, _rx) = crate::runtime::RuntimeIngress::channel(runtime.clone());
+        let (plugin_events, _plugin_events_rx) = helix_runtime::channel(1);
+        let idle_reset = crate::runtime::IdleResetGate::new().handle();
+        let redraw = editor.redraw_handle();
+        let notifier = crate::handlers::local::Notifier {
+            redraw: redraw.clone(),
+            plugin_events: plugin_events.into(),
+        };
+        let mut exit_tasks = crate::runtime::ExitTaskSet::default();
+        let exit_task_work = editor.work();
+        let mut compositor = Compositor::new(area);
+        compositor.last_layout = Some(layout);
+        compositor.push(Box::new(ScrollProbe {
+            panel_id,
+            area: panel_area,
+            handled_scroll: false,
+            fallback_scroll: 0,
+        }));
+        let mut cx = Context::new(
+            &mut editor,
+            &mut exit_tasks,
+            exit_task_work,
+            notifier,
+            ingress,
+            idle_reset,
+            crate::plugin_registry::PluginRuntime::default(),
+        );
+
+        let consumed = compositor.handle_event(
+            &Event::Mouse(MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: panel_area.x + 1,
+                row: panel_area.y + 1,
+                modifiers: helix_view::input::KeyModifiers::NONE,
+            }),
+            &mut cx,
+        );
+        let probe = compositor.find::<ScrollProbe>().expect("probe");
+
+        assert!(consumed);
+        assert!(probe.handled_scroll);
+        assert_eq!(probe.fallback_scroll, 0);
     }
 
     #[tokio::test]
@@ -1644,6 +1931,85 @@ mod tests {
             layout.global_status_row.y,
             panel_rect.bottom().saturating_sub(1)
         );
+    }
+
+    #[tokio::test]
+    async fn side_panel_divider_keeps_window_style_through_global_status_row() {
+        let mut editor = test_editor(120, 40);
+        editor.model.insert_panel(
+            "Assistant",
+            Box::new(AssistantModel::default()),
+            PanelSide::Right,
+            PanelSize::Percent(35),
+        );
+        let area = Rect::new(0, 0, 120, 40);
+        let layout = compute_panel_layout(area, &editor);
+        let (_, panel_rect) = &layout.panel_areas[0];
+        let divider = (panel_rect.x, panel_rect.bottom().saturating_sub(1));
+
+        let runtime = helix_runtime::test::runtime();
+        let (ingress, _rx) = crate::runtime::RuntimeIngress::channel(runtime.clone());
+        let render_ctx = RenderContext::new(&editor, ingress, editor.redraw_handle());
+        let mut surface = crate::render::CellSurface::empty(tui::ratatui::to_ratatui_rect(area));
+
+        surface[divider]
+            .set_symbol("│")
+            .set_style(tui::ratatui::style::Style::default().fg(tui::ratatui::style::Color::White));
+        SidePanelDividersRender::collect(&layout, &render_ctx).paint(&mut surface);
+
+        assert_eq!(surface[divider].symbol(), "│");
+        let window_style = tui::ratatui::to_ratatui_style(editor.theme.get("ui.window"));
+        assert_eq!(
+            surface[divider].fg,
+            window_style.fg.unwrap_or(tui::ratatui::style::Color::Reset)
+        );
+    }
+
+    #[tokio::test]
+    async fn autoinfo_popup_paints_over_side_panel_divider() {
+        let mut editor = test_editor(120, 40);
+        editor.model.insert_panel(
+            "Assistant",
+            Box::new(AssistantModel::default()),
+            PanelSide::Right,
+            PanelSize::Percent(35),
+        );
+        let rows = vec![
+            (
+                "c",
+                "Connect to an assistant backend. Shows picker if no args, or use :assistant-connect <command> [args...]",
+            ),
+            ("o", "Open the assistant panel."),
+            ("q", "Close assistant panel."),
+        ];
+        editor.autoinfo = Some(helix_view::info::Info::new("Assistant", &rows));
+
+        let area = Rect::new(0, 0, 120, 40);
+        let layout = compute_panel_layout(area, &editor);
+        let (_, panel_rect) = &layout.panel_areas[0];
+        let divider_x = panel_rect.x;
+        let popup_area = editor
+            .autoinfo
+            .as_ref()
+            .expect("autoinfo")
+            .screen_area(area);
+        assert!(popup_area.left() < divider_x);
+        assert!(divider_x < popup_area.right());
+        let covered_y = popup_area.y.saturating_add(1);
+
+        let runtime = helix_runtime::test::runtime();
+        let (ingress, _rx) = crate::runtime::RuntimeIngress::channel(runtime.clone());
+        let render_ctx = RenderContext::new(&editor, ingress, editor.redraw_handle());
+        let mut surface = crate::render::CellSurface::empty(tui::ratatui::to_ratatui_rect(area));
+
+        SidePanelDividersRender::collect(&layout, &render_ctx).paint(&mut surface);
+        assert_eq!(surface[(divider_x, covered_y)].symbol(), "│");
+
+        let mut info = editor.autoinfo.as_ref().expect("autoinfo").clone();
+        let prepared = info.prepare_render(area, &render_ctx);
+        crate::render::CacheStore::default().compose(prepared, &mut surface);
+
+        assert_ne!(surface[(divider_x, covered_y)].symbol(), "│");
     }
 
     #[tokio::test]

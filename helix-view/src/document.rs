@@ -14,7 +14,7 @@ use helix_core::text_folding::{EndFoldPoint, FoldContainer, RopeSliceFoldExt, St
 use helix_lsp::util::lsp_pos_to_pos;
 use helix_runtime::{FrameHandle, Task, TaskError, Work};
 use helix_stdx::faccess::{copy_metadata, readonly};
-use helix_vcs::{DiffHandle, DiffProviderRegistry};
+use helix_vcs::DiffHandle;
 
 use ::parking_lot::Mutex;
 use serde::de::{self, Deserialize, Deserializer};
@@ -50,7 +50,7 @@ use helix_core::{
 };
 
 use crate::{
-    bench::{current_bench_command_context, log_command_phase},
+    bench::log_command_phase,
     document_lsp::{DocumentCodeLenses, DocumentColorSwatches, DocumentLinks, DocumentLspState},
     editor::{Config, CursorShapeConfig, LifecycleBus},
     events::{DocumentDidChange, SelectionDidChange},
@@ -148,6 +148,14 @@ const BUF_SIZE: usize = 8192;
 const DEFAULT_INDENT: IndentStyle = IndentStyle::Tabs;
 const DEFAULT_TAB_WIDTH: usize = 4;
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DocumentReloadFormatConfig {
+    pub forced_indent: Option<IndentStyle>,
+    pub fallback_indent: IndentStyle,
+    pub forced_line_ending: Option<LineEnding>,
+    pub fallback_line_ending: LineEnding,
+}
+
 pub const DEFAULT_LANGUAGE_NAME: &str = "text";
 
 pub const SCRATCH_BUFFER_NAME: &str = "[scratch]";
@@ -215,6 +223,38 @@ pub type DocumentSavedEventResult = Result<Option<DocumentSavedEvent>, anyhow::E
 pub type DocumentSavedTask = Task<DocumentSavedEventResult>;
 pub type DocumentFormatTask = Task<Result<Transaction, FormatterError>>;
 
+#[derive(Clone)]
+pub struct SyntaxRefreshRequest {
+    pub document: DocumentId,
+    pub version: i32,
+    text: Rope,
+    language: Arc<LanguageConfiguration>,
+    loader: Arc<syntax::Loader>,
+}
+
+impl fmt::Debug for SyntaxRefreshRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SyntaxRefreshRequest")
+            .field("document", &self.document)
+            .field("version", &self.version)
+            .field("lines", &self.text.len_lines())
+            .field("bytes", &self.text.len_bytes())
+            .finish_non_exhaustive()
+    }
+}
+
+impl SyntaxRefreshRequest {
+    pub fn execute(self) -> Result<Syntax, syntax::HighlighterError> {
+        Syntax::new_with_timeout(
+            self.text.slice(..),
+            self.language.language(),
+            &self.loader,
+            syntax::BACKGROUND_PARSE_TIMEOUT,
+        )
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct DocumentSaveLock {
     inner: Arc<tokio::sync::Mutex<()>>,
@@ -267,10 +307,16 @@ pub struct SavePoint {
 
 #[derive(Debug, thiserror::Error)]
 pub enum DocumentOpenError {
-    #[error("path must be a regular file, symlink, or directory")]
+    #[error("path is a directory")]
+    Directory,
+    #[error("path must be a regular file or symlink")]
     IrregularFile,
     #[error(transparent)]
     IoError(#[from] io::Error),
+    #[error("document open worker failed: {0}")]
+    Worker(String),
+    #[error("file contains binary data")]
+    BinaryFile,
 }
 
 #[derive(Debug, Clone)]
@@ -347,25 +393,25 @@ pub struct DocumentInlayHints {
     pub id: DocumentInlayHintsId,
 
     /// Inlay hints of `TYPE` kind, if any.
-    pub type_inlay_hints: Vec<InlineAnnotation>,
+    pub type_inlay_hints: Arc<[InlineAnnotation]>,
 
     /// Inlay hints of `PARAMETER` kind, if any.
-    pub parameter_inlay_hints: Vec<InlineAnnotation>,
+    pub parameter_inlay_hints: Arc<[InlineAnnotation]>,
 
     /// Inlay hints that are neither `TYPE` nor `PARAMETER`.
     ///
     /// LSPs are not required to associate a kind to their inlay hints, for example Rust-Analyzer
     /// currently never does (February 2023) and the LSP spec may add new kinds in the future that
     /// we want to display even if we don't have some special highlighting for them.
-    pub other_inlay_hints: Vec<InlineAnnotation>,
+    pub other_inlay_hints: Arc<[InlineAnnotation]>,
 
     /// Inlay hint padding. When creating the final `TextAnnotations`, the `before` padding must be
     /// added first, then the regular inlay hints, then the `after` padding.
-    pub padding_before_inlay_hints: Vec<InlineAnnotation>,
-    pub padding_after_inlay_hints: Vec<InlineAnnotation>,
+    pub padding_before_inlay_hints: Arc<[InlineAnnotation]>,
+    pub padding_after_inlay_hints: Arc<[InlineAnnotation]>,
 
     /// Raw LSP hints used for lazy tooltip resolution on hover.
-    pub lsp_hints: Vec<DocumentInlayHint>,
+    pub lsp_hints: Arc<[DocumentInlayHint]>,
 }
 
 impl DocumentInlayHints {
@@ -373,12 +419,12 @@ impl DocumentInlayHints {
     pub fn empty_with_id(id: DocumentInlayHintsId) -> Self {
         Self {
             id,
-            type_inlay_hints: Vec::new(),
-            parameter_inlay_hints: Vec::new(),
-            other_inlay_hints: Vec::new(),
-            padding_before_inlay_hints: Vec::new(),
-            padding_after_inlay_hints: Vec::new(),
-            lsp_hints: Vec::new(),
+            type_inlay_hints: Arc::from([]),
+            parameter_inlay_hints: Arc::from([]),
+            other_inlay_hints: Arc::from([]),
+            padding_before_inlay_hints: Arc::from([]),
+            padding_after_inlay_hints: Arc::from([]),
+            lsp_hints: Arc::from([]),
         }
     }
 }
@@ -848,8 +894,13 @@ impl Document {
         syn_loader: Arc<ArcSwap<syntax::Loader>>,
     ) -> Result<Self, DocumentOpenError> {
         // If the path is not a regular file (e.g.: /dev/random) it should not be opened.
-        if path.metadata().is_ok_and(|metadata| !metadata.is_file()) {
-            return Err(DocumentOpenError::IrregularFile);
+        if let Ok(metadata) = path.metadata() {
+            if metadata.is_dir() {
+                return Err(DocumentOpenError::Directory);
+            }
+            if !metadata.is_file() {
+                return Err(DocumentOpenError::IrregularFile);
+            }
         }
 
         let editor_config = if config.load().editor_config {
@@ -906,53 +957,72 @@ impl Document {
     // We can't use anyhow::Result here since the output of the future has to be
     // clonable to be used as shared future. So use a custom error type.
     pub fn format(&self, editor: &Editor) -> Option<DocumentFormatTask> {
-        if let Some((fmt_cmd, fmt_args)) = self
-            .language_config()
-            .and_then(|c| c.formatter.as_ref())
-            .and_then(|formatter| {
-                Some((
-                    helix_pkg::resolve::command(
-                        &helix_pkg::Store::open_default(),
-                        &formatter.command,
-                    )?
-                    .path,
-                    &formatter.args,
-                ))
-            })
-        {
-            log::debug!(
-                "formatting '{}' with command '{}', args {fmt_args:?}",
-                self.display_name(),
-                fmt_cmd.display(),
-            );
-            use std::process::Stdio;
-            let text = self.text().clone();
-
-            let mut process = tokio::process::Command::new(&fmt_cmd);
-
-            if let Some(doc_dir) = self.path().and_then(|path| path.parent()) {
-                process.current_dir(doc_dir);
-            }
-
-            let args = match fmt_args
+        if let Some(formatter) = self.language_config().and_then(|c| c.formatter.as_ref()) {
+            let configured_command = formatter.command.clone();
+            let configured_args = formatter.args.clone();
+            let args = match configured_args
                 .iter()
-                .map(|content| expansion::expand(editor, Token::expand(content)))
+                .map(|content| {
+                    expansion::expand(editor, Token::expand(content)).map(Cow::into_owned)
+                })
                 .collect::<Result<Vec<_>, _>>()
             {
                 Ok(args) => args,
                 Err(err) => {
-                    log::error!("Failed to expand formatter arguments: {err}");
-                    return None;
+                    let error = FormatterError::ArgumentExpansion(err.to_string());
+                    return Some(editor.runtime().work().spawn(async move { Err(error) }));
                 }
             };
-
-            process
-                .args(args.iter().map(AsRef::as_ref))
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
+            let display_name = self.display_name().to_string();
+            let doc_dir = self
+                .path()
+                .and_then(|path| path.parent())
+                .map(Path::to_path_buf);
+            let text = self.text().clone();
 
             let formatting_future = async move {
+                let command_for_lookup = configured_command.clone();
+                let launch = tokio::task::spawn_blocking(move || {
+                    helix_loader::runtime_assets()
+                        .and_then(|assets| assets.resolve_command(&command_for_lookup))
+                })
+                .await
+                .map_err(|error| FormatterError::RuntimeAsset {
+                    command: configured_command.clone(),
+                    message: format!("command resolver task failed: {error}"),
+                })?
+                .map_err(|error| FormatterError::RuntimeAsset {
+                    command: configured_command.clone(),
+                    message: error.to_string(),
+                })?
+                .ok_or_else(|| FormatterError::RuntimeAsset {
+                    command: configured_command.clone(),
+                    message: "command was not found in managed runtime assets or PATH".into(),
+                })?;
+
+                let fmt_cmd = launch.program;
+                log::debug!(
+                    "formatting '{}' with command '{}', prefix args {:?}, default args {:?}, configured args {:?}",
+                    display_name,
+                    fmt_cmd.display(),
+                    launch.prefix_args,
+                    launch.default_args,
+                    configured_args,
+                );
+                use std::process::Stdio;
+                let mut process = tokio::process::Command::new(&fmt_cmd);
+                if let Some(doc_dir) = doc_dir {
+                    process.current_dir(doc_dir);
+                }
+                process
+                    .args(&launch.prefix_args)
+                    .args(&launch.default_args)
+                    .args(&args)
+                    .envs(&launch.env)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
+
                 let mut process = process
                     .spawn()
                     .map_err(|e| FormatterError::SpawningFailed {
@@ -1249,7 +1319,7 @@ impl Document {
 
     /// Detect the programming language based on the file type.
     pub fn detect_language(&mut self, loader: &syntax::Loader) {
-        self.set_language(self.detect_language_config(loader), loader);
+        self.set_language(self.detect_language_config(loader));
     }
 
     /// Detect the programming language based on the file type.
@@ -1289,6 +1359,21 @@ impl Document {
         }
     }
 
+    pub(crate) fn reload_format_config(&self) -> DocumentReloadFormatConfig {
+        let editor_config = self.presentation.editor_config();
+        let fallback_indent = self
+            .language_config()
+            .and_then(|config| config.indent.as_ref())
+            .map_or(DEFAULT_INDENT, |config| IndentStyle::from_str(&config.unit));
+
+        DocumentReloadFormatConfig {
+            forced_indent: editor_config.indent_style,
+            fallback_indent,
+            forced_line_ending: editor_config.line_ending,
+            fallback_line_ending: self.line_ending(),
+        }
+    }
+
     pub fn detect_editor_config(&mut self) {
         if self.config.load().editor_config {
             if let Some(path) = self.path() {
@@ -1310,48 +1395,6 @@ impl Document {
     // Detect if the file is readonly and change the readonly field if necessary (unix only)
     pub fn detect_readonly(&mut self) {
         self.file.detect_readonly();
-    }
-
-    /// Reload the document from its path.
-    pub fn reload(
-        &mut self,
-        view: &mut View,
-        provider_registry: &DiffProviderRegistry,
-        redraw: &DocumentRedrawHandle,
-    ) -> Result<(), Error> {
-        let encoding = self.encoding();
-        let path = match self.path() {
-            None => return Ok(()),
-            Some(path) => match path.exists() {
-                true => path.to_owned(),
-                false => bail!("can't find file to reload from {:?}", self.display_name()),
-            },
-        };
-
-        // Once we have a valid path we check if its readonly status has changed
-        self.detect_readonly();
-
-        let mut file = std::fs::File::open(&path)?;
-        let (rope, ..) = from_reader(&mut file, Some(encoding))?;
-
-        // Calculate the difference between the buffer and source text, and apply it.
-        // This is not considered a modification of the contents of the file regardless
-        // of the encoding.
-        let transaction = helix_core::diff::compare_ropes(self.text(), &rope);
-        self.apply(&transaction, view.id);
-        self.append_changes_to_history(view);
-        self.reset_modified();
-        self.pickup_last_saved_time();
-        self.detect_indent_and_line_ending();
-
-        match provider_registry.get_diff_base(&path) {
-            Some(diff_base) => self.set_diff_base(diff_base, redraw),
-            None => self.vcs.clear_diff_base(),
-        }
-
-        self.set_version_control_head(provider_registry.get_current_head_name(&path));
-
-        Ok(())
     }
 
     /// Sets the [`Document`]'s encoding with the encoding correspondent to `label`.
@@ -1376,12 +1419,8 @@ impl Document {
     pub fn set_language(
         &mut self,
         language_config: Option<Arc<syntax::config::LanguageConfiguration>>,
-        loader: &syntax::Loader,
     ) {
-        let display_name = self.display_name().into_owned();
-        let text = self.text().clone();
-        self.syntax_aware
-            .set_language(language_config, text.slice(..), loader, &display_name);
+        self.syntax_aware.set_language(language_config);
     }
 
     /// Set the programming language for the file if you know the language but don't have the
@@ -1395,7 +1434,7 @@ impl Document {
             .language_for_name(language_id)
             .ok_or_else(|| anyhow!("invalid language id: {}", language_id))?;
         let config = loader.language(language).config().clone();
-        self.set_language(Some(config), loader);
+        self.set_language(Some(config));
         Ok(())
     }
 
@@ -1635,37 +1674,18 @@ impl Document {
             });
         }
 
-        // update tree-sitter syntax tree
-        let loader = self.syn_loader.load();
-        let current_doc = self.buffer.text().clone();
+        // The syntax service reconstructs the newest document version off the
+        // foreground thread. The previous tree remains readable while stale.
         let syntax_start = Instant::now();
-        let _syntax_trace = current_bench_command_context().and_then(|ctx| {
-            ctx.event_log_path.map(|log_path| {
-                syntax::Syntax::enter_trace(syntax::SyntaxTraceContext {
-                    log_path,
-                    seed: ctx.seed,
-                    elapsed_secs: ctx.elapsed_secs,
-                    action_index: ctx.action_index,
-                    category: ctx.category,
-                    macro_str: ctx.macro_str,
-                    force_insert: ctx.force_insert,
-                })
-            })
-        });
-        self.syntax_aware.update_syntax(
-            old_doc.slice(..),
-            current_doc.slice(..),
-            transaction.changes(),
-            &loader,
-        );
+        self.syntax_aware.mark_syntax_stale();
         let syntax_dur = syntax_start.elapsed();
-        log_command_phase("document_apply", "update_syntax", syntax_dur, || {
+        log_command_phase("document_apply", "invalidate_syntax", syntax_dur, || {
             format!(
                 "before_lines={} after_lines={} before_bytes={} after_bytes={}",
                 before_lines,
-                current_doc.len_lines(),
+                self.buffer.text().len_lines(),
                 before_bytes,
-                current_doc.len_bytes()
+                self.buffer.text().len_bytes()
             )
         });
 
@@ -1705,9 +1725,9 @@ impl Document {
         );
 
         // Update the inlay hint annotations' positions, helping ensure they are displayed in the proper place
-        let apply_inlay_hint_changes = |annotations: &mut Vec<InlineAnnotation>| {
+        let apply_inlay_hint_changes = |annotations: &mut Arc<[InlineAnnotation]>| {
             changes.update_positions(
-                annotations
+                Arc::make_mut(annotations)
                     .iter_mut()
                     .map(|annotation| (&mut annotation.char_idx, Assoc::After)),
             );
@@ -2187,6 +2207,14 @@ impl Document {
     }
 
     pub fn clear_language_servers(&mut self) {
+        let server_ids = self
+            .syntax_aware
+            .all_language_servers()
+            .map(|server| server.id())
+            .collect::<Vec<_>>();
+        for server_id in server_ids {
+            self.lsp.clear_pull_diagnostics_server(server_id);
+        }
         self.syntax_aware.clear_language_servers();
     }
 
@@ -2202,7 +2230,36 @@ impl Document {
         &mut self,
         language_servers: HashMap<LanguageServerName, Arc<Client>>,
     ) {
+        let retained = language_servers
+            .values()
+            .map(|server| server.id())
+            .collect::<std::collections::HashSet<_>>();
+        let removed = self
+            .syntax_aware
+            .all_language_servers()
+            .map(|server| server.id())
+            .filter(|server_id| !retained.contains(server_id))
+            .collect::<Vec<_>>();
+        for server_id in removed {
+            self.lsp.clear_pull_diagnostics_server(server_id);
+        }
         self.syntax_aware.set_language_servers(language_servers);
+    }
+
+    pub fn insert_language_server(
+        &mut self,
+        name: LanguageServerName,
+        client: Arc<Client>,
+    ) -> Option<Arc<Client>> {
+        let replaced = self
+            .syntax_aware
+            .insert_language_server(name, client.clone());
+        if let Some(replaced) = &replaced {
+            if replaced.id() != client.id() {
+                self.lsp.clear_pull_diagnostics_server(replaced.id());
+            }
+        }
+        replaced
     }
 
     pub fn remove_language_server_by_name(&mut self, name: &str) -> Option<Arc<Client>> {
@@ -2292,20 +2349,37 @@ impl Document {
         self.presentation.clear_inlay_hints_outdated();
     }
 
-    pub fn restart_pull_diagnostics(&mut self) -> helix_runtime::Token {
-        self.lsp.restart_pull_diagnostics()
+    pub fn next_pull_diagnostics_generation(&mut self, server_id: LanguageServerId) -> u64 {
+        self.lsp.next_pull_diagnostics_generation(server_id)
     }
 
-    pub fn cancel_pull_diagnostics(&mut self) -> bool {
-        self.lsp.cancel_pull_diagnostics()
+    pub fn pull_diagnostics_generation(&self, server_id: LanguageServerId) -> Option<u64> {
+        self.lsp.pull_diagnostics_generation(server_id)
     }
 
-    pub fn previous_diagnostic_id(&self) -> Option<&str> {
-        self.lsp.previous_diagnostic_id()
+    pub fn is_current_pull_diagnostics(
+        &self,
+        server_id: LanguageServerId,
+        generation: u64,
+    ) -> bool {
+        self.lsp.is_current_pull_diagnostics(server_id, generation)
     }
 
-    pub fn set_previous_diagnostic_id(&mut self, previous_diagnostic_id: Option<String>) {
-        self.lsp.set_previous_diagnostic_id(previous_diagnostic_id);
+    pub fn previous_diagnostic_id(&self, server_id: LanguageServerId) -> Option<&str> {
+        self.lsp.previous_diagnostic_id(server_id)
+    }
+
+    pub fn set_previous_diagnostic_id(
+        &mut self,
+        server_id: LanguageServerId,
+        previous_diagnostic_id: Option<String>,
+    ) {
+        self.lsp
+            .set_previous_diagnostic_id(server_id, previous_diagnostic_id);
+    }
+
+    pub fn clear_pull_diagnostics_server(&mut self, server_id: LanguageServerId) {
+        self.lsp.clear_pull_diagnostics_server(server_id);
     }
 
     pub fn restart_color_swatches(&mut self) -> helix_runtime::Token {
@@ -2316,8 +2390,16 @@ impl Document {
         self.lsp.cancel_color_swatches()
     }
 
+    pub fn is_current_color_swatches(&self, request: &helix_runtime::Token) -> bool {
+        self.lsp.is_current_color_swatches(request)
+    }
+
     pub fn color_swatches(&self) -> Option<&DocumentColorSwatches> {
         self.lsp.color_swatches()
+    }
+
+    pub fn color_swatches_snapshot(&self) -> Option<Arc<DocumentColorSwatches>> {
+        self.lsp.color_swatches_snapshot()
     }
 
     pub fn clear_color_swatches(&mut self) {
@@ -2338,6 +2420,10 @@ impl Document {
 
     pub fn cancel_code_lenses(&mut self) -> bool {
         self.lsp.cancel_code_lenses()
+    }
+
+    pub fn is_current_code_lenses(&self, request: &helix_runtime::Token) -> bool {
+        self.lsp.is_current_code_lenses(request)
     }
 
     pub fn code_lenses(&self) -> Option<&DocumentCodeLenses> {
@@ -2364,6 +2450,10 @@ impl Document {
         self.lsp.cancel_document_links()
     }
 
+    pub fn is_current_document_links(&self, request: &helix_runtime::Token) -> bool {
+        self.lsp.is_current_document_links(request)
+    }
+
     pub fn document_links(&self) -> Option<&DocumentLinks> {
         self.lsp.document_links()
     }
@@ -2382,6 +2472,10 @@ impl Document {
 
     pub fn cancel_semantic_tokens(&mut self) -> bool {
         self.lsp.cancel_semantic_tokens()
+    }
+
+    pub fn is_current_semantic_tokens(&self, request: &helix_runtime::Token) -> bool {
+        self.lsp.is_current_semantic_tokens(request)
     }
 
     pub fn clear_semantic_tokens(&mut self) {
@@ -2432,8 +2526,18 @@ impl Document {
         self.lsp.cancel_inline_completion()
     }
 
+    pub fn is_current_inline_completion(&self, request: &helix_runtime::Token) -> bool {
+        self.lsp.is_current_inline_completion(request)
+    }
+
     pub fn inline_completion(&self) -> Option<&crate::document_lsp::InlineCompletionGhost> {
         self.lsp.inline_completion()
+    }
+
+    pub fn inline_completion_snapshot(
+        &self,
+    ) -> Option<Arc<crate::document_lsp::InlineCompletionGhost>> {
+        self.lsp.inline_completion_snapshot()
     }
 
     pub fn set_inline_completion(
@@ -2455,8 +2559,16 @@ impl Document {
         self.lsp.cancel_inline_values()
     }
 
+    pub fn is_current_inline_values(&self, request: &helix_runtime::Token) -> bool {
+        self.lsp.is_current_inline_values(request)
+    }
+
     pub fn inline_values(&self) -> Option<&crate::document_lsp::DocumentInlineValues> {
         self.lsp.inline_values()
+    }
+
+    pub fn inline_values_snapshot(&self) -> Option<Arc<crate::document_lsp::DocumentInlineValues>> {
+        self.lsp.inline_values_snapshot()
     }
 
     pub fn set_inline_values(&mut self, values: crate::document_lsp::DocumentInlineValues) {
@@ -2473,6 +2585,10 @@ impl Document {
 
     pub fn cancel_folding_ranges(&mut self) -> bool {
         self.lsp.cancel_folding_ranges()
+    }
+
+    pub fn is_current_folding_ranges(&self, request: &helix_runtime::Token) -> bool {
+        self.lsp.is_current_folding_ranges(request)
     }
 
     pub fn diff_handle(&self) -> Option<&DiffHandle> {
@@ -2511,6 +2627,28 @@ impl Document {
         }
     }
 
+    pub(crate) fn set_decoded_diff_base(
+        &mut self,
+        diff_base: Option<Rope>,
+        redraw: &DocumentRedrawHandle,
+    ) {
+        match diff_base {
+            Some(diff_base) => {
+                self.vcs
+                    .set_diff_base(diff_base, self.text().clone(), redraw.frame_handle());
+            }
+            None => self.vcs.clear_diff_base(),
+        }
+    }
+
+    pub(crate) fn apply_reloaded_disk_state(
+        &mut self,
+        last_saved_time: SystemTime,
+        readonly: bool,
+    ) {
+        self.file.apply_disk_state(last_saved_time, readonly);
+    }
+
     pub fn version_control_head(&self) -> Option<Arc<Box<str>>> {
         self.vcs.version_control_head()
     }
@@ -2526,6 +2664,11 @@ impl Document {
     /// Tree-sitter AST tree
     pub fn syntax(&self) -> Option<&Syntax> {
         self.syntax_aware.syntax()
+    }
+
+    /// Cheap shared ownership of the immutable syntax tree for background readers.
+    pub fn syntax_arc(&self) -> Option<Arc<Syntax>> {
+        self.syntax_aware.syntax_arc()
     }
 
     pub fn has_syntax(&self) -> bool {
@@ -3108,10 +3251,15 @@ impl Document {
         self.syntax_aware.set_syntax(syntax);
     }
 
-    pub fn refresh_stale_syntax(&mut self, loader: &syntax::Loader) -> bool {
-        let text = self.text().clone();
-        self.syntax_aware
-            .refresh_stale_syntax(text.slice(..), loader)
+    pub fn prepare_syntax_refresh(&self) -> Option<SyntaxRefreshRequest> {
+        self.syntax_snapshot().is_stale().then_some(())?;
+        Some(SyntaxRefreshRequest {
+            document: self.id,
+            version: self.version(),
+            text: self.text().clone(),
+            language: self.language_configuration()?.clone(),
+            loader: self.syn_loader.load_full(),
+        })
     }
 
     /// The width that the tab character is rendered at
@@ -3354,6 +3502,15 @@ impl Document {
         self.syntax_aware.diagnostics()
     }
 
+    /// Cheap shared ownership of the immutable diagnostic snapshot.
+    pub fn diagnostics_arc(&self) -> Arc<Vec<Diagnostic>> {
+        self.syntax_aware.diagnostics_arc()
+    }
+
+    pub fn swap_diagnostics(&mut self, diagnostics: Vec<Diagnostic>) -> Arc<Vec<Diagnostic>> {
+        self.syntax_aware.swap_diagnostics(diagnostics)
+    }
+
     pub fn replace_diagnostics(
         &mut self,
         diagnostics: impl IntoIterator<Item = Diagnostic>,
@@ -3496,9 +3653,17 @@ impl Document {
         self.presentation.jump_labels(view_id)
     }
 
+    pub fn jump_labels_snapshot(&self, view_id: ViewId) -> Option<Arc<[Overlay]>> {
+        self.presentation.jump_labels_snapshot(view_id)
+    }
+
     /// Get the inlay hints for this document and `view_id`.
     pub fn inlay_hints(&self, view_id: ViewId) -> Option<&DocumentInlayHints> {
         self.presentation.inlay_hints(view_id)
+    }
+
+    pub fn inlay_hints_snapshot(&self, view_id: ViewId) -> Option<Arc<DocumentInlayHints>> {
+        self.presentation.inlay_hints_snapshot(view_id)
     }
 
     /// Completely removes all the inlay hints saved for the document, dropping them to free memory
@@ -3532,8 +3697,8 @@ impl Document {
         self.presentation.fold_container(view_id)
     }
 
-    pub fn plugin_annotations(&self, view_id: ViewId) -> Option<Vec<PluginAnnotation>> {
-        self.presentation.plugin_annotations(view_id)
+    pub fn fold_container_snapshot(&self, view_id: ViewId) -> Option<Arc<FoldContainer>> {
+        self.presentation.fold_container_snapshot(view_id)
     }
 
     pub fn set_plugin_annotations(
@@ -3563,18 +3728,8 @@ impl Document {
             .set_presence_annotations(view_id, annotations);
     }
 
-    pub fn visual_annotations(&self, view_id: ViewId) -> Option<Vec<PluginAnnotation>> {
-        let plugin = self.plugin_annotations(view_id);
-        let presence = self.presence_annotations(view_id);
-        match (plugin, presence) {
-            (None, None) => None,
-            (Some(plugin), None) => Some(plugin),
-            (None, Some(presence)) => Some(presence.clone()),
-            (Some(mut plugin), Some(presence)) => {
-                plugin.extend_from_slice(presence);
-                Some(plugin)
-            }
-        }
+    pub fn visual_annotations(&self, view_id: ViewId) -> Option<Arc<[PluginAnnotation]>> {
+        self.presentation.visual_annotations(view_id)
     }
 
     fn add_folds_impl(
@@ -3626,6 +3781,11 @@ impl Document {
 
 #[derive(Clone, Debug)]
 pub enum FormatterError {
+    RuntimeAsset {
+        command: String,
+        message: String,
+    },
+    ArgumentExpansion(String),
     SpawningFailed {
         command: String,
         error: std::io::ErrorKind,
@@ -3642,6 +3802,12 @@ impl std::error::Error for FormatterError {}
 impl Display for FormatterError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::RuntimeAsset { command, message } => {
+                write!(f, "Could not resolve formatter {command}: {message}")
+            }
+            Self::ArgumentExpansion(error) => {
+                write!(f, "Could not expand formatter arguments: {error}")
+            }
             Self::SpawningFailed { command, error } => {
                 write!(f, "Failed to spawn formatter {}: {:?}", command, error)
             }

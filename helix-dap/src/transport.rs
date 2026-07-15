@@ -11,6 +11,8 @@ use tokio::{
     sync::Mutex,
 };
 
+const MAX_DAP_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Request {
     #[serde(skip)]
@@ -38,7 +40,7 @@ pub struct Event {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
-pub enum Payload {
+pub(crate) enum Payload {
     // type = "event"
     Event(Event),
     // type = "response"
@@ -47,20 +49,53 @@ pub enum Payload {
     Request(Request),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServerMessageError {
+    Unhandled,
+    Invalid(String),
+}
+
 #[derive(Debug)]
-pub struct Transport {
+pub struct ServerAdapterRequest {
+    pub sequence: u64,
+    pub command: String,
+    pub request: core::result::Result<crate::Request, ServerMessageError>,
+}
+
+#[derive(Debug)]
+pub struct ServerAdapterEvent {
+    pub name: String,
+    pub event: core::result::Result<crate::Event, ServerMessageError>,
+}
+
+#[derive(Debug)]
+pub enum ServerEvent {
+    Event(ServerAdapterEvent),
+    Request(ServerAdapterRequest),
+    UnexpectedResponse(Response),
+}
+
+fn server_message_result<T>(result: Result<T>) -> core::result::Result<T, ServerMessageError> {
+    result.map_err(|error| match error {
+        Error::Unhandled => ServerMessageError::Unhandled,
+        error => ServerMessageError::Invalid(error.to_string()),
+    })
+}
+
+#[derive(Debug)]
+pub(crate) struct Transport {
     #[allow(unused)]
     id: DebugAdapterId,
     pending_requests: Mutex<HashMap<u64, Sender<Result<Response>>>>,
 }
 
 impl Transport {
-    pub fn start(
+    pub(crate) fn start(
         server_stdout: Box<dyn AsyncBufRead + Unpin + Send>,
         server_stdin: Box<dyn AsyncWrite + Unpin + Send>,
         server_stderr: Option<Box<dyn AsyncBufRead + Unpin + Send>>,
         id: DebugAdapterId,
-    ) -> (Receiver<Payload>, Sender<Payload>) {
+    ) -> (Receiver<ServerEvent>, Sender<Payload>) {
         let (client_tx, rx) = channel(256);
         let (tx, client_rx) = channel(256);
 
@@ -117,18 +152,24 @@ impl Transport {
         }
 
         let content_length = content_length.context("missing content length")?;
+        if content_length > MAX_DAP_MESSAGE_BYTES {
+            return Err(Error::Other(anyhow::anyhow!(
+                "DAP message exceeds {MAX_DAP_MESSAGE_BYTES} byte limit: {content_length}"
+            )));
+        }
         content.resize(content_length, 0);
         reader.read_exact(content).await?;
-        let msg = std::str::from_utf8(content).context("invalid utf8 from server")?;
+        log::debug!("[{id}] <- DAP bytes={content_length}");
 
-        info!("[{}] <- DAP {}", id, msg);
-
-        // NOTE: We avoid using `?` here, since it would return early on error
-        // and skip clearing `content`. By returning the result directly instead,
-        // we ensure `content.clear()` is always called.
-        let output = sonic_rs::from_slice(content).map_err(Into::into);
-
-        content.clear();
+        let bytes = std::mem::take(content);
+        let (mut bytes, output) = tokio::task::spawn_blocking(move || {
+            let output = sonic_rs::from_slice(&bytes).map_err(Into::into);
+            (bytes, output)
+        })
+        .await
+        .map_err(|error| Error::Other(error.into()))?;
+        bytes.clear();
+        *content = bytes;
 
         output
     }
@@ -156,7 +197,9 @@ impl Transport {
                 self.pending_requests.lock().await.insert(request.seq, back);
             }
         }
-        let json = serde_json::to_string(&payload)?;
+        let json = tokio::task::spawn_blocking(move || serde_json::to_string(&payload))
+            .await
+            .map_err(|error| Error::Other(error.into()))??;
         self.send_string_to_server(server_stdin, json).await
     }
 
@@ -165,7 +208,7 @@ impl Transport {
         server_stdin: &mut Box<dyn AsyncWrite + Unpin + Send>,
         request: String,
     ) -> Result<()> {
-        info!("[{}] -> DAP {}", self.id, request);
+        log::debug!("[{}] -> DAP bytes={}", self.id, request.len());
 
         // send the headers
         server_stdin
@@ -190,17 +233,32 @@ impl Transport {
             Ok(res)
         } else {
             error!(
-                "[{}] <- DAP error {:?} ({:?}) for command #{} {}",
-                self.id, res.message, res.body, res.request_seq, res.command
+                "[{}] <- DAP error {:?} for command #{} {}",
+                self.id, res.message, res.request_seq, res.command
             );
 
-            Err(Error::Other(anyhow::format_err!("{:?}", res.body)))
+            Err(Error::Other(anyhow::format_err!(
+                "debug adapter request failed: {}",
+                res.message.as_deref().unwrap_or("unknown error")
+            )))
+        }
+    }
+
+    async fn close_pending_requests(&self) {
+        let pending = {
+            let mut pending = self.pending_requests.lock().await;
+            pending.drain().collect::<Vec<_>>()
+        };
+        for (id, tx) in pending {
+            if tx.send(Err(Error::StreamClosed)).await.is_err() {
+                log::debug!("debug request receiver closed before transport shutdown id={id}");
+            }
         }
     }
 
     async fn process_server_message(
         &self,
-        client_tx: &Sender<Payload>,
+        client_tx: &Sender<ServerEvent>,
         msg: Payload,
     ) -> Result<()> {
         match msg {
@@ -218,24 +276,38 @@ impl Transport {
                     }
                     None => {
                         warn!("Response to nonexistent request #{}", res.request_seq);
-                        let _ = client_tx.send(Payload::Response(res)).await;
+                        let _ = client_tx.send(ServerEvent::UnexpectedResponse(res)).await;
                     }
                 }
 
                 Ok(())
             }
             Payload::Request(Request {
-                ref command,
-                ref seq,
+                seq,
+                command,
+                arguments,
                 ..
             }) => {
                 info!("[{}] <- DAP request {} #{}", self.id, command, seq);
-                let _ = client_tx.send(msg).await;
+                let request = server_message_result(crate::Request::parse(&command, arguments));
+                let _ = client_tx
+                    .send(ServerEvent::Request(ServerAdapterRequest {
+                        sequence: seq,
+                        command,
+                        request,
+                    }))
+                    .await;
                 Ok(())
             }
-            Payload::Event(ref event) => {
-                info!("[{}] <- DAP event {:?}", self.id, event);
-                let _ = client_tx.send(msg).await;
+            Payload::Event(event) => {
+                log::debug!("[{}] <- DAP event {}", self.id, event.event);
+                let parsed = server_message_result(crate::Event::parse(&event.event, event.body));
+                let _ = client_tx
+                    .send(ServerEvent::Event(ServerAdapterEvent {
+                        name: event.event,
+                        event: parsed,
+                    }))
+                    .await;
                 Ok(())
             }
         }
@@ -245,7 +317,7 @@ impl Transport {
         id: DebugAdapterId,
         transport: Arc<Self>,
         mut server_stdout: Box<dyn AsyncBufRead + Unpin + Send>,
-        client_tx: Sender<Payload>,
+        client_tx: Sender<ServerEvent>,
     ) {
         let mut recv_buffer = String::new();
         let mut content_buffer = Vec::new();
@@ -270,15 +342,8 @@ impl Transport {
                         error!("Exiting after unexpected error: {err:?}");
                     }
 
-                    // Close any outstanding requests.
-                    for (id, tx) in transport.pending_requests.lock().await.drain() {
-                        match tx.send(Err(Error::StreamClosed)).await {
-                            Ok(_) => (),
-                            Err(_) => {
-                                error!("Could not close request on a closed channel (id={id})");
-                            }
-                        }
-                    }
+                    transport.close_pending_requests().await;
+                    break;
                 }
             }
         }
@@ -302,8 +367,9 @@ impl Transport {
         server_stdin: Box<dyn AsyncWrite + Unpin + Send>,
         client_rx: Receiver<Payload>,
     ) {
-        if let Err(err) = Self::send_inner(transport, server_stdin, client_rx).await {
+        if let Err(err) = Self::send_inner(transport.clone(), server_stdin, client_rx).await {
             error!("err: <- {:?}", err);
+            transport.close_pending_requests().await;
         }
     }
 
@@ -318,5 +384,110 @@ impl Transport {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{duplex, AsyncWriteExt, BufReader};
+
+    fn test_transport() -> Transport {
+        Transport {
+            id: DebugAdapterId::default(),
+            pending_requests: Mutex::new(HashMap::new()),
+        }
+    }
+
+    #[tokio::test]
+    async fn transport_decodes_adapter_events_before_client_delivery() {
+        let transport = test_transport();
+        let (tx, mut rx) = channel(1);
+
+        transport
+            .process_server_message(
+                &tx,
+                Payload::Event(Event {
+                    event: "output".to_owned(),
+                    body: Some(serde_json::json!({
+                        "category": "stdout",
+                        "output": "ready\n"
+                    })),
+                }),
+            )
+            .await
+            .unwrap();
+
+        let ServerEvent::Event(event) = rx.recv().await.unwrap() else {
+            panic!("expected typed adapter event");
+        };
+        assert_eq!(event.name, "output");
+        assert!(matches!(event.event, Ok(crate::Event::Output(_))));
+    }
+
+    #[tokio::test]
+    async fn transport_classifies_unknown_adapter_events() {
+        let transport = test_transport();
+        let (tx, mut rx) = channel(1);
+
+        transport
+            .process_server_message(
+                &tx,
+                Payload::Event(Event {
+                    event: "vendor/custom".to_owned(),
+                    body: None,
+                }),
+            )
+            .await
+            .unwrap();
+
+        let ServerEvent::Event(event) = rx.recv().await.unwrap() else {
+            panic!("expected typed adapter event");
+        };
+        assert!(matches!(event.event, Err(ServerMessageError::Unhandled)));
+    }
+
+    #[tokio::test]
+    async fn closed_adapter_stdout_terminates_reader_without_spinning() {
+        let (server_stdout, transport_stdout) = duplex(64);
+        drop(server_stdout);
+        let (client_tx, _client_rx) = channel(1);
+
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            Transport::recv(
+                DebugAdapterId::default(),
+                Arc::new(test_transport()),
+                Box::new(BufReader::new(transport_stdout)),
+                client_tx,
+            ),
+        )
+        .await
+        .expect("closed adapter reader must terminate");
+    }
+
+    #[tokio::test]
+    async fn oversized_adapter_message_is_rejected_before_allocation() {
+        let (mut server_stdout, transport_stdout) = duplex(128);
+        server_stdout
+            .write_all(format!("Content-Length: {}\r\n\r\n", MAX_DAP_MESSAGE_BYTES + 1).as_bytes())
+            .await
+            .unwrap();
+        let mut reader: Box<dyn AsyncBufRead + Unpin + Send> =
+            Box::new(BufReader::new(transport_stdout));
+        let mut header = String::new();
+        let mut content = Vec::new();
+
+        let error = Transport::recv_server_message(
+            DebugAdapterId::default(),
+            &mut reader,
+            &mut header,
+            &mut content,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("exceeds"));
+        assert!(content.is_empty());
     }
 }

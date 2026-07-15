@@ -4,7 +4,9 @@ mod transport;
 
 pub use client::{should_evaluate_inline_value, Client, FrameVariables, RequestHandle};
 pub use helix_dap_types::*;
-pub use transport::{Payload, Response, Transport};
+pub use transport::{
+    Response, ServerAdapterEvent, ServerAdapterRequest, ServerEvent, ServerMessageError,
+};
 
 use serde::de::DeserializeOwned;
 

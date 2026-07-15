@@ -6,6 +6,7 @@ use helix_core::{
     editor_config::EditorConfig, indent::IndentStyle, text_annotations::Overlay,
     text_folding::FoldContainer,
 };
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AnnotationSnapshot {
@@ -173,8 +174,16 @@ impl DocumentPresentationState {
         self.annotations.jump_labels(view_id)
     }
 
+    pub fn jump_labels_snapshot(&self, view_id: ViewId) -> Option<Arc<[Overlay]>> {
+        self.annotations.jump_labels_snapshot(view_id)
+    }
+
     pub fn inlay_hints(&self, view_id: ViewId) -> Option<&DocumentInlayHints> {
         self.annotations.inlay_hints(view_id)
+    }
+
+    pub fn inlay_hints_snapshot(&self, view_id: ViewId) -> Option<Arc<DocumentInlayHints>> {
+        self.annotations.inlay_hints_snapshot(view_id)
     }
 
     pub fn reset_all_inlay_hints(&mut self) {
@@ -193,6 +202,10 @@ impl DocumentPresentationState {
         self.annotations.fold_container(view_id)
     }
 
+    pub fn fold_container_snapshot(&self, view_id: ViewId) -> Option<Arc<FoldContainer>> {
+        self.annotations.fold_container_snapshot(view_id)
+    }
+
     pub fn fold_container_mut(&mut self, view_id: ViewId) -> &mut FoldContainer {
         self.annotations.fold_container_mut(view_id)
     }
@@ -205,8 +218,11 @@ impl DocumentPresentationState {
         self.annotations.fold_containers_mut()
     }
 
-    pub fn plugin_annotations(&self, view_id: ViewId) -> Option<Vec<PluginAnnotation>> {
-        self.annotations.plugin_annotations(view_id)
+    pub fn visual_annotations(
+        &self,
+        view_id: ViewId,
+    ) -> Option<std::sync::Arc<[PluginAnnotation]>> {
+        self.annotations.visual_annotations(view_id)
     }
 
     pub fn set_plugin_annotations(

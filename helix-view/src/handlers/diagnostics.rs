@@ -3,72 +3,156 @@ use std::sync::atomic::{self, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use helix_runtime::{send_blocking, Clock, DebouncedSender, FrameHandle, Runtime, Sender, Work};
+use helix_runtime::{FrameHandle, PulseGate, PulseHandle, Runtime, Work};
 
 use crate::{Document, DocumentId, ViewId};
 
 #[derive(Debug)]
-pub enum DiagnosticEvent {
+enum DiagnosticEvent {
     CursorLineChanged { generation: usize },
     Refresh,
-    FlushDebounced,
+}
+
+#[derive(Default)]
+struct DiagnosticRequests {
+    generation: Option<usize>,
+    refresh: bool,
+}
+
+impl DiagnosticRequests {
+    fn push(&mut self, event: DiagnosticEvent) {
+        match event {
+            DiagnosticEvent::CursorLineChanged { generation } => {
+                self.generation = Some(
+                    self.generation
+                        .map_or(generation, |current| current.max(generation)),
+                );
+            }
+            DiagnosticEvent::Refresh => self.refresh = true,
+        }
+    }
+
+    fn take(&mut self) -> Self {
+        std::mem::take(self)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.generation.is_none() && !self.refresh
+    }
+}
+
+enum DiagnosticWake {}
+
+#[derive(Clone)]
+struct DiagnosticInbox {
+    requests: Arc<Mutex<DiagnosticRequests>>,
+    wake: PulseHandle<DiagnosticWake>,
+}
+
+impl DiagnosticInbox {
+    fn spawn(active_generation: Arc<AtomicUsize>, work: Work, redraw: FrameHandle) -> Self {
+        let mut gate = PulseGate::<DiagnosticWake>::new();
+        let wake = gate.handle();
+        let wake_rx = gate.take_receiver();
+        let requests = Arc::new(Mutex::new(DiagnosticRequests::default()));
+        let actor_requests = requests.clone();
+
+        work.spawn(async move {
+            DiagnosticTimeout::new(active_generation, redraw)
+                .run(wake_rx, actor_requests)
+                .await;
+        })
+        .detach();
+
+        Self { requests, wake }
+    }
+
+    fn send(&self, event: DiagnosticEvent) {
+        self.requests
+            .lock()
+            .expect("diagnostics request lock poisoned")
+            .push(event);
+        self.wake.request();
+    }
 }
 
 struct DiagnosticTimeout {
     active_generation: Arc<AtomicUsize>,
     pending_generation: Option<usize>,
-    debouncer: DebouncedSender<DiagnosticEvent>,
+    deadline: Option<tokio::time::Instant>,
     redraw: FrameHandle,
 }
 
 const TIMEOUT: Duration = Duration::from_millis(350);
 
 impl DiagnosticTimeout {
-    fn spawn(
-        active_generation: Arc<AtomicUsize>,
-        work: Work,
-        clock: Clock,
-        redraw: FrameHandle,
-    ) -> Sender<DiagnosticEvent> {
-        let (tx, mut rx) = helix_runtime::channel(128);
-        let mut timeout = Self {
+    fn new(active_generation: Arc<AtomicUsize>, redraw: FrameHandle) -> Self {
+        Self {
             active_generation,
             pending_generation: None,
-            debouncer: DebouncedSender::new(TIMEOUT, work.clone(), clock, tx.clone()),
+            deadline: None,
             redraw,
-        };
-        work.spawn(async move {
-            while let Some(event) = rx.recv().await {
-                timeout.handle_event(event);
-            }
-            timeout.debouncer.cancel();
-        })
-        .detach();
-        tx
-    }
-
-    fn handle_event(&mut self, event: DiagnosticEvent) {
-        match event {
-            DiagnosticEvent::CursorLineChanged { generation } => {
-                if self
-                    .pending_generation
-                    .is_none_or(|pending| generation > pending)
-                {
-                    self.pending_generation = Some(generation);
-                    self.restart();
-                }
-            }
-            DiagnosticEvent::Refresh => {
-                if self.pending_generation.is_some() {
-                    self.restart();
-                }
-            }
-            DiagnosticEvent::FlushDebounced => self.commit_pending_generation(),
         }
     }
 
-    fn restart(&mut self) {
-        self.debouncer.send(DiagnosticEvent::FlushDebounced);
+    async fn run(
+        mut self,
+        mut wake_rx: helix_runtime::PulseReceiver<DiagnosticWake>,
+        requests: Arc<Mutex<DiagnosticRequests>>,
+    ) {
+        loop {
+            let Some(deadline) = self.deadline else {
+                if wake_rx.recv().await.is_none() {
+                    return;
+                }
+                self.consume_requests(&requests);
+                continue;
+            };
+
+            tokio::select! {
+                biased;
+                wake = wake_rx.recv() => {
+                    if wake.is_none() {
+                        return;
+                    }
+                    self.consume_requests(&requests);
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                    self.consume_requests(&requests);
+                    if self.deadline.is_some_and(|current| current <= tokio::time::Instant::now()) {
+                        self.commit_pending_generation();
+                        self.deadline = None;
+                    }
+                }
+            }
+        }
+    }
+
+    fn consume_requests(&mut self, requests: &Mutex<DiagnosticRequests>) {
+        let requests = requests
+            .lock()
+            .expect("diagnostics request lock poisoned")
+            .take();
+        if requests.is_empty() {
+            return;
+        }
+
+        let mut restart = false;
+        if let Some(generation) = requests.generation {
+            if self
+                .pending_generation
+                .is_none_or(|pending| generation > pending)
+            {
+                self.pending_generation = Some(generation);
+                restart = true;
+            }
+        }
+        if requests.refresh && self.pending_generation.is_some() {
+            restart = true;
+        }
+        if restart {
+            self.deadline = Some(tokio::time::Instant::now() + TIMEOUT);
+        }
     }
 
     fn commit_pending_generation(&mut self) {
@@ -101,27 +185,25 @@ struct DiagnosticRuntime {
 enum DiagnosticEventSource {
     Unbound,
     Bound(DiagnosticRuntime),
-    Spawned(Sender<DiagnosticEvent>),
+    Spawned(DiagnosticInbox),
 }
 
 enum DiagnosticEventTarget {
     Unbound,
-    Spawned(Sender<DiagnosticEvent>),
+    Spawned(DiagnosticInbox),
 }
 
 impl DiagnosticEventTarget {
     fn send(self, event: DiagnosticEvent) {
-        let Self::Spawned(tx) = self else {
+        let Self::Spawned(inbox) = self else {
             return;
         };
-        send_blocking(&tx, event);
+        inbox.send(event);
     }
 }
 
-// make sure we never share handlers across multiple views this is a stop
-// gap solution. We just shouldn't be cloneing a view to begin with (we do
-// for :hsplit/vsplit) and really this should not be view specific to begin with
-// but to fix that larger architecutre changes are needed
+// Views currently clone this handler during splits. Keep each clone independent
+// until diagnostics state moves out of the view entirely.
 impl Clone for DiagnosticsHandler {
     fn clone(&self) -> Self {
         Self::new()
@@ -172,22 +254,19 @@ impl DiagnosticsHandler {
 
         match &*source {
             DiagnosticEventSource::Unbound => DiagnosticEventTarget::Unbound,
-            DiagnosticEventSource::Spawned(tx) => DiagnosticEventTarget::Spawned(tx.clone()),
+            DiagnosticEventSource::Spawned(inbox) => DiagnosticEventTarget::Spawned(inbox.clone()),
             DiagnosticEventSource::Bound(runtime) => {
-                let tx = DiagnosticTimeout::spawn(
+                let inbox = DiagnosticInbox::spawn(
                     self.active_generation.clone(),
                     runtime.runtime.work().clone(),
-                    runtime.runtime.clock().clone(),
                     runtime.redraw.clone(),
                 );
-                *source = DiagnosticEventSource::Spawned(tx.clone());
-                DiagnosticEventTarget::Spawned(tx)
+                *source = DiagnosticEventSource::Spawned(inbox.clone());
+                DiagnosticEventTarget::Spawned(inbox)
             }
         }
     }
-}
 
-impl DiagnosticsHandler {
     pub fn refresh(&self) {
         self.events().send(DiagnosticEvent::Refresh);
     }
@@ -202,6 +281,7 @@ impl DiagnosticsHandler {
         self.active_generation
             .store(self.generation.load(Ordering::Relaxed), Ordering::Relaxed);
     }
+
     pub fn show_cursorline_diagnostics(&self, doc: &Document, view: ViewId) -> bool {
         if !self.active {
             return false;
@@ -225,5 +305,53 @@ impl DiagnosticsHandler {
             });
             false
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use helix_runtime::{test::RuntimeTest, FrameGate, TryRecvError};
+
+    #[test]
+    fn cursor_generation_coalesces_under_saturation() {
+        let rt = RuntimeTest::new_paused();
+        let active = Arc::new(AtomicUsize::new(0));
+        let mut frames = FrameGate::new();
+        let inbox =
+            DiagnosticInbox::spawn(active.clone(), rt.runtime().work().clone(), frames.handle());
+        let mut frame_rx = frames.take_receiver();
+
+        for generation in 1..=10_000 {
+            inbox.send(DiagnosticEvent::CursorLineChanged { generation });
+        }
+        rt.block_on(tokio::task::yield_now());
+        rt.advance(TIMEOUT - Duration::from_millis(1));
+        assert_eq!(active.load(Ordering::Relaxed), 0);
+        rt.advance(Duration::from_millis(1));
+
+        assert_eq!(active.load(Ordering::Relaxed), 10_000);
+        assert!(frame_rx.try_recv().is_ok());
+        assert!(matches!(frame_rx.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn refresh_restarts_the_single_pending_deadline() {
+        let rt = RuntimeTest::new_paused();
+        let active = Arc::new(AtomicUsize::new(0));
+        let mut frames = FrameGate::new();
+        let inbox =
+            DiagnosticInbox::spawn(active.clone(), rt.runtime().work().clone(), frames.handle());
+        let _frame_rx = frames.take_receiver();
+
+        inbox.send(DiagnosticEvent::CursorLineChanged { generation: 7 });
+        rt.block_on(tokio::task::yield_now());
+        rt.advance(Duration::from_millis(300));
+        inbox.send(DiagnosticEvent::Refresh);
+        rt.block_on(tokio::task::yield_now());
+        rt.advance(TIMEOUT - Duration::from_millis(1));
+        assert_eq!(active.load(Ordering::Relaxed), 0);
+        rt.advance(Duration::from_millis(1));
+        assert_eq!(active.load(Ordering::Relaxed), 7);
     }
 }

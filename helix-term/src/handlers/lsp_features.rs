@@ -1,10 +1,9 @@
 use std::{
     collections::{HashMap, HashSet},
-    sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
-use helix_runtime::{Runtime, Work};
+use helix_runtime::Runtime;
 use helix_view::{
     handlers::{
         lsp::{LspFeatureRefreshEvent, LspFeatureRefreshKind},
@@ -24,62 +23,74 @@ use crate::{
 const CODE_LENS_PLUGIN_SCOPE: &str = "helix-lsp-code-lens";
 
 pub(super) struct LspFeatureRefreshHandler {
-    docs: Arc<Mutex<HashMap<DocumentId, HashSet<LspFeatureRefreshKind>>>>,
-    debouncer: crate::runtime::RuntimeTaskDebouncer,
+    docs: HashMap<DocumentId, HashSet<LspFeatureRefreshKind>>,
+    deadline: Option<Instant>,
+    clock: helix_runtime::Clock,
+    ingress: crate::runtime::RuntimeIngress,
 }
 
 const DOCUMENT_CHANGE_DEBOUNCE: Duration = Duration::from_millis(250);
 
 impl LspFeatureRefreshHandler {
-    fn new(
-        work: Work,
-        clock: helix_runtime::Clock,
-        ingress: crate::runtime::RuntimeIngress,
-    ) -> Self {
+    fn new(clock: helix_runtime::Clock, ingress: crate::runtime::RuntimeIngress) -> Self {
         Self {
             docs: Default::default(),
-            debouncer: crate::runtime::RuntimeTaskDebouncer::new(
-                DOCUMENT_CHANGE_DEBOUNCE,
-                work,
-                clock,
-                ingress,
-            ),
+            deadline: None,
+            clock,
+            ingress,
         }
     }
 
     fn event(&mut self, event: LspFeatureRefreshEvent) {
         self.docs
-            .lock()
-            .expect("lsp feature refresh lock poisoned")
             .entry(event.doc_id)
             .or_default()
             .insert(event.kind);
+        self.deadline = Some(self.clock.deadline_after(DOCUMENT_CHANGE_DEBOUNCE));
+    }
 
-        let docs = self.docs.clone();
-        self.debouncer
-            .send_after_with(DOCUMENT_CHANGE_DEBOUNCE, move || {
-                let docs = {
-                    let mut docs = docs.lock().expect("lsp feature refresh lock poisoned");
-                    std::mem::take(&mut *docs)
-                };
-                (!docs.is_empty()).then(|| RuntimeTaskEvent::RequestLspFeaturesDebounced { docs })
-            });
+    async fn flush(&mut self) {
+        let docs = std::mem::take(&mut self.docs);
+        if !docs.is_empty() {
+            let _ = self
+                .ingress
+                .send_task(RuntimeTaskEvent::RequestLspFeaturesDebounced { docs })
+                .await;
+        }
+    }
+
+    async fn run(mut self, mut rx: helix_runtime::Receiver<LspFeatureRefreshEvent>) {
+        loop {
+            if let Some(deadline) = self.deadline {
+                let mut timer = self.clock.timer_at(deadline);
+                tokio::select! {
+                    biased;
+                    event = rx.recv() => {
+                        let Some(event) = event else { break };
+                        self.event(event);
+                    }
+                    _ = &mut timer => {
+                        self.deadline = None;
+                        self.flush().await;
+                    }
+                }
+            } else {
+                let Some(event) = rx.recv().await else { break };
+                self.event(event);
+            }
+        }
     }
 
     pub fn spawn(
         runtime: Runtime,
         ingress: crate::runtime::RuntimeIngress,
     ) -> helix_runtime::Sender<LspFeatureRefreshEvent> {
-        let (tx, mut rx) = helix_runtime::channel(128);
+        let (tx, rx) = helix_runtime::channel(128);
         let work = runtime.work().clone();
         let clock = runtime.clock().clone();
         work.clone()
             .spawn(async move {
-                let mut handler = LspFeatureRefreshHandler::new(work, clock, ingress);
-                while let Some(event) = rx.recv().await {
-                    handler.event(event);
-                }
-                handler.debouncer.cancel();
+                LspFeatureRefreshHandler::new(clock, ingress).run(rx).await;
             })
             .detach();
         tx
@@ -100,7 +111,7 @@ pub(super) fn attach(
         Ok(())
     });
 
-    let tx = handlers.lsp_feature_refresh.clone();
+    let refreshes = handlers.lsp_feature_refresh.clone();
     editor.lifecycle().on_document_change(move |event| {
         if !event.ghost_transaction {
             event.doc.cancel_code_lenses();
@@ -115,28 +126,31 @@ pub(super) fn attach(
                 LspFeatureRefreshKind::SemanticTokens,
                 LspFeatureRefreshKind::InlineCompletion,
             ] {
-                helix_runtime::send_blocking(
-                    &tx,
-                    LspFeatureRefreshEvent {
-                        doc_id: event.doc.id(),
-                        kind,
-                    },
-                );
+                refreshes.send(LspFeatureRefreshEvent {
+                    doc_id: event.doc.id(),
+                    kind,
+                });
             }
         }
         Ok(())
     });
 
-    let init_ingress = ingress.clone();
+    let init_refreshes = handlers.lsp_feature_refresh.clone();
     editor
         .lifecycle()
         .on_language_server_initialized(move |event| {
-            let doc_ids: Vec<_> = event.editor.documents().map(|doc| doc.id()).collect();
+            let doc_ids = event
+                .editor
+                .documents_supporting_language_server(event.server_id);
             for doc_id in doc_ids {
-                request_code_lenses(event.editor, doc_id, init_ingress.clone());
-                request_document_links(event.editor, doc_id, init_ingress.clone());
-                request_folding_ranges(event.editor, doc_id, init_ingress.clone());
-                request_semantic_tokens(event.editor, doc_id, init_ingress.clone());
+                for kind in [
+                    LspFeatureRefreshKind::CodeLens,
+                    LspFeatureRefreshKind::DocumentLinks,
+                    LspFeatureRefreshKind::FoldingRanges,
+                    LspFeatureRefreshKind::SemanticTokens,
+                ] {
+                    init_refreshes.send(LspFeatureRefreshEvent { doc_id, kind });
+                }
             }
             Ok(())
         });

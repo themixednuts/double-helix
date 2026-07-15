@@ -14,7 +14,7 @@ use tokio::sync::mpsc;
 /// Channel sender used by the native handler to request shutdown. Set during
 /// [`setup`]; the handler sends one message then the process should exit.
 #[cfg(windows)]
-static SENDER: OnceLock<mpsc::UnboundedSender<()>> = OnceLock::new();
+static SENDER: OnceLock<mpsc::Sender<()>> = OnceLock::new();
 
 /// Creates the shutdown channel and registers the native OS handler. Returns
 /// the receiver; when it yields, the application should exit the event loop
@@ -24,10 +24,10 @@ static SENDER: OnceLock<mpsc::UnboundedSender<()>> = OnceLock::new();
 ///   and sends on the channel so the process can exit instead of being killed.
 /// - **Unix (Linux, macOS, BSD)**: returns `None`; shutdown is driven by the
 ///   signal stream (SIGTERM, SIGINT, SIGHUP) in the event loop.
-pub fn setup() -> Option<mpsc::UnboundedReceiver<()>> {
+pub fn setup() -> Option<mpsc::Receiver<()>> {
     #[cfg(windows)]
     {
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(1);
         if SENDER.set(tx).is_err() {
             return None;
         }
@@ -52,7 +52,7 @@ unsafe extern "system" fn ctrl_handler(ctrl_type: u32) -> i32 {
     );
     if handled {
         if let Some(tx) = SENDER.get() {
-            let _ = tx.send(());
+            let _ = tx.try_send(());
         }
     }
     TRUE

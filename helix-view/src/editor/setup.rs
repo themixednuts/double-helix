@@ -11,7 +11,7 @@ use helix_vcs::DiffProviderRegistry;
 use super::{
     core::{
         AssistantFollowState, AssistantPersistenceState, AssistantRuntimeState, AssistantServices,
-        FrontendState,
+        FrontendState, PackagedAssistantAgentCache,
     },
     types::Diagnostics,
     Config, CursorCache, Editor, NotificationManager, WorkspaceDiagnosticCounts,
@@ -31,7 +31,7 @@ impl EditorBuilder {
     pub fn new(area: Rect, runtime: Runtime) -> Self {
         Self {
             area,
-            theme_loader: Arc::new(theme::Loader::new(helix_loader::runtime_dirs())),
+            theme_loader: Arc::new(theme::Loader::new(&[])),
             language_loader: Arc::new(ArcSwap::from_pointee(
                 helix_core::config::default_lang_loader(),
             )),
@@ -99,7 +99,7 @@ impl Editor {
         runtime: Runtime,
         handlers: Handlers,
     ) -> Self {
-        let language_servers = helix_lsp::Registry::new(syn_loader.clone());
+        let language_servers = helix_lsp::Registry::new();
         let conf = config.load();
         let auto_pairs = (&conf.auto_pairs).into();
         let (assistant_updates_tx, assistant_updates_rx) = helix_runtime::channel(128);
@@ -119,9 +119,15 @@ impl Editor {
             write_count: 0,
             macro_recording: None,
             macro_replaying: Vec::new(),
-            theme: theme_loader.default(),
+            theme: Arc::new(theme_loader.default()),
+            theme_generation: 0,
             language_servers,
+            language_server_supervisor:
+                super::language_server_supervisor::LanguageServerSupervisor::default(),
             diagnostics: Diagnostics::new(),
+            diagnostics_revision: 0,
+            diagnostic_summaries: Default::default(),
+            diagnostic_path_summaries: Default::default(),
             workspace_diagnostic_counts: WorkspaceDiagnosticCounts::default(),
             diff_providers: DiffProviderRegistry::new(conf.vcs.provider.into()),
             debug_adapters: dap::registry::Registry::new(),
@@ -145,13 +151,14 @@ impl Editor {
             auto_pairs,
             exit_code: 0,
             config_events: helix_runtime::channel(64),
-            frame_gate: helix_runtime::FrameGate::new(64),
+            frame_gate: helix_runtime::FrameGate::new(),
             needs_redraw: false,
             config_gen: 0,
             handlers,
             lifecycle: std::sync::Arc::new(super::hooks::LifecycleBus::default()),
             file_watcher: None,
             file_operations: super::file_operation::FileOperationJournal::default(),
+            prepared_document_opens: super::document_io::PreparedDocumentOpenCache::default(),
             mouse_down_range: None,
             cursor_cache: CursorCache::default(),
             model: crate::model::Model::default(),
@@ -183,6 +190,7 @@ impl Editor {
                 updates_tx: assistant_updates_tx,
                 updates_rx: assistant_updates_rx,
             },
+            assistant_packaged_agents: PackagedAssistantAgentCache::default(),
             assistant_follow: AssistantFollowState {
                 snapshot: None,
                 suppress_pause: false,

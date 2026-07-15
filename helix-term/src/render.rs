@@ -1,11 +1,235 @@
+use std::any::Any;
 use std::collections::hash_map::DefaultHasher;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
-use helix_view::graphics::{Rect, Style};
+use helix_view::graphics::{CursorKind, Rect, Style};
 
 /// Terminal-style cell grid used by the current render pipeline.
 pub type CellSurface = tui::ratatui::buffer::Buffer;
+
+/// Complete immutable frame handed from the renderer to the terminal presenter.
+pub(crate) struct FramePacket {
+    pub generation: helix_runtime::FrameGeneration,
+    pub area: Rect,
+    pub surface: CellSurface,
+    pub cursor: Option<(u16, u16)>,
+    pub cursor_kind: CursorKind,
+    pub full_redraw: bool,
+}
+
+#[derive(Clone)]
+pub struct RenderCancellation {
+    latest: Arc<AtomicU64>,
+    sequence: u64,
+}
+
+impl RenderCancellation {
+    pub(crate) fn for_sequence(latest: Arc<AtomicU64>, sequence: u64) -> Self {
+        Self { latest, sequence }
+    }
+
+    pub(crate) fn never() -> Self {
+        Self {
+            latest: Arc::new(AtomicU64::new(0)),
+            sequence: 0,
+        }
+    }
+
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.latest.load(Ordering::Acquire) != self.sequence
+    }
+}
+
+type RenderStepWork = Box<dyn FnOnce(&mut CellSurface, &RenderCancellation) + Send>;
+type StatefulRenderStepWork = Box<
+    dyn FnOnce(&mut CellSurface, &mut CacheStore, &mut RenderMetadata, &RenderCancellation) + Send,
+>;
+
+enum RenderStepKind {
+    Paint(RenderStepWork),
+    Stateful(StatefulRenderStepWork),
+    Prepared(Vec<PreparedRender>),
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RenderMetadata {
+    cursor: Option<RenderCursor>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RenderCursor {
+    pub position: Option<(u16, u16)>,
+    pub kind: CursorKind,
+}
+
+impl RenderMetadata {
+    pub fn set_cursor(&mut self, position: Option<(u16, u16)>, kind: CursorKind) {
+        self.cursor = Some(RenderCursor { position, kind });
+    }
+
+    pub fn cursor_override(self) -> Option<RenderCursor> {
+        self.cursor
+    }
+}
+
+pub(crate) struct RenderStep {
+    name: &'static str,
+    kind: RenderStepKind,
+}
+
+impl RenderStep {
+    pub(crate) fn paint(
+        name: &'static str,
+        work: impl FnOnce(&mut CellSurface, &RenderCancellation) + Send + 'static,
+    ) -> Self {
+        Self {
+            name,
+            kind: RenderStepKind::Paint(Box::new(work)),
+        }
+    }
+
+    pub(crate) fn prepared(name: &'static str, batch: Vec<PreparedRender>) -> Option<Self> {
+        (!batch.is_empty()).then_some(Self {
+            name,
+            kind: RenderStepKind::Prepared(batch),
+        })
+    }
+
+    pub(crate) fn stateful(
+        name: &'static str,
+        work: impl FnOnce(&mut CellSurface, &mut CacheStore, &mut RenderMetadata, &RenderCancellation)
+            + Send
+            + 'static,
+    ) -> Self {
+        Self {
+            name,
+            kind: RenderStepKind::Stateful(Box::new(work)),
+        }
+    }
+}
+
+/// Ordered, owned work for one coherent frame generation.
+///
+/// A plan can be seeded with previously prepared cells and extended with
+/// `Send + 'static` paint steps. The render actor executes steps in z-order and
+/// checks for supersession between them, so component snapshots never need to
+/// borrow the foreground editor or compositor.
+pub(crate) struct RenderPlan {
+    area: Rect,
+    seed: Option<CellSurface>,
+    steps: Vec<RenderStep>,
+}
+
+pub(crate) struct RenderPlanResult {
+    pub surface: CellSurface,
+    pub complete: bool,
+    pub metadata: RenderMetadata,
+}
+
+impl RenderPlan {
+    /// Start from already prepared cells. This is also useful for partial-frame
+    /// reuse: later steps may repaint only invalid regions in order.
+    pub fn seeded(area: Rect, surface: CellSurface) -> Self {
+        debug_assert_eq!(*surface.area(), tui::ratatui::to_ratatui_rect(area));
+        Self {
+            area,
+            seed: Some(surface),
+            steps: Vec::new(),
+        }
+    }
+
+    pub fn extend(&mut self, steps: impl IntoIterator<Item = RenderStep>) {
+        self.steps.extend(steps);
+    }
+
+    pub fn area(&self) -> Rect {
+        self.area
+    }
+
+    pub fn take_seed(&mut self) -> Option<CellSurface> {
+        self.seed.take()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.steps.is_empty()
+    }
+
+    pub fn execute(
+        self,
+        mut surface: CellSurface,
+        cache: &mut CacheStore,
+        cancellation: &RenderCancellation,
+    ) -> RenderPlanResult {
+        debug_assert_eq!(*surface.area(), tui::ratatui::to_ratatui_rect(self.area));
+        if cancellation.is_cancelled() {
+            return RenderPlanResult {
+                surface,
+                complete: false,
+                metadata: RenderMetadata::default(),
+            };
+        }
+        let mut metadata = RenderMetadata::default();
+        let mut active_cache_ids = Vec::new();
+        for step in &self.steps {
+            if let RenderStepKind::Prepared(batch) = &step.kind {
+                active_cache_ids.extend(
+                    batch
+                        .iter()
+                        .filter_map(|prepared| prepared.tag.map(|tag| tag.id)),
+                );
+            }
+        }
+        cache.retain(|id| active_cache_ids.contains(&id));
+
+        for step in self.steps {
+            if cancellation.is_cancelled() {
+                return RenderPlanResult {
+                    surface,
+                    complete: false,
+                    metadata,
+                };
+            }
+            let started = std::time::Instant::now();
+            match step.kind {
+                RenderStepKind::Paint(work) => work(&mut surface, cancellation),
+                RenderStepKind::Stateful(work) => {
+                    work(&mut surface, cache, &mut metadata, cancellation)
+                }
+                RenderStepKind::Prepared(batch) => {
+                    for prepared in batch {
+                        if cancellation.is_cancelled() {
+                            return RenderPlanResult {
+                                surface,
+                                complete: false,
+                                metadata,
+                            };
+                        }
+                        let Some(prepared) = cache.resolve(prepared, cancellation) else {
+                            return RenderPlanResult {
+                                surface,
+                                complete: false,
+                                metadata,
+                            };
+                        };
+                        blit_render(&prepared, &mut surface);
+                    }
+                }
+            }
+            helix_view::bench::log_run_phase("render_actor", step.name, started.elapsed(), || {
+                format!("area={}x{}", self.area.width, self.area.height)
+            });
+        }
+        RenderPlanResult {
+            surface,
+            complete: !cancellation.is_cancelled(),
+            metadata,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CacheId(u64);
@@ -30,7 +254,7 @@ impl CacheKey {
 }
 
 /// Cache identity bundle: stable slot + frame fingerprint + cached region.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CacheTag {
     pub id: CacheId,
     pub key: CacheKey,
@@ -41,7 +265,16 @@ pub struct CacheTag {
 pub struct RenderOutput {
     area: Rect,
     surface: CellSurface,
+    blend: RenderBlend,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RenderBlend {
+    Opaque,
+    Sparse,
+}
+
+const SPARSE_CELL_MARKER: &str = "\u{fdd0}";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RenderCell<'a> {
@@ -99,6 +332,39 @@ impl RenderOutput {
         Self {
             area,
             surface: CellSurface::empty(tui::ratatui::to_ratatui_rect(area)),
+            blend: RenderBlend::Opaque,
+        }
+    }
+
+    #[must_use]
+    pub fn sparse(area: Rect) -> Self {
+        let mut output = Self::new(area);
+        output.blend = RenderBlend::Sparse;
+        for cell in &mut output.surface.content {
+            cell.set_symbol(SPARSE_CELL_MARKER);
+        }
+        output
+    }
+
+    #[must_use]
+    pub fn reuse(area: Rect, mut surface: CellSurface) -> Self {
+        if *surface.area() != tui::ratatui::to_ratatui_rect(area) {
+            return Self::new(area);
+        }
+        surface.reset();
+        Self {
+            area,
+            surface,
+            blend: RenderBlend::Opaque,
+        }
+    }
+
+    pub(crate) fn from_surface(area: Rect, surface: CellSurface) -> Self {
+        debug_assert_eq!(*surface.area(), tui::ratatui::to_ratatui_rect(area));
+        Self {
+            area,
+            surface,
+            blend: RenderBlend::Opaque,
         }
     }
 
@@ -117,6 +383,13 @@ impl RenderOutput {
 
     pub fn into_surface(self) -> CellSurface {
         self.surface
+    }
+
+    fn into_resolved(self) -> ResolvedRender {
+        ResolvedRender {
+            surface: self.surface,
+            blend: self.blend,
+        }
     }
 
     pub fn cells(&self) -> impl Iterator<Item = RenderCell<'_>> {
@@ -304,14 +577,14 @@ impl RenderRow {
 
 pub enum RenderWork {
     Ready(RenderOutput),
-    Deferred(Box<dyn FnOnce() -> RenderOutput + Send>),
+    Deferred(Box<dyn FnOnce(&RenderCancellation) -> RenderOutput + Send>),
 }
 
 impl RenderWork {
-    fn run(self) -> RenderOutput {
+    fn run(self, cancellation: &RenderCancellation) -> RenderOutput {
         match self {
             Self::Ready(output) => output,
-            Self::Deferred(work) => work(),
+            Self::Deferred(work) => work(cancellation),
         }
     }
 }
@@ -340,7 +613,9 @@ impl PreparedRender {
     }
 
     /// Uncached deferred render.
-    pub fn deferred(work: impl FnOnce() -> RenderOutput + Send + 'static) -> Self {
+    pub fn deferred(
+        work: impl FnOnce(&RenderCancellation) -> RenderOutput + Send + 'static,
+    ) -> Self {
         Self {
             tag: None,
             work: RenderWork::Deferred(Box::new(work)),
@@ -355,11 +630,13 @@ impl PreparedRender {
     pub fn snapshot<T, F>(tag: CacheTag, snapshot: T, render: F) -> Self
     where
         T: Send + 'static,
-        F: FnOnce(T) -> RenderOutput + Send + 'static,
+        F: FnOnce(T, &RenderCancellation) -> RenderOutput + Send + 'static,
     {
         Self {
             tag: Some(tag),
-            work: RenderWork::Deferred(Box::new(move || render(snapshot))),
+            work: RenderWork::Deferred(Box::new(move |cancellation| {
+                render(snapshot, cancellation)
+            })),
         }
     }
 }
@@ -380,6 +657,11 @@ struct CacheMeta {
     area: Rect,
 }
 
+struct ResolvedRender {
+    surface: CellSurface,
+    blend: RenderBlend,
+}
+
 /// SoA (struct-of-arrays) cache store. The lookup hot path touches
 /// only `meta` (contiguous 24-byte entries). Surfaces are stored in
 /// a parallel array and only accessed on hit or store.
@@ -387,10 +669,33 @@ struct CacheMeta {
 pub struct CacheStore {
     index: HashMap<CacheId, u32>,
     meta: Vec<CacheMeta>,
-    surfaces: Vec<CellSurface>,
+    surfaces: Vec<Arc<ResolvedRender>>,
+    domains: HashMap<CacheId, Box<dyn Any + Send>>,
+    domain_order: VecDeque<CacheId>,
 }
 
 impl CacheStore {
+    const DOMAIN_CAPACITY: usize = 128;
+
+    pub(crate) fn domain_mut<T>(&mut self, id: CacheId) -> &mut T
+    where
+        T: Default + Send + 'static,
+    {
+        self.domain_order.retain(|cached| *cached != id);
+        self.domain_order.push_back(id);
+        while self.domain_order.len() > Self::DOMAIN_CAPACITY {
+            if let Some(retired) = self.domain_order.pop_front() {
+                self.domains.remove(&retired);
+            }
+        }
+
+        self.domains
+            .entry(id)
+            .or_insert_with(|| Box::new(T::default()))
+            .downcast_mut()
+            .expect("render cache domain ID must have one stable type")
+    }
+
     pub fn retain(&mut self, mut keep: impl FnMut(CacheId) -> bool) {
         let mut i = 0;
         while i < self.meta.len() {
@@ -409,21 +714,23 @@ impl CacheStore {
     }
 
     pub fn compose(&mut self, prepared: PreparedRender, surface: &mut CellSurface) -> CacheState {
+        let cancellation = RenderCancellation::never();
         let PreparedRender { tag, work } = prepared;
         let Some(tag) = tag else {
-            let output = work.run();
-            blit_cells(output.surface(), surface);
+            let output = work.run(&cancellation);
+            blit_render(&output.into_resolved(), surface);
             return CacheState::Uncached;
         };
 
         if let Some(cached) = self.lookup(tag.id, tag.key, tag.area) {
-            blit_cells(cached, surface);
+            blit_render(cached, surface);
             return CacheState::Hit;
         }
 
-        let output = work.run();
-        blit_cells(output.surface(), surface);
-        self.store(tag, output.into_surface());
+        let output = work.run(&cancellation);
+        let output = output.into_resolved();
+        blit_render(&output, surface);
+        self.store(tag, output);
         CacheState::Miss
     }
 
@@ -438,57 +745,72 @@ impl CacheStore {
     ) {
         use rayon::prelude::*;
 
-        struct Pending {
-            tag: Option<CacheTag>,
-            work: RenderWork,
+        let cancellation = RenderCancellation::never();
+
+        enum Slot {
+            Hit(usize),
+            Pending(usize),
         }
 
         let batch = batch.into_iter();
-        let mut pending: Vec<Pending> = Vec::with_capacity(batch.size_hint().0);
+        let mut slots = Vec::with_capacity(batch.size_hint().0);
+        let mut pending = Vec::with_capacity(slots.capacity());
 
         for prepared in batch {
             let PreparedRender { tag, work } = prepared;
             if let Some(tag) = tag {
-                if let Some(cached) = self.lookup(tag.id, tag.key, tag.area) {
-                    blit_cells(cached, surface);
+                if let Some(index) = self.lookup_index(tag.id, tag.key, tag.area) {
+                    slots.push(Slot::Hit(index));
                     continue;
                 }
-                pending.push(Pending {
-                    tag: Some(tag),
-                    work,
-                });
+                let index = pending.len();
+                pending.push((Some(tag), work));
+                slots.push(Slot::Pending(index));
             } else {
-                pending.push(Pending { tag: None, work });
+                let index = pending.len();
+                pending.push((None, work));
+                slots.push(Slot::Pending(index));
             }
         }
 
-        if pending.is_empty() {
-            return;
-        }
-
-        let outputs: Vec<(Option<CacheTag>, RenderOutput)> = pending
+        let mut outputs: Vec<Option<(Option<CacheTag>, RenderOutput)>> = pending
             .into_par_iter()
-            .map(|p| {
-                let output = p.work.run();
-                (p.tag, output)
-            })
+            .map(|(tag, work)| Some((tag, work.run(&cancellation))))
             .collect();
 
-        for (tag, output) in outputs {
-            blit_cells(output.surface(), surface);
-            if let Some(tag) = tag {
-                self.store(tag, output.into_surface());
+        for slot in slots {
+            match slot {
+                Slot::Hit(index) => blit_render(&self.surfaces[index], surface),
+                Slot::Pending(index) => {
+                    let (tag, output) = outputs[index]
+                        .take()
+                        .expect("each prepared render slot must be composed once");
+                    let output = output.into_resolved();
+                    blit_render(&output, surface);
+                    if let Some(tag) = tag {
+                        self.store(tag, output);
+                    }
+                }
             }
         }
     }
 
-    fn lookup(&self, id: CacheId, key: CacheKey, area: Rect) -> Option<&CellSurface> {
-        let &idx = self.index.get(&id)?;
-        let m = &self.meta[idx as usize];
-        (m.key == key && m.area == area).then(|| &self.surfaces[idx as usize])
+    fn lookup_index(&self, id: CacheId, key: CacheKey, area: Rect) -> Option<usize> {
+        let &index = self.index.get(&id)?;
+        let meta = &self.meta[index as usize];
+        (meta.key == key && meta.area == area).then_some(index as usize)
     }
 
-    fn store(&mut self, tag: CacheTag, surface: CellSurface) {
+    fn lookup(&self, id: CacheId, key: CacheKey, area: Rect) -> Option<&ResolvedRender> {
+        self.lookup_index(id, key, area)
+            .map(|index| self.surfaces[index].as_ref())
+    }
+
+    fn store(&mut self, tag: CacheTag, surface: ResolvedRender) {
+        self.store_shared(tag, Arc::new(surface));
+    }
+
+    fn store_shared(&mut self, tag: CacheTag, surface: Arc<ResolvedRender>) {
         if let Some(&idx) = self.index.get(&tag.id) {
             let i = idx as usize;
             self.meta[i] = CacheMeta {
@@ -509,9 +831,72 @@ impl CacheStore {
         self.surfaces.push(surface);
         self.index.insert(tag.id, idx);
     }
+
+    fn resolve(
+        &mut self,
+        prepared: PreparedRender,
+        cancellation: &RenderCancellation,
+    ) -> Option<Arc<ResolvedRender>> {
+        let PreparedRender { tag, work } = prepared;
+        if let Some(tag) = tag {
+            if let Some(index) = self.lookup_index(tag.id, tag.key, tag.area) {
+                return Some(Arc::clone(&self.surfaces[index]));
+            }
+            let surface = Arc::new(work.run(cancellation).into_resolved());
+            if cancellation.is_cancelled() {
+                return None;
+            }
+            self.store_shared(tag, Arc::clone(&surface));
+            Some(surface)
+        } else {
+            let surface = Arc::new(work.run(cancellation).into_resolved());
+            (!cancellation.is_cancelled()).then_some(surface)
+        }
+    }
 }
 
-/// Blit one cell surface onto another without style conversion.
+fn blit_render(src: &ResolvedRender, dst: &mut CellSurface) {
+    match src.blend {
+        RenderBlend::Opaque => blit_cells(&src.surface, dst),
+        RenderBlend::Sparse => blit_sparse_cells(&src.surface, dst),
+    }
+}
+
+fn blit_sparse_cells(src: &CellSurface, dst: &mut CellSurface) {
+    let src_area = tui::ratatui::to_helix_rect(*src.area());
+    let dst_area = tui::ratatui::to_helix_rect(*dst.area());
+    let area = src_area.intersection(dst_area);
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+
+    let mut untouched = tui::ratatui::buffer::Cell::default();
+    untouched.set_symbol(SPARSE_CELL_MARKER);
+    let src_w = src.area().width as usize;
+    let dst_w = dst.area().width as usize;
+    let src_x = (area.x - src_area.x) as usize;
+    let src_y = (area.y - src_area.y) as usize;
+    let dst_x = (area.x - dst_area.x) as usize;
+    let dst_y = (area.y - dst_area.y) as usize;
+
+    for row in 0..area.height as usize {
+        let src_start = (src_y + row) * src_w + src_x;
+        let dst_start = (dst_y + row) * dst_w + dst_x;
+        for column in 0..area.width as usize {
+            let source = &src.content[src_start + column];
+            if source == &untouched {
+                continue;
+            }
+            let destination = &mut dst.content[dst_start + column];
+            destination.clone_from(source);
+            if destination.symbol() == SPARSE_CELL_MARKER {
+                destination.set_symbol(" ");
+            }
+        }
+    }
+}
+
+/// Blit one opaque cell surface onto another without style conversion.
 pub fn blit_cells(src: &CellSurface, dst: &mut CellSurface) {
     let src_area = tui::ratatui::to_helix_rect(*src.area());
     let dst_area = tui::ratatui::to_helix_rect(*dst.area());
@@ -539,6 +924,126 @@ pub fn blit_cells(src: &CellSurface, dst: &mut CellSurface) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn render_output_reuse_resets_matching_surface() {
+        let area = Rect::new(0, 0, 2, 1);
+        let mut surface = CellSurface::empty(tui::ratatui::to_ratatui_rect(area));
+        surface[(0, 0)].set_symbol("x");
+
+        let output = RenderOutput::reuse(area, surface);
+
+        assert_eq!(output.surface()[(0, 0)].symbol(), " ");
+        assert_eq!(output.area(), area);
+    }
+
+    #[test]
+    fn render_plan_executes_steps_in_z_order() {
+        let area = Rect::new(0, 0, 1, 1);
+        let mut plan = RenderPlan::seeded(
+            area,
+            CellSurface::empty(tui::ratatui::to_ratatui_rect(area)),
+        );
+        plan.extend([
+            RenderStep::paint("base", |surface, _| {
+                surface[(0, 0)].set_symbol("a");
+            }),
+            RenderStep::paint("overlay", |surface, _| {
+                surface[(0, 0)].set_symbol("b");
+            }),
+        ]);
+
+        let surface = plan.take_seed().unwrap();
+        let result = plan.execute(
+            surface,
+            &mut CacheStore::default(),
+            &RenderCancellation::never(),
+        );
+
+        assert!(result.complete);
+        assert_eq!(result.surface[(0, 0)].symbol(), "b");
+    }
+
+    #[test]
+    fn render_plan_stops_before_a_superseded_step() {
+        let area = Rect::new(0, 0, 1, 1);
+        let mut plan = RenderPlan::seeded(
+            area,
+            CellSurface::empty(tui::ratatui::to_ratatui_rect(area)),
+        );
+        plan.extend([
+            RenderStep::paint("base", |surface, cancellation| {
+                surface[(0, 0)].set_symbol("a");
+                cancellation.latest.store(2, Ordering::Release);
+            }),
+            RenderStep::paint("overlay", |surface, _| {
+                surface[(0, 0)].set_symbol("b");
+            }),
+        ]);
+        let cancellation = RenderCancellation::for_sequence(Arc::new(AtomicU64::new(1)), 1);
+
+        let surface = plan.take_seed().unwrap();
+        let result = plan.execute(surface, &mut CacheStore::default(), &cancellation);
+
+        assert!(!result.complete);
+        assert_eq!(result.surface[(0, 0)].symbol(), "a");
+    }
+
+    #[test]
+    fn stateful_render_steps_reuse_actor_owned_state_and_return_metadata() {
+        #[derive(Default)]
+        struct Counter(u8);
+
+        let area = Rect::new(0, 0, 1, 1);
+        let state_id = CacheId::hashed(&"stateful-render-test");
+        let mut store = CacheStore::default();
+
+        for expected in [1, 2] {
+            let mut plan = RenderPlan::seeded(
+                area,
+                CellSurface::empty(tui::ratatui::to_ratatui_rect(area)),
+            );
+            plan.extend([RenderStep::stateful(
+                "stateful",
+                move |surface, store, metadata, _cancellation| {
+                    let counter = store.domain_mut::<Counter>(state_id);
+                    counter.0 += 1;
+                    surface[(0, 0)].set_symbol(&counter.0.to_string());
+                    metadata.set_cursor(Some((counter.0 as u16, 0)), CursorKind::Block);
+                },
+            )]);
+
+            let surface = plan.take_seed().unwrap();
+            let result = plan.execute(surface, &mut store, &RenderCancellation::never());
+
+            assert!(result.complete);
+            assert_eq!(result.surface[(0, 0)].symbol(), expected.to_string());
+            assert_eq!(
+                result.metadata.cursor_override(),
+                Some(RenderCursor {
+                    position: Some((expected as u16, 0)),
+                    kind: CursorKind::Block,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn actor_owned_state_domains_evict_least_recently_used_entries() {
+        let mut store = CacheStore::default();
+        let ids = (0..=CacheStore::DOMAIN_CAPACITY)
+            .map(|index| CacheId::hashed(&("domain", index)))
+            .collect::<Vec<_>>();
+
+        for (index, id) in ids.iter().copied().enumerate() {
+            *store.domain_mut::<usize>(id) = index;
+        }
+
+        assert_eq!(store.domains.len(), CacheStore::DOMAIN_CAPACITY);
+        assert_eq!(store.domain_order.len(), CacheStore::DOMAIN_CAPACITY);
+        assert!(!store.domains.contains_key(&ids[0]));
+        assert!(store.domains.contains_key(ids.last().unwrap()));
+    }
 
     fn render_char(ch: char, area: Rect) -> RenderOutput {
         let mut output = RenderOutput::new(area);
@@ -586,7 +1091,7 @@ mod tests {
             area,
         };
 
-        let prepared = PreparedRender::snapshot(tag, 'z', move |ch| {
+        let prepared = PreparedRender::snapshot(tag, 'z', move |ch, _cancellation| {
             let mut output = RenderOutput::new(area);
             let symbol = ch.to_string();
             output.surface_mut()[(0, 0)].set_symbol(&symbol);
@@ -595,6 +1100,35 @@ mod tests {
 
         assert_eq!(store.compose(prepared, &mut surface), CacheState::Miss);
         assert_eq!(surface[(0, 0)].symbol(), "z");
+    }
+
+    #[test]
+    fn cache_batch_preserves_order_across_misses_and_hits() {
+        let area = Rect::new(0, 0, 1, 1);
+        let mut store = CacheStore::default();
+        let tag = CacheTag {
+            id: CacheId::hashed(&"top"),
+            key: CacheKey::hashed(&1_u8),
+            area,
+        };
+        let mut surface = CellSurface::empty(tui::ratatui::to_ratatui_rect(area));
+        assert_eq!(
+            store.compose(
+                PreparedRender::cached(tag, render_char('b', area)),
+                &mut surface,
+            ),
+            CacheState::Miss,
+        );
+
+        store.compose_batch(
+            [
+                PreparedRender::ready(render_char('a', area)),
+                PreparedRender::cached(tag, render_char('x', area)),
+            ],
+            &mut surface,
+        );
+
+        assert_eq!(surface[(0, 0)].symbol(), "b");
     }
 
     #[test]
@@ -608,7 +1142,7 @@ mod tests {
             area,
         };
 
-        let prepared = PreparedRender::snapshot(tag, 'q', move |ch| {
+        let prepared = PreparedRender::snapshot(tag, 'q', move |ch, _cancellation| {
             let mut output = RenderOutput::new(area);
             let symbol = ch.to_string();
             output.surface_mut()[(0, 0)].set_symbol(&symbol);
@@ -648,6 +1182,113 @@ mod tests {
             CacheState::Hit
         );
         assert_eq!(surface[(0, 0)].symbol(), "a");
+    }
+
+    #[test]
+    fn sparse_render_only_replaces_cells_that_were_painted() {
+        let area = Rect::new(0, 0, 2, 1);
+        let mut destination = CellSurface::empty(tui::ratatui::to_ratatui_rect(area));
+        destination[(0, 0)]
+            .set_symbol("a")
+            .set_fg(tui::ratatui::style::Color::Red);
+        destination[(1, 0)].set_symbol("b");
+        let mut patch = RenderOutput::sparse(area);
+        patch.surface_mut()[(1, 0)]
+            .set_symbol("x")
+            .set_fg(tui::ratatui::style::Color::Green);
+
+        blit_render(&patch.into_resolved(), &mut destination);
+
+        assert_eq!(destination[(0, 0)].symbol(), "a");
+        assert_eq!(destination[(0, 0)].fg, tui::ratatui::style::Color::Red);
+        assert_eq!(destination[(1, 0)].symbol(), "x");
+        assert_eq!(destination[(1, 0)].fg, tui::ratatui::style::Color::Green);
+    }
+
+    #[test]
+    fn sparse_style_only_paint_clears_the_underlying_symbol() {
+        let area = Rect::new(0, 0, 1, 1);
+        let mut destination = CellSurface::empty(tui::ratatui::to_ratatui_rect(area));
+        destination[(0, 0)].set_symbol("a");
+        let mut patch = RenderOutput::sparse(area);
+        patch.surface_mut()[(0, 0)].set_bg(tui::ratatui::style::Color::Blue);
+
+        blit_render(&patch.into_resolved(), &mut destination);
+
+        assert_eq!(destination[(0, 0)].symbol(), " ");
+        assert_eq!(destination[(0, 0)].bg, tui::ratatui::style::Color::Blue);
+    }
+
+    #[test]
+    fn cancelled_cache_miss_is_neither_stored_nor_composed() {
+        let area = Rect::new(0, 0, 1, 1);
+        let tag = CacheTag {
+            id: CacheId::hashed(&"cancelled"),
+            key: CacheKey::hashed(&1_u8),
+            area,
+        };
+        let latest = Arc::new(AtomicU64::new(1));
+        let cancellation = RenderCancellation::for_sequence(Arc::clone(&latest), 1);
+        let prepared = PreparedRender::snapshot(tag, (), move |(), cancellation| {
+            cancellation.latest.store(2, Ordering::Release);
+            render_char('x', area)
+        });
+        let mut seed = CellSurface::empty(tui::ratatui::to_ratatui_rect(area));
+        seed[(0, 0)].set_symbol("a");
+        let mut plan = RenderPlan::seeded(area, seed);
+        plan.extend([RenderStep::prepared("cancelled", vec![prepared]).unwrap()]);
+        let surface = plan.take_seed().unwrap();
+        let mut cache = CacheStore::default();
+
+        let result = plan.execute(surface, &mut cache, &cancellation);
+
+        assert!(!result.complete);
+        assert_eq!(result.surface[(0, 0)].symbol(), "a");
+        assert!(cache.lookup(tag.id, tag.key, tag.area).is_none());
+    }
+
+    #[test]
+    fn render_plan_retires_cache_slots_absent_from_the_frame() {
+        let area = Rect::new(0, 0, 1, 1);
+        let first = CacheTag {
+            id: CacheId::hashed(&"first"),
+            key: CacheKey::hashed(&1_u8),
+            area,
+        };
+        let retired = CacheTag {
+            id: CacheId::hashed(&"retired"),
+            key: CacheKey::hashed(&1_u8),
+            area,
+        };
+        let mut cache = CacheStore::default();
+        let mut surface = CellSurface::empty(tui::ratatui::to_ratatui_rect(area));
+        cache.compose(
+            PreparedRender::cached(first, render_char('a', area)),
+            &mut surface,
+        );
+        cache.compose(
+            PreparedRender::cached(retired, render_char('b', area)),
+            &mut surface,
+        );
+        let mut plan = RenderPlan::seeded(
+            area,
+            CellSurface::empty(tui::ratatui::to_ratatui_rect(area)),
+        );
+        plan.extend([RenderStep::prepared(
+            "first",
+            vec![PreparedRender::cached(first, render_char('x', area))],
+        )
+        .unwrap()]);
+        let surface = plan.take_seed().unwrap();
+
+        let result = plan.execute(surface, &mut cache, &RenderCancellation::never());
+
+        assert!(result.complete);
+        assert_eq!(cache.meta.len(), 1);
+        assert!(cache.lookup(first.id, first.key, first.area).is_some());
+        assert!(cache
+            .lookup(retired.id, retired.key, retired.area)
+            .is_none());
     }
 
     #[test]

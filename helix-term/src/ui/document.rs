@@ -7,6 +7,7 @@ use helix_core::doc_formatter::{
     HorizontalLineSeekResult, TextFormat,
 };
 use helix_core::graphemes::Grapheme;
+use helix_core::indent::IndentStyle;
 use helix_core::str_utils::char_to_byte_idx;
 use helix_core::syntax::{self, HighlightEvent, Highlighter, OverlayHighlights};
 use helix_core::text_annotations::TextAnnotations;
@@ -15,22 +16,102 @@ use helix_core::{
     visual_offset_from_block_with_metrics, Position, RopeSlice, VisualBlockOffsetSeekKind,
 };
 use helix_stdx::rope::RopeSliceExt;
-use helix_view::editor::{WhitespaceConfig, WhitespaceRenderValue};
+use helix_view::editor::{IndentGuidesConfig, WhitespaceConfig, WhitespaceRenderValue};
 use helix_view::graphics::Rect;
 use helix_view::theme::Style;
 use helix_view::view::{RenderSeed, ViewPosition};
 use helix_view::{Document, Theme};
 
+use crate::render::RenderCancellation;
 use crate::ui::text_decorations::DecorationManager;
 use crate::widgets::AnchoredText;
 
-/// Input to the document renderer: either a live tree-sitter highlighter
-/// or cached syntax styles from a previous frame.
-pub enum HighlighterInput<'a> {
-    /// Live highlighter — runs tree-sitter queries. Output is recorded for caching.
+/// Owned syntax-paint inputs for one document viewport.
+///
+/// The syntax tree, loader, and cached styles use shared immutable ownership, so
+/// constructing the short-lived highlighter can happen inside the render job.
+#[derive(Clone)]
+pub struct SyntaxRenderSnapshot(SyntaxRenderSource);
+
+#[derive(Clone)]
+enum SyntaxRenderSource {
+    Plain,
+    Live {
+        syntax: Arc<syntax::Syntax>,
+        loader: Arc<syntax::Loader>,
+        byte_range: std::ops::Range<u32>,
+    },
+    Cached(Arc<[helix_view::view::SyntaxStyleEntry]>),
+}
+
+impl SyntaxRenderSnapshot {
+    pub fn plain() -> Self {
+        Self(SyntaxRenderSource::Plain)
+    }
+
+    pub fn live(
+        syntax: Option<Arc<syntax::Syntax>>,
+        loader: Arc<syntax::Loader>,
+        byte_range: std::ops::Range<usize>,
+    ) -> Self {
+        let Some(syntax) = syntax else {
+            return Self::plain();
+        };
+        let end = byte_range.end.min(u32::MAX as usize) as u32;
+        let start = (byte_range.start.min(u32::MAX as usize) as u32).min(end);
+        Self(SyntaxRenderSource::Live {
+            syntax,
+            loader,
+            byte_range: start..end,
+        })
+    }
+
+    pub fn cached(entries: Arc<[helix_view::view::SyntaxStyleEntry]>) -> Self {
+        Self(SyntaxRenderSource::Cached(entries))
+    }
+}
+
+enum HighlighterInput<'a> {
     Live(Option<Highlighter<'a>>),
-    /// Cached styles — replays pre-computed styles. No tree-sitter queries.
     Cached(&'a [helix_view::view::SyntaxStyleEntry]),
+}
+
+/// Owned text-paint inputs for one document viewport.
+///
+/// The Rope clone shares immutable chunks with the foreground document. The
+/// remaining fields are compact formatting values, so this snapshot can cross
+/// the render-actor boundary without retaining `&Document` or editor config
+/// guards.
+#[derive(Clone)]
+pub struct DocumentRenderSnapshot {
+    text: helix_core::Rope,
+    text_format: TextFormat,
+    whitespace: WhitespaceConfig,
+    indent_guides: IndentGuidesConfig,
+    tab_width: usize,
+    indent_style: IndentStyle,
+}
+
+impl DocumentRenderSnapshot {
+    pub fn new(doc: &Document, viewport_width: u16, theme: Option<&Theme>) -> Self {
+        let config = doc.config.load();
+        Self {
+            text: doc.text().clone(),
+            text_format: doc.text_format(viewport_width, theme),
+            whitespace: config.whitespace.clone(),
+            indent_guides: config.indent_guides.clone(),
+            tab_width: doc.tab_width(),
+            indent_style: doc.indent_style(),
+        }
+    }
+
+    pub fn text(&self) -> &helix_core::Rope {
+        &self.text
+    }
+
+    pub fn text_format(&self) -> &TextFormat {
+        &self.text_format
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
@@ -51,6 +132,7 @@ pub struct RenderOutput {
     pub syntax_styles: Vec<helix_view::view::SyntaxStyleEntry>,
     pub line_map: helix_view::view::LineMap,
     pub metrics: RenderMetrics,
+    pub cursor_position: Option<Position>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -64,42 +146,62 @@ pub struct RenderMetrics {
 pub fn render_document(
     surface: &mut crate::render::CellSurface,
     viewport: Rect,
-    doc: &Document,
+    document: &DocumentRenderSnapshot,
     offset: ViewPosition,
     doc_annotations: &TextAnnotations,
-    highlighter_input: HighlighterInput<'_>,
+    syntax: SyntaxRenderSnapshot,
     overlay_highlights: Vec<syntax::OverlayHighlights>,
     theme: &Theme,
     decorations: DecorationManager,
     dirty_rows: Option<&std::collections::HashSet<u16>>,
     seed: Option<RenderSeed>,
     seed_line_map: Option<&helix_view::view::LineMap>,
+    cancellation: &RenderCancellation,
 ) -> RenderOutput {
     let mut renderer = TextRenderer::new(
         surface,
-        doc,
+        document,
         theme,
         Position::new(offset.vertical_offset, offset.horizontal_offset),
         viewport,
     );
-    render_text(
-        &mut renderer,
-        doc.text().slice(..),
-        offset.anchor,
-        &doc.text_format(viewport.width, Some(theme)),
-        doc_annotations,
-        highlighter_input,
-        overlay_highlights,
-        theme,
-        decorations,
-        dirty_rows,
-        seed,
-        seed_line_map,
-    )
+    let text = document.text.slice(..);
+    let render = |renderer: &mut TextRenderer, highlighter_input| {
+        render_text(
+            renderer,
+            text,
+            offset.anchor,
+            &document.text_format,
+            doc_annotations,
+            highlighter_input,
+            overlay_highlights,
+            theme,
+            decorations,
+            dirty_rows,
+            seed,
+            seed_line_map,
+            cancellation,
+        )
+    };
+
+    match syntax.0 {
+        SyntaxRenderSource::Plain => render(&mut renderer, HighlighterInput::Live(None)),
+        SyntaxRenderSource::Live {
+            syntax,
+            loader,
+            byte_range,
+        } => {
+            let highlighter = syntax.highlighter(text, &loader, byte_range);
+            render(&mut renderer, HighlighterInput::Live(Some(highlighter)))
+        }
+        SyntaxRenderSource::Cached(entries) => {
+            render(&mut renderer, HighlighterInput::Cached(&entries))
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn render_text(
+fn render_text(
     renderer: &mut TextRenderer,
     text: RopeSlice<'_>,
     anchor: usize,
@@ -112,6 +214,7 @@ pub fn render_text(
     dirty_rows: Option<&std::collections::HashSet<u16>>,
     seed: Option<RenderSeed>,
     seed_line_map: Option<&helix_view::view::LineMap>,
+    cancellation: &RenderCancellation,
 ) -> RenderOutput {
     use helix_view::view::{HorizontalCheckpoint, LineMap, VisualLineInfo};
 
@@ -293,7 +396,12 @@ pub fn render_text(
     let mut line_map_lines: Vec<VisualLineInfo> = Vec::new();
 
     let mut pending_grapheme: Option<FormattedGrapheme<'_>> = None;
+    let mut cancellation_counter = 0usize;
     'render: loop {
+        if cancellation_counter.is_multiple_of(256) && cancellation.is_cancelled() {
+            break;
+        }
+        cancellation_counter = cancellation_counter.wrapping_add(1);
         let next_start = Instant::now();
         let Some(mut grapheme) = pending_grapheme.take().or_else(|| formatter.next()) else {
             break;
@@ -837,6 +945,7 @@ pub fn render_text(
         )
     });
 
+    let cursor_position = decorations.cursor_position();
     RenderOutput {
         syntax_styles: syntax_highlighter.take_recorded_styles(),
         line_map: LineMap {
@@ -847,6 +956,7 @@ pub fn render_text(
             skip_right_syntax_advances,
             skip_right_eof_fast_paths,
         },
+        cursor_position,
     }
 }
 
@@ -877,18 +987,17 @@ pub struct GraphemeStyle {
 impl<'a> TextRenderer<'a> {
     pub fn new(
         surface: &'a mut crate::render::CellSurface,
-        doc: &Document,
+        document: &DocumentRenderSnapshot,
         theme: &Theme,
         offset: Position,
         viewport: Rect,
     ) -> TextRenderer<'a> {
-        let editor_config = doc.config.load();
         let WhitespaceConfig {
             render: ws_render,
             characters: ws_chars,
-        } = &editor_config.whitespace;
+        } = &document.whitespace;
 
-        let tab_width = doc.tab_width();
+        let tab_width = document.tab_width;
         let tab = if ws_render.tab() == WhitespaceRenderValue::All {
             std::iter::once(ws_chars.tab)
                 .chain(std::iter::repeat_n(ws_chars.tabpad, tab_width - 1))
@@ -921,11 +1030,11 @@ impl<'a> TextRenderer<'a> {
 
         let text_style = theme.get("ui.text");
 
-        let indent_width = doc.indent_style().indent_width(tab_width) as u16;
+        let indent_width = document.indent_style.indent_width(tab_width) as u16;
 
         TextRenderer {
             surface,
-            indent_guide_char: editor_config.indent_guides.character.into(),
+            indent_guide_char: document.indent_guides.character.into(),
             newline,
             nbsp,
             nnbsp,
@@ -936,14 +1045,14 @@ impl<'a> TextRenderer<'a> {
             indent_width,
             starting_indent: offset.col / indent_width as usize
                 + !offset.col.is_multiple_of(indent_width as usize) as usize
-                + editor_config.indent_guides.skip_levels as usize,
+                + document.indent_guides.skip_levels as usize,
             indent_guide_style: text_style.patch(
                 theme
                     .try_get("ui.virtual.indent-guide")
                     .unwrap_or_else(|| theme.get("ui.virtual.whitespace")),
             ),
             text_style,
-            draw_indent_guides: editor_config.indent_guides.render,
+            draw_indent_guides: document.indent_guides.render,
             viewport,
             offset,
         }
@@ -1378,20 +1487,23 @@ mod tests {
         let doc = test_doc(&giant_two_line_fixture(32 * 1024));
         let viewport = Rect::new(0, 0, 160, 61);
         let mut surface = Surface::empty(tui::ratatui::to_ratatui_rect(viewport));
+        let theme = Theme::default();
+        let document = DocumentRenderSnapshot::new(&doc, viewport.width, Some(&theme));
 
         let output = render_document(
             &mut surface,
             viewport,
-            &doc,
+            &document,
             ViewPosition::default(),
             &TextAnnotations::default(),
-            HighlighterInput::Live(None),
+            SyntaxRenderSnapshot::plain(),
             Vec::new(),
-            &Theme::default(),
+            &theme,
             DecorationManager::default(),
             None,
             None,
             None,
+            &RenderCancellation::never(),
         );
 
         assert!(!output.line_map.lines.is_empty());
@@ -1410,20 +1522,23 @@ mod tests {
             .collect::<Vec<_>>();
         let viewport = Rect::new(0, 0, 80, 10);
         let mut surface = Surface::empty(tui::ratatui::to_ratatui_rect(viewport));
+        let theme = Theme::default();
+        let document = DocumentRenderSnapshot::new(&doc, viewport.width, Some(&theme));
 
         let output = render_document(
             &mut surface,
             viewport,
-            &doc,
+            &document,
             ViewPosition::default(),
             &TextAnnotations::default(),
-            HighlighterInput::Cached(&syntax_entries),
+            SyntaxRenderSnapshot::cached(Arc::from(syntax_entries)),
             Vec::new(),
-            &Theme::default(),
+            &theme,
             DecorationManager::default(),
             None,
             None,
             None,
+            &RenderCancellation::never(),
         );
 
         assert_eq!(output.metrics.skip_right_eof_fast_paths, 1);
@@ -1451,20 +1566,23 @@ mod tests {
         let viewport = Rect::new(0, 0, 160, 61);
         let mut surface = Surface::empty(tui::ratatui::to_ratatui_rect(viewport));
         let start = std::time::Instant::now();
+        let theme = Theme::default();
+        let document = DocumentRenderSnapshot::new(&doc, viewport.width, Some(&theme));
 
         let output = render_document(
             &mut surface,
             viewport,
-            &doc,
+            &document,
             ViewPosition::default(),
             &TextAnnotations::default(),
-            HighlighterInput::Live(None),
+            SyntaxRenderSnapshot::plain(),
             Vec::new(),
-            &Theme::default(),
+            &theme,
             DecorationManager::default(),
             None,
             None,
             None,
+            &RenderCancellation::never(),
         );
 
         eprintln!(
@@ -1512,19 +1630,22 @@ mod tests {
         for offset in offsets {
             let mut surface = Surface::empty(tui::ratatui::to_ratatui_rect(viewport));
             let start = std::time::Instant::now();
+            let theme = Theme::default();
+            let document = DocumentRenderSnapshot::new(&doc, viewport.width, Some(&theme));
             let output = render_document(
                 &mut surface,
                 viewport,
-                &doc,
+                &document,
                 offset,
                 &TextAnnotations::default(),
-                HighlighterInput::Live(None),
+                SyntaxRenderSnapshot::plain(),
                 Vec::new(),
-                &Theme::default(),
+                &theme,
                 DecorationManager::default(),
                 None,
                 None,
                 None,
+                &RenderCancellation::never(),
             );
             eprintln!(
                 "render_document_giant_line_horizontal_offsets_repro: h_offset={} elapsed_us={} mapped_lines={}",

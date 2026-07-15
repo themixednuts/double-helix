@@ -78,6 +78,7 @@ use std::cmp::{max, min, Ordering};
 use std::fmt;
 use std::iter::once;
 use std::ops;
+use std::sync::Arc;
 
 use helix_stdx::rope::RopeSliceExt;
 
@@ -726,23 +727,48 @@ impl FoldContainer {
     }
 }
 
+#[derive(Debug, Clone)]
+pub(super) enum FoldContainerStorage<'a> {
+    Borrowed(&'a FoldContainer),
+    Shared(Arc<FoldContainer>),
+}
+
+impl FoldContainerStorage<'_> {
+    fn as_ref(&self) -> &FoldContainer {
+        match self {
+            Self::Borrowed(container) => container,
+            Self::Shared(container) => container,
+        }
+    }
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct FoldAnnotations<'a> {
-    pub(super) container: Option<&'a FoldContainer>,
+    pub(super) container: Option<FoldContainerStorage<'a>>,
     pub(super) current_index: Cell<isize>,
 }
 
 impl<'a> FoldAnnotations<'a> {
     pub fn new(container: Option<&'a FoldContainer>) -> Self {
         Self {
-            container,
+            container: container.map(FoldContainerStorage::Borrowed),
+            current_index: Cell::new(0),
+        }
+    }
+
+    pub fn shared(container: Option<Arc<FoldContainer>>) -> Self {
+        Self {
+            container: container.map(FoldContainerStorage::Shared),
             current_index: Cell::new(0),
         }
     }
 
     /// `None` when container is empty.
-    pub fn container(&self) -> Option<&'a FoldContainer> {
-        self.container.filter(|container| !container.is_empty())
+    pub fn container(&self) -> Option<&FoldContainer> {
+        self.container
+            .as_ref()
+            .map(FoldContainerStorage::as_ref)
+            .filter(|container| !container.is_empty())
     }
 
     pub fn reset_pos(&self, idx: usize, mut get_idx: impl FnMut(Fold) -> usize) {
@@ -781,7 +807,7 @@ impl<'a> FoldAnnotations<'a> {
         &self,
         idx: usize,
         mut get_idx: impl FnMut(Fold) -> usize,
-    ) -> Option<Fold<'a>> {
+    ) -> Option<Fold<'_>> {
         let container = self.container()?;
         let current_index: usize = self.current_index.get().try_into().ok()?;
         let fold = container

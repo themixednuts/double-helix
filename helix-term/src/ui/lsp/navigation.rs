@@ -1,14 +1,10 @@
 //! LSP goto / jump (compositor + editor). Ingress types: [`crate::runtime::ui::command::LspLocation`].
 
-use std::path::Path;
-
-use helix_core::Selection;
-use helix_lsp::util::lsp_range_to_range;
 use helix_lsp::{lsp, OffsetEncoding};
 use helix_stdx::env;
 use helix_view::editor::Action;
 use helix_view::view::push_jump;
-use helix_view::{align_view, Align, Editor};
+use helix_view::Editor;
 
 use crate::compositor::Compositor;
 use crate::runtime::ui::command::LspLocation;
@@ -41,7 +37,13 @@ pub(crate) fn location_to_file_location(location: &LspLocation) -> Option<FileLo
     Some((path.into(), line))
 }
 
-pub(crate) fn jump_to_location(editor: &mut Editor, location: &LspLocation, action: Action) {
+pub(crate) fn jump_to_location(
+    editor: &mut Editor,
+    ingress: &crate::runtime::RuntimeIngress,
+    foreground: &crate::runtime::ForegroundEvents,
+    location: &LspLocation,
+    action: Action,
+) {
     let (view_id, doc) = focused!(editor);
     let view = view_mut!(editor, view_id);
     push_jump(view, doc);
@@ -51,42 +53,27 @@ pub(crate) fn jump_to_location(editor: &mut Editor, location: &LspLocation, acti
         editor.set_error(err);
         return;
     };
-    jump_to_position(
+    crate::runtime::ui::document::queue_document_open(
         editor,
-        path,
-        location.range,
-        location.offset_encoding,
-        action,
+        ingress,
+        foreground,
+        crate::runtime::DocumentOpenRequest {
+            path: path.to_path_buf(),
+            action,
+            lane: crate::runtime::DocumentOpenLane::Navigation,
+            target: crate::runtime::DocumentOpenTarget::View(view_id),
+            selection: crate::runtime::DocumentOpenSelection::LspRange {
+                range: location.range,
+                offset_encoding: location.offset_encoding,
+            },
+            alignment: crate::runtime::DocumentOpenAlignment::CenterIfAction,
+            default_folding_if_new: false,
+            fff_record: None,
+            external_if_binary: None,
+            post_action: crate::runtime::DocumentOpenPostAction::None,
+            completion: crate::runtime::DocumentOpenCompletionTarget::Editor,
+        },
     );
-}
-
-fn jump_to_position(
-    editor: &mut Editor,
-    path: &Path,
-    range: lsp::Range,
-    offset_encoding: OffsetEncoding,
-    action: Action,
-) {
-    let doc = match editor.open(path, action) {
-        Ok(id) => doc_mut!(editor, &id),
-        Err(err) => {
-            let err = format!("failed to open path: {:?}: {:?}", path, err);
-            editor.set_error(err);
-            return;
-        }
-    };
-    let view = view_mut!(editor);
-    let new_range = if let Some(new_range) = lsp_range_to_range(doc.text(), range, offset_encoding)
-    {
-        new_range
-    } else {
-        log::warn!("lsp position out of bounds - {:?}", range);
-        return;
-    };
-    doc.set_selection(view.id, Selection::single(new_range.head, new_range.anchor));
-    if action.align_view(view, doc.id()) {
-        align_view(doc, view, Align::Center);
-    }
 }
 
 /// Picker or single-file jump. Call only when `locations` is non-empty, or rely on [`crate::runtime::ui::apply`] empty handling for [`crate::runtime::ui::command::LspCommand::Goto`].
@@ -94,13 +81,14 @@ pub(crate) fn goto_locations(
     editor: &mut Editor,
     compositor: &mut Compositor,
     ingress: crate::runtime::RuntimeIngress,
+    foreground: &crate::runtime::ForegroundEvents,
     locations: Vec<LspLocation>,
 ) {
     let cwdir = env::current_working_dir();
 
     match locations.as_slice() {
         [location] => {
-            jump_to_location(editor, location, Action::Replace);
+            jump_to_location(editor, &ingress, foreground, location, Action::Replace);
         }
         [] => {}
         _ => {
@@ -125,7 +113,7 @@ pub(crate) fn goto_locations(
                 crate::ui::PickerRuntime::new(editor),
                 ingress,
                 |cx: &mut crate::compositor::Context, location, action| {
-                    jump_to_location(cx.editor, location, action);
+                    jump_to_location(cx.editor, &cx.ingress, &cx.foreground, location, action);
                 },
             )
             .with_preview(|_editor, location| location_to_file_location(location));

@@ -112,6 +112,11 @@ impl FileBoundState {
         self.last_saved_time
     }
 
+    pub(crate) fn apply_disk_state(&mut self, last_saved_time: SystemTime, readonly: bool) {
+        self.last_saved_time = last_saved_time;
+        self.readonly = readonly;
+    }
+
     pub fn detect_readonly(&mut self) {
         self.readonly = match self.path() {
             None => false,

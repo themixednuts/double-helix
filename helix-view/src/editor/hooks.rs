@@ -25,6 +25,11 @@ type LanguageServerInitializedHook = Arc<
 >;
 type LanguageServerExitedHook =
     Arc<dyn for<'a> Fn(&mut events::LanguageServerExited<'a>) -> anyhow::Result<()> + Send + Sync>;
+type DocumentLanguageServersChangeHook = Arc<
+    dyn for<'a> Fn(&mut events::DocumentLanguageServersDidChange<'a>) -> anyhow::Result<()>
+        + Send
+        + Sync,
+>;
 type ConfigChangeHook =
     Arc<dyn for<'a> Fn(&mut events::ConfigDidChange<'a>) -> anyhow::Result<()> + Send + Sync>;
 
@@ -39,6 +44,7 @@ pub struct LifecycleBus {
     document_focus_lost: RwLock<Vec<DocumentFocusLostHook>>,
     language_server_initialized: RwLock<Vec<LanguageServerInitializedHook>>,
     language_server_exited: RwLock<Vec<LanguageServerExitedHook>>,
+    document_language_servers_change: RwLock<Vec<DocumentLanguageServersChangeHook>>,
     config_change: RwLock<Vec<ConfigChangeHook>>,
     error_reporter: RwLock<Option<ErrorReporter>>,
 }
@@ -147,6 +153,18 @@ impl LifecycleBus {
         self.language_server_exited.write().push(Arc::new(hook));
     }
 
+    pub fn on_document_language_servers_change(
+        &self,
+        hook: impl for<'a> Fn(&mut events::DocumentLanguageServersDidChange<'a>) -> anyhow::Result<()>
+            + Send
+            + Sync
+            + 'static,
+    ) {
+        self.document_language_servers_change
+            .write()
+            .push(Arc::new(hook));
+    }
+
     pub fn on_config_change(
         &self,
         hook: impl for<'a> Fn(&mut events::ConfigDidChange<'a>) -> anyhow::Result<()>
@@ -228,6 +246,17 @@ impl LifecycleBus {
         for hook in self.language_server_exited.read().iter() {
             if let Err(err) = hook(event) {
                 self.report_hook_error("language_server_exited", err);
+            }
+        }
+    }
+
+    pub fn dispatch_document_language_servers_change(
+        &self,
+        event: &mut events::DocumentLanguageServersDidChange<'_>,
+    ) {
+        for hook in self.document_language_servers_change.read().iter() {
+            if let Err(err) = hook(event) {
+                self.report_hook_error("document_language_servers_change", err);
             }
         }
     }

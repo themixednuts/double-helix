@@ -52,6 +52,11 @@ impl<T> std::fmt::Debug for Receiver<T> {
 }
 
 impl<T> Sender<T> {
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.inner.is_closed()
+    }
+
     pub async fn send(&self, value: T) -> Result<(), Closed<T>> {
         self.inner.send(value).await.map_err(|err| Closed(err.0))
     }
@@ -98,11 +103,13 @@ mod tests {
         let rt = RuntimeTest::default();
         let (tx, mut rx) = channel(1);
         tx.try_send(1).unwrap();
+        assert!(!tx.is_closed());
         assert!(matches!(tx.try_send(2), Err(TrySend::Full(2))));
         rt.block_on(async {
             assert_eq!(rx.recv().await, Some(1));
         });
         drop(rx);
+        assert!(tx.is_closed());
         assert!(matches!(tx.try_send(3), Err(TrySend::Closed(3))));
     }
 }

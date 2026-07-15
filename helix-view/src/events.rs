@@ -53,6 +53,11 @@ pub struct LanguageServerExited<'a> {
     pub server_id: LanguageServerId,
 }
 
+pub struct DocumentLanguageServersDidChange<'a> {
+    pub editor: &'a mut Editor,
+    pub doc: DocumentId,
+}
+
 pub struct ConfigDidChange<'a> {
     pub editor: &'a mut Editor,
     pub old: &'a Config,

@@ -3,20 +3,18 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
-use crate::assistant::{context, thread};
+use crate::{
+    assistant::{context, thread},
+    theme::Style,
+};
 
 /// Picker render state — a snapshot of the visible window.
 ///
-/// This is a **render-ready, theme-independent** snapshot. The Picker<T,D> controller
-/// in helix-term writes this after each tick. Frontends read it and apply their own
-/// theme styles. Highlight indices tell the renderer which graphemes to emphasize
-/// (fuzzy match positions); the renderer maps those to the current theme.
-///
-/// **Why text + highlights, not styled spans?**
-/// Styled spans would bake in the current theme. If the theme changes, every snapshot
-/// is stale. Storing raw text + highlight positions lets any frontend (terminal, GUI,
-/// headless test) apply its own styling without re-computing the match.
+/// The controller publishes this after each nonblocking matcher tick. Visible rows
+/// retain their semantic styles and fuzzy-match indices so every frontend consumes
+/// the same complete projection instead of formatting generic picker items again.
 #[derive(Debug, Clone, Default)]
 pub struct PickerModel {
     /// Current query string.
@@ -29,12 +27,18 @@ pub struct PickerModel {
     pub total_items: usize,
     /// Whether the matcher or injector is still processing items.
     pub is_running: bool,
+    /// Whether rows can be marked for a multi-selection action.
+    pub markable: bool,
     /// Column headers. Empty for single-column pickers.
-    pub headers: Box<[PickerColumnHeader]>,
+    pub headers: Arc<[PickerColumnHeader]>,
     /// Which column header is "active" (cursor is in that query field). `None` for primary.
     pub active_column: Option<usize>,
+    /// Stable column widths, one per visible column.
+    pub widths: Arc<[u16]>,
+    /// Whether overflowing cell content is truncated from the start.
+    pub truncate_start: bool,
     /// The visible window of items — already paginated by the controller.
-    pub visible_items: Box<[PickerRow]>,
+    pub visible_items: Arc<[PickerRow]>,
     /// Preview for the currently selected item.
     pub preview: Option<PickerPreview>,
     /// Whether preview pane is enabled.
@@ -51,7 +55,8 @@ pub struct PickerColumnHeader {
 #[derive(Debug, Clone)]
 pub struct PickerRow {
     /// One cell per visible column.
-    pub cells: Box<[PickerCell]>,
+    pub cells: Arc<[PickerCell]>,
+    pub marked: bool,
     /// Metadata for action dispatch when this row is selected.
     pub data: PickerItemData,
 }
@@ -59,11 +64,17 @@ pub struct PickerRow {
 /// A single cell in a picker row (one column's content).
 #[derive(Debug, Clone)]
 pub struct PickerCell {
-    /// Plain text content (what the column format function produced).
-    pub text: String,
+    /// Styled source spans produced by the picker column formatter.
+    pub spans: Arc<[PickerSpan]>,
     /// Grapheme indices that should receive fuzzy-match highlighting.
     /// Sorted, deduplicated. The renderer maps these to the theme's highlight style.
-    pub highlight_indices: Box<[u32]>,
+    pub highlight_indices: Arc<[u32]>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PickerSpan {
+    pub text: String,
+    pub style: Style,
 }
 
 /// Type-specific metadata for picker items. Adding a new picker variant = one variant here.
@@ -145,7 +156,11 @@ pub struct AssistantModel {
     /// Active thread id.
     pub active_thread: Option<thread::Id>,
     /// Chat history entries in display order.
-    pub entries: Vec<AssistantEntry>,
+    pub entries: Arc<[AssistantEntry]>,
+    /// Monotonic revision of the active thread's message content.
+    pub content_revision: u64,
+    /// Thought entry currently receiving streamed thought updates.
+    pub active_thought: Option<thread::EntryId>,
     /// Panel viewport scroll offset (0 = showing newest at bottom).
     pub viewport_scroll: u16,
     /// Maximum panel viewport scroll value (total content height - visible height).
@@ -165,6 +180,8 @@ pub struct AssistantModel {
     pub mode_name: Option<String>,
     /// Active assistant model label.
     pub model_label: Option<String>,
+    /// Active assistant thinking level label.
+    pub thinking_label: Option<String>,
     /// Active assistant profile label.
     pub active_profile: Option<String>,
     /// Local active thread rating/note.
@@ -310,6 +327,12 @@ impl AssistantModel {
                 label: model_label.clone(),
             });
         }
+        if let Some(thinking_label) = &self.thinking_label {
+            items.push(AssistantStatusItem {
+                kind: AssistantStatusItemKind::Thinking,
+                label: format!("· thinking {thinking_label}"),
+            });
+        }
         if let Some(follow_label) = self.follow_label() {
             items.push(AssistantStatusItem {
                 kind: AssistantStatusItemKind::Follow,
@@ -322,21 +345,52 @@ impl AssistantModel {
             kind: AssistantStatusItemKind::Review,
             label: format!("· {}", self.review_mode.label()),
         });
+        if self.usage.context_used_tokens > 0 || self.usage.context_window_tokens > 0 {
+            items.push(AssistantStatusItem {
+                kind: AssistantStatusItemKind::Usage,
+                label: format!(
+                    "{} / {} tok",
+                    compact_count(self.usage.context_used_tokens),
+                    compact_count(self.usage.context_window_tokens)
+                ),
+            });
+        } else {
+            let total_tokens = self
+                .usage
+                .total_input_tokens
+                .saturating_add(self.usage.total_output_tokens);
+            let last_tokens = self
+                .usage
+                .input_tokens
+                .saturating_add(self.usage.output_tokens);
+            if total_tokens > 0 || last_tokens > 0 {
+                items.push(AssistantStatusItem {
+                    kind: AssistantStatusItemKind::Usage,
+                    label: format!(
+                        "{} tok · last {}",
+                        compact_count(total_tokens),
+                        compact_count(last_tokens)
+                    ),
+                });
+            }
+        }
         items
     }
 
     #[must_use]
     pub fn has_running_activity(&self) -> bool {
-        self.entries.iter().any(|entry| {
-            matches!(
-                &entry.kind,
-                AssistantEntryKind::ToolCall { status, .. } if status == "running"
-            )
-        }) || self.plan_items().is_some_and(|items| {
-            items
-                .iter()
-                .any(|item| item.status == AssistantPlanStatus::InProgress)
-        })
+        self.agent_busy
+            || self.entries.iter().any(|entry| {
+                matches!(
+                    &entry.kind,
+                    AssistantEntryKind::ToolCall { status, .. } if status == "running"
+                )
+            })
+            || self.plan_items().is_some_and(|items| {
+                items
+                    .iter()
+                    .any(|item| item.status == AssistantPlanStatus::InProgress)
+            })
     }
 
     #[must_use]
@@ -382,70 +436,10 @@ impl AssistantModel {
             }
         }
 
-        let mut trailing = Vec::new();
-        trailing.push(AssistantHeaderItem {
-            label: match self.focus() {
-                thread::Focus::Input => " INPUT ".to_string(),
-                thread::Focus::Messages => " MESSAGES ".to_string(),
-            },
-            tone: AssistantHeaderTone::Active,
-        });
-        for item in self.status_items().into_iter().filter(|item| {
-            matches!(
-                item.kind,
-                AssistantStatusItemKind::Mode
-                    | AssistantStatusItemKind::Model
-                    | AssistantStatusItemKind::Review
-            )
-        }) {
-            trailing.push(AssistantHeaderItem {
-                label: item.label,
-                tone: AssistantHeaderTone::Default,
-            });
+        AssistantHeaderModel {
+            leading,
+            trailing: Vec::new(),
         }
-        if let Some(profile) = &self.active_profile {
-            trailing.push(AssistantHeaderItem {
-                label: format!("profile {profile}"),
-                tone: AssistantHeaderTone::Default,
-            });
-        }
-        if let Some(feedback) = self.feedback_label() {
-            trailing.push(AssistantHeaderItem {
-                label: feedback,
-                tone: AssistantHeaderTone::Default,
-            });
-        }
-        if let Some(status) = &self.agent_status {
-            trailing.push(AssistantHeaderItem {
-                label: status.clone(),
-                tone: AssistantHeaderTone::Warning,
-            });
-        } else if self.agent_busy {
-            trailing.push(AssistantHeaderItem {
-                label: "working".to_string(),
-                tone: AssistantHeaderTone::Warning,
-            });
-        }
-        let total_tokens = self
-            .usage
-            .total_input_tokens
-            .saturating_add(self.usage.total_output_tokens);
-        let last_tokens = self
-            .usage
-            .input_tokens
-            .saturating_add(self.usage.output_tokens);
-        if total_tokens > 0 || last_tokens > 0 {
-            trailing.push(AssistantHeaderItem {
-                label: format!(
-                    "{} tok · last {}",
-                    compact_count(total_tokens),
-                    compact_count(last_tokens)
-                ),
-                tone: AssistantHeaderTone::Default,
-            });
-        }
-
-        AssistantHeaderModel { leading, trailing }
     }
 
     #[must_use]
@@ -509,8 +503,10 @@ pub struct AssistantContextItem {
 pub enum AssistantStatusItemKind {
     Mode,
     Model,
+    Thinking,
     Follow,
     Review,
+    Usage,
 }
 
 #[derive(Debug, Clone)]
@@ -977,15 +973,22 @@ impl AssistantEntry {
                     text: text.clone(),
                 })
             }
-            AssistantEntryKind::Thought(text) => AssistantEntryDisplay::Plain(AssistantEntryRow {
-                leading: " … ".to_string(),
-                leading_tone: AssistantEntryTone::Inactive,
-                animate_leading: false,
-                body: format!("thinking... {}", Self::summary(text, 96)),
-                body_tone: AssistantEntryTone::Inactive,
-                accessory: None,
-                accessory_tone: AssistantEntryTone::Default,
-            }),
+            AssistantEntryKind::Thought(text) => {
+                let summary = Self::thought_summary(text, 96);
+                AssistantEntryDisplay::Plain(AssistantEntryRow {
+                    leading: "   ".to_string(),
+                    leading_tone: AssistantEntryTone::Inactive,
+                    animate_leading: true,
+                    body: if summary.is_empty() {
+                        "thinking".to_string()
+                    } else {
+                        format!("thinking · {summary}")
+                    },
+                    body_tone: AssistantEntryTone::Inactive,
+                    accessory: None,
+                    accessory_tone: AssistantEntryTone::Default,
+                })
+            }
             AssistantEntryKind::ToolCall { .. }
             | AssistantEntryKind::Status(_)
             | AssistantEntryKind::ChangeSummary { .. }
@@ -1027,6 +1030,14 @@ impl AssistantEntry {
             .chain(std::iter::once('…'))
             .collect()
     }
+
+    fn thought_summary(text: &str, max: usize) -> String {
+        let cleaned = text
+            .chars()
+            .filter(|ch| !matches!(ch, '*' | '`'))
+            .collect::<String>();
+        Self::summary(cleaned.trim(), max)
+    }
 }
 
 /// A plan/task item displayed in the assistant panel.
@@ -1064,5 +1075,37 @@ impl AssistantPlanStatus {
             Self::Completed => " ● ",
             Self::Failed => " ✕ ",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn assistant_header_is_title_only() {
+        let model = AssistantModel {
+            agent_name: "Agent".to_string(),
+            focus: Some(thread::Focus::Input),
+            mode_name: Some("write".to_string()),
+            model_label: Some("GPT-5.5".to_string()),
+            thinking_label: Some("high".to_string()),
+            usage: thread::Usage {
+                total_input_tokens: 10,
+                input_tokens: 4,
+                ..thread::Usage::default()
+            },
+            ..AssistantModel::default()
+        };
+
+        let header = model.header();
+
+        assert_eq!(header.leading.len(), 1);
+        assert_eq!(header.leading[0].label, "Agent");
+        assert!(header.trailing.is_empty());
+        assert!(model
+            .status_items()
+            .iter()
+            .any(|item| item.kind == AssistantStatusItemKind::Usage));
     }
 }

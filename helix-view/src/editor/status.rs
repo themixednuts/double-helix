@@ -1,5 +1,5 @@
 use crate::theme::Theme;
-use std::borrow::Cow;
+use std::{borrow::Cow, sync::Arc};
 use tokio::time::{Duration, Instant};
 
 use super::{Editor, NotificationStyle, PopupBorderConfig, Severity};
@@ -10,6 +10,67 @@ pub struct WorkspaceDiagnosticCounts {
     pub info: u32,
     pub warnings: u32,
     pub errors: u32,
+}
+
+impl WorkspaceDiagnosticCounts {
+    pub fn total(self) -> u32 {
+        self.hints
+            .saturating_add(self.info)
+            .saturating_add(self.warnings)
+            .saturating_add(self.errors)
+    }
+
+    pub(crate) fn from_diagnostics<'a>(
+        diagnostics: impl IntoIterator<Item = &'a helix_lsp::lsp::Diagnostic>,
+    ) -> Self {
+        let mut counts = Self::default();
+        for diagnostic in diagnostics {
+            counts.increment(diagnostic);
+        }
+        counts
+    }
+
+    pub(crate) fn increment(&mut self, diagnostic: &helix_lsp::lsp::Diagnostic) {
+        match diagnostic.severity {
+            Some(helix_lsp::lsp::DiagnosticSeverity::WARNING) => {
+                self.warnings = self.warnings.saturating_add(1)
+            }
+            Some(helix_lsp::lsp::DiagnosticSeverity::ERROR) => {
+                self.errors = self.errors.saturating_add(1)
+            }
+            Some(helix_lsp::lsp::DiagnosticSeverity::INFORMATION) => {
+                self.info = self.info.saturating_add(1)
+            }
+            Some(helix_lsp::lsp::DiagnosticSeverity::HINT) | None => {
+                self.hints = self.hints.saturating_add(1)
+            }
+            Some(_) => self.hints = self.hints.saturating_add(1),
+        }
+    }
+
+    pub(crate) fn replace(&mut self, previous: Self, replacement: Self) {
+        debug_assert!(self.hints >= previous.hints);
+        debug_assert!(self.info >= previous.info);
+        debug_assert!(self.warnings >= previous.warnings);
+        debug_assert!(self.errors >= previous.errors);
+
+        self.hints = self
+            .hints
+            .saturating_sub(previous.hints)
+            .saturating_add(replacement.hints);
+        self.info = self
+            .info
+            .saturating_sub(previous.info)
+            .saturating_add(replacement.info);
+        self.warnings = self
+            .warnings
+            .saturating_sub(previous.warnings)
+            .saturating_add(replacement.warnings);
+        self.errors = self
+            .errors
+            .saturating_sub(previous.errors)
+            .saturating_add(replacement.errors);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -42,21 +103,8 @@ impl Notification {
     }
 
     pub fn is_expired(&self) -> bool {
-        if let Some(timeout) = self.timeout {
-            let elapsed = self.timestamp.elapsed();
-            let expired = elapsed >= timeout;
-            if expired {
-                log::warn!(
-                    "Notification {} expired: elapsed={:?}, timeout={:?}",
-                    self.id,
-                    elapsed,
-                    timeout
-                );
-            }
-            expired
-        } else {
-            false
-        }
+        self.timeout
+            .is_some_and(|timeout| self.timestamp.elapsed() >= timeout)
     }
 
     pub fn dismiss(&mut self) {
@@ -153,6 +201,70 @@ impl Editor {
         self.workspace_diagnostic_counts
     }
 
+    pub fn diagnostics_revision(&self) -> u64 {
+        self.diagnostics_revision
+    }
+
+    pub fn workspace_diagnostic_summaries(
+        &self,
+    ) -> impl Iterator<Item = (&helix_core::Uri, WorkspaceDiagnosticCounts)> {
+        self.diagnostic_summaries
+            .iter()
+            .map(|(uri, summary)| (uri, *summary))
+    }
+
+    pub fn workspace_diagnostic_path_summary(
+        &self,
+        path: &std::path::Path,
+    ) -> Option<WorkspaceDiagnosticCounts> {
+        self.diagnostic_path_summaries.get(path).copied()
+    }
+
+    pub fn workspace_diagnostic_path_summaries_under<'a>(
+        &'a self,
+        root: &'a std::path::Path,
+    ) -> impl Iterator<Item = (&'a std::path::Path, WorkspaceDiagnosticCounts)> {
+        let start = root.to_path_buf();
+        self.diagnostic_path_summaries
+            .range(start..)
+            .take_while(move |(path, _)| path.starts_with(root))
+            .map(|(path, summary)| (path.as_path(), *summary))
+    }
+
+    pub(crate) fn replace_workspace_diagnostic_summary(
+        &mut self,
+        uri: &helix_core::Uri,
+        previous: WorkspaceDiagnosticCounts,
+        replacement: WorkspaceDiagnosticCounts,
+    ) {
+        let summary_empty = {
+            let summary = self.diagnostic_summaries.entry(uri.clone()).or_default();
+            summary.replace(previous, replacement);
+            summary.total() == 0
+        };
+        if summary_empty {
+            self.diagnostic_summaries.remove(uri);
+        }
+
+        let Some(path) = uri.as_path() else {
+            return;
+        };
+        let path = path.to_path_buf();
+        for ancestor in path.ancestors() {
+            let remove = {
+                let summary = self
+                    .diagnostic_path_summaries
+                    .entry(ancestor.to_path_buf())
+                    .or_default();
+                summary.replace(previous, replacement);
+                summary.total() == 0
+            };
+            if remove {
+                self.diagnostic_path_summaries.remove(ancestor);
+            }
+        }
+    }
+
     pub fn document_diagnostics(
         &self,
         uri: &helix_core::Uri,
@@ -160,11 +272,25 @@ impl Editor {
         helix_lsp::lsp::Diagnostic,
         helix_core::diagnostic::DiagnosticProvider,
     )> {
-        self.diagnostics.get(uri).cloned().unwrap_or_default()
+        self.diagnostics
+            .get(uri)
+            .map(|diagnostics| diagnostics.as_ref().clone())
+            .unwrap_or_default()
     }
 
-    pub fn diagnostics_snapshot(&self) -> super::types::Diagnostics {
-        self.diagnostics.clone()
+    pub fn diagnostics_snapshot(
+        &self,
+    ) -> std::collections::BTreeMap<
+        helix_core::Uri,
+        Vec<(
+            helix_lsp::lsp::Diagnostic,
+            helix_core::diagnostic::DiagnosticProvider,
+        )>,
+    > {
+        self.diagnostics
+            .iter()
+            .map(|(uri, diagnostics)| (uri.clone(), diagnostics.as_ref().clone()))
+            .collect()
     }
 
     pub fn clear_status(&mut self) {
@@ -355,7 +481,7 @@ impl Editor {
 
     pub fn unset_theme_preview(&mut self) {
         if let Some(last_theme) = self.last_theme.take() {
-            self.set_theme(last_theme);
+            self.set_theme_arc(last_theme, ThemeAction::Set);
         }
     }
 
@@ -378,17 +504,33 @@ impl Editor {
         });
 
         self.frontend.assistant_panel_theme =
-            theme_name.and_then(|name| self.theme_loader.load(&name).ok());
+            theme_name.and_then(|name| self.theme_loader.load(&name).ok().map(Arc::new));
+        self.theme_generation = self.theme_generation.wrapping_add(1);
     }
 
     pub fn assistant_theme(&self) -> &Theme {
         self.frontend
             .assistant_panel_theme
             .as_ref()
-            .unwrap_or(&self.theme)
+            .map_or(self.theme.as_ref(), Arc::as_ref)
+    }
+
+    pub fn theme_arc(&self) -> Arc<Theme> {
+        Arc::clone(&self.theme)
+    }
+
+    pub fn assistant_theme_arc(&self) -> Arc<Theme> {
+        self.frontend
+            .assistant_panel_theme
+            .as_ref()
+            .map_or_else(|| Arc::clone(&self.theme), Arc::clone)
     }
 
     fn set_theme_impl(&mut self, theme: Theme, preview: ThemeAction) {
+        self.set_theme_arc(Arc::new(theme), preview);
+    }
+
+    fn set_theme_arc(&mut self, theme: Arc<Theme>, preview: ThemeAction) {
         if theme.find_highlight_exact("ui.selection").is_none() {
             self.set_error("Invalid theme: `ui.selection` required");
             return;
@@ -407,6 +549,8 @@ impl Editor {
                 self.theme = theme;
             }
         }
+
+        self.theme_generation = self.theme_generation.wrapping_add(1);
 
         self._refresh();
     }

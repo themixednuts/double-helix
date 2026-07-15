@@ -3,7 +3,10 @@
     reason = "LSP feature tests stay near the helper functions they cover in this large effect module"
 )]
 
-use std::{collections::HashSet, time::Duration};
+use std::{
+    collections::HashSet,
+    time::{Duration, Instant},
+};
 
 use futures_util::{
     stream::{FuturesOrdered, FuturesUnordered},
@@ -26,10 +29,15 @@ use helix_view::{
         DocumentCodeLenses, DocumentColorSwatches, DocumentInlineValues, DocumentLink,
         DocumentLinks, DocumentSemanticTokenUpdate, InlineCompletionGhost,
     },
+    editor::{Action, Config},
     handlers::lsp::{SignatureHelpInvoked, SignatureHelpRequestId},
     DocumentId, Editor, Theme, ViewId,
 };
 
+use crate::handlers::diagnostics::{
+    PullDiagnosticsPriority, PullDiagnosticsRequestOutcome, PullDiagnosticsResponse,
+    PullDiagnosticsTarget,
+};
 use crate::runtime::{
     ingress::{send_task_event_with, send_ui_command_with},
     ui::command::LspCodeActionItem,
@@ -41,138 +49,141 @@ const INLINE_VALUE_LIMIT: usize = 128;
 const INLINE_VALUE_EVALUATE_LIMIT: usize = 16;
 const SEMANTIC_TOKENS_FULL_LINE_LIMIT: usize = 10_000;
 
-pub(crate) fn request_document_diagnostics_for_language_servers(
-    editor: &mut Editor,
-    doc_id: DocumentId,
-    language_servers: HashSet<LanguageServerId>,
-    ingress: crate::runtime::RuntimeIngress,
-) {
-    let Some(doc) = editor.document_mut(doc_id) else {
-        return;
-    };
-
-    let cancel = doc.restart_pull_diagnostics();
-
-    let mut futures: FuturesUnordered<_> = language_servers
-        .iter()
-        .filter_map(|server_id| {
-            doc.language_servers()
-                .find(|server| &server.id() == server_id)
-        })
-        .filter_map(|language_server| {
-            let future = language_server.text_document_diagnostic(
-                doc.identifier(),
-                doc.previous_diagnostic_id().map(ToOwned::to_owned),
-            )?;
-
-            let identifier = language_server
-                .capabilities()
-                .diagnostic_provider
-                .as_ref()
-                .and_then(|diagnostic_provider| match diagnostic_provider {
-                    lsp::DiagnosticServerCapabilities::Options(options) => {
-                        options.identifier.clone()
-                    }
-                    lsp::DiagnosticServerCapabilities::RegistrationOptions(options) => {
-                        options.diagnostic_options.identifier.clone()
-                    }
-                });
-
-            let provider = DiagnosticProvider::Lsp {
-                server_id: language_server.id(),
-                identifier,
-            };
-            let uri = doc.uri()?;
-
-            Some(async move {
-                let result = future.await;
-                (result, provider, uri)
-            })
-        })
-        .collect();
-
-    if futures.is_empty() {
-        return;
-    }
-
-    editor
-        .runtime()
-        .work()
-        .clone()
-        .spawn(async move {
-            let mut retry_language_servers = HashSet::new();
-            loop {
-                let next = tokio::select! {
-                    _ = cancel.canceled() => return,
-                    next = futures.next() => next,
-                };
-                match next {
-                    Some((Ok(result), provider, uri)) => {
-                        send_task_event_with(
-                            RuntimeTaskEvent::PullDiagnosticsResponse {
-                                doc_id,
-                                uri,
-                                provider,
-                                result,
-                            },
-                            ingress.clone(),
-                        )
-                        .await;
-                    }
-                    Some((Err(err), DiagnosticProvider::Lsp { server_id, .. }, _)) => {
-                        let parsed_cancellation_data = if let helix_lsp::Error::Rpc(error) = err {
-                            error.data.and_then(|data| {
-                                serde_json::from_value::<lsp::DiagnosticServerCancellationData>(
-                                    data,
-                                )
-                                .ok()
-                            })
-                        } else {
-                            log::error!("Pull diagnostic request failed: {err}");
-                            continue;
-                        };
-                        if parsed_cancellation_data.is_some_and(|data| data.retrigger_request) {
-                            retry_language_servers.insert(server_id);
-                        }
-                    }
-                    None => break,
-                }
-            }
-
-            if !retry_language_servers.is_empty() {
-                tokio::select! {
-                    _ = cancel.canceled() => return,
-                    _ = tokio::time::sleep(Duration::from_millis(500)) => {}
-                }
-
-                send_task_event_with(
-                    RuntimeTaskEvent::RetryPullDiagnostics {
-                        doc_id,
-                        language_servers: retry_language_servers,
-                    },
-                    ingress,
-                )
-                .await;
-            }
-        })
-        .detach();
+fn folding_ranges_are_needed(config: &Config) -> bool {
+    config.lsp.folding && config.fold_on_open
 }
 
-pub(crate) fn request_document_diagnostics(
+pub(crate) fn queue_document_diagnostics(
     editor: &mut Editor,
-    doc_id: DocumentId,
+    document_ids: impl IntoIterator<Item = DocumentId>,
+    language_servers: Option<&HashSet<LanguageServerId>>,
     ingress: crate::runtime::RuntimeIngress,
 ) {
-    let Some(doc) = editor.document(doc_id) else {
+    queue_document_diagnostics_with_priority(
+        editor,
+        document_ids,
+        language_servers,
+        PullDiagnosticsPriority::Interactive,
+        ingress,
+    );
+}
+
+fn queue_document_diagnostics_with_priority(
+    editor: &mut Editor,
+    document_ids: impl IntoIterator<Item = DocumentId>,
+    language_servers: Option<&HashSet<LanguageServerId>>,
+    priority: PullDiagnosticsPriority,
+    ingress: crate::runtime::RuntimeIngress,
+) {
+    let mut targets = Vec::new();
+    for document_id in document_ids {
+        let Some(doc) = editor.document_mut(document_id) else {
+            continue;
+        };
+        let version = doc.version();
+        let Some(uri) = doc.uri() else {
+            continue;
+        };
+        let mut seen = HashSet::new();
+        let server_ids = doc
+            .language_servers_with_feature(LanguageServerFeature::PullDiagnostics)
+            .map(|server| server.id())
+            .filter(|server_id| {
+                seen.insert(*server_id)
+                    && language_servers.is_none_or(|servers| servers.contains(server_id))
+            })
+            .collect::<Vec<_>>();
+
+        for server_id in server_ids {
+            targets.push(PullDiagnosticsTarget {
+                server_id,
+                document_id,
+                generation: doc.next_pull_diagnostics_generation(server_id),
+                version,
+                uri: uri.clone(),
+                priority,
+            });
+        }
+    }
+    ingress.schedule_pull_diagnostics(targets);
+}
+
+pub(crate) fn queue_document_diagnostics_for_language_servers(
+    editor: &mut Editor,
+    document_ids: impl IntoIterator<Item = DocumentId>,
+    language_servers: &HashSet<LanguageServerId>,
+    ingress: crate::runtime::RuntimeIngress,
+) {
+    queue_document_diagnostics_with_priority(
+        editor,
+        document_ids,
+        Some(language_servers),
+        PullDiagnosticsPriority::Background,
+        ingress,
+    );
+}
+
+pub(crate) fn start_pull_diagnostics_request(
+    editor: &mut Editor,
+    target: PullDiagnosticsTarget,
+    cancel: helix_runtime::Token,
+    ingress: crate::runtime::RuntimeIngress,
+) {
+    let work = editor.runtime().work().clone();
+    let request = editor.document(target.document_id).and_then(|doc| {
+        if doc.version() != target.version
+            || !doc.is_current_pull_diagnostics(target.server_id, target.generation)
+            || doc.uri().as_ref() != Some(&target.uri)
+        {
+            return None;
+        }
+
+        let language_server = doc
+            .language_servers_with_feature(LanguageServerFeature::PullDiagnostics)
+            .find(|server| server.id() == target.server_id)?;
+        let future = language_server.text_document_diagnostic(
+            doc.identifier(),
+            doc.previous_diagnostic_id(target.server_id)
+                .map(ToOwned::to_owned),
+        )?;
+        let identifier = language_server
+            .capabilities()
+            .diagnostic_provider
+            .as_ref()
+            .and_then(|diagnostic_provider| match diagnostic_provider {
+                lsp::DiagnosticServerCapabilities::Options(options) => options.identifier.clone(),
+                lsp::DiagnosticServerCapabilities::RegistrationOptions(options) => {
+                    options.diagnostic_options.identifier.clone()
+                }
+            });
+        let provider = DiagnosticProvider::Lsp {
+            server_id: target.server_id,
+            identifier,
+        };
+        Some((future, provider, target.uri.clone()))
+    });
+
+    let Some((future, provider, uri)) = request else {
+        ingress.finish_pull_diagnostics_now(target, PullDiagnosticsRequestOutcome::Abandoned);
         return;
     };
 
-    let language_servers = doc
-        .language_servers_with_feature(LanguageServerFeature::PullDiagnostics)
-        .map(|language_server| language_server.id())
-        .collect();
-
-    request_document_diagnostics_for_language_servers(editor, doc_id, language_servers, ingress);
+    work.spawn(async move {
+        let outcome = tokio::select! {
+            biased;
+            _ = cancel.canceled() => PullDiagnosticsRequestOutcome::Abandoned,
+            result = future => match result {
+                Ok(result) => PullDiagnosticsRequestOutcome::Response(PullDiagnosticsResponse {
+                    result,
+                    provider,
+                    uri,
+                }),
+                Err(error) => PullDiagnosticsRequestOutcome::Failed(error),
+            },
+        };
+        ingress.finish_pull_diagnostics(target, outcome).await;
+    })
+    .detach();
 }
 
 pub(crate) fn request_document_colors(
@@ -189,6 +200,7 @@ pub(crate) fn request_document_colors(
     };
 
     let cancel = doc.restart_color_swatches();
+    let expected_version = doc.version();
 
     let mut seen_language_servers = HashSet::new();
     let mut futures: FuturesOrdered<_> = doc
@@ -243,6 +255,8 @@ pub(crate) fn request_document_colors(
             send_task_event_with(
                 RuntimeTaskEvent::AttachDocumentColors {
                     doc_id,
+                    expected_version,
+                    request: cancel,
                     colors: all_colors,
                 },
                 ingress,
@@ -264,6 +278,7 @@ pub(crate) fn request_code_lenses(
         return;
     };
     let cancel = doc.restart_code_lenses();
+    let expected_version = doc.version();
     let mut seen_language_servers = HashSet::new();
     let mut futures: FuturesOrdered<_> = doc
         .language_servers_with_feature(LanguageServerFeature::CodeLens)
@@ -310,7 +325,12 @@ pub(crate) fn request_code_lenses(
                 }
             }
             send_task_event_with(
-                RuntimeTaskEvent::ApplyCodeLenses { doc_id, lenses },
+                RuntimeTaskEvent::ApplyCodeLenses {
+                    doc_id,
+                    expected_version,
+                    request: cancel,
+                    lenses,
+                },
                 ingress,
             )
             .await;
@@ -330,6 +350,7 @@ pub(crate) fn request_document_links(
         return;
     };
     let cancel = doc.restart_document_links();
+    let expected_version = doc.version();
     let mut seen_language_servers = HashSet::new();
     let mut futures: FuturesOrdered<_> = doc
         .language_servers_with_feature(LanguageServerFeature::DocumentLinks)
@@ -376,7 +397,12 @@ pub(crate) fn request_document_links(
                 }
             }
             send_task_event_with(
-                RuntimeTaskEvent::ApplyDocumentLinks { doc_id, links },
+                RuntimeTaskEvent::ApplyDocumentLinks {
+                    doc_id,
+                    expected_version,
+                    request: cancel,
+                    links,
+                },
                 ingress,
             )
             .await;
@@ -551,6 +577,7 @@ pub(crate) fn request_semantic_tokens(
                             RuntimeTaskEvent::ApplySemanticTokens {
                                 doc_id,
                                 server_id,
+                                request: cancel.clone(),
                                 tokens: DocumentSemanticTokenUpdate {
                                     version,
                                     result_id,
@@ -591,13 +618,16 @@ pub(crate) fn request_folding_ranges(
     doc_id: DocumentId,
     ingress: crate::runtime::RuntimeIngress,
 ) {
-    if !editor.config().lsp.folding {
+    if !folding_ranges_are_needed(&editor.config()) {
         return;
     }
+    let block = editor.runtime().block().clone();
     let Some(doc) = editor.document_mut(doc_id) else {
         return;
     };
     let cancel = doc.restart_folding_ranges();
+    let expected_version = doc.version();
+    let text = doc.text().clone();
     let mut seen_language_servers = HashSet::new();
     let mut futures: FuturesOrdered<_> = doc
         .language_servers_with_feature(LanguageServerFeature::FoldingRange)
@@ -643,8 +673,43 @@ pub(crate) fn request_folding_ranges(
                     None => break,
                 }
             }
+            let range_count = ranges.len();
+            let build_start = Instant::now();
+            let build = block.spawn(move || {
+                let points = ranges
+                    .iter()
+                    .filter_map(|(_, offset_encoding, range)| {
+                        folding_range_to_fold(&text, *offset_encoding, range)
+                    })
+                    .collect::<Vec<_>>();
+                FoldContainer::from(text.slice(..), points)
+            });
+            let folds = tokio::select! {
+                _ = cancel.canceled() => return,
+                result = build => match result {
+                    Ok(folds) => folds,
+                    Err(err) => {
+                        log::error!("folding range preparation failed: {err}");
+                        return;
+                    }
+                }
+            };
+            let build_elapsed = build_start.elapsed();
+            if build_elapsed >= Duration::from_millis(8) {
+                log::info!(
+                    "lsp_folding phase=prepare_slow ranges={} folds={} elapsed_us={}",
+                    range_count,
+                    folds.len(),
+                    build_elapsed.as_micros(),
+                );
+            }
             send_task_event_with(
-                RuntimeTaskEvent::ApplyFoldingRanges { doc_id, ranges },
+                RuntimeTaskEvent::ApplyFoldingRanges {
+                    doc_id,
+                    expected_version,
+                    request: cancel,
+                    folds,
+                },
                 ingress,
             )
             .await;
@@ -769,10 +834,133 @@ pub(crate) fn apply_execute_lsp_command(
         .detach();
 }
 
+pub(crate) fn apply_resolved_code_lens(
+    editor: &mut Editor,
+    doc_id: DocumentId,
+    expected_version: i32,
+    server_id: LanguageServerId,
+    original: lsp::CodeLens,
+    resolved: lsp::CodeLens,
+    foreground: &crate::runtime::ForegroundEvents,
+) {
+    let current = editor.document_mut(doc_id).is_some_and(|doc| {
+        if doc.version() != expected_version {
+            return false;
+        }
+        let Some(code_lenses) = doc.code_lenses_mut() else {
+            return false;
+        };
+        let Some(stored) = code_lenses
+            .lenses
+            .iter_mut()
+            .find(|stored| stored.server_id == server_id && stored.lens == original)
+        else {
+            return false;
+        };
+        stored.lens = resolved.clone();
+        stored.resolved = true;
+        true
+    });
+    if !current {
+        editor.set_status("Code lens changed before it resolved");
+        return;
+    }
+
+    let Some(command) = resolved.command else {
+        editor.set_error("Code lens did not resolve to a command");
+        return;
+    };
+    if let Err(error) = foreground.task(RuntimeTaskEvent::ExecuteLspCommand { command, server_id })
+    {
+        editor.set_error(error.to_string());
+    }
+}
+
+pub(crate) fn apply_resolved_document_link(
+    editor: &mut Editor,
+    doc_id: DocumentId,
+    expected_version: i32,
+    target: lsp::Url,
+    action: Action,
+    ingress: crate::runtime::RuntimeIngress,
+    foreground: &crate::runtime::ForegroundEvents,
+) {
+    if editor
+        .document(doc_id)
+        .is_none_or(|doc| doc.version() != expected_version)
+    {
+        editor.set_status("Document link changed before it resolved");
+        return;
+    }
+
+    if target.scheme() == "file" {
+        let Ok(uri) = Uri::try_from(target) else {
+            editor.set_error("Document link target is not a valid file URI");
+            return;
+        };
+        let Some(path) = uri.as_path() else {
+            editor.set_error("Document link target is not a local path");
+            return;
+        };
+        let target = editor.focused_view_id();
+        crate::runtime::ui::document::queue_document_open(
+            editor,
+            &ingress,
+            foreground,
+            crate::runtime::DocumentOpenRequest {
+                path: path.to_path_buf(),
+                action,
+                lane: crate::runtime::DocumentOpenLane::Navigation,
+                target: crate::runtime::DocumentOpenTarget::View(target),
+                selection: crate::runtime::DocumentOpenSelection::None,
+                alignment: crate::runtime::DocumentOpenAlignment::None,
+                default_folding_if_new: false,
+                fff_record: None,
+                external_if_binary: None,
+                post_action: crate::runtime::DocumentOpenPostAction::None,
+                completion: crate::runtime::DocumentOpenCompletionTarget::Editor,
+            },
+        );
+    } else {
+        crate::runtime::ingress::spawn_task_event_with_future(
+            editor.work(),
+            crate::open_external_url_task_event(target),
+            ingress,
+        );
+    }
+}
+
+pub(crate) fn apply_rename_edit(
+    editor: &mut Editor,
+    ingress: crate::runtime::RuntimeIngress,
+    doc_id: DocumentId,
+    expected_version: i32,
+    offset_encoding: helix_lsp::OffsetEncoding,
+    workspace_edit: Option<lsp::WorkspaceEdit>,
+) {
+    if editor
+        .document(doc_id)
+        .is_none_or(|doc| doc.version() != expected_version)
+    {
+        editor.set_status("Document changed before rename completed");
+        return;
+    }
+    if let Err(error) = crate::effect::file_operation::apply_workspace_edit(
+        editor,
+        ingress,
+        offset_encoding,
+        &workspace_edit.unwrap_or_default(),
+        None,
+    ) {
+        editor.set_error(format!("Failed to apply rename edits: {}", error.kind));
+    }
+}
+
 pub(crate) fn request_apply_code_action(
     editor: &mut Editor,
     item: LspCodeActionItem,
     ingress: crate::runtime::RuntimeIngress,
+    foreground: &crate::runtime::ForegroundEvents,
 ) {
     let Some(language_server) = editor.language_server_by_id(item.language_server_id) else {
         editor.set_error("Language Server disappeared");
@@ -782,10 +970,12 @@ pub(crate) fn request_apply_code_action(
 
     match item.lsp_item {
         lsp::CodeActionOrCommand::Command(command) => {
-            ingress.task(RuntimeTaskEvent::ExecuteLspCommand {
+            if let Err(error) = foreground.task(RuntimeTaskEvent::ExecuteLspCommand {
                 command,
                 server_id: item.language_server_id,
-            });
+            }) {
+                editor.set_error(error.to_string());
+            }
         }
         lsp::CodeActionOrCommand::CodeAction(code_action) => {
             let server_id = item.language_server_id;
@@ -810,28 +1000,42 @@ pub(crate) fn request_apply_code_action(
                 }
             }
 
-            ingress.task(RuntimeTaskEvent::ApplyCodeAction {
+            if let Err(error) = foreground.task(RuntimeTaskEvent::ApplyCodeAction {
                 offset_encoding,
                 workspace_edit: code_action.edit,
                 command: code_action.command,
                 server_id,
-            });
+            }) {
+                editor.set_error(error.to_string());
+            }
         }
     }
 }
 
 pub(crate) fn apply_code_action(
     editor: &mut Editor,
+    ingress: crate::runtime::RuntimeIngress,
     offset_encoding: helix_lsp::OffsetEncoding,
     workspace_edit: Option<lsp::WorkspaceEdit>,
     command: Option<lsp::Command>,
     server_id: LanguageServerId,
 ) {
     if let Some(workspace_edit) = workspace_edit {
-        let _ = editor.apply_workspace_edit(offset_encoding, &workspace_edit);
-    }
-
-    if let Some(command) = command {
+        let continuation =
+            command.map(
+                |command| helix_view::editor::WorkspaceEditContinuation::ExecuteCommand {
+                    server_id,
+                    command,
+                },
+            );
+        let _ = crate::effect::file_operation::apply_workspace_edit(
+            editor,
+            ingress,
+            offset_encoding,
+            &workspace_edit,
+            continuation,
+        );
+    } else if let Some(command) = command {
         apply_execute_lsp_command(editor, command, server_id);
     }
 }
@@ -889,7 +1093,7 @@ pub(crate) fn apply_inlay_hints(
     }
 
     hints.sort_by_key(|inlay_hint| inlay_hint.position);
-    let lsp_hints = hints
+    let lsp_hints: Vec<DocumentInlayHint> = hints
         .iter()
         .cloned()
         .map(|hint| DocumentInlayHint {
@@ -967,12 +1171,12 @@ pub(crate) fn apply_inlay_hints(
         view_id,
         DocumentInlayHints {
             id,
-            type_inlay_hints,
-            parameter_inlay_hints,
-            other_inlay_hints,
-            padding_before_inlay_hints,
-            padding_after_inlay_hints,
-            lsp_hints,
+            type_inlay_hints: type_inlay_hints.into(),
+            parameter_inlay_hints: parameter_inlay_hints.into(),
+            other_inlay_hints: other_inlay_hints.into(),
+            padding_before_inlay_hints: padding_before_inlay_hints.into(),
+            padding_after_inlay_hints: padding_after_inlay_hints.into(),
+            lsp_hints: lsp_hints.into(),
         },
     );
     doc.clear_inlay_hints_outdated();
@@ -1054,9 +1258,17 @@ fn refresh_code_lens_annotations(editor: &mut Editor, doc_id: DocumentId) {
 pub(crate) fn apply_code_lenses(
     editor: &mut Editor,
     doc_id: DocumentId,
+    expected_version: i32,
+    request: &helix_runtime::Token,
     lenses: Vec<(LanguageServerId, helix_lsp::OffsetEncoding, lsp::CodeLens)>,
 ) {
     if !editor.config().lsp.code_lens {
+        return;
+    }
+    if !editor
+        .document(doc_id)
+        .is_some_and(|doc| doc.version() == expected_version && doc.is_current_code_lenses(request))
+    {
         return;
     }
     let Some(doc) = editor.document_mut(doc_id) else {
@@ -1084,42 +1296,56 @@ pub(crate) fn apply_semantic_tokens(
     editor: &mut Editor,
     doc_id: DocumentId,
     server_id: LanguageServerId,
+    request: &helix_runtime::Token,
     tokens: DocumentSemanticTokenUpdate,
 ) {
     if !editor.config().lsp.semantic_tokens {
         return;
     }
+    if !editor.document(doc_id).is_some_and(|doc| {
+        doc.version() == tokens.version && doc.is_current_semantic_tokens(request)
+    }) {
+        return;
+    }
     let Some(doc) = editor.document_mut(doc_id) else {
         return;
     };
-    if doc.version() != tokens.version {
-        return;
-    }
     doc.set_semantic_token_update(server_id, tokens);
 }
 
 pub(crate) fn apply_inline_completion(
     editor: &mut Editor,
     doc_id: DocumentId,
+    request: &helix_runtime::Token,
     completion: InlineCompletionGhost,
 ) {
     if !editor.config().lsp.inline_completion {
         return;
     }
+    if !editor.document(doc_id).is_some_and(|doc| {
+        doc.version() == completion.version && doc.is_current_inline_completion(request)
+    }) {
+        return;
+    }
     let Some(doc) = editor.document_mut(doc_id) else {
         return;
     };
-    if doc.version() == completion.version {
-        doc.set_inline_completion(completion);
-    }
+    doc.set_inline_completion(completion);
 }
 
 pub(crate) fn apply_inline_values(
     editor: &mut Editor,
     doc_id: DocumentId,
+    expected_version: i32,
+    request: &helix_runtime::Token,
     values: DocumentInlineValues,
 ) {
     if !editor.config().lsp.inline_values {
+        return;
+    }
+    if !editor.document(doc_id).is_some_and(|doc| {
+        doc.version() == expected_version && doc.is_current_inline_values(request)
+    }) {
         return;
     }
     if let Some(doc) = editor.document_mut(doc_id) {
@@ -1209,6 +1435,7 @@ pub(crate) fn request_inline_completion(
                     send_task_event_with(
                         RuntimeTaskEvent::ApplyInlineCompletion {
                             doc_id,
+                            request: cancel,
                             completion: InlineCompletionGhost {
                                 view_id,
                                 version,
@@ -1296,6 +1523,7 @@ pub(crate) fn request_inline_values(
     };
     let frame_id = frame.id;
     let cancel = doc.restart_inline_values();
+    let expected_version = doc.version();
 
     editor
         .runtime()
@@ -1321,7 +1549,11 @@ pub(crate) fn request_inline_values(
                     send_task_event_with(
                         RuntimeTaskEvent::ApplyInlineValues {
                             doc_id,
-                            values: DocumentInlineValues { annotations },
+                            expected_version,
+                            request: cancel,
+                            values: DocumentInlineValues {
+                                annotations: annotations.into(),
+                            },
                         },
                         ingress,
                     )
@@ -1529,12 +1761,19 @@ async fn inline_value_annotations(
 pub(crate) fn apply_document_links(
     editor: &mut Editor,
     doc_id: DocumentId,
+    expected_version: i32,
+    request: &helix_runtime::Token,
     links: Vec<(
         LanguageServerId,
         helix_lsp::OffsetEncoding,
         lsp::DocumentLink,
     )>,
 ) {
+    if !editor.document(doc_id).is_some_and(|doc| {
+        doc.version() == expected_version && doc.is_current_document_links(request)
+    }) {
+        return;
+    }
     let Some(doc) = editor.document_mut(doc_id) else {
         return;
     };
@@ -1608,19 +1847,20 @@ pub(crate) fn folding_range_to_fold(
 pub(crate) fn apply_folding_ranges(
     editor: &mut Editor,
     doc_id: DocumentId,
-    ranges: Vec<(
-        LanguageServerId,
-        helix_lsp::OffsetEncoding,
-        lsp::FoldingRange,
-    )>,
+    expected_version: i32,
+    request: &helix_runtime::Token,
+    folds: FoldContainer,
 ) {
-    if !editor.config().lsp.folding {
+    let config = editor.config();
+    if !folding_ranges_are_needed(&config) {
         return;
     }
-    let fold_on_open = editor.config().fold_on_open;
-    if !fold_on_open {
+    if !editor.document(doc_id).is_some_and(|doc| {
+        doc.version() == expected_version && doc.is_current_folding_ranges(request)
+    }) {
         return;
     }
+    let fold_on_open = config.fold_on_open;
     let view_ids: Vec<_> = editor
         .tree
         .views()
@@ -1629,22 +1869,26 @@ pub(crate) fn apply_folding_ranges(
     let Some(doc) = editor.document_mut(doc_id) else {
         return;
     };
-    let text = doc.text().clone();
-    let points = ranges
-        .iter()
-        .filter_map(|(_, offset_encoding, range)| {
-            folding_range_to_fold(&text, *offset_encoding, range)
+    let target_view_ids = view_ids
+        .into_iter()
+        .filter(|view_id| {
+            should_replace_folds_with_lsp(
+                doc.fold_container(*view_id),
+                doc.is_lsp_fold_container(*view_id),
+                fold_on_open,
+            )
         })
         .collect::<Vec<_>>();
-    for view_id in view_ids {
-        if should_replace_folds_with_lsp(
-            doc.fold_container(view_id),
-            doc.is_lsp_fold_container(view_id),
-            fold_on_open,
-        ) {
-            doc.insert_fold_container(view_id, FoldContainer::from(text.slice(..), points.clone()));
-            doc.mark_lsp_fold_container(view_id);
-        }
+    let target_count = target_view_ids.len();
+    let mut folds = Some(folds);
+    for (index, view_id) in target_view_ids.into_iter().enumerate() {
+        let view_folds = if index + 1 == target_count {
+            folds.take().expect("fold container available")
+        } else {
+            folds.as_ref().expect("fold container available").clone()
+        };
+        doc.insert_fold_container(view_id, view_folds);
+        doc.mark_lsp_fold_container(view_id);
     }
 }
 
@@ -1730,6 +1974,13 @@ mod tests {
         let doc_id = editor.new_file_from_document(Action::VerticalSplit, doc);
         let view_id = editor.tree.focus;
         (editor, doc_id, view_id)
+    }
+
+    fn prepared_folds(text: &str, range: &lsp::FoldingRange) -> FoldContainer {
+        let text = Rope::from(text);
+        let points = folding_range_to_fold(&text, helix_lsp::OffsetEncoding::Utf8, range)
+            .expect("valid folding range");
+        FoldContainer::from(text.slice(..), vec![points])
     }
 
     #[test]
@@ -1829,15 +2080,20 @@ mod tests {
             ..Default::default()
         };
 
+        assert!(!folding_ranges_are_needed(&Config::default()));
+
         let (mut editor, doc_id, view_id) = editor_with_text(text, Config::default());
+        let version = editor.document(doc_id).expect("document").version();
+        let request = editor
+            .document_mut(doc_id)
+            .expect("document")
+            .restart_folding_ranges();
         apply_folding_ranges(
             &mut editor,
             doc_id,
-            vec![(
-                LanguageServerId::default(),
-                helix_lsp::OffsetEncoding::Utf8,
-                range,
-            )],
+            version,
+            &request,
+            prepared_folds(text, &range),
         );
         let doc = editor.document(doc_id).expect("document");
         assert!(doc
@@ -1848,19 +2104,35 @@ mod tests {
             fold_on_open: true,
             ..Default::default()
         };
+        assert!(folding_ranges_are_needed(&config));
         let (mut editor, doc_id, view_id) = editor_with_text(text, config);
+        let version = editor.document(doc_id).expect("document").version();
+        let stale_request = editor
+            .document_mut(doc_id)
+            .expect("document")
+            .restart_folding_ranges();
+        let request = editor
+            .document_mut(doc_id)
+            .expect("document")
+            .restart_folding_ranges();
         apply_folding_ranges(
             &mut editor,
             doc_id,
-            vec![(
-                LanguageServerId::default(),
-                helix_lsp::OffsetEncoding::Utf8,
-                lsp::FoldingRange {
-                    start_line: 0,
-                    end_line: 2,
-                    ..Default::default()
-                },
-            )],
+            version,
+            &stale_request,
+            prepared_folds(text, &range),
+        );
+        assert!(editor
+            .document(doc_id)
+            .expect("document")
+            .fold_container(view_id)
+            .is_none_or(FoldContainer::is_empty));
+        apply_folding_ranges(
+            &mut editor,
+            doc_id,
+            version,
+            &request,
+            prepared_folds(text, &range),
         );
         let doc = editor.document(doc_id).expect("document");
         assert_eq!(doc.fold_container(view_id).map(FoldContainer::len), Some(1));
@@ -1929,11 +2201,84 @@ mod tests {
         };
         assert_eq!(name, "x");
     }
+
+    #[test]
+    fn pull_diagnostics_response_requires_current_identity_and_attachment() {
+        let server_id = LanguageServerId::default();
+        let document_id = DocumentId::default();
+        let uri = Uri::from(std::path::PathBuf::from("pull-diagnostics.rs"));
+        let target = PullDiagnosticsTarget {
+            server_id,
+            document_id,
+            generation: 2,
+            version: 7,
+            uri: uri.clone(),
+            priority: crate::handlers::diagnostics::PullDiagnosticsPriority::Interactive,
+        };
+        let renamed = Uri::from(std::path::PathBuf::from("renamed.rs"));
+
+        assert!(pull_diagnostics_response_is_current(
+            &target,
+            Some(server_id),
+            &uri,
+            7,
+            true,
+            Some(&uri),
+            true,
+        ));
+        assert!(!pull_diagnostics_response_is_current(
+            &target,
+            Some(server_id),
+            &uri,
+            7,
+            false,
+            Some(&uri),
+            true,
+        ));
+        assert!(!pull_diagnostics_response_is_current(
+            &target,
+            Some(server_id),
+            &uri,
+            8,
+            true,
+            Some(&uri),
+            true,
+        ));
+        assert!(!pull_diagnostics_response_is_current(
+            &target,
+            Some(server_id),
+            &uri,
+            7,
+            true,
+            Some(&renamed),
+            true,
+        ));
+        assert!(!pull_diagnostics_response_is_current(
+            &target,
+            Some(server_id),
+            &renamed,
+            7,
+            true,
+            Some(&uri),
+            true,
+        ));
+        assert!(!pull_diagnostics_response_is_current(
+            &target,
+            Some(server_id),
+            &uri,
+            7,
+            true,
+            Some(&uri),
+            false,
+        ));
+    }
 }
 
 pub(crate) fn attach_document_colors(
     editor: &mut Editor,
     doc_id: DocumentId,
+    expected_version: i32,
+    request: &helix_runtime::Token,
     mut doc_colors: Vec<(usize, lsp::Color)>,
 ) {
     let config = editor.config();
@@ -1943,6 +2288,12 @@ pub(crate) fn attach_document_colors(
     }
 
     let color_swatch_string = &config.lsp.color_swatches_string;
+
+    if !editor.document(doc_id).is_some_and(|doc| {
+        doc.version() == expected_version && doc.is_current_color_swatches(request)
+    }) {
+        return;
+    }
 
     let Some(doc) = editor.documents.get_mut(&doc_id) else {
         return;
@@ -1970,9 +2321,9 @@ pub(crate) fn attach_document_colors(
     }
 
     doc.set_color_swatches(DocumentColorSwatches {
-        color_swatches,
-        colors,
-        color_swatches_padding,
+        color_swatches: color_swatches.into(),
+        colors: colors.into(),
+        color_swatches_padding: color_swatches_padding.into(),
     });
 }
 
@@ -1981,30 +2332,111 @@ pub(crate) fn apply_pull_diagnostics_response(
     result: lsp::DocumentDiagnosticReportResult,
     provider: DiagnosticProvider,
     uri: Uri,
-    document_id: DocumentId,
+    target: PullDiagnosticsTarget,
 ) {
-    match result {
-        lsp::DocumentDiagnosticReportResult::Report(report) => {
-            let result_id = match report {
-                lsp::DocumentDiagnosticReport::Full(report) => {
-                    editor.handle_lsp_diagnostics(
-                        &provider,
-                        uri,
-                        None,
-                        report.full_document_diagnostic_report.items,
-                    );
+    let is_current = editor.document(target.document_id).is_some_and(|doc| {
+        let server_attached = doc
+            .language_servers_with_feature(LanguageServerFeature::PullDiagnostics)
+            .any(|server| server.id() == target.server_id);
+        pull_diagnostics_response_is_current(
+            &target,
+            provider.language_server_id(),
+            &uri,
+            doc.version(),
+            doc.is_current_pull_diagnostics(target.server_id, target.generation),
+            doc.uri().as_ref(),
+            server_attached,
+        )
+    });
+    if !is_current {
+        log::debug!(
+            "dropping stale pull diagnostics response for server {} document {:?} generation {} version {}",
+            target.server_id,
+            target.document_id,
+            target.generation,
+            target.version,
+        );
+        return;
+    }
 
-                    report.full_document_diagnostic_report.result_id
+    let related = match result {
+        lsp::DocumentDiagnosticReportResult::Report(report) => match report {
+            lsp::DocumentDiagnosticReport::Full(report) => {
+                let result_id = apply_document_diagnostic_kind(
+                    editor,
+                    &provider,
+                    uri.clone(),
+                    lsp::DocumentDiagnosticReportKind::Full(report.full_document_diagnostic_report),
+                );
+                if let Some(doc) = editor.document_mut(target.document_id) {
+                    doc.set_previous_diagnostic_id(target.server_id, result_id);
                 }
-                lsp::DocumentDiagnosticReport::Unchanged(report) => {
-                    Some(report.unchanged_document_diagnostic_report.result_id)
+                report.related_documents
+            }
+            lsp::DocumentDiagnosticReport::Unchanged(report) => {
+                let result_id = apply_document_diagnostic_kind(
+                    editor,
+                    &provider,
+                    uri,
+                    lsp::DocumentDiagnosticReportKind::Unchanged(
+                        report.unchanged_document_diagnostic_report,
+                    ),
+                );
+                if let Some(doc) = editor.document_mut(target.document_id) {
+                    doc.set_previous_diagnostic_id(target.server_id, result_id);
                 }
-            };
-
-            if let Some(doc) = editor.document_mut(document_id) {
-                doc.set_previous_diagnostic_id(result_id);
-            };
-        }
-        lsp::DocumentDiagnosticReportResult::Partial(_) => {}
+                report.related_documents
+            }
+        },
+        lsp::DocumentDiagnosticReportResult::Partial(report) => report.related_documents,
     };
+
+    for (url, report) in related.into_iter().flatten() {
+        let Ok(uri) = Uri::try_from(&url) else {
+            log::debug!("ignoring pull diagnostics for unsupported related URI {url}");
+            continue;
+        };
+        let result_id = apply_document_diagnostic_kind(editor, &provider, uri.clone(), report);
+        let document_id = editor
+            .documents()
+            .find(|document| document.uri().as_ref() == Some(&uri))
+            .map(|document| document.id());
+        if let Some(document_id) = document_id {
+            if let Some(document) = editor.document_mut(document_id) {
+                document.set_previous_diagnostic_id(target.server_id, result_id);
+            }
+        }
+    }
+}
+
+fn pull_diagnostics_response_is_current(
+    target: &PullDiagnosticsTarget,
+    provider_server: Option<LanguageServerId>,
+    response_uri: &Uri,
+    document_version: i32,
+    generation_is_current: bool,
+    document_uri: Option<&Uri>,
+    server_attached: bool,
+) -> bool {
+    provider_server == Some(target.server_id)
+        && document_version == target.version
+        && generation_is_current
+        && document_uri == Some(&target.uri)
+        && response_uri == &target.uri
+        && server_attached
+}
+
+fn apply_document_diagnostic_kind(
+    editor: &mut Editor,
+    provider: &DiagnosticProvider,
+    uri: Uri,
+    report: lsp::DocumentDiagnosticReportKind,
+) -> Option<String> {
+    match report {
+        lsp::DocumentDiagnosticReportKind::Full(report) => {
+            editor.handle_lsp_diagnostics(provider, uri, None, report.items);
+            report.result_id
+        }
+        lsp::DocumentDiagnosticReportKind::Unchanged(report) => Some(report.result_id),
+    }
 }

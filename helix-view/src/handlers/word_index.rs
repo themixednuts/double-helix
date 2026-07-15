@@ -7,11 +7,12 @@ use std::{borrow::Cow, collections::HashMap, iter, mem, sync::Arc, time::Duratio
 
 use arc_swap::ArcSwap;
 use helix_core::{
-    chars::char_is_word, fuzzy::fuzzy_match, movement, text_annotations::TextAnnotations,
-    ChangeSet, Range, Rope, RopeSlice,
+    chars::char_is_word, diff::compare_ropes, fuzzy::fuzzy_match, movement,
+    text_annotations::TextAnnotations, ChangeSet, Range, Rope, RopeSlice,
 };
-use helix_runtime::{channel, send_blocking, Clock, DebouncedSender, Runtime, Sender, Work};
+use helix_runtime::{Clock, PulseGate, PulseHandle, PulseReceiver, Runtime};
 use helix_stdx::rope::RopeSliceExt as _;
+use parking_lot::Mutex;
 
 use crate::{bench::log_command_phase, DocumentId};
 
@@ -25,128 +26,239 @@ struct Change {
 }
 
 #[derive(Debug)]
-enum Event {
-    Insert(Rope),
-    Update(DocumentId, Change),
-    Delete(DocumentId, Rope),
-    /// Clear the entire word index.
-    /// This is used to clear memory when the feature is turned off.
-    Clear,
-    FlushDebounced,
+enum DocumentIntent {
+    Replace(Rope),
+    Update(Change),
+    Delete,
+}
+
+#[derive(Debug, Default)]
+struct ReadyWordIndex {
+    clear: bool,
+    documents: HashMap<DocumentId, DocumentIntent>,
+}
+
+impl ReadyWordIndex {
+    fn is_empty(&self) -> bool {
+        !self.clear && self.documents.is_empty()
+    }
+}
+
+#[derive(Debug, Default)]
+struct PendingWordIndex {
+    ready: ReadyWordIndex,
+    debounced: HashMap<DocumentId, Change>,
+    debounce_generation: u64,
+}
+
+#[derive(Clone, Debug)]
+enum ReadyPulse {}
+
+#[derive(Clone, Debug)]
+enum DebouncePulse {}
+
+/// A state-based inbox sender. There is at most one ready and one debounced
+/// intent per document, regardless of producer rate.
+#[derive(Clone, Debug)]
+struct WordIndexSender {
+    pending: Option<Arc<Mutex<PendingWordIndex>>>,
+    ready_wake: Option<PulseHandle<ReadyPulse>>,
+    debounce_wake: Option<PulseHandle<DebouncePulse>>,
+}
+
+#[derive(Debug)]
+struct WordIndexInbox {
+    pending: Arc<Mutex<PendingWordIndex>>,
+    wake: PulseReceiver<ReadyPulse>,
+}
+
+#[derive(Debug)]
+struct WordIndexDebounceInbox {
+    pending: Arc<Mutex<PendingWordIndex>>,
+    wake: PulseReceiver<DebouncePulse>,
+    ready_wake: PulseHandle<ReadyPulse>,
+}
+
+fn word_index_channel() -> (WordIndexSender, WordIndexInbox, WordIndexDebounceInbox) {
+    let pending = Arc::new(Mutex::new(PendingWordIndex::default()));
+    let mut ready_gate = PulseGate::new();
+    let mut debounce_gate = PulseGate::new();
+    let ready_wake = ready_gate.handle();
+
+    (
+        WordIndexSender {
+            pending: Some(pending.clone()),
+            ready_wake: Some(ready_wake.clone()),
+            debounce_wake: Some(debounce_gate.handle()),
+        },
+        WordIndexInbox {
+            pending: pending.clone(),
+            wake: ready_gate.take_receiver(),
+        },
+        WordIndexDebounceInbox {
+            pending,
+            wake: debounce_gate.take_receiver(),
+            ready_wake,
+        },
+    )
+}
+
+impl WordIndexSender {
+    fn closed() -> Self {
+        Self {
+            pending: None,
+            ready_wake: None,
+            debounce_wake: None,
+        }
+    }
+
+    fn insert(&self, doc: DocumentId, text: Rope) {
+        let Some(pending) = &self.pending else {
+            return;
+        };
+        let mut pending = pending.lock();
+        pending.debounced.remove(&doc);
+        pending
+            .ready
+            .documents
+            .insert(doc, DocumentIntent::Replace(text));
+        drop(pending);
+        self.wake_ready();
+    }
+
+    fn update(&self, doc: DocumentId, change: Change) {
+        let Some(pending) = &self.pending else {
+            return;
+        };
+        let mut pending = pending.lock();
+        let debounce =
+            pending.debounced.contains_key(&doc) || !is_changeset_significant(&change.changes);
+        if debounce {
+            pending.debounce_generation = pending.debounce_generation.wrapping_add(1);
+            pending.debounced.insert(doc, change);
+        } else {
+            pending.debounced.remove(&doc);
+            pending
+                .ready
+                .documents
+                .insert(doc, DocumentIntent::Update(change));
+        }
+        drop(pending);
+
+        if debounce {
+            if let Some(wake) = &self.debounce_wake {
+                wake.request();
+            }
+        } else {
+            self.wake_ready();
+        }
+    }
+
+    fn delete(&self, doc: DocumentId) {
+        let Some(pending) = &self.pending else {
+            return;
+        };
+        let mut pending = pending.lock();
+        pending.debounced.remove(&doc);
+        pending.ready.documents.insert(doc, DocumentIntent::Delete);
+        drop(pending);
+        self.wake_ready();
+    }
+
+    fn clear(&self) {
+        let Some(pending) = &self.pending else {
+            return;
+        };
+        let mut pending = pending.lock();
+        pending.debounced.clear();
+        pending.ready.clear = true;
+        pending.ready.documents.clear();
+        drop(pending);
+        self.wake_ready();
+    }
+
+    fn wake_ready(&self) {
+        if let Some(wake) = &self.ready_wake {
+            wake.request();
+        }
+    }
+}
+
+impl WordIndexInbox {
+    fn take_ready(&self) -> ReadyWordIndex {
+        mem::take(&mut self.pending.lock().ready)
+    }
+}
+
+impl WordIndexDebounceInbox {
+    fn generation(&self) -> Option<u64> {
+        let pending = self.pending.lock();
+        (!pending.debounced.is_empty()).then_some(pending.debounce_generation)
+    }
+
+    fn flush_if_current(&self, generation: u64) -> bool {
+        let mut pending = self.pending.lock();
+        if pending.debounce_generation != generation || pending.debounced.is_empty() {
+            return false;
+        }
+
+        let changes = mem::take(&mut pending.debounced);
+        pending.ready.documents.extend(
+            changes
+                .into_iter()
+                .map(|(doc, change)| (doc, DocumentIntent::Update(change))),
+        );
+        drop(pending);
+        self.ready_wake.request();
+        true
+    }
 }
 
 #[derive(Debug)]
 pub struct Handler {
     pub(super) index: WordIndex,
-    /// A sender into the debounced update actor for index maintenance.
-    hook: Sender<Event>,
-    /// A sender to a tokio task which coordinates the indexing of documents.
-    ///
-    /// See [WordIndex::run]. A supervisor-like task is in charge of spawning tasks to update the
-    /// index. This ensures that consecutive edits to a document trigger the correct order of
-    /// insertions and deletions into the word set.
-    coordinator: Sender<Event>,
+    events: WordIndexSender,
 }
 
 impl Handler {
     /// Create a dummy handler for headless testing (no async tasks spawned).
     pub fn dummy() -> Self {
-        let (hook_tx, _) = helix_runtime::channel(1);
-        let (coord_tx, _) = channel(1);
         Self {
             index: WordIndex::default(),
-            hook: hook_tx,
-            coordinator: coord_tx,
+            events: WordIndexSender::closed(),
         }
     }
 
     pub fn spawn(runtime: Runtime) -> Self {
         let index = WordIndex::default();
-        let (tx, rx) = channel(128);
-        runtime.work().spawn(index.clone().run(rx)).detach();
-        Self {
-            hook: Hook::spawn(tx.clone(), runtime.work().clone(), runtime.clock().clone()),
-            index,
-            coordinator: tx,
-        }
+        let (events, inbox, debounce_inbox) = word_index_channel();
+        runtime.work().spawn(index.clone().run(inbox)).detach();
+        runtime
+            .work()
+            .spawn(run_debounce(debounce_inbox, runtime.clock().clone()))
+            .detach();
+        Self { index, events }
     }
-}
-
-#[derive(Debug)]
-struct Hook {
-    changes: HashMap<DocumentId, Change>,
-    coordinator: Sender<Event>,
-    debouncer: DebouncedSender<Event>,
 }
 
 const DEBOUNCE: Duration = Duration::from_secs(1);
 
-impl Hook {
-    fn spawn(coordinator: Sender<Event>, work: Work, clock: Clock) -> Sender<Event> {
-        let (tx, mut rx) = helix_runtime::channel(128);
-        let mut hook = Self {
-            changes: HashMap::default(),
-            coordinator,
-            debouncer: DebouncedSender::new(DEBOUNCE, work.clone(), clock, tx.clone()),
-        };
-        work.spawn(async move {
-            while let Some(event) = rx.recv().await {
-                hook.handle_event(event);
-            }
-            hook.debouncer.cancel();
-        })
-        .detach();
-        tx
-    }
-
-    fn handle_event(&mut self, event: Event) {
-        match event {
-            Event::Insert(_) => unreachable!("inserts are sent to the worker directly"),
-            Event::Update(doc, change) => {
-                if let Some(pending_change) = self.changes.get_mut(&doc) {
-                    // If there is already a change waiting for this document, merge the two
-                    // changes together by composing the changesets and saving the new `text`.
-                    let pending = mem::take(&mut pending_change.changes);
-                    pending_change.changes = if pending.len_after() == change.changes.len() {
-                        pending.compose(change.changes)
-                    } else {
-                        change.changes
-                    };
-                    pending_change.text = change.text;
-                    self.restart_debounce();
-                } else if !is_changeset_significant(&change.changes) {
-                    // If the changeset is fairly large, debounce before updating the index.
-                    self.changes.insert(doc, change);
-                    self.restart_debounce();
-                } else {
-                    // Otherwise if the change is small, queue the update to the index immediately.
-                    send_blocking(&self.coordinator, Event::Update(doc, change));
+async fn run_debounce(mut inbox: WordIndexDebounceInbox, clock: Clock) {
+    while inbox.wake.recv().await.is_some() {
+        while let Some(generation) = inbox.generation() {
+            let mut timer = clock.timer(DEBOUNCE);
+            tokio::select! {
+                pulse = inbox.wake.recv() => {
+                    if pulse.is_none() {
+                        return;
+                    }
+                }
+                _ = &mut timer => {
+                    if inbox.flush_if_current(generation) {
+                        break;
+                    }
                 }
             }
-            Event::Delete(doc, text) => {
-                // If there are pending changes that haven't been indexed since the last debounce,
-                // forget them and delete the old text.
-                if let Some(change) = self.changes.remove(&doc) {
-                    send_blocking(&self.coordinator, Event::Delete(doc, change.old_text));
-                } else {
-                    send_blocking(&self.coordinator, Event::Delete(doc, text));
-                }
-            }
-            Event::Clear => {
-                self.flush();
-                send_blocking(&self.coordinator, Event::Clear);
-            }
-            Event::FlushDebounced => self.flush(),
-        }
-    }
-
-    fn restart_debounce(&mut self) {
-        self.debouncer.send(Event::FlushDebounced);
-    }
-
-    fn flush(&mut self) {
-        for (doc, change) in self.changes.drain() {
-            send_blocking(&self.coordinator, Event::Update(doc, change));
         }
     }
 }
@@ -227,57 +339,109 @@ impl WordIndex {
             .collect()
     }
 
-    /// Coordinate the indexing of documents.
-    ///
-    /// The worker owns a local mutable copy of the index and publishes immutable
-    /// snapshots via ArcSwap after each batch — readers never block.
-    async fn run(self, mut events: helix_runtime::Receiver<Event>) {
+    /// The worker owns mutable document state and publishes immutable index
+    /// snapshots after each coalesced batch, so readers never block.
+    async fn run(self, mut inbox: WordIndexInbox) {
         let shared = self.inner;
         let mut local = WordIndexInner::default();
-        while let Some(event) = events.recv().await {
-            let shared = shared.clone();
-            local = tokio::task::spawn_blocking(move || {
-                match event {
-                    Event::Insert(text) => {
-                        for word in words(text.slice(..)) {
-                            local.insert(word);
-                        }
-                    }
-                    Event::Update(
-                        _doc,
-                        Change {
-                            old_text,
-                            text,
-                            changes,
-                            ..
-                        },
-                    ) => {
-                        for (old_window, new_window) in
-                            changed_windows(old_text.slice(..), text.slice(..), &changes)
-                        {
-                            for word in words(new_window) {
-                                local.insert(word);
-                            }
-                            for word in words(old_window) {
-                                local.remove(word);
-                            }
-                        }
-                    }
-                    Event::Delete(_doc, text) => {
-                        for word in words(text.slice(..)) {
-                            local.remove(word);
-                        }
-                    }
-                    Event::Clear => {
-                        local.clear();
-                    }
-                    Event::FlushDebounced => unreachable!("flush stays in hook actor"),
+        let mut documents = HashMap::default();
+        while inbox.wake.recv().await.is_some() {
+            loop {
+                let batch = inbox.take_ready();
+                if batch.is_empty() {
+                    break;
                 }
-                shared.store(Arc::new(local.clone()));
-                local
-            })
-            .await
-            .unwrap();
+
+                let shared = shared.clone();
+                (local, documents) = tokio::task::spawn_blocking(move || {
+                    apply_batch(&mut local, &mut documents, batch);
+                    shared.store(Arc::new(local.clone()));
+                    (local, documents)
+                })
+                .await
+                .unwrap();
+            }
+        }
+    }
+}
+
+fn apply_batch(
+    index: &mut WordIndexInner,
+    documents: &mut HashMap<DocumentId, Rope>,
+    batch: ReadyWordIndex,
+) {
+    if batch.clear {
+        index.clear();
+        documents.clear();
+    }
+
+    for (doc, intent) in batch.documents {
+        match intent {
+            DocumentIntent::Delete => {
+                if let Some(text) = documents.remove(&doc) {
+                    remove_document(index, &text);
+                }
+            }
+            DocumentIntent::Replace(text) => {
+                upsert_document(index, documents, doc, text, None);
+            }
+            DocumentIntent::Update(change) => {
+                let Change {
+                    old_text,
+                    text,
+                    changes,
+                } = change;
+                upsert_document(index, documents, doc, text, Some((old_text, changes)));
+            }
+        }
+    }
+}
+
+fn upsert_document(
+    index: &mut WordIndexInner,
+    documents: &mut HashMap<DocumentId, Rope>,
+    doc: DocumentId,
+    text: Rope,
+    delta: Option<(Rope, ChangeSet)>,
+) {
+    if let Some(previous) = documents.get(&doc) {
+        if previous != &text {
+            if let Some((old_text, changes)) = delta.filter(|(old_text, changes)| {
+                previous == old_text
+                    && changes.len() == previous.len_chars()
+                    && changes.len_after() == text.len_chars()
+            }) {
+                update_document(index, &old_text, &text, &changes);
+            } else {
+                let transaction = compare_ropes(previous, &text);
+                update_document(index, previous, &text, transaction.changes());
+            }
+        }
+    } else {
+        add_document(index, &text);
+    }
+    documents.insert(doc, text);
+}
+
+fn add_document(index: &mut WordIndexInner, text: &Rope) {
+    for word in words(text.slice(..)) {
+        index.insert(word);
+    }
+}
+
+fn remove_document(index: &mut WordIndexInner, text: &Rope) {
+    for word in words(text.slice(..)) {
+        index.remove(word);
+    }
+}
+
+fn update_document(index: &mut WordIndexInner, old_text: &Rope, text: &Rope, changes: &ChangeSet) {
+    for (old_window, new_window) in changed_windows(old_text.slice(..), text.slice(..), changes) {
+        for word in words(new_window) {
+            index.insert(word);
+        }
+        for word in words(old_window) {
+            index.remove(word);
         }
     }
 }
@@ -401,29 +565,26 @@ fn is_changeset_significant(changes: &ChangeSet) -> bool {
 }
 
 pub(crate) fn attach(editor: &crate::Editor, handlers: &Handlers) {
-    let coordinator = handlers.word_index.coordinator.clone();
+    let events = handlers.word_index.events.clone();
     editor.lifecycle().on_document_open(move |event| {
         let doc = doc!(event.editor, &event.doc);
         if doc.word_completion_enabled() {
-            send_blocking(&coordinator, Event::Insert(doc.text().clone()));
+            events.insert(doc.id(), doc.text().clone());
         }
         Ok(())
     });
 
-    let tx = handlers.word_index.hook.clone();
+    let events = handlers.word_index.events.clone();
     editor.lifecycle().on_document_change(move |event| {
         let hook_start = std::time::Instant::now();
         if !event.ghost_transaction && event.doc.word_completion_enabled() {
-            helix_runtime::send_blocking(
-                &tx,
-                Event::Update(
-                    event.doc.id(),
-                    Change {
-                        old_text: event.old_text.clone(),
-                        text: event.doc.text().clone(),
-                        changes: event.changes.clone(),
-                    },
-                ),
+            events.update(
+                event.doc.id(),
+                Change {
+                    old_text: event.old_text.clone(),
+                    text: event.doc.text().clone(),
+                    changes: event.changes.clone(),
+                },
             );
         }
         let hook_dur = hook_start.elapsed();
@@ -441,29 +602,26 @@ pub(crate) fn attach(editor: &crate::Editor, handlers: &Handlers) {
         Ok(())
     });
 
-    let tx = handlers.word_index.hook.clone();
+    let events = handlers.word_index.events.clone();
     editor.lifecycle().on_document_close(move |event| {
         if event.doc.word_completion_enabled() {
-            helix_runtime::send_blocking(
-                &tx,
-                Event::Delete(event.doc.id(), event.doc.text().clone()),
-            );
+            events.delete(event.doc.id());
         }
         Ok(())
     });
 
-    let coordinator = handlers.word_index.coordinator.clone();
+    let events = handlers.word_index.events.clone();
     editor.lifecycle().on_config_change(move |event| {
         // The feature has been turned off. Clear the index and reclaim any used memory.
         if event.old.word_completion.enable && !event.new.word_completion.enable {
-            send_blocking(&coordinator, Event::Clear);
+            events.clear();
         }
 
         // The feature has been turned on. Index open documents.
         if !event.old.word_completion.enable && event.new.word_completion.enable {
             for doc in event.editor.documents() {
                 if doc.word_completion_enabled() {
-                    send_blocking(&coordinator, Event::Insert(doc.text().clone()));
+                    events.insert(doc.id(), doc.text().clone());
                 }
             }
         }
@@ -474,31 +632,22 @@ pub(crate) fn attach(editor: &crate::Editor, handlers: &Handlers) {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::{collections::HashSet, num::NonZeroUsize};
 
     use super::*;
-    use helix_core::diff::compare_ropes;
 
-    fn add_document(inner: &mut WordIndexInner, text: &Rope) {
-        for word in words(text.slice(..)) {
-            inner.insert(word);
-        }
+    fn doc_id(value: usize) -> DocumentId {
+        DocumentId::new(NonZeroUsize::new(value).unwrap())
     }
 
-    fn update_document(
-        inner: &mut WordIndexInner,
-        old_text: &Rope,
-        text: &Rope,
-        changes: &ChangeSet,
-    ) {
-        for (old_window, new_window) in changed_windows(old_text.slice(..), text.slice(..), changes)
-        {
-            for word in words(new_window) {
-                inner.insert(word);
-            }
-            for word in words(old_window) {
-                inner.remove(word);
-            }
+    fn change(before: &str, after: &str) -> Change {
+        let old_text = Rope::from_str(before);
+        let text = Rope::from_str(after);
+        let changes = compare_ropes(&old_text, &text).changes().clone();
+        Change {
+            old_text,
+            text,
+            changes,
         }
     }
 
@@ -564,5 +713,110 @@ mod tests {
         assert_diff("one two three", "one three", ["two"], []);
         assert_diff("one two three", "one t{o three", ["two"], []);
         assert_diff("one foo three", "one fooo three", ["foo"], ["fooo"]);
+    }
+
+    #[test]
+    fn ready_inbox_coalesces_saturation_and_uses_one_wakeup() {
+        let (sender, mut inbox, _debounce) = word_index_channel();
+        let doc = doc_id(1);
+        let stale = Rope::from_str("stale words");
+
+        for _ in 0..10_000 {
+            sender.insert(doc, stale.clone());
+        }
+        sender.insert(doc, Rope::from_str("latest words"));
+
+        assert!(inbox.wake.try_recv().is_ok());
+        assert!(matches!(
+            inbox.wake.try_recv(),
+            Err(helix_runtime::TryRecvError::Empty)
+        ));
+        let batch = inbox.take_ready();
+        assert_eq!(batch.documents.len(), 1);
+        assert!(matches!(
+            batch.documents.get(&doc),
+            Some(DocumentIntent::Replace(text)) if text == &Rope::from_str("latest words")
+        ));
+    }
+
+    #[test]
+    fn debounce_keeps_latest_state_and_rejects_stale_timer() {
+        let (sender, ready, mut debounce) = word_index_channel();
+        let doc = doc_id(1);
+
+        sender.update(doc, change("alpha word", "beta word"));
+        let stale_generation = debounce.generation().unwrap();
+        sender.update(doc, change("beta word", "gamma word"));
+
+        assert!(debounce.wake.try_recv().is_ok());
+        assert!(matches!(
+            debounce.wake.try_recv(),
+            Err(helix_runtime::TryRecvError::Empty)
+        ));
+        assert!(!debounce.flush_if_current(stale_generation));
+        assert!(ready.take_ready().is_empty());
+
+        let current_generation = debounce.generation().unwrap();
+        assert!(debounce.flush_if_current(current_generation));
+        let batch = ready.take_ready();
+        assert_eq!(batch.documents.len(), 1);
+        assert!(matches!(
+            batch.documents.get(&doc),
+            Some(DocumentIntent::Update(Change { text, .. }))
+                if text == &Rope::from_str("gamma word")
+        ));
+    }
+
+    #[test]
+    fn deletes_and_clears_remain_semantically_lossless() {
+        let (sender, inbox, _debounce) = word_index_channel();
+        let first = doc_id(1);
+        let second = doc_id(2);
+        let mut index = WordIndexInner::default();
+        let mut documents = HashMap::default();
+
+        sender.insert(first, Rope::from_str("alpha word"));
+        apply_batch(&mut index, &mut documents, inbox.take_ready());
+        assert_words_in_index(&index, ["alpha", "word"]);
+
+        sender.delete(first);
+        apply_batch(&mut index, &mut documents, inbox.take_ready());
+        assert!(index.words().next().is_none());
+
+        sender.insert(first, Rope::from_str("stale value"));
+        sender.clear();
+        sender.insert(second, Rope::from_str("fresh value"));
+        apply_batch(&mut index, &mut documents, inbox.take_ready());
+        assert_words_in_index(&index, ["fresh", "value"]);
+        assert_eq!(documents.len(), 1);
+        assert!(documents.contains_key(&second));
+    }
+
+    #[test]
+    fn skipped_coalesced_delta_diffs_against_indexed_text() {
+        let doc = doc_id(1);
+        let mut index = WordIndexInner::default();
+        let mut documents = HashMap::default();
+        let mut initial = ReadyWordIndex::default();
+        initial
+            .documents
+            .insert(doc, DocumentIntent::Replace(Rope::from_str("alpha word")));
+        apply_batch(&mut index, &mut documents, initial);
+
+        let mut latest = ReadyWordIndex::default();
+        latest.documents.insert(
+            doc,
+            DocumentIntent::Update(change("beta word", "gamma word")),
+        );
+        apply_batch(&mut index, &mut documents, latest);
+
+        assert_words_in_index(&index, ["gamma", "word"]);
+    }
+
+    #[track_caller]
+    fn assert_words_in_index<const N: usize>(index: &WordIndexInner, expected: [&str; N]) {
+        let actual = collect_words(index);
+        let expected = expected.into_iter().map(str::to_owned).collect();
+        assert_eq!(actual, expected);
     }
 }

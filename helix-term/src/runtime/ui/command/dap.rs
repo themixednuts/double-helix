@@ -1,7 +1,13 @@
 use std::path::PathBuf;
 
 use helix_core::syntax::config::DebugConfigCompletion;
-use helix_dap::{StackFrame, Thread, ThreadId};
+use helix_dap::{StackFrame, Thread, ThreadId, Variable};
+
+#[derive(Debug, Clone)]
+pub struct DapScopeVariables {
+    pub name: String,
+    pub variables: Vec<Variable>,
+}
 
 /// Debugger UI ingress (async -> main thread).
 pub enum DapCommand {
@@ -32,6 +38,9 @@ pub enum DapCommand {
         thread_id: ThreadId,
         frames: Vec<StackFrame>,
     },
+    VariablesPopup {
+        scopes: Vec<DapScopeVariables>,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -58,6 +67,10 @@ impl std::fmt::Debug for DapCommand {
                 .field("thread_id", thread_id)
                 .field("frames", frames)
                 .finish_non_exhaustive(),
+            Self::VariablesPopup { scopes } => f
+                .debug_struct("VariablesPopup")
+                .field("scopes", scopes)
+                .finish(),
         }
     }
 }

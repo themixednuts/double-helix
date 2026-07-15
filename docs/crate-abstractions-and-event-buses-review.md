@@ -1,6 +1,7 @@
 # Crate Abstractions, Types, and Event Bus Review
 
-Status: updated Apr 2026
+Status: historical review, superseded for plugin/runtime ownership by
+`responsive-application-architecture.md` and `runtime-architecture.md`.
 
 This document maps the current crate abstractions in the Helix fork, how the crates interact, and where the remaining API and ownership work still lives.
 
@@ -349,7 +350,7 @@ Primary homes:
 
 Current strengths:
 
-- `PluginManager` is a clear ownership root for plugin loading and event delivery
+- the former `PluginManager` provided one ownership root for plugin loading and event delivery
 - Rust-side plugin events now use a single typed `PluginEvent` enum, with `EventType` retained for registration and naming
 - `helix-plugin` defines a `DrawSurface` abstraction so the plugin crate does not depend directly on `helix-tui`
 - command execution and UI bridging are already separated into host traits (`EditorCommandRegistry`, `UiHandler`)

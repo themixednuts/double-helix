@@ -33,6 +33,10 @@ impl Editor {
         self.config_gen = self.config_gen.wrapping_add(1);
     }
 
+    pub(crate) fn bump_diagnostics_revision(&mut self) {
+        self.diagnostics_revision = self.diagnostics_revision.wrapping_add(1);
+    }
+
     pub fn frontend(&self) -> &super::core::FrontendState {
         &self.frontend
     }
@@ -90,6 +94,7 @@ impl Editor {
     }
 
     pub fn dispatch_document_close(&mut self, doc: crate::Document) {
+        self.remove_closed_document_language_server_demands(doc.id());
         let lifecycle = self.lifecycle();
         let mut event = crate::events::DocumentDidClose { editor: self, doc };
         lifecycle.dispatch_document_close(&mut event);
@@ -131,6 +136,12 @@ impl Editor {
             server_id,
         };
         lifecycle.dispatch_language_server_exited(&mut event);
+    }
+
+    pub fn dispatch_document_language_servers_change(&mut self, doc: DocumentId) {
+        let lifecycle = self.lifecycle();
+        let mut event = crate::events::DocumentLanguageServersDidChange { editor: self, doc };
+        lifecycle.dispatch_document_language_servers_change(&mut event);
     }
 
     pub fn dispatch_editor_config_change(&mut self, old_config: &Config) {
@@ -350,21 +361,19 @@ impl Editor {
         self.handlers.completions.active_completions.iter()
     }
 
-    pub fn signature_help_sender(
-        &self,
-    ) -> &helix_runtime::Sender<crate::handlers::lsp::SignatureHelpEvent> {
+    pub fn signature_help_sender(&self) -> &crate::handlers::SignatureHelpEvents {
         &self.handlers.signature_hints
     }
 
-    pub fn auto_save_sender(&self) -> &helix_runtime::Sender<crate::handlers::AutoSaveEvent> {
+    pub fn auto_save_sender(&self) -> &crate::handlers::AutoSaveEvents {
         &self.handlers.auto_save
     }
 
-    pub fn auto_reload_sender(&self) -> &helix_runtime::Sender<crate::handlers::AutoReloadEvent> {
+    pub fn auto_reload_sender(&self) -> &crate::handlers::AutoReloadEvents {
         &self.handlers.auto_reload
     }
 
-    pub fn pkg_sender(&self) -> &helix_runtime::Sender<crate::handlers::PkgEvent> {
+    pub fn pkg_sender(&self) -> &crate::handlers::PkgEvents {
         &self.handlers.pkg
     }
 
@@ -385,29 +394,41 @@ impl Editor {
         lifecycle.dispatch_config_change(&mut event)
     }
 
-    pub fn refresh_workspace_diagnostic_counts(&mut self) {
-        let mut counts = WorkspaceDiagnosticCounts::default();
-        for (diagnostic, _) in self.diagnostics.values().flatten() {
-            match diagnostic.severity {
-                Some(helix_lsp::lsp::DiagnosticSeverity::WARNING) => counts.warnings += 1,
-                Some(helix_lsp::lsp::DiagnosticSeverity::ERROR) => counts.errors += 1,
-                Some(helix_lsp::lsp::DiagnosticSeverity::HINT) => counts.hints += 1,
-                Some(helix_lsp::lsp::DiagnosticSeverity::INFORMATION) => counts.info += 1,
-                _ => counts.hints += 1,
-            }
-        }
-        self.workspace_diagnostic_counts = counts;
-    }
-
     pub fn remove_language_server_diagnostics(
         &mut self,
         language_server_id: helix_lsp::LanguageServerId,
     ) {
-        for diags in self.diagnostics.values_mut() {
-            diags.retain(|(_, provider)| provider.language_server_id() != Some(language_server_id));
+        let mut removed_counts = WorkspaceDiagnosticCounts::default();
+        let mut removed_by_uri = Vec::new();
+        for (uri, diags) in &mut self.diagnostics {
+            let mut uri_removed = WorkspaceDiagnosticCounts::default();
+            let diags = std::sync::Arc::make_mut(diags);
+            diags.retain(|(diagnostic, provider)| {
+                let remove = provider.language_server_id() == Some(language_server_id);
+                if remove {
+                    removed_counts.increment(diagnostic);
+                    uri_removed.increment(diagnostic);
+                }
+                !remove
+            });
+            if uri_removed.total() != 0 {
+                removed_by_uri.push((uri.clone(), uri_removed));
+            }
+        }
+        if removed_counts == WorkspaceDiagnosticCounts::default() {
+            return;
         }
         self.diagnostics.retain(|_, diags| !diags.is_empty());
-        self.refresh_workspace_diagnostic_counts();
+        for (uri, removed) in removed_by_uri {
+            self.replace_workspace_diagnostic_summary(
+                &uri,
+                removed,
+                WorkspaceDiagnosticCounts::default(),
+            );
+        }
+        self.workspace_diagnostic_counts
+            .replace(removed_counts, WorkspaceDiagnosticCounts::default());
+        self.bump_diagnostics_revision();
     }
 
     pub fn apply_motion<F: Fn(&mut Self) + Send + Sync + 'static>(&mut self, motion: F) {

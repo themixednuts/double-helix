@@ -4,23 +4,19 @@ mod file_operations;
 pub mod jsonrpc;
 mod transport;
 
-use arc_swap::ArcSwap;
 pub use client::Client;
 pub use futures_executor::block_on;
 pub use helix_lsp_types as lsp;
-pub use jsonrpc::Call;
 pub use lsp::{Position, Url};
 
 use futures_util::stream::select_all::SelectAll;
-use helix_core::syntax::config::{
-    LanguageConfiguration, LanguageServerConfiguration, LanguageServerFeatures, RootMarkers,
-};
+use helix_core::syntax::config::{LanguageConfiguration, LanguageServerConfiguration, RootMarkers};
 use helix_runtime::Receiver;
 use helix_stdx::path;
-use slotmap::SlotMap;
+use slotmap::{SecondaryMap, SlotMap};
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
     sync::Arc,
@@ -44,12 +40,42 @@ pub enum Error {
     Timeout(jsonrpc::Id),
     #[error("server closed the stream")]
     StreamClosed,
+    #[error("language server protocol header exceeded {limit} bytes")]
+    HeaderTooLarge { limit: usize },
+    #[error("language server message was {size} bytes, exceeding the {limit} byte limit")]
+    MessageTooLarge { size: usize, limit: usize },
+    #[error("language-server outbound control queue is full")]
+    OutboundControlQueueFull,
+    #[error("language-server outbound queue is full")]
+    OutboundQueueFull,
     #[error("Unhandled")]
     Unhandled,
     #[error(transparent)]
     ExecutableNotFound(#[from] helix_stdx::env::ExecutableNotFoundError),
     #[error(transparent)]
+    RuntimeAssets(#[from] helix_loader::RuntimeAssetsError),
+    #[error("command '{command}' not found")]
+    CommandNotFound { command: String, generation: u64 },
+    #[error(transparent)]
     Other(#[from] anyhow::Error),
+}
+
+impl Error {
+    /// Whether launching failed because no provider exists for the configured command.
+    /// Broken managed activations are deliberately excluded so callers can surface repair errors.
+    pub const fn is_missing_launch_command(&self) -> bool {
+        matches!(
+            self,
+            Self::ExecutableNotFound(_) | Self::CommandNotFound { .. }
+        )
+    }
+
+    pub const fn runtime_generation(&self) -> Option<u64> {
+        match self {
+            Self::CommandNotFound { generation, .. } => Some(*generation),
+            _ => None,
+        }
+    }
 }
 
 impl From<serde_json::Error> for Error {
@@ -574,21 +600,87 @@ impl Notification {
     }
 }
 
+#[derive(Debug, PartialEq, Clone)]
+pub enum ServerRequestError {
+    MethodNotFound,
+    Malformed(String),
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub struct ServerRequest {
+    pub id: jsonrpc::Id,
+    pub method: String,
+    pub request: std::result::Result<MethodCall, ServerRequestError>,
+}
+
+/// Parsed domain message delivered by the language-server transport.
+///
+/// Raw JSON-RPC never crosses into editor or terminal state. Parsing and
+/// admission happen in the transport actor, where backpressure cannot stall
+/// foreground input handling.
+#[derive(Debug, PartialEq, Clone)]
+pub enum ServerEvent {
+    Notification(Notification),
+    Request(ServerRequest),
+    Invalid { id: jsonrpc::Id },
+}
+
+impl ServerEvent {
+    pub(crate) fn from_call(call: jsonrpc::Call) -> Option<Self> {
+        match call {
+            jsonrpc::Call::Notification(jsonrpc::Notification { method, params, .. }) => {
+                match Notification::parse(&method, params) {
+                    Ok(notification) => Some(Self::Notification(notification)),
+                    Err(Error::Unhandled) => {
+                        log::info!("ignoring unhandled language-server notification '{method}'");
+                        None
+                    }
+                    Err(error) => {
+                        log::error!(
+                            "ignoring malformed language-server notification '{method}': {error}"
+                        );
+                        None
+                    }
+                }
+            }
+            jsonrpc::Call::MethodCall(jsonrpc::MethodCall {
+                method, params, id, ..
+            }) => {
+                let request = match MethodCall::parse(&method, params) {
+                    Ok(request) => Ok(request),
+                    Err(Error::Unhandled) => Err(ServerRequestError::MethodNotFound),
+                    Err(error) => Err(ServerRequestError::Malformed(error.to_string())),
+                };
+                Some(Self::Request(ServerRequest {
+                    id,
+                    method,
+                    request,
+                }))
+            }
+            jsonrpc::Call::Invalid { id } => Some(Self::Invalid { id }),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Registry {
-    inner: SlotMap<LanguageServerId, Arc<Client>>,
+    ids: SlotMap<LanguageServerId, ()>,
+    inner: SecondaryMap<LanguageServerId, Arc<Client>>,
     inner_by_name: HashMap<LanguageServerName, Vec<Arc<Client>>>,
-    syn_loader: Arc<ArcSwap<helix_core::syntax::Loader>>,
-    pub incoming: SelectAll<Receiver<(LanguageServerId, Call)>>,
+    manually_stopped: HashSet<LanguageServerName>,
+    initialized_dispatched: HashSet<LanguageServerId>,
+    pub incoming: SelectAll<Receiver<(LanguageServerId, ServerEvent)>>,
     pub file_event_handler: file_event::Handler,
 }
 
 impl Registry {
-    pub fn new(syn_loader: Arc<ArcSwap<helix_core::syntax::Loader>>) -> Self {
+    pub fn new() -> Self {
         Self {
-            inner: SlotMap::with_key(),
+            ids: SlotMap::with_key(),
+            inner: SecondaryMap::new(),
             inner_by_name: HashMap::new(),
-            syn_loader,
+            manually_stopped: HashSet::new(),
+            initialized_dispatched: HashSet::new(),
             incoming: SelectAll::new(),
             file_event_handler: file_event::Handler::new(),
         }
@@ -598,12 +690,75 @@ impl Registry {
         self.inner.get(id)
     }
 
+    pub fn reserve_id(&mut self) -> LanguageServerId {
+        self.ids.insert(())
+    }
+
+    pub fn release_reserved_id(&mut self, id: LanguageServerId) {
+        if self.inner.get(id).is_none() {
+            self.ids.remove(id);
+        }
+    }
+
+    pub fn install_spawned(&mut self, spawned: SpawnedLanguageServer) -> Result<Arc<Client>> {
+        let SpawnedLanguageServer(client, incoming) = spawned;
+        let id = client.id();
+        if !self.ids.contains_key(id) || self.inner.get(id).is_some() {
+            return Err(Error::Other(anyhow::anyhow!(
+                "language-server id {id:?} was not reserved for installation"
+            )));
+        }
+        self.incoming.push(incoming);
+        self.inner.insert(id, client.clone());
+        self.inner_by_name
+            .entry(client.name().to_owned())
+            .or_default()
+            .push(client.clone());
+        Ok(client)
+    }
+
+    pub fn is_manually_stopped(&self, name: &str) -> bool {
+        self.manually_stopped.contains(name)
+    }
+
+    pub fn compatible_prepared_client(
+        &mut self,
+        prepared: &PreparedClientLaunch,
+    ) -> Option<Arc<Client>> {
+        let identity = prepared.identity();
+        self.inner_by_name
+            .get(prepared.name())?
+            .iter()
+            .enumerate()
+            .find(|(index, client)| {
+                client.launch_identity() == &identity
+                    && client.try_add_prepared_doc(
+                        prepared.root_path(),
+                        prepared.root_uri().cloned(),
+                        *index == 0,
+                    )
+            })
+            .map(|(_, client)| client.clone())
+    }
+
+    pub fn mark_initialization_dispatched(&mut self, id: LanguageServerId) -> bool {
+        self.inner.get(id).is_some() && self.initialized_dispatched.insert(id)
+    }
+
+    pub fn initialization_was_dispatched(&self, id: LanguageServerId) -> bool {
+        self.initialized_dispatched.contains(&id)
+    }
+
     pub fn remove_by_id(&mut self, id: LanguageServerId) {
         let Some(client) = self.inner.remove(id) else {
-            log::debug!("client was already removed");
+            if self.ids.remove(id).is_none() {
+                log::debug!("client was already removed");
+            }
+            self.initialized_dispatched.remove(&id);
             return;
         };
         self.file_event_handler.remove_client(id);
+        self.initialized_dispatched.remove(&id);
         let instances = self
             .inner_by_name
             .get_mut(client.name())
@@ -612,90 +767,17 @@ impl Registry {
         if instances.is_empty() {
             self.inner_by_name.remove(client.name());
         }
-    }
-
-    fn start_client(
-        &mut self,
-        name: String,
-        ls_config: &LanguageConfiguration,
-        doc_path: Option<&std::path::PathBuf>,
-        root_dirs: &[PathBuf],
-        enable_snippets: bool,
-    ) -> Result<Arc<Client>, StartupError> {
-        let syn_loader = self.syn_loader.load();
-        let config = syn_loader
-            .language_server_configs()
-            .get(&name)
-            .ok_or_else(|| anyhow::anyhow!("Language server '{name}' not defined"))?;
-        let id = self.inner.try_insert_with_key(|id| {
-            start_client(
-                id,
-                name,
-                ls_config,
-                config,
-                doc_path,
-                root_dirs,
-                enable_snippets,
-            )
-            .map(|client| {
-                self.incoming.push(client.1);
-                client.0
-            })
-        })?;
-        Ok(self.inner[id].clone())
-    }
-
-    /// If this method is called, all documents that have a reference to the language server have to refresh their language servers,
-    /// See helix_view::editor::Editor::refresh_language_servers
-    pub fn restart_server(
-        &mut self,
-        name: &str,
-        language_config: &LanguageConfiguration,
-        doc_path: Option<&std::path::PathBuf>,
-        root_dirs: &[PathBuf],
-        enable_snippets: bool,
-    ) -> Option<Result<Arc<Client>>> {
-        if let Some(old_clients) = self.inner_by_name.remove(name) {
-            if old_clients.is_empty() {
-                log::info!("restarting client for '{name}' which was manually stopped");
-            } else {
-                log::info!("stopping existing clients for '{name}'");
-            }
-            for old_client in old_clients {
-                self.file_event_handler.remove_client(old_client.id());
-                self.inner.remove(old_client.id());
-                tokio::spawn(async move {
-                    let _ = old_client.force_shutdown().await;
-                });
-            }
-        }
-        let client = match self.start_client(
-            name.to_string(),
-            language_config,
-            doc_path,
-            root_dirs,
-            enable_snippets,
-        ) {
-            Ok(client) => client,
-            Err(StartupError::NoRequiredRootFound) => return None,
-            Err(StartupError::Error(err)) => return Some(Err(err)),
-        };
-        self.inner_by_name
-            .insert(name.to_owned(), vec![client.clone()]);
-
-        Some(Ok(client))
+        self.ids.remove(id);
     }
 
     pub fn stop(&mut self, name: &str) {
-        if let Some(clients) = self.inner_by_name.get_mut(name) {
-            // Drain the clients vec so that the entry in `inner_by_name` remains
-            // empty. We use the empty vec as a "tombstone" to mean that a server
-            // has been manually stopped with :lsp-stop and shouldn't be automatically
-            // restarted by `get`. :lsp-restart can be used to restart the server
-            // manually.
-            for client in clients.drain(..) {
+        self.manually_stopped.insert(name.to_owned());
+        if let Some(clients) = self.inner_by_name.remove(name) {
+            for client in clients {
                 self.file_event_handler.remove_client(client.id());
+                self.initialized_dispatched.remove(&client.id());
                 self.inner.remove(client.id());
+                self.ids.remove(client.id());
                 tokio::spawn(async move {
                     let _ = client.force_shutdown().await;
                 });
@@ -703,57 +785,35 @@ impl Registry {
         }
     }
 
-    pub fn get<'a>(
-        &'a mut self,
-        language_config: &'a LanguageConfiguration,
-        doc_path: Option<&'a std::path::PathBuf>,
-        root_dirs: &'a [PathBuf],
-        enable_snippets: bool,
-    ) -> impl Iterator<Item = (LanguageServerName, Result<Arc<Client>>)> + 'a {
-        language_config.language_servers.iter().filter_map(
-            move |LanguageServerFeatures { name, .. }| {
-                if let Some(clients) = self.inner_by_name.get(name) {
-                    // If the clients vec is empty, do not automatically start a client
-                    // for this server. The empty vec is a tombstone left to mean that a
-                    // server has been manually stopped and shouldn't be started automatically.
-                    // See `stop`.
-                    if clients.is_empty() {
-                        return None;
-                    }
+    /// Removes all clients for `name` while preserving explicit stop policy.
+    pub fn invalidate(&mut self, name: &str) -> bool {
+        let Some(clients) = self.inner_by_name.remove(name) else {
+            return false;
+        };
+        for client in clients {
+            self.file_event_handler.remove_client(client.id());
+            self.initialized_dispatched.remove(&client.id());
+            self.inner.remove(client.id());
+            self.ids.remove(client.id());
+            tokio::spawn(async move {
+                let _ = client.force_shutdown().await;
+            });
+        }
+        true
+    }
 
-                    if let Some((_, client)) = clients.iter().enumerate().find(|(i, client)| {
-                        let manual_roots = language_config
-                            .workspace_lsp_roots
-                            .as_deref()
-                            .unwrap_or(root_dirs);
-                        client.try_add_doc(&language_config.roots, manual_roots, doc_path, *i == 0)
-                    }) {
-                        return Some((name.to_owned(), Ok(client.clone())));
-                    }
-                }
-                match self.start_client(
-                    name.clone(),
-                    language_config,
-                    doc_path,
-                    root_dirs,
-                    enable_snippets,
-                ) {
-                    Ok(client) => {
-                        self.inner_by_name
-                            .entry(name.to_owned())
-                            .or_default()
-                            .push(client.clone());
-                        Some((name.clone(), Ok(client)))
-                    }
-                    Err(StartupError::NoRequiredRootFound) => None,
-                    Err(StartupError::Error(err)) => Some((name.to_owned(), Err(err))),
-                }
-            },
-        )
+    pub fn clear_manual_stop(&mut self, name: &str) {
+        self.manually_stopped.remove(name);
     }
 
     pub fn iter_clients(&self) -> impl Iterator<Item = &Arc<Client>> {
         self.inner.values()
+    }
+}
+
+impl Default for Registry {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -874,38 +934,132 @@ impl LspProgressMap {
     }
 }
 
-struct NewClient(Arc<Client>, Receiver<(LanguageServerId, Call)>);
-
-enum StartupError {
-    NoRequiredRootFound,
-    Error(Error),
+#[derive(Debug, Clone)]
+pub struct LanguageServerLaunchRequest {
+    pub name: String,
+    pub language: Arc<LanguageConfiguration>,
+    pub server: LanguageServerConfiguration,
+    pub doc_path: Option<PathBuf>,
+    pub root_dirs: Vec<PathBuf>,
+    pub enable_snippets: bool,
 }
 
-impl<T: Into<Error>> From<T> for StartupError {
-    fn from(value: T) -> Self {
-        StartupError::Error(value.into())
+#[derive(Debug)]
+pub enum PreparedLanguageServerLaunch {
+    Ready(Box<PreparedClientLaunch>),
+    NoRequiredRoot,
+}
+
+#[derive(Debug)]
+pub struct PreparedClientLaunch {
+    name: String,
+    root_path: PathBuf,
+    root_uri: Option<lsp::Url>,
+    enable_snippets: bool,
+    launch: helix_loader::ResolvedLaunch,
+    args: Vec<String>,
+    environment: HashMap<String, String>,
+    config: Option<serde_json::Value>,
+    timeout: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientLaunchIdentity {
+    program: PathBuf,
+    resolved_args: Vec<String>,
+    resolved_environment: BTreeMap<String, String>,
+    origin: helix_loader::Origin,
+    configured_environment: HashMap<String, String>,
+    config: Option<serde_json::Value>,
+    timeout: u64,
+    enable_snippets: bool,
+}
+
+impl PreparedClientLaunch {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn root_path(&self) -> &Path {
+        &self.root_path
+    }
+
+    pub fn root_uri(&self) -> Option<&lsp::Url> {
+        self.root_uri.as_ref()
+    }
+
+    pub fn runtime_generation(&self) -> u64 {
+        self.launch.generation
+    }
+
+    pub fn identity(&self) -> ClientLaunchIdentity {
+        let mut resolved_args = self.launch.prefix_args.clone();
+        resolved_args.extend(self.launch.default_args.clone());
+        resolved_args.extend(self.args.clone());
+        ClientLaunchIdentity {
+            program: self.launch.program.clone(),
+            resolved_args,
+            resolved_environment: self.launch.env.clone(),
+            origin: self.launch.origin.clone(),
+            configured_environment: self.environment.clone(),
+            config: self.config.clone(),
+            timeout: self.timeout,
+            enable_snippets: self.enable_snippets,
+        }
     }
 }
 
-/// start_client takes both a LanguageConfiguration and a LanguageServerConfiguration to ensure that
-/// it is only called when it makes sense.
-fn start_client(
-    id: LanguageServerId,
+pub struct SpawnedLanguageServer(Arc<Client>, Receiver<(LanguageServerId, ServerEvent)>);
+
+impl std::fmt::Debug for SpawnedLanguageServer {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SpawnedLanguageServer")
+            .field("id", &self.0.id())
+            .field("name", &self.0.name())
+            .finish_non_exhaustive()
+    }
+}
+
+impl SpawnedLanguageServer {
+    pub fn id(&self) -> LanguageServerId {
+        self.0.id()
+    }
+
+    pub async fn force_shutdown(self) {
+        let _ = self.0.force_shutdown().await;
+    }
+}
+
+pub fn prepare_language_server_launch(
+    request: LanguageServerLaunchRequest,
+) -> Result<PreparedLanguageServerLaunch> {
+    prepare_language_server_launch_parts(
+        request.name,
+        &request.language,
+        &request.server,
+        request.doc_path.as_ref(),
+        &request.root_dirs,
+        request.enable_snippets,
+    )
+}
+
+fn prepare_language_server_launch_parts(
     name: String,
-    config: &LanguageConfiguration,
-    ls_config: &LanguageServerConfiguration,
-    doc_path: Option<&std::path::PathBuf>,
+    language: &LanguageConfiguration,
+    server: &LanguageServerConfiguration,
+    doc_path: Option<&PathBuf>,
     root_dirs: &[PathBuf],
     enable_snippets: bool,
-) -> Result<NewClient, StartupError> {
+) -> Result<PreparedLanguageServerLaunch> {
     let (workspace, workspace_is_cwd) = helix_loader::find_workspace();
     let workspace = path::normalize(workspace);
     let root = find_lsp_workspace(
         doc_path
             .and_then(|x| x.parent().and_then(|x| x.to_str()))
             .unwrap_or("."),
-        &config.roots,
-        config.workspace_lsp_roots.as_deref().unwrap_or(root_dirs),
+        &language.roots,
+        language.workspace_lsp_roots.as_deref().unwrap_or(root_dirs),
         &workspace,
         workspace_is_cwd,
     );
@@ -915,27 +1069,69 @@ fn start_client(
     let root_path = root.clone().unwrap_or_else(|| workspace.clone());
     let root_uri = root.and_then(|root| lsp::Url::from_file_path(root).ok());
 
-    if let Some(globset) = &ls_config.required_root_patterns {
+    if let Some(globset) = &server.required_root_patterns {
         if !root_path
             .read_dir()?
             .flatten()
             .map(|entry| entry.file_name())
             .any(|entry| globset.is_match(entry))
         {
-            return Err(StartupError::NoRequiredRootFound);
+            return Ok(PreparedLanguageServerLaunch::NoRequiredRoot);
         }
     }
 
-    let (client, incoming, initialize_notify) = Client::start(
-        &ls_config.command,
-        &ls_config.args,
-        ls_config.config.clone(),
-        &ls_config.environment,
+    let runtime = helix_loader::runtime_assets()?.snapshot();
+    let runtime_generation = runtime.generation();
+    let launch =
+        runtime
+            .resolve_command(&server.command)?
+            .ok_or_else(|| Error::CommandNotFound {
+                command: server.command.clone(),
+                generation: runtime_generation,
+            })?;
+
+    Ok(PreparedLanguageServerLaunch::Ready(Box::new(
+        PreparedClientLaunch {
+            name,
+            root_path,
+            root_uri,
+            enable_snippets,
+            launch,
+            args: server.args.clone(),
+            environment: server.environment.clone(),
+            config: server.config.clone(),
+            timeout: server.timeout,
+        },
+    )))
+}
+
+pub fn spawn_language_server(
+    id: LanguageServerId,
+    prepared: PreparedClientLaunch,
+) -> Result<SpawnedLanguageServer> {
+    let identity = prepared.identity();
+    let PreparedClientLaunch {
+        name,
+        root_path,
+        root_uri,
+        enable_snippets,
+        launch,
+        args,
+        environment,
+        config,
+        timeout,
+    } = prepared;
+    let (client, incoming) = Client::start_with_launch(
+        launch,
+        &args,
+        config,
+        &environment,
         root_path,
         root_uri,
         id,
         name,
-        ls_config.timeout,
+        identity,
+        timeout,
     )?;
 
     let client = Arc::new(client);
@@ -953,18 +1149,20 @@ fn start_client(
             })
             .await;
 
-        if let Err(e) = value {
-            log::error!("failed to initialize language server: {}", e);
-            return;
+        match value {
+            Ok(_) => {
+                if let Err(error) = _client.finish_initialization().await {
+                    log::error!("failed to finish language server initialization: {error}");
+                }
+            }
+            Err(error) => {
+                log::error!("failed to initialize language server: {error}");
+                _client.fail_initialization(error.to_string());
+            }
         }
-
-        // next up, notify<initialized>
-        _client.notify::<lsp::notification::Initialized>(lsp::InitializedParams {});
-
-        initialize_notify.notify_one();
     });
 
-    Ok(NewClient(client, incoming))
+    Ok(SpawnedLanguageServer(client, incoming))
 }
 
 /// Find an LSP workspace of a file using the following mechanism:
@@ -1034,7 +1232,7 @@ pub fn find_lsp_workspace(
 
 #[cfg(test)]
 mod tests {
-    use super::{lsp, util::*, OffsetEncoding};
+    use super::{lsp, util::*, Error, OffsetEncoding, Registry};
     use helix_core::Rope;
 
     #[test]
@@ -1100,5 +1298,39 @@ mod tests {
         let transaction = generate_transaction_from_edits(&source, edits, OffsetEncoding::Utf16);
         assert!(transaction.apply(&mut source));
         assert_eq!(source, "[\n  \"🇺🇸\",\n  \"🎄\",\n]");
+    }
+
+    #[test]
+    fn missing_launch_classification_excludes_broken_managed_assets() {
+        assert!(Error::CommandNotFound {
+            command: "rust-analyzer".into(),
+            generation: 7,
+        }
+        .is_missing_launch_command());
+
+        let broken = Error::RuntimeAssets(helix_loader::RuntimeAssetsError::BrokenManaged {
+            kind: helix_loader::RuntimeAssetKind::Command,
+            key: "rust-analyzer".into(),
+            package: Box::new(helix_loader::ActivePackage::new(
+                "lsp",
+                "rust-analyzer",
+                "test",
+            )),
+            path: "missing-rust-analyzer".into(),
+        });
+        assert!(!broken.is_missing_launch_command());
+    }
+
+    #[tokio::test]
+    async fn manual_stop_policy_is_explicit_and_survives_invalidation() {
+        let mut registry = Registry::new();
+
+        registry.stop("rust-analyzer");
+        assert!(registry.is_manually_stopped("rust-analyzer"));
+        assert!(!registry.invalidate("rust-analyzer"));
+        assert!(registry.is_manually_stopped("rust-analyzer"));
+
+        registry.clear_manual_stop("rust-analyzer");
+        assert!(!registry.is_manually_stopped("rust-analyzer"));
     }
 }

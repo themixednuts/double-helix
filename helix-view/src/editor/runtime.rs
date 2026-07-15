@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use anyhow::bail;
 use futures_util::stream::SelectAll;
 use helix_dap as dap;
-use helix_lsp::{Call, LanguageServerId};
+use helix_lsp::{LanguageServerId, ServerEvent};
 use helix_runtime::{FrameHandle, FrameReceiver, Receiver as RuntimeReceiver, Runtime, Work};
 
 use crate::document::{DocumentSavedEvent, DocumentSavedEventResult};
@@ -43,13 +43,13 @@ impl Editor {
 
     pub fn take_lsp_incoming(
         &mut self,
-    ) -> SelectAll<helix_runtime::Receiver<(LanguageServerId, Call)>> {
+    ) -> SelectAll<helix_runtime::Receiver<(LanguageServerId, ServerEvent)>> {
         std::mem::replace(&mut self.language_servers.incoming, SelectAll::new())
     }
 
     pub fn take_debugger_incoming(
         &mut self,
-    ) -> SelectAll<helix_runtime::Receiver<(dap::registry::DebugAdapterId, dap::Payload)>> {
+    ) -> SelectAll<helix_runtime::Receiver<(dap::registry::DebugAdapterId, dap::ServerEvent)>> {
         std::mem::replace(&mut self.debug_adapters.incoming, SelectAll::new())
     }
 
@@ -93,7 +93,8 @@ impl Editor {
             res
         });
 
-        self.save_queue.push_back(task);
+        self.save_queue
+            .push_back(super::core::PendingDocumentSave { doc_id, task });
         self.write_count += 1;
 
         Ok(())
@@ -140,9 +141,9 @@ impl Editor {
     }
 
     pub async fn recv_save_result(&mut self) -> Option<DocumentSavedEventResult> {
-        let save_task = self.save_queue.pop_front()?;
+        let pending = self.save_queue.pop_front()?;
         self.write_count = self.write_count.saturating_sub(1);
-        Some(match save_task.await {
+        Some(match pending.task.await {
             Ok(result) => result,
             Err(err) => Err(anyhow::anyhow!("document save task failed: {err}")),
         })
@@ -150,6 +151,10 @@ impl Editor {
 
     pub fn has_pending_writes(&self) -> bool {
         self.write_count > 0
+    }
+
+    pub fn pending_write_documents(&self) -> impl Iterator<Item = DocumentId> + '_ {
+        self.save_queue.iter().map(|pending| pending.doc_id)
     }
 
     pub async fn flush_writes(&mut self) -> anyhow::Result<()> {

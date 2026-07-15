@@ -96,7 +96,13 @@ pub fn show_document_symbol_picker(
         crate::ui::PickerRuntime::new(editor),
         ingress,
         move |cx: &mut crate::compositor::Context, item, action| {
-            navigation::jump_to_location(cx.editor, &item.location, action);
+            navigation::jump_to_location(
+                cx.editor,
+                &cx.ingress,
+                &cx.foreground,
+                &item.location,
+                action,
+            );
         },
     )
     .with_preview(move |_editor, item| navigation::location_to_file_location(&item.location))
@@ -163,7 +169,13 @@ pub fn show_hierarchy_picker(
         crate::ui::PickerRuntime::new(editor),
         ingress,
         move |cx: &mut crate::compositor::Context, item, action| {
-            navigation::jump_to_location(cx.editor, &item.location, action);
+            navigation::jump_to_location(
+                cx.editor,
+                &cx.ingress,
+                &cx.foreground,
+                &item.location,
+                action,
+            );
         },
     )
     .with_preview(move |_editor, item| navigation::location_to_file_location(&item.location))
@@ -184,8 +196,7 @@ pub fn show_hierarchy_prepare_picker(
         return;
     }
     if items.len() == 1 {
-        let hierarchy_items = hierarchy_items_for_prepare(editor, items[0].clone());
-        show_hierarchy_picker(editor, compositor, ingress, hierarchy_items, empty_message);
+        request_hierarchy_items(editor, ingress, items[0].clone(), empty_message);
         return;
     }
 
@@ -222,13 +233,7 @@ pub fn show_hierarchy_prepare_picker(
         crate::ui::PickerRuntime::new(editor),
         ingress.clone(),
         move |cx: &mut crate::compositor::Context, item, _action| {
-            let hierarchy_items = hierarchy_items_for_prepare(cx.editor, item.clone());
-            ingress.ui(crate::runtime::UiCommand::Lsp(
-                crate::runtime::ui::command::LspCommand::Hierarchy {
-                    items: hierarchy_items,
-                    empty_message,
-                },
-            ));
+            request_hierarchy_items(cx.editor, ingress.clone(), item.clone(), empty_message);
         },
     )
     .truncate_start(false);
@@ -236,67 +241,90 @@ pub fn show_hierarchy_prepare_picker(
     compositor.push(Box::new(overlaid(picker)));
 }
 
-fn hierarchy_items_for_prepare(
+fn request_hierarchy_items(
     editor: &mut helix_view::Editor,
+    ingress: crate::runtime::RuntimeIngress,
     item: LspHierarchyPrepareItem,
-) -> Vec<LspHierarchyPickerItem> {
-    match item {
+    empty_message: &'static str,
+) {
+    let server_id = match &item {
+        LspHierarchyPrepareItem::Call { server_id, .. }
+        | LspHierarchyPrepareItem::Type { server_id, .. } => *server_id,
+    };
+    let Some(language_server) = editor.language_server_client(server_id).cloned() else {
+        editor.set_error("Language server is no longer available");
+        return;
+    };
+    editor.set_status("Loading hierarchy...");
+    editor
+        .work()
+        .spawn(async move {
+            let result = hierarchy_items_for_prepare(language_server, item).await;
+            match result {
+                Ok(items) => {
+                    let _ = ingress
+                        .send_ui(crate::runtime::UiCommand::Lsp(
+                            crate::runtime::ui::command::LspCommand::Hierarchy {
+                                items,
+                                empty_message,
+                            },
+                        ))
+                        .await;
+                }
+                Err(error) => ingress.status(anyhow::anyhow!("Failed to load hierarchy: {error}")),
+            }
+        })
+        .detach();
+}
+
+async fn hierarchy_items_for_prepare(
+    language_server: std::sync::Arc<helix_lsp::Client>,
+    item: LspHierarchyPrepareItem,
+) -> helix_lsp::Result<Vec<LspHierarchyPickerItem>> {
+    Ok(match item {
         LspHierarchyPrepareItem::Call {
-            server_id,
             offset_encoding,
             item,
             direction,
-        } => {
-            let Some(language_server) = editor.language_server_by_id(server_id) else {
-                editor.set_error("Language server is no longer available");
-                return Vec::new();
-            };
-            match direction {
-                LspCallHierarchyDirection::Incoming => language_server
-                    .call_hierarchy_incoming_calls(item, None)
-                    .and_then(|request| helix_lsp::block_on(request).ok())
-                    .flatten()
-                    .map(|calls| {
-                        crate::commands::lsp::call_hierarchy_incoming_picker_items(
-                            calls,
-                            offset_encoding,
-                        )
-                    }),
-                LspCallHierarchyDirection::Outgoing => language_server
-                    .call_hierarchy_outgoing_calls(item, None)
-                    .and_then(|request| helix_lsp::block_on(request).ok())
-                    .flatten()
-                    .map(|calls| {
-                        crate::commands::lsp::call_hierarchy_outgoing_picker_items(
-                            calls,
-                            offset_encoding,
-                        )
-                    }),
+            ..
+        } => match direction {
+            LspCallHierarchyDirection::Incoming => {
+                let Some(request) = language_server.call_hierarchy_incoming_calls(item, None)
+                else {
+                    return Ok(Vec::new());
+                };
+                let calls = request.await?.unwrap_or_default();
+                crate::commands::lsp::call_hierarchy_incoming_picker_items(calls, offset_encoding)
             }
-            .unwrap_or_default()
-        }
+            LspCallHierarchyDirection::Outgoing => {
+                let Some(request) = language_server.call_hierarchy_outgoing_calls(item, None)
+                else {
+                    return Ok(Vec::new());
+                };
+                let calls = request.await?.unwrap_or_default();
+                crate::commands::lsp::call_hierarchy_outgoing_picker_items(calls, offset_encoding)
+            }
+        },
         LspHierarchyPrepareItem::Type {
-            server_id,
             offset_encoding,
             item,
             direction,
-        } => {
-            let Some(language_server) = editor.language_server_by_id(server_id) else {
-                editor.set_error("Language server is no longer available");
-                return Vec::new();
-            };
-            let result = match direction {
-                LspTypeHierarchyDirection::Supertypes => language_server
-                    .type_hierarchy_supertypes(item, None)
-                    .and_then(|request| helix_lsp::block_on(request).ok())
-                    .flatten(),
-                LspTypeHierarchyDirection::Subtypes => language_server
-                    .type_hierarchy_subtypes(item, None)
-                    .and_then(|request| helix_lsp::block_on(request).ok())
-                    .flatten(),
+            ..
+        } => match direction {
+            LspTypeHierarchyDirection::Supertypes => {
+                let Some(request) = language_server.type_hierarchy_supertypes(item, None) else {
+                    return Ok(Vec::new());
+                };
+                let items = request.await?.unwrap_or_default();
+                crate::commands::lsp::type_hierarchy_picker_items(items, offset_encoding)
             }
-            .unwrap_or_default();
-            crate::commands::lsp::type_hierarchy_picker_items(result, offset_encoding)
-        }
-    }
+            LspTypeHierarchyDirection::Subtypes => {
+                let Some(request) = language_server.type_hierarchy_subtypes(item, None) else {
+                    return Ok(Vec::new());
+                };
+                let items = request.await?.unwrap_or_default();
+                crate::commands::lsp::type_hierarchy_picker_items(items, offset_encoding)
+            }
+        },
+    })
 }

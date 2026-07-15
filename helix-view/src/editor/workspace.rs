@@ -8,18 +8,9 @@ use anyhow::Error;
 use helix_core::Selection;
 use helix_lsp::{self};
 
-use crate::{
-    document::{DocumentOpenError, LanguageInitialization},
-    Align, Document, DocumentId, View, ViewId,
-};
+use crate::{document::DocumentOpenError, Align, Document, DocumentId, View, ViewId};
 
-use super::{Action, CloseError, Editor};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DocumentOpenRole {
-    Interactive,
-    Preview,
-}
+use super::{Action, CloseError, DocumentOpenRole, Editor};
 
 #[derive(Debug)]
 pub struct DetachedPreviewDocument {
@@ -45,19 +36,6 @@ impl DetachedPreviewDocument {
 
     fn into_document(self) -> Document {
         self.document
-    }
-}
-
-impl DocumentOpenRole {
-    const fn language_initialization(self) -> LanguageInitialization {
-        match self {
-            Self::Interactive => LanguageInitialization::Full,
-            Self::Preview => LanguageInitialization::Full,
-        }
-    }
-
-    const fn is_preview(self) -> bool {
-        matches!(self, Self::Preview)
     }
 }
 
@@ -237,75 +215,6 @@ impl Editor {
         self.document_by_path(path).map(|doc| doc.id)
     }
 
-    fn initialize_visual_document(&mut self, id: DocumentId, path: &Path) {
-        let start = Instant::now();
-        let diagnostics_start = Instant::now();
-        let diagnostics = {
-            let doc = self
-                .documents
-                .get(&id)
-                .expect("document must exist before visual initialization");
-            Editor::doc_diagnostics(&self.language_servers, &self.diagnostics, doc)
-        };
-        let diagnostics_us = diagnostics_start.elapsed().as_micros();
-        let diff_start = Instant::now();
-        let diff_base = self.diff_providers.get_diff_base(path);
-        let diff_base_us = diff_start.elapsed().as_micros();
-        let head_start = Instant::now();
-        let version_control_head = self.diff_providers.get_current_head_name(path);
-        let head_us = head_start.elapsed().as_micros();
-        let redraw = self.document_redraw_handle();
-
-        let doc = self
-            .documents
-            .get_mut(&id)
-            .expect("document must exist before visual initialization");
-        doc.replace_diagnostics(diagnostics, &[], None);
-        if let Some(diff_base) = diff_base {
-            doc.set_diff_base(diff_base, &redraw);
-        }
-        doc.set_version_control_head(version_control_head);
-        log::info!(
-            "[document_open] visual_init doc={:?} path={} diagnostics={} diff_base={} diagnostics_us={} diff_base_us={} head_us={} total_us={}",
-            id,
-            path.display(),
-            doc.diagnostics().len(),
-            doc.diff_handle().is_some(),
-            diagnostics_us,
-            diff_base_us,
-            head_us,
-            start.elapsed().as_micros()
-        );
-    }
-
-    fn initialize_interactive_document(&mut self, id: DocumentId, path: &std::path::PathBuf) {
-        self.initialize_visual_document(id, path);
-        let doc = self
-            .documents
-            .get_mut(&id)
-            .expect("document must exist before interactive initialization");
-        doc.promote_from_preview();
-
-        self.launch_language_servers(id);
-        self.dispatch_document_open(id, path);
-    }
-
-    fn initialize_preview_document(&mut self, id: DocumentId, path: &Path) {
-        self.initialize_visual_document(id, path);
-        self.launch_language_servers(id);
-        let language_servers = self
-            .documents
-            .get(&id)
-            .map(|doc| doc.language_servers().count())
-            .unwrap_or(0);
-        log::info!(
-            "[document_open] preview_lsp doc={:?} path={} language_servers={}",
-            id,
-            path.display(),
-            language_servers,
-        );
-    }
-
     fn close_preview_language_servers(doc: &mut Document) -> usize {
         let language_servers = doc.language_servers().count();
         for language_server in doc.language_servers() {
@@ -329,19 +238,29 @@ impl Editor {
             .documents
             .get_mut(&id)
             .expect("document must exist while promoting preview");
+        let syntax_was_present = doc.has_syntax();
         doc.promote_from_preview();
 
         self.launch_language_servers(id);
         self.dispatch_document_open(id, &path);
-        let language_servers = self
+        let (language_name, has_syntax, language_servers) = self
             .documents
             .get(&id)
-            .map(|doc| doc.language_servers().count())
-            .unwrap_or(0);
+            .map(|doc| {
+                (
+                    doc.language_name().unwrap_or("<none>").to_owned(),
+                    doc.has_syntax(),
+                    doc.language_servers().count(),
+                )
+            })
+            .unwrap_or_else(|| (String::from("<missing>"), false, 0));
         log::info!(
-            "[document_open] preview_promote doc={:?} path={} language_servers={} documents={}",
+            "[document_open] preview_promote doc={:?} path={} language={} syntax_was_present={} has_syntax={} language_servers={} documents={}",
             id,
             path.display(),
+            language_name,
+            syntax_was_present,
+            has_syntax,
             language_servers,
             self.document_count(),
         );
@@ -362,26 +281,16 @@ impl Editor {
             }
             id
         } else {
-            let mut doc = Document::open(
-                &path,
-                None,
-                role.language_initialization(),
-                self.config.clone(),
-                self.syn_loader.clone(),
-            )?;
-
-            if role.is_preview() {
-                doc.mark_preview();
+            let prepared = match self.take_prepared_document_open(&path) {
+                Some(prepared) => prepared,
+                None => self.prepare_document_open(&path, role).execute()?,
+            };
+            let prepared_role = prepared.role();
+            let id = self.apply_prepared_document_open(prepared, action);
+            if !role.is_preview() && prepared_role.is_preview() {
+                self.promote_preview_document(id);
             }
-
-            let id = self.new_document(doc);
-            if role.is_preview() {
-                self.initialize_preview_document(id, &path);
-            } else {
-                self.initialize_interactive_document(id, &path);
-            }
-
-            id
+            return Ok(id);
         };
 
         self.switch(id, action);
@@ -437,6 +346,46 @@ impl Editor {
             self.document_count(),
             restore_us,
             lsp_us,
+            switch_us,
+            restore_start.elapsed().as_micros(),
+        );
+        id
+    }
+
+    pub fn restore_and_promote_preview_document(
+        &mut self,
+        detached: DetachedPreviewDocument,
+        action: Action,
+    ) -> DocumentId {
+        let restore_start = Instant::now();
+        let restore_language_servers = detached.restore_language_servers();
+        let doc = detached.into_document();
+        debug_assert!(doc.is_preview());
+        let path = doc.path().cloned();
+        let id = self.restore_document(doc);
+        let restore_us = restore_start.elapsed().as_micros();
+        let promote_start = Instant::now();
+        self.promote_preview_document(id);
+        let promote_us = promote_start.elapsed().as_micros();
+        let switch_start = Instant::now();
+        self.switch(id, action);
+        let switch_us = switch_start.elapsed().as_micros();
+        let language_servers = self
+            .documents
+            .get(&id)
+            .map(|doc| doc.language_servers().count())
+            .unwrap_or(0);
+        log::info!(
+            "[document_open] preview_restore_promote doc={:?} path={} restore_language_servers={} language_servers={} documents={} restore_us={} promote_us={} switch_us={} total_us={}",
+            id,
+            path.as_deref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| String::from("<scratch>")),
+            restore_language_servers,
+            language_servers,
+            self.document_count(),
+            restore_us,
+            promote_us,
             switch_us,
             restore_start.elapsed().as_micros(),
         );

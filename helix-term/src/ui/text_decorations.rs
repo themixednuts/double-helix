@@ -4,7 +4,6 @@ use helix_core::doc_formatter::FormattedGrapheme;
 use helix_core::text_annotations::TextAnnotations;
 use helix_core::text_folding::FoldAnnotations;
 use helix_core::Position;
-use helix_view::editor::CursorCache;
 use helix_view::theme::{Style, Theme};
 
 use crate::ui::document::{LinePos, TextRenderer};
@@ -94,6 +93,10 @@ pub trait Decoration {
     fn fast_forward_to_char(&mut self, char_idx: usize, _doc_line: usize) -> usize {
         self.reset_pos(char_idx)
     }
+
+    fn cursor_position(&self) -> Option<Position> {
+        None
+    }
 }
 
 impl<F: FnMut(&mut TextRenderer, LinePos)> Decoration for F {
@@ -158,15 +161,30 @@ impl<'a> DecorationManager<'a> {
             virt_off += decoration.render_virt_lines(renderer, pos, virt_off);
         }
     }
+
+    pub fn cursor_position(&self) -> Option<Position> {
+        self.decorations
+            .iter()
+            .find_map(|(decoration, _)| decoration.cursor_position())
+    }
 }
 
-/// Cursor rendering is done externally so all the cursor decoration
-/// does is save the position of primary cursor
-pub struct Cursor<'a> {
-    pub cache: &'a CursorCache,
+/// Locates the primary cursor while traversing the exact formatted document.
+pub struct Cursor {
     pub primary_cursor: usize,
+    position: Option<Position>,
 }
-impl Decoration for Cursor<'_> {
+
+impl Cursor {
+    pub fn new(primary_cursor: usize) -> Self {
+        Self {
+            primary_cursor,
+            position: None,
+        }
+    }
+}
+
+impl Decoration for Cursor {
     fn reset_pos(&mut self, pos: usize) -> usize {
         if pos <= self.primary_cursor {
             self.primary_cursor
@@ -183,10 +201,13 @@ impl Decoration for Cursor<'_> {
         if renderer.column_in_bounds(grapheme.visual_pos.col, grapheme.width())
             && renderer.offset.row < grapheme.visual_pos.row
         {
-            let position = grapheme.visual_pos - renderer.offset;
-            self.cache.set(Some(position));
+            self.position = Some(grapheme.visual_pos - renderer.offset);
         }
         usize::MAX
+    }
+
+    fn cursor_position(&self) -> Option<Position> {
+        self.position
     }
 }
 

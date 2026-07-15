@@ -1,4 +1,4 @@
-use futures_util::{Stream, StreamExt};
+use futures_util::{FutureExt, Stream, StreamExt};
 use helix_view::bench::{
     enter_bench_command, enter_bench_run, log_command_phase, BenchResetStats, BENCH_INSERT_SNIPPETS,
 };
@@ -10,7 +10,8 @@ impl Application {
     #[cfg(feature = "integration")]
     pub async fn render_timed(&mut self) -> std::time::Duration {
         let start = std::time::Instant::now();
-        self.render().await;
+        self.invalidate(super::FRAME_TIMER);
+        let _ = self.render_if_due().await;
         start.elapsed()
     }
 
@@ -60,7 +61,7 @@ impl Application {
             let redraw = self.editor.redraw_handle();
             let notifier = crate::handlers::local::Notifier {
                 redraw: redraw.clone(),
-                plugin_events: self.ingress().plugin_event_tx.clone(),
+                plugin_events: self.ingress().tx.clone().into(),
             };
             let mut cx = Self::make_compositor_context(
                 &mut self.editor,
@@ -69,13 +70,15 @@ impl Application {
                 notifier,
                 ingress,
                 idle_reset,
-                self.plugin_manager.clone(),
+                self.plugin_runtime.clone(),
+                self.foreground.clone(),
             );
 
             for key in &keys {
                 self.compositor.handle_event(&ViewEvent::Key(*key), &mut cx);
             }
         }
+        self.drain_foreground();
 
         let action_dur = action_start.elapsed();
         let (post_action_lines, post_action_bytes) = self.bench_buffer_stats();
@@ -162,7 +165,7 @@ impl Application {
             let redraw = self.editor.redraw_handle();
             let notifier = crate::handlers::local::Notifier {
                 redraw: redraw.clone(),
-                plugin_events: self.ingress().plugin_event_tx.clone(),
+                plugin_events: self.ingress().tx.clone().into(),
             };
             let mut cx = Self::make_compositor_context(
                 &mut self.editor,
@@ -171,10 +174,12 @@ impl Application {
                 notifier,
                 ingress,
                 idle_reset,
-                self.plugin_manager.clone(),
+                self.plugin_runtime.clone(),
+                self.foreground.clone(),
             );
             self.compositor.handle_event(&ViewEvent::Key(esc), &mut cx);
         }
+        self.drain_foreground();
 
         if self.editor.should_close() {
             let _ = self.editor.new_file(helix_view::editor::Action::Replace);
@@ -208,10 +213,11 @@ impl Application {
 
             let poll_dur = if last_poll.elapsed() >= std::time::Duration::from_millis(200) {
                 let poll_start = std::time::Instant::now();
-                if let Ok(Some(event)) =
-                    tokio::time::timeout(std::time::Duration::ZERO, input_stream.next()).await
-                {
-                    self.handle_terminal_events(event).await;
+                if let Some(Some(event)) = input_stream.next().now_or_never() {
+                    if !self.handle_terminal_events(event).await {
+                        self.editor.cancel_bench();
+                        break;
+                    }
                     if !self.editor.has_active_bench() {
                         break;
                     }
@@ -238,13 +244,14 @@ impl Application {
 
             let action_dur = batch_start.elapsed();
 
-            if tokio::time::Instant::now() >= self.timers.idle.deadline() {
+            if self.timers.idle.is_due(self.runtime.clock().now()) {
                 self.service_idle_timeout(crate::runtime::IdleRender::Defer)
                     .await;
             }
 
             let render_start = std::time::Instant::now();
-            self.render().await;
+            self.invalidate(super::FRAME_TIMER);
+            let _ = self.render_if_due().await;
             let render_dur = render_start.elapsed();
 
             let tick_dur = action_dur + render_dur + poll_dur;

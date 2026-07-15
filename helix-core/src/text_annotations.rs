@@ -3,10 +3,11 @@ use std::cmp::Ordering;
 use std::fmt::Debug;
 use std::ops::Range;
 use std::ptr::NonNull;
+use std::sync::Arc;
 
 use crate::doc_formatter::FormattedGrapheme;
 use crate::syntax::{Highlight, OverlayHighlights};
-use crate::text_folding::{FoldAnnotations, FoldContainer};
+use crate::text_folding::{FoldAnnotations, FoldContainer, FoldContainerStorage};
 use crate::{Position, Tendril};
 
 /// An inline annotation is continuous text shown
@@ -113,7 +114,7 @@ impl Overlay {
 /// state of some kind should use `Cell`. Using interior mutability for
 /// caches is preferable as otherwise a lot of lifetimes become invariant
 /// which complicates APIs a lot.
-pub trait LineAnnotation {
+pub trait LineAnnotation: Send {
     fn plain_viewport_debug_name(&self) -> &'static str {
         std::any::type_name::<Self>()
     }
@@ -187,8 +188,38 @@ pub trait LineAnnotation {
 }
 
 #[derive(Debug)]
+enum AnnotationStorage<'a, A> {
+    Borrowed(&'a [A]),
+    Shared {
+        annotations: Arc<[A]>,
+        range: Range<usize>,
+    },
+}
+
+impl<A> AnnotationStorage<'_, A> {
+    fn as_slice(&self) -> &[A] {
+        match self {
+            Self::Borrowed(annotations) => annotations,
+            Self::Shared { annotations, range } => &annotations[range.clone()],
+        }
+    }
+}
+
+impl<A> Clone for AnnotationStorage<'_, A> {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Borrowed(annotations) => Self::Borrowed(annotations),
+            Self::Shared { annotations, range } => Self::Shared {
+                annotations: Arc::clone(annotations),
+                range: range.clone(),
+            },
+        }
+    }
+}
+
+#[derive(Debug)]
 struct Layer<'a, A, M> {
-    annotations: &'a [A],
+    annotations: AnnotationStorage<'a, A>,
     current_index: Cell<usize>,
     metadata: M,
 }
@@ -261,7 +292,7 @@ impl PlainViewportSupportReport {
 impl<A, M: Clone> Clone for Layer<'_, A, M> {
     fn clone(&self) -> Self {
         Layer {
-            annotations: self.annotations,
+            annotations: self.annotations.clone(),
             current_index: self.current_index.clone(),
             metadata: self.metadata.clone(),
         }
@@ -272,12 +303,13 @@ impl<A, M> Layer<'_, A, M> {
     pub fn reset_pos(&self, char_idx: usize, get_char_idx: impl Fn(&A) -> usize) {
         let new_index = self
             .annotations
+            .as_slice()
             .partition_point(|annot| get_char_idx(annot) < char_idx);
         self.current_index.set(new_index);
     }
 
     pub fn consume(&self, char_idx: usize, get_char_idx: impl Fn(&A) -> usize) -> Option<&A> {
-        let annot = self.annotations.get(self.current_index.get())?;
+        let annot = self.annotations.as_slice().get(self.current_index.get())?;
         debug_assert!(get_char_idx(annot) >= char_idx);
         if get_char_idx(annot) == char_idx {
             self.current_index.set(self.current_index.get() + 1);
@@ -291,7 +323,20 @@ impl<A, M> Layer<'_, A, M> {
 impl<'a, A, M> From<(&'a [A], M)> for Layer<'a, A, M> {
     fn from((annotations, metadata): (&'a [A], M)) -> Layer<'a, A, M> {
         Layer {
-            annotations,
+            annotations: AnnotationStorage::Borrowed(annotations),
+            current_index: Cell::new(0),
+            metadata,
+        }
+    }
+}
+
+impl<A, M> From<(Arc<[A]>, M)> for Layer<'static, A, M> {
+    fn from((annotations, metadata): (Arc<[A]>, M)) -> Self {
+        Self {
+            annotations: AnnotationStorage::Shared {
+                range: 0..annotations.len(),
+                annotations,
+            },
             current_index: Cell::new(0),
             metadata,
         }
@@ -328,6 +373,10 @@ fn reset_pos<A, M>(layers: &[Layer<A, M>], pos: usize, get_pos: impl Fn(&A) -> u
 /// that is covariant over `'a` (or in other words it's a raw pointer, as long as
 /// we don't hand out references we are free to do whatever we want).
 struct RawBox<T: ?Sized>(NonNull<T>);
+
+// SAFETY: `RawBox` uniquely owns the allocation and never exposes aliases. Moving it
+// between threads only transfers that ownership, which is valid when `T: Send`.
+unsafe impl<T: ?Sized + Send> Send for RawBox<T> {}
 
 impl<T: ?Sized> RawBox<T> {
     /// Safety: Only a single mutable reference
@@ -460,7 +509,7 @@ impl<'a> TextAnnotations<'a> {
             get_char_idx: impl Fn(&A) -> usize,
         ) -> bool {
             layers.iter().any(|layer| {
-                let annotations = layer.annotations;
+                let annotations = layer.annotations.as_slice();
                 let start = annotations.partition_point(|annot| get_char_idx(annot) < line_start);
                 annotations
                     .get(start)
@@ -562,6 +611,43 @@ impl<'a> TextAnnotations<'a> {
         self
     }
 
+    pub fn add_shared_inline_annotations(
+        &mut self,
+        layer: Arc<[InlineAnnotation]>,
+        highlight: Option<Highlight>,
+    ) -> &mut Self {
+        if !layer.is_empty() {
+            self.inline_annotations.push(Layer {
+                annotations: AnnotationStorage::Shared {
+                    range: 0..layer.len(),
+                    annotations: layer,
+                },
+                current_index: Cell::new(0),
+                metadata: highlight,
+            });
+        }
+        self
+    }
+
+    pub fn add_shared_inline_annotation(
+        &mut self,
+        layer: Arc<[InlineAnnotation]>,
+        index: usize,
+        highlight: Option<Highlight>,
+    ) -> &mut Self {
+        if index < layer.len() {
+            self.inline_annotations.push(Layer {
+                annotations: AnnotationStorage::Shared {
+                    annotations: layer,
+                    range: index..index + 1,
+                },
+                current_index: Cell::new(0),
+                metadata: highlight,
+            });
+        }
+        self
+    }
+
     /// Add new grapheme overlays.
     ///
     /// The overlaid grapheme will be rendered with `highlight`
@@ -579,9 +665,34 @@ impl<'a> TextAnnotations<'a> {
         self
     }
 
+    pub fn add_shared_overlay(
+        &mut self,
+        layer: Arc<[Overlay]>,
+        highlight: Option<Highlight>,
+    ) -> &mut Self {
+        if !layer.is_empty() {
+            self.overlays.push(Layer {
+                annotations: AnnotationStorage::Shared {
+                    range: 0..layer.len(),
+                    annotations: layer,
+                },
+                current_index: Cell::new(0),
+                metadata: highlight,
+            });
+        }
+        self
+    }
+
     pub fn add_folds(&mut self, fold_container: &'a FoldContainer) -> &mut Self {
         if !fold_container.is_empty() {
-            self.folds.container = Some(fold_container);
+            self.folds.container = Some(FoldContainerStorage::Borrowed(fold_container));
+        }
+        self
+    }
+
+    pub fn add_shared_folds(&mut self, fold_container: Arc<FoldContainer>) -> &mut Self {
+        if !fold_container.is_empty() {
+            self.folds.container = Some(FoldContainerStorage::Shared(fold_container));
         }
         self
     }
@@ -666,6 +777,13 @@ mod tests {
     };
     use crate::Position;
     use crate::Rope;
+
+    #[test]
+    fn owned_text_annotations_are_send() {
+        fn assert_send<T: Send>() {}
+
+        assert_send::<TextAnnotations<'static>>();
+    }
 
     #[test]
     fn plain_viewport_support_ignores_folds_outside_line_span() {

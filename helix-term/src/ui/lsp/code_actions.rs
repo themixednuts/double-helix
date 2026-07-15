@@ -10,15 +10,22 @@ use crate::ui::{self, overlay::overlaid, Popup, PromptEvent};
 pub fn apply_code_action_item(
     editor: &mut Editor,
     ingress: crate::runtime::RuntimeIngress,
+    foreground: &crate::runtime::ForegroundEvents,
     item: &LspCodeActionItem,
 ) {
-    crate::effect::language_server::request_apply_code_action(editor, item.clone(), ingress);
+    crate::effect::language_server::request_apply_code_action(
+        editor,
+        item.clone(),
+        ingress,
+        foreground,
+    );
 }
 
 pub fn show_code_action_menu(
     editor: &mut Editor,
     compositor: &mut Compositor,
     ingress: crate::runtime::RuntimeIngress,
+    foreground: crate::runtime::ForegroundEvents,
     items: Vec<LspCodeActionItem>,
 ) {
     if items.is_empty() {
@@ -30,7 +37,7 @@ pub fn show_code_action_menu(
             return;
         }
         let action = action.unwrap();
-        apply_code_action_item(editor, ingress.clone(), action);
+        apply_code_action_item(editor, ingress.clone(), &foreground, action);
     });
     picker.move_down();
 
@@ -42,6 +49,7 @@ pub fn show_code_action_picker(
     editor: &mut Editor,
     compositor: &mut Compositor,
     ingress: crate::runtime::RuntimeIngress,
+    _foreground: crate::runtime::ForegroundEvents,
     items: Vec<LspCodeActionItem>,
 ) {
     if items.is_empty() {
@@ -64,7 +72,7 @@ pub fn show_code_action_picker(
         ui::PickerRuntime::new(editor),
         ingress.clone(),
         move |cx: &mut crate::compositor::Context, lsp_item, _action| {
-            apply_code_action_item(cx.editor, cx.ingress.clone(), lsp_item);
+            apply_code_action_item(cx.editor, cx.ingress.clone(), &cx.foreground, lsp_item);
         },
     );
     compositor.push(Box::new(overlaid(picker)));

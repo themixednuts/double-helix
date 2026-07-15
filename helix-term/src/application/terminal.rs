@@ -1,7 +1,8 @@
 use futures_util::Stream;
 
-use helix_plugin::contract::{adapt, events};
-use helix_plugin::PluginNotification;
+use crate::runtime::PluginNotification;
+use helix_plugin_api::events;
+use helix_plugin_editor::adapt;
 use helix_view::graphics::Rect;
 
 use super::{Application, TerminalEvent};
@@ -14,9 +15,7 @@ impl Application {
                 view: adapt::view_handle(view.id),
                 document: adapt::document_handle(view.doc),
             });
-            self.plugin_manager
-                .fire_event(&mut self.editor, &event)
-                .ok();
+            self.plugin_runtime.notify_event(event);
         }
     }
 
@@ -26,13 +25,10 @@ impl Application {
         let redraw = self.editor.redraw_handle();
         let notifier = crate::handlers::local::Notifier {
             redraw: redraw.clone(),
-            plugin_events: self.ingress().plugin_event_tx.clone(),
+            plugin_events: self.ingress().tx.clone().into(),
         };
-        self.terminal
-            .resize(Rect::new(0, 0, width, height))
-            .expect("Unable to resize terminal");
-
-        let area = self.terminal.size();
+        let area = Rect::new(0, 0, width, height);
+        self.terminal_state.area = area;
         self.compositor.resize(area);
 
         let mut cx = Self::make_compositor_context(
@@ -42,11 +38,14 @@ impl Application {
             notifier,
             ingress,
             idle_reset,
-            self.plugin_manager.clone(),
+            self.plugin_runtime.clone(),
+            self.foreground.clone(),
         );
         let should_redraw = self
             .compositor
             .handle_event(&super::Event::Resize(width, height), &mut cx);
+        drop(cx);
+        self.drain_foreground();
         self.fire_view_change_event();
         should_redraw
     }
@@ -87,7 +86,7 @@ impl Application {
             eprintln!("{report}");
             self.editor
                 .set_status("Bench cancelled (Ctrl+C). Report printed to stderr.");
-            self.render().await;
+            self.invalidate(super::FRAME_INPUT);
         }
 
         true
@@ -98,20 +97,20 @@ impl Application {
         Self::load_configured_theme(
             &mut self.editor,
             &self.config.load(),
-            self.terminal.backend().supports_true_color(),
+            self.terminal_state.supports_true_color,
             Some(mode.into()),
         );
         true
     }
 
     fn dispatch_terminal_input(&mut self, event: helix_view::input::Event) -> bool {
+        let focused_before = self.editor.focused_view_id();
         if let helix_view::input::Event::Key(key) = &event {
-            helix_runtime::send_blocking(
-                &self.ingress().plugin_event_tx,
-                PluginNotification::KeyPress {
-                    key: key.to_string(),
-                },
-            );
+            if let Err(error) = self.foreground.plugin(PluginNotification::KeyPress {
+                key: key.to_string(),
+            }) {
+                self.editor.set_error(error.to_string());
+            }
         }
 
         let ingress = self.ingress().tx.clone();
@@ -119,7 +118,7 @@ impl Application {
         let redraw = self.editor.redraw_handle();
         let notifier = crate::handlers::local::Notifier {
             redraw: redraw.clone(),
-            plugin_events: self.ingress().plugin_event_tx.clone(),
+            plugin_events: self.ingress().tx.clone().into(),
         };
         let mut cx = Self::make_compositor_context(
             &mut self.editor,
@@ -128,9 +127,16 @@ impl Application {
             notifier,
             ingress,
             idle_reset,
-            self.plugin_manager.clone(),
+            self.plugin_runtime.clone(),
+            self.foreground.clone(),
         );
-        self.compositor.handle_event(&event, &mut cx)
+        let handled = self.compositor.handle_event(&event, &mut cx);
+        drop(cx);
+        self.drain_foreground();
+        if self.editor.focused_view_id() != focused_before {
+            self.fire_view_change_event();
+        }
+        handled
     }
 
     #[cfg(windows)]
@@ -142,7 +148,7 @@ impl Application {
     pub async fn handle_signals(&mut self, signal: i32) -> bool {
         match signal {
             signal_hook::consts::signal::SIGTSTP => {
-                self.restore_term().unwrap();
+                self.restore_term().await.unwrap();
 
                 let res = unsafe { libc::kill(0, signal_hook::consts::signal::SIGSTOP) };
 
@@ -150,32 +156,40 @@ impl Application {
                     let err = std::io::Error::last_os_error();
                     eprintln!("{}", err);
                     let res = err.raw_os_error().unwrap_or(1);
+                    crate::logging::flush();
                     std::process::exit(res);
                 }
             }
             signal_hook::consts::signal::SIGCONT => {
                 for retries in 1..=10 {
-                    match self.terminal.claim() {
-                        Ok(()) => break,
+                    match self
+                        .presenter
+                        .as_ref()
+                        .expect("terminal presenter must exist while handling signals")
+                        .claim()
+                        .await
+                    {
+                        Ok(area) => {
+                            self.terminal_state.area = area;
+                            self.compositor.resize(area);
+                            break;
+                        }
                         Err(err) if retries == 10 => panic!("Failed to claim terminal: {}", err),
-                        Err(_) => continue,
+                        Err(_) => tokio::task::yield_now().await,
                     }
                 }
 
-                let area = self.terminal.size();
-                self.compositor.resize(area);
-                self.terminal.clear().expect("couldn't clear terminal");
-
-                self.render().await;
+                self.compositor.full_redraw = true;
+                self.invalidate(super::FRAME_CONFIG);
             }
             signal_hook::consts::signal::SIGUSR1 => {
                 self.refresh_config();
-                self.render().await;
+                self.invalidate(super::FRAME_CONFIG);
             }
             signal_hook::consts::signal::SIGTERM
             | signal_hook::consts::signal::SIGINT
             | signal_hook::consts::signal::SIGHUP => {
-                self.restore_term().unwrap();
+                self.restore_term().await.unwrap();
                 return false;
             }
             _ => unreachable!(),
@@ -184,15 +198,23 @@ impl Application {
         true
     }
 
-    pub async fn handle_terminal_events(&mut self, event: std::io::Result<TerminalEvent>) {
+    pub async fn handle_terminal_events(&mut self, event: std::io::Result<TerminalEvent>) -> bool {
         #[cfg(not(windows))]
         use termina::escape::csi;
 
         if self.cancel_bench_if_requested(&event).await {
-            return;
+            return true;
         }
 
-        let should_redraw = match event.unwrap() {
+        let event = match event {
+            Ok(event) => event,
+            Err(error) => {
+                self.editor.exit_code = 1;
+                log::error!("terminal input failed: {error}");
+                return false;
+            }
+        };
+        let should_redraw = match event {
             #[cfg(not(windows))]
             termina::Event::WindowResized(termina::WindowSize { rows, cols, .. }) => {
                 self.handle_resize_event(cols, rows)
@@ -220,14 +242,21 @@ impl Application {
         };
 
         if should_redraw && !self.editor.should_close() {
-            self.render().await;
+            self.invalidate(super::FRAME_INPUT);
         }
+        true
     }
 
     #[cfg(all(not(feature = "integration"), not(windows)))]
     pub fn event_stream(&self) -> impl Stream<Item = std::io::Result<TerminalEvent>> + Unpin {
         use termina::{escape::csi, Terminal as _};
-        let reader = self.terminal.backend().terminal().event_reader();
+        let reader = self
+            .terminal
+            .as_ref()
+            .expect("terminal event stream must be created before application run")
+            .backend()
+            .terminal()
+            .event_reader();
         termina::EventStream::new(reader, |event| {
             !event.is_escape()
                 || matches!(

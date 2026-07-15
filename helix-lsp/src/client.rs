@@ -1,8 +1,11 @@
 use crate::{
     file_operations::FileOperationsInterest,
-    find_lsp_workspace, jsonrpc,
-    transport::{Payload, Transport},
-    Call, Error, LanguageServerId, OffsetEncoding, Result,
+    jsonrpc,
+    transport::{
+        DocumentChangeTarget, DocumentUpdate, InitializationState, Payload, Transport,
+        TransportHandle,
+    },
+    ClientLaunchIdentity, Error, LanguageServerId, OffsetEncoding, Result, ServerEvent,
 };
 
 use crate::lsp::{
@@ -10,15 +13,10 @@ use crate::lsp::{
     DidChangeWorkspaceFoldersParams, OneOf, PositionEncodingKind, SignatureHelp, Url,
     WorkspaceFolder, WorkspaceFoldersChangeEvent,
 };
-use helix_core::{
-    find_workspace,
-    syntax::config::{LanguageServerFeature, RootMarkers},
-    ChangeSet, Rope,
-};
-use helix_loader::VERSION_AND_GIT_HASH;
-use helix_runtime::{channel, send_blocking, Receiver, Sender};
-use helix_stdx::path;
-use parking_lot::Mutex;
+use arc_swap::ArcSwap;
+use helix_core::{syntax::config::LanguageServerFeature, ChangeSet, Rope};
+use helix_loader::{ResolvedLaunch, VERSION_AND_GIT_HASH};
+use helix_runtime::Receiver;
 use serde::Deserialize;
 use serde_json::Value;
 use std::{collections::HashMap, path::PathBuf};
@@ -34,7 +32,7 @@ use std::{path::Path, process::Stdio};
 use tokio::{
     io::{BufReader, BufWriter},
     process::{Child, Command},
-    sync::{Mutex as AsyncMutex, Notify, OnceCell},
+    sync::{Mutex as AsyncMutex, OnceCell},
 };
 
 fn workspace_for_uri(uri: lsp::Url) -> WorkspaceFolder {
@@ -48,6 +46,48 @@ fn workspace_for_uri(uri: lsp::Url) -> WorkspaceFolder {
     }
 }
 
+#[derive(Debug)]
+struct WorkspaceFolders {
+    snapshot: ArcSwap<Vec<WorkspaceFolder>>,
+}
+
+impl WorkspaceFolders {
+    fn new(folders: Vec<WorkspaceFolder>) -> Self {
+        Self {
+            snapshot: ArcSwap::from_pointee(folders),
+        }
+    }
+
+    fn snapshot(&self) -> Arc<Vec<WorkspaceFolder>> {
+        self.snapshot.load_full()
+    }
+
+    fn contains(&self, uri: &lsp::Url) -> bool {
+        self.snapshot
+            .load()
+            .iter()
+            .any(|workspace| &workspace.uri == uri)
+    }
+
+    fn insert(&self, folder: WorkspaceFolder) -> bool {
+        loop {
+            let current = self.snapshot.load_full();
+            if current.iter().any(|workspace| workspace.uri == folder.uri) {
+                return false;
+            }
+
+            let mut next = (*current).clone();
+            next.push(folder.clone());
+            let previous = arc_swap::Guard::into_inner(
+                self.snapshot.compare_and_swap(&current, Arc::new(next)),
+            );
+            if Arc::ptr_eq(&previous, &current) {
+                return true;
+            }
+        }
+    }
+}
+
 fn file_operation_uri(path: &Path, is_dir: bool) -> Option<String> {
     let url = if is_dir {
         Url::from_directory_path(path)
@@ -57,46 +97,24 @@ fn file_operation_uri(path: &Path, is_dir: bool) -> Option<String> {
     Some(url.ok()?.to_string())
 }
 
-#[derive(Debug)]
-struct CancelOnDrop {
-    server_tx: Sender<Payload>,
-    id: jsonrpc::Id,
-    armed: bool,
-}
-
-impl CancelOnDrop {
-    fn new(server_tx: Sender<Payload>, id: jsonrpc::Id) -> Self {
-        Self {
-            server_tx,
-            id,
-            armed: true,
-        }
-    }
-
-    fn disarm(&mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for CancelOnDrop {
-    fn drop(&mut self) {
-        if self.armed {
-            send_blocking(
-                &self.server_tx,
-                Payload::CancelRequest {
-                    id: self.id.clone(),
-                },
-            );
-        }
-    }
-}
-
 fn client_locale() -> Option<String> {
     ["LC_ALL", "LC_MESSAGES", "LANG"]
         .into_iter()
         .filter_map(|key| std::env::var(key).ok())
         .filter_map(|locale| normalize_locale(&locale))
         .next()
+}
+
+fn launch_arguments<'a>(
+    prefix_args: &'a [String],
+    default_args: &'a [String],
+    configured_args: &'a [String],
+) -> impl Iterator<Item = &'a str> {
+    prefix_args
+        .iter()
+        .chain(default_args)
+        .chain(configured_args)
+        .map(String::as_str)
 }
 
 fn normalize_locale(locale: &str) -> Option<String> {
@@ -111,50 +129,38 @@ fn normalize_locale(locale: &str) -> Option<String> {
 pub struct Client {
     id: LanguageServerId,
     name: String,
+    launch_identity: ClientLaunchIdentity,
     process: AsyncMutex<Child>,
-    server_tx: Sender<Payload>,
+    transport: TransportHandle,
     request_counter: AtomicU64,
     pub(crate) capabilities: OnceCell<lsp::ServerCapabilities>,
     pub(crate) file_operation_interest: OnceLock<FileOperationsInterest>,
     config: Option<Value>,
     root_path: std::path::PathBuf,
     root_uri: Option<lsp::Url>,
-    workspace_folders: Mutex<Vec<lsp::WorkspaceFolder>>,
-    initialize_notify: Arc<Notify>,
+    workspace_folders: WorkspaceFolders,
     /// workspace folders added while the server is still initializing
     req_timeout: u64,
 }
 
 impl Client {
-    pub fn try_add_doc(
+    pub(crate) fn try_add_prepared_doc(
         self: &Arc<Self>,
-        root_markers: &RootMarkers,
-        manual_roots: &[PathBuf],
-        doc_path: Option<&std::path::PathBuf>,
+        root_path: &Path,
+        root_uri: Option<lsp::Url>,
         may_support_workspace: bool,
     ) -> bool {
-        let (workspace, workspace_is_cwd) = find_workspace();
-        let workspace = path::normalize(workspace);
-        let root = find_lsp_workspace(
-            doc_path
-                .and_then(|x| x.parent().and_then(|x| x.to_str()))
-                .unwrap_or("."),
-            root_markers,
-            manual_roots,
-            &workspace,
-            workspace_is_cwd,
-        );
-        let root_uri = root
-            .as_ref()
-            .and_then(|root| lsp::Url::from_file_path(root).ok());
+        if matches!(
+            self.transport.initialization_state(),
+            InitializationState::Failed(_) | InitializationState::Closed
+        ) {
+            return false;
+        }
 
-        if self.root_path == root.unwrap_or(workspace)
-            || root_uri.as_ref().is_some_and(|root_uri| {
-                self.workspace_folders
-                    .lock()
-                    .iter()
-                    .any(|workspace| &workspace.uri == root_uri)
-            })
+        if self.root_path == root_path
+            || root_uri
+                .as_ref()
+                .is_some_and(|root_uri| self.workspace_folders.contains(root_uri))
         {
             // workspace URI is already registered so we can use this client
             return true;
@@ -176,9 +182,16 @@ impl Client {
             // documents LSP client handle. It's doable but a pretty weird edgecase so let's
             // wait and see if anyone ever runs into it.
             tokio::spawn(async move {
-                client.initialize_notify.notified().await;
-                if let Some(workspace_folders_caps) = client
-                    .capabilities()
+                if !matches!(
+                    client.transport.wait_for_initialization().await,
+                    InitializationState::Initialized
+                ) {
+                    return;
+                }
+                let Some(capabilities) = client.capabilities.get() else {
+                    return;
+                };
+                if let Some(workspace_folders_caps) = capabilities
                     .workspace
                     .as_ref()
                     .and_then(|cap| cap.workspace_folders.as_ref())
@@ -225,9 +238,12 @@ impl Client {
         };
 
         // server supports workspace folders, let's add the new root to the list
-        self.workspace_folders
-            .lock()
-            .push(workspace_for_uri(root_uri.clone()));
+        if !self
+            .workspace_folders
+            .insert(workspace_for_uri(root_uri.clone()))
+        {
+            return;
+        }
         if Some(&OneOf::Left(false)) == change_notifications {
             // server specifically opted out of DidWorkspaceChange notifications
             // let's assume the server will request the workspace folders itself
@@ -261,8 +277,8 @@ impl Client {
     }
 
     #[allow(clippy::type_complexity, clippy::too_many_arguments)]
-    pub fn start(
-        cmd: &str,
+    pub(crate) fn start_with_launch(
+        launch: ResolvedLaunch,
         args: &[String],
         config: Option<Value>,
         server_environment: impl IntoIterator<Item = (impl AsRef<OsStr>, impl AsRef<OsStr>)>,
@@ -270,16 +286,20 @@ impl Client {
         root_uri: Option<lsp::Url>,
         id: LanguageServerId,
         name: String,
+        launch_identity: ClientLaunchIdentity,
         req_timeout: u64,
-    ) -> Result<(Self, Receiver<(LanguageServerId, Call)>, Arc<Notify>)> {
-        let cmd = match helix_pkg::resolve::command(&helix_pkg::Store::open_default(), cmd) {
-            Some(resolved) => resolved.path,
-            None => helix_stdx::env::which(cmd)?,
-        };
-
-        let process = Command::new(cmd)
+    ) -> Result<(Self, Receiver<(LanguageServerId, ServerEvent)>)> {
+        let ResolvedLaunch {
+            program,
+            prefix_args,
+            default_args,
+            env,
+            ..
+        } = launch;
+        let process = Command::new(program)
+            .envs(env)
             .envs(server_environment)
-            .args(args)
+            .args(launch_arguments(&prefix_args, &default_args, args))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -295,8 +315,7 @@ impl Client {
         let reader = BufReader::new(process.stdout.take().expect("Failed to open stdout"));
         let stderr = BufReader::new(process.stderr.take().expect("Failed to open stderr"));
 
-        let (server_rx, server_tx, initialize_notify) =
-            Transport::start(reader, writer, stderr, id, name.clone());
+        let (server_rx, transport) = Transport::start(reader, writer, stderr, id, name.clone());
 
         let workspace_folders = root_uri
             .clone()
@@ -306,8 +325,9 @@ impl Client {
         let client = Self {
             id,
             name,
+            launch_identity,
             process: AsyncMutex::new(process),
-            server_tx,
+            transport,
             request_counter: AtomicU64::new(0),
             capabilities: OnceCell::new(),
             file_operation_interest: OnceLock::new(),
@@ -315,11 +335,10 @@ impl Client {
             req_timeout,
             root_path,
             root_uri,
-            workspace_folders: Mutex::new(workspace_folders),
-            initialize_notify: initialize_notify.clone(),
+            workspace_folders: WorkspaceFolders::new(workspace_folders),
         };
 
-        Ok((client, server_rx, initialize_notify))
+        Ok((client, server_rx))
     }
 
     pub fn name(&self) -> &str {
@@ -328,6 +347,10 @@ impl Client {
 
     pub fn id(&self) -> LanguageServerId {
         self.id
+    }
+
+    pub(crate) fn launch_identity(&self) -> &ClientLaunchIdentity {
+        &self.launch_identity
     }
 
     fn next_request_id(&self) -> jsonrpc::Id {
@@ -562,9 +585,11 @@ impl Client {
                 "utf-16" => Some(OffsetEncoding::Utf16),
                 "utf-32" => Some(OffsetEncoding::Utf32),
                 encoding => {
-                    log::error!("Server provided invalid position encoding {encoding}, defaulting to utf-16");
+                    log::error!(
+                        "Server provided invalid position encoding {encoding}, defaulting to utf-16"
+                    );
                     None
-                },
+                }
             })
             .unwrap_or_default()
     }
@@ -573,10 +598,8 @@ impl Client {
         self.config.as_ref()
     }
 
-    pub async fn workspace_folders(
-        &self,
-    ) -> parking_lot::MutexGuard<'_, Vec<lsp::WorkspaceFolder>> {
-        self.workspace_folders.lock()
+    pub fn workspace_folders(&self) -> Arc<Vec<lsp::WorkspaceFolder>> {
+        self.workspace_folders.snapshot()
     }
 
     /// Execute a RPC request on the language server.
@@ -585,9 +608,9 @@ impl Client {
         params: R::Params,
     ) -> impl Future<Output = Result<R::Result>>
     where
-        R::Params: serde::Serialize,
+        R::Params: serde::Serialize + Send + 'static,
     {
-        self.call_with_ref::<R>(&params)
+        self.call_with_timeout::<R>(params, self.req_timeout)
     }
 
     fn call_with_ref<R: lsp::request::Request>(
@@ -595,79 +618,123 @@ impl Client {
         params: &R::Params,
     ) -> impl Future<Output = Result<R::Result>>
     where
-        R::Params: serde::Serialize,
+        R::Params: serde::Serialize + Clone + Send + 'static,
     {
-        self.call_with_timeout::<R>(params, self.req_timeout)
+        self.call::<R>(params.clone())
     }
 
     fn call_with_timeout<R: lsp::request::Request>(
         &self,
-        params: &R::Params,
+        params: R::Params,
         timeout_secs: u64,
     ) -> impl Future<Output = Result<R::Result>>
     where
-        R::Params: serde::Serialize,
+        R::Params: serde::Serialize + Send + 'static,
     {
-        let server_tx = self.server_tx.clone();
+        let transport = self.transport.clone();
         let id = self.next_request_id();
-        let request = serde_json::to_value(params)
-            .map_err(Error::from)
-            .map(|params| jsonrpc::MethodCall {
-                jsonrpc: Some(jsonrpc::Version::V2),
-                id: id.clone(),
-                method: R::METHOD.to_string(),
-                params: Self::value_into_params(params),
-            });
+        let request_id = id.clone();
 
         async move {
             use std::time::Duration;
-            use tokio::time::timeout;
-            let request = request?;
-            let (tx, mut rx) = channel::<Result<Value>>(1);
-            server_tx
-                .send(Payload::Request {
-                    chan: tx,
-                    value: request,
-                })
+            transport
+                .request_deferred(
+                    id,
+                    R::METHOD,
+                    move || {
+                        let params = serde_json::to_value(params)?;
+                        serde_json::to_string(&jsonrpc::MethodCall {
+                            jsonrpc: Some(jsonrpc::Version::V2),
+                            id: request_id,
+                            method: R::METHOD.to_string(),
+                            params: Self::value_into_params(params),
+                        })
+                    },
+                    Duration::from_secs(timeout_secs),
+                )
                 .await
-                .map_err(|e| Error::Other(e.into()))?;
-            let mut cancel_on_drop = CancelOnDrop::new(server_tx, id.clone());
-            // TODO: delay other calls until initialize success
-            let response = timeout(Duration::from_secs(timeout_secs), rx.recv())
+                .and_then(|value| serde_json::from_value(value).map_err(Into::into))
+        }
+    }
+
+    /// Execute a dynamically named request while retaining normal timeout and
+    /// request-lease cancellation semantics.
+    pub fn call_custom(
+        &self,
+        method: String,
+        params: Value,
+    ) -> impl Future<Output = Result<Value>> {
+        let transport = self.transport.clone();
+        let id = self.next_request_id();
+        let timeout = self.req_timeout;
+        let request = jsonrpc::MethodCall {
+            jsonrpc: Some(jsonrpc::Version::V2),
+            id,
+            method,
+            params: Self::value_into_params(params),
+        };
+        async move {
+            transport
+                .request(request, std::time::Duration::from_secs(timeout))
                 .await
-                .map_err(|_| Error::Timeout(id))? // return Timeout
-                .ok_or(Error::StreamClosed)?;
-            cancel_on_drop.disarm();
-            response.and_then(|value| serde_json::from_value(value).map_err(Into::into))
         }
     }
 
     /// Send a RPC notification to the language server.
     pub fn notify<R: lsp::notification::Notification>(&self, params: R::Params)
     where
-        R::Params: serde::Serialize,
+        R::Params: serde::Serialize + Send + 'static,
     {
-        let server_tx = self.server_tx.clone();
+        self.notify_deferred::<R, _>(move || params);
+    }
 
-        let params = match serde_json::to_value(params) {
-            Ok(params) => params,
-            Err(err) => {
-                log::error!(
-                    "Failed to serialize params for notification '{}' for server '{}': {err}",
-                    R::METHOD,
-                    self.name,
-                );
-                return;
-            }
-        };
+    fn notify_deferred<R, F>(&self, build_params: F)
+    where
+        R: lsp::notification::Notification,
+        R::Params: serde::Serialize,
+        F: FnOnce() -> R::Params + Send + 'static,
+    {
+        let payload = Payload::deferred_notification(R::METHOD, move || {
+            let params = serde_json::to_value(build_params())?;
+            let notification = jsonrpc::Notification {
+                jsonrpc: Some(jsonrpc::Version::V2),
+                method: R::METHOD.to_string(),
+                params: Self::value_into_params(params),
+            };
+            serde_json::to_string(&notification)
+        });
+        match self.transport.send(payload) {
+            Ok(()) => {}
+            Err(Error::OutboundQueueFull) => log::error!(
+                "language-server outbound queue saturated; rejected notification '{}' for server '{}'",
+                R::METHOD,
+                self.name,
+            ),
+            Err(Error::StreamClosed) => log::debug!(
+                "Discarded notification '{}' because language server '{}' is closed",
+                R::METHOD,
+                self.name,
+            ),
+            Err(error) => log::error!(
+                "Failed to enqueue notification '{}' for language server '{}': {error}",
+                R::METHOD,
+                self.name,
+            ),
+        }
+    }
 
-        let notification = jsonrpc::Notification {
-            jsonrpc: Some(jsonrpc::Version::V2),
-            method: R::METHOD.to_string(),
-            params: Self::value_into_params(params),
-        };
-
-        send_blocking(&server_tx, Payload::Notification(notification));
+    fn update_document(&self, update: DocumentUpdate) {
+        match self.transport.send(Payload::DocumentUpdate(update)) {
+            Ok(()) => {}
+            Err(Error::StreamClosed) => log::debug!(
+                "discarded document synchronization because language server '{}' is closed",
+                self.name,
+            ),
+            Err(error) => log::error!(
+                "failed to update document synchronization for language server '{}': {error}",
+                self.name,
+            ),
+        }
     }
 
     /// Reply to a language server RPC call.
@@ -676,11 +743,27 @@ impl Client {
         id: jsonrpc::Id,
         result: core::result::Result<Value, jsonrpc::Error>,
     ) -> Result<()> {
+        self.transport.reply(Self::reply_output(id, result))
+    }
+
+    /// Reply and wait until the response has been written to the server stream.
+    pub async fn reply_async(
+        &self,
+        id: jsonrpc::Id,
+        result: core::result::Result<Value, jsonrpc::Error>,
+    ) -> Result<()> {
+        self.transport
+            .reply_async(Self::reply_output(id, result))
+            .await
+    }
+
+    fn reply_output(
+        id: jsonrpc::Id,
+        result: core::result::Result<Value, jsonrpc::Error>,
+    ) -> jsonrpc::Output {
         use jsonrpc::{Failure, Output, Success, Version};
 
-        let server_tx = self.server_tx.clone();
-
-        let output = match result {
+        match result {
             Ok(result) => Output::Success(Success {
                 jsonrpc: Some(Version::V2),
                 id,
@@ -691,16 +774,20 @@ impl Client {
                 id,
                 error,
             }),
-        };
-
-        send_blocking(&server_tx, Payload::Response(output));
-
-        Ok(())
+        }
     }
 
     // -------------------------------------------------------------------------------------------
     // General messages
     // -------------------------------------------------------------------------------------------
+
+    pub(crate) async fn finish_initialization(&self) -> Result<()> {
+        self.transport.initialized().await
+    }
+
+    pub(crate) fn fail_initialization(&self, error: impl Into<Arc<str>>) {
+        self.transport.fail_initialization(error);
+    }
 
     pub(crate) async fn initialize(&self, enable_snippets: bool) -> Result<lsp::InitializeResult> {
         if let Some(config) = &self.config {
@@ -710,7 +797,7 @@ impl Client {
         #[allow(deprecated)]
         let params = lsp::InitializeParams {
             process_id: Some(std::process::id()),
-            workspace_folders: Some(self.workspace_folders.lock().clone()),
+            workspace_folders: Some((*self.workspace_folders.snapshot()).clone()),
             // root_path is obsolete, but some clients like pyright still use it so we specify both.
             // clients will prefer _uri if possible
             root_path: self.root_path.to_str().map(|path| path.to_owned()),
@@ -1056,7 +1143,7 @@ impl Client {
             uri: file_operation_uri(path, is_dir)?,
         }];
         Some(self.call_with_timeout::<lsp::request::WillCreateFiles>(
-            &lsp::CreateFilesParams { files },
+            lsp::CreateFilesParams { files },
             5,
         ))
     }
@@ -1088,7 +1175,7 @@ impl Client {
             new_uri: file_operation_uri(new_path, is_dir)?,
         }];
         Some(self.call_with_timeout::<lsp::request::WillRenameFiles>(
-            &lsp::RenameFilesParams { files },
+            lsp::RenameFilesParams { files },
             5,
         ))
     }
@@ -1120,7 +1207,7 @@ impl Client {
             uri: file_operation_uri(path, is_dir)?,
         }];
         Some(self.call_with_timeout::<lsp::request::WillDeleteFiles>(
-            &lsp::DeleteFilesParams { files },
+            lsp::DeleteFilesParams { files },
             5,
         ))
     }
@@ -1148,14 +1235,12 @@ impl Client {
         doc: &Rope,
         language_id: String,
     ) {
-        self.notify::<lsp::notification::DidOpenTextDocument>(lsp::DidOpenTextDocumentParams {
-            text_document: lsp::TextDocumentItem {
-                uri,
-                language_id,
-                version,
-                text: String::from(doc),
-            },
-        })
+        self.update_document(DocumentUpdate::Open {
+            uri,
+            version,
+            text: doc.clone(),
+            language_id,
+        });
     }
 
     pub fn changeset_to_changes(
@@ -1271,9 +1356,7 @@ impl Client {
     pub fn text_document_did_change(
         &self,
         text_document: lsp::VersionedTextDocumentIdentifier,
-        old_text: &Rope,
         new_text: &Rope,
-        changes: &ChangeSet,
     ) -> Option<()> {
         let capabilities = self.capabilities.get().unwrap();
 
@@ -1290,33 +1373,32 @@ impl Client {
             _ => return None,
         };
 
-        let changes = match sync_capabilities {
-            lsp::TextDocumentSyncKind::FULL => {
-                vec![lsp::TextDocumentContentChangeEvent {
-                    // range = None -> whole document
-                    range: None,        //Some(Range)
-                    range_length: None, // u64 apparently deprecated
-                    text: new_text.to_string(),
-                }]
-            }
-            lsp::TextDocumentSyncKind::INCREMENTAL => {
-                Self::changeset_to_changes(old_text, new_text, changes, self.offset_encoding())
-            }
+        match sync_capabilities {
+            lsp::TextDocumentSyncKind::FULL | lsp::TextDocumentSyncKind::INCREMENTAL => {}
             lsp::TextDocumentSyncKind::NONE => return None,
-            kind => unimplemented!("{:?}", kind),
-        };
+            kind => {
+                log::error!(
+                    "language server '{}' advertised unsupported document sync kind {kind:?}",
+                    self.name
+                );
+                return None;
+            }
+        }
 
-        self.notify::<lsp::notification::DidChangeTextDocument>(lsp::DidChangeTextDocumentParams {
+        let update = DocumentUpdate::Change(DocumentChangeTarget {
             text_document,
-            content_changes: changes,
+            new_text: new_text.clone(),
+            sync_kind: sync_capabilities,
+            offset_encoding: self.offset_encoding(),
         });
+        self.update_document(update);
         Some(())
     }
 
     pub fn text_document_did_close(&self, text_document: lsp::TextDocumentIdentifier) {
-        self.notify::<lsp::notification::DidCloseTextDocument>(lsp::DidCloseTextDocumentParams {
-            text_document,
-        })
+        self.update_document(DocumentUpdate::Close {
+            uri: text_document.uri,
+        });
     }
 
     // will_save / will_save_wait_until
@@ -1343,9 +1425,10 @@ impl Client {
             lsp::TextDocumentSyncCapability::Kind(..) => false,
         };
 
-        self.notify::<lsp::notification::DidSaveTextDocument>(lsp::DidSaveTextDocumentParams {
-            text_document,
-            text: include_text.then_some(text.into()),
+        self.update_document(DocumentUpdate::Save {
+            uri: text_document.uri,
+            text: text.clone(),
+            include_text,
         });
         Some(())
     }
@@ -2380,36 +2463,65 @@ mod tests {
     use super::*;
 
     #[test]
-    fn dropped_cancel_guard_sends_cancel_once() {
-        let (tx, mut rx) = channel(2);
-        let guard = CancelOnDrop::new(tx, jsonrpc::Id::Num(42));
-
-        drop(guard);
-
-        assert!(matches!(
-            rx.try_recv(),
-            Ok(Payload::CancelRequest {
-                id: jsonrpc::Id::Num(42)
-            })
-        ));
-        assert!(rx.try_recv().is_err());
-    }
-
-    #[test]
-    fn disarmed_cancel_guard_does_not_cancel() {
-        let (tx, mut rx) = channel(2);
-        let mut guard = CancelOnDrop::new(tx, jsonrpc::Id::Num(42));
-
-        guard.disarm();
-        drop(guard);
-
-        assert!(rx.try_recv().is_err());
-    }
-
-    #[test]
     fn normalize_locale_uses_lsp_locale_shape() {
         assert_eq!(normalize_locale("en_US.UTF-8"), Some("en-US".to_string()));
         assert_eq!(normalize_locale("C"), None);
+    }
+
+    #[test]
+    fn resolved_launch_prefix_and_default_arguments_are_preserved() {
+        let prefix = vec!["run".to_string()];
+        let defaults = vec!["--stdio".to_string()];
+        let configured = vec!["--pipe".to_string()];
+
+        assert_eq!(
+            launch_arguments(&prefix, &defaults, &[]).collect::<Vec<_>>(),
+            ["run", "--stdio"]
+        );
+        assert_eq!(
+            launch_arguments(&prefix, &defaults, &configured).collect::<Vec<_>>(),
+            ["run", "--stdio", "--pipe"]
+        );
+    }
+
+    #[test]
+    fn broken_managed_server_command_does_not_fall_back_to_path() {
+        let command = "helix-lsp-test-broken-managed-command";
+        let package = helix_loader::ActivePackage::new("lsp", "test", "1");
+        let asset = helix_loader::RuntimeAsset::from_spec(
+            package,
+            helix_loader::RuntimeAssetSpec::command(
+                command,
+                std::env::temp_dir().join(format!(
+                    "helix-lsp-missing-managed-command-{}",
+                    std::process::id()
+                )),
+            ),
+        );
+        let runtime_assets =
+            helix_loader::RuntimeAssets::from_snapshot(helix_loader::RuntimeSnapshot {
+                generation: 1,
+                assets: vec![asset],
+            });
+
+        assert!(matches!(
+            runtime_assets.resolve_command(command),
+            Err(helix_loader::RuntimeAssetsError::BrokenManaged { .. })
+        ));
+    }
+
+    #[test]
+    fn workspace_folders_publish_coherent_deduplicated_snapshots() {
+        let first = lsp::Url::parse("file:///workspace/first").unwrap();
+        let second = lsp::Url::parse("file:///workspace/second").unwrap();
+        let folders = WorkspaceFolders::new(vec![workspace_for_uri(first)]);
+        let old_snapshot = folders.snapshot();
+
+        assert!(folders.insert(workspace_for_uri(second.clone())));
+        assert!(!folders.insert(workspace_for_uri(second)));
+
+        assert_eq!(old_snapshot.len(), 1);
+        assert_eq!(folders.snapshot().len(), 2);
     }
 
     #[test]
@@ -2431,19 +2543,39 @@ mod tests {
     #[cfg(windows)]
     #[tokio::test]
     async fn force_kill_reaps_unresponsive_server_process() {
-        let (client, _rx, _notify) = Client::start(
-            "powershell.exe",
-            &[
-                "-NoProfile".to_string(),
-                "-Command".to_string(),
-                "Start-Sleep -Seconds 60".to_string(),
-            ],
+        let args = vec![
+            "-NoProfile".to_string(),
+            "-Command".to_string(),
+            "Start-Sleep -Seconds 60".to_string(),
+        ];
+        let launch = helix_loader::ResolvedLaunch {
+            generation: 0,
+            program: "powershell.exe".into(),
+            prefix_args: Vec::new(),
+            default_args: Vec::new(),
+            env: Default::default(),
+            origin: helix_loader::Origin::Explicit,
+        };
+        let identity = ClientLaunchIdentity {
+            program: launch.program.clone(),
+            resolved_args: args.clone(),
+            resolved_environment: launch.env.clone(),
+            origin: launch.origin.clone(),
+            configured_environment: Default::default(),
+            config: None,
+            timeout: 60,
+            enable_snippets: false,
+        };
+        let (client, _rx) = Client::start_with_launch(
+            launch,
+            &args,
             None,
             std::iter::empty::<(&str, &str)>(),
             std::env::current_dir().unwrap(),
             None,
             Default::default(),
             "sleeping-test-server".to_string(),
+            identity,
             60,
         )
         .unwrap();

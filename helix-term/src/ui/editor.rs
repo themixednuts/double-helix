@@ -3049,9 +3049,10 @@ mod tests {
             let seed = CellSurface::empty(tui::ratatui::to_ratatui_rect(area));
             let prepared = editor_view.prepare_render(area, &render_ctx);
             let mut plan = crate::render::RenderPlan::seeded(area, seed);
-            plan.extend(
-                crate::render::RenderStep::prepared("editor_test", vec![prepared]).into_iter(),
-            );
+            plan.extend(crate::render::RenderStep::prepared(
+                "editor_test",
+                vec![prepared],
+            ));
             plan.extend(render_ctx.take_render_steps());
             let seed = plan.take_seed().expect("editor test render seed");
             let surface = plan

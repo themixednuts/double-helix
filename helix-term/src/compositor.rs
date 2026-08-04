@@ -1596,9 +1596,10 @@ mod tests {
         let surface = crate::render::CellSurface::empty(tui::ratatui::to_ratatui_rect(area));
         let prepared = component.prepare_render(area, render_ctx);
         let mut plan = crate::render::RenderPlan::seeded(area, surface);
-        plan.extend(
-            crate::render::RenderStep::prepared("test_component", vec![prepared]).into_iter(),
-        );
+        plan.extend(crate::render::RenderStep::prepared(
+            "test_component",
+            vec![prepared],
+        ));
         plan.extend(render_ctx.take_render_steps());
         let seed = plan.take_seed().expect("test render plan seed");
         plan.execute(

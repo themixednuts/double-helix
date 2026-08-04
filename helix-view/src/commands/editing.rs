@@ -3279,8 +3279,8 @@ mod tests {
             &Selection::single(1, 4)
         );
         assert_eq!(
-            editor.tree.get(view_id).object_selections,
-            [expected.clone()]
+            editor.tree.get(view_id).object_selections.as_slice(),
+            std::slice::from_ref(&expected)
         );
 
         shrink_selection(&mut editor, view_id, doc_id);

@@ -604,7 +604,7 @@ mod tests {
             assert!(editor
                 .connect_assistant_backend(backend_launch(backend_id.clone(), "Closed", ""), None,)
                 .is_err());
-            assert!(editor.assistant_runtime.backends.get(&backend_id).is_none());
+            assert!(!editor.assistant_runtime.backends.contains_key(&backend_id));
         });
     }
 

@@ -3480,7 +3480,7 @@ mod tests {
                 .expanded_dirs
                 .contains(&local_path(helix_stdx::path::normalize(&src))));
             assert_eq!(
-                state.selected_path.as_ref().map(|path| display_name(path)),
+                state.selected_path.as_ref().map(display_name),
                 Some("main.rs".to_owned())
             );
             assert_eq!(state.scroll_x, 3);

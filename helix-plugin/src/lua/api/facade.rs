@@ -68,7 +68,7 @@ fn with_query_bridge<T>(
     }
     #[cfg(test)]
     {
-        return crate::lua::with_current_editor(|editor| f(&EditorQueryBridge::new(editor)))?;
+        crate::lua::with_current_editor(|editor| f(&EditorQueryBridge::new(editor)))?
     }
     #[cfg(not(test))]
     Err(LuaError::RuntimeError(
@@ -89,10 +89,10 @@ fn with_mutation_bridge<T>(
     }
     #[cfg(test)]
     {
-        return crate::lua::with_current_editor_mut(|editor| {
+        crate::lua::with_current_editor_mut(|editor| {
             let mut bridge = EditorMutationBridge::new(editor);
             f(&mut bridge)
-        })?;
+        })?
     }
     #[cfg(not(test))]
     Err(LuaError::RuntimeError(

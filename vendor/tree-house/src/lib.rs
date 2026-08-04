@@ -540,7 +540,7 @@ mod unit_tests {
             Some("bcd".to_owned())
         );
         assert!(checked_byte_slice(slice, &(4..8)).is_none());
-        assert!(checked_byte_slice(slice, &(5..4)).is_none());
+        assert!(checked_byte_slice(slice, &std::ops::Range { start: 5, end: 4 }).is_none());
     }
 
     #[test]
@@ -553,6 +553,6 @@ mod unit_tests {
             Some("cde".to_owned())
         );
         assert!(checked_byte_slice_usize(slice, &(5..9)).is_none());
-        assert!(checked_byte_slice_usize(slice, &(5..4)).is_none());
+        assert!(checked_byte_slice_usize(slice, &std::ops::Range { start: 5, end: 4 }).is_none());
     }
 }

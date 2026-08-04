@@ -70,7 +70,7 @@ pub struct ServerAdapterEvent {
 
 #[derive(Debug)]
 pub enum ServerEvent {
-    Event(ServerAdapterEvent),
+    Event(Box<ServerAdapterEvent>),
     Request(ServerAdapterRequest),
     UnexpectedResponse(Response),
 }
@@ -303,10 +303,10 @@ impl Transport {
                 log::debug!("[{}] <- DAP event {}", self.id, event.event);
                 let parsed = server_message_result(crate::Event::parse(&event.event, event.body));
                 let _ = client_tx
-                    .send(ServerEvent::Event(ServerAdapterEvent {
+                    .send(ServerEvent::Event(Box::new(ServerAdapterEvent {
                         name: event.event,
                         event: parsed,
-                    }))
+                    })))
                     .await;
                 Ok(())
             }

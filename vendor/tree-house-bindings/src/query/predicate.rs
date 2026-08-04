@@ -164,7 +164,11 @@ mod tests {
         let mut input = RopeInput::new(rope.slice(..));
 
         assert!(!input_matches_str("ell", 1..9, &mut input));
-        assert!(!input_matches_str("ell", 4..2, &mut input));
+        assert!(!input_matches_str(
+            "ell",
+            std::ops::Range { start: 4, end: 2 },
+            &mut input
+        ));
     }
 }
 

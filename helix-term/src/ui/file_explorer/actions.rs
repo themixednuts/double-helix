@@ -341,10 +341,7 @@ impl FileExplorerPanel {
         };
 
         let mut rows = self.rows.to_vec();
-        let is_last = match rows.get(insert_index) {
-            Some(next) if next.depth == depth => false,
-            _ => true,
-        };
+        let is_last = !matches!(rows.get(insert_index), Some(next) if next.depth == depth);
         if insert_index > 0 {
             if let Some(prev) = rows.get_mut(insert_index - 1) {
                 if prev.depth == depth {

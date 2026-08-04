@@ -746,6 +746,7 @@ mod tests {
         fs::write(&explicit, b"explicit").unwrap();
         fs::write(&managed, b"managed").unwrap();
         fs::write(&path_program, b"path").unwrap();
+        make_executable(&path_program);
         fs::write(override_root.join("queries/demo/test.scm"), b"override").unwrap();
         fs::write(&managed_file, b"managed file").unwrap();
         fs::write(bundled_root.join("queries/demo/test.scm"), b"bundled").unwrap();
@@ -835,7 +836,7 @@ mod tests {
         assert!(matches!(
             assets.require_file("queries/demo/missing.scm"),
             Err(RuntimeAssetsError::MissingFile(path))
-                if path == PathBuf::from("queries/demo/missing.scm")
+                if path == Path::new("queries/demo/missing.scm")
         ));
         assert_eq!(
             assets.file_keys_in("queries/demo").unwrap(),
@@ -1299,6 +1300,20 @@ mod tests {
             format!("{name}.exe")
         } else {
             name.to_owned()
+        }
+    }
+
+    fn make_executable(path: &Path) {
+        #[cfg(not(unix))]
+        let _ = path;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mut permissions = fs::metadata(path).unwrap().permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(path, permissions).unwrap();
         }
     }
 }

@@ -2254,14 +2254,25 @@ mod tests {
         let (_, responder) = state
             .begin_task(plugin_id(), operation)
             .expect("begin operation");
-        let held = state.lock();
+        let held_state = state.clone();
+        let (locked_tx, locked_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        let lock_thread = std::thread::spawn(move || {
+            let _held = held_state.lock();
+            locked_tx.send(()).expect("report held host state");
+            let _ = release_rx.recv();
+        });
+        locked_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("host state lock timeout");
 
         responder.send(Ok(helix_plugin_api::PluginTaskResult::Unit));
         let delivery = tokio::time::timeout(std::time::Duration::from_secs(1), outbound.recv())
             .await
             .expect("task completion timeout")
             .expect("task completion delivery");
-        drop(held);
+        release_tx.send(()).expect("release held host state");
+        lock_thread.join().expect("host state lock thread");
 
         assert!(matches!(
             delivery,

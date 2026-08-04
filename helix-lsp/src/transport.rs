@@ -835,31 +835,32 @@ impl OutboundMailbox {
             let wait_for_space = self.space_ready.notified();
             tokio::pin!(wait_for_space);
             wait_for_space.as_mut().enable();
-            let mut state = self.state.lock();
-            if state.closed {
-                return Err(Error::StreamClosed);
-            }
-            let current = payload.take().expect("outbound payload disappeared");
-            if let Payload::DocumentUpdate(update) = current {
-                state.enqueue_document_update(update);
-                drop(state);
+            let rejected = {
+                let mut state = self.state.lock();
+                if state.closed {
+                    return Err(Error::StreamClosed);
+                }
+                let current = payload.take().expect("outbound payload disappeared");
+                match current {
+                    Payload::DocumentUpdate(update) => {
+                        state.enqueue_document_update(update);
+                        None
+                    }
+                    current
+                        if state.normal.len() < self.normal_capacity
+                            || payload_is_initialize(&current) =>
+                    {
+                        state.normal.push_back(current);
+                        None
+                    }
+                    current => Some(current),
+                }
+            };
+            let Some(current) = rejected else {
                 self.ready.notify_one();
                 return Ok(());
-            }
-            if state.normal.len() < self.normal_capacity {
-                state.normal.push_back(current);
-                drop(state);
-                self.ready.notify_one();
-                return Ok(());
-            }
-            if payload_is_initialize(&current) {
-                state.normal.push_back(current);
-                drop(state);
-                self.ready.notify_one();
-                return Ok(());
-            }
+            };
             payload = Some(current);
-            drop(state);
             wait_for_space.await;
         }
     }
@@ -939,6 +940,9 @@ impl OutboundMailbox {
         normal_mode: NormalReceiveMode,
     ) -> Option<OutboundMessage> {
         loop {
+            let wait_for_ready = self.ready.notified();
+            tokio::pin!(wait_for_ready);
+            wait_for_ready.as_mut().enable();
             let message = {
                 let mut state = self.state.lock();
                 if state.closed {
@@ -951,14 +955,10 @@ impl OutboundMailbox {
                     *priority_streak = (*priority_streak).saturating_add(1);
                     state.priority.pop_front().map(OutboundMessage::Control)
                 } else if !matches!(normal_mode, NormalReceiveMode::None) {
-                    let payload = state.pop_normal(normal_mode);
-                    let Some(payload) = payload else {
-                        drop(state);
-                        self.ready.notified().await;
-                        continue;
-                    };
-                    *priority_streak = 0;
-                    Some(OutboundMessage::Payload(payload))
+                    state.pop_normal(normal_mode).map(|payload| {
+                        *priority_streak = 0;
+                        OutboundMessage::Payload(payload)
+                    })
                 } else {
                     None
                 }
@@ -973,7 +973,7 @@ impl OutboundMailbox {
             if message.is_some() {
                 return message;
             }
-            self.ready.notified().await;
+            wait_for_ready.await;
         }
     }
 
@@ -1114,33 +1114,47 @@ impl InboundDispatcher {
             tokio::pin!(space_wait);
             space_wait.as_mut().enable();
 
-            let mut state = self.state.lock();
-            if state.exited {
-                return Err(Error::StreamClosed);
-            }
+            let (admitted, backpressure) = {
+                let mut state = self.state.lock();
+                if state.exited {
+                    return Err(Error::StreamClosed);
+                }
 
-            if coalesce_inbound(&mut state, &mut event) {
-                return Ok(());
-            }
+                if coalesce_inbound(&mut state, &mut event) {
+                    return Ok(());
+                }
 
-            if state.queue.len() < self.capacity {
-                admit_inbound(&mut state, event.take().expect("inbound event disappeared"));
-                let depth = state.queue.len();
-                state.high_watermark = state.high_watermark.max(depth);
-                drop(state);
+                if state.queue.len() < self.capacity {
+                    admit_inbound(&mut state, event.take().expect("inbound event disappeared"));
+                    let depth = state.queue.len();
+                    state.high_watermark = state.high_watermark.max(depth);
+                    (true, None)
+                } else {
+                    let backpressure = (!reported_backpressure).then(|| {
+                        (
+                            state.queue.len(),
+                            state.coalesced_diagnostics,
+                            state.coalesced_progress,
+                            inbound_queue_profile(&state),
+                        )
+                    });
+                    (false, backpressure)
+                }
+            };
+            if admitted {
                 self.ready.notify_one();
                 return Ok(());
             }
 
-            if !reported_backpressure {
-                let profile = inbound_queue_profile(&state);
+            if let Some((queued, diagnostics_coalesced, progress_coalesced, profile)) = backpressure
+            {
                 log::warn!(
                     "lsp_rpc direction=in server={} outcome=backpressure queued={} hard_capacity={} diagnostics_coalesced={} progress_coalesced={} diagnostics={} progress={} log_messages={} requests={} notifications={} invalid={}",
                     self.server_name,
-                    state.queue.len(),
+                    queued,
                     self.capacity,
-                    state.coalesced_diagnostics,
-                    state.coalesced_progress,
+                    diagnostics_coalesced,
+                    progress_coalesced,
                     profile.diagnostics,
                     profile.progress,
                     profile.log_messages,
@@ -1150,7 +1164,6 @@ impl InboundDispatcher {
                 );
                 reported_backpressure = true;
             }
-            drop(state);
             space_wait.await;
         }
     }
@@ -2657,7 +2670,7 @@ mod tests {
             Some(OutboundMessage::Payload(Payload::DocumentWire(DocumentWire::Save {
                 text: Some(text),
                 ..
-            }))) if text.to_string() == "a"
+            }))) if text == "a"
         ));
         assert!(matches!(
             outbound
@@ -2685,7 +2698,7 @@ mod tests {
                 version: 0,
                 text,
                 ..
-            }))) if text.to_string() == "new"
+            }))) if text == "new"
         ));
     }
 

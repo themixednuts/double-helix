@@ -87,6 +87,6 @@ mod tests {
         let mut input = RopeInput::new(rope.slice(..));
 
         assert!(!input.eq(1..9, 1..3));
-        assert!(!input.eq(4..2, 1..3));
+        assert!(!input.eq(std::ops::Range { start: 4, end: 2 }, 1..3));
     }
 }

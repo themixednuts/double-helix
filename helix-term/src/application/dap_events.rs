@@ -113,9 +113,7 @@ impl DapEventReceiver {
 fn is_output(event: &ServerEvent) -> bool {
     matches!(
         event,
-        ServerEvent::Event(helix_dap::ServerAdapterEvent {
-            event: Ok(helix_dap::Event::Output(_)),
-            ..
-        })
+        ServerEvent::Event(event)
+            if matches!(event.event, Ok(helix_dap::Event::Output(_)))
     )
 }

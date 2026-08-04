@@ -1,0 +1,38 @@
+[package]
+name = "helix-remote"
+description = "Remote workspace protocol and runtime for Helix"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+categories.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+helix-ipc = { path = "../helix-ipc" }
+helix-workspace = { path = "../helix-workspace" }
+fff-search = "=0.9.6"
+getrandom.workspace = true
+globset.workspace = true
+ignore = "0.4"
+log = "0.4"
+notify.workspace = true
+parking_lot.workspace = true
+serde.workspace = true
+serde_bytes = "0.11"
+sha2.workspace = true
+tar.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+tokio = { version = "1", features = ["fs", "io-std", "io-util", "macros", "process", "rt", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+ureq.workspace = true
+url = "2.5.4"
+percent-encoding = "2.3"
+xz2.workspace = true
+
+[dev-dependencies]
+rmp-serde = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

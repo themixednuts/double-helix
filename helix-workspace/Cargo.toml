@@ -1,0 +1,28 @@
+[package]
+name = "helix-workspace"
+description = "Workspace-domain types shared by local, remote, and collaborative backends"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+fff-search = "=0.9.6"
+rmp-serde = "1"
+serde.workspace = true
+thiserror.workspace = true
+tokio = { version = "1", features = ["fs", "rt"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
+
+[dev-dependencies]
+rmp-serde = "1"
+tempfile.workspace = true
+tokio = { version = "1", features = ["macros", "rt"] }

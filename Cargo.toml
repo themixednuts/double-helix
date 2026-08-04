@@ -1,6 +1,8 @@
 [workspace]
 resolver = "2"
 members = [
+  "code-atlas",
+  "helix-collab",
   "helix-core",
   "helix-view",
   "helix-term",
@@ -8,6 +10,9 @@ members = [
   "helix-lsp-types",
   "helix-lsp",
   "helix-runtime",
+  "helix-ipc",
+  "helix-remote",
+  "helix-workspace",
   "helix-store",
   "helix-dap-types",
   "helix-dap",
@@ -47,6 +52,8 @@ package.helix-tui.opt-level = 2
 package.helix-term.opt-level = 2
 
 [workspace.dependencies]
+automerge = "0.10"
+base64 = "0.22"
 tree-house = { version = "0.3.0", default-features = false }
 nucleo = "0.5.0"
 slotmap = "1.1.1"
@@ -80,6 +87,9 @@ xz2 = "0.1"
 ureq = { version = "2.12", default-features = true }
 arc-swap = "1.8"
 notify = { version = "7", default-features = false, features = ["macos_kqueue"] }
+getrandom = "0.3"
+quinn = { version = "0.11.9", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+rcgen = { version = "0.14.8", default-features = false, features = ["crypto", "ring"] }
 
 [workspace.package]
 version = "25.7.1"

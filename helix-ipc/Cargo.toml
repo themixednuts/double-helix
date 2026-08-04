@@ -1,0 +1,17 @@
+[package]
+name = "helix-ipc"
+description = "Bounded framed IPC transport for Helix process boundaries"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+categories.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+rmp-serde = "1"
+serde.workspace = true
+thiserror.workspace = true
+tokio = { version = "1", features = ["io-util"] }

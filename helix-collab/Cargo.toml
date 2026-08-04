@@ -1,0 +1,38 @@
+[package]
+name = "helix-collab"
+description = "Authenticated multi-contributor sessions and replicated text for Helix"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+automerge.workspace = true
+base64.workspace = true
+fff-search = "=0.9.6"
+getrandom.workspace = true
+helix-ipc = { path = "../helix-ipc" }
+helix-remote = { path = "../helix-remote" }
+helix-workspace = { path = "../helix-workspace" }
+ignore = "0.4"
+log = "0.4"
+parking_lot.workspace = true
+percent-encoding = "2.3"
+notify.workspace = true
+quinn.workspace = true
+rcgen.workspace = true
+rmp-serde = "1"
+serde.workspace = true
+serde_bytes = "0.11"
+sha2.workspace = true
+thiserror.workspace = true
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+url = "2.5.4"
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

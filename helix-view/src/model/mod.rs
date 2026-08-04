@@ -356,6 +356,12 @@ impl Model {
 
     // ─── Focus management ──────────────────────────────────────────────
 
+    /// Make the editor the root focus target and discard stale transient focus history.
+    pub fn focus_editor(&mut self) {
+        self.focus = FocusTarget::Editor;
+        self.focus_history.clear();
+    }
+
     /// Push the current focus onto the history stack and set a new focus target.
     pub fn push_focus(&mut self, target: FocusTarget) {
         if self.focus != target {
@@ -515,7 +521,7 @@ pub struct ListPanelItem {
 /// Tree panel model — hierarchical expandable nodes.
 #[derive(Debug, Clone, Default)]
 pub struct TreePanelModel {
-    pub root: PathBuf,
+    pub root: String,
     pub items: Vec<TreePanelNode>,
     pub selection: Option<usize>,
 }
@@ -524,7 +530,7 @@ pub struct TreePanelModel {
 #[derive(Debug, Clone)]
 pub struct TreePanelNode {
     pub label: String,
-    pub path: Option<PathBuf>,
+    pub path: Option<String>,
     pub is_dir: bool,
     pub depth: usize,
     pub expanded: bool,
@@ -929,5 +935,29 @@ mod tests {
         let mut ui = Model::default();
         ui.push_focus(FocusTarget::Editor);
         assert!(ui.focus_history.is_empty());
+    }
+
+    #[test]
+    fn focusing_editor_discards_stale_panel_history() {
+        let mut ui = Model::default();
+        let first = ui.insert_panel(
+            "First",
+            Box::new(ListPanelModel::default()),
+            PanelSide::Left,
+            PanelSize::fixed(20),
+        );
+        let second = ui.insert_panel(
+            "Second",
+            Box::new(ListPanelModel::default()),
+            PanelSide::Right,
+            PanelSize::fixed(20),
+        );
+        ui.focus_panel(first);
+        ui.focus_panel(second);
+
+        ui.focus_editor();
+        ui.pop_focus();
+
+        assert_eq!(ui.focus, FocusTarget::Editor);
     }
 }

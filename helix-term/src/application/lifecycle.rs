@@ -1,5 +1,5 @@
-use helix_stdx::path::get_relative_path;
 use helix_view::document::DocumentSavedEventResult;
+use helix_view::file_bound::DocumentLocation;
 
 use super::Application;
 
@@ -12,15 +12,17 @@ impl Application {
             redraw: redraw.clone(),
             plugin_events: self.ingress().tx.clone().into(),
         };
-        let mut cx = Self::make_compositor_context(
+        let mut cx = crate::compositor::Context::with_services(
             &mut self.editor,
             &mut self.exit.tasks,
-            self.exit.work.clone(),
-            notifier,
-            ingress,
-            idle_reset,
-            self.plugin_runtime.clone(),
-            self.foreground.clone(),
+            crate::compositor::ContextServices::new(
+                self.exit.work.clone(),
+                notifier,
+                ingress,
+                idle_reset,
+                self.plugin_runtime.clone(),
+                self.foreground.clone(),
+            ),
         );
         let should_render = self
             .compositor
@@ -55,17 +57,23 @@ impl Application {
         let lines = report.line_count;
         let size = format_written_size(report.byte_count);
 
-        self.editor.set_status(format!(
-            "'{}' written, {lines}L {size}",
-            get_relative_path(&report.path).to_string_lossy(),
-        ));
+        let display = match &report.location {
+            DocumentLocation::Local(path) => helix_stdx::path::get_relative_path(path)
+                .to_string_lossy()
+                .into_owned(),
+            DocumentLocation::Remote(_) | DocumentLocation::Collaboration(_) => {
+                report.location.to_string()
+            }
+        };
+        self.editor
+            .set_status(format!("'{display}' written, {lines}L {size}"));
 
         {
             use helix_plugin_api::events;
             use helix_plugin_editor::adapt;
             let event = events::PluginEvent::DocumentSaved(events::DocumentSavedEvent {
                 document: adapt::document_handle(report.doc_id),
-                path: Some(report.path.to_string_lossy().into_owned()),
+                path: Some(report.location.to_string()),
                 success: true,
             });
             self.plugin_runtime.notify_event(event);

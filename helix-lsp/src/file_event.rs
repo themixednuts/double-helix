@@ -60,22 +60,17 @@ impl std::fmt::Debug for Handler {
     }
 }
 
-impl Default for Handler {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl Handler {
-    pub fn new() -> Self {
+    pub fn new(work: helix_runtime::Work) -> Self {
         let registrations = Arc::new(Mutex::new(Arc::new(RegistrationSnapshot::new())));
         let pending = Arc::new(Mutex::new(PendingFileEvents::default()));
         let mut gate = PulseGate::new();
-        tokio::spawn(Self::run(
+        work.spawn(Self::run(
             registrations.clone(),
             pending.clone(),
             gate.take_receiver(),
-        ));
+        ))
+        .detach();
         Self {
             registrations,
             pending,

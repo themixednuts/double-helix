@@ -426,7 +426,7 @@ pub(crate) struct Initialization {
 }
 
 impl Initialization {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let (state_tx, _) = watch::channel(InitializationState::Pending);
         Self { state_tx }
     }
@@ -435,7 +435,7 @@ impl Initialization {
         self.state_tx.subscribe()
     }
 
-    fn initialized(&self) -> bool {
+    pub(crate) fn initialized(&self) -> bool {
         self.state_tx.send_if_modified(|state| {
             if matches!(state, InitializationState::Pending) {
                 *state = InitializationState::Initialized;
@@ -446,11 +446,11 @@ impl Initialization {
         })
     }
 
-    fn current(&self) -> InitializationState {
+    pub(crate) fn current(&self) -> InitializationState {
         self.state_tx.borrow().clone()
     }
 
-    fn fail(&self, message: impl Into<Arc<str>>) {
+    pub(crate) fn fail(&self, message: impl Into<Arc<str>>) {
         let message = message.into();
         self.state_tx.send_if_modified(move |state| {
             if matches!(state, InitializationState::Pending) {
@@ -462,7 +462,7 @@ impl Initialization {
         });
     }
 
-    fn close(&self) {
+    pub(crate) fn close(&self) {
         self.state_tx.send_if_modified(|state| {
             if matches!(
                 state,

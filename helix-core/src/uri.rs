@@ -6,13 +6,12 @@ use std::{
 
 /// A generic pointer to a file location.
 ///
-/// Currently this type only supports paths to local files.
-///
 /// Cloning this type is cheap: the internal representation uses an Arc.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[non_exhaustive]
 pub enum Uri {
     File(Arc<Path>),
+    Resource(Arc<url::Url>),
 }
 
 impl Uri {
@@ -21,12 +20,14 @@ impl Uri {
     pub fn to_url(&self) -> Result<url::Url, ()> {
         match self {
             Uri::File(path) => url::Url::from_file_path(path),
+            Uri::Resource(url) => Ok(url.as_ref().clone()),
         }
     }
 
     pub fn as_path(&self) -> Option<&Path> {
         match self {
             Self::File(path) => Some(path),
+            Self::Resource(_) => None,
         }
     }
 }
@@ -41,6 +42,7 @@ impl fmt::Display for Uri {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::File(path) => write!(f, "{}", path.display()),
+            Self::Resource(url) => write!(f, "{url}"),
         }
     }
 }
@@ -83,7 +85,7 @@ fn convert_url_to_uri(url: &url::Url) -> Result<Uri, UrlConversionErrorKind> {
             .map(|path| Uri::File(helix_stdx::path::normalize(path).into()))
             .map_err(|_| UrlConversionErrorKind::UnableToConvert)
     } else {
-        Err(UrlConversionErrorKind::UnsupportedScheme)
+        Ok(Uri::Resource(Arc::new(url.clone())))
     }
 }
 
@@ -112,14 +114,10 @@ mod test {
     use url::Url;
 
     #[test]
-    fn unknown_scheme() {
+    fn non_file_resource_round_trips() {
         let url = Url::parse("csharp:/metadata/foo/bar/Baz.cs").unwrap();
-        assert!(matches!(
-            Uri::try_from(url),
-            Err(UrlConversionError {
-                kind: UrlConversionErrorKind::UnsupportedScheme,
-                ..
-            })
-        ));
+        let uri = Uri::try_from(url.clone()).unwrap();
+        assert_eq!(uri.to_url().unwrap(), url);
+        assert!(uri.as_path().is_none());
     }
 }

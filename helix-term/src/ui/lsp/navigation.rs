@@ -28,8 +28,17 @@ pub(crate) fn lsp_location_to_lsp_location(
     })
 }
 
-pub(crate) fn location_to_file_location(location: &LspLocation) -> Option<FileLocation<'_>> {
+pub(crate) fn location_to_file_location(
+    editor: &Editor,
+    location: &LspLocation,
+) -> Option<FileLocation<'static>> {
     let path = location.uri.as_path()?;
+    let path = helix_view::editor::WorkspaceContext::from_backend(
+        env::current_working_dir(),
+        &editor.workspace_backend,
+    )
+    .resolve_reported_path(path)
+    .ok()?;
     let line = Some((
         location.range.start.line as usize,
         location.range.end.line as usize,
@@ -48,17 +57,29 @@ pub(crate) fn jump_to_location(
     let view = view_mut!(editor, view_id);
     push_jump(view, doc);
 
-    let Some(path) = location.uri.as_path() else {
+    let Some(reported_path) = location.uri.as_path() else {
         let err = format!("unable to convert URI to filepath: {:?}", location.uri);
         editor.set_error(err);
         return;
+    };
+    let path = match helix_view::editor::WorkspaceContext::from_backend(
+        env::current_working_dir(),
+        &editor.workspace_backend,
+    )
+    .resolve_reported_path(reported_path)
+    {
+        Ok(path) => path,
+        Err(error) => {
+            editor.set_error(format!("unable to resolve LSP location: {error}"));
+            return;
+        }
     };
     crate::runtime::ui::document::queue_document_open(
         editor,
         ingress,
         foreground,
         crate::runtime::DocumentOpenRequest {
-            path: path.to_path_buf(),
+            path,
             action,
             lane: crate::runtime::DocumentOpenLane::Navigation,
             target: crate::runtime::DocumentOpenTarget::View(view_id),
@@ -116,7 +137,7 @@ pub(crate) fn goto_locations(
                     jump_to_location(cx.editor, &cx.ingress, &cx.foreground, location, action);
                 },
             )
-            .with_preview(|_editor, location| location_to_file_location(location));
+            .with_preview(|editor, location| location_to_file_location(editor, location));
             compositor.push(Box::new(overlaid(picker)));
         }
     }

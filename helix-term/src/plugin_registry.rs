@@ -1885,18 +1885,33 @@ async fn stop_plugin_child(child: &mut tokio::process::Child, already_exited: bo
     }
 }
 
-async fn run_host_generation(
-    config: &PluginConfig,
-    host: &PluginHostConfig,
-    ingress: &crate::runtime::RuntimeIngress,
-    state: &PluginHostState,
-    work: &helix_runtime::Work,
-    control: &mut helix_runtime::Receiver<HostOutbound>,
-    events: &mut helix_runtime::Receiver<helix_plugin_api::events::PluginEvent>,
-    shutdown: &helix_runtime::Token,
-) -> HostGenerationExit {
+struct PluginHostSupervisor {
+    config: PluginConfig,
+    host: PluginHostConfig,
+    ingress: crate::runtime::RuntimeIngress,
+    state: PluginHostState,
+    work: helix_runtime::Work,
+    control: helix_runtime::Receiver<HostOutbound>,
+    events: helix_runtime::Receiver<helix_plugin_api::events::PluginEvent>,
+    shutdown: helix_runtime::Token,
+    stopped: tokio::sync::watch::Sender<bool>,
+}
+
+async fn run_host_generation(supervisor: &mut PluginHostSupervisor) -> HostGenerationExit {
     const GENERATION_CONTROL_CAPACITY: usize = 64;
     const GENERATION_EVENT_CAPACITY: usize = 256;
+
+    let PluginHostSupervisor {
+        config,
+        host,
+        ingress,
+        state,
+        work,
+        control,
+        events,
+        shutdown,
+        ..
+    } = supervisor;
 
     let started = std::time::Instant::now();
     let mut command = tokio::process::Command::new(&host.command);
@@ -2059,54 +2074,33 @@ async fn run_host_generation(
     outcome
 }
 
-async fn supervise_plugin_host(
-    config: PluginConfig,
-    host: PluginHostConfig,
-    ingress: crate::runtime::RuntimeIngress,
-    state: PluginHostState,
-    work: helix_runtime::Work,
-    mut control: helix_runtime::Receiver<HostOutbound>,
-    mut events: helix_runtime::Receiver<helix_plugin_api::events::PluginEvent>,
-    shutdown: helix_runtime::Token,
-    stopped: tokio::sync::watch::Sender<bool>,
-) {
+async fn supervise_plugin_host(mut supervisor: PluginHostSupervisor) {
     let mut backoff = RestartBackoff::default();
     loop {
-        if shutdown.is_canceled() {
+        if supervisor.shutdown.is_canceled() {
             break;
         }
-        match run_host_generation(
-            &config,
-            &host,
-            &ingress,
-            &state,
-            &work,
-            &mut control,
-            &mut events,
-            &shutdown,
-        )
-        .await
-        {
+        match run_host_generation(&mut supervisor).await {
             HostGenerationExit::Shutdown => break,
             HostGenerationExit::Restart { uptime } => {
-                if shutdown.is_canceled() {
+                if supervisor.shutdown.is_canceled() {
                     break;
                 }
                 let delay = backoff.after_generation(uptime);
                 log::info!(
                     "plugin host '{}' restarting in {}ms",
-                    host.name,
+                    supervisor.host.name,
                     delay.as_millis()
                 );
                 tokio::select! {
                     _ = tokio::time::sleep(delay) => {}
-                    _ = shutdown.canceled() => break,
+                    _ = supervisor.shutdown.canceled() => break,
                 }
             }
         }
     }
-    state.release_all_resources();
-    let _ = stopped.send(true);
+    supervisor.state.release_all_resources();
+    let _ = supervisor.stopped.send(true);
 }
 
 pub(crate) fn spawn_plugin_runtime(
@@ -2151,17 +2145,17 @@ fn spawn_plugin_hosts(
             control_tx.clone(),
             work.clone(),
         );
-        work.spawn(supervise_plugin_host(
-            host_config(config, host),
-            host.clone(),
-            ingress.clone(),
-            state.clone(),
-            work.clone(),
-            control_rx,
-            event_rx,
-            shutdown.clone(),
-            stopped_tx,
-        ))
+        work.spawn(supervise_plugin_host(PluginHostSupervisor {
+            config: host_config(config, host),
+            host: host.clone(),
+            ingress: ingress.clone(),
+            state: state.clone(),
+            work: work.clone(),
+            control: control_rx,
+            events: event_rx,
+            shutdown: shutdown.clone(),
+            stopped: stopped_tx,
+        }))
         .detach();
 
         hosts.push(SupervisedPluginHost {

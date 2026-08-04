@@ -85,6 +85,22 @@ pub enum LspDiagnosticsApply {
 }
 
 impl LspDiagnosticsWork {
+    pub fn serialize_publish_diagnostics(&self, uri: &lsp::Url) -> serde_json::Result<Vec<u8>> {
+        #[derive(serde::Serialize)]
+        struct BorrowedPublishDiagnostics<'a> {
+            uri: &'a lsp::Url,
+            diagnostics: &'a [lsp::Diagnostic],
+            #[serde(skip_serializing_if = "Option::is_none")]
+            version: Option<i32>,
+        }
+
+        serde_json::to_vec(&BorrowedPublishDiagnostics {
+            uri,
+            diagnostics: &self.diagnostics,
+            version: self.version,
+        })
+    }
+
     fn baseline_diagnostics(&self) -> impl Clone + Iterator<Item = &lsp::Diagnostic> {
         self.workspace_baseline
             .iter()

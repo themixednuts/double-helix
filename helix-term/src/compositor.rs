@@ -74,6 +74,9 @@ pub enum PostAction {
         register: Option<char>,
         count: Option<std::num::NonZeroUsize>,
     },
+    OpenFileExplorer {
+        root: helix_view::editor::WorkspaceDocumentPath,
+    },
     RestoreLastPicker,
     ReplayKeys {
         keys: Vec<helix_view::input::KeyEvent>,
@@ -114,6 +117,10 @@ impl std::fmt::Debug for PostAction {
                 .debug_struct("ShowCommandPalette")
                 .field("register", register)
                 .field("count", count)
+                .finish(),
+            Self::OpenFileExplorer { root } => f
+                .debug_struct("OpenFileExplorer")
+                .field("root", root)
                 .finish(),
             Self::RestoreLastPicker => f.write_str("RestoreLastPicker"),
             Self::ReplayKeys {
@@ -446,6 +453,35 @@ pub struct Context<'a> {
     pub(crate) plugin_runtime: crate::plugin_registry::PluginRuntime,
 }
 
+pub(crate) struct ContextServices {
+    exit_task_work: helix_runtime::Work,
+    notifier: crate::handlers::local::Notifier,
+    ingress: crate::runtime::RuntimeIngress,
+    idle_reset: crate::runtime::IdleResetHandle,
+    plugin_runtime: crate::plugin_registry::PluginRuntime,
+    foreground: crate::runtime::ForegroundEvents,
+}
+
+impl ContextServices {
+    pub(crate) fn new(
+        exit_task_work: helix_runtime::Work,
+        notifier: crate::handlers::local::Notifier,
+        ingress: crate::runtime::RuntimeIngress,
+        idle_reset: crate::runtime::IdleResetHandle,
+        plugin_runtime: crate::plugin_registry::PluginRuntime,
+        foreground: crate::runtime::ForegroundEvents,
+    ) -> Self {
+        Self {
+            exit_task_work,
+            notifier,
+            ingress,
+            idle_reset,
+            plugin_runtime,
+            foreground,
+        }
+    }
+}
+
 impl<'a> Context<'a> {
     pub fn new(
         editor: &'a mut Editor,
@@ -456,28 +492,33 @@ impl<'a> Context<'a> {
         idle_reset: crate::runtime::IdleResetHandle,
         plugin_runtime: crate::plugin_registry::PluginRuntime,
     ) -> Self {
-        Self::with_foreground(
+        Self::with_services(
             editor,
             exit_tasks,
+            ContextServices::new(
+                exit_task_work,
+                notifier,
+                ingress,
+                idle_reset,
+                plugin_runtime,
+                crate::runtime::ForegroundEvents::new(),
+            ),
+        )
+    }
+
+    pub(crate) fn with_services(
+        editor: &'a mut Editor,
+        exit_tasks: &'a mut ExitTaskSet,
+        services: ContextServices,
+    ) -> Self {
+        let ContextServices {
             exit_task_work,
             notifier,
             ingress,
             idle_reset,
             plugin_runtime,
-            crate::runtime::ForegroundEvents::new(),
-        )
-    }
-
-    pub fn with_foreground(
-        editor: &'a mut Editor,
-        exit_tasks: &'a mut ExitTaskSet,
-        exit_task_work: helix_runtime::Work,
-        notifier: crate::handlers::local::Notifier,
-        ingress: crate::runtime::RuntimeIngress,
-        idle_reset: crate::runtime::IdleResetHandle,
-        plugin_runtime: crate::plugin_registry::PluginRuntime,
-        foreground: crate::runtime::ForegroundEvents,
-    ) -> Self {
+            foreground,
+        } = services;
         let redraw = editor.redraw_handle();
         Self {
             editor,
@@ -635,6 +676,7 @@ pub trait Component: Any + Send {
 
 pub trait PickerComponent {
     fn instance_id(&self) -> picker::PickerInstanceId;
+    fn refresh_scope(&self) -> Option<picker::PickerRefreshScope>;
 
     fn request_preview_highlight(&mut self, editor: &mut Editor, path: std::path::PathBuf);
 
@@ -1352,6 +1394,21 @@ impl Compositor {
             .and_then(|component| component.as_picker_component())
     }
 
+    pub fn refresh_picker(
+        &mut self,
+        editor: &mut Editor,
+        scope: picker::PickerRefreshScope,
+    ) -> bool {
+        let Some(picker) = self.find_picker() else {
+            return false;
+        };
+        if picker.refresh_scope() != Some(scope) {
+            return false;
+        }
+        picker.refresh_dynamic_query(editor);
+        true
+    }
+
     pub fn need_full_redraw(&mut self) {
         self.full_redraw = true;
     }
@@ -1426,6 +1483,9 @@ pub(crate) fn apply_post_action(compositor: &mut Compositor, cx: &mut Context, a
         }
         PostAction::ShowCommandPalette { register, count } => {
             crate::commands::show_command_palette(compositor, cx, register, count);
+        }
+        PostAction::OpenFileExplorer { root } => {
+            crate::runtime::ui::file_explorer::open_file_explorer(compositor, cx, root);
         }
         PostAction::RestoreLastPicker => {
             if let Some(picker) = compositor.last_picker.take() {
@@ -1558,7 +1618,8 @@ mod tests {
             .to_path_buf();
         let runtime = helix_runtime::test::runtime();
         let (ingress, _rx) = crate::runtime::RuntimeIngress::channel(runtime.clone());
-        let mut picker = crate::ui::file_picker(&editor, root, ingress.clone());
+        let mut picker =
+            crate::ui::file_picker(&editor, root.into(), ingress.clone()).expect("file picker");
         picker.required_size((151, 43));
         picker.sync(Rect::new(0, 0, 151, 43), &mut editor);
 

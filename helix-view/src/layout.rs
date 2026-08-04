@@ -167,6 +167,8 @@ pub struct TextInputLayout {
     pub cursor_y: u16,
     /// Whether the cursor cell is inside the input area and can be styled.
     pub cursor_in_area: bool,
+    /// Whether the cursor is the insertion point after the final grapheme.
+    pub cursor_at_end: bool,
     /// Whether the text is clipped before `anchor`.
     pub truncated_start: bool,
     /// Whether the text extends past the visible area.
@@ -183,6 +185,7 @@ pub fn text_input_layout(area: Rect, text: &str, cursor: usize) -> TextInputLayo
             cursor_x: area.x,
             cursor_y: area.y,
             cursor_in_area: false,
+            cursor_at_end: cursor == text.len(),
             truncated_start: false,
             truncated_end: false,
         };
@@ -190,7 +193,8 @@ pub fn text_input_layout(area: Rect, text: &str, cursor: usize) -> TextInputLayo
 
     let line_width = area.width as usize;
 
-    if text.width() <= line_width {
+    let cursor_width = text[..cursor].width();
+    if text.width() <= line_width && cursor_width < line_width {
         let cursor_col = text[..cursor].width() as u16;
         let cursor_x = area.x.saturating_add(cursor_col);
         return TextInputLayout {
@@ -198,12 +202,16 @@ pub fn text_input_layout(area: Rect, text: &str, cursor: usize) -> TextInputLayo
             cursor_x: cursor_x.min(area.right().saturating_sub(1)),
             cursor_y: area.y,
             cursor_in_area: cursor_x < area.right(),
+            cursor_at_end: cursor == text.len(),
             truncated_start: false,
             truncated_end: false,
         };
     }
 
-    let anchor = text_input_anchor(text, cursor, line_width);
+    // The insertion cursor occupies a cell of its own. Keep one cell free at
+    // the right edge instead of hiding the cursor when the prefix exactly
+    // fills the input.
+    let anchor = text_input_anchor(text, cursor, line_width.saturating_sub(1));
     let truncated_start = anchor > 0;
     let truncated_end = text[anchor..].width() > line_width;
     let cursor_col = if cursor >= anchor {
@@ -218,6 +226,7 @@ pub fn text_input_layout(area: Rect, text: &str, cursor: usize) -> TextInputLayo
         cursor_x: cursor_x.min(area.right().saturating_sub(1)),
         cursor_y: area.y,
         cursor_in_area: cursor_x < area.right(),
+        cursor_at_end: cursor == text.len(),
         truncated_start,
         truncated_end,
     }
@@ -492,9 +501,9 @@ mod tests {
     fn text_input_layout_scrolls_to_cursor() {
         let state = text_input_layout(Rect::new(0, 0, 4, 1), "abcdef", 6);
 
-        assert_eq!(state.anchor, 2);
+        assert_eq!(state.anchor, 3);
         assert_eq!(state.cursor_x, 3);
-        assert!(!state.cursor_in_area);
+        assert!(state.cursor_in_area);
         assert!(state.truncated_start);
         assert!(!state.truncated_end);
     }
@@ -509,11 +518,13 @@ mod tests {
     }
 
     #[test]
-    fn text_input_layout_reports_full_width_cursor_outside_area() {
+    fn text_input_layout_keeps_full_width_cursor_inside_area() {
         let state = text_input_layout(Rect::new(0, 0, 4, 1), "abcd", 4);
 
+        assert_eq!(state.anchor, 1);
         assert_eq!(state.cursor_x, 3);
-        assert!(!state.cursor_in_area);
+        assert!(state.cursor_in_area);
+        assert!(state.truncated_start);
     }
 
     // ─── empty input ────────────────────────────────────────────────

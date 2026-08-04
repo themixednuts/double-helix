@@ -215,13 +215,20 @@ fn open(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow:
 
 fn open_impl(cx: &mut compositor::Context, args: Args, action: Action) -> anyhow::Result<()> {
     let initial_view = cx.editor.focused_view_id();
+    let workspace = helix_view::editor::WorkspaceContext::from_backend(
+        helix_stdx::env::current_working_dir(),
+        &cx.editor.workspace_backend,
+    );
     let requests = args
         .into_iter()
         .enumerate()
         .map(|(index, arg)| {
             let (path, pos) = crate::args::parse_file(&arg);
-            crate::runtime::DocumentOpenRequest {
-                path: helix_stdx::path::expand_tilde(path).into_owned(),
+            let path = workspace
+                .resolve(&path)
+                .with_context(|| format!("invalid workspace path '{arg}'"))?;
+            anyhow::Ok(crate::runtime::DocumentOpenRequest {
+                path,
                 action,
                 lane: crate::runtime::DocumentOpenLane::Command,
                 target: if index == 0 {
@@ -236,14 +243,14 @@ fn open_impl(cx: &mut compositor::Context, args: Args, action: Action) -> anyhow
                 external_if_binary: None,
                 post_action: crate::runtime::DocumentOpenPostAction::None,
                 completion: crate::runtime::DocumentOpenCompletionTarget::Editor,
-            }
+            })
         })
-        .collect::<Vec<_>>();
+        .collect::<anyhow::Result<Vec<_>>>()?;
     crate::runtime::ui::document::queue_document_open_batch(cx.editor, &cx.ingress, requests);
     Ok(())
 }
 
-fn queue_plain_document_open(
+fn queue_local_document_open(
     cx: &mut compositor::Context,
     path: PathBuf,
     action: Action,
@@ -255,7 +262,7 @@ fn queue_plain_document_open(
         &cx.ingress,
         &cx.foreground,
         crate::runtime::DocumentOpenRequest {
-            path,
+            path: helix_view::editor::WorkspaceDocumentPath::Local(path),
             action,
             lane: crate::runtime::DocumentOpenLane::Command,
             target: crate::runtime::DocumentOpenTarget::View(target),
@@ -492,6 +499,15 @@ fn write_impl(
     options: WriteOptions,
 ) -> anyhow::Result<DocumentId> {
     let path = path.filter(|path| !path.is_empty());
+    let path = path
+        .map(|path| {
+            helix_view::editor::WorkspaceContext::from_backend(
+                helix_stdx::env::current_working_dir(),
+                &cx.editor.workspace_backend,
+            )
+            .resolve(Path::new(path))
+        })
+        .transpose()?;
     let config = cx.editor.config();
     let (view_id, doc) = focused!(cx.editor);
 
@@ -509,7 +525,7 @@ fn write_impl(
     let view = view_mut!(cx.editor, view_id);
     doc.append_changes_to_history(view);
 
-    if path.is_none() && focused_ref!(cx.editor).1.path().is_none() {
+    if path.is_none() && focused_ref!(cx.editor).1.location().is_none() {
         bail!("Can't save with no path set!");
     }
 
@@ -523,7 +539,7 @@ fn write_impl(
                     view_id,
                     fmt,
                     Some(PendingFormatWrite {
-                        path: path.map(Into::into),
+                        path: path.clone(),
                         policy: options.policy,
                     }),
                 )
@@ -1080,7 +1096,7 @@ pub fn write_all_editor_impl(
         };
 
         if fmt.is_none() {
-            editor.save::<PathBuf>(doc_id, None, options.policy)?;
+            editor.save(doc_id, None, options.policy)?;
         }
     }
 
@@ -1458,6 +1474,14 @@ fn change_current_directory(
         return Ok(());
     }
 
+    ensure!(
+        matches!(
+            cx.editor.workspace_backend,
+            helix_view::editor::WorkspaceBackend::Local
+        ),
+        ":cd cannot change the root of a remote or collaborative workspace"
+    );
+
     let dir = match args.first().map(AsRef::as_ref) {
         Some("-") => cx
             .editor
@@ -1492,13 +1516,23 @@ fn show_current_directory(
         return Ok(());
     }
 
-    let cwd = std::env::current_dir().unwrap_or_default();
-    let message = format!("Current working directory is {}", cwd.display());
-
-    if cwd.exists() {
-        cx.editor.set_status(message);
-    } else {
-        cx.editor.set_error(format!("{} (deleted)", message));
+    match &cx.editor.workspace_backend {
+        helix_view::editor::WorkspaceBackend::Local => {
+            let cwd = std::env::current_dir().unwrap_or_default();
+            let message = format!("Current working directory is {}", cwd.display());
+            if cwd.exists() {
+                cx.editor.set_status(message);
+            } else {
+                cx.editor.set_error(format!("{} (deleted)", message));
+            }
+        }
+        helix_view::editor::WorkspaceBackend::Remote(remote) => cx.editor.set_status(format!(
+            "Remote workspace root is {}",
+            remote.workspace().root
+        )),
+        helix_view::editor::WorkspaceBackend::Collaboration(session) => cx.editor.set_status(
+            format!("Collaborative workspace is {}", session.project().name),
+        ),
     }
     Ok(())
 }
@@ -2063,13 +2097,250 @@ fn debug_remote(
     dap_start_impl(cx, name.as_deref(), address, Some(args))
 }
 
+fn collaboration_role(value: &str) -> anyhow::Result<helix_collab::Role> {
+    match value {
+        "observe" => Ok(helix_collab::Role::Observe),
+        "read" => Ok(helix_collab::Role::Read),
+        "write" => Ok(helix_collab::Role::Write),
+        _ => anyhow::bail!("collaboration role must be observe, read, or write"),
+    }
+}
+
+fn collaboration_share(
+    cx: &mut compositor::Context,
+    args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+    if cx.editor.collaboration.session().is_some() {
+        anyhow::bail!("a collaboration session is already active");
+    }
+    let advertised = args
+        .first()
+        .unwrap_or("127.0.0.1:0")
+        .parse::<std::net::SocketAddr>()?;
+    let backend = if let Some(remote) = cx.editor.workspace_backend.remote().cloned() {
+        crate::runtime::collaboration::ShareBackend::Remote(remote)
+    } else {
+        crate::runtime::collaboration::ShareBackend::Local(helix_stdx::env::current_working_dir())
+    };
+    let project_name = match &backend {
+        crate::runtime::collaboration::ShareBackend::Local(root) => root
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| String::from("project")),
+        crate::runtime::collaboration::ShareBackend::Remote(remote) => remote
+            .workspace()
+            .root
+            .rsplit('/')
+            .find(|segment| !segment.is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| String::from("remote-project")),
+    };
+    let owner_name = crate::runtime::collaboration::participant_name();
+    cx.spawn_task_event(async move {
+        let launch =
+            crate::runtime::collaboration::share(backend, advertised, project_name, owner_name)
+                .await?;
+        Ok(crate::runtime::RuntimeTaskEvent::CollaborationStarted(
+            launch,
+        ))
+    });
+    cx.editor.notify_info("Starting collaboration session");
+    Ok(())
+}
+
+fn collaboration_join(
+    cx: &mut compositor::Context,
+    args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+    if cx.editor.collaboration.session().is_some() {
+        anyhow::bail!("a collaboration session is already active");
+    }
+    let values = args.into_iter().collect::<Vec<_>>();
+    let code = values
+        .first()
+        .ok_or_else(|| anyhow!("missing collaboration invitation"))?
+        .parse::<helix_collab::ConnectCode>()?;
+    let participant_name = values
+        .get(1)
+        .map(|name| name.clone().into_owned())
+        .unwrap_or_else(crate::runtime::collaboration::participant_name);
+    cx.spawn_task_event(async move {
+        let launch = crate::runtime::collaboration::join(code, participant_name).await?;
+        Ok(crate::runtime::RuntimeTaskEvent::CollaborationStarted(
+            launch,
+        ))
+    });
+    cx.editor.notify_info("Joining collaboration session");
+    Ok(())
+}
+
+fn collaboration_invite(
+    cx: &mut compositor::Context,
+    args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+    let role = args
+        .first()
+        .map(collaboration_role)
+        .transpose()?
+        .unwrap_or(helix_collab::Role::Write);
+    let session = cx
+        .editor
+        .collaboration
+        .session()
+        .ok_or_else(|| anyhow!("no collaboration session is active"))?;
+    cx.spawn_task_event(async move {
+        let code = session
+            .invite(
+                role,
+                crate::runtime::collaboration::now_unix_secs().saturating_add(60 * 60),
+            )
+            .await?;
+        Ok(crate::runtime::RuntimeTaskEvent::CollaborationInvitation(
+            code,
+        ))
+    });
+    Ok(())
+}
+
+fn collaboration_set_role(
+    cx: &mut compositor::Context,
+    args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+    let values = args.into_iter().collect::<Vec<_>>();
+    let participant = values
+        .first()
+        .ok_or_else(|| anyhow!("missing participant id"))?
+        .parse::<helix_collab::ParticipantId>()?;
+    let role = collaboration_role(
+        values
+            .get(1)
+            .ok_or_else(|| anyhow!("missing collaboration role"))?,
+    )?;
+    let session = cx
+        .editor
+        .collaboration
+        .session()
+        .ok_or_else(|| anyhow!("no collaboration session is active"))?;
+    cx.spawn_task_event(async move {
+        session.set_role(participant, role).await?;
+        Ok(crate::runtime::RuntimeTaskEvent::CollaborationNotice(
+            format!("Participant role changed to {role:?}"),
+        ))
+    });
+    Ok(())
+}
+
+fn collaboration_remove(
+    cx: &mut compositor::Context,
+    args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+    let participant = args
+        .first()
+        .ok_or_else(|| anyhow!("missing participant id"))?
+        .parse::<helix_collab::ParticipantId>()?;
+    cx.editor
+        .collaboration
+        .session()
+        .ok_or_else(|| anyhow!("no collaboration session is active"))?;
+    cx.submit_ui(UiCommand::Layer(
+        LayerCommand::CollaborationRemoveConfirmation { participant },
+    ));
+    Ok(())
+}
+
+fn collaboration_participants(
+    cx: &mut compositor::Context,
+    _args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+    cx.editor
+        .collaboration
+        .session()
+        .ok_or_else(|| anyhow!("no collaboration session is active"))?;
+    cx.submit_ui(UiCommand::Layer(LayerCommand::CollaborationParticipants));
+    Ok(())
+}
+
+fn collaboration_follow(
+    cx: &mut compositor::Context,
+    args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+    let participant = args
+        .first()
+        .ok_or_else(|| anyhow!("missing participant id"))?
+        .parse::<helix_collab::ParticipantId>()?;
+    let session = cx
+        .editor
+        .collaboration
+        .session()
+        .ok_or_else(|| anyhow!("no collaboration session is active"))?;
+    cx.spawn_task_event(async move {
+        session.follow(participant).await?;
+        Ok(crate::runtime::RuntimeTaskEvent::CollaborationNotice(
+            String::from("Following participant"),
+        ))
+    });
+    Ok(())
+}
+
+fn collaboration_unfollow(
+    cx: &mut compositor::Context,
+    _args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event == PromptEvent::Validate {
+        cx.editor.collaboration.set_following(None);
+        cx.editor.notify_info("Stopped following participant");
+    }
+    Ok(())
+}
+
+fn collaboration_leave(
+    cx: &mut compositor::Context,
+    _args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event == PromptEvent::Validate {
+        cx.submit_task(crate::runtime::RuntimeTaskEvent::CollaborationStop);
+    }
+    Ok(())
+}
+
 fn tutor(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> anyhow::Result<()> {
     if event != PromptEvent::Validate {
         return Ok(());
     }
 
     let path = helix_loader::runtime_assets()?.require_file("tutor")?.path;
-    queue_plain_document_open(
+    queue_local_document_open(
         cx,
         path,
         Action::Replace,
@@ -2553,7 +2824,7 @@ fn open_config(
         return Ok(());
     }
 
-    queue_plain_document_open(
+    queue_local_document_open(
         cx,
         helix_loader::config_file(),
         Action::Replace,
@@ -2571,7 +2842,7 @@ fn open_workspace_config(
         return Ok(());
     }
 
-    queue_plain_document_open(
+    queue_local_document_open(
         cx,
         helix_loader::workspace_config_file(),
         Action::Replace,
@@ -2585,7 +2856,7 @@ fn open_log(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> an
         return Ok(());
     }
 
-    queue_plain_document_open(
+    queue_local_document_open(
         cx,
         helix_loader::log_file(),
         Action::Replace,
@@ -2823,7 +3094,11 @@ fn move_buffer(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> 
         return Ok(());
     }
 
-    let new_path: PathBuf = args.first().unwrap().into();
+    let new_path = helix_view::editor::WorkspaceContext::from_backend(
+        helix_stdx::env::current_working_dir(),
+        &cx.editor.workspace_backend,
+    )
+    .resolve(Path::new(args.first().unwrap()))?;
     move_buffer_impl(
         cx,
         new_path,
@@ -2842,7 +3117,11 @@ fn force_move_buffer(
         return Ok(());
     }
 
-    let new_path: PathBuf = args.first().unwrap().into();
+    let new_path = helix_view::editor::WorkspaceContext::from_backend(
+        helix_stdx::env::current_working_dir(),
+        &cx.editor.workspace_backend,
+    )
+    .resolve(Path::new(args.first().unwrap()))?;
     move_buffer_impl(
         cx,
         new_path,
@@ -2854,14 +3133,22 @@ fn force_move_buffer(
 
 fn move_buffer_impl(
     cx: &mut compositor::Context,
-    new_path: PathBuf,
+    new_path: helix_view::editor::WorkspaceDocumentPath,
     options: MoveBufferOptions,
 ) -> anyhow::Result<()> {
     let (_, doc) = focused_ref!(cx.editor);
     let old_path = doc
-        .path()
+        .location()
         .context("Scratch buffer cannot be moved. Use :write instead")?
-        .clone();
+        .into();
+
+    let (
+        helix_view::editor::WorkspaceDocumentPath::Local(old_path),
+        helix_view::editor::WorkspaceDocumentPath::Local(new_path),
+    ) = (old_path, new_path)
+    else {
+        bail!(":move is not yet supported for remote or collaborative documents");
+    };
 
     crate::effect::file_operation::submit(
         cx.editor,
@@ -2925,27 +3212,59 @@ fn read(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow:
     let (view_id, doc) = focused_ref!(cx.editor);
 
     let filename = args.first().unwrap();
-    let path = helix_stdx::path::expand_tilde(PathBuf::from(filename.to_string())).into_owned();
+    let workspace = helix_view::editor::WorkspaceContext::from_backend(
+        helix_stdx::env::current_working_dir(),
+        &cx.editor.workspace_backend,
+    );
+    let path = workspace.resolve(Path::new(filename))?;
     let document = doc.id();
     let version = doc.version();
     let encoding = doc.encoding();
     let selection = doc.selection(view_id).clone();
-    let read_path = path.clone();
     let ingress = cx.ingress.clone();
-    let read = cx.editor.runtime().block().spawn(move || {
-        let file = std::fs::File::open(&read_path)
-            .map_err(|error| format!("error opening file: {error}"))?;
-        let mut reader = BufReader::new(file);
-        read_to_string(&mut reader, Some(encoding))
-            .map(|(contents, _, _)| contents)
-            .map_err(|error| format!("error reading file: {error}"))
-    });
+    let backend = workspace.backend().clone();
+    let read_path = path.clone();
+    let block = cx.editor.runtime().block().clone();
     cx.editor
         .work()
         .spawn(async move {
-            let result = read
-                .await
-                .unwrap_or_else(|error| Err(format!("document read worker failed: {error}")));
+            let result = match (backend, read_path) {
+                (
+                    helix_view::editor::WorkspaceBackend::Local,
+                    helix_view::editor::WorkspaceDocumentPath::Local(path),
+                ) => block
+                    .spawn(move || {
+                        let file = std::fs::File::open(path)
+                            .map_err(|error| format!("error opening file: {error}"))?;
+                        let mut reader = BufReader::new(file);
+                        read_to_string(&mut reader, Some(encoding))
+                            .map(|(contents, _, _)| contents)
+                            .map_err(|error| format!("error reading file: {error}"))
+                    })
+                    .await
+                    .unwrap_or_else(|error| Err(format!("document read worker failed: {error}"))),
+                (
+                    helix_view::editor::WorkspaceBackend::Remote(remote),
+                    helix_view::editor::WorkspaceDocumentPath::Remote(path),
+                ) => match remote
+                    .read_file(path, tokio_util::sync::CancellationToken::new())
+                    .await
+                {
+                    Ok(file) => {
+                        let mut reader = std::io::Cursor::new(file.bytes);
+                        read_to_string(&mut reader, Some(encoding))
+                            .map(|(contents, _, _)| contents)
+                            .map_err(|error| format!("error decoding remote file: {error}"))
+                    }
+                    Err(error) => Err(format!("error reading remote file: {error}")),
+                },
+                (helix_view::editor::WorkspaceBackend::Collaboration(_), _) => Err(String::from(
+                    ":read is unavailable for collaborative workspaces",
+                )),
+                _ => Err(String::from(
+                    "file path does not belong to its workspace backend",
+                )),
+            };
             let _ = ingress
                 .send_ui(crate::runtime::UiCommand::Document(
                     crate::runtime::DocumentCommand::InsertFileFinished {
@@ -3691,6 +4010,14 @@ fn assistant_connect(
     Ok(())
 }
 
+fn understand(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+    cx.submit_ui(super::understanding::prepare(cx.editor)?);
+    Ok(())
+}
+
 fn assistant_agents(
     cx: &mut compositor::Context,
     _args: Args,
@@ -4092,7 +4419,7 @@ fn assistant_reveal_entry_location(
         .into_iter()
         .next()
         .context("Selected assistant entry has no location")?;
-    queue_plain_document_open(
+    queue_local_document_open(
         cx,
         location.path,
         Action::Replace,
@@ -4247,6 +4574,17 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         aliases: &[],
         doc: "Open the package manager picker.",
         fun: pkg,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "understand",
+        aliases: &["code-atlas"],
+        doc: "Open an evidence-backed briefing for the current file.",
+        fun: understand,
         completer: CommandCompleter::none(),
         signature: Signature {
             positionals: (0, Some(0)),
@@ -5408,6 +5746,105 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         aliases: &["notif-test", "nt"],
         doc: "Test notification system with sample notifications.",
         fun: notifications_test,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "collab-share",
+        aliases: &["share"],
+        doc: "Share the current local or Remote SSH project. Optionally provide the reachable IP address and UDP port to advertise.",
+        fun: collaboration_share,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(1)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "collab-join",
+        aliases: &["join"],
+        doc: "Join a shared project using a collaboration invitation, with an optional participant name.",
+        fun: collaboration_join,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (1, Some(2)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "collab-invite",
+        aliases: &[],
+        doc: "Create and copy a single-use collaboration invitation for an optional observe, read, or write role.",
+        fun: collaboration_invite,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(1)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "collab-set-role",
+        aliases: &[],
+        doc: "Set a collaboration participant's role.",
+        fun: collaboration_set_role,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (2, Some(2)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "collab-remove",
+        aliases: &[],
+        doc: "Remove a participant from the collaboration session.",
+        fun: collaboration_remove,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (1, Some(1)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "collab-participants",
+        aliases: &[],
+        doc: "Manage participants in the active collaboration session.",
+        fun: collaboration_participants,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "collab-follow",
+        aliases: &[],
+        doc: "Follow a collaboration participant's active location.",
+        fun: collaboration_follow,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (1, Some(1)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "collab-unfollow",
+        aliases: &[],
+        doc: "Stop following the active collaboration participant.",
+        fun: collaboration_unfollow,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "collab-leave",
+        aliases: &[],
+        doc: "Leave the active collaboration session and stop its host when sharing.",
+        fun: collaboration_leave,
         completer: CommandCompleter::none(),
         signature: Signature {
             positionals: (0, Some(0)),

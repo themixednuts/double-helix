@@ -107,6 +107,7 @@ pub struct Editor {
     pub breakpoints: HashMap<PathBuf, Vec<Breakpoint>>,
 
     pub(super) runtime: Runtime,
+    pub workspace_backend: super::WorkspaceBackend,
 
     pub syn_loader: Arc<ArcSwap<syntax::Loader>>,
     pub theme_loader: Arc<theme::Loader>,
@@ -146,6 +147,7 @@ pub struct Editor {
     pub model: crate::model::Model,
     pub surface_registry: crate::collab::Registry,
     pub collab: crate::collab::Store,
+    pub collaboration: crate::collab::Replication,
     pub assistant: crate::assistant::Store,
     pub frontend: FrontendState,
     pub(crate) assistant_services: AssistantServices,

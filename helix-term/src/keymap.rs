@@ -835,8 +835,8 @@ fn insert_compiled_binding(
         return Ok(());
     }
 
-    if !node.map.contains_key(&key) {
-        node.map.insert(key, KeyTrie::Node(KeyTrieNode::default()));
+    if let std::collections::hash_map::Entry::Vacant(entry) = node.map.entry(key) {
+        entry.insert(KeyTrie::Node(KeyTrieNode::default()));
         node.order.push(key);
     }
     let child = node

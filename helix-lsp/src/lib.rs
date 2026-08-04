@@ -4,7 +4,7 @@ mod file_operations;
 pub mod jsonrpc;
 mod transport;
 
-pub use client::Client;
+pub use client::{Client, LanguageServerProcess, LanguageServerProxy};
 pub use futures_executor::block_on;
 pub use helix_lsp_types as lsp;
 pub use lsp::{Position, Url};
@@ -674,7 +674,7 @@ pub struct Registry {
 }
 
 impl Registry {
-    pub fn new() -> Self {
+    pub fn new(runtime: &helix_runtime::Runtime) -> Self {
         Self {
             ids: SlotMap::with_key(),
             inner: SecondaryMap::new(),
@@ -682,7 +682,7 @@ impl Registry {
             manually_stopped: HashSet::new(),
             initialized_dispatched: HashSet::new(),
             incoming: SelectAll::new(),
-            file_event_handler: file_event::Handler::new(),
+            file_event_handler: file_event::Handler::new(runtime.work().clone()),
         }
     }
 
@@ -808,12 +808,6 @@ impl Registry {
 
     pub fn iter_clients(&self) -> impl Iterator<Item = &Arc<Client>> {
         self.inner.values()
-    }
-}
-
-impl Default for Registry {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -956,11 +950,37 @@ pub struct PreparedClientLaunch {
     root_path: PathBuf,
     root_uri: Option<lsp::Url>,
     enable_snippets: bool,
-    launch: helix_loader::ResolvedLaunch,
-    args: Vec<String>,
-    environment: HashMap<String, String>,
+    command: PreparedLanguageServerCommand,
     config: Option<serde_json::Value>,
     timeout: u64,
+}
+
+#[derive(Debug)]
+enum PreparedLanguageServerCommand {
+    Local {
+        launch: helix_loader::ResolvedLaunch,
+        args: Vec<String>,
+        environment: HashMap<String, String>,
+    },
+    External(PreparedExternalLanguageServerCommand),
+    Proxy {
+        scope: Arc<str>,
+        server: String,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct PreparedExternalLanguageServerCommand {
+    pub scope: Arc<str>,
+    pub program: String,
+    pub args: Vec<String>,
+    pub environment: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ClientLaunchScope {
+    Local(helix_loader::Origin),
+    External(Arc<str>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -968,8 +988,7 @@ pub struct ClientLaunchIdentity {
     program: PathBuf,
     resolved_args: Vec<String>,
     resolved_environment: BTreeMap<String, String>,
-    origin: helix_loader::Origin,
-    configured_environment: HashMap<String, String>,
+    scope: ClientLaunchScope,
     config: Option<serde_json::Value>,
     timeout: u64,
     enable_snippets: bool,
@@ -989,22 +1008,102 @@ impl PreparedClientLaunch {
     }
 
     pub fn runtime_generation(&self) -> u64 {
-        self.launch.generation
+        match &self.command {
+            PreparedLanguageServerCommand::Local { launch, .. } => launch.generation,
+            PreparedLanguageServerCommand::External(_) => 0,
+            PreparedLanguageServerCommand::Proxy { .. } => 0,
+        }
+    }
+
+    pub fn external_command(&self) -> Option<&PreparedExternalLanguageServerCommand> {
+        match &self.command {
+            PreparedLanguageServerCommand::External(command) => Some(command),
+            PreparedLanguageServerCommand::Local { .. } => None,
+            PreparedLanguageServerCommand::Proxy { .. } => None,
+        }
     }
 
     pub fn identity(&self) -> ClientLaunchIdentity {
-        let mut resolved_args = self.launch.prefix_args.clone();
-        resolved_args.extend(self.launch.default_args.clone());
-        resolved_args.extend(self.args.clone());
+        let (program, resolved_args, resolved_environment, scope) = match &self.command {
+            PreparedLanguageServerCommand::Local {
+                launch,
+                args,
+                environment,
+            } => {
+                let mut resolved_args = launch.prefix_args.clone();
+                resolved_args.extend(launch.default_args.clone());
+                resolved_args.extend(args.clone());
+                let mut resolved_environment = launch.env.clone();
+                resolved_environment.extend(environment.clone());
+                (
+                    launch.program.clone(),
+                    resolved_args,
+                    resolved_environment,
+                    ClientLaunchScope::Local(launch.origin.clone()),
+                )
+            }
+            PreparedLanguageServerCommand::External(command) => (
+                PathBuf::from(&command.program),
+                command.args.clone(),
+                command.environment.clone(),
+                ClientLaunchScope::External(command.scope.clone()),
+            ),
+            PreparedLanguageServerCommand::Proxy { scope, server } => (
+                PathBuf::from(server),
+                Vec::new(),
+                BTreeMap::new(),
+                ClientLaunchScope::External(scope.clone()),
+            ),
+        };
         ClientLaunchIdentity {
-            program: self.launch.program.clone(),
+            program,
             resolved_args,
-            resolved_environment: self.launch.env.clone(),
-            origin: self.launch.origin.clone(),
-            configured_environment: self.environment.clone(),
+            resolved_environment,
+            scope,
             config: self.config.clone(),
             timeout: self.timeout,
             enable_snippets: self.enable_snippets,
+        }
+    }
+
+    pub fn external(
+        name: String,
+        root_path: PathBuf,
+        root_uri: Option<lsp::Url>,
+        enable_snippets: bool,
+        command: PreparedExternalLanguageServerCommand,
+        config: Option<serde_json::Value>,
+        timeout: u64,
+    ) -> Self {
+        Self {
+            name,
+            root_path,
+            root_uri,
+            enable_snippets,
+            command: PreparedLanguageServerCommand::External(command),
+            config,
+            timeout,
+        }
+    }
+
+    pub fn proxy(
+        name: String,
+        root_uri: lsp::Url,
+        enable_snippets: bool,
+        scope: Arc<str>,
+        timeout: u64,
+    ) -> Self {
+        Self {
+            command: PreparedLanguageServerCommand::Proxy {
+                scope,
+                server: name.clone(),
+            },
+            name,
+            root_path: PathBuf::new(),
+            root_uri: Some(root_uri),
+            enable_snippets,
+            config: None,
+            timeout,
         }
     }
 }
@@ -1096,9 +1195,11 @@ fn prepare_language_server_launch_parts(
             root_path,
             root_uri,
             enable_snippets,
-            launch,
-            args: server.args.clone(),
-            environment: server.environment.clone(),
+            command: PreparedLanguageServerCommand::Local {
+                launch,
+                args: server.args.clone(),
+                environment: server.environment.clone(),
+            },
             config: server.config.clone(),
             timeout: server.timeout,
         },
@@ -1115,12 +1216,20 @@ pub fn spawn_language_server(
         root_path,
         root_uri,
         enable_snippets,
-        launch,
-        args,
-        environment,
+        command,
         config,
         timeout,
     } = prepared;
+    let PreparedLanguageServerCommand::Local {
+        launch,
+        args,
+        environment,
+    } = command
+    else {
+        return Err(Error::Other(anyhow::anyhow!(
+            "external language server requires a stream launcher"
+        )));
+    };
     let (client, incoming) = Client::start_with_launch(
         launch,
         &args,
@@ -1134,6 +1243,87 @@ pub fn spawn_language_server(
         timeout,
     )?;
 
+    Ok(finish_language_server_spawn(
+        client,
+        incoming,
+        enable_snippets,
+    ))
+}
+
+pub fn spawn_language_server_with_streams<R, W, E>(
+    id: LanguageServerId,
+    prepared: PreparedClientLaunch,
+    process: Arc<dyn LanguageServerProcess>,
+    reader: R,
+    writer: W,
+    stderr: E,
+) -> Result<SpawnedLanguageServer>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+    E: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    let identity = prepared.identity();
+    let PreparedClientLaunch {
+        name,
+        root_path,
+        root_uri,
+        enable_snippets,
+        config,
+        timeout,
+        ..
+    } = prepared;
+    let (client, incoming) = Client::start_with_streams(
+        reader, writer, stderr, process, config, root_path, root_uri, id, name, identity, timeout,
+    );
+    Ok(finish_language_server_spawn(
+        client,
+        incoming,
+        enable_snippets,
+    ))
+}
+
+pub fn spawn_language_server_with_proxy(
+    id: LanguageServerId,
+    prepared: PreparedClientLaunch,
+    process: Arc<dyn LanguageServerProcess>,
+    proxy: Arc<dyn LanguageServerProxy>,
+) -> Result<SpawnedLanguageServer> {
+    if !matches!(
+        prepared.command,
+        PreparedLanguageServerCommand::Proxy { .. }
+    ) {
+        return Err(Error::Other(anyhow::anyhow!(
+            "language-server proxy requires a proxy launch"
+        )));
+    }
+    let identity = prepared.identity();
+    let PreparedClientLaunch {
+        name,
+        root_path,
+        root_uri,
+        enable_snippets,
+        config,
+        timeout,
+        ..
+    } = prepared;
+    let client = Client::start_with_proxy(
+        proxy, process, config, root_path, root_uri, id, name, identity, timeout,
+    );
+    let (sender, incoming) = helix_runtime::channel(1);
+    drop(sender);
+    Ok(finish_language_server_spawn(
+        client,
+        incoming,
+        enable_snippets,
+    ))
+}
+
+fn finish_language_server_spawn(
+    client: Client,
+    incoming: Receiver<(LanguageServerId, ServerEvent)>,
+    enable_snippets: bool,
+) -> SpawnedLanguageServer {
     let client = Arc::new(client);
 
     // Initialize the client asynchronously
@@ -1162,7 +1352,7 @@ pub fn spawn_language_server(
         }
     });
 
-    Ok(SpawnedLanguageServer(client, incoming))
+    SpawnedLanguageServer(client, incoming)
 }
 
 /// Find an LSP workspace of a file using the following mechanism:
@@ -1323,7 +1513,8 @@ mod tests {
 
     #[tokio::test]
     async fn manual_stop_policy_is_explicit_and_survives_invalidation() {
-        let mut registry = Registry::new();
+        let runtime = helix_runtime::Runtime::current().expect("test runtime");
+        let mut registry = Registry::new(&runtime);
 
         registry.stop("rust-analyzer");
         assert!(registry.is_manually_stopped("rust-analyzer"));

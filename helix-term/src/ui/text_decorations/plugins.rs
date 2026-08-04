@@ -37,7 +37,7 @@ impl PluginDecoration {
         let annotations = sources
             .iter()
             .map(|source| RenderAnnotation {
-                resolved_style: Self::resolve_style(theme, &source),
+                resolved_style: Self::resolve_style(theme, source),
                 source: source.clone(),
             })
             .collect::<Vec<_>>();

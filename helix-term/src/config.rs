@@ -271,7 +271,7 @@ mod tests {
             config.editor.bufferline.render_mode,
             helix_view::editor::BufferLineRenderMode::Multiple
         );
-        assert_eq!(config.editor.bufferline.separator, "│");
+        assert!(config.editor.bufferline.separator.is_empty());
     }
 
     #[test]

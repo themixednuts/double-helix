@@ -91,10 +91,15 @@ impl PkgHandler {
                 .await;
             return;
         }
-        let Some(package) = status.package.map(|package| package.name) else {
-            log::debug!(
-                "no package maps to missing language server '{server}' command '{command}'"
-            );
+        let package = status.package.map(|package| package.name);
+        log::info!(
+            "[pkg] missing_language_server server={server} language={language} command={command} package={} auto_install={}",
+            package.as_deref().unwrap_or("<none>"),
+            config.auto_install,
+        );
+        let Some(package) = package else {
+            self.ingress
+                .status(missing_language_server_status(&command, None));
             return;
         };
         if config.auto_install {
@@ -111,7 +116,7 @@ impl PkgHandler {
             }
         } else {
             self.ingress
-                .status(format!("{command} not installed - :pkg-install {package}"));
+                .status(missing_language_server_status(&command, Some(&package)));
         }
     }
 
@@ -133,6 +138,13 @@ impl PkgHandler {
     }
 }
 
+fn missing_language_server_status(command: &str, package: Option<&str>) -> String {
+    package.map_or_else(
+        || format!("{command} not installed"),
+        |package| format!("{command} not installed - :pkg-install {package}"),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -150,5 +162,17 @@ mod tests {
 
         assert!(handled.insert(key.clone()));
         assert!(!handled.insert(key));
+    }
+
+    #[test]
+    fn missing_server_status_only_offers_install_for_mapped_packages() {
+        assert_eq!(
+            missing_language_server_status("unknown-lsp", None),
+            "unknown-lsp not installed"
+        );
+        assert_eq!(
+            missing_language_server_status("json-lsp", Some("json-package")),
+            "json-lsp not installed - :pkg-install json-package"
+        );
     }
 }

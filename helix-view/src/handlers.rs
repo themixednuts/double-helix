@@ -45,7 +45,7 @@ pub enum NavigationPurpose {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NavigationRequest {
-    pub path: std::path::PathBuf,
+    pub path: crate::editor::WorkspaceDocumentPath,
     pub action: Action,
     pub target: ViewId,
     pub range: Option<helix_core::Range>,

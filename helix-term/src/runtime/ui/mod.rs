@@ -6,6 +6,7 @@
 
 pub mod apply;
 pub(crate) mod assistant;
+pub(crate) mod code_atlas;
 pub mod command;
 pub(crate) mod completion;
 pub(crate) mod dap;
@@ -21,8 +22,9 @@ pub(crate) mod snapshot;
 
 pub use apply::apply_ui_command;
 pub use command::{
-    AssistantCommand, CompletionCommand, DapCommand, DocumentCommand, DocumentOpenAlignment,
-    DocumentOpenCompletionTarget, DocumentOpenLane, DocumentOpenPostAction, DocumentOpenRequest,
-    DocumentOpenSelection, DocumentOpenTarget, DocumentReloadOrigin, FffOpenRecord, LayerCommand,
-    PickerCommand, PkgCommand, PkgRefreshStage, PromptCommand, PromptCompletionResult, UiCommand,
+    AssistantCommand, BriefingTarget, CodeAtlasCommand, CompletionCommand, DapCommand,
+    DocumentCommand, DocumentOpenAlignment, DocumentOpenCompletionTarget, DocumentOpenLane,
+    DocumentOpenPostAction, DocumentOpenRequest, DocumentOpenSelection, DocumentOpenTarget,
+    DocumentReloadOrigin, FffOpenRecord, FileExplorerCommand, LayerCommand, PickerCommand,
+    PkgCommand, PkgRefreshStage, PromptCommand, PromptCompletionResult, UiCommand,
 };

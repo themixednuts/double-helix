@@ -187,6 +187,24 @@ impl Default for FilePickerConfig {
     }
 }
 
+impl FilePickerConfig {
+    pub fn workspace_scan_options(&self) -> helix_workspace::ScanOptions {
+        helix_workspace::ScanOptions {
+            hidden: self.hidden,
+            parents: self.parents,
+            ignore: self.ignore,
+            git_ignore: self.git_ignore,
+            git_global: self.git_global,
+            git_exclude: self.git_exclude,
+            follow_symlinks: self.follow_symlinks,
+            deduplicate_symlinks: self.deduplicate_links,
+            max_depth: self
+                .max_depth
+                .map(|depth| u32::try_from(depth).unwrap_or(u32::MAX)),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", default, deny_unknown_fields)]
 pub struct FileExplorerConfig {
@@ -201,6 +219,11 @@ pub struct FileExplorerConfig {
     pub icons: bool,
     pub vcs: bool,
     pub diagnostics: bool,
+    /// Keep the file explorer open after opening a file.
+    ///
+    /// When `false` (the default), opening a file closes the explorer and
+    /// focuses the editor. When `true`, the explorer stays open (unfocused).
+    pub sticky: bool,
 }
 
 impl Default for FileExplorerConfig {
@@ -217,6 +240,33 @@ impl Default for FileExplorerConfig {
             icons: true,
             vcs: true,
             diagnostics: true,
+            sticky: false,
+        }
+    }
+}
+
+impl FileExplorerConfig {
+    pub fn workspace_scan_options(&self) -> helix_workspace::ScanOptions {
+        helix_workspace::ScanOptions {
+            hidden: self.hidden,
+            parents: self.parents,
+            ignore: self.ignore,
+            git_ignore: self.git_ignore,
+            git_global: self.git_global,
+            git_exclude: self.git_exclude,
+            follow_symlinks: self.follow_symlinks,
+            deduplicate_symlinks: true,
+            max_depth: None,
+        }
+    }
+
+    pub fn workspace_directory_options(&self) -> helix_workspace::DirectoryOptions {
+        helix_workspace::DirectoryOptions {
+            scan: helix_workspace::ScanOptions {
+                deduplicate_symlinks: false,
+                ..self.workspace_scan_options()
+            },
+            flatten_dirs: self.flatten_dirs,
         }
     }
 }
@@ -930,20 +980,11 @@ where
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct BufferLineConfig {
     pub render_mode: BufferLineRenderMode,
     pub separator: String,
-}
-
-impl Default for BufferLineConfig {
-    fn default() -> Self {
-        Self {
-            render_mode: BufferLineRenderMode::default(),
-            separator: String::new(),
-        }
-    }
 }
 
 impl<'de> Deserialize<'de> for BufferLineConfig {
@@ -1561,7 +1602,65 @@ impl Default for Config {
 
 #[cfg(test)]
 mod tests {
-    use super::{AgentConfig, BufferLineRenderMode, Config, VcsProvider};
+    use super::{
+        AgentConfig, BufferLineRenderMode, Config, FileExplorerConfig, FilePickerConfig,
+        VcsProvider,
+    };
+
+    #[test]
+    fn workspace_scan_options_preserve_picker_policy() {
+        let config = FilePickerConfig {
+            hidden: false,
+            follow_symlinks: false,
+            deduplicate_links: false,
+            parents: false,
+            ignore: false,
+            git_ignore: false,
+            git_global: false,
+            git_exclude: false,
+            max_depth: Some(7),
+            hide_preview: true,
+        };
+
+        let options = config.workspace_scan_options();
+        assert!(!options.hidden);
+        assert!(!options.follow_symlinks);
+        assert!(!options.deduplicate_symlinks);
+        assert!(!options.parents);
+        assert!(!options.ignore);
+        assert!(!options.git_ignore);
+        assert!(!options.git_global);
+        assert!(!options.git_exclude);
+        assert_eq!(options.max_depth, Some(7));
+
+        let options = FilePickerConfig {
+            max_depth: Some(usize::MAX),
+            ..FilePickerConfig::default()
+        }
+        .workspace_scan_options();
+        assert_eq!(options.max_depth, Some(u32::MAX));
+    }
+
+    #[test]
+    fn explorer_search_and_directory_policies_only_differ_on_deduplication() {
+        let config = FileExplorerConfig {
+            follow_symlinks: true,
+            ..FileExplorerConfig::default()
+        };
+
+        let search = config.workspace_scan_options();
+        let directory = config.workspace_directory_options();
+        assert!(search.deduplicate_symlinks);
+        assert!(!directory.scan.deduplicate_symlinks);
+        assert_eq!(
+            directory.scan,
+            helix_workspace::ScanOptions {
+                deduplicate_symlinks: false,
+                ..search
+            }
+        );
+        assert_eq!(directory.flatten_dirs, config.flatten_dirs);
+    }
 
     #[test]
     fn agent_config_id_is_optional_and_serialized_when_present() {

@@ -4,8 +4,8 @@ use helix_core::{Position, Selection, Syntax};
 use helix_view::{
     document::DocumentOpenError,
     editor::{
-        Action, ClosePolicy, DocumentReloadError, FilePickerConfig, PreparedDocumentOpen,
-        PreparedDocumentReload,
+        Action, ClosePolicy, DocumentReloadError, FilePickerConfig, PreparedDocumentReload,
+        PreparedWorkspaceDocumentOpen, WorkspaceDocumentPath,
     },
     DocumentId, ViewId,
 };
@@ -82,7 +82,7 @@ pub struct FffOpenRecord {
 
 #[derive(Debug, Clone)]
 pub struct DocumentOpenRequest {
-    pub path: PathBuf,
+    pub path: WorkspaceDocumentPath,
     pub action: Action,
     pub lane: DocumentOpenLane,
     pub target: DocumentOpenTarget,
@@ -97,7 +97,7 @@ pub struct DocumentOpenRequest {
 
 pub struct DocumentOpenCompletion {
     pub request: DocumentOpenRequest,
-    pub result: Result<PreparedDocumentOpen, DocumentOpenError>,
+    pub result: Result<PreparedWorkspaceDocumentOpen, DocumentOpenError>,
 }
 
 impl std::fmt::Debug for DocumentOpenCompletion {
@@ -145,7 +145,7 @@ pub enum DocumentCommand {
         version: i32,
         selection: Selection,
         scrolloff: usize,
-        path: PathBuf,
+        path: WorkspaceDocumentPath,
         result: Result<String, String>,
     },
     ReloadFinished {

@@ -21,6 +21,7 @@ pub struct Args {
     pub config_file: Option<PathBuf>,
     pub files: IndexMap<PathBuf, Vec<Position>>,
     pub working_directory: Option<PathBuf>,
+    pub remote: Option<helix_remote::ssh::RemoteUri>,
 }
 
 pub struct PkgArgs {
@@ -124,6 +125,15 @@ impl Args {
                         anyhow::bail!("--working-dir must specify an initial working directory")
                     }
                 },
+                "--remote" => match argv.next().as_deref() {
+                    Some(uri) => {
+                        if args.remote.is_some() {
+                            anyhow::bail!("only one remote workspace may be opened");
+                        }
+                        args.remote = Some(helix_remote::ssh::RemoteUri::parse(uri)?);
+                    }
+                    None => anyhow::bail!("--remote must specify an ssh:// workspace URI"),
+                },
                 arg if arg.starts_with("--") => {
                     anyhow::bail!("unexpected double dash argument: {}", arg)
                 }
@@ -145,6 +155,12 @@ impl Args {
                         _ => insert_file_with_position(arg),
                     };
                 }
+                arg if arg.starts_with("ssh://") => {
+                    if args.remote.is_some() {
+                        anyhow::bail!("only one remote workspace may be opened");
+                    }
+                    args.remote = Some(helix_remote::ssh::RemoteUri::parse(arg)?);
+                }
                 arg => insert_file_with_position(arg),
             }
         }
@@ -162,6 +178,12 @@ impl Args {
             {
                 first_position.row = line_number;
             }
+        }
+
+        if args.remote.is_some() && (!args.files.is_empty() || args.working_directory.is_some()) {
+            anyhow::bail!(
+                "a remote workspace cannot be combined with local files or --working-dir"
+            );
         }
 
         Ok(args)

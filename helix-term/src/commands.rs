@@ -4,6 +4,7 @@ pub(crate) mod lsp;
 pub(crate) mod notification;
 pub(crate) mod syntax;
 pub(crate) mod typed;
+pub(crate) mod understanding;
 
 pub use context::*;
 pub use dap::*;
@@ -62,9 +63,14 @@ use movement::Movement;
 
 use crate::{
     compositor::{self, Compositor},
-    filter_picker_entry,
     runtime::{send_task_event_with, AssistantCommand, RuntimeTaskEvent, UiCommand},
-    ui::{self, menu::Cell, overlay::overlaid, Picker, PickerColumn, Prompt, PromptEvent},
+    ui::{
+        self,
+        file_scan::{configure_walk, filter_picker_entry},
+        menu::Cell,
+        overlay::overlaid,
+        Picker, PickerColumn, Prompt, PromptEvent,
+    },
 };
 use std::{collections::HashSet, fmt, num::NonZeroUsize, sync::OnceLock};
 
@@ -336,6 +342,7 @@ impl MappableCommand {
         call_hierarchy_outgoing => "Show outgoing calls",
         type_hierarchy_super => "Show supertypes",
         type_hierarchy_sub => "Show subtypes",
+        understand => "Open an evidence-backed briefing for the current file",
         goto_file => "Goto files/URLs in selections",
         goto_file_hsplit => "Goto files in selections (hsplit)",
         goto_file_vsplit => "Goto files in selections (vsplit)",
@@ -603,6 +610,15 @@ fn assistant_panel(cx: &mut Context) {
     cx.spawn_ui(async { Ok(UiCommand::Assistant(AssistantCommand::TogglePanelFocus)) });
 }
 
+fn understand(cx: &mut Context) {
+    match understanding::prepare(cx.editor) {
+        Ok(command) => cx.submit_ui(command),
+        Err(error) => cx
+            .editor
+            .set_error(format!("Could not start briefing: {error}")),
+    }
+}
+
 fn assistant_close_panel(cx: &mut Context) {
     cx.spawn_ui(async { Ok(UiCommand::Assistant(AssistantCommand::ClosePanel)) });
 }
@@ -765,7 +781,7 @@ fn goto_file_vsplit(cx: &mut Context) {
 
 fn queue_picker_document_open(
     cx: &mut compositor::Context,
-    path: PathBuf,
+    path: helix_view::editor::WorkspaceDocumentPath,
     action: Action,
     selection: crate::runtime::DocumentOpenSelection,
     alignment: crate::runtime::DocumentOpenAlignment,
@@ -837,6 +853,10 @@ fn goto_file_impl(cx: &mut Context, action: Action) {
     };
 
     let initial_view = cx.editor.focused_view_id();
+    let workspace = helix_view::editor::WorkspaceContext::from_backend(
+        helix_stdx::env::current_working_dir(),
+        &cx.editor.workspace_backend,
+    );
     let mut requests = Vec::new();
     for selected in paths {
         let (path, external_if_binary) = match Url::parse(&selected) {
@@ -851,6 +871,14 @@ fn goto_file_impl(cx: &mut Context, action: Action) {
             crate::runtime::DocumentOpenTarget::View(initial_view)
         } else {
             crate::runtime::DocumentOpenTarget::PreviousResult
+        };
+        let path = match workspace.resolve(&path) {
+            Ok(path) => path,
+            Err(error) => {
+                cx.editor
+                    .notify_error(format!("Cannot open '{selected}': {error}"));
+                continue;
+            }
         };
         requests.push(crate::runtime::DocumentOpenRequest {
             path,
@@ -1324,16 +1352,24 @@ fn make_search_word_bounded(cx: &mut Context) {
 fn global_search(cx: &mut Context) {
     #[derive(Debug)]
     struct FileResult {
-        path: PathBuf,
+        path: helix_view::editor::WorkspaceDocumentPath,
         /// 0 indexed lines
         line_num: usize,
     }
 
     impl FileResult {
-        fn new(path: &Path, line_num: usize) -> Self {
-            Self {
-                path: path.to_path_buf(),
-                line_num,
+        fn new(path: helix_view::editor::WorkspaceDocumentPath, line_num: usize) -> Self {
+            Self { path, line_num }
+        }
+
+        fn display_path(&self) -> String {
+            match &self.path {
+                helix_view::editor::WorkspaceDocumentPath::Local(path) => {
+                    helix_stdx::path::get_relative_path(path)
+                        .to_string_lossy()
+                        .into_owned()
+                }
+                path => path.display(),
             }
         }
     }
@@ -1357,23 +1393,15 @@ fn global_search(cx: &mut Context) {
 
     let columns = [
         PickerColumn::new("path", |item: &FileResult, config: &GlobalSearchConfig| {
-            let path = helix_stdx::path::get_relative_path(&item.path);
-
-            let directories = path
-                .parent()
-                .filter(|p| !p.as_os_str().is_empty())
-                .map(|p| format!("{}{}", p.display(), std::path::MAIN_SEPARATOR))
-                .unwrap_or_default();
-
-            let filename = item
-                .path
-                .file_name()
-                .expect("global search paths are normalized (can't end in `..`)")
-                .to_string_lossy();
+            let display = item.display_path();
+            let split = display
+                .rfind(['/', '\\'])
+                .map_or(("", display.as_str()), |index| display.split_at(index + 1));
+            let (directories, filename) = split;
 
             Cell::from(Spans::from(vec![
-                Span::styled(directories, config.directory_style),
-                Span::raw(filename),
+                Span::styled(directories.to_owned(), config.directory_style),
+                Span::raw(filename.to_owned()),
                 Span::styled(":", config.colon_style),
                 Span::styled((item.line_num + 1).to_string(), config.number_style),
             ]))
@@ -1391,65 +1419,92 @@ fn global_search(cx: &mut Context) {
             return work.spawn(async { Ok(()) });
         }
 
-        let search_root = helix_stdx::env::current_working_dir();
+        let search_root = find_workspace().0;
+        let backend = editor.workspace_backend.clone();
+        let source = ui::ExplorerSource::from_backend(search_root.clone(), &backend);
         let content_overlay_snapshots: Vec<_> = editor
             .documents()
             .filter(|doc| doc.is_modified())
             .filter_map(|doc| {
-                let path = doc.path()?;
-                Some((
-                    helix_stdx::path::normalize(path),
-                    doc.text().clone(),
-                    doc.version() as u64,
-                ))
+                let target = match (&backend, doc.location()?) {
+                    (
+                        helix_view::editor::WorkspaceBackend::Local,
+                        helix_view::file_bound::DocumentLocation::Local(path),
+                    ) => helix_view::editor::WorkspaceDocumentPath::Local(
+                        helix_stdx::path::normalize(path),
+                    ),
+                    (
+                        helix_view::editor::WorkspaceBackend::Remote(_),
+                        helix_view::file_bound::DocumentLocation::Remote(location),
+                    ) => helix_view::editor::WorkspaceDocumentPath::Remote(location.path.clone()),
+                    _ => return None,
+                };
+                Some((target, doc.text().clone(), doc.version() as u64))
             })
             .collect();
-
-        match RegexMatcherBuilder::new()
-            .case_smart(config.smart_case)
-            .build(query)
-        {
-            Ok(matcher) => {
-                // Clear any "Failed to compile regex" errors out of the statusline.
-                editor.clear_status();
-                drop(matcher);
-            }
-            Err(err) => {
-                log::info!("Failed to compile search pattern in global search: {}", err);
-                return work.spawn(async { Err(anyhow::anyhow!("Failed to compile regex")) });
-            }
-        }
+        editor.clear_status();
 
         let injector = injector.clone();
         let query = query.to_owned();
-        let search = block.spawn(move || -> anyhow::Result<()> {
-            let content_overlays: Vec<_> = content_overlay_snapshots
-                .into_iter()
-                .map(|(path, text, revision)| fff_search::ContentOverlay {
-                    path,
-                    bytes: std::sync::Arc::from(text.to_string().into_bytes().into_boxed_slice()),
-                    revision,
-                })
-                .collect();
-            let matches = crate::fff::grep_files(
-                &search_root,
-                &query,
-                config.smart_case,
-                &config.file_picker_config,
-                &content_overlays,
-            )?;
-            for item in matches {
-                if injector
-                    .push(FileResult::new(&item.path, item.line_num))
-                    .is_err()
-                {
-                    break;
+        work.clone().spawn(async move {
+            let result: anyhow::Result<()> = async {
+                let overlays = block
+                    .clone()
+                    .spawn(move || {
+                        content_overlay_snapshots
+                            .into_iter()
+                            .map(|(target, text, revision)| {
+                                ui::WorkspaceContentOverlay::new(
+                                    target,
+                                    std::sync::Arc::from(
+                                        text.to_string().into_bytes().into_boxed_slice(),
+                                    ),
+                                    revision,
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .await?;
+                let mut search = ui::WorkspaceContentSearch::new(
+                    source,
+                    query,
+                    config.smart_case,
+                    std::sync::Arc::new(config.file_picker_config.clone()),
+                    overlays,
+                    injector.cancellation_token(),
+                )?;
+                let mut total = 0usize;
+                loop {
+                    if !injector.is_active() || total >= helix_workspace::MAX_CONTENT_SEARCH_RESULTS
+                    {
+                        break;
+                    }
+                    let remaining = helix_workspace::MAX_CONTENT_SEARCH_RESULTS - total;
+                    let page = search
+                        .next_page(
+                            block.clone(),
+                            remaining.min(helix_workspace::MAX_CONTENT_SEARCH_PAGE_RESULTS),
+                        )
+                        .await?;
+                    for item in page.matches.into_iter().take(remaining) {
+                        if injector
+                            .push(FileResult::new(item.path, item.line))
+                            .is_err()
+                        {
+                            return Ok(());
+                        }
+                        total += 1;
+                    }
+                    if page.done {
+                        break;
+                    }
                 }
+                Ok(())
             }
-            Ok(())
-        });
-        work.spawn(async move {
-            search.await??;
+            .await;
+            if let Err(error) = result {
+                injector.report_error(error);
+            }
             Ok(())
         })
     };
@@ -1475,13 +1530,13 @@ fn global_search(cx: &mut Context) {
         },
     )
     .with_preview(|_editor, FileResult { path, line_num, .. }| {
-        Some((path.as_path().into(), Some((*line_num, *line_num))))
+        Some((
+            ui::picker::PathOrId::from(path),
+            Some((*line_num, *line_num)),
+        ))
     })
     .with_history_register(Some(reg))
-    .with_dynamic_query(
-        get_files,
-        ui::picker::DynamicQuerySchedule::debounced_ms(275),
-    );
+    .with_dynamic_query(get_files, ui::picker::DynamicQuerySchedule::Immediate);
 
     cx.push_layer(Box::new(overlaid(picker)));
 }
@@ -1571,7 +1626,8 @@ fn local_search_grep(cx: &mut Context) {
             }
         };
 
-        let dedup_symlinks = config.file_picker_config.deduplicate_links;
+        let scan = config.file_picker_config.workspace_scan_options();
+        let dedup_symlinks = scan.deduplicate_symlinks;
         let injector = injector.clone();
         let search = block.spawn(move || {
             let absolute_root = search_root
@@ -1580,100 +1636,89 @@ fn local_search_grep(cx: &mut Context) {
             let searcher = SearcherBuilder::new()
                 .binary_detection(BinaryDetection::quit(b'\x00'))
                 .build();
-            WalkBuilder::new(search_root)
-                .hidden(config.file_picker_config.hidden)
-                .parents(config.file_picker_config.parents)
-                .ignore(config.file_picker_config.ignore)
-                .follow_links(config.file_picker_config.follow_symlinks)
-                .git_ignore(config.file_picker_config.git_ignore)
-                .git_global(config.file_picker_config.git_global)
-                .git_exclude(config.file_picker_config.git_exclude)
-                .max_depth(config.file_picker_config.max_depth)
-                .filter_entry(move |entry| {
-                    filter_picker_entry(entry, &absolute_root, dedup_symlinks)
+            let mut walk = WalkBuilder::new(search_root);
+            configure_walk(&mut walk, scan);
+            walk.filter_entry(move |entry| {
+                filter_picker_entry(entry, &absolute_root, dedup_symlinks)
+            })
+            .add_custom_ignore_filename(helix_loader::config_dir().join("ignore"))
+            .add_custom_ignore_filename(helix_loader::workspace_ignore_file_name())
+            .build_parallel()
+            .run(|| {
+                let mut searcher = searcher.clone();
+                let matcher = matcher.clone();
+                let injector = injector.clone();
+                let documents = &documents;
+                Box::new(move |entry: Result<DirEntry, ignore::Error>| -> WalkState {
+                    let entry = match entry {
+                        Ok(entry) => entry,
+                        Err(_) => return WalkState::Continue,
+                    };
+
+                    match entry.file_type() {
+                        Some(entry) if entry.is_file() => {}
+                        // skip everything else
+                        _ => return WalkState::Continue,
+                    };
+
+                    let mut stop = false;
+
+                    // Maximum line length of the content displayed within the result picker.
+                    // User should be allowed to control this to accomodate their monitor width.
+                    // TODO: Expose this setting to the user so they can control it.
+                    let local_search_result_line_length = 80;
+
+                    let sink = sinks::UTF8(|line_num, line_content| {
+                        stop = injector
+                            .push(FileResult::new(
+                                entry.path(),
+                                line_num as usize - 1,
+                                line_content[0..std::cmp::min(
+                                    local_search_result_line_length,
+                                    line_content.len(),
+                                )]
+                                    .to_string(),
+                            ))
+                            .is_err();
+
+                        Ok(!stop)
+                    });
+                    let doc = documents.iter().find(|&(doc_path, _)| {
+                        doc_path
+                            .as_ref()
+                            .is_some_and(|doc_path| doc_path == entry.path())
+                    });
+
+                    // search in current document
+                    let result = if let Some((_, doc)) = doc {
+                        // there is already a buffer for this file
+                        // search the buffer instead of the file because it's faster
+                        // and captures new edits without requiring a save
+                        if searcher.multi_line_with_matcher(&matcher) {
+                            // in this case a continuous buffer is required
+                            // convert the rope to a string
+                            let text = doc.to_string();
+                            searcher.search_slice(&matcher, text.as_bytes(), sink)
+                        } else {
+                            searcher.search_reader(&matcher, RopeReader::new(doc.slice(..)), sink)
+                        }
+                    } else {
+                        // Note: This is a hack!
+                        // We ignore all other files.
+                        // We only search an empty string (to satisfy rust's return type).
+                        searcher.search_slice(&matcher, "".to_owned().as_bytes(), sink)
+                    };
+
+                    if let Err(err) = result {
+                        log::error!("Local search error: {}, {}", entry.path().display(), err);
+                    }
+                    if stop {
+                        WalkState::Quit
+                    } else {
+                        WalkState::Continue
+                    }
                 })
-                .add_custom_ignore_filename(helix_loader::config_dir().join("ignore"))
-                .add_custom_ignore_filename(helix_loader::workspace_ignore_file_name())
-                .build_parallel()
-                .run(|| {
-                    let mut searcher = searcher.clone();
-                    let matcher = matcher.clone();
-                    let injector = injector.clone();
-                    let documents = &documents;
-                    Box::new(move |entry: Result<DirEntry, ignore::Error>| -> WalkState {
-                        let entry = match entry {
-                            Ok(entry) => entry,
-                            Err(_) => return WalkState::Continue,
-                        };
-
-                        match entry.file_type() {
-                            Some(entry) if entry.is_file() => {}
-                            // skip everything else
-                            _ => return WalkState::Continue,
-                        };
-
-                        let mut stop = false;
-
-                        // Maximum line length of the content displayed within the result picker.
-                        // User should be allowed to control this to accomodate their monitor width.
-                        // TODO: Expose this setting to the user so they can control it.
-                        let local_search_result_line_length = 80;
-
-                        let sink = sinks::UTF8(|line_num, line_content| {
-                            stop = injector
-                                .push(FileResult::new(
-                                    entry.path(),
-                                    line_num as usize - 1,
-                                    line_content[0..std::cmp::min(
-                                        local_search_result_line_length,
-                                        line_content.len(),
-                                    )]
-                                        .to_string(),
-                                ))
-                                .is_err();
-
-                            Ok(!stop)
-                        });
-                        let doc = documents.iter().find(|&(doc_path, _)| {
-                            doc_path
-                                .as_ref()
-                                .is_some_and(|doc_path| doc_path == entry.path())
-                        });
-
-                        // search in current document
-                        let result = if let Some((_, doc)) = doc {
-                            // there is already a buffer for this file
-                            // search the buffer instead of the file because it's faster
-                            // and captures new edits without requiring a save
-                            if searcher.multi_line_with_matcher(&matcher) {
-                                // in this case a continuous buffer is required
-                                // convert the rope to a string
-                                let text = doc.to_string();
-                                searcher.search_slice(&matcher, text.as_bytes(), sink)
-                            } else {
-                                searcher.search_reader(
-                                    &matcher,
-                                    RopeReader::new(doc.slice(..)),
-                                    sink,
-                                )
-                            }
-                        } else {
-                            // Note: This is a hack!
-                            // We ignore all other files.
-                            // We only search an empty string (to satisfy rust's return type).
-                            searcher.search_slice(&matcher, "".to_owned().as_bytes(), sink)
-                        };
-
-                        if let Err(err) = result {
-                            log::error!("Local search error: {}, {}", entry.path().display(), err);
-                        }
-                        if stop {
-                            WalkState::Quit
-                        } else {
-                            WalkState::Continue
-                        }
-                    })
-                });
+            });
         });
         work.spawn(async move {
             search.await?;
@@ -1694,7 +1739,7 @@ fn local_search_grep(cx: &mut Context) {
         move |cx, FileResult { path, line_num, .. }, action| {
             queue_picker_document_open(
                 cx,
-                path.clone(),
+                helix_view::editor::WorkspaceDocumentPath::Local(path.clone()),
                 action,
                 crate::runtime::DocumentOpenSelection::Line(*line_num),
                 crate::runtime::DocumentOpenAlignment::CenterIfAction,
@@ -1770,7 +1815,7 @@ fn local_search_fuzzy(cx: &mut Context) {
         move |cx, FileResult { path, line_num, .. }, action| {
             queue_picker_document_open(
                 cx,
-                path.as_ref().clone(),
+                helix_view::editor::WorkspaceDocumentPath::Local(path.as_ref().clone()),
                 action,
                 crate::runtime::DocumentOpenSelection::Line(*line_num),
                 crate::runtime::DocumentOpenAlignment::CenterIfAction,
@@ -1831,13 +1876,34 @@ fn append_mode(cx: &mut Context) {
 }
 
 fn file_picker(cx: &mut Context) {
-    let root = find_workspace().0;
+    let local_root = find_workspace().0;
+    let root = match &cx.editor.workspace_backend {
+        helix_view::editor::WorkspaceBackend::Local => {
+            helix_view::editor::WorkspaceDocumentPath::Local(local_root)
+        }
+        helix_view::editor::WorkspaceBackend::Remote(_) => {
+            helix_view::editor::WorkspaceDocumentPath::Remote(helix_remote::WorkspacePath::root())
+        }
+        helix_view::editor::WorkspaceBackend::Collaboration(session) => {
+            helix_view::editor::WorkspaceDocumentPath::Collaboration {
+                project: session.project().id,
+                path: helix_remote::WorkspacePath::root(),
+            }
+        }
+    };
     log::info!(
         target: ui::picker::PICKER_TRACE_TARGET,
         "phase=command_start command=file_picker root={}",
         root.display(),
     );
-    let picker = ui::file_picker(cx.editor, root.clone(), cx.ingress.clone());
+    let picker = match ui::file_picker(cx.editor, root.clone(), cx.ingress.clone()) {
+        Ok(picker) => picker,
+        Err(error) => {
+            cx.editor
+                .set_error(format!("Failed to open file picker: {error}"));
+            return;
+        }
+    };
     if cx.editor.config().file_picker.hide_preview {
         let overlay = ui::overlay::Overlay {
             content: picker,
@@ -1859,13 +1925,48 @@ fn file_picker(cx: &mut Context) {
 fn file_picker_in_current_buffer_directory(cx: &mut Context) {
     let doc_dir = focused_ref!(cx.editor)
         .1
-        .path()
-        .and_then(|path| path.parent().map(|path| path.to_path_buf()));
+        .location()
+        .and_then(|location| match location {
+            helix_view::file_bound::DocumentLocation::Local(path) => path
+                .parent()
+                .map(|path| helix_view::editor::WorkspaceDocumentPath::Local(path.to_path_buf())),
+            helix_view::file_bound::DocumentLocation::Remote(location) => location
+                .path
+                .parent()
+                .or_else(|| Some(helix_remote::WorkspacePath::root()))
+                .map(helix_view::editor::WorkspaceDocumentPath::Remote),
+            helix_view::file_bound::DocumentLocation::Collaboration(location) => {
+                Some(helix_view::editor::WorkspaceDocumentPath::Collaboration {
+                    project: location.project,
+                    path: location
+                        .path
+                        .parent()
+                        .unwrap_or_else(helix_remote::WorkspacePath::root),
+                })
+            }
+        });
 
     let path = match doc_dir {
         Some(path) => path,
         None => {
-            let cwd = helix_stdx::env::current_working_dir();
+            let cwd = match &cx.editor.workspace_backend {
+                helix_view::editor::WorkspaceBackend::Local => {
+                    helix_view::editor::WorkspaceDocumentPath::Local(
+                        helix_stdx::env::current_working_dir(),
+                    )
+                }
+                helix_view::editor::WorkspaceBackend::Remote(_) => {
+                    helix_view::editor::WorkspaceDocumentPath::Remote(
+                        helix_remote::WorkspacePath::root(),
+                    )
+                }
+                helix_view::editor::WorkspaceBackend::Collaboration(session) => {
+                    helix_view::editor::WorkspaceDocumentPath::Collaboration {
+                        project: session.project().id,
+                        path: helix_remote::WorkspacePath::root(),
+                    }
+                }
+            };
             cx.editor.notify_warning(
                 "Current buffer has no parent, opening file picker in current working directory",
             );
@@ -1878,7 +1979,14 @@ fn file_picker_in_current_buffer_directory(cx: &mut Context) {
         "phase=command_start command=file_picker_in_current_buffer_directory root={}",
         path.display(),
     );
-    let picker = ui::file_picker(cx.editor, path, cx.ingress.clone());
+    let picker = match ui::file_picker(cx.editor, path, cx.ingress.clone()) {
+        Ok(picker) => picker,
+        Err(error) => {
+            cx.editor
+                .set_error(format!("Failed to open file picker: {error}"));
+            return;
+        }
+    };
     cx.push_layer(Box::new(overlaid(picker)));
     log::info!(
         target: ui::picker::PICKER_TRACE_TARGET,
@@ -1887,13 +1995,33 @@ fn file_picker_in_current_buffer_directory(cx: &mut Context) {
 }
 
 fn file_picker_in_current_directory(cx: &mut Context) {
-    let cwd = helix_stdx::env::current_working_dir();
+    let cwd = match &cx.editor.workspace_backend {
+        helix_view::editor::WorkspaceBackend::Local => {
+            helix_view::editor::WorkspaceDocumentPath::Local(helix_stdx::env::current_working_dir())
+        }
+        helix_view::editor::WorkspaceBackend::Remote(_) => {
+            helix_view::editor::WorkspaceDocumentPath::Remote(helix_remote::WorkspacePath::root())
+        }
+        helix_view::editor::WorkspaceBackend::Collaboration(session) => {
+            helix_view::editor::WorkspaceDocumentPath::Collaboration {
+                project: session.project().id,
+                path: helix_remote::WorkspacePath::root(),
+            }
+        }
+    };
     log::info!(
         target: ui::picker::PICKER_TRACE_TARGET,
         "phase=command_start command=file_picker_in_current_directory root={}",
         cwd.display(),
     );
-    let picker = ui::file_picker(cx.editor, cwd, cx.ingress.clone());
+    let picker = match ui::file_picker(cx.editor, cwd, cx.ingress.clone()) {
+        Ok(picker) => picker,
+        Err(error) => {
+            cx.editor
+                .set_error(format!("Failed to open file picker: {error}"));
+            return;
+        }
+    };
     cx.push_layer(Box::new(overlaid(picker)));
     log::info!(
         target: ui::picker::PICKER_TRACE_TARGET,
@@ -1902,20 +2030,31 @@ fn file_picker_in_current_directory(cx: &mut Context) {
 }
 
 fn file_explorer(cx: &mut Context) {
-    let root = find_workspace().0;
+    let root = helix_view::editor::WorkspaceContext::from_backend(
+        find_workspace().0,
+        &cx.editor.workspace_backend,
+    )
+    .root()
+    .clone();
     open_file_explorer_panel(cx, root);
 }
 
 fn file_explorer_in_current_buffer_directory(cx: &mut Context) {
     let doc_dir = focused_ref!(cx.editor)
         .1
-        .path()
-        .and_then(|path| path.parent().map(|path| path.to_path_buf()));
+        .location()
+        .map(helix_view::editor::WorkspaceDocumentPath::from)
+        .and_then(|path| path.parent());
 
     let path = match doc_dir {
         Some(path) => path,
         None => {
-            let cwd = helix_stdx::env::current_working_dir();
+            let cwd = helix_view::editor::WorkspaceContext::from_backend(
+                helix_stdx::env::current_working_dir(),
+                &cx.editor.workspace_backend,
+            )
+            .root()
+            .clone();
             cx.editor.notify_warning(
                 "Current buffer has no parent, opening file explorer in current working directory",
             );
@@ -1927,29 +2066,24 @@ fn file_explorer_in_current_buffer_directory(cx: &mut Context) {
 }
 
 fn file_explorer_in_current_directory(cx: &mut Context) {
-    let cwd = helix_stdx::env::current_working_dir();
+    let cwd = helix_view::editor::WorkspaceContext::from_backend(
+        helix_stdx::env::current_working_dir(),
+        &cx.editor.workspace_backend,
+    )
+    .root()
+    .clone();
     open_file_explorer_panel(cx, cwd);
 }
 
-fn open_file_explorer_panel(cx: &mut Context, root: PathBuf) {
-    let root = helix_stdx::path::normalize(root);
-    let mut panel = ui::FileExplorerPanel::new_deferred(root.clone(), cx.editor);
-    crate::runtime::ui::file_explorer::queue_file_explorer_tree_refresh(
-        &mut panel,
-        cx.editor,
-        cx.ingress.clone(),
-        None,
-        None,
-        None,
-        true,
-        false,
-    );
-    cx.replace_or_push_layer(ui::FILE_EXPLORER_ID, panel);
-    crate::runtime::ui::file_explorer::queue_file_explorer_vcs_snapshot(
-        cx.editor,
-        cx.ingress.clone(),
-        root,
-    );
+fn open_file_explorer_panel(cx: &mut Context, root: helix_view::editor::WorkspaceDocumentPath) {
+    let root = match root {
+        helix_view::editor::WorkspaceDocumentPath::Local(root) => {
+            helix_view::editor::WorkspaceDocumentPath::Local(helix_stdx::path::normalize(root))
+        }
+        root => root,
+    };
+    cx.callback
+        .push(crate::compositor::PostAction::OpenFileExplorer { root });
 }
 
 fn buffer_picker(cx: &mut Context) {
@@ -2266,7 +2400,7 @@ fn changed_file_picker(cx: &mut Context) {
         |cx, meta: &FileChange, action| {
             queue_picker_document_open(
                 cx,
-                meta.path().to_path_buf(),
+                helix_view::editor::WorkspaceDocumentPath::Local(meta.path().to_path_buf()),
                 action,
                 crate::runtime::DocumentOpenSelection::None,
                 crate::runtime::DocumentOpenAlignment::None,

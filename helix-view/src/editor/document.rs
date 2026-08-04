@@ -37,4 +37,28 @@ impl Editor {
         doc.detect_editor_config();
         self.refresh_doc_language(doc_id)
     }
+
+    pub fn set_doc_remote_path(
+        &mut self,
+        doc_id: DocumentId,
+        path: helix_remote::WorkspacePath,
+    ) -> Result<bool, url::ParseError> {
+        {
+            let doc = doc_mut!(self, &doc_id);
+            if doc
+                .remote_location()
+                .is_none_or(|location| location.path == path)
+            {
+                return Ok(false);
+            }
+            for language_server in doc.language_servers() {
+                language_server.text_document_did_close(doc.identifier());
+            }
+            doc.clear_language_servers();
+            doc.set_remote_path(path)?;
+            doc.detect_editor_config();
+        }
+        self.refresh_doc_language(doc_id);
+        Ok(true)
+    }
 }

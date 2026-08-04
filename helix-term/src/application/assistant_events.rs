@@ -42,23 +42,25 @@ impl AssistantEvents {
         let events = self.clone();
         work.spawn(async move {
             while let Some(update) = incoming.next().await {
-                match textual_stream(update) {
-                    Ok((key, entry)) => {
-                        match events.streams.try_fold(key, entry, merge_text_stream) {
-                            Ok(_) => {}
-                            Err(LatestAdmissionError::Full(key, entry)) => {
-                                if events.streams.send(key, entry).await.is_err() {
-                                    break;
-                                }
+                if let Some(key) = textual_stream_key(&update) {
+                    let backend::Update::Thread {
+                        event: thread::Event::Content(thread::Content::Stream(entry)),
+                        ..
+                    } = update
+                    else {
+                        unreachable!("textual stream classification must preserve its shape")
+                    };
+                    match events.streams.try_fold(key, entry, merge_text_stream) {
+                        Ok(_) => {}
+                        Err(LatestAdmissionError::Full(key, entry)) => {
+                            if events.streams.send(key, entry).await.is_err() {
+                                break;
                             }
-                            Err(LatestAdmissionError::Closed(_, _)) => break,
                         }
+                        Err(LatestAdmissionError::Closed(_, _)) => break,
                     }
-                    Err(update) => {
-                        if events.reliable.send(update).await.is_err() {
-                            break;
-                        }
-                    }
+                } else if events.reliable.send(update).await.is_err() {
+                    break;
                 }
             }
         })
@@ -89,33 +91,23 @@ impl AssistantEventReceiver {
     }
 }
 
-fn textual_stream(
-    update: backend::Update,
-) -> Result<(StreamKey, thread::NewEntry), backend::Update> {
+fn textual_stream_key(update: &backend::Update) -> Option<StreamKey> {
     let backend::Update::Thread { thread, event } = update else {
-        return Err(update);
+        return None;
     };
     let thread::Event::Content(thread::Content::Stream(entry)) = event else {
-        return Err(backend::Update::Thread { thread, event });
+        return None;
     };
-    let Some(stream) = entry.stream.clone() else {
-        return Err(backend::Update::Thread {
-            thread,
-            event: thread::Event::Content(thread::Content::Stream(entry)),
-        });
-    };
+    let stream = entry.stream.clone()?;
     if !matches!(
         &entry.kind,
         thread::EntryKind::UserPrompt { .. }
             | thread::EntryKind::AssistantText { .. }
             | thread::EntryKind::Thought { .. }
     ) {
-        return Err(backend::Update::Thread {
-            thread,
-            event: thread::Event::Content(thread::Content::Stream(entry)),
-        });
+        return None;
     }
-    Ok(((thread, stream), entry))
+    Some((*thread, stream))
 }
 
 fn merge_text_stream(current: &mut thread::NewEntry, incoming: thread::NewEntry) {
@@ -157,7 +149,14 @@ mod tests {
                     locations: Vec::new(),
                 })),
             };
-            let (key, entry) = textual_stream(update).unwrap();
+            let key = textual_stream_key(&update).unwrap();
+            let backend::Update::Thread {
+                event: thread::Event::Content(thread::Content::Stream(entry)),
+                ..
+            } = update
+            else {
+                panic!("expected textual stream update")
+            };
             events
                 .streams
                 .try_fold(key, entry, merge_text_stream)

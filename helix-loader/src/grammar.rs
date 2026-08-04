@@ -12,7 +12,7 @@ use std::{
 use tempfile::TempPath;
 use tree_house::tree_sitter::Grammar;
 
-use crate::assets::DYLIB_EXTENSION;
+use crate::{assets::DYLIB_EXTENSION, BUILD_TARGET};
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Configuration {
@@ -51,7 +51,6 @@ pub enum GrammarSource {
     },
 }
 
-const BUILD_TARGET: &str = env!("BUILD_TARGET");
 const REMOTE_NAME: &str = "origin";
 
 #[cfg(target_arch = "wasm32")]

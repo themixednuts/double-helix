@@ -354,9 +354,9 @@ pub(crate) fn apply_plugin_host_request(
                 crate::runtime::ui::document::queue_document_open(
                     editor,
                     &ingress,
-                    &foreground,
+                    foreground,
                     crate::runtime::DocumentOpenRequest {
-                        path: request.path.into(),
+                        path: std::path::PathBuf::from(request.path).into(),
                         action: if request.focus {
                             helix_view::editor::Action::Replace
                         } else {
@@ -505,7 +505,9 @@ pub(crate) fn notification_to_event(
 ) -> Option<events::PluginEvent> {
     match notification {
         PluginNotification::BufferOpen {
-            document_id, path, ..
+            document_id,
+            resource,
+            ..
         } => {
             let lang = editor
                 .documents
@@ -514,7 +516,7 @@ pub(crate) fn notification_to_event(
             Some(events::PluginEvent::DocumentOpened(
                 events::DocumentOpenedEvent {
                     document: adapt::document_handle(*document_id),
-                    path: path.as_ref().map(|p| p.to_string_lossy().into_owned()),
+                    path: resource.clone(),
                     language: lang,
                 },
             ))

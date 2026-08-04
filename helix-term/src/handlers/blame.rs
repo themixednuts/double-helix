@@ -99,11 +99,13 @@ pub(super) fn attach(editor: &helix_view::Editor, handlers: &Handlers) {
     let open_requests = requests.clone();
     editor.lifecycle().on_document_open(move |event| {
         if event.editor.config().inline_blame.auto_fetch {
-            open_requests.send(BlameEvent {
-                path: event.path.to_path_buf(),
-                doc_id: event.doc,
-                line: None,
-            });
+            if let Some(path) = event.location.local_path() {
+                open_requests.send(BlameEvent {
+                    path: path.to_path_buf(),
+                    doc_id: event.doc,
+                    line: None,
+                });
+            }
         }
         Ok(())
     });

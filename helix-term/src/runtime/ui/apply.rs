@@ -64,5 +64,8 @@ pub fn apply_ui_command(
             foreground,
             cmd,
         ),
+        UiCommand::CodeAtlas(cmd) => {
+            super::code_atlas::apply_code_atlas_command(context.editor, compositor, ingress, cmd)
+        }
     }
 }

@@ -10,7 +10,8 @@ use serde_json::json;
 
 use crate::runtime::{
     ingress::{DapConfiguredBreakpoints, DapOperation, DapParentRequest, DapSessionRequest},
-    send_task_event_with, RuntimeIngress, RuntimeTaskEvent,
+    send_task_event_with, DapStackFramesCompletion, DapStoppedCompletion, RuntimeIngress,
+    RuntimeTaskEvent,
 };
 
 pub(crate) fn handle_message(
@@ -134,13 +135,13 @@ fn handle_event(
                 }
 
                 send_task_event_with(
-                    RuntimeTaskEvent::DapStoppedCompleted {
+                    RuntimeTaskEvent::DapStoppedCompleted(DapStoppedCompletion {
                         client_id,
                         generation,
                         preferred_thread_id,
                         stacks,
                         errors,
-                    },
+                    }),
                     ingress,
                 )
                 .await;
@@ -626,12 +627,15 @@ pub(crate) fn apply_stopped_completed(
     editor: &mut Editor,
     ingress: RuntimeIngress,
     foreground: &crate::runtime::ForegroundEvents,
-    client_id: DebugAdapterId,
-    generation: u64,
-    preferred_thread_id: Option<DebugThreadId>,
-    stacks: Vec<(DebugThreadId, Vec<StackFrame>)>,
-    errors: Vec<String>,
+    completion: DapStoppedCompletion,
 ) {
+    let DapStoppedCompletion {
+        client_id,
+        generation,
+        preferred_thread_id,
+        stacks,
+        errors,
+    } = completion;
     if !ingress.is_current_dap_operation(client_id, DapOperation::StackTrace, generation) {
         log::debug!("discarding superseded DAP stack completion for {client_id}");
         return;
@@ -949,13 +953,13 @@ pub(crate) fn request_select_debug_thread(
         match request.await {
             Ok((frames, _)) => {
                 send_task_event_with(
-                    RuntimeTaskEvent::ApplyStackFrames {
+                    RuntimeTaskEvent::ApplyStackFrames(DapStackFramesCompletion {
                         client_id,
                         generation,
                         thread_id,
                         frames,
                         selection: helix_view::editor::FrameSelection::SelectFirst,
-                    },
+                    }),
                     ingress,
                 )
                 .await;
@@ -1029,12 +1033,15 @@ pub(crate) fn apply_stack_frames(
     editor: &mut Editor,
     ingress: crate::runtime::RuntimeIngress,
     foreground: &crate::runtime::ForegroundEvents,
-    client_id: DebugAdapterId,
-    generation: u64,
-    thread_id: DebugThreadId,
-    frames: Vec<StackFrame>,
-    selection: helix_view::editor::FrameSelection,
+    completion: DapStackFramesCompletion,
 ) {
+    let DapStackFramesCompletion {
+        client_id,
+        generation,
+        thread_id,
+        frames,
+        selection,
+    } = completion;
     if !ingress.is_current_dap_operation(client_id, DapOperation::StackTrace, generation) {
         log::debug!("discarding superseded stack-frame selection for {client_id}");
         return;
@@ -1078,7 +1085,7 @@ fn queue_stack_frame_open(
         &ingress,
         foreground,
         crate::runtime::DocumentOpenRequest {
-            path,
+            path: path.into(),
             action: Action::Replace,
             lane: crate::runtime::DocumentOpenLane::Debug,
             target: crate::runtime::DocumentOpenTarget::View(target),

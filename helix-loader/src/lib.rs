@@ -16,7 +16,7 @@ pub use helix_stdx::paths::{
     cache_dir, config_dir, data_dir, legacy_config_dir, LEGACY_CONFIG_DIR, PRODUCT_CONFIG_DIR,
 };
 
-pub const VERSION_AND_GIT_HASH: &str = env!("VERSION_AND_GIT_HASH");
+pub use helix_ipc::{BUILD_TARGET, VERSION_AND_GIT_HASH};
 pub const WORKSPACE_CONFIG_DIR: &str = ".double-helix";
 pub const WORKSPACE_IGNORE_FILE: &str = ".double-helix/ignore";
 

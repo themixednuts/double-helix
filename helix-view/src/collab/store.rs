@@ -59,6 +59,15 @@ impl Store {
     }
 
     #[must_use]
+    pub fn clear_participant_presence(&mut self, participant: ParticipantId) -> Vec<Effect> {
+        self.locations.remove(&participant);
+        self.presence
+            .values_mut()
+            .for_each(|items| items.retain(|item| item.participant != participant));
+        vec![Effect::ClearPresence { participant }]
+    }
+
+    #[must_use]
     pub fn show_presence(&mut self, surface: SurfaceId, presence: Vec<Presence>) -> Vec<Effect> {
         self.presence.insert(surface, presence.clone());
         vec![Effect::ShowPresence { surface, presence }]
@@ -72,6 +81,26 @@ impl Store {
 
     pub fn participant(&self, id: ParticipantId) -> Option<&Participant> {
         self.participants.get(&id)
+    }
+
+    pub fn participants(&self) -> impl Iterator<Item = &Participant> {
+        self.participants.values()
+    }
+
+    pub fn set_access(
+        &mut self,
+        id: ParticipantId,
+        access: super::participant::Access,
+    ) -> Result<bool, MissingParticipant> {
+        let participant = self
+            .participants
+            .get_mut(&id)
+            .ok_or(MissingParticipant { id })?;
+        if participant.access == access {
+            return Ok(false);
+        }
+        participant.access = access;
+        Ok(true)
     }
 
     pub fn location(&self, id: ParticipantId) -> Option<&Location> {

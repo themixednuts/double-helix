@@ -64,7 +64,7 @@ pub struct StatusMessage {
 
 #[derive(Debug, Clone)]
 pub struct PendingFormatWrite {
-    pub path: Option<PathBuf>,
+    pub path: Option<helix_view::editor::WorkspaceDocumentPath>,
     pub policy: SavePolicy,
 }
 
@@ -106,6 +106,24 @@ pub struct DapConfiguredBreakpoints {
     pub path: PathBuf,
     pub expected: Vec<helix_view::editor::Breakpoint>,
     pub result: Result<Option<Vec<helix_dap::Breakpoint>>, String>,
+}
+
+#[derive(Debug)]
+pub struct DapStoppedCompletion {
+    pub client_id: helix_dap::registry::DebugAdapterId,
+    pub generation: u64,
+    pub preferred_thread_id: Option<DebugThreadId>,
+    pub stacks: Vec<(DebugThreadId, Vec<helix_dap::StackFrame>)>,
+    pub errors: Vec<String>,
+}
+
+#[derive(Debug)]
+pub struct DapStackFramesCompletion {
+    pub client_id: helix_dap::registry::DebugAdapterId,
+    pub generation: u64,
+    pub thread_id: DebugThreadId,
+    pub frames: Vec<helix_dap::StackFrame>,
+    pub selection: FrameSelection,
 }
 
 #[derive(Debug, Default)]
@@ -283,9 +301,9 @@ struct RuntimeEvent(RuntimeDelivery);
 #[derive(Debug, thiserror::Error)]
 pub enum RuntimeSendError {
     #[error("runtime ingress is full")]
-    Full(RuntimeDelivery),
+    Full(Box<RuntimeDelivery>),
     #[error("runtime ingress is closed")]
-    Closed(RuntimeDelivery),
+    Closed(Box<RuntimeDelivery>),
 }
 
 impl std::fmt::Debug for RuntimeEvent {
@@ -318,6 +336,11 @@ impl std::fmt::Debug for RuntimeEvent {
 
 #[derive(Clone, Debug)]
 pub struct RuntimeIngress {
+    inner: Arc<RuntimeIngressInner>,
+}
+
+#[derive(Debug)]
+struct RuntimeIngressInner {
     tx: IngressSender<RuntimeEvent>,
     status_tx: LatestByKeySender<(), StatusMessage, StatusLane>,
     timer_tx: LatestByKeySender<TimerId, (), TimerLane>,
@@ -380,18 +403,20 @@ impl RuntimeIngress {
         );
         let packages = super::pkg::PkgService::spawn(work.clone(), block, task_sink.clone());
         let ingress = Self {
-            tx,
-            status_tx,
-            timer_tx,
-            pull_diagnostics,
-            file_explorer_previews,
-            file_explorer_searches,
-            file_explorer_trees,
-            document_reloads,
-            document_opens,
-            syntax,
-            packages,
-            dap_operations: Arc::new(DapOperationTracker::default()),
+            inner: Arc::new(RuntimeIngressInner {
+                tx,
+                status_tx,
+                timer_tx,
+                pull_diagnostics,
+                file_explorer_previews,
+                file_explorer_searches,
+                file_explorer_trees,
+                document_reloads,
+                document_opens,
+                syntax,
+                packages,
+                dap_operations: Arc::new(DapOperationTracker::default()),
+            }),
         };
         PullDiagnosticsCoordinator::spawn(work, clock, pull_diagnostics_rx, task_sink);
         (
@@ -408,23 +433,28 @@ impl RuntimeIngress {
     }
 
     fn try_send(&self, event: RuntimeEvent) -> Result<(), RuntimeSendError> {
-        match self.tx.try_send(event) {
+        match self.inner.tx.try_send(event) {
             Ok(()) => Ok(()),
-            Err(helix_runtime::TrySend::Full(event)) => Err(RuntimeSendError::Full(event.0)),
-            Err(helix_runtime::TrySend::Closed(event)) => Err(RuntimeSendError::Closed(event.0)),
+            Err(helix_runtime::TrySend::Full(event)) => {
+                Err(RuntimeSendError::Full(Box::new(event.0)))
+            }
+            Err(helix_runtime::TrySend::Closed(event)) => {
+                Err(RuntimeSendError::Closed(Box::new(event.0)))
+            }
         }
     }
 
     async fn send(&self, event: RuntimeEvent) -> Result<(), RuntimeSendError> {
-        self.tx
+        self.inner
+            .tx
             .send(event)
             .await
-            .map_err(|event| RuntimeSendError::Closed(event.0 .0))
+            .map_err(|event| RuntimeSendError::Closed(Box::new(event.0 .0)))
     }
 
     pub fn status(&self, message: impl Into<StatusMessage>) {
         let message = message.into();
-        let _ = self.status_tx.try_send((), message);
+        let _ = self.inner.status_tx.try_send((), message);
     }
 
     pub async fn send_status(&self, message: impl Into<StatusMessage>) {
@@ -437,6 +467,14 @@ impl RuntimeIngress {
 
     pub async fn send_task(&self, task: RuntimeTaskEvent) -> Result<(), RuntimeSendError> {
         self.send(RuntimeEvent(RuntimeDelivery::Task(Box::new(task))))
+            .await
+    }
+
+    pub async fn collaboration_update(
+        &self,
+        update: helix_collab::GuestSessionUpdate,
+    ) -> Result<(), RuntimeSendError> {
+        self.send_task(RuntimeTaskEvent::Collaboration(update))
             .await
     }
 
@@ -454,14 +492,14 @@ impl RuntimeIngress {
         config: helix_pkg::PkgConfig,
         origin: super::pkg::PkgOperationOrigin,
     ) -> Result<(), super::pkg::PkgAdmissionError> {
-        self.packages.submit(operation, config, origin)
+        self.inner.packages.submit(operation, config, origin)
     }
 
     pub(crate) fn schedule_pull_diagnostics(&self, targets: Vec<PullDiagnosticsTarget>) {
         if targets.is_empty() {
             return;
         }
-        self.pull_diagnostics.schedule(targets);
+        self.inner.pull_diagnostics.schedule(targets);
     }
 
     pub(crate) async fn finish_pull_diagnostics(
@@ -469,7 +507,7 @@ impl RuntimeIngress {
         target: PullDiagnosticsTarget,
         outcome: PullDiagnosticsRequestOutcome,
     ) {
-        self.pull_diagnostics.finish(target, outcome);
+        self.inner.pull_diagnostics.finish(target, outcome);
     }
 
     pub(crate) fn finish_pull_diagnostics_now(
@@ -477,15 +515,15 @@ impl RuntimeIngress {
         target: PullDiagnosticsTarget,
         outcome: PullDiagnosticsRequestOutcome,
     ) {
-        self.pull_diagnostics.finish(target, outcome);
+        self.inner.pull_diagnostics.finish(target, outcome);
     }
 
     pub(crate) fn pull_diagnostics_server_exited(&self, server_id: LanguageServerId) {
-        self.pull_diagnostics.server_exited(server_id);
+        self.inner.pull_diagnostics.server_exited(server_id);
     }
 
     pub(crate) fn debounce_pull_diagnostics_document(&self, document_id: DocumentId) {
-        self.pull_diagnostics.debounce_document(document_id);
+        self.inner.pull_diagnostics.debounce_document(document_id);
     }
 
     pub(crate) fn debounce_pull_diagnostics_inter_file_sweep(
@@ -493,7 +531,8 @@ impl RuntimeIngress {
         language_servers: HashSet<LanguageServerId>,
     ) {
         if !language_servers.is_empty() {
-            self.pull_diagnostics
+            self.inner
+                .pull_diagnostics
                 .debounce_inter_file_sweep(language_servers);
         }
     }
@@ -503,7 +542,9 @@ impl RuntimeIngress {
     }
 
     pub(crate) fn file_explorer_search(&self, request: FileExplorerSearchRequest) {
-        self.file_explorer_searches.submit(request, self.clone());
+        self.inner
+            .file_explorer_searches
+            .submit(request, self.clone());
     }
 
     pub(crate) fn document_reload(
@@ -511,44 +552,54 @@ impl RuntimeIngress {
         work: helix_view::editor::DocumentReloadWork,
         origin: DocumentReloadOrigin,
     ) {
-        self.document_reloads.submit(work, origin, self.clone());
+        self.inner
+            .document_reloads
+            .submit(work, origin, self.clone());
     }
 
     pub(crate) fn syntax_refresh(
         &self,
         request: helix_view::document::SyntaxRefreshRequest,
     ) -> Result<(), super::syntax::SyntaxAdmissionError> {
-        self.syntax.submit(request)
+        self.inner.syntax.submit(request)
     }
 
     pub(crate) fn take_document_reload(&self, document: DocumentId, generation: u64) -> bool {
-        self.document_reloads.take_current(document, generation)
+        self.inner
+            .document_reloads
+            .take_current(document, generation)
     }
 
     pub(crate) fn document_open(
         &self,
-        work: helix_view::editor::DocumentOpenWork,
+        work: helix_view::editor::WorkspaceDocumentOpenWork,
         request: DocumentOpenRequest,
     ) {
-        self.document_opens.submit(work, request, self.clone());
+        self.inner
+            .document_opens
+            .submit(work, request, self.clone());
     }
 
     pub(crate) fn document_open_batch(
         &self,
-        jobs: Vec<(helix_view::editor::DocumentOpenWork, DocumentOpenRequest)>,
+        jobs: Vec<(
+            helix_view::editor::WorkspaceDocumentOpenWork,
+            DocumentOpenRequest,
+        )>,
         lane: DocumentOpenLane,
         stop_on_error: bool,
     ) {
-        self.document_opens
+        self.inner
+            .document_opens
             .submit_batch(jobs, lane, stop_on_error, self.clone());
     }
 
     pub(crate) fn take_document_open(&self, lane: DocumentOpenLane, generation: u64) -> bool {
-        self.document_opens.take_current(lane, generation)
+        self.inner.document_opens.take_current(lane, generation)
     }
 
     pub(crate) fn cancel_document_open(&self, lane: DocumentOpenLane) {
-        self.document_opens.cancel(lane);
+        self.inner.document_opens.cancel(lane);
     }
 
     pub(crate) fn begin_dap_operation(
@@ -556,7 +607,7 @@ impl RuntimeIngress {
         client_id: helix_dap::registry::DebugAdapterId,
         operation: DapOperation,
     ) -> u64 {
-        self.dap_operations.begin(client_id, operation)
+        self.inner.dap_operations.begin(client_id, operation)
     }
 
     pub(crate) fn is_current_dap_operation(
@@ -565,44 +616,47 @@ impl RuntimeIngress {
         operation: DapOperation,
         generation: u64,
     ) -> bool {
-        self.dap_operations
+        self.inner
+            .dap_operations
             .is_current(client_id, operation, generation)
     }
 
     pub(crate) fn clear_dap_client(&self, client_id: helix_dap::registry::DebugAdapterId) {
-        self.dap_operations.clear(client_id);
+        self.inner.dap_operations.clear(client_id);
     }
 
     pub(crate) fn file_explorer_preview(&self, request: FileExplorerPreviewLoadRequest) {
-        self.file_explorer_previews.submit(request, self.clone());
+        self.inner
+            .file_explorer_previews
+            .submit(request, self.clone());
     }
 
     pub(crate) fn file_explorer_tree(&self, work: crate::ui::FileExplorerTreeWork) {
-        self.file_explorer_trees.submit(work, self.clone());
+        self.inner.file_explorer_trees.submit(work, self.clone());
     }
 
     pub(crate) fn take_file_explorer_tree(
         &self,
-        root: &std::path::Path,
+        root: &crate::ui::ExplorerPath,
         generation: u64,
     ) -> Option<crate::ui::PreparedFileExplorerTree> {
-        self.file_explorer_trees.take(root, generation)
+        self.inner.file_explorer_trees.take(root, generation)
     }
 
     pub(crate) fn cancel_file_explorer_preview(&self) {
-        self.file_explorer_previews.cancel();
+        self.inner.file_explorer_previews.cancel();
     }
 
     pub(crate) fn take_file_explorer_preview(
         &self,
         request: &FileExplorerPreviewRequest,
     ) -> Option<PreparedFileExplorerPreview> {
-        self.file_explorer_previews.take(request)
+        self.inner.file_explorer_previews.take(request)
     }
 
     #[cfg(test)]
     pub(crate) fn store_file_explorer_preview(&self, prepared: PreparedFileExplorerPreview) {
-        self.file_explorer_previews.store_prepared(prepared);
+        self.inner.file_explorer_previews.store_prepared(prepared);
     }
 
     pub fn plugin(&self, notification: super::PluginNotification) -> Result<(), RuntimeSendError> {
@@ -622,7 +676,7 @@ impl RuntimeIngress {
     }
 
     pub async fn send_timer(&self, id: TimerId) {
-        let _ = self.timer_tx.send(id, ()).await;
+        let _ = self.inner.timer_tx.send(id, ()).await;
     }
 
     pub fn assistant_permission_resolved(
@@ -662,7 +716,7 @@ impl RuntimeIngress {
                 delay,
                 runtime.work().clone(),
                 runtime.clock().clone(),
-                self.tx.clone(),
+                self.inner.tx.clone(),
             ),
         }
     }
@@ -677,7 +731,7 @@ impl RuntimeIngress {
                 delay,
                 runtime.work().clone(),
                 runtime.clock().clone(),
-                self.tx.clone(),
+                self.inner.tx.clone(),
             ),
         }
     }
@@ -765,7 +819,7 @@ impl RuntimeTaskDebouncer {
         ingress: RuntimeIngress,
     ) -> Self {
         Self {
-            inner: DebouncedSender::new(delay, work, clock, ingress.tx),
+            inner: DebouncedSender::new(delay, work, clock, ingress.inner.tx.clone()),
         }
     }
 
@@ -810,7 +864,7 @@ impl RuntimeUiDebouncer {
         ingress: RuntimeIngress,
     ) -> Self {
         Self {
-            inner: DebouncedSender::new(delay, work, clock, ingress.tx),
+            inner: DebouncedSender::new(delay, work, clock, ingress.inner.tx.clone()),
         }
     }
 
@@ -847,6 +901,52 @@ impl RuntimeUiDebouncer {
 pub enum RuntimeTaskEvent {
     /// No-op success (e.g. best-effort steps that did not need an effect).
     Stub,
+    /// A collaboration session update ready for main-thread editor application.
+    Collaboration(helix_collab::GuestSessionUpdate),
+    /// A fully connected collaboration session ready for application ownership.
+    CollaborationStarted(super::collaboration::Launch),
+    /// Stop and release the application-owned collaboration session.
+    CollaborationStop,
+    /// Copy a newly minted single-use invitation away from the UI thread.
+    CollaborationInvitation(helix_collab::ConnectCode),
+    /// Result of copying a collaboration invitation to the system clipboard.
+    CollaborationInvitationCopied(Result<(), String>),
+    /// A host-side document opened and may need to join the shared buffer graph.
+    CollaborationHostDocumentOpened {
+        document: DocumentId,
+    },
+    /// A host-side document closed while a shared binding was active or pending.
+    CollaborationHostDocumentClosed {
+        document: DocumentId,
+    },
+    /// The shared project opened a host document on a worker.
+    CollaborationHostBufferOpened {
+        project: helix_collab::ProjectId,
+        document: DocumentId,
+        path: helix_workspace::WorkspacePath,
+        result: Result<helix_collab::OpenedBuffer, String>,
+    },
+    /// Initial host text reached the authoritative shared replica.
+    CollaborationHostBufferReady {
+        project: helix_collab::ProjectId,
+        document: DocumentId,
+        result: Result<(), String>,
+    },
+    /// A guest LSP request that must execute against the host editor's document and server.
+    CollaborationHostLanguageServerRequest(helix_collab::HostLanguageServerRequest),
+    /// A background host document finished loading for a guest LSP request.
+    CollaborationHostLanguageServerDocumentOpened {
+        request: helix_collab::HostLanguageServerRequest,
+        result: Box<Result<helix_view::editor::PreparedWorkspaceDocumentOpen, String>>,
+    },
+    CollaborationLanguageServerDiagnosticsParsed {
+        project: helix_collab::ProjectId,
+        path: helix_workspace::WorkspacePath,
+        server: String,
+        result: Result<helix_lsp::lsp::PublishDiagnosticsParams, String>,
+    },
+    /// User-visible confirmation for a completed collaboration action.
+    CollaborationNotice(String),
     /// A background syntax parse completed for an exact document version.
     ApplySyntax {
         document: DocumentId,
@@ -1056,13 +1156,7 @@ pub enum RuntimeTaskEvent {
         result: Result<(), String>,
     },
     /// Stack traces fetched for one stopped event. Superseded stop/continue results are dropped.
-    DapStoppedCompleted {
-        client_id: helix_dap::registry::DebugAdapterId,
-        generation: u64,
-        preferred_thread_id: Option<DebugThreadId>,
-        stacks: Vec<(DebugThreadId, Vec<helix_dap::StackFrame>)>,
-        errors: Vec<String>,
-    },
+    DapStoppedCompleted(DapStoppedCompletion),
     /// Existing breakpoints and configurationDone completed for an initialized adapter.
     DapInitializedCompleted {
         client_id: helix_dap::registry::DebugAdapterId,
@@ -1214,13 +1308,7 @@ pub enum RuntimeTaskEvent {
         frame_id: usize,
     },
     /// Apply fetched stack frames for a debug thread on the main loop.
-    ApplyStackFrames {
-        client_id: helix_dap::registry::DebugAdapterId,
-        generation: u64,
-        thread_id: DebugThreadId,
-        frames: Vec<helix_dap::StackFrame>,
-        selection: FrameSelection,
-    },
+    ApplyStackFrames(DapStackFramesCompletion),
     /// Apply a DAP breakpoint response only if the submitted snapshot is still current.
     ApplyBreakpointsResponse {
         client_id: helix_dap::registry::DebugAdapterId,
@@ -1392,7 +1480,8 @@ mod tests {
         }
         assert!(matches!(
             ingress.task(RuntimeTaskEvent::DapRestarted),
-            Err(RuntimeSendError::Full(RuntimeDelivery::Task(_)))
+            Err(RuntimeSendError::Full(delivery))
+                if matches!(*delivery, RuntimeDelivery::Task(_))
         ));
     }
 

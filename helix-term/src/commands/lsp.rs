@@ -225,7 +225,7 @@ fn diag_picker(
                 .immediately_show_diagnostic(doc, view_id);
         },
     )
-    .with_preview(move |_editor, diag| navigation::location_to_file_location(&diag.location))
+    .with_preview(move |editor, diag| navigation::location_to_file_location(editor, &diag.location))
     .truncate_start(false)
 }
 
@@ -471,7 +471,7 @@ pub fn workspace_symbol_picker(cx: &mut Context) {
             );
         },
     )
-    .with_preview(|_editor, item| navigation::location_to_file_location(&item.location))
+    .with_preview(|editor, item| navigation::location_to_file_location(editor, &item.location))
     .with_dynamic_query(get_symbols, ui::picker::DynamicQuerySchedule::Immediate)
     .truncate_start(false);
 

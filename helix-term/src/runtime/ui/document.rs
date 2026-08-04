@@ -10,8 +10,8 @@ use helix_core::{Selection, Syntax, Tendril, Transaction};
 use helix_view::{
     document::DocumentOpenError,
     editor::{
-        DocumentOpenWork, DocumentReloadApply, DocumentReloadError, DocumentReloadWork,
-        PreparedDocumentOpen,
+        DocumentReloadApply, DocumentReloadError, DocumentReloadWork,
+        PreparedWorkspaceDocumentOpen, WorkspaceDocumentOpenWork,
     },
     Align, DocumentId, Editor,
 };
@@ -212,7 +212,7 @@ impl DocumentReloadQueue {
 
 struct DocumentOpenJob {
     request: DocumentOpenRequest,
-    work: DocumentOpenWork,
+    work: WorkspaceDocumentOpenWork,
 }
 
 struct QueuedDocumentOpen {
@@ -220,13 +220,14 @@ struct QueuedDocumentOpen {
     lane: DocumentOpenLane,
     jobs: Vec<DocumentOpenJob>,
     stop_on_error: bool,
+    canceled: tokio_util::sync::CancellationToken,
 }
 
 #[derive(Default)]
 struct DocumentOpenQueueState {
     next_generation: u64,
     pending: VecDeque<QueuedDocumentOpen>,
-    active: HashSet<DocumentOpenLane>,
+    active: HashMap<DocumentOpenLane, tokio_util::sync::CancellationToken>,
     latest: HashMap<DocumentOpenLane, u64>,
 }
 
@@ -240,12 +241,17 @@ impl DocumentOpenQueueState {
         self.next_generation = self.next_generation.wrapping_add(1).max(1);
         let generation = self.next_generation;
         self.latest.insert(lane, generation);
+        if let Some(active) = self.active.get(&lane) {
+            active.cancel();
+        }
+        let canceled = tokio_util::sync::CancellationToken::new();
         if let Some(pending) = self.pending.iter_mut().find(|pending| pending.lane == lane) {
             *pending = QueuedDocumentOpen {
                 generation,
                 lane,
                 jobs,
                 stop_on_error,
+                canceled,
             };
         } else {
             self.pending.push_back(QueuedDocumentOpen {
@@ -253,6 +259,7 @@ impl DocumentOpenQueueState {
                 lane,
                 jobs,
                 stop_on_error,
+                canceled,
             });
         }
         self.take_ready()
@@ -264,7 +271,7 @@ impl DocumentOpenQueueState {
             let Some(index) = self
                 .pending
                 .iter()
-                .position(|pending| !self.active.contains(&pending.lane))
+                .position(|pending| !self.active.contains_key(&pending.lane))
             else {
                 break;
             };
@@ -272,7 +279,7 @@ impl DocumentOpenQueueState {
                 .pending
                 .remove(index)
                 .expect("pending document open index disappeared");
-            self.active.insert(queued.lane);
+            self.active.insert(queued.lane, queued.canceled.clone());
             ready.push(queued);
         }
         ready
@@ -281,6 +288,9 @@ impl DocumentOpenQueueState {
     fn cancel(&mut self, lane: DocumentOpenLane) {
         self.pending.retain(|pending| pending.lane != lane);
         self.latest.remove(&lane);
+        if let Some(active) = self.active.get(&lane) {
+            active.cancel();
+        }
     }
 }
 
@@ -316,7 +326,7 @@ impl DocumentOpenQueue {
 
     pub(crate) fn submit(
         &self,
-        work: DocumentOpenWork,
+        work: WorkspaceDocumentOpenWork,
         request: DocumentOpenRequest,
         ingress: crate::runtime::RuntimeIngress,
     ) {
@@ -326,7 +336,7 @@ impl DocumentOpenQueue {
 
     pub(crate) fn submit_batch(
         &self,
-        jobs: Vec<(DocumentOpenWork, DocumentOpenRequest)>,
+        jobs: Vec<(WorkspaceDocumentOpenWork, DocumentOpenRequest)>,
         lane: DocumentOpenLane,
         stop_on_error: bool,
         ingress: crate::runtime::RuntimeIngress,
@@ -375,10 +385,14 @@ impl DocumentOpenQueue {
                     let generation = queued.generation;
                     let lane = queued.lane;
                     let stop_on_error = queued.stop_on_error;
+                    let canceled = queued.canceled;
                     let batch_start = Instant::now();
                     let mut completions = Vec::with_capacity(queued.jobs.len());
                     for job in queued.jobs {
-                        let path = job.work.path().to_path_buf();
+                        if canceled.is_cancelled() {
+                            break;
+                        }
+                        let path = job.work.path();
                         let start = Instant::now();
                         log::info!(
                             "[document_open] phase=load_start path={} generation={} lane={lane:?}",
@@ -386,18 +400,36 @@ impl DocumentOpenQueue {
                             generation,
                         );
                         let inspect_binary = job.request.external_if_binary.is_some();
-                        let worker_path = path.clone();
-                        let result = match block.spawn(move || {
-                            if inspect_binary
-                                && file_is_binary(&worker_path).unwrap_or(false)
-                            {
-                                return Err(DocumentOpenError::BinaryFile);
+                        let result = match job.work {
+                            WorkspaceDocumentOpenWork::Local(work) => {
+                                let worker_path = work.path().to_path_buf();
+                                match block
+                                    .spawn(move || {
+                                        if inspect_binary
+                                            && file_is_binary(&worker_path).unwrap_or(false)
+                                        {
+                                            return Err(DocumentOpenError::BinaryFile);
+                                        }
+                                        work.execute().map(PreparedWorkspaceDocumentOpen::Local)
+                                    })
+                                    .await
+                                {
+                                    Ok(result) => result,
+                                    Err(error) => {
+                                        Err(DocumentOpenError::Worker(error.to_string()))
+                                    }
+                                }
                             }
-                            job.work.execute()
-                        }).await {
-                                Ok(result) => result,
-                                Err(error) => Err(DocumentOpenError::Worker(error.to_string())),
-                            };
+                            WorkspaceDocumentOpenWork::Remote(work) => work
+                                .execute(canceled.child_token(), inspect_binary)
+                                .await
+                                .map(PreparedWorkspaceDocumentOpen::Remote),
+                            WorkspaceDocumentOpenWork::Collaboration(work) => work
+                                .execute()
+                                .await
+                                .map(PreparedWorkspaceDocumentOpen::Collaboration),
+                            WorkspaceDocumentOpenWork::Failed { error, .. } => Err(error),
+                        };
                         let failed = result.as_ref().is_err_and(|error| {
                             !matches!(
                                 error,
@@ -459,12 +491,12 @@ pub(crate) fn queue_document_open(
     foreground: &crate::runtime::ForegroundEvents,
     mut request: DocumentOpenRequest,
 ) {
-    let work = editor.prepare_document_open(
-        &request.path,
+    let work = editor.prepare_workspace_document_open(
+        request.path.clone(),
         helix_view::editor::DocumentOpenRole::Interactive,
     );
-    request.path = work.path().to_path_buf();
-    if let Some(document) = editor.document_id_by_path(&request.path) {
+    request.path = work.path();
+    if let Some(document) = editor.document_id_by_workspace_path(&request.path) {
         let Some(target) = resolve_document_open_target(&request, None) else {
             complete_document_open(
                 editor,
@@ -493,7 +525,12 @@ pub(crate) fn queue_document_open(
         complete_document_open(editor, foreground, &request, result);
         return;
     }
-    if let Some(prepared) = editor.take_prepared_document_open(&request.path) {
+    let cached = request
+        .path
+        .local_path()
+        .and_then(|path| editor.take_prepared_document_open(path))
+        .map(PreparedWorkspaceDocumentOpen::Local);
+    if let Some(prepared) = cached {
         let Some(target) = resolve_document_open_target(&request, None) else {
             complete_document_open(
                 editor,
@@ -551,11 +588,11 @@ pub(crate) fn queue_document_open_batch(
     let jobs = requests
         .into_iter()
         .map(|mut request| {
-            let work = editor.prepare_document_open(
-                &request.path,
+            let work = editor.prepare_workspace_document_open(
+                request.path.clone(),
                 helix_view::editor::DocumentOpenRole::Interactive,
             );
-            request.path = work.path().to_path_buf();
+            request.path = work.path();
             (work, request)
         })
         .collect::<Vec<_>>();
@@ -674,7 +711,9 @@ fn finish_document_open(
         }
     }
     if let Some(record) = request.fff_record.clone() {
-        let path = request.path.clone();
+        let Some(path) = request.path.clone().into_local() else {
+            return;
+        };
         let tracking = editor.runtime().block().spawn(move || {
             crate::fff::record_file_open(&record.root, &record.config, &record.query, &path);
         });
@@ -705,7 +744,7 @@ fn apply_document_open_at_target(
     foreground: &crate::runtime::ForegroundEvents,
     request: &DocumentOpenRequest,
     target: helix_view::ViewId,
-    prepared: Option<PreparedDocumentOpen>,
+    prepared: Option<PreparedWorkspaceDocumentOpen>,
     existing: Option<DocumentId>,
 ) -> Option<(DocumentId, helix_view::ViewId)> {
     if !editor.tree.contains(target) {
@@ -718,16 +757,19 @@ fn apply_document_open_at_target(
 
     let current = editor.focused_view_id();
     let apply = move |editor: &mut Editor| {
-        let was_existing = editor.document_id_by_path(&request.path).is_some();
+        let was_existing = editor
+            .document_id_by_workspace_path(&request.path)
+            .is_some();
         let document = if let Some(prepared) = prepared {
             let role = prepared.role();
-            let document = editor.apply_prepared_document_open(prepared, request.action);
+            let document = editor.apply_prepared_workspace_document_open(prepared, request.action);
             if role.is_preview() {
                 editor.promote_preview_document(document);
             }
             document
         } else {
-            let document = existing.or_else(|| editor.document_id_by_path(&request.path))?;
+            let document =
+                existing.or_else(|| editor.document_id_by_workspace_path(&request.path))?;
             editor.promote_preview_document(document);
             editor.switch(document, request.action);
             document
@@ -1216,7 +1258,7 @@ mod tests {
 
     fn open_request(path: PathBuf, selection: DocumentOpenSelection) -> DocumentOpenRequest {
         DocumentOpenRequest {
-            path,
+            path: path.into(),
             action: Action::Replace,
             lane: DocumentOpenLane::Navigation,
             target: DocumentOpenTarget::View(helix_view::ViewId::default()),
@@ -1248,13 +1290,16 @@ mod tests {
             helix_view::editor::DocumentOpenRole::Interactive,
         );
         let mut state = DocumentOpenQueueState::default();
-        state.active.insert(DocumentOpenLane::Navigation);
+        state.active.insert(
+            DocumentOpenLane::Navigation,
+            tokio_util::sync::CancellationToken::new(),
+        );
 
         assert!(state
             .enqueue(
                 DocumentOpenLane::Navigation,
                 vec![DocumentOpenJob {
-                    work: first_work,
+                    work: WorkspaceDocumentOpenWork::Local(first_work),
                     request: open_request(first_path, DocumentOpenSelection::None),
                 }],
                 false,
@@ -1264,7 +1309,7 @@ mod tests {
             .enqueue(
                 DocumentOpenLane::Navigation,
                 vec![DocumentOpenJob {
-                    work: second_work,
+                    work: WorkspaceDocumentOpenWork::Local(second_work),
                     request: open_request(second_path.clone(), DocumentOpenSelection::None),
                 }],
                 false,
@@ -1293,7 +1338,14 @@ mod tests {
                 .prepare_document_open(&path, helix_view::editor::DocumentOpenRole::Interactive);
             let mut request = open_request(path, DocumentOpenSelection::None);
             request.lane = DocumentOpenLane::Plugin(operation);
-            state.enqueue(request.lane, vec![DocumentOpenJob { request, work }], false)
+            state.enqueue(
+                request.lane,
+                vec![DocumentOpenJob {
+                    request,
+                    work: WorkspaceDocumentOpenWork::Local(work),
+                }],
+                false,
+            )
         };
 
         let first_ready = enqueue(&mut state, first, "first.txt");
@@ -1301,8 +1353,8 @@ mod tests {
 
         assert_eq!(first_ready.len(), 1);
         assert_eq!(second_ready.len(), 1);
-        assert!(state.active.contains(&DocumentOpenLane::Plugin(first)));
-        assert!(state.active.contains(&DocumentOpenLane::Plugin(second)));
+        assert!(state.active.contains_key(&DocumentOpenLane::Plugin(first)));
+        assert!(state.active.contains_key(&DocumentOpenLane::Plugin(second)));
     }
 
     #[tokio::test]
@@ -1319,10 +1371,19 @@ mod tests {
         let mut request = open_request(path, DocumentOpenSelection::None);
         request.lane = lane;
         let mut state = DocumentOpenQueueState::default();
-        state.active.insert(lane);
+        state
+            .active
+            .insert(lane, tokio_util::sync::CancellationToken::new());
 
         assert!(state
-            .enqueue(lane, vec![DocumentOpenJob { request, work }], false)
+            .enqueue(
+                lane,
+                vec![DocumentOpenJob {
+                    request,
+                    work: WorkspaceDocumentOpenWork::Local(work),
+                }],
+                false,
+            )
             .is_empty());
         let generation = state.latest[&lane];
         state.cancel(lane);
@@ -1387,7 +1448,7 @@ mod tests {
             &foreground,
             &request,
             target_view,
-            Some(prepared),
+            Some(PreparedWorkspaceDocumentOpen::Local(prepared)),
             None,
         )
         .expect("open applies");
@@ -1437,7 +1498,7 @@ mod tests {
             &foreground,
             &request,
             target_view,
-            Some(prepared),
+            Some(PreparedWorkspaceDocumentOpen::Local(prepared)),
             None,
         )
         .expect("open applies");
@@ -1474,7 +1535,7 @@ mod tests {
                 version,
                 selection,
                 scrolloff: 0,
-                path: PathBuf::from("insert.txt"),
+                path: helix_view::editor::WorkspaceDocumentPath::Local(PathBuf::from("insert.txt")),
                 result: Ok("loaded".to_owned()),
             },
         );
@@ -1515,7 +1576,7 @@ mod tests {
                 version,
                 selection,
                 scrolloff: 0,
-                path: PathBuf::from("insert.txt"),
+                path: helix_view::editor::WorkspaceDocumentPath::Local(PathBuf::from("insert.txt")),
                 result: Ok("loaded".to_owned()),
             },
         );

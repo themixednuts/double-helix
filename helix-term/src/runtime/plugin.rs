@@ -5,7 +5,7 @@ use std::path::PathBuf;
 pub enum PluginNotification {
     BufferOpen {
         document_id: helix_view::DocumentId,
-        path: Option<PathBuf>,
+        resource: Option<String>,
     },
     BufferChanged {
         document_id: helix_view::DocumentId,

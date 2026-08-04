@@ -18,6 +18,12 @@ impl Editor {
             view.gutters = config.gutters.clone();
             view.ensure_cursor_in_view(doc, config.scrolloff)
         }
+        let view = self.tree.focus;
+        if let Some(document) = self.tree.try_get(view).map(|view| view.doc) {
+            if let Some(doc) = self.document(document) {
+                self.collaboration.publish_presence(doc, view);
+            }
+        }
     }
 
     pub(super) fn replace_document_in_view(&mut self, current_view: ViewId, doc_id: DocumentId) {

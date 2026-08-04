@@ -105,7 +105,7 @@ pub fn show_document_symbol_picker(
             );
         },
     )
-    .with_preview(move |_editor, item| navigation::location_to_file_location(&item.location))
+    .with_preview(move |editor, item| navigation::location_to_file_location(editor, &item.location))
     .truncate_start(false);
 
     compositor.push(Box::new(overlaid(picker)));
@@ -178,7 +178,7 @@ pub fn show_hierarchy_picker(
             );
         },
     )
-    .with_preview(move |_editor, item| navigation::location_to_file_location(&item.location))
+    .with_preview(move |editor, item| navigation::location_to_file_location(editor, &item.location))
     .truncate_start(false);
 
     compositor.push(Box::new(overlaid(picker)));

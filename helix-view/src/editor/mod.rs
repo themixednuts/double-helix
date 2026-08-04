@@ -27,6 +27,7 @@ mod surface;
 mod test_support;
 mod types;
 mod workspace;
+mod workspace_backend;
 
 use crate::document::Mode;
 
@@ -48,8 +49,11 @@ pub use config::{
 };
 pub use core::Editor;
 pub use document_io::{
-    DocumentOpenRole, DocumentOpenWork, DocumentReloadApply, DocumentReloadError,
-    DocumentReloadStale, DocumentReloadWork, PreparedDocumentOpen, PreparedDocumentReload,
+    CollaborationDocumentOpenWork, DocumentOpenRole, DocumentOpenWork, DocumentReloadApply,
+    DocumentReloadError, DocumentReloadStale, DocumentReloadWork,
+    PreparedCollaborationDocumentOpen, PreparedDocumentOpen, PreparedDocumentReload,
+    PreparedRemoteDocumentOpen, PreparedWorkspaceDocumentOpen, RemoteDocumentOpenWork,
+    WorkspaceDocumentOpenWork,
 };
 pub use embed::{
     DocumentSnapshot, EditorSession, EditorSessionBuilder, EditorSessionEvent, EditorSnapshot,
@@ -79,6 +83,9 @@ pub use types::{
     PanelBehavior, SavePolicy, ShowDocumentRequest, ThreadSelectPolicy,
 };
 pub use workspace::DetachedPreviewDocument;
+pub use workspace_backend::{
+    WorkspaceBackend, WorkspaceContext, WorkspaceContextError, WorkspaceDocumentPath, WorkspaceId,
+};
 impl crate::traits::Modal for Editor {
     fn mode(&self) -> Mode {
         Editor::mode(self)

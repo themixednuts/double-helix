@@ -53,6 +53,7 @@ impl TerminalPresenter {
     pub fn spawn(
         mut terminal: Terminal,
         resync: helix_runtime::PulseHandle<PresenterResync>,
+        pipeline_ready: helix_runtime::PulseHandle<super::FramePipelineReady>,
     ) -> Self {
         let shared = Arc::new(Shared {
             state: Mutex::new(State::default()),
@@ -61,7 +62,7 @@ impl TerminalPresenter {
         let actor = shared.clone();
         let thread = std::thread::Builder::new()
             .name("helix-terminal-presenter".to_owned())
-            .spawn(move || presenter_loop(&mut terminal, actor, resync))
+            .spawn(move || presenter_loop(&mut terminal, actor, resync, pipeline_ready))
             .expect("failed to spawn terminal presenter");
         Self {
             shared,
@@ -143,6 +144,15 @@ impl TerminalPresenter {
 }
 
 impl PresenterHandle {
+    pub fn has_pending_frame(&self) -> bool {
+        self.shared
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .frame
+            .is_some()
+    }
+
     pub fn submit(&self, frame: FramePacket) -> io::Result<()> {
         let mut state = self
             .shared
@@ -225,6 +235,7 @@ fn presenter_loop(
     terminal: &mut Terminal,
     shared: Arc<Shared>,
     resync: helix_runtime::PulseHandle<PresenterResync>,
+    pipeline_ready: helix_runtime::PulseHandle<super::FramePipelineReady>,
 ) {
     let mut claimed = false;
     let mut force_full_redraw = false;
@@ -250,6 +261,9 @@ fn presenter_loop(
             let replaced_frames = std::mem::take(&mut state.replaced_frames);
             (config, control, frame, replaced_frames, state.closed)
         };
+        if frame.is_some() {
+            pipeline_ready.request();
+        }
 
         if let Some(config) = config {
             if let Err(error) = terminal.reconfigure(config) {
@@ -410,6 +424,16 @@ mod tests {
         assert_eq!(state.replaced_frames, 1);
         assert_eq!(state.recycled_buffers.len(), 1);
         assert_eq!(state.frame.as_ref().unwrap().surface[(0, 0)].symbol(), "b");
+    }
+
+    #[test]
+    fn handle_reports_pending_frame_pressure() {
+        let presenter = presenter_without_thread();
+        let handle = presenter.handle();
+
+        assert!(!handle.has_pending_frame());
+        handle.submit(frame("a")).unwrap();
+        assert!(handle.has_pending_frame());
     }
 
     #[test]

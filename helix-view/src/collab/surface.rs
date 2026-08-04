@@ -163,7 +163,7 @@ fn presence_label(editor: &crate::Editor, participant: super::ParticipantId) -> 
     editor
         .participant(participant)
         .map(|participant| participant.name.clone())
-        .unwrap_or_else(|| format!("participant-{}", participant.value().get()))
+        .unwrap_or_else(|| format!("participant-{participant}"))
 }
 
 pub(crate) fn presence_annotations(

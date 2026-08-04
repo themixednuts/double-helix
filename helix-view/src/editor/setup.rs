@@ -99,14 +99,16 @@ impl Editor {
         runtime: Runtime,
         handlers: Handlers,
     ) -> Self {
-        let language_servers = helix_lsp::Registry::new();
+        let language_servers = helix_lsp::Registry::new(&runtime);
         let conf = config.load();
         let auto_pairs = (&conf.auto_pairs).into();
         let (assistant_updates_tx, assistant_updates_rx) = helix_runtime::channel(128);
+        let lifecycle = std::sync::Arc::new(super::hooks::LifecycleBus::default());
+        let collaboration = crate::collab::Replication::default();
 
         area.height = area.height.saturating_sub(1);
 
-        Self {
+        let editor = Self {
             mode: Mode::Normal,
             tree: crate::tree::Tree::new(area),
             next_document_id: crate::DocumentId::default(),
@@ -133,6 +135,7 @@ impl Editor {
             debug_adapters: dap::registry::Registry::new(),
             breakpoints: HashMap::new(),
             runtime,
+            workspace_backend: super::WorkspaceBackend::Local,
             syn_loader,
             theme_loader,
             last_theme: None,
@@ -155,7 +158,7 @@ impl Editor {
             needs_redraw: false,
             config_gen: 0,
             handlers,
-            lifecycle: std::sync::Arc::new(super::hooks::LifecycleBus::default()),
+            lifecycle: lifecycle.clone(),
             file_watcher: None,
             file_operations: super::file_operation::FileOperationJournal::default(),
             prepared_document_opens: super::document_io::PreparedDocumentOpenCache::default(),
@@ -164,6 +167,7 @@ impl Editor {
             model: crate::model::Model::default(),
             surface_registry: crate::collab::Registry::new(),
             collab: crate::collab::Store::default(),
+            collaboration: collaboration.clone(),
             assistant: crate::assistant::Store::default(),
             frontend: FrontendState {
                 focused_modal_input: crate::engine::ModalInputState::default(),
@@ -196,7 +200,17 @@ impl Editor {
                 suppress_pause: false,
             },
             bench: None,
-        }
+        };
+        lifecycle.on_document_change(move |event| {
+            collaboration.document_changed(event);
+            Ok(())
+        });
+        let collaboration = editor.collaboration.clone();
+        lifecycle.on_selection_change(move |event| {
+            collaboration.selection_changed(event);
+            Ok(())
+        });
+        editor
     }
 }
 

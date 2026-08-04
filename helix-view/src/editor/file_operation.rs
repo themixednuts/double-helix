@@ -470,6 +470,10 @@ impl FileOperationWork {
         self.id
     }
 
+    pub fn planned_change(&self) -> Option<FileOperationChange> {
+        prepared_change(&self.operation)
+    }
+
     pub fn execute(self) -> FileOperationOutcome {
         let Self {
             id,
@@ -989,58 +993,60 @@ impl FileOperationInspection {
                 None => PreparedFileOperation::NoHistory,
             },
         };
-        let will_change = match &operation {
-            PreparedFileOperation::Create {
-                path,
-                is_dir,
-                created,
-                ..
-            } if *created => Some(FileOperationChange::Create {
-                path: path.clone(),
-                is_dir: *is_dir,
-            }),
-            PreparedFileOperation::Copy {
-                destination,
-                created,
-                ..
-            } if *created => Some(FileOperationChange::Create {
-                path: destination.clone(),
-                is_dir: false,
-            }),
-            PreparedFileOperation::Move {
-                source,
-                destination,
-                is_dir,
-                skip,
-                ..
-            } if !skip => Some(FileOperationChange::Move {
-                from: source.clone(),
-                to: destination.clone(),
-                is_dir: *is_dir,
-            }),
-            PreparedFileOperation::Delete { path, is_dir, .. } => {
-                Some(FileOperationChange::Delete {
-                    path: path.clone(),
-                    is_dir: *is_dir,
-                })
-            }
-            PreparedFileOperation::Replay { direction, change } => {
-                Some(if *direction == ReplayDirection::Undo {
-                    change.inverse()
-                } else {
-                    change.clone()
-                })
-            }
-            PreparedFileOperation::NoHistory
-            | PreparedFileOperation::Create { .. }
-            | PreparedFileOperation::Copy { .. }
-            | PreparedFileOperation::Move { .. } => None,
-        };
+        let will_change = prepared_change(&operation);
         Ok(FileOperationPrepared {
             id: self.id,
             operation,
             will_change,
         })
+    }
+}
+
+fn prepared_change(operation: &PreparedFileOperation) -> Option<FileOperationChange> {
+    match operation {
+        PreparedFileOperation::Create {
+            path,
+            is_dir,
+            created,
+            ..
+        } if *created => Some(FileOperationChange::Create {
+            path: path.clone(),
+            is_dir: *is_dir,
+        }),
+        PreparedFileOperation::Copy {
+            destination,
+            created,
+            ..
+        } if *created => Some(FileOperationChange::Create {
+            path: destination.clone(),
+            is_dir: false,
+        }),
+        PreparedFileOperation::Move {
+            source,
+            destination,
+            is_dir,
+            skip,
+            ..
+        } if !skip => Some(FileOperationChange::Move {
+            from: source.clone(),
+            to: destination.clone(),
+            is_dir: *is_dir,
+        }),
+        PreparedFileOperation::Delete { path, is_dir, .. } => Some(FileOperationChange::Delete {
+            path: path.clone(),
+            is_dir: *is_dir,
+        }),
+        PreparedFileOperation::Replay { direction, change } => {
+            Some(if *direction == ReplayDirection::Undo {
+                change.inverse()
+            } else {
+                change.clone()
+            })
+        }
+        PreparedFileOperation::NoHistory
+        | PreparedFileOperation::Create { .. }
+        | PreparedFileOperation::Copy { .. }
+        | PreparedFileOperation::Move { .. } => None,
     }
 }
 
@@ -1810,13 +1816,10 @@ impl FileOperationRecord {
                     before.destination.path.as_path(),
                 ]
                 .into_iter()
-                .chain(
-                    [
-                        after.source.path.as_path(),
-                        after.destination.path.as_path(),
-                    ]
-                    .into_iter(),
-                ),
+                .chain([
+                    after.source.path.as_path(),
+                    after.destination.path.as_path(),
+                ]),
             ),
         }
     }

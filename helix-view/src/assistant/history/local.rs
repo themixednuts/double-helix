@@ -1334,11 +1334,11 @@ impl PersistedContextKind {
 enum PersistedFollow {
     Off,
     On {
-        participant: u64,
+        participant: [u8; 16],
         last: Option<PersistedLocation>,
     },
     Paused {
-        participant: u64,
+        participant: [u8; 16],
         last: Option<PersistedLocation>,
         reason: PersistedPause,
     },
@@ -1351,7 +1351,7 @@ impl From<&collab::FollowState> for PersistedFollow {
             collab::FollowState::On {
                 participant, last, ..
             } => Self::On {
-                participant: participant.value().get(),
+                participant: participant.0,
                 last: last.as_ref().map(PersistedLocation::from),
             },
             collab::FollowState::Paused {
@@ -1360,7 +1360,7 @@ impl From<&collab::FollowState> for PersistedFollow {
                 reason,
                 ..
             } => Self::Paused {
-                participant: participant.value().get(),
+                participant: participant.0,
                 last: last.as_ref().map(PersistedLocation::from),
                 reason: PersistedPause::from(*reason),
             },
@@ -1623,8 +1623,8 @@ fn turn_id(raw: u64) -> thread::TurnId {
     thread::TurnId::new(NonZeroU64::new(raw).expect("turn id"))
 }
 
-fn participant_id(raw: u64) -> collab::ParticipantId {
-    collab::ParticipantId::new(NonZeroU64::new(raw).expect("participant id"))
+fn participant_id(bytes: [u8; 16]) -> collab::ParticipantId {
+    collab::ParticipantId::from_bytes(bytes)
 }
 
 fn surface_id(raw: u64) -> collab::SurfaceId {

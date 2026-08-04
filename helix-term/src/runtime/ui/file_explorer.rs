@@ -15,12 +15,15 @@ use crate::{
         UiCommand,
     },
     ui::{
-        Confirmation, FileExplorerPanel, FileExplorerTreeWork, PreparedFileExplorerTree, Prompt,
+        Confirmation, ExplorerPath, ExplorerSource, ExplorerSourceId, FileExplorerPanel,
+        FileExplorerTreeRefresh, FileExplorerTreeWork, PreparedFileExplorerTree, Prompt,
         PromptEvent, FILE_EXPLORER_ID,
     },
 };
 use helix_view::{
-    editor::{DocumentOpenRole, DocumentOpenWork, PreparedDocumentOpen, SavePolicy},
+    editor::{
+        DocumentOpenRole, PreparedWorkspaceDocumentOpen, SavePolicy, WorkspaceDocumentOpenWork,
+    },
     DocumentId, Editor,
 };
 
@@ -32,6 +35,7 @@ struct FileExplorerTreeJob {
 #[derive(Default)]
 struct FileExplorerTreeQueueState {
     pending: Option<FileExplorerTreeJob>,
+    active: Option<tokio_util::sync::CancellationToken>,
     prepared: Option<PreparedFileExplorerTree>,
 }
 
@@ -78,12 +82,27 @@ impl FileExplorerTreeQueue {
                     };
                     let FileExplorerTreeJob { work, ingress } = job;
                     let generation = work.generation();
-                    let root = work.root().to_path_buf();
-                    let result = block.spawn(move || work.execute()).await;
+                    let root = work.root().clone();
+                    let canceled = tokio_util::sync::CancellationToken::new();
+                    actor_state
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .active = Some(canceled.clone());
+                    let result = if work.is_remote() {
+                        Ok(work.execute_remote(canceled.clone()).await)
+                    } else if work.is_collaboration() {
+                        Ok(work.execute_collaboration(canceled.clone()).await)
+                    } else {
+                        block.spawn(move || work.execute()).await
+                    };
                     let outcome = {
                         let mut state = actor_state
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        state.active = None;
+                        if canceled.is_cancelled() {
+                            continue;
+                        }
                         if state.pending.is_some() {
                             continue;
                         }
@@ -127,13 +146,20 @@ impl FileExplorerTreeQueue {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(active) = &state.active {
+            active.cancel();
+        }
         state.pending = Some(FileExplorerTreeJob { work, ingress });
         state.prepared = None;
         drop(state);
         self.wake.request();
     }
 
-    pub(crate) fn take(&self, root: &Path, generation: u64) -> Option<PreparedFileExplorerTree> {
+    pub(crate) fn take(
+        &self,
+        root: &ExplorerPath,
+        generation: u64,
+    ) -> Option<PreparedFileExplorerTree> {
         let mut state = self
             .state
             .lock()
@@ -141,7 +167,7 @@ impl FileExplorerTreeQueue {
         if state
             .prepared
             .as_ref()
-            .is_some_and(|prepared| prepared.root == root && prepared.generation == generation)
+            .is_some_and(|prepared| &prepared.root == root && prepared.generation == generation)
         {
             state.prepared.take()
         } else {
@@ -152,20 +178,21 @@ impl FileExplorerTreeQueue {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct FileExplorerPreviewRequest {
-    pub(crate) root: PathBuf,
-    pub(crate) path: PathBuf,
+    pub(crate) source: ExplorerSourceId,
+    pub(crate) root: ExplorerPath,
+    pub(crate) path: ExplorerPath,
     pub(crate) cursor: u32,
     pub(crate) generation: u64,
 }
 
 pub(crate) struct PreparedFileExplorerPreview {
     pub(crate) request: FileExplorerPreviewRequest,
-    pub(crate) result: Result<PreparedDocumentOpen, String>,
+    pub(crate) result: Result<PreparedWorkspaceDocumentOpen, String>,
 }
 
 pub(crate) struct FileExplorerPreviewLoadRequest {
     request: FileExplorerPreviewRequest,
-    work: DocumentOpenWork,
+    work: WorkspaceDocumentOpenWork,
 }
 
 struct FileExplorerPreviewJob {
@@ -177,7 +204,7 @@ struct FileExplorerPreviewJob {
 struct FileExplorerPreviewQueueState {
     generation: Option<u64>,
     pending: Option<FileExplorerPreviewJob>,
-    active: Option<(u64, helix_runtime::Token)>,
+    active: Option<(u64, tokio_util::sync::CancellationToken)>,
     prepared: Option<PreparedFileExplorerPreview>,
 }
 
@@ -227,7 +254,7 @@ impl FileExplorerPreviewQueue {
                     };
                     let request = job.load.request.clone();
                     let generation = request.generation;
-                    let token = helix_runtime::Token::new();
+                    let token = tokio_util::sync::CancellationToken::new();
                     {
                         let mut queue = actor_state
                             .lock()
@@ -235,18 +262,37 @@ impl FileExplorerPreviewQueue {
                         queue.active = Some((generation, token.clone()));
                     }
 
-                    let worker_token = token.clone();
-                    let result = block
-                        .spawn(move || prepare_file_explorer_preview(job.load, &worker_token))
-                        .await
-                        .unwrap_or_else(|error| Err(format!("preview worker failed: {error}")));
+                    let result = match job.load.work {
+                        WorkspaceDocumentOpenWork::Local(work) => {
+                            let worker_token = token.clone();
+                            block
+                                .spawn(move || {
+                                    prepare_local_file_explorer_preview(work, &worker_token)
+                                })
+                                .await
+                                .unwrap_or_else(|error| {
+                                    Err(format!("preview worker failed: {error}"))
+                                })
+                        }
+                        WorkspaceDocumentOpenWork::Remote(work) => work
+                            .execute(token.child_token(), false)
+                            .await
+                            .map(PreparedWorkspaceDocumentOpen::Remote)
+                            .map_err(|error| error.to_string()),
+                        WorkspaceDocumentOpenWork::Collaboration(work) => work
+                            .execute()
+                            .await
+                            .map(PreparedWorkspaceDocumentOpen::Collaboration)
+                            .map_err(|error| error.to_string()),
+                        WorkspaceDocumentOpenWork::Failed { error, .. } => Err(error.to_string()),
+                    };
 
                     let should_notify = {
                         let mut queue = actor_state
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
                         queue.active = None;
-                        let current = !token.is_canceled()
+                        let current = !token.is_cancelled()
                             && queue.generation == Some(generation)
                             && queue.pending.is_none();
                         if current {
@@ -262,6 +308,7 @@ impl FileExplorerPreviewQueue {
                         let _ = job
                             .ingress
                             .send_ui(UiCommand::FileExplorer(FileExplorerCommand::ApplyPreview {
+                                source: request.source,
                                 root: request.root,
                                 path: request.path,
                                 cursor: request.cursor,
@@ -344,22 +391,22 @@ impl FileExplorerPreviewQueue {
     }
 }
 
-fn prepare_file_explorer_preview(
-    load: FileExplorerPreviewLoadRequest,
-    token: &helix_runtime::Token,
-) -> Result<PreparedDocumentOpen, String> {
+fn prepare_local_file_explorer_preview(
+    work: helix_view::editor::DocumentOpenWork,
+    token: &tokio_util::sync::CancellationToken,
+) -> Result<PreparedWorkspaceDocumentOpen, String> {
     let start = Instant::now();
-    let prepared = load.work.execute().map_err(|error| error.to_string())?;
-    if token.is_canceled() {
+    let prepared = work.execute().map_err(|error| error.to_string())?;
+    if token.is_cancelled() {
         return Err(String::from("preview request canceled"));
     }
     log::info!(
         "[file_explorer] preview prepared path={} generation={} elapsed_us={}",
         prepared.path().display(),
-        load.request.generation,
+        0,
         start.elapsed().as_micros(),
     );
-    Ok(prepared)
+    Ok(PreparedWorkspaceDocumentOpen::Local(prepared))
 }
 
 pub(crate) fn queue_file_explorer_preview(
@@ -367,13 +414,16 @@ pub(crate) fn queue_file_explorer_preview(
     ingress: crate::runtime::RuntimeIngress,
     request: FileExplorerPreviewRequest,
 ) {
-    let work = editor.prepare_document_open(&request.path, DocumentOpenRole::Preview);
+    let work =
+        editor.prepare_workspace_document_open(request.path.clone(), DocumentOpenRole::Preview);
     ingress.file_explorer_preview(FileExplorerPreviewLoadRequest { request, work });
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct FileExplorerSearchRequest {
-    root: PathBuf,
+    source: ExplorerSource,
+    source_id: ExplorerSourceId,
+    root: ExplorerPath,
     query: String,
     generation: u64,
     config: helix_view::editor::FileExplorerConfig,
@@ -383,12 +433,14 @@ struct FileExplorerSearchJob {
     request: FileExplorerSearchRequest,
     ingress: crate::runtime::RuntimeIngress,
     abort: Arc<AtomicBool>,
+    canceled: tokio_util::sync::CancellationToken,
 }
 
 #[derive(Default)]
 struct FileExplorerSearchState {
     pending: Option<FileExplorerSearchJob>,
     active_abort: Option<Arc<AtomicBool>>,
+    active_canceled: Option<tokio_util::sync::CancellationToken>,
 }
 
 impl FileExplorerSearchState {
@@ -396,8 +448,12 @@ impl FileExplorerSearchState {
         if let Some(active) = &self.active_abort {
             active.store(true, Ordering::Release);
         }
+        if let Some(active) = &self.active_canceled {
+            active.cancel();
+        }
         if let Some(pending) = &self.pending {
             pending.abort.store(true, Ordering::Release);
+            pending.canceled.cancel();
         }
         self.pending = Some(job);
     }
@@ -405,6 +461,7 @@ impl FileExplorerSearchState {
     fn take(&mut self) -> Option<FileExplorerSearchJob> {
         let job = self.pending.take()?;
         self.active_abort = Some(job.abort.clone());
+        self.active_canceled = Some(job.canceled.clone());
         Some(job)
     }
 
@@ -419,6 +476,7 @@ impl FileExplorerSearchState {
             .is_some_and(|active| Arc::ptr_eq(active, abort))
         {
             self.active_abort = None;
+            self.active_canceled = None;
         }
         abort.load(Ordering::Acquire) || self.is_pending()
     }
@@ -469,10 +527,39 @@ impl FileExplorerSearchQueue {
                     };
                     let request = job.request.clone();
                     let abort = job.abort.clone();
-                    let worker_abort = abort.clone();
-                    let result = block
-                        .spawn(move || execute_file_explorer_search(request, &worker_abort))
-                        .await;
+                    let result = match request.source.backend() {
+                        helix_view::editor::WorkspaceBackend::Local => {
+                            let worker_abort = abort.clone();
+                            block
+                                .spawn(move || {
+                                    execute_local_file_explorer_search(request, &worker_abort)
+                                })
+                                .await
+                                .map(Some)
+                                .map_err(|error| error.to_string())
+                        }
+                        helix_view::editor::WorkspaceBackend::Remote(_) => {
+                            execute_remote_file_explorer_search(
+                                &request,
+                                &job.ingress,
+                                job.canceled.clone(),
+                            )
+                            .await
+                            .map(|()| None)
+                            .map_err(|error| error.to_string())
+                        }
+                        helix_view::editor::WorkspaceBackend::Collaboration(_) => {
+                            execute_collaboration_file_explorer_search(
+                                &request,
+                                &abort,
+                                job.canceled.clone(),
+                                block.clone(),
+                            )
+                            .await
+                            .map(Some)
+                            .map_err(|error| error.to_string())
+                        }
+                    };
                     let superseded = actor_state
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -481,11 +568,12 @@ impl FileExplorerSearchQueue {
                         continue;
                     }
                     match result {
-                        Ok(matches) => {
+                        Ok(Some(matches)) => {
                             let _ = job
                                 .ingress
                                 .send_ui(UiCommand::FileExplorer(
                                     FileExplorerCommand::ApplySearchResults {
+                                        source: job.request.source_id,
                                         root: job.request.root,
                                         query: job.request.query,
                                         generation: job.request.generation,
@@ -494,6 +582,7 @@ impl FileExplorerSearchQueue {
                                 ))
                                 .await;
                         }
+                        Ok(None) => {}
                         Err(error) => log::warn!(
                             "[file_explorer] search worker failed generation={}: {error}",
                             job.request.generation
@@ -519,18 +608,22 @@ impl FileExplorerSearchQueue {
                 request,
                 ingress,
                 abort: Arc::new(AtomicBool::new(false)),
+                canceled: tokio_util::sync::CancellationToken::new(),
             });
         self.wake.request();
     }
 }
 
-fn execute_file_explorer_search(
+fn execute_local_file_explorer_search(
     request: FileExplorerSearchRequest,
     abort: &AtomicBool,
-) -> Vec<PathBuf> {
+) -> Vec<ExplorerPath> {
     let start = Instant::now();
+    let Some(root) = request.root.local_path() else {
+        return Vec::new();
+    };
     match crate::fff::search_file_explorer_available_cancellable(
-        &request.root,
+        root,
         &request.query,
         &request.config,
         Some(abort),
@@ -549,7 +642,7 @@ fn execute_file_explorer_search(
                     .unwrap_or_else(|| String::from("<none>")),
                 start.elapsed().as_micros(),
             );
-            matches
+            matches.into_iter().map(ExplorerPath::Local).collect()
         }
         Err(error) => {
             log::debug!(
@@ -562,6 +655,134 @@ fn execute_file_explorer_search(
     }
 }
 
+async fn execute_remote_file_explorer_search(
+    request: &FileExplorerSearchRequest,
+    ingress: &crate::runtime::RuntimeIngress,
+    canceled: tokio_util::sync::CancellationToken,
+) -> Result<(), helix_remote::backend::BackendError> {
+    let remote = request
+        .source
+        .remote()
+        .expect("remote search request has a remote source");
+    let mut search = remote
+        .search_files(
+            request
+                .root
+                .remote_path()
+                .cloned()
+                .unwrap_or_else(helix_remote::WorkspacePath::root),
+            request.query.clone(),
+            request.config.workspace_scan_options(),
+            100_000,
+            canceled.child_token(),
+        )
+        .await?;
+
+    loop {
+        let snapshot = tokio::select! {
+            _ = canceled.cancelled() => {
+                return search.cancel().await;
+            }
+            snapshot = search.next() => snapshot,
+        };
+        let Some(snapshot) = snapshot else {
+            return Ok(());
+        };
+        let matches = snapshot
+            .entries
+            .into_iter()
+            .map(|entry| ExplorerPath::Remote(entry.path))
+            .collect();
+        let _ = ingress
+            .send_ui(UiCommand::FileExplorer(
+                FileExplorerCommand::ApplySearchResults {
+                    source: request.source_id.clone(),
+                    root: request.root.clone(),
+                    query: request.query.clone(),
+                    generation: request.generation,
+                    matches,
+                },
+            ))
+            .await;
+        if snapshot.done {
+            return Ok(());
+        }
+    }
+}
+
+async fn execute_collaboration_file_explorer_search(
+    request: &FileExplorerSearchRequest,
+    abort: &Arc<AtomicBool>,
+    canceled: tokio_util::sync::CancellationToken,
+    block: helix_runtime::Block,
+) -> anyhow::Result<Vec<ExplorerPath>> {
+    let session = request
+        .source
+        .collaboration()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("collaboration search has a local source"))?;
+    let files = session
+        .list_files(request.config.workspace_scan_options())
+        .await?;
+    if canceled.is_cancelled() || abort.load(Ordering::Acquire) {
+        return Ok(Vec::new());
+    }
+    let query = request.query.clone();
+    let root = request
+        .root
+        .collaboration_path()
+        .cloned()
+        .unwrap_or_else(helix_remote::WorkspacePath::root);
+    let project = session.project().id;
+    let abort = abort.clone();
+    block
+        .spawn(move || {
+            use nucleo::{
+                pattern::{Atom, AtomKind, CaseMatching, Normalization},
+                Utf32Str,
+            };
+
+            let mut matcher = nucleo::Matcher::default();
+            matcher.config.set_match_paths();
+            let pattern = Atom::new(
+                &query,
+                CaseMatching::Smart,
+                Normalization::Smart,
+                AtomKind::Fuzzy,
+                false,
+            );
+            let mut utf32 = Vec::new();
+            let mut matches = Vec::new();
+            for (index, path) in files.iter().enumerate() {
+                if index % 256 == 0 && abort.load(Ordering::Acquire) {
+                    return Vec::new();
+                }
+                if !path.starts_with(&root) {
+                    continue;
+                }
+                let display = path.to_string();
+                if let Some(score) =
+                    pattern.score(Utf32Str::new(&display, &mut utf32), &mut matcher)
+                {
+                    matches.push((score, path));
+                }
+            }
+            matches.sort_unstable_by(|(left_score, left), (right_score, right)| {
+                right_score.cmp(left_score).then_with(|| left.cmp(right))
+            });
+            matches.truncate(100_000);
+            matches
+                .into_iter()
+                .map(|(_, path)| ExplorerPath::Collaboration {
+                    project,
+                    path: path.clone(),
+                })
+                .collect()
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("collaboration search worker failed: {error}"))
+}
+
 struct FileExplorerApplyContext<'a> {
     editor: &'a mut Editor,
     ingress: crate::runtime::RuntimeIngress,
@@ -570,6 +791,7 @@ struct FileExplorerApplyContext<'a> {
 fn file_explorer_command_name(cmd: &FileExplorerCommand) -> &'static str {
     match cmd {
         FileExplorerCommand::ToggleSourceOption { .. } => "ToggleSourceOption",
+        FileExplorerCommand::RefreshCollaboration { .. } => "RefreshCollaboration",
         FileExplorerCommand::FileOperationCompleted { .. } => "FileOperationCompleted",
         FileExplorerCommand::ApplyTree { .. } => "ApplyTree",
         FileExplorerCommand::PreviewSelection { .. } => "PreviewSelection",
@@ -577,6 +799,13 @@ fn file_explorer_command_name(cmd: &FileExplorerCommand) -> &'static str {
         FileExplorerCommand::ApplyVcsSnapshot { .. } => "ApplyVcsSnapshot",
         FileExplorerCommand::StartSearch { .. } => "StartSearch",
         FileExplorerCommand::ApplySearchResults { .. } => "ApplySearchResults",
+        FileExplorerCommand::ApplyWorkspaceTransaction { .. } => "ApplyWorkspaceTransaction",
+        FileExplorerCommand::ApplyWorkspacePaste { .. } => "ApplyWorkspacePaste",
+        FileExplorerCommand::PromptWorkspaceDelete { .. } => "PromptWorkspaceDelete",
+        FileExplorerCommand::ReplayWorkspaceTransaction { .. } => "ReplayWorkspaceTransaction",
+        FileExplorerCommand::WorkspaceTransactionCompleted { .. } => {
+            "WorkspaceTransactionCompleted"
+        }
         FileExplorerCommand::ApplyCreate { .. } => "ApplyCreate",
         FileExplorerCommand::ApplyMove { .. } => "ApplyMove",
         FileExplorerCommand::PromptDelete { .. } => "PromptDelete",
@@ -674,14 +903,21 @@ fn queue_file_explorer_command(
         .detach();
 }
 
+fn local_vcs_snapshot_root(root: ExplorerPath) -> Option<PathBuf> {
+    root.into_local()
+}
+
 pub(crate) fn queue_file_explorer_vcs_snapshot(
     editor: &Editor,
     ingress: crate::runtime::RuntimeIngress,
-    root: PathBuf,
+    root: ExplorerPath,
 ) {
     if !editor.config().file_explorer.vcs {
         return;
     }
+    let Some(root) = local_vcs_snapshot_root(root) else {
+        return;
+    };
 
     let diff_providers = editor.diff_providers.clone();
     UiSnapshotRequest::new("[file_explorer] vcs_snapshot", root)
@@ -698,7 +934,8 @@ pub(crate) fn queue_file_explorer_vcs_snapshot(
 
 fn queue_file_explorer_search(
     ingress: crate::runtime::RuntimeIngress,
-    root: PathBuf,
+    source: ExplorerSource,
+    root: ExplorerPath,
     query: String,
     generation: u64,
     config: helix_view::editor::FileExplorerConfig,
@@ -715,6 +952,8 @@ fn queue_file_explorer_search(
         config.follow_symlinks,
     );
     let request = FileExplorerSearchRequest {
+        source_id: source.identity(),
+        source,
         root,
         query,
         generation,
@@ -727,21 +966,70 @@ pub(crate) fn queue_file_explorer_tree_refresh(
     panel: &mut FileExplorerPanel,
     editor: &Editor,
     ingress: crate::runtime::RuntimeIngress,
-    root: Option<PathBuf>,
-    cursor: Option<usize>,
-    select_path: Option<PathBuf>,
-    follow_current_file: bool,
-    clear_cache: bool,
+    request: crate::ui::FileExplorerTreeRefresh,
 ) {
-    let work = panel.prepare_tree_refresh(
-        editor,
-        root,
-        cursor,
-        select_path,
-        follow_current_file,
-        clear_cache,
-    );
+    let work = panel.prepare_tree_refresh(editor, request);
     ingress.file_explorer_tree(work);
+}
+
+pub(crate) fn open_file_explorer(
+    compositor: &mut Compositor,
+    cx: &mut crate::compositor::Context,
+    root: ExplorerPath,
+) {
+    let root = match root {
+        ExplorerPath::Local(root) => ExplorerPath::Local(helix_stdx::path::normalize(root)),
+        root => root,
+    };
+    let source = match ExplorerSource::from_root(root, &cx.editor.workspace_backend) {
+        Ok(source) => source,
+        Err(error) => {
+            notify_file_explorer_error(cx.editor, format!("Failed to open file explorer: {error}"));
+            return;
+        }
+    };
+    let explorer_root = source.root().clone();
+    let source_id = source.identity();
+
+    if let Some(panel) = compositor.find_id::<FileExplorerPanel>(FILE_EXPLORER_ID) {
+        if panel.root_path() == &explorer_root && panel.source_identity() == source_id {
+            panel.focus_panel(cx.editor);
+            log::info!(
+                "[file_explorer] open_reuse root={} reason=already_open",
+                explorer_root.display()
+            );
+            return;
+        }
+        panel.dismiss_panel(cx.editor, &cx.ingress);
+        compositor.remove(FILE_EXPLORER_ID);
+    }
+
+    let mut panel = FileExplorerPanel::new_deferred(source, cx.editor);
+    let refresh = if let Some(state) =
+        FileExplorerPanel::take_matching_session(panel.root_path(), &panel.source_identity())
+    {
+        let selected = state.selected_path.clone();
+        panel.restore_ui_state(state);
+        log::info!(
+            "[file_explorer] open_restore root={} selected={}",
+            explorer_root.display(),
+            selected
+                .as_ref()
+                .map(|path| path.display())
+                .unwrap_or_else(|| "-".into()),
+        );
+        FileExplorerTreeRefresh::preserve().selecting(selected)
+    } else {
+        log::info!(
+            "[file_explorer] open_fresh root={} reason=no_session",
+            explorer_root.display()
+        );
+        FileExplorerTreeRefresh::follow_current_file()
+    };
+
+    queue_file_explorer_tree_refresh(&mut panel, cx.editor, cx.ingress.clone(), refresh);
+    compositor.push(Box::new(panel));
+    queue_file_explorer_vcs_snapshot(cx.editor, cx.ingress.clone(), explorer_root);
 }
 
 fn refresh_file_explorer_panel(
@@ -759,11 +1047,9 @@ fn refresh_file_explorer_panel(
             panel,
             editor,
             ingress.clone(),
-            Some(root),
-            Some(cursor),
-            None,
-            false,
-            true,
+            FileExplorerTreeRefresh::invalidate_cache()
+                .at_root(ExplorerPath::Local(root))
+                .at_cursor(cursor),
         );
         log::info!(
             "[file_explorer] runtime_refresh existing_panel=true root={} cursor={} elapsed_us={}",
@@ -771,18 +1057,25 @@ fn refresh_file_explorer_panel(
             cursor,
             start.elapsed().as_micros()
         );
-        queue_file_explorer_vcs_snapshot(editor, ingress, requested_root);
+        queue_file_explorer_vcs_snapshot(editor, ingress, ExplorerPath::Local(requested_root));
     } else {
-        let mut panel = FileExplorerPanel::new_deferred(root, editor);
+        let source =
+            match ExplorerSource::from_root(ExplorerPath::Local(root), &editor.workspace_backend) {
+                Ok(source) => source,
+                Err(error) => {
+                    notify_file_explorer_error(
+                        editor,
+                        format!("Failed to refresh file explorer: {error}"),
+                    );
+                    return;
+                }
+            };
+        let mut panel = FileExplorerPanel::new_deferred(source, editor);
         queue_file_explorer_tree_refresh(
             &mut panel,
             editor,
             ingress.clone(),
-            None,
-            Some(cursor),
-            None,
-            false,
-            false,
+            FileExplorerTreeRefresh::preserve().at_cursor(cursor),
         );
         compositor.push(Box::new(panel));
         log::info!(
@@ -791,7 +1084,7 @@ fn refresh_file_explorer_panel(
             cursor,
             start.elapsed().as_micros()
         );
-        queue_file_explorer_vcs_snapshot(editor, ingress, requested_root);
+        queue_file_explorer_vcs_snapshot(editor, ingress, ExplorerPath::Local(requested_root));
     }
 }
 
@@ -812,11 +1105,10 @@ fn refresh_file_explorer_panel_selecting_path(
             panel,
             editor,
             ingress.clone(),
-            Some(root),
-            Some(cursor),
-            Some(path),
-            false,
-            true,
+            FileExplorerTreeRefresh::invalidate_cache()
+                .at_root(ExplorerPath::Local(root))
+                .at_cursor(cursor)
+                .selecting_path(ExplorerPath::Local(path)),
         );
         log::info!(
             "[file_explorer] runtime_refresh existing_panel=true root={} select_path={} fallback_cursor={} elapsed_us={}",
@@ -825,18 +1117,27 @@ fn refresh_file_explorer_panel_selecting_path(
             cursor,
             start.elapsed().as_micros()
         );
-        queue_file_explorer_vcs_snapshot(editor, ingress, requested_root);
+        queue_file_explorer_vcs_snapshot(editor, ingress, ExplorerPath::Local(requested_root));
     } else {
-        let mut panel = FileExplorerPanel::new_deferred(root, editor);
+        let source =
+            match ExplorerSource::from_root(ExplorerPath::Local(root), &editor.workspace_backend) {
+                Ok(source) => source,
+                Err(error) => {
+                    notify_file_explorer_error(
+                        editor,
+                        format!("Failed to refresh file explorer: {error}"),
+                    );
+                    return;
+                }
+            };
+        let mut panel = FileExplorerPanel::new_deferred(source, editor);
         queue_file_explorer_tree_refresh(
             &mut panel,
             editor,
             ingress.clone(),
-            None,
-            Some(cursor),
-            Some(path),
-            false,
-            false,
+            FileExplorerTreeRefresh::preserve()
+                .at_cursor(cursor)
+                .selecting_path(ExplorerPath::Local(path)),
         );
         compositor.push(Box::new(panel));
         log::info!(
@@ -846,7 +1147,7 @@ fn refresh_file_explorer_panel_selecting_path(
             cursor,
             start.elapsed().as_micros()
         );
-        queue_file_explorer_vcs_snapshot(editor, ingress, requested_root);
+        queue_file_explorer_vcs_snapshot(editor, ingress, ExplorerPath::Local(requested_root));
     }
 }
 
@@ -874,6 +1175,127 @@ fn modified_documents_for_paths(editor: &Editor, paths: &[PathBuf]) -> Vec<Docum
     documents
 }
 
+fn workspace_transaction_paths(
+    transaction: &helix_workspace::FileTransaction,
+) -> Vec<&helix_workspace::WorkspacePath> {
+    transaction
+        .operations
+        .iter()
+        .flat_map(|operation| match operation {
+            helix_remote::FileOperation::CreateFile { path, .. }
+            | helix_remote::FileOperation::CreateDirectory { path }
+            | helix_remote::FileOperation::Remove { path, .. } => vec![path],
+            helix_remote::FileOperation::Copy { from, to, .. }
+            | helix_remote::FileOperation::Rename { from, to, .. } => vec![from, to],
+        })
+        .collect()
+}
+
+fn modified_documents_for_workspace_paths(
+    editor: &Editor,
+    root: &ExplorerPath,
+    paths: &[&helix_workspace::WorkspacePath],
+) -> Vec<DocumentId> {
+    editor
+        .documents()
+        .filter(|document| document.is_modified())
+        .filter_map(|document| {
+            let path = match root {
+                ExplorerPath::Remote(_) => {
+                    document.remote_location().map(|location| &location.path)
+                }
+                ExplorerPath::Collaboration { project, .. } => document
+                    .collaboration_location()
+                    .filter(|location| location.project == *project)
+                    .map(|location| &location.path),
+                ExplorerPath::Local(_) => None,
+            }?;
+            paths
+                .iter()
+                .any(|operation| path == *operation || path.starts_with(operation))
+                .then_some(document.id())
+        })
+        .collect()
+}
+
+#[derive(Clone)]
+enum WorkspaceFileBackend {
+    Remote(std::sync::Arc<helix_remote::backend::RemoteWorkspaceClient>),
+    Collaboration(helix_collab::GuestSessionHandle),
+}
+
+impl WorkspaceFileBackend {
+    async fn apply(&self, transaction: helix_workspace::FileTransaction) -> Result<bool, String> {
+        match self {
+            Self::Remote(remote) => remote
+                .apply_file_transaction(transaction)
+                .await
+                .map(|_| true)
+                .map_err(|error| error.to_string()),
+            Self::Collaboration(session) => session
+                .apply_file_transaction(transaction)
+                .await
+                .map_err(|error| error.to_string()),
+        }
+    }
+
+    async fn replay(&self, redo: bool) -> Result<bool, String> {
+        match self {
+            Self::Remote(remote) => if redo {
+                remote.redo_file_transaction().await
+            } else {
+                remote.undo_file_transaction().await
+            }
+            .map_err(|error| error.to_string()),
+            Self::Collaboration(session) => session
+                .replay_file_transaction(redo)
+                .await
+                .map_err(|error| error.to_string()),
+        }
+    }
+
+    async fn path_exists(&self, path: helix_workspace::WorkspacePath) -> Result<bool, String> {
+        match self {
+            Self::Remote(remote) => remote
+                .stat(path, tokio_util::sync::CancellationToken::new())
+                .await
+                .map(|metadata| metadata.is_some())
+                .map_err(|error| error.to_string()),
+            Self::Collaboration(session) => session
+                .path_exists(path)
+                .await
+                .map_err(|error| error.to_string()),
+        }
+    }
+}
+
+fn workspace_file_backend(
+    editor: &Editor,
+    root: &ExplorerPath,
+) -> Result<WorkspaceFileBackend, &'static str> {
+    match root {
+        ExplorerPath::Remote(_) if editor.collaboration.is_hosting() => editor
+            .collaboration
+            .session()
+            .map(WorkspaceFileBackend::Collaboration)
+            .ok_or("shared remote project is no longer connected"),
+        ExplorerPath::Remote(_) => editor
+            .workspace_backend
+            .remote()
+            .cloned()
+            .map(WorkspaceFileBackend::Remote)
+            .ok_or("remote workspace is no longer connected"),
+        ExplorerPath::Collaboration { project, .. } => editor
+            .workspace_backend
+            .collaboration()
+            .filter(|session| session.project().id == *project)
+            .cloned()
+            .map(WorkspaceFileBackend::Collaboration)
+            .ok_or("shared project is no longer connected"),
+        ExplorerPath::Local(_) => Err("local path was routed to a workspace transaction"),
+    }
+}
+
 fn save_modified_documents(
     cx: &mut crate::compositor::Context,
     documents: &[DocumentId],
@@ -887,7 +1309,7 @@ fn save_modified_documents(
         }
 
         append_document_changes_to_history(cx.editor, doc_id);
-        cx.editor.save(doc_id, None::<PathBuf>, SavePolicy::Safe)?;
+        cx.editor.save(doc_id, None, SavePolicy::Safe)?;
     }
     Ok(())
 }
@@ -929,6 +1351,14 @@ fn without_modified_buffer_check(mut command: FileExplorerCommand) -> FileExplor
         | FileExplorerCommand::ApplyCopy {
             modified_buffer_check,
             ..
+        }
+        | FileExplorerCommand::ApplyWorkspaceTransaction {
+            modified_buffer_check,
+            ..
+        }
+        | FileExplorerCommand::ApplyWorkspacePaste {
+            modified_buffer_check,
+            ..
         } => *modified_buffer_check = ModifiedBufferCheck::Skip,
         _ => {}
     }
@@ -957,6 +1387,258 @@ fn prompt_save_before_modified_documents(
         },
     );
     true
+}
+
+fn prompt_save_before_workspace_transaction(
+    editor: &mut Editor,
+    ingress: crate::runtime::RuntimeIngress,
+    operation: String,
+    root: &ExplorerPath,
+    transaction: &helix_workspace::FileTransaction,
+    continuation: FileExplorerCommand,
+) -> bool {
+    let paths = workspace_transaction_paths(transaction);
+    let documents = modified_documents_for_workspace_paths(editor, root, &paths);
+    if documents.is_empty() {
+        return false;
+    }
+    queue_file_explorer_command(
+        editor,
+        ingress,
+        FileExplorerCommand::PromptSaveBefore {
+            operation,
+            documents,
+            continuation: Box::new(continuation),
+        },
+    );
+    true
+}
+
+fn apply_workspace_transaction(
+    cx: &mut FileExplorerApplyContext<'_>,
+    root: ExplorerPath,
+    cursor: u32,
+    select_path: Option<ExplorerPath>,
+    transaction: helix_workspace::FileTransaction,
+    success: String,
+    modified_buffer_check: ModifiedBufferCheck,
+) {
+    let command = FileExplorerCommand::ApplyWorkspaceTransaction {
+        root: root.clone(),
+        cursor,
+        select_path: select_path.clone(),
+        transaction: transaction.clone(),
+        success: success.clone(),
+        modified_buffer_check,
+    };
+    if modified_buffer_check == ModifiedBufferCheck::Prompt
+        && prompt_save_before_workspace_transaction(
+            cx.editor,
+            cx.ingress.clone(),
+            success.clone(),
+            &root,
+            &transaction,
+            command,
+        )
+    {
+        return;
+    }
+    let backend = match workspace_file_backend(cx.editor, &root) {
+        Ok(backend) => backend,
+        Err(error) => {
+            notify_file_explorer_error(cx.editor, error);
+            return;
+        }
+    };
+    let ingress = cx.ingress.clone();
+    cx.editor
+        .work()
+        .spawn(async move {
+            let result = backend.apply(transaction).await.and_then(|changed| {
+                changed
+                    .then_some(success)
+                    .ok_or("No file changes".to_owned())
+            });
+            let _ = ingress
+                .send_ui(UiCommand::FileExplorer(
+                    FileExplorerCommand::WorkspaceTransactionCompleted {
+                        root,
+                        cursor,
+                        select_path,
+                        result,
+                    },
+                ))
+                .await;
+        })
+        .detach();
+}
+
+fn replay_workspace_transaction(
+    cx: &mut FileExplorerApplyContext<'_>,
+    root: ExplorerPath,
+    cursor: u32,
+    redo: bool,
+) {
+    let backend = match workspace_file_backend(cx.editor, &root) {
+        Ok(backend) => backend,
+        Err(error) => {
+            notify_file_explorer_error(cx.editor, error);
+            return;
+        }
+    };
+    let ingress = cx.ingress.clone();
+    cx.editor
+        .work()
+        .spawn(async move {
+            let result = backend.replay(redo).await.and_then(|changed| {
+                changed
+                    .then(|| {
+                        if redo {
+                            String::from("Redid file operation")
+                        } else {
+                            String::from("Undid file operation")
+                        }
+                    })
+                    .ok_or_else(|| String::from("No file operation to replay"))
+            });
+            let _ = ingress
+                .send_ui(UiCommand::FileExplorer(
+                    FileExplorerCommand::WorkspaceTransactionCompleted {
+                        root,
+                        cursor,
+                        select_path: None,
+                        result,
+                    },
+                ))
+                .await;
+        })
+        .detach();
+}
+
+fn apply_workspace_paste(
+    cx: &mut FileExplorerApplyContext<'_>,
+    root: ExplorerPath,
+    cursor: u32,
+    source: helix_workspace::WorkspacePath,
+    destination: helix_workspace::WorkspacePath,
+    move_source: bool,
+    modified_buffer_check: ModifiedBufferCheck,
+) {
+    let command = FileExplorerCommand::ApplyWorkspacePaste {
+        root: root.clone(),
+        cursor,
+        source: source.clone(),
+        destination: destination.clone(),
+        move_source,
+        modified_buffer_check,
+    };
+    let inspection = helix_remote::FileTransaction {
+        operations: vec![helix_remote::FileOperation::Copy {
+            from: source.clone(),
+            to: destination.clone(),
+            overwrite: false,
+        }],
+    };
+    if modified_buffer_check == ModifiedBufferCheck::Prompt
+        && prompt_save_before_workspace_transaction(
+            cx.editor,
+            cx.ingress.clone(),
+            if move_source {
+                format!("moving {source}")
+            } else {
+                format!("copying {source}")
+            },
+            &root,
+            &inspection,
+            command,
+        )
+    {
+        return;
+    }
+    let backend = match workspace_file_backend(cx.editor, &root) {
+        Ok(backend) => backend,
+        Err(error) => {
+            notify_file_explorer_error(cx.editor, error);
+            return;
+        }
+    };
+    let ingress = cx.ingress.clone();
+    cx.editor
+        .work()
+        .spawn(async move {
+            let result = async {
+                let target = workspace_unique_destination(&backend, &destination, &source).await?;
+                let operation = if move_source {
+                    helix_remote::FileOperation::Rename {
+                        from: source,
+                        to: target.clone(),
+                        overwrite: false,
+                    }
+                } else {
+                    helix_remote::FileOperation::Copy {
+                        from: source,
+                        to: target.clone(),
+                        overwrite: false,
+                    }
+                };
+                backend
+                    .apply(helix_workspace::FileTransaction {
+                        operations: vec![operation],
+                    })
+                    .await?;
+                Ok::<_, String>((target, if move_source { "Moved" } else { "Copied" }))
+            }
+            .await;
+            let (select_path, result) = match result {
+                Ok((target, verb)) => (
+                    root.with_workspace_path(target),
+                    Ok(format!("{verb} workspace path")),
+                ),
+                Err(error) => (None, Err(error.to_string())),
+            };
+            let _ = ingress
+                .send_ui(UiCommand::FileExplorer(
+                    FileExplorerCommand::WorkspaceTransactionCompleted {
+                        root,
+                        cursor,
+                        select_path,
+                        result,
+                    },
+                ))
+                .await;
+        })
+        .detach();
+}
+
+async fn workspace_unique_destination(
+    backend: &WorkspaceFileBackend,
+    directory: &helix_workspace::WorkspacePath,
+    source: &helix_workspace::WorkspacePath,
+) -> Result<helix_workspace::WorkspacePath, String> {
+    let name = source
+        .file_name()
+        .ok_or_else(|| String::from("source path has no file name"))?;
+    let candidate = directory
+        .join(name.to_owned())
+        .map_err(|error| error.to_string())?;
+    if !backend.path_exists(candidate.clone()).await? {
+        return Ok(candidate);
+    }
+    let (stem, extension) = match name.rsplit_once('.') {
+        Some((stem, extension)) if !stem.is_empty() => (stem, Some(extension)),
+        _ => (name, None),
+    };
+    for index in 1_u64.. {
+        let name = extension.map_or_else(
+            || format!("{stem} ({index})"),
+            |extension| format!("{stem} ({index}).{extension}"),
+        );
+        let candidate = directory.join(name).map_err(|error| error.to_string())?;
+        if !backend.path_exists(candidate.clone()).await? {
+            return Ok(candidate);
+        }
+    }
+    unreachable!("unbounded unique destination loop")
 }
 
 fn apply_create(
@@ -1170,13 +1852,25 @@ pub(crate) fn apply_file_explorer_command(
                     panel,
                     editor,
                     ingress.clone(),
-                    None,
-                    Some(cursor),
-                    None,
-                    false,
-                    true,
+                    FileExplorerTreeRefresh::invalidate_cache().at_cursor(cursor),
                 );
                 panel.queue_current_search(editor, ingress);
+            }
+        }
+        FileExplorerCommand::RefreshCollaboration { project } => {
+            if let Some(panel) = compositor.find_id::<FileExplorerPanel>(FILE_EXPLORER_ID) {
+                let matches = panel.source_for_context().identity()
+                    == ExplorerSourceId::Collaboration { project };
+                if matches {
+                    let cursor = panel.selection_for_log();
+                    queue_file_explorer_tree_refresh(
+                        panel,
+                        editor,
+                        ingress.clone(),
+                        FileExplorerTreeRefresh::invalidate_cache().at_cursor(cursor),
+                    );
+                    panel.queue_current_search(editor, ingress);
+                }
             }
         }
         FileExplorerCommand::FileOperationCompleted {
@@ -1187,7 +1881,8 @@ pub(crate) fn apply_file_explorer_command(
         } => {
             let matching_panel = compositor
                 .find_id::<FileExplorerPanel>(FILE_EXPLORER_ID)
-                .is_some_and(|panel| same_explorer_root(panel.root_for_context(), &root));
+                .and_then(|panel| panel.root_for_context().local_path())
+                .is_some_and(|panel_root| same_explorer_root(panel_root, &root));
             if result.is_ok() && matching_panel {
                 if let Some(path) = select_path {
                     refresh_file_explorer_panel_selecting_path(
@@ -1225,6 +1920,7 @@ pub(crate) fn apply_file_explorer_command(
             }
         }
         FileExplorerCommand::PreviewSelection {
+            source,
             root,
             path,
             cursor,
@@ -1235,15 +1931,21 @@ pub(crate) fn apply_file_explorer_command(
                     editor,
                     ingress.clone(),
                     FileExplorerPreviewRequest {
+                        source,
                         root,
                         path,
                         cursor,
                         generation,
                     },
                 );
+                if panel.take_dismiss_after_open() {
+                    panel.dismiss_panel(editor, &ingress);
+                    compositor.remove(FILE_EXPLORER_ID);
+                }
             }
         }
         FileExplorerCommand::ApplyPreview {
+            source,
             root,
             path,
             cursor,
@@ -1254,12 +1956,17 @@ pub(crate) fn apply_file_explorer_command(
                     editor,
                     ingress.clone(),
                     FileExplorerPreviewRequest {
+                        source,
                         root,
                         path,
                         cursor,
                         generation,
                     },
                 );
+                if panel.take_dismiss_after_open() {
+                    panel.dismiss_panel(editor, &ingress);
+                    compositor.remove(FILE_EXPLORER_ID);
+                }
             }
         }
         FileExplorerCommand::ApplyVcsSnapshot { root, snapshot } => {
@@ -1270,23 +1977,21 @@ pub(crate) fn apply_file_explorer_command(
                         panel,
                         editor,
                         ingress.clone(),
-                        None,
-                        Some(cursor),
-                        None,
-                        false,
-                        false,
+                        FileExplorerTreeRefresh::preserve().at_cursor(cursor),
                     );
                 }
             }
         }
         FileExplorerCommand::StartSearch {
+            source,
             root,
             query,
             generation,
             config,
         } => {
             if let Some(panel) = compositor.find_id::<FileExplorerPanel>(FILE_EXPLORER_ID) {
-                let accepted = panel.accepts_search_request(&root, &query, generation);
+                let accepted = panel.source_for_context().identity() == source.identity()
+                    && panel.accepts_search_request(&root, &query, generation);
                 log::info!(
                     "[file_explorer] search_start_request root={} query={query:?} generation={} accepted={} panel_query={:?} panel_generation={} panel_pending={} rows={} selection={} selected={}",
                     root.display(),
@@ -1300,7 +2005,7 @@ pub(crate) fn apply_file_explorer_command(
                     panel.selected_path_for_log(),
                 );
                 if accepted {
-                    queue_file_explorer_search(ingress, root, query, generation, config);
+                    queue_file_explorer_search(ingress, source, root, query, generation, config);
                 }
             } else {
                 log::info!(
@@ -1311,13 +2016,15 @@ pub(crate) fn apply_file_explorer_command(
             }
         }
         FileExplorerCommand::ApplySearchResults {
+            source,
             root,
             query,
             generation,
             matches,
         } => {
             if let Some(panel) = compositor.find_id::<FileExplorerPanel>(FILE_EXPLORER_ID) {
-                let applied = panel.apply_search_results(editor, root, query, generation, matches);
+                let applied = panel.source_for_context().identity() == source
+                    && panel.apply_search_results(editor, root, query, generation, matches);
                 log::info!(
                     "[file_explorer] search_results_command applied={} rows={} selection={} selected={} pending={} generation={}",
                     applied,
@@ -1333,6 +2040,107 @@ pub(crate) fn apply_file_explorer_command(
             } else {
                 log::info!("[file_explorer] search_results_command applied=false reason=no_panel");
             }
+        }
+        FileExplorerCommand::ApplyWorkspaceTransaction {
+            root,
+            cursor,
+            select_path,
+            transaction,
+            success,
+            modified_buffer_check,
+        } => apply_workspace_transaction(
+            &mut FileExplorerApplyContext { editor, ingress },
+            root,
+            cursor,
+            select_path,
+            transaction,
+            success,
+            modified_buffer_check,
+        ),
+        FileExplorerCommand::ApplyWorkspacePaste {
+            root,
+            cursor,
+            source,
+            destination,
+            move_source,
+            modified_buffer_check,
+        } => apply_workspace_paste(
+            &mut FileExplorerApplyContext { editor, ingress },
+            root,
+            cursor,
+            source,
+            destination,
+            move_source,
+            modified_buffer_check,
+        ),
+        FileExplorerCommand::PromptWorkspaceDelete {
+            root,
+            cursor,
+            target,
+        } => {
+            let kind = if matches!(root, ExplorerPath::Collaboration { .. }) {
+                "shared"
+            } else {
+                "remote"
+            };
+            let message = format!("Delete {kind} path {target}?");
+            let cancelled_target = target.clone();
+            let confirmation = Confirmation::new(message, move |cx| {
+                spawn_file_explorer_command(
+                    cx,
+                    FileExplorerCommand::ApplyWorkspaceTransaction {
+                        root: root.clone(),
+                        cursor,
+                        select_path: None,
+                        transaction: helix_workspace::FileTransaction {
+                            operations: vec![helix_workspace::FileOperation::Remove {
+                                path: target.clone(),
+                                recursive: true,
+                            }],
+                        },
+                        success: format!("Deleted {kind} path {target}"),
+                        modified_buffer_check: ModifiedBufferCheck::Prompt,
+                    },
+                );
+            })
+            .on_cancel(move |cx| {
+                cx.editor
+                    .notify_info(format!("Delete canceled: {cancelled_target}"));
+            });
+            compositor.push(Box::new(confirmation.into_prompt()));
+        }
+        FileExplorerCommand::ReplayWorkspaceTransaction { root, cursor, redo } => {
+            replay_workspace_transaction(
+                &mut FileExplorerApplyContext { editor, ingress },
+                root,
+                cursor,
+                redo,
+            );
+        }
+        FileExplorerCommand::WorkspaceTransactionCompleted {
+            root,
+            cursor,
+            select_path,
+            result,
+        } => {
+            let matching_panel = compositor
+                .find_id::<FileExplorerPanel>(FILE_EXPLORER_ID)
+                .is_some_and(|panel| panel.root_for_context() == &root);
+            if result.is_ok() && matching_panel {
+                if let Some(panel) = compositor.find_id::<FileExplorerPanel>(FILE_EXPLORER_ID) {
+                    queue_file_explorer_tree_refresh(
+                        panel,
+                        editor,
+                        ingress.clone(),
+                        FileExplorerTreeRefresh::invalidate_cache()
+                            .at_root(root)
+                            .at_cursor(usize::try_from(cursor).unwrap_or(usize::MAX))
+                            .selecting(select_path),
+                    );
+                    panel.queue_current_search(editor, ingress.clone());
+                }
+            }
+            notify_file_explorer_result(editor, result);
         }
         FileExplorerCommand::PromptDelete {
             target,
@@ -1537,11 +2345,20 @@ mod tests {
         let runtime = helix_runtime::test::RuntimeTest::default();
         let (ingress, _receiver) =
             crate::runtime::RuntimeIngress::channel(runtime.runtime().clone());
-        let request = |generation, query: &str| FileExplorerSearchRequest {
-            root: PathBuf::from("workspace"),
-            query: query.to_owned(),
-            generation,
-            config: helix_view::editor::FileExplorerConfig::default(),
+        let request = |generation, query: &str| {
+            let root = PathBuf::from("workspace");
+            let source = ExplorerSource::from_backend(
+                root.clone(),
+                &helix_view::editor::WorkspaceBackend::Local,
+            );
+            FileExplorerSearchRequest {
+                source_id: source.identity(),
+                source,
+                root: ExplorerPath::Local(root),
+                query: query.to_owned(),
+                generation,
+                config: helix_view::editor::FileExplorerConfig::default(),
+            }
         };
         let mut latest = FileExplorerSearchState::default();
 
@@ -1549,16 +2366,19 @@ mod tests {
             request: request(1, "s"),
             ingress: ingress.clone(),
             abort: Arc::new(AtomicBool::new(false)),
+            canceled: tokio_util::sync::CancellationToken::new(),
         });
         latest.replace(FileExplorerSearchJob {
             request: request(2, "sr"),
             ingress: ingress.clone(),
             abort: Arc::new(AtomicBool::new(false)),
+            canceled: tokio_util::sync::CancellationToken::new(),
         });
         latest.replace(FileExplorerSearchJob {
             request: request(3, "src"),
             ingress,
             abort: Arc::new(AtomicBool::new(false)),
+            canceled: tokio_util::sync::CancellationToken::new(),
         });
 
         let job = latest.take().expect("latest search");
@@ -1572,17 +2392,27 @@ mod tests {
         let runtime = helix_runtime::test::RuntimeTest::default();
         let (ingress, _receiver) =
             crate::runtime::RuntimeIngress::channel(runtime.runtime().clone());
-        let request = |generation, query: &str| FileExplorerSearchRequest {
-            root: PathBuf::from("workspace"),
-            query: query.to_owned(),
-            generation,
-            config: helix_view::editor::FileExplorerConfig::default(),
+        let request = |generation, query: &str| {
+            let root = PathBuf::from("workspace");
+            let source = ExplorerSource::from_backend(
+                root.clone(),
+                &helix_view::editor::WorkspaceBackend::Local,
+            );
+            FileExplorerSearchRequest {
+                source_id: source.identity(),
+                source,
+                root: ExplorerPath::Local(root),
+                query: query.to_owned(),
+                generation,
+                config: helix_view::editor::FileExplorerConfig::default(),
+            }
         };
         let mut latest = FileExplorerSearchState::default();
         latest.replace(FileExplorerSearchJob {
             request: request(1, "s"),
             ingress: ingress.clone(),
             abort: Arc::new(AtomicBool::new(false)),
+            canceled: tokio_util::sync::CancellationToken::new(),
         });
         let active = latest.take().expect("active search");
 
@@ -1590,6 +2420,7 @@ mod tests {
             request: request(2, "src"),
             ingress,
             abort: Arc::new(AtomicBool::new(false)),
+            canceled: tokio_util::sync::CancellationToken::new(),
         });
 
         assert!(active.abort.load(Ordering::Acquire));
@@ -1606,6 +2437,17 @@ mod tests {
         std::fs::write(&child, "").unwrap();
 
         assert!(path_affects_document(&root, &child));
+    }
+
+    #[test]
+    fn vcs_snapshot_never_falls_back_to_the_client_filesystem_for_remote_roots() {
+        let remote = ExplorerPath::Remote(helix_remote::WorkspacePath::root());
+
+        assert_eq!(local_vcs_snapshot_root(remote), None);
+        assert_eq!(
+            local_vcs_snapshot_root(ExplorerPath::Local(PathBuf::from("workspace"))),
+            Some(PathBuf::from("workspace"))
+        );
     }
 
     #[test]

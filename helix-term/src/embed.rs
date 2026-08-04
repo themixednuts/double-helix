@@ -244,6 +244,7 @@ impl EmbeddedEditor {
                     self.ingress.clone(),
                     self.foreground.clone(),
                     self.plugin_runtime.clone(),
+                    None,
                     *task,
                 );
             }
@@ -347,15 +348,17 @@ impl EmbeddedEditor {
             redraw: self.editor.redraw_handle(),
             plugin_events: self.plugin_events.clone().into(),
         };
-        let mut context = Context::with_foreground(
+        let mut context = Context::with_services(
             &mut self.editor,
             &mut self.exit_tasks,
-            self.exit_task_work.clone(),
-            notifier,
-            self.ingress.clone(),
-            self.idle_reset.clone(),
-            self.plugin_runtime.clone(),
-            self.foreground.clone(),
+            crate::compositor::ContextServices::new(
+                self.exit_task_work.clone(),
+                notifier,
+                self.ingress.clone(),
+                self.idle_reset.clone(),
+                self.plugin_runtime.clone(),
+                self.foreground.clone(),
+            ),
         );
         let result = f(&mut self.compositor, &mut context);
         drop(context);
@@ -436,7 +439,7 @@ mod tests {
 
             let applied = embedded.try_apply_pending_deliveries().unwrap();
 
-            assert_eq!(applied, 2);
+            assert_eq!(applied, 1);
             let (message, _) = embedded.editor().status_msg.as_ref().unwrap();
             assert_eq!(message.as_ref(), "second");
         });

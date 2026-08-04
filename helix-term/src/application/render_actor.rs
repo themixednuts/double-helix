@@ -59,7 +59,9 @@ pub(super) struct RenderActor {
     tx: LatestByKeySender<(), QueuedFrame>,
     next_sequence: AtomicU64,
     latest_sequence: Arc<AtomicU64>,
+    occupied: Arc<AtomicBool>,
     presenter: PresenterHandle,
+    pipeline_ready: helix_runtime::PulseHandle<super::FramePipelineReady>,
     cancel: helix_runtime::Token,
 }
 
@@ -68,11 +70,15 @@ impl RenderActor {
         work: helix_runtime::Work,
         block: helix_runtime::Block,
         presenter: PresenterHandle,
+        pipeline_ready: helix_runtime::PulseHandle<super::FramePipelineReady>,
     ) -> Self {
         let (tx, mut rx) = helix_runtime::latest_by_key::<(), QueuedFrame>(1);
         let latest_sequence = Arc::new(AtomicU64::new(0));
         let actor_latest = latest_sequence.clone();
+        let occupied = Arc::new(AtomicBool::new(false));
+        let actor_occupied = occupied.clone();
         let actor_presenter = presenter.clone();
+        let actor_pipeline_ready = pipeline_ready.clone();
         let cancel = helix_runtime::Token::new();
         let actor_cancel = cancel.clone();
 
@@ -124,6 +130,12 @@ impl RenderActor {
                             log::error!("render worker failed sequence={sequence} error={error}");
                             cache = crate::render::CacheStore::default();
                             force_full_redraw.store(true, Ordering::Release);
+                            release_if_latest(
+                                &actor_latest,
+                                &actor_occupied,
+                                &actor_pipeline_ready,
+                                sequence,
+                            );
                             continue;
                         }
                     }
@@ -134,6 +146,12 @@ impl RenderActor {
                         force_full_redraw.store(true, Ordering::Release);
                     }
                     actor_presenter.recycle_surface(result.surface);
+                    release_if_latest(
+                        &actor_latest,
+                        &actor_occupied,
+                        &actor_pipeline_ready,
+                        sequence,
+                    );
                     continue;
                 }
 
@@ -153,8 +171,20 @@ impl RenderActor {
                 };
                 if let Err(error) = actor_presenter.submit(packet) {
                     log::error!("failed to submit rendered frame: {error}");
+                    release_if_latest(
+                        &actor_latest,
+                        &actor_occupied,
+                        &actor_pipeline_ready,
+                        sequence,
+                    );
                     break;
                 }
+                release_if_latest(
+                    &actor_latest,
+                    &actor_occupied,
+                    &actor_pipeline_ready,
+                    sequence,
+                );
             }
         })
         .detach();
@@ -163,9 +193,15 @@ impl RenderActor {
             tx,
             next_sequence: AtomicU64::new(1),
             latest_sequence,
+            occupied,
             presenter,
+            pipeline_ready,
             cancel,
         }
+    }
+
+    pub fn is_saturated(&self) -> bool {
+        self.occupied.load(Ordering::Acquire) || self.presenter.has_pending_frame()
     }
 
     pub fn take_surface(&self, area: Rect) -> Buffer {
@@ -175,6 +211,7 @@ impl RenderActor {
     pub fn submit(&self, frame: PreparedFrame) -> Result<(), RenderAdmissionError> {
         let sequence = self.next_sequence.fetch_add(1, Ordering::Relaxed);
         let previous = self.latest_sequence.swap(sequence, Ordering::AcqRel);
+        let was_occupied = self.occupied.swap(true, Ordering::AcqRel);
         let queued = QueuedFrame { sequence, frame };
         let admitted = self
             .tx
@@ -195,8 +232,24 @@ impl RenderActor {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             );
+            self.occupied.store(was_occupied, Ordering::Release);
+            if !was_occupied {
+                self.pipeline_ready.request();
+            }
         }
         admitted
+    }
+}
+
+fn release_if_latest(
+    latest_sequence: &AtomicU64,
+    occupied: &AtomicBool,
+    pipeline_ready: &helix_runtime::PulseHandle<super::FramePipelineReady>,
+    sequence: u64,
+) {
+    if latest_sequence.load(Ordering::Acquire) == sequence {
+        occupied.store(false, Ordering::Release);
+        pipeline_ready.request();
     }
 }
 
@@ -235,5 +288,25 @@ mod tests {
         let mut pending = frame(true);
         PreparedFrame::preserve_full_redraw(&mut pending, frame(false));
         assert!(pending.full_redraw);
+    }
+
+    #[test]
+    fn stale_completion_cannot_release_a_newer_render() {
+        let latest = AtomicU64::new(2);
+        let occupied = AtomicBool::new(true);
+        let mut gate = helix_runtime::PulseGate::<super::super::FramePipelineReady>::new();
+        let ready = gate.handle();
+        let mut ready_rx = gate.take_receiver();
+
+        release_if_latest(&latest, &occupied, &ready, 1);
+        assert!(occupied.load(Ordering::Acquire));
+        assert!(matches!(
+            ready_rx.try_recv(),
+            Err(helix_runtime::TryRecvError::Empty)
+        ));
+
+        release_if_latest(&latest, &occupied, &ready, 2);
+        assert!(!occupied.load(Ordering::Acquire));
+        assert!(ready_rx.try_recv().is_ok());
     }
 }

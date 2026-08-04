@@ -367,7 +367,7 @@ impl PluginMutationHost for EditorMutationBridge<'_> {
 
         // Use the editor-level save which handles async work spawning and LSP notifications.
         self.editor
-            .save::<std::path::PathBuf>(doc_id, None, policy)
+            .save(doc_id, None, policy)
             .map_err(|e| ContractError::InternalError {
                 message: e.to_string(),
             })?;

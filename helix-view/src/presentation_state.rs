@@ -66,6 +66,7 @@ pub struct DocumentPresentationState {
     editor_config: EditorConfig,
     is_welcome: bool,
     persistent_scratch: bool,
+    scratch_name: Option<Arc<str>>,
 }
 
 impl Default for DocumentPresentationState {
@@ -78,6 +79,7 @@ impl Default for DocumentPresentationState {
             editor_config: EditorConfig::default(),
             is_welcome: false,
             persistent_scratch: false,
+            scratch_name: None,
         }
     }
 }
@@ -109,6 +111,14 @@ impl DocumentPresentationState {
 
     pub fn set_persistent_scratch(&mut self, persistent_scratch: bool) {
         self.persistent_scratch = persistent_scratch;
+    }
+
+    pub fn scratch_name(&self) -> Option<&str> {
+        self.scratch_name.as_deref()
+    }
+
+    pub fn set_scratch_name(&mut self, name: impl Into<Arc<str>>) {
+        self.scratch_name = Some(name.into());
     }
 
     pub fn indent_style(&self) -> IndentStyle {

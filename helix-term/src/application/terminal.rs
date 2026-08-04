@@ -31,15 +31,17 @@ impl Application {
         self.terminal_state.area = area;
         self.compositor.resize(area);
 
-        let mut cx = Self::make_compositor_context(
+        let mut cx = crate::compositor::Context::with_services(
             &mut self.editor,
             &mut self.exit.tasks,
-            self.exit.work.clone(),
-            notifier,
-            ingress,
-            idle_reset,
-            self.plugin_runtime.clone(),
-            self.foreground.clone(),
+            crate::compositor::ContextServices::new(
+                self.exit.work.clone(),
+                notifier,
+                ingress,
+                idle_reset,
+                self.plugin_runtime.clone(),
+                self.foreground.clone(),
+            ),
         );
         let should_redraw = self
             .compositor
@@ -70,7 +72,7 @@ impl Application {
                 code: termina::event::KeyCode::Char('c'),
                 modifiers,
                 ..
-            })) if modifiers.contains(termina::event::KeyModifiers::CONTROL)
+            })) if modifiers.contains(termina::event::Modifiers::CONTROL)
         )
     }
 
@@ -93,7 +95,7 @@ impl Application {
     }
 
     #[cfg(not(windows))]
-    fn apply_reported_theme_mode(&mut self, mode: termina::escape::csi::Mode) -> bool {
+    fn apply_reported_theme_mode(&mut self, mode: termina::escape::csi::ThemeMode) -> bool {
         Self::load_configured_theme(
             &mut self.editor,
             &self.config.load(),
@@ -120,15 +122,17 @@ impl Application {
             redraw: redraw.clone(),
             plugin_events: self.ingress().tx.clone().into(),
         };
-        let mut cx = Self::make_compositor_context(
+        let mut cx = crate::compositor::Context::with_services(
             &mut self.editor,
             &mut self.exit.tasks,
-            self.exit.work.clone(),
-            notifier,
-            ingress,
-            idle_reset,
-            self.plugin_runtime.clone(),
-            self.foreground.clone(),
+            crate::compositor::ContextServices::new(
+                self.exit.work.clone(),
+                notifier,
+                ingress,
+                idle_reset,
+                self.plugin_runtime.clone(),
+                self.foreground.clone(),
+            ),
         );
         let handled = self.compositor.handle_event(&event, &mut cx);
         drop(cx);
@@ -183,7 +187,7 @@ impl Application {
                 self.invalidate(super::FRAME_CONFIG);
             }
             signal_hook::consts::signal::SIGUSR1 => {
-                self.refresh_config();
+                self.handle_config_events(helix_view::editor::ConfigEvent::Refresh);
                 self.invalidate(super::FRAME_CONFIG);
             }
             signal_hook::consts::signal::SIGTERM

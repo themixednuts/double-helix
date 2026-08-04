@@ -92,6 +92,7 @@ fn plugin_config(config: &Config) -> Result<PluginConfig, Error> {
 const SLOW_RENDER_LOG_THRESHOLD: std::time::Duration = std::time::Duration::from_millis(8);
 const SLOW_REDRAW_LAG_THRESHOLD: std::time::Duration = std::time::Duration::from_millis(8);
 const SLOW_LSP_EVENT_THRESHOLD: std::time::Duration = std::time::Duration::from_millis(4);
+const MAX_PENDING_COLLABORATION_DIAGNOSTICS_BYTES: usize = 16 * 1024 * 1024;
 const FRAME_STARTUP: FrameSource = FrameSource::new("application.startup");
 const FRAME_EDITOR: FrameSource = FrameSource::new("application.editor");
 const FRAME_RUNTIME: FrameSource = FrameSource::new("application.runtime");
@@ -104,6 +105,13 @@ const FRAME_SAVE: FrameSource = FrameSource::new("application.save");
 const FRAME_TIMER: FrameSource = FrameSource::new("application.timer");
 const FRAME_EXIT_TASK: FrameSource = FrameSource::new("application.exit-task");
 const FRAME_PRESENTER: FrameSource = FrameSource::new("application.presenter-resync");
+const FRAME_REMOTE: FrameSource = FrameSource::new("application.remote");
+
+enum FramePipelineReady {}
+
+fn should_defer_frame(frames: &FrameScheduler, pipeline_saturated: bool) -> bool {
+    pipeline_saturated && !frames.is_invalidated(FRAME_INPUT)
+}
 
 type Terminal = ratatui_terminal::AppTerminal<TerminalBackend>;
 
@@ -139,6 +147,7 @@ struct IngressState {
 struct TimerState {
     frame: DeadlineTimer,
     idle: DeadlineTimer,
+    host_language_servers: DeadlineTimer,
 }
 
 struct DeadlineTimer {
@@ -234,11 +243,88 @@ struct TerminalState {
     supports_true_color: bool,
     resync: helix_runtime::PulseHandle<terminal_presenter::PresenterResync>,
     resync_rx: helix_runtime::PulseReceiver<terminal_presenter::PresenterResync>,
+    pipeline_ready: helix_runtime::PulseHandle<FramePipelineReady>,
+    pipeline_ready_rx: helix_runtime::PulseReceiver<FramePipelineReady>,
 }
 
 struct LanguageState {
     progress: LspProgressMap,
     diagnostics_generations: std::collections::HashMap<(LanguageServerId, Uri), u64>,
+}
+
+struct CollaborationApplicationSession {
+    host: Option<helix_collab::HostHandle>,
+    hosted: Option<crate::runtime::collaboration::HostedProject>,
+    handle: helix_collab::GuestSessionHandle,
+    updates: helix_runtime::Task<()>,
+    language_servers: Option<helix_runtime::Task<()>>,
+    previous_workspace_backend: Option<helix_view::editor::WorkspaceBackend>,
+    pending_invitation: Option<helix_collab::ConnectCode>,
+    bootstrap_pending: std::collections::HashSet<helix_view::DocumentId>,
+    bootstrap_failed: std::collections::HashSet<helix_view::DocumentId>,
+    host_bindings_pending: std::collections::HashSet<helix_view::DocumentId>,
+    pending_language_servers: Vec<PendingHostLanguageServerRequest>,
+    pending_diagnostics:
+        std::collections::HashMap<(helix_workspace::WorkspacePath, String), Vec<u8>>,
+    pending_diagnostics_bytes: usize,
+}
+
+#[derive(Debug)]
+struct PendingHostLanguageServerRequest {
+    request: helix_collab::HostLanguageServerRequest,
+    document: helix_view::DocumentId,
+    deadline: std::time::Instant,
+}
+
+fn host_language_server_error(
+    code: i64,
+    message: impl Into<String>,
+) -> helix_collab::LanguageServerResponse {
+    helix_collab::LanguageServerResponse {
+        result: Err(helix_collab::LanguageServerError {
+            code,
+            message: message.into(),
+            data: None,
+        }),
+    }
+}
+
+fn host_language_server_result(
+    result: helix_lsp::Result<serde_json::Value>,
+) -> helix_collab::LanguageServerResponse {
+    match result {
+        Ok(value) => match serde_json::to_vec(&value) {
+            Ok(bytes) if bytes.len() <= helix_collab::MAX_LANGUAGE_SERVER_PAYLOAD_BYTES => {
+                helix_collab::LanguageServerResponse {
+                    result: Ok(bytes.into()),
+                }
+            }
+            Ok(_) => host_language_server_error(-32603, "language-server response is too large"),
+            Err(error) => {
+                log::warn!("failed to serialize hosted language-server response: {error}");
+                host_language_server_error(-32603, "host language-server response was invalid")
+            }
+        },
+        Err(helix_lsp::Error::Rpc(error)) => {
+            let data = error.data.and_then(|data| {
+                serde_json::to_vec(&data)
+                    .ok()
+                    .filter(|data| data.len() <= helix_collab::MAX_LANGUAGE_SERVER_PAYLOAD_BYTES)
+                    .map(Into::into)
+            });
+            helix_collab::LanguageServerResponse {
+                result: Err(helix_collab::LanguageServerError {
+                    code: error.code.code(),
+                    message: error.message,
+                    data,
+                }),
+            }
+        }
+        Err(error) => {
+            log::warn!("hosted language-server request failed: {error}");
+            host_language_server_error(-32603, "host language-server request failed")
+        }
+    }
 }
 
 pub struct Application {
@@ -263,6 +349,14 @@ pub struct Application {
     language: LanguageState,
     foreground: crate::runtime::ForegroundEvents,
     plugin_runtime: crate::plugin_registry::PluginRuntime,
+    remote: Option<RemoteApplicationSession>,
+    collaboration: Option<CollaborationApplicationSession>,
+    collaboration_shutdowns: Vec<helix_runtime::Task<()>>,
+}
+
+pub struct RemoteApplicationSession {
+    pub transport: helix_remote::ssh::SshSession,
+    pub workspace: Arc<helix_remote::backend::RemoteWorkspaceClient>,
 }
 
 #[cfg(feature = "integration")]
@@ -299,6 +393,7 @@ impl Application {
         let presenter = terminal_presenter::TerminalPresenter::spawn(
             terminal,
             self.terminal_state.resync.clone(),
+            self.terminal_state.pipeline_ready.clone(),
         );
         let area = presenter.claim().await?;
         self.terminal_state.area = area;
@@ -307,31 +402,10 @@ impl Application {
             self.runtime.work().clone(),
             self.runtime.block().clone(),
             presenter.handle(),
+            self.terminal_state.pipeline_ready.clone(),
         ));
         self.presenter = Some(presenter);
         Ok(())
-    }
-
-    fn make_compositor_context<'a>(
-        editor: &'a mut Editor,
-        exit_tasks: &'a mut ExitTaskSet,
-        exit_task_work: Work,
-        notifier: crate::handlers::local::Notifier,
-        ingress: crate::runtime::RuntimeIngress,
-        idle_reset: crate::runtime::IdleResetHandle,
-        plugin_runtime: crate::plugin_registry::PluginRuntime,
-        foreground: crate::runtime::ForegroundEvents,
-    ) -> crate::compositor::Context<'a> {
-        crate::compositor::Context::with_foreground(
-            editor,
-            exit_tasks,
-            exit_task_work,
-            notifier,
-            ingress,
-            idle_reset,
-            plugin_runtime,
-            foreground,
-        )
     }
 
     pub fn new(
@@ -339,6 +413,16 @@ impl Application {
         config: Config,
         lang_loader: syntax::Loader,
         runtime: Runtime,
+    ) -> Result<Self, Error> {
+        Self::new_with_remote(args, config, lang_loader, runtime, None)
+    }
+
+    pub fn new_with_remote(
+        args: Args,
+        config: Config,
+        lang_loader: syntax::Loader,
+        runtime: Runtime,
+        remote: Option<RemoteApplicationSession>,
     ) -> Result<Self, Error> {
         #[cfg(feature = "integration")]
         setup_integration_logging();
@@ -368,6 +452,7 @@ impl Application {
         let area = terminal.size();
         let supports_true_color = terminal.backend().supports_true_color();
         let mut presenter_resync = helix_runtime::PulseGate::new();
+        let mut pipeline_ready = helix_runtime::PulseGate::new();
         let mut compositor = Compositor::new(area);
         let config = Arc::new(ArcSwap::from_pointee(config));
         let (ingress_tx, ingress_rx) = crate::runtime::RuntimeIngress::channel(runtime.clone());
@@ -382,6 +467,11 @@ impl Application {
             )))
             .handlers(handlers)
             .build();
+        if let Some(remote) = &remote {
+            editor.set_workspace_backend(helix_view::editor::WorkspaceBackend::Remote(
+                remote.workspace.clone(),
+            ));
+        }
         editor
             .lifecycle()
             .set_error_reporter(crate::runtime::status_error_reporter(ingress_tx.clone()));
@@ -395,7 +485,7 @@ impl Application {
         editor.set_assistant_context_registry(helix_view::assistant::context::core_registry());
         crate::effect::refresh_assistant_agent_cache(&editor, ingress_tx.clone());
         let fff_root = find_workspace().0;
-        if fff_root.exists() {
+        if remote.is_none() && fff_root.exists() {
             let fff_config = editor.config().file_picker.clone();
             runtime
                 .block()
@@ -430,7 +520,9 @@ impl Application {
             )?;
         }
         // Initialize OS-native file watcher for auto-reload
-        crate::handlers::auto_reload::setup_file_watcher(&mut editor);
+        if remote.is_none() {
+            crate::handlers::auto_reload::setup_file_watcher(&mut editor);
+        }
 
         Self::load_configured_theme(&mut editor, &config.load(), supports_true_color, theme_mode);
 
@@ -465,7 +557,7 @@ impl Application {
 
             // If the first file is a directory, skip it and open a picker
             if let Some((first, _)) = files_it.next_if(|(p, _)| p.is_dir()) {
-                let picker = ui::file_picker(&editor, first, ingress_tx.clone());
+                let picker = ui::file_picker(&editor, first.into(), ingress_tx.clone())?;
                 compositor.push(Box::new(overlaid(picker)));
             }
 
@@ -580,11 +672,19 @@ impl Application {
 
         let redraw = editor.redraw_handle();
         let plugin_foreground = foreground.clone();
+        let collaboration_ingress = ingress_tx.clone();
         editor.lifecycle().on_document_open(move |event| {
             plugin_foreground.plugin(PluginNotification::BufferOpen {
                 document_id: event.doc,
-                path: Some(event.path.clone()),
+                resource: Some(event.location.to_string()),
             })?;
+            if event.editor.collaboration.is_hosting() {
+                let _ = collaboration_ingress.task(
+                    crate::runtime::RuntimeTaskEvent::CollaborationHostDocumentOpened {
+                        document: event.doc,
+                    },
+                );
+            }
             redraw.request_redraw();
             Ok(())
         });
@@ -598,10 +698,16 @@ impl Application {
         });
 
         let plugin_foreground = foreground.clone();
+        let collaboration_ingress = ingress_tx.clone();
         editor.lifecycle().on_document_close(move |event| {
+            let document = event.doc.id();
             plugin_foreground.plugin(PluginNotification::BufferClosed {
-                document_id: event.doc.id(),
+                document_id: document,
             })?;
+            event.editor.unbind_collaboration_document(document);
+            let _ = collaboration_ingress.task(
+                crate::runtime::RuntimeTaskEvent::CollaborationHostDocumentClosed { document },
+            );
             Ok(())
         });
 
@@ -654,6 +760,7 @@ impl Application {
         let timers = TimerState {
             frame: DeadlineTimer::unarmed(runtime.clock().clone()),
             idle: DeadlineTimer::after(runtime.clock().clone(), idle_timeout),
+            host_language_servers: DeadlineTimer::unarmed(runtime.clock().clone()),
         };
         let app = Self {
             compositor,
@@ -695,6 +802,8 @@ impl Application {
                 supports_true_color,
                 resync: presenter_resync.handle(),
                 resync_rx: presenter_resync.take_receiver(),
+                pipeline_ready: pipeline_ready.handle(),
+                pipeline_ready_rx: pipeline_ready.take_receiver(),
             },
             language: LanguageState {
                 progress: LspProgressMap::new(),
@@ -702,6 +811,9 @@ impl Application {
             },
             foreground,
             plugin_runtime,
+            remote,
+            collaboration: None,
+            collaboration_shutdowns: Vec::new(),
         };
 
         Ok(app)
@@ -709,6 +821,82 @@ impl Application {
 
     pub fn runtime(&self) -> &Runtime {
         &self.runtime
+    }
+
+    fn handle_remote_session_event(&mut self, event: helix_remote::ssh::SshSessionEvent) {
+        use helix_remote::{client::ClientEvent, RemoteLogLevel, ServerEvent};
+
+        match event {
+            helix_remote::ssh::SshSessionEvent::Diagnostic(line) => {
+                log::warn!(target: "helix_remote_ssh", "{line}");
+            }
+            helix_remote::ssh::SshSessionEvent::Exited(status) => {
+                let message = format!("Remote SSH process exited with {status}");
+                log::warn!(target: "helix_remote_ssh", "{message}");
+            }
+            helix_remote::ssh::SshSessionEvent::Reconnecting { attempt } => {
+                let message = format!("Reconnecting remote workspace (attempt {attempt})");
+                log::info!(target: "helix_remote_ssh", "{message}");
+                if !self.editor.should_close() {
+                    self.editor.notify_warning(message);
+                }
+            }
+            helix_remote::ssh::SshSessionEvent::ReconnectFailed {
+                attempt,
+                error,
+                retry_in,
+            } => {
+                log::warn!(
+                    target: "helix_remote_ssh",
+                    "remote reconnect attempt {attempt} failed: {error}; retrying in {retry_in:?}"
+                );
+            }
+            helix_remote::ssh::SshSessionEvent::Reconnected => {
+                log::info!(target: "helix_remote_ssh", "remote workspace reconnected");
+                if !self.editor.should_close() {
+                    self.editor.notify_info("Remote workspace reconnected");
+                }
+            }
+            helix_remote::ssh::SshSessionEvent::Remote(ClientEvent::TransportLog(message)) => {
+                log::debug!(target: "helix_remote", "{message}");
+            }
+            helix_remote::ssh::SshSessionEvent::Remote(ClientEvent::Remote(event)) => {
+                let routed = self
+                    .remote
+                    .as_ref()
+                    .is_some_and(|remote| remote.workspace.route_event(&event));
+                match event {
+                    ServerEvent::Log(remote) => match remote.level {
+                        RemoteLogLevel::Error => {
+                            log::error!(target: "helix_remote", "{}: {}", remote.target, remote.message)
+                        }
+                        RemoteLogLevel::Warn => {
+                            log::warn!(target: "helix_remote", "{}: {}", remote.target, remote.message)
+                        }
+                        RemoteLogLevel::Info => {
+                            log::info!(target: "helix_remote", "{}: {}", remote.target, remote.message)
+                        }
+                        RemoteLogLevel::Debug => {
+                            log::debug!(target: "helix_remote", "{}: {}", remote.target, remote.message)
+                        }
+                        RemoteLogLevel::Trace => {
+                            log::trace!(target: "helix_remote", "{}: {}", remote.target, remote.message)
+                        }
+                    },
+                    ServerEvent::WorkspaceInvalidated { reason } => {
+                        self.editor
+                            .notify_error(format!("Remote workspace invalidated: {reason}"));
+                    }
+                    ServerEvent::SearchBatch(_) if routed => {}
+                    ServerEvent::SearchBatch(_)
+                    | ServerEvent::FileChanges(_)
+                    | ServerEvent::ProcessOutput(_)
+                    | ServerEvent::ProcessExited(_) => {
+                        log::trace!(target: "helix_remote", "remote capability event received");
+                    }
+                }
+            }
+        }
     }
 
     /// Clone of the typed ingress for deliveries into the main loop.
@@ -744,8 +932,1022 @@ impl Application {
         log::trace!("runtime timer fired: {:?}", id);
     }
 
+    fn install_collaboration(&mut self, launch: crate::runtime::collaboration::Launch) {
+        if self.collaboration.is_some() {
+            self.editor
+                .notify_warning("Leave the current collaboration session before starting another");
+            return;
+        }
+
+        let crate::runtime::collaboration::Launch {
+            mut session,
+            host,
+            invitation,
+            hosted,
+            language_servers,
+        } = launch;
+        let joined_project = host.is_none();
+        let handle = session.handle();
+        let previous_workspace_backend = joined_project.then(|| {
+            std::mem::replace(
+                &mut self.editor.workspace_backend,
+                helix_view::editor::WorkspaceBackend::Collaboration(handle.clone()),
+            )
+        });
+        self.editor
+            .attach_collaboration_session(handle.clone(), !joined_project);
+        let ingress = self.ingress.tx.clone();
+        let updates = self.runtime.work().spawn(async move {
+            while let Some(update) = session.next_update().await {
+                if ingress.collaboration_update(update).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let language_servers = language_servers.map(|mut requests| {
+            let ingress = self.ingress.tx.clone();
+            self.runtime.work().spawn(async move {
+                while let Some(request) = requests.recv().await {
+                    if ingress
+                        .send_task(
+                            crate::runtime::RuntimeTaskEvent::CollaborationHostLanguageServerRequest(
+                                request,
+                            ),
+                        )
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            })
+        });
+        self.collaboration = Some(CollaborationApplicationSession {
+            host,
+            hosted,
+            handle,
+            updates,
+            language_servers,
+            previous_workspace_backend,
+            pending_invitation: invitation,
+            bootstrap_pending: std::collections::HashSet::new(),
+            bootstrap_failed: std::collections::HashSet::new(),
+            host_bindings_pending: std::collections::HashSet::new(),
+            pending_language_servers: Vec::new(),
+            pending_diagnostics: std::collections::HashMap::new(),
+            pending_diagnostics_bytes: 0,
+        });
+        self.editor.notify_info("Collaboration session connected");
+        if joined_project {
+            let root = helix_view::editor::WorkspaceDocumentPath::Collaboration {
+                project: self
+                    .collaboration
+                    .as_ref()
+                    .expect("installed collaboration disappeared")
+                    .handle
+                    .project()
+                    .id,
+                path: helix_remote::WorkspacePath::root(),
+            };
+            match crate::ui::file_picker(&self.editor, root, self.ingress.tx.clone()) {
+                Ok(picker) => self
+                    .compositor
+                    .push(Box::new(crate::ui::overlay::overlaid(picker))),
+                Err(error) => self
+                    .editor
+                    .set_error(format!("Failed to open collaboration file picker: {error}")),
+            }
+        } else {
+            let documents = self.editor.document_ids().collect::<Vec<_>>();
+            for document in documents {
+                self.start_host_document_binding(document, true);
+            }
+            self.publish_host_invitation_if_ready();
+        }
+    }
+
+    fn start_host_document_binding(
+        &mut self,
+        document: helix_view::DocumentId,
+        bootstrap: bool,
+    ) -> bool {
+        let Some((project, handle, hosted)) = self.collaboration.as_ref().and_then(|session| {
+            session.hosted.as_ref().map(|hosted| {
+                (
+                    session.handle.project().id,
+                    session.handle.clone(),
+                    hosted.clone(),
+                )
+            })
+        }) else {
+            return false;
+        };
+        let Some(path) = self
+            .editor
+            .document(document)
+            .and_then(|doc| doc.location())
+            .and_then(|location| hosted.document_path(location))
+        else {
+            return false;
+        };
+        if !self.editor.collaboration.begin_host_binding(document) {
+            return false;
+        }
+        if bootstrap {
+            self.collaboration
+                .as_mut()
+                .expect("collaboration disappeared while binding a host document")
+                .bootstrap_pending
+                .insert(document);
+        }
+        self.collaboration
+            .as_mut()
+            .expect("collaboration disappeared while binding a host document")
+            .host_bindings_pending
+            .insert(document);
+        let ingress = self.ingress.tx.clone();
+        self.runtime
+            .work()
+            .spawn(async move {
+                let result = handle
+                    .open(path.clone())
+                    .await
+                    .map_err(|error| error.to_string());
+                let _ = ingress
+                    .send_task(
+                        crate::runtime::RuntimeTaskEvent::CollaborationHostBufferOpened {
+                            project,
+                            document,
+                            path,
+                            result,
+                        },
+                    )
+                    .await;
+            })
+            .detach();
+        true
+    }
+
+    fn finish_host_document_binding(
+        &mut self,
+        project: helix_collab::ProjectId,
+        document: helix_view::DocumentId,
+        path: helix_workspace::WorkspacePath,
+        result: Result<helix_collab::OpenedBuffer, String>,
+    ) {
+        let Some((current_project, handle, hosted)) =
+            self.collaboration.as_ref().and_then(|session| {
+                session.hosted.as_ref().map(|hosted| {
+                    (
+                        session.handle.project().id,
+                        session.handle.clone(),
+                        hosted.clone(),
+                    )
+                })
+            })
+        else {
+            return;
+        };
+        if current_project != project {
+            return;
+        }
+        let was_bootstrap = self
+            .collaboration
+            .as_ref()
+            .expect("collaboration disappeared while finishing a host binding")
+            .bootstrap_pending
+            .contains(&document);
+        let current_path = self
+            .editor
+            .document(document)
+            .and_then(|doc| doc.location())
+            .and_then(|location| hosted.document_path(location));
+        if current_path.as_ref() != Some(&path) {
+            self.editor.collaboration.cancel_host_binding(document);
+            if let Some(session) = self.collaboration.as_mut() {
+                session.host_bindings_pending.remove(&document);
+            }
+            if current_path.is_some() {
+                self.start_host_document_binding(document, was_bootstrap);
+            } else if let Some(session) = self.collaboration.as_mut() {
+                session.bootstrap_pending.remove(&document);
+            }
+            self.publish_host_invitation_if_ready();
+            return;
+        }
+        match result {
+            Ok(opened) => {
+                let text = self
+                    .editor
+                    .document(document)
+                    .expect("host document disappeared after its path was checked")
+                    .text()
+                    .to_string();
+                if self
+                    .editor
+                    .bind_collaboration_buffer(document, opened.buffer, path)
+                    && text != opened.text
+                {
+                    handle.queue_snapshot(opened.buffer, text);
+                }
+                if let Some(session) = self.collaboration.as_mut() {
+                    session.bootstrap_failed.remove(&document);
+                }
+                let ingress = self.ingress.tx.clone();
+                self.runtime
+                    .work()
+                    .spawn(async move {
+                        let result = handle
+                            .flush(opened.buffer)
+                            .await
+                            .map_err(|error| error.to_string());
+                        let _ = ingress
+                            .send_task(
+                                crate::runtime::RuntimeTaskEvent::CollaborationHostBufferReady {
+                                    project,
+                                    document,
+                                    result,
+                                },
+                            )
+                            .await;
+                    })
+                    .detach();
+                return;
+            }
+            Err(error) => {
+                self.editor.collaboration.cancel_host_binding(document);
+                if let Some(session) = self.collaboration.as_mut() {
+                    session.host_bindings_pending.remove(&document);
+                }
+                if was_bootstrap {
+                    let session = self
+                        .collaboration
+                        .as_mut()
+                        .expect("collaboration disappeared while recording bootstrap failure");
+                    session.bootstrap_pending.remove(&document);
+                    session.bootstrap_failed.insert(document);
+                }
+                self.editor
+                    .notify_error(format!("Could not share an open document: {error}"));
+            }
+        }
+        self.publish_host_invitation_if_ready();
+    }
+
+    fn host_buffer_ready(
+        &mut self,
+        project: helix_collab::ProjectId,
+        document: helix_view::DocumentId,
+        result: Result<(), String>,
+    ) {
+        let Some(session) = self
+            .collaboration
+            .as_mut()
+            .filter(|session| session.handle.project().id == project)
+        else {
+            return;
+        };
+        let was_bootstrap = session.bootstrap_pending.remove(&document);
+        session.host_bindings_pending.remove(&document);
+        match result {
+            Ok(()) => {
+                session.bootstrap_failed.remove(&document);
+            }
+            Err(error) => {
+                if was_bootstrap {
+                    session.bootstrap_failed.insert(document);
+                }
+                self.editor.unbind_collaboration_document(document);
+                self.editor.notify_error(format!(
+                    "Could not synchronize an open document for sharing: {error}"
+                ));
+            }
+        }
+        self.publish_host_invitation_if_ready();
+        self.drive_host_language_server_requests();
+    }
+
+    fn host_document_closed(&mut self, document: helix_view::DocumentId) {
+        if let Some(session) = self.collaboration.as_mut() {
+            session.bootstrap_pending.remove(&document);
+            session.bootstrap_failed.remove(&document);
+            session.host_bindings_pending.remove(&document);
+            let mut retained = Vec::with_capacity(session.pending_language_servers.len());
+            for pending in session.pending_language_servers.drain(..) {
+                if pending.document == document {
+                    pending.request.respond(host_language_server_error(
+                        -32603,
+                        "host document closed before the language-server request completed",
+                    ));
+                } else {
+                    retained.push(pending);
+                }
+            }
+            session.pending_language_servers = retained;
+        }
+        self.arm_host_language_server_deadline();
+        self.publish_host_invitation_if_ready();
+    }
+
+    fn handle_host_language_server_request(
+        &mut self,
+        request: helix_collab::HostLanguageServerRequest,
+    ) {
+        if request.is_canceled() {
+            return;
+        }
+        let Some(hosted) = self
+            .collaboration
+            .as_ref()
+            .and_then(|session| session.hosted.clone())
+        else {
+            request.respond(host_language_server_error(
+                -32603,
+                "collaboration host is unavailable",
+            ));
+            return;
+        };
+        let workspace_path = hosted.workspace_document_path(&request.path);
+        if let Some(document) = self.editor.document_id_by_workspace_path(&workspace_path) {
+            self.queue_host_language_server_request(request, document);
+            return;
+        }
+
+        let work = self.editor.prepare_workspace_document_open(
+            workspace_path,
+            helix_view::editor::DocumentOpenRole::Background,
+        );
+        let block = self.runtime.block().clone();
+        let ingress = self.ingress.tx.clone();
+        self.runtime
+            .work()
+            .spawn(async move {
+                let result = match work {
+                    helix_view::editor::WorkspaceDocumentOpenWork::Local(work) => block
+                        .spawn(move || {
+                            work.execute()
+                                .map(helix_view::editor::PreparedWorkspaceDocumentOpen::Local)
+                        })
+                        .await
+                        .map_err(|error| error.to_string())
+                        .and_then(|result| result.map_err(|error| error.to_string())),
+                    helix_view::editor::WorkspaceDocumentOpenWork::Remote(work) => work
+                        .execute(tokio_util::sync::CancellationToken::new(), false)
+                        .await
+                        .map(helix_view::editor::PreparedWorkspaceDocumentOpen::Remote)
+                        .map_err(|error| error.to_string()),
+                    helix_view::editor::WorkspaceDocumentOpenWork::Collaboration(_) => Err(
+                        "a collaboration host cannot source documents from another collaboration"
+                            .to_owned(),
+                    ),
+                    helix_view::editor::WorkspaceDocumentOpenWork::Failed { error, .. } => {
+                        Err(error.to_string())
+                    }
+                };
+                let _ = ingress
+                    .send_task(
+                        crate::runtime::RuntimeTaskEvent::CollaborationHostLanguageServerDocumentOpened {
+                            request,
+                            result: Box::new(result),
+                        },
+                    )
+                    .await;
+            })
+            .detach();
+    }
+
+    fn finish_host_language_server_document_open(
+        &mut self,
+        mut request: helix_collab::HostLanguageServerRequest,
+        result: Result<helix_view::editor::PreparedWorkspaceDocumentOpen, String>,
+    ) {
+        if request.is_canceled() {
+            return;
+        }
+        let Some(hosted) = self
+            .collaboration
+            .as_ref()
+            .and_then(|session| session.hosted.clone())
+        else {
+            request.respond(host_language_server_error(
+                -32603,
+                "collaboration host is unavailable",
+            ));
+            return;
+        };
+        let workspace_path = hosted.workspace_document_path(&request.path);
+        if let Some(document) = self.editor.document_id_by_workspace_path(&workspace_path) {
+            self.queue_host_language_server_request(request, document);
+            return;
+        }
+        let mut prepared = match result {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                log::warn!(
+                    "failed to open host document for collaboration language server: {error}"
+                );
+                request.respond(host_language_server_error(
+                    -32603,
+                    "host could not open the requested document",
+                ));
+                return;
+            }
+        };
+        prepared.replace_initial_text(std::mem::take(&mut request.text));
+        let document = self
+            .editor
+            .apply_prepared_workspace_document_open(prepared, helix_view::editor::Action::Load);
+        if !self
+            .editor
+            .bind_collaboration_buffer(document, request.buffer, request.path.clone())
+        {
+            request.respond(host_language_server_error(
+                -32603,
+                "host document disappeared while binding collaboration state",
+            ));
+            return;
+        }
+        self.queue_host_language_server_request(request, document);
+    }
+
+    fn queue_host_language_server_request(
+        &mut self,
+        mut request: helix_collab::HostLanguageServerRequest,
+        document: helix_view::DocumentId,
+    ) {
+        if request.is_canceled() {
+            return;
+        }
+        request.text.clear();
+        let Some(doc) = self.editor.document(document) else {
+            request.respond(host_language_server_error(
+                -32603,
+                "host document is unavailable",
+            ));
+            return;
+        };
+        let configured = doc.language_configuration().is_some_and(|language| {
+            language
+                .language_servers
+                .iter()
+                .any(|server| server.name == request.server)
+        });
+        if !configured {
+            request.respond(host_language_server_error(
+                -32601,
+                "language server is not configured for this document",
+            ));
+            return;
+        }
+
+        match self.editor.collaboration.buffer(document) {
+            Some(buffer) if buffer != request.buffer => {
+                request.respond(host_language_server_error(
+                    -32603,
+                    "host document is bound to a different collaboration buffer",
+                ));
+                return;
+            }
+            Some(_) => {}
+            None => {
+                self.start_host_document_binding(document, false);
+            }
+        }
+        if self
+            .editor
+            .document(document)
+            .and_then(|doc| doc.language_server_by_name(&request.server))
+            .is_some()
+            && !self
+                .collaboration
+                .as_ref()
+                .is_some_and(|session| session.host_bindings_pending.contains(&document))
+        {
+            self.execute_host_language_server_request(request, document);
+            return;
+        }
+        self.editor.refresh_language_servers(document);
+        let Some(session) = self.collaboration.as_mut() else {
+            request.respond(host_language_server_error(
+                -32603,
+                "collaboration host is unavailable",
+            ));
+            return;
+        };
+        let deadline = self
+            .runtime
+            .clock()
+            .deadline_after(helix_collab::LANGUAGE_SERVER_REQUEST_TIMEOUT);
+        session
+            .pending_language_servers
+            .push(PendingHostLanguageServerRequest {
+                request,
+                document,
+                deadline,
+            });
+        self.arm_host_language_server_deadline();
+    }
+
+    fn drive_host_language_server_requests(&mut self) {
+        let Some(session) = self.collaboration.as_mut() else {
+            self.timers.host_language_servers.disarm();
+            return;
+        };
+        let now = self.runtime.clock().now();
+        let pending = std::mem::take(&mut session.pending_language_servers);
+        let mut retained = Vec::with_capacity(pending.len());
+        for pending in pending {
+            if pending.request.is_canceled() {
+                continue;
+            }
+            if pending.deadline <= now {
+                pending.request.respond(host_language_server_error(
+                    -32000,
+                    "host language-server request timed out",
+                ));
+                continue;
+            }
+            let Some(doc) = self.editor.document(pending.document) else {
+                pending.request.respond(host_language_server_error(
+                    -32603,
+                    "host document is unavailable",
+                ));
+                continue;
+            };
+            if self.editor.collaboration.buffer(pending.document) != Some(pending.request.buffer) {
+                if self.collaboration.as_ref().is_some_and(|session| {
+                    session.host_bindings_pending.contains(&pending.document)
+                }) {
+                    retained.push(pending);
+                } else {
+                    pending.request.respond(host_language_server_error(
+                        -32603,
+                        "host document collaboration binding failed",
+                    ));
+                }
+                continue;
+            }
+            if doc
+                .language_server_by_name(&pending.request.server)
+                .is_none()
+            {
+                retained.push(pending);
+                continue;
+            }
+            self.execute_host_language_server_request(pending.request, pending.document);
+        }
+        if let Some(session) = self.collaboration.as_mut() {
+            session.pending_language_servers.extend(retained);
+        } else {
+            for pending in retained {
+                pending.request.respond(host_language_server_error(
+                    -32603,
+                    "collaboration host is unavailable",
+                ));
+            }
+        }
+        self.arm_host_language_server_deadline();
+    }
+
+    fn arm_host_language_server_deadline(&mut self) {
+        let deadline = self.collaboration.as_ref().and_then(|session| {
+            session
+                .pending_language_servers
+                .iter()
+                .map(|pending| pending.deadline)
+                .min()
+        });
+        match deadline {
+            Some(deadline) => self.timers.host_language_servers.arm_at(deadline),
+            None => self.timers.host_language_servers.disarm(),
+        }
+    }
+
+    fn execute_host_language_server_request(
+        &mut self,
+        mut request: helix_collab::HostLanguageServerRequest,
+        document: helix_view::DocumentId,
+    ) {
+        let Some((client, hosted)) = self.editor.document(document).and_then(|doc| {
+            let client = doc.language_server_by_name(&request.server)?.clone();
+            let hosted = self
+                .collaboration
+                .as_ref()
+                .and_then(|session| session.hosted.clone())?;
+            Some((client, hosted))
+        }) else {
+            request.respond(host_language_server_error(
+                -32603,
+                "host language server is unavailable",
+            ));
+            return;
+        };
+        let method = std::mem::take(&mut request.method);
+        let params = std::mem::take(&mut request.params);
+        request.text.clear();
+        self.runtime
+            .work()
+            .spawn(async move {
+                let operation = async {
+                    let mut params = serde_json::from_slice(&params).map_err(|error| {
+                        helix_lsp::Error::Rpc(helix_lsp::jsonrpc::Error::invalid_params(
+                            error.to_string(),
+                        ))
+                    })?;
+                    hosted
+                        .rewrite_language_server_request(&mut params)
+                        .map_err(|error| {
+                            helix_lsp::Error::Rpc(helix_lsp::jsonrpc::Error::invalid_params(error))
+                        })?;
+                    client.wait_until_initialized().await?;
+                    let mut result = if method == "initialize" {
+                        serde_json::json!({ "capabilities": client.capabilities() })
+                    } else {
+                        client.call_custom(method, params).await?
+                    };
+                    hosted
+                        .rewrite_language_server_response(&mut result)
+                        .map_err(|error| helix_lsp::Error::Other(anyhow::Error::msg(error)))?;
+                    Ok(result)
+                };
+                tokio::select! {
+                    biased;
+                    _ = request.canceled() => {}
+                    result = operation => request.respond(host_language_server_result(result)),
+                }
+            })
+            .detach();
+    }
+
+    fn queue_collaboration_language_server_diagnostics(
+        &mut self,
+        diagnostics: helix_collab::LanguageServerDiagnostics,
+    ) {
+        if diagnostics.params.len() > helix_collab::MAX_LANGUAGE_SERVER_PAYLOAD_BYTES {
+            log::warn!("discarding oversized collaboration diagnostics payload");
+            return;
+        }
+        let Some(session) = self
+            .collaboration
+            .as_mut()
+            .filter(|session| session.hosted.is_none())
+        else {
+            return;
+        };
+        let key = (diagnostics.path, diagnostics.server);
+        let params = diagnostics.params.into_vec();
+        if let Some(replaced) = session.pending_diagnostics.insert(key.clone(), params) {
+            session.pending_diagnostics_bytes = session
+                .pending_diagnostics_bytes
+                .saturating_sub(replaced.len());
+        }
+        session.pending_diagnostics_bytes = session.pending_diagnostics.get(&key).map_or(
+            session.pending_diagnostics_bytes,
+            |params| {
+                session
+                    .pending_diagnostics_bytes
+                    .saturating_add(params.len())
+            },
+        );
+        while session.pending_diagnostics_bytes > MAX_PENDING_COLLABORATION_DIAGNOSTICS_BYTES {
+            let evicted = session
+                .pending_diagnostics
+                .keys()
+                .find(|candidate| **candidate != key)
+                .cloned()
+                .or_else(|| session.pending_diagnostics.keys().next().cloned());
+            let Some(evicted) = evicted else {
+                break;
+            };
+            if let Some(params) = session.pending_diagnostics.remove(&evicted) {
+                session.pending_diagnostics_bytes = session
+                    .pending_diagnostics_bytes
+                    .saturating_sub(params.len());
+            }
+        }
+        self.drive_collaboration_language_server_diagnostics();
+    }
+
+    fn drive_collaboration_language_server_diagnostics(&mut self) {
+        let Some(session) = self
+            .collaboration
+            .as_ref()
+            .filter(|session| session.hosted.is_none())
+        else {
+            return;
+        };
+        let project = session.handle.project().id;
+        let ready = session
+            .pending_diagnostics
+            .keys()
+            .filter(|(path, server)| {
+                let path = helix_view::editor::WorkspaceDocumentPath::Collaboration {
+                    project,
+                    path: path.clone(),
+                };
+                self.editor
+                    .document_id_by_workspace_path(&path)
+                    .and_then(|document| self.editor.document(document))
+                    .and_then(|document| document.language_server_by_name(server))
+                    .is_some()
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+
+        for (path, server) in ready {
+            let Some(params) = self.collaboration.as_mut().and_then(|session| {
+                session
+                    .pending_diagnostics
+                    .remove(&(path.clone(), server.clone()))
+            }) else {
+                continue;
+            };
+            if let Some(session) = self.collaboration.as_mut() {
+                session.pending_diagnostics_bytes = session
+                    .pending_diagnostics_bytes
+                    .saturating_sub(params.len());
+            }
+            let blocking = self.runtime.block().spawn(move || {
+                serde_json::from_slice::<lsp_types::PublishDiagnosticsParams>(&params)
+                    .map_err(|error| error.to_string())
+            });
+            let ingress = self.ingress.tx.clone();
+            self.runtime
+                .work()
+                .spawn(async move {
+                    let result = match blocking.await {
+                        Ok(result) => result,
+                        Err(error) => Err(error.to_string()),
+                    };
+                    let _ = ingress
+                        .send_task(
+                            crate::runtime::RuntimeTaskEvent::CollaborationLanguageServerDiagnosticsParsed {
+                                project,
+                                path,
+                                server,
+                                result,
+                            },
+                        )
+                        .await;
+                })
+                .detach();
+        }
+    }
+
+    fn apply_collaboration_language_server_diagnostics(
+        &mut self,
+        project: helix_collab::ProjectId,
+        path: helix_workspace::WorkspacePath,
+        server: String,
+        result: Result<lsp_types::PublishDiagnosticsParams, String>,
+    ) {
+        let Some(_session) = self
+            .collaboration
+            .as_ref()
+            .filter(|session| session.hosted.is_none() && session.handle.project().id == project)
+        else {
+            return;
+        };
+        let params = match result {
+            Ok(params) => params,
+            Err(error) => {
+                log::warn!("discarding malformed collaboration diagnostics: {error}");
+                return;
+            }
+        };
+        let path = helix_view::editor::WorkspaceDocumentPath::Collaboration { project, path };
+        let Some(document) = self.editor.document_id_by_workspace_path(&path) else {
+            return;
+        };
+        let Some((server_id, expected_uri)) = self.editor.document(document).and_then(|document| {
+            Some((
+                document.language_server_by_name(&server)?.id(),
+                document.url()?,
+            ))
+        }) else {
+            return;
+        };
+        if params.uri != expected_uri {
+            log::warn!("discarding collaboration diagnostics with a mismatched document URI");
+            return;
+        }
+        self.queue_lsp_diagnostics(server_id, params);
+    }
+
+    fn publish_host_invitation_if_ready(&mut self) {
+        let invitation = self.collaboration.as_mut().and_then(|session| {
+            (session.bootstrap_pending.is_empty() && session.bootstrap_failed.is_empty())
+                .then(|| session.pending_invitation.take())
+                .flatten()
+        });
+        if let Some(invitation) = invitation {
+            self.copy_collaboration_invitation(invitation);
+        }
+    }
+
+    fn stop_collaboration(&mut self) {
+        let Some(session) = self.collaboration.take() else {
+            self.editor
+                .notify_warning("No collaboration session is active");
+            return;
+        };
+        let CollaborationApplicationSession {
+            host,
+            hosted: _,
+            handle,
+            updates,
+            language_servers,
+            previous_workspace_backend,
+            pending_invitation: _,
+            bootstrap_pending: _,
+            bootstrap_failed: _,
+            host_bindings_pending: _,
+            pending_language_servers,
+            pending_diagnostics: _,
+            pending_diagnostics_bytes: _,
+        } = session;
+        for pending in pending_language_servers {
+            pending.request.respond(host_language_server_error(
+                -32603,
+                "collaboration host is shutting down",
+            ));
+        }
+        self.timers.host_language_servers.disarm();
+        self.editor.detach_collaboration_session();
+        if let Some(previous) = previous_workspace_backend {
+            self.editor.set_workspace_backend(previous);
+        }
+        let shutdown = self.runtime.work().spawn(async move {
+            if let Err(error) = handle.leave().await {
+                log::warn!("failed to leave collaboration session cleanly: {error}");
+            }
+            let _ = updates.await;
+            if let Some(host) = host {
+                if let Err(error) = host.shutdown().await {
+                    log::warn!("failed to shut down collaboration host cleanly: {error}");
+                }
+            }
+            if let Some(language_servers) = language_servers {
+                let _ = language_servers.await;
+            }
+        });
+        self.collaboration_shutdowns.push(shutdown);
+        self.editor.notify_info("Collaboration session closed");
+    }
+
+    fn copy_collaboration_invitation(&mut self, code: helix_collab::ConnectCode) {
+        use helix_view::clipboard::ClipboardType;
+
+        let code = code.to_string();
+        let _ = self.editor.registers.write('"', vec![code.clone()]);
+        let provider = self.editor.config().clipboard_provider.clone();
+        let copy = self
+            .runtime
+            .block()
+            .spawn(move || provider.set_contents(&code, ClipboardType::Clipboard));
+        let ingress = self.ingress.tx.clone();
+        self.runtime
+            .work()
+            .spawn(async move {
+                let result = match copy.await {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(error)) => Err(error.to_string()),
+                    Err(error) => Err(error.to_string()),
+                };
+                let _ = ingress
+                    .send_task(
+                        crate::runtime::RuntimeTaskEvent::CollaborationInvitationCopied(result),
+                    )
+                    .await;
+            })
+            .detach();
+    }
+
     fn handle_runtime_task(&mut self, task: crate::runtime::RuntimeTaskEvent) {
         let task = match task {
+            crate::runtime::RuntimeTaskEvent::CollaborationHostDocumentOpened { document } => {
+                self.start_host_document_binding(document, false);
+                return;
+            }
+            crate::runtime::RuntimeTaskEvent::CollaborationHostDocumentClosed { document } => {
+                self.host_document_closed(document);
+                return;
+            }
+            crate::runtime::RuntimeTaskEvent::CollaborationHostBufferOpened {
+                project,
+                document,
+                path,
+                result,
+            } => {
+                self.finish_host_document_binding(project, document, path, result);
+                return;
+            }
+            crate::runtime::RuntimeTaskEvent::CollaborationHostBufferReady {
+                project,
+                document,
+                result,
+            } => {
+                self.host_buffer_ready(project, document, result);
+                return;
+            }
+            crate::runtime::RuntimeTaskEvent::CollaborationHostLanguageServerRequest(request) => {
+                self.handle_host_language_server_request(request);
+                return;
+            }
+            crate::runtime::RuntimeTaskEvent::CollaborationHostLanguageServerDocumentOpened {
+                request,
+                result,
+            } => {
+                self.finish_host_language_server_document_open(request, *result);
+                return;
+            }
+            crate::runtime::RuntimeTaskEvent::CollaborationLanguageServerDiagnosticsParsed {
+                project,
+                path,
+                server,
+                result,
+            } => {
+                self.apply_collaboration_language_server_diagnostics(project, path, server, result);
+                return;
+            }
+            crate::runtime::RuntimeTaskEvent::Collaboration(
+                helix_collab::GuestSessionUpdate::LanguageServerDiagnostics(diagnostics),
+            ) => {
+                self.queue_collaboration_language_server_diagnostics(diagnostics);
+                return;
+            }
+            crate::runtime::RuntimeTaskEvent::Collaboration(
+                helix_collab::GuestSessionUpdate::LanguageServerRefresh(refresh),
+            ) => {
+                self.apply_collaboration_language_server_refresh(refresh);
+                return;
+            }
+            crate::runtime::RuntimeTaskEvent::Collaboration(update) => {
+                let project = self
+                    .collaboration
+                    .as_ref()
+                    .map(|session| session.handle.project().id);
+                let refresh_files = matches!(
+                    &update,
+                    helix_collab::GuestSessionUpdate::FilesChanged { .. }
+                        | helix_collab::GuestSessionUpdate::WorktreeChanged { .. }
+                        | helix_collab::GuestSessionUpdate::ProjectState(_)
+                );
+                let refresh_participants = matches!(
+                    &update,
+                    helix_collab::GuestSessionUpdate::ProjectState(_)
+                        | helix_collab::GuestSessionUpdate::ParticipantJoined(_)
+                        | helix_collab::GuestSessionUpdate::ParticipantLeft(_)
+                        | helix_collab::GuestSessionUpdate::RoleChanged { .. }
+                        | helix_collab::GuestSessionUpdate::Connection(
+                            helix_collab::ConnectionState::Connected(_)
+                        )
+                );
+                self.editor.apply_collaboration_update(update);
+                self.drive_collaboration_language_server_diagnostics();
+                if let Some(project) = project.filter(|_| refresh_files) {
+                    self.compositor.refresh_picker(
+                        &mut self.editor,
+                        crate::ui::picker::PickerRefreshScope::CollaborationFiles(project),
+                    );
+                    self.handle_runtime_ui_command(crate::runtime::UiCommand::FileExplorer(
+                        crate::runtime::FileExplorerCommand::RefreshCollaboration { project },
+                    ));
+                }
+                if let Some(project) = project.filter(|_| refresh_participants) {
+                    self.compositor.refresh_picker(
+                        &mut self.editor,
+                        crate::ui::picker::PickerRefreshScope::CollaborationParticipants(project),
+                    );
+                }
+                return;
+            }
+            crate::runtime::RuntimeTaskEvent::CollaborationStarted(launch) => {
+                self.install_collaboration(launch);
+                return;
+            }
+            crate::runtime::RuntimeTaskEvent::CollaborationStop => {
+                self.stop_collaboration();
+                return;
+            }
+            crate::runtime::RuntimeTaskEvent::CollaborationInvitation(code) => {
+                self.copy_collaboration_invitation(code);
+                return;
+            }
+            crate::runtime::RuntimeTaskEvent::CollaborationInvitationCopied(result) => {
+                match result {
+                    Ok(()) => {
+                        self.editor
+                            .notify_info("Collaboration invitation copied to clipboard");
+                    }
+                    Err(error) => {
+                        self.editor.notify_warning(format!(
+                            "Could not copy collaboration invitation: {error}. It is in the unnamed register"
+                        ));
+                    }
+                }
+                return;
+            }
             crate::runtime::RuntimeTaskEvent::ApplyConfigReload(prepared) => {
                 self.apply_prepared_config_reload(prepared);
                 return;
@@ -789,11 +1991,16 @@ impl Application {
             }
         }
         let ingress = self.ingress().tx.clone();
+        let hosted = self
+            .collaboration
+            .as_ref()
+            .and_then(|session| session.hosted.clone());
         crate::effect::apply_runtime_task_event(
             &mut self.editor,
             ingress,
             self.foreground.clone(),
             self.plugin_runtime.clone(),
+            hosted,
             task,
         );
     }
@@ -843,15 +2050,17 @@ impl Application {
             redraw: self.editor.redraw_handle(),
             plugin_events: self.ingress.tx.clone().into(),
         };
-        let mut context = Self::make_compositor_context(
+        let mut context = crate::compositor::Context::with_services(
             &mut self.editor,
             &mut self.exit.tasks,
-            self.exit.work.clone(),
-            notifier,
-            self.ingress.tx.clone(),
-            self.ingress.idle_reset.clone(),
-            self.plugin_runtime.clone(),
-            self.foreground.clone(),
+            crate::compositor::ContextServices::new(
+                self.exit.work.clone(),
+                notifier,
+                self.ingress.tx.clone(),
+                self.ingress.idle_reset.clone(),
+                self.plugin_runtime.clone(),
+                self.foreground.clone(),
+            ),
         );
         crate::runtime::apply_ui_command(&mut self.compositor, &mut context, cmd);
     }
@@ -987,15 +2196,17 @@ impl Application {
             redraw: redraw.clone(),
             plugin_events: self.ingress().tx.clone().into(),
         };
-        let mut cx = Self::make_compositor_context(
+        let mut cx = crate::compositor::Context::with_services(
             &mut self.editor,
             &mut self.exit.tasks,
-            self.exit.work.clone(),
-            notifier,
-            ingress,
-            idle_reset,
-            self.plugin_runtime.clone(),
-            self.foreground.clone(),
+            crate::compositor::ContextServices::new(
+                self.exit.work.clone(),
+                notifier,
+                ingress,
+                idle_reset,
+                self.plugin_runtime.clone(),
+                self.foreground.clone(),
+            ),
         );
 
         cx.editor.clear_redraw_request();
@@ -1109,6 +2320,15 @@ impl Application {
             self.frames.invalidate(FRAME_EDITOR);
         }
 
+        let pipeline_saturated = self
+            .renderer
+            .as_ref()
+            .is_some_and(render_actor::RenderActor::is_saturated);
+        if should_defer_frame(&self.frames, pipeline_saturated) {
+            self.timers.frame.disarm();
+            return false;
+        }
+
         let Some(generation) = self.frames.begin_frame(now) else {
             self.arm_frame_timer();
             return false;
@@ -1204,6 +2424,9 @@ impl Application {
                         );
                     }
                 }
+                _ = self.timers.host_language_servers.elapsed() => {
+                    self.drive_host_language_server_requests();
+                }
                 Some(delivery) = self.ingress.rx.recv() => {
                     self.handle_runtime_delivery(delivery);
                     self.drain_foreground();
@@ -1214,6 +2437,8 @@ impl Application {
                 }
                 Some(event) = self.ingress.language_server_supervisor_rx.recv() => {
                     self.editor.handle_language_server_supervisor_event(event);
+                    self.drive_host_language_server_requests();
+                    self.drive_collaboration_language_server_diagnostics();
                     sync_editor_streams(
                         &mut self.editor,
                         &self.ingress.lsp_events,
@@ -1255,6 +2480,24 @@ impl Application {
                 Some(_request) = self.terminal_state.resync_rx.recv() => {
                     self.compositor.full_redraw = true;
                     self.invalidate(FRAME_PRESENTER);
+                }
+                Some(_request) = self.terminal_state.pipeline_ready_rx.recv() => {
+                    self.arm_frame_timer();
+                }
+                event = async {
+                    match &mut self.remote {
+                        Some(remote) => remote.transport.next_event().await,
+                        None => pending::<Option<helix_remote::ssh::SshSessionEvent>>().await,
+                    }
+                } => {
+                    match event {
+                        Some(event) => self.handle_remote_session_event(event),
+                        None => {
+                            self.remote = None;
+                            self.editor.notify_error("Remote workspace connection closed");
+                        }
+                    }
+                    self.invalidate(FRAME_REMOTE);
                 }
                 _ = self.timers.idle.elapsed() => {
                     self.timers.idle.disarm();
@@ -1333,6 +2576,9 @@ impl Application {
         self.event_loop(input_stream).await;
         self.plugin_runtime.shutdown().await;
         let close_errs = self.close().await;
+        if let Some(remote) = self.remote.take() {
+            remote.transport.shutdown().await;
+        }
 
         self.presenter
             .take()
@@ -1366,6 +2612,17 @@ impl ui::menu::Item for lsp_types::MessageActionItem {
 mod tests {
     use super::*;
     use helix_view::graphics::Rect;
+
+    #[test]
+    fn saturated_pipeline_defers_background_but_never_input() {
+        let mut frames = FrameScheduler::new();
+        frames.invalidate(FRAME_LSP);
+        assert!(should_defer_frame(&frames, true));
+
+        frames.invalidate(FRAME_INPUT);
+        assert!(!should_defer_frame(&frames, true));
+        assert!(!should_defer_frame(&frames, false));
+    }
 
     #[cfg(not(windows))]
     fn empty_signals() -> Signals {

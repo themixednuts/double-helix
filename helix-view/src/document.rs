@@ -31,7 +31,7 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
 };
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use helix_core::{
     editor_config::EditorConfig,
@@ -53,9 +53,11 @@ use crate::{
     bench::log_command_phase,
     document_lsp::{DocumentCodeLenses, DocumentColorSwatches, DocumentLinks, DocumentLspState},
     editor::{Config, CursorShapeConfig, LifecycleBus},
-    events::{DocumentDidChange, SelectionDidChange},
+    events::{DocumentChangeOrigin, DocumentDidChange, SelectionDidChange},
     expansion,
-    file_bound::FileBoundState,
+    file_bound::{
+        CollaborationDocumentLocation, DocumentLocation, FileBoundState, RemoteDocumentLocation,
+    },
     graphics::CursorKind,
     presentation_state::DocumentPresentationState,
     selection_store::SelectionStore,
@@ -215,7 +217,7 @@ pub struct DocumentSavedEvent {
     pub revision: usize,
     pub save_time: SystemTime,
     pub doc_id: DocumentId,
-    pub path: PathBuf,
+    pub location: DocumentLocation,
     pub text: Rope,
 }
 
@@ -315,6 +317,10 @@ pub enum DocumentOpenError {
     IoError(#[from] io::Error),
     #[error("document open worker failed: {0}")]
     Worker(String),
+    #[error("remote document open failed: {0}")]
+    Remote(String),
+    #[error("collaboration document open failed: {0}")]
+    Collaboration(String),
     #[error("file contains binary data")]
     BinaryFile,
 }
@@ -360,6 +366,7 @@ pub struct Document {
     file: FileBoundState,
 
     syntax_aware: SyntaxAwareState,
+    collaboration_role: Option<helix_collab::Role>,
     pub config: Arc<dyn DynAccess<Config> + Send + Sync>,
 
     vcs: VcsState,
@@ -852,6 +859,7 @@ impl Document {
             session: DocumentSessionState::default(),
             snippet: DocumentSnippetState::default(),
             syntax_aware: SyntaxAwareState::default(),
+            collaboration_role: None,
             vcs: VcsState::default(),
             config,
             lsp: DocumentLspState::default(),
@@ -880,6 +888,11 @@ impl Document {
 
     pub fn with_persistent_scratch(mut self) -> Self {
         self.presentation.set_persistent_scratch(true);
+        self
+    }
+
+    pub fn with_scratch_name(mut self, name: impl Into<Arc<str>>) -> Self {
+        self.presentation.set_scratch_name(name);
         self
     }
 
@@ -940,6 +953,49 @@ impl Document {
         doc.detect_indent_and_line_ending();
 
         Ok(doc)
+    }
+
+    pub fn open_remote(
+        bytes: &[u8],
+        location: RemoteDocumentLocation,
+        encoding: Option<&'static Encoding>,
+        language_initialization: LanguageInitialization,
+        config: Arc<dyn DynAccess<Config> + Send + Sync>,
+        syn_loader: Arc<ArcSwap<syntax::Loader>>,
+    ) -> Result<Self, DocumentOpenError> {
+        let (rope, encoding, has_bom) = from_reader(&mut std::io::Cursor::new(bytes), encoding)?;
+        let loader = syn_loader.load();
+        let mut doc = Self::from(rope, Some((encoding, has_bom)), config, syn_loader);
+        doc.file.set_remote(location);
+        match language_initialization {
+            LanguageInitialization::Full => doc.detect_language(&loader),
+            LanguageInitialization::MetadataOnly => {
+                let language_config = doc.detect_language_config(&loader);
+                doc.set_language_configuration(language_config);
+            }
+            LanguageInitialization::Disabled => {}
+        }
+        doc.presentation.set_editor_config(EditorConfig::default());
+        doc.detect_indent_and_line_ending();
+        Ok(doc)
+    }
+
+    pub fn open_collaboration(
+        text: String,
+        location: CollaborationDocumentLocation,
+        role: helix_collab::Role,
+        config: Arc<dyn DynAccess<Config> + Send + Sync>,
+        syn_loader: Arc<ArcSwap<syntax::Loader>>,
+    ) -> Self {
+        let loader = syn_loader.load();
+        let mut doc = Self::from(text.into(), None, config, syn_loader);
+        doc.file
+            .set_collaboration(location, !role.allows(helix_collab::Role::Write));
+        doc.collaboration_role = Some(role);
+        doc.detect_language(&loader);
+        doc.presentation.set_editor_config(EditorConfig::default());
+        doc.detect_indent_and_line_ending();
+        doc
     }
 
     /// The same as [`format`], but only returns formatting changes if auto-formatting
@@ -1112,6 +1168,154 @@ impl Document {
         let ticket = save_lock.ticket(path.is_none());
         self.save_impl(path, policy, Some(ticket.clone()))
             .map(|future| work.spawn(async move { ticket.run(future).await }))
+    }
+
+    pub(crate) fn save_remote_serialized(
+        &mut self,
+        work: &Work,
+        backend: Arc<helix_remote::backend::RemoteWorkspaceClient>,
+        path: Option<helix_remote::WorkspacePath>,
+        policy: crate::editor::SavePolicy,
+        save_lock: DocumentSaveLock,
+    ) -> Result<DocumentSavedTask, anyhow::Error> {
+        let previous_location = self.remote_location().cloned();
+        let serialized = path.is_none();
+        let path = path
+            .or_else(|| {
+                previous_location
+                    .as_ref()
+                    .map(|location| location.path.clone())
+            })
+            .ok_or_else(|| anyhow!("remote document has no path"))?;
+        let ticket = save_lock.ticket(serialized);
+        let text = self.text().clone();
+        let current_rev = self.get_current_revision();
+        let doc_id = self.id();
+        let encoding_with_bom_info = self.file.encoding_with_bom_info();
+        let language_servers: Vec<_> = self.syntax_aware.all_language_servers().cloned().collect();
+        let identifier = Some(self.identifier());
+        let future_ticket = ticket.clone();
+        let future = async move {
+            if future_ticket.is_superseded() {
+                return Ok(None);
+            }
+            let mut bytes = Vec::with_capacity(text.len_bytes());
+            to_writer(&mut bytes, encoding_with_bom_info, &text).await?;
+            let expected = if policy.should_overwrite() {
+                None
+            } else if let Some(location) = previous_location
+                .as_ref()
+                .filter(|location| location.path == path)
+            {
+                Some(location.content)
+            } else {
+                if backend
+                    .stat(path.clone(), tokio_util::sync::CancellationToken::new())
+                    .await?
+                    .is_some()
+                {
+                    bail!("can't save file, destination already exists (use :w! to overwrite)");
+                }
+                None
+            };
+            let metadata = backend
+                .write_file(
+                    path.clone(),
+                    &bytes,
+                    expected,
+                    tokio_util::sync::CancellationToken::new(),
+                )
+                .await?;
+            let content = metadata
+                .content
+                .ok_or_else(|| anyhow!("remote save returned no content generation"))?;
+            let location = crate::file_bound::RemoteDocumentLocation::new(
+                Arc::<str>::from(backend.authority()),
+                backend.workspace().session,
+                Arc::<str>::from(backend.workspace().root.as_str()),
+                path,
+                content,
+                metadata.readonly,
+                backend.hello().platform.path_separator,
+            )?;
+            let save_time = metadata
+                .modified_unix_nanos
+                .map(Duration::from_nanos)
+                .and_then(|duration| UNIX_EPOCH.checked_add(duration))
+                .unwrap_or_else(SystemTime::now);
+            for language_server in language_servers {
+                if !language_server.is_initialized() {
+                    continue;
+                }
+                if let Some(id) = identifier.clone() {
+                    language_server.text_document_did_save(id, &text);
+                }
+            }
+            Ok(Some(DocumentSavedEvent {
+                revision: current_rev,
+                save_time,
+                doc_id,
+                location: DocumentLocation::Remote(location),
+                text,
+            }))
+        };
+        Ok(work.spawn(async move { ticket.run(future).await }))
+    }
+
+    pub(crate) fn save_collaboration_serialized(
+        &mut self,
+        work: &Work,
+        session: helix_collab::GuestSessionHandle,
+        buffer: helix_collab::BufferId,
+        policy: crate::editor::SavePolicy,
+        save_lock: DocumentSaveLock,
+    ) -> Result<DocumentSavedTask, anyhow::Error> {
+        let location = self
+            .location()
+            .cloned()
+            .ok_or_else(|| anyhow!("shared document has no location"))?;
+        let ticket = save_lock.ticket(true);
+        let text = self.text().clone();
+        let revision = self.get_current_revision();
+        let doc_id = self.id();
+        let language_servers: Vec<_> = self.syntax_aware.all_language_servers().cloned().collect();
+        let identifier = Some(self.identifier());
+        let future_ticket = ticket.clone();
+        let future = async move {
+            if future_ticket.is_superseded() {
+                return Ok(None);
+            }
+            let version = session.save(buffer, policy.should_overwrite()).await?;
+            let (location, save_time) = match location {
+                DocumentLocation::Remote(mut remote) => {
+                    let content = helix_collab::RemoteBackend::decode_file_version(&version)?;
+                    remote.content = content;
+                    let save_time = content
+                        .modified_unix_nanos
+                        .map(Duration::from_nanos)
+                        .and_then(|duration| UNIX_EPOCH.checked_add(duration))
+                        .unwrap_or_else(SystemTime::now);
+                    (DocumentLocation::Remote(remote), save_time)
+                }
+                location => (location, SystemTime::now()),
+            };
+            for language_server in language_servers {
+                if !language_server.is_initialized() {
+                    continue;
+                }
+                if let Some(id) = identifier.clone() {
+                    language_server.text_document_did_save(id, &text);
+                }
+            }
+            Ok(Some(DocumentSavedEvent {
+                revision,
+                save_time,
+                doc_id,
+                location,
+                text,
+            }))
+        };
+        Ok(work.spawn(async move { ticket.run(future).await }))
     }
 
     /// The `Document`'s text is encoded according to its encoding and written to the file located
@@ -1298,7 +1502,7 @@ impl Document {
                 revision: current_rev,
                 save_time,
                 doc_id,
-                path,
+                location: DocumentLocation::Local(path),
                 text: text.clone(),
             };
 
@@ -1327,8 +1531,9 @@ impl Document {
         &self,
         loader: &syntax::Loader,
     ) -> Option<Arc<syntax::config::LanguageConfiguration>> {
+        let language_path = self.file.language_path()?;
         let language = loader
-            .language_for_filename(self.path()?)
+            .language_for_filename(&language_path)
             .or_else(|| loader.language_for_shebang(self.text().slice(..)))?;
 
         Some(loader.language(language).config().clone())
@@ -1414,6 +1619,19 @@ impl Document {
         self.file.set_path(path);
     }
 
+    pub(crate) fn apply_saved_location(&mut self, location: DocumentLocation) {
+        match location {
+            DocumentLocation::Local(path) => self.file.set_path(Some(&path)),
+            DocumentLocation::Remote(location) => self.file.set_remote(location),
+            DocumentLocation::Collaboration(location) => self.file.set_collaboration(
+                location,
+                !self
+                    .collaboration_role
+                    .is_some_and(|role| role.allows(helix_collab::Role::Write)),
+            ),
+        }
+    }
+
     /// Set the programming language for the file and load associated data (e.g. highlighting)
     /// if it exists.
     pub fn set_language(
@@ -1448,6 +1666,21 @@ impl Document {
 
     /// Select text within the [`Document`].
     pub fn set_selection(&mut self, view_id: ViewId, selection: Selection) {
+        self.set_selection_state(view_id, selection);
+
+        let lifecycle = self.lifecycle.clone();
+        let mut event = SelectionDidChange {
+            doc: self,
+            view: view_id,
+        };
+        lifecycle.dispatch_selection_change(&mut event)
+    }
+
+    pub(crate) fn set_collaboration_selection(&mut self, view_id: ViewId, selection: Selection) {
+        self.set_selection_state(view_id, selection);
+    }
+
+    fn set_selection_state(&mut self, view_id: ViewId, selection: Selection) {
         // TODO: use a transaction?
         self.selection_store
             .insert_selection(view_id, selection.ensure_invariants(self.text().slice(..)));
@@ -1460,13 +1693,6 @@ impl Document {
             let text = self.buffer.text().slice(..);
             container.remove_by_selection(text, selection)
         }
-
-        let lifecycle = self.lifecycle.clone();
-        let mut event = SelectionDidChange {
-            doc: self,
-            view: view_id,
-        };
-        lifecycle.dispatch_selection_change(&mut event)
     }
 
     /// Find the origin selection of the text in a document, i.e. where
@@ -1555,10 +1781,21 @@ impl Document {
     fn apply_impl(
         &mut self,
         transaction: &Transaction,
-        view_id: ViewId,
+        view_id: Option<ViewId>,
         emit_lsp_notification: bool,
+        origin: DocumentChangeOrigin,
     ) -> bool {
         use helix_core::Assoc;
+
+        if origin == DocumentChangeOrigin::Local
+            && !transaction.changes().is_empty()
+            && self.collaboration_location().is_some()
+            && !self
+                .collaboration_role
+                .is_some_and(|role| role.allows(helix_collab::Role::Write))
+        {
+            return false;
+        }
 
         let old_doc = self.text().clone();
         let before_lines = old_doc.len_lines();
@@ -1584,7 +1821,7 @@ impl Document {
         }
 
         if changes.is_empty() {
-            if let Some(selection) = transaction.selection() {
+            if let (Some(view_id), Some(selection)) = (view_id, transaction.selection()) {
                 self.set_selection(
                     view_id,
                     selection.clone().ensure_invariants(self.text().slice(..)),
@@ -1759,7 +1996,7 @@ impl Document {
         log_command_phase("document_apply", "remap_inlay_hints", inlay_dur, || {
             format!(
                 "has_inlay_hints={} before_lines={} after_lines={} before_bytes={} after_bytes={}",
-                self.presentation.inlay_hints(view_id).is_some(),
+                view_id.is_some_and(|view_id| self.presentation.inlay_hints(view_id).is_some()),
                 before_lines,
                 self.text().len_lines(),
                 before_bytes,
@@ -1775,6 +2012,7 @@ impl Document {
             old_text: &old_doc,
             changes,
             ghost_transaction: !emit_lsp_notification,
+            origin,
         };
         lifecycle.dispatch_document_change(&mut event);
         let dispatch_dur = dispatch_start.elapsed();
@@ -1794,7 +2032,7 @@ impl Document {
         );
 
         // if specified, the current selection should instead be replaced by transaction.selection
-        if let Some(selection) = transaction.selection() {
+        if let (Some(view_id), Some(selection)) = (view_id, transaction.selection()) {
             let selection_apply_start = Instant::now();
             self.set_selection(
                 view_id,
@@ -1822,19 +2060,22 @@ impl Document {
     fn apply_inner(
         &mut self,
         transaction: &Transaction,
-        view_id: ViewId,
+        view_id: Option<ViewId>,
         emit_lsp_notification: bool,
+        origin: DocumentChangeOrigin,
     ) -> bool {
         // store the state just before any changes are made. This allows us to undo to the
         // state just before a transaction was applied.
         if self.changes().is_empty() && !transaction.changes().is_empty() {
             self.buffer.set_old_state(Some(State {
                 doc: self.text().clone(),
-                selection: self.selection(view_id).clone(),
+                selection: view_id
+                    .map(|view_id| self.selection(view_id).clone())
+                    .unwrap_or_else(|| Selection::point(0)),
             }));
         }
 
-        let success = self.apply_impl(transaction, view_id, emit_lsp_notification);
+        let success = self.apply_impl(transaction, view_id, emit_lsp_notification, origin);
 
         if success && !transaction.changes().is_empty() {
             // Compose this transaction with the previous one.
@@ -1877,7 +2118,37 @@ impl Document {
     }
     /// Apply a [`Transaction`] to the [`Document`] to change its text.
     pub fn apply(&mut self, transaction: &Transaction, view_id: ViewId) -> bool {
-        self.apply_inner(transaction, view_id, true)
+        self.apply_inner(
+            transaction,
+            Some(view_id),
+            true,
+            DocumentChangeOrigin::Local,
+        )
+    }
+
+    /// Apply a remote collaborative change while preserving normal LSP and syntax updates.
+    pub fn apply_collaboration(
+        &mut self,
+        transaction: &Transaction,
+        view_id: Option<ViewId>,
+    ) -> bool {
+        self.apply_inner(
+            transaction,
+            view_id,
+            true,
+            DocumentChangeOrigin::Collaboration,
+        )
+    }
+
+    pub fn set_collaboration_role(&mut self, role: Option<helix_collab::Role>) {
+        self.collaboration_role = role;
+        self.file.set_collaboration_readonly(
+            !role.is_some_and(|role| role.allows(helix_collab::Role::Write)),
+        );
+    }
+
+    pub fn collaboration_role(&self) -> Option<helix_collab::Role> {
+        self.collaboration_role
     }
 
     /// Get the line blame for this view
@@ -1889,7 +2160,12 @@ impl Document {
     /// without notifying the language servers. This is useful for temporary transactions
     /// that must not influence the server.
     pub fn apply_temporary(&mut self, transaction: &Transaction, view_id: ViewId) -> bool {
-        self.apply_inner(transaction, view_id, false)
+        self.apply_inner(
+            transaction,
+            Some(view_id),
+            false,
+            DocumentChangeOrigin::Local,
+        )
     }
 
     fn undo_redo_impl<V>(&mut self, view: &mut V, undo: bool) -> bool
@@ -1932,7 +2208,7 @@ impl Document {
         });
         let apply_start = Instant::now();
         let success = if let Some(txn) = txn {
-            self.apply_impl(&txn, view.id(), true)
+            self.apply_impl(&txn, Some(view.id()), true, DocumentChangeOrigin::Local)
         } else {
             false
         };
@@ -2018,7 +2294,12 @@ impl Document {
         // this avoids a deadlock as we need to lock the mutex
         let savepoint_ref = self.session.remove_savepoint(savepoint);
         let mut revert = savepoint.revert.lock();
-        self.apply_inner(&revert, view.id, emit_lsp_notification);
+        self.apply_inner(
+            &revert,
+            Some(view.id),
+            emit_lsp_notification,
+            DocumentChangeOrigin::Local,
+        );
         *revert = Transaction::new(self.text()).with_selection(self.selection(view.id).clone());
         self.session.restore_savepoint_tracking(savepoint_ref)
     }
@@ -2041,7 +2322,7 @@ impl Document {
         });
         let mut success = false;
         for txn in txns {
-            if self.apply_impl(&txn, view.id(), true) {
+            if self.apply_impl(&txn, Some(view.id()), true, DocumentChangeOrigin::Local) {
                 success = true;
             }
         }
@@ -2311,6 +2592,10 @@ impl Document {
 
     pub fn is_persistent_scratch(&self) -> bool {
         self.presentation.is_persistent_scratch()
+    }
+
+    pub fn scratch_name(&self) -> Option<&str> {
+        self.presentation.scratch_name()
     }
 
     pub fn is_preview(&self) -> bool {
@@ -3252,6 +3537,9 @@ impl Document {
     }
 
     pub fn prepare_syntax_refresh(&self) -> Option<SyntaxRefreshRequest> {
+        if self.text().len_bytes() > syntax::MAX_FULL_DOCUMENT_SYNTAX_BYTES {
+            return None;
+        }
         self.syntax_snapshot().is_stale().then_some(())?;
         Some(SyntaxRefreshRequest {
             document: self.id,
@@ -3306,6 +3594,44 @@ impl Document {
         self.file.path()
     }
 
+    pub fn location(&self) -> Option<&DocumentLocation> {
+        self.file.location()
+    }
+
+    pub fn remote_location(&self) -> Option<&RemoteDocumentLocation> {
+        self.file.remote()
+    }
+
+    pub fn collaboration_location(&self) -> Option<&CollaborationDocumentLocation> {
+        self.file.collaboration()
+    }
+
+    pub(crate) fn set_collaboration_path(
+        &mut self,
+        path: helix_workspace::WorkspacePath,
+    ) -> Result<bool, url::ParseError> {
+        self.file.set_collaboration_path(path)
+    }
+
+    pub(crate) fn set_remote_path(
+        &mut self,
+        path: helix_remote::WorkspacePath,
+    ) -> Result<bool, url::ParseError> {
+        self.file.set_remote_path(path)
+    }
+
+    pub(crate) fn set_remote_content(&mut self, content: helix_remote::ContentId) -> bool {
+        let Some(location) = self.remote_location() else {
+            return false;
+        };
+        if location.content == content {
+            return false;
+        }
+        let readonly = location.readonly;
+        self.file.set_remote_saved(content, readonly);
+        true
+    }
+
     /// File path as a URL.
     pub fn url(&self) -> Option<Url> {
         self.file.url()
@@ -3323,6 +3649,17 @@ impl Document {
     #[inline]
     pub fn text(&self) -> &Rope {
         self.buffer.text()
+    }
+
+    pub(crate) fn replace_initial_text(&mut self, text: Rope) {
+        if self.text() == &text {
+            return;
+        }
+        let line_ending = auto_detect_line_ending(&text).unwrap_or_else(|| self.line_ending());
+        self.buffer = TextBuffer::new(text, line_ending);
+        self.session.mark_text_changed();
+        self.set_syntax(None);
+        self.detect_indent_and_line_ending();
     }
 
     #[inline]
@@ -3375,7 +3712,8 @@ impl Document {
     }
 
     pub fn display_name(&self) -> Cow<'_, str> {
-        self.file.display_name(SCRATCH_BUFFER_NAME)
+        self.file
+            .display_name(self.scratch_name().unwrap_or(SCRATCH_BUFFER_NAME))
     }
 
     pub fn readonly(&self) -> bool {
@@ -3913,6 +4251,38 @@ mod test {
     use arc_swap::ArcSwap;
 
     use super::*;
+
+    #[test]
+    fn oversized_documents_do_not_schedule_full_tree_sitter_parses() {
+        let loader = Arc::new(ArcSwap::from_pointee(
+            helix_core::config::default_lang_loader(),
+        ));
+        let mut doc = Document::from(
+            Rope::from(" ".repeat(syntax::MAX_FULL_DOCUMENT_SYNTAX_BYTES + 1)),
+            None,
+            Arc::new(ArcSwap::new(Arc::new(Config::default()))),
+            loader.clone(),
+        );
+        doc.set_language_by_language_id("rust", &loader.load())
+            .unwrap();
+
+        assert!(doc.prepare_syntax_refresh().is_none());
+    }
+
+    #[test]
+    fn collaboration_changes_apply_without_a_view() {
+        let mut doc = Document::from(
+            Rope::from("abc"),
+            None,
+            Arc::new(ArcSwap::new(Arc::new(Config::default()))),
+            Arc::new(ArcSwap::from_pointee(syntax::Loader::default())),
+        );
+        let transaction =
+            Transaction::change(doc.text(), std::iter::once((1, 2, Some("XYZ".into()))));
+
+        assert!(doc.apply_collaboration(&transaction, None));
+        assert_eq!(doc.text().to_string(), "aXYZc");
+    }
 
     #[test]
     fn changeset_to_changes_ignore_line_endings() {

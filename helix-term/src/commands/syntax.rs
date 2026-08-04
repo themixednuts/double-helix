@@ -23,13 +23,11 @@ use helix_view::{
 };
 use ignore::{DirEntry, WalkBuilder, WalkState};
 
-use crate::{
-    filter_picker_entry,
-    ui::{
-        overlay::overlaid,
-        picker::{Injector, PathOrId},
-        Picker, PickerColumn,
-    },
+use crate::ui::{
+    file_scan::{configure_walk, filter_picker_entry},
+    overlay::overlaid,
+    picker::{Injector, PathOrId},
+    Picker, PickerColumn,
 };
 
 use super::{queue_picker_document_open, Context};
@@ -229,18 +227,12 @@ pub fn syntax_workspace_symbol_picker(cx: &mut Context) {
         .unwrap_or_else(|_| search_root.clone());
 
     let config = cx.editor.config();
-    let dedup_symlinks = config.file_picker.deduplicate_links;
+    let scan = config.file_picker.workspace_scan_options();
+    let dedup_symlinks = scan.deduplicate_symlinks;
 
     let mut walk_builder = WalkBuilder::new(&search_root);
+    configure_walk(&mut walk_builder, scan);
     walk_builder
-        .hidden(config.file_picker.hidden)
-        .parents(config.file_picker.parents)
-        .ignore(config.file_picker.ignore)
-        .follow_links(config.file_picker.follow_symlinks)
-        .git_ignore(config.file_picker.git_ignore)
-        .git_global(config.file_picker.git_global)
-        .git_exclude(config.file_picker.git_exclude)
-        .max_depth(config.file_picker.max_depth)
         .filter_entry(move |entry| filter_picker_entry(entry, &absolute_root, dedup_symlinks))
         .add_custom_ignore_filename(helix_loader::config_dir().join("ignore"))
         .add_custom_ignore_filename(helix_loader::workspace_ignore_file_name());
@@ -433,7 +425,7 @@ pub fn syntax_workspace_symbol_picker(cx: &mut Context) {
                     };
                     queue_picker_document_open(
                         cx,
-                        path.to_path_buf(),
+                        helix_view::editor::WorkspaceDocumentPath::Local(path.to_path_buf()),
                         action,
                         crate::runtime::DocumentOpenSelection::CharRange {
                             start: tag.start,

@@ -13,12 +13,22 @@ use helix_view::{
 };
 use serde_json::json;
 
+use crate::runtime::collaboration::HostedProject;
 use crate::runtime::{RuntimeIngress, RuntimeTaskEvent};
 
 /// Submit work to the single editor-owned FIFO and start it if idle.
 pub(crate) fn submit(editor: &mut Editor, ingress: RuntimeIngress, request: FileOperationRequest) {
+    submit_with_host(editor, ingress, request, None);
+}
+
+fn submit_with_host(
+    editor: &mut Editor,
+    ingress: RuntimeIngress,
+    request: FileOperationRequest,
+    hosted: Option<HostedProject>,
+) {
     editor.enqueue_file_operation(request);
-    drive(editor, ingress);
+    drive(editor, ingress, hosted);
 }
 
 /// Snapshot main-thread document state and prepare the workspace edit on a
@@ -41,11 +51,12 @@ pub(crate) fn apply_inspected(
     ingress: RuntimeIngress,
     id: FileOperationId,
     result: Result<FileOperationPrepared, FileOperationError>,
+    hosted: Option<HostedProject>,
 ) {
     let prepared = match result {
         Ok(prepared) => prepared,
         Err(error) => {
-            complete_preparation_failure(editor, ingress, id, error);
+            complete_preparation_failure(editor, ingress, id, error, hosted);
             return;
         }
     };
@@ -59,7 +70,7 @@ pub(crate) fn apply_inspected(
             return;
         }
     }
-    spawn_mutation(editor, ingress, id);
+    spawn_mutation(editor, ingress, id, hosted);
 }
 
 pub(crate) fn apply_will_completed(
@@ -68,6 +79,7 @@ pub(crate) fn apply_will_completed(
     id: FileOperationId,
     edits: Vec<(OffsetEncoding, lsp::WorkspaceEdit)>,
     errors: Vec<String>,
+    hosted: Option<HostedProject>,
 ) {
     if !editor.file_operation_accepts_will_completion(id) {
         return;
@@ -78,7 +90,7 @@ pub(crate) fn apply_will_completed(
     if !editor.begin_file_operation_workspace_edits(id, edits) {
         return;
     }
-    advance_will_workspace_edits(editor, ingress, id);
+    advance_will_workspace_edits(editor, ingress, id, hosted);
 }
 
 pub(crate) fn apply_workspace_edit_prepared(
@@ -90,6 +102,7 @@ pub(crate) fn apply_workspace_edit_prepared(
         helix_view::handlers::workspace_edit::WorkspaceEditPlan,
         helix_view::handlers::workspace_edit::ApplyEditError,
     >,
+    hosted: Option<HostedProject>,
 ) {
     if let Some(parent) = parent {
         if !editor.file_operation_accepts_workspace_edit_preparation(parent) {
@@ -102,7 +115,7 @@ pub(crate) fn apply_workspace_edit_prepared(
             let continuation = continuation
                 .or_else(|| parent.map(|id| WorkspaceEditContinuation::ResumeFileOperation { id }));
             let update = editor.start_workspace_edit_execution(plan, continuation, parent);
-            apply_workspace_edit_execution_update(editor, ingress, update);
+            apply_workspace_edit_execution_update(editor, ingress, update, hosted);
         }
         Err(error) => match parent {
             Some(parent) => complete_waiting_failure(
@@ -112,6 +125,7 @@ pub(crate) fn apply_workspace_edit_prepared(
                 FileOperationError::WorkspaceEdit {
                     message: error.kind.to_string(),
                 },
+                hosted,
             ),
             None => apply_workspace_edit_batch_completion(
                 editor,
@@ -123,6 +137,7 @@ pub(crate) fn apply_workspace_edit_prepared(
                     }),
                 },
                 ingress,
+                hosted,
             ),
         },
     }
@@ -132,17 +147,18 @@ pub(crate) fn apply_mutated(
     editor: &mut Editor,
     ingress: RuntimeIngress,
     outcome: helix_view::editor::FileOperationOutcome,
+    hosted: Option<HostedProject>,
 ) {
     let Some(completions) = editor.finish_file_operation(outcome) else {
         return;
     };
     for completion in completions {
-        apply_completion(editor, ingress.clone(), completion);
+        apply_completion(editor, ingress.clone(), completion, hosted.clone());
     }
-    drive(editor, ingress);
+    drive(editor, ingress, hosted);
 }
 
-fn drive(editor: &mut Editor, ingress: RuntimeIngress) {
+fn drive(editor: &mut Editor, ingress: RuntimeIngress, hosted: Option<HostedProject>) {
     let Some(dispatch) = editor.next_file_operation_dispatch() else {
         return;
     };
@@ -166,33 +182,69 @@ fn drive(editor: &mut Editor, ingress: RuntimeIngress) {
                 })
                 .detach();
         }
-        FileOperationDispatch::Mutate(work) => spawn_work_mutation(editor, ingress, work),
+        FileOperationDispatch::Mutate(work) => spawn_work_mutation(editor, ingress, work, hosted),
     }
 }
 
-fn spawn_mutation(editor: &mut Editor, ingress: RuntimeIngress, id: FileOperationId) {
+fn spawn_mutation(
+    editor: &mut Editor,
+    ingress: RuntimeIngress,
+    id: FileOperationId,
+    hosted: Option<HostedProject>,
+) {
     let Some(work) = editor.begin_file_operation_mutation(id) else {
         return;
     };
-    spawn_work_mutation(editor, ingress, work);
+    spawn_work_mutation(editor, ingress, work, hosted);
 }
 
 fn spawn_work_mutation(
     editor: &Editor,
     ingress: RuntimeIngress,
     work: helix_view::editor::FileOperationWork,
+    hosted: Option<HostedProject>,
 ) {
     let id = work.id();
-    let mutation = editor.runtime().block().spawn(move || work.execute());
+    let change = work.planned_change();
+    let block = editor.runtime().block().clone();
     editor
         .work()
         .spawn(async move {
+            let reservation = match (hosted, change.as_ref()) {
+                (Some(hosted), Some(change)) => {
+                    match hosted.reserve_local_file_change(change).await {
+                        Ok(reservation) => reservation,
+                        Err(error) => {
+                            let _ = ingress
+                                .send_task(RuntimeTaskEvent::FileOperationMutated(
+                                    helix_view::editor::FileOperationOutcome::task_failed(
+                                        id,
+                                        format!("shared project rejected file operation: {error}"),
+                                    ),
+                                ))
+                                .await;
+                            return;
+                        }
+                    }
+                }
+                _ => None,
+            };
+            let mutation = block.spawn(move || work.execute());
             let outcome = mutation.await.unwrap_or_else(|error| {
                 helix_view::editor::FileOperationOutcome::task_failed(
                     id,
                     format!("file operation mutation task failed: {error}"),
                 )
             });
+            if outcome
+                .result
+                .as_ref()
+                .is_ok_and(|applied| !applied.changes.is_empty())
+            {
+                if let Some(reservation) = reservation {
+                    reservation.commit().await;
+                }
+            }
             let _ = ingress
                 .send_task(RuntimeTaskEvent::FileOperationMutated(outcome))
                 .await;
@@ -200,7 +252,12 @@ fn spawn_work_mutation(
         .detach();
 }
 
-fn advance_will_workspace_edits(editor: &mut Editor, ingress: RuntimeIngress, id: FileOperationId) {
+fn advance_will_workspace_edits(
+    editor: &mut Editor,
+    ingress: RuntimeIngress,
+    id: FileOperationId,
+    hosted: Option<HostedProject>,
+) {
     if let Some((offset_encoding, workspace_edit)) = editor.next_file_operation_workspace_edit(id) {
         let preparation = editor.prepare_workspace_edit(offset_encoding, workspace_edit);
         spawn_workspace_edit_preparation(editor, ingress, Some(id), None, preparation);
@@ -208,8 +265,10 @@ fn advance_will_workspace_edits(editor: &mut Editor, ingress: RuntimeIngress, id
     }
 
     match editor.finish_file_operation_workspace_edits(id) {
-        Some(FileOperationWorkspaceEditAction::Mutate) => spawn_mutation(editor, ingress, id),
-        Some(FileOperationWorkspaceEditAction::Drive) => drive(editor, ingress),
+        Some(FileOperationWorkspaceEditAction::Mutate) => {
+            spawn_mutation(editor, ingress, id, hosted)
+        }
+        Some(FileOperationWorkspaceEditAction::Drive) => drive(editor, ingress, hosted),
         None => {}
     }
 }
@@ -297,14 +356,15 @@ fn complete_preparation_failure(
     ingress: RuntimeIngress,
     id: FileOperationId,
     error: FileOperationError,
+    hosted: Option<HostedProject>,
 ) {
     let Some(completions) = editor.fail_file_operation_preparation(id, error) else {
         return;
     };
     for completion in completions {
-        apply_completion(editor, ingress.clone(), completion);
+        apply_completion(editor, ingress.clone(), completion, hosted.clone());
     }
-    drive(editor, ingress);
+    drive(editor, ingress, hosted);
 }
 
 fn complete_waiting_failure(
@@ -312,18 +372,20 @@ fn complete_waiting_failure(
     ingress: RuntimeIngress,
     id: FileOperationId,
     error: FileOperationError,
+    hosted: Option<HostedProject>,
 ) {
     let Some(completion) = editor.fail_file_operation_waiting(id, error) else {
         return;
     };
-    apply_completion(editor, ingress.clone(), completion);
-    drive(editor, ingress);
+    apply_completion(editor, ingress.clone(), completion, hosted.clone());
+    drive(editor, ingress, hosted);
 }
 
 fn apply_completion(
     editor: &mut Editor,
     ingress: RuntimeIngress,
     completion: FileOperationCompletion,
+    hosted: Option<HostedProject>,
 ) {
     let workspace_edit_update = editor.resume_workspace_edit_execution(&completion);
     match &completion.result {
@@ -343,9 +405,9 @@ fn apply_completion(
     }
     if let Some(mut update) = workspace_edit_update {
         if let Some(parent_completion) = update.parent_completion.take() {
-            apply_completion(editor, ingress.clone(), parent_completion);
+            apply_completion(editor, ingress.clone(), parent_completion, hosted.clone());
         }
-        apply_workspace_edit_execution_update(editor, ingress, update);
+        apply_workspace_edit_execution_update(editor, ingress, update, hosted);
     }
 }
 
@@ -353,18 +415,19 @@ fn apply_workspace_edit_execution_update(
     editor: &mut Editor,
     ingress: RuntimeIngress,
     update: WorkspaceEditExecutionUpdate,
+    hosted: Option<HostedProject>,
 ) {
     match update.dispatch {
         WorkspaceEditExecutionDispatch::EnqueueResource(request) => {
-            submit(editor, ingress, request)
+            submit_with_host(editor, ingress, request, hosted)
         }
-        WorkspaceEditExecutionDispatch::Drive => drive(editor, ingress),
+        WorkspaceEditExecutionDispatch::Drive => drive(editor, ingress, hosted),
         WorkspaceEditExecutionDispatch::Advance(batch_id) => {
             let update = editor.advance_workspace_edit_execution_batch(batch_id);
-            apply_workspace_edit_execution_update(editor, ingress, update);
+            apply_workspace_edit_execution_update(editor, ingress, update, hosted);
         }
         WorkspaceEditExecutionDispatch::Complete(completion) => {
-            apply_workspace_edit_batch_completion(editor, completion, ingress)
+            apply_workspace_edit_batch_completion(editor, completion, ingress, hosted)
         }
     }
 }
@@ -373,6 +436,7 @@ fn apply_workspace_edit_batch_completion(
     editor: &mut Editor,
     completion: WorkspaceEditBatchCompletion,
     ingress: RuntimeIngress,
+    hosted: Option<HostedProject>,
 ) {
     match completion.continuation {
         None => {
@@ -404,7 +468,7 @@ fn apply_workspace_edit_batch_completion(
             crate::effect::language_server::apply_execute_lsp_command(editor, command, server_id);
         }
         Some(WorkspaceEditContinuation::ResumeFileOperation { id }) => match completion.result {
-            Ok(()) => advance_will_workspace_edits(editor, ingress, id),
+            Ok(()) => advance_will_workspace_edits(editor, ingress, id, hosted),
             Err(error) => complete_waiting_failure(
                 editor,
                 ingress,
@@ -412,6 +476,7 @@ fn apply_workspace_edit_batch_completion(
                 FileOperationError::WorkspaceEdit {
                     message: error.message,
                 },
+                hosted,
             ),
         },
     }

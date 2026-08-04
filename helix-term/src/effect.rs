@@ -150,10 +150,28 @@ pub(crate) fn apply_runtime_task_event(
     ingress: crate::runtime::RuntimeIngress,
     foreground: crate::runtime::ForegroundEvents,
     plugin_runtime: crate::plugin_registry::PluginRuntime,
+    hosted: Option<crate::runtime::collaboration::HostedProject>,
     task: RuntimeTaskEvent,
 ) {
     match task {
         RuntimeTaskEvent::Stub => {}
+        RuntimeTaskEvent::Collaboration(update) => editor.apply_collaboration_update(update),
+        RuntimeTaskEvent::CollaborationStarted(_)
+        | RuntimeTaskEvent::CollaborationStop
+        | RuntimeTaskEvent::CollaborationInvitation(_)
+        | RuntimeTaskEvent::CollaborationInvitationCopied(_)
+        | RuntimeTaskEvent::CollaborationHostDocumentOpened { .. }
+        | RuntimeTaskEvent::CollaborationHostDocumentClosed { .. }
+        | RuntimeTaskEvent::CollaborationHostBufferOpened { .. }
+        | RuntimeTaskEvent::CollaborationHostBufferReady { .. }
+        | RuntimeTaskEvent::CollaborationHostLanguageServerRequest(_)
+        | RuntimeTaskEvent::CollaborationHostLanguageServerDocumentOpened { .. }
+        | RuntimeTaskEvent::CollaborationLanguageServerDiagnosticsParsed { .. } => {
+            unreachable!("application-owned collaboration event reached editor effect reducer")
+        }
+        RuntimeTaskEvent::CollaborationNotice(message) => {
+            editor.notify_info(message);
+        }
         RuntimeTaskEvent::ApplySyntax {
             document,
             version,
@@ -170,10 +188,10 @@ pub(crate) fn apply_runtime_task_event(
             editor.request_redraw();
         }
         RuntimeTaskEvent::FileOperationInspected { id, result } => {
-            file_operation::apply_inspected(editor, ingress.clone(), id, result)
+            file_operation::apply_inspected(editor, ingress.clone(), id, result, hosted)
         }
         RuntimeTaskEvent::FileOperationWillCompleted { id, edits, errors } => {
-            file_operation::apply_will_completed(editor, ingress.clone(), id, edits, errors)
+            file_operation::apply_will_completed(editor, ingress.clone(), id, edits, errors, hosted)
         }
         RuntimeTaskEvent::WorkspaceEditPrepared {
             parent,
@@ -185,9 +203,10 @@ pub(crate) fn apply_runtime_task_event(
             parent,
             continuation,
             result,
+            hosted,
         ),
         RuntimeTaskEvent::FileOperationMutated(outcome) => {
-            file_operation::apply_mutated(editor, ingress.clone(), outcome)
+            file_operation::apply_mutated(editor, ingress.clone(), outcome, hosted)
         }
         RuntimeTaskEvent::ApplyTransactionIfCurrent {
             doc_id,
@@ -463,22 +482,9 @@ pub(crate) fn apply_runtime_task_event(
             parent,
             result,
         } => dap::apply_session_startup_completed(editor, ingress, client_id, parent, result),
-        RuntimeTaskEvent::DapStoppedCompleted {
-            client_id,
-            generation,
-            preferred_thread_id,
-            stacks,
-            errors,
-        } => dap::apply_stopped_completed(
-            editor,
-            ingress,
-            &foreground,
-            client_id,
-            generation,
-            preferred_thread_id,
-            stacks,
-            errors,
-        ),
+        RuntimeTaskEvent::DapStoppedCompleted(completion) => {
+            dap::apply_stopped_completed(editor, ingress, &foreground, completion)
+        }
         RuntimeTaskEvent::DapInitializedCompleted {
             client_id,
             generation,
@@ -785,22 +791,9 @@ pub(crate) fn apply_runtime_task_event(
                 frame_id,
             );
         }
-        RuntimeTaskEvent::ApplyStackFrames {
-            client_id,
-            generation,
-            thread_id,
-            frames,
-            selection,
-        } => dap::apply_stack_frames(
-            editor,
-            ingress.clone(),
-            &foreground,
-            client_id,
-            generation,
-            thread_id,
-            frames,
-            selection,
-        ),
+        RuntimeTaskEvent::ApplyStackFrames(completion) => {
+            dap::apply_stack_frames(editor, ingress.clone(), &foreground, completion)
+        }
         RuntimeTaskEvent::ApplyBreakpointsResponse {
             client_id,
             path,
@@ -899,7 +892,7 @@ pub(crate) fn apply_exit_task_result(
 ) -> anyhow::Result<()> {
     match result {
         Ok(Ok(task)) => {
-            apply_runtime_task_event(editor, ingress, foreground, plugin_runtime, task);
+            apply_runtime_task_event(editor, ingress, foreground, plugin_runtime, None, task);
             Ok(())
         }
         Ok(Err(err)) => Err(err),

@@ -83,12 +83,16 @@ impl Editor {
         &self.assistant_services.context
     }
 
-    pub fn dispatch_document_open(&mut self, doc: DocumentId, path: &std::path::PathBuf) {
+    pub fn dispatch_document_open(
+        &mut self,
+        doc: DocumentId,
+        location: &crate::file_bound::DocumentLocation,
+    ) {
         let lifecycle = self.lifecycle();
         let mut event = crate::events::DocumentDidOpen {
             editor: self,
             doc,
-            path,
+            location,
         };
         lifecycle.dispatch_document_open(&mut event);
     }

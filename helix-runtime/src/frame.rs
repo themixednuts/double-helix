@@ -126,6 +126,11 @@ impl FrameScheduler {
         !self.dirty.is_empty() || self.deadlines.values().any(|deadline| *deadline <= now)
     }
 
+    /// Whether `source` has an immediate invalidation waiting to be rendered.
+    pub fn is_invalidated(&self, source: FrameSource) -> bool {
+        self.dirty.contains_key(&source)
+    }
+
     fn advance_sequence(&mut self) -> u64 {
         self.sequence = self.sequence.wrapping_add(1);
         if self.sequence == 0 {
@@ -165,6 +170,12 @@ pub struct FrameHandle(PulseHandle<FramePulse>);
 
 #[derive(Debug)]
 pub struct FrameReceiver(PulseReceiver<FramePulse>);
+
+impl Default for FrameGate {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl FrameGate {
     pub fn new() -> Self {
@@ -309,6 +320,20 @@ mod tests {
         let second = scheduler.begin_frame(now).unwrap();
         scheduler.end_frame(second);
         assert_eq!(scheduler.begin_frame(now), None);
+    }
+
+    #[test]
+    fn scheduler_reports_the_source_of_pending_interactive_work() {
+        let now = Instant::now();
+        let mut scheduler = FrameScheduler::new();
+        scheduler.invalidate(PICKER);
+
+        assert!(scheduler.is_invalidated(PICKER));
+        assert!(!scheduler.is_invalidated(INPUT));
+
+        let generation = scheduler.begin_frame(now).unwrap();
+        scheduler.end_frame(generation);
+        assert!(!scheduler.is_invalidated(PICKER));
     }
 
     #[test]

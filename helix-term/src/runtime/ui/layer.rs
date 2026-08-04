@@ -21,8 +21,12 @@ pub(crate) fn apply_layer_command(
             compositor.replace_or_push(layer_id, popup);
         }
         LayerCommand::PushFilePicker { root } => {
-            let picker = crate::ui::file_picker(editor, root, ingress);
-            compositor.push(Box::new(crate::ui::overlay::overlaid(picker)));
+            match crate::ui::file_picker(editor, root, ingress) {
+                Ok(picker) => {
+                    compositor.push(Box::new(crate::ui::overlay::overlaid(picker)));
+                }
+                Err(error) => editor.set_error(format!("Failed to open file picker: {error}")),
+            }
         }
         LayerCommand::PkgManager => match crate::ui::pkg::manager(editor, ingress) {
             Ok(manager) => compositor.push(Box::new(crate::ui::overlay::overlaid(manager))),
@@ -32,6 +36,18 @@ pub(crate) fn apply_layer_command(
             Ok(manager) => compositor.push(Box::new(crate::ui::overlay::overlaid(manager))),
             Err(err) => editor.set_error(format!("Failed to open ACP agents manager: {err}")),
         },
+        LayerCommand::CollaborationParticipants => {
+            crate::ui::collaboration::push_participants(editor, compositor, ingress)
+        }
+        LayerCommand::CollaborationRolePicker { participant } => {
+            crate::ui::collaboration::push_role_picker(editor, compositor, ingress, participant)
+        }
+        LayerCommand::CollaborationInviteRolePicker => {
+            crate::ui::collaboration::push_invite_role_picker(editor, compositor, ingress)
+        }
+        LayerCommand::CollaborationRemoveConfirmation { participant } => {
+            crate::ui::collaboration::push_remove_confirmation(editor, compositor, participant)
+        }
         LayerCommand::LspCommandPicker { commands } => {
             let columns = [crate::ui::PickerColumn::new(
                 "title",

@@ -23,7 +23,7 @@ pub type TurnId = StableId<TurnKind, NonZeroU64>;
 
 #[must_use]
 pub fn participant(id: Id) -> crate::collab::ParticipantId {
-    crate::collab::ParticipantId::new(id.value())
+    crate::collab::ids::assistant_participant(id.value().get())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

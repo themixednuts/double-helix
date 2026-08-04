@@ -70,6 +70,10 @@ impl CursorCache {
 }
 
 impl Editor {
+    pub fn set_workspace_backend(&mut self, backend: super::WorkspaceBackend) {
+        self.workspace_backend = backend;
+    }
+
     /// Returns all supported diagnostics for the document
     pub fn doc_diagnostics<'a>(
         language_servers: &'a helix_lsp::Registry,

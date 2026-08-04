@@ -49,7 +49,7 @@ pub(super) fn collab_test_location(
     let path = doc
         .path()
         .map(|path| path.to_path_buf())
-        .unwrap_or_else(|| PathBuf::from(format!("participant-{}.rs", participant.value().get())));
+        .unwrap_or_else(|| PathBuf::from(format!("participant-{participant}.rs")));
 
     let mut location =
         Location::new(path, Source::Tool).with_range(RangeAnchor::new(range.start, range.end));

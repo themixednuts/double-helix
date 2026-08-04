@@ -14,6 +14,7 @@ use crate::lsp::{
     WorkspaceFolder, WorkspaceFoldersChangeEvent,
 };
 use arc_swap::ArcSwap;
+use futures_util::future::BoxFuture;
 use helix_core::{syntax::config::LanguageServerFeature, ChangeSet, Rope};
 use helix_loader::{ResolvedLaunch, VERSION_AND_GIT_HASH};
 use helix_runtime::Receiver;
@@ -130,8 +131,8 @@ pub struct Client {
     id: LanguageServerId,
     name: String,
     launch_identity: ClientLaunchIdentity,
-    process: AsyncMutex<Child>,
-    transport: TransportHandle,
+    process: Arc<dyn LanguageServerProcess>,
+    transport: ClientTransport,
     request_counter: AtomicU64,
     pub(crate) capabilities: OnceCell<lsp::ServerCapabilities>,
     pub(crate) file_operation_interest: OnceLock<FileOperationsInterest>,
@@ -141,6 +142,139 @@ pub struct Client {
     workspace_folders: WorkspaceFolders,
     /// workspace folders added while the server is still initializing
     req_timeout: u64,
+}
+
+pub trait LanguageServerProcess: std::fmt::Debug + Send + Sync {
+    fn kill(&self) -> BoxFuture<'_, std::io::Result<()>>;
+    fn wait(&self) -> BoxFuture<'_, std::io::Result<()>>;
+}
+
+/// A request transport for a language server owned by another authority.
+///
+/// The proxy receives typed-client parameters as JSON values, before JSON-RPC
+/// framing. Document lifecycle notifications remain owned by that authority.
+pub trait LanguageServerProxy: std::fmt::Debug + Send + Sync {
+    fn request(&self, method: &str, params: Value) -> BoxFuture<'_, Result<Value>>;
+}
+
+#[derive(Clone)]
+enum ClientTransport {
+    Direct(TransportHandle),
+    Proxy {
+        backend: Arc<dyn LanguageServerProxy>,
+        initialization: crate::transport::Initialization,
+    },
+}
+
+impl std::fmt::Debug for ClientTransport {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Direct(_) => formatter.write_str("ClientTransport::Direct"),
+            Self::Proxy { backend, .. } => formatter
+                .debug_tuple("ClientTransport::Proxy")
+                .field(backend)
+                .finish(),
+        }
+    }
+}
+
+impl ClientTransport {
+    fn initialization_state(&self) -> InitializationState {
+        match self {
+            Self::Direct(transport) => transport.initialization_state(),
+            Self::Proxy { initialization, .. } => initialization.current(),
+        }
+    }
+
+    async fn wait_for_initialization(&self) -> InitializationState {
+        match self {
+            Self::Direct(transport) => transport.wait_for_initialization().await,
+            Self::Proxy { initialization, .. } => initialization.wait().await,
+        }
+    }
+
+    async fn request_proxy(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: std::time::Duration,
+    ) -> Result<Value> {
+        let Self::Proxy {
+            backend,
+            initialization,
+        } = self
+        else {
+            unreachable!("proxy request used with a direct transport")
+        };
+        if method != <lsp::request::Initialize as lsp::request::Request>::METHOD {
+            match initialization.wait().await {
+                InitializationState::Initialized => {}
+                InitializationState::Failed(message) => {
+                    return Err(Error::Other(anyhow::anyhow!(message.to_string())))
+                }
+                InitializationState::Pending => {
+                    unreachable!("initialization wait returned pending")
+                }
+                InitializationState::Closed => return Err(Error::StreamClosed),
+            }
+        }
+        tokio::time::timeout(timeout, backend.request(method, params))
+            .await
+            .map_err(|_| Error::Timeout(jsonrpc::Id::Null))?
+    }
+
+    fn send(&self, payload: Payload) -> Result<()> {
+        match self {
+            Self::Direct(transport) => transport.send(payload),
+            Self::Proxy { .. } => Ok(()),
+        }
+    }
+
+    fn reply(&self, output: jsonrpc::Output) -> Result<()> {
+        match self {
+            Self::Direct(transport) => transport.reply(output),
+            Self::Proxy { .. } => Ok(()),
+        }
+    }
+
+    async fn reply_async(&self, output: jsonrpc::Output) -> Result<()> {
+        match self {
+            Self::Direct(transport) => transport.reply_async(output).await,
+            Self::Proxy { .. } => Ok(()),
+        }
+    }
+
+    async fn initialized(&self) -> Result<()> {
+        match self {
+            Self::Direct(transport) => transport.initialized().await,
+            Self::Proxy { initialization, .. } => {
+                initialization.initialized();
+                Ok(())
+            }
+        }
+    }
+
+    fn fail_initialization(&self, error: impl Into<Arc<str>>) {
+        match self {
+            Self::Direct(transport) => transport.fail_initialization(error),
+            Self::Proxy { initialization, .. } => initialization.fail(error),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct LocalLanguageServerProcess {
+    child: AsyncMutex<Child>,
+}
+
+impl LanguageServerProcess for LocalLanguageServerProcess {
+    fn kill(&self) -> BoxFuture<'_, std::io::Result<()>> {
+        Box::pin(async move { self.child.lock().await.kill().await })
+    }
+
+    fn wait(&self) -> BoxFuture<'_, std::io::Result<()>> {
+        Box::pin(async move { self.child.lock().await.wait().await.map(|_| ()) })
+    }
 }
 
 impl Client {
@@ -311,11 +445,54 @@ impl Client {
         let mut process = process?;
 
         // TODO: do we need bufreader/writer here? or do we use async wrappers on unblock?
-        let writer = BufWriter::new(process.stdin.take().expect("Failed to open stdin"));
-        let reader = BufReader::new(process.stdout.take().expect("Failed to open stdout"));
-        let stderr = BufReader::new(process.stderr.take().expect("Failed to open stderr"));
+        let writer = process.stdin.take().expect("Failed to open stdin");
+        let reader = process.stdout.take().expect("Failed to open stdout");
+        let stderr = process.stderr.take().expect("Failed to open stderr");
+        let process = Arc::new(LocalLanguageServerProcess {
+            child: AsyncMutex::new(process),
+        });
 
-        let (server_rx, transport) = Transport::start(reader, writer, stderr, id, name.clone());
+        Ok(Self::start_with_streams(
+            reader,
+            writer,
+            stderr,
+            process,
+            config,
+            root_path,
+            root_uri,
+            id,
+            name,
+            launch_identity,
+            req_timeout,
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn start_with_streams<R, W, E>(
+        reader: R,
+        writer: W,
+        stderr: E,
+        process: Arc<dyn LanguageServerProcess>,
+        config: Option<Value>,
+        root_path: PathBuf,
+        root_uri: Option<lsp::Url>,
+        id: LanguageServerId,
+        name: String,
+        launch_identity: ClientLaunchIdentity,
+        req_timeout: u64,
+    ) -> (Self, Receiver<(LanguageServerId, ServerEvent)>)
+    where
+        R: tokio::io::AsyncRead + Unpin + Send + 'static,
+        W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+        E: tokio::io::AsyncRead + Unpin + Send + 'static,
+    {
+        let (server_rx, transport) = Transport::start(
+            BufReader::new(reader),
+            BufWriter::new(writer),
+            BufReader::new(stderr),
+            id,
+            name.clone(),
+        );
 
         let workspace_folders = root_uri
             .clone()
@@ -326,8 +503,8 @@ impl Client {
             id,
             name,
             launch_identity,
-            process: AsyncMutex::new(process),
-            transport,
+            process,
+            transport: ClientTransport::Direct(transport),
             request_counter: AtomicU64::new(0),
             capabilities: OnceCell::new(),
             file_operation_interest: OnceLock::new(),
@@ -338,7 +515,43 @@ impl Client {
             workspace_folders: WorkspaceFolders::new(workspace_folders),
         };
 
-        Ok((client, server_rx))
+        (client, server_rx)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn start_with_proxy(
+        proxy: Arc<dyn LanguageServerProxy>,
+        process: Arc<dyn LanguageServerProcess>,
+        config: Option<Value>,
+        root_path: PathBuf,
+        root_uri: Option<lsp::Url>,
+        id: LanguageServerId,
+        name: String,
+        launch_identity: ClientLaunchIdentity,
+        req_timeout: u64,
+    ) -> Self {
+        let workspace_folders = root_uri
+            .clone()
+            .map(|root| vec![workspace_for_uri(root)])
+            .unwrap_or_default();
+        Self {
+            id,
+            name,
+            launch_identity,
+            process,
+            transport: ClientTransport::Proxy {
+                backend: proxy,
+                initialization: crate::transport::Initialization::new(),
+            },
+            request_counter: AtomicU64::new(0),
+            capabilities: OnceCell::new(),
+            file_operation_interest: OnceLock::new(),
+            config,
+            req_timeout,
+            root_path,
+            root_uri,
+            workspace_folders: WorkspaceFolders::new(workspace_folders),
+        }
     }
 
     pub fn name(&self) -> &str {
@@ -637,23 +850,32 @@ impl Client {
 
         async move {
             use std::time::Duration;
-            transport
-                .request_deferred(
-                    id,
-                    R::METHOD,
-                    move || {
-                        let params = serde_json::to_value(params)?;
-                        serde_json::to_string(&jsonrpc::MethodCall {
-                            jsonrpc: Some(jsonrpc::Version::V2),
-                            id: request_id,
-                            method: R::METHOD.to_string(),
-                            params: Self::value_into_params(params),
-                        })
-                    },
-                    Duration::from_secs(timeout_secs),
-                )
-                .await
-                .and_then(|value| serde_json::from_value(value).map_err(Into::into))
+            let timeout = Duration::from_secs(timeout_secs);
+            let value = match &transport {
+                ClientTransport::Direct(transport) => {
+                    transport
+                        .request_deferred(
+                            id,
+                            R::METHOD,
+                            move || {
+                                let params = serde_json::to_value(params)?;
+                                serde_json::to_string(&jsonrpc::MethodCall {
+                                    jsonrpc: Some(jsonrpc::Version::V2),
+                                    id: request_id,
+                                    method: R::METHOD.to_string(),
+                                    params: Self::value_into_params(params),
+                                })
+                            },
+                            timeout,
+                        )
+                        .await?
+                }
+                ClientTransport::Proxy { .. } => {
+                    let params = serde_json::to_value(params)?;
+                    transport.request_proxy(R::METHOD, params, timeout).await?
+                }
+            };
+            serde_json::from_value(value).map_err(Into::into)
         }
     }
 
@@ -667,16 +889,26 @@ impl Client {
         let transport = self.transport.clone();
         let id = self.next_request_id();
         let timeout = self.req_timeout;
-        let request = jsonrpc::MethodCall {
-            jsonrpc: Some(jsonrpc::Version::V2),
-            id,
-            method,
-            params: Self::value_into_params(params),
-        };
         async move {
-            transport
-                .request(request, std::time::Duration::from_secs(timeout))
-                .await
+            let timeout = std::time::Duration::from_secs(timeout);
+            match &transport {
+                ClientTransport::Direct(transport) => {
+                    transport
+                        .request(
+                            jsonrpc::MethodCall {
+                                jsonrpc: Some(jsonrpc::Version::V2),
+                                id,
+                                method,
+                                params: Self::value_into_params(params),
+                            },
+                            timeout,
+                        )
+                        .await
+                }
+                ClientTransport::Proxy { .. } => {
+                    transport.request_proxy(&method, params, timeout).await
+                }
+            }
         }
     }
 
@@ -787,6 +1019,17 @@ impl Client {
 
     pub(crate) fn fail_initialization(&self, error: impl Into<Arc<str>>) {
         self.transport.fail_initialization(error);
+    }
+
+    pub async fn wait_until_initialized(&self) -> Result<()> {
+        match self.transport.wait_for_initialization().await {
+            InitializationState::Initialized => Ok(()),
+            InitializationState::Failed(message) => {
+                Err(Error::Other(anyhow::anyhow!(message.to_string())))
+            }
+            InitializationState::Pending => unreachable!("initialization wait returned pending"),
+            InitializationState::Closed => Err(Error::StreamClosed),
+        }
     }
 
     pub(crate) async fn initialize(&self, enable_snippets: bool) -> Result<lsp::InitializeResult> {
@@ -1106,12 +1349,12 @@ impl Client {
     }
 
     pub async fn force_kill(&self) -> Result<()> {
-        self.process.lock().await.kill().await?;
+        self.process.kill().await?;
         Ok(())
     }
 
-    pub async fn wait(&self) -> Result<std::process::ExitStatus> {
-        self.process.lock().await.wait().await.map_err(Into::into)
+    pub async fn wait(&self) -> Result<()> {
+        self.process.wait().await.map_err(Into::into)
     }
 
     // -------------------------------------------------------------------------------------------
@@ -2462,6 +2705,40 @@ impl Client {
 mod tests {
     use super::*;
 
+    #[derive(Debug, Default)]
+    struct RecordingProxy {
+        methods: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl LanguageServerProxy for RecordingProxy {
+        fn request(&self, method: &str, params: Value) -> BoxFuture<'_, Result<Value>> {
+            self.methods.lock().unwrap().push(method.to_owned());
+            let initialize = method == <lsp::request::Initialize as lsp::request::Request>::METHOD;
+            Box::pin(async move {
+                if initialize {
+                    Ok(serde_json::json!({
+                        "capabilities": { "hoverProvider": true }
+                    }))
+                } else {
+                    Ok(params)
+                }
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct NoopProcess;
+
+    impl LanguageServerProcess for NoopProcess {
+        fn kill(&self) -> BoxFuture<'_, std::io::Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn wait(&self) -> BoxFuture<'_, std::io::Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
     #[test]
     fn normalize_locale_uses_lsp_locale_shape() {
         assert_eq!(normalize_locale("en_US.UTF-8"), Some("en-US".to_string()));
@@ -2540,6 +2817,55 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn proxy_clients_preserve_typed_initialization_and_own_no_documents() {
+        let proxy = Arc::new(RecordingProxy::default());
+        let identity = ClientLaunchIdentity {
+            program: PathBuf::from("proxy"),
+            resolved_args: Vec::new(),
+            resolved_environment: Default::default(),
+            scope: crate::ClientLaunchScope::External(Arc::from("test")),
+            config: None,
+            timeout: 1,
+            enable_snippets: false,
+        };
+        let client = Client::start_with_proxy(
+            proxy.clone(),
+            Arc::new(NoopProcess),
+            None,
+            PathBuf::new(),
+            Some(lsp::Url::parse("dhx-collab://project/").unwrap()),
+            LanguageServerId::default(),
+            "test-server".to_owned(),
+            identity,
+            1,
+        );
+
+        let initialize = client.initialize(false).await.unwrap();
+        client.capabilities.set(initialize.capabilities).unwrap();
+        client.finish_initialization().await.unwrap();
+        client.wait_until_initialized().await.unwrap();
+        client.text_document_did_open(
+            lsp::Url::parse("dhx-collab://project/src/main.rs").unwrap(),
+            1,
+            &Rope::from("fn main() {}"),
+            "rust".to_owned(),
+        );
+        let params = serde_json::json!({ "value": 7 });
+        assert_eq!(
+            client
+                .call_custom("custom/echo".to_owned(), params.clone())
+                .await
+                .unwrap(),
+            params
+        );
+
+        assert_eq!(
+            *proxy.methods.lock().unwrap(),
+            vec!["initialize".to_owned(), "custom/echo".to_owned()]
+        );
+    }
+
     #[cfg(windows)]
     #[tokio::test]
     async fn force_kill_reaps_unresponsive_server_process() {
@@ -2560,8 +2886,7 @@ mod tests {
             program: launch.program.clone(),
             resolved_args: args.clone(),
             resolved_environment: launch.env.clone(),
-            origin: launch.origin.clone(),
-            configured_environment: Default::default(),
+            scope: crate::ClientLaunchScope::Local(launch.origin.clone()),
             config: None,
             timeout: 60,
             enable_snippets: false,
@@ -2590,6 +2915,9 @@ mod tests {
         );
 
         client.force_kill().await.unwrap();
-        assert!(client.process.lock().await.try_wait().unwrap().is_some());
+        tokio::time::timeout(std::time::Duration::from_secs(1), client.wait())
+            .await
+            .expect("killed language server was not reaped")
+            .unwrap();
     }
 }

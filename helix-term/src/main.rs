@@ -1,7 +1,7 @@
 use anyhow::{Context, Error, Result};
-use helix_loader::VERSION_AND_GIT_HASH;
+use helix_loader::{BUILD_TARGET, VERSION_AND_GIT_HASH};
 use helix_pkg::{OpEvent, Ops, PackageChange, PackageSpec, PkgKind, RegistrySource, UpdatePlan};
-use helix_term::application::Application;
+use helix_term::application::{Application, RemoteApplicationSession};
 use helix_term::args::{Args, PkgCommand};
 use helix_term::config::{Config, ConfigLoadError};
 
@@ -64,6 +64,7 @@ FLAGS:
     --vsplit                       Split all given files vertically into different windows
     --hsplit                       Split all given files horizontally into different windows
     -w, --working-dir <path>       Specify an initial working directory
+    --remote <ssh://host/path>     Open a remote workspace over OpenSSH
     +[N]                           Open the first given file at line number N, or the last line, if
                                    N is not specified.
 ",
@@ -150,13 +151,67 @@ FLAGS:
         helix_core::config::default_lang_loader()
     });
 
-    let mut app =
-        Application::new(args, config, lang_loader, runtime).context("unable to start Helix")?;
+    let remote = match args.remote.clone() {
+        Some(uri) => Some(connect_remote_workspace(&uri).await?),
+        None => None,
+    };
+    let mut app = Application::new_with_remote(args, config, lang_loader, runtime, remote)
+        .context("unable to start Helix")?;
     let mut events = app.event_stream();
 
     let exit_code = app.run(&mut events).await?;
 
     Ok(exit_code)
+}
+
+async fn connect_remote_workspace(
+    uri: &helix_remote::ssh::RemoteUri,
+) -> Result<RemoteApplicationSession> {
+    eprintln!("Connecting to {}...", uri.target.destination());
+    let config = helix_remote::ssh::SshConfig::new(uri.target.clone());
+    let build = helix_remote::ssh::ServerBuild::current(
+        VERSION_AND_GIT_HASH,
+        env!("CARGO_PKG_VERSION"),
+        BUILD_TARGET,
+    )?;
+    let server = config.prepare_server(&build).await.with_context(|| {
+        format!(
+            "failed to prepare remote server on {}",
+            uri.target.destination()
+        )
+    })?;
+    let mut transport = helix_remote::ssh::SshSession::connect(&config, &server)
+        .await
+        .with_context(|| format!("failed to connect to {}", uri.target.destination()))?;
+    let workspace = match helix_remote::backend::RemoteWorkspaceClient::open(
+        transport.client.clone(),
+        uri.target.destination(),
+        VERSION_AND_GIT_HASH,
+        uri.workspace.clone(),
+    )
+    .await
+    {
+        Ok(workspace) => workspace,
+        Err(error) => {
+            let mut diagnostics = Vec::new();
+            while let Ok(line) = transport.try_diagnostic() {
+                diagnostics.push(line.to_string());
+            }
+            transport.shutdown().await;
+            let detail = if diagnostics.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", diagnostics.join("; "))
+            };
+            anyhow::bail!("remote workspace handshake failed: {error}{detail}");
+        }
+    };
+    let workspace = std::sync::Arc::new(workspace);
+    transport.enable_reconnect(workspace.clone());
+    Ok(RemoteApplicationSession {
+        transport,
+        workspace,
+    })
 }
 
 fn run_pkg(command: PkgCommand) -> Result<i32> {

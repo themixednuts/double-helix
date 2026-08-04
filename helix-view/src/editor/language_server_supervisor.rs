@@ -6,7 +6,8 @@ use std::{
 
 use helix_lsp::{
     Client, ClientLaunchIdentity, LanguageServerLaunchRequest, LanguageServerName,
-    PreparedClientLaunch, PreparedLanguageServerLaunch, SpawnedLanguageServer,
+    PreparedClientLaunch, PreparedExternalLanguageServerCommand, PreparedLanguageServerLaunch,
+    SpawnedLanguageServer,
 };
 use helix_runtime::{Receiver, Sender};
 
@@ -32,20 +33,195 @@ struct DemandKey {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct InstanceKey {
     server: LanguageServerName,
-    root: PathBuf,
+    root: String,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 struct DemandSignature {
     config_generation: u64,
     language: String,
-    path: Option<PathBuf>,
+    location: DemandLocation,
     command: String,
     args: Vec<String>,
     environment: HashMap<String, String>,
     config: Option<serde_json::Value>,
     root_dirs: Vec<PathBuf>,
     enable_snippets: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum DemandLocation {
+    Local(PathBuf),
+    Remote {
+        session: helix_remote::SessionId,
+        path: helix_remote::WorkspacePath,
+    },
+    Collaboration {
+        project: helix_collab::ProjectId,
+        path: helix_workspace::WorkspacePath,
+    },
+}
+
+#[derive(Clone, Debug)]
+enum SupervisorLaunchRequest {
+    Local(LanguageServerLaunchRequest),
+    Remote(RemoteLanguageServerLaunchRequest),
+    Collaboration(CollaborationLanguageServerLaunchRequest),
+}
+
+#[derive(Clone, Debug)]
+struct RemoteLanguageServerLaunchRequest {
+    backend: Arc<helix_remote::backend::RemoteWorkspaceClient>,
+    name: String,
+    language: Arc<helix_core::syntax::config::LanguageConfiguration>,
+    server: helix_core::syntax::config::LanguageServerConfiguration,
+    document: helix_remote::WorkspacePath,
+    root_dirs: Vec<PathBuf>,
+    enable_snippets: bool,
+}
+
+#[derive(Clone, Debug)]
+struct CollaborationLanguageServerLaunchRequest {
+    session: helix_collab::GuestSessionHandle,
+    project: helix_collab::ProjectId,
+    buffer: helix_collab::BufferId,
+    name: String,
+    enable_snippets: bool,
+    timeout: u64,
+}
+
+#[derive(Debug)]
+enum PreparedSupervisorLaunch {
+    Ready(Box<(PreparedClientLaunch, LanguageServerLaunchTarget)>),
+    NoRequiredRoot,
+}
+
+#[derive(Debug)]
+enum LanguageServerLaunchTarget {
+    Local,
+    Remote {
+        backend: Arc<helix_remote::backend::RemoteWorkspaceClient>,
+        cwd: helix_remote::WorkspacePath,
+    },
+    Collaboration {
+        session: helix_collab::GuestSessionHandle,
+        buffer: helix_collab::BufferId,
+        server: String,
+    },
+}
+
+#[derive(Debug)]
+struct RemoteLanguageServerProcess(helix_remote::backend::RemoteProcessControl);
+
+impl helix_lsp::LanguageServerProcess for RemoteLanguageServerProcess {
+    fn kill(&self) -> futures_util::future::BoxFuture<'_, std::io::Result<()>> {
+        Box::pin(async move { self.0.kill().await.map_err(std::io::Error::other) })
+    }
+
+    fn wait(&self) -> futures_util::future::BoxFuture<'_, std::io::Result<()>> {
+        Box::pin(async move {
+            self.0
+                .wait()
+                .await
+                .map(|_| ())
+                .map_err(std::io::Error::other)
+        })
+    }
+}
+
+#[derive(Debug)]
+struct CollaborationLanguageServerState {
+    closed: tokio::sync::watch::Sender<bool>,
+}
+
+impl CollaborationLanguageServerState {
+    fn new() -> Arc<Self> {
+        let (closed, _) = tokio::sync::watch::channel(false);
+        Arc::new(Self { closed })
+    }
+
+    fn close(&self) {
+        self.closed.send_if_modified(|closed| {
+            if *closed {
+                false
+            } else {
+                *closed = true;
+                true
+            }
+        });
+    }
+
+    async fn wait(&self) {
+        let mut closed = self.closed.subscribe();
+        while !*closed.borrow() {
+            if closed.changed().await.is_err() {
+                break;
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct CollaborationLanguageServerProcess(Arc<CollaborationLanguageServerState>);
+
+impl helix_lsp::LanguageServerProcess for CollaborationLanguageServerProcess {
+    fn kill(&self) -> futures_util::future::BoxFuture<'_, std::io::Result<()>> {
+        Box::pin(async move {
+            self.0.close();
+            Ok(())
+        })
+    }
+
+    fn wait(&self) -> futures_util::future::BoxFuture<'_, std::io::Result<()>> {
+        Box::pin(async move {
+            self.0.wait().await;
+            Ok(())
+        })
+    }
+}
+
+#[derive(Debug)]
+struct CollaborationLanguageServerProxy {
+    session: helix_collab::GuestSessionHandle,
+    buffer: helix_collab::BufferId,
+    server: String,
+    state: Arc<CollaborationLanguageServerState>,
+}
+
+impl helix_lsp::LanguageServerProxy for CollaborationLanguageServerProxy {
+    fn request(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> futures_util::future::BoxFuture<'_, helix_lsp::Result<serde_json::Value>> {
+        let method = method.to_owned();
+        Box::pin(async move {
+            if method == "shutdown" {
+                self.state.close();
+                return Ok(serde_json::Value::Null);
+            }
+            let params = serde_json::to_vec(&params)?;
+            let result = self
+                .session
+                .language_server_request(self.buffer, self.server.clone(), method, params)
+                .await
+                .map_err(|error| helix_lsp::Error::Other(anyhow::Error::new(error)))?;
+            match result {
+                Ok(value) => serde_json::from_slice(&value).map_err(Into::into),
+                Err(error) => {
+                    let data = error
+                        .data
+                        .map(|data| serde_json::from_slice(&data))
+                        .transpose()?;
+                    Err(helix_lsp::Error::Rpc(helix_lsp::jsonrpc::Error {
+                        code: error.code.into(),
+                        message: error.message,
+                        data,
+                    }))
+                }
+            }
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -56,7 +232,7 @@ enum DemandStage {
     Prepared {
         instance: InstanceKey,
         identity: Box<ClientLaunchIdentity>,
-        launch: Option<Box<PreparedClientLaunch>>,
+        launch: Option<Box<(PreparedClientLaunch, LanguageServerLaunchTarget)>>,
     },
     Attached {
         client: helix_lsp::LanguageServerId,
@@ -69,7 +245,7 @@ enum DemandStage {
 struct DemandState {
     revision: u64,
     signature: DemandSignature,
-    request: LanguageServerLaunchRequest,
+    request: SupervisorLaunchRequest,
     origin: LaunchOrigin,
     failure_count: u8,
     stage: DemandStage,
@@ -86,12 +262,12 @@ enum SupervisorEventKind {
     Prepared {
         key: DemandKey,
         revision: u64,
-        result: helix_lsp::Result<PreparedLanguageServerLaunch>,
+        result: helix_lsp::Result<PreparedSupervisorLaunch>,
     },
     Spawned {
         instance: InstanceKey,
         id: helix_lsp::LanguageServerId,
-        result: helix_lsp::Result<SpawnedLanguageServer>,
+        result: Box<helix_lsp::Result<SpawnedLanguageServer>>,
     },
     Retry {
         key: DemandKey,
@@ -165,7 +341,7 @@ impl Editor {
                 instance,
                 id,
                 result,
-            } => self.handle_spawned_language_server(instance, id, result),
+            } => self.handle_spawned_language_server(instance, id, *result),
             SupervisorEventKind::Retry { key, revision } => {
                 self.handle_language_server_retry(key, revision)
             }
@@ -195,7 +371,59 @@ impl Editor {
             self.remove_document_language_server_demands(document, &HashSet::new());
             return;
         };
-        let path = doc.path().cloned();
+        let Some(location) = doc.location().cloned() else {
+            self.remove_document_language_server_demands(document, &HashSet::new());
+            return;
+        };
+        let (demand_location, local_path, remote, collaboration) = match location {
+            crate::file_bound::DocumentLocation::Local(path) => {
+                (DemandLocation::Local(path.clone()), Some(path), None, None)
+            }
+            crate::file_bound::DocumentLocation::Remote(location) => {
+                let Some(backend) = self
+                    .workspace_backend
+                    .remote()
+                    .cloned()
+                    .filter(|backend| backend.workspace().session == location.session)
+                else {
+                    self.remove_document_language_server_demands(document, &HashSet::new());
+                    return;
+                };
+                (
+                    DemandLocation::Remote {
+                        session: location.session,
+                        path: location.path.clone(),
+                    },
+                    None,
+                    Some((backend, location.path)),
+                    None,
+                )
+            }
+            crate::file_bound::DocumentLocation::Collaboration(location) => {
+                let Some(session) = self
+                    .collaboration
+                    .session()
+                    .filter(|session| session.project().id == location.project)
+                else {
+                    self.remove_document_language_server_demands(document, &HashSet::new());
+                    return;
+                };
+                let Some(buffer) = self.collaboration.buffer(document) else {
+                    self.remove_document_language_server_demands(document, &HashSet::new());
+                    return;
+                };
+                let demand = DemandLocation::Collaboration {
+                    project: location.project,
+                    path: location.path.clone(),
+                };
+                (
+                    demand,
+                    None,
+                    None,
+                    Some((session, location.project, buffer)),
+                )
+            }
+        };
         let editor_config = doc.config.load();
         let root_dirs = editor_config.workspace_lsp_roots.clone();
         let enable_snippets = editor_config.lsp.snippets;
@@ -235,7 +463,7 @@ impl Editor {
             let signature = DemandSignature {
                 config_generation: self.config_gen,
                 language: language.language_id.clone(),
-                path: path.clone(),
+                location: demand_location.clone(),
                 command: server.command.clone(),
                 args: server.args.clone(),
                 environment: server.environment.clone(),
@@ -243,13 +471,36 @@ impl Editor {
                 root_dirs: root_dirs.clone(),
                 enable_snippets,
             };
-            let request = LanguageServerLaunchRequest {
-                name: server_name.clone(),
-                language: language.clone(),
-                server,
-                doc_path: path.clone(),
-                root_dirs: root_dirs.clone(),
-                enable_snippets,
+            let request = match (&remote, &collaboration) {
+                (Some((backend, path)), _) => {
+                    SupervisorLaunchRequest::Remote(RemoteLanguageServerLaunchRequest {
+                        backend: backend.clone(),
+                        name: server_name.clone(),
+                        language: language.clone(),
+                        server,
+                        document: path.clone(),
+                        root_dirs: root_dirs.clone(),
+                        enable_snippets,
+                    })
+                }
+                (_, Some((session, project, buffer))) => SupervisorLaunchRequest::Collaboration(
+                    CollaborationLanguageServerLaunchRequest {
+                        session: session.clone(),
+                        project: *project,
+                        buffer: *buffer,
+                        name: server_name.clone(),
+                        enable_snippets,
+                        timeout: server.timeout,
+                    },
+                ),
+                (None, None) => SupervisorLaunchRequest::Local(LanguageServerLaunchRequest {
+                    name: server_name.clone(),
+                    language: language.clone(),
+                    server,
+                    doc_path: local_path.clone(),
+                    root_dirs: root_dirs.clone(),
+                    enable_snippets,
+                }),
             };
             let force = force_servers.is_some_and(|servers| servers.contains(&server_name));
             self.upsert_language_server_demand(
@@ -287,7 +538,7 @@ impl Editor {
         &mut self,
         key: DemandKey,
         signature: DemandSignature,
-        request: LanguageServerLaunchRequest,
+        request: SupervisorLaunchRequest,
         origin: LaunchOrigin,
         force: bool,
     ) {
@@ -356,14 +607,31 @@ impl Editor {
         let block = self.runtime().block().clone();
         self.work()
             .spawn(async move {
-                let result = match block
-                    .spawn(move || helix_lsp::prepare_language_server_launch(request))
-                    .await
-                {
-                    Ok(result) => result,
-                    Err(error) => Err(helix_lsp::Error::Other(anyhow::anyhow!(
-                        "language-server preparation task failed: {error}"
-                    ))),
+                let result = match request {
+                    SupervisorLaunchRequest::Local(request) => match block
+                        .spawn(move || helix_lsp::prepare_language_server_launch(request))
+                        .await
+                    {
+                        Ok(Ok(PreparedLanguageServerLaunch::Ready(launch))) => {
+                            Ok(PreparedSupervisorLaunch::Ready(Box::new((
+                                *launch,
+                                LanguageServerLaunchTarget::Local,
+                            ))))
+                        }
+                        Ok(Ok(PreparedLanguageServerLaunch::NoRequiredRoot)) => {
+                            Ok(PreparedSupervisorLaunch::NoRequiredRoot)
+                        }
+                        Ok(Err(error)) => Err(error),
+                        Err(error) => Err(helix_lsp::Error::Other(anyhow::anyhow!(
+                            "language-server preparation task failed: {error}"
+                        ))),
+                    },
+                    SupervisorLaunchRequest::Remote(request) => {
+                        prepare_remote_language_server(request).await
+                    }
+                    SupervisorLaunchRequest::Collaboration(request) => {
+                        prepare_collaboration_language_server(request)
+                    }
                 };
                 let _ = tx
                     .send(LanguageServerSupervisorEvent(
@@ -445,7 +713,7 @@ impl Editor {
         &mut self,
         key: DemandKey,
         revision: u64,
-        result: helix_lsp::Result<PreparedLanguageServerLaunch>,
+        result: helix_lsp::Result<PreparedSupervisorLaunch>,
     ) {
         let Some(state) = self.language_server_supervisor.demands.get(&key) else {
             return;
@@ -461,8 +729,8 @@ impl Editor {
         }
 
         let prepared = match result {
-            Ok(PreparedLanguageServerLaunch::Ready(prepared)) => *prepared,
-            Ok(PreparedLanguageServerLaunch::NoRequiredRoot) => {
+            Ok(PreparedSupervisorLaunch::Ready(prepared)) => prepared,
+            Ok(PreparedSupervisorLaunch::NoRequiredRoot) => {
                 if let Some(state) = self.language_server_supervisor.demands.get_mut(&key) {
                     state.stage = DemandStage::Failed;
                 }
@@ -487,7 +755,8 @@ impl Editor {
             }
         };
 
-        if self.language_servers.is_manually_stopped(prepared.name()) {
+        let (launch, _) = prepared.as_ref();
+        if self.language_servers.is_manually_stopped(launch.name()) {
             if let Some(state) = self.language_server_supervisor.demands.get_mut(&key) {
                 state.stage = DemandStage::Failed;
             }
@@ -495,11 +764,14 @@ impl Editor {
         }
 
         let instance = InstanceKey {
-            server: prepared.name().to_owned(),
-            root: prepared.root_path().to_path_buf(),
+            server: launch.name().to_owned(),
+            root: launch
+                .root_uri()
+                .map(ToString::to_string)
+                .unwrap_or_else(|| launch.root_path().display().to_string()),
         };
-        let identity = prepared.identity();
-        if let Some(client) = self.language_servers.compatible_prepared_client(&prepared) {
+        let identity = launch.identity();
+        if let Some(client) = self.language_servers.compatible_prepared_client(launch) {
             self.attach_supervised_language_server(&key, revision, client);
             return;
         }
@@ -508,7 +780,7 @@ impl Editor {
             state.stage = DemandStage::Prepared {
                 instance: instance.clone(),
                 identity: Box::new(identity),
-                launch: Some(Box::new(prepared)),
+                launch: Some(prepared),
             };
         }
         self.start_prepared_language_server(instance);
@@ -569,21 +841,32 @@ impl Editor {
         let block = self.runtime().block().clone();
         self.work()
             .spawn(async move {
-                let result = match block
-                    .spawn(move || helix_lsp::spawn_language_server(id, launch))
-                    .await
-                {
-                    Ok(result) => result,
-                    Err(error) => Err(helix_lsp::Error::Other(anyhow::anyhow!(
-                        "language-server spawn task failed: {error}"
-                    ))),
+                let (launch, target) = launch;
+                let result = match target {
+                    LanguageServerLaunchTarget::Local => match block
+                        .spawn(move || helix_lsp::spawn_language_server(id, launch))
+                        .await
+                    {
+                        Ok(result) => result,
+                        Err(error) => Err(helix_lsp::Error::Other(anyhow::anyhow!(
+                            "language-server spawn task failed: {error}"
+                        ))),
+                    },
+                    LanguageServerLaunchTarget::Remote { backend, cwd } => {
+                        spawn_remote_language_server(id, launch, backend, cwd).await
+                    }
+                    LanguageServerLaunchTarget::Collaboration {
+                        session,
+                        buffer,
+                        server,
+                    } => spawn_collaboration_language_server(id, launch, session, buffer, server),
                 };
                 let _ = tx
                     .send(LanguageServerSupervisorEvent(
                         SupervisorEventKind::Spawned {
                             instance,
                             id,
-                            result,
+                            result: Box::new(result),
                         },
                     ))
                     .await;
@@ -992,4 +1275,155 @@ impl Editor {
             self.detach_document_language_server(document, server);
         }
     }
+}
+
+fn prepare_collaboration_language_server(
+    request: CollaborationLanguageServerLaunchRequest,
+) -> helix_lsp::Result<PreparedSupervisorLaunch> {
+    let root_uri = helix_lsp::lsp::Url::parse(&format!("dhx-collab://{}/", request.project))
+        .map_err(|error| helix_lsp::Error::Other(anyhow::Error::new(error)))?;
+    let scope: Arc<str> = Arc::from(format!("collaboration://{}", request.project));
+    let launch = PreparedClientLaunch::proxy(
+        request.name.clone(),
+        root_uri,
+        request.enable_snippets,
+        scope,
+        request.timeout,
+    );
+    Ok(PreparedSupervisorLaunch::Ready(Box::new((
+        launch,
+        LanguageServerLaunchTarget::Collaboration {
+            session: request.session,
+            buffer: request.buffer,
+            server: request.name,
+        },
+    ))))
+}
+
+fn spawn_collaboration_language_server(
+    id: helix_lsp::LanguageServerId,
+    launch: PreparedClientLaunch,
+    session: helix_collab::GuestSessionHandle,
+    buffer: helix_collab::BufferId,
+    server: String,
+) -> helix_lsp::Result<SpawnedLanguageServer> {
+    let state = CollaborationLanguageServerState::new();
+    let process = Arc::new(CollaborationLanguageServerProcess(state.clone()));
+    let proxy = Arc::new(CollaborationLanguageServerProxy {
+        session,
+        buffer,
+        server,
+        state,
+    });
+    helix_lsp::spawn_language_server_with_proxy(id, launch, process, proxy)
+}
+
+async fn prepare_remote_language_server(
+    request: RemoteLanguageServerLaunchRequest,
+) -> helix_lsp::Result<PreparedSupervisorLaunch> {
+    let root_dirs = request
+        .language
+        .workspace_lsp_roots
+        .as_deref()
+        .unwrap_or(&request.root_dirs)
+        .iter()
+        .map(|path| remote_workspace_path(path))
+        .collect::<helix_lsp::Result<Vec<_>>>()?;
+    let workspace = request
+        .backend
+        .resolve_language_server_workspace(helix_remote::ResolveLanguageServerWorkspace {
+            document: request.document,
+            root_markers: request.language.roots.patterns().to_vec(),
+            root_dirs,
+            required_root_patterns: request
+                .server
+                .required_root_patterns
+                .as_ref()
+                .map(|patterns| patterns.patterns().to_vec()),
+        })
+        .await
+        .map_err(|error| helix_lsp::Error::Other(anyhow::Error::new(error)))?;
+    let Some(workspace) = workspace else {
+        return Ok(PreparedSupervisorLaunch::NoRequiredRoot);
+    };
+    let root_uri = helix_lsp::Url::parse(&workspace.uri)
+        .map_err(|error| helix_lsp::Error::Other(anyhow::Error::new(error)))?;
+    let scope: Arc<str> = Arc::from(format!(
+        "ssh://{}#{}",
+        request.backend.authority(),
+        request.backend.workspace().session.0
+    ));
+    let command = PreparedExternalLanguageServerCommand {
+        scope,
+        program: request.server.command,
+        args: request.server.args,
+        environment: request.server.environment.into_iter().collect(),
+    };
+    let launch = PreparedClientLaunch::external(
+        request.name,
+        PathBuf::from(workspace.absolute_path),
+        Some(root_uri),
+        request.enable_snippets,
+        command,
+        request.server.config,
+        request.server.timeout,
+    );
+    Ok(PreparedSupervisorLaunch::Ready(Box::new((
+        launch,
+        LanguageServerLaunchTarget::Remote {
+            backend: request.backend,
+            cwd: workspace.root,
+        },
+    ))))
+}
+
+fn remote_workspace_path(path: &std::path::Path) -> helix_lsp::Result<helix_remote::WorkspacePath> {
+    let path = path.to_str().ok_or_else(|| {
+        helix_lsp::Error::Other(anyhow::anyhow!(
+            "remote language-server root is not valid UTF-8"
+        ))
+    })?;
+    helix_remote::WorkspacePath::from_slash_path(&path.replace('\\', "/")).map_err(|error| {
+        helix_lsp::Error::Other(anyhow::anyhow!(
+            "invalid remote language-server root '{path}': {error}"
+        ))
+    })
+}
+
+async fn spawn_remote_language_server(
+    id: helix_lsp::LanguageServerId,
+    launch: PreparedClientLaunch,
+    backend: Arc<helix_remote::backend::RemoteWorkspaceClient>,
+    cwd: helix_remote::WorkspacePath,
+) -> helix_lsp::Result<SpawnedLanguageServer> {
+    let command = launch.external_command().cloned().ok_or_else(|| {
+        helix_lsp::Error::Other(anyhow::anyhow!(
+            "remote language-server launch has no remote command"
+        ))
+    })?;
+    let process = backend
+        .start_process(helix_remote::backend::RemoteProcessSpec {
+            program: command.program,
+            args: command.args,
+            cwd,
+            env: command.environment,
+        })
+        .await
+        .map_err(|error| helix_lsp::Error::Other(anyhow::Error::new(error)))?;
+    let parts = process.into_parts();
+    let remote_control = parts.control.clone();
+    let control: Arc<dyn helix_lsp::LanguageServerProcess> =
+        Arc::new(RemoteLanguageServerProcess(parts.control));
+    let result = helix_lsp::spawn_language_server_with_streams(
+        id,
+        launch,
+        control,
+        parts.stdout,
+        parts.stdin,
+        parts.stderr,
+    );
+    if result.is_err() {
+        let _ = remote_control.kill().await;
+    }
+    result
 }

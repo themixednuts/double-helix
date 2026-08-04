@@ -16,6 +16,13 @@ struct SlowLspUiCall<'a> {
     started_at: std::time::Instant,
 }
 
+struct CollaborationDiagnosticsPublication {
+    hosted: crate::runtime::collaboration::HostedProject,
+    path: helix_workspace::WorkspacePath,
+    server: String,
+    uri: lsp::Url,
+}
+
 fn notification_method(notification: &Notification) -> &'static str {
     match notification {
         Notification::Initialized => "initialized",
@@ -386,80 +393,52 @@ impl Application {
                         Ok(json!(result))
                     }
                     Ok(MethodCall::WorkspaceDiagnosticRefresh) => {
-                        let language_server = language_server!().id();
-                        let documents = self
-                            .editor
-                            .documents_supporting_language_server(language_server);
-                        let ingress = self.ingress().tx.clone();
-                        let language_servers = std::collections::HashSet::from([language_server]);
-                        crate::effect::language_server::queue_document_diagnostics_for_language_servers(
-                            &mut self.editor,
-                            documents,
-                            &language_servers,
-                            ingress,
+                        let kind = helix_collab::LanguageServerRefreshKind::WorkspaceDiagnostics;
+                        self.apply_language_server_refreshes(
+                            std::collections::HashSet::from([server_id]),
+                            kind,
                         );
+                        self.publish_host_language_server_refresh(server_id, kind);
 
                         Ok(serde_json::Value::Null)
                     }
                     Ok(MethodCall::SemanticTokensRefresh) => {
-                        let language_server = language_server!().id();
-                        let documents = self
-                            .editor
-                            .documents_supporting_language_server(language_server);
-                        let ingress = self.ingress().tx.clone();
-
-                        for document in documents {
-                            crate::effect::language_server::request_semantic_tokens(
-                                &mut self.editor,
-                                document,
-                                ingress.clone(),
-                            );
-                        }
+                        let kind = helix_collab::LanguageServerRefreshKind::SemanticTokens;
+                        self.apply_language_server_refreshes(
+                            std::collections::HashSet::from([server_id]),
+                            kind,
+                        );
+                        self.publish_host_language_server_refresh(server_id, kind);
 
                         Ok(serde_json::Value::Null)
                     }
                     Ok(MethodCall::CodeLensRefresh) => {
-                        let language_server = language_server!().id();
-                        let documents = self
-                            .editor
-                            .documents_supporting_language_server(language_server);
-                        let ingress = self.ingress().tx.clone();
-
-                        for document in documents {
-                            crate::effect::language_server::request_code_lenses(
-                                &mut self.editor,
-                                document,
-                                ingress.clone(),
-                            );
-                        }
+                        let kind = helix_collab::LanguageServerRefreshKind::CodeLens;
+                        self.apply_language_server_refreshes(
+                            std::collections::HashSet::from([server_id]),
+                            kind,
+                        );
+                        self.publish_host_language_server_refresh(server_id, kind);
 
                         Ok(serde_json::Value::Null)
                     }
                     Ok(MethodCall::InlayHintRefresh) => {
-                        for doc in self.editor.documents_mut() {
-                            doc.mark_inlay_hints_outdated();
-                        }
-                        let ingress = self.ingress().tx.clone();
-                        crate::commands::compute_inlay_hints_for_all_views(
-                            &mut self.editor,
-                            ingress,
+                        let kind = helix_collab::LanguageServerRefreshKind::InlayHints;
+                        self.apply_language_server_refreshes(
+                            std::collections::HashSet::from([server_id]),
+                            kind,
                         );
+                        self.publish_host_language_server_refresh(server_id, kind);
+
                         Ok(serde_json::Value::Null)
                     }
                     Ok(MethodCall::InlineValueRefresh) => {
-                        let language_server = language_server!().id();
-                        let documents = self
-                            .editor
-                            .documents_supporting_language_server(language_server);
-                        let ingress = self.ingress().tx.clone();
-
-                        for document in documents {
-                            crate::effect::language_server::request_inline_values(
-                                &mut self.editor,
-                                document,
-                                ingress.clone(),
-                            );
-                        }
+                        let kind = helix_collab::LanguageServerRefreshKind::InlineValues;
+                        self.apply_language_server_refreshes(
+                            std::collections::HashSet::from([server_id]),
+                            kind,
+                        );
+                        self.publish_host_language_server_refresh(server_id, kind);
 
                         Ok(serde_json::Value::Null)
                     }
@@ -515,11 +494,136 @@ impl Application {
         }
     }
 
-    fn queue_lsp_diagnostics(
+    pub(super) fn apply_collaboration_language_server_refresh(
+        &mut self,
+        refresh: helix_collab::LanguageServerRefresh,
+    ) {
+        if self
+            .collaboration
+            .as_ref()
+            .is_none_or(|session| session.hosted.is_some())
+        {
+            return;
+        }
+        let language_servers = self
+            .editor
+            .documents()
+            .filter_map(|document| document.language_server_by_name(&refresh.server))
+            .map(|client| client.id())
+            .collect();
+        self.apply_language_server_refreshes(language_servers, refresh.kind);
+    }
+
+    fn apply_language_server_refreshes(
+        &mut self,
+        language_servers: std::collections::HashSet<LanguageServerId>,
+        kind: helix_collab::LanguageServerRefreshKind,
+    ) {
+        if language_servers.is_empty() {
+            return;
+        }
+        let documents = language_servers
+            .iter()
+            .flat_map(|server| {
+                self.editor
+                    .documents_supporting_language_server(*server)
+                    .into_iter()
+            })
+            .collect::<std::collections::HashSet<_>>();
+        let ingress = self.ingress().tx.clone();
+        match kind {
+            helix_collab::LanguageServerRefreshKind::WorkspaceDiagnostics => {
+                crate::effect::language_server::queue_document_diagnostics_for_language_servers(
+                    &mut self.editor,
+                    documents,
+                    &language_servers,
+                    ingress,
+                );
+            }
+            helix_collab::LanguageServerRefreshKind::SemanticTokens => {
+                for document in documents {
+                    crate::effect::language_server::request_semantic_tokens(
+                        &mut self.editor,
+                        document,
+                        ingress.clone(),
+                    );
+                }
+            }
+            helix_collab::LanguageServerRefreshKind::CodeLens => {
+                for document in documents {
+                    crate::effect::language_server::request_code_lenses(
+                        &mut self.editor,
+                        document,
+                        ingress.clone(),
+                    );
+                }
+            }
+            helix_collab::LanguageServerRefreshKind::InlayHints => {
+                for document in documents {
+                    if let Some(document) = self.editor.document_mut(document) {
+                        document.mark_inlay_hints_outdated();
+                    }
+                }
+                crate::commands::compute_inlay_hints_for_all_views(&mut self.editor, ingress);
+            }
+            helix_collab::LanguageServerRefreshKind::InlineValues => {
+                for document in documents {
+                    crate::effect::language_server::request_inline_values(
+                        &mut self.editor,
+                        document,
+                        ingress.clone(),
+                    );
+                }
+            }
+        }
+    }
+
+    fn publish_host_language_server_refresh(
+        &self,
+        server_id: LanguageServerId,
+        kind: helix_collab::LanguageServerRefreshKind,
+    ) {
+        let Some((hosted, server)) = self.collaboration.as_ref().and_then(|session| {
+            let hosted = session.hosted.clone()?;
+            let server = self
+                .editor
+                .language_server_by_id(server_id)?
+                .name()
+                .to_owned();
+            Some((hosted, server))
+        }) else {
+            return;
+        };
+        self.runtime
+            .work()
+            .spawn(async move {
+                if let Err(error) = hosted.publish_language_server_refresh(server, kind).await {
+                    log::warn!("failed to publish collaboration language-server refresh: {error}");
+                }
+            })
+            .detach();
+    }
+
+    pub(super) fn queue_lsp_diagnostics(
         &mut self,
         server_id: LanguageServerId,
         params: lsp::PublishDiagnosticsParams,
     ) {
+        let publication = self.collaboration.as_ref().and_then(|session| {
+            let hosted = session.hosted.clone()?;
+            let path = hosted.workspace_path_from_language_server_url(&params.uri)?;
+            let server = self
+                .editor
+                .language_server_by_id(server_id)?
+                .name()
+                .to_owned();
+            Some(CollaborationDiagnosticsPublication {
+                uri: hosted.collaboration_document_url(&path),
+                hosted,
+                path,
+                server,
+            })
+        });
         let uri = match Uri::try_from(params.uri) {
             Ok(uri) => uri,
             Err(error) => {
@@ -558,7 +662,7 @@ impl Application {
             .and_modify(|generation| *generation = generation.wrapping_add(1))
             .or_insert(1)
             .to_owned();
-        self.spawn_lsp_diagnostics_work(server_id, uri, generation, work);
+        self.spawn_lsp_diagnostics_work(server_id, uri, generation, work, publication);
     }
 
     fn spawn_lsp_diagnostics_work(
@@ -567,14 +671,21 @@ impl Application {
         uri: Uri,
         generation: u64,
         work: helix_view::handlers::lsp::LspDiagnosticsWork,
+        publication: Option<CollaborationDiagnosticsPublication>,
     ) {
-        let blocking = self.runtime.block().spawn(move || work.execute());
+        let blocking = self.runtime.block().spawn(move || {
+            let publication = publication.map(|publication| {
+                let serialized = work.serialize_publish_diagnostics(&publication.uri);
+                (publication, serialized)
+            });
+            (work.execute(), publication)
+        });
         let ingress = self.ingress_sender();
         self.runtime
             .work()
             .spawn(async move {
                 let started_at = std::time::Instant::now();
-                let prepared = match blocking.await {
+                let (prepared, publication) = match blocking.await {
                     Ok(prepared) => prepared,
                     Err(error) => {
                         log::error!(
@@ -592,16 +703,38 @@ impl Application {
                         elapsed.as_micros(),
                     );
                 }
-                let _ = ingress
-                    .send_task(
-                        crate::runtime::RuntimeTaskEvent::ApplyPreparedLspDiagnostics {
-                            server_id,
-                            uri,
-                            generation,
-                            prepared,
-                        },
-                    )
-                    .await;
+                let publish = async move {
+                    let Some((publication, serialized)) = publication else {
+                        return;
+                    };
+                    let params = match serialized {
+                        Ok(params) => params,
+                        Err(error) => {
+                            log::warn!("failed to serialize collaboration diagnostics: {error}");
+                            return;
+                        }
+                    };
+                    if let Err(error) = publication
+                        .hosted
+                        .publish_language_server_diagnostics(
+                            publication.path,
+                            publication.server,
+                            params,
+                        )
+                        .await
+                    {
+                        log::warn!("failed to publish collaboration diagnostics: {error}");
+                    }
+                };
+                let apply = ingress.send_task(
+                    crate::runtime::RuntimeTaskEvent::ApplyPreparedLspDiagnostics {
+                        server_id,
+                        uri,
+                        generation,
+                        prepared,
+                    },
+                );
+                let (_, _) = tokio::join!(publish, apply);
             })
             .detach();
     }
@@ -651,7 +784,7 @@ impl Application {
                 }
             }
             helix_view::handlers::lsp::LspDiagnosticsApply::Retry(work) => {
-                self.spawn_lsp_diagnostics_work(server_id, uri, generation, work);
+                self.spawn_lsp_diagnostics_work(server_id, uri, generation, work, None);
             }
         }
     }
@@ -715,7 +848,7 @@ impl Application {
             &self.ingress.tx,
             &self.foreground,
             crate::runtime::DocumentOpenRequest {
-                path: path.to_path_buf(),
+                path: path.to_path_buf().into(),
                 action,
                 lane: crate::runtime::DocumentOpenLane::Navigation,
                 target: crate::runtime::DocumentOpenTarget::View(target),

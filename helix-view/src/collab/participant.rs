@@ -8,12 +8,7 @@ pub enum Kind {
     Human,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Access {
-    Observe,
-    Read,
-    Write,
-}
+pub use helix_collab::Role as Access;
 
 /// Collaboration participant.
 #[derive(Debug, Clone, PartialEq, Eq)]

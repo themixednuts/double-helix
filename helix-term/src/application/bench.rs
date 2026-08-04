@@ -63,15 +63,17 @@ impl Application {
                 redraw: redraw.clone(),
                 plugin_events: self.ingress().tx.clone().into(),
             };
-            let mut cx = Self::make_compositor_context(
+            let mut cx = crate::compositor::Context::with_services(
                 &mut self.editor,
                 &mut self.exit.tasks,
-                self.exit.work.clone(),
-                notifier,
-                ingress,
-                idle_reset,
-                self.plugin_runtime.clone(),
-                self.foreground.clone(),
+                crate::compositor::ContextServices::new(
+                    self.exit.work.clone(),
+                    notifier,
+                    ingress,
+                    idle_reset,
+                    self.plugin_runtime.clone(),
+                    self.foreground.clone(),
+                ),
             );
 
             for key in &keys {
@@ -167,15 +169,17 @@ impl Application {
                 redraw: redraw.clone(),
                 plugin_events: self.ingress().tx.clone().into(),
             };
-            let mut cx = Self::make_compositor_context(
+            let mut cx = crate::compositor::Context::with_services(
                 &mut self.editor,
                 &mut self.exit.tasks,
-                self.exit.work.clone(),
-                notifier,
-                ingress,
-                idle_reset,
-                self.plugin_runtime.clone(),
-                self.foreground.clone(),
+                crate::compositor::ContextServices::new(
+                    self.exit.work.clone(),
+                    notifier,
+                    ingress,
+                    idle_reset,
+                    self.plugin_runtime.clone(),
+                    self.foreground.clone(),
+                ),
             );
             self.compositor.handle_event(&ViewEvent::Key(esc), &mut cx);
         }

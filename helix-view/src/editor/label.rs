@@ -4,6 +4,9 @@ use crate::{Document, Editor};
 
 impl Editor {
     pub fn buffer_label(&self, doc: &Document) -> String {
+        if let Some(name) = doc.scratch_name() {
+            return name.to_owned();
+        }
         let scratch = PathBuf::from(crate::document::SCRATCH_BUFFER_NAME);
 
         if doc.path().is_none() {

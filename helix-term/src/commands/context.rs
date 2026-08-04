@@ -122,15 +122,17 @@ impl Context<'_> {
     }
 
     pub fn compositor_context(&mut self) -> compositor::Context<'_> {
-        compositor::Context::with_foreground(
+        compositor::Context::with_services(
             self.editor,
             self.exit_tasks,
-            self.exit_task_work.clone(),
-            self.notifier.clone(),
-            self.ingress.clone(),
-            self.idle_reset.clone(),
-            self.plugin_runtime.clone(),
-            self.foreground.clone(),
+            compositor::ContextServices::new(
+                self.exit_task_work.clone(),
+                self.notifier.clone(),
+                self.ingress.clone(),
+                self.idle_reset.clone(),
+                self.plugin_runtime.clone(),
+                self.foreground.clone(),
+            ),
         )
     }
 

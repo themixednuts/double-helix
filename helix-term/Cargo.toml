@@ -59,8 +59,10 @@ path = "src/bin/hx_bench.rs"
 required-features = ["integration", "bench"]
 
 [dependencies]
+code-atlas = { path = "../code-atlas" }
 helix-stdx = { path = "../helix-stdx" }
 helix-core = { path = "../helix-core" }
+helix-collab = { path = "../helix-collab" }
 helix-view = { path = "../helix-view" }
 helix-lsp = { path = "../helix-lsp" }
 helix-dap = { path = "../helix-dap" }
@@ -73,6 +75,8 @@ helix-plugin-editor = { path = "../helix-plugin-editor" }
 helix-acp = { path = "../helix-acp" }
 helix-modal = { path = "../helix-modal" }
 helix-runtime = { path = "../helix-runtime" }
+helix-remote = { path = "../helix-remote" }
+helix-workspace = { path = "../helix-workspace" }
 helix-store = { path = "../helix-store" }
 
 anyhow = "1"
@@ -83,6 +87,7 @@ tui = { path = "../helix-tui", package = "helix-tui", default-features = false, 
 termina = { workspace = true, features = ["event-stream"] }
 signal-hook = "0.4"
 tokio-stream = "0.1"
+tokio-util = { version = "0.7", features = ["rt"] }
 futures-util = { version = "0.3", features = ["std", "async-await"], default-features = false }
 arc-swap.workspace = true
 termini = "1"

@@ -587,6 +587,8 @@ pub struct SyntaxComplexity {
 pub const INTERACTIVE_PARSE_TIMEOUT: Duration = Duration::from_millis(12);
 pub const IDLE_PARSE_TIMEOUT: Duration = Duration::from_millis(500);
 pub const BACKGROUND_PARSE_TIMEOUT: Duration = Duration::from_secs(2);
+/// Full-document syntax work above this size is disabled to preserve editor responsiveness.
+pub const MAX_FULL_DOCUMENT_SYNTAX_BYTES: usize = 10 * 1024 * 1024;
 
 impl Syntax {
     pub fn enter_trace(ctx: SyntaxTraceContext) -> SyntaxTraceGuard {

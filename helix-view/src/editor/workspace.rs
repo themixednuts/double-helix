@@ -30,6 +30,10 @@ impl DetachedPreviewDocument {
         self.document.path().map(PathBuf::as_path)
     }
 
+    pub fn location(&self) -> Option<&crate::file_bound::DocumentLocation> {
+        self.document.location()
+    }
+
     pub const fn restore_language_servers(&self) -> bool {
         self.restore_language_servers
     }
@@ -169,6 +173,27 @@ impl Editor {
         self.new_file_from_document(action, doc)
     }
 
+    pub fn open_named_scratch(
+        &mut self,
+        action: Action,
+        text: String,
+        name: impl Into<std::sync::Arc<str>>,
+        language_id: Option<&str>,
+    ) -> DocumentId {
+        let mut doc = Document::from(
+            text.into(),
+            None,
+            self.config.clone(),
+            self.syn_loader.clone(),
+        )
+        .with_persistent_scratch()
+        .with_scratch_name(name);
+        if let Some(language_id) = language_id {
+            let _ = doc.set_language_by_language_id(language_id, &self.syn_loader.load());
+        }
+        self.new_file_from_document(action, doc)
+    }
+
     pub fn switch_document_if_exists(&mut self, id: DocumentId, action: Action) -> bool {
         if self.document(id).is_none() {
             return false;
@@ -225,11 +250,11 @@ impl Editor {
     }
 
     pub fn promote_preview_document(&mut self, id: DocumentId) {
-        let Some(path) = self
+        let Some(location) = self
             .documents
             .get(&id)
             .filter(|doc| doc.is_preview())
-            .and_then(|doc| doc.path().cloned())
+            .and_then(|doc| doc.location().cloned())
         else {
             return;
         };
@@ -241,8 +266,10 @@ impl Editor {
         let syntax_was_present = doc.has_syntax();
         doc.promote_from_preview();
 
-        self.launch_language_servers(id);
-        self.dispatch_document_open(id, &path);
+        if matches!(location, crate::file_bound::DocumentLocation::Local(_)) {
+            self.launch_language_servers(id);
+        }
+        self.dispatch_document_open(id, &location);
         let (language_name, has_syntax, language_servers) = self
             .documents
             .get(&id)
@@ -257,7 +284,7 @@ impl Editor {
         log::info!(
             "[document_open] preview_promote doc={:?} path={} language={} syntax_was_present={} has_syntax={} language_servers={} documents={}",
             id,
-            path.display(),
+            location,
             language_name,
             syntax_was_present,
             has_syntax,
@@ -395,6 +422,11 @@ impl Editor {
     pub fn take_preview_document(&mut self, id: DocumentId) -> Option<DetachedPreviewDocument> {
         let doc = self.documents.get(&id)?;
         if !doc.is_preview() {
+            return None;
+        }
+        // A detached collaboration preview would stop receiving replicated
+        // updates. Close it instead; reopening obtains a fresh CRDT snapshot.
+        if doc.collaboration_location().is_some() {
             return None;
         }
         if doc.is_modified() {
@@ -535,6 +567,7 @@ impl Editor {
             }
         }
 
+        self.unbind_collaboration_document(doc_id);
         let doc = self.documents.remove(&doc_id).unwrap();
 
         if self.tree.views().next().is_none() {

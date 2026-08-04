@@ -3,18 +3,25 @@ use helix_lsp::LanguageServerId;
 
 use crate::{editor::Config, Document, DocumentId, Editor, ViewId};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DocumentChangeOrigin {
+    Local,
+    Collaboration,
+}
+
 pub struct DocumentDidOpen<'a> {
     pub editor: &'a mut Editor,
     pub doc: DocumentId,
-    pub path: &'a std::path::PathBuf,
+    pub location: &'a crate::file_bound::DocumentLocation,
 }
 
 pub struct DocumentDidChange<'a> {
     pub doc: &'a mut Document,
-    pub view: ViewId,
+    pub view: Option<ViewId>,
     pub old_text: &'a Rope,
     pub changes: &'a ChangeSet,
     pub ghost_transaction: bool,
+    pub origin: DocumentChangeOrigin,
 }
 
 pub struct EditorConfigDidChange<'a> {

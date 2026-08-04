@@ -15,6 +15,7 @@ name = "hx-loader"
 path = "src/main.rs"
 
 [dependencies]
+helix-ipc = { path = "../helix-ipc" }
 helix-stdx = { path = "../helix-stdx" }
 helix-store = { path = "../helix-store" }
 

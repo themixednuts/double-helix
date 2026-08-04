@@ -1,5 +1,3 @@
-use std::path::PathBuf;
-
 use helix_lsp::{lsp, LanguageServerId};
 
 /// Layer stack / overlay operations.
@@ -17,11 +15,25 @@ pub enum LayerCommand {
         markdown: String,
     },
     /// Push the directory file picker rooted at `root` (cmdline `:open` on a directory).
-    PushFilePicker { root: PathBuf },
+    PushFilePicker {
+        root: helix_view::editor::WorkspaceDocumentPath,
+    },
     /// Push the runtime package manager.
     PkgManager,
     /// Push the package manager focused on Agent Client Protocol agents.
     AcpAgentsManager,
+    /// Manage participants in the active collaboration session.
+    CollaborationParticipants,
+    /// Select a new role for an existing collaboration participant.
+    CollaborationRolePicker {
+        participant: helix_collab::ParticipantId,
+    },
+    /// Select the access granted by a new single-use invitation.
+    CollaborationInviteRolePicker,
+    /// Confirm removal of a collaboration participant.
+    CollaborationRemoveConfirmation {
+        participant: helix_collab::ParticipantId,
+    },
     /// Picker to run an LSP command when multiple servers advertise the same command list.
     LspCommandPicker {
         commands: Vec<(LanguageServerId, lsp::Command)>,

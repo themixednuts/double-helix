@@ -5,6 +5,7 @@
 //! each feature flow into central schema churn.
 
 mod assistant;
+mod code_atlas;
 mod completion;
 mod dap;
 mod document;
@@ -17,6 +18,7 @@ mod plugin;
 mod prompt;
 
 pub use assistant::{AssistantCommand, ModeConfigPickerItem};
+pub use code_atlas::{BriefingTarget, CodeAtlasCommand};
 pub use completion::CompletionCommand;
 pub use dap::{DapCommand, DapScopeVariables, DapThreadAction};
 pub use document::{
@@ -52,6 +54,8 @@ pub enum UiCommand {
     Document(DocumentCommand),
     /// LSP navigation / overlays.
     Lsp(LspCommand),
+    /// Evidence-backed semantic exploration panel.
+    CodeAtlas(CodeAtlasCommand),
     /// Async work completed with nothing to apply on the main loop.
     Nop,
     /// Full compositor redraw (e.g. after async prompt validation).
@@ -91,6 +95,7 @@ impl std::fmt::Debug for UiCommand {
                 LspCommand::SignatureHelp { .. } => f.write_str("Lsp(SignatureHelp(..))"),
                 LspCommand::PrepareRename { .. } => f.write_str("Lsp(PrepareRename(..))"),
             },
+            Self::CodeAtlas(c) => f.debug_tuple("CodeAtlas").field(c).finish(),
             Self::Nop => f.write_str("Nop"),
             Self::NeedFullRedraw => f.write_str("NeedFullRedraw"),
             Self::Dap(c) => f.debug_tuple("Dap").field(c).finish(),

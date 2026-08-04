@@ -270,8 +270,8 @@ pub(crate) fn debug_parameter_prompt(
     .to_owned();
 
     let completer = match field_type {
-        "filename" => ui::completers::filename_with_git_ignore(false),
-        "directory" => ui::completers::directory_with_git_ignore(false),
+        "filename" => ui::completers::local_filename(false),
+        "directory" => ui::completers::local_directory(false),
         _ => ui::completers::none,
     };
 

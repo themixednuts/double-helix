@@ -15,9 +15,9 @@ pub enum AppEvent {
 #[derive(Debug, thiserror::Error)]
 pub enum ForegroundAdmissionError {
     #[error("foreground events may only be submitted by their owner thread")]
-    WrongThread(RuntimeDelivery),
+    WrongThread(Box<RuntimeDelivery>),
     #[error("foreground transaction queue is full")]
-    Full(RuntimeDelivery),
+    Full(Box<RuntimeDelivery>),
 }
 
 #[derive(Debug)]
@@ -57,7 +57,7 @@ impl ForegroundEvents {
 
     pub fn submit(&self, delivery: RuntimeDelivery) -> Result<(), ForegroundAdmissionError> {
         if !self.is_owner() {
-            return Err(ForegroundAdmissionError::WrongThread(delivery));
+            return Err(ForegroundAdmissionError::WrongThread(Box::new(delivery)));
         }
 
         let mut state = self
@@ -65,7 +65,7 @@ impl ForegroundEvents {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if state.queue.len() == FOREGROUND_BOUND {
-            return Err(ForegroundAdmissionError::Full(delivery));
+            return Err(ForegroundAdmissionError::Full(Box::new(delivery)));
         }
         state.queue.push_back(delivery);
         Ok(())

@@ -908,7 +908,7 @@ pub(crate) fn apply_resolved_document_link(
             &ingress,
             foreground,
             crate::runtime::DocumentOpenRequest {
-                path: path.to_path_buf(),
+                path: path.to_path_buf().into(),
                 action,
                 lane: crate::runtime::DocumentOpenLane::Navigation,
                 target: crate::runtime::DocumentOpenTarget::View(target),

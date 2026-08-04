@@ -125,11 +125,7 @@ impl Editor {
         match decision {
             AcceptedReviewApplyDecision::ApplyAndSave => {
                 if applied {
-                    if let Err(err) = self.save::<std::path::PathBuf>(
-                        doc_id,
-                        None,
-                        crate::editor::SavePolicy::Safe,
-                    ) {
+                    if let Err(err) = self.save(doc_id, None, crate::editor::SavePolicy::Safe) {
                         self.set_error(format!("Accepted review edit but save failed: {err}"));
                         return;
                     }

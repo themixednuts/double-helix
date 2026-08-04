@@ -10,9 +10,11 @@ pub enum SurfaceKind {}
 /// Opaque surface identity (tabs, panels, scratch buffers tied to collab).
 pub type SurfaceId = Id<SurfaceKind, NonZeroU64>;
 
-/// Marker for [`ParticipantId`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ParticipantKind {}
+pub use helix_collab::ParticipantId;
 
-/// Collaboration participant (human or agent).
-pub type ParticipantId = Id<ParticipantKind, NonZeroU64>;
+pub fn assistant_participant(raw: u64) -> ParticipantId {
+    let mut bytes = [0_u8; 16];
+    bytes[..8].copy_from_slice(b"assistant");
+    bytes[8..].copy_from_slice(&raw.to_be_bytes());
+    ParticipantId::from_bytes(bytes)
+}

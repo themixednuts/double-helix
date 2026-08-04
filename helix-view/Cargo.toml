@@ -18,6 +18,8 @@ mock-acp = []
 bench = ["helix-core/bench"]
 
 [dependencies]
+helix-collab = { path = "../helix-collab" }
+helix-workspace = { path = "../helix-workspace" }
 helix-stdx = { path = "../helix-stdx" }
 helix-core = { path = "../helix-core" }
 helix-loader = { path = "../helix-loader" }
@@ -27,10 +29,12 @@ helix-store = { path = "../helix-store" }
 helix-dap = { path = "../helix-dap" }
 helix-acp = { path = "../helix-acp" }
 helix-runtime = { path = "../helix-runtime" }
+helix-remote = { path = "../helix-remote" }
 helix-vcs = { path = "../helix-vcs", features = ["git"] }
 
 bitflags.workspace = true
 anyhow = "1"
+content_inspector = "0.2.4"
 termina = { workspace = true, optional = true }
 
 tempfile.workspace = true
@@ -43,6 +47,7 @@ arc-swap.workspace = true
 
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "io-util", "io-std", "time", "process", "macros", "fs", "parking_lot"] }
 tokio-stream = "0.1"
+tokio-util = { version = "0.7", features = ["rt"] }
 futures-util = { version = "0.3", features = ["std", "async-await"], default-features = false }
 
 slotmap.workspace = true

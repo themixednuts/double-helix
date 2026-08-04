@@ -2154,7 +2154,18 @@ mod tests {
         let event = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 let event = guest.next_event().await.unwrap();
-                if matches!(event, Event::WorktreeChanged { .. }) {
+                if matches!(
+                    &event,
+                    Event::WorktreeChanged {
+                        file_revision,
+                        changes,
+                        rescan,
+                    } if *file_revision > 0
+                        && (*rescan
+                            || changes
+                                .iter()
+                                .any(|change| change.path.to_string() == "external.txt"))
+                ) {
                     break event;
                 }
             }
@@ -2166,9 +2177,10 @@ mod tests {
             Event::WorktreeChanged {
                 file_revision,
                 changes,
-                rescan: false,
+                rescan,
             } if *file_revision > 0
-                && changes.iter().any(|change| change.path.to_string() == "external.txt")
+                && (*rescan
+                    || changes.iter().any(|change| change.path.to_string() == "external.txt"))
         );
         assert!(expected, "unexpected worktree event: {event:?}");
 

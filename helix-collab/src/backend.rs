@@ -222,31 +222,10 @@ impl Backend for LocalBackend {
             let mut watcher =
                 notify::recommended_watcher(move |result: Result<notify::Event, notify::Error>| {
                     let update = match result {
-                        Ok(event) => {
-                            let mut changes = event
-                                .paths
-                                .iter()
-                                .filter_map(|path| {
-                                    helix_workspace::relative_workspace_path(&watch_root, path).ok()
-                                })
-                                .filter(|path| !is_private_workspace_path(path))
-                                .map(|path| FileChange {
-                                    path,
-                                    kind: local_change_kind(&event.kind),
-                                })
-                                .take(MAX_WORKTREE_CHANGES_PER_EVENT + 1)
-                                .collect::<Vec<_>>();
-                            if changes.is_empty() {
-                                return;
-                            }
-                            if changes.len() > MAX_WORKTREE_CHANGES_PER_EVENT {
-                                BackendFileUpdate::Rescan
-                            } else {
-                                changes.sort_unstable_by(|left, right| left.path.cmp(&right.path));
-                                changes.dedup();
-                                BackendFileUpdate::Changes(changes)
-                            }
-                        }
+                        Ok(event) => match local_file_update(&watch_root, event) {
+                            Some(update) => update,
+                            None => return,
+                        },
                         Err(error) => {
                             log::warn!("local collaboration worktree watch failed: {error}");
                             BackendFileUpdate::Rescan
@@ -638,6 +617,34 @@ fn is_private_workspace_path(path: &WorkspacePath) -> bool {
         })
 }
 
+fn local_file_update(root: &Path, event: notify::Event) -> Option<BackendFileUpdate> {
+    let kind = local_change_kind(&event.kind);
+    let mut changes = Vec::new();
+    for path in event.paths {
+        let Ok(path) = helix_workspace::relative_workspace_path(root, &path) else {
+            continue;
+        };
+        // Recursive macOS watches can report only the watched root. That proves
+        // something changed, but not which descendant changed.
+        if path.is_root() {
+            return Some(BackendFileUpdate::Rescan);
+        }
+        if is_private_workspace_path(&path) {
+            continue;
+        }
+        changes.push(FileChange { path, kind });
+        if changes.len() > MAX_WORKTREE_CHANGES_PER_EVENT {
+            return Some(BackendFileUpdate::Rescan);
+        }
+    }
+    if changes.is_empty() {
+        return None;
+    }
+    changes.sort_unstable_by(|left, right| left.path.cmp(&right.path));
+    changes.dedup();
+    Some(BackendFileUpdate::Changes(changes))
+}
+
 fn local_change_kind(kind: &EventKind) -> FileChangeKind {
     match kind {
         EventKind::Create(_) => FileChangeKind::Created,
@@ -761,6 +768,18 @@ fn project_search_error(error: WorkspaceSearchIndexError) -> ProjectError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_root_notifications_require_a_rescan() {
+        let root = Path::new("workspace");
+        let event = notify::Event::new(EventKind::Create(notify::event::CreateKind::Folder))
+            .add_path(root.to_path_buf());
+
+        assert_eq!(
+            local_file_update(root, event),
+            Some(BackendFileUpdate::Rescan)
+        );
+    }
 
     #[tokio::test]
     async fn local_backend_streams_external_worktree_changes() {

@@ -54,7 +54,7 @@ jobs:
           cargo test -p helix-view --features mock-acp mock_feature_adds_fixture_agent
 
   test:
-    name: Test Suite
+    name: ${{ matrix.suite.name }} (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     if: github.repository == 'themixednuts/double-helix' || github.event_name != 'schedule'
     timeout-minutes: 30
@@ -81,15 +81,17 @@ jobs:
           key: ${{ runner.os }}-${{ runner.arch }}-stable-v${{ env.GRAMMAR_CACHE_VERSION }}-tree-sitter-grammars-${{ hashFiles('languages.toml') }}
           restore-keys: ${{ runner.os }}-${{ runner.arch }}-stable-v${{ env.GRAMMAR_CACHE_VERSION }}-tree-sitter-grammars-
 
-      - name: Run cargo test
-        run: cargo test --workspace
-
-      - name: Run cargo integration-test
-        run: cargo integration-test
+      - name: Run ${{ matrix.suite.name }}
+        run: ${{ matrix.suite.command }}
 
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest, ubuntu-24.04-arm]
+        suite:
+          - name: Unit tests
+            command: cargo test --workspace
+          - name: Integration tests
+            command: cargo integration-test
 
   lints:
     name: Lints

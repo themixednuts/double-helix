@@ -501,6 +501,8 @@ mod tests {
     };
     use tokio::io::{duplex, split, AsyncReadExt, AsyncWriteExt};
 
+    const PROCESS_STREAM_HELPER_ENV: &str = "HELIX_REMOTE_PROCESS_STREAM_HELPER";
+
     #[tokio::test]
     async fn client_routes_concurrent_responses() {
         let workspace = tempfile::tempdir().unwrap();
@@ -732,27 +734,26 @@ mod tests {
         .await
         .unwrap();
 
-        #[cfg(windows)]
-        let (program, args) = (
-            "powershell.exe".to_owned(),
-            vec![
-                "-NoProfile".to_owned(),
-                "-Command".to_owned(),
-                "$value = [Console]::In.ReadToEnd(); [Console]::Out.Write($value); [Console]::Error.Write('stderr')".to_owned(),
-            ],
-        );
-        #[cfg(unix)]
-        let (program, args) = (
-            "/bin/sh".to_owned(),
-            vec!["-c".to_owned(), "cat; printf stderr >&2".to_owned()],
-        );
+        let program = std::env::current_exe()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let args = vec![
+            "--ignored".to_owned(),
+            "--exact".to_owned(),
+            "client::tests::remote_process_stream_helper".to_owned(),
+            "--nocapture".to_owned(),
+            "--quiet".to_owned(),
+        ];
 
         let process = backend
             .start_process(RemoteProcessSpec {
                 program,
                 args,
                 cwd: WorkspacePath::root(),
-                env: Default::default(),
+                env: [(PROCESS_STREAM_HELPER_ENV.to_owned(), "1".to_owned())]
+                    .into_iter()
+                    .collect(),
             })
             .await
             .unwrap();
@@ -764,7 +765,7 @@ mod tests {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let (stdout_result, stderr_result, exit_result) =
-            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
                 tokio::join!(
                     parts.stdout.read_to_end(&mut stdout),
                     parts.stderr.read_to_end(&mut stderr),
@@ -775,9 +776,13 @@ mod tests {
             .expect("remote process timed out");
         stdout_result.unwrap();
         stderr_result.unwrap();
-        exit_result.unwrap();
-        assert_eq!(stdout, b"alpha-beta");
-        assert_eq!(stderr, b"stderr");
+        let exit = exit_result.unwrap();
+        assert_eq!(exit.code, Some(0));
+        assert!(
+            stdout.ends_with(b"alpha-beta"),
+            "unexpected stdout: {stdout:?}"
+        );
+        assert!(stderr.ends_with(b"stderr"), "unexpected stderr: {stderr:?}");
         assert!(matches!(
             events.try_recv(),
             Err(mpsc::error::TryRecvError::Empty)
@@ -785,6 +790,23 @@ mod tests {
 
         client.shutdown().await;
         server.await.unwrap().unwrap();
+    }
+
+    #[test]
+    #[ignore = "spawned by remote_process_streams_are_ordered_and_bypass_ui_events"]
+    fn remote_process_stream_helper() {
+        if std::env::var_os(PROCESS_STREAM_HELPER_ENV).is_none() {
+            return;
+        }
+
+        use std::io::{Read as _, Write as _};
+        let mut input = Vec::new();
+        std::io::stdin().read_to_end(&mut input).unwrap();
+        std::io::stdout().write_all(&input).unwrap();
+        std::io::stdout().flush().unwrap();
+        std::io::stderr().write_all(b"stderr").unwrap();
+        std::io::stderr().flush().unwrap();
+        std::process::exit(0);
     }
 
     #[tokio::test]

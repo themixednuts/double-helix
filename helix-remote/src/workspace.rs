@@ -346,7 +346,9 @@ mod tests {
     async fn lists_filenames_containing_backslashes_as_single_segments() {
         let workspace_dir = tempfile::tempdir().unwrap();
         let name = r"\home\jonfo\src";
-        std::fs::write(workspace_dir.path().join(name), b"remote file").unwrap();
+        let mut path = workspace_dir.path().to_owned();
+        path.push(name);
+        std::fs::write(path, b"remote file").unwrap();
         let workspace = Workspace::open(
             workspace_dir.path().to_string_lossy().into_owned(),
             crate::SessionId(5),

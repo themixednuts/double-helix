@@ -2,7 +2,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::ErrorKind;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 use std::{
     collections::{BTreeSet, HashSet},
     path::{Path, PathBuf},
@@ -52,6 +52,8 @@ pub enum GrammarSource {
 }
 
 const REMOTE_NAME: &str = "origin";
+const GIT_FETCH_ATTEMPTS: u32 = 3;
+const GIT_FETCH_RETRY_DELAY: Duration = Duration::from_millis(250);
 
 #[cfg(target_arch = "wasm32")]
 pub fn get_language(name: &str) -> Result<Option<Grammar>> {
@@ -325,7 +327,7 @@ impl VendoredGrammar {
         let staged = Self::at(staging_dir.clone());
         let result = (|| {
             staged.init(remote)?;
-            git(&staging_dir, ["fetch", "--depth", "1", REMOTE_NAME, rev])?;
+            staged.fetch_revision(rev)?;
             git(&staging_dir, ["checkout", rev])?;
             self.promote(&staging_dir)
         })();
@@ -346,6 +348,27 @@ impl VendoredGrammar {
                 }
             }
         }
+    }
+
+    fn fetch_revision(&self, revision: &str) -> Result<()> {
+        for attempt in 1..=GIT_FETCH_ATTEMPTS {
+            match git(&self.dir, ["fetch", "--depth", "1", REMOTE_NAME, revision]) {
+                Ok(_) => return Ok(()),
+                Err(error) if attempt == GIT_FETCH_ATTEMPTS => {
+                    return Err(error).with_context(|| {
+                        format!("git fetch failed after {GIT_FETCH_ATTEMPTS} attempts")
+                    });
+                }
+                Err(error) => {
+                    log::warn!(
+                        "grammar git fetch attempt {attempt}/{GIT_FETCH_ATTEMPTS} failed in {:?}: {error:#}",
+                        self.dir
+                    );
+                    std::thread::sleep(GIT_FETCH_RETRY_DELAY.saturating_mul(attempt));
+                }
+            }
+        }
+        unreachable!("grammar git fetch attempt loop always returns")
     }
 
     /// Initializes the grammar directory.
@@ -935,6 +958,7 @@ void *tree_sitter_test(void) {{ return 0; }}
         let error = format!("{error:#}");
         assert!(error.contains(missing_revision));
         assert!(error.contains("git fetch --depth 1 origin"));
+        assert!(error.contains("git fetch failed after 3 attempts"));
         assert_eq!(repo.revision().as_deref(), Some(revision.as_str()));
         assert!(!repo.staging_dir().unwrap().exists());
     }

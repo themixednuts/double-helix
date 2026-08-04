@@ -5,20 +5,22 @@ use assert_fs::{prelude::*, TempDir};
 #[derive(Debug)]
 pub(crate) struct TempFs {
     temp: TempDir,
+    root: PathBuf,
 }
 
 impl TempFs {
     pub(crate) fn new() -> Self {
         let temp = TempDir::new().expect("create temp test filesystem");
-        Self { temp }
+        let root = helix_stdx::path::normalize(temp.path());
+        Self { temp, root }
     }
 
     pub(crate) fn root(&self) -> &Path {
-        self.temp.path()
+        &self.root
     }
 
     pub(crate) fn path(&self, relative: impl AsRef<Path>) -> PathBuf {
-        self.temp.child(relative).to_path_buf()
+        helix_stdx::path::normalize(self.temp.child(relative))
     }
 
     pub(crate) fn dir(&self, relative: impl AsRef<Path>) -> &Self {

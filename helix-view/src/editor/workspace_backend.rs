@@ -42,7 +42,7 @@ impl WorkspaceContext {
     pub fn from_backend(local_root: PathBuf, backend: &WorkspaceBackend) -> Self {
         match backend {
             WorkspaceBackend::Local => Self {
-                root: WorkspaceDocumentPath::Local(local_root),
+                root: WorkspaceDocumentPath::local(local_root),
                 backend: WorkspaceBackend::Local,
             },
             WorkspaceBackend::Remote(remote) => Self {
@@ -63,6 +63,7 @@ impl WorkspaceContext {
         root: WorkspaceDocumentPath,
         backend: &WorkspaceBackend,
     ) -> Result<Self, WorkspaceContextError> {
+        let root = root.normalized();
         let belongs = matches!(
             (backend, &root),
             (WorkspaceBackend::Local, WorkspaceDocumentPath::Local(_))
@@ -193,11 +194,26 @@ pub enum WorkspaceContextError {
 }
 
 impl WorkspaceDocumentPath {
+    /// Construct a local path using the editor's canonical path identity.
+    ///
+    /// In addition to lexical cleanup, this expands equivalent Windows path
+    /// spellings such as 8.3 short names when their components exist.
+    pub fn local(path: impl AsRef<Path>) -> Self {
+        Self::Local(helix_stdx::path::normalize(path))
+    }
+
+    pub fn normalized(self) -> Self {
+        match self {
+            Self::Local(path) => Self::local(path),
+            path @ (Self::Remote(_) | Self::Collaboration { .. }) => path,
+        }
+    }
+
     pub fn resolve(&self, path: &Path) -> Result<Self, WorkspaceContextError> {
         match self {
             Self::Local(root) => {
                 let path = helix_stdx::path::expand_tilde(path);
-                Ok(Self::Local(if path.is_absolute() {
+                Ok(Self::local(if path.is_absolute() {
                     path.into_owned()
                 } else {
                     root.join(path.as_ref())
@@ -388,20 +404,20 @@ impl WorkspaceDocumentPath {
 
 impl From<PathBuf> for WorkspaceDocumentPath {
     fn from(path: PathBuf) -> Self {
-        Self::Local(path)
+        Self::local(path)
     }
 }
 
 impl From<&Path> for WorkspaceDocumentPath {
     fn from(path: &Path) -> Self {
-        Self::Local(path.to_path_buf())
+        Self::local(path)
     }
 }
 
 impl From<&crate::file_bound::DocumentLocation> for WorkspaceDocumentPath {
     fn from(location: &crate::file_bound::DocumentLocation) -> Self {
         match location {
-            crate::file_bound::DocumentLocation::Local(path) => Self::Local(path.clone()),
+            crate::file_bound::DocumentLocation::Local(path) => Self::local(path),
             crate::file_bound::DocumentLocation::Remote(location) => {
                 Self::Remote(location.path.clone())
             }
@@ -494,11 +510,24 @@ mod tests {
 
     #[test]
     fn local_document_paths_resolve_from_the_captured_root() {
-        let root = WorkspaceDocumentPath::Local(PathBuf::from("workspace"));
+        let root = WorkspaceDocumentPath::local(PathBuf::from("workspace"));
 
         assert_eq!(
             root.resolve(Path::new("src/main.rs")).unwrap(),
-            WorkspaceDocumentPath::Local(PathBuf::from("workspace/src/main.rs"))
+            WorkspaceDocumentPath::local(PathBuf::from("workspace/src/main.rs"))
+        );
+    }
+
+    #[test]
+    fn local_document_paths_collapse_equivalent_components() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join("directory");
+        std::fs::create_dir(&directory).unwrap();
+        let aliased = directory.join("..").join("directory");
+
+        assert_eq!(
+            WorkspaceDocumentPath::local(aliased),
+            WorkspaceDocumentPath::local(directory)
         );
     }
 }

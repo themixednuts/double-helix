@@ -275,13 +275,31 @@ impl Editor {
         self.documents.values_mut()
     }
 
-    pub fn document_by_path<P: AsRef<Path>>(&self, path: P) -> Option<&Document> {
+    fn find_document_id_by_path(&self, path: &Path) -> Option<DocumentId> {
+        let exact = self
+            .documents()
+            .find(|doc| doc.path().map(|path| path.as_path()) == Some(path))
+            .map(|document| document.id);
+        if exact.is_some() {
+            return exact;
+        }
+
+        let normalized = helix_stdx::path::canonicalize(path);
+        if normalized == path {
+            return None;
+        }
         self.documents()
-            .find(|doc| doc.path().map(|p| p == path.as_ref()).unwrap_or(false))
+            .find(|doc| doc.path().map(|path| path.as_path()) == Some(normalized.as_path()))
+            .map(|document| document.id)
+    }
+
+    pub fn document_by_path<P: AsRef<Path>>(&self, path: P) -> Option<&Document> {
+        let id = self.find_document_id_by_path(path.as_ref())?;
+        self.documents.get(&id)
     }
 
     pub fn document_by_path_mut<P: AsRef<Path>>(&mut self, path: P) -> Option<&mut Document> {
-        self.documents_mut()
-            .find(|doc| doc.path().map(|p| p == path.as_ref()).unwrap_or(false))
+        let id = self.find_document_id_by_path(path.as_ref())?;
+        self.documents.get_mut(&id)
     }
 }

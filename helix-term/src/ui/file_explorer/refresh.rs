@@ -352,7 +352,7 @@ impl FileExplorerPanel {
         fallback_cursor: usize,
     ) -> Result<(), std::io::Error> {
         self.refresh(editor, root, Some(fallback_cursor))?;
-        self.select_path_or_index(path, fallback_cursor);
+        self.select_path_or_index(&helix_stdx::path::normalize(path), fallback_cursor);
         Ok(())
     }
 

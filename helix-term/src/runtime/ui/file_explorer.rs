@@ -977,10 +977,6 @@ pub(crate) fn open_file_explorer(
     cx: &mut crate::compositor::Context,
     root: ExplorerPath,
 ) {
-    let root = match root {
-        ExplorerPath::Local(root) => ExplorerPath::Local(helix_stdx::path::normalize(root)),
-        root => root,
-    };
     let source = match ExplorerSource::from_root(root, &cx.editor.workspace_backend) {
         Ok(source) => source,
         Err(error) => {

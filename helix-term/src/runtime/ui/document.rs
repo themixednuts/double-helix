@@ -1452,6 +1452,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("target.txt");
         std::fs::write(&path, "first\nsecond\n").unwrap();
+        let path = helix_stdx::path::normalize(path);
         let runtime = helix_runtime::Runtime::new(tokio::runtime::Handle::current());
         let mut editor = test_editor(runtime);
         editor.new_file(Action::VerticalSplit);

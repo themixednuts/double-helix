@@ -107,7 +107,7 @@ impl FileExplorerTreeRefresh {
     }
 
     pub(crate) fn at_root(mut self, root: ExplorerPath) -> Self {
-        self.root = Some(root);
+        self.root = Some(root.normalized());
         self
     }
 
@@ -117,12 +117,12 @@ impl FileExplorerTreeRefresh {
     }
 
     pub(crate) fn selecting_path(mut self, path: ExplorerPath) -> Self {
-        self.select_path = Some(path);
+        self.select_path = Some(path.normalized());
         self
     }
 
     pub(crate) fn selecting(mut self, path: Option<ExplorerPath>) -> Self {
-        self.select_path = path;
+        self.select_path = path.map(ExplorerPath::normalized);
         self
     }
 
@@ -414,9 +414,8 @@ impl FileExplorerPanel {
         editor: &Editor,
         cursor: Option<usize>,
     ) -> Result<Self, std::io::Error> {
-        let root = helix_stdx::path::normalize(root);
         let source =
-            ExplorerSource::from_root(ExplorerPath::Local(root), &editor.workspace_backend)
+            ExplorerSource::from_root(ExplorerPath::local(root), &editor.workspace_backend)
                 .map_err(std::io::Error::other)?;
         let mut panel = Self::new_deferred(source, editor);
         panel.refresh(editor, None, cursor)?;
@@ -3360,8 +3359,8 @@ mod tests {
         )
     }
 
-    fn local_path(path: impl Into<PathBuf>) -> ExplorerPath {
-        ExplorerPath::Local(path.into())
+    fn local_path(path: impl AsRef<Path>) -> ExplorerPath {
+        ExplorerPath::local(path)
     }
 
     #[test]
@@ -4807,6 +4806,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let main = temp.path().join("main.rs");
         fs::write(&main, "fn main() {}\n").unwrap();
+        let main = helix_stdx::path::normalize(main);
         let rt = helix_runtime::test::RuntimeTest::default();
         rt.block_on(async {
             let mut editor = test_editor(100, 30, rt.runtime());
@@ -5301,6 +5301,7 @@ mod tests {
         fs::create_dir_all(temp.path().join("src").join("nested")).unwrap();
         let current = temp.path().join("src").join("nested").join("main.rs");
         fs::write(&current, "").unwrap();
+        let current = helix_stdx::path::normalize(current);
         let rt = helix_runtime::test::RuntimeTest::default();
         rt.block_on(async {
             let mut editor = test_editor(100, 30, rt.runtime());
@@ -5332,6 +5333,7 @@ mod tests {
             .join("deep")
             .join("main.rs");
         fs::write(&current, "").unwrap();
+        let current = helix_stdx::path::normalize(current);
         let rt = helix_runtime::test::RuntimeTest::default();
         rt.block_on(async {
             let mut editor = test_editor(100, 30, rt.runtime());

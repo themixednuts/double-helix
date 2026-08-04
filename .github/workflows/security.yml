@@ -24,12 +24,14 @@ concurrency:
 
 jobs:
   rustsec:
-    name: RustSec audit
+    name: Dependency Audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Install cargo-audit
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install Cargo Audit
         run: cargo install cargo-audit --locked
-      - name: Audit locked dependencies
+      - name: Audit Locked Dependencies
         run: cargo audit

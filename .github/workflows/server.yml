@@ -30,22 +30,26 @@ concurrency:
 
 jobs:
   build:
-    name: ${{ matrix.platform }}
+    name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - platform: x86_64-linux
+          - name: Linux x86_64
+            platform: x86_64-linux
             os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
-          - platform: aarch64-linux
+          - name: Linux aarch64
+            platform: aarch64-linux
             os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-          - platform: x86_64-macos
+          - name: macOS x86_64
+            platform: x86_64-macos
             os: macos-15-intel
             target: x86_64-apple-darwin
-          - platform: aarch64-macos
+          - name: macOS aarch64
+            platform: aarch64-macos
             os: macos-15
             target: aarch64-apple-darwin
     steps:
@@ -57,18 +61,18 @@ jobs:
         with:
           target: ${{ matrix.target }}
 
-      - name: Cache Rust build
+      - name: Cache Rust Build
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: dhx-server-${{ matrix.target }}
 
-      - name: Test server crates
+      - name: Test Server Crates
         run: cargo test --locked -p helix-workspace -p helix-remote -j4
 
-      - name: Build server
+      - name: Build Server
         run: cargo build --profile opt --locked --target ${{ matrix.target }} -p helix-remote --bin dhx-server -j4
 
-      - name: Verify identity
+      - name: Verify Server Identity
         shell: bash
         run: |
           server="target/${{ matrix.target }}/opt/dhx-server"
@@ -78,14 +82,14 @@ jobs:
             *) printf 'invalid server identity: %s\n' "$identity" >&2; exit 1 ;;
           esac
 
-      - name: Stage artifact
+      - name: Stage Server Artifact
         shell: bash
         run: |
           mkdir artifact
           cp "target/${{ matrix.target }}/opt/dhx-server" artifact/dhx-server
           chmod 755 artifact/dhx-server
 
-      - name: Upload artifact
+      - name: Upload Server Artifact
         uses: actions/upload-artifact@v6
         with:
           name: dhx-server-${{ matrix.platform }}

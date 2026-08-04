@@ -17,6 +17,16 @@ use crossterm::event::{Event, KeyEvent};
 #[cfg(not(windows))]
 use termina::{event::KeyEvent, Event};
 
+#[cfg(windows)]
+fn focus_lost_event() -> Event {
+    Event::FocusLost
+}
+
+#[cfg(not(windows))]
+fn focus_lost_event() -> Event {
+    Event::FocusOut
+}
+
 #[cfg(unix)]
 fn create_file_symlink(original: &Path, link: &Path) -> std::io::Result<()> {
     std::os::unix::fs::symlink(original, link)
@@ -63,7 +73,7 @@ async fn send_keys_and_focus_lost(app: &mut Application, keys: &str) -> anyhow::
     for key_event in parse_macro(keys)? {
         tx.send(Ok(Event::Key(KeyEvent::from(key_event))))?;
     }
-    tx.send(Ok(Event::FocusLost))?;
+    tx.send(Ok(focus_lost_event()))?;
     app.event_loop_until_idle(&mut rx_stream).await;
     Ok(())
 }

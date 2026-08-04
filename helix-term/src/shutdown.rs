@@ -8,6 +8,7 @@
 //!   and SIGHUP (terminal closed, e.g. close tab in macOS Terminal.app or
 //!   SSH disconnect). When any of these are received, the event loop exits.
 
+#[cfg(windows)]
 use std::sync::OnceLock;
 use tokio::sync::mpsc;
 

@@ -634,7 +634,7 @@ mod tests {
             counter
         ));
         fs::create_dir_all(&dir).expect("create temp dir");
-        dir
+        helix_stdx::path::normalize(dir)
     }
 
     fn text_edit(range: std::ops::Range<usize>, replacement: &str) -> lsp::TextEdit {

@@ -714,7 +714,7 @@ mod tests {
 
     #[test]
     fn collects_locations_from_resource_updates() {
-        let path = std::env::temp_dir().join("example.js");
+        let path = helix_stdx::path::normalize(std::env::temp_dir().join("example.js"));
         let uri = url::Url::from_file_path(&path).unwrap().to_string();
         let update = acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(
             "tool-1",
@@ -731,7 +731,7 @@ mod tests {
 
     #[test]
     fn thread_event_keeps_chunk_locations() {
-        let path = std::env::temp_dir().join("example.ts");
+        let path = helix_stdx::path::normalize(std::env::temp_dir().join("example.ts"));
         let uri = url::Url::from_file_path(&path).unwrap().to_string();
         let update = acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
             acp::ContentBlock::Resource(acp::EmbeddedResource::new(

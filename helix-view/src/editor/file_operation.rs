@@ -2587,6 +2587,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let source = temp.path().join("source");
         fs::create_dir_all(&source).unwrap();
+        let source = helix_stdx::path::normalize(source);
         let inspection = FileOperationInspection {
             id: FileOperationId(1),
             operation: FileOperation::Copy {

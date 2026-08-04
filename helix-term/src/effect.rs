@@ -77,6 +77,7 @@ fn context_kind_label(kind: &helix_view::assistant::context::Kind) -> String {
 
 fn apply_shell_result(
     editor: &mut Editor,
+    _mutation: crate::runtime::ingress::DocumentMutation,
     doc_id: DocumentId,
     view_id: ViewId,
     expected_version: i32,
@@ -229,6 +230,7 @@ pub(crate) fn apply_runtime_task_event(
             }
         }
         RuntimeTaskEvent::ApplyShellResult {
+            mutation,
             doc_id,
             view_id,
             expected_version,
@@ -236,6 +238,7 @@ pub(crate) fn apply_runtime_task_event(
             selection,
         } => apply_shell_result(
             editor,
+            mutation,
             doc_id,
             view_id,
             expected_version,

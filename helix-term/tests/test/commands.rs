@@ -273,6 +273,19 @@ async fn test_multi_selection_shell_commands() -> anyhow::Result<()> {
     ))
     .await?;
 
+    // Typable commands submitted while a shell transform is running must observe
+    // the transformed document, including on hosts where process startup is slow.
+    let mut file = tempfile::NamedTempFile::new()?;
+    let expected_contents = LineFeedHandling::Native.apply("foo\n");
+    test_key_sequence(
+        &mut AppBuilder::new().with_file(file.path(), None).build()?,
+        Some("ilorem<esc>%|echo foo<ret>:w<ret>"),
+        None,
+        false,
+    )
+    .await?;
+    helpers::assert_file_has_content(&mut file, &expected_contents)?;
+
     Ok(())
 }
 

@@ -1142,6 +1142,7 @@ pub enum RuntimeTaskEvent {
     },
     /// Apply output from an external shell command against its exact source revision.
     ApplyShellResult {
+        mutation: DocumentMutation,
         doc_id: DocumentId,
         view_id: ViewId,
         expected_version: i32,

@@ -4122,6 +4122,7 @@ fn shell_keep_pipe(cx: &mut Context) {
     shell_prompt(cx, "keep-pipe:".into(), |cx, args| {
         let shell = cx.editor.config().shell.clone();
         let command = args.join(" ");
+        let mutation = cx.ingress.begin_document_mutation();
         let (doc_id, view_id, expected_version, selection, text) = {
             let (view_id, doc) = focused!(cx.editor);
             (
@@ -4153,6 +4154,7 @@ fn shell_keep_pipe(cx: &mut Context) {
             }
             let index = index.unwrap_or_else(|| ranges.len() - 1);
             Ok(crate::runtime::RuntimeTaskEvent::ApplyShellResult {
+                mutation,
                 doc_id,
                 view_id,
                 expected_version,
@@ -4236,6 +4238,7 @@ fn shell(cx: &mut compositor::Context, cmd: &str, behavior: &ShellBehavior) {
     };
     let shell = cx.editor.config().shell.clone();
     let command = cmd.to_owned();
+    let mutation = cx.ingress.begin_document_mutation();
     let (doc_id, view_id, expected_version, selection, text) = {
         let (view_id, doc) = focused!(cx.editor);
         (
@@ -4297,6 +4300,7 @@ fn shell(cx: &mut compositor::Context, cmd: &str, behavior: &ShellBehavior) {
                 .with_selection(Selection::new(ranges, selection.primary_index()))
         });
         Ok(crate::runtime::RuntimeTaskEvent::ApplyShellResult {
+            mutation,
             doc_id,
             view_id,
             expected_version,

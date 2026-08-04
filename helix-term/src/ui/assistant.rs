@@ -1163,7 +1163,7 @@ impl AssistantRenderSnapshot {
             surface.set_stringn(
                 area.x,
                 area.y,
-                &format!(
+                format!(
                     "{top_left}{}{top_right}",
                     "─".repeat(width.saturating_sub(2))
                 ),
@@ -1190,7 +1190,7 @@ impl AssistantRenderSnapshot {
             surface.set_stringn(
                 area.x,
                 area.bottom().saturating_sub(1),
-                &format!(
+                format!(
                     "{bottom_left}{}{bottom_right}",
                     "─".repeat(width.saturating_sub(2))
                 ),
@@ -1870,6 +1870,7 @@ impl AssistantPanel {
 
     fn release_focus_to_editor(&mut self, editor: &mut Editor) {
         self.set_focused(false);
+        editor.model.focus_editor();
         if self.shown_help.take().is_some() {
             editor.autoinfo = None;
         }

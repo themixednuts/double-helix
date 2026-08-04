@@ -249,11 +249,13 @@ impl Prompt {
             return;
         };
         self.completion_pipeline.submit(
-            self.completion_id,
-            self.completion_generation,
-            Arc::from(self.line.as_str()),
-            request,
-            self.completion_session.clone(),
+            completion::CompletionJob::new(
+                self.completion_id,
+                self.completion_generation,
+                Arc::from(self.line.as_str()),
+                request,
+                self.completion_session.clone(),
+            ),
             runtime.work().clone(),
             runtime.block().clone(),
             ingress,
@@ -795,8 +797,7 @@ impl PromptRenderSnapshot {
                 Some(&self.theme),
                 loader,
                 None,
-            )
-            .into();
+            );
             crate::ui::text::paint_text(surface, self.line_area, &text);
         } else if let Some(state) = &self.text_input {
             crate::widgets::paint_text_input(
@@ -1240,38 +1241,49 @@ mod tests {
         let loader_gate = gate.clone();
         let loader_started = started_tx.clone();
         let loader_finished = worker_finished.clone();
-        let loader: completion::CompletionLoader = Arc::new(move |key, cancellation| {
-            assert_ne!(
-                std::thread::current().id(),
-                input_thread,
-                "completion loader ran on the input thread"
-            );
-            let completion::CompletionWorkKey::Test(key) = key else {
-                panic!("unexpected completion work: {key:?}");
-            };
-            if key == "a" {
-                if let Some(started) = loader_started
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .take()
-                {
-                    let _ = started.send(());
-                }
-                let (mutex, signal) = &*loader_gate;
-                let open = mutex
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let _ = signal
-                    .wait_timeout_while(open, Duration::from_secs(2), |open| !*open)
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-            }
-            loader_finished.store(true, Ordering::Release);
-            if cancellation.is_cancelled() {
-                return None;
-            }
-            Some(completion::CompletionWorkOutput::Test {
-                key: key.clone(),
-                values: Arc::from([format!("{key}-result")]),
+        let loader: completion::CompletionLoader = Arc::new(move |key, cancellation, block| {
+            let loader_gate = loader_gate.clone();
+            let loader_started = loader_started.clone();
+            let loader_finished = loader_finished.clone();
+            Box::pin(async move {
+                block
+                    .spawn(move || {
+                        assert_ne!(
+                            std::thread::current().id(),
+                            input_thread,
+                            "completion loader ran on the input thread"
+                        );
+                        let completion::CompletionWorkKey::Test(key) = key else {
+                            panic!("unexpected completion work: {key:?}");
+                        };
+                        if key == "a" {
+                            if let Some(started) = loader_started
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .take()
+                            {
+                                let _ = started.send(());
+                            }
+                            let (mutex, signal) = &*loader_gate;
+                            let open = mutex
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            let _ = signal
+                                .wait_timeout_while(open, Duration::from_secs(2), |open| !*open)
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        }
+                        loader_finished.store(true, Ordering::Release);
+                        if cancellation.is_cancelled() {
+                            return None;
+                        }
+                        Some(completion::CompletionWorkOutput::Test {
+                            values: Arc::from([format!("{key}-result")]),
+                            key,
+                        })
+                    })
+                    .await
+                    .ok()
+                    .flatten()
             })
         });
 

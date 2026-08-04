@@ -2,7 +2,8 @@ use std::{
     cell::RefCell,
     collections::HashMap,
     ffi::OsString,
-    path::PathBuf,
+    future::Future,
+    pin::Pin,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex, MutexGuard, OnceLock,
@@ -15,6 +16,7 @@ use crate::runtime::{
     RuntimeIngress, UiCommand,
 };
 use crate::ui::prompt::Completion;
+use helix_view::editor::{WorkspaceContext, WorkspaceDocumentPath, WorkspaceId};
 
 const FILE_INDEX_FRESHNESS: Duration = Duration::from_secs(1);
 const FILE_INDEX_CAPACITY: usize = 8;
@@ -41,13 +43,34 @@ impl PromptId {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct FileIndexKey {
-    pub(crate) directory: PathBuf,
-    pub(crate) git_ignore: bool,
+    pub(crate) workspace: WorkspaceId,
+    pub(crate) directory: WorkspaceDocumentPath,
+    pub(crate) options: helix_workspace::DirectoryOptions,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct FileIndexRequest {
+    pub(crate) key: FileIndexKey,
+    pub(crate) workspace: WorkspaceContext,
+}
+
+impl PartialEq for FileIndexRequest {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key
+    }
+}
+
+impl Eq for FileIndexRequest {}
+
+impl std::hash::Hash for FileIndexRequest {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.key.hash(state);
+    }
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct FileIndexEntry {
-    pub(crate) path: PathBuf,
+    pub(crate) path: WorkspaceDocumentPath,
     pub(crate) is_dir: bool,
     pub(crate) is_symlink: bool,
 }
@@ -56,7 +79,7 @@ pub(crate) struct FileIndexEntry {
 pub(crate) enum CompletionWorkKey {
     Themes,
     Programs,
-    Files(FileIndexKey),
+    Files(FileIndexRequest),
     #[cfg(test)]
     Test(String),
 }
@@ -215,11 +238,11 @@ impl CompletionSession {
                     loaded_at: Instant::now(),
                 });
             }
-            (CompletionWorkKey::Files(key), CompletionWorkOutput::Files(entries)) => {
+            (CompletionWorkKey::Files(request), CompletionWorkOutput::Files(entries)) => {
                 cache.clock = cache.clock.wrapping_add(1);
                 let used_at = cache.clock;
                 cache.files.insert(
-                    key,
+                    request.key,
                     CachedFiles {
                         entries,
                         loaded_at: Instant::now(),
@@ -298,13 +321,14 @@ pub(crate) fn program_names() -> Option<Arc<[String]>> {
     .flatten()
 }
 
-pub(crate) fn file_entries(key: FileIndexKey) -> Option<Arc<[FileIndexEntry]>> {
+pub(crate) fn file_entries(requested: FileIndexRequest) -> Option<Arc<[FileIndexEntry]>> {
     with_scope(|scope| {
+        let key = &requested.key;
         let now = Instant::now();
         let mut cache = lock(&scope.cache);
         cache.clock = cache.clock.wrapping_add(1);
         let used_at = cache.clock;
-        let mut cached = cache.files.get_mut(&key);
+        let mut cached = cache.files.get_mut(key);
         let entries = cached.as_mut().map(|cached| {
             cached.used_at = used_at;
             cached.entries.clone()
@@ -314,7 +338,7 @@ pub(crate) fn file_entries(key: FileIndexKey) -> Option<Arc<[FileIndexEntry]>> {
             .is_none_or(|cached| now.duration_since(cached.loaded_at) >= FILE_INDEX_FRESHNESS);
         drop(cache);
         if needs_refresh {
-            request(scope, CompletionWorkKey::Files(key));
+            request(scope, CompletionWorkKey::Files(requested));
         }
         entries
     })
@@ -333,12 +357,32 @@ pub(crate) fn test_values(key: &str) -> Option<Arc<[String]>> {
     .flatten()
 }
 
-struct CompletionJob {
+pub(crate) struct CompletionJob {
     prompt_id: PromptId,
     generation: u64,
     query: Arc<str>,
     request: CompletionRequest,
     session: CompletionSession,
+    cancellation: tokio_util::sync::CancellationToken,
+}
+
+impl CompletionJob {
+    pub(crate) fn new(
+        prompt_id: PromptId,
+        generation: u64,
+        query: Arc<str>,
+        request: CompletionRequest,
+        session: CompletionSession,
+    ) -> Self {
+        Self {
+            prompt_id,
+            generation,
+            query,
+            request,
+            session,
+            cancellation: tokio_util::sync::CancellationToken::new(),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -346,23 +390,35 @@ struct PipelineState {
     closed: bool,
     latest: Option<(PromptId, u64)>,
     pending: Option<CompletionJob>,
+    active: Option<tokio_util::sync::CancellationToken>,
 }
 
+#[derive(Clone)]
 pub(crate) struct CompletionCancellation {
     state: Arc<Mutex<PipelineState>>,
     prompt_id: PromptId,
     generation: u64,
+    token: tokio_util::sync::CancellationToken,
 }
 
 impl CompletionCancellation {
     pub(crate) fn is_cancelled(&self) -> bool {
+        if self.token.is_cancelled() {
+            return true;
+        }
         let state = lock(&self.state);
         state.closed || state.latest != Some((self.prompt_id, self.generation))
     }
+
+    fn child_token(&self) -> tokio_util::sync::CancellationToken {
+        self.token.child_token()
+    }
 }
 
+type CompletionLoadFuture =
+    Pin<Box<dyn Future<Output = Option<CompletionWorkOutput>> + Send + 'static>>;
 pub(crate) type CompletionLoader = Arc<
-    dyn Fn(&CompletionWorkKey, &CompletionCancellation) -> Option<CompletionWorkOutput>
+    dyn Fn(CompletionWorkKey, CompletionCancellation, helix_runtime::Block) -> CompletionLoadFuture
         + Send
         + Sync,
 >;
@@ -386,11 +442,7 @@ impl Default for CompletionPipeline {
 impl CompletionPipeline {
     pub(crate) fn submit(
         &mut self,
-        prompt_id: PromptId,
-        generation: u64,
-        query: Arc<str>,
-        request: CompletionRequest,
-        session: CompletionSession,
+        job: CompletionJob,
         work: helix_runtime::Work,
         block: helix_runtime::Block,
         ingress: RuntimeIngress,
@@ -405,14 +457,11 @@ impl CompletionPipeline {
         }
 
         let mut state = lock(&self.state);
-        state.latest = Some((prompt_id, generation));
-        state.pending = Some(CompletionJob {
-            prompt_id,
-            generation,
-            query,
-            request,
-            session,
-        });
+        if let Some(active) = state.active.replace(job.cancellation.clone()) {
+            active.cancel();
+        }
+        state.latest = Some((job.prompt_id, job.generation));
+        state.pending = Some(job);
         drop(state);
 
         if let Some(wake) = &self.wake {
@@ -428,6 +477,9 @@ impl CompletionPipeline {
 
     pub(crate) fn cancel(&mut self) {
         let mut state = lock(&self.state);
+        if let Some(active) = state.active.take() {
+            active.cancel();
+        }
         state.latest = None;
         state.pending = None;
     }
@@ -446,6 +498,9 @@ impl Drop for CompletionPipeline {
     fn drop(&mut self) {
         let mut state = lock(&self.state);
         state.closed = true;
+        if let Some(active) = state.active.take() {
+            active.cancel();
+        }
         state.latest = None;
         state.pending = None;
     }
@@ -463,54 +518,60 @@ async fn run_worker(
             let Some(mut job) = lock(&state).pending.take() else {
                 break;
             };
-            let load_state = state.clone();
-            let load = loader.clone();
-            let prompt_id = job.prompt_id;
-            let generation = job.generation;
             let started = Instant::now();
-            let evaluated = block
-                .spawn(move || {
-                    let cancellation = CompletionCancellation {
-                        state: load_state,
-                        prompt_id,
-                        generation,
-                    };
-                    loop {
-                        if cancellation.is_cancelled() {
+            let cancellation = CompletionCancellation {
+                state: state.clone(),
+                prompt_id: job.prompt_id,
+                generation: job.generation,
+                token: job.cancellation.clone(),
+            };
+            let evaluated = 'evaluate: loop {
+                if cancellation.is_cancelled() {
+                    break None;
+                }
+                let evaluate_cancellation = cancellation.clone();
+                let evaluation = block
+                    .spawn(move || {
+                        if evaluate_cancellation.is_cancelled() {
                             return None;
                         }
-                        let (completions, mut keys) =
-                            job.session.evaluate(|| job.request.evaluate());
-                        keys.dedup();
-                        if keys.is_empty() {
-                            return Some((job, completions));
-                        }
-                        for key in keys {
-                            if cancellation.is_cancelled() {
-                                return None;
-                            }
-                            let output = load(&key, &cancellation)?;
-                            job.session.insert(key, output);
-                        }
+                        let (completions, keys) = job.session.evaluate(|| job.request.evaluate());
+                        Some((job, completions, keys))
+                    })
+                    .await;
+                let (next_job, completions, keys) = match evaluation {
+                    Ok(Some(evaluated)) => evaluated,
+                    Ok(None) => break None,
+                    Err(error) => {
+                        log::warn!(
+                            "prompt_completion phase=worker_join_error error={error} elapsed_us={}",
+                            started.elapsed().as_micros()
+                        );
+                        break None;
                     }
-                })
-                .await;
+                };
+                job = next_job;
+                if keys.is_empty() {
+                    break Some((job, completions));
+                }
+                for key in keys {
+                    if cancellation.is_cancelled() {
+                        break 'evaluate None;
+                    }
+                    let Some(output) =
+                        loader(key.clone(), cancellation.clone(), block.clone()).await
+                    else {
+                        break 'evaluate None;
+                    };
+                    job.session.insert(key, output);
+                }
+            };
 
-            let (job, completions) = match evaluated {
-                Ok(Some(result)) => result,
-                Ok(None) => {
-                    if lock(&state).pending.is_none() {
-                        break;
-                    }
-                    continue;
+            let Some((job, completions)) = evaluated else {
+                if lock(&state).pending.is_none() {
+                    break;
                 }
-                Err(error) => {
-                    log::warn!(
-                        "prompt_completion phase=worker_join_error error={error} elapsed_us={}",
-                        started.elapsed().as_micros()
-                    );
-                    continue;
-                }
+                continue;
             };
 
             let dispatch = {
@@ -546,21 +607,33 @@ async fn run_worker(
 }
 
 fn load_completion(
-    key: &CompletionWorkKey,
-    cancellation: &CompletionCancellation,
-) -> Option<CompletionWorkOutput> {
-    match key {
-        CompletionWorkKey::Themes => load_themes(cancellation).map(CompletionWorkOutput::Themes),
-        CompletionWorkKey::Programs => load_programs(cancellation),
-        CompletionWorkKey::Files(key) => {
-            load_files(key, cancellation).map(CompletionWorkOutput::Files)
+    key: CompletionWorkKey,
+    cancellation: CompletionCancellation,
+    block: helix_runtime::Block,
+) -> CompletionLoadFuture {
+    Box::pin(async move {
+        match key {
+            CompletionWorkKey::Files(request) => load_files(request, cancellation, block)
+                .await
+                .map(CompletionWorkOutput::Files),
+            key => block
+                .spawn(move || match key {
+                    CompletionWorkKey::Themes => {
+                        load_themes(&cancellation).map(CompletionWorkOutput::Themes)
+                    }
+                    CompletionWorkKey::Programs => load_programs(&cancellation),
+                    #[cfg(test)]
+                    CompletionWorkKey::Test(key) => Some(CompletionWorkOutput::Test {
+                        values: Arc::from([format!("{key}-result")]),
+                        key,
+                    }),
+                    CompletionWorkKey::Files(_) => unreachable!(),
+                })
+                .await
+                .ok()
+                .flatten(),
         }
-        #[cfg(test)]
-        CompletionWorkKey::Test(key) => Some(CompletionWorkOutput::Test {
-            key: key.clone(),
-            values: Arc::from([format!("{key}-result")]),
-        }),
-    }
+    })
 }
 
 fn load_themes(cancellation: &CompletionCancellation) -> Option<Arc<[String]>> {
@@ -611,17 +684,65 @@ fn load_programs(cancellation: &CompletionCancellation) -> Option<CompletionWork
     })
 }
 
-fn load_files(
+async fn load_files(
+    request: FileIndexRequest,
+    cancellation: CompletionCancellation,
+    block: helix_runtime::Block,
+) -> Option<Arc<[FileIndexEntry]>> {
+    match request.workspace.backend() {
+        helix_view::editor::WorkspaceBackend::Local => block
+            .spawn(move || load_local_files(&request.key, &cancellation))
+            .await
+            .ok()
+            .flatten(),
+        helix_view::editor::WorkspaceBackend::Remote(remote) => {
+            let path = request.key.directory.remote_path()?.clone();
+            let entries = remote
+                .read_dir(path, request.key.options, cancellation.child_token())
+                .await
+                .ok()?;
+            if cancellation.is_cancelled() {
+                return None;
+            }
+            Some(
+                entries
+                    .into_iter()
+                    .map(|entry| FileIndexEntry {
+                        path: WorkspaceDocumentPath::Remote(entry.path),
+                        is_dir: matches!(entry.metadata.kind, helix_remote::FileKind::Directory),
+                        is_symlink: matches!(entry.metadata.kind, helix_remote::FileKind::Symlink),
+                    })
+                    .collect::<Vec<_>>()
+                    .into(),
+            )
+        }
+        helix_view::editor::WorkspaceBackend::Collaboration(session) => {
+            let (project, directory) = match &request.key.directory {
+                WorkspaceDocumentPath::Collaboration { project, path } => (*project, path.clone()),
+                _ => return None,
+            };
+            let files = tokio::select! {
+                _ = cancellation.token.cancelled() => return None,
+                files = session.list_files(request.key.options.scan) => files.ok()?,
+            };
+            collaboration_entries(project, &directory, &files)
+        }
+    }
+}
+
+fn load_local_files(
     key: &FileIndexKey,
     cancellation: &CompletionCancellation,
 ) -> Option<Arc<[FileIndexEntry]>> {
+    let directory = key.directory.local_path()?;
     let mut entries = Vec::new();
-    let walker = ignore::WalkBuilder::new(&key.directory)
-        .hidden(false)
-        .follow_links(false)
-        .git_ignore(key.git_ignore)
-        .parents(false)
+    let mut builder = ignore::WalkBuilder::new(directory);
+    crate::ui::file_scan::configure_walk(&mut builder, key.options.scan);
+    let walker = builder
         .max_depth(Some(1))
+        .add_custom_ignore_filename(helix_loader::config_dir().join("ignore"))
+        .add_custom_ignore_filename(helix_loader::workspace_ignore_file_name())
+        .types(crate::ui::file_scan::excluded_types())
         .build();
 
     for entry in walker {
@@ -648,10 +769,73 @@ fn load_files(
             },
         );
         entries.push(FileIndexEntry {
-            path,
+            path: WorkspaceDocumentPath::Local(path),
             is_dir,
             is_symlink,
         });
     }
     Some(entries.into())
+}
+
+fn collaboration_entries(
+    project: helix_collab::ProjectId,
+    directory: &helix_workspace::WorkspacePath,
+    files: &[helix_workspace::WorkspacePath],
+) -> Option<Arc<[FileIndexEntry]>> {
+    let mut entries = std::collections::BTreeMap::<String, bool>::new();
+    for path in files {
+        let Some(relative) = path.strip_prefix(directory) else {
+            continue;
+        };
+        let Some(name) = relative.segments().first() else {
+            continue;
+        };
+        let is_dir = relative.segments().len() > 1;
+        entries
+            .entry(name.clone())
+            .and_modify(|entry_is_dir| *entry_is_dir |= is_dir)
+            .or_insert(is_dir);
+    }
+    Some(
+        entries
+            .into_iter()
+            .filter_map(|(name, is_dir)| {
+                Some(FileIndexEntry {
+                    path: WorkspaceDocumentPath::Collaboration {
+                        project,
+                        path: directory.join(name).ok()?,
+                    },
+                    is_dir,
+                    is_symlink: false,
+                })
+            })
+            .collect::<Vec<_>>()
+            .into(),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn collaboration_completion_lists_direct_children_once() {
+        let project = helix_collab::ProjectId::from_bytes([7; 16]);
+        let directory = helix_workspace::WorkspacePath::from_slash_path("src").unwrap();
+        let files = [
+            helix_workspace::WorkspacePath::from_slash_path("src/lib.rs").unwrap(),
+            helix_workspace::WorkspacePath::from_slash_path("src/ui/mod.rs").unwrap(),
+            helix_workspace::WorkspacePath::from_slash_path("src/ui/view.rs").unwrap(),
+            helix_workspace::WorkspacePath::from_slash_path("tests/smoke.rs").unwrap(),
+        ];
+
+        let entries = collaboration_entries(project, &directory, &files).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(entries
+            .iter()
+            .any(|entry| { entry.path.file_name().as_deref() == Some("lib.rs") && !entry.is_dir }));
+        assert!(entries
+            .iter()
+            .any(|entry| { entry.path.file_name().as_deref() == Some("ui") && entry.is_dir }));
+    }
 }

@@ -3,11 +3,13 @@ use crate::{
     ui::{self, Prompt, PromptEvent},
 };
 
+type ConfirmationAction = Box<dyn FnOnce(&mut Context) + Send>;
+
 /// A deferred action gated by the standard yes/no prompt.
 pub struct Confirmation {
     message: String,
-    on_confirm: Option<Box<dyn FnOnce(&mut Context) + Send>>,
-    on_cancel: Option<Box<dyn FnOnce(&mut Context) + Send>>,
+    on_confirm: Option<ConfirmationAction>,
+    on_cancel: Option<ConfirmationAction>,
 }
 
 impl Confirmation {

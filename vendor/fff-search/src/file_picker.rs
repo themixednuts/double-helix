@@ -401,6 +401,13 @@ impl FileItem {
 
 /// FFF_SCAN_OPTIONS_BLOCKER: Helix needs file-picker scan semantics finer than
 /// upstream's coarse options.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SymlinkTargetScope {
+    #[default]
+    Any,
+    BaseDirectory,
+}
+
 #[derive(Debug, Clone)]
 pub struct FilePickerScanOptions {
     pub hidden: bool,
@@ -413,6 +420,7 @@ pub struct FilePickerScanOptions {
     pub max_depth: Option<usize>,
     pub custom_ignore_files: Box<[PathBuf]>,
     pub deduplicate_links: bool,
+    pub symlink_target_scope: SymlinkTargetScope,
 }
 
 impl Default for FilePickerScanOptions {
@@ -428,6 +436,7 @@ impl Default for FilePickerScanOptions {
             max_depth: None,
             custom_ignore_files: Box::default(),
             deduplicate_links: true,
+            symlink_target_scope: SymlinkTargetScope::Any,
         }
     }
 }
@@ -1284,6 +1293,7 @@ impl FilePicker {
         query: &FFFQuery<'_>,
         options: &GrepSearchOptions,
         content_overlays: &[ContentOverlay],
+        include_overlay_matches: bool,
     ) -> OwnedGrepResult {
         let result = self.grep(query, options);
         let overlay_paths: std::collections::HashSet<&Path> = content_overlays
@@ -1308,20 +1318,25 @@ impl FilePicker {
         }
 
         let mut regex_fallback_error = result.regex_fallback_error;
-        for overlay in content_overlays {
-            let (overlay_matches, overlay_regex_error) = grep_bytes(query, options, &overlay.bytes);
-            if regex_fallback_error.is_none() {
-                regex_fallback_error = overlay_regex_error;
+        if include_overlay_matches {
+            for overlay in content_overlays {
+                let (overlay_matches, overlay_regex_error) =
+                    grep_bytes(query, options, &overlay.bytes);
+                if regex_fallback_error.is_none() {
+                    regex_fallback_error = overlay_regex_error;
+                }
+                matches.extend(overlay_matches.into_iter().map(|item| OwnedGrepMatch {
+                    path: overlay.path.clone(),
+                    line_number: item.line_number,
+                    line_content: item.line_content,
+                }));
             }
-            matches.extend(overlay_matches.into_iter().map(|item| OwnedGrepMatch {
-                path: overlay.path.clone(),
-                line_number: item.line_number,
-                line_content: item.line_content,
-            }));
         }
 
         OwnedGrepResult {
             matches,
+            next_file_offset: result.next_file_offset,
+            filtered_file_count: result.filtered_file_count,
             regex_fallback_error,
         }
     }
@@ -1938,11 +1953,13 @@ impl FileSync {
 
         let filter_base_path = base_path.to_path_buf();
         let deduplicate_links = scan_options.deduplicate_links;
+        let symlink_target_scope = scan_options.symlink_target_scope;
         walk_builder.filter_entry(move |entry| {
             is_supported_entry(
                 entry.path(),
                 &filter_base_path,
                 deduplicate_links,
+                symlink_target_scope,
                 entry.path_is_symlink(),
             )
         });
@@ -2287,25 +2304,126 @@ fn is_supported_entry(
     path: &Path,
     base_path: &Path,
     deduplicate_links: bool,
+    symlink_target_scope: SymlinkTargetScope,
     is_symlink: bool,
 ) -> bool {
     if is_git_file(path) {
         return false;
     }
 
-    if deduplicate_links && is_symlink {
-        return path
-            .canonicalize()
-            .ok()
-            .is_some_and(|path| !path.starts_with(base_path));
+    if is_symlink {
+        return is_supported_symlink(
+            path,
+            base_path,
+            deduplicate_links,
+            symlink_target_scope,
+        );
     }
 
     true
 }
 
+pub(crate) fn is_supported_symlink(
+    path: &Path,
+    base_path: &Path,
+    deduplicate_links: bool,
+    target_scope: SymlinkTargetScope,
+) -> bool {
+    let Ok(target) = crate::path_utils::canonicalize(path) else {
+        return false;
+    };
+    is_supported_symlink_target(&target, base_path, deduplicate_links, target_scope)
+}
+
+fn is_supported_symlink_target(
+    target: &Path,
+    base_path: &Path,
+    deduplicate_links: bool,
+    target_scope: SymlinkTargetScope,
+) -> bool {
+    let within_base = target.starts_with(base_path);
+    if target_scope == SymlinkTargetScope::BaseDirectory && !within_base {
+        return false;
+    }
+    !(deduplicate_links && within_base)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn symlink_target_policy_separates_scope_from_deduplication() {
+        let base = Path::new("workspace");
+        let internal = base.join("target");
+        let external = Path::new("outside").join("target");
+
+        assert!(is_supported_symlink_target(
+            &internal,
+            base,
+            false,
+            SymlinkTargetScope::BaseDirectory,
+        ));
+        assert!(!is_supported_symlink_target(
+            &external,
+            base,
+            false,
+            SymlinkTargetScope::BaseDirectory,
+        ));
+        assert!(is_supported_symlink_target(
+            &external,
+            base,
+            false,
+            SymlinkTargetScope::Any,
+        ));
+        assert!(!is_supported_symlink_target(
+            &internal,
+            base,
+            true,
+            SymlinkTargetScope::Any,
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_target_scope_keeps_workspace_scans_contained() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("inside.txt"), "inside").unwrap();
+        std::fs::write(outside.path().join("outside.txt"), "outside").unwrap();
+        let internal_link = workspace.path().join("internal-link");
+        let external_link = workspace.path().join("external-link");
+        symlink(workspace.path().join("inside.txt"), &internal_link).unwrap();
+        symlink(outside.path().join("outside.txt"), &external_link).unwrap();
+        let base = crate::path_utils::canonicalize(workspace.path()).unwrap();
+
+        assert!(is_supported_symlink(
+            &internal_link,
+            &base,
+            false,
+            SymlinkTargetScope::BaseDirectory,
+        ));
+        assert!(!is_supported_symlink(
+            &external_link,
+            &base,
+            false,
+            SymlinkTargetScope::BaseDirectory,
+        ));
+        assert!(is_supported_symlink(
+            &external_link,
+            &base,
+            false,
+            SymlinkTargetScope::Any,
+        ));
+        assert!(!is_supported_symlink(
+            &internal_link,
+            &base,
+            true,
+            SymlinkTargetScope::BaseDirectory,
+        ));
+    }
 
     /// The watcher must watch every ancestor directory up to `base_path`,
     /// not just the immediate parents of indexed files. Intermediate dirs

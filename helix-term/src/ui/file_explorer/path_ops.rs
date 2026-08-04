@@ -2,6 +2,8 @@ use std::path::{Path, PathBuf};
 
 use helix_view::modal_text::ModalTextSelection as LabelSelection;
 
+use super::ExplorerPath;
+
 pub(super) fn selected_cursor(selection: usize) -> u32 {
     u32::try_from(selection).unwrap_or(u32::MAX)
 }
@@ -125,6 +127,12 @@ pub(super) fn sibling_path_with_label(
     source: &Path,
     label: &str,
 ) -> Result<PathBuf, LabelRenameError> {
+    validate_label(label)?;
+    let parent = source.parent().ok_or(LabelRenameError::MissingParent)?;
+    Ok(parent.join(label))
+}
+
+pub(super) fn validate_label(label: &str) -> Result<(), LabelRenameError> {
     if label.is_empty() {
         return Err(LabelRenameError::Empty);
     }
@@ -134,25 +142,82 @@ pub(super) fn sibling_path_with_label(
     if matches!(label, "." | "..") {
         return Err(LabelRenameError::DotSegment);
     }
-    let parent = source.parent().ok_or(LabelRenameError::MissingParent)?;
-    Ok(parent.join(label))
+    Ok(())
 }
 
-pub(super) fn display_name(path: &Path) -> String {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| display_path(path))
+pub(super) trait DisplayExplorerPath {
+    fn display_explorer_path(&self) -> String;
+    fn explorer_file_name(&self) -> Option<String>;
+    fn relative_explorer_path(&self, base: &Self) -> Option<String>;
 }
 
-pub(super) fn display_path(path: &Path) -> String {
-    path.display().to_string().replace('\\', "/")
+impl DisplayExplorerPath for Path {
+    fn display_explorer_path(&self) -> String {
+        self.display().to_string().replace('\\', "/")
+    }
+
+    fn explorer_file_name(&self) -> Option<String> {
+        self.file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+    }
+
+    fn relative_explorer_path(&self, base: &Self) -> Option<String> {
+        let relative = self.strip_prefix(base).ok()?;
+        (!relative.as_os_str().is_empty()).then(|| relative.display_explorer_path())
+    }
 }
 
-pub(super) fn relative_display(base: &Path, path: &Path) -> String {
-    path.strip_prefix(base)
-        .ok()
-        .filter(|path| !path.as_os_str().is_empty())
-        .map(display_path)
+impl DisplayExplorerPath for PathBuf {
+    fn display_explorer_path(&self) -> String {
+        self.as_path().display_explorer_path()
+    }
+
+    fn explorer_file_name(&self) -> Option<String> {
+        self.as_path().explorer_file_name()
+    }
+
+    fn relative_explorer_path(&self, base: &Self) -> Option<String> {
+        self.as_path().relative_explorer_path(base)
+    }
+}
+
+impl DisplayExplorerPath for ExplorerPath {
+    fn display_explorer_path(&self) -> String {
+        match self {
+            ExplorerPath::Local(path) => path.display_explorer_path(),
+            ExplorerPath::Remote(_) | ExplorerPath::Collaboration { .. } => self.display(),
+        }
+    }
+
+    fn explorer_file_name(&self) -> Option<String> {
+        self.file_name().map(|name| name.into_owned())
+    }
+
+    fn relative_explorer_path(&self, base: &Self) -> Option<String> {
+        let relative = self.relative_to(base)?;
+        (!relative.is_root()).then(|| relative.display_explorer_path())
+    }
+}
+
+pub(super) fn display_name<P>(path: &P) -> String
+where
+    P: DisplayExplorerPath + ?Sized,
+{
+    path.explorer_file_name()
+        .unwrap_or_else(|| path.display_explorer_path())
+}
+
+pub(super) fn display_path<P>(path: &P) -> String
+where
+    P: DisplayExplorerPath + ?Sized,
+{
+    path.display_explorer_path()
+}
+
+pub(super) fn relative_display<P>(base: &P, path: &P) -> String
+where
+    P: DisplayExplorerPath + ?Sized,
+{
+    path.relative_explorer_path(base)
         .unwrap_or_else(|| display_name(path))
 }

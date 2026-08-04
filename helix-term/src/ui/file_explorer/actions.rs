@@ -1,5 +1,3 @@
-use std::path::{Path, PathBuf};
-
 use helix_core::movement::Movement as CoreMovement;
 use helix_view::{
     document::Mode,
@@ -20,11 +18,15 @@ use crate::{
 };
 
 use super::{
-    input::{ExplorerFileOperation, ExplorerOperator, ExplorerPastePlacement},
+    input::{CreatePlacement, ExplorerFileOperation, ExplorerOperator, ExplorerPastePlacement},
     model::ExplorerRow,
-    path_ops::{parse_entry_path, selected_cursor, sibling_path_with_label},
-    windows_reserved_basename, windows_reserved_path, FileExplorerPanel,
+    path_ops::{parse_entry_path, selected_cursor, sibling_path_with_label, validate_label},
+    windows_reserved_basename, windows_reserved_path, ExplorerPath, FileExplorerPanel,
 };
+
+/// Ephemeral path segment for an in-progress create row. Never written to disk;
+/// the commit path uses the typed buffer under `LabelEditKind::Create::parent`.
+const CREATE_ROW_SEGMENT: &str = ".helix-creating";
 #[derive(Clone, Debug)]
 pub(super) struct LabelEdit {
     /// Index into `self.rows` of the row being edited.
@@ -50,21 +52,23 @@ pub(super) enum LabelEditKind {
     /// being edited; `original_label` is what was there before we started
     /// editing (so cancelling restores it).
     Rename {
-        source: PathBuf,
+        source: ExplorerPath,
         original_label: String,
     },
     /// A brand-new row inserted into the tree at this depth — committing
     /// creates the file (or directory if the buffer ends in `/`).
     Create {
         /// Directory the new entry will be created in.
-        parent: PathBuf,
+        parent: ExplorerPath,
+        /// Selection restored when the create is cancelled or aborted.
+        restore_selection: usize,
     },
 }
 
 #[derive(Clone, Debug)]
 pub(super) struct ExplorerFileClipboard {
     operation: ExplorerFileOperation,
-    paths: Box<[PathBuf]>,
+    paths: Box<[ExplorerPath]>,
 }
 
 impl FileExplorerPanel {
@@ -95,12 +99,22 @@ impl FileExplorerPanel {
     /// `ApplyCreate`, confirmed deletes, and the clipboard paste operations —
     /// so a single binding (`u` by default) reverts any of them.
     pub(super) fn undo_file_operation(&mut self, cx: &mut Context) {
+        let Some(root) = self.root.local_path().map(std::path::Path::to_path_buf) else {
+            cx.submit_ui(UiCommand::FileExplorer(
+                FileExplorerCommand::ReplayWorkspaceTransaction {
+                    root: self.root.clone(),
+                    cursor: selected_cursor(self.selection),
+                    redo: false,
+                },
+            ));
+            return;
+        };
         crate::effect::file_operation::submit(
             cx.editor,
             cx.ingress.clone(),
             helix_view::editor::FileOperationRequest::undo(
                 helix_view::editor::FileOperationOrigin::Explorer {
-                    root: self.root.clone(),
+                    root,
                     cursor: selected_cursor(self.selection),
                     select_path: None,
                 },
@@ -109,12 +123,22 @@ impl FileExplorerPanel {
     }
 
     pub(super) fn redo_file_operation(&mut self, cx: &mut Context) {
+        let Some(root) = self.root.local_path().map(std::path::Path::to_path_buf) else {
+            cx.submit_ui(UiCommand::FileExplorer(
+                FileExplorerCommand::ReplayWorkspaceTransaction {
+                    root: self.root.clone(),
+                    cursor: selected_cursor(self.selection),
+                    redo: true,
+                },
+            ));
+            return;
+        };
         crate::effect::file_operation::submit(
             cx.editor,
             cx.ingress.clone(),
             helix_view::editor::FileOperationRequest::redo(
                 helix_view::editor::FileOperationOrigin::Explorer {
-                    root: self.root.clone(),
+                    root,
                     cursor: selected_cursor(self.selection),
                     select_path: None,
                 },
@@ -130,18 +154,24 @@ impl FileExplorerPanel {
             .unwrap_or(editor.config().default_yank_register)
     }
 
-    fn path_register_values(paths: &[PathBuf]) -> Result<Vec<String>, PathBuf> {
+    fn path_register_values(paths: &[ExplorerPath]) -> Result<Vec<String>, ExplorerPath> {
         paths
             .iter()
-            .map(|path| {
-                let relative = helix_stdx::path::get_relative_path(path);
-                let value = relative.to_str().ok_or_else(|| path.clone())?;
-                Ok(value.replace('\\', "/"))
+            .map(|path| match path {
+                ExplorerPath::Local(path) => {
+                    let relative = helix_stdx::path::get_relative_path(path);
+                    let value = relative
+                        .to_str()
+                        .ok_or_else(|| ExplorerPath::Local(path.clone()))?;
+                    Ok(value.replace('\\', "/"))
+                }
+                ExplorerPath::Remote(path) => Ok(path.to_string()),
+                ExplorerPath::Collaboration { path, .. } => Ok(path.to_string()),
             })
             .collect()
     }
 
-    fn write_path_register(&mut self, cx: &mut Context, paths: &[PathBuf]) -> bool {
+    fn write_path_register(&mut self, cx: &mut Context, paths: &[ExplorerPath]) -> bool {
         let register = self.selected_register(cx.editor);
         let register_values = match Self::path_register_values(paths) {
             Ok(values) => values,
@@ -282,35 +312,80 @@ impl FileExplorerPanel {
         self.sync_label_edit_from_region(editor);
     }
 
-    /// Begin an inline create on the selected row. Target parent depends
-    /// on what's selected:
-    /// - Expanded directory → create INSIDE it (the new row appears as a
-    ///   visible child)
-    /// - Collapsed directory → create at the explorer root, since adding
-    ///   inside a closed folder would silently hide the new entry
-    /// - File → create as a SIBLING in the file's parent directory
+    /// Begin an inline create by inserting a new tree row (like editor `o`/`O`)
+    /// and editing its empty label.
     ///
-    /// The buffer starts empty so the user types the name directly. `/`
-    /// in the name commits as nested directories (handled downstream by
+    /// Target parent / insert position:
+    /// - Expanded directory + below → first child inside it
+    /// - Expanded directory + above → sibling above the directory
+    /// - Collapsed directory → sibling (never inside a closed folder)
+    /// - File → sibling in the file's parent directory
+    /// - Root row → child of the explorer root
+    ///
+    /// `/` in the name commits as nested directories (handled downstream by
     /// the parsed entry path's directory marker).
-    pub(super) fn enter_label_edit_create(&mut self, cx: &mut Context) {
+    pub(super) fn enter_label_edit_create(&mut self, cx: &mut Context, placement: CreatePlacement) {
+        if self.label_edit.is_some() {
+            return;
+        }
         let Some(row) = self.selected().cloned() else {
             return;
         };
-        let parent = if row.is_dir && row.expanded {
-            row.path.clone()
-        } else if row.is_dir {
-            // Collapsed dir — create at the visible root so the new entry
-            // doesn't get hidden behind a closed folder.
-            self.root.clone()
-        } else {
-            // File — sibling in its parent. Falls back to root if the
-            // file somehow has no parent (shouldn't happen, but defensive).
-            row.path
-                .parent()
-                .map(Path::to_path_buf)
-                .unwrap_or_else(|| self.root.clone())
+        let restore_selection = self.selection;
+        let (parent, insert_index, depth, ancestor_last) =
+            self.create_insert_target(&row, placement);
+
+        let Ok(path) = parent.join(CREATE_ROW_SEGMENT) else {
+            cx.editor.set_error("Cannot create here");
+            return;
         };
+
+        let mut rows = self.rows.to_vec();
+        let is_last = match rows.get(insert_index) {
+            Some(next) if next.depth == depth => false,
+            _ => true,
+        };
+        if insert_index > 0 {
+            if let Some(prev) = rows.get_mut(insert_index - 1) {
+                if prev.depth == depth {
+                    prev.is_last = false;
+                }
+            }
+        }
+
+        rows.insert(
+            insert_index,
+            ExplorerRow {
+                path,
+                label: String::new(),
+                is_dir: false,
+                depth,
+                expanded: false,
+                is_last,
+                ancestor_last,
+                vcs_status: None,
+                diagnostic_status: None,
+            },
+        );
+        self.rows = rows.into();
+        // Keep the unfiltered tree in sync so a later empty-query filter
+        // rebuild does not drop the create row.
+        if self.search_query.trim().is_empty() {
+            let mut all_rows = self.all_rows.to_vec();
+            if insert_index <= all_rows.len() {
+                if insert_index > 0 {
+                    if let Some(prev) = all_rows.get_mut(insert_index - 1) {
+                        if prev.depth == depth {
+                            prev.is_last = false;
+                        }
+                    }
+                }
+                all_rows.insert(insert_index, self.rows[insert_index].clone());
+                self.all_rows = all_rows.into();
+            }
+        }
+
+        self.seek_to(insert_index);
 
         // Empty buffer, cursor at 0 — user types the name directly.
         self.label_edit_region.set_text(cx.editor, "", 0);
@@ -318,12 +393,97 @@ impl FileExplorerPanel {
             .enter_insert_at(cx.editor, helix_view::edit_region::InsertEntry::AtCurrent);
 
         self.label_edit = Some(LabelEdit {
-            row_index: self.selection,
-            kind: LabelEditKind::Create { parent },
+            row_index: insert_index,
+            kind: LabelEditKind::Create {
+                parent,
+                restore_selection,
+            },
             buffer: String::new(),
             cursor: 0,
         });
         self.sync_label_edit_from_region(cx.editor);
+    }
+
+    /// Resolve parent directory, insert index, depth, and tree-guide ancestors
+    /// for a create row at `placement` relative to `row`.
+    fn create_insert_target(
+        &self,
+        row: &ExplorerRow,
+        placement: CreatePlacement,
+    ) -> (ExplorerPath, usize, usize, Vec<bool>) {
+        let selection = self.selection;
+        let root_child = || {
+            let mut ancestors = Vec::new();
+            if let Some(root_row) = self.rows.first() {
+                ancestors.push(root_row.is_last);
+            } else {
+                ancestors.push(true);
+            }
+            (self.root.clone(), 1usize, ancestors)
+        };
+
+        match placement {
+            CreatePlacement::Below if row.is_dir && row.expanded => {
+                let mut ancestor_last = row.ancestor_last.clone();
+                ancestor_last.push(row.is_last);
+                (
+                    row.path.clone(),
+                    selection + 1,
+                    row.depth + 1,
+                    ancestor_last,
+                )
+            }
+            CreatePlacement::Below if row.depth == 0 => {
+                let (parent, depth, ancestor_last) = root_child();
+                (parent, selection + 1, depth, ancestor_last)
+            }
+            CreatePlacement::Below => {
+                let parent = row.path.parent().unwrap_or_else(|| self.root.clone());
+                (parent, selection + 1, row.depth, row.ancestor_last.clone())
+            }
+            CreatePlacement::Above if row.depth == 0 => {
+                // Nothing above the root — open as first child instead.
+                let (parent, depth, ancestor_last) = root_child();
+                (parent, selection + 1, depth, ancestor_last)
+            }
+            CreatePlacement::Above if row.is_dir && row.expanded => {
+                // Sibling above the directory, not a child above the header.
+                let parent = row.path.parent().unwrap_or_else(|| self.root.clone());
+                (parent, selection, row.depth, row.ancestor_last.clone())
+            }
+            CreatePlacement::Above => {
+                let parent = row.path.parent().unwrap_or_else(|| self.root.clone());
+                (parent, selection, row.depth, row.ancestor_last.clone())
+            }
+        }
+    }
+
+    /// Remove an in-progress create row and fix sibling `is_last` flags.
+    fn remove_create_row_at(&mut self, index: usize) {
+        let remove_from = |rows: &mut Vec<ExplorerRow>| {
+            if index >= rows.len() {
+                return;
+            }
+            let removed = rows.remove(index);
+            if removed.is_last {
+                if let Some(prev_idx) = rows[..index]
+                    .iter()
+                    .rposition(|row| row.depth == removed.depth)
+                {
+                    rows[prev_idx].is_last = true;
+                }
+            }
+        };
+
+        let mut rows = self.rows.to_vec();
+        remove_from(&mut rows);
+        self.rows = rows.into();
+
+        if self.search_query.trim().is_empty() {
+            let mut all_rows = self.all_rows.to_vec();
+            remove_from(&mut all_rows);
+            self.all_rows = all_rows.into();
+        }
     }
 
     /// Mirror the region's text and cursor into the cached `LabelEdit`
@@ -352,8 +512,17 @@ impl FileExplorerPanel {
     /// file-system operation is performed. Clears the underlying
     /// [`Self::label_edit_region`] so a subsequent rename starts from
     /// a clean slate (no leftover undo history from the previous edit).
+    /// Create edits also remove the inserted tree row and restore selection.
     pub(super) fn cancel_label_edit(&mut self, editor: &mut Editor) {
-        self.label_edit = None;
+        if let Some(edit) = self.label_edit.take() {
+            if let LabelEditKind::Create {
+                restore_selection, ..
+            } = edit.kind
+            {
+                self.remove_create_row_at(edit.row_index);
+                self.seek_to(restore_selection.min(self.rows.len().saturating_sub(1)));
+            }
+        }
         self.label_selection = LabelSelection::default();
         self.input.mode = Mode::Normal;
         self.label_edit_region.clear(editor);
@@ -380,6 +549,13 @@ impl FileExplorerPanel {
 
         let buffer = edit.buffer.trim();
         if buffer.is_empty() {
+            if let LabelEditKind::Create {
+                restore_selection, ..
+            } = edit.kind
+            {
+                self.remove_create_row_at(edit.row_index);
+                self.seek_to(restore_selection.min(self.rows.len().saturating_sub(1)));
+            }
             cx.editor.set_error("Name cannot be empty");
             return;
         }
@@ -405,7 +581,9 @@ impl FileExplorerPanel {
                 };
                 // Windows treats these names as device handles in every path
                 // component, including nested create/rename input.
-                if let Some(reserved) = windows_reserved_basename(source)
+                if let Some(reserved) = source
+                    .local_path()
+                    .and_then(windows_reserved_basename)
                     .or_else(|| windows_reserved_path(&entry.relative))
                 {
                     cx.editor.set_error(format!(
@@ -413,11 +591,74 @@ impl FileExplorerPanel {
                     ));
                     return;
                 }
-                let destination = parent.join(entry.relative);
+                let destination = match parent.join_relative(&entry.relative) {
+                    Ok(destination) => destination,
+                    Err(error) => {
+                        cx.editor.set_error(error);
+                        return;
+                    }
+                };
 
-                let root = self.root.clone();
+                if let (Some(source), Some(destination)) = (
+                    source.remote_path().cloned(),
+                    destination.remote_path().cloned(),
+                ) {
+                    cx.submit_ui(UiCommand::FileExplorer(
+                        FileExplorerCommand::ApplyWorkspaceTransaction {
+                            root: self.root.clone(),
+                            cursor: selected_cursor(self.selection),
+                            select_path: Some(ExplorerPath::Remote(destination.clone())),
+                            transaction: helix_remote::FileTransaction {
+                                operations: vec![helix_remote::FileOperation::Rename {
+                                    from: source,
+                                    to: destination.clone(),
+                                    overwrite: false,
+                                }],
+                            },
+                            success: format!("Renamed remote path to {destination}"),
+                            modified_buffer_check: ModifiedBufferCheck::Prompt,
+                        },
+                    ));
+                    return;
+                }
+
+                if let (Some(source), Some(destination)) = (
+                    source.collaboration_path().cloned(),
+                    destination.collaboration_path().cloned(),
+                ) {
+                    cx.submit_ui(UiCommand::FileExplorer(
+                        FileExplorerCommand::ApplyWorkspaceTransaction {
+                            root: self.root.clone(),
+                            cursor: selected_cursor(self.selection),
+                            select_path: self.root.with_workspace_path(destination.clone()),
+                            transaction: helix_workspace::FileTransaction {
+                                operations: vec![helix_workspace::FileOperation::Rename {
+                                    from: source,
+                                    to: destination.clone(),
+                                    overwrite: false,
+                                }],
+                            },
+                            success: format!("Renamed shared path to {destination}"),
+                            modified_buffer_check: ModifiedBufferCheck::Prompt,
+                        },
+                    ));
+                    return;
+                }
+
+                let Some(root) = self.root.local_path().map(std::path::Path::to_path_buf) else {
+                    cx.editor
+                        .notify_error("Cannot rename across workspace backends");
+                    return;
+                };
                 let cursor = selected_cursor(self.selection);
-                let source = source.clone();
+                let Some(source) = source.local_path().map(std::path::Path::to_path_buf) else {
+                    cx.editor.notify_error("Remote rename is not available yet");
+                    return;
+                };
+                let Some(destination) = destination.into_local() else {
+                    cx.editor.notify_error("Remote rename is not available yet");
+                    return;
+                };
                 cx.spawn_ui(async move {
                     Ok(UiCommand::FileExplorer(FileExplorerCommand::ApplyMove {
                         source,
@@ -430,7 +671,15 @@ impl FileExplorerPanel {
                     }))
                 });
             }
-            LabelEditKind::Create { parent } => {
+            LabelEditKind::Create {
+                parent,
+                restore_selection,
+            } => {
+                // Drop the placeholder row before the filesystem create; a
+                // successful ApplyCreate refreshes the real tree afterward.
+                self.remove_create_row_at(edit.row_index);
+                self.seek_to((*restore_selection).min(self.rows.len().saturating_sub(1)));
+
                 let entry = match parse_entry_path(buffer) {
                     Ok(entry) => entry,
                     Err(error) => {
@@ -444,10 +693,75 @@ impl FileExplorerPanel {
                     ));
                     return;
                 }
-                let target = parent.join(&entry.relative);
-                let root = self.root.clone();
-                let cursor = selected_cursor(self.selection);
                 let is_dir = entry.is_dir;
+                let target = match parent.join_relative(&entry.relative) {
+                    Ok(target) => target,
+                    Err(error) => {
+                        cx.editor.set_error(error);
+                        return;
+                    }
+                };
+                if let Some(target) = target.remote_path().cloned() {
+                    let operation = if is_dir {
+                        helix_remote::FileOperation::CreateDirectory {
+                            path: target.clone(),
+                        }
+                    } else {
+                        helix_remote::FileOperation::CreateFile {
+                            path: target.clone(),
+                            overwrite: false,
+                        }
+                    };
+                    cx.submit_ui(UiCommand::FileExplorer(
+                        FileExplorerCommand::ApplyWorkspaceTransaction {
+                            root: self.root.clone(),
+                            cursor: selected_cursor(self.selection),
+                            select_path: Some(ExplorerPath::Remote(target.clone())),
+                            transaction: helix_remote::FileTransaction {
+                                operations: vec![operation],
+                            },
+                            success: format!("Created remote path {target}"),
+                            modified_buffer_check: ModifiedBufferCheck::Prompt,
+                        },
+                    ));
+                    return;
+                }
+                if let Some(target) = target.collaboration_path().cloned() {
+                    let operation = if is_dir {
+                        helix_workspace::FileOperation::CreateDirectory {
+                            path: target.clone(),
+                        }
+                    } else {
+                        helix_workspace::FileOperation::CreateFile {
+                            path: target.clone(),
+                            overwrite: false,
+                        }
+                    };
+                    cx.submit_ui(UiCommand::FileExplorer(
+                        FileExplorerCommand::ApplyWorkspaceTransaction {
+                            root: self.root.clone(),
+                            cursor: selected_cursor(self.selection),
+                            select_path: self.root.with_workspace_path(target.clone()),
+                            transaction: helix_workspace::FileTransaction {
+                                operations: vec![operation],
+                            },
+                            success: format!("Created shared path {target}"),
+                            modified_buffer_check: ModifiedBufferCheck::Prompt,
+                        },
+                    ));
+                    return;
+                }
+                let Some(root) = self.root.local_path().map(std::path::Path::to_path_buf) else {
+                    cx.editor
+                        .notify_error("Cannot create across workspace backends");
+                    return;
+                };
+                let Some(target) = target.into_local() else {
+                    cx.editor
+                        .notify_error("Cannot create across workspace backends");
+                    return;
+                };
+                let cursor = selected_cursor(self.selection);
                 cx.spawn_ui(async move {
                     Ok(UiCommand::FileExplorer(FileExplorerCommand::ApplyCreate {
                         root,
@@ -495,20 +809,96 @@ impl FileExplorerPanel {
     }
 
     fn rename_selected_label(&mut self, cx: &mut Context, row: &ExplorerRow, new_label: String) {
-        let destination = match sibling_path_with_label(&row.path, &new_label) {
+        if let Some(source) = row.path.remote_path().cloned() {
+            if let Err(error) = validate_label(&new_label) {
+                cx.editor.set_error(error.to_string());
+                return;
+            }
+            let Some(parent) = source.parent() else {
+                cx.editor.set_error("Cannot rename root");
+                return;
+            };
+            let destination = match parent.join(new_label) {
+                Ok(destination) => destination,
+                Err(error) => {
+                    cx.editor.set_error(error.to_string());
+                    return;
+                }
+            };
+            cx.submit_ui(UiCommand::FileExplorer(
+                FileExplorerCommand::ApplyWorkspaceTransaction {
+                    root: self.root.clone(),
+                    cursor: selected_cursor(self.selection),
+                    select_path: Some(ExplorerPath::Remote(destination.clone())),
+                    transaction: helix_remote::FileTransaction {
+                        operations: vec![helix_remote::FileOperation::Rename {
+                            from: source,
+                            to: destination.clone(),
+                            overwrite: false,
+                        }],
+                    },
+                    success: format!("Renamed remote path to {destination}"),
+                    modified_buffer_check: ModifiedBufferCheck::Prompt,
+                },
+            ));
+            return;
+        }
+        if let Some(source) = row.path.collaboration_path().cloned() {
+            if let Err(error) = validate_label(&new_label) {
+                cx.editor.set_error(error.to_string());
+                return;
+            }
+            let Some(parent) = source.parent() else {
+                cx.editor.set_error("Cannot rename root");
+                return;
+            };
+            let destination = match parent.join(new_label) {
+                Ok(destination) => destination,
+                Err(error) => {
+                    cx.editor.set_error(error.to_string());
+                    return;
+                }
+            };
+            cx.submit_ui(UiCommand::FileExplorer(
+                FileExplorerCommand::ApplyWorkspaceTransaction {
+                    root: self.root.clone(),
+                    cursor: selected_cursor(self.selection),
+                    select_path: self.root.with_workspace_path(destination.clone()),
+                    transaction: helix_workspace::FileTransaction {
+                        operations: vec![helix_workspace::FileOperation::Rename {
+                            from: source,
+                            to: destination.clone(),
+                            overwrite: false,
+                        }],
+                    },
+                    success: format!("Renamed shared path to {destination}"),
+                    modified_buffer_check: ModifiedBufferCheck::Prompt,
+                },
+            ));
+            return;
+        }
+        let Some(local_path) = row.path.local_path() else {
+            cx.editor
+                .notify_error("Cannot rename across workspace backends");
+            return;
+        };
+        let destination = match sibling_path_with_label(local_path, &new_label) {
             Ok(destination) => destination,
             Err(err) => {
                 cx.editor.set_error(err.to_string());
                 return;
             }
         };
-        if destination == row.path {
+        if row.path.local_path() == Some(destination.as_path()) {
             cx.editor.set_status("File name unchanged");
             return;
         }
 
-        let source = row.path.clone();
-        let root = self.root.clone();
+        let source = local_path.to_path_buf();
+        let Some(root) = self.root.local_path().map(std::path::Path::to_path_buf) else {
+            cx.editor.notify_error("Remote rename is not available yet");
+            return;
+        };
         let cursor = selected_cursor(self.selection);
         cx.spawn_ui(async move {
             Ok(UiCommand::FileExplorer(FileExplorerCommand::ApplyMove {
@@ -531,9 +921,68 @@ impl FileExplorerPanel {
             return;
         };
         let destination_dir = self.selected_base_dir();
-        let root = self.root.clone();
+        if let Some(destination) = destination_dir.remote_path().cloned() {
+            for source in clipboard.paths.iter() {
+                let Some(source) = source.remote_path().cloned() else {
+                    cx.editor
+                        .notify_error("Cannot mix local and remote clipboard paths");
+                    return;
+                };
+                cx.submit_ui(UiCommand::FileExplorer(
+                    FileExplorerCommand::ApplyWorkspacePaste {
+                        root: self.root.clone(),
+                        cursor: selected_cursor(self.selection),
+                        source,
+                        destination: destination.clone(),
+                        move_source: clipboard.operation == ExplorerFileOperation::Move,
+                        modified_buffer_check: ModifiedBufferCheck::Prompt,
+                    },
+                ));
+            }
+            if clipboard.operation == ExplorerFileOperation::Move {
+                self.file_clipboard = None;
+            }
+            return;
+        }
+        if let Some(destination) = destination_dir.collaboration_path().cloned() {
+            for source in clipboard.paths.iter() {
+                let Some(source) = source.collaboration_path().cloned() else {
+                    cx.editor
+                        .notify_error("Cannot mix workspace backends in the file clipboard");
+                    return;
+                };
+                cx.submit_ui(UiCommand::FileExplorer(
+                    FileExplorerCommand::ApplyWorkspacePaste {
+                        root: self.root.clone(),
+                        cursor: selected_cursor(self.selection),
+                        source,
+                        destination: destination.clone(),
+                        move_source: clipboard.operation == ExplorerFileOperation::Move,
+                        modified_buffer_check: ModifiedBufferCheck::Prompt,
+                    },
+                ));
+            }
+            if clipboard.operation == ExplorerFileOperation::Move {
+                self.file_clipboard = None;
+            }
+            return;
+        }
+        let Some(destination_dir) = destination_dir.into_local() else {
+            cx.editor
+                .notify_error("Cannot paste across workspace backends");
+            return;
+        };
+        let Some(root) = self.root.local_path().map(std::path::Path::to_path_buf) else {
+            cx.editor.notify_error("Remote paste is not available yet");
+            return;
+        };
         let cursor = selected_cursor(self.selection);
         for source in clipboard.paths.iter() {
+            let Some(source) = source.local_path().map(std::path::Path::to_path_buf) else {
+                cx.editor
+                    .notify_error("Cannot mix local and remote clipboard paths");
+                return;
+            };
             let destination = helix_view::editor::FileOperationDestination::UniqueInDirectory(
                 destination_dir.clone(),
             );
@@ -546,7 +995,7 @@ impl FileExplorerPanel {
                     modified_buffer_check: ModifiedBufferCheck::Prompt,
                 },
                 ExplorerFileOperation::Move => FileExplorerCommand::ApplyMove {
-                    source: source.clone(),
+                    source,
                     root: root.clone(),
                     cursor,
                     destination,
@@ -566,7 +1015,35 @@ impl FileExplorerPanel {
             return;
         };
         let target = row.path.clone();
-        let root = self.root.clone();
+        if let Some(target) = target.remote_path().cloned() {
+            cx.submit_ui(UiCommand::FileExplorer(
+                FileExplorerCommand::PromptWorkspaceDelete {
+                    root: self.root.clone(),
+                    cursor: selected_cursor(self.selection),
+                    target,
+                },
+            ));
+            return;
+        }
+        if let Some(target) = target.collaboration_path().cloned() {
+            cx.submit_ui(UiCommand::FileExplorer(
+                FileExplorerCommand::PromptWorkspaceDelete {
+                    root: self.root.clone(),
+                    cursor: selected_cursor(self.selection),
+                    target,
+                },
+            ));
+            return;
+        }
+        let Some(target) = target.into_local() else {
+            cx.editor
+                .notify_error("Cannot delete across workspace backends");
+            return;
+        };
+        let Some(root) = self.root.local_path().map(std::path::Path::to_path_buf) else {
+            cx.editor.notify_error("Remote delete is not available yet");
+            return;
+        };
         let cursor = selected_cursor(self.selection);
         cx.spawn_ui(async move {
             Ok(UiCommand::FileExplorer(FileExplorerCommand::PromptDelete {

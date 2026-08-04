@@ -1,19 +1,21 @@
 use std::{
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, OnceLock},
+    sync::{atomic::AtomicBool, Arc, Mutex, OnceLock},
     time::Duration,
 };
 
 use fff_search::{
-    ContentOverlay, FFFMode, FilePicker, FilePickerOptions, FilePickerScanOptions,
-    FileSearchConfig, FrecencyRecord, FrecencyStore, FrecencyTracker, FuzzySearchOptions,
-    GrepConfig, GrepMode, GrepSearchOptions, PaginationArgs, QueryHistoryKind, QueryMatchEntry,
-    QueryParser, QueryTracker, QueryTrackerStore, SharedFrecency, SharedPicker, SharedQueryTracker,
+    grep_byte_sources_page, ByteSourceGrepCursor, ContentOverlay, FFFMode, FilePicker,
+    FilePickerOptions, FilePickerScanOptions, FileSearchConfig, FrecencyRecord, FrecencyStore,
+    FrecencyTracker, FuzzySearchOptions, GrepConfig, GrepMode, GrepSearchOptions, PaginationArgs,
+    QueryHistoryKind, QueryMatchEntry, QueryParser, QueryTracker, QueryTrackerStore,
+    SharedFrecency, SharedPicker, SharedQueryTracker,
 };
 use heed::types::{Bytes, SerdeBincode};
 use heed::{Database, EnvOpenOptions};
 use helix_store::{CacheStore, FrecencyEntry, QueryHistory};
 use helix_view::editor::{FileExplorerConfig, FilePickerConfig};
+use helix_workspace::ScanOptions as WorkspaceScanOptions;
 use once_cell::sync::OnceCell;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
@@ -22,8 +24,6 @@ const FILE_SEARCH_LIMIT: usize = 1_000;
 const SCAN_WAIT: Duration = Duration::from_millis(20);
 const FIRST_RESULTS_WAIT: Duration = Duration::from_secs(2);
 const INITIAL_SCAN_WAIT: Duration = Duration::from_secs(30);
-const GREP_SEARCH_LIMIT: usize = 2_000;
-const GREP_SCAN_WAIT: Duration = Duration::from_millis(250);
 const PICKER_TRACE_TARGET: &str = crate::ui::picker::PICKER_TRACE_TARGET;
 const FFF_CACHE_IMPORT_MARKER: &str = "fff-cache-v1";
 const WORKSPACE_CACHE_CAPACITY: usize = 4;
@@ -43,6 +43,25 @@ pub(crate) struct GrepMatch {
 }
 
 #[derive(Debug)]
+pub(crate) struct GrepPage {
+    pub(crate) matches: Vec<GrepMatch>,
+    pub(crate) next_file_offset: Option<usize>,
+    pub(crate) done: bool,
+}
+
+#[derive(Debug)]
+pub(crate) struct OverlayGrepPage {
+    pub(crate) matches: Vec<OverlayGrepMatch>,
+    pub(crate) next: Option<ByteSourceGrepCursor>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct OverlayGrepMatch {
+    pub(crate) source: usize,
+    pub(crate) line_num: usize,
+}
+
+#[derive(Debug)]
 struct FffWorkspace {
     root: PathBuf,
     picker: SharedPicker,
@@ -57,15 +76,15 @@ struct FffWorkspaceCache {
 
 struct FffWorkspaceSlot {
     root: PathBuf,
-    config: FilePickerConfig,
+    options: WorkspaceScanOptions,
     workspace: OnceCell<Arc<FffWorkspace>>,
 }
 
 impl FffWorkspaceSlot {
-    fn new(root: PathBuf, config: FilePickerConfig) -> Self {
+    fn new(root: PathBuf, options: WorkspaceScanOptions) -> Self {
         Self {
             root,
-            config,
+            options,
             workspace: OnceCell::new(),
         }
     }
@@ -75,12 +94,12 @@ impl FffWorkspaceCache {
     fn slot_for(
         &mut self,
         root: PathBuf,
-        config: &FilePickerConfig,
+        options: WorkspaceScanOptions,
     ) -> (Arc<FffWorkspaceSlot>, bool) {
         if let Some(index) = self
             .slots
             .iter()
-            .position(|slot| slot.root == root && same_file_index_config(&slot.config, config))
+            .position(|slot| slot.root == root && slot.options == options)
         {
             let slot = self
                 .slots
@@ -90,17 +109,17 @@ impl FffWorkspaceCache {
             return (slot, true);
         }
 
-        let slot = Arc::new(FffWorkspaceSlot::new(root, config.clone()));
+        let slot = Arc::new(FffWorkspaceSlot::new(root, options));
         self.slots.push_back(slot.clone());
         self.trim();
         (slot, false)
     }
 
-    fn ready(&mut self, root: &Path, config: &FilePickerConfig) -> Option<Arc<FffWorkspace>> {
+    fn ready(&mut self, root: &Path, options: WorkspaceScanOptions) -> Option<Arc<FffWorkspace>> {
         let index = self
             .slots
             .iter()
-            .position(|slot| slot.root == root && same_file_index_config(&slot.config, config))?;
+            .position(|slot| slot.root == root && slot.options == options)?;
         let slot = self
             .slots
             .remove(index)
@@ -152,9 +171,8 @@ pub(crate) fn search_file_explorer_available_cancellable(
     config: &FileExplorerConfig,
     abort_signal: Option<&std::sync::atomic::AtomicBool>,
 ) -> anyhow::Result<Vec<PathBuf>> {
-    let config = file_explorer_picker_config(config);
     let total_start = std::time::Instant::now();
-    let workspace = workspace_for_root(root, &config)?;
+    let workspace = workspace_for_scan(root, config.workspace_scan_options())?;
     search_workspace_files_cancellable(
         &workspace,
         query,
@@ -213,8 +231,7 @@ pub(crate) fn prewarm(root: &Path, config: &FilePickerConfig) {
 }
 
 pub(crate) fn prewarm_file_explorer(root: &Path, config: &FileExplorerConfig) {
-    let config = file_explorer_picker_config(config);
-    if let Err(err) = workspace_for_root(root, &config) {
+    if let Err(err) = workspace_for_scan(root, config.workspace_scan_options()) {
         log::debug!(
             "failed to prewarm FFF file explorer workspace for {}: {err:#}",
             root.display()
@@ -351,17 +368,20 @@ fn responsive_search_threads_for(available: usize) -> usize {
     available.saturating_sub((available / 4).max(1)).max(1)
 }
 
-pub(crate) fn grep_files(
-    root: &Path,
-    query: &str,
-    smart_case: bool,
-    config: &FilePickerConfig,
-    content_overlays: &[ContentOverlay],
-) -> anyhow::Result<Vec<GrepMatch>> {
-    let workspace = workspace_for_root(root, config)?;
-    if !workspace.picker.wait_for_scan(GREP_SCAN_WAIT) {
-        anyhow::bail!("FFF scan is not ready");
-    }
+pub(crate) struct GrepFilesPageRequest<'a> {
+    pub root: &'a Path,
+    pub query: &'a str,
+    pub smart_case: bool,
+    pub config: &'a FilePickerConfig,
+    pub content_overlays: &'a [ContentOverlay],
+    pub file_offset: usize,
+    pub limit: usize,
+    pub abort_signal: Arc<AtomicBool>,
+}
+
+pub(crate) fn grep_files_page(request: GrepFilesPageRequest<'_>) -> anyhow::Result<GrepPage> {
+    let workspace = workspace_for_root(request.root, request.config)?;
+    let scan_complete = workspace.picker.wait_for_scan(Duration::from_millis(40));
 
     let picker_guard = workspace.picker.read()?;
     let Some(picker) = picker_guard.as_ref() else {
@@ -369,17 +389,20 @@ pub(crate) fn grep_files(
     };
 
     let parser = QueryParser::new(GrepConfig);
-    let parsed = parser.parse(query);
+    let parsed = parser.parse(request.query);
     let results = picker.grep_owned(
         &parsed,
         &GrepSearchOptions {
-            smart_case,
+            smart_case: request.smart_case,
             mode: GrepMode::Regex,
-            page_limit: GREP_SEARCH_LIMIT,
-            time_budget_ms: 250,
+            file_offset: request.file_offset,
+            page_limit: request.limit,
+            time_budget_ms: 40,
+            abort_signal: Some(request.abort_signal),
             ..GrepSearchOptions::default()
         },
-        content_overlays,
+        request.content_overlays,
+        false,
     );
 
     if let Some(err) = results.regex_fallback_error {
@@ -395,7 +418,57 @@ pub(crate) fn grep_files(
         })
         .collect();
 
-    Ok(matches)
+    let next_file_offset = if results.next_file_offset != 0 {
+        Some(results.next_file_offset)
+    } else if scan_complete {
+        None
+    } else {
+        Some(results.filtered_file_count.max(request.file_offset))
+    };
+    Ok(GrepPage {
+        matches,
+        next_file_offset,
+        done: scan_complete && next_file_offset.is_none(),
+    })
+}
+
+pub(crate) fn grep_overlays_page(
+    query: &str,
+    smart_case: bool,
+    overlays: &[ContentOverlay],
+    cursor: ByteSourceGrepCursor,
+    limit: usize,
+    abort_signal: Arc<AtomicBool>,
+) -> anyhow::Result<OverlayGrepPage> {
+    let parser = QueryParser::new(GrepConfig);
+    let parsed = parser.parse(query);
+    let options = GrepSearchOptions {
+        smart_case,
+        mode: GrepMode::Regex,
+        ..GrepSearchOptions::default()
+    };
+    let page = grep_byte_sources_page(
+        &parsed,
+        &options,
+        overlays.len(),
+        cursor,
+        limit,
+        Duration::from_millis(40),
+        Some(&abort_signal),
+        |index| Some(overlays[index].bytes.clone()),
+    )
+    .map_err(anyhow::Error::new)?;
+    Ok(OverlayGrepPage {
+        matches: page
+            .matches
+            .into_iter()
+            .map(|item| OverlayGrepMatch {
+                source: item.source,
+                line_num: item.line_number.saturating_sub(1) as usize,
+            })
+            .collect(),
+        next: page.next,
+    })
 }
 
 pub(crate) fn record_file_open(root: &Path, config: &FilePickerConfig, query: &str, path: &Path) {
@@ -439,6 +512,13 @@ pub(crate) fn record_file_open(root: &Path, config: &FilePickerConfig, query: &s
 }
 
 fn workspace_for_root(root: &Path, config: &FilePickerConfig) -> anyhow::Result<Arc<FffWorkspace>> {
+    workspace_for_scan(root, config.workspace_scan_options())
+}
+
+fn workspace_for_scan(
+    root: &Path,
+    options: WorkspaceScanOptions,
+) -> anyhow::Result<Arc<FffWorkspace>> {
     let start = std::time::Instant::now();
     let root = helix_stdx::path::normalize(root);
     let (slot, cached) = {
@@ -446,7 +526,7 @@ fn workspace_for_root(root: &Path, config: &FilePickerConfig) -> anyhow::Result<
         let mut cache = cache
             .lock()
             .map_err(|_| anyhow::anyhow!("FFF workspace cache lock was poisoned"))?;
-        cache.slot_for(root, config)
+        cache.slot_for(root, options)
     };
 
     if let Some(workspace) = slot.workspace.get() {
@@ -467,9 +547,7 @@ fn workspace_for_root(root: &Path, config: &FilePickerConfig) -> anyhow::Result<
     );
     let workspace = slot
         .workspace
-        .get_or_try_init(|| {
-            FffWorkspace::new(slot.root.clone(), slot.config.clone()).map(Arc::new)
-        })?
+        .get_or_try_init(|| FffWorkspace::new(slot.root.clone(), slot.options).map(Arc::new))?
         .clone();
     if let Some(cache) = WORKSPACES.get() {
         cache
@@ -497,11 +575,11 @@ fn workspace_if_ready(
     let mut cache = cache
         .lock()
         .map_err(|_| anyhow::anyhow!("FFF workspace cache lock was poisoned"))?;
-    Ok(cache.ready(&root, config))
+    Ok(cache.ready(&root, config.workspace_scan_options()))
 }
 
 impl FffWorkspace {
-    fn new(root: PathBuf, config: FilePickerConfig) -> anyhow::Result<Self> {
+    fn new(root: PathBuf, options: WorkspaceScanOptions) -> anyhow::Result<Self> {
         let picker = SharedPicker::default();
         let workspace = stable_path_hash(&root);
         let store = match CacheStore::open_default() {
@@ -519,7 +597,7 @@ impl FffWorkspace {
         }
         let frecency = init_frecency(&root, &workspace, store.clone());
         let query_tracker = init_query_tracker(&root, &workspace, store.clone());
-        let scan = scan_options(&config);
+        let scan = scan_options(options);
 
         FilePicker::new_with_shared_state(
             picker.clone(),
@@ -547,48 +625,22 @@ impl FffWorkspace {
     }
 }
 
-fn same_file_index_config(left: &FilePickerConfig, right: &FilePickerConfig) -> bool {
-    left.hidden == right.hidden
-        && left.follow_symlinks == right.follow_symlinks
-        && left.deduplicate_links == right.deduplicate_links
-        && left.parents == right.parents
-        && left.ignore == right.ignore
-        && left.git_ignore == right.git_ignore
-        && left.git_global == right.git_global
-        && left.git_exclude == right.git_exclude
-        && left.max_depth == right.max_depth
-}
-
-fn scan_options(config: &FilePickerConfig) -> FilePickerScanOptions {
+fn scan_options(options: WorkspaceScanOptions) -> FilePickerScanOptions {
     FilePickerScanOptions {
-        hidden: config.hidden,
-        parents: config.parents,
-        ignore: config.ignore,
-        git_ignore: config.git_ignore,
-        git_global: config.git_global,
-        git_exclude: config.git_exclude,
-        follow_links: config.follow_symlinks,
-        max_depth: config.max_depth,
+        hidden: options.hidden,
+        parents: options.parents,
+        ignore: options.ignore,
+        git_ignore: options.git_ignore,
+        git_global: options.git_global,
+        git_exclude: options.git_exclude,
+        follow_links: options.follow_symlinks,
+        max_depth: options.max_depth.map(|depth| depth as usize),
         custom_ignore_files: Box::from([
             helix_loader::config_dir().join("ignore"),
             helix_loader::workspace_ignore_file_name().into(),
         ]),
-        deduplicate_links: config.deduplicate_links,
-    }
-}
-
-fn file_explorer_picker_config(config: &FileExplorerConfig) -> FilePickerConfig {
-    FilePickerConfig {
-        hidden: config.hidden,
-        follow_symlinks: config.follow_symlinks,
-        deduplicate_links: true,
-        parents: config.parents,
-        ignore: config.ignore,
-        git_ignore: config.git_ignore,
-        git_global: config.git_global,
-        git_exclude: config.git_exclude,
-        max_depth: None,
-        hide_preview: true,
+        deduplicate_links: options.deduplicate_symlinks,
+        symlink_target_scope: fff_search::SymlinkTargetScope::Any,
     }
 }
 
@@ -1165,7 +1217,7 @@ mod tests {
             max_depth: Some(2),
             ..FilePickerConfig::default()
         };
-        let scan = scan_options(&config);
+        let scan = scan_options(config.workspace_scan_options());
 
         assert!(!scan.ignore);
         assert!(!scan.git_ignore);
@@ -1173,7 +1225,7 @@ mod tests {
     }
 
     #[test]
-    fn explorer_picker_config_preserves_explorer_scan_semantics() {
+    fn explorer_scan_options_preserve_explorer_semantics() {
         let config = FileExplorerConfig {
             hidden: false,
             follow_symlinks: false,
@@ -1184,8 +1236,7 @@ mod tests {
             git_exclude: false,
             ..FileExplorerConfig::default()
         };
-        let picker_config = file_explorer_picker_config(&config);
-        let scan = scan_options(&picker_config);
+        let scan = scan_options(config.workspace_scan_options());
 
         assert_eq!(scan.hidden, config.hidden);
         assert_eq!(scan.follow_links, config.follow_symlinks);
@@ -1200,14 +1251,14 @@ mod tests {
     #[test]
     fn workspace_cache_keeps_picker_and_explorer_indexes_separate_and_reusable() {
         let root = PathBuf::from("workspace");
-        let picker_config = FilePickerConfig::default();
-        let explorer_config = file_explorer_picker_config(&FileExplorerConfig::default());
-        assert!(!same_file_index_config(&picker_config, &explorer_config));
+        let picker_options = FilePickerConfig::default().workspace_scan_options();
+        let explorer_options = FileExplorerConfig::default().workspace_scan_options();
+        assert_ne!(picker_options, explorer_options);
 
         let mut cache = FffWorkspaceCache::default();
-        let (picker, picker_cached) = cache.slot_for(root.clone(), &picker_config);
-        let (explorer, explorer_cached) = cache.slot_for(root.clone(), &explorer_config);
-        let (picker_again, picker_again_cached) = cache.slot_for(root, &picker_config);
+        let (picker, picker_cached) = cache.slot_for(root.clone(), picker_options);
+        let (explorer, explorer_cached) = cache.slot_for(root.clone(), explorer_options);
+        let (picker_again, picker_again_cached) = cache.slot_for(root, picker_options);
 
         assert!(!picker_cached);
         assert!(!explorer_cached);
@@ -1219,13 +1270,13 @@ mod tests {
 
     #[test]
     fn workspace_cache_bounds_live_indexes_and_evicts_least_recently_used() {
-        let config = FilePickerConfig::default();
+        let options = FilePickerConfig::default().workspace_scan_options();
         let mut cache = FffWorkspaceCache::default();
         let oldest_root = PathBuf::from("workspace-0");
-        cache.slot_for(oldest_root.clone(), &config);
+        cache.slot_for(oldest_root.clone(), options);
 
         for index in 1..=WORKSPACE_CACHE_CAPACITY {
-            cache.slot_for(PathBuf::from(format!("workspace-{index}")), &config);
+            cache.slot_for(PathBuf::from(format!("workspace-{index}")), options);
         }
 
         assert_eq!(cache.slots.len(), WORKSPACE_CACHE_CAPACITY);

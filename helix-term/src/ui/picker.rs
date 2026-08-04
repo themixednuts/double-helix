@@ -58,7 +58,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{self, AtomicBool, AtomicU64, AtomicUsize},
-        Arc,
+        Arc, Mutex,
     },
     time::Duration,
 };
@@ -71,7 +71,8 @@ use helix_core::{
 use helix_view::{
     content_region::ContentRegion,
     editor::{
-        Action, DocumentOpenRole, DocumentOpenWork, FileExplorerConfig, PreparedDocumentOpen,
+        Action, DocumentOpenRole, FileExplorerConfig, PreparedWorkspaceDocumentOpen,
+        WorkspaceDocumentOpenWork, WorkspaceDocumentPath,
     },
     graphics::{CursorKind, Margin, Modifier, Rect},
     input::KeyEvent,
@@ -138,172 +139,147 @@ fn directory_preview(
 
 static NEXT_PICKER_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
-// Picker keys are component-local hardcoded bindings, not user keymap entries,
-// so this table is the single source for both dispatch and footer hints.
+// Picker keys are component-local hardcoded bindings, not user keymap entries.
 const PICKER_BINDINGS: &[PickerBinding] = &[
-    PickerBinding::visible(
+    PickerBinding::new(
         KeyEvent {
             code: KeyCode::Enter,
             modifiers: KeyModifiers::NONE,
         },
         PickerBindingAction::Open,
-        "Enter",
-        "open",
-        220,
     ),
-    PickerBinding::visible(
+    PickerBinding::new(
         KeyEvent {
             code: KeyCode::Esc,
             modifiers: KeyModifiers::NONE,
         },
         PickerBindingAction::Close,
-        "Esc",
-        "close",
-        210,
     ),
-    PickerBinding::hidden(
+    PickerBinding::new(
         KeyEvent {
             code: KeyCode::Char('c'),
             modifiers: KeyModifiers::CONTROL,
         },
         PickerBindingAction::Close,
     ),
-    PickerBinding::visible(
+    PickerBinding::new(
         KeyEvent {
             code: KeyCode::Tab,
             modifiers: KeyModifiers::NONE,
         },
         PickerBindingAction::Next,
-        "Tab",
-        "next",
-        200,
     ),
-    PickerBinding::visible(
+    PickerBinding::new(
         KeyEvent {
             code: KeyCode::Tab,
             modifiers: KeyModifiers::SHIFT,
         },
         PickerBindingAction::Previous,
-        "S-Tab",
-        "prev",
-        190,
     ),
-    PickerBinding::hidden(
+    PickerBinding::new(
         KeyEvent {
             code: KeyCode::Up,
             modifiers: KeyModifiers::NONE,
         },
         PickerBindingAction::Previous,
     ),
-    PickerBinding::hidden(
+    PickerBinding::new(
         KeyEvent {
             code: KeyCode::Char('p'),
             modifiers: KeyModifiers::CONTROL,
         },
         PickerBindingAction::Previous,
     ),
-    PickerBinding::hidden(
+    PickerBinding::new(
         KeyEvent {
             code: KeyCode::Down,
             modifiers: KeyModifiers::NONE,
         },
         PickerBindingAction::Next,
     ),
-    PickerBinding::hidden(
+    PickerBinding::new(
         KeyEvent {
             code: KeyCode::Char('n'),
             modifiers: KeyModifiers::CONTROL,
         },
         PickerBindingAction::Next,
     ),
-    PickerBinding::hidden(
+    PickerBinding::new(
         KeyEvent {
             code: KeyCode::PageDown,
             modifiers: KeyModifiers::NONE,
         },
         PickerBindingAction::PageDown,
     ),
-    PickerBinding::hidden(
+    PickerBinding::new(
         KeyEvent {
             code: KeyCode::Char('d'),
             modifiers: KeyModifiers::CONTROL,
         },
         PickerBindingAction::PageDown,
     ),
-    PickerBinding::hidden(
+    PickerBinding::new(
         KeyEvent {
             code: KeyCode::PageUp,
             modifiers: KeyModifiers::NONE,
         },
         PickerBindingAction::PageUp,
     ),
-    PickerBinding::hidden(
+    PickerBinding::new(
         KeyEvent {
             code: KeyCode::Char('u'),
             modifiers: KeyModifiers::CONTROL,
         },
         PickerBindingAction::PageUp,
     ),
-    PickerBinding::hidden(
+    PickerBinding::new(
         KeyEvent {
             code: KeyCode::Home,
             modifiers: KeyModifiers::NONE,
         },
         PickerBindingAction::Start,
     ),
-    PickerBinding::hidden(
+    PickerBinding::new(
         KeyEvent {
             code: KeyCode::End,
             modifiers: KeyModifiers::NONE,
         },
         PickerBindingAction::End,
     ),
-    PickerBinding::visible(
+    PickerBinding::new(
         KeyEvent {
             code: KeyCode::Char(' '),
             modifiers: KeyModifiers::NONE,
         },
         PickerBindingAction::ToggleMark,
-        "Space",
-        "mark",
-        205,
     ),
-    PickerBinding::hidden(
+    PickerBinding::new(
         KeyEvent {
             code: KeyCode::Enter,
             modifiers: KeyModifiers::ALT,
         },
         PickerBindingAction::OpenKeep,
     ),
-    PickerBinding::visible(
+    PickerBinding::new(
         KeyEvent {
             code: KeyCode::Char('s'),
             modifiers: KeyModifiers::CONTROL,
         },
         PickerBindingAction::HorizontalSplit,
-        "C-s",
-        "split",
-        120,
     ),
-    PickerBinding::visible(
+    PickerBinding::new(
         KeyEvent {
             code: KeyCode::Char('v'),
             modifiers: KeyModifiers::CONTROL,
         },
         PickerBindingAction::VerticalSplit,
-        "C-v",
-        "vsplit",
-        110,
     ),
-    PickerBinding::visible(
+    PickerBinding::new(
         KeyEvent {
             code: KeyCode::Char('t'),
             modifiers: KeyModifiers::CONTROL,
         },
         PickerBindingAction::TogglePreview,
-        "C-t",
-        "preview",
-        100,
     ),
 ];
 
@@ -328,47 +304,11 @@ enum PickerBindingAction {
 struct PickerBinding {
     key: KeyEvent,
     action: PickerBindingAction,
-    hint: PickerHintPolicy,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PickerHintPolicy {
-    Visible(PickerHint),
-    Hidden,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct PickerHint {
-    key: &'static str,
-    label: &'static str,
-    priority: u8,
 }
 
 impl PickerBinding {
-    const fn visible(
-        key: KeyEvent,
-        action: PickerBindingAction,
-        hint_key: &'static str,
-        hint_label: &'static str,
-        priority: u8,
-    ) -> Self {
-        Self {
-            key,
-            action,
-            hint: PickerHintPolicy::Visible(PickerHint {
-                key: hint_key,
-                label: hint_label,
-                priority,
-            }),
-        }
-    }
-
-    const fn hidden(key: KeyEvent, action: PickerBindingAction) -> Self {
-        Self {
-            key,
-            action,
-            hint: PickerHintPolicy::Hidden,
-        }
+    const fn new(key: KeyEvent, action: PickerBindingAction) -> Self {
+        Self { key, action }
     }
 }
 
@@ -462,12 +402,14 @@ fn picker_preview_layout(show_preview: bool, has_preview: bool, area: Rect) -> P
     }
 }
 /// Biggest file size to preview in bytes
-pub const MAX_FILE_SIZE_FOR_PREVIEW: u64 = 10 * 1024 * 1024;
+pub const MAX_FILE_SIZE_FOR_PREVIEW: u64 =
+    helix_core::syntax::MAX_FULL_DOCUMENT_SYNTAX_BYTES as u64;
 
 #[derive(PartialEq, Eq, Hash)]
 pub enum PathOrId<'a> {
     Id(DocumentId),
     Path(&'a Path),
+    Workspace(std::borrow::Cow<'a, WorkspaceDocumentPath>),
 }
 
 impl<'a> From<&'a Path> for PathOrId<'a> {
@@ -482,6 +424,18 @@ impl From<DocumentId> for PathOrId<'_> {
     }
 }
 
+impl<'a> From<&'a WorkspaceDocumentPath> for PathOrId<'a> {
+    fn from(path: &'a WorkspaceDocumentPath) -> Self {
+        Self::Workspace(std::borrow::Cow::Borrowed(path))
+    }
+}
+
+impl From<WorkspaceDocumentPath> for PathOrId<'_> {
+    fn from(path: WorkspaceDocumentPath) -> Self {
+        Self::Workspace(std::borrow::Cow::Owned(path))
+    }
+}
+
 type FileCallback<T> = Box<dyn for<'a> Fn(&'a Editor, &'a T) -> Option<FileLocation<'a>> + Send>;
 
 /// File path and range of lines (used to align and highlight lines)
@@ -489,7 +443,7 @@ pub type FileLocation<'a> = (PathOrId<'a>, Option<(usize, usize)>);
 
 pub enum CachedPreview {
     Loading,
-    Document(Box<PreparedDocumentOpen>),
+    Document(Box<PreparedWorkspaceDocumentOpen>),
     Directory(Arc<[(String, bool)]>),
     Binary,
     LargeFile,
@@ -499,14 +453,17 @@ pub enum CachedPreview {
 struct PreviewLoadRequest {
     generation: u64,
     picker: PickerInstanceId,
-    path: PathBuf,
-    open: DocumentOpenWork,
+    path: WorkspaceDocumentPath,
+    cache_path: PathBuf,
+    open: WorkspaceDocumentOpenWork,
     config: FileExplorerConfig,
+    canceled: tokio_util::sync::CancellationToken,
 }
 
 struct PreviewLoadService {
     tx: LatestByKeySender<(), PreviewLoadRequest>,
     latest_generation: Arc<AtomicU64>,
+    active: Arc<Mutex<Option<(u64, tokio_util::sync::CancellationToken)>>>,
     next_generation: u64,
 }
 
@@ -519,21 +476,16 @@ impl PreviewLoadService {
         let (tx, mut rx) = helix_runtime::latest_by_key::<(), PreviewLoadRequest>(1);
         let latest_generation = Arc::new(AtomicU64::new(0));
         let actor_latest = Arc::clone(&latest_generation);
+        let active = Arc::new(Mutex::new(None));
+        let actor_active = Arc::clone(&active);
         work.spawn(async move {
             while let Some(((), request)) = rx.recv().await {
                 let generation = request.generation;
                 let picker = request.picker;
                 let path = request.path.clone();
+                let cache_path = request.cache_path.clone();
                 let started = std::time::Instant::now();
-                let preview = match block.spawn(move || load_preview(request)).await {
-                    Ok(preview) => preview,
-                    Err(error) => {
-                        log::error!(
-                            "picker preview worker failed picker={picker:?} generation={generation} error={error}"
-                        );
-                        CachedPreview::NotFound
-                    }
-                };
+                let preview = load_preview(request, block.clone()).await;
                 let stale = actor_latest.load(atomic::Ordering::Acquire) != generation;
                 log::info!(
                     target: PICKER_TRACE_TARGET,
@@ -551,11 +503,19 @@ impl PreviewLoadService {
                         crate::runtime::ui::command::PickerCommand::ApplyPreview {
                             picker,
                             generation,
-                            path,
+                            path: cache_path,
                             preview,
                         },
                     ))
                     .await;
+                let mut active = actor_active
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if active.as_ref().is_some_and(|(active_generation, _)| {
+                    *active_generation == generation
+                }) {
+                    *active = None;
+                }
             }
         })
         .detach();
@@ -563,6 +523,7 @@ impl PreviewLoadService {
         Self {
             tx,
             latest_generation,
+            active,
             next_generation: 1,
         }
     }
@@ -571,6 +532,17 @@ impl PreviewLoadService {
         let generation = self.next_generation;
         self.next_generation = self.next_generation.wrapping_add(1).max(1);
         request.generation = generation;
+        let canceled = tokio_util::sync::CancellationToken::new();
+        request.canceled = canceled.clone();
+        {
+            let mut active = self
+                .active
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some((_, previous)) = active.replace((generation, canceled)) {
+                previous.cancel();
+            }
+        }
         let previous = self
             .latest_generation
             .swap(generation, atomic::Ordering::AcqRel);
@@ -601,15 +573,70 @@ impl PreviewLoadService {
 
     fn cancel(&self) {
         self.latest_generation.store(0, atomic::Ordering::Release);
+        if let Some((_, canceled)) = self
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            canceled.cancel();
+        }
     }
 }
 
-fn load_preview(request: PreviewLoadRequest) -> CachedPreview {
-    let path = request.path;
+async fn load_preview(request: PreviewLoadRequest, block: helix_runtime::Block) -> CachedPreview {
+    match request.open {
+        WorkspaceDocumentOpenWork::Local(open) => block
+            .spawn(move || load_local_preview(request.path, open, request.config))
+            .await
+            .unwrap_or(CachedPreview::NotFound),
+        WorkspaceDocumentOpenWork::Remote(open) => {
+            let metadata = match open.metadata(request.canceled.child_token()).await {
+                Ok(Some(metadata)) => metadata,
+                Ok(None) | Err(_) => return CachedPreview::NotFound,
+            };
+            if matches!(metadata.kind, helix_remote::FileKind::Directory) {
+                return CachedPreview::NotFound;
+            }
+            if !matches!(
+                metadata.kind,
+                helix_remote::FileKind::File | helix_remote::FileKind::Symlink
+            ) {
+                return CachedPreview::NotFound;
+            }
+            if metadata.len > MAX_FILE_SIZE_FOR_PREVIEW {
+                return CachedPreview::LargeFile;
+            }
+            match open.execute(request.canceled, true).await {
+                Ok(prepared) => CachedPreview::Document(Box::new(
+                    PreparedWorkspaceDocumentOpen::Remote(prepared),
+                )),
+                Err(helix_view::document::DocumentOpenError::BinaryFile) => CachedPreview::Binary,
+                Err(_) => CachedPreview::NotFound,
+            }
+        }
+        WorkspaceDocumentOpenWork::Collaboration(open) => match open.execute().await {
+            Ok(prepared) => CachedPreview::Document(Box::new(
+                PreparedWorkspaceDocumentOpen::Collaboration(prepared),
+            )),
+            Err(_) => CachedPreview::NotFound,
+        },
+        WorkspaceDocumentOpenWork::Failed { .. } => CachedPreview::NotFound,
+    }
+}
+
+fn load_local_preview(
+    path: WorkspaceDocumentPath,
+    open: helix_view::editor::DocumentOpenWork,
+    config: FileExplorerConfig,
+) -> CachedPreview {
+    let WorkspaceDocumentPath::Local(path) = path else {
+        return CachedPreview::NotFound;
+    };
     (|| -> Result<CachedPreview, std::io::Error> {
         let metadata = std::fs::metadata(&path)?;
         if metadata.is_dir() {
-            let files = directory_preview(&path, &request.config)?;
+            let files = directory_preview(&path, &config)?;
             let names = files
                 .iter()
                 .filter_map(|(path, is_dir)| {
@@ -642,12 +669,16 @@ fn load_preview(request: PreviewLoadRequest) -> CachedPreview {
             return Ok(CachedPreview::Binary);
         }
 
-        request.open.execute().map_or(
+        open.execute().map_or(
             Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 "cannot open document",
             )),
-            |prepared| Ok(CachedPreview::Document(Box::new(prepared))),
+            |prepared| {
+                Ok(CachedPreview::Document(Box::new(
+                    PreparedWorkspaceDocumentOpen::Local(prepared),
+                )))
+            },
         )
     })()
     .unwrap_or(CachedPreview::NotFound)
@@ -754,6 +785,7 @@ pub struct Injector<T, D> {
     ingress: SharedIngress,
     redraw: SharedRedraw,
     trace: Option<PickerTrace>,
+    canceled: tokio_util::sync::CancellationToken,
     /// A marker that requests a redraw when the injector drops.
     /// This marker causes the "running" indicator to disappear when a background job
     /// providing items is finished and drops. This could be wrapped in an [Arc] to ensure
@@ -801,6 +833,7 @@ impl<I, D> Clone for Injector<I, D> {
             ingress: self.ingress.clone(),
             redraw: self.redraw.clone(),
             trace: self.trace,
+            canceled: self.canceled.clone(),
             _redraw: RuntimeRedrawOnDrop {
                 redraw: self.redraw.clone(),
                 version: self.version,
@@ -824,6 +857,22 @@ impl<T, D> Injector<T, D> {
 
         inject_nucleo_item(&self.dst, &self.columns, item, &self.editor_data);
         Ok(())
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.alive.load(atomic::Ordering::Acquire)
+            && self.version == self.picker_version.load(atomic::Ordering::Acquire)
+            && !self.canceled.is_cancelled()
+    }
+
+    pub fn cancellation_token(&self) -> tokio_util::sync::CancellationToken {
+        self.canceled.clone()
+    }
+
+    pub fn report_error(&self, error: anyhow::Error) {
+        if self.is_active() {
+            self.ingress.status(error);
+        }
     }
 }
 
@@ -903,6 +952,12 @@ pub enum DynamicQuerySchedule {
     Debounced(Duration),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PickerRefreshScope {
+    CollaborationFiles(helix_collab::ProjectId),
+    CollaborationParticipants(helix_collab::ProjectId),
+}
+
 impl DynamicQuerySchedule {
     pub const fn debounced_ms(milliseconds: u64) -> Self {
         Self::Debounced(Duration::from_millis(milliseconds))
@@ -950,13 +1005,11 @@ struct PickerChromeRenderSnapshot {
     gradient_border: Option<GradientBorder>,
     prompt_row: Rect,
     separator_row: Rect,
-    hint_row: Rect,
     count: Arc<str>,
     count_width: u16,
     selected_style: Style,
     muted_style: Style,
     separator_style: Style,
-    hints: Arc<[crate::widgets::Hint<'static>]>,
 }
 
 impl PickerChromeRenderSnapshot {
@@ -992,17 +1045,6 @@ impl PickerChromeRenderSnapshot {
             tui::ratatui::to_ratatui_style(self.muted_style),
         );
         crate::widgets::hdivider(surface, self.separator_row, self.separator_style);
-        crate::widgets::hint_bar(
-            surface,
-            self.hint_row,
-            self.hints.as_ref(),
-            crate::widgets::HintBarStyle {
-                background: self.background,
-                key: self.selected_style,
-                label: self.muted_style,
-                separator: self.muted_style,
-            },
-        );
     }
 }
 
@@ -1328,6 +1370,8 @@ pub struct Picker<T: 'static + Send + Sync, D: 'static> {
     prepared_preview: Option<PreparedPreview>,
     last_preview_selection: Option<PreviewSelectionKey>,
     dynamic_query: DynamicQuery<T, D>,
+    dynamic_query_canceled: tokio_util::sync::CancellationToken,
+    refresh_scope: Option<PickerRefreshScope>,
     /// Cached gradient border for rendering when enabled in config
     gradient_border: Option<GradientBorder>,
     trace: Option<PickerTrace>,
@@ -1342,7 +1386,6 @@ pub struct Picker<T: 'static + Send + Sync, D: 'static> {
     /// If `None`, items are stored as `PickerItemData::Plain`.
     item_data_fn: Option<PickerItemDataFn<T>>,
     selection_changed_handler: Option<PickerSelectionHandler<T, D>>,
-    custom_hints: Vec<crate::widgets::Hint<'static>>,
     marked: Option<HashSet<u32>>,
     ingress: SharedIngress,
     redraw: SharedRedraw,
@@ -1389,6 +1432,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             ingress: ingress.clone(),
             redraw: redraw.clone(),
             trace: None,
+            canceled: tokio_util::sync::CancellationToken::new(),
             _redraw: RuntimeRedrawOnDrop {
                 redraw,
                 version: 0,
@@ -1449,6 +1493,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             ingress: ingress.clone(),
             redraw: redraw.clone(),
             trace: None,
+            canceled: tokio_util::sync::CancellationToken::new(),
             _redraw: RuntimeRedrawOnDrop {
                 redraw: redraw.clone(),
                 version: 0,
@@ -1484,6 +1529,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             alive,
             ingress,
             redraw,
+            canceled,
             ..
         } = injector;
         assert!(!columns.is_empty());
@@ -1547,6 +1593,8 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             prepared_preview: None,
             last_preview_selection: None,
             dynamic_query: DynamicQuery::Disabled,
+            dynamic_query_canceled: canceled,
+            refresh_scope: None,
             gradient_border: None,
             trace: None,
             render_count: 0,
@@ -1555,7 +1603,6 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             render_model: Arc::new(helix_view::model::PickerModel::default()),
             item_data_fn: None,
             selection_changed_handler: None,
-            custom_hints: Vec::new(),
             marked: None,
             ingress,
             redraw,
@@ -1575,14 +1622,6 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
         self
     }
 
-    pub fn with_custom_hints(
-        mut self,
-        hints: impl IntoIterator<Item = crate::widgets::Hint<'static>>,
-    ) -> Self {
-        self.custom_hints.extend(hints);
-        self
-    }
-
     pub fn injector(&self) -> Injector<T, D> {
         Injector {
             dst: self.matcher.injector(),
@@ -1594,6 +1633,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             ingress: self.ingress.clone(),
             redraw: self.redraw.clone(),
             trace: self.trace,
+            canceled: self.dynamic_query_canceled.clone(),
             _redraw: RuntimeRedrawOnDrop {
                 redraw: self.redraw.clone(),
                 version: self.version.load(atomic::Ordering::Acquire),
@@ -1654,6 +1694,11 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
 
     pub fn with_external_filtering(mut self) -> Self {
         self.external_filtering = true;
+        self
+    }
+
+    pub fn with_refresh_scope(mut self, scope: PickerRefreshScope) -> Self {
+        self.refresh_scope = Some(scope);
         self
     }
 
@@ -1804,21 +1849,29 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
         doc.document_mut().set_syntax(Some(syntax));
     }
 
-    fn queue_preview_load(&mut self, editor: &Editor, path: Arc<Path>) {
-        self.cancel_pending_preview_except(Some(path.as_ref()));
+    fn queue_preview_load(&mut self, editor: &Editor, path: WorkspaceDocumentPath) {
+        let cache_path: Arc<Path> = match &path {
+            WorkspaceDocumentPath::Local(path) => Arc::from(path.as_path()),
+            WorkspaceDocumentPath::Remote(path) => Arc::from(path.to_path_buf()),
+            WorkspaceDocumentPath::Collaboration { path, .. } => Arc::from(path.to_path_buf()),
+        };
+        self.cancel_pending_preview_except(Some(cache_path.as_ref()));
         let request = PreviewLoadRequest {
             generation: 0,
             picker: self.instance_id,
-            path: path.to_path_buf(),
-            open: editor.prepare_document_open(&path, DocumentOpenRole::Preview),
+            cache_path: cache_path.to_path_buf(),
+            open: editor.prepare_workspace_document_open(path.clone(), DocumentOpenRole::Preview),
+            path,
             config: editor.config().file_explorer.clone(),
+            canceled: tokio_util::sync::CancellationToken::new(),
         };
         if let Some(generation) = self.preview_load_service.submit(request) {
             self.preview_cache
-                .insert(path.clone(), CachedPreview::Loading);
-            self.pending_preview_load = Some((generation, path));
+                .insert(cache_path.clone(), CachedPreview::Loading);
+            self.pending_preview_load = Some((generation, cache_path));
         } else {
-            self.preview_cache.insert(path, CachedPreview::NotFound);
+            self.preview_cache
+                .insert(cache_path, CachedPreview::NotFound);
         }
     }
 
@@ -1892,6 +1945,8 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             }
             return;
         }
+        self.dynamic_query_canceled.cancel();
+        self.dynamic_query_canceled = tokio_util::sync::CancellationToken::new();
         let generation = self.version.fetch_add(1, atomic::Ordering::Relaxed) + 1;
         if let Some(trace) = self.trace {
             let snapshot = self.matcher.snapshot();
@@ -1919,11 +1974,13 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             self.work.clone(),
             self.block.clone(),
         );
+        let canceled = self.dynamic_query_canceled.clone();
         self.work
             .clone()
             .spawn(async move {
                 match task.await {
                     Ok(Ok(())) => {}
+                    Ok(Err(_)) | Err(_) if canceled.is_cancelled() => {}
                     Ok(Err(err)) => log::info!("Dynamic request failed: {err}"),
                     Err(err) => log::info!("Dynamic request task failed: {err}"),
                 }
@@ -2065,15 +2122,43 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
         let preview_path = self.selection().and_then(|option| {
             let (path, _) = self.file_fn.as_ref()?(ctx.editor, option)?;
             match path {
-                PathOrId::Path(path) => Some(path.to_path_buf()),
+                PathOrId::Path(path) => Some((
+                    path.to_path_buf(),
+                    WorkspaceDocumentPath::Local(path.to_path_buf()),
+                )),
+                PathOrId::Workspace(path) => Some((
+                    match path.as_ref() {
+                        WorkspaceDocumentPath::Local(path) => path.clone(),
+                        WorkspaceDocumentPath::Remote(path) => path.to_path_buf(),
+                        WorkspaceDocumentPath::Collaboration { path, .. } => path.to_path_buf(),
+                    },
+                    path.into_owned(),
+                )),
                 PathOrId::Id(_) => None,
             }
         });
-        if let Some(path) = preview_path {
+        if let Some((path, workspace_path)) = preview_path {
             if let Some(CachedPreview::Document(prepared)) =
                 self.preview_cache.remove(path.as_path())
             {
-                ctx.editor.cache_prepared_document_open(*prepared);
+                match *prepared {
+                    PreparedWorkspaceDocumentOpen::Local(prepared) => {
+                        ctx.editor.cache_prepared_document_open(prepared);
+                    }
+                    PreparedWorkspaceDocumentOpen::Remote(prepared) => {
+                        debug_assert!(matches!(workspace_path, WorkspaceDocumentPath::Remote(_)));
+                        ctx.editor
+                            .apply_prepared_remote_document_open(prepared, Action::Load);
+                    }
+                    PreparedWorkspaceDocumentOpen::Collaboration(prepared) => {
+                        debug_assert!(matches!(
+                            workspace_path,
+                            WorkspaceDocumentPath::Collaboration { .. }
+                        ));
+                        ctx.editor
+                            .apply_prepared_collaboration_document_open(prepared, Action::Load);
+                    }
+                }
             }
         }
         if let Some(option) = self.selection() {
@@ -2316,6 +2401,16 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
                     path: p.to_path_buf(),
                     line: range.map(|(start, _)| start),
                 }),
+                PathOrId::Workspace(path) => match path.as_ref() {
+                    WorkspaceDocumentPath::Local(path) => {
+                        Some(helix_view::model::PickerPreview::FilePath {
+                            path: path.clone(),
+                            line: range.map(|(start, _)| start),
+                        })
+                    }
+                    WorkspaceDocumentPath::Remote(_)
+                    | WorkspaceDocumentPath::Collaboration { .. } => None,
+                },
                 PathOrId::Id(_) => None,
             }
         });
@@ -2591,9 +2686,64 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
                         ),
                     );
                 }
-                self.queue_preview_load(editor, path.clone());
+                self.queue_preview_load(editor, WorkspaceDocumentPath::Local(path.to_path_buf()));
                 self.prepared_preview = Some(PreparedPreview {
                     source: PreparedPreviewSource::CachedPath(path),
+                    range,
+                });
+            }
+            PathOrId::Workspace(workspace_path) => {
+                let workspace_path = workspace_path.into_owned();
+                let cache_path: Arc<Path> = match &workspace_path {
+                    WorkspaceDocumentPath::Local(path) => Arc::from(path.as_path()),
+                    WorkspaceDocumentPath::Remote(path) => Arc::from(path.to_path_buf()),
+                    WorkspaceDocumentPath::Collaboration { path, .. } => {
+                        Arc::from(path.to_path_buf())
+                    }
+                };
+                let selection_changed = should_request_preview_for_current_selection(
+                    &mut self.last_preview_selection,
+                    PreviewSelectionKey::Path(cache_path.clone()),
+                );
+                if selection_changed {
+                    self.cancel_pending_preview_except(Some(cache_path.as_ref()));
+                }
+
+                if let Some(document) = editor
+                    .document_id_by_workspace_path(&workspace_path)
+                    .and_then(|document| editor.document(document))
+                {
+                    self.prepared_preview = Some(PreparedPreview {
+                        source: PreparedPreviewSource::Document(document.id()),
+                        range,
+                    });
+                    return;
+                }
+
+                if self.preview_cache.contains_key(cache_path.as_ref()) {
+                    let (cache_path, preview) = self
+                        .preview_cache
+                        .get_key_value(cache_path.as_ref())
+                        .expect("preview cache key disappeared");
+                    if selection_changed
+                        && matches!(
+                            preview,
+                            CachedPreview::Document(prepared)
+                                if prepared.document().language_config().is_none()
+                        )
+                    {
+                        self.preview_highlight_handler.request(cache_path.clone());
+                    }
+                    self.prepared_preview = Some(PreparedPreview {
+                        source: PreparedPreviewSource::CachedPath(cache_path.clone()),
+                        range,
+                    });
+                    return;
+                }
+
+                self.queue_preview_load(editor, workspace_path);
+                self.prepared_preview = Some(PreparedPreview {
+                    source: PreparedPreviewSource::CachedPath(cache_path),
                     range,
                 });
             }
@@ -2662,14 +2812,10 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
         };
 
         use helix_view::layout::{split_vertical, Size};
-        let vertical = split_vertical(
-            inner,
-            &[Size::fixed(1), Size::fixed(1), Size::Fill, Size::fixed(1)],
-        );
+        let vertical = split_vertical(inner, &[Size::fixed(1), Size::fixed(1), Size::Fill]);
         let prompt_row = vertical[0];
         let separator_row = vertical[1];
         let table_area = vertical[2];
-        let hint_row = vertical[3];
 
         let count: Arc<str> = Arc::from(format!(
             "{}{} · {}",
@@ -2680,20 +2826,6 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
         let prompt_area = prompt_row.clip_left(2);
         let count_width = UnicodeWidthStr::width(count.as_ref()) as u16;
         let line_area = prompt_area.clip_right(count_width.saturating_add(1));
-        let hints: Arc<[crate::widgets::Hint<'static>]> = PICKER_BINDINGS
-            .iter()
-            .filter_map(|binding| match binding.hint {
-                PickerHintPolicy::Visible(hint)
-                    if binding.action != PickerBindingAction::ToggleMark
-                        || self.marked.is_some() =>
-                {
-                    Some(crate::widgets::Hint::new(hint.key, hint.label).priority(hint.priority))
-                }
-                _ => None,
-            })
-            .chain(self.custom_hints.iter().cloned())
-            .collect::<Vec<_>>()
-            .into();
 
         let chrome = PickerChromeRenderSnapshot {
             area,
@@ -2702,13 +2834,11 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             gradient_border,
             prompt_row,
             separator_row,
-            hint_row,
             count,
             count_width,
             selected_style: selected,
             muted_style,
             separator_style: theme.get("ui.background.separator"),
-            hints,
         };
         cx.defer_paint("picker_chrome", move |surface, cancellation| {
             if !cancellation.is_cancelled() {
@@ -3203,6 +3333,10 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> PickerComponent for Pic
         self.instance_id
     }
 
+    fn refresh_scope(&self) -> Option<PickerRefreshScope> {
+        self.refresh_scope
+    }
+
     fn request_preview_highlight(&mut self, editor: &mut Editor, path: std::path::PathBuf) {
         Self::request_preview_highlight(self, editor, path);
     }
@@ -3238,6 +3372,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> PickerComponent for Pic
 impl<T: 'static + Send + Sync, D> Drop for Picker<T, D> {
     fn drop(&mut self) {
         // ensure we cancel any ongoing background threads streaming into the picker
+        self.dynamic_query_canceled.cancel();
         self.alive.store(false, atomic::Ordering::Release);
         self.version.fetch_add(1, atomic::Ordering::Relaxed);
         if let DynamicQuery::Debounced { debouncer, .. } = &self.dynamic_query {
@@ -3342,6 +3477,51 @@ mod tests {
         })
     }
 
+    fn empty_dynamic_query(
+        _query: &str,
+        _editor: &mut Editor,
+        _data: Arc<()>,
+        _injector: &Injector<String, ()>,
+        work: helix_runtime::Work,
+        _block: helix_runtime::Block,
+    ) -> helix_runtime::Task<anyhow::Result<()>> {
+        work.spawn(async { Ok(()) })
+    }
+
+    #[tokio::test]
+    async fn dynamic_query_generations_cancel_stale_injectors_and_picker_drop() {
+        with_test_context(|cx| {
+            let mut picker = Picker::new(
+                [Column::new("value", |item: &String, _: &()| {
+                    Cell::from(item.as_str())
+                })],
+                0,
+                [],
+                (),
+                PickerRuntime::new(cx.editor),
+                cx.ingress.clone(),
+                |_cx, _item, _action| {},
+            )
+            .with_dynamic_query(empty_dynamic_query, DynamicQuerySchedule::Immediate);
+            let stale = picker.injector();
+            assert!(stale.is_active());
+
+            picker.run_dynamic_query(cx.editor, Arc::from(""));
+
+            assert!(stale.cancellation_token().is_cancelled());
+            assert!(!stale.is_active());
+            assert!(stale.push("stale".to_owned()).is_err());
+            let current = picker.injector();
+            assert!(current.is_active());
+
+            drop(picker);
+
+            assert!(current.cancellation_token().is_cancelled());
+            assert!(!current.is_active());
+            assert!(current.push("closed".to_owned()).is_err());
+        });
+    }
+
     #[test]
     fn stale_picker_injector_drop_does_not_request_frame() {
         let mut gate = helix_runtime::FrameGate::new();
@@ -3429,17 +3609,10 @@ mod tests {
     }
 
     #[test]
-    fn picker_bindings_all_have_hint_policy() {
+    fn picker_bindings_are_unique_and_dispatchable() {
         let mut keys = HashSet::new();
         for binding in PICKER_BINDINGS {
             assert!(keys.insert(binding.key), "duplicate picker key binding");
-            match binding.hint {
-                PickerHintPolicy::Visible(hint) => {
-                    assert!(!hint.key.is_empty(), "visible hint key must be named");
-                    assert!(!hint.label.is_empty(), "visible hint label must be named");
-                }
-                PickerHintPolicy::Hidden => {}
-            }
             assert_eq!(
                 picker_binding_for_key(binding.key).map(|binding| binding.action),
                 Some(binding.action)
@@ -3563,6 +3736,8 @@ mod tests {
             )
             .with_preview(|_editor, item| Some((PathOrId::Path(item.as_path()), None)));
 
+            picker.drain_matcher();
+
             <Picker<PathBuf, ()> as Component>::sync(
                 &mut picker,
                 Rect::new(0, 0, 120, 40),
@@ -3588,11 +3763,12 @@ mod tests {
 
         with_test_context(|cx| {
             cx.editor.new_file(Action::VerticalSplit);
-            let prepared = cx
-                .editor
-                .prepare_document_open(&path, DocumentOpenRole::Preview)
-                .execute()
-                .unwrap();
+            let prepared = helix_view::editor::PreparedWorkspaceDocumentOpen::Local(
+                cx.editor
+                    .prepare_document_open(&path, DocumentOpenRole::Preview)
+                    .execute()
+                    .unwrap(),
+            );
             let mut picker = Picker::new(
                 [Column::new("path", |item: &PathBuf, _: &()| {
                     Cell::from(item.display().to_string())

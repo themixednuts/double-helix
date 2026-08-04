@@ -63,6 +63,7 @@ pub(super) struct ExplorerRenderSnapshot {
     search_generation: u64,
     selection: usize,
     scroll: usize,
+    scroll_x: u16,
     focused: bool,
     show_icons: bool,
     label_selection: helix_view::modal_text::ModalTextSelection,
@@ -121,16 +122,20 @@ fn row_icon<'a>(
         ));
     }
 
+    let icon_path = row.path.icon_path().into_owned();
     if let Some(icon) = icons
         .mime()
-        .get(Some(&row.path), None)
-        .or_else(|| icons.mime().get_or_default(Some(&row.path), None))
+        .get(Some(&icon_path), None)
+        .or_else(|| icons.mime().get_or_default(Some(&icon_path), None))
     {
         let icon_style = icon
             .color()
             .map(|color| styles.base.patch(Style::default().fg(color)))
             .unwrap_or(styles.base);
-        Some(crate::widgets::TreeListIcon::new(icon.glyph(), icon_style))
+        Some(crate::widgets::TreeListIcon::new(
+            icon.glyph().to_owned(),
+            icon_style,
+        ))
     } else {
         Some(crate::widgets::TreeListIcon::new(
             FALLBACK_FILE_ICON,
@@ -220,6 +225,21 @@ impl FileExplorerPanel {
         self.set_area(area);
         self.clamp_viewport();
 
+        // Mirror the list geometry used by render_surface so horizontal
+        // scroll clamps against the real content viewport: indent column,
+        // optional vertical scrollbar.
+        let list_height = area
+            .height
+            .saturating_sub(HEADER_ROWS + SEARCH_ROWS + FOOTER_ROWS);
+        let list_width = area.width.saturating_sub(2).saturating_sub(1);
+        let has_scrollbar = self.rows.len() > list_height as usize;
+        self.tree_content_width = if has_scrollbar {
+            list_width.saturating_sub(1)
+        } else {
+            list_width
+        };
+        self.ensure_selection_horizontally_visible();
+
         let theme = cx.theme();
         let styles = crate::ui::design::FileExplorerStyles::from_theme(theme, self.focused);
         let base = if self.focused {
@@ -263,9 +283,10 @@ impl FileExplorerPanel {
             search_generation: self.search_generation,
             selection: self.selection,
             scroll: self.scroll,
+            scroll_x: self.scroll_x,
             focused: self.focused,
             show_icons: self.config.icons,
-            label_selection: self.label_selection.clone(),
+            label_selection: self.label_selection,
             label_edit: self.label_edit.as_ref().map(|edit| RenderLabelEdit {
                 row_index: edit.row_index,
                 buffer: edit.buffer.clone(),
@@ -334,10 +355,11 @@ impl ExplorerRenderSnapshot {
             };
             return text_width(fallback).saturating_add(2);
         }
+        let icon_path = row.path.icon_path().into_owned();
         icons
             .mime()
-            .get(Some(&row.path), None)
-            .or_else(|| icons.mime().get_or_default(Some(&row.path), None))
+            .get(Some(&icon_path), None)
+            .or_else(|| icons.mime().get_or_default(Some(&icon_path), None))
             .map_or_else(
                 || text_width(FALLBACK_FILE_ICON).saturating_add(2),
                 icon_width,
@@ -483,7 +505,7 @@ impl ExplorerRenderSnapshot {
                 )
             })
             .collect::<Vec<_>>();
-        let visible_rows = crate::widgets::tree_list(
+        let visible_rows = crate::widgets::tree_list_scrolled(
             surface,
             tree_area,
             &visible_items,
@@ -496,6 +518,7 @@ impl ExplorerRenderSnapshot {
                 selection: styles.selection,
             },
             Some("No files"),
+            self.scroll_x,
         );
         drop(visible_items);
 
@@ -653,7 +676,12 @@ impl ExplorerRenderSnapshot {
                 break;
             };
             let label_offset = self.row_label_offset(row);
-            let label_x = list.x.saturating_add(label_offset);
+            if label_offset < self.scroll_x {
+                continue;
+            }
+            let label_x = list
+                .x
+                .saturating_add(label_offset.saturating_sub(self.scroll_x));
             let label_y = list.y.saturating_add(screen_row as u16);
             // Defensive: if the label offset already runs past the
             // visible width, there's no room to draw — skip rather

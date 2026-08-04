@@ -1,6 +1,6 @@
 use std::{
-    collections::{HashMap, HashSet},
-    path::{Path, PathBuf},
+    collections::{BTreeMap, HashMap, HashSet},
+    path::PathBuf,
     sync::Arc,
     time::Instant,
 };
@@ -13,42 +13,51 @@ use helix_view::{
     model::{FocusTarget, PanelSide, PanelSize, TreePanelModel, TreePanelNode},
     Editor,
 };
+#[cfg(test)]
+use std::path::Path;
 
 use crate::compositor::Context;
 
 use super::{
     model::{DiagnosticSnapshot, ExplorerRow, RowBuildContext, VcsSnapshot},
-    path_ops::{display_name, display_path, relative_display},
+    path_ops::{display_path, relative_display},
     scan::{DirectoryScanner, ExplorerChild},
-    selected_path_for_log, FileExplorerPanel, PANEL_WIDTH,
+    selected_path_for_log, ExplorerPath, ExplorerSource, ExplorerSourceId, FileExplorerPanel,
+    FileExplorerTreeRefresh, PANEL_WIDTH,
 };
+
+#[cfg(any(test, feature = "storybook"))]
+use super::path_ops::display_name;
 
 pub(crate) struct FileExplorerTreeWork {
     generation: u64,
-    root: PathBuf,
-    expanded_dirs: HashSet<PathBuf>,
+    source_id: ExplorerSourceId,
+    source: ExplorerSource,
+    root: ExplorerPath,
+    expanded_dirs: HashSet<ExplorerPath>,
     config: FileExplorerConfig,
     vcs: VcsSnapshot,
     diagnostics: DiagnosticSnapshot,
-    children_cache: HashMap<PathBuf, Vec<ExplorerChild>>,
+    children_cache: HashMap<ExplorerPath, Vec<ExplorerChild>>,
     cursor: Option<usize>,
-    select_path: Option<PathBuf>,
-    followed_file: Option<PathBuf>,
+    select_path: Option<ExplorerPath>,
+    followed_file: Option<ExplorerPath>,
     original_selection: usize,
-    original_selection_path: Option<PathBuf>,
+    original_selection_path: Option<ExplorerPath>,
 }
 
 pub(crate) struct PreparedFileExplorerTree {
     pub(crate) generation: u64,
-    pub(crate) root: PathBuf,
-    expanded_dirs: HashSet<PathBuf>,
+    pub(crate) root: ExplorerPath,
+    source_id: ExplorerSourceId,
+    expanded_dirs: HashSet<ExplorerPath>,
     rows: Vec<ExplorerRow>,
-    children_cache: HashMap<PathBuf, Vec<ExplorerChild>>,
+    children_cache: HashMap<ExplorerPath, Vec<ExplorerChild>>,
     cursor: Option<usize>,
-    select_path: Option<PathBuf>,
-    followed_file: Option<PathBuf>,
+    select_path: Option<ExplorerPath>,
+    followed_file: Option<ExplorerPath>,
     original_selection: usize,
-    original_selection_path: Option<PathBuf>,
+    original_selection_path: Option<ExplorerPath>,
 }
 
 impl FileExplorerTreeWork {
@@ -56,21 +65,129 @@ impl FileExplorerTreeWork {
         self.generation
     }
 
-    pub(crate) fn root(&self) -> &Path {
+    pub(crate) fn root(&self) -> &ExplorerPath {
         &self.root
+    }
+
+    pub(crate) fn is_remote(&self) -> bool {
+        self.source.remote().is_some()
+    }
+
+    pub(crate) fn is_collaboration(&self) -> bool {
+        self.source.collaboration().is_some()
+    }
+
+    pub(crate) async fn execute_remote(
+        mut self,
+        canceled: tokio_util::sync::CancellationToken,
+    ) -> Result<PreparedFileExplorerTree, std::io::Error> {
+        let remote = self
+            .source
+            .remote()
+            .cloned()
+            .ok_or_else(|| std::io::Error::other("remote tree work has a local source"))?;
+        let mut directories = self.expanded_dirs.iter().cloned().collect::<Vec<_>>();
+        directories.sort_by_key(|path| path.remote_path().map_or(0, |path| path.segments().len()));
+        for directory in directories {
+            if self.children_cache.contains_key(&directory) {
+                continue;
+            }
+            let path = directory.remote_path().cloned().ok_or_else(|| {
+                std::io::Error::other("remote tree work contains a local directory")
+            })?;
+            let entries = remote
+                .read_dir(
+                    path,
+                    self.config.workspace_directory_options(),
+                    canceled.child_token(),
+                )
+                .await
+                .map_err(std::io::Error::other)?;
+            let mut children = entries
+                .into_iter()
+                .map(|entry| ExplorerChild {
+                    path: ExplorerPath::Remote(entry.path),
+                    is_dir: matches!(entry.metadata.kind, helix_remote::FileKind::Directory),
+                })
+                .collect::<Vec<_>>();
+            children.sort_by(|left, right| {
+                (!left.is_dir, &left.path).cmp(&(!right.is_dir, &right.path))
+            });
+            self.children_cache.insert(directory, children);
+        }
+        self.execute()
+    }
+
+    pub(crate) async fn execute_collaboration(
+        mut self,
+        canceled: tokio_util::sync::CancellationToken,
+    ) -> Result<PreparedFileExplorerTree, std::io::Error> {
+        let session = self
+            .source
+            .collaboration()
+            .cloned()
+            .ok_or_else(|| std::io::Error::other("collaboration tree has a local source"))?;
+        let files = session
+            .list_files(self.config.workspace_scan_options())
+            .await
+            .map_err(std::io::Error::other)?;
+        if canceled.is_cancelled() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "collaboration tree refresh was canceled",
+            ));
+        }
+        let project = session.project().id;
+        let expanded = self
+            .expanded_dirs
+            .iter()
+            .filter_map(|path| match path {
+                ExplorerPath::Collaboration {
+                    project: path_project,
+                    path,
+                } if *path_project == project => Some(path.clone()),
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
+        let children = collaboration_children(&files, &expanded, self.config.flatten_dirs);
+        for directory in expanded {
+            let key = ExplorerPath::Collaboration {
+                project,
+                path: directory.clone(),
+            };
+            if self.children_cache.contains_key(&key) {
+                continue;
+            }
+            let entries = children
+                .get(&directory)
+                .into_iter()
+                .flatten()
+                .map(|child| ExplorerChild {
+                    path: ExplorerPath::Collaboration {
+                        project,
+                        path: child.path.clone(),
+                    },
+                    is_dir: child.is_dir,
+                })
+                .collect();
+            self.children_cache.insert(key, entries);
+        }
+        self.execute()
     }
 
     pub(crate) fn execute(mut self) -> Result<PreparedFileExplorerTree, std::io::Error> {
         let scanner = DirectoryScanner::new(&self.config);
         let mut rows = Vec::new();
         let mut seen = HashSet::new();
-        if let Ok(canonical_root) = self.root.canonicalize() {
-            seen.insert(canonical_root);
+        if let Some(root) = self.root.local_path() {
+            if let Ok(canonical_root) = root.canonicalize() {
+                seen.insert(ExplorerPath::Local(canonical_root));
+            }
         }
         let root_expanded = self.expanded_dirs.contains(&self.root);
         rows.push(ExplorerRow {
             path: self.root.clone(),
-            label: display_name(&self.root),
+            label: self.source.root_label(),
             is_dir: true,
             depth: 0,
             expanded: root_expanded,
@@ -97,6 +214,7 @@ impl FileExplorerTreeWork {
         Ok(PreparedFileExplorerTree {
             generation: self.generation,
             root: self.root,
+            source_id: self.source_id,
             expanded_dirs: self.expanded_dirs,
             rows,
             children_cache: self.children_cache,
@@ -107,6 +225,98 @@ impl FileExplorerTreeWork {
             original_selection_path: self.original_selection_path,
         })
     }
+}
+
+struct CollaborationChild {
+    path: helix_remote::WorkspacePath,
+    is_dir: bool,
+}
+
+#[derive(Default)]
+struct CollaborationChildGroup {
+    is_dir: bool,
+    common_directories: Option<Vec<String>>,
+}
+
+fn collaboration_children(
+    files: &[helix_remote::WorkspacePath],
+    expanded: &HashSet<helix_remote::WorkspacePath>,
+    flatten: bool,
+) -> HashMap<helix_remote::WorkspacePath, Vec<CollaborationChild>> {
+    let mut depths = expanded
+        .iter()
+        .map(|path| path.segments().len())
+        .collect::<Vec<_>>();
+    depths.sort_unstable();
+    depths.dedup();
+    let mut grouped =
+        HashMap::<helix_remote::WorkspacePath, BTreeMap<String, CollaborationChildGroup>>::new();
+
+    for file in files {
+        let segments = file.segments();
+        for &depth in &depths {
+            if depth >= segments.len() {
+                continue;
+            }
+            let directory = helix_remote::WorkspacePath::new(segments[..depth].iter().cloned())
+                .expect("validated path prefixes remain valid");
+            if !expanded.contains(&directory) {
+                continue;
+            }
+            let remaining = &segments[depth..];
+            let group = grouped
+                .entry(directory)
+                .or_default()
+                .entry(remaining[0].clone())
+                .or_default();
+            group.is_dir |= remaining.len() > 1;
+            if remaining.len() <= 1 {
+                group.common_directories = Some(Vec::new());
+                continue;
+            }
+            let directories = &remaining[1..remaining.len() - 1];
+            match &mut group.common_directories {
+                Some(common) => {
+                    let shared = common
+                        .iter()
+                        .zip(directories)
+                        .take_while(|(left, right)| left == right)
+                        .count();
+                    common.truncate(shared);
+                }
+                None => group.common_directories = Some(directories.to_vec()),
+            }
+        }
+    }
+
+    grouped
+        .into_iter()
+        .map(|(directory, groups)| {
+            let mut children = groups
+                .into_iter()
+                .map(|(name, group)| {
+                    let mut path = directory
+                        .join(name)
+                        .expect("validated child segment remains valid");
+                    if flatten && group.is_dir {
+                        for segment in group.common_directories.unwrap_or_default() {
+                            path = path
+                                .join(segment)
+                                .expect("validated child segment remains valid");
+                        }
+                    }
+                    CollaborationChild {
+                        path,
+                        is_dir: group.is_dir,
+                    }
+                })
+                .collect::<Vec<_>>();
+            children.sort_by(|left, right| {
+                (!left.is_dir, &left.path).cmp(&(!right.is_dir, &right.path))
+            });
+            (directory, children)
+        })
+        .collect()
 }
 
 impl FileExplorerPanel {
@@ -181,7 +391,7 @@ impl FileExplorerPanel {
         let original_cache_entries = self.children_cache.len();
         let mut root_changed = false;
         if let Some(root) = root {
-            let root = helix_stdx::path::normalize(&root);
+            let root = ExplorerPath::Local(helix_stdx::path::normalize(&root));
             if root != self.root {
                 root_changed = true;
                 self.root = root.clone();
@@ -220,8 +430,10 @@ impl FileExplorerPanel {
         let root = self.root.clone();
         let mut rows = Vec::new();
         let mut seen = HashSet::new();
-        if let Ok(canonical_root) = root.canonicalize() {
-            seen.insert(canonical_root);
+        if let Some(local_root) = root.local_path() {
+            if let Ok(canonical_root) = local_root.canonicalize() {
+                seen.insert(ExplorerPath::Local(canonical_root));
+            }
         }
         let root_expanded = self.expanded_dirs.contains(&root);
         rows.push(ExplorerRow {
@@ -272,10 +484,10 @@ impl FileExplorerPanel {
             self.seek_to(0); // empty list: nav resets selection + scroll
         } else {
             let followed_selection = followed_file
-                .as_deref()
+                .as_ref()
                 .and_then(|path| self.selection_for_path(path));
             let restored_selection = original_selection_path
-                .as_deref()
+                .as_ref()
                 .and_then(|path| self.selection_for_path(path));
             let target = cursor
                 .or(followed_selection)
@@ -293,7 +505,7 @@ impl FileExplorerPanel {
             root_changed,
             follow_current_file,
             followed_file
-                .as_deref()
+                .as_ref()
                 .map(display_path)
                 .unwrap_or_else(|| String::from("<none>")),
             original_rows,
@@ -319,15 +531,19 @@ impl FileExplorerPanel {
     pub(crate) fn prepare_tree_refresh(
         &mut self,
         editor: &Editor,
-        root: Option<PathBuf>,
-        cursor: Option<usize>,
-        select_path: Option<PathBuf>,
-        follow_current_file: bool,
-        clear_cache: bool,
+        request: FileExplorerTreeRefresh,
     ) -> FileExplorerTreeWork {
+        let clears_cache = request.clears_cache();
+        let follows_current_file = request.follows_current_file();
+        let FileExplorerTreeRefresh {
+            root,
+            cursor,
+            select_path,
+            ..
+        } = request;
         let original_selection = self.selection;
         let original_selection_path = self.rows.get(self.selection).map(|row| row.path.clone());
-        if clear_cache {
+        if clears_cache {
             self.children_cache.clear();
             self.invalidate_vcs_snapshot(editor);
         }
@@ -342,7 +558,7 @@ impl FileExplorerPanel {
                 self.prewarm_search_index(editor);
             }
         }
-        let followed_file = follow_current_file
+        let followed_file = follows_current_file
             .then(|| self.followed_file(editor))
             .flatten();
         if let Some(path) = &followed_file {
@@ -363,6 +579,8 @@ impl FileExplorerPanel {
 
         FileExplorerTreeWork {
             generation: self.tree_generation,
+            source_id: self.source.identity(),
+            source: self.source.clone(),
             root: self.root.clone(),
             expanded_dirs: self.expanded_dirs.clone(),
             config: self.config.clone(),
@@ -383,6 +601,7 @@ impl FileExplorerPanel {
         prepared: PreparedFileExplorerTree,
     ) -> bool {
         if prepared.generation != self.tree_generation
+            || prepared.source_id != self.source.identity()
             || prepared.root != self.root
             || prepared.expanded_dirs != self.expanded_dirs
         {
@@ -409,15 +628,15 @@ impl FileExplorerPanel {
         } else {
             let followed_selection = prepared
                 .followed_file
-                .as_deref()
+                .as_ref()
                 .and_then(|path| self.selection_for_path(path));
             let requested_selection = prepared
                 .select_path
-                .as_deref()
+                .as_ref()
                 .and_then(|path| self.selection_for_path(path));
             let restored_selection = prepared
                 .original_selection_path
-                .as_deref()
+                .as_ref()
                 .and_then(|path| self.selection_for_path(path));
             let target = requested_selection
                 .or(prepared.cursor)
@@ -426,9 +645,26 @@ impl FileExplorerPanel {
                 .unwrap_or(prepared.original_selection)
                 .min(self.rows.len() - 1);
             self.seek_to(target);
-            if prepared.select_path.is_some() {
+            if let Some(scroll) = self.pending_scroll_restore.take() {
+                // Restore the prior viewport when it still shows the
+                // selection. If the tree height changed enough that the
+                // saved scroll would hide the cursor row, fall back to
+                // ensure_visible (already done by seek_to) instead of
+                // blanking the cursor with focused_without_visible_label.
+                let visible = self.visible_height();
+                let shows_selection =
+                    visible > 0 && target >= scroll && target < scroll.saturating_add(visible);
+                if shows_selection {
+                    self.nav.set_item_count(self.rows.len());
+                    self.nav.set_viewport_height(visible);
+                    self.nav.set_scroll(scroll);
+                    self.selection = self.nav.selection();
+                    self.scroll = self.nav.scroll();
+                }
+            } else if prepared.select_path.is_some() {
                 self.center_selection();
             }
+            self.ensure_selection_horizontally_visible();
             self.clamp_label_selection();
             self.collapse_label_selection_to_cursor();
         }
@@ -501,7 +737,8 @@ impl FileExplorerPanel {
         snapshot: VcsSnapshot,
     ) -> bool {
         let start = Instant::now();
-        if root != self.root {
+        let explorer_root = ExplorerPath::Local(root.clone());
+        if explorer_root != self.root {
             log::info!(
                 "[file_explorer] vcs_snapshot phase=ignored root={} current_root={} changes={} elapsed_us={}",
                 display_path(&root),
@@ -513,7 +750,7 @@ impl FileExplorerPanel {
         }
 
         if self.config.vcs {
-            if !snapshot.is_current_for(&root, true) {
+            if !snapshot.is_current_for(&explorer_root, true) {
                 log::info!(
                     "[file_explorer] vcs_snapshot phase=ignored root={} reason=stale_snapshot elapsed_us={}",
                     display_path(&root),
@@ -534,21 +771,29 @@ impl FileExplorerPanel {
         true
     }
 
-    fn followed_file(&self, editor: &Editor) -> Option<PathBuf> {
+    fn followed_file(&self, editor: &Editor) -> Option<ExplorerPath> {
         let view = editor.tree.try_get(editor.tree.focus)?;
         let doc = editor.document(view.doc)?;
-        let path = doc.path()?;
-        let path = path.to_path_buf();
+        let location = doc.location()?;
+        let path = match location {
+            helix_view::file_bound::DocumentLocation::Local(path) => {
+                ExplorerPath::Local(path.clone())
+            }
+            helix_view::file_bound::DocumentLocation::Remote(location) => {
+                ExplorerPath::Remote(location.path.clone())
+            }
+            helix_view::file_bound::DocumentLocation::Collaboration(_) => return None,
+        };
         path.starts_with(&self.root).then_some(path)
     }
 
-    pub(super) fn expand_to_path(&mut self, path: &Path) {
+    pub(super) fn expand_to_path(&mut self, path: &ExplorerPath) {
         let mut ancestor = path.parent();
         while let Some(dir) = ancestor {
             if !dir.starts_with(&self.root) {
                 break;
             }
-            self.expanded_dirs.insert(dir.to_path_buf());
+            self.expanded_dirs.insert(dir.clone());
             if dir == self.root {
                 break;
             }
@@ -556,14 +801,14 @@ impl FileExplorerPanel {
         }
     }
 
-    pub(super) fn collapse_dir_preserving_descendant_state(&mut self, path: &Path) {
+    pub(super) fn collapse_dir_preserving_descendant_state(&mut self, path: &ExplorerPath) {
         self.expanded_dirs.remove(path);
     }
 
-    fn selection_for_path(&self, path: &Path) -> Option<usize> {
+    fn selection_for_path(&self, path: &ExplorerPath) -> Option<usize> {
         self.rows
             .iter()
-            .position(|row| row.path == path)
+            .position(|row| &row.path == path)
             .or_else(|| {
                 self.rows
                     .iter()
@@ -575,7 +820,7 @@ impl FileExplorerPanel {
     }
 
     #[cfg(test)]
-    fn select_path_or_index(&mut self, path: &Path, fallback: usize) {
+    fn select_path_or_index(&mut self, path: &std::path::Path, fallback: usize) {
         if self.rows.is_empty() {
             self.label_selection = LabelSelection::default();
             self.seek_to(0);
@@ -583,7 +828,7 @@ impl FileExplorerPanel {
         }
 
         let target = self
-            .selection_for_path(path)
+            .selection_for_path(&ExplorerPath::Local(path.to_path_buf()))
             .unwrap_or(fallback)
             .min(self.rows.len() - 1);
         self.seek_to(target);
@@ -592,10 +837,10 @@ impl FileExplorerPanel {
     }
 
     fn collect_rows(
-        root: &Path,
+        root: &ExplorerPath,
         depth: usize,
         ancestor_last: &[bool],
-        expanded_dirs: &HashSet<PathBuf>,
+        expanded_dirs: &HashSet<ExplorerPath>,
         build: &mut RowBuildContext<'_>,
     ) -> Result<(), std::io::Error> {
         let children = build.children_for(root)?;
@@ -621,8 +866,10 @@ impl FileExplorerPanel {
 
             let canonical = child
                 .path
-                .canonicalize()
-                .unwrap_or_else(|_| child.path.clone());
+                .local_path()
+                .and_then(|path| path.canonicalize().ok())
+                .map(ExplorerPath::Local)
+                .unwrap_or_else(|| child.path.clone());
             if build.seen.insert(canonical) {
                 let mut child_ancestors = ancestor_last.to_vec();
                 child_ancestors.push(is_last);
@@ -666,7 +913,7 @@ impl FileExplorerPanel {
         if self.focused {
             editor.model.focus_panel(panel_id);
         } else if editor.model.focus == FocusTarget::Panel(panel_id) {
-            editor.model.pop_focus();
+            editor.model.focus_editor();
         }
 
         let Some(model) = editor.model.panel_model_mut::<TreePanelModel>(panel_id) else {
@@ -677,24 +924,25 @@ impl FileExplorerPanel {
         let items_current = model.items.len() == self.rows.len()
             && model.items.iter().zip(self.rows.iter()).all(|(item, row)| {
                 item.label == row.label
-                    && item.path.as_deref() == Some(row.path.as_path())
+                    && item.path.as_deref() == Some(row.path.model_id().as_str())
                     && item.is_dir == row.is_dir
                     && item.depth == row.depth
                     && item.expanded == row.expanded
             });
 
-        if model.root == self.root && model.selection == selection && items_current {
+        let root = self.root.model_id();
+        if model.root == root && model.selection == selection && items_current {
             return;
         }
 
-        model.root.clone_from(&self.root);
+        model.root = root;
         model.items.clear();
         model.items.reserve(self.rows.len());
         model
             .items
             .extend(self.rows.iter().map(|row| TreePanelNode {
                 label: row.label.clone(),
-                path: Some(row.path.clone()),
+                path: Some(row.path.model_id()),
                 is_dir: row.is_dir,
                 depth: row.depth,
                 expanded: row.expanded,
@@ -716,11 +964,10 @@ impl FileExplorerPanel {
             self,
             cx.editor,
             cx.ingress.clone(),
-            None,
-            Some(self.selection),
-            None,
-            false,
-            true,
+            FileExplorerTreeRefresh {
+                cursor: Some(self.selection),
+                ..FileExplorerTreeRefresh::invalidate_cache()
+            },
         );
     }
 

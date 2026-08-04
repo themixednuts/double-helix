@@ -4,7 +4,7 @@
 
 use std::{borrow::Cow, ops::Range};
 
-use helix_core::unicode::width::UnicodeWidthStr;
+use helix_core::unicode::width::{UnicodeWidthChar, UnicodeWidthStr};
 use helix_view::graphics::{Rect, Style};
 use tui::ratatui::widgets::Widget;
 
@@ -153,12 +153,38 @@ pub fn tree_list_label_offset(ancestor_count: usize, depth: usize, icon_width: u
         .saturating_add(icon_width)
 }
 
+pub fn tree_list_item_content_width(item: &TreeListItem<'_>) -> u16 {
+    let icon_width = item
+        .icon
+        .as_ref()
+        .map(|icon| text_width(icon.text.as_ref()).saturating_add(2))
+        .unwrap_or(0);
+    let label_end = tree_list_label_offset(item.ancestor_last.len(), item.depth, icon_width)
+        .saturating_add(text_width(item.label));
+    if item.is_dir {
+        label_end.saturating_add(1)
+    } else {
+        label_end
+    }
+}
+
 pub fn tree_list(
     surface: &mut crate::render::CellSurface,
     area: Rect,
     items: &[TreeListItem<'_>],
     styles: TreeListStyles,
     empty_message: Option<&str>,
+) -> usize {
+    tree_list_scrolled(surface, area, items, styles, empty_message, 0)
+}
+
+pub fn tree_list_scrolled(
+    surface: &mut crate::render::CellSurface,
+    area: Rect,
+    items: &[TreeListItem<'_>],
+    styles: TreeListStyles,
+    empty_message: Option<&str>,
+    scroll_x: u16,
 ) -> usize {
     if area.width == 0 || area.height == 0 {
         return 0;
@@ -198,7 +224,7 @@ pub fn tree_list(
             row_area.width.saturating_sub(status_width),
             1,
         );
-        draw_item(surface, content, item, styles);
+        draw_item(surface, content, item, styles, scroll_x);
         draw_statuses(surface, row_area, item);
     }
     visible_rows
@@ -209,9 +235,9 @@ fn draw_item(
     area: Rect,
     item: &TreeListItem<'_>,
     styles: TreeListStyles,
+    scroll_x: u16,
 ) {
-    let mut x = area.x;
-    let mut remaining = area.width;
+    let mut content_x = 0u16;
 
     // The selected row's connector glyph is drawn in the selection foreground
     // colour, so the eye lands on the tree symbol (├╴ / └╴) without needing
@@ -230,31 +256,31 @@ fn draw_item(
 
     for ancestor_last in item.ancestor_last {
         let guide = if *ancestor_last { "  " } else { TREE_GUIDE };
-        draw_segment(surface, &mut x, area.y, &mut remaining, guide, styles.guide);
+        draw_segment_scrolled(surface, area, &mut content_x, guide, styles.guide, scroll_x);
     }
 
     if item.depth > 0 {
         let connector = if item.is_last { TREE_LAST } else { TREE_MIDDLE };
-        draw_segment(
+        draw_segment_scrolled(
             surface,
-            &mut x,
-            area.y,
-            &mut remaining,
+            area,
+            &mut content_x,
             connector,
             connector_style,
+            scroll_x,
         );
     }
 
     if let Some(icon) = item.icon.as_ref() {
-        draw_segment(
+        draw_segment_scrolled(
             surface,
-            &mut x,
-            area.y,
-            &mut remaining,
+            area,
+            &mut content_x,
             icon.text.as_ref(),
             icon.style,
+            scroll_x,
         );
-        draw_segment(surface, &mut x, area.y, &mut remaining, "  ", icon.style);
+        draw_segment_scrolled(surface, area, &mut content_x, "  ", icon.style, scroll_x);
     }
 
     let label_style = if item.is_dir {
@@ -270,25 +296,25 @@ fn draw_item(
     } else {
         label_style
     };
-    draw_label(
+    draw_label_scrolled(
         surface,
-        &mut x,
-        area.y,
-        &mut remaining,
+        area,
+        &mut content_x,
         item.label,
         label_style,
         item.label_selection.as_ref(),
         styles.selection,
+        scroll_x,
     );
 
     if item.is_dir {
-        draw_segment(
+        draw_segment_scrolled(
             surface,
-            &mut x,
-            area.y,
-            &mut remaining,
+            area,
+            &mut content_x,
             "/",
             styles.directory,
+            scroll_x,
         );
     }
 }
@@ -297,18 +323,18 @@ fn draw_item(
     clippy::too_many_arguments,
     reason = "tree label drawing keeps cursor, widths, icons, and selection styling independent"
 )]
-fn draw_label(
+fn draw_label_scrolled(
     surface: &mut crate::render::CellSurface,
-    x: &mut u16,
-    y: u16,
-    remaining: &mut u16,
+    area: Rect,
+    content_x: &mut u16,
     label: &str,
     base_style: Style,
     selection: Option<&Range<usize>>,
     selection_style: Style,
+    scroll_x: u16,
 ) {
     let Some(selection) = selection.filter(|selection| !selection.is_empty()) else {
-        draw_segment(surface, x, y, remaining, label, base_style);
+        draw_segment_scrolled(surface, area, content_x, label, base_style, scroll_x);
         return;
     };
 
@@ -323,7 +349,7 @@ fn draw_label(
         };
         if current_style != Some(style) {
             if let Some(style) = current_style {
-                draw_segment(surface, x, y, remaining, &current, style);
+                draw_segment_scrolled(surface, area, content_x, &current, style, scroll_x);
                 current.clear();
             }
             current_style = Some(style);
@@ -332,7 +358,7 @@ fn draw_label(
     }
 
     if let Some(style) = current_style {
-        draw_segment(surface, x, y, remaining, &current, style);
+        draw_segment_scrolled(surface, area, content_x, &current, style, scroll_x);
     }
 }
 
@@ -362,28 +388,49 @@ fn draw_status_icon_right(
     *right = x.saturating_sub(1);
 }
 
-fn draw_segment(
+fn draw_segment_scrolled(
     surface: &mut crate::render::CellSurface,
-    x: &mut u16,
-    y: u16,
-    remaining: &mut u16,
+    area: Rect,
+    content_x: &mut u16,
     text: &str,
     style: Style,
+    scroll_x: u16,
 ) {
-    if *remaining == 0 || text.is_empty() {
+    if text.is_empty() || area.width == 0 {
         return;
     }
 
-    surface.set_stringn(
-        *x,
-        y,
-        text,
-        *remaining as usize,
-        tui::ratatui::to_ratatui_style(style),
-    );
-    let width = text_width(text).min(*remaining);
-    *x = (*x).saturating_add(width);
-    *remaining = (*remaining).saturating_sub(width);
+    let right = area.right();
+    let style = tui::ratatui::to_ratatui_style(style);
+    let view_end = scroll_x.saturating_add(area.width);
+
+    for ch in text.chars() {
+        let width = ch.width().unwrap_or(1).max(1) as u16;
+        let char_start = *content_x;
+        *content_x = content_x.saturating_add(width);
+
+        // Skip glyphs that are fully left of the viewport, or that would be
+        // split by the left clip edge.
+        if char_start.saturating_add(width) <= scroll_x || char_start < scroll_x {
+            continue;
+        }
+        // Fully right of the viewport — still advance content_x above.
+        if char_start >= view_end {
+            continue;
+        }
+
+        let screen_x = area.x.saturating_add(char_start.saturating_sub(scroll_x));
+        if screen_x >= right {
+            continue;
+        }
+        let remaining = right.saturating_sub(screen_x);
+        if remaining == 0 {
+            continue;
+        }
+        let mut buf = [0u8; 4];
+        let rendered = ch.encode_utf8(&mut buf);
+        surface.set_stringn(screen_x, area.y, rendered, remaining as usize, style);
+    }
 }
 
 fn status_icon_width(icon: &str) -> u16 {
@@ -399,6 +446,24 @@ mod tests {
     use super::*;
     use helix_view::graphics::Color;
     use tui::ratatui::{buffer::Buffer, layout::Rect as RatatuiRect};
+
+    #[test]
+    fn tree_list_scrolled_hides_leading_columns() {
+        let mut surface = Buffer::empty(RatatuiRect::new(0, 0, 10, 1));
+        let item = TreeListItem::new("abcdefghij");
+
+        tree_list_scrolled(
+            &mut surface,
+            Rect::new(0, 0, 10, 1),
+            &[item],
+            TreeListStyles::default(),
+            None,
+            3,
+        );
+
+        assert_eq!(surface[(0, 0)].symbol(), "d");
+        assert_eq!(surface[(1, 0)].symbol(), "e");
+    }
 
     #[test]
     fn tree_list_renders_connectors_inside_caller_panel() {

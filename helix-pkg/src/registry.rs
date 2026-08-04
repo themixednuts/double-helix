@@ -25,6 +25,7 @@ const BUILTIN: &[&str] = &[
     include_str!("../../registry/lsp/typescript-language-server.toml"),
     include_str!("../../registry/lsp/bash-language-server.toml"),
     include_str!("../../registry/lsp/yaml-language-server.toml"),
+    include_str!("../../registry/lsp/vscode-json-language-server.toml"),
     include_str!("../../registry/lsp/jdtls.toml"),
     include_str!("../../registry/lsp/omnisharp.toml"),
     include_str!("../../registry/dap/codelldb.toml"),
@@ -296,6 +297,7 @@ mod tests {
     fn builtin_registry_parses_and_lints() {
         let registry = Registry::builtin().unwrap();
         assert!(registry.find("rust-analyzer").is_some());
+        assert!(registry.find("vscode-json-language-server").is_some());
         for package in registry.iter() {
             Registry::lint_seed_shape(package).unwrap();
         }

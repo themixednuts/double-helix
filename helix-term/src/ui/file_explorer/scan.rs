@@ -6,10 +6,11 @@ use std::{
 use helix_view::editor::FileExplorerConfig;
 
 use super::path_ops::display_path;
+use super::ExplorerPath;
 
 #[derive(Clone, Debug)]
 pub(super) struct ExplorerChild {
-    pub(super) path: PathBuf,
+    pub(super) path: ExplorerPath,
     pub(super) is_dir: bool,
 }
 
@@ -34,15 +35,10 @@ impl<'a> DirectoryScanner<'a> {
         use ignore::WalkBuilder;
 
         let start = Instant::now();
+        let scan = self.explorer.workspace_directory_options().scan;
         let mut walk_builder = WalkBuilder::new(root);
+        crate::ui::file_scan::configure_walk(&mut walk_builder, scan);
         let mut children: Vec<ExplorerChild> = walk_builder
-            .hidden(self.explorer.hidden)
-            .parents(self.explorer.parents)
-            .ignore(self.explorer.ignore)
-            .follow_links(self.explorer.follow_symlinks)
-            .git_ignore(self.explorer.git_ignore)
-            .git_global(self.explorer.git_global)
-            .git_exclude(self.explorer.git_exclude)
             .max_depth(Some(1))
             .add_custom_ignore_filename(self.config_ignore.clone())
             .add_custom_ignore_filename(self.workspace_ignore)
@@ -63,7 +59,10 @@ impl<'a> DirectoryScanner<'a> {
                                 path = single_child_directory;
                             }
                         }
-                        ExplorerChild { path, is_dir }
+                        ExplorerChild {
+                            path: ExplorerPath::Local(path),
+                            is_dir,
+                        }
                     }
                     Err(err) => {
                         log::debug!(
@@ -73,7 +72,7 @@ impl<'a> DirectoryScanner<'a> {
                         return None;
                     }
                 };
-                (child.path != root).then_some(child)
+                (child.path.local_path() != Some(root)).then_some(child)
             })
             .collect();
 

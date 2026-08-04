@@ -11,12 +11,13 @@ use helix_view::{editor::WorkspaceDiagnosticCounts, icons::Icons, theme::Style, 
 use super::{
     path_ops::display_path,
     scan::{DirectoryScanner, ExplorerChild},
+    ExplorerPath,
 };
 
 /// Explorer rows are the current visible tree, not the full filesystem.
 #[derive(Clone, Debug)]
 pub(super) struct ExplorerRow {
-    pub(super) path: PathBuf,
+    pub(super) path: ExplorerPath,
     pub(super) label: String,
     pub(super) is_dir: bool,
     pub(super) depth: usize,
@@ -103,16 +104,17 @@ impl VcsStatus {
 
 #[derive(Clone, Debug, Default)]
 pub struct VcsSnapshot {
-    root: PathBuf,
+    root: Option<PathBuf>,
     enabled: bool,
     statuses: HashMap<PathBuf, VcsStatus>,
 }
 
 impl VcsSnapshot {
-    pub(crate) fn empty(root: &Path, enabled: bool) -> Self {
+    pub(crate) fn empty(root: &ExplorerPath, enabled: bool) -> Self {
+        let root = root.local_path().map(Path::to_path_buf);
         Self {
-            root: root.to_path_buf(),
-            enabled,
+            enabled: enabled && root.is_some(),
+            root,
             statuses: HashMap::new(),
         }
     }
@@ -120,7 +122,7 @@ impl VcsSnapshot {
     pub(crate) fn from_changes(root: &Path, changes: impl IntoIterator<Item = FileChange>) -> Self {
         let root = helix_stdx::path::normalize(root);
         let mut snapshot = Self {
-            root: root.clone(),
+            root: Some(root.clone()),
             enabled: true,
             statuses: HashMap::new(),
         };
@@ -139,15 +141,16 @@ impl VcsSnapshot {
         snapshot
     }
 
-    pub(super) fn status(&self, path: &Path) -> Option<VcsStatus> {
+    pub(super) fn status(&self, path: &ExplorerPath) -> Option<VcsStatus> {
         if !self.enabled {
             return None;
         }
-        self.statuses.get(path).copied()
+        self.statuses.get(path.local_path()?).copied()
     }
 
-    pub(crate) fn is_current_for(&self, root: &Path, enabled: bool) -> bool {
-        self.root == root && self.enabled == enabled
+    pub(crate) fn is_current_for(&self, root: &ExplorerPath, enabled: bool) -> bool {
+        let local_root = root.local_path();
+        self.root.as_deref() == local_root && self.enabled == (enabled && local_root.is_some())
     }
 
     pub(super) fn len(&self) -> usize {
@@ -232,27 +235,31 @@ impl DiagnosticStatus {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) struct DiagnosticSnapshot {
-    root: PathBuf,
+    root: Option<PathBuf>,
     enabled: bool,
     statuses: HashMap<PathBuf, DiagnosticStatus>,
 }
 
 impl DiagnosticSnapshot {
-    pub(super) fn empty(root: &Path, enabled: bool) -> Self {
+    pub(super) fn empty(root: &ExplorerPath, enabled: bool) -> Self {
+        let root = root.local_path().map(Path::to_path_buf);
         Self {
-            root: root.to_path_buf(),
-            enabled,
+            enabled: enabled && root.is_some(),
+            root,
             statuses: HashMap::new(),
         }
     }
 
-    pub(super) fn from_editor(root: &Path, editor: &Editor, enabled: bool) -> Self {
+    pub(super) fn from_editor(root: &ExplorerPath, editor: &Editor, enabled: bool) -> Self {
         if !enabled {
             return Self::empty(root, false);
         }
+        let Some(root) = root.local_path() else {
+            return Self::empty(root, false);
+        };
 
         let mut snapshot = Self {
-            root: root.to_path_buf(),
+            root: Some(root.to_path_buf()),
             enabled,
             statuses: HashMap::new(),
         };
@@ -266,15 +273,16 @@ impl DiagnosticSnapshot {
         snapshot
     }
 
-    pub(super) fn is_current(&self, root: &Path, enabled: bool) -> bool {
-        self.root == root && self.enabled == enabled
+    pub(super) fn is_current(&self, root: &ExplorerPath, enabled: bool) -> bool {
+        let local_root = root.local_path();
+        self.root.as_deref() == local_root && self.enabled == (enabled && local_root.is_some())
     }
 
-    pub(super) fn status(&self, path: &Path) -> Option<DiagnosticStatus> {
+    pub(super) fn status(&self, path: &ExplorerPath) -> Option<DiagnosticStatus> {
         if !self.enabled {
             return None;
         }
-        self.statuses.get(path).copied()
+        self.statuses.get(path.local_path()?).copied()
     }
 
     pub(super) fn len(&self) -> usize {
@@ -286,9 +294,9 @@ pub(super) struct RowBuildContext<'a> {
     pub(super) scanner: DirectoryScanner<'a>,
     pub(super) vcs: &'a VcsSnapshot,
     pub(super) diagnostics: &'a DiagnosticSnapshot,
-    pub(super) seen: &'a mut HashSet<PathBuf>,
+    pub(super) seen: &'a mut HashSet<ExplorerPath>,
     pub(super) rows: &'a mut Vec<ExplorerRow>,
-    pub(super) children_cache: &'a mut HashMap<PathBuf, Vec<ExplorerChild>>,
+    pub(super) children_cache: &'a mut HashMap<ExplorerPath, Vec<ExplorerChild>>,
     pub(super) cache_hits: usize,
     pub(super) cache_misses: usize,
     pub(super) scan_us: u128,
@@ -298,7 +306,7 @@ pub(super) struct RowBuildContext<'a> {
 impl RowBuildContext<'_> {
     pub(super) fn children_for(
         &mut self,
-        root: &Path,
+        root: &ExplorerPath,
     ) -> Result<Vec<ExplorerChild>, std::io::Error> {
         if let Some(children) = self.children_cache.get(root) {
             self.cache_hits += 1;
@@ -311,7 +319,13 @@ impl RowBuildContext<'_> {
         }
 
         let scan_start = Instant::now();
-        let children = self.scanner.children(root)?;
+        let root_path = root.local_path().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "local directory scanner received a remote path",
+            )
+        })?;
+        let children = self.scanner.children(root_path)?;
         let scan_elapsed = scan_start.elapsed();
         self.cache_misses += 1;
         self.scan_us += scan_elapsed.as_micros();
@@ -322,8 +336,7 @@ impl RowBuildContext<'_> {
             children.len(),
             scan_elapsed.as_micros()
         );
-        self.children_cache
-            .insert(root.to_path_buf(), children.clone());
+        self.children_cache.insert(root.clone(), children.clone());
         Ok(children)
     }
 }

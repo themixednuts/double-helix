@@ -295,6 +295,8 @@ pub struct OwnedGrepMatch {
 #[derive(Debug, Clone, Default)]
 pub struct OwnedGrepResult {
     pub matches: Vec<OwnedGrepMatch>,
+    pub next_file_offset: usize,
+    pub filtered_file_count: usize,
     pub regex_fallback_error: Option<String>,
 }
 
@@ -1276,7 +1278,6 @@ where
                         let mut need_abort = ctx.abort_signal.load(Ordering::Relaxed);
                         if !need_abort
                             && let Some(budget) = time_budget
-                            && all_matches.len() > 1
                             && search_start.elapsed() > budget
                         {
                             need_abort = true;
@@ -2409,6 +2410,138 @@ pub fn grep_bytes(
     (matches, regex_fallback_error)
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ByteSourceGrepCursor {
+    pub source: usize,
+    pub match_offset: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ByteSourceGrepMatch {
+    pub source: usize,
+    /// One-based line number, matching [`GrepMatch::line_number`].
+    pub line_number: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ByteSourceGrepPage {
+    pub matches: Vec<ByteSourceGrepMatch>,
+    pub next: Option<ByteSourceGrepCursor>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ByteSourceGrepError {
+    #[error("in-memory search page limit must be greater than zero")]
+    ZeroPageLimit,
+    #[error("invalid in-memory search cursor")]
+    InvalidCursor,
+    #[error("in-memory search was canceled")]
+    Canceled,
+    #[error("failed to compile search pattern: {0}")]
+    InvalidPattern(String),
+}
+
+/// Page grep matches over lazily loaded in-memory sources.
+///
+/// A source is searched atomically, then the deadline is checked before the
+/// next source. This keeps callers responsive without splitting multiline
+/// regex semantics at arbitrary byte boundaries.
+pub fn grep_byte_sources_page<B, F>(
+    query: &FFFQuery<'_>,
+    options: &GrepSearchOptions,
+    source_count: usize,
+    cursor: ByteSourceGrepCursor,
+    page_limit: usize,
+    time_budget: std::time::Duration,
+    abort_signal: Option<&AtomicBool>,
+    mut load: F,
+) -> Result<ByteSourceGrepPage, ByteSourceGrepError>
+where
+    B: AsRef<[u8]>,
+    F: FnMut(usize) -> Option<B>,
+{
+    if page_limit == 0 {
+        return Err(ByteSourceGrepError::ZeroPageLimit);
+    }
+    if cursor.source > source_count
+        || (cursor.source == source_count && cursor.match_offset != 0)
+    {
+        return Err(ByteSourceGrepError::InvalidCursor);
+    }
+
+    let started = std::time::Instant::now();
+    let mut source = cursor.source;
+    let mut match_offset = cursor.match_offset;
+    let mut matches = Vec::with_capacity(page_limit);
+    let mut attempted = false;
+    while source < source_count {
+        if abort_signal.is_some_and(|signal| signal.load(Ordering::Acquire)) {
+            return Err(ByteSourceGrepError::Canceled);
+        }
+        if attempted && started.elapsed() >= time_budget {
+            return Ok(ByteSourceGrepPage {
+                matches,
+                next: Some(ByteSourceGrepCursor {
+                    source,
+                    match_offset,
+                }),
+            });
+        }
+        attempted = true;
+        let Some(bytes) = load(source) else {
+            source += 1;
+            match_offset = 0;
+            continue;
+        };
+        let (source_matches, regex_fallback_error) = grep_bytes(query, options, bytes.as_ref());
+        if abort_signal.is_some_and(|signal| signal.load(Ordering::Acquire)) {
+            return Err(ByteSourceGrepError::Canceled);
+        }
+        if let Some(error) = regex_fallback_error {
+            return Err(ByteSourceGrepError::InvalidPattern(error));
+        }
+        if match_offset > source_matches.len() {
+            return Err(ByteSourceGrepError::InvalidCursor);
+        }
+        let remaining = page_limit.saturating_sub(matches.len());
+        let available = source_matches.len() - match_offset;
+        let take = remaining.min(available);
+        matches.extend(
+            source_matches[match_offset..match_offset + take]
+                .iter()
+                .map(|item| ByteSourceGrepMatch {
+                    source,
+                    line_number: item.line_number,
+                }),
+        );
+        match_offset += take;
+        if match_offset < source_matches.len() {
+            return Ok(ByteSourceGrepPage {
+                matches,
+                next: Some(ByteSourceGrepCursor {
+                    source,
+                    match_offset,
+                }),
+            });
+        }
+        source += 1;
+        match_offset = 0;
+        if matches.len() >= page_limit && source < source_count {
+            return Ok(ByteSourceGrepPage {
+                matches,
+                next: Some(ByteSourceGrepCursor {
+                    source,
+                    match_offset: 0,
+                }),
+            });
+        }
+    }
+    Ok(ByteSourceGrepPage {
+        matches,
+        next: None,
+    })
+}
+
 fn grep_text_for_query(query: &FFFQuery<'_>) -> String {
     if !matches!(query.fuzzy_query, fff_query_parser::FuzzyQuery::Empty) {
         return query.grep_text();
@@ -2711,6 +2844,81 @@ mod tests {
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].line_number, 2);
         assert_eq!(matches[0].line_content, "unsaved overlay");
+    }
+
+    #[test]
+    fn byte_source_grep_pages_without_duplicates_or_gaps() {
+        let query = super::parse_grep_query("needle");
+        let options = super::GrepSearchOptions {
+            mode: super::GrepMode::PlainText,
+            ..Default::default()
+        };
+        let sources: Vec<&[u8]> = vec![
+            b"needle one\nneedle two\nneedle three\n",
+            b"needle four\nneedle five\n",
+        ];
+        let mut cursor = ByteSourceGrepCursor::default();
+        let mut found = Vec::new();
+
+        loop {
+            let page = grep_byte_sources_page(
+                &query,
+                &options,
+                sources.len(),
+                cursor,
+                2,
+                std::time::Duration::MAX,
+                None,
+                |index| sources.get(index).copied(),
+            )
+            .unwrap();
+            found.extend(
+                page.matches
+                    .into_iter()
+                    .map(|item| (item.source, item.line_number)),
+            );
+            let Some(next) = page.next else {
+                break;
+            };
+            assert_ne!(next, cursor, "a continuation cursor must make progress");
+            cursor = next;
+        }
+
+        assert_eq!(found, vec![(0, 1), (0, 2), (0, 3), (1, 1), (1, 2)]);
+    }
+
+    #[test]
+    fn byte_source_grep_rejects_non_progressing_requests() {
+        let query = super::parse_grep_query("needle");
+        let options = super::GrepSearchOptions::default();
+        let source = b"needle\n".as_slice();
+
+        let zero_limit = grep_byte_sources_page(
+            &query,
+            &options,
+            1,
+            ByteSourceGrepCursor::default(),
+            0,
+            std::time::Duration::MAX,
+            None,
+            |_| Some(source),
+        );
+        assert_eq!(zero_limit, Err(ByteSourceGrepError::ZeroPageLimit));
+
+        let invalid_cursor = grep_byte_sources_page(
+            &query,
+            &options,
+            1,
+            ByteSourceGrepCursor {
+                source: 1,
+                match_offset: 1,
+            },
+            1,
+            std::time::Duration::MAX,
+            None,
+            |_| Some(source),
+        );
+        assert_eq!(invalid_cursor, Err(ByteSourceGrepError::InvalidCursor));
     }
 
     /// Regression test for issue #407: Live grep returns duplicate results

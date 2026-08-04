@@ -1,0 +1,27 @@
+name = "vscode-json-language-server"
+kind = "lsp"
+description = "Visual Studio Code JSON language server"
+homepage = "https://github.com/microsoft/vscode"
+aliases = ["vscode-json-languageserver"]
+languages = ["json", "jsonc", "json-ld"]
+
+[version]
+tag-source = "npm:vscode-json-languageserver"
+
+[[artifact]]
+os = "windows"
+arch = "x86_64"
+source = { npm = "vscode-json-languageserver", bin = "vscode-json-languageserver" }
+bin = "vscode-json-language-server"
+
+[[artifact]]
+os = "linux"
+arch = "x86_64"
+source = { npm = "vscode-json-languageserver", bin = "vscode-json-languageserver" }
+bin = "vscode-json-language-server"
+
+[[artifact]]
+os = "macos"
+arch = "aarch64"
+source = { npm = "vscode-json-languageserver", bin = "vscode-json-languageserver" }
+bin = "vscode-json-language-server"

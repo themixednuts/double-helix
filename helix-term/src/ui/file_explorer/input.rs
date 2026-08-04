@@ -38,6 +38,15 @@ pub(super) enum ExplorerPastePlacement {
     Before,
 }
 
+/// Where a new create row is inserted relative to the current selection.
+///
+/// Mirrors editor `o` / `O` (open line below / above).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum CreatePlacement {
+    Below,
+    Above,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ExplorerOperator {
     Yank,
@@ -180,6 +189,11 @@ pub(super) enum ExplorerAction {
     Refresh,
     ShowOptions,
     ShowHelp,
+    /// Scroll the tree horizontally by `delta` columns (negative = left).
+    ScrollHorizontal(i16),
+    /// Jump horizontal scroll to the start (`0`) or end (`i16::MAX` sentinel
+    /// handled as "max") of the content.
+    ScrollHorizontalEdge(bool),
     SelectFirstDiagnostic,
     SelectLastDiagnostic,
     SelectNextDiagnostic,
@@ -211,10 +225,10 @@ pub(super) enum ExplorerAction {
     /// transform so the file explorer can't drift from the main editor's
     /// behavior.
     EnterLabelEdit(helix_view::edit_region::InsertEntry),
-    /// Start an inline create — `o` from a directory row creates a new
-    /// entry inside that directory, from a file row creates a sibling in
-    /// the same parent. Buffer starts empty.
-    EnterCreate,
+    /// Start an inline create — inserts a new tree row and edits its name.
+    /// `o` / [`CreatePlacement::Below`] opens below the selection (inside an
+    /// expanded directory); `O` / [`CreatePlacement::Above`] opens above.
+    EnterCreate(CreatePlacement),
     /// Begin a label-jump session over visible rows. Triggered by Helix's
     /// `goto_word` Frontend intent (`gw`). The panel renders two-letter
     /// labels over each visible row's label, then intercepts the user's
@@ -246,10 +260,14 @@ enum ExplorerCommand {
     Refresh,
     ShowOptions,
     ShowHelp,
+    ScrollLeft,
+    ScrollRight,
+    ScrollLeftmost,
+    ScrollRightmost,
 }
 
 impl ExplorerCommand {
-    const ALL: [Self; 19] = [
+    const ALL: [Self; 23] = [
         Self::Close,
         Self::SelectPrevious,
         Self::SelectNext,
@@ -269,6 +287,10 @@ impl ExplorerCommand {
         Self::Refresh,
         Self::ShowOptions,
         Self::ShowHelp,
+        Self::ScrollLeft,
+        Self::ScrollRight,
+        Self::ScrollLeftmost,
+        Self::ScrollRightmost,
     ];
 
     const fn id(self) -> ComponentIntentId {
@@ -292,6 +314,10 @@ impl ExplorerCommand {
             Self::Refresh => "file_explorer.refresh",
             Self::ShowOptions => "file_explorer.show_options",
             Self::ShowHelp => "file_explorer.show_help",
+            Self::ScrollLeft => "file_explorer.scroll_left",
+            Self::ScrollRight => "file_explorer.scroll_right",
+            Self::ScrollLeftmost => "file_explorer.scroll_leftmost",
+            Self::ScrollRightmost => "file_explorer.scroll_rightmost",
         })
     }
 
@@ -320,6 +346,10 @@ impl ExplorerCommand {
             Self::Refresh => "Refresh tree",
             Self::ShowOptions => "Configure file source",
             Self::ShowHelp => "Show explorer key bindings",
+            Self::ScrollLeft => "Scroll tree left",
+            Self::ScrollRight => "Scroll tree right",
+            Self::ScrollLeftmost => "Scroll tree to the left edge",
+            Self::ScrollRightmost => "Scroll tree to the right edge",
         }
     }
 
@@ -348,6 +378,10 @@ impl ExplorerCommand {
             Self::Refresh => ExplorerAction::Refresh,
             Self::ShowOptions => ExplorerAction::ShowOptions,
             Self::ShowHelp => ExplorerAction::ShowHelp,
+            Self::ScrollLeft => ExplorerAction::ScrollHorizontal(-4),
+            Self::ScrollRight => ExplorerAction::ScrollHorizontal(4),
+            Self::ScrollLeftmost => ExplorerAction::ScrollHorizontalEdge(true),
+            Self::ScrollRightmost => ExplorerAction::ScrollHorizontalEdge(false),
         }
     }
 }
@@ -436,6 +470,10 @@ pub(super) fn explorer_local_keymap(editing_engine: EditingEngineConfig) -> Moda
     let mut folds = ExplorerKeymapBuilder::new("Explorer folds");
     folds.command(key!('M'), ExplorerCommand::CollapseAll);
     folds.command(key!('R'), ExplorerCommand::ExpandAll);
+    folds.command(key!('h'), ExplorerCommand::ScrollLeft);
+    folds.command(key!('l'), ExplorerCommand::ScrollRight);
+    folds.command(key!('H'), ExplorerCommand::ScrollLeftmost);
+    folds.command(key!('L'), ExplorerCommand::ScrollRightmost);
     root.node(key!('z'), folds);
 
     if editing_engine == EditingEngineConfig::Vim {
@@ -1154,8 +1192,8 @@ impl ExplorerInputEngine {
             "insert_at_line_end" => Some(ExplorerAction::EnterLabelEdit(
                 helix_view::edit_region::InsertEntry::AtLineEnd,
             )),
-            "open_below" => Some(ExplorerAction::EnterCreate),
-            "open_above" => Some(ExplorerAction::EnterCreate),
+            "open_below" => Some(ExplorerAction::EnterCreate(CreatePlacement::Below)),
+            "open_above" => Some(ExplorerAction::EnterCreate(CreatePlacement::Above)),
             // `gw` in the editor opens a two-letter label jump over
             // visible words. In the file explorer the analog is "jump
             // to any visible row by typing its label" — same algorithm,

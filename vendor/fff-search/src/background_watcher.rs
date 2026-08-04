@@ -797,12 +797,13 @@ fn should_include_path(
         return false;
     }
 
-    if scan_options.deduplicate_links
-        && std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink())
-        && path
-            .canonicalize()
-            .ok()
-            .is_some_and(|path| !path.starts_with(base_path))
+    if std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink())
+        && !crate::file_picker::is_supported_symlink(
+            path,
+            base_path,
+            scan_options.deduplicate_links,
+            scan_options.symlink_target_scope,
+        )
     {
         return false;
     }

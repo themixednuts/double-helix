@@ -3389,12 +3389,9 @@ mod tests {
             crate::render::RenderCancellation::for_sequence(Arc::new(AtomicU64::new(2)), 1);
 
         let output = snapshot.render(&cancellation);
+        let untouched = crate::render::RenderOutput::sparse(area);
 
-        for y in area.top()..area.bottom() {
-            for x in area.left()..area.right() {
-                assert_eq!(output.surface()[(x, y)].symbol(), " ");
-            }
-        }
+        assert_eq!(output.surface(), untouched.surface());
     }
 
     #[test]

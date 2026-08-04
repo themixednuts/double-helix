@@ -1,10 +1,8 @@
-use std::{
-    collections::VecDeque,
-    num::NonZeroUsize,
-    path::{Path, PathBuf},
-};
+use std::{collections::VecDeque, num::NonZeroUsize};
 
 use helix_view::{editor::DetachedPreviewDocument, DocumentId};
+
+use super::ExplorerPath;
 
 const PREVIEW_DOCUMENT_CACHE_LIMIT: NonZeroUsize =
     NonZeroUsize::new(4).expect("preview cache limit must be non-zero");
@@ -22,17 +20,17 @@ pub(super) struct PreviewDocumentCache {
 }
 
 struct PreviewDocumentCacheEntry {
-    path: PathBuf,
+    path: ExplorerPath,
     document: DetachedPreviewDocument,
 }
 
 impl PreviewDocumentCache {
-    pub(super) fn take(&mut self, path: &Path) -> Option<DetachedPreviewDocument> {
-        let position = self.entries.iter().position(|entry| entry.path == path)?;
+    pub(super) fn take(&mut self, path: &ExplorerPath) -> Option<DetachedPreviewDocument> {
+        let position = self.entries.iter().position(|entry| &entry.path == path)?;
         self.entries.remove(position).map(|entry| entry.document)
     }
 
-    pub(super) fn insert(&mut self, path: PathBuf, document: DetachedPreviewDocument) {
+    pub(super) fn insert(&mut self, path: ExplorerPath, document: DetachedPreviewDocument) {
         self.entries.retain(|entry| entry.path != path);
         self.entries
             .push_front(PreviewDocumentCacheEntry { path, document });
@@ -50,7 +48,7 @@ impl PreviewDocumentCache {
     }
 
     #[cfg(test)]
-    pub(super) fn contains_path(&self, path: &Path) -> bool {
-        self.entries.iter().any(|entry| entry.path == path)
+    pub(super) fn contains_path(&self, path: &ExplorerPath) -> bool {
+        self.entries.iter().any(|entry| &entry.path == path)
     }
 }

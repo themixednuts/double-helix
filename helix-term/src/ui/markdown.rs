@@ -543,14 +543,12 @@ pub fn fit_bubble_width(text: &str, min_w: usize, max_w: usize) -> usize {
     let min_w = min_w.min(max_w);
     let inner_max = max_w.saturating_sub(4).max(1);
     let sample_limit = inner_max.saturating_mul(4);
-    let mut sampled = 0usize;
     let mut line_width = 0usize;
     let mut longest = 0usize;
-    for ch in text.chars() {
+    for (sampled, ch) in text.chars().enumerate() {
         if sampled >= sample_limit {
             return max_w;
         }
-        sampled += 1;
         if ch == '\n' {
             longest = longest.max(line_width);
             line_width = 0;

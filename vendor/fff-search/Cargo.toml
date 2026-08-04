@@ -140,7 +140,7 @@ version = "0.9.6"
 default-features = false
 
 [dependencies.git2]
-version = "0.20.2"
+version = "0.21"
 features = ["vendored-libgit2"]
 default-features = false
 

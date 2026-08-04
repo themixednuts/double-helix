@@ -48,7 +48,7 @@ fff-query-parser = { workspace = true , version = "0.9.0" }
 blake3 = { workspace = true }
 dirs = { workspace = true }
 libc = "0.2"
-git2 = { workspace = true }
+git2 = { version = "0.21", default-features = false, features = ["vendored-libgit2"] }
 glidesort = { workspace = true }
 globset = { workspace = true }
 fff-grep = { workspace = true , version = "0.9.0" }

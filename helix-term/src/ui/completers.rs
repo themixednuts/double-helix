@@ -10,9 +10,15 @@ use once_cell::sync::Lazy;
 use tui::text::Span;
 
 use super::prompt::{
-    completion::{self, CompletionRequest, FileIndexKey},
+    completion::{self, CompletionRequest, FileIndexKey, FileIndexRequest},
     Completion, CompletionProvider,
 };
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PathCompletionScope {
+    Workspace,
+    Local,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Completer {
@@ -22,10 +28,16 @@ pub enum Completer {
     ActiveLanguageServers,
     ConfiguredLanguageServers,
     Setting,
-    Filename { git_ignore: bool },
+    Filename {
+        scope: PathCompletionScope,
+        git_ignore: Option<bool>,
+    },
     Language,
     LspWorkspaceCommand,
-    Directory { git_ignore: bool },
+    Directory {
+        scope: PathCompletionScope,
+        git_ignore: Option<bool>,
+    },
     Register,
     Program,
     RepeatingFilenames,
@@ -46,13 +58,19 @@ pub const configured_language_servers: Completer = Completer::ConfiguredLanguage
 #[allow(non_upper_case_globals)]
 pub const setting: Completer = Completer::Setting;
 #[allow(non_upper_case_globals)]
-pub const filename: Completer = Completer::Filename { git_ignore: true };
+pub const filename: Completer = Completer::Filename {
+    scope: PathCompletionScope::Workspace,
+    git_ignore: None,
+};
 #[allow(non_upper_case_globals)]
 pub const language: Completer = Completer::Language;
 #[allow(non_upper_case_globals)]
 pub const lsp_workspace_command: Completer = Completer::LspWorkspaceCommand;
 #[allow(non_upper_case_globals)]
-pub const directory: Completer = Completer::Directory { git_ignore: true };
+pub const directory: Completer = Completer::Directory {
+    scope: PathCompletionScope::Local,
+    git_ignore: None,
+};
 #[allow(non_upper_case_globals)]
 pub const register: Completer = Completer::Register;
 #[allow(non_upper_case_globals)]
@@ -64,20 +82,30 @@ pub const shell: Completer = Completer::Shell;
 #[allow(non_upper_case_globals)]
 pub const foldable_textobjects: Completer = Completer::FoldableTextobjects;
 
-pub const fn filename_with_git_ignore(git_ignore: bool) -> Completer {
-    Completer::Filename { git_ignore }
+pub const fn local_filename(git_ignore: bool) -> Completer {
+    Completer::Filename {
+        scope: PathCompletionScope::Local,
+        git_ignore: Some(git_ignore),
+    }
 }
 
-pub const fn directory_with_git_ignore(git_ignore: bool) -> Completer {
-    Completer::Directory { git_ignore }
+pub const fn local_directory(git_ignore: bool) -> Completer {
+    Completer::Directory {
+        scope: PathCompletionScope::Local,
+        git_ignore: Some(git_ignore),
+    }
 }
 
 #[derive(Clone)]
 pub(crate) enum CompleterSnapshot {
     Empty,
     Names(Arc<[String]>),
-    Theme(Arc<Theme>),
     Syntax(Arc<helix_core::syntax::Loader>),
+    Files {
+        theme: Arc<Theme>,
+        workspace: helix_view::editor::WorkspaceContext,
+        options: helix_workspace::ScanOptions,
+    },
 }
 
 impl Completer {
@@ -129,10 +157,12 @@ impl Completer {
                     .collect::<Vec<_>>()
                     .into(),
             ),
-            Self::Filename { .. }
-            | Self::Directory { .. }
-            | Self::RepeatingFilenames
-            | Self::Shell => CompleterSnapshot::Theme(editor.theme.clone()),
+            Self::Filename { scope, .. } | Self::Directory { scope, .. } => {
+                file_snapshot(editor, scope)
+            }
+            Self::RepeatingFilenames | Self::Shell => {
+                file_snapshot(editor, PathCompletionScope::Local)
+            }
             Self::Register => CompleterSnapshot::Names(
                 editor
                     .registers
@@ -172,10 +202,10 @@ impl Completer {
                 });
                 fuzzy_names(input, KEYS.iter(), false)
             }
-            Self::Filename { git_ignore } => {
+            Self::Filename { git_ignore, .. } => {
                 filename_impl(snapshot, input, git_ignore, FileTarget::File)
             }
-            Self::Directory { git_ignore } => {
+            Self::Directory { git_ignore, .. } => {
                 filename_impl(snapshot, input, git_ignore, FileTarget::Directory)
             }
             Self::Language => {
@@ -218,6 +248,24 @@ impl Completer {
                 false,
             ),
         }
+    }
+}
+
+fn file_snapshot(editor: &Editor, scope: PathCompletionScope) -> CompleterSnapshot {
+    let root = helix_stdx::env::current_working_dir();
+    let workspace = match scope {
+        PathCompletionScope::Workspace => {
+            helix_view::editor::WorkspaceContext::from_backend(root, &editor.workspace_backend)
+        }
+        PathCompletionScope::Local => helix_view::editor::WorkspaceContext::from_backend(
+            root,
+            &helix_view::editor::WorkspaceBackend::Local,
+        ),
+    };
+    CompleterSnapshot::Files {
+        theme: editor.theme.clone(),
+        workspace,
+        options: editor.config().file_picker.workspace_scan_options(),
     }
 }
 
@@ -330,20 +378,37 @@ enum FileTarget {
 fn filename_impl(
     snapshot: &CompleterSnapshot,
     input: &str,
-    git_ignore: bool,
+    git_ignore: Option<bool>,
     target: FileTarget,
 ) -> Vec<Completion> {
-    let CompleterSnapshot::Theme(theme_snapshot) = snapshot else {
+    let CompleterSnapshot::Files {
+        theme: theme_snapshot,
+        workspace,
+        options,
+    } = snapshot
+    else {
         return Vec::new();
     };
-    let is_tilde = input == "~";
-    let path = helix_stdx::path::expand_tilde(Path::new(input));
-    #[cfg(windows)]
-    if path.is_absolute() {
-        return Vec::new();
-    }
+    let is_local = workspace.root().local_path().is_some();
+    let is_tilde = is_local && input == "~";
+    let normalized;
+    let path = if is_local {
+        helix_stdx::path::expand_tilde(Path::new(input))
+    } else {
+        normalized = input.replace('\\', "/");
+        Cow::Borrowed(Path::new(if normalized.ends_with('/') {
+            normalized.trim_end_matches('/')
+        } else {
+            &normalized
+        }))
+    };
 
-    let (base_directory, file_name) = if input.ends_with(std::path::MAIN_SEPARATOR) {
+    let ends_with_separator = if is_local {
+        input.ends_with(std::path::MAIN_SEPARATOR)
+    } else {
+        input.ends_with(['/', '\\'])
+    };
+    let (base_directory, file_name) = if ends_with_separator {
         (path.into_owned(), None)
     } else {
         let is_period = (input.ends_with(format!("{}.", std::path::MAIN_SEPARATOR).as_str())
@@ -366,9 +431,26 @@ fn filename_impl(
         (base_directory.into_owned(), file_name)
     };
 
-    let Some(entries) = completion::file_entries(FileIndexKey {
+    let Ok(base_directory) = workspace.resolve(&base_directory) else {
+        return Vec::new();
+    };
+
+    let mut options = *options;
+    if let Some(git_ignore) = git_ignore {
+        options.git_ignore = git_ignore;
+    }
+    options.max_depth = Some(1);
+    let key = FileIndexKey {
+        workspace: workspace.identity(),
         directory: base_directory.clone(),
-        git_ignore,
+        options: helix_workspace::DirectoryOptions {
+            scan: options,
+            flatten_dirs: false,
+        },
+    };
+    let Some(entries) = completion::file_entries(FileIndexRequest {
+        key,
+        workspace: workspace.clone(),
     }) else {
         return Vec::new();
     };
@@ -383,19 +465,22 @@ fn filename_impl(
         if matched == FileMatch::Reject {
             return None;
         }
-        let mut path = if is_tilde {
+        let path = if is_tilde {
             entry.path.clone()
         } else {
             entry
                 .path
-                .strip_prefix(&base_directory)
-                .unwrap_or(&entry.path)
-                .to_path_buf()
+                .relative_to(&base_directory)
+                .unwrap_or_else(|| entry.path.clone())
         };
+        let mut path = path.display();
         if matched == FileMatch::AcceptIncomplete {
-            path.push("");
+            path.push(if is_local {
+                std::path::MAIN_SEPARATOR
+            } else {
+                '/'
+            });
         }
-        let path = path.into_os_string().into_string().ok()?;
         (!path.is_empty()).then_some(Utf8PathBuf {
             path,
             is_dir: entry.is_dir,
@@ -434,10 +519,10 @@ fn complete_repeating_filenames(snapshot: &CompleterSnapshot, input: &str) -> Ve
     let token = match Tokenizer::new(input, false).last() {
         Some(Ok(token)) => token,
         Some(Err(_)) => return Vec::new(),
-        None => return filename_impl(snapshot, input, true, FileTarget::File),
+        None => return filename_impl(snapshot, input, Some(true), FileTarget::File),
     };
     let offset = token.content_start;
-    let mut completions = filename_impl(snapshot, &input[offset..], true, FileTarget::File);
+    let mut completions = filename_impl(snapshot, &input[offset..], Some(true), FileTarget::File);
     for completion in &mut completions {
         completion.0.start += offset;
     }

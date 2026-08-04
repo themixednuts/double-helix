@@ -49,11 +49,12 @@ pub fn paint_text_input(
 
         // Draw cursor cell.
         if state.cursor_in_area {
-            {
-                if let Some(cell) = surface.cell_mut((state.cursor_x, area.y)) {
-                    cell.set_style(tui::ratatui::to_ratatui_style(cursor_style));
+            if let Some(cell) = surface.cell_mut((state.cursor_x, area.y)) {
+                if state.cursor_at_end {
+                    cell.set_symbol(" ");
                 }
-            };
+                cell.set_style(tui::ratatui::to_ratatui_style(cursor_style));
+            }
         }
 
         return;
@@ -71,11 +72,12 @@ pub fn paint_text_input(
 
     // Draw cursor cell.
     if state.cursor_in_area {
-        {
-            if let Some(cell) = surface.cell_mut((state.cursor_x, area.y)) {
-                cell.set_style(tui::ratatui::to_ratatui_style(cursor_style));
+        if let Some(cell) = surface.cell_mut((state.cursor_x, area.y)) {
+            if state.cursor_at_end {
+                cell.set_symbol(" ");
             }
-        };
+            cell.set_style(tui::ratatui::to_ratatui_style(cursor_style));
+        }
     }
 }
 
@@ -100,9 +102,9 @@ mod tests {
         assert!(state.truncated_start);
         assert!(!state.truncated_end);
         assert_eq!(surface[(0, 0)].symbol(), "…");
-        assert_eq!(surface[(1, 0)].symbol(), "c");
-        assert_eq!(surface[(2, 0)].symbol(), "d");
-        assert_eq!(surface[(3, 0)].symbol(), "e");
+        assert_eq!(surface[(1, 0)].symbol(), "d");
+        assert_eq!(surface[(2, 0)].symbol(), "e");
+        assert_eq!(surface[(3, 0)].symbol(), " ");
     }
 
     #[test]
@@ -122,8 +124,8 @@ mod tests {
         assert!(state.truncated_start);
         assert!(!state.truncated_end);
         assert_eq!(surface[(0, 0)].symbol(), "…");
-        assert_eq!(surface[(1, 0)].symbol(), "c");
-        assert_eq!(surface[(2, 0)].symbol(), "d");
-        assert_eq!(surface[(3, 0)].symbol(), "e");
+        assert_eq!(surface[(1, 0)].symbol(), "d");
+        assert_eq!(surface[(2, 0)].symbol(), "e");
+        assert_eq!(surface[(3, 0)].symbol(), " ");
     }
 }

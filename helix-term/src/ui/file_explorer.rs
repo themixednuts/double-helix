@@ -4836,6 +4836,8 @@ mod tests {
         let second = temp.path().join("beta.rs");
         fs::write(&first, "fn alpha() {}\n").unwrap();
         fs::write(&second, "fn beta() {}\n").unwrap();
+        let first = helix_stdx::path::normalize(first);
+        let second = helix_stdx::path::normalize(second);
         let rt = helix_runtime::test::RuntimeTest::default();
         rt.block_on(async {
             let mut editor = test_editor(100, 30, rt.runtime());

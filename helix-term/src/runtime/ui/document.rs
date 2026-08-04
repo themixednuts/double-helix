@@ -1306,6 +1306,8 @@ mod tests {
         let second_path = temp.path().join("second.txt");
         std::fs::write(&first_path, "first").unwrap();
         std::fs::write(&second_path, "second").unwrap();
+        let first_path = helix_stdx::path::normalize(first_path);
+        let second_path = helix_stdx::path::normalize(second_path);
         let runtime = helix_runtime::Runtime::new(tokio::runtime::Handle::current());
         let editor = test_editor(runtime);
         let first_work = editor.prepare_document_open(

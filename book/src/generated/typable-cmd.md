@@ -6,6 +6,7 @@
 | `:quit!`, `:q!` | Force close the current view, ignoring unsaved changes. |
 | `:open`, `:o`, `:edit`, `:e` | Open a file from disk into the current view. |
 | `:pkg` | Open the package manager picker. |
+| `:understand`, `:code-atlas` | Open an evidence-backed briefing for the current file. |
 | `:pkg-install`, `:pkg install` | Install one or more packages. |
 | `:pkg-update`, `:pkg update` | Update packages, or all installed packages when no name is supplied. |
 | `:pkg-sync`, `:pkg sync` | Sync installed packages from pkg.toml and pkg.lock. |

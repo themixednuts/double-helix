@@ -16,6 +16,7 @@
   - [Command line](./command-line.md)
   - [Commands](./commands.md)
   - [Package Manager](./package-manager.md)
+  - [Remote SSH](./remote-ssh.md)
   - [Assistant](./assistant.md)
   - [Language support](./lang-support.md)
   - [Plugins](./plugins.md)

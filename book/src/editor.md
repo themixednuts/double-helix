@@ -257,6 +257,11 @@ Note that the ignore files consulted by the file explorer when `ignore` is set t
 |`icons` | Enables file and directory icons | `true`
 |`vcs` | Enables VCS status indicators in the file explorer | `true`
 |`diagnostics` | Enables LSP diagnostic indicators in the file explorer | `true`
+|`sticky` | Keep the file explorer open after opening a file | `false`
+
+Closing the explorer (Esc, or opening a file when `sticky` is false) remembers expanded folders, selection, and scroll positions for that workspace root. Reopening the same root restores them.
+
+Horizontal scrolling: `zh` / `zl` scroll left/right, `zH` / `zL` jump to the edges. Horizontal mouse-wheel also works when the pointer is over the panel.
 
 ### `[editor.buffer-picker]` Section
 

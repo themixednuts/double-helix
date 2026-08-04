@@ -1,4 +1,6 @@
 target
+helix.log
+helix-debug.log
 .direnv
 helix-term/rustfmt.toml
 result

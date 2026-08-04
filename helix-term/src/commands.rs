@@ -2592,7 +2592,7 @@ fn blame_line(cx: &mut Context) {
 
 #[cfg(test)]
 mod tests {
-    use super::{CommandScope, MappableCommand};
+    use super::{is_early_shell_stdin_close, CommandScope, MappableCommand};
     use helix_modal::CommandRegistry;
 
     #[test]
@@ -2617,6 +2617,16 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn successful_shell_commands_may_close_stdin_without_consuming_it() {
+        let broken_pipe = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+        assert!(is_early_shell_stdin_close(&broken_pipe));
+
+        let permission_denied =
+            anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        assert!(!is_early_shell_stdin_close(&permission_denied));
     }
 
     #[test]
@@ -4203,8 +4213,14 @@ async fn shell_impl_async(
             anyhow::Ok(())
         };
         let (output, input_result) = tokio::join!(process.wait_with_output(), write_input);
-        input_result?;
-        output?
+        let output = output?;
+        if let Err(error) = input_result {
+            if !is_early_shell_stdin_close(&error) {
+                return Err(error);
+            }
+            log::debug!("Shell command closed stdin before consuming all input");
+        }
+        output
     } else {
         // Process has no stdin, so we just take the output
         process.wait_with_output().await?
@@ -4228,6 +4244,14 @@ async fn shell_impl_async(
     };
 
     Ok(Tendril::from(output))
+}
+
+fn is_early_shell_stdin_close(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::BrokenPipe)
+    })
 }
 
 fn shell(cx: &mut compositor::Context, cmd: &str, behavior: &ShellBehavior) {

@@ -1,0 +1,93 @@
+name: Server
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/server.yml'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - 'helix-ipc/**'
+      - 'helix-remote/**'
+      - 'helix-workspace/**'
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/server.yml'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - 'helix-ipc/**'
+      - 'helix-remote/**'
+      - 'helix-workspace/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ matrix.platform }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: x86_64-linux
+            os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - platform: aarch64-linux
+            os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - platform: x86_64-macos
+            os: macos-15-intel
+            target: x86_64-apple-darwin
+          - platform: aarch64-macos
+            os: macos-15
+            target: aarch64-apple-darwin
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          target: ${{ matrix.target }}
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: dhx-server-${{ matrix.target }}
+
+      - name: Test server crates
+        run: cargo test --locked -p helix-workspace -p helix-remote -j4
+
+      - name: Build server
+        run: cargo build --profile opt --locked --target ${{ matrix.target }} -p helix-remote --bin dhx-server -j4
+
+      - name: Verify identity
+        shell: bash
+        run: |
+          server="target/${{ matrix.target }}/opt/dhx-server"
+          identity=$("$server" --identity)
+          case "$identity" in
+            "double-helix "*" remote-protocol "*) ;;
+            *) printf 'invalid server identity: %s\n' "$identity" >&2; exit 1 ;;
+          esac
+
+      - name: Stage artifact
+        shell: bash
+        run: |
+          mkdir artifact
+          cp "target/${{ matrix.target }}/opt/dhx-server" artifact/dhx-server
+          chmod 755 artifact/dhx-server
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: dhx-server-${{ matrix.platform }}
+          path: artifact/dhx-server
+          if-no-files-found: error

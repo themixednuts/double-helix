@@ -3,10 +3,17 @@ on:
   pull_request:
   push:
     branches:
-      - master
+      - main
   merge_group:
   schedule:
     - cron: "00 01 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   MSRV: "1.94"
@@ -17,7 +24,7 @@ jobs:
   check:
     name: Check (msrv)
     runs-on: ubuntu-latest
-    if: github.repository == 'helix-editor/helix' || github.event_name != 'schedule'
+    if: github.repository == 'themixednuts/double-helix' || github.event_name != 'schedule'
     steps:
       - name: Checkout sources
         uses: actions/checkout@v6
@@ -49,7 +56,7 @@ jobs:
   test:
     name: Test Suite
     runs-on: ${{ matrix.os }}
-    if: github.repository == 'helix-editor/helix' || github.event_name != 'schedule'
+    if: github.repository == 'themixednuts/double-helix' || github.event_name != 'schedule'
     timeout-minutes: 30
     env:
       RUST_BACKTRACE: 1
@@ -87,7 +94,7 @@ jobs:
   lints:
     name: Lints
     runs-on: ubuntu-latest
-    if: github.repository == 'helix-editor/helix' || github.event_name != 'schedule'
+    if: github.repository == 'themixednuts/double-helix' || github.event_name != 'schedule'
     steps:
       - name: Checkout sources
         uses: actions/checkout@v6
@@ -115,10 +122,10 @@ jobs:
       - name: Run cargo clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-  arch-check:
+  architecture:
     name: Architectural checks
     runs-on: ubuntu-latest
-    if: github.repository == 'helix-editor/helix' || github.event_name != 'schedule'
+    if: github.repository == 'themixednuts/double-helix' || github.event_name != 'schedule'
     steps:
       - name: Checkout sources
         uses: actions/checkout@v6

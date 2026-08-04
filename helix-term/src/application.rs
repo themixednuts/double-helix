@@ -2403,6 +2403,11 @@ impl Application {
     where
         S: Stream<Item = std::io::Result<TerminalEvent>> + Unpin,
     {
+        #[cfg(feature = "integration")]
+        self.timers
+            .idle
+            .arm_after(self.editor.config().idle_timeout);
+
         loop {
             if self.editor.should_close() {
                 return false;

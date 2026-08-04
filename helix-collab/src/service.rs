@@ -733,6 +733,8 @@ impl Service {
         mut file_watch: Option<crate::BackendFileWatch>,
     ) -> Result<(), HostServiceError> {
         let mut connections = JoinSet::new();
+        // Authentication spans multiple polls and must survive unrelated host events.
+        let mut accept = std::pin::pin!(accept_connection(self.endpoint.clone()));
         loop {
             tokio::select! {
                 changed = shutdown.changed() => {
@@ -740,7 +742,7 @@ impl Service {
                         break;
                     }
                 }
-                accepted = self.endpoint.accept(now_unix_secs()) => {
+                accepted = &mut accept => {
                     match accepted {
                         Ok(connection) => {
                             let service = self.clone();
@@ -749,6 +751,7 @@ impl Service {
                         Err(TransportError::EndpointClosed) => break,
                         Err(error) => log_transport_error(&error),
                     }
+                    accept.set(accept_connection(self.endpoint.clone()));
                 }
                 completed = connections.join_next(), if !connections.is_empty() => {
                     if let Some(Err(error)) = completed {
@@ -1465,6 +1468,10 @@ impl Service {
             }
         });
     }
+}
+
+async fn accept_connection(endpoint: Arc<HostEndpoint>) -> Result<Accepted, TransportError> {
+    endpoint.accept(now_unix_secs()).await
 }
 
 async fn next_file_update(

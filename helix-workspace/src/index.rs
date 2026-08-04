@@ -259,7 +259,13 @@ impl WorkspaceSearchIndex {
                 return Ok(None);
             }
         }
-        let path = relative_workspace_path(&self.workspace_root, absolute)?;
+        let path = match relative_workspace_path(&self.workspace_root, absolute) {
+            Ok(path) => path,
+            Err(error) if error.kind() == crate::WorkspaceFsErrorKind::OutsideRoot => {
+                return Ok(None);
+            }
+            Err(error) => return Err(error.into()),
+        };
         Ok((!is_internal_path(&path)).then_some(path))
     }
 }
@@ -270,22 +276,39 @@ fn responsive_search_threads() -> usize {
 }
 
 fn search_path(path: PathBuf) -> PathBuf {
-    #[cfg(windows)]
-    {
-        let path = path.to_string_lossy();
-        if let Some(path) = path.strip_prefix(r"\\?\UNC\") {
-            return PathBuf::from(format!(r"\\{path}"));
-        }
-        if let Some(path) = path.strip_prefix(r"\\?\") {
-            return PathBuf::from(path);
-        }
-    }
-    path
+    fff_search::path_utils::canonicalize(&path).unwrap_or(path)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn search_paths_use_the_picker_path_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let nested = root.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        let aliased = nested.join("..");
+
+        assert_eq!(
+            search_path(aliased),
+            fff_search::path_utils::canonicalize(root.path()).unwrap()
+        );
+    }
+
+    #[test]
+    fn search_results_outside_the_workspace_are_filtered() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let index = WorkspaceSearchIndex::new(
+            root.path().to_path_buf(),
+            root.path().to_path_buf(),
+            ScanOptions::default(),
+        )
+        .unwrap();
+
+        assert!(matches!(index.public_path(outside.path()), Ok(None)));
+    }
 
     #[test]
     fn content_pages_respect_ignores_exclusions_and_zero_based_lines() {

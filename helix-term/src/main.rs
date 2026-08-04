@@ -1,5 +1,5 @@
 use anyhow::{Context, Error, Result};
-use helix_loader::{BUILD_TARGET, VERSION_AND_GIT_HASH};
+use helix_loader::VERSION_AND_GIT_HASH;
 use helix_pkg::{OpEvent, Ops, PackageChange, PackageSpec, PkgKind, RegistrySource, UpdatePlan};
 use helix_term::application::{Application, RemoteApplicationSession};
 use helix_term::args::{Args, PkgCommand};
@@ -169,11 +169,8 @@ async fn connect_remote_workspace(
 ) -> Result<RemoteApplicationSession> {
     eprintln!("Connecting to {}...", uri.target.destination());
     let config = helix_remote::ssh::SshConfig::new(uri.target.clone());
-    let build = helix_remote::ssh::ServerBuild::current(
-        VERSION_AND_GIT_HASH,
-        env!("CARGO_PKG_VERSION"),
-        BUILD_TARGET,
-    )?;
+    let build =
+        helix_remote::ssh::ServerBuild::current(VERSION_AND_GIT_HASH, env!("CARGO_PKG_VERSION"));
     let server = config.prepare_server(&build).await.with_context(|| {
         format!(
             "failed to prepare remote server on {}",

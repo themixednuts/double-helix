@@ -280,6 +280,11 @@ jobs:
 
           source="$(pwd)"
           tag=${GITHUB_REF_NAME//\//}
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')
+          if [[ "$GITHUB_REF" == refs/tags/* && "$tag" != "$version" ]]; then
+              printf 'release tag %s does not match workspace version %s\n' "$tag" "$version" >&2
+              exit 1
+          fi
           mkdir -p runtime/grammars/sources
           tar xJf grammars/grammars.tar.xz -C runtime/grammars/sources
           rm -rf grammars
@@ -323,6 +328,12 @@ jobs:
               else
                   7z a -r dist/$pkgname.zip $pkgname
               fi
+          done
+
+          for platform in x86_64-linux aarch64-linux x86_64-macos aarch64-macos ; do
+              archive="dist/dhx-server-$tag-$platform.tar.xz"
+              test -f "$archive"
+              test "$(tar -tJf "$archive")" = "dhx-server"
           done
 
           tar cJf dist/double-helix-$tag-source.tar.xz -C $source .

@@ -379,15 +379,6 @@ impl RemotePlatform {
             Self::MacosAarch64 => "aarch64-macos",
         }
     }
-
-    fn matches_target(self, target: &str) -> bool {
-        match self {
-            Self::LinuxX86_64 => target.starts_with("x86_64-") && target.contains("-linux-"),
-            Self::LinuxAarch64 => target.starts_with("aarch64-") && target.contains("-linux-"),
-            Self::MacosX86_64 => target == "x86_64-apple-darwin",
-            Self::MacosAarch64 => target == "aarch64-apple-darwin",
-        }
-    }
 }
 
 struct RemoteProbe {
@@ -399,24 +390,16 @@ struct RemoteProbe {
 pub struct ServerBuild {
     version: Arc<str>,
     release_tag: Arc<str>,
-    target: Arc<str>,
-    executable: PathBuf,
     override_executable: Option<PathBuf>,
 }
 
 impl ServerBuild {
-    pub fn current(
-        version: impl Into<Arc<str>>,
-        release_tag: impl Into<Arc<str>>,
-        target: impl Into<Arc<str>>,
-    ) -> Result<Self, SshError> {
-        Ok(Self {
+    pub fn current(version: impl Into<Arc<str>>, release_tag: impl Into<Arc<str>>) -> Self {
+        Self {
             version: version.into(),
             release_tag: release_tag.into(),
-            target: target.into(),
-            executable: std::env::current_exe().map_err(SshError::CurrentExecutable)?,
             override_executable: std::env::var_os(SERVER_OVERRIDE_ENV).map(PathBuf::from),
-        })
+        }
     }
 
     fn identity(&self, platform: RemotePlatform) -> String {
@@ -433,22 +416,18 @@ impl ServerBuild {
     }
 
     async fn install_id(&self, platform: RemotePlatform) -> Result<String, SshError> {
-        if let Some(path) = self.local_executable(platform) {
+        if let Some(path) = self.local_executable() {
             return hash_file(path).await;
         }
         Ok(sha256_bytes(self.identity(platform).as_bytes()))
     }
 
-    fn local_executable(&self, platform: RemotePlatform) -> Option<&Path> {
-        self.override_executable.as_deref().or_else(|| {
-            platform
-                .matches_target(&self.target)
-                .then_some(self.executable.as_path())
-        })
+    fn local_executable(&self) -> Option<&Path> {
+        self.override_executable.as_deref()
     }
 
     async fn resolve(&self, platform: RemotePlatform) -> Result<ServerExecutable, SshError> {
-        if let Some(path) = self.local_executable(platform) {
+        if let Some(path) = self.local_executable() {
             if !path.is_file() {
                 return Err(SshError::ServerOverrideMissing(path.to_path_buf()));
             }
@@ -1129,8 +1108,6 @@ pub enum SshError {
     InvalidUri(String),
     #[error("invalid remote SSH target: {0}")]
     InvalidTarget(String),
-    #[error("failed to resolve the current editor executable: {0}")]
-    CurrentExecutable(#[source] std::io::Error),
     #[error("failed to hash the remote server binary: {0}")]
     HashTask(#[source] tokio::task::JoinError),
     #[error("remote server artifact worker failed: {0}")]
@@ -1247,8 +1224,6 @@ mod tests {
         let platform = RemotePlatform::detect("Linux", "x86_64").unwrap();
         assert_eq!(platform, RemotePlatform::LinuxX86_64);
         assert_eq!(platform.release_name(), "x86_64-linux");
-        assert!(platform.matches_target("x86_64-unknown-linux-gnu"));
-        assert!(!platform.matches_target("x86_64-pc-windows-msvc"));
 
         assert_eq!(
             RemotePlatform::detect("Darwin", "arm64").unwrap(),
@@ -1285,7 +1260,7 @@ mod tests {
 
     #[test]
     fn server_identity_includes_the_remote_protocol_revision() {
-        let build = ServerBuild::current("25.07.1 (test)", "25.7.1", "test-target").unwrap();
+        let build = ServerBuild::current("25.07.1 (test)", "25.7.1");
 
         assert_eq!(
             build.server_identity(),
@@ -1297,6 +1272,17 @@ mod tests {
         assert!(build
             .identity(RemotePlatform::LinuxX86_64)
             .contains(&format!("protocol-{}", crate::PROTOCOL_VERSION)));
+    }
+
+    #[test]
+    fn server_build_has_no_implicit_local_executable() {
+        let build = ServerBuild {
+            version: Arc::from("25.07.1 (test)"),
+            release_tag: Arc::from("25.7.1"),
+            override_executable: None,
+        };
+
+        assert!(build.local_executable().is_none());
     }
 
     #[test]
@@ -1326,11 +1312,8 @@ mod tests {
     async fn ssh_end_to_end_opens_a_remote_workspace() -> Result<(), Box<dyn std::error::Error>> {
         let uri = RemoteUri::parse(&std::env::var("DHX_TEST_SSH_URI")?)?;
         let config = SshConfig::new(uri.target.clone());
-        let build = ServerBuild::current(
-            helix_ipc::VERSION_AND_GIT_HASH,
-            env!("CARGO_PKG_VERSION"),
-            helix_ipc::BUILD_TARGET,
-        )?;
+        let build =
+            ServerBuild::current(helix_ipc::VERSION_AND_GIT_HASH, env!("CARGO_PKG_VERSION"));
         let server = config.prepare_server(&build).await?;
         let mut session = SshSession::connect(&config, &server).await?;
         let workspace = crate::backend::RemoteWorkspaceClient::open(

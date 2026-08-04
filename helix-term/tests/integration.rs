@@ -9,7 +9,7 @@ mod test {
 
     use self::helpers::*;
 
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn hello_world() -> anyhow::Result<()> {
         test(("#[\n|]#", "ihello world<esc>", "hello world#[|\n]#")).await?;
         Ok(())

@@ -1,6 +1,6 @@
 use super::*;
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_move_parent_node_end() -> anyhow::Result<()> {
     let tests = vec![
         // single cursor stays single cursor, first goes to end of current
@@ -78,7 +78,7 @@ async fn test_move_parent_node_end() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_move_parent_node_start() -> anyhow::Result<()> {
     let tests = vec![
         // single cursor stays single cursor, first goes to end of current
@@ -198,7 +198,7 @@ async fn test_move_parent_node_start() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_smart_tab_move_parent_node_end() -> anyhow::Result<()> {
     let tests = vec![
         // single cursor stays single cursor, first goes to end of current
@@ -451,7 +451,7 @@ async fn test_smart_tab_move_parent_node_end() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn select_all_siblings() -> anyhow::Result<()> {
     let tests = vec![
         // basic tests
@@ -602,7 +602,7 @@ async fn select_all_siblings() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn select_all_children() -> anyhow::Result<()> {
     let tests = vec![
         // basic tests
@@ -727,7 +727,7 @@ async fn select_all_children() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_select_next_sibling() -> anyhow::Result<()> {
     let tests = vec![
         // basic test
@@ -767,7 +767,7 @@ async fn test_select_next_sibling() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_select_prev_sibling() -> anyhow::Result<()> {
     let tests = vec![
         // basic test
@@ -807,7 +807,7 @@ async fn test_select_prev_sibling() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn match_bracket() -> anyhow::Result<()> {
     let rust_tests = vec![
         // fwd

@@ -2,7 +2,7 @@ use super::*;
 
 use helix_stdx::path;
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_split_write_quit_all() -> anyhow::Result<()> {
     let mut file1 = tempfile::NamedTempFile::new()?;
     let mut file2 = tempfile::NamedTempFile::new()?;
@@ -69,7 +69,7 @@ async fn test_split_write_quit_all() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_split_write_quit_same_file() -> anyhow::Result<()> {
     let mut file = tempfile::NamedTempFile::new()?;
     let mut app = helpers::AppBuilder::new()
@@ -127,7 +127,7 @@ async fn test_split_write_quit_same_file() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_changes_in_splits_apply_to_all_views() -> anyhow::Result<()> {
     // See <https://github.com/helix-editor/helix/issues/4732>.
     // Transactions must be applied to any view that has the changed document open.
@@ -196,7 +196,7 @@ async fn test_changes_in_splits_apply_to_all_views() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_changes_in_splits_jumplist_sync() -> anyhow::Result<()> {
     // See <https://github.com/helix-editor/helix/issues/9833>
     // When jumping backwards (<C-o>) switches between two documents, we need to

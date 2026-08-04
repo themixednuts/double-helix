@@ -12,7 +12,7 @@ fn matching_pairs() -> impl Iterator<Item = &'static (char, char)> {
     DEFAULT_PAIRS.iter().filter(|(open, close)| open == close)
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn insert_basic() -> anyhow::Result<()> {
     for pair in DEFAULT_PAIRS {
         test((
@@ -27,7 +27,7 @@ async fn insert_basic() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn insert_configured_multi_byte_chars() -> anyhow::Result<()> {
     // NOTE: these are multi-byte Unicode characters
     let pairs = hashmap!('„' => '“', '‚' => '‘', '「' => '」');
@@ -67,7 +67,7 @@ async fn insert_configured_multi_byte_chars() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn insert_after_word() -> anyhow::Result<()> {
     for pair in differing_pairs() {
         test((
@@ -92,7 +92,7 @@ async fn insert_after_word() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn insert_before_word() -> anyhow::Result<()> {
     for pair in DEFAULT_PAIRS {
         test((
@@ -107,7 +107,7 @@ async fn insert_before_word() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn insert_before_word_selection() -> anyhow::Result<()> {
     for pair in DEFAULT_PAIRS {
         test((
@@ -122,7 +122,7 @@ async fn insert_before_word_selection() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn insert_before_word_selection_trailing_word() -> anyhow::Result<()> {
     for pair in differing_pairs() {
         test((
@@ -137,7 +137,7 @@ async fn insert_before_word_selection_trailing_word() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn insert_closer_selection_trailing_word() -> anyhow::Result<()> {
     for pair in differing_pairs() {
         test((
@@ -152,7 +152,7 @@ async fn insert_closer_selection_trailing_word() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn insert_before_eol() -> anyhow::Result<()> {
     for pair in DEFAULT_PAIRS {
         test((
@@ -172,7 +172,7 @@ async fn insert_before_eol() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn insert_auto_pairs_disabled() -> anyhow::Result<()> {
     for pair in DEFAULT_PAIRS {
         test_with_config(
@@ -196,7 +196,7 @@ async fn insert_auto_pairs_disabled() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn insert_multi_range() -> anyhow::Result<()> {
     for pair in DEFAULT_PAIRS {
         test((
@@ -216,7 +216,7 @@ async fn insert_multi_range() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn insert_before_multi_code_point_graphemes() -> anyhow::Result<()> {
     for pair in differing_pairs() {
         test((
@@ -230,7 +230,7 @@ async fn insert_before_multi_code_point_graphemes() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn insert_at_end_of_document() -> anyhow::Result<()> {
     for pair in DEFAULT_PAIRS {
         test(TestCase {
@@ -257,7 +257,7 @@ async fn insert_at_end_of_document() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn insert_close_inside_pair() -> anyhow::Result<()> {
     for pair in DEFAULT_PAIRS {
         test((
@@ -282,7 +282,7 @@ async fn insert_close_inside_pair() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn insert_close_inside_pair_multi() -> anyhow::Result<()> {
     for pair in DEFAULT_PAIRS {
         test((
@@ -307,7 +307,7 @@ async fn insert_close_inside_pair_multi() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn insert_nested_open_inside_pair() -> anyhow::Result<()> {
     for pair in differing_pairs() {
         test((
@@ -332,7 +332,7 @@ async fn insert_nested_open_inside_pair() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn insert_nested_open_inside_pair_multi() -> anyhow::Result<()> {
     for outer_pair in DEFAULT_PAIRS {
         for inner_pair in DEFAULT_PAIRS {
@@ -365,7 +365,7 @@ async fn insert_nested_open_inside_pair_multi() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn append_basic() -> anyhow::Result<()> {
     for pair in DEFAULT_PAIRS {
         test((
@@ -385,7 +385,7 @@ async fn append_basic() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn append_multi_range() -> anyhow::Result<()> {
     for pair in DEFAULT_PAIRS {
         test((
@@ -405,7 +405,7 @@ async fn append_multi_range() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn append_close_inside_pair() -> anyhow::Result<()> {
     for pair in DEFAULT_PAIRS {
         test((
@@ -430,7 +430,7 @@ async fn append_close_inside_pair() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn append_close_inside_pair_multi() -> anyhow::Result<()> {
     for pair in DEFAULT_PAIRS {
         test((
@@ -455,7 +455,7 @@ async fn append_close_inside_pair_multi() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn append_end_of_word() -> anyhow::Result<()> {
     for pair in differing_pairs() {
         test((
@@ -475,7 +475,7 @@ async fn append_end_of_word() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn append_middle_of_word() -> anyhow::Result<()> {
     for pair in differing_pairs() {
         test((
@@ -490,7 +490,7 @@ async fn append_middle_of_word() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn append_end_of_word_multi() -> anyhow::Result<()> {
     for pair in differing_pairs() {
         test((
@@ -510,7 +510,7 @@ async fn append_end_of_word_multi() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn append_inside_nested_pair() -> anyhow::Result<()> {
     for pair in differing_pairs() {
         test((
@@ -535,7 +535,7 @@ async fn append_inside_nested_pair() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn append_inside_nested_pair_multi() -> anyhow::Result<()> {
     for outer_pair in DEFAULT_PAIRS {
         for inner_pair in DEFAULT_PAIRS {

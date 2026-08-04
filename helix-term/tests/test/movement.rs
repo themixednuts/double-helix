@@ -1,6 +1,6 @@
 use super::*;
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn insert_mode_cursor_position() -> anyhow::Result<()> {
     test(TestCase {
         in_text: String::new(),
@@ -20,7 +20,7 @@ async fn insert_mode_cursor_position() -> anyhow::Result<()> {
 }
 
 /// Range direction is preserved when escaping insert mode to normal
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn insert_to_normal_mode_cursor_position() -> anyhow::Result<()> {
     test(("#[f|]#oo\n", "vll<A-;><esc>", "#[|foo]#\n")).await?;
     test((
@@ -65,7 +65,7 @@ async fn insert_to_normal_mode_cursor_position() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn surround_by_character() -> anyhow::Result<()> {
     // Only pairs matching the passed character count
     test((
@@ -118,7 +118,7 @@ async fn surround_by_character() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn surround_inside_pair() -> anyhow::Result<()> {
     // Works at first character of buffer
     // TODO: Adjust test when opening pair failure is fixed
@@ -246,7 +246,7 @@ async fn surround_inside_pair() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn surround_around_pair() -> anyhow::Result<()> {
     // Works at first character of buffer
     // TODO: Adjust test when opening pair failure is fixed
@@ -374,7 +374,7 @@ async fn surround_around_pair() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn match_around_closest_ts() -> anyhow::Result<()> {
     test_with_config(
         AppBuilder::new().with_file("foo.rs", None),
@@ -411,7 +411,7 @@ async fn match_around_closest_ts() -> anyhow::Result<()> {
 
 /// Ensure the very initial cursor in an opened file is the width of
 /// the first grapheme
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cursor_position_newly_opened_file() -> anyhow::Result<()> {
     let test = |content: &str, expected_sel: Selection| -> anyhow::Result<()> {
         let file = helpers::temp_file_with_contents(content)?;
@@ -433,7 +433,7 @@ async fn cursor_position_newly_opened_file() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cursor_position_append_eof() -> anyhow::Result<()> {
     // Selection is forwards
     test(("#[foo|]#", "abar<esc>", "#[foobar|]#\n")).await?;
@@ -444,7 +444,7 @@ async fn cursor_position_append_eof() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn select_mode_tree_sitter_next_function_is_union_of_objects() -> anyhow::Result<()> {
     test_with_config(
         AppBuilder::new().with_file("foo.rs", None),
@@ -469,7 +469,7 @@ async fn select_mode_tree_sitter_next_function_is_union_of_objects() -> anyhow::
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn select_mode_tree_sitter_prev_function_unselects_object() -> anyhow::Result<()> {
     test_with_config(
         AppBuilder::new().with_file("foo.rs", None),
@@ -494,7 +494,7 @@ async fn select_mode_tree_sitter_prev_function_unselects_object() -> anyhow::Res
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn select_mode_tree_sitter_prev_function_goes_backwards_to_object() -> anyhow::Result<()> {
     // Note: the anchor stays put and the head moves back.
     test_with_config(
@@ -548,7 +548,7 @@ async fn select_mode_tree_sitter_prev_function_goes_backwards_to_object() -> any
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn find_char_line_ending() -> anyhow::Result<()> {
     test((
         indoc! {
@@ -587,7 +587,7 @@ async fn find_char_line_ending() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_surround_replace() -> anyhow::Result<()> {
     test((
         indoc! {"\
@@ -631,7 +631,7 @@ async fn test_surround_replace() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_surround_delete() -> anyhow::Result<()> {
     test((
         indoc! {"\
@@ -670,7 +670,7 @@ async fn test_surround_delete() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tree_sitter_motions_work_across_injections() -> anyhow::Result<()> {
     test_with_config(
         AppBuilder::new().with_file("foo.html", None),

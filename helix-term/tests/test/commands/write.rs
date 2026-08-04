@@ -78,7 +78,7 @@ async fn send_keys_and_focus_lost(app: &mut Application, keys: &str) -> anyhow::
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_exit_w_buffer_w_path() -> anyhow::Result<()> {
     let mut file = tempfile::NamedTempFile::new()?;
     let mut app = helpers::AppBuilder::new()
@@ -105,7 +105,7 @@ async fn test_exit_w_buffer_w_path() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_exit_wo_buffer_w_path() -> anyhow::Result<()> {
     let mut file = tempfile::NamedTempFile::new()?;
     let mut app = helpers::AppBuilder::new()
@@ -130,7 +130,7 @@ async fn test_exit_wo_buffer_w_path() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_exit_wo_buffer_wo_path() -> anyhow::Result<()> {
     test_key_sequence(
         &mut AppBuilder::new().build()?,
@@ -145,12 +145,12 @@ async fn test_exit_wo_buffer_wo_path() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_quit_last_view_does_not_render_empty_tree() -> anyhow::Result<()> {
     test_key_sequence(&mut AppBuilder::new().build()?, Some(":q<ret>"), None, true).await
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_exit_w_buffer_wo_file() -> anyhow::Result<()> {
     let mut file = tempfile::NamedTempFile::new()?;
     test_key_sequence(
@@ -177,7 +177,7 @@ async fn test_exit_w_buffer_wo_file() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_write_quit_fail() -> anyhow::Result<()> {
     let file = helpers::new_readonly_tempfile()?;
     let mut app = helpers::AppBuilder::new()
@@ -202,7 +202,7 @@ async fn test_write_quit_fail() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_buffer_close_concurrent() -> anyhow::Result<()> {
     test_key_sequences(
         &mut helpers::AppBuilder::new().build()?,
@@ -271,7 +271,7 @@ async fn test_buffer_close_concurrent() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_write() -> anyhow::Result<()> {
     let mut file = tempfile::NamedTempFile::new()?;
     let mut app = helpers::AppBuilder::new()
@@ -298,7 +298,7 @@ async fn test_write() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_write_family_plain_write_persists_bytes_and_clears_modified() -> anyhow::Result<()> {
     let mut file = tempfile::NamedTempFile::new()?;
     let mut app = helpers::AppBuilder::new()
@@ -321,7 +321,7 @@ async fn test_write_family_plain_write_persists_bytes_and_clears_modified() -> a
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_write_family_save_as_persists_bytes_and_clears_modified() -> anyhow::Result<()> {
     let mut file = tempfile::NamedTempFile::new()?;
 
@@ -351,7 +351,7 @@ async fn test_write_family_save_as_persists_bytes_and_clears_modified() -> anyho
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_write_family_force_write_persists_bytes_and_clears_modified() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("missing-parent").join("forced.txt");
@@ -378,7 +378,7 @@ async fn test_write_family_force_write_persists_bytes_and_clears_modified() -> a
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_write_while_file_explorer_focused() -> anyhow::Result<()> {
     let mut file = tempfile::NamedTempFile::new()?;
     let mut app = helpers::AppBuilder::new()
@@ -405,7 +405,7 @@ async fn test_write_while_file_explorer_focused() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_overwrite_protection() -> anyhow::Result<()> {
     let mut file = tempfile::NamedTempFile::new()?;
     let mut app = helpers::AppBuilder::new()
@@ -431,7 +431,7 @@ async fn test_overwrite_protection() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_write_quit() -> anyhow::Result<()> {
     let mut file = tempfile::NamedTempFile::new()?;
     let mut app = helpers::AppBuilder::new()
@@ -459,7 +459,7 @@ async fn test_write_quit() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_write_family_force_write_quit_persists_before_exit() -> anyhow::Result<()> {
     let mut file = tempfile::NamedTempFile::new()?;
     let mut app = helpers::AppBuilder::new()
@@ -482,7 +482,7 @@ async fn test_write_family_force_write_quit_persists_before_exit() -> anyhow::Re
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_write_family_write_all_persists_bytes_and_clears_modified() -> anyhow::Result<()> {
     let mut file1 = tempfile::NamedTempFile::new()?;
     let mut file2 = tempfile::NamedTempFile::new()?;
@@ -514,7 +514,7 @@ async fn test_write_family_write_all_persists_bytes_and_clears_modified() -> any
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_write_family_write_all_quit_variants_persist_before_exit() -> anyhow::Result<()> {
     for command in [":wqa<ret>", ":xa<ret>", ":wqa!<ret>"] {
         let mut file1 = tempfile::NamedTempFile::new()?;
@@ -548,7 +548,7 @@ async fn test_write_family_write_all_quit_variants_persist_before_exit() -> anyh
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_write_family_write_buffer_close_persists_before_close() -> anyhow::Result<()> {
     let mut file1 = tempfile::NamedTempFile::new()?;
     let file2 = tempfile::NamedTempFile::new()?;
@@ -578,7 +578,7 @@ async fn test_write_family_write_buffer_close_persists_before_close() -> anyhow:
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_write_family_auto_save_after_delay_persists_bytes() -> anyhow::Result<()> {
     let mut file = tempfile::NamedTempFile::new()?;
     let mut app = helpers::AppBuilder::new()
@@ -614,7 +614,7 @@ async fn test_write_family_auto_save_after_delay_persists_bytes() -> anyhow::Res
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_write_family_auto_save_focus_lost_persists_bytes() -> anyhow::Result<()> {
     let mut file = tempfile::NamedTempFile::new()?;
     let mut app = helpers::AppBuilder::new()
@@ -644,7 +644,7 @@ async fn test_write_family_auto_save_focus_lost_persists_bytes() -> anyhow::Resu
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_write_concurrent() -> anyhow::Result<()> {
     let mut file = tempfile::NamedTempFile::new()?;
     let mut command = String::new();
@@ -672,7 +672,7 @@ async fn test_write_concurrent() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_write_fail_mod_flag() -> anyhow::Result<()> {
     let file = helpers::new_readonly_tempfile()?;
     let mut app = helpers::AppBuilder::new()
@@ -713,7 +713,7 @@ async fn test_write_fail_mod_flag() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_write_scratch_to_new_path() -> anyhow::Result<()> {
     let mut file = tempfile::NamedTempFile::new()?;
 
@@ -738,7 +738,7 @@ async fn test_write_scratch_to_new_path() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_write_scratch_to_new_path_force_creates_file() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let new_path = dir.path().join("new-file.txt");
@@ -765,7 +765,7 @@ async fn test_write_scratch_to_new_path_force_creates_file() -> anyhow::Result<(
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_write_scratch_no_path_fails() -> anyhow::Result<()> {
     helpers::test_key_sequence_with_input_text(
         None,
@@ -786,7 +786,7 @@ async fn test_write_scratch_no_path_fails() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_write_auto_format_fails_still_writes() -> anyhow::Result<()> {
     let mut file = tempfile::Builder::new().suffix(".rs").tempfile()?;
 
@@ -810,7 +810,7 @@ async fn test_write_auto_format_fails_still_writes() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_write_new_path() -> anyhow::Result<()> {
     let mut file1 = tempfile::NamedTempFile::new().unwrap();
     let mut file2 = tempfile::NamedTempFile::new().unwrap();
@@ -856,7 +856,7 @@ async fn test_write_new_path() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_write_fail_new_path() -> anyhow::Result<()> {
     let file = helpers::new_readonly_tempfile()?;
 
@@ -893,7 +893,7 @@ async fn test_write_fail_new_path() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_write_utf_bom_file() -> anyhow::Result<()> {
     // "ABC" with utf8 bom
     const UTF8_FILE: [u8; 6] = [0xef, 0xbb, 0xbf, b'A', b'B', b'C'];
@@ -909,7 +909,7 @@ async fn test_write_utf_bom_file() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_write_trim_trailing_whitespace() -> anyhow::Result<()> {
     let mut file = tempfile::NamedTempFile::new()?;
     let mut app = helpers::AppBuilder::new()
@@ -931,7 +931,7 @@ async fn test_write_trim_trailing_whitespace() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_write_trim_final_newlines() -> anyhow::Result<()> {
     let mut file = tempfile::NamedTempFile::new()?;
     let mut app = helpers::AppBuilder::new()
@@ -953,7 +953,7 @@ async fn test_write_trim_final_newlines() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_write_insert_final_newline_added_if_missing() -> anyhow::Result<()> {
     let mut file = tempfile::NamedTempFile::new()?;
     let mut app = helpers::AppBuilder::new()
@@ -971,7 +971,7 @@ async fn test_write_insert_final_newline_added_if_missing() -> anyhow::Result<()
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_write_insert_final_newline_unchanged_if_empty() -> anyhow::Result<()> {
     let mut file = tempfile::NamedTempFile::new()?;
     let mut app = helpers::AppBuilder::new()
@@ -986,7 +986,7 @@ async fn test_write_insert_final_newline_unchanged_if_empty() -> anyhow::Result<
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_write_insert_final_newline_unchanged_if_not_missing() -> anyhow::Result<()> {
     let mut file = tempfile::NamedTempFile::new()?;
     let mut app = helpers::AppBuilder::new()
@@ -1004,7 +1004,7 @@ async fn test_write_insert_final_newline_unchanged_if_not_missing() -> anyhow::R
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_write_insert_final_newline_unchanged_if_missing_and_false() -> anyhow::Result<()> {
     let mut file = tempfile::NamedTempFile::new()?;
     let mut app = helpers::AppBuilder::new()
@@ -1027,7 +1027,7 @@ async fn test_write_insert_final_newline_unchanged_if_missing_and_false() -> any
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_write_all_insert_final_newline_add_if_missing_and_modified() -> anyhow::Result<()> {
     let mut file1 = tempfile::NamedTempFile::new()?;
     let mut file2 = tempfile::NamedTempFile::new()?;
@@ -1060,7 +1060,7 @@ async fn test_write_all_insert_final_newline_add_if_missing_and_modified() -> an
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_write_all_insert_final_newline_do_not_add_if_unmodified() -> anyhow::Result<()> {
     let mut file = tempfile::NamedTempFile::new()?;
     let mut app = helpers::AppBuilder::new()
@@ -1077,7 +1077,7 @@ async fn test_write_all_insert_final_newline_do_not_add_if_unmodified() -> anyho
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_symlink_write() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
 
@@ -1112,7 +1112,7 @@ async fn test_symlink_write() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_symlink_write_fail() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
 
@@ -1146,7 +1146,7 @@ async fn test_symlink_write_fail() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_symlink_write_relative() -> anyhow::Result<()> {
     // tempdir
     // |- - b
@@ -1188,7 +1188,7 @@ async fn test_symlink_write_relative() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[cfg(not(target_os = "android"))]
 async fn test_hardlink_write() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
@@ -1253,7 +1253,7 @@ async fn edit_file_with_content(file_content: &[u8]) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_move_file_when_given_dir_and_filename() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let source_file = tempfile::NamedTempFile::new_in(&dir)?;
@@ -1285,7 +1285,7 @@ async fn test_move_file_when_given_dir_and_filename() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_move_file_when_given_dir_only() -> anyhow::Result<()> {
     let source_dir = tempfile::tempdir()?;
     let target_dir = tempfile::tempdir()?;

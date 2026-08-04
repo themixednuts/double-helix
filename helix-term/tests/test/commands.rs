@@ -10,7 +10,7 @@ mod rotate_selection_contents;
 mod text_folding;
 mod write;
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn search_selection_detect_word_boundaries_at_eof() -> anyhow::Result<()> {
     // <https://github.com/helix-editor/helix/issues/12609>
     test((
@@ -30,7 +30,7 @@ async fn search_selection_detect_word_boundaries_at_eof() -> anyhow::Result<()> 
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_selection_duplication() -> anyhow::Result<()> {
     // Forward
     test((
@@ -122,7 +122,7 @@ async fn test_selection_duplication() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_goto_file_impl() -> anyhow::Result<()> {
     let file = tempfile::NamedTempFile::new()?;
 
@@ -203,7 +203,7 @@ async fn test_goto_file_impl() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_multi_selection_paste() -> anyhow::Result<()> {
     test((
         indoc! {"\
@@ -223,7 +223,7 @@ async fn test_multi_selection_paste() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_multi_selection_shell_commands() -> anyhow::Result<()> {
     // pipe
     test((
@@ -276,7 +276,7 @@ async fn test_multi_selection_shell_commands() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_undo_redo() -> anyhow::Result<()> {
     // A jumplist selection is created at a point which is undone.
     //
@@ -322,7 +322,7 @@ async fn test_undo_redo() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_extend_line() -> anyhow::Result<()> {
     // extend with line selected then count
     test((
@@ -361,7 +361,7 @@ async fn test_extend_line() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_character_info() -> anyhow::Result<()> {
     let config = helpers::test_config();
 
@@ -429,7 +429,7 @@ async fn test_character_info() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_delete_char_backward() -> anyhow::Result<()> {
     // don't panic when deleting overlapping ranges
     test(("#(x|)# #[x|]#", "c<space><backspace><esc>", "#[\n|]#")).await?;
@@ -445,13 +445,13 @@ async fn test_delete_char_backward() -> anyhow::Result<()> {
 
 // Cursor behavior is different when the text is created in the buffer vs loaded from a file.
 // This test will not work for reproducing the crash or verifying the result after the fix.
-// // #[tokio::test(flavor = "multi_thread")]
+// // #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 // async fn test_try_restore_indent() -> anyhow::Result<()> {
 //     test((" #[ |]#foo\na#( |)#bar\n", "o<C-u><esc>", " foo\n#[\n|]#a bar\n#(\n|)#")).await?;
 //     Ok(())
 // }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_try_restore_indent() -> anyhow::Result<()> {
     // Bug: 15228 try_restore_indent uses primary cursor position for all selections,
     // causing invalid range errors when multiple cursors are on different lines
@@ -467,21 +467,21 @@ async fn test_try_restore_indent() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_delete_word_backward() -> anyhow::Result<()> {
     // don't panic when deleting overlapping ranges
     test(("fo#[o|]#ba#(r|)#", "a<C-w><esc>", "#[\n|]#")).await?;
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_delete_word_forward() -> anyhow::Result<()> {
     // don't panic when deleting overlapping ranges
     test(("fo#[o|]#b#(|ar)#", "i<A-d><esc>", "fo#[\n|]#")).await?;
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_delete_char_forward() -> anyhow::Result<()> {
     test((
         indoc! {"\
@@ -503,7 +503,7 @@ async fn test_delete_char_forward() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_insert_with_indent() -> anyhow::Result<()> {
     const INPUT: &str = indoc! { "
         #[f|]#n foo() {
@@ -542,7 +542,7 @@ async fn test_insert_with_indent() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_join_selections() -> anyhow::Result<()> {
     // normal join
     test((
@@ -588,7 +588,7 @@ async fn test_join_selections() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_join_selections_space() -> anyhow::Result<()> {
     // join with empty lines panic
     test((
@@ -671,7 +671,7 @@ async fn test_join_selections_space() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_join_selections_comment() -> anyhow::Result<()> {
     test((
         indoc! {"\
@@ -714,7 +714,7 @@ async fn test_join_selections_comment() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_read_file() -> anyhow::Result<()> {
     let mut file = tempfile::NamedTempFile::new()?;
     let contents_to_read = "some contents";
@@ -738,7 +738,7 @@ async fn test_read_file() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn surround_delete() -> anyhow::Result<()> {
     // Test `surround_delete` when head < anchor
     test(("(#[|  ]#)", "mdm", "#[|  ]#")).await?;
@@ -747,7 +747,7 @@ async fn surround_delete() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn surround_replace_ts() -> anyhow::Result<()> {
     const INPUT: &str = r#"\
 fn foo() {
@@ -812,7 +812,7 @@ fn foo() {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn macro_play_within_macro_record() -> anyhow::Result<()> {
     // <https://github.com/helix-editor/helix/issues/12697>
     //
@@ -839,7 +839,7 @@ async fn macro_play_within_macro_record() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn global_search_with_multibyte_chars() -> anyhow::Result<()> {
     // Assert that `helix_term::commands::global_search` handles multibyte characters correctly.
     test((
@@ -862,7 +862,7 @@ async fn global_search_with_multibyte_chars() -> anyhow::Result<()> {
 }
 
 // Line selection movement tests
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_move_selection_single_selection_up() -> anyhow::Result<()> {
     test((
         indoc! {"
@@ -882,7 +882,7 @@ async fn test_move_selection_single_selection_up() -> anyhow::Result<()> {
     .await?;
     Ok(())
 }
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_move_selection_single_selection_down() -> anyhow::Result<()> {
     test((
         indoc! {"
@@ -902,7 +902,7 @@ async fn test_move_selection_single_selection_down() -> anyhow::Result<()> {
     .await?;
     Ok(())
 }
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_move_selection_single_selection_top_up() -> anyhow::Result<()> {
     // if already on top of the file and going up, nothing should change
     test((
@@ -921,7 +921,7 @@ async fn test_move_selection_single_selection_top_up() -> anyhow::Result<()> {
     .await?;
     Ok(())
 }
-// #[tokio::test(flavor = "multi_thread")]
+// #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 // async fn test_move_selection_single_selection_bottom_down() -> anyhow::Result<()> {
 //     // If going down on the bottom line, nothing should change
 //     // Note that this test is broken, due to the testing framework
@@ -934,7 +934,7 @@ async fn test_move_selection_single_selection_top_up() -> anyhow::Result<()> {
 //     .await?;
 //     Ok(())
 // }
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_move_selection_block_up() -> anyhow::Result<()> {
     test((
         indoc! {"
@@ -956,7 +956,7 @@ async fn test_move_selection_block_up() -> anyhow::Result<()> {
     .await?;
     Ok(())
 }
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_move_selection_block_down() -> anyhow::Result<()> {
     test((
         indoc! {"
@@ -978,7 +978,7 @@ async fn test_move_selection_block_down() -> anyhow::Result<()> {
     .await?;
     Ok(())
 }
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_move_two_cursors_down() -> anyhow::Result<()> {
     test((
         indoc! {"

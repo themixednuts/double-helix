@@ -137,6 +137,8 @@ pub async fn test_key_sequences(
     let mut rx_stream = UnboundedReceiverStream::new(rx);
     let num_inputs = inputs.len();
 
+    app.event_loop_until_idle(&mut rx_stream).await;
+
     for (i, (in_keys, test_fn)) in inputs.into_iter().enumerate() {
         let (view_id, doc) = focused_ref!(app.editor);
         let state = test::plain(doc.text().slice(..), doc.selection(view_id));
@@ -239,6 +241,8 @@ pub async fn test_key_sequence_with_input_text<T: Into<TestCase>>(
             test_runtime(),
         )?,
     };
+
+    run_event_loop_until_idle(&mut app).await;
 
     let (view_id, doc) = helix_view::focused!(app.editor);
     let sel = doc.selection(view_id).clone();
@@ -446,7 +450,7 @@ impl AppBuilder {
 }
 
 pub async fn run_event_loop_until_idle(app: &mut Application) {
-    let (_, rx) = tokio::sync::mpsc::unbounded_channel();
+    let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut rx_stream = UnboundedReceiverStream::new(rx);
     app.event_loop_until_idle(&mut rx_stream).await;
 }

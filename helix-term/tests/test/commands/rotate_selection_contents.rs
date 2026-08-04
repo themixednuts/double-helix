@@ -34,7 +34,7 @@ const D: &str = indoc! {"
     #(b|)#"
 };
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rotate_selection_contents_forward_repeated() -> anyhow::Result<()> {
     test((A, "<A-)>", B)).await?;
     test((B, "<A-)>", C)).await?;
@@ -43,7 +43,7 @@ async fn rotate_selection_contents_forward_repeated() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rotate_selection_contents_forward_with_count() -> anyhow::Result<()> {
     test((A, "2<A-)>", C)).await?;
     test((A, "3<A-)>", D)).await?;
@@ -52,7 +52,7 @@ async fn rotate_selection_contents_forward_with_count() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rotate_selection_contents_backward_repeated() -> anyhow::Result<()> {
     test((D, "<A-(>", C)).await?;
     test((C, "<A-(>", B)).await?;
@@ -61,7 +61,7 @@ async fn rotate_selection_contents_backward_repeated() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rotate_selection_contents_backward_with_count() -> anyhow::Result<()> {
     test((D, "2<A-(>", B)).await?;
     test((D, "3<A-(>", A)).await?;

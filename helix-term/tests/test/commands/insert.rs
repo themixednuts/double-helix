@@ -1,6 +1,6 @@
 use super::*;
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn change_line_above_comment() -> anyhow::Result<()> {
     // <https://github.com/helix-editor/helix/issues/12570>
     test((
@@ -19,7 +19,7 @@ async fn change_line_above_comment() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn insert_newline_many_selections() -> anyhow::Result<()> {
     test((
         indoc! {"\
@@ -120,7 +120,7 @@ async fn insert_newline_many_selections() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn insert_newline_trim_trailing_whitespace() -> anyhow::Result<()> {
     // Trailing whitespace is trimmed.
     test((
@@ -172,7 +172,7 @@ async fn insert_newline_trim_trailing_whitespace() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn insert_newline_trim_whitespace_to_previous_selection() -> anyhow::Result<()> {
     test((
         indoc! {"\"#[a|]# #(a|)# #(a|)#\""},
@@ -184,7 +184,7 @@ async fn insert_newline_trim_whitespace_to_previous_selection() -> anyhow::Resul
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn insert_newline_continue_line_comment() -> anyhow::Result<()> {
     // `insert_newline` continues a single line comment
     test((
@@ -280,7 +280,7 @@ async fn insert_newline_continue_line_comment() -> anyhow::Result<()> {
 }
 
 /// NOTE: Language is set to markdown to check if the indentation is correct for the new line
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_open_above() -> anyhow::Result<()> {
     // `O` is pressed in the first line
     test((
@@ -343,7 +343,7 @@ async fn test_open_above() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_open_above_with_multiple_cursors() -> anyhow::Result<()> {
     // the primary cursor is also in the top line
     test((
@@ -404,7 +404,7 @@ async fn test_open_above_with_multiple_cursors() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_open_below_with_multiple_cursors() -> anyhow::Result<()> {
     // the primary cursor is also in the top line
     test((
@@ -465,7 +465,7 @@ async fn test_open_below_with_multiple_cursors() -> anyhow::Result<()> {
 }
 
 /// NOTE: To make the `open_above` comment-aware, we're setting the language for each test to rust.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_open_above_with_comments() -> anyhow::Result<()> {
     // `O` is pressed in the first line inside a line comment
     test((
@@ -525,7 +525,7 @@ async fn test_open_above_with_comments() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn try_restore_indent() -> anyhow::Result<()> {
     // Assert that `helix_view::editor::try_restore_indent` handles line endings correctly
     // endings.
@@ -549,7 +549,7 @@ async fn try_restore_indent() -> anyhow::Result<()> {
 
 // Tests being able to jump in insert mode, then undo the write performed by the jump
 // https://github.com/helix-editor/helix/issues/13480
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_jump_undo_redo() -> anyhow::Result<()> {
     use helix_core::hashmap;
     use helix_term::keymap;

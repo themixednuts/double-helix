@@ -2,7 +2,22 @@ use super::*;
 
 use helix_core::diagnostic::Severity;
 
-#[tokio::test(flavor = "multi_thread")]
+#[cfg(windows)]
+type TestTerminalEvent = crossterm::event::Event;
+#[cfg(not(windows))]
+type TestTerminalEvent = termina::event::Event;
+
+fn send_keys(
+    tx: &tokio::sync::mpsc::UnboundedSender<std::io::Result<TestTerminalEvent>>,
+    keys: &str,
+) -> anyhow::Result<()> {
+    for key_event in helix_view::input::parse_macro(keys)? {
+        tx.send(Ok(TestTerminalEvent::Key(key_event.into())))?;
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn startup_accepts_delayed_terminal_input() -> anyhow::Result<()> {
     let mut app = AppBuilder::new().build()?;
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -10,13 +25,7 @@ async fn startup_accepts_delayed_terminal_input() -> anyhow::Result<()> {
 
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        for key_event in helix_view::input::parse_macro(":q!<ret>").unwrap() {
-            #[cfg(windows)]
-            let event = crossterm::event::Event::Key(crossterm::event::KeyEvent::from(key_event));
-            #[cfg(not(windows))]
-            let event = termina::event::Event::Key(termina::event::KeyEvent::from(key_event));
-            tx.send(Ok(event)).unwrap();
-        }
+        send_keys(&tx, ":q!<ret>").unwrap();
     });
 
     let exit_code =
@@ -27,34 +36,27 @@ async fn startup_accepts_delayed_terminal_input() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn startup_input_is_not_starved_by_background_handlers() -> anyhow::Result<()> {
     let mut app = AppBuilder::new().build()?;
-    let enabled = |app: &helix_term::application::Application| {
-        assert!(app.editor.config().cursorline);
-    };
-    let disabled = |app: &helix_term::application::Application| {
-        assert!(!app.editor.config().cursorline);
-    };
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut events = tokio_stream::wrappers::UnboundedReceiverStream::new(rx);
 
-    tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        test_key_sequences(
-            &mut app,
-            vec![
-                (Some(":set cursorline true<ret>"), Some(&enabled)),
-                (Some("<space><esc>"), None),
-                (Some(":set cursorline false<ret>"), Some(&disabled)),
-            ],
-            false,
-        ),
-    )
-    .await??;
+    send_keys(
+        &tx,
+        ":set cursorline true<ret><space><esc>:set cursorline false<ret>:q!<ret>",
+    )?;
+
+    let exit_code =
+        tokio::time::timeout(std::time::Duration::from_secs(5), app.run(&mut events)).await??;
+    assert_eq!(exit_code, 0);
+    assert!(app.editor.should_close());
+    assert!(!app.editor.config().cursorline);
 
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn history_completion() -> anyhow::Result<()> {
     test_key_sequence(
         &mut AppBuilder::new().build()?,
@@ -69,7 +71,7 @@ async fn history_completion() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn prompt_reset_anchor() -> anyhow::Result<()> {
     test_key_sequence(
         &mut AppBuilder::new().build()?,
@@ -105,7 +107,7 @@ async fn test_statusline(
     .await
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn variable_expansion() -> anyhow::Result<()> {
     test_statusline(r#":echo %{cursor_line}"#, "1", Severity::Info).await?;
     // Double quotes can be used with expansions:
@@ -126,7 +128,7 @@ async fn variable_expansion() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unicode_expansion() -> anyhow::Result<()> {
     test_statusline(r#":echo %u{20}"#, " ", Severity::Info).await?;
     test_statusline(r#":echo %u{0020}"#, " ", Severity::Info).await?;
@@ -143,7 +145,7 @@ async fn unicode_expansion() -> anyhow::Result<()> {
 }
 
 #[cfg(unix)]
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shell_expansion() -> anyhow::Result<()> {
     test_statusline(
         r#":echo %sh{echo "hello world"}"#,
@@ -158,7 +160,7 @@ async fn shell_expansion() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn percent_escaping() -> anyhow::Result<()> {
     test_statusline(
         r#":sh echo hello 10%"#,

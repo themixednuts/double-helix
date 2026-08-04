@@ -10,7 +10,7 @@ use indoc::indoc;
 use std::io::Read;
 
 /// Motion: j/k move cursor vertically.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn golden_motion_jk() -> anyhow::Result<()> {
     test((
         indoc! {"\
@@ -45,7 +45,7 @@ async fn golden_motion_jk() -> anyhow::Result<()> {
 
 /// Motion: w moves to next word start.
 /// "ww" from "f" moves to end of "bar " (selection 4-8).
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn golden_motion_w() -> anyhow::Result<()> {
     test((
         "#[f|]#oo bar baz",
@@ -60,7 +60,7 @@ async fn golden_motion_w() -> anyhow::Result<()> {
 
 /// Edit: insert mode, type, escape.
 /// After insert, cursor is at end of "hello" (position 5).
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn golden_edit_insert() -> anyhow::Result<()> {
     test(("#[|]#", "ihello<esc>", "hello#[|]#", LineFeedHandling::AsIs)).await?;
 
@@ -68,7 +68,7 @@ async fn golden_edit_insert() -> anyhow::Result<()> {
 }
 
 /// Command palette: open (space ?) and dismiss (esc). Verify no error.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn golden_command_palette_open_dismiss() -> anyhow::Result<()> {
     test_key_sequence(
         &mut AppBuilder::new().build()?,
@@ -87,7 +87,7 @@ async fn golden_command_palette_open_dismiss() -> anyhow::Result<()> {
 }
 
 /// Prompt: :echo and verify status.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn golden_prompt_echo() -> anyhow::Result<()> {
     test_key_sequence(
         &mut AppBuilder::new().build()?,
@@ -104,7 +104,7 @@ async fn golden_prompt_echo() -> anyhow::Result<()> {
 }
 
 /// Typable command: :write with path (no LSP).
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn golden_write_quit() -> anyhow::Result<()> {
     let mut file = tempfile::NamedTempFile::new()?;
     let mut app = AppBuilder::new().with_file(file.path(), None).build()?;

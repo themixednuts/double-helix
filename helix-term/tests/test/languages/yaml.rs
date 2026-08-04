@@ -1,6 +1,6 @@
 use super::*;
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn auto_indent() -> anyhow::Result<()> {
     let app = || AppBuilder::new().with_file("foo.yaml", None);
 

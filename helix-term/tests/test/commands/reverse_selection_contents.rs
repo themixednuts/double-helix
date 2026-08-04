@@ -31,7 +31,7 @@ const B_REV: &str = indoc! {"
 
 const CMD: &str = "<space>?reverse_selection_contents<ret>";
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reverse_selection_contents() -> anyhow::Result<()> {
     test((A, CMD, A_REV)).await?;
     test((B, CMD, B_REV)).await?;
@@ -39,7 +39,7 @@ async fn reverse_selection_contents() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reverse_selection_contents_with_count() -> anyhow::Result<()> {
     test((B, format!("2{CMD}"), B)).await?;
     test((B, format!("3{CMD}"), B_REV)).await?;

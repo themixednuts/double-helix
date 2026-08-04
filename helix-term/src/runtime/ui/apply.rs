@@ -11,8 +11,18 @@ pub fn apply_ui_command(
     let ingress = context.ingress.clone();
     let foreground = context.foreground.clone();
     match cmd {
+        UiCommand::AfterDocumentMutations { .. } => {
+            unreachable!(
+                "application-owned document mutation continuation reached generic UI apply"
+            )
+        }
         UiCommand::AfterWrites { .. } => {
             unreachable!("application-owned write continuation reached generic UI apply")
+        }
+        UiCommand::Typable { name, arguments } => {
+            if let Err(error) = crate::commands::typed::execute_typable(context, name, &arguments) {
+                context.editor.set_error(error.to_string());
+            }
         }
         UiCommand::Layer(layer) => {
             super::layer::apply_layer_command(context.editor, compositor, ingress.clone(), layer)

@@ -160,6 +160,10 @@ impl Application {
 
         errs.extend(self.editor.flush_assistant_persistence().await);
 
+        if let Some(renderer) = self.renderer.take() {
+            renderer.shutdown().await;
+        }
+
         if let Err(err) = self.restore_term().await {
             log::error!("Error restoring terminal: {}", err);
             errs.push(err.into());

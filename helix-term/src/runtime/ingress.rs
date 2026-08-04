@@ -10,7 +10,7 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use helix_core::diagnostic::{DiagnosticProvider, Severity};
@@ -353,6 +353,98 @@ struct RuntimeIngressInner {
     syntax: super::syntax::SyntaxService,
     packages: super::pkg::PkgService,
     dap_operations: Arc<DapOperationTracker>,
+    activity: Arc<RuntimeActivity>,
+    document_mutations: Arc<DocumentMutationTracker>,
+    input_barriers: Arc<InputBarrierTracker>,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct RuntimeActivity {
+    active: AtomicUsize,
+}
+
+impl RuntimeActivity {
+    pub(crate) fn track(self: &Arc<Self>) -> RuntimeActivityGuard {
+        self.active.fetch_add(1, Ordering::AcqRel);
+        RuntimeActivityGuard {
+            activity: self.clone(),
+        }
+    }
+
+    #[cfg(any(feature = "integration", test))]
+    fn is_idle(&self) -> bool {
+        self.active.load(Ordering::Acquire) == 0
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct RuntimeActivityGuard {
+    activity: Arc<RuntimeActivity>,
+}
+
+impl Drop for RuntimeActivityGuard {
+    fn drop(&mut self) {
+        self.activity.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+#[derive(Debug, Default)]
+struct DocumentMutationTracker {
+    active: AtomicUsize,
+}
+
+impl DocumentMutationTracker {
+    fn is_idle(&self) -> bool {
+        self.active.load(Ordering::Acquire) == 0
+    }
+}
+
+/// Keeps later typable commands ordered behind an asynchronous document mutation.
+#[must_use = "dropping the mutation lease releases queued typable commands"]
+pub struct DocumentMutation {
+    tracker: Arc<DocumentMutationTracker>,
+    _activity: RuntimeActivityGuard,
+}
+
+impl std::fmt::Debug for DocumentMutation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("DocumentMutation(..)")
+    }
+}
+
+impl Drop for DocumentMutation {
+    fn drop(&mut self) {
+        self.tracker.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+#[derive(Debug, Default)]
+struct InputBarrierTracker {
+    active: AtomicUsize,
+}
+
+impl InputBarrierTracker {
+    fn is_idle(&self) -> bool {
+        self.active.load(Ordering::Acquire) == 0
+    }
+}
+
+/// Buffers terminal input until a foreground state transition finishes applying.
+#[must_use = "dropping the input barrier allows queued terminal input to resume"]
+pub struct InputBarrier {
+    tracker: Arc<InputBarrierTracker>,
+}
+
+impl std::fmt::Debug for InputBarrier {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("InputBarrier(..)")
+    }
+}
+
+impl Drop for InputBarrier {
+    fn drop(&mut self) {
+        self.tracker.active.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 #[derive(Debug)]
@@ -395,11 +487,15 @@ impl RuntimeIngress {
         let document_reloads = DocumentReloadQueue::new(work.clone(), block.clone());
         let document_opens = DocumentOpenQueue::new(work.clone(), block.clone());
         let task_sink = RuntimeTaskSink { tx: tx.clone() };
+        let activity = Arc::new(RuntimeActivity::default());
+        let document_mutations = Arc::new(DocumentMutationTracker::default());
+        let input_barriers = Arc::new(InputBarrierTracker::default());
         let syntax = super::syntax::SyntaxService::spawn(
             work.clone(),
             block.clone(),
             BOUND,
             task_sink.clone(),
+            activity.clone(),
         );
         let packages = super::pkg::PkgService::spawn(work.clone(), block, task_sink.clone());
         let ingress = Self {
@@ -416,6 +512,9 @@ impl RuntimeIngress {
                 syntax,
                 packages,
                 dap_operations: Arc::new(DapOperationTracker::default()),
+                activity,
+                document_mutations,
+                input_barriers,
             }),
         };
         PullDiagnosticsCoordinator::spawn(work, clock, pull_diagnostics_rx, task_sink);
@@ -430,6 +529,48 @@ impl RuntimeIngress {
                 timer_open: true,
             },
         )
+    }
+
+    pub(crate) fn track_activity(&self) -> RuntimeActivityGuard {
+        self.inner.activity.track()
+    }
+
+    pub(crate) fn begin_document_mutation(&self) -> DocumentMutation {
+        self.inner
+            .document_mutations
+            .active
+            .fetch_add(1, Ordering::AcqRel);
+        DocumentMutation {
+            tracker: self.inner.document_mutations.clone(),
+            _activity: self.track_activity(),
+        }
+    }
+
+    pub(crate) fn has_pending_document_mutations(&self) -> bool {
+        !self.inner.document_mutations.is_idle()
+    }
+
+    pub(crate) fn begin_input_barrier(&self) -> InputBarrier {
+        self.inner
+            .input_barriers
+            .active
+            .fetch_add(1, Ordering::AcqRel);
+        InputBarrier {
+            tracker: self.inner.input_barriers.clone(),
+        }
+    }
+
+    pub(crate) fn has_pending_input_barriers(&self) -> bool {
+        !self.inner.input_barriers.is_idle()
+    }
+
+    #[cfg(any(feature = "integration", test))]
+    pub(crate) fn is_idle(&self) -> bool {
+        self.inner.activity.is_idle()
+            && self.inner.input_barriers.is_idle()
+            && self.inner.tx.is_empty()
+            && self.inner.status_tx.pending_len() == 0
+            && self.inner.timer_tx.pending_len() == 0
     }
 
     fn try_send(&self, event: RuntimeEvent) -> Result<(), RuntimeSendError> {
@@ -564,6 +705,14 @@ impl RuntimeIngress {
         self.inner.syntax.submit(request)
     }
 
+    pub(crate) fn interactive_syntax_refresh(
+        &self,
+        request: helix_view::document::SyntaxRefreshRequest,
+    ) -> Result<(), super::syntax::SyntaxAdmissionError> {
+        let barrier = self.begin_input_barrier();
+        self.inner.syntax.submit_interactive(request, barrier)
+    }
+
     pub(crate) fn take_document_reload(&self, document: DocumentId, generation: u64) -> bool {
         self.inner
             .document_reloads
@@ -600,6 +749,10 @@ impl RuntimeIngress {
 
     pub(crate) fn cancel_document_open(&self, lane: DocumentOpenLane) {
         self.inner.document_opens.cancel(lane);
+    }
+
+    pub(crate) fn has_pending_interactive_document_open(&self) -> bool {
+        self.inner.document_opens.has_pending_interaction()
     }
 
     pub(crate) fn begin_dap_operation(
@@ -952,6 +1105,7 @@ pub enum RuntimeTaskEvent {
         document: DocumentId,
         version: i32,
         syntax: helix_core::Syntax,
+        input_barrier: Option<InputBarrier>,
     },
     /// Blocking inspection completed for the active file-operation FIFO entry.
     FileOperationInspected {
@@ -1406,7 +1560,9 @@ pub fn spawn_task_event_with_future(
     future: impl std::future::Future<Output = anyhow::Result<RuntimeTaskEvent>> + Send + 'static,
     ingress: RuntimeIngress,
 ) {
+    let activity = ingress.track_activity();
     work.spawn(async move {
+        let _activity = activity;
         match future.await {
             Ok(task) => send_task_event_with(task, ingress.clone()).await,
             Err(err) => send_status_message_with(err, ingress).await,
@@ -1420,7 +1576,9 @@ pub fn spawn_ui_command_with_future(
     future: impl std::future::Future<Output = anyhow::Result<UiCommand>> + Send + 'static,
     ingress: RuntimeIngress,
 ) {
+    let activity = ingress.track_activity();
     work.spawn(async move {
+        let _activity = activity;
         match future.await {
             Ok(cmd) => send_ui_command_with(cmd, ingress.clone()).await,
             Err(err) => send_status_message_with(err, ingress).await,
@@ -1515,5 +1673,40 @@ mod tests {
         tracker.clear(id);
         assert!(!tracker.is_current(id, DapOperation::StackTrace, second));
         assert!(!tracker.is_current(id, DapOperation::Configuration, configuration));
+    }
+
+    #[test]
+    fn document_mutation_lease_tracks_overlapping_work_until_every_lease_drops() {
+        let rt = helix_runtime::test::RuntimeTest::default();
+        let (ingress, _receiver) = RuntimeIngress::channel(rt.runtime().clone());
+
+        let first = ingress.begin_document_mutation();
+        let second = ingress.begin_document_mutation();
+        assert!(ingress.has_pending_document_mutations());
+
+        drop(first);
+        assert!(ingress.has_pending_document_mutations());
+
+        drop(second);
+        assert!(!ingress.has_pending_document_mutations());
+    }
+
+    #[test]
+    fn input_barrier_tracks_overlapping_foreground_transitions() {
+        let rt = helix_runtime::test::RuntimeTest::default();
+        let (ingress, _receiver) = RuntimeIngress::channel(rt.runtime().clone());
+
+        let first = ingress.begin_input_barrier();
+        let second = ingress.begin_input_barrier();
+        assert!(ingress.has_pending_input_barriers());
+        assert!(!ingress.is_idle());
+
+        drop(first);
+        assert!(ingress.has_pending_input_barriers());
+        assert!(!ingress.is_idle());
+
+        drop(second);
+        assert!(!ingress.has_pending_input_barriers());
+        assert!(ingress.is_idle());
     }
 }

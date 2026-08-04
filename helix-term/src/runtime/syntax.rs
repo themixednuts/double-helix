@@ -6,7 +6,9 @@ use helix_runtime::{LatestAdmissionError, LatestByKeySender};
 use helix_view::document::SyntaxRefreshRequest;
 use helix_view::DocumentId;
 
-use super::ingress::{RuntimeTaskEvent, RuntimeTaskSink};
+use super::ingress::{
+    InputBarrier, RuntimeActivity, RuntimeActivityGuard, RuntimeTaskEvent, RuntimeTaskSink,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum SyntaxAdmissionError {
@@ -21,12 +23,15 @@ pub(crate) struct SyntaxService {
     tx: LatestByKeySender<DocumentId, SyntaxJob>,
     generations: Arc<Generations>,
     next_generation: Arc<AtomicU64>,
+    activity: Arc<RuntimeActivity>,
 }
 
 #[derive(Debug)]
 struct SyntaxJob {
     generation: u64,
     request: SyntaxRefreshRequest,
+    _activity: RuntimeActivityGuard,
+    input_barrier: Option<InputBarrier>,
 }
 
 #[derive(Debug, Default)]
@@ -73,6 +78,7 @@ impl SyntaxService {
         block: helix_runtime::Block,
         capacity: usize,
         sink: RuntimeTaskSink,
+        activity: Arc<RuntimeActivity>,
     ) -> Self {
         let (tx, mut rx) = helix_runtime::latest_by_key::<DocumentId, SyntaxJob>(capacity);
         let generations = Arc::new(Generations::default());
@@ -83,6 +89,8 @@ impl SyntaxService {
                 let SyntaxJob {
                     generation,
                     request,
+                    _activity,
+                    input_barrier,
                 } = job;
                 let version = request.version;
                 let started = std::time::Instant::now();
@@ -93,11 +101,16 @@ impl SyntaxService {
 
                 let keep_running = match result {
                     Ok(Ok(syntax)) => {
+                        log::debug!(
+                            "[syntax_service] parse_done document={document:?} version={version} elapsed_us={}",
+                            started.elapsed().as_micros(),
+                        );
                         sink
                             .send(RuntimeTaskEvent::ApplySyntax {
                                 document,
                                 version,
                                 syntax,
+                                input_barrier,
                             })
                             .await
                     }
@@ -128,10 +141,27 @@ impl SyntaxService {
             tx,
             generations,
             next_generation: Arc::new(AtomicU64::new(1)),
+            activity,
         }
     }
 
     pub(crate) fn submit(&self, request: SyntaxRefreshRequest) -> Result<(), SyntaxAdmissionError> {
+        self.submit_with_barrier(request, None)
+    }
+
+    pub(crate) fn submit_interactive(
+        &self,
+        request: SyntaxRefreshRequest,
+        input_barrier: InputBarrier,
+    ) -> Result<(), SyntaxAdmissionError> {
+        self.submit_with_barrier(request, Some(input_barrier))
+    }
+
+    fn submit_with_barrier(
+        &self,
+        request: SyntaxRefreshRequest,
+        input_barrier: Option<InputBarrier>,
+    ) -> Result<(), SyntaxAdmissionError> {
         let document = request.document;
         let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
         let previous = self.generations.record(document, generation);
@@ -140,6 +170,8 @@ impl SyntaxService {
             SyntaxJob {
                 generation,
                 request,
+                _activity: self.activity.track(),
+                input_barrier,
             },
         ) {
             Ok(_) => Ok(()),

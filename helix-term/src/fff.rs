@@ -221,6 +221,7 @@ pub(crate) fn wait_for_initial_file_results(
     Ok(false)
 }
 
+#[cfg(not(feature = "integration"))]
 pub(crate) fn prewarm(root: &Path, config: &FilePickerConfig) {
     if let Err(err) = workspace_for_root(root, config) {
         log::debug!(

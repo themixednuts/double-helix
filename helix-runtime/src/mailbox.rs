@@ -67,6 +67,11 @@ impl<T> Sender<T> {
             tokio::sync::mpsc::error::TrySendError::Closed(value) => TrySend::Closed(value),
         })
     }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.inner.capacity() == self.inner.max_capacity()
+    }
 }
 
 impl<T> Receiver<T> {
@@ -103,11 +108,13 @@ mod tests {
         let rt = RuntimeTest::default();
         let (tx, mut rx) = channel(1);
         tx.try_send(1).unwrap();
+        assert!(!tx.is_empty());
         assert!(!tx.is_closed());
         assert!(matches!(tx.try_send(2), Err(TrySend::Full(2))));
         rt.block_on(async {
             assert_eq!(rx.recv().await, Some(1));
         });
+        assert!(tx.is_empty());
         drop(rx);
         assert!(tx.is_closed());
         assert!(matches!(tx.try_send(3), Err(TrySend::Closed(3))));

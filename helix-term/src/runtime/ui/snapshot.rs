@@ -93,7 +93,9 @@ where
         let start = Instant::now();
         log::info!("{label} phase=load_start key={load_key:?}");
         let loaded = block.spawn(move || load(load_key));
+        let activity = ingress.track_activity();
         work.spawn(async move {
+            let _activity = activity;
             match loaded.await {
                 Ok(Ok(output)) => {
                     log::info!(

@@ -118,9 +118,11 @@ pub(crate) fn refresh_assistant_agent_cache(
         let runtime_assets = helix_loader::runtime_assets()?;
         Editor::load_assistant_packaged_agents(config, runtime_assets)
     });
+    let activity = ingress.track_activity();
     editor
         .work()
         .spawn(async move {
+            let _activity = activity;
             let loaded = loaded.await;
             match loaded {
                 Ok(Ok((generation, agents))) => {
@@ -176,14 +178,20 @@ pub(crate) fn apply_runtime_task_event(
             document,
             version,
             syntax,
+            input_barrier,
         } => {
-            let Some(doc) = editor.document_mut(document) else {
-                return;
-            };
-            if doc.version() != version || !doc.syntax_snapshot().is_stale() {
+            let _input_barrier = input_barrier;
+            let applied = editor.document_mut(document).is_some_and(|doc| {
+                if doc.version() != version || !doc.syntax_snapshot().is_stale() {
+                    return false;
+                }
+                doc.set_syntax(Some(syntax));
+                true
+            });
+            if !applied {
                 return;
             }
-            doc.set_syntax(Some(syntax));
+            crate::ui::default_folding_for_document(editor, document);
             editor.mark_redraw_pending();
             editor.request_redraw();
         }

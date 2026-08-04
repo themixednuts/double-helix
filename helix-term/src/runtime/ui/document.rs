@@ -158,8 +158,10 @@ impl DocumentReloadQueue {
             let queue = self.clone();
             let worker_ingress = ingress.clone();
             let block = self.block.clone();
+            let activity = ingress.track_activity();
             self.work
                 .spawn(async move {
+                    let _activity = activity;
                     let document = queued.work.document();
                     let path = queued.work.path().to_path_buf();
                     let start = Instant::now();
@@ -375,13 +377,29 @@ impl DocumentOpenQueue {
             .cancel(lane);
     }
 
+    pub(crate) fn has_pending_interaction(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .latest
+            .keys()
+            .any(|lane| {
+                matches!(
+                    lane,
+                    DocumentOpenLane::Navigation | DocumentOpenLane::Command
+                )
+            })
+    }
+
     fn spawn_ready(&self, ready: Vec<QueuedDocumentOpen>, ingress: crate::runtime::RuntimeIngress) {
         for queued in ready {
             let queue = self.clone();
             let worker_ingress = ingress.clone();
             let block = self.block.clone();
+            let activity = ingress.track_activity();
             self.work
                 .spawn(async move {
+                    let _activity = activity;
                     let generation = queued.generation;
                     let lane = queued.lane;
                     let stop_on_error = queued.stop_on_error;
@@ -996,11 +1014,19 @@ pub(crate) fn apply_document_command(
                     false
                 }
             };
+            if !retry
+                && editor
+                    .document(document)
+                    .is_some_and(helix_view::Document::has_syntax)
+            {
+                crate::ui::default_folding_for_document(editor, document);
+            }
             if retry {
                 queue_runtime_syntax(editor, document, generation, ingress);
             }
         }
         DocumentCommand::InsertFileFinished {
+            mutation,
             document,
             view,
             version,
@@ -1009,6 +1035,7 @@ pub(crate) fn apply_document_command(
             path,
             result,
         } => {
+            let _mutation = mutation;
             let contents = match result {
                 Ok(contents) => contents,
                 Err(error) => {
@@ -1527,9 +1554,10 @@ mod tests {
 
         apply_document_command(
             &mut editor,
-            ingress,
+            ingress.clone(),
             foreground,
             DocumentCommand::InsertFileFinished {
+                mutation: ingress.begin_document_mutation(),
                 document,
                 view,
                 version,
@@ -1568,9 +1596,10 @@ mod tests {
 
         apply_document_command(
             &mut editor,
-            ingress,
+            ingress.clone(),
             foreground,
             DocumentCommand::InsertFileFinished {
+                mutation: ingress.begin_document_mutation(),
                 document,
                 view,
                 version,

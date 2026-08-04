@@ -27,6 +27,7 @@ enum Control {
 #[derive(Default)]
 struct State {
     frame: Option<FramePacket>,
+    presenting: bool,
     config: Option<tui::terminal::Config>,
     control: VecDeque<Control>,
     recycled_buffers: Vec<Buffer>,
@@ -145,12 +146,12 @@ impl TerminalPresenter {
 
 impl PresenterHandle {
     pub fn has_pending_frame(&self) -> bool {
-        self.shared
+        let state = self
+            .shared
             .state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .frame
-            .is_some()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.presenting || state.frame.is_some()
     }
 
     pub fn submit(&self, frame: FramePacket) -> io::Result<()> {
@@ -258,12 +259,14 @@ fn presenter_loop(
             let config = state.config.take();
             let control = state.control.pop_front();
             let frame = state.frame.take();
+            state.presenting = frame.is_some();
             let replaced_frames = std::mem::take(&mut state.replaced_frames);
             (config, control, frame, replaced_frames, state.closed)
         };
         if frame.is_some() {
             pipeline_ready.request();
         }
+        let had_frame = frame.is_some();
 
         if let Some(config) = config {
             if let Err(error) = terminal.reconfigure(config) {
@@ -313,6 +316,7 @@ fn presenter_loop(
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 state.closed = true;
                 state.frame = None;
+                state.presenting = false;
                 drop(state);
                 shared.ready.notify_all();
                 return;
@@ -359,6 +363,15 @@ fn presenter_loop(
                     }
                 }
             }
+        }
+
+        if had_frame {
+            shared
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .presenting = false;
+            pipeline_ready.request();
         }
 
         if closed {

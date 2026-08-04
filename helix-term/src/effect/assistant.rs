@@ -310,9 +310,11 @@ pub(crate) fn request_load_assistant_history_thread(
         return;
     };
 
+    let activity = ingress.track_activity();
     editor
         .work()
         .spawn(async move {
+            let _activity = activity;
             match history.load(thread).await {
                 Ok(Some(record)) => {
                     send_task_event_with(
@@ -357,9 +359,11 @@ pub(crate) fn request_bootstrap_assistant_history(
         return;
     };
 
+    let activity = ingress.track_activity();
     editor
         .work()
         .spawn(async move {
+            let _activity = activity;
             if let Ok(entries) = history.load_scope(&scope).await {
                 send_task_event_with(
                     RuntimeTaskEvent::ApplyAssistantHistoryEntries {

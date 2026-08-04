@@ -5,8 +5,10 @@ use std::{
 
 use crate::runtime::{send_task_event_with, RuntimeTaskEvent};
 use helix_runtime::Runtime;
+#[cfg(not(feature = "integration"))]
 use helix_view::file_watcher::{FileWatcher, FileWatcherEvent};
 use helix_view::handlers::{AutoReloadEvent, Handlers};
+#[cfg(not(feature = "integration"))]
 use helix_view::Editor;
 
 #[derive(Debug)]
@@ -67,6 +69,7 @@ impl AutoReloadHandler {
 }
 
 /// Initialize the file watcher and publish directly into the auto-reload reducer.
+#[cfg(not(feature = "integration"))]
 pub fn setup_file_watcher(editor: &mut Editor) {
     if !editor.config().auto_reload {
         return;

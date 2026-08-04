@@ -2591,7 +2591,7 @@ fn language(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> any
         .document(id)
         .and_then(helix_view::Document::prepare_syntax_refresh)
     {
-        if let Err(error) = cx.ingress.syntax_refresh(request) {
+        if let Err(error) = cx.ingress.interactive_syntax_refresh(request) {
             log::warn!("[syntax_service] language_change_admission_failed error={error}");
         }
     }
@@ -3222,6 +3222,7 @@ fn read(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow:
     let encoding = doc.encoding();
     let selection = doc.selection(view_id).clone();
     let ingress = cx.ingress.clone();
+    let mutation = ingress.begin_document_mutation();
     let backend = workspace.backend().clone();
     let read_path = path.clone();
     let block = cx.editor.runtime().block().clone();
@@ -3268,6 +3269,7 @@ fn read(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow:
             let _ = ingress
                 .send_ui(crate::runtime::UiCommand::Document(
                     crate::runtime::DocumentCommand::InsertFileFinished {
+                        mutation,
                         document,
                         view: view_id,
                         version,
@@ -6186,6 +6188,16 @@ pub(super) fn execute_command(
     args: &str,
     event: PromptEvent,
 ) -> anyhow::Result<()> {
+    if event == PromptEvent::Validate && cx.ingress.has_pending_document_mutations() {
+        cx.submit_ui(UiCommand::AfterDocumentMutations {
+            command: Box::new(UiCommand::Typable {
+                name: cmd.name,
+                arguments: args.to_owned(),
+            }),
+        });
+        return Ok(());
+    }
+
     let args = if event == PromptEvent::Validate {
         Args::parse(args, cmd.signature, true, |token| {
             expansion::expand(cx.editor, token).map_err(|err| err.into())
@@ -6197,6 +6209,17 @@ pub(super) fn execute_command(
     };
 
     (cmd.fun)(cx, args, event).map_err(|err| anyhow!("'{}': {err}", cmd.name))
+}
+
+pub(crate) fn execute_typable(
+    cx: &mut compositor::Context,
+    name: &str,
+    arguments: &str,
+) -> anyhow::Result<()> {
+    let command = TYPABLE_COMMAND_MAP
+        .get(name)
+        .ok_or_else(|| anyhow!("no such command: '{name}'"))?;
+    execute_command(cx, command, arguments, PromptEvent::Validate)
 }
 
 #[allow(clippy::unnecessary_unwrap)]

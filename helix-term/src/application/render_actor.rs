@@ -63,6 +63,7 @@ pub(super) struct RenderActor {
     presenter: PresenterHandle,
     pipeline_ready: helix_runtime::PulseHandle<super::FramePipelineReady>,
     cancel: helix_runtime::Token,
+    worker: Option<helix_runtime::Task<()>>,
 }
 
 impl RenderActor {
@@ -82,7 +83,7 @@ impl RenderActor {
         let cancel = helix_runtime::Token::new();
         let actor_cancel = cancel.clone();
 
-        work.spawn(async move {
+        let worker = work.spawn(async move {
             let force_full_redraw = AtomicBool::new(false);
             let mut cache = crate::render::CacheStore::default();
             loop {
@@ -186,8 +187,7 @@ impl RenderActor {
                     sequence,
                 );
             }
-        })
-        .detach();
+        });
 
         Self {
             tx,
@@ -197,6 +197,17 @@ impl RenderActor {
             presenter,
             pipeline_ready,
             cancel,
+            worker: Some(worker),
+        }
+    }
+
+    pub async fn shutdown(mut self) {
+        self.cancel.cancel();
+        if let Some(worker) = self.worker.take() {
+            match worker.await {
+                Ok(()) | Err(helix_runtime::TaskError::Canceled) => {}
+                Err(error) => log::error!("render actor failed during shutdown: {error}"),
+            }
         }
     }
 

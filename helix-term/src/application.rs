@@ -1,6 +1,8 @@
 use arc_swap::{access::Map, ArcSwap};
 use futures_util::{Stream, StreamExt};
-use helix_core::{find_workspace, pos_at_coords, syntax, Range, Uri};
+#[cfg(not(feature = "integration"))]
+use helix_core::find_workspace;
+use helix_core::{pos_at_coords, syntax, Range, Uri};
 use helix_lsp::{
     lsp::{self as lsp_types},
     LanguageServerId, LspProgressMap,
@@ -141,6 +143,7 @@ struct IngressState {
     redraw_rx: FrameReceiver,
     idle_reset_rx: crate::runtime::IdleResetReceiver,
     idle_reset: crate::runtime::IdleResetHandle,
+    after_document_mutations: Vec<crate::runtime::UiCommand>,
     after_writes: Vec<(Vec<helix_view::DocumentId>, crate::runtime::UiCommand)>,
 }
 
@@ -429,10 +432,13 @@ impl Application {
 
         use helix_view::editor::Action;
 
-        // Package migration and reconciliation has one owner. Complete it before any
-        // runtime consumer captures the process-wide activation snapshot.
-        if let Err(error) = helix_pkg::Store::open_default().receipts() {
-            log::warn!("failed to reconcile package runtime state: {error}");
+        #[cfg(not(feature = "integration"))]
+        {
+            // Package migration and reconciliation has one owner. Complete it before any
+            // runtime consumer captures the process-wide activation snapshot.
+            if let Err(error) = helix_pkg::Store::open_default().receipts() {
+                log::warn!("failed to reconcile package runtime state: {error}");
+            }
         }
 
         let theme_loader = theme::Loader::new(&[helix_loader::config_dir()])
@@ -481,16 +487,20 @@ impl Application {
             ingress_tx.clone(),
             foreground.clone(),
         );
+        #[cfg(not(feature = "integration"))]
         editor.set_assistant_history_backend(helix_view::assistant::history::local_backend());
         editor.set_assistant_context_registry(helix_view::assistant::context::core_registry());
-        crate::effect::refresh_assistant_agent_cache(&editor, ingress_tx.clone());
-        let fff_root = find_workspace().0;
-        if remote.is_none() && fff_root.exists() {
-            let fff_config = editor.config().file_picker.clone();
-            runtime
-                .block()
-                .spawn(move || crate::fff::prewarm(&fff_root, &fff_config))
-                .detach();
+        #[cfg(not(feature = "integration"))]
+        {
+            crate::effect::refresh_assistant_agent_cache(&editor, ingress_tx.clone());
+            let fff_root = find_workspace().0;
+            if remote.is_none() && fff_root.exists() {
+                let fff_config = editor.config().file_picker.clone();
+                runtime
+                    .block()
+                    .spawn(move || crate::fff::prewarm(&fff_root, &fff_config))
+                    .detach();
+            }
         }
         let (lsp_events, lsp_events_rx) = lsp_events::LspEvents::channel();
         let lsp_incoming = editor.take_lsp_incoming();
@@ -512,6 +522,7 @@ impl Application {
         let idle_reset = idle_reset_gate.handle();
         let idle_reset_rx = idle_reset_gate.take_receiver();
         let idle_timeout = editor.config().idle_timeout;
+        #[cfg(not(feature = "integration"))]
         if editor.assistant_history_backend().is_some() {
             foreground.task(
                 crate::runtime::RuntimeTaskEvent::BootstrapAssistantHistory {
@@ -520,6 +531,7 @@ impl Application {
             )?;
         }
         // Initialize OS-native file watcher for auto-reload
+        #[cfg(not(feature = "integration"))]
         if remote.is_none() {
             crate::handlers::auto_reload::setup_file_watcher(&mut editor);
         }
@@ -783,6 +795,7 @@ impl Application {
                 redraw_rx,
                 idle_reset_rx,
                 idle_reset,
+                after_document_mutations: Vec::new(),
                 after_writes: Vec::new(),
             },
             exit: ExitState {
@@ -2021,6 +2034,15 @@ impl Application {
         let mut cmd = cmd;
         loop {
             match cmd {
+                crate::runtime::UiCommand::AfterDocumentMutations { command }
+                    if self.ingress.tx.has_pending_document_mutations() =>
+                {
+                    self.ingress.after_document_mutations.push(*command);
+                    return;
+                }
+                crate::runtime::UiCommand::AfterDocumentMutations { command } => {
+                    cmd = *command;
+                }
                 crate::runtime::UiCommand::AfterWrites { documents, command }
                     if self.write_barrier_pending() =>
                 {
@@ -2076,6 +2098,21 @@ impl Application {
 
     fn write_barrier_pending(&self) -> bool {
         self.editor.has_pending_writes() || !self.exit.tasks.is_empty()
+    }
+
+    fn service_after_document_mutations(&mut self) {
+        if self.ingress.tx.has_pending_document_mutations()
+            || self.ingress.after_document_mutations.is_empty()
+        {
+            return;
+        }
+        let commands = std::mem::take(&mut self.ingress.after_document_mutations);
+        for command in commands {
+            self.handle_runtime_ui_command(command);
+            if self.editor.should_close() {
+                break;
+            }
+        }
     }
 
     fn service_after_writes(&mut self) {
@@ -2378,6 +2415,14 @@ impl Application {
             );
 
             use futures_util::future::{pending, Either};
+            let input_barrier_pending = self.ingress.tx.has_pending_input_barriers();
+            let document_open_pending = self.ingress.tx.has_pending_interactive_document_open();
+            let input_blocked = input_barrier_pending || document_open_pending;
+            if input_blocked {
+                log::trace!(
+                    "terminal input gated: input_barrier_pending={input_barrier_pending} document_open_pending={document_open_pending}"
+                );
+            }
 
             tokio::select! {
                 biased;
@@ -2396,7 +2441,13 @@ impl Application {
                     }
                     return false;
                 },
-                event = input_stream.next() => {
+                event = async {
+                    if input_blocked {
+                        pending().await
+                    } else {
+                        input_stream.next().await
+                    }
+                } => {
                     let Some(event) = event else {
                         self.editor.exit_code = 1;
                         log::error!("terminal input stream closed unexpectedly");
@@ -2505,7 +2556,17 @@ impl Application {
 
                     #[cfg(feature = "integration")]
                     {
-                        if self.exit.tasks.is_empty() && !self.editor.has_pending_writes() {
+                        let now = self.runtime.clock().now();
+                        if self.exit.tasks.is_empty()
+                            && !self.editor.has_pending_writes()
+                            && self.ingress.tx.is_idle()
+                            && !self.editor.is_redraw_pending()
+                            && !self.frames.has_pending_frame(now)
+                            && !self
+                                .renderer
+                                .as_ref()
+                                .is_some_and(render_actor::RenderActor::is_saturated)
+                        {
                             return true;
                         }
                     }
@@ -2525,6 +2586,7 @@ impl Application {
                 }
             }
 
+            self.service_after_document_mutations();
             self.service_after_writes();
             self.drain_foreground();
 

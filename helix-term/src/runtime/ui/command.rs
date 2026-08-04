@@ -40,10 +40,19 @@ pub use prompt::{PromptCommand, PromptCompletionResult};
 
 /// Top-level UI command delivered on the main thread via typed runtime ingress.
 pub enum UiCommand {
+    /// Run a typable command after all in-flight document mutations finish applying.
+    AfterDocumentMutations {
+        command: Box<UiCommand>,
+    },
     /// Run a UI command after all currently pending document writes succeed.
     AfterWrites {
         documents: Vec<helix_view::DocumentId>,
         command: Box<UiCommand>,
+    },
+    /// Replay a validated typable command through the normal command path.
+    Typable {
+        name: &'static str,
+        arguments: String,
     },
     Layer(LayerCommand),
     Completion(Box<CompletionCommand>),
@@ -75,10 +84,19 @@ pub enum UiCommand {
 impl std::fmt::Debug for UiCommand {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::AfterDocumentMutations { command } => f
+                .debug_struct("AfterDocumentMutations")
+                .field("command", command)
+                .finish(),
             Self::AfterWrites { documents, command } => f
                 .debug_struct("AfterWrites")
                 .field("documents", documents)
                 .field("command", command)
+                .finish(),
+            Self::Typable { name, arguments } => f
+                .debug_struct("Typable")
+                .field("name", name)
+                .field("arguments", arguments)
                 .finish(),
             Self::Layer(c) => f.debug_tuple("Layer").field(c).finish(),
             Self::Completion(c) => f.debug_tuple("Completion").field(c).finish(),

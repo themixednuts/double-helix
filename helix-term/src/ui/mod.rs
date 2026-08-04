@@ -872,6 +872,11 @@ fn collaboration_picker_matches(
 }
 
 pub fn default_folding(editor: &mut Editor) {
+    let document = editor.focused_document_id();
+    default_folding_for_document(editor, document);
+}
+
+pub fn default_folding_for_document(editor: &mut Editor, document: helix_view::DocumentId) {
     use crate::commands::typed::{fold_textobjects, FOLD_SIGNATURE};
     use helix_core::command_line::Args;
 
@@ -882,11 +887,21 @@ pub fn default_folding(editor: &mut Editor) {
 
     let loader = editor.syn_loader.load();
 
-    let str = format!("--document {textobjects}");
-    let args = Args::parse(&str, FOLD_SIGNATURE, true, |token| Ok(token.content)).unwrap();
-
-    let (view_id, doc) = focused!(editor);
-    let view = view!(editor, view_id);
-    _ = fold_textobjects(doc, view, &loader, args);
+    let arguments = format!("--document {textobjects}");
+    let views: Vec<_> = editor
+        .tree
+        .views()
+        .filter_map(|(view, _)| (view.doc == document).then_some(view.id))
+        .collect();
+    for view_id in views {
+        let doc = doc_mut!(editor, &document);
+        if !doc.has_syntax() || doc.fold_container(view_id).is_some() {
+            continue;
+        }
+        let args =
+            Args::parse(&arguments, FOLD_SIGNATURE, true, |token| Ok(token.content)).unwrap();
+        let view = view_mut!(editor, view_id);
+        _ = fold_textobjects(doc, view, &loader, args);
+    }
 }
 pub mod completers;

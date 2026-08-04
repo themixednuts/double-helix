@@ -140,6 +140,7 @@ pub enum DocumentCommand {
         syntax: Syntax,
     },
     InsertFileFinished {
+        mutation: crate::runtime::ingress::DocumentMutation,
         document: DocumentId,
         view: ViewId,
         version: i32,

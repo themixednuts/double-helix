@@ -224,12 +224,16 @@ impl EndFoldPoint {
     }
 
     /// Returns the last line of the block.
-    ///
-    /// Always excludes the target's line so closing context
-    /// (e.g. `}`, `} satisfies Config;`) remains visible after folding.
     fn block_line(&self, text: RopeSlice) -> usize {
         let target_line = text.char_to_line(self.target);
-        target_line.saturating_sub(1)
+        let truncate = text
+            .graphemes_at(text.char_to_byte(self.target))
+            .skip((self.target != line_end_char_index(&text, target_line)) as usize)
+            .take_while(|&grapheme| !rope_is_line_ending(grapheme))
+            .flat_map(|grapheme| grapheme.chars())
+            .any(|character| !character.is_whitespace());
+
+        target_line.saturating_sub(truncate as usize)
     }
 
     /// Sets `byte`, `char`, `line` fields.

@@ -68,7 +68,7 @@ fn position_from_char(text: RopeSlice, char: usize) -> Position {
 }
 
 // INFO: to update the folded text, set the environment variable HELIX_UPDATE_FOLDED_RUST_CODE
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fold_rust_code() -> anyhow::Result<()> {
     use std::fs::File;
 
@@ -103,7 +103,7 @@ async fn fold_rust_code() -> anyhow::Result<()> {
 }
 
 // INFO: to update the folded text, set the environment variable HELIX_UPDATE_FOLDED_PYTHON_CODE
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fold_python_code() -> anyhow::Result<()> {
     use std::fs::File;
 
@@ -137,7 +137,7 @@ async fn fold_python_code() -> anyhow::Result<()> {
     .await
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fold_class() -> anyhow::Result<()> {
     let app = &mut AppBuilder::new()
         .with_file(RUST_CODE, None)
@@ -244,7 +244,7 @@ async fn fold_class() -> anyhow::Result<()> {
     .await
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fold_function() -> anyhow::Result<()> {
     let app = &mut AppBuilder::new()
         .with_file(RUST_CODE, None)
@@ -341,7 +341,7 @@ async fn fold_function() -> anyhow::Result<()> {
     .await
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fold_comment() -> anyhow::Result<()> {
     let app = &mut AppBuilder::new()
         .with_file(RUST_CODE, None)
@@ -473,7 +473,7 @@ async fn fold_comment() -> anyhow::Result<()> {
     .await
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fold_selection() -> anyhow::Result<()> {
     let app = &mut AppBuilder::new()
         .with_file(RUST_CODE, None)
@@ -590,7 +590,7 @@ async fn fold_selection() -> anyhow::Result<()> {
     .await
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fold() -> anyhow::Result<()> {
     let app = &mut AppBuilder::new()
         .with_file(RUST_CODE, None)
@@ -700,7 +700,7 @@ async fn fold() -> anyhow::Result<()> {
     .await
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn format() -> anyhow::Result<()> {
     let app = &mut AppBuilder::new()
         .with_file(RUST_CODE, None)
@@ -744,7 +744,7 @@ async fn format() -> anyhow::Result<()> {
     .await
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unfold_class() -> anyhow::Result<()> {
     let app = &mut AppBuilder::new()
         .with_file(RUST_CODE, None)
@@ -908,7 +908,7 @@ async fn unfold_class() -> anyhow::Result<()> {
     .await
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unfold_function() -> anyhow::Result<()> {
     let app = &mut AppBuilder::new()
         .with_file(RUST_CODE, None)
@@ -1018,7 +1018,7 @@ async fn unfold_function() -> anyhow::Result<()> {
     .await
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unfold_comment() -> anyhow::Result<()> {
     let app = &mut AppBuilder::new()
         .with_file(RUST_CODE, None)
@@ -1202,7 +1202,7 @@ async fn unfold_comment() -> anyhow::Result<()> {
     .await
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unfold_selection() -> anyhow::Result<()> {
     let app = &mut AppBuilder::new()
         .with_file(RUST_CODE, None)
@@ -1309,7 +1309,7 @@ async fn unfold_selection() -> anyhow::Result<()> {
     .await
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unfold() -> anyhow::Result<()> {
     let app = &mut AppBuilder::new()
         .with_file(RUST_CODE, None)
@@ -1448,7 +1448,7 @@ async fn unfold() -> anyhow::Result<()> {
     .await
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn open() -> anyhow::Result<()> {
     let app = &mut AppBuilder::new()
         .with_file(RUST_CODE, None)
@@ -1548,7 +1548,7 @@ async fn open() -> anyhow::Result<()> {
                     new text<esc>",
                 ),
                 Some(&|app| {
-                    let expected = ("        new text\n".into(), -1);
+                    let expected = ("        new text\n".into(), 0);
                     let result = result(app, 71);
                     assert_eq!((result.0.replace("\r\n", "\n"), result.1), expected);
                 }),
@@ -1598,7 +1598,7 @@ async fn open() -> anyhow::Result<()> {
     .await
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn default_folding() -> anyhow::Result<()> {
     use helix_view::editor::LspConfig;
 
@@ -1639,7 +1639,7 @@ async fn default_folding() -> anyhow::Result<()> {
     .await
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn toggle_fold() -> anyhow::Result<()> {
     let app = &mut AppBuilder::new()
         .with_file(RUST_CODE, None)
@@ -1666,6 +1666,10 @@ async fn toggle_fold() -> anyhow::Result<()> {
             ),
             (
                 Some("g7gz<A-f>"),
+                Some(&|app| assert_eq!(folds_number(app), 1)),
+            ),
+            (
+                Some("z<A-f>"),
                 Some(&|app| assert_eq!(folds_number(app), 0)),
             ),
             (

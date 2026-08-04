@@ -420,11 +420,18 @@ fn render_text(
         }
 
         // if the end of the viewport is reached stop rendering
-        if grapheme.visual_pos.row as u16 >= renderer.viewport.height + renderer.offset.row as u16 {
+        if grapheme.visual_pos.row
+            >= renderer
+                .offset
+                .row
+                .saturating_add(renderer.viewport.height as usize)
+        {
             break;
         }
 
-        let visual_row = grapheme.visual_pos.row as u16;
+        let Ok(visual_row) = u16::try_from(grapheme.visual_pos.row) else {
+            break;
+        };
 
         // Is this row dirty? (None = all rows dirty = full render)
         let row_is_dirty = dirty_rows.is_none_or(|dr| dr.contains(&visual_row));
@@ -826,7 +833,8 @@ fn render_text(
     // char_range_end is continuously updated during iteration
     // (set to grapheme.char_idx when entering a new line, or grapheme.char_idx+1 for each grapheme)
 
-    let last_row_dirty = dirty_rows.is_none_or(|dr| dr.contains(&last_line_pos.visual_line));
+    let last_row_dirty = last_line_pos.doc_line != usize::MAX
+        && dirty_rows.is_none_or(|dr| dr.contains(&last_line_pos.visual_line));
     if last_row_dirty {
         let line_finalize_start = Instant::now();
         renderer.draw_indent_guides(last_line_indent_level, last_line_pos.visual_line);

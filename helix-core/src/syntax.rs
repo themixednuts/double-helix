@@ -1383,6 +1383,7 @@ mod test {
             r#"
 /// a comment on
 /// multiple lines
+/// with a third line
         "#,
         );
 
@@ -1408,8 +1409,8 @@ mod test {
             )
         };
 
-        test("quantified_nodes", 1..37);
-        test("quantified_nodes_grouped", 1..37);
+        test("quantified_nodes", 1..59);
+        test("quantified_nodes_grouped", 1..59);
         // TODO: the query for this works instead as
         // ```
         // ((line_comment) @capture (line_comment) @capture)

@@ -15,8 +15,7 @@ fn fold_text() {
 #[test]
 fn fold_container_from() {
     let mut points = fold_points();
-    // additional points will be removed (single-line targets get eliminated
-    // because end block_line = target_line - 1 < start block_line)
+    // additional points will be removed
     points.extend(
         [("rm", 73, 77..=77)]
             .into_iter()
@@ -27,15 +26,11 @@ fn fold_container_from() {
 
     let container = FoldContainer::from(*TEXT_SAMPLE, points.clone());
 
-    // Single-line target folds are removed (indices 0,1,8,16,17,18,20,21 from fold_points, plus "rm")
-    let surviving_indices: Vec<usize> = vec![2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15, 19];
-    assert_eq!(container.len(), surviving_indices.len());
-
     let partial_eq = |sfp1: &StartFoldPoint, sfp2: &StartFoldPoint| -> bool {
         sfp1.object == sfp2.object && sfp1.header == sfp2.header && sfp1.target == sfp2.target
     };
     assert!(container.start_points.iter().enumerate().all(|(i, sfp)| {
-        let (expected, _) = &points[surviving_indices[i]];
+        let (expected, _) = &points[i];
         if partial_eq(sfp, expected) {
             return true;
         }
@@ -50,7 +45,7 @@ fn fold_container_from() {
     let partial_eq =
         |efp1: &EndFoldPoint, efp2: &EndFoldPoint| -> bool { efp1.target == efp2.target };
     assert!(container.end_points.iter().enumerate().all(|(i, efp)| {
-        let (_, expected) = &points[surviving_indices[efp.link]];
+        let (_, expected) = &points[efp.link];
         if partial_eq(efp, expected) {
             return true;
         }
@@ -244,10 +239,10 @@ fn fold_container_remove_by_selection() {
         (5, 6, &[][..]),
         (6, 7, &[][..]),
         (8, 8, &[2][..]),
-        (17, 19, &[2, 4, 5][..]),
+        (17, 19, &[2, 4][..]),
         (21, 34, &[2, 5, 6, 9, 10, 11][..]),
         (40, 42, &[12][..]),
-        (45, 55, &[][..]),
+        (45, 55, &[12, 13, 15][..]),
     ];
 
     for (case_idx, (from, to, removed)) in cases.into_iter().enumerate() {
@@ -274,12 +269,12 @@ fn fold_container_throw_range_out_of_folds() {
 
     // line from, line to, expected (line from, line to)
     let cases = [
-        ((1, 1), Range::new(16, 31)),      // (1, 2)
-        ((4, 4), Range::new(50, 65)),      // (4, 5)
-        ((1, 4), Range::new(16, 65)),      // (1, 5)
-        ((19, 63), Range::new(67, 842)),   // (6, 62)
+        ((1, 1), Range::new(0, 16)),       // (0, 0)
+        ((4, 4), Range::new(34, 50)),      // (3, 3)
+        ((1, 4), Range::new(0, 50)),       // (0, 3)
+        ((19, 63), Range::new(67, 827)),   // (6, 62)
         ((44, 10), Range::new(576, 67)),   // (39, 6)
-        ((77, 45), Range::new(1027, 628)), // (72, 45)
+        ((77, 45), Range::new(1009, 558)), // (72, 39)
     ];
 
     for (case_idx, ((from, to), expected)) in cases.into_iter().enumerate() {
@@ -301,13 +296,13 @@ fn fold_container_find() {
 
     // object, block line range, expected
     let cases = [
-        ("2", 8..=28, Some(0)),
-        ("a", 8..=28, None),
-        ("2", 8..=29, None),
-        ("7", 28..=28, Some(5)),
-        ("6", 20..=21, Some(4)),
-        ("9", 32..=35, Some(6)),
-        ("10", 33..=34, Some(7)),
+        ("0", 1..=1, Some(0)),
+        ("a", 1..=1, None),
+        ("0", 1..=2, None),
+        ("7", 28..=29, Some(7)),
+        ("6", 20..=22, Some(6)),
+        ("2", 8..=29, Some(2)),
+        ("10", 33..=35, Some(10)),
     ];
 
     for (case_idx, (object, block, expected)) in cases.into_iter().enumerate() {
@@ -326,10 +321,10 @@ fn fold_container_start_points_in_range() {
     // block line range, expected
     let cases = [
         (0..=0, None),
-        (6..=40, Some(0..=8)),
-        (10..=15, Some(1..=1)),
-        (55..=70, Some(13..=13)),
-        (0..=9, Some(0..=0)),
+        (6..=40, Some(2..=11)),
+        (10..=15, Some(3..=3)),
+        (55..=70, Some(16..=19)),
+        (0..=9, Some(0..=2)),
     ];
 
     for (case_idx, (block, expected)) in cases.into_iter().enumerate() {
@@ -346,14 +341,14 @@ fn fold_container_fold_containing() {
     // line, expected
     let cases = [
         (0, None),
-        (1, None),
+        (1, Some(0)),
         (7, None),
-        (11, Some(0)),
-        (9, Some(0)),
+        (11, Some(3)),
+        (9, Some(2)),
         (57, None),
-        (78, None),
-        (12, Some(0)),
-        (19, Some(3)),
+        (78, Some(21)),
+        (12, Some(2)),
+        (19, Some(2)),
     ];
 
     for (case_idx, (line, expected)) in cases.into_iter().enumerate() {
@@ -370,14 +365,14 @@ fn fold_container_superest_fold_containing() {
     // line, expected
     let cases = [
         (0, None),
-        (1, None),
+        (1, Some(0)),
         (7, None),
-        (11, Some(0)),
-        (9, Some(0)),
+        (11, Some(2)),
+        (9, Some(2)),
         (57, None),
-        (78, None),
-        (12, Some(0)),
-        (19, Some(0)),
+        (78, Some(21)),
+        (12, Some(2)),
+        (19, Some(2)),
     ];
 
     for (case_idx, (line, expected)) in cases.into_iter().enumerate() {
@@ -397,14 +392,14 @@ fn fold_annotations_folded_lines_between() {
     let cases = [
         (0..=0, 0),
         (3..=3, 0),
-        (0..=3, 0),
-        (0..=5, 0),
+        (0..=3, 1),
+        (0..=5, 2),
         (5..=7, 0),
-        (5..=30, 21),
+        (5..=30, 22),
         (30..=31, 0),
-        (30..=51, 10),
+        (30..=51, 13),
         (51..=51, 0),
-        (62..=79, 1),
+        (62..=79, 5),
     ];
 
     for (case_idx, (line_range, expected)) in cases.into_iter().enumerate() {
@@ -442,7 +437,7 @@ fn fold_container_update_by_transaction() {
                 let fold = container.start_points[0].fold(&container);
 
                 assert!(
-                    fold.header() == 66 && object_eq(fold, "2") && decrease_eq(0),
+                    fold.header() == 0 && object_eq(fold, "0") && decrease_eq(0),
                     "fold = {fold:#?}"
                 );
             }),
@@ -454,7 +449,7 @@ fn fold_container_update_by_transaction() {
                 let container = container.borrow();
                 let fold = container.start_points[0].fold(&container);
 
-                assert!(object_eq(fold, "2") && decrease_eq(0), "fold = {fold:#?}");
+                assert!(object_eq(fold, "0") && decrease_eq(0), "fold = {fold:#?}");
             }),
         ),
         (
@@ -464,7 +459,7 @@ fn fold_container_update_by_transaction() {
                 let container = container.borrow();
                 let fold = container.start_points[0].fold(&container);
 
-                assert!(object_eq(fold, "2") && decrease_eq(0), "fold = {fold:#?}");
+                assert!(object_eq(fold, "1") && decrease_eq(1), "fold = {fold:#?}");
             }),
         ),
         (
@@ -474,7 +469,7 @@ fn fold_container_update_by_transaction() {
                 let container = container.borrow();
                 let fold = container.start_points[0].fold(&container);
 
-                assert!(object_eq(fold, "2") && decrease_eq(0), "fold = {fold:#?}");
+                assert!(object_eq(fold, "1") && decrease_eq(1), "fold = {fold:#?}");
             }),
         ),
         (
@@ -482,7 +477,7 @@ fn fold_container_update_by_transaction() {
             (137, 138, None),
             Box::new(|| {
                 let container = container.borrow();
-                let fold = container.start_points[1].fold(&container);
+                let fold = container.start_points[3].fold(&container);
 
                 assert!(object_eq(fold, "4") && decrease_eq(1), "fold = {fold:#?}");
             }),
@@ -492,7 +487,7 @@ fn fold_container_update_by_transaction() {
             (263, 264, None),
             Box::new(|| {
                 let container = container.borrow();
-                let fold = container.start_points[2].fold(&container);
+                let fold = container.start_points[4].fold(&container);
 
                 assert!(object_eq(fold, "5") && decrease_eq(1), "fold = {fold:#?}");
             }),
@@ -502,7 +497,7 @@ fn fold_container_update_by_transaction() {
             (486, 504, None),
             Box::new(|| {
                 let container = container.borrow();
-                let fold = container.start_points[6].fold(&container);
+                let fold = container.start_points[9].fold(&container);
 
                 assert!(object_eq(fold, "9") && decrease_eq(2), "fold = {fold:#?}");
             }),
@@ -512,7 +507,7 @@ fn fold_container_update_by_transaction() {
             (263, 264, None),
             Box::new(|| {
                 let container = container.borrow();
-                let fold = container.start_points[2].fold(&container);
+                let fold = container.start_points[4].fold(&container);
 
                 assert!(
                     object_eq(fold, "5") && fold.start.line == 19 && decrease_eq(1),
@@ -527,7 +522,7 @@ fn fold_container_update_by_transaction() {
                 let container = container.borrow();
                 let fold = container.start_points[3].fold(&container);
 
-                assert!(object_eq(fold, "5") && decrease_eq(0), "fold = {fold:#?}");
+                assert!(object_eq(fold, "3") && decrease_eq(0), "fold = {fold:#?}");
             }),
         ),
         (
@@ -535,7 +530,7 @@ fn fold_container_update_by_transaction() {
             (279, 285, Some("new text\n\t".into())),
             Box::new(|| {
                 let container = container.borrow();
-                let fold = container.start_points[4].fold(&container);
+                let fold = container.start_points[6].fold(&container);
 
                 assert!(object_eq(fold, "6") && decrease_eq(0), "fold = {fold:#?}");
             }),
@@ -545,7 +540,7 @@ fn fold_container_update_by_transaction() {
             (279, 292, Some("new text\n\t\tnew text".into())),
             Box::new(|| {
                 let container = container.borrow();
-                let fold = container.start_points[4].fold(&container);
+                let fold = container.start_points[6].fold(&container);
 
                 assert!(object_eq(fold, "7") && decrease_eq(1), "fold = {fold:#?}");
             }),
@@ -555,7 +550,7 @@ fn fold_container_update_by_transaction() {
             (737, 740, None),
             Box::new(|| {
                 let container = container.borrow();
-                let fold = container.start_points[12].fold(&container);
+                let fold = container.start_points[15].fold(&container);
 
                 assert!(
                     object_eq(fold, "15") && decrease_eq(0) && fold.end.line == 54,
@@ -568,10 +563,10 @@ fn fold_container_update_by_transaction() {
             (502, 503, None),
             Box::new(|| {
                 let container = container.borrow();
-                let fold = container.start_points[8].fold(&container);
+                let fold = container.start_points[11].fold(&container);
 
                 assert!(
-                    object_eq(fold, "12") && decrease_eq(1) && fold.end.line == 43,
+                    object_eq(fold, "11") && decrease_eq(0) && fold.end.line == 34,
                     "fold = {fold:#?}"
                 )
             }),
@@ -581,7 +576,7 @@ fn fold_container_update_by_transaction() {
             (558, 576, None),
             Box::new(|| {
                 let container = container.borrow();
-                let fold = container.start_points[9].fold(&container);
+                let fold = container.start_points[12].fold(&container);
 
                 assert!(
                     object_eq(fold, "13") && decrease_eq(1) && fold.is_superest(),

@@ -81,8 +81,8 @@ const VER_BAR: &str = "│";
 
 struct Renderer<'a, 'b> {
     renderer: &'a mut TextRenderer<'b>,
-    first_row: u16,
-    row: u16,
+    first_row: usize,
+    row: usize,
     config: &'a InlineDiagnosticsConfig,
     styles: &'a Styles,
 }
@@ -92,7 +92,10 @@ impl Renderer<'_, '_> {
         self.draw_decoration_at(g, severity, col, self.row)
     }
 
-    fn draw_decoration_at(&mut self, g: &'static str, severity: Severity, col: u16, row: u16) {
+    fn draw_decoration_at(&mut self, g: &'static str, severity: Severity, col: u16, row: usize) {
+        let Ok(row) = u16::try_from(row) else {
+            return;
+        };
         self.renderer.draw_decoration_grapheme(
             Grapheme::new_decoration(g),
             self.styles.severity_style(severity),
@@ -172,10 +175,14 @@ impl Renderer<'_, '_> {
         let style = self.styles.severity_style(severity);
         for grapheme in formatter {
             last_row = grapheme.visual_pos.row;
+            let row = self.row.saturating_add(grapheme.visual_pos.row);
+            let Ok(row) = u16::try_from(row) else {
+                continue;
+            };
             self.renderer.draw_decoration_grapheme(
                 grapheme.raw,
                 style,
-                self.row + grapheme.visual_pos.row as u16,
+                row,
                 text_col + grapheme.visual_pos.col as u16,
             );
         }
@@ -188,7 +195,7 @@ impl Renderer<'_, '_> {
                 self.row += 1;
             }
         } else {
-            self.row += extra_lines as u16;
+            self.row = self.row.saturating_add(extra_lines);
         }
     }
 
@@ -298,8 +305,8 @@ impl Decoration for InlineDiagnostics {
         if let Some((eol_diagnostic, _)) = eol_diagnostic {
             let mut renderer = Renderer {
                 renderer,
-                first_row: pos.visual_line,
-                row: pos.visual_line,
+                first_row: pos.visual_line as usize,
+                row: pos.visual_line as usize,
                 config: &self.state.config,
                 styles: &self.styles,
             };
@@ -317,17 +324,18 @@ impl Decoration for InlineDiagnostics {
             .drain(..)
             .map(|(diagnostic, anchor)| (&diagnostics[diagnostic], anchor))
             .collect();
+        let first_row = (pos.visual_line as usize).saturating_add(virt_off.row);
         let mut renderer = Renderer {
             renderer,
-            first_row: pos.visual_line + virt_off.row as u16,
-            row: pos.visual_line + virt_off.row as u16,
+            first_row,
+            row: first_row,
             config: &self.state.config,
             styles: &self.styles,
         };
         renderer.draw_multi_diagnostics(&mut stack);
         renderer.draw_diagnostics(&mut stack);
         let horizontal_off = renderer.row - renderer.first_row;
-        Position::new(horizontal_off as usize, col_off as usize)
+        Position::new(horizontal_off, col_off as usize)
     }
 
     fn reset_pos(&mut self, pos: usize) -> usize {

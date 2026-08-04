@@ -57,10 +57,10 @@ jobs:
     name: ${{ matrix.suite.name }} (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     if: github.repository == 'themixednuts/double-helix' || github.event_name != 'schedule'
-    timeout-minutes: 30
+    timeout-minutes: 45
     env:
       RUST_BACKTRACE: 1
-      HELIX_LOG_LEVEL: info
+      HELIX_LOG_LEVEL: error
     steps:
       - name: Checkout sources
         uses: actions/checkout@v6

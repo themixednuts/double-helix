@@ -3,11 +3,12 @@ use crate::{
         ErrorCode, FileChange, FileChangeKind, FileChanges, RemoteError, ServerEvent, ServerFrame,
         Watch, WatchId, MAX_ACTIVE_WATCHES,
     },
+    server::ServerOutbound,
     workspace::{is_internal_path, relative_path, Workspace},
 };
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::{collections::HashMap, sync::Arc};
-use tokio::sync::{mpsc, Mutex, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 
 pub(crate) struct WatchTable {
     watches: Mutex<HashMap<WatchId, WatchHandle>>,
@@ -32,7 +33,7 @@ impl WatchTable {
         id: WatchId,
         request: Watch,
         workspace: Arc<Workspace>,
-        outbound: mpsc::Sender<ServerFrame>,
+        outbound: ServerOutbound,
     ) -> Result<(), RemoteError> {
         let slot = self.slots.clone().try_acquire_owned().map_err(|_| {
             RemoteError::new(ErrorCode::ResourceExhausted, "remote watch limit reached").retryable()

@@ -4,6 +4,7 @@ use crate::{
         RemoteError, ServerEvent, ServerFrame, MAX_ACTIVE_PROCESSES, MAX_PROCESS_ARGUMENTS,
         MAX_PROCESS_ENVIRONMENT, MAX_PROCESS_INPUT_BYTES, MAX_PROCESS_SPEC_BYTES,
     },
+    server::ServerOutbound,
     workspace::Workspace,
 };
 use serde_bytes::ByteBuf;
@@ -41,7 +42,7 @@ impl ProcessTable {
         self: &Arc<Self>,
         spec: ProcessSpec,
         workspace: Arc<Workspace>,
-        outbound: mpsc::Sender<ServerFrame>,
+        outbound: ServerOutbound,
     ) -> Result<(), RemoteError> {
         if !matches!(spec.kind, ProcessKind::Pipes) {
             return Err(RemoteError::new(
@@ -328,7 +329,7 @@ async fn forward_output(
     process: ProcessId,
     stream: ProcessStream,
     mut reader: impl AsyncRead + Unpin,
-    outbound: mpsc::Sender<ServerFrame>,
+    outbound: ServerOutbound,
 ) {
     let mut bytes = vec![0; PROCESS_OUTPUT_CHUNK_BYTES];
     loop {

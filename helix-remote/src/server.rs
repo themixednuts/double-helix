@@ -36,6 +36,54 @@ pub enum ServerError {
     WriterTask(#[from] tokio::task::JoinError),
 }
 
+#[derive(Clone)]
+pub(crate) struct ServerOutbound {
+    frames: mpsc::Sender<OutboundFrame>,
+}
+
+struct OutboundFrame {
+    frame: ServerFrame,
+    disposition: OutboundDisposition,
+}
+
+enum OutboundDisposition {
+    Continue,
+    Terminal,
+}
+
+#[derive(Debug)]
+pub(crate) struct OutboundClosed;
+
+impl ServerOutbound {
+    pub(crate) async fn send(&self, frame: ServerFrame) -> Result<(), OutboundClosed> {
+        self.send_frame(frame, OutboundDisposition::Continue).await
+    }
+
+    pub(crate) fn blocking_send(&self, frame: ServerFrame) -> Result<(), OutboundClosed> {
+        self.frames
+            .blocking_send(OutboundFrame {
+                frame,
+                disposition: OutboundDisposition::Continue,
+            })
+            .map_err(|_| OutboundClosed)
+    }
+
+    async fn send_terminal(&self, frame: ServerFrame) -> Result<(), OutboundClosed> {
+        self.send_frame(frame, OutboundDisposition::Terminal).await
+    }
+
+    async fn send_frame(
+        &self,
+        frame: ServerFrame,
+        disposition: OutboundDisposition,
+    ) -> Result<(), OutboundClosed> {
+        self.frames
+            .send(OutboundFrame { frame, disposition })
+            .await
+            .map_err(|_| OutboundClosed)
+    }
+}
+
 pub async fn run_stdio(server_version: impl Into<String>) -> Result<(), ServerError> {
     run_connection(tokio::io::stdin(), tokio::io::stdout(), server_version).await
 }
@@ -51,6 +99,9 @@ where
 {
     let state = Arc::new(ServerState::new(server_version.into()));
     let (outbound_tx, outbound_rx) = mpsc::channel(OUTBOUND_CAPACITY);
+    let outbound_tx = ServerOutbound {
+        frames: outbound_tx,
+    };
     let writer_task = tokio::spawn(write_frames(writer, outbound_rx));
     let mut codec = FrameCodec::with_limits(8 * 1024, MAX_REMOTE_FRAME_BYTES);
 
@@ -88,7 +139,9 @@ where
                 if matches!(request, ClientRequest::Shutdown) {
                     let result = state.handle(request, outbound_tx.clone(), token).await;
                     state.finish_request(id).await;
-                    let _ = outbound_tx.send(ServerFrame::Response { id, result }).await;
+                    let _ = outbound_tx
+                        .send_terminal(ServerFrame::Response { id, result })
+                        .await;
                     break;
                 }
 
@@ -132,14 +185,17 @@ where
 
 async fn write_frames<W>(
     mut writer: W,
-    mut outbound: mpsc::Receiver<ServerFrame>,
+    mut outbound: mpsc::Receiver<OutboundFrame>,
 ) -> Result<(), FrameError>
 where
     W: AsyncWrite + Unpin,
 {
     let mut codec = FrameCodec::with_limits(8 * 1024, MAX_REMOTE_FRAME_BYTES);
-    while let Some(frame) = outbound.recv().await {
-        codec.write(&mut writer, &frame).await?;
+    while let Some(outbound) = outbound.recv().await {
+        codec.write(&mut writer, &outbound.frame).await?;
+        if matches!(outbound.disposition, OutboundDisposition::Terminal) {
+            break;
+        }
     }
     Ok(())
 }
@@ -235,7 +291,7 @@ impl ServerState {
     async fn handle(
         self: &Arc<Self>,
         request: ClientRequest,
-        outbound: mpsc::Sender<ServerFrame>,
+        outbound: ServerOutbound,
         canceled: CancellationToken,
     ) -> Result<ServerResponse, RemoteError> {
         if let ClientRequest::Hello(hello) = request {
@@ -563,7 +619,7 @@ impl ServerState {
     async fn start_search(
         self: &Arc<Self>,
         request: SearchFiles,
-        outbound: mpsc::Sender<ServerFrame>,
+        outbound: ServerOutbound,
     ) -> Result<ServerResponse, RemoteError> {
         if request.query.len() > MAX_SEARCH_QUERY_BYTES || request.query.contains('\0') {
             return Err(RemoteError::new(
@@ -969,13 +1025,13 @@ async fn validate_expected_content(
 }
 
 async fn send_search_revision(
-    outbound: &mpsc::Sender<ServerFrame>,
+    outbound: &ServerOutbound,
     operation: OperationId,
     revision: u64,
     entries: Vec<SearchEntry>,
     scanned: u64,
     done: bool,
-) -> Result<(), mpsc::error::SendError<ServerFrame>> {
+) -> Result<(), OutboundClosed> {
     if entries.is_empty() {
         return outbound
             .send(ServerFrame::Event(ServerEvent::SearchBatch(SearchBatch {
@@ -1028,6 +1084,48 @@ fn canceled_error() -> RemoteError {
 mod tests {
     use super::*;
     use tokio::io::{duplex, split};
+
+    #[tokio::test]
+    async fn terminal_frame_ends_output_before_later_producer_events() {
+        let (frames, receiver) = mpsc::channel(3);
+        let outbound = ServerOutbound { frames };
+        let response = ServerFrame::Response {
+            id: RequestId(1),
+            result: Ok(ServerResponse::Pong { nonce: 1 }),
+        };
+        let terminal = ServerFrame::Response {
+            id: RequestId(2),
+            result: Ok(ServerResponse::Unit),
+        };
+        let trailing = ServerFrame::Response {
+            id: RequestId(3),
+            result: Ok(ServerResponse::Pong { nonce: 3 }),
+        };
+
+        outbound.send(response.clone()).await.unwrap();
+        outbound.send_terminal(terminal.clone()).await.unwrap();
+        outbound.send(trailing).await.unwrap();
+
+        let (mut client, server) = duplex(1024);
+        tokio::spawn(write_frames(server, receiver))
+            .await
+            .unwrap()
+            .unwrap();
+
+        let mut codec = FrameCodec::new();
+        assert_eq!(
+            codec.read::<ServerFrame, _>(&mut client).await.unwrap(),
+            response
+        );
+        assert_eq!(
+            codec.read::<ServerFrame, _>(&mut client).await.unwrap(),
+            terminal
+        );
+        assert!(matches!(
+            codec.read::<ServerFrame, _>(&mut client).await,
+            Err(FrameError::Io(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof
+        ));
+    }
 
     async fn request(
         codec: &mut FrameCodec,

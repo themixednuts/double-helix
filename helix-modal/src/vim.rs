@@ -308,9 +308,9 @@ impl VimEngine {
             }
             KeymapLookup::NotFound => EngineResult::Unbound,
             KeymapLookup::Cancelled(_) => EngineResult::Executed,
-            KeymapLookup::Fallback(command, ch) => {
+            KeymapLookup::Fallback(command, key) => {
                 self.execute_char_pending(
-                    editor, view_id, doc_id, command, ch, count_val, register,
+                    editor, view_id, doc_id, command, key, count_val, register,
                 );
                 EngineResult::Executed
             }
@@ -354,12 +354,12 @@ impl VimEngine {
                 self.motion_count = motion_count;
                 EngineResult::Pending
             }
-            KeymapLookup::Fallback(command, ch) => {
+            KeymapLookup::Fallback(command, key) => {
                 self.sub_mode = SubMode::Normal;
                 self.pending_display_buf.clear();
 
                 if let Some(cp) = self.registry.char_pending(command) {
-                    match (cp.resolve)(ch, total_count) {
+                    match (cp.resolve)(key, total_count) {
                         CharPendingResolution::Motion(motion) => {
                             motion(editor, view_id, doc_id, Movement::Extend);
                             self.execute_operator(
@@ -371,7 +371,7 @@ impl VimEngine {
                             );
                             self.last_action = Some(RecordedAction::OperatorMotion {
                                 operator: pending.operator,
-                                target: OperatorTargetId::CharPending(command, ch),
+                                target: OperatorTargetId::CharPending(command, key),
                                 motion_count: motion_count_nz,
                                 operator_count: pending.count,
                                 register: pending.register,
@@ -668,7 +668,7 @@ impl VimEngine {
         view_id: ViewId,
         doc_id: DocumentId,
         command: CharPendingId,
-        ch: char,
+        key: KeyEvent,
         count: usize,
         register: Option<char>,
     ) {
@@ -681,7 +681,7 @@ impl VimEngine {
             } else {
                 Movement::Move
             };
-            match (cp.resolve)(ch, count) {
+            match (cp.resolve)(key, count) {
                 CharPendingResolution::Motion(motion) => {
                     motion(editor, view_id, doc_id, movement);
                 }
@@ -869,9 +869,10 @@ impl EditingEngine for VimEngine {
                             self.execute_operator(editor, view_id, doc_id, operator, register);
                         }
                     }
-                    OperatorTargetId::CharPending(command, ch) => {
+                    OperatorTargetId::CharPending(command, key) => {
                         if let Some(cp) = self.registry.char_pending(command) {
-                            if let CharPendingResolution::Motion(motion) = (cp.resolve)(ch, total) {
+                            if let CharPendingResolution::Motion(motion) = (cp.resolve)(key, total)
+                            {
                                 motion(editor, view_id, doc_id, Movement::Extend);
                                 self.execute_operator(editor, view_id, doc_id, operator, register);
                             }

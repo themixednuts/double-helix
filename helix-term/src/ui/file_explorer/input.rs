@@ -1117,7 +1117,8 @@ impl ExplorerInputEngine {
         }
     }
 
-    fn action_for_char_pending(&self, id: CharPendingId, ch: char) -> Option<ExplorerAction> {
+    fn action_for_char_pending(&self, id: CharPendingId, key: KeyEvent) -> Option<ExplorerAction> {
+        let ch = key.char()?;
         let count = self.count.map(NonZeroUsize::get).unwrap_or(1);
         let mode_movement = if self.mode == Mode::Select {
             CoreMovement::Extend

@@ -194,18 +194,16 @@ impl Context<'_> {
                 };
                 let command = cp.id;
                 self.on_next_key(move |cx, event| {
-                    if let Some(ch) = event.char() {
-                        let Some(cp) = cx.registry.char_pending(command) else {
-                            return;
-                        };
-                        match (cp.resolve)(ch, count) {
-                            CharPendingResolution::Motion(motion) => {
-                                cx.editor
-                                    .apply_motion(move |ed| motion(ed, view_id, doc_id, movement));
-                            }
-                            CharPendingResolution::Action(action) => {
-                                action(cx.editor, view_id, doc_id, register);
-                            }
+                    let Some(cp) = cx.registry.char_pending(command) else {
+                        return;
+                    };
+                    match (cp.resolve)(event, count) {
+                        CharPendingResolution::Motion(motion) => {
+                            cx.editor
+                                .apply_motion(move |ed| motion(ed, view_id, doc_id, movement));
+                        }
+                        CharPendingResolution::Action(action) => {
+                            action(cx.editor, view_id, doc_id, register);
                         }
                     }
                 });

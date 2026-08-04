@@ -28,13 +28,17 @@ fn registry() -> Arc<Registry<Toy>> {
     builder.action(ActionId::new("mark"), |toy: &mut Toy, args| {
         toy.marks.push(format!("mark:{}", args.count));
     });
-    builder.char_pending(CharPendingId::new("find"), |ch, count| {
+    builder.char_pending(CharPendingId::new("find"), |key, count| {
+        let ch = key.char_value().expect("find test expects a character key");
         CharPendingCommand::Motion(Box::new(move |toy: &mut Toy, args| {
             assert_eq!(args.count, count);
             toy.pos += ch as usize % 10 + args.count;
         }))
     });
-    builder.char_pending(CharPendingId::new("replace"), |ch, count| {
+    builder.char_pending(CharPendingId::new("replace"), |key, count| {
+        let ch = key
+            .char_value()
+            .expect("replace test expects a character key");
         CharPendingCommand::Action(Box::new(move |toy: &mut Toy, args| {
             assert_eq!(args.count, count);
             toy.marks.push(format!("replace:{ch}:{}", args.count));
@@ -120,7 +124,7 @@ fn char_pending_motion_and_action_both_execute() {
             &mut toy,
             Mode::Normal,
             Key::char('f'),
-            Lookup::Fallback(CharPendingId::new("find"), 'a'),
+            Lookup::Fallback(CharPendingId::new("find"), Key::char('a')),
         ),
         EngineResult::Executed
     ));
@@ -131,7 +135,7 @@ fn char_pending_motion_and_action_both_execute() {
             &mut toy,
             Mode::Normal,
             Key::char('r'),
-            Lookup::Fallback(CharPendingId::new("replace"), 'x'),
+            Lookup::Fallback(CharPendingId::new("replace"), Key::char('x')),
         ),
         EngineResult::Executed
     ));

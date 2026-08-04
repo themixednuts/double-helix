@@ -23,8 +23,8 @@ pub enum Lookup {
     NotFound,
     /// A pending insert-mode key sequence was cancelled.
     Cancelled(Vec<Key>),
-    /// The key supplied the character for a char-pending command.
-    Fallback(CharPendingId, char),
+    /// The key supplied to a command waiting for one more input event.
+    Fallback(CharPendingId, Key),
 }
 
 /// Minimal keymap queries needed before command lookup.
@@ -63,7 +63,7 @@ pub enum OperatorTarget {
     /// A text object target.
     TextObject(TextObjectId, TextObject),
     /// A char-pending motion target.
-    CharPending(CharPendingId, char),
+    CharPending(CharPendingId, Key),
     /// A linewise doubled operator target.
     Linewise,
 }
@@ -234,9 +234,9 @@ pub(super) fn execute_target<Ctx>(
                 ((text_object.make)(total))(ctx, TextObjectArgs { count: total, kind });
             }
         }
-        OperatorTarget::CharPending(id, ch) => {
+        OperatorTarget::CharPending(id, key) => {
             if let Some(entry) = registry.char_pending(id) {
-                if let CharPendingCommand::Motion(motion) = (entry.resolve)(ch, total) {
+                if let CharPendingCommand::Motion(motion) = (entry.resolve)(key, total) {
                     motion(
                         ctx,
                         MotionArgs {

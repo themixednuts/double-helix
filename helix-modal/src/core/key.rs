@@ -283,8 +283,8 @@ pub struct CharActionArgs {
     pub count: usize,
     /// Selected register, if any.
     pub register: Option<char>,
-    /// Character supplied by the pending key.
-    pub ch: char,
+    /// Key supplied to the pending command.
+    pub key: Key,
 }
 
 /// A boxed motion implementation.

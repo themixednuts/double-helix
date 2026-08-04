@@ -45,7 +45,7 @@ pub struct ActionEntry<Ctx> {
 pub struct CharPendingEntry<Ctx> {
     /// Command identifier.
     pub id: CharPendingId,
-    pub(crate) resolve: Box<dyn Fn(char, usize) -> CharPendingCommand<Ctx> + Send + Sync + 'static>,
+    pub(crate) resolve: Box<dyn Fn(Key, usize) -> CharPendingCommand<Ctx> + Send + Sync + 'static>,
 }
 
 /// A command category resolved from a registry.
@@ -163,7 +163,7 @@ impl<Ctx> Builder<Ctx> {
     /// Register a char-pending command.
     pub fn char_pending<F>(&mut self, id: CharPendingId, resolve: F)
     where
-        F: Fn(char, usize) -> CharPendingCommand<Ctx> + Send + Sync + 'static,
+        F: Fn(Key, usize) -> CharPendingCommand<Ctx> + Send + Sync + 'static,
     {
         self.char_pending.push(CharPendingEntry {
             id,

@@ -10,6 +10,7 @@ use helix_view::commands::{editing, movement as mv};
 use helix_view::engine::{
     ActionId, CharPendingId, MotionFn, MotionId, OperatorId, TextObjectFn, TextObjectId,
 };
+use helix_view::input::{KeyCode, KeyEvent};
 use helix_view::{DocumentId, ViewId};
 use std::num::NonZeroUsize;
 use std::sync::OnceLock;
@@ -66,7 +67,7 @@ trait EngineCommandCatalog {
         name: &'static str,
         doc: &'static str,
         scope: CommandScope,
-        resolve: fn(char, usize) -> MotionFn,
+        resolve: fn(KeyEvent, usize) -> MotionFn,
     );
 }
 
@@ -139,7 +140,7 @@ impl EngineCommandCatalog for SpecCatalogBuilder {
         name: &'static str,
         doc: &'static str,
         scope: CommandScope,
-        _resolve: fn(char, usize) -> MotionFn,
+        _resolve: fn(KeyEvent, usize) -> MotionFn,
     ) {
         self.specs
             .push(EngineCommandSpec::char_pending(name, doc, scope));
@@ -229,13 +230,13 @@ impl EngineCommandCatalog for RegistryCatalogBuilder {
         name: &'static str,
         _doc: &'static str,
         _scope: CommandScope,
-        resolve: fn(char, usize) -> MotionFn,
+        resolve: fn(KeyEvent, usize) -> MotionFn,
     ) {
         self.registry
             .register(CommandKind::CharPending(CharPendingEntry {
                 id: CharPendingId::new(name),
-                resolve: Box::new(move |ch, count| {
-                    CharPendingResolution::Motion(resolve(ch, count))
+                resolve: Box::new(move |key, count| {
+                    CharPendingResolution::Motion(resolve(key, count))
                 }),
             }));
     }
@@ -868,7 +869,18 @@ fn register_operators(catalog: &mut impl EngineCommandCatalog) {
         CommandScope::Viewport,
         |ed, vid, did, register| {
             let r = register.unwrap_or_else(|| ed.config().default_yank_register);
-            editing::change_selection(ed, vid, did, r, true);
+            if editing::change_selection(ed, vid, did, r, true) {
+                editing::open(
+                    ed,
+                    vid,
+                    did,
+                    1,
+                    editing::Open::Above,
+                    editing::CommentContinuation::Disabled,
+                );
+            } else {
+                ed.mode = helix_view::document::Mode::Insert;
+            }
         },
     );
     catalog.operator(
@@ -877,7 +889,18 @@ fn register_operators(catalog: &mut impl EngineCommandCatalog) {
         CommandScope::Viewport,
         |ed, vid, did, register| {
             let r = register.unwrap_or_else(|| ed.config().default_yank_register);
-            editing::change_selection(ed, vid, did, r, false);
+            if editing::change_selection(ed, vid, did, r, false) {
+                editing::open(
+                    ed,
+                    vid,
+                    did,
+                    1,
+                    editing::Open::Above,
+                    editing::CommentContinuation::Disabled,
+                );
+            } else {
+                ed.mode = helix_view::document::Mode::Insert;
+            }
         },
     );
     catalog.operator(
@@ -1735,15 +1758,31 @@ fn register_actions(catalog: &mut impl EngineCommandCatalog) {
 
 // ─── CharPending (wait for next char, then execute) ──────────────────
 
+fn char_pending_no_op() -> MotionFn {
+    Box::new(|_, _, _, _| {})
+}
+
+fn find_target(key: KeyEvent) -> Option<mv::FindTarget> {
+    match key.code {
+        KeyCode::Char(character) => Some(mv::FindTarget::Character(character)),
+        KeyCode::Tab => Some(mv::FindTarget::Character('\t')),
+        KeyCode::Enter => Some(mv::FindTarget::LineEnding),
+        _ => None,
+    }
+}
+
 fn register_char_pending(catalog: &mut impl EngineCommandCatalog) {
     // Find char motions (f/t/F/T)
     catalog.char_pending(
         "find_next_char",
         "Move to next occurrence of char",
         CommandScope::Viewport,
-        |ch, count| {
+        |key, count| {
+            let Some(target) = find_target(key) else {
+                return char_pending_no_op();
+            };
             Box::new(move |ed, vid, did, m| {
-                mv::find_char(ed, vid, did, ch, Direction::Forward, true, count, m)
+                mv::find_char(ed, vid, did, target, Direction::Forward, true, count, m)
             })
         },
     );
@@ -1751,9 +1790,12 @@ fn register_char_pending(catalog: &mut impl EngineCommandCatalog) {
         "find_till_char",
         "Move till next occurrence of char",
         CommandScope::Viewport,
-        |ch, count| {
+        |key, count| {
+            let Some(target) = find_target(key) else {
+                return char_pending_no_op();
+            };
             Box::new(move |ed, vid, did, m| {
-                mv::find_char(ed, vid, did, ch, Direction::Forward, false, count, m)
+                mv::find_char(ed, vid, did, target, Direction::Forward, false, count, m)
             })
         },
     );
@@ -1761,9 +1803,12 @@ fn register_char_pending(catalog: &mut impl EngineCommandCatalog) {
         "find_prev_char",
         "Move to previous occurrence of char",
         CommandScope::Viewport,
-        |ch, count| {
+        |key, count| {
+            let Some(target) = find_target(key) else {
+                return char_pending_no_op();
+            };
             Box::new(move |ed, vid, did, m| {
-                mv::find_char(ed, vid, did, ch, Direction::Backward, true, count, m)
+                mv::find_char(ed, vid, did, target, Direction::Backward, true, count, m)
             })
         },
     );
@@ -1771,9 +1816,12 @@ fn register_char_pending(catalog: &mut impl EngineCommandCatalog) {
         "till_prev_char",
         "Move till previous occurrence of char",
         CommandScope::Viewport,
-        |ch, count| {
+        |key, count| {
+            let Some(target) = find_target(key) else {
+                return char_pending_no_op();
+            };
             Box::new(move |ed, vid, did, m| {
-                mv::find_char(ed, vid, did, ch, Direction::Backward, false, count, m)
+                mv::find_char(ed, vid, did, target, Direction::Backward, false, count, m)
             })
         },
     );
@@ -1783,13 +1831,16 @@ fn register_char_pending(catalog: &mut impl EngineCommandCatalog) {
         "extend_next_char",
         "Extend to next occurrence of char",
         CommandScope::Viewport,
-        |ch, count| {
+        |key, count| {
+            let Some(target) = find_target(key) else {
+                return char_pending_no_op();
+            };
             Box::new(move |ed, vid, did, _m| {
                 mv::find_char(
                     ed,
                     vid,
                     did,
-                    ch,
+                    target,
                     Direction::Forward,
                     true,
                     count,
@@ -1802,13 +1853,16 @@ fn register_char_pending(catalog: &mut impl EngineCommandCatalog) {
         "extend_till_char",
         "Extend till next occurrence of char",
         CommandScope::Viewport,
-        |ch, count| {
+        |key, count| {
+            let Some(target) = find_target(key) else {
+                return char_pending_no_op();
+            };
             Box::new(move |ed, vid, did, _m| {
                 mv::find_char(
                     ed,
                     vid,
                     did,
-                    ch,
+                    target,
                     Direction::Forward,
                     false,
                     count,
@@ -1821,13 +1875,16 @@ fn register_char_pending(catalog: &mut impl EngineCommandCatalog) {
         "extend_prev_char",
         "Extend to previous occurrence of char",
         CommandScope::Viewport,
-        |ch, count| {
+        |key, count| {
+            let Some(target) = find_target(key) else {
+                return char_pending_no_op();
+            };
             Box::new(move |ed, vid, did, _m| {
                 mv::find_char(
                     ed,
                     vid,
                     did,
-                    ch,
+                    target,
                     Direction::Backward,
                     true,
                     count,
@@ -1840,13 +1897,16 @@ fn register_char_pending(catalog: &mut impl EngineCommandCatalog) {
         "extend_till_prev_char",
         "Extend till previous occurrence of char",
         CommandScope::Viewport,
-        |ch, count| {
+        |key, count| {
+            let Some(target) = find_target(key) else {
+                return char_pending_no_op();
+            };
             Box::new(move |ed, vid, did, _m| {
                 mv::find_char(
                     ed,
                     vid,
                     did,
-                    ch,
+                    target,
                     Direction::Backward,
                     false,
                     count,
@@ -1863,7 +1923,10 @@ fn register_char_pending(catalog: &mut impl EngineCommandCatalog) {
         "select_textobject_inside_surrounding_pair",
         "Select inside surrounding pair",
         CommandScope::Viewport,
-        |ch, count| {
+        |key, count| {
+            let Some(ch) = key.char() else {
+                return char_pending_no_op();
+            };
             Box::new(move |ed, vid, did, _movement| {
                 editing::textobject_surrounding_pair(
                     ed,
@@ -1881,7 +1944,10 @@ fn register_char_pending(catalog: &mut impl EngineCommandCatalog) {
         "select_textobject_around_surrounding_pair",
         "Select around surrounding pair",
         CommandScope::Viewport,
-        |ch, count| {
+        |key, count| {
+            let Some(ch) = key.char() else {
+                return char_pending_no_op();
+            };
             Box::new(move |ed, vid, did, _movement| {
                 editing::textobject_surrounding_pair(
                     ed,
@@ -1899,7 +1965,10 @@ fn register_char_pending(catalog: &mut impl EngineCommandCatalog) {
         "select_textobject_inside_prev_pair",
         "Select inside previous pair",
         CommandScope::Viewport,
-        |ch, count| {
+        |key, count| {
+            let Some(ch) = key.char() else {
+                return char_pending_no_op();
+            };
             Box::new(move |ed, vid, did, _movement| {
                 editing::textobject_surrounding_pair(
                     ed,
@@ -1917,7 +1986,10 @@ fn register_char_pending(catalog: &mut impl EngineCommandCatalog) {
         "select_textobject_inside_next_pair",
         "Select inside next pair",
         CommandScope::Viewport,
-        |ch, count| {
+        |key, count| {
+            let Some(ch) = key.char() else {
+                return char_pending_no_op();
+            };
             Box::new(move |ed, vid, did, _movement| {
                 editing::textobject_surrounding_pair(
                     ed,

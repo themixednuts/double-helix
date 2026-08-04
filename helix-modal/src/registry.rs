@@ -10,6 +10,7 @@ use helix_view::engine::{
     ActionId, CharPendingId, CommandToken, MotionFn, MotionId, OperatorId, TextObjectFn,
     TextObjectId,
 };
+use helix_view::input::KeyEvent;
 use helix_view::{DocumentId, Editor, ViewId};
 use std::num::NonZeroUsize;
 
@@ -194,7 +195,7 @@ pub enum CharPendingResolution {
 pub struct CharPendingEntry {
     pub id: CharPendingId,
     /// After receiving the character, produces a motion or direct action.
-    pub resolve: Box<dyn Fn(char, usize) -> CharPendingResolution + Send + Sync>,
+    pub resolve: Box<dyn Fn(KeyEvent, usize) -> CharPendingResolution + Send + Sync>,
 }
 
 /// Mutable builder for assembling a command registry at startup.

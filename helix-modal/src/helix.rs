@@ -277,7 +277,7 @@ impl HelixEngine {
         view_id: ViewId,
         doc_id: DocumentId,
         command: CharPendingId,
-        ch: char,
+        key: KeyEvent,
         count: usize,
         register: Option<char>,
     ) -> EngineResult {
@@ -286,7 +286,7 @@ impl HelixEngine {
             return EngineResult::Unbound;
         };
 
-        match (cp.resolve)(ch, count) {
+        match (cp.resolve)(key, count) {
             CharPendingResolution::Motion(motion) => {
                 let movement = movement_from_mode(editor);
                 motion(editor, view_id, doc_id, movement);
@@ -493,9 +493,10 @@ impl EditingEngine for HelixEngine {
                             );
                         }
                     }
-                    OperatorTargetId::CharPending(command, ch) => {
+                    OperatorTargetId::CharPending(command, key) => {
                         if let Some(cp) = self.registry.char_pending(command) {
-                            if let CharPendingResolution::Motion(motion) = (cp.resolve)(ch, total) {
+                            if let CharPendingResolution::Motion(motion) = (cp.resolve)(key, total)
+                            {
                                 motion(editor, view_id, doc_id, Movement::Extend);
                             }
                         }

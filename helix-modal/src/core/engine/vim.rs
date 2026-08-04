@@ -314,10 +314,10 @@ impl<Ctx> Engine<Ctx> for Vim<Ctx> {
                         }
                         Lookup::NotFound => EngineResult::Unbound,
                         Lookup::Cancelled(_) => EngineResult::Executed,
-                        Lookup::Fallback(command, ch) => {
+                        Lookup::Fallback(command, key) => {
                             let count = count.map_or(1, NonZeroUsize::get);
                             if let Some(entry) = self.registry.char_pending(command) {
-                                match (entry.resolve)(ch, count) {
+                                match (entry.resolve)(key, count) {
                                     CharPendingCommand::Motion(motion) => motion(
                                         ctx,
                                         MotionArgs {
@@ -330,7 +330,7 @@ impl<Ctx> Engine<Ctx> for Vim<Ctx> {
                                         CharActionArgs {
                                             count,
                                             register,
-                                            ch,
+                                            key,
                                         },
                                     ),
                                 }
@@ -358,11 +358,11 @@ impl<Ctx> Engine<Ctx> for Vim<Ctx> {
                         self.motion_count = motion_count;
                         EngineResult::Pending
                     }
-                    Lookup::Fallback(command, ch) => {
+                    Lookup::Fallback(command, key) => {
                         self.sub_mode = SubMode::Normal;
                         self.pending_display.clear();
                         if let Some(entry) = self.registry.char_pending(command) {
-                            match (entry.resolve)(ch, total_count) {
+                            match (entry.resolve)(key, total_count) {
                                 CharPendingCommand::Motion(motion) => {
                                     motion(
                                         ctx,
@@ -374,7 +374,7 @@ impl<Ctx> Engine<Ctx> for Vim<Ctx> {
                                     self.execute_operator(ctx, pending.operator, pending.register);
                                     self.last_action = Some(RecordedAction::OperatorMotion {
                                         operator: pending.operator,
-                                        target: OperatorTarget::CharPending(command, ch),
+                                        target: OperatorTarget::CharPending(command, key),
                                         motion_count: motion_count_nz,
                                         operator_count: pending.count,
                                         register: pending.register,
@@ -386,7 +386,7 @@ impl<Ctx> Engine<Ctx> for Vim<Ctx> {
                                         CharActionArgs {
                                             count: total_count,
                                             register: pending.register,
-                                            ch,
+                                            key,
                                         },
                                     );
                                 }

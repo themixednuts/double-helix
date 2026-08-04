@@ -93,7 +93,7 @@ impl<Ctx> Helix<Ctx> {
         &self,
         ctx: &mut Ctx,
         command: CharPendingId,
-        ch: char,
+        key: Key,
         count: usize,
         register: Option<char>,
         extend: bool,
@@ -101,7 +101,7 @@ impl<Ctx> Helix<Ctx> {
         let Some(entry) = self.registry.char_pending(command) else {
             return EngineResult::Unbound;
         };
-        match (entry.resolve)(ch, count) {
+        match (entry.resolve)(key, count) {
             CharPendingCommand::Motion(motion) => {
                 motion(
                     ctx,
@@ -117,7 +117,7 @@ impl<Ctx> Helix<Ctx> {
                     CharActionArgs {
                         count,
                         register,
-                        ch,
+                        key,
                     },
                 );
             }
@@ -181,8 +181,8 @@ impl<Ctx> Engine<Ctx> for Helix<Ctx> {
                     .char_value()
                     .map_or(EngineResult::Unbound, EngineResult::InsertChar),
                 Lookup::Cancelled(keys) => EngineResult::CancelledInsert(keys),
-                Lookup::Fallback(command, ch) => {
-                    self.execute_char_pending(ctx, command, ch, 1, None, false)
+                Lookup::Fallback(command, key) => {
+                    self.execute_char_pending(ctx, command, key, 1, None, false)
                 }
             }
         } else {
@@ -201,8 +201,8 @@ impl<Ctx> Engine<Ctx> for Helix<Ctx> {
                 Lookup::Pending => EngineResult::Pending,
                 Lookup::NotFound => EngineResult::Unbound,
                 Lookup::Cancelled(_) => EngineResult::Executed,
-                Lookup::Fallback(command, ch) => {
-                    self.execute_char_pending(ctx, command, ch, count_value, register, extend)
+                Lookup::Fallback(command, key) => {
+                    self.execute_char_pending(ctx, command, key, count_value, register, extend)
                 }
             };
             if !matches!(result, EngineResult::Pending) {

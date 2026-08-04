@@ -8,7 +8,7 @@ use helix_view::{
     document::Mode,
     engine::{CharPendingBinding, KeymapLookup},
     info::Info,
-    input::KeyEvent,
+    input::{KeyCode, KeyEvent},
     keymap::{
         FrontendIntentId, ModalCommandBinding, ModalIntent, ModalIntentBinding, ModalIntentTrie,
         ModalIntentTrieNode, ModalKeyTrie, ModalKeyTrieNode,
@@ -315,7 +315,7 @@ pub enum KeymapResult {
     /// Key is invalid in combination with previous keys. Contains keys leading upto
     /// and including current (invalid) key.
     Cancelled(Vec<KeyEvent>),
-    Fallback(helix_view::engine::CharPendingId, char),
+    Fallback(helix_view::engine::CharPendingId, KeyEvent),
 }
 
 /// A map of command names to keybinds that will execute the command.
@@ -508,10 +508,10 @@ fn lookup_keymap(
             KeymapResult::MatchedSequence(cmds.clone())
         }
         None => {
-            if let Some(ch) = key.char() {
+            if matches!(key.code, KeyCode::Char(_) | KeyCode::Enter | KeyCode::Tab) {
                 if let Some(fallback) = trie.search_fallback(&state[1..]) {
                     state.clear();
-                    return KeymapResult::Fallback(fallback.id(), ch);
+                    return KeymapResult::Fallback(fallback.id(), key);
                 }
             }
 
@@ -727,7 +727,7 @@ pub fn resolve_keymap_result(result: &KeymapResult) -> KeymapLookup {
         KeymapResult::Pending(node) => KeymapLookup::Pending(Some(node.infobox())),
         KeymapResult::NotFound => KeymapLookup::NotFound,
         KeymapResult::Cancelled(keys) => KeymapLookup::Cancelled(keys.clone().into_boxed_slice()),
-        KeymapResult::Fallback(fallback, ch) => KeymapLookup::Fallback(*fallback, *ch),
+        KeymapResult::Fallback(fallback, key) => KeymapLookup::Fallback(*fallback, *key),
     }
 }
 
@@ -962,6 +962,23 @@ mod tests {
     fn check_duplicate_keys_in_default_keymap() {
         // will panic on duplicate keys, assumes that `Keymaps` uses keymap! macro
         Keymaps::default();
+    }
+
+    #[test]
+    fn char_pending_fallback_preserves_character_tab_and_enter_keys() {
+        for target in [key!('x'), key!(Tab), key!(Enter)] {
+            let mut keymaps = Keymaps::default();
+            assert!(matches!(
+                keymaps.get(Mode::Normal, key!('f')),
+                KeymapResult::Pending(_)
+            ));
+            assert!(matches!(
+                keymaps.get(Mode::Normal, target),
+                KeymapResult::Fallback(id, key)
+                    if id == helix_view::engine::CharPendingId::new("find_next_char")
+                        && key == target
+            ));
+        }
     }
 
     #[test]

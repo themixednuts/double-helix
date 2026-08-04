@@ -7,7 +7,7 @@ use helix_core::{
     char_idx_at_visual_offset,
     doc_formatter::TextFormat,
     graphemes::{self, next_folded_grapheme_boundary, prev_folded_grapheme_boundary},
-    line_ending::line_end_char_index,
+    line_ending::{line_end_char_index, rope_is_line_ending},
     movement::{
         move_horizontally, move_next_paragraph, move_prev_paragraph, move_vertically,
         move_vertically_visual, Direction, Movement,
@@ -28,6 +28,21 @@ use crate::{DocumentId, Editor, ViewId};
 
 pub type DirectionalMoveFn =
     fn(RopeSlice, Range, Direction, usize, Movement, &TextFormat, &mut TextAnnotations) -> Range;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FindTarget {
+    Character(char),
+    LineEnding,
+}
+
+impl GraphemeMatcher for FindTarget {
+    fn grapheme_match(&self, grapheme: RopeSlice) -> bool {
+        match *self {
+            Self::Character(character) => character.grapheme_match(grapheme),
+            Self::LineEnding => rope_is_line_ending(grapheme),
+        }
+    }
+}
 
 /// Core primitive for directional movements (char, line, visual line).
 ///
@@ -1563,7 +1578,7 @@ pub fn find_char(
     editor: &mut Editor,
     view_id: ViewId,
     doc_id: DocumentId,
-    ch: char,
+    target: FindTarget,
     direction: Direction,
     inclusive: bool,
     count: usize,
@@ -1575,7 +1590,7 @@ pub fn find_char(
         Direction::Backward => find_prev_char_impl,
     };
     editor.with_view_doc_mut(view_id, doc_id, |view, doc| {
-        find_char_in(view, doc, &search_fn, inclusive, extend, ch, count);
+        find_char_in(view, doc, &search_fn, inclusive, extend, target, count);
     });
 }
 

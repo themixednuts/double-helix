@@ -144,7 +144,7 @@ pub enum ModalLookup<T> {
     Pending(Option<Info>),
     NotFound,
     Cancelled(Box<[KeyEvent]>),
-    Fallback(CharPendingId, char),
+    Fallback(CharPendingId, KeyEvent),
 }
 
 pub struct ModalKeymapState<T> {
@@ -254,10 +254,10 @@ fn lookup_keymap<T: Copy>(
             ModalLookup::MatchedSequence(targets.into_boxed_slice())
         }
         None => {
-            if let Some(ch) = key.char() {
+            if matches!(key.code, KeyCode::Char(_) | KeyCode::Enter | KeyCode::Tab) {
                 if let Some(fallback) = trie.search_fallback(&state[1..]) {
                     state.clear();
-                    return ModalLookup::Fallback(fallback.id(), ch);
+                    return ModalLookup::Fallback(fallback.id(), key);
                 }
             }
             ModalLookup::Cancelled(std::mem::take(state).into_boxed_slice())

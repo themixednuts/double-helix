@@ -36,7 +36,7 @@ pub enum KeymapLookup {
     /// Multi-key sequence was cancelled. Contains the buffered keys.
     Cancelled(Box<[KeyEvent]>),
     /// Matched a fallback command (text object surround, etc.).
-    Fallback(CharPendingId, char),
+    Fallback(CharPendingId, KeyEvent),
 }
 
 /// Read-only keymap queries used by the engine for count/register decisions.
@@ -181,7 +181,7 @@ pub enum RepeatableCommandId {
 pub enum OperatorTargetId {
     Motion(MotionId),
     TextObject(TextObjectId),
-    CharPending(CharPendingId, char),
+    CharPending(CharPendingId, KeyEvent),
     Linewise,
 }
 

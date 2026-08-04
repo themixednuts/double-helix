@@ -13,6 +13,7 @@ use crate::{
 };
 use helix_core::{
     auto_pairs, comment,
+    doc_formatter::TextFormat,
     graphemes::{self, prev_grapheme_boundary},
     increment as hx_increment,
     line_ending::line_end_char_index,
@@ -125,6 +126,160 @@ pub fn append_mode(editor: &mut Editor, view_id: ViewId, doc_id: DocumentId) {
         )
     });
     doc.set_selection(view_id, selection);
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Open {
+    Below,
+    Above,
+}
+
+impl Open {
+    pub fn from_signature_help_position(pos: &crate::editor::SignatureHelpPosition) -> Self {
+        match pos {
+            crate::editor::SignatureHelpPosition::Above => Self::Above,
+            crate::editor::SignatureHelpPosition::Below => Self::Below,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum CommentContinuation {
+    Enabled,
+    Disabled,
+}
+
+/// Open one or more lines above or below every selection and enter insert mode.
+pub fn open(
+    editor: &mut Editor,
+    view_id: ViewId,
+    doc_id: DocumentId,
+    count: usize,
+    open: Open,
+    comment_continuation: CommentContinuation,
+) {
+    editor.mode = Mode::Insert;
+    let config = editor.config();
+    let doc = crate::doc!(editor, &doc_id);
+    let view = crate::view!(editor, view_id);
+    let loader = editor.syn_loader.load();
+    let mut annotations = view.text_annotations(doc, None);
+
+    let text = doc.text().slice(..);
+    let contents = doc.text();
+    let selection = doc.selection(view_id);
+    let mut offs = 0;
+    let mut ranges = SmallVec::with_capacity(selection.len());
+    let continue_comment_tokens =
+        if comment_continuation == CommentContinuation::Enabled && config.continue_comments {
+            doc.language_config()
+                .and_then(|config| config.comment_tokens.as_ref())
+        } else {
+            None
+        };
+
+    let mut transaction = Transaction::change_by_selection(contents, selection, |range| {
+        let (range, open) = (open == Open::Below)
+            .then(|| {
+                let next_line_is_folded = {
+                    let next_line = text.char_to_line(prev_grapheme_boundary(text, range.to())) + 1;
+                    annotations
+                        .folds
+                        .superest_fold_containing(next_line, |fold| fold.start.line..=fold.end.line)
+                        .is_some()
+                };
+
+                next_line_is_folded.then(|| {
+                    movement::move_vertically(
+                        text,
+                        *range,
+                        Direction::Forward,
+                        1,
+                        Movement::Move,
+                        &TextFormat::default(),
+                        &mut annotations,
+                    )
+                })
+            })
+            .flatten()
+            .map_or((*range, open), |range| (range, Open::Above));
+
+        let curr_line_num = text.char_to_line(match open {
+            Open::Below => graphemes::prev_grapheme_boundary(text, range.to()),
+            Open::Above => range.from(),
+        });
+        let next_new_line_num = match open {
+            Open::Below => curr_line_num + 1,
+            Open::Above => curr_line_num,
+        };
+        let above_next_new_line_num = next_new_line_num.saturating_sub(1);
+        let continue_comment_token = continue_comment_tokens
+            .and_then(|tokens| comment::get_comment_token(text, tokens, curr_line_num));
+        let (above_next_line_end_index, above_next_line_end_width) = if next_new_line_num == 0 {
+            (0, 0)
+        } else {
+            (
+                line_end_char_index(&text, above_next_new_line_num),
+                doc.line_ending().len_chars(),
+            )
+        };
+
+        let line = text.line(curr_line_num);
+        let indent = match line.first_non_whitespace_char() {
+            Some(pos) if continue_comment_token.is_some() => line.slice(..pos).to_string(),
+            _ => doc.indent_for_newline(
+                &loader,
+                &config.indent_heuristic,
+                text,
+                above_next_new_line_num,
+                above_next_line_end_index,
+                curr_line_num,
+            ),
+        };
+        let indent_len = indent.len();
+        let mut inserted = String::with_capacity(1 + indent_len);
+
+        if open == Open::Above && next_new_line_num == 0 {
+            inserted.push_str(&indent);
+            if let Some(token) = continue_comment_token {
+                inserted.push_str(token);
+                inserted.push(' ');
+            }
+            inserted.push_str(doc.line_ending().as_str());
+        } else {
+            inserted.push_str(doc.line_ending().as_str());
+            inserted.push_str(&indent);
+            if let Some(token) = continue_comment_token {
+                inserted.push_str(token);
+                inserted.push(' ');
+            }
+        }
+
+        let inserted = inserted.repeat(count);
+        let pos = offs + above_next_line_end_index + above_next_line_end_width;
+        let comment_len = continue_comment_token
+            .map(|token| token.len() + 1)
+            .unwrap_or_default();
+        for i in 0..count {
+            ranges.push(Range::point(
+                pos + (i * (doc.line_ending().len_chars() + indent_len + comment_len))
+                    + indent_len
+                    + comment_len,
+            ));
+        }
+        offs += inserted.chars().count();
+
+        (
+            above_next_line_end_index,
+            above_next_line_end_index,
+            Some(inserted.into()),
+        )
+    });
+    drop(annotations);
+
+    transaction = transaction.with_selection(Selection::new(ranges, selection.primary_index()));
+    let doc = crate::doc_mut!(editor, &doc_id);
+    doc.apply(&transaction, view_id);
 }
 
 /// Rotate the primary selection index forward.

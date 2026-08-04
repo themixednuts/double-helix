@@ -23,15 +23,13 @@ pub use typed::*;
 use helix_core::{
     chars::char_is_word,
     command_line::{self, Args},
-    comment,
-    doc_formatter::TextFormat,
     encoding, find_workspace,
     graphemes::{self, next_grapheme_boundary, prev_grapheme_boundary},
     history::UndoKind,
     indent::IndentStyle,
     line_ending::{get_line_ending_of_str, line_end_char_index},
     match_brackets,
-    movement::{self, move_vertically, Direction},
+    movement::{self, Direction},
     regex::{self, Regex},
     selection,
     syntax::config::LanguageServerFeature,
@@ -2759,172 +2757,19 @@ pub(crate) async fn make_format_task_event(
     })
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Open {
-    Below,
-    Above,
-}
-
-impl Open {
-    pub fn from_signature_help_position(pos: &helix_view::editor::SignatureHelpPosition) -> Self {
-        match pos {
-            helix_view::editor::SignatureHelpPosition::Above => Self::Above,
-            helix_view::editor::SignatureHelpPosition::Below => Self::Below,
-        }
-    }
-}
-
-#[derive(PartialEq)]
-pub enum CommentContinuation {
-    Enabled,
-    Disabled,
-}
+pub use helix_view::commands::editing::{CommentContinuation, Open};
 
 fn open(cx: &mut Context, open: Open, comment_continuation: CommentContinuation) {
-    let count = cx.count();
-    enter_insert_mode(cx);
-    let config = cx.editor.config();
-    let (view_id, doc) = focused!(cx.editor);
-    let view = view!(cx.editor, view_id);
-    let loader = cx.editor.syn_loader.load();
-    let mut annotations = view.text_annotations(doc, None);
-
-    let text = doc.text().slice(..);
-    let contents = doc.text();
-    let selection = doc.selection(view_id);
-    let mut offs = 0;
-
-    let mut ranges = SmallVec::with_capacity(selection.len());
-
-    let continue_comment_tokens =
-        if comment_continuation == CommentContinuation::Enabled && config.continue_comments {
-            doc.language_config()
-                .and_then(|config| config.comment_tokens.as_ref())
-        } else {
-            None
-        };
-
-    let mut transaction = Transaction::change_by_selection(contents, selection, |range| {
-        // if open is Below and next line is folded,
-        // move the range to the next visible line, and open Above
-        let (range, open) = (open == Open::Below)
-            .then(|| {
-                let next_line_is_folded = {
-                    let next_line = text.char_to_line(prev_grapheme_boundary(text, range.to())) + 1;
-                    annotations
-                        .folds
-                        .superest_fold_containing(next_line, |fold| fold.start.line..=fold.end.line)
-                        .is_some()
-                };
-
-                next_line_is_folded.then(|| {
-                    move_vertically(
-                        text,
-                        *range,
-                        Direction::Forward,
-                        1,
-                        Movement::Move,
-                        &TextFormat::default(),
-                        &mut annotations,
-                    )
-                })
-            })
-            .flatten()
-            .map_or((*range, open), |range| (range, Open::Above));
-
-        // the line number, where the cursor is currently
-        let curr_line_num = text.char_to_line(match open {
-            Open::Below => graphemes::prev_grapheme_boundary(text, range.to()),
-            Open::Above => range.from(),
-        });
-
-        // the next line number, where the cursor will be, after finishing the transaction
-        let next_new_line_num = match open {
-            Open::Below => curr_line_num + 1,
-            Open::Above => curr_line_num,
-        };
-
-        let above_next_new_line_num = next_new_line_num.saturating_sub(1);
-
-        let continue_comment_token = continue_comment_tokens
-            .and_then(|tokens| comment::get_comment_token(text, tokens, curr_line_num));
-
-        // Index to insert newlines after, as well as the char width
-        // to use to compensate for those inserted newlines.
-        let (above_next_line_end_index, above_next_line_end_width) = if next_new_line_num == 0 {
-            (0, 0)
-        } else {
-            (
-                line_end_char_index(&text, above_next_new_line_num),
-                doc.line_ending().len_chars(),
-            )
-        };
-
-        let line = text.line(curr_line_num);
-        let indent = match line.first_non_whitespace_char() {
-            Some(pos) if continue_comment_token.is_some() => line.slice(..pos).to_string(),
-            _ => doc.indent_for_newline(
-                &loader,
-                &config.indent_heuristic,
-                text,
-                above_next_new_line_num,
-                above_next_line_end_index,
-                curr_line_num,
-            ),
-        };
-
-        let indent_len = indent.len();
-        let mut text = String::with_capacity(1 + indent_len);
-
-        if open == Open::Above && next_new_line_num == 0 {
-            text.push_str(&indent);
-            if let Some(token) = continue_comment_token {
-                text.push_str(token);
-                text.push(' ');
-            }
-            text.push_str(doc.line_ending().as_str());
-        } else {
-            text.push_str(doc.line_ending().as_str());
-            text.push_str(&indent);
-
-            if let Some(token) = continue_comment_token {
-                text.push_str(token);
-                text.push(' ');
-            }
-        }
-
-        let text = text.repeat(count);
-
-        // calculate new selection ranges
-        let pos = offs + above_next_line_end_index + above_next_line_end_width;
-        let comment_len = continue_comment_token
-            .map(|token| token.len() + 1) // `+ 1` for the extra space added
-            .unwrap_or_default();
-        for i in 0..count {
-            // pos                     -> beginning of reference line,
-            // + (i * (line_ending_len + indent_len + comment_len)) -> beginning of i'th line from pos (possibly including comment token)
-            // + indent_len + comment_len ->        -> indent for i'th line
-            ranges.push(Range::point(
-                pos + (i * (doc.line_ending().len_chars() + indent_len + comment_len))
-                    + indent_len
-                    + comment_len,
-            ));
-        }
-
-        // update the offset for the next range
-        offs += text.chars().count();
-
-        (
-            above_next_line_end_index,
-            above_next_line_end_index,
-            Some(text.into()),
-        )
-    });
-    drop(annotations);
-
-    transaction = transaction.with_selection(Selection::new(ranges, selection.primary_index()));
-
-    doc.apply(&transaction, view_id);
+    let view_id = cx.editor.focused_view_id();
+    let doc_id = cx.editor.focused_document_id();
+    helix_view::commands::editing::open(
+        cx.editor,
+        view_id,
+        doc_id,
+        cx.count(),
+        open,
+        comment_continuation,
+    );
 }
 
 // o inserts a new line after each line with a selection

@@ -819,8 +819,8 @@ mod tests {
             .unwrap();
         assert!(resolved.root.is_root());
         assert_eq!(
-            std::path::PathBuf::from(&resolved.absolute_path),
-            workspace.path()
+            std::fs::canonicalize(&resolved.absolute_path).unwrap(),
+            std::fs::canonicalize(workspace.path()).unwrap()
         );
         assert_eq!(url::Url::parse(&resolved.uri).unwrap().scheme(), "file");
 

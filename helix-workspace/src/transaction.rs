@@ -761,10 +761,10 @@ fn acquire_journal_lock(storage_root: &Path) -> Result<JournalLock, RemoteError>
     if result != 0 {
         let error = std::io::Error::last_os_error();
         return Err(
-            if matches!(
-                error.raw_os_error(),
-                Some(libc::EWOULDBLOCK) | Some(libc::EAGAIN)
-            ) {
+            if error
+                .raw_os_error()
+                .is_some_and(|code| code == libc::EWOULDBLOCK || code == libc::EAGAIN)
+            {
                 io_error(
                     std::io::Error::new(
                         std::io::ErrorKind::WouldBlock,

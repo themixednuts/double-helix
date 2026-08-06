@@ -177,6 +177,9 @@ async fn connect_remote_workspace(
             uri.target.destination()
         )
     })?;
+    for warning in server.warnings() {
+        eprintln!("warning: {warning}");
+    }
     let mut transport = helix_remote::ssh::SshSession::connect(&config, &server)
         .await
         .with_context(|| format!("failed to connect to {}", uri.target.destination()))?;

@@ -33,10 +33,12 @@ the executable again before an atomic install under:
 ```
 
 Each connection checks the cached server's compiled identity and protocol
-against the local client before starting it. Different editor builds use
-different cache entries.
+against the local client before starting it. A matching version and protocol
+are accepted even when commit hashes drift or one build has no hash; the
+client prints a warning and shares the cache entry for that version, protocol,
+and platform. Remove `~/.cache/double-helix/server` to force a clean reinstall.
 
-Developers testing an unpublished cross-platform build can provide a matching
-server executable through `DOUBLE_HELIX_SERVER`. The file is read on the
-local machine and must target the remote platform; it is hashed and installed
+Developers testing an unpublished cross-platform build can provide a compatible
+server executable through `DOUBLE_HELIX_SERVER`. The file is read on the local
+machine and must target the remote platform; it is hashed and installed
 through the same SSH verification path.

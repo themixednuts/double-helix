@@ -159,19 +159,25 @@ impl SshConfig {
     pub async fn prepare_server(&self, build: &ServerBuild) -> Result<PreparedServer, SshError> {
         let expected_identity = build.server_identity();
         let probe = self.probe_server().await?;
-        if probe.path_identity.as_deref() == Some(expected_identity.as_str()) {
-            return Ok(PreparedServer {
-                remote_command: "exec dhx-server".to_owned(),
-                build_id: Arc::from(build.identity(probe.platform)),
-            });
+        if let Some(server) = accepted_server(
+            "exec dhx-server".to_owned(),
+            Arc::from(build.identity(probe.platform)),
+            &expected_identity,
+            probe.path_identity.as_deref(),
+        ) {
+            return Ok(server);
         }
 
         let install_id = build.install_id(probe.platform).await?;
         let remote_binary = format!("$HOME/{REMOTE_SERVER_DIR}/{install_id}/dhx-server");
-        if self.remote_identity(&remote_binary).await?.as_deref()
-            == Some(expected_identity.as_str())
-        {
-            return Ok(PreparedServer::versioned(remote_binary, install_id));
+        let cached_identity = self.remote_identity(&remote_binary).await?;
+        if let Some(server) = accepted_server(
+            format!("exec \"{remote_binary}\""),
+            Arc::from(install_id.clone()),
+            &expected_identity,
+            cached_identity.as_deref(),
+        ) {
+            return Ok(server);
         }
 
         let executable = build.resolve(probe.platform).await?;
@@ -187,13 +193,18 @@ impl SshConfig {
             return Err(SshError::InvalidInstallOutput);
         }
         let installed = self.remote_identity(&remote_binary).await?;
-        if installed.as_deref() != Some(expected_identity.as_str()) {
-            return Err(SshError::InstalledIdentityMismatch {
-                expected: expected_identity,
-                actual: installed.unwrap_or_else(|| "<no identity>".to_owned()),
-            });
+        if let Some(server) = accepted_server(
+            format!("exec \"{remote_binary}\""),
+            Arc::from(install_id),
+            &expected_identity,
+            installed.as_deref(),
+        ) {
+            return Ok(server);
         }
-        Ok(PreparedServer::versioned(remote_binary, install_id))
+        Err(SshError::InstalledIdentityMismatch {
+            expected: expected_identity,
+            actual: installed.unwrap_or_else(|| "<no identity>".to_owned()),
+        })
     }
 
     async fn probe_server(&self) -> Result<RemoteProbe, SshError> {
@@ -405,7 +416,7 @@ impl ServerBuild {
     fn identity(&self, platform: RemotePlatform) -> String {
         format!(
             "{}:protocol-{}:{}",
-            self.version,
+            version_without_hash(&self.version),
             crate::PROTOCOL_VERSION,
             platform.release_name()
         )
@@ -471,19 +482,54 @@ impl ServerExecutable {
 pub struct PreparedServer {
     remote_command: String,
     build_id: Arc<str>,
+    warnings: Vec<String>,
 }
 
 impl PreparedServer {
-    fn versioned(remote_binary: String, digest: String) -> Self {
-        Self {
-            remote_command: format!("exec \"{remote_binary}\""),
-            build_id: Arc::from(digest),
-        }
-    }
-
     pub fn build_id(&self) -> &str {
         &self.build_id
     }
+
+    pub fn warnings(&self) -> &[String] {
+        &self.warnings
+    }
+}
+
+fn accepted_server(
+    remote_command: String,
+    build_id: Arc<str>,
+    expected: &str,
+    actual: Option<&str>,
+) -> Option<PreparedServer> {
+    let actual = actual?;
+    let warning = match crate::server_identity_match(expected, actual) {
+        crate::ServerIdentityMatch::Exact | crate::ServerIdentityMatch::Compatible => None,
+        crate::ServerIdentityMatch::Drifted => Some(identity_drift_warning(expected, actual)),
+        crate::ServerIdentityMatch::Incompatible => return None,
+    };
+    if let Some(warning) = &warning {
+        log::warn!("{warning}");
+    }
+    Some(PreparedServer {
+        remote_command,
+        build_id,
+        warnings: warning.into_iter().collect(),
+    })
+}
+
+fn identity_drift_warning(expected: &str, actual: &str) -> String {
+    format!(
+        "remote server identity drift accepted: local identity '{expected}', remote identity '{actual}'; remove ~/.cache/double-helix/server to force a clean reinstall"
+    )
+}
+
+fn version_without_hash(version: &str) -> &str {
+    let version = version.trim();
+    version
+        .strip_suffix(')')
+        .and_then(|version_and_hash| version_and_hash.rsplit_once(" ("))
+        .and_then(|(version, hash)| (!hash.is_empty()).then_some(version.trim()))
+        .unwrap_or(version)
 }
 
 struct CapturedOutput {
@@ -1144,7 +1190,7 @@ pub enum SshError {
     },
     #[error("invalid remote server archive: {0}")]
     InvalidServerArchive(String),
-    #[error("installed server identity mismatch: expected {expected}, got {actual}")]
+    #[error("installed server identity mismatch: local build expects {expected}, but the published release asset reports {actual}; the published release assets do not match the local build's version/protocol, and refreshing them requires pushing the release tag")]
     InstalledIdentityMismatch { expected: String, actual: String },
     #[error("SSH {phase} timed out after {timeout:?}")]
     CommandTimeout {
@@ -1272,6 +1318,119 @@ mod tests {
         assert!(build
             .identity(RemotePlatform::LinuxX86_64)
             .contains(&format!("protocol-{}", crate::PROTOCOL_VERSION)));
+    }
+
+    #[test]
+    fn accepts_exact_server_identity() {
+        let identity = crate::server_identity("25.07.1 (test)");
+
+        assert_eq!(
+            crate::server_identity_match(&identity, &identity),
+            crate::ServerIdentityMatch::Exact
+        );
+    }
+
+    #[test]
+    fn detects_server_commit_drift() {
+        let expected = crate::server_identity("25.07.1 (local)");
+        let actual = crate::server_identity("25.07.1 (remote)");
+
+        assert_eq!(
+            crate::server_identity_match(&expected, &actual),
+            crate::ServerIdentityMatch::Drifted
+        );
+    }
+
+    #[test]
+    fn detects_hashless_server_identity_drift() {
+        let expected = crate::server_identity("25.07.1 (remote)");
+        let actual = crate::server_identity("25.07.1");
+
+        assert_eq!(
+            crate::server_identity_match(&expected, &actual),
+            crate::ServerIdentityMatch::Drifted
+        );
+    }
+
+    #[test]
+    fn rejects_server_identity_protocol_mismatch() {
+        let expected = crate::server_identity("25.07.1 (test)");
+        let actual = format!(
+            "double-helix 25.07.1 (test) remote-protocol {}",
+            crate::PROTOCOL_VERSION.saturating_add(1)
+        );
+
+        assert_eq!(
+            crate::server_identity_match(&expected, &actual),
+            crate::ServerIdentityMatch::Incompatible
+        );
+    }
+
+    #[test]
+    fn rejects_server_identity_version_mismatch() {
+        let expected = crate::server_identity("25.07.1 (test)");
+        let actual = crate::server_identity("25.07.2 (test)");
+
+        assert_eq!(
+            crate::server_identity_match(&expected, &actual),
+            crate::ServerIdentityMatch::Incompatible
+        );
+    }
+
+    #[test]
+    fn rejects_garbage_server_identity() {
+        let expected = crate::server_identity("25.07.1 (test)");
+
+        assert_eq!(
+            crate::server_identity_match(&expected, "not a server identity"),
+            crate::ServerIdentityMatch::Incompatible
+        );
+    }
+
+    #[test]
+    fn cache_identity_ignores_commit_hash() {
+        let first = ServerBuild {
+            version: Arc::from("25.07.1 (first)"),
+            release_tag: Arc::from("25.7.1"),
+            override_executable: None,
+        };
+        let second = ServerBuild {
+            version: Arc::from("25.07.1 (second)"),
+            release_tag: Arc::from("25.7.1"),
+            override_executable: None,
+        };
+        let hashless = ServerBuild {
+            version: Arc::from("25.07.1"),
+            release_tag: Arc::from("25.7.1"),
+            override_executable: None,
+        };
+
+        assert_eq!(
+            first.identity(RemotePlatform::LinuxX86_64),
+            second.identity(RemotePlatform::LinuxX86_64)
+        );
+        assert_eq!(
+            first.identity(RemotePlatform::LinuxX86_64),
+            hashless.identity(RemotePlatform::LinuxX86_64)
+        );
+    }
+
+    #[test]
+    fn attaches_warning_for_server_identity_drift() {
+        let expected = crate::server_identity("25.07.1 (local)");
+        let actual = crate::server_identity("25.07.1 (remote)");
+        let server = accepted_server(
+            "exec dhx-server".to_owned(),
+            Arc::from("build-id"),
+            &expected,
+            Some(actual.as_str()),
+        )
+        .expect("drifted identities are accepted");
+
+        assert_eq!(server.warnings().len(), 1);
+        assert!(server.warnings()[0].contains(&expected));
+        assert!(server.warnings()[0].contains(&actual));
+        assert!(server.warnings()[0].contains("~/.cache/double-helix/server"));
     }
 
     #[test]

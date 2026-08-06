@@ -317,12 +317,28 @@ pub enum DocumentOpenError {
     IoError(#[from] io::Error),
     #[error("document open worker failed: {0}")]
     Worker(String),
-    #[error("remote document open failed: {0}")]
-    Remote(String),
+    #[error("remote document open failed for {path}: {source}")]
+    Remote {
+        path: helix_remote::WorkspacePath,
+        #[source]
+        source: RemoteDocumentOpenError,
+    },
     #[error("collaboration document open failed: {0}")]
     Collaboration(String),
     #[error("file contains binary data")]
     BinaryFile,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum RemoteDocumentOpenError {
+    #[error(transparent)]
+    Backend(#[from] helix_remote::backend::BackendError),
+    #[error("remote file has no content generation")]
+    MissingContentGeneration,
+    #[error("invalid remote document location: {0}")]
+    InvalidLocation(#[from] url::ParseError),
+    #[error("workspace is not remote")]
+    WorkspaceUnavailable,
 }
 
 #[derive(Debug, Clone)]
@@ -4251,6 +4267,43 @@ mod test {
     use arc_swap::ArcSwap;
 
     use super::*;
+
+    #[test]
+    fn remote_open_errors_retain_the_requested_path_and_typed_source() {
+        let path = helix_remote::WorkspacePath::from_slash_path("core.99075").unwrap();
+        let remote = helix_remote::RemoteError::new(
+            helix_remote::ErrorCode::PermissionDenied,
+            "permission denied (os error 13)",
+        )
+        .at(path.clone());
+        let error = DocumentOpenError::Remote {
+            path,
+            source: RemoteDocumentOpenError::Backend(helix_remote::backend::BackendError::Request(
+                helix_remote::client::ClientRequestError::Remote(remote),
+            )),
+        };
+
+        assert_eq!(
+            error.to_string(),
+            "remote document open failed for core.99075: permission denied (os error 13)"
+        );
+        assert!(matches!(
+            error,
+            DocumentOpenError::Remote {
+                source: RemoteDocumentOpenError::Backend(
+                    helix_remote::backend::BackendError::Request(
+                        helix_remote::client::ClientRequestError::Remote(
+                            helix_remote::RemoteError {
+                                code: helix_remote::ErrorCode::PermissionDenied,
+                                ..
+                            }
+                        )
+                    )
+                ),
+                ..
+            }
+        ));
+    }
 
     #[test]
     fn oversized_documents_do_not_schedule_full_tree_sitter_parses() {

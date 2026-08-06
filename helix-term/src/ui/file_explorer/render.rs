@@ -11,8 +11,7 @@ use crate::compositor::RenderContext;
 
 use super::{
     icon_width, selected_path_for_log, text_width, ExplorerRow, FileExplorerPanel, VcsStatus,
-    FALLBACK_FILE_ICON, FALLBACK_FOLDER_ICON, FALLBACK_FOLDER_OPEN_ICON, FOOTER_ROWS, HEADER_ROWS,
-    SEARCH_ROWS,
+    FALLBACK_FILE_ICON, FALLBACK_FOLDER_ICON, FALLBACK_FOLDER_OPEN_ICON, HEADER_ROWS, SEARCH_ROWS,
 };
 #[derive(Clone)]
 pub(super) struct ExplorerTreeItemStyles {
@@ -41,18 +40,6 @@ struct RenderLabelEdit {
     buffer: String,
 }
 
-#[derive(Clone)]
-struct ExplorerFooterStyles {
-    base: Style,
-    muted: Style,
-    mode_label: Option<String>,
-    mode_chip: Style,
-    added: Style,
-    modified: Style,
-    warning: Style,
-    error: Style,
-}
-
 pub(super) struct ExplorerRenderSnapshot {
     rows: Arc<[ExplorerRow]>,
     all_rows_len: usize,
@@ -73,7 +60,6 @@ pub(super) struct ExplorerRenderSnapshot {
     styles: crate::ui::design::FileExplorerStyles,
     scrollbar_style: Style,
     jump_label_style: Style,
-    footer: ExplorerFooterStyles,
 }
 
 fn row_icon<'a>(
@@ -217,6 +203,76 @@ impl FileExplorerPanel {
         tree_item(row, label, selected, active, styles, icons, status_styles)
     }
 
+    pub(super) fn global_statusline(
+        &self,
+        cx: &RenderContext,
+    ) -> crate::ui::statusline::PanelStatusline {
+        use helix_core::diagnostic::Severity;
+
+        let icons = ICONS.load();
+        let mut modified_count = 0;
+        let mut added_count = 0;
+        let mut error_count = 0;
+        let mut warning_count = 0;
+        for row in self.rows.iter() {
+            match row.vcs_status {
+                Some(VcsStatus::Added) => added_count += 1,
+                Some(VcsStatus::Modified | VcsStatus::Renamed) => modified_count += 1,
+                _ => {}
+            }
+            match row.diagnostic_status.map(|status| status.severity) {
+                Some(Severity::Error) => error_count += 1,
+                Some(Severity::Warning) => warning_count += 1,
+                _ => {}
+            }
+        }
+
+        let mut right = Vec::new();
+        let theme = cx.theme();
+        if added_count > 0 {
+            right.push(crate::ui::statusline::StatuslineText {
+                text: format!(" {} {} ", icons.vcs().added(), added_count),
+                style: theme.get("diff.plus"),
+            });
+        }
+        if modified_count > 0 {
+            right.push(crate::ui::statusline::StatuslineText {
+                text: format!(" {} {} ", icons.vcs().modified(), modified_count),
+                style: theme.get("diff.delta"),
+            });
+        }
+        if warning_count > 0 {
+            right.push(crate::ui::statusline::StatuslineText {
+                text: format!(" {} {} ", icons.diagnostic().warning(), warning_count),
+                style: theme.get("warning"),
+            });
+        }
+        if error_count > 0 {
+            right.push(crate::ui::statusline::StatuslineText {
+                text: format!(" {} {} ", icons.diagnostic().error(), error_count),
+                style: theme.get("error"),
+            });
+        }
+        let current = if self.rows.is_empty() {
+            0
+        } else {
+            self.selection + 1
+        };
+        right.push(crate::ui::statusline::StatuslineText {
+            text: format!(" {current} · {} ", self.rows.len()),
+            style: theme
+                .try_get("ui.text.inactive")
+                .or_else(|| theme.try_get("comment"))
+                .unwrap_or_else(|| theme.get("ui.statusline")),
+        });
+
+        crate::ui::statusline::PanelStatusline {
+            state: crate::ui::statusline::PanelStatuslineState::Mode(self.input.mode),
+            identity: format!("Files - {}", selected_path_for_log(&self.rows, self.selection)),
+            right,
+        }
+    }
+
     pub(super) fn render_snapshot(
         &mut self,
         area: Rect,
@@ -230,7 +286,7 @@ impl FileExplorerPanel {
         // optional vertical scrollbar.
         let list_height = area
             .height
-            .saturating_sub(HEADER_ROWS + SEARCH_ROWS + FOOTER_ROWS);
+            .saturating_sub(HEADER_ROWS + SEARCH_ROWS);
         let list_width = area.width.saturating_sub(2).saturating_sub(1);
         let has_scrollbar = self.rows.len() > list_height as usize;
         self.tree_content_width = if has_scrollbar {
@@ -242,27 +298,6 @@ impl FileExplorerPanel {
 
         let theme = cx.theme();
         let styles = crate::ui::design::FileExplorerStyles::from_theme(theme, self.focused);
-        let base = if self.focused {
-            theme.get("ui.statusline")
-        } else {
-            theme.get("ui.statusline.inactive")
-        };
-        let muted = theme
-            .try_get("ui.text.inactive")
-            .or_else(|| theme.try_get("comment"))
-            .unwrap_or(base);
-        let (mode_label, mode_chip) = if self.focused {
-            use helix_view::statusline_mode::{mode_style, padded_mode_name};
-            (
-                Some(padded_mode_name(
-                    self.input.mode,
-                    &cx.config().statusline.mode,
-                )),
-                mode_style(self.input.mode, theme, base),
-            )
-        } else {
-            (None, Style::default())
-        };
         let jump_label_style = theme.try_get("ui.virtual.jump-label").unwrap_or_else(|| {
             theme
                 .get("ui.text")
@@ -296,16 +331,6 @@ impl FileExplorerPanel {
             styles,
             scrollbar_style: theme.get("ui.menu.scroll"),
             jump_label_style,
-            footer: ExplorerFooterStyles {
-                base,
-                muted,
-                mode_label,
-                mode_chip,
-                added: theme.get("diff.plus"),
-                modified: theme.get("diff.delta"),
-                warning: theme.get("warning"),
-                error: theme.get("error"),
-            },
         }
     }
 }
@@ -413,13 +438,6 @@ impl ExplorerRenderSnapshot {
             return;
         }
 
-        let current = if self.rows.is_empty() {
-            0
-        } else {
-            self.selection + 1
-        };
-        // Header is now just the section label — counts moved to the
-        // statusline below so the top reads as a clean orientation cue.
         crate::widgets::header(surface, inner, " FILES", styles.header);
         let search_area = Rect::new(
             inner.x,
@@ -431,7 +449,6 @@ impl ExplorerRenderSnapshot {
 
         let list = inner
             .clip_top(HEADER_ROWS + SEARCH_ROWS)
-            .clip_bottom(FOOTER_ROWS)
             .clip_left(1);
         if list.height == 0 {
             log::trace!(
@@ -540,17 +557,6 @@ impl ExplorerRenderSnapshot {
         if let Some(session) = self.jump_session.as_ref() {
             self.render_jump_labels(surface, tree_area, session);
         }
-
-        // Two-row footer anchored at the bottom of the panel: statusline
-        // strip + error/info line. Mirrors the editor view's chrome so the
-        // panel's bottom edge aligns instead of running past it.
-        let footer_area = Rect::new(
-            inner.x,
-            inner.bottom().saturating_sub(FOOTER_ROWS),
-            inner.width,
-            FOOTER_ROWS,
-        );
-        self.render_footer(surface, footer_area, current, self.rows.len(), cancellation);
 
         log::trace!(
             "[file_explorer] render_snapshot rows={} all_rows={} visible_rows={} area={}x{}+{},{} list={}x{} scroll={} selection={} selected={} focused={} query={:?} search_active={} search_pending={} search_generation={} elapsed_us={}",
@@ -698,125 +704,4 @@ impl ExplorerRenderSnapshot {
         }
     }
 
-    /// Single-row statusline strip for the file explorer panel.
-    ///
-    /// Layout: ` MODE ` chip (left, only when focused) · diagnostic + vcs
-    /// summary chips (centre, only non-zero ones) · `cur · total` counts
-    /// (right). Transient error / info messages don't live here — the
-    /// editor's bottom row owns that channel globally.
-    fn render_footer(
-        &self,
-        surface: &mut crate::render::CellSurface,
-        area: Rect,
-        current: usize,
-        total: usize,
-        cancellation: &crate::render::RenderCancellation,
-    ) {
-        if area.width == 0 || area.height == 0 {
-            return;
-        }
-
-        let base_style = self.footer.base;
-        surface.set_style(
-            tui::ratatui::to_ratatui_rect(area),
-            tui::ratatui::to_ratatui_style(base_style),
-        );
-
-        let muted_style = self.footer.muted;
-
-        // --- Left: mode chip when focused -----------------------------------
-        // Uses the shared `statusline_mode` helpers so the file
-        // explorer's chip respects `[editor.statusline.mode]` config
-        // (same labels the editor's statusline shows) and resolves
-        // theme scopes the same way every other surface does.
-        let mut left_cursor = area.x;
-        if let Some(label) = &self.footer.mode_label {
-            let chip =
-                crate::widgets::Chip::new(label.as_str(), base_style.patch(self.footer.mode_chip));
-            left_cursor = crate::widgets::chip_strip_left(
-                surface,
-                left_cursor,
-                area.right(),
-                area.y,
-                std::slice::from_ref(&chip),
-            );
-        }
-
-        // --- Right: ` current · total ` counts -------------------------------
-        // Right-anchored via the shared chip_strip helper — the only
-        // chip on the right cluster. The returned anchor becomes the
-        // budget cap for the middle chips below.
-        let count_label = format!(" {current} · {total} ");
-        let right_chips = [crate::widgets::Chip::new(
-            &count_label,
-            base_style.patch(muted_style),
-        )];
-        let right_anchor = crate::widgets::chip_strip_right(
-            surface,
-            left_cursor,
-            area.right(),
-            area.y,
-            &right_chips,
-        );
-
-        // --- Centre: summary chips for vcs + diagnostics ---------------------
-        // Only render non-zero totals. Each chip is ` <glyph> <count> `; we
-        // paint them muted by default and tint with their semantic colour so
-        // the dots read at a glance. Drawn via the same shared helper that
-        // future panel footers will use.
-        let icons = ICONS.load();
-        let mut modified_count = 0;
-        let mut added_count = 0;
-        let mut error_count = 0;
-        let mut warning_count = 0;
-        use helix_core::diagnostic::Severity;
-        for (index, row) in self.rows.iter().enumerate() {
-            if index % 256 == 0 && cancellation.is_cancelled() {
-                return;
-            }
-            match row.vcs_status {
-                Some(VcsStatus::Added) => added_count += 1,
-                Some(VcsStatus::Modified | VcsStatus::Renamed) => modified_count += 1,
-                _ => {}
-            }
-            match row.diagnostic_status.map(|status| status.severity) {
-                Some(Severity::Error) => error_count += 1,
-                Some(Severity::Warning) => warning_count += 1,
-                _ => {}
-            }
-        }
-        // Build chip labels into owned Strings first so we can pass
-        // borrowed `&str` views to the strip helper. (Chip<'a> borrows
-        // its label.)
-        let mut chip_labels: Vec<(String, helix_view::theme::Style)> = Vec::new();
-        if added_count > 0 {
-            chip_labels.push((
-                format!(" {} {} ", icons.vcs().added(), added_count),
-                base_style.patch(self.footer.added),
-            ));
-        }
-        if modified_count > 0 {
-            chip_labels.push((
-                format!(" {} {} ", icons.vcs().modified(), modified_count),
-                base_style.patch(self.footer.modified),
-            ));
-        }
-        if warning_count > 0 {
-            chip_labels.push((
-                format!(" {} {} ", icons.diagnostic().warning(), warning_count),
-                base_style.patch(self.footer.warning),
-            ));
-        }
-        if error_count > 0 {
-            chip_labels.push((
-                format!(" {} {} ", icons.diagnostic().error(), error_count),
-                base_style.patch(self.footer.error),
-            ));
-        }
-        let chips: Vec<crate::widgets::Chip<'_>> = chip_labels
-            .iter()
-            .map(|(label, style)| crate::widgets::Chip::new(label.as_str(), *style))
-            .collect();
-        crate::widgets::chip_strip_left(surface, left_cursor, right_anchor, area.y, &chips);
-    }
 }

@@ -55,7 +55,6 @@ pub struct DiagnosticCounts {
 /// Modal/editor-global data rendered in the statusline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ModalStatus {
-    pub focused: bool,
     pub mode: Mode,
     pub selected_register: Option<char>,
 }
@@ -63,7 +62,6 @@ pub struct ModalStatus {
 impl Default for ModalStatus {
     fn default() -> Self {
         Self {
-            focused: false,
             mode: Mode::Normal,
             selected_register: None,
         }
@@ -129,24 +127,29 @@ pub trait DocumentStatusProvider {
 
 impl DocumentStatusProvider for Document {
     fn document_status(&self) -> DocumentStatus<'_> {
-        let relative_path = self
-            .relative_path()
-            .as_ref()
-            .map(|path| Cow::Owned(path.to_string_lossy().into_owned()))
-            .unwrap_or_else(|| Cow::Borrowed(SCRATCH_BUFFER_NAME));
+        let relative_path = self.display_name();
         let absolute_path = self
-            .path()
-            .as_ref()
-            .map(|path| Cow::Owned(path.to_string_lossy().into_owned()))
+            .location()
+            .map(|location| Cow::Owned(location.to_string()))
             .unwrap_or_else(|| Cow::Borrowed(SCRATCH_BUFFER_NAME));
-        let file_base_name = self
-            .relative_path()
-            .as_ref()
-            .and_then(|path| {
-                path.file_name()
-                    .map(|name| Cow::Owned(name.to_string_lossy().into_owned()))
-            })
-            .unwrap_or(Cow::Borrowed(SCRATCH_BUFFER_NAME));
+        let file_base_name = match self.location() {
+            Some(crate::file_bound::DocumentLocation::Local(_)) => self
+                .relative_path()
+                .and_then(|path| path.file_name())
+                .map(|name| name.to_string_lossy())
+                .unwrap_or(Cow::Borrowed(SCRATCH_BUFFER_NAME)),
+            Some(crate::file_bound::DocumentLocation::Remote(location)) => location
+                .path
+                .file_name()
+                .map(Cow::Borrowed)
+                .unwrap_or(Cow::Borrowed(SCRATCH_BUFFER_NAME)),
+            Some(crate::file_bound::DocumentLocation::Collaboration(location)) => location
+                .path
+                .file_name()
+                .map(Cow::Borrowed)
+                .unwrap_or(Cow::Borrowed(SCRATCH_BUFFER_NAME)),
+            None => Cow::Borrowed(SCRATCH_BUFFER_NAME),
+        };
         let encoding_name =
             (self.encoding() != helix_core::encoding::UTF_8).then(|| self.encoding().name());
 

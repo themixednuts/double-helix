@@ -454,6 +454,14 @@ impl DocumentOpenQueue {
                                 DocumentOpenError::Directory | DocumentOpenError::BinaryFile
                             )
                         });
+                        if failed && !canceled.is_cancelled() {
+                            let error = result.as_ref().expect_err("failed result has an error");
+                            log::warn!(
+                                "[document_open] phase=load_failed path={} generation={} lane={lane:?} error={error}",
+                                path.display(),
+                                generation,
+                            );
+                        }
                         log::info!(
                             "[document_open] phase=load_done path={} generation={} lane={lane:?} success={} elapsed_us={}",
                             path.display(),

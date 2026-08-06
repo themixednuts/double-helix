@@ -442,7 +442,7 @@ static STORIES: &[Story] = &[
         category: "UI Patterns",
         component: "Editor/Shell",
         variant: "Normal Mode",
-        summary: "Helix document viewport with bufferline, gutter, cursorline, and statusline.",
+        summary: "Helix document viewport with bufferline, gutter, cursorline, split identity rule, and global statusline.",
         kind: StoryKind::Pattern,
         args: &[
             StoryArg::new("mode", "normal", "Statusline mode state"),
@@ -2360,7 +2360,7 @@ const EDITOR_SHELL_FIXTURE: &str = "use crate::compositor::{Component, RenderCon
                                     \x20   fn render(&mut self, area: Rect, surface: &mut Buffer, cx: &RenderContext) {\n\
                                     \x20       self.draw_bufferline_model(&model, area.with_height(1), surface);\n\
                                     \x20       self.render_document(surface, inner, doc, view_offset, ...);\n\
-                                    \x20       self.prepare_statusline(cx, doc, view, is_focused);\n\
+                                    \x20       compositor.global_status(EditorView::focused_statusline(cx));\n\
                                     \x20   }\n\
                                     }\n\
                                     \n\

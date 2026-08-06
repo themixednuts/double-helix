@@ -1,11 +1,11 @@
 use helix_core::diagnostic::Severity;
 use helix_core::indent::IndentStyle;
-use helix_core::unicode::width::UnicodeWidthStr;
 use helix_view::document::Mode;
 use helix_view::editor::{
     StatusLineConfig, StatusLineElement as StatusLineElementId, WorkspaceDiagnosticCounts,
 };
 use helix_view::icons::ICONS;
+use helix_view::model::FocusTarget;
 use helix_view::statusline::{
     CursorStatusProvider, DiagnosticCounts, DiagnosticStatusProvider, DocumentStatusProvider,
     SelectionStatusProvider, StatuslineSnapshot,
@@ -20,6 +20,7 @@ use tui::ratatui::{
     text::{Line, Span},
 };
 
+use crate::render::{CacheKey, CacheTag, PreparedRender, RenderOutput};
 use crate::ui::{design::StatuslineStyles, ProgressSpinners};
 
 #[derive(Debug, Clone, Copy)]
@@ -27,6 +28,40 @@ pub struct BenchOverlay {
     pub rolling_fps: f64,
     pub actions_executed: usize,
     pub remaining_seconds: f64,
+}
+
+#[derive(Clone)]
+pub(crate) enum GlobalStatusline {
+    Editor(StatuslineModel),
+    Panel {
+        panel: PanelStatusline,
+        editor: StatuslineModel,
+    },
+}
+
+#[derive(Clone)]
+pub struct PanelStatusline {
+    pub state: PanelStatuslineState,
+    pub identity: String,
+    pub right: Vec<StatuslineText>,
+}
+
+#[derive(Clone)]
+pub enum PanelStatuslineState {
+    Mode(Mode),
+    Label { label: String, style: ThemeStyle },
+}
+
+#[derive(Clone)]
+pub struct StatuslineText {
+    pub text: String,
+    pub style: ThemeStyle,
+}
+
+#[derive(Clone)]
+pub struct PendingKeys {
+    pub display: String,
+    pub register: Option<char>,
 }
 
 #[derive(Clone)]
@@ -46,7 +81,6 @@ impl StatuslineModel {
         context: StatuslineContext<'_>,
         doc: &Document,
         view: &View,
-        focused: bool,
     ) -> Self {
         let cursor = doc.cursor_status(view.id);
         let selection = doc.selection_status(view.id);
@@ -85,7 +119,6 @@ impl StatuslineModel {
             color_modes: context.color_modes,
             snapshot: StatuslineSnapshot {
                 modal: helix_view::statusline::ModalStatus {
-                    focused,
                     mode: context.mode,
                     selected_register: context.selected_register,
                 },
@@ -125,8 +158,8 @@ pub struct StatuslineContext<'a> {
     pub frame_time: Instant,
 }
 
-pub(crate) fn cache_id(view_id: ViewId) -> crate::render::CacheId {
-    crate::render::CacheId::hashed(&("statusline", view_id))
+pub(crate) fn cache_id(focus_target: FocusTarget) -> crate::render::CacheId {
+    crate::render::CacheId::hashed(&("statusline", focus_target))
 }
 
 #[derive(Default)]
@@ -152,11 +185,10 @@ impl<'a> Statusline<'a> {
     pub fn prepare(
         model: StatuslineModel,
         area: helix_view::graphics::Rect,
+        focus_target: FocusTarget,
     ) -> crate::render::PreparedRender {
-        use crate::render::{CacheKey, CacheTag, PreparedRender, RenderOutput};
-
         let tag = CacheTag {
-            id: cache_id(model.view_id),
+            id: cache_id(focus_target),
             key: CacheKey::hashed(&(
                 &model.config,
                 &model.theme_name,
@@ -181,17 +213,64 @@ impl<'a> Statusline<'a> {
         })
     }
 
+    pub(crate) fn prepare_global(
+        source: GlobalStatusline,
+        area: helix_view::graphics::Rect,
+        focus_target: FocusTarget,
+    ) -> crate::render::PreparedRender {
+        match source {
+            GlobalStatusline::Editor(model) => Self::prepare(model, area, focus_target),
+            GlobalStatusline::Panel { panel, editor } => {
+                let right_text: Vec<&str> = panel
+                    .right
+                    .iter()
+                    .map(|item| item.text.as_str())
+                    .collect();
+                let state = match &panel.state {
+                    PanelStatuslineState::Mode(mode) => format!("mode:{mode:?}"),
+                    PanelStatuslineState::Label { label, .. } => format!("label:{label}"),
+                };
+                let tag = CacheTag {
+                    id: cache_id(focus_target),
+                    key: CacheKey::hashed(&(
+                        &editor.config,
+                        &editor.theme_name,
+                        editor.color_modes,
+                        &editor.snapshot,
+                        &editor.pkg_progress,
+                        editor.bench_overlay.map(|overlay| {
+                            (
+                                overlay.rolling_fps.to_bits(),
+                                overlay.actions_executed,
+                                overlay.remaining_seconds.to_bits(),
+                            )
+                        }),
+                        state,
+                        &panel.identity,
+                        right_text,
+                    )),
+                    area,
+                };
+                PreparedRender::snapshot(
+                    tag,
+                    PanelStatuslineSnapshot { panel, editor },
+                    move |model, _cancellation| {
+                        let mut output = RenderOutput::new(area);
+                        render_panel_surface(model, area, output.surface_mut());
+                        output
+                    },
+                )
+            }
+        }
+    }
+
     pub fn render_surface(
         &mut self,
         viewport: helix_view::graphics::Rect,
         surface: &mut crate::render::CellSurface,
     ) {
         let statusline_styles = StatuslineStyles::from_theme(&self.model.theme);
-        let base_style = if self.model.snapshot.modal.focused {
-            rat_style(statusline_styles.base)
-        } else {
-            rat_style(statusline_styles.inactive)
-        };
+        let base_style = rat_style(statusline_styles.base);
 
         surface.set_style(
             tui::ratatui::to_ratatui_rect(viewport.with_height(1)),
@@ -233,23 +312,7 @@ impl<'a> Statusline<'a> {
             );
         }
 
-        if let Some(bench) = self.model.bench_overlay {
-            let fps_text = format!(
-                " BENCH {:.0}fps {}act {:.0}s ",
-                bench.rolling_fps, bench.actions_executed, bench.remaining_seconds,
-            );
-            let bench_style = self
-                .model
-                .theme
-                .get("ui.statusline")
-                .fg(helix_view::graphics::Color::Black)
-                .bg(helix_view::graphics::Color::Yellow);
-            append(
-                &mut self.parts.right,
-                themed_span(fps_text, bench_style),
-                base_style,
-            );
-        }
+        append_bench_overlay(&self.model, &mut self.parts.right, base_style);
 
         surface.set_line(
             viewport.x
@@ -287,10 +350,112 @@ impl<'a> Statusline<'a> {
             center_width,
         );
     }
+
+    fn append_editor_globals(&mut self, base_style: RatatuiStyle) {
+        self.append_editor_global(StatusLineElementId::WorkspaceDiagnostics, base_style);
+        self.append_editor_global(StatusLineElementId::Spinner, base_style);
+        self.append_editor_global(StatusLineElementId::Register, base_style);
+        append_bench_overlay(&self.model, &mut self.parts.right, base_style);
+    }
+
+    fn append_editor_global(
+        &mut self,
+        element_id: StatusLineElementId,
+        base_style: RatatuiStyle,
+    ) {
+        let render = get_render_function(element_id);
+        (render)(self, |statusline, span| {
+            append(&mut statusline.parts.right, span, base_style)
+        });
+    }
+}
+
+struct PanelStatuslineSnapshot {
+    panel: PanelStatusline,
+    editor: StatuslineModel,
+}
+
+fn render_panel_surface(
+    model: PanelStatuslineSnapshot,
+    viewport: helix_view::graphics::Rect,
+    surface: &mut crate::render::CellSurface,
+) {
+    if viewport.width == 0 || viewport.height == 0 {
+        return;
+    }
+
+    let styles = StatuslineStyles::from_theme(&model.editor.theme);
+    let base_style = rat_style(styles.base);
+    let identity_style = rat_style(styles.base.patch(model.editor.theme.get("ui.text.focus")));
+    surface.set_style(
+        tui::ratatui::to_ratatui_rect(viewport.with_height(1)),
+        base_style,
+    );
+
+    let (state_label, state_style) = match &model.panel.state {
+        PanelStatuslineState::Mode(mode) => (
+            helix_view::statusline_mode::padded_mode_name(*mode, &model.editor.config.mode),
+            helix_view::statusline_mode::mode_style(*mode, &model.editor.theme, styles.base),
+        ),
+        PanelStatuslineState::Label { label, style } => (format!(" {label} "), *style),
+    };
+    let state_chip = crate::widgets::Chip::new(&state_label, styles.base.patch(state_style));
+
+    let mut editor_statusline = Statusline::new(model.editor);
+    editor_statusline.append_editor_globals(base_style);
+    let mut right = editor_statusline.parts.right;
+    for item in &model.panel.right {
+        append(
+            &mut right,
+            themed_span(item.text.as_str(), item.style),
+            base_style,
+        );
+    }
+    let right_width = (right.width() as u16).min(viewport.width);
+    let right_x = viewport.right().saturating_sub(right_width);
+    surface.set_line(right_x, viewport.y, &right, right_width);
+
+    let left_end = crate::widgets::chip_strip_left(
+        surface,
+        viewport.x,
+        right_x,
+        viewport.y,
+        std::slice::from_ref(&state_chip),
+    );
+    if left_end < right_x {
+        let identity_x = left_end.saturating_add(1);
+        surface.set_stringn(
+            identity_x,
+            viewport.y,
+            &model.panel.identity,
+            right_x.saturating_sub(identity_x) as usize,
+            identity_style,
+        );
+    }
 }
 
 fn rat_style(style: ThemeStyle) -> RatatuiStyle {
     tui::ratatui::to_ratatui_style(style)
+}
+
+fn append_bench_overlay(
+    model: &StatuslineModel,
+    right: &mut Line<'_>,
+    base_style: RatatuiStyle,
+) {
+    let Some(bench) = model.bench_overlay else {
+        return;
+    };
+    let fps_text = format!(
+        " BENCH {:.0}fps {}act {:.0}s ",
+        bench.rolling_fps, bench.actions_executed, bench.remaining_seconds,
+    );
+    let bench_style = model
+        .theme
+        .get("ui.statusline")
+        .fg(helix_view::graphics::Color::Black)
+        .bg(helix_view::graphics::Color::Yellow);
+    append(right, themed_span(fps_text, bench_style), base_style);
 }
 
 fn themed_span<'a>(content: impl Into<Cow<'a, str>>, style: ThemeStyle) -> Span<'a> {
@@ -350,20 +515,11 @@ fn render_mode<'a, F>(statusline: &mut Statusline<'a>, write: F)
 where
     F: Fn(&mut Statusline<'a>, Span<'a>) + Copy,
 {
-    let visible = statusline.model.snapshot.modal.focused;
     let modenames = &statusline.model.config.mode;
     let mode = statusline.model.snapshot.modal.mode;
-    // Shared lookup with the file explorer / future surfaces.
-    // `mode_name` returns the user-configured label; on
-    // unfocused statuslines we pad to the same width so the
-    // chrome doesn't shift when focus changes.
     let mode_str = helix_view::statusline_mode::mode_name(mode, modenames);
-    let content = if visible {
-        format!(" {mode_str} ")
-    } else {
-        " ".repeat(mode_str.width() + 2)
-    };
-    let style = if visible && statusline.model.color_modes {
+    let content = format!(" {mode_str} ");
+    let style = if statusline.model.color_modes {
         let styles = StatuslineStyles::from_theme(&statusline.model.theme);
         match mode {
             Mode::Insert => styles.insert,

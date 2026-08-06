@@ -153,7 +153,7 @@ pub(super) trait DisplayExplorerPath {
 
 impl DisplayExplorerPath for Path {
     fn display_explorer_path(&self) -> String {
-        self.display().to_string().replace('\\', "/")
+        helix_stdx::path::display_path(self).into_owned()
     }
 
     fn explorer_file_name(&self) -> Option<String> {

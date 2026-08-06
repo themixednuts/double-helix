@@ -18,6 +18,7 @@ use helix_vcs::DiffProviderRegistry;
 use crate::{
     document::{
         from_reader, DocumentOpenError, DocumentReloadFormatConfig, LanguageInitialization,
+        RemoteDocumentOpenError,
     },
     handlers::BlameEvent,
     traits::{HistoryViewport, Identified},
@@ -377,7 +378,10 @@ impl RemoteDocumentOpenWork {
         self.backend
             .stat(self.path.clone(), canceled)
             .await
-            .map_err(|error| DocumentOpenError::Remote(error.to_string()))
+            .map_err(|source| DocumentOpenError::Remote {
+                path: self.path.clone(),
+                source: source.into(),
+            })
     }
 
     pub async fn execute(
@@ -389,15 +393,22 @@ impl RemoteDocumentOpenWork {
             .backend
             .read_file(self.path.clone(), canceled)
             .await
-            .map_err(|error| DocumentOpenError::Remote(error.to_string()))?;
+            .map_err(|source| DocumentOpenError::Remote {
+                path: self.path.clone(),
+                source: source.into(),
+            })?;
         if inspect_binary
             && content_inspector::inspect(&file.bytes[..file.bytes.len().min(1024)]).is_binary()
         {
             return Err(DocumentOpenError::BinaryFile);
         }
-        let content = file.metadata.content.ok_or_else(|| {
-            DocumentOpenError::Remote("remote file has no content generation".to_owned())
-        })?;
+        let content = file
+            .metadata
+            .content
+            .ok_or_else(|| DocumentOpenError::Remote {
+                path: self.path.clone(),
+                source: RemoteDocumentOpenError::MissingContentGeneration,
+            })?;
         let location = crate::file_bound::RemoteDocumentLocation::new(
             self.backend.authority(),
             self.backend.workspace().session,
@@ -407,7 +418,10 @@ impl RemoteDocumentOpenWork {
             file.metadata.readonly,
             self.backend.hello().platform.path_separator,
         )
-        .map_err(|error| DocumentOpenError::Remote(error.to_string()))?;
+        .map_err(|source| DocumentOpenError::Remote {
+            path: self.path.clone(),
+            source: source.into(),
+        })?;
         let role = self.role;
         let path = self.path;
         let log_path = path.clone();
@@ -854,11 +868,12 @@ impl Editor {
         path: helix_remote::WorkspacePath,
         role: DocumentOpenRole,
     ) -> Result<RemoteDocumentOpenWork, DocumentOpenError> {
-        let backend = self
-            .workspace_backend
-            .remote()
-            .cloned()
-            .ok_or_else(|| DocumentOpenError::Remote("workspace is not remote".to_owned()))?;
+        let Some(backend) = self.workspace_backend.remote().cloned() else {
+            return Err(DocumentOpenError::Remote {
+                path,
+                source: RemoteDocumentOpenError::WorkspaceUnavailable,
+            });
+        };
         Ok(RemoteDocumentOpenWork {
             path,
             role,

@@ -4,7 +4,6 @@ use crate::ui::animation::{
     Animation, AnimationDirection, AnimationFillMode, AnimationIterationCount, AnimationSpec,
     AnimationTimingFunction,
 };
-use crate::widgets::{Marquee, MarqueeFrame};
 use crate::widgets::{Message, MessageCorners, MessageCursor, MessageListState, Spinner};
 use helix_core::unicode::width::{UnicodeWidthChar, UnicodeWidthStr};
 use helix_core::Position;
@@ -20,8 +19,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-const ERROR_MARQUEE_FRAME: helix_runtime::FrameSource =
-    helix_runtime::FrameSource::new("assistant.error-marquee");
 const ACTIVITY_SPINNER_FRAME: helix_runtime::FrameSource =
     helix_runtime::FrameSource::new("assistant.activity-spinner");
 const MESSAGE_FOCUS_FRAME: helix_runtime::FrameSource =
@@ -316,10 +313,8 @@ pub struct AssistantPanel {
     render_model: Arc<helix_view::model::AssistantModel>,
     /// Editable input area backed by a component-owned document.
     input: helix_view::edit_region::EditRegion,
-    /// Last assistant/backend error message, shown below the status line.
-    panel_error: Option<String>,
-    /// Marquee for long error text (scroll, hold, reset, repeat; pauses after inactivity).
-    error_marquee: Marquee,
+    /// Last assistant error forwarded to the editor's global message row.
+    last_routed_error: Option<String>,
     /// Last input cursor screen position (set during render, read by cursor()).
     last_input_cursor: Option<(u16, u16)>,
     input_layout: InputLayoutCache,
@@ -858,8 +853,6 @@ struct AssistantRenderAreas {
     plan: Rect,
     context: Rect,
     input_raw: Rect,
-    status: Rect,
-    error: Rect,
 }
 
 struct AssistantInputSnapshot {
@@ -881,10 +874,6 @@ struct AssistantRenderSnapshot {
     theme: Arc<helix_view::Theme>,
     model: Arc<helix_view::model::AssistantModel>,
     focused: bool,
-    badge: Arc<str>,
-    status: Arc<str>,
-    position: Option<Arc<str>>,
-    error: Option<MarqueeFrame>,
     input: AssistantInputSnapshot,
     mention: Option<AssistantMentionSnapshot>,
     blocks: Arc<[Message]>,
@@ -928,12 +917,10 @@ impl AssistantRenderSnapshot {
         } else {
             self.theme.get("ui.statusline.inactive")
         };
-        for area in [self.areas.header, self.areas.status] {
-            surface.set_style(
-                tui::ratatui::to_ratatui_rect(area),
-                tui::ratatui::to_ratatui_style(bar_style),
-            );
-        }
+        surface.set_style(
+            tui::ratatui::to_ratatui_rect(self.areas.header),
+            tui::ratatui::to_ratatui_style(bar_style),
+        );
 
         let header = self.model.header();
         let trailing_width = header
@@ -998,75 +985,6 @@ impl AssistantRenderSnapshot {
             x = x.saturating_add(width.min(right_edge.saturating_sub(x)).saturating_add(1));
         }
 
-        let badge_style = if self.focused {
-            self.theme.get("ui.text.focus").add_modifier(Modifier::BOLD)
-        } else {
-            self.theme.get("ui.text.inactive")
-        };
-        surface.set_stringn(
-            self.areas.status.x.saturating_add(1),
-            self.areas.status.y,
-            &self.badge,
-            UnicodeWidthStr::width(self.badge.as_ref())
-                .min(self.areas.status.width.saturating_sub(2) as usize),
-            tui::ratatui::to_ratatui_style(badge_style.patch(bar_style)),
-        );
-        let position_width = self
-            .position
-            .as_deref()
-            .map(UnicodeWidthStr::width)
-            .unwrap_or_default() as u16;
-        let right_reserved = position_width.saturating_add(u16::from(position_width > 0) * 2);
-        let status_start = self
-            .areas
-            .status
-            .x
-            .saturating_add(UnicodeWidthStr::width(self.badge.as_ref()) as u16)
-            .saturating_add(3);
-        let status_end = self
-            .areas
-            .status
-            .right()
-            .saturating_sub(1)
-            .saturating_sub(right_reserved);
-        if !self.status.is_empty() && status_start < status_end {
-            surface.set_stringn(
-                status_start,
-                self.areas.status.y,
-                &self.status,
-                status_end.saturating_sub(status_start) as usize,
-                tui::ratatui::to_ratatui_style(self.theme.get("ui.text.inactive").patch(bar_style)),
-            );
-        }
-        if let Some(position) = &self.position {
-            if self.areas.status.width > position_width.saturating_add(2) {
-                surface.set_stringn(
-                    self.areas
-                        .status
-                        .right()
-                        .saturating_sub(position_width.saturating_add(1)),
-                    self.areas.status.y,
-                    position,
-                    position_width as usize,
-                    tui::ratatui::to_ratatui_style(
-                        self.theme.get("ui.text.inactive").patch(bar_style),
-                    ),
-                );
-            }
-        }
-
-        if let Some(error) = &self.error {
-            error.paint(
-                Rect::new(
-                    self.areas.error.x.saturating_add(1),
-                    self.areas.error.y,
-                    self.areas.error.width.saturating_sub(2),
-                    self.areas.error.height,
-                ),
-                surface,
-                self.theme.get("error"),
-            );
-        }
     }
 
     fn paint_plan_and_context(&self, surface: &mut crate::render::CellSurface) {
@@ -1379,6 +1297,12 @@ impl AssistantPanel {
 
     fn sync_from_assistant(&mut self, editor: &mut Editor) {
         let model = Self::assistant_model(editor);
+        if self.last_routed_error != model.error {
+            if let Some(error) = model.error.as_deref() {
+                editor.set_error(format!("Assistant: {error}"));
+            }
+            self.last_routed_error = model.error.clone();
+        }
         if model.active_thread.is_none() {
             self.output.set_content(Arc::from([]));
             self.output.scroll_to(0);
@@ -1652,8 +1576,7 @@ impl AssistantPanel {
             output: ContentRegion::default(),
             render_model: Arc::new(helix_view::model::AssistantModel::default()),
             input: helix_view::edit_region::EditRegion::default(),
-            panel_error: None,
-            error_marquee: Marquee::new(),
+            last_routed_error: None,
             last_input_cursor: None,
             input_layout: InputLayoutCache::default(),
             model_panel_id: None,
@@ -1684,13 +1607,6 @@ impl AssistantPanel {
 
     pub fn model_panel_id(&self) -> Option<helix_view::model::PanelId> {
         self.model_panel_id
-    }
-
-    /// Set or clear the panel error message shown below the status line.
-    pub fn set_panel_error(&mut self, msg: Option<String>) {
-        self.panel_error = msg.clone();
-        self.error_marquee
-            .set_text(msg.map(|s| format!("Assistant: {}", s)));
     }
 
     pub fn activate_input(&mut self, editor: &mut Editor) {
@@ -2496,7 +2412,6 @@ impl AssistantPanel {
         snapshot.viewport_max_scroll = self.output.max_scroll() as u16;
         snapshot.focused = self.focused;
         snapshot.insert_mode = self.focused && self.input.mode() == Mode::Insert;
-        snapshot.error = self.panel_error.clone();
         snapshot.input_cursor = 0; // cursor position tracked by engine, not model
 
         *model = snapshot;
@@ -2558,8 +2473,6 @@ impl AssistantPanel {
                 Size::fixed(plan_rows),
                 Size::fixed(context_rows),
                 Size::fixed(5),
-                Size::fixed(1),
-                Size::fixed(1),
             ],
         );
         let content_raw = vertical[1];
@@ -2578,48 +2491,9 @@ impl AssistantPanel {
             plan: vertical[2],
             context: vertical[3],
             input_raw: vertical[4],
-            status: vertical[5],
-            error: vertical[6],
-        };
-
-        let layer = self.active_layer_for_model(&model);
-        let badge: Arc<str> = Arc::from(if self.editing.is_some() {
-            "EDIT"
-        } else {
-            match layer {
-                AssistantLayer::Input => "INPUT",
-                AssistantLayer::Messages => "MESSAGES",
-                AssistantLayer::Elicitation => "FORM",
-                AssistantLayer::Auth => "AUTH",
-            }
-        });
-        let status: Arc<str> = Arc::from(self.status_bar_parts(&model).join("  "));
-        let position = if layer == AssistantLayer::Messages {
-            let total = self.output.content().len();
-            (total > 0).then(|| {
-                Arc::<str>::from(
-                    model
-                        .selected_entry_id()
-                        .and_then(|id| {
-                            self.output
-                                .content()
-                                .iter()
-                                .position(|entry| entry.id == id)
-                        })
-                        .map(|index| format!("{}/{}", index + 1, total))
-                        .unwrap_or_else(|| total.to_string()),
-                )
-            })
-        } else {
-            None
         };
 
         let now = cx.frame_time();
-        let error_width = areas.error.width.saturating_sub(2);
-        let error = self.error_marquee.sample(error_width, now);
-        if let Some(next) = error.as_ref().and_then(|frame| frame.next_redraw) {
-            cx.request_frame_at(ERROR_MARQUEE_FRAME, next);
-        }
         let selected_accent = self.current_message_accent(&model, cx.assistant_theme(), now);
         if let Some((_, progress)) = selected_accent {
             if progress < 1.0 {
@@ -2826,10 +2700,6 @@ impl AssistantPanel {
             theme: cx.assistant_theme_arc(),
             model,
             focused: self.focused,
-            badge,
-            status,
-            position,
-            error,
             input,
             mention,
             blocks,
@@ -3313,7 +3183,6 @@ impl AssistantPanel {
             None => return,
         };
         if !text.is_empty() {
-            self.panel_error = None;
             if let Some(editing) = self.editing.take() {
                 if !Self::fork_submit_prompt(editing.target, text.clone(), cx) {
                     self.editing = Some(editing);
@@ -3738,9 +3607,6 @@ impl Focusable for AssistantPanel {
 
     fn set_focused(&mut self, focused: bool) {
         self.focused = focused;
-        if focused {
-            self.error_marquee.touch();
-        }
     }
 }
 
@@ -3774,6 +3640,76 @@ impl Scrollable for AssistantPanel {
 // ---------------------------------------------------------------------------
 
 impl Component for AssistantPanel {
+    fn global_status(
+        &self,
+        cx: &RenderContext,
+    ) -> Option<crate::ui::statusline::PanelStatusline> {
+        let model = self.render_model.as_ref();
+        let layer = self.active_layer_for_model(model);
+        let badge = if self.editing.is_some() {
+            "EDIT"
+        } else {
+            match layer {
+                AssistantLayer::Input => "INPUT",
+                AssistantLayer::Messages => "MESSAGES",
+                AssistantLayer::Elicitation => "FORM",
+                AssistantLayer::Auth => "AUTH",
+            }
+        };
+        let identity = model
+            .header()
+            .leading
+            .first()
+            .map(|item| item.label.trim().to_owned())
+            .filter(|label| !label.is_empty())
+            .unwrap_or_else(|| "Assistant".to_owned());
+        let status = self.status_bar_parts(model).join("  ");
+        let identity = if status.is_empty() {
+            identity
+        } else {
+            format!("{identity}  {status}")
+        };
+        let position = if layer == AssistantLayer::Messages {
+            let total = self.output.content().len();
+            (total > 0).then(|| {
+                model
+                    .selected_entry_id()
+                    .and_then(|id| {
+                        self.output
+                            .content()
+                            .iter()
+                            .position(|entry| entry.id == id)
+                    })
+                    .map(|index| format!(" {}/{} ", index + 1, total))
+                    .unwrap_or_else(|| format!(" {total} "))
+            })
+        } else {
+            None
+        };
+
+        let mut right = Vec::new();
+        if let Some(position) = position {
+            right.push(crate::ui::statusline::StatuslineText {
+                text: position,
+                style: cx
+                    .assistant_theme()
+                    .try_get("ui.text.inactive")
+                    .unwrap_or_else(|| cx.assistant_theme().get("ui.statusline")),
+            });
+        }
+        Some(crate::ui::statusline::PanelStatusline {
+            state: crate::ui::statusline::PanelStatuslineState::Label {
+                label: badge.to_owned(),
+                style: cx
+                    .assistant_theme()
+                    .get("ui.text.focus")
+                    .add_modifier(Modifier::BOLD),
+            },
+            identity,
+            right,
+        })
+    }
+
     fn sync(&mut self, _viewport: Rect, editor: &mut Editor) {
         self.output.ensure_init(editor);
         self.input.ensure_init(editor);
@@ -3809,8 +3745,6 @@ impl Component for AssistantPanel {
             }
             return EventResult::Ignored(None);
         }
-
-        self.error_marquee.touch();
 
         if matches!(
             (key.code, key.modifiers),
@@ -4148,6 +4082,26 @@ mod tests {
         fn assert_send<T: Send>() {}
 
         assert_send::<AssistantRenderSnapshot>();
+    }
+
+    #[test]
+    fn assistant_global_status_hook_reports_state_and_identity() {
+        with_test_runtime(|| {
+            let editor = test_editor();
+            let panel = AssistantPanel::new();
+            let (ingress, _receiver) =
+                crate::runtime::RuntimeIngress::channel(editor.runtime().clone());
+            let render_ctx = RenderContext::new(&editor, ingress, editor.redraw_handle());
+            let status = panel.global_status(&render_ctx).expect("assistant status");
+
+            assert!(matches!(
+                status.state,
+                crate::ui::statusline::PanelStatuslineState::Label { ref label, .. }
+                    if label == "INPUT"
+            ));
+            assert!(status.identity.starts_with("Assistant"));
+            assert!(status.right.is_empty());
+        });
     }
 
     #[test]

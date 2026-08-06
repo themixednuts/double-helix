@@ -67,7 +67,7 @@ impl<'a> DirectoryScanner<'a> {
                     Err(err) => {
                         log::debug!(
                             "failed to read file explorer entry under {}: {err}",
-                            root.display()
+                            helix_stdx::path::display_path(root)
                         );
                         return None;
                     }

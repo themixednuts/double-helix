@@ -117,7 +117,7 @@ impl Completer {
                     .values()
                     .map(|doc| {
                         doc.relative_path()
-                            .map(|path| path.display().to_string())
+                            .map(|path| helix_stdx::path::display_path(path).into_owned())
                             .unwrap_or_else(|| SCRATCH_BUFFER_NAME.to_owned())
                     })
                     .collect::<Vec<_>>()
@@ -403,17 +403,16 @@ fn filename_impl(
         }))
     };
 
-    let ends_with_separator = if is_local {
-        input.ends_with(std::path::MAIN_SEPARATOR)
-    } else {
-        input.ends_with(['/', '\\'])
-    };
+    let accepts_windows_separator = is_local && cfg!(windows);
+    let ends_with_separator =
+        input.ends_with('/') || (accepts_windows_separator && input.ends_with('\\'));
     let (base_directory, file_name) = if ends_with_separator {
         (path.into_owned(), None)
     } else {
-        let is_period = (input.ends_with(format!("{}.", std::path::MAIN_SEPARATOR).as_str())
-            && input.len() > 2)
-            || input == ".";
+        let is_period = input == "."
+            || (input.len() > 2
+                && (input.ends_with("/.")
+                    || (accepts_windows_separator && input.ends_with("\\."))));
         let file_name = if is_period {
             Some(".".to_owned())
         } else {
@@ -475,11 +474,7 @@ fn filename_impl(
         };
         let mut path = path.display();
         if matched == FileMatch::AcceptIncomplete {
-            path.push(if is_local {
-                std::path::MAIN_SEPARATOR
-            } else {
-                '/'
-            });
+            path.push('/');
         }
         (!path.is_empty()).then_some(Utf8PathBuf {
             path,

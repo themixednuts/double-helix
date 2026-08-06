@@ -584,7 +584,7 @@ pub struct DocumentFloatModel {
     pub document: crate::DocumentId,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FocusTarget {
     /// The main editor split tree (delegates to `tree.focus`).
     Editor,

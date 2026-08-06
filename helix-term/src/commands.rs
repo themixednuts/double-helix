@@ -1363,9 +1363,8 @@ fn global_search(cx: &mut Context) {
         fn display_path(&self) -> String {
             match &self.path {
                 helix_view::editor::WorkspaceDocumentPath::Local(path) => {
-                    helix_stdx::path::get_relative_path(path)
-                        .to_string_lossy()
-                        .into_owned()
+                    let relative = helix_stdx::path::get_relative_path(path);
+                    helix_stdx::path::display_path(&relative).into_owned()
                 }
                 path => path.display(),
             }
@@ -1393,7 +1392,7 @@ fn global_search(cx: &mut Context) {
         PickerColumn::new("path", |item: &FileResult, config: &GlobalSearchConfig| {
             let display = item.display_path();
             let split = display
-                .rfind(['/', '\\'])
+                .rfind('/')
                 .map_or(("", display.as_str()), |index| display.split_at(index + 1));
             let (directories, filename) = split;
 
@@ -2133,8 +2132,8 @@ fn buffer_picker(cx: &mut Context) {
 
             let name = path
                 .as_deref()
-                .and_then(Path::to_str)
-                .unwrap_or(SCRATCH_BUFFER_NAME);
+                .map(helix_stdx::path::display_path)
+                .unwrap_or_else(|| SCRATCH_BUFFER_NAME.into());
             let icons = ICONS.load();
 
             let mut spans = Vec::with_capacity(2);
@@ -2153,7 +2152,7 @@ fn buffer_picker(cx: &mut Context) {
                 }
             }
 
-            spans.push(Span::raw(name.to_string()));
+            spans.push(Span::raw(name.into_owned()));
 
             Spans::from(spans).into()
         }),
@@ -2247,8 +2246,8 @@ fn jumplist_picker(cx: &mut Context) {
 
             let name = path
                 .as_deref()
-                .and_then(Path::to_str)
-                .unwrap_or(SCRATCH_BUFFER_NAME);
+                .map(helix_stdx::path::display_path)
+                .unwrap_or_else(|| SCRATCH_BUFFER_NAME.into());
             let icons = ICONS.load();
 
             let mut spans = Vec::with_capacity(2);
@@ -2267,7 +2266,7 @@ fn jumplist_picker(cx: &mut Context) {
                 }
             }
 
-            spans.push(Span::raw(name.to_string()));
+            spans.push(Span::raw(name.into_owned()));
 
             Spans::from(spans).into()
         }),
@@ -2363,10 +2362,8 @@ fn changed_file_picker(cx: &mut Context) {
         }),
         PickerColumn::new("path", |change: &FileChange, data: &FileChangeData| {
             let display_path = |path: &PathBuf| {
-                path.strip_prefix(&data.cwd)
-                    .unwrap_or(path)
-                    .display()
-                    .to_string()
+                helix_stdx::path::display_path(path.strip_prefix(&data.cwd).unwrap_or(path))
+                    .into_owned()
             };
             match change {
                 FileChange::Untracked { path } => display_path(path),
@@ -2561,7 +2558,10 @@ pub(crate) fn blame_line_impl(editor: &mut Editor, doc_id: DocumentId, cursor_li
                     doc_id: doc.id(),
                     line: Some(cursor_line),
                 });
-                editor.set_status(format!("Requested blame for {}...", path.display()));
+                editor.set_status(format!(
+                    "Requested blame for {}...",
+                    helix_stdx::path::display_path(path)
+                ));
                 let doc = editor
                     .document_mut(doc_id)
                     .expect("exists since we return from the function earlier if it does not");

@@ -263,7 +263,7 @@ pub fn syntax_workspace_symbol_picker(cx: &mut Context) {
                         } else {
                             path
                         };
-                        path.to_string_lossy().into()
+                        helix_stdx::path::display_path(path).into()
                     } else {
                         uri.to_string().into()
                     }

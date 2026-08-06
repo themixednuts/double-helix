@@ -38,11 +38,12 @@ macro_rules! component_traits {
 
 use crate::render::{CacheStore, CellSurface, PreparedRender, RenderOutput};
 use helix_core::Position;
+use helix_core::unicode::width::UnicodeWidthStr;
 use helix_runtime::{FrameHandle, FrameSource};
 use helix_view::bench::log_run_phase;
 use helix_view::graphics::{CursorKind, Rect};
 use helix_view::input::{MouseButton, MouseEvent, MouseEventKind};
-use helix_view::model::{PanelEntry, PanelId, PanelSide, PanelSize, TreePanelModel};
+use helix_view::model::{PanelId, PanelSide, PanelSize};
 use helix_view::Editor;
 use std::sync::Arc;
 
@@ -155,6 +156,10 @@ pub(crate) struct PanelLayout {
     pub editor_area: Rect,
     /// Panel areas keyed by `PanelId` — type-safe, no string matching.
     pub panel_areas: Vec<(PanelId, Rect)>,
+    /// Full-width global statusline row directly above `global_status_row`.
+    /// Zero-height when the cmdline is configured to take the full editor
+    /// height, or when the terminal is too short to reserve both rows.
+    pub statusline_row: Rect,
     /// Bottom row reserved for the global status line (errors, info, the
     /// active cmdline prompt). Spans the full terminal width so messages
     /// remain visible no matter which panel has focus. Zero-height when
@@ -168,12 +173,9 @@ pub(crate) struct PanelLayout {
 /// the same side stack (each takes from the remaining space). The order is
 /// determined by iteration order of the SlotMap.
 pub(crate) fn compute_panel_layout(area: Rect, editor: &Editor) -> PanelLayout {
-    // Reserve the very bottom row of the terminal for the global status
-    // line (cmdline / status_msg / errors). The editor lives above this row.
-    // Side panels underlap it by one row because their own final internal row
-    // is transient/error chrome; the global row paints over that row, leaving
-    // the panel footer on the same baseline as the editor statusline.
-    // The Popup-full-height cmdline opts out — there's no reserved row.
+    // Reserve two full-width rows for the compositor-owned statusline and the
+    // message/cmdline row. The Popup-full-height cmdline opts out — neither
+    // row is reserved in that mode.
     let config = editor.config();
     let reserve_global = !matches!(
         (config.cmdline.style, config.cmdline.use_full_height),
@@ -181,9 +183,33 @@ pub(crate) fn compute_panel_layout(area: Rect, editor: &Editor) -> PanelLayout {
     );
     drop(config);
 
-    let (chrome_area, global_status_row) = if reserve_global && area.height > 1 {
+    let (chrome_area, statusline_row, global_status_row) = if reserve_global
+        && area.height > 1
+    {
+        (
+            area.clip_bottom(2),
+            Rect {
+                x: area.x,
+                y: area.bottom().saturating_sub(2),
+                width: area.width,
+                height: 1,
+            },
+            Rect {
+                x: area.x,
+                y: area.bottom().saturating_sub(1),
+                width: area.width,
+                height: 1,
+            },
+        )
+    } else if reserve_global && area.height > 0 {
         (
             area.clip_bottom(1),
+            Rect {
+                x: area.x,
+                y: area.bottom(),
+                width: area.width,
+                height: 0,
+            },
             Rect {
                 x: area.x,
                 y: area.bottom().saturating_sub(1),
@@ -194,6 +220,12 @@ pub(crate) fn compute_panel_layout(area: Rect, editor: &Editor) -> PanelLayout {
     } else {
         (
             area,
+            Rect {
+                x: area.x,
+                y: area.bottom(),
+                width: area.width,
+                height: 0,
+            },
             Rect {
                 x: area.x,
                 y: area.bottom(),
@@ -212,7 +244,7 @@ pub(crate) fn compute_panel_layout(area: Rect, editor: &Editor) -> PanelLayout {
         }
         let axis_total = match panel.side {
             PanelSide::Left | PanelSide::Right => area.width,
-            PanelSide::Bottom => area.height,
+            PanelSide::Bottom => chrome_area.height,
         };
         let panel_size = match panel.size {
             PanelSize::Fixed(px) => px.map_or(0, |n| n.get()),
@@ -230,9 +262,9 @@ pub(crate) fn compute_panel_layout(area: Rect, editor: &Editor) -> PanelLayout {
                 let w = panel_size.max(30).min(editor_area.width.saturating_sub(40));
                 let panel_rect = Rect {
                     x: editor_area.x + editor_area.width - w,
-                    y: area.y,
+                    y: chrome_area.y,
                     width: w,
-                    height: side_panel_height(area, chrome_area, panel),
+                    height: chrome_area.height,
                 };
                 editor_area.width = editor_area.width.saturating_sub(w);
                 panel_areas.push((panel_id, panel_rect));
@@ -244,9 +276,9 @@ pub(crate) fn compute_panel_layout(area: Rect, editor: &Editor) -> PanelLayout {
                 let w = panel_size.max(20).min(editor_area.width.saturating_sub(40));
                 let panel_rect = Rect {
                     x: editor_area.x,
-                    y: area.y,
+                    y: chrome_area.y,
                     width: w,
-                    height: side_panel_height(area, chrome_area, panel),
+                    height: chrome_area.height,
                 };
                 editor_area.x += w;
                 editor_area.width = editor_area.width.saturating_sub(w);
@@ -288,35 +320,25 @@ pub(crate) fn compute_panel_layout(area: Rect, editor: &Editor) -> PanelLayout {
     PanelLayout {
         editor_area,
         panel_areas,
+        statusline_row,
         global_status_row,
     }
-}
-
-fn side_panel_height(area: Rect, chrome_area: Rect, panel: &PanelEntry) -> u16 {
-    if side_panel_underlaps_global_status_row(panel) {
-        area.height
-    } else {
-        chrome_area.height
-    }
-}
-
-fn side_panel_underlaps_global_status_row(panel: &PanelEntry) -> bool {
-    // The assistant has an internal transient/error row below its statusline,
-    // so it keeps the full-height underlap and lets the global row paint over
-    // that final internal row. The file explorer has only a one-row footer;
-    // clipping it to the chrome area puts that footer on the editor
-    // statusline baseline and leaves the global row to the compositor.
-    !(panel.title == "Files" && panel.content.is::<TreePanelModel>())
 }
 
 struct GlobalStatusRowRender {
     area: Rect,
     background: helix_view::graphics::Style,
     message: Option<(Arc<str>, helix_view::graphics::Style)>,
+    pending: Option<crate::ui::statusline::PendingKeys>,
+    pending_style: helix_view::graphics::Style,
 }
 
 impl GlobalStatusRowRender {
-    fn collect(area: Rect, ctx: &RenderContext) -> Self {
+    fn collect(
+        area: Rect,
+        ctx: &RenderContext,
+        pending: Option<crate::ui::statusline::PendingKeys>,
+    ) -> Self {
         use helix_view::editor::Severity;
 
         let theme = ctx.theme();
@@ -336,6 +358,8 @@ impl GlobalStatusRowRender {
             area,
             background,
             message,
+            pending,
+            pending_style: theme.get("ui.text"),
         }
     }
 
@@ -348,16 +372,55 @@ impl GlobalStatusRowRender {
             tui::ratatui::to_ratatui_style(self.background),
         );
 
-        let Some((message, style)) = self.message else {
+        let pending_width = self.pending.as_ref().map_or(0, |pending| {
+            let display_width = pending.display.width().min(15) as u16;
+            display_width.saturating_add(u16::from(pending.register.is_some()) * 3)
+        });
+        if let Some((message, style)) = self.message {
+            let message_width = self
+                .area
+                .width
+                .saturating_sub(1)
+                .saturating_sub(pending_width.saturating_add(u16::from(pending_width > 0)));
+            surface.set_stringn(
+                self.area.x.saturating_add(1),
+                self.area.y,
+                message.as_ref(),
+                message_width as usize,
+                tui::ratatui::to_ratatui_style(style),
+            );
+        }
+
+        let Some(pending) = self.pending else {
             return;
         };
-        surface.set_stringn(
-            self.area.x.saturating_add(1),
-            self.area.y,
-            message.as_ref(),
-            self.area.width.saturating_sub(1) as usize,
-            tui::ratatui::to_ratatui_style(style),
-        );
+        let display_width = pending.display.width().min(15) as u16;
+        let right_edge = self.area.right();
+        if display_width > 0 {
+            surface.set_stringn(
+                right_edge
+                    .saturating_sub(display_width)
+                    .saturating_sub(u16::from(pending.register.is_some()) * 3),
+                self.area.y,
+                &pending.display,
+                display_width as usize,
+                tui::ratatui::to_ratatui_style(self.pending_style),
+            );
+        }
+        if let Some(register) = pending.register {
+            let display = format!("[{register}]");
+            let style = self
+                .pending_style
+                .fg(helix_view::graphics::Color::Yellow)
+                .add_modifier(helix_view::graphics::Modifier::BOLD);
+            surface.set_stringn(
+                right_edge.saturating_sub(3),
+                self.area.y,
+                &display,
+                3,
+                tui::ratatui::to_ratatui_style(style),
+            );
+        }
     }
 }
 
@@ -420,6 +483,57 @@ fn resolve_area(layer: &dyn Component, full_area: Rect, layout: &PanelLayout) ->
             })
             .unwrap_or_default(),
         LayoutRole::Overlay => full_area,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FocusStatuslineSourceKind {
+    Editor,
+    Panel,
+    Previous,
+}
+
+fn focus_statusline_source_kind(
+    focus: helix_view::model::FocusTarget,
+    has_editor: bool,
+    has_panel: bool,
+    has_previous: bool,
+) -> Option<FocusStatuslineSourceKind> {
+    let focused = match focus {
+        helix_view::model::FocusTarget::Editor => {
+            has_editor.then_some(FocusStatuslineSourceKind::Editor)
+        }
+        helix_view::model::FocusTarget::Panel(_) => {
+            (has_panel && has_editor).then_some(FocusStatuslineSourceKind::Panel)
+        }
+        helix_view::model::FocusTarget::Layer(_) | helix_view::model::FocusTarget::Float(_) => {
+            None
+        }
+    };
+    focused.or(has_previous.then_some(FocusStatuslineSourceKind::Previous))
+        .or(has_editor.then_some(FocusStatuslineSourceKind::Editor))
+}
+
+fn focus_statusline_source(
+    focus: helix_view::model::FocusTarget,
+    editor: Option<crate::ui::statusline::StatuslineModel>,
+    panel: Option<crate::ui::statusline::PanelStatusline>,
+    previous: Option<crate::ui::statusline::GlobalStatusline>,
+) -> Option<crate::ui::statusline::GlobalStatusline> {
+    match focus_statusline_source_kind(
+        focus,
+        editor.is_some(),
+        panel.is_some(),
+        previous.is_some(),
+    ) {
+        Some(FocusStatuslineSourceKind::Editor) => {
+            editor.map(crate::ui::statusline::GlobalStatusline::Editor)
+        }
+        Some(FocusStatuslineSourceKind::Panel) => panel.zip(editor).map(|(panel, editor)| {
+            crate::ui::statusline::GlobalStatusline::Panel { panel, editor }
+        }),
+        Some(FocusStatuslineSourceKind::Previous) => previous,
+        None => None,
     }
 }
 
@@ -618,6 +732,31 @@ pub trait Component: Any + Send {
     /// Capture owned frame data and defer all cell painting to the render actor.
     fn prepare_render(&mut self, area: Rect, ctx: &RenderContext) -> PreparedRender;
 
+    /// Provide the component's content for the compositor-owned global
+    /// statusline when this component is the focused surface.
+    fn global_status(
+        &self,
+        _ctx: &RenderContext,
+    ) -> Option<crate::ui::statusline::PanelStatusline> {
+        None
+    }
+
+    /// Provide the focused editor view's statusline model to the compositor.
+    fn editor_statusline(
+        &self,
+        _ctx: &RenderContext,
+    ) -> Option<crate::ui::statusline::StatuslineModel> {
+        None
+    }
+
+    /// Provide pending modal keys for the compositor-owned message row.
+    fn pending_keys(
+        &self,
+        _ctx: &RenderContext,
+    ) -> Option<crate::ui::statusline::PendingKeys> {
+        None
+    }
+
     /// Get cursor position and cursor kind.
     fn cursor(&self, _area: Rect, _ctx: &Editor) -> (Option<Position>, CursorKind) {
         (None, CursorKind::Hidden)
@@ -708,6 +847,8 @@ pub struct Compositor {
     pending_timers: std::collections::HashMap<crate::host::TimerId, std::time::Duration>,
     /// Cached from the most recent render pass so mouse events can do hit-testing.
     last_layout: Option<PanelLayout>,
+    /// Most recent editor/panel statusline retained while a layer or float has focus.
+    last_statusline: Option<crate::ui::statusline::GlobalStatusline>,
     render_cache: CacheStore,
 }
 
@@ -720,6 +861,7 @@ impl Compositor {
             full_redraw: false,
             pending_timers: std::collections::HashMap::new(),
             last_layout: None,
+            last_statusline: None,
             render_cache: CacheStore::default(),
         }
     }
@@ -1056,6 +1198,32 @@ impl Compositor {
         self.collect_frame(area, cx)
     }
 
+    fn global_statusline_for_frame(
+        &mut self,
+        ctx: &RenderContext,
+    ) -> Option<crate::ui::statusline::GlobalStatusline> {
+        let focus = ctx.focus_target();
+        let mut editor = None;
+        let mut panel = None;
+        for layer in &self.layers {
+            if let Some(statusline) = layer.editor_statusline(ctx) {
+                editor = Some(statusline);
+            }
+            if let Some(statusline) = layer.global_status(ctx) {
+                if matches!(focus, helix_view::model::FocusTarget::Panel(id) if layer.panel_id() == Some(id))
+                {
+                    panel = Some(statusline);
+                }
+            }
+        }
+
+        let source = focus_statusline_source(focus, editor, panel, self.last_statusline.clone());
+        if source.is_some() {
+            self.last_statusline = source.clone();
+        }
+        source
+    }
+
     pub fn render_frame(&mut self, area: Rect, cx: &mut Context) -> RenderOutput {
         let preparation = self.prepare_frame(area, cx);
         let surface = CellSurface::empty(tui::ratatui::to_ratatui_rect(area));
@@ -1160,6 +1328,23 @@ impl Compositor {
             area,
         );
 
+        let global_statusline = self.global_statusline_for_frame(&render_ctx);
+        let pending_keys = self
+            .layers
+            .iter()
+            .find_map(|layer| layer.pending_keys(&render_ctx));
+        let prepared_global_statusline = if layout.statusline_row.height > 0 {
+            global_statusline.map(|source| {
+                crate::ui::statusline::Statusline::prepare_global(
+                    source,
+                    layout.statusline_row,
+                    render_ctx.focus_target(),
+                )
+            })
+        } else {
+            None
+        };
+
         // Set prompt_active on EditorView before render.
         for layer in &mut self.layers {
             if let Some(editor_view) = layer.downcast_mut::<crate::ui::EditorView>() {
@@ -1202,7 +1387,11 @@ impl Compositor {
         // rendered before popups so framed/help surfaces can cover panel
         // boundaries instead of being split by them.
         if layout.global_status_row.height > 0 {
-            let row = GlobalStatusRowRender::collect(layout.global_status_row, &render_ctx);
+            let row = GlobalStatusRowRender::collect(
+                layout.global_status_row,
+                &render_ctx,
+                pending_keys,
+            );
             render_steps.push(crate::render::RenderStep::paint(
                 "global_status_row",
                 move |surface, cancellation| {
@@ -1285,6 +1474,33 @@ impl Compositor {
                 overlay_start_time.elapsed(),
                 || format!("count={count} phase=overlay_direct"),
             );
+        }
+
+        // The global statusline is the final writer of its reserved row, so
+        // focused layers and floats cannot blank the most recent editor/panel
+        // source. The message/cmdline row remains above the base layers and
+        // below overlays so bottom prompts retain their normal ownership.
+        if let Some(prepared) = prepared_global_statusline {
+            if let Some(step) = crate::render::RenderStep::prepared(
+                "global_statusline",
+                vec![prepared],
+            ) {
+                render_steps.push(step);
+            }
+        } else if layout.statusline_row.height > 0 {
+            let area = layout.statusline_row;
+            let style = render_ctx.theme().get("ui.statusline");
+            render_steps.push(crate::render::RenderStep::paint(
+                "global_statusline_background",
+                move |surface, cancellation| {
+                    if !cancellation.is_cancelled() {
+                        surface.set_style(
+                            tui::ratatui::to_ratatui_rect(area),
+                            tui::ratatui::to_ratatui_style(style),
+                        );
+                    }
+                },
+            ));
         }
 
         FramePreparation {
@@ -1570,9 +1786,16 @@ mod tests {
     use std::sync::Arc;
 
     fn test_editor(width: u16, height: u16) -> Editor {
+        test_editor_with_config(width, height, helix_view::editor::Config::default())
+    }
+
+    fn test_editor_with_config(
+        width: u16,
+        height: u16,
+        config: helix_view::editor::Config,
+    ) -> Editor {
         let theme_loader = helix_view::theme::Loader::new(&[]);
         let syn_loader = helix_core::config::default_lang_loader();
-        let config = helix_view::editor::Config::default();
         let config = Arc::new(ArcSwap::from_pointee(config));
         let handlers = helix_view::handlers::Handlers::dummy();
         Editor::new(
@@ -1963,16 +2186,17 @@ mod tests {
         assert_eq!(layout.editor_area.width, 78); // 120 - 42
         assert_eq!(layout.editor_area.x, 0);
         assert_eq!(panel_rect.x, 78);
-        // Bottom row reserved for the global status line; side panels
-        // underlap it so their internal footer/status row aligns with the
-        // editor statusline one row above the global message row.
-        assert_eq!(layout.editor_area.height, 39);
-        assert_eq!(panel_rect.height, 40);
+        // Two full-width rows are reserved below the uniform editor/panel
+        // chrome: the global statusline and the message/cmdline row.
+        assert_eq!(layout.editor_area.height, 38);
+        assert_eq!(panel_rect.height, 38);
+        assert_eq!(panel_rect.bottom(), layout.statusline_row.y);
+        assert_eq!(layout.statusline_row, Rect::new(0, 38, 120, 1));
         assert_eq!(layout.global_status_row, Rect::new(0, 39, 120, 1));
     }
 
     #[tokio::test]
-    async fn panel_layout_side_panel_footer_aligns_with_editor_statusline() {
+    async fn panel_layout_side_panel_matches_editor_chrome_height() {
         let mut editor = test_editor(120, 40);
         editor.model.insert_panel(
             "Assistant",
@@ -1983,20 +2207,80 @@ mod tests {
         let layout = compute_panel_layout(Rect::new(0, 0, 120, 40), &editor);
         let (_, panel_rect) = &layout.panel_areas[0];
 
-        // AssistantPanel lays out [header, content, input, footer, error].
-        // The global status row paints over the error row, so the footer must
-        // land on the editor's own statusline baseline.
-        let editor_statusline_row = layout.editor_area.bottom().saturating_sub(1);
-        let panel_footer_row = panel_rect.bottom().saturating_sub(2);
-        assert_eq!(panel_footer_row, editor_statusline_row);
+        assert_eq!(panel_rect.y, layout.editor_area.y);
+        assert_eq!(panel_rect.height, layout.editor_area.height);
+        assert_eq!(panel_rect.bottom(), layout.statusline_row.y);
+        assert_eq!(layout.statusline_row.bottom(), layout.global_status_row.y);
+    }
+
+    #[tokio::test]
+    async fn panel_layout_all_docked_panels_end_above_statusline() {
+        let mut editor = test_editor(120, 40);
+        editor.model.insert_panel(
+            "Assistant",
+            Box::new(AssistantModel::default()),
+            PanelSide::Right,
+            PanelSize::Percent(35),
+        );
+        editor.model.insert_panel(
+            "Bottom",
+            Box::new(AssistantModel::default()),
+            PanelSide::Bottom,
+            PanelSize::fixed(5),
+        );
+        let layout = compute_panel_layout(Rect::new(0, 0, 120, 40), &editor);
+
+        assert_eq!(layout.statusline_row, Rect::new(0, 38, 120, 1));
+        assert_eq!(layout.global_status_row, Rect::new(0, 39, 120, 1));
+        assert!(layout
+            .panel_areas
+            .iter()
+            .all(|(_, rect)| rect.bottom() == layout.statusline_row.y),
+            "panel areas: {:?}",
+            layout.panel_areas
+        );
+        assert!(layout.editor_area.bottom() <= layout.statusline_row.y);
+    }
+
+    #[test]
+    fn focus_target_switching_selects_global_statusline_source() {
+        use helix_view::model::{FocusTarget, LayerId, PanelId};
+
         assert_eq!(
-            layout.global_status_row.y,
-            panel_rect.bottom().saturating_sub(1)
+            focus_statusline_source_kind(FocusTarget::Editor, true, true, false),
+            Some(FocusStatuslineSourceKind::Editor)
+        );
+        assert_eq!(
+            focus_statusline_source_kind(
+                FocusTarget::Panel(PanelId::default()),
+                true,
+                true,
+                false
+            ),
+            Some(FocusStatuslineSourceKind::Panel)
+        );
+        assert_eq!(
+            focus_statusline_source_kind(
+                FocusTarget::Layer(LayerId::new(1)),
+                true,
+                false,
+                true
+            ),
+            Some(FocusStatuslineSourceKind::Previous)
+        );
+        assert_eq!(
+            focus_statusline_source_kind(
+                FocusTarget::Layer(LayerId::new(1)),
+                true,
+                false,
+                false
+            ),
+            Some(FocusStatuslineSourceKind::Editor)
         );
     }
 
     #[tokio::test]
-    async fn side_panel_divider_keeps_window_style_through_global_status_row() {
+    async fn side_panel_divider_keeps_window_style_through_global_chrome() {
         let mut editor = test_editor(120, 40);
         editor.model.insert_panel(
             "Assistant",
@@ -2075,7 +2359,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn panel_layout_file_explorer_footer_aligns_without_global_underlap() {
+    async fn panel_layout_file_explorer_matches_uniform_chrome_height() {
         let mut editor = test_editor(120, 40);
         editor.model.insert_panel(
             "Files",
@@ -2086,25 +2370,12 @@ mod tests {
         let layout = compute_panel_layout(Rect::new(0, 0, 120, 40), &editor);
         let (_, panel_rect) = &layout.panel_areas[0];
 
-        // H = 40. The editor renders inside chrome_area (0..39), so its
-        // statusline is row H-2 = 38 and the compositor-owned global
-        // status/error row is H-1 = 39.
-        let editor_statusline_row = layout.editor_area.bottom().saturating_sub(1);
-        assert_eq!(editor_statusline_row, 38);
+        // The explorer no longer reserves an internal footer. Its content
+        // area ends at the same chrome boundary as the editor.
+        assert_eq!(panel_rect.height, layout.editor_area.height);
+        assert_eq!(panel_rect.bottom(), layout.statusline_row.y);
+        assert_eq!(layout.statusline_row, Rect::new(0, 38, 120, 1));
         assert_eq!(layout.global_status_row, Rect::new(0, 39, 120, 1));
-
-        // FileExplorerPanel has a single-row footer and uses Panel::edge,
-        // whose content area only removes the side divider. Giving the
-        // explorer chrome_area height makes its footer row match the editor
-        // statusline and keeps row H-1 outside the explorer rect.
-        let explorer_inner = crate::widgets::Panel::edge(
-            crate::widgets::PanelStyle::default(),
-            crate::widgets::PanelEdge::Right,
-        )
-        .content_area(*panel_rect);
-        let explorer_statusline_row = explorer_inner.bottom().saturating_sub(1);
-        assert_eq!(explorer_statusline_row, editor_statusline_row);
-        assert_eq!(panel_rect.bottom(), layout.global_status_row.y);
     }
 
     #[tokio::test]
@@ -2121,8 +2392,37 @@ mod tests {
         // Terminal too narrow (≤60) — panel should be skipped
         assert!(layout.panel_areas.is_empty());
         assert_eq!(layout.editor_area.width, 50);
-        // Bottom row reserved for the global status line.
-        assert_eq!(layout.editor_area.height, 23);
+        // Two rows are reserved when there is enough room for both.
+        assert_eq!(layout.editor_area.height, 22);
+        assert_eq!(layout.statusline_row, Rect::new(0, 22, 50, 1));
+    }
+
+    #[test]
+    fn panel_layout_tiny_terminal_does_not_underflow_reserved_rows() {
+        let editor = test_editor(20, 1);
+        let layout = compute_panel_layout(Rect::new(0, 0, 20, 1), &editor);
+        assert_eq!(layout.editor_area, Rect::new(0, 0, 20, 0));
+        assert_eq!(layout.statusline_row, Rect::new(0, 1, 20, 0));
+        assert_eq!(layout.global_status_row, Rect::new(0, 0, 20, 1));
+
+        let editor = test_editor(20, 0);
+        let layout = compute_panel_layout(Rect::new(0, 0, 20, 0), &editor);
+        assert_eq!(layout.editor_area, Rect::new(0, 0, 20, 0));
+        assert_eq!(layout.statusline_row.height, 0);
+        assert_eq!(layout.global_status_row.height, 0);
+    }
+
+    #[test]
+    fn panel_layout_popup_full_height_keeps_all_rows_available() {
+        let mut config = helix_view::editor::Config::default();
+        config.cmdline.style = helix_view::editor::CmdlineStyle::Popup;
+        config.cmdline.use_full_height = true;
+        let editor = test_editor_with_config(20, 10, config);
+        let layout = compute_panel_layout(Rect::new(0, 0, 20, 10), &editor);
+
+        assert_eq!(layout.editor_area, Rect::new(0, 0, 20, 10));
+        assert_eq!(layout.statusline_row.height, 0);
+        assert_eq!(layout.global_status_row.height, 0);
     }
 
     #[tokio::test]
@@ -2139,8 +2439,9 @@ mod tests {
         let layout = compute_panel_layout(Rect::new(0, 0, 120, 40), &editor);
 
         assert!(layout.panel_areas.is_empty());
-        // Bottom row reserved for the global status line — editor gets the rest.
-        assert_eq!(layout.editor_area, Rect::new(0, 0, 120, 39));
+        // Both global rows remain reserved even when no panel is visible.
+        assert_eq!(layout.editor_area, Rect::new(0, 0, 120, 38));
+        assert_eq!(layout.statusline_row, Rect::new(0, 38, 120, 1));
         assert_eq!(layout.global_status_row, Rect::new(0, 39, 120, 1));
     }
 

@@ -670,7 +670,10 @@ fn review_message(
         }
         lines.push(Spans::from(vec![
             Span::styled("   ", muted_style),
-            Span::styled(path.display().to_string(), title_style),
+            Span::styled(
+                helix_stdx::path::display_path(path).into_owned(),
+                title_style,
+            ),
             Span::styled(format!("  {}", status.label()), muted_style),
         ]));
         if expanded {

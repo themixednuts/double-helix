@@ -192,9 +192,8 @@ fn diag_picker(
             3,
             ui::PickerColumn::new("path", |item: &PickerDiagnostic, _| {
                 if let Some(path) = item.location.uri.as_path() {
-                    path::get_truncated_path(path)
-                        .to_string_lossy()
-                        .to_string()
+                    path::display_path(&path::get_truncated_path(path))
+                        .into_owned()
                         .into()
                 } else {
                     Default::default()
@@ -444,9 +443,8 @@ pub fn workspace_symbol_picker(cx: &mut Context) {
         }),
         ui::PickerColumn::new("path", |item: &DocumentSymbolPickerItem, _| {
             if let Some(path) = item.location.uri.as_path() {
-                path::get_relative_path(path)
-                    .to_string_lossy()
-                    .to_string()
+                path::display_path(&path::get_relative_path(path))
+                    .into_owned()
                     .into()
             } else {
                 item.symbol.location.uri.to_string().into()

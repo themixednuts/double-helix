@@ -377,7 +377,7 @@ impl WorkspaceDocumentPath {
 
     pub fn display(&self) -> String {
         match self {
-            Self::Local(path) => path.display().to_string(),
+            Self::Local(path) => helix_stdx::path::display_path(path).into_owned(),
             Self::Remote(path) if path.is_root() => String::from("."),
             Self::Remote(path) => path.to_string(),
             Self::Collaboration { path, .. } if path.is_root() => String::from("."),
@@ -529,5 +529,13 @@ mod tests {
             WorkspaceDocumentPath::local(aliased),
             WorkspaceDocumentPath::local(directory)
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn local_document_path_display_uses_forward_slashes() {
+        let path = WorkspaceDocumentPath::local(PathBuf::from(r"C:\workspace\src\main.rs"));
+
+        assert_eq!(path.display(), "C:/workspace/src/main.rs");
     }
 }

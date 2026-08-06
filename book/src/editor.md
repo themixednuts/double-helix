@@ -100,7 +100,8 @@ For custom commands the contents of the yank/paste is communicated over stdin/st
 
 ### `[editor.statusline]` Section
 
-Allows configuring the statusline at the bottom of the editor.
+Allows configuring the editor-focused content of the global statusline, which
+spans the full terminal width above the message/cmdline row.
 
 The configuration distinguishes between three areas of the status line:
 

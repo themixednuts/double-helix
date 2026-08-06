@@ -40,7 +40,7 @@ impl DocumentLocation {
 impl std::fmt::Display for DocumentLocation {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Local(path) => write!(formatter, "{}", path.display()),
+            Self::Local(path) => formatter.write_str(&helix_stdx::path::display_path(path)),
             Self::Remote(location) => write!(formatter, "{}", location.resource_url()),
             Self::Collaboration(location) => write!(formatter, "{}", location.resource_url()),
         }
@@ -324,8 +324,16 @@ impl FileBoundState {
     }
 
     pub fn display_name<'a>(&'a self, scratch_name: &'a str) -> Cow<'a, str> {
-        self.relative_path()
-            .map_or_else(|| scratch_name.into(), |path| path.to_string_lossy())
+        match self.location.as_ref() {
+            Some(DocumentLocation::Local(_)) => self
+                .relative_path()
+                .map_or_else(|| scratch_name.into(), helix_stdx::path::display_path),
+            Some(DocumentLocation::Remote(location)) => Cow::Owned(location.path.to_string()),
+            Some(DocumentLocation::Collaboration(location)) => {
+                Cow::Owned(location.path.to_string())
+            }
+            None => Cow::Borrowed(scratch_name),
+        }
     }
 
     pub fn pickup_last_saved_time(&mut self) {
@@ -401,4 +409,50 @@ fn remote_saved_time(content: helix_remote::ContentId) -> SystemTime {
         .map(Duration::from_nanos)
         .and_then(|duration| UNIX_EPOCH.checked_add(duration))
         .unwrap_or_else(SystemTime::now)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn local_document_names_use_forward_slashes() {
+        let mut state = FileBoundState::new(helix_core::encoding::UTF_8, false);
+        state.location = Some(DocumentLocation::Local(PathBuf::from(
+            r"C:\workspace\src\main.rs",
+        )));
+        state
+            .relative_path
+            .set(Some(PathBuf::from(r"src\main.rs")))
+            .unwrap();
+
+        assert_eq!(state.display_name("scratch"), "src/main.rs");
+        assert_eq!(
+            state.location().unwrap().to_string(),
+            "C:/workspace/src/main.rs"
+        );
+    }
+
+    #[test]
+    fn remote_document_names_preserve_authority_filename_data() {
+        let mut state = FileBoundState::new(helix_core::encoding::UTF_8, false);
+        state.set_remote(
+            RemoteDocumentLocation::new(
+                "host",
+                helix_remote::SessionId(1),
+                "/workspace",
+                helix_remote::WorkspacePath::from_slash_path(r"directory\name/file.rs").unwrap(),
+                helix_remote::ContentId {
+                    len: 0,
+                    modified_unix_nanos: None,
+                },
+                false,
+                '/',
+            )
+            .unwrap(),
+        );
+
+        assert_eq!(state.display_name("scratch"), r"directory\name/file.rs");
+    }
 }

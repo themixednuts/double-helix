@@ -117,7 +117,7 @@ pub(crate) fn goto_locations(
                 "location",
                 |item: &LspLocation, cwdir: &std::path::PathBuf| {
                     let path = if let Some(path) = item.uri.as_path() {
-                        path.strip_prefix(cwdir).unwrap_or(path).to_string_lossy()
+                        helix_stdx::path::display_path(path.strip_prefix(cwdir).unwrap_or(path))
                     } else {
                         item.uri.to_string().into()
                     };

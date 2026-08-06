@@ -2206,7 +2206,7 @@ impl Application {
                 .editor
                 .focused_document()
                 .and_then(|doc| doc.path())
-                .map(|path| path.display().to_string().replace('\\', "/"))
+                .map(|path| helix_stdx::path::display_path(path).into_owned())
                 .unwrap_or_else(|| String::from("<scratch>"));
             log::trace!(
                 target: crate::ui::picker::PICKER_TRACE_TARGET,

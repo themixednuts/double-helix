@@ -58,9 +58,10 @@ impl Application {
         let size = format_written_size(report.byte_count);
 
         let display = match &report.location {
-            DocumentLocation::Local(path) => helix_stdx::path::get_relative_path(path)
-                .to_string_lossy()
-                .into_owned(),
+            DocumentLocation::Local(path) => {
+                let path = helix_stdx::path::get_relative_path(path);
+                helix_stdx::path::display_path(&path).into_owned()
+            }
             DocumentLocation::Remote(_) | DocumentLocation::Collaboration(_) => {
                 report.location.to_string()
             }

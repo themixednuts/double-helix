@@ -21,6 +21,7 @@ use crate::{
     },
 };
 use helix_view::{
+    document::DocumentOpenError,
     editor::{
         DocumentOpenRole, PreparedWorkspaceDocumentOpen, SavePolicy, WorkspaceDocumentOpenWork,
     },
@@ -187,7 +188,7 @@ pub(crate) struct FileExplorerPreviewRequest {
 
 pub(crate) struct PreparedFileExplorerPreview {
     pub(crate) request: FileExplorerPreviewRequest,
-    pub(crate) result: Result<PreparedWorkspaceDocumentOpen, String>,
+    pub(crate) result: Result<PreparedWorkspaceDocumentOpen, DocumentOpenError>,
 }
 
 pub(crate) struct FileExplorerPreviewLoadRequest {
@@ -271,20 +272,20 @@ impl FileExplorerPreviewQueue {
                                 })
                                 .await
                                 .unwrap_or_else(|error| {
-                                    Err(format!("preview worker failed: {error}"))
+                                    Err(DocumentOpenError::Worker(format!(
+                                        "preview worker failed: {error}"
+                                    )))
                                 })
                         }
                         WorkspaceDocumentOpenWork::Remote(work) => work
                             .execute(token.child_token(), false)
                             .await
-                            .map(PreparedWorkspaceDocumentOpen::Remote)
-                            .map_err(|error| error.to_string()),
+                            .map(PreparedWorkspaceDocumentOpen::Remote),
                         WorkspaceDocumentOpenWork::Collaboration(work) => work
                             .execute()
                             .await
-                            .map(PreparedWorkspaceDocumentOpen::Collaboration)
-                            .map_err(|error| error.to_string()),
-                        WorkspaceDocumentOpenWork::Failed { error, .. } => Err(error.to_string()),
+                            .map(PreparedWorkspaceDocumentOpen::Collaboration),
+                        WorkspaceDocumentOpenWork::Failed { error, .. } => Err(error),
                     };
 
                     let should_notify = {
@@ -394,15 +395,17 @@ impl FileExplorerPreviewQueue {
 fn prepare_local_file_explorer_preview(
     work: helix_view::editor::DocumentOpenWork,
     token: &tokio_util::sync::CancellationToken,
-) -> Result<PreparedWorkspaceDocumentOpen, String> {
+) -> Result<PreparedWorkspaceDocumentOpen, DocumentOpenError> {
     let start = Instant::now();
-    let prepared = work.execute().map_err(|error| error.to_string())?;
+    let prepared = work.execute()?;
     if token.is_cancelled() {
-        return Err(String::from("preview request canceled"));
+        return Err(DocumentOpenError::Worker(String::from(
+            "preview request canceled",
+        )));
     }
     log::info!(
         "[file_explorer] preview prepared path={} generation={} elapsed_us={}",
-        prepared.path().display(),
+        helix_stdx::path::display_path(prepared.path()),
         0,
         start.elapsed().as_micros(),
     );
@@ -638,7 +641,7 @@ fn execute_local_file_explorer_search(
                 matches.len(),
                 matches
                     .first()
-                    .map(|path| path.display().to_string())
+                    .map(|path| helix_stdx::path::display_path(path).into_owned())
                     .unwrap_or_else(|| String::from("<none>")),
                 start.elapsed().as_micros(),
             );
@@ -850,14 +853,14 @@ fn validate_explorer_descendant(
     if !path.starts_with(&root) {
         return Err(format!(
             "Refusing to {operation} {} because it is outside explorer root {}",
-            path.display(),
-            root.display()
+            helix_stdx::path::display_path(&path),
+            helix_stdx::path::display_path(&root)
         ));
     }
     if !allow_root && path == root {
         return Err(format!(
             "Refusing to {operation} the explorer root {}",
-            root.display()
+            helix_stdx::path::display_path(&root)
         ));
     }
     Ok(())
@@ -1660,7 +1663,7 @@ fn apply_create(
         && prompt_save_before_modified_documents(
             cx.editor,
             cx.ingress.clone(),
-            format!("creating {}", target.display()),
+            format!("creating {}", helix_stdx::path::display_path(&target)),
             std::slice::from_ref(&target),
             command,
         )
@@ -1708,7 +1711,7 @@ fn apply_move(
         && prompt_save_before_modified_documents(
             cx.editor,
             cx.ingress.clone(),
-            format!("moving {}", source.display()),
+            format!("moving {}", helix_stdx::path::display_path(&source)),
             std::slice::from_ref(&source),
             command,
         )
@@ -1753,7 +1756,7 @@ fn apply_confirmed_delete(
         && prompt_save_before_modified_documents(
             cx.editor,
             cx.ingress.clone(),
-            format!("deleting {}", target.display()),
+            format!("deleting {}", helix_stdx::path::display_path(&target)),
             std::slice::from_ref(&target),
             command,
         )
@@ -1807,7 +1810,7 @@ fn apply_copy(
         && prompt_save_before_modified_documents(
             cx.editor,
             cx.ingress.clone(),
-            format!("copying {}", source.display()),
+            format!("copying {}", helix_stdx::path::display_path(&source)),
             std::slice::from_ref(&source),
             command,
         )
@@ -2148,7 +2151,7 @@ pub(crate) fn apply_file_explorer_command(
                 notify_file_explorer_error(editor, error);
                 return;
             }
-            let message = format!("Move {} to trash?", target.display());
+            let message = format!("Move {} to trash?", helix_stdx::path::display_path(&target));
             notify_file_explorer_confirmation(editor, format!("{message} Enter y to confirm."));
             let cancelled_target = target.clone();
             let confirmation = Confirmation::new(message, move |cx| {
@@ -2165,7 +2168,10 @@ pub(crate) fn apply_file_explorer_command(
             .on_cancel(move |cx| {
                 notify_file_explorer_info(
                     cx.editor,
-                    format!("Cancelled trash: {}", cancelled_target.display()),
+                    format!(
+                        "Cancelled trash: {}",
+                        helix_stdx::path::display_path(&cancelled_target)
+                    ),
                 );
             });
 
@@ -2178,7 +2184,7 @@ pub(crate) fn apply_file_explorer_command(
             prefill,
         } => {
             let prompt = Prompt::new(
-                format!("Copy {} -> ", source.display()).into(),
+                format!("Copy {} -> ", helix_stdx::path::display_path(&source)).into(),
                 None,
                 crate::ui::completers::none,
                 move |cx, input: &str, event: PromptEvent| {

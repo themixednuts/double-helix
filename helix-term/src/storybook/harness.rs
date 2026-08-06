@@ -83,7 +83,7 @@ impl Stage {
     }
 
     /// Open a document and apply a small edit on top so the bufferline and
-    /// statusline render with the modified marker (`[+]`).
+    /// split identity-rule render with the modified marker (`[+]`).
     pub fn with_modified_document(self, name: &str, text: &str) -> Self {
         let mut stage = self.with_document(name, text);
         let view_id = stage.embedded.editor().focused_view_id();
@@ -102,7 +102,7 @@ impl Stage {
         stage
     }
 
-    /// Set the editor status message (rendered in the statusline).
+    /// Set the editor status message (rendered in the global message row).
     pub fn with_status(mut self, message: impl Into<String>) -> Self {
         self.embedded.editor_mut().set_status(message.into());
         self

@@ -137,11 +137,6 @@ impl FileExplorerTreeRefresh {
 
 const HEADER_ROWS: u16 = 1;
 const SEARCH_ROWS: u16 = 1;
-/// Single statusline strip beneath the tree (mode chip · summary chips ·
-/// counts). Transient error / info messages live in the editor's global
-/// status row (rendered by `EditorView` from `cx.status_msg()`) — no
-/// need to duplicate them here.
-const FOOTER_ROWS: u16 = 1;
 pub(crate) const PANEL_WIDTH: u16 = 34;
 const SYNC_SLOW_LOG_THRESHOLD: Duration = Duration::from_millis(4);
 const FALLBACK_FOLDER_ICON: &str = "";
@@ -475,7 +470,7 @@ impl FileExplorerPanel {
     fn visible_height(&self) -> usize {
         self.area
             .height
-            .saturating_sub(HEADER_ROWS + SEARCH_ROWS + FOOTER_ROWS) as usize
+            .saturating_sub(HEADER_ROWS + SEARCH_ROWS) as usize
     }
 
     /// Pull `nav`'s state into the cached `selection` / `scroll`
@@ -1671,7 +1666,7 @@ impl FileExplorerPanel {
                     );
                 }
                 Err(error) => {
-                    cx.editor.set_error(error.clone());
+                    cx.editor.set_error(error.to_string());
                     log::info!(
                         "[file_explorer] open_error path={} generation={} error={} rows={} selection={} elapsed_us={}",
                         display_path(&row.path),
@@ -2400,11 +2395,15 @@ impl FileExplorerPanel {
                 }
             }
             Err(error) => {
-                editor.set_error(error.clone());
-                log::info!(
-                    "[file_explorer] preview_result_error path={} generation={} error={} elapsed_us={}",
+                let explicit_open = self.preview_promotion_action(&request).is_some();
+                if explicit_open {
+                    editor.set_error(error.to_string());
+                }
+                log::warn!(
+                    "[file_explorer] preview_result_error path={} generation={} explicit_open={} error={} elapsed_us={}",
                     display_path(&request.path),
                     request.generation,
+                    explicit_open,
                     error,
                     start.elapsed().as_micros(),
                 );
@@ -2717,7 +2716,7 @@ impl FileExplorerPanel {
     }
 
     fn list_area(area: Rect) -> Option<Rect> {
-        if area.width == 0 || area.height <= HEADER_ROWS + SEARCH_ROWS + FOOTER_ROWS {
+        if area.width == 0 || area.height <= HEADER_ROWS + SEARCH_ROWS {
             return None;
         }
 
@@ -2732,13 +2731,12 @@ impl FileExplorerPanel {
 
         let list = inner
             .clip_top(HEADER_ROWS + SEARCH_ROWS)
-            .clip_bottom(FOOTER_ROWS)
             .clip_left(1);
         (list.width > 0 && list.height > 0).then_some(list)
     }
 
     fn search_input_area(area: Rect) -> Option<Rect> {
-        if area.width == 0 || area.height <= HEADER_ROWS + FOOTER_ROWS {
+        if area.width == 0 || area.height <= HEADER_ROWS {
             return None;
         }
 
@@ -2747,7 +2745,7 @@ impl FileExplorerPanel {
             crate::widgets::PanelEdge::Right,
         )
         .content_area(area);
-        if inner.width <= 3 || inner.height <= HEADER_ROWS + FOOTER_ROWS {
+        if inner.width <= 3 || inner.height <= HEADER_ROWS {
             return None;
         }
 
@@ -3052,6 +3050,13 @@ impl Scrollable for FileExplorerPanel {
 }
 
 impl Component for FileExplorerPanel {
+    fn global_status(
+        &self,
+        cx: &RenderContext,
+    ) -> Option<crate::ui::statusline::PanelStatusline> {
+        Some(self.global_statusline(cx))
+    }
+
     fn sync(&mut self, _viewport: Rect, editor: &mut Editor) {
         let start = Instant::now();
         if self.refresh_diagnostic_snapshot(editor) {
@@ -4710,10 +4715,42 @@ mod tests {
                 Some(local_path(target))
             );
             let visible_height = panel.visible_height();
-            assert_eq!(visible_height, 6);
+            assert_eq!(visible_height, 7);
             assert!(panel.selection >= panel.scroll);
             assert!(panel.selection < panel.scroll + visible_height);
             assert_eq!(panel.selection - panel.scroll, visible_height / 2);
+        });
+    }
+
+    #[test]
+    fn file_explorer_global_status_hook_reports_selection_and_counts() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("alpha.rs"), "").unwrap();
+        let rt = helix_runtime::test::RuntimeTest::default();
+        rt.block_on(async {
+            let editor = test_editor(100, 30, rt.runtime());
+            let panel = FileExplorerPanel::new(temp.path().to_path_buf(), &editor).unwrap();
+            let (ingress, _receiver) = crate::runtime::RuntimeIngress::channel(rt.runtime().clone());
+            let render_ctx = crate::compositor::RenderContext::new(
+                &editor,
+                ingress,
+                editor.redraw_handle(),
+            );
+            let status = panel.global_statusline(&render_ctx);
+
+            assert!(matches!(
+                status.state,
+                crate::ui::statusline::PanelStatuslineState::Mode(Mode::Normal)
+            ));
+            assert_eq!(
+                status.identity,
+                format!("Files - {}", panel.selected_path_for_log())
+            );
+            let expected_count = format!(" {} · {} ", panel.selection + 1, panel.rows.len());
+            assert_eq!(
+                status.right.last().map(|item| item.text.as_str()),
+                Some(expected_count.as_str())
+            );
         });
     }
 
@@ -5143,6 +5180,76 @@ mod tests {
             assert!(panel.preview_request.is_none());
             assert!(panel.preview_generation > request.generation);
             assert!(ingress.take_file_explorer_preview(&request).is_none());
+        });
+    }
+
+    #[test]
+    fn passive_preview_failure_does_not_replace_editor_status() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("main.rs");
+        fs::write(&path, "fn main() {}\n").unwrap();
+        let rt = helix_runtime::test::RuntimeTest::default();
+        rt.block_on(async {
+            let mut editor = test_editor(100, 30, rt.runtime());
+            let mut panel = FileExplorerPanel::new(temp.path().to_path_buf(), &editor).unwrap();
+            let (ingress, _receiver) =
+                crate::runtime::RuntimeIngress::channel(rt.runtime().clone());
+            panel.seek_to(row_index_by_name(&panel, "main.rs"));
+            let request = panel
+                .queue_selected_preview_request(&editor, ingress.clone())
+                .expect("preview request");
+            ingress.store_file_explorer_preview(
+                crate::runtime::ui::file_explorer::PreparedFileExplorerPreview {
+                    request: request.clone(),
+                    result: Err(helix_view::document::DocumentOpenError::Worker(
+                        String::from("permission denied"),
+                    )),
+                },
+            );
+
+            panel.apply_prepared_preview(&mut editor, ingress, request);
+
+            assert!(editor.get_status().is_none());
+            assert!(panel.preview_request.is_none());
+        });
+    }
+
+    #[test]
+    fn explicit_open_reports_a_matching_preview_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("main.rs");
+        fs::write(&path, "fn main() {}\n").unwrap();
+        let rt = helix_runtime::test::RuntimeTest::default();
+        rt.block_on(async {
+            let mut editor = test_editor(100, 30, rt.runtime());
+            let mut panel = FileExplorerPanel::new(temp.path().to_path_buf(), &editor).unwrap();
+            let (ingress, _receiver) =
+                crate::runtime::RuntimeIngress::channel(rt.runtime().clone());
+            panel.seek_to(row_index_by_name(&panel, "main.rs"));
+            let request = panel
+                .queue_selected_preview_request(&editor, ingress.clone())
+                .expect("preview request");
+            panel.preview_promotion = Some(ExplorerPreviewPromotion {
+                request: request.clone(),
+                action: Action::Replace,
+            });
+            ingress.store_file_explorer_preview(
+                crate::runtime::ui::file_explorer::PreparedFileExplorerPreview {
+                    request: request.clone(),
+                    result: Err(helix_view::document::DocumentOpenError::Worker(
+                        String::from("permission denied"),
+                    )),
+                },
+            );
+
+            panel.apply_prepared_preview(&mut editor, ingress, request);
+
+            let (message, _) = editor.get_status().expect("explicit-open error status");
+            assert_eq!(
+                message.as_ref(),
+                "document open worker failed: permission denied"
+            );
+            assert!(panel.preview_request.is_none());
         });
     }
 

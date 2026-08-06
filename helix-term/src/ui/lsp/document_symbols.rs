@@ -154,7 +154,12 @@ pub fn show_hierarchy_picker(
         }),
         ui::PickerColumn::new("path", |item: &LspHierarchyPickerItem, _| {
             if let Some(path) = item.location.uri.as_path() {
-                format!("{}:{}", path.display(), item.location.range.start.line + 1).into()
+                format!(
+                    "{}:{}",
+                    helix_stdx::path::display_path(path),
+                    item.location.range.start.line + 1
+                )
+                .into()
             } else {
                 item.location.uri.to_string().into()
             }

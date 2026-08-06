@@ -14,6 +14,21 @@ use std::{
 
 use crate::env::current_working_dir;
 
+/// Format a native path for user-facing, platform-independent UI.
+///
+/// Filesystem paths remain native `Path` values. Only Windows separators are
+/// rewritten; on Unix a backslash is valid filename data and must be preserved.
+pub fn display_path(path: &Path) -> Cow<'_, str> {
+    let path = path.to_string_lossy();
+    #[cfg(windows)]
+    {
+        if path.contains('\\') {
+            return Cow::Owned(path.replace('\\', "/"));
+        }
+    }
+    path
+}
+
 /// Replaces users home directory from `path` with tilde `~` if the directory
 /// is available, otherwise returns the path unchanged.
 pub fn fold_home_dir<'a, P>(path: P) -> Cow<'a, Path>
@@ -311,6 +326,24 @@ mod tests {
     use ropey::RopeSlice;
 
     use crate::path::{self, compile_path_regex};
+
+    #[cfg(windows)]
+    #[test]
+    fn display_paths_use_forward_slashes_on_windows() {
+        assert_eq!(
+            path::display_path(Path::new(r"C:\workspace\src\main.rs")),
+            "C:/workspace/src/main.rs"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn display_paths_preserve_unix_backslash_filename_data() {
+        assert_eq!(
+            path::display_path(Path::new(r"directory\name/file.rs")),
+            r"directory\name/file.rs"
+        );
+    }
 
     #[test]
     fn expand_tilde() {

@@ -25,7 +25,7 @@ use crate::{
 
 use helix_core::{
     diagnostic::NumberOrString, movement::Direction, text_annotations::TextAnnotations,
-    visual_offset_from_block, Position, Range, Selection,
+    unicode::width::UnicodeWidthStr, visual_offset_from_block, Position, Range, Selection,
 };
 use helix_loader::VERSION_AND_GIT_HASH;
 use helix_view::{
@@ -66,6 +66,66 @@ const MAX_SEED_LINE_MAP_GAP: usize = 4_096;
 
 fn view_content_area(area: Rect) -> Rect {
     area.clip_bottom(1)
+}
+
+fn paint_identity_rule(
+    surface: &mut CellSurface,
+    view_area: Rect,
+    identity: &str,
+    modified: bool,
+    is_focused: bool,
+    theme: &Theme,
+) {
+    if view_area.width == 0 || view_area.height == 0 {
+        return;
+    }
+
+    let y = view_area.bottom().saturating_sub(1);
+    let rule_style = tui::ratatui::to_ratatui_style(theme.get("ui.window"));
+    surface.set_stringn(
+        view_area.x,
+        y,
+        "─".repeat(view_area.width as usize),
+        view_area.width as usize,
+        rule_style,
+    );
+
+    let label = format!(" {identity} ");
+    let marker = modified.then_some("[+]");
+    let marker_width = marker.map_or(0, UnicodeWidthStr::width);
+    let total_width = label.width().saturating_add(marker_width);
+    let start = view_area.x.saturating_add(
+        view_area
+            .width
+            .saturating_sub(total_width as u16)
+            / 2,
+    );
+    let label_style = if is_focused {
+        theme.get("ui.text.focus")
+    } else {
+        theme.get("ui.statusline.inactive")
+    };
+    surface.set_stringn(
+        start,
+        y,
+        &label,
+        view_area.right().saturating_sub(start) as usize,
+        tui::ratatui::to_ratatui_style(label_style),
+    );
+    if let Some(marker) = marker {
+        let marker_x = start.saturating_add(label.width() as u16);
+        let marker_style = theme
+            .try_get("ui.text.focus")
+            .or_else(|| theme.try_get("warning"))
+            .unwrap_or_else(|| theme.get("ui.statusline"));
+        surface.set_stringn(
+            marker_x,
+            y,
+            marker,
+            view_area.right().saturating_sub(marker_x) as usize,
+            tui::ratatui::to_ratatui_style(marker_style),
+        );
+    }
 }
 
 /// View render context grouping parameters for `render_view`.
@@ -232,6 +292,8 @@ struct DeferredViewPaint {
     key: ViewRenderCacheKey,
     view_id: ViewId,
     view_area: Rect,
+    identity: String,
+    modified: bool,
     inner: Rect,
     viewport: Rect,
     view_offset: ViewPosition,
@@ -373,6 +435,8 @@ impl DeferredViewPaint {
             key: ViewRenderCacheKey::new(view.id, doc.id()),
             view_id: view.id,
             view_area: view.area,
+            identity: doc.display_name().into_owned(),
+            modified: doc.is_modified(),
             inner,
             viewport: *viewport,
             view_offset,
@@ -828,10 +892,22 @@ impl EditorFrameSnapshot {
             }
             let is_focused = view.is_focused;
             let inner = view.inner;
+            let view_area = view.view_area;
+            let identity = view.identity.clone();
+            let modified = view.modified;
+            let theme = Arc::clone(&view.theme);
             let cursor = Self::paint_view(view, surface, cache, cancellation, self.frame_num);
             if cancellation.is_cancelled() {
                 return;
             }
+            paint_identity_rule(
+                surface,
+                view_area,
+                &identity,
+                modified,
+                is_focused,
+                &theme,
+            );
             if self.cursor_owner && is_focused {
                 let mut absolute = cursor.and_then(|position| {
                     let col = usize::from(inner.x).checked_add(position.col)?;
@@ -1097,22 +1173,20 @@ impl EditorView {
         editor.frontend_mut().focused_modal_input = self.engine_input_state();
     }
 
-    fn prepare_statusline(
+    fn collect_statusline(
         &self,
         cx: &RenderContext,
-        doc: &Document,
-        view: &View,
-        is_focused: bool,
-    ) -> PreparedRender {
+    ) -> Option<statusline::StatuslineModel> {
         if let Some(deadline) = self.spinners.next_redraw_at(cx.frame_time()) {
             cx.request_frame_at(
                 helix_runtime::FrameSource::new("statusline.lsp-spinner"),
                 deadline,
             );
         }
-        let statusline_area = view.area.clip_top(view.area.height.saturating_sub(1));
+        let (view, _) = cx.views().find(|(_, is_focused)| *is_focused)?;
+        let doc = cx.document(view.doc)?;
         let config = cx.config();
-        let statusline_model = statusline::StatuslineModel::collect(
+        Some(statusline::StatuslineModel::collect(
             statusline::StatuslineContext {
                 config: &config.statusline,
                 theme: cx.theme(),
@@ -1128,9 +1202,33 @@ impl EditorView {
             },
             doc,
             view,
-            is_focused,
-        );
-        statusline::Statusline::prepare(statusline_model, statusline_area)
+        ))
+    }
+
+    fn collect_pending_keys(&self, cx: &RenderContext) -> Option<statusline::PendingKeys> {
+        let mut display = String::new();
+        if let Some(count) = self.engine_input_state().count {
+            display.push_str(&count.to_string());
+        }
+        if let Some(engine) = &self.engine {
+            display.push_str(engine.pending_display());
+        }
+        for key in self.keymaps.pending() {
+            display.push_str(&key.key_sequence_format());
+        }
+        for key in &self.pseudo_pending {
+            display.push_str(&key.key_sequence_format());
+        }
+
+        let register = cx.macro_recording_register();
+        if display.is_empty() && register.is_none() {
+            return None;
+        }
+        let display = display
+            .get(display.len().saturating_sub(15)..)
+            .unwrap_or(&display)
+            .to_owned();
+        Some(statusline::PendingKeys { display, register })
     }
 
     fn new(
@@ -2540,69 +2638,6 @@ impl EditorView {
             cx.defer_prepared("bufferline", vec![bufferline]);
         }
 
-        let statusline_start = std::time::Instant::now();
-        let statuslines: Vec<PreparedRender> = cx
-            .views()
-            .filter_map(|(view, is_focused)| {
-                cx.document(view.doc)
-                    .map(|doc| self.prepare_statusline(cx, doc, view, is_focused))
-            })
-            .collect();
-        let statusline_count = statuslines.len();
-        cx.defer_prepared("statusline", statuslines);
-        helix_view::bench::log_run_phase(
-            "editor_prepare",
-            "statusline_snapshot",
-            statusline_start.elapsed(),
-            || format!("count={statusline_count}"),
-        );
-
-        let key_width = 15u16;
-        if area.width > key_width {
-            let mut display = String::new();
-            if let Some(count) = self.engine_input_state().count {
-                display.push_str(&count.to_string());
-            }
-            if let Some(engine) = &self.engine {
-                display.push_str(engine.pending_display());
-            }
-            for key in self.keymaps.pending() {
-                display.push_str(&key.key_sequence_format());
-            }
-            for key in &self.pseudo_pending {
-                display.push_str(&key.key_sequence_format());
-            }
-
-            let style = cx.style("ui.text");
-            let register = cx.macro_recording_register();
-            let macro_width = u16::from(register.is_some()) * 3;
-            let display = display
-                .get(display.len().saturating_sub(key_width as usize)..)
-                .unwrap_or(&display)
-                .to_owned();
-            cx.defer_paint("pending_keys", move |surface, _cancellation| {
-                let y = area.y + area.height.saturating_sub(1);
-                surface.set_string(
-                    area.x + area.width.saturating_sub(key_width + macro_width),
-                    y,
-                    &display,
-                    tui::ratatui::to_ratatui_style(style),
-                );
-                if let Some(register) = register {
-                    let display = format!("[{register}]");
-                    let style = style
-                        .fg(helix_view::graphics::Color::Yellow)
-                        .add_modifier(Modifier::BOLD);
-                    surface.set_string(
-                        area.x + area.width.saturating_sub(3),
-                        y,
-                        &display,
-                        tui::ratatui::to_ratatui_style(style),
-                    );
-                }
-            });
-        }
-
         if let Some(completion) = self.completion.as_mut() {
             let completion = completion.prepare_render(area, cx);
             cx.defer_prepared("completion", vec![completion]);
@@ -2622,6 +2657,14 @@ impl EditorView {
 }
 
 impl Component for EditorView {
+    fn editor_statusline(&self, cx: &RenderContext) -> Option<statusline::StatuslineModel> {
+        self.collect_statusline(cx)
+    }
+
+    fn pending_keys(&self, cx: &RenderContext) -> Option<statusline::PendingKeys> {
+        self.collect_pending_keys(cx)
+    }
+
     fn handle_event(
         &mut self,
         event: &Event,

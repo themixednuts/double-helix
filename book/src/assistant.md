@@ -48,7 +48,7 @@ Open or connect with `:assistant-open` and `:assistant-connect`. With no argumen
 
 ## Panel Keys
 
-The assistant is a docked panel with two focus modes: Input and Messages. Press `?` in Messages (or the auth card) to show the active layer's keys in the standard info popup; form and auth layers show it automatically when `editor.auto-info` is enabled. The panel footer shows only the layer badge and message position — never key hints.
+The assistant is a docked panel with two focus modes: Input and Messages. Press `?` in Messages (or the auth card) to show the active layer's keys in the standard info popup; form and auth layers show it automatically when `editor.auto-info` is enabled. When the panel is focused, the global statusline shows its layer badge, thread identity, and message position — never key hints.
 
 ### Input
 
@@ -88,7 +88,7 @@ Messages focus is a single transcript list. Cards are entries in that list; they
 | `Ctrl-o` | Open the standard mode/model/config picker |
 | `?` | Toggle the key-help info popup |
 
-Editing is available only for user prompts. Press `e` on a selected user prompt to load that text into Input mode. The header shows `editing message · esc cancels`, the footer badge shows `EDIT`, and the target message remains highlighted in the transcript.
+Editing is available only for user prompts. Press `e` on a selected user prompt to load that text into Input mode. The header shows `editing message · esc cancels`, the global statusline badge shows `EDIT`, and the target message remains highlighted in the transcript.
 
 While editing, `Esc` cancels the edit, restores the draft that was in the input before editing, and returns to the previous focus without changing the thread. The normal send action resubmits the edit: Helix locally forks at that prompt by removing the edited prompt and every later entry, then sends the edited text as the replacement prompt.
 

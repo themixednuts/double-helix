@@ -28,7 +28,7 @@ pub mod popup;
 pub mod prompt;
 mod select;
 mod spinner;
-mod statusline;
+pub mod statusline;
 mod text;
 mod text_decorations;
 pub(crate) mod text_layout;
@@ -326,6 +326,46 @@ pub struct FilePickerItem {
 
 pub type FilePicker = Picker<FilePickerItem, FilePickerData>;
 
+fn file_picker_display_parts(path: &ExplorerPath) -> (String, String) {
+    let display = path.display();
+    let Some(separator) = display.rfind('/') else {
+        return (String::new(), display);
+    };
+    let (directories, filename) = display.split_at(separator + 1);
+    (directories.to_owned(), filename.to_owned())
+}
+
+#[cfg(test)]
+mod file_picker_display_tests {
+    use super::*;
+
+    #[test]
+    fn remote_picker_paths_use_only_forward_slashes() {
+        let path = ExplorerPath::Remote(
+            helix_remote::WorkspacePath::from_slash_path("src/nested/main.rs").unwrap(),
+        );
+
+        assert_eq!(
+            file_picker_display_parts(&path),
+            (String::from("src/nested/"), String::from("main.rs"))
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn local_picker_paths_use_only_forward_slashes() {
+        let path = ExplorerPath::local(r"C:\workspace\src\nested\main.rs");
+
+        assert_eq!(
+            file_picker_display_parts(&path),
+            (
+                String::from("C:/workspace/src/nested/"),
+                String::from("main.rs")
+            )
+        );
+    }
+}
+
 pub fn file_picker(
     editor: &Editor,
     root: helix_view::editor::WorkspaceDocumentPath,
@@ -391,32 +431,11 @@ pub fn file_picker(
                 .path
                 .relative_to(&data.root)
                 .unwrap_or_else(|| item.path.clone());
-            let mut spans = Vec::with_capacity(3);
-            let display_path = path.icon_path();
-            if let Some(dirs) = display_path
-                .parent()
-                .filter(|path| !path.as_os_str().is_empty())
-            {
-                spans.extend([
-                    Span::styled(dirs.to_string_lossy().into_owned(), data.directory_style),
-                    Span::styled(
-                        if matches!(
-                            path,
-                            ExplorerPath::Remote(_) | ExplorerPath::Collaboration { .. }
-                        ) {
-                            "/"
-                        } else {
-                            std::path::MAIN_SEPARATOR_STR
-                        },
-                        data.directory_style,
-                    ),
-                ]);
+            let (directories, filename) = file_picker_display_parts(&path);
+            let mut spans = Vec::with_capacity(2);
+            if !directories.is_empty() {
+                spans.push(Span::styled(directories, data.directory_style));
             }
-            let filename = display_path
-                .file_name()
-                .expect("normalized paths can't end in `..`")
-                .to_string_lossy()
-                .into_owned();
             spans.push(Span::raw(filename));
             Spans::from(spans).into()
         },

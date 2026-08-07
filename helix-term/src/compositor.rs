@@ -37,8 +37,8 @@ macro_rules! component_traits {
 }
 
 use crate::render::{CacheStore, CellSurface, PreparedRender, RenderOutput};
-use helix_core::Position;
 use helix_core::unicode::width::UnicodeWidthStr;
+use helix_core::Position;
 use helix_runtime::{FrameHandle, FrameSource};
 use helix_view::bench::log_run_phase;
 use helix_view::graphics::{CursorKind, Rect};
@@ -183,9 +183,7 @@ pub(crate) fn compute_panel_layout(area: Rect, editor: &Editor) -> PanelLayout {
     );
     drop(config);
 
-    let (chrome_area, statusline_row, global_status_row) = if reserve_global
-        && area.height > 1
-    {
+    let (chrome_area, statusline_row, global_status_row) = if reserve_global && area.height > 1 {
         (
             area.clip_bottom(2),
             Rect {
@@ -506,11 +504,10 @@ fn focus_statusline_source_kind(
         helix_view::model::FocusTarget::Panel(_) => {
             (has_panel && has_editor).then_some(FocusStatuslineSourceKind::Panel)
         }
-        helix_view::model::FocusTarget::Layer(_) | helix_view::model::FocusTarget::Float(_) => {
-            None
-        }
+        helix_view::model::FocusTarget::Layer(_) | helix_view::model::FocusTarget::Float(_) => None,
     };
-    focused.or(has_previous.then_some(FocusStatuslineSourceKind::Previous))
+    focused
+        .or(has_previous.then_some(FocusStatuslineSourceKind::Previous))
         .or(has_editor.then_some(FocusStatuslineSourceKind::Editor))
 }
 
@@ -520,12 +517,8 @@ fn focus_statusline_source(
     panel: Option<crate::ui::statusline::PanelStatusline>,
     previous: Option<crate::ui::statusline::GlobalStatusline>,
 ) -> Option<crate::ui::statusline::GlobalStatusline> {
-    match focus_statusline_source_kind(
-        focus,
-        editor.is_some(),
-        panel.is_some(),
-        previous.is_some(),
-    ) {
+    match focus_statusline_source_kind(focus, editor.is_some(), panel.is_some(), previous.is_some())
+    {
         Some(FocusStatuslineSourceKind::Editor) => {
             editor.map(crate::ui::statusline::GlobalStatusline::Editor)
         }
@@ -750,10 +743,7 @@ pub trait Component: Any + Send {
     }
 
     /// Provide pending modal keys for the compositor-owned message row.
-    fn pending_keys(
-        &self,
-        _ctx: &RenderContext,
-    ) -> Option<crate::ui::statusline::PendingKeys> {
+    fn pending_keys(&self, _ctx: &RenderContext) -> Option<crate::ui::statusline::PendingKeys> {
         None
     }
 
@@ -1387,11 +1377,8 @@ impl Compositor {
         // rendered before popups so framed/help surfaces can cover panel
         // boundaries instead of being split by them.
         if layout.global_status_row.height > 0 {
-            let row = GlobalStatusRowRender::collect(
-                layout.global_status_row,
-                &render_ctx,
-                pending_keys,
-            );
+            let row =
+                GlobalStatusRowRender::collect(layout.global_status_row, &render_ctx, pending_keys);
             render_steps.push(crate::render::RenderStep::paint(
                 "global_status_row",
                 move |surface, cancellation| {
@@ -1481,10 +1468,9 @@ impl Compositor {
         // source. The message/cmdline row remains above the base layers and
         // below overlays so bottom prompts retain their normal ownership.
         if let Some(prepared) = prepared_global_statusline {
-            if let Some(step) = crate::render::RenderStep::prepared(
-                "global_statusline",
-                vec![prepared],
-            ) {
+            if let Some(step) =
+                crate::render::RenderStep::prepared("global_statusline", vec![prepared])
+            {
                 render_steps.push(step);
             }
         } else if layout.statusline_row.height > 0 {
@@ -2232,10 +2218,11 @@ mod tests {
 
         assert_eq!(layout.statusline_row, Rect::new(0, 38, 120, 1));
         assert_eq!(layout.global_status_row, Rect::new(0, 39, 120, 1));
-        assert!(layout
-            .panel_areas
-            .iter()
-            .all(|(_, rect)| rect.bottom() == layout.statusline_row.y),
+        assert!(
+            layout
+                .panel_areas
+                .iter()
+                .all(|(_, rect)| rect.bottom() == layout.statusline_row.y),
             "panel areas: {:?}",
             layout.panel_areas
         );
@@ -2251,30 +2238,15 @@ mod tests {
             Some(FocusStatuslineSourceKind::Editor)
         );
         assert_eq!(
-            focus_statusline_source_kind(
-                FocusTarget::Panel(PanelId::default()),
-                true,
-                true,
-                false
-            ),
+            focus_statusline_source_kind(FocusTarget::Panel(PanelId::default()), true, true, false),
             Some(FocusStatuslineSourceKind::Panel)
         );
         assert_eq!(
-            focus_statusline_source_kind(
-                FocusTarget::Layer(LayerId::new(1)),
-                true,
-                false,
-                true
-            ),
+            focus_statusline_source_kind(FocusTarget::Layer(LayerId::new(1)), true, false, true),
             Some(FocusStatuslineSourceKind::Previous)
         );
         assert_eq!(
-            focus_statusline_source_kind(
-                FocusTarget::Layer(LayerId::new(1)),
-                true,
-                false,
-                false
-            ),
+            focus_statusline_source_kind(FocusTarget::Layer(LayerId::new(1)), true, false, false),
             Some(FocusStatuslineSourceKind::Editor)
         );
     }

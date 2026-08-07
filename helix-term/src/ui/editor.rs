@@ -94,12 +94,9 @@ fn paint_identity_rule(
     let marker = modified.then_some("[+]");
     let marker_width = marker.map_or(0, UnicodeWidthStr::width);
     let total_width = label.width().saturating_add(marker_width);
-    let start = view_area.x.saturating_add(
-        view_area
-            .width
-            .saturating_sub(total_width as u16)
-            / 2,
-    );
+    let start = view_area
+        .x
+        .saturating_add(view_area.width.saturating_sub(total_width as u16) / 2);
     let label_style = if is_focused {
         theme.get("ui.text.focus")
     } else {
@@ -900,14 +897,7 @@ impl EditorFrameSnapshot {
             if cancellation.is_cancelled() {
                 return;
             }
-            paint_identity_rule(
-                surface,
-                view_area,
-                &identity,
-                modified,
-                is_focused,
-                &theme,
-            );
+            paint_identity_rule(surface, view_area, &identity, modified, is_focused, &theme);
             if self.cursor_owner && is_focused {
                 let mut absolute = cursor.and_then(|position| {
                     let col = usize::from(inner.x).checked_add(position.col)?;
@@ -1173,10 +1163,7 @@ impl EditorView {
         editor.frontend_mut().focused_modal_input = self.engine_input_state();
     }
 
-    fn collect_statusline(
-        &self,
-        cx: &RenderContext,
-    ) -> Option<statusline::StatuslineModel> {
+    fn collect_statusline(&self, cx: &RenderContext) -> Option<statusline::StatuslineModel> {
         if let Some(deadline) = self.spinners.next_redraw_at(cx.frame_time()) {
             cx.request_frame_at(
                 helix_runtime::FrameSource::new("statusline.lsp-spinner"),

@@ -468,9 +468,7 @@ impl FileExplorerPanel {
     }
 
     fn visible_height(&self) -> usize {
-        self.area
-            .height
-            .saturating_sub(HEADER_ROWS + SEARCH_ROWS) as usize
+        self.area.height.saturating_sub(HEADER_ROWS + SEARCH_ROWS) as usize
     }
 
     /// Pull `nav`'s state into the cached `selection` / `scroll`
@@ -2729,9 +2727,7 @@ impl FileExplorerPanel {
             return None;
         }
 
-        let list = inner
-            .clip_top(HEADER_ROWS + SEARCH_ROWS)
-            .clip_left(1);
+        let list = inner.clip_top(HEADER_ROWS + SEARCH_ROWS).clip_left(1);
         (list.width > 0 && list.height > 0).then_some(list)
     }
 
@@ -3050,10 +3046,7 @@ impl Scrollable for FileExplorerPanel {
 }
 
 impl Component for FileExplorerPanel {
-    fn global_status(
-        &self,
-        cx: &RenderContext,
-    ) -> Option<crate::ui::statusline::PanelStatusline> {
+    fn global_status(&self, cx: &RenderContext) -> Option<crate::ui::statusline::PanelStatusline> {
         Some(self.global_statusline(cx))
     }
 
@@ -4730,12 +4723,10 @@ mod tests {
         rt.block_on(async {
             let editor = test_editor(100, 30, rt.runtime());
             let panel = FileExplorerPanel::new(temp.path().to_path_buf(), &editor).unwrap();
-            let (ingress, _receiver) = crate::runtime::RuntimeIngress::channel(rt.runtime().clone());
-            let render_ctx = crate::compositor::RenderContext::new(
-                &editor,
-                ingress,
-                editor.redraw_handle(),
-            );
+            let (ingress, _receiver) =
+                crate::runtime::RuntimeIngress::channel(rt.runtime().clone());
+            let render_ctx =
+                crate::compositor::RenderContext::new(&editor, ingress, editor.redraw_handle());
             let status = panel.global_statusline(&render_ctx);
 
             assert!(matches!(

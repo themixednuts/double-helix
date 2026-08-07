@@ -268,7 +268,10 @@ impl FileExplorerPanel {
 
         crate::ui::statusline::PanelStatusline {
             state: crate::ui::statusline::PanelStatuslineState::Mode(self.input.mode),
-            identity: format!("Files - {}", selected_path_for_log(&self.rows, self.selection)),
+            identity: format!(
+                "Files - {}",
+                selected_path_for_log(&self.rows, self.selection)
+            ),
             right,
         }
     }
@@ -284,9 +287,7 @@ impl FileExplorerPanel {
         // Mirror the list geometry used by render_surface so horizontal
         // scroll clamps against the real content viewport: indent column,
         // optional vertical scrollbar.
-        let list_height = area
-            .height
-            .saturating_sub(HEADER_ROWS + SEARCH_ROWS);
+        let list_height = area.height.saturating_sub(HEADER_ROWS + SEARCH_ROWS);
         let list_width = area.width.saturating_sub(2).saturating_sub(1);
         let has_scrollbar = self.rows.len() > list_height as usize;
         self.tree_content_width = if has_scrollbar {
@@ -447,9 +448,7 @@ impl ExplorerRenderSnapshot {
         );
         self.render_search_bar(surface, search_area, styles);
 
-        let list = inner
-            .clip_top(HEADER_ROWS + SEARCH_ROWS)
-            .clip_left(1);
+        let list = inner.clip_top(HEADER_ROWS + SEARCH_ROWS).clip_left(1);
         if list.height == 0 {
             log::trace!(
                 "[file_explorer] render skipped=empty_list area={}x{}+{},{} inner={}x{} elapsed_us={}",
@@ -703,5 +702,4 @@ impl ExplorerRenderSnapshot {
             }
         }
     }
-
 }

@@ -77,11 +77,7 @@ pub struct StatuslineModel {
 }
 
 impl StatuslineModel {
-    pub fn collect(
-        context: StatuslineContext<'_>,
-        doc: &Document,
-        view: &View,
-    ) -> Self {
+    pub fn collect(context: StatuslineContext<'_>, doc: &Document, view: &View) -> Self {
         let cursor = doc.cursor_status(view.id);
         let selection = doc.selection_status(view.id);
         let first_server = doc.language_servers().next().map(|server| server.id());
@@ -221,11 +217,8 @@ impl<'a> Statusline<'a> {
         match source {
             GlobalStatusline::Editor(model) => Self::prepare(model, area, focus_target),
             GlobalStatusline::Panel { panel, editor } => {
-                let right_text: Vec<&str> = panel
-                    .right
-                    .iter()
-                    .map(|item| item.text.as_str())
-                    .collect();
+                let right_text: Vec<&str> =
+                    panel.right.iter().map(|item| item.text.as_str()).collect();
                 let state = match &panel.state {
                     PanelStatuslineState::Mode(mode) => format!("mode:{mode:?}"),
                     PanelStatuslineState::Label { label, .. } => format!("label:{label}"),
@@ -358,11 +351,7 @@ impl<'a> Statusline<'a> {
         append_bench_overlay(&self.model, &mut self.parts.right, base_style);
     }
 
-    fn append_editor_global(
-        &mut self,
-        element_id: StatusLineElementId,
-        base_style: RatatuiStyle,
-    ) {
+    fn append_editor_global(&mut self, element_id: StatusLineElementId, base_style: RatatuiStyle) {
         let render = get_render_function(element_id);
         (render)(self, |statusline, span| {
             append(&mut statusline.parts.right, span, base_style)
@@ -438,11 +427,7 @@ fn rat_style(style: ThemeStyle) -> RatatuiStyle {
     tui::ratatui::to_ratatui_style(style)
 }
 
-fn append_bench_overlay(
-    model: &StatuslineModel,
-    right: &mut Line<'_>,
-    base_style: RatatuiStyle,
-) {
+fn append_bench_overlay(model: &StatuslineModel, right: &mut Line<'_>, base_style: RatatuiStyle) {
     let Some(bench) = model.bench_overlay else {
         return;
     };

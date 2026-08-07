@@ -984,7 +984,6 @@ impl AssistantRenderSnapshot {
             );
             x = x.saturating_add(width.min(right_edge.saturating_sub(x)).saturating_add(1));
         }
-
     }
 
     fn paint_plan_and_context(&self, surface: &mut crate::render::CellSurface) {
@@ -3640,10 +3639,7 @@ impl Scrollable for AssistantPanel {
 // ---------------------------------------------------------------------------
 
 impl Component for AssistantPanel {
-    fn global_status(
-        &self,
-        cx: &RenderContext,
-    ) -> Option<crate::ui::statusline::PanelStatusline> {
+    fn global_status(&self, cx: &RenderContext) -> Option<crate::ui::statusline::PanelStatusline> {
         let model = self.render_model.as_ref();
         let layer = self.active_layer_for_model(model);
         let badge = if self.editing.is_some() {

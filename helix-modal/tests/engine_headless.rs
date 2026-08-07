@@ -101,6 +101,16 @@ impl TestKeymap {
             char_key('u'),
             CommandToken::Action(ActionId::new("undo")),
         ));
+        mappings.push((
+            n,
+            char_key('X'),
+            CommandToken::Action(ActionId::new("extend_line_below")),
+        ));
+        mappings.push((
+            n,
+            char_key('A'),
+            CommandToken::Action(ActionId::new("extend_line_above")),
+        ));
 
         Self { mappings }
     }
@@ -223,6 +233,13 @@ fn doc_text(editor: &Editor) -> String {
     doc.text().to_string()
 }
 
+/// `(from, to)` of the primary selection in the focused view.
+fn primary_bounds(editor: &Editor) -> (usize, usize) {
+    let (view_id, doc) = helix_view::focused_ref!(editor);
+    let range = doc.selection(view_id).primary();
+    (range.from(), range.to())
+}
+
 // ─── Tests ───────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -286,6 +303,59 @@ async fn helix_engine_count_then_motion() {
     assert!(matches!(result, EngineResult::Executed));
 
     assert_eq!(cursor_pos(&editor), 3);
+}
+
+#[tokio::test]
+async fn helix_engine_extend_line_below_accumulates_lines() {
+    let mut editor = test_editor();
+    let mut engine = build_helix_engine();
+    let mut keymaps = TestKeymap::new();
+    editor_with_content(&mut editor, "one\ntwo\nthree\n");
+
+    feed_key(&mut *engine, &mut editor, &mut keymaps, char_key('X'));
+    assert_eq!(primary_bounds(&editor), (0, 4));
+
+    feed_key(&mut *engine, &mut editor, &mut keymaps, char_key('X'));
+    assert_eq!(primary_bounds(&editor), (0, 8));
+
+    feed_key(&mut *engine, &mut editor, &mut keymaps, char_key('X'));
+    assert_eq!(primary_bounds(&editor), (0, 14));
+}
+
+#[tokio::test]
+async fn helix_engine_extend_line_below_with_count() {
+    let mut editor = test_editor();
+    let mut engine = build_helix_engine();
+    let mut keymaps = TestKeymap::new();
+    editor_with_content(&mut editor, "one\ntwo\nthree\n");
+
+    feed_key(&mut *engine, &mut editor, &mut keymaps, char_key('2'));
+    feed_key(&mut *engine, &mut editor, &mut keymaps, char_key('X'));
+    assert_eq!(primary_bounds(&editor), (0, 8));
+
+    // a count on an already line-bounded selection adds that many more lines
+    feed_key(&mut *engine, &mut editor, &mut keymaps, char_key('X'));
+    assert_eq!(primary_bounds(&editor), (0, 14));
+}
+
+#[tokio::test]
+async fn helix_engine_extend_line_above_accumulates_lines() {
+    let mut editor = test_editor();
+    let mut engine = build_helix_engine();
+    let mut keymaps = TestKeymap::new();
+    editor_with_content(&mut editor, "one\ntwo\nthree\n");
+    {
+        let view_id = editor.tree.focus;
+        let doc_id = editor.tree.get(view_id).doc;
+        let doc = editor.document_mut(doc_id).unwrap();
+        doc.set_selection(view_id, helix_core::Selection::point(9));
+    }
+
+    feed_key(&mut *engine, &mut editor, &mut keymaps, char_key('A'));
+    assert_eq!(primary_bounds(&editor), (8, 14));
+
+    feed_key(&mut *engine, &mut editor, &mut keymaps, char_key('A'));
+    assert_eq!(primary_bounds(&editor), (4, 14));
 }
 
 #[tokio::test]

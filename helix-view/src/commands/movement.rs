@@ -1892,4 +1892,124 @@ mod tests {
         assert_eq!(range.from(), 0);
         assert_eq!(range.to(), 8);
     }
+
+    /// `(from, to)` of the primary range, the shape `extend_line_in` is asserted on.
+    fn bounds(doc: &Document, view_id: ViewId) -> (usize, usize) {
+        let range = doc.selection(view_id).primary();
+        (range.from(), range.to())
+    }
+
+    #[test]
+    fn extend_line_below_in_accumulates_one_line_per_repeat() {
+        let view_id = ViewId::default();
+        let viewport = TestViewport { id: view_id };
+        let mut doc = test_doc("one\ntwo\nthree\n");
+        doc.set_selection(view_id, helix_core::Selection::point(1));
+
+        extend_line_in(&viewport, &mut doc, 1, Extend::Below);
+        assert_eq!(bounds(&doc, view_id), (0, 4));
+
+        extend_line_in(&viewport, &mut doc, 1, Extend::Below);
+        assert_eq!(bounds(&doc, view_id), (0, 8));
+
+        extend_line_in(&viewport, &mut doc, 1, Extend::Below);
+        assert_eq!(bounds(&doc, view_id), (0, 14));
+    }
+
+    #[test]
+    fn extend_line_below_in_with_count_selects_count_lines() {
+        let view_id = ViewId::default();
+        let viewport = TestViewport { id: view_id };
+        let mut doc = test_doc("one\ntwo\nthree\n");
+        doc.set_selection(view_id, helix_core::Selection::point(1));
+
+        extend_line_in(&viewport, &mut doc, 2, Extend::Below);
+
+        assert_eq!(bounds(&doc, view_id), (0, 8));
+    }
+
+    #[test]
+    fn extend_line_below_in_with_count_extends_selected_line() {
+        let view_id = ViewId::default();
+        let viewport = TestViewport { id: view_id };
+        let mut doc = test_doc("one\ntwo\nthree\n");
+        doc.set_selection(view_id, helix_core::Selection::point(1));
+
+        extend_line_in(&viewport, &mut doc, 1, Extend::Below);
+        extend_line_in(&viewport, &mut doc, 2, Extend::Below);
+
+        assert_eq!(bounds(&doc, view_id), (0, 14));
+    }
+
+    #[test]
+    fn extend_line_below_in_clamps_at_last_line() {
+        let view_id = ViewId::default();
+        let viewport = TestViewport { id: view_id };
+        let mut doc = test_doc("one\ntwo\nthree");
+        doc.set_selection(view_id, helix_core::Selection::point(9));
+
+        extend_line_in(&viewport, &mut doc, 1, Extend::Below);
+        assert_eq!(bounds(&doc, view_id), (8, 13));
+
+        extend_line_in(&viewport, &mut doc, 1, Extend::Below);
+        assert_eq!(bounds(&doc, view_id), (8, 13));
+    }
+
+    #[test]
+    fn extend_line_above_in_accumulates_one_line_per_repeat() {
+        let view_id = ViewId::default();
+        let viewport = TestViewport { id: view_id };
+        let mut doc = test_doc("one\ntwo\nthree\n");
+        doc.set_selection(view_id, helix_core::Selection::point(9));
+
+        extend_line_in(&viewport, &mut doc, 1, Extend::Above);
+        assert_eq!(bounds(&doc, view_id), (8, 14));
+
+        extend_line_in(&viewport, &mut doc, 1, Extend::Above);
+        assert_eq!(bounds(&doc, view_id), (4, 14));
+
+        extend_line_in(&viewport, &mut doc, 1, Extend::Above);
+        assert_eq!(bounds(&doc, view_id), (0, 14));
+
+        // clamped at the first line
+        extend_line_in(&viewport, &mut doc, 1, Extend::Above);
+        assert_eq!(bounds(&doc, view_id), (0, 14));
+    }
+
+    #[test]
+    fn extend_line_above_in_with_count_selects_count_lines() {
+        let view_id = ViewId::default();
+        let viewport = TestViewport { id: view_id };
+        let mut doc = test_doc("one\ntwo\nthree\n");
+        doc.set_selection(view_id, helix_core::Selection::point(9));
+
+        extend_line_in(&viewport, &mut doc, 2, Extend::Above);
+
+        assert_eq!(bounds(&doc, view_id), (4, 14));
+    }
+
+    /// `extend_line` picks its direction from the primary range, so each variant
+    /// has to hand back a range pointing the way it grew.
+    #[test]
+    fn extend_line_in_keeps_growth_direction() {
+        let view_id = ViewId::default();
+        let viewport = TestViewport { id: view_id };
+        let mut doc = test_doc("one\ntwo\nthree\n");
+
+        doc.set_selection(view_id, helix_core::Selection::single(4, 8));
+        extend_line_in(&viewport, &mut doc, 1, Extend::Below);
+        assert_eq!(bounds(&doc, view_id), (4, 14));
+        assert_eq!(
+            doc.selection(view_id).primary().direction(),
+            Direction::Forward
+        );
+
+        doc.set_selection(view_id, helix_core::Selection::single(8, 4));
+        extend_line_in(&viewport, &mut doc, 1, Extend::Above);
+        assert_eq!(bounds(&doc, view_id), (0, 8));
+        assert_eq!(
+            doc.selection(view_id).primary().direction(),
+            Direction::Backward
+        );
+    }
 }

@@ -371,6 +371,52 @@ async fn test_extend_line() -> anyhow::Result<()> {
     ))
     .await?;
 
+    // each repeated press adds one more line
+    test((
+        indoc! {"\
+            #[l|]#orem
+            ipsum
+            dolor
+
+            "},
+        "xxx",
+        indoc! {"\
+            #[lorem
+            ipsum
+            dolor\n|]#
+
+            "},
+    ))
+    .await?;
+
+    // an accumulated selection deletes as whole lines
+    test((
+        indoc! {"\
+            #[l|]#orem
+            ipsum
+            dolor
+            "},
+        "xxd",
+        indoc! {"\
+            #[d|]#olor
+            "},
+    ))
+    .await?;
+
+    // repeated presses clamp at the last line instead of running past it
+    test((
+        indoc! {"\
+            #[l|]#orem
+            ipsum
+            "},
+        "xxxx",
+        indoc! {"\
+            #[lorem
+            ipsum
+            |]#"},
+    ))
+    .await?;
+
     Ok(())
 }
 

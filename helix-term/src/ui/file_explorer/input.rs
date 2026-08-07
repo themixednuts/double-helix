@@ -200,6 +200,10 @@ pub(super) enum ExplorerAction {
     SelectPreviousDiagnostic,
     MoveLabelSelection(LabelMotion, CoreMovement),
     SelectLabelTextObject(LabelTextObject),
+    /// Extend the contiguous row selection downward by `count` rows,
+    /// mirroring the editor's line-wise `x`. The first press selects the
+    /// cursor row; each repeat adds a row, clamped at the last row.
+    ExtendRowSelection(usize),
     SelectWholeLabel,
     CollapseLabelSelection,
     FlipLabelSelection,
@@ -598,7 +602,8 @@ fn explorer_engine_doc(token: CommandToken) -> Option<&'static str> {
             "goto_file_end" | "goto_last_line" | "extend_to_file_end" | "extend_to_last_line" => {
                 Some("Select last item")
             }
-            "extend_line_below" | "extend_to_line_bounds" => Some("Select whole item label"),
+            "extend_line_below" => Some("Extend selection to next item"),
+            "extend_to_line_bounds" => Some("Select whole item label"),
             _ => None,
         },
         CommandToken::Action(id) => match id.as_str() {
@@ -608,7 +613,8 @@ fn explorer_engine_doc(token: CommandToken) -> Option<&'static str> {
             "normal_mode" | "exit_select_mode" => Some("Exit label selection mode"),
             "paste_after" => Some("Paste file operation after selection"),
             "paste_before" => Some("Paste file operation before selection"),
-            "extend_line_below" | "extend_to_line_bounds" => Some("Select whole item label"),
+            "extend_line_below" => Some("Extend selection to next item"),
+            "extend_to_line_bounds" => Some("Select whole item label"),
             "select_all" => Some("Select whole item label"),
             "collapse_selection" => Some("Collapse label selection"),
             "flip_selections" => Some("Flip label selection direction"),
@@ -1055,9 +1061,8 @@ impl ExplorerInputEngine {
                 | "goto_last_line"
                 | "extend_to_file_end"
                 | "extend_to_last_line" => Some(ExplorerAction::SelectLast),
-                "extend_line_below" | "extend_to_line_bounds" => {
-                    Some(ExplorerAction::SelectWholeLabel)
-                }
+                "extend_line_below" => Some(ExplorerAction::ExtendRowSelection(count)),
+                "extend_to_line_bounds" => Some(ExplorerAction::SelectWholeLabel),
                 _ => None,
             },
             CommandToken::Action(id) => match id.as_str() {
@@ -1074,9 +1079,8 @@ impl ExplorerInputEngine {
                 "paste_before" => Some(ExplorerAction::PasteClipboard(
                     ExplorerPastePlacement::Before,
                 )),
-                "extend_line_below" | "extend_to_line_bounds" => {
-                    Some(ExplorerAction::SelectWholeLabel)
-                }
+                "extend_line_below" => Some(ExplorerAction::ExtendRowSelection(count)),
+                "extend_to_line_bounds" => Some(ExplorerAction::SelectWholeLabel),
                 "select_all" => Some(ExplorerAction::SelectWholeLabel),
                 "collapse_selection" => Some(ExplorerAction::CollapseLabelSelection),
                 "flip_selections" => Some(ExplorerAction::FlipLabelSelection),

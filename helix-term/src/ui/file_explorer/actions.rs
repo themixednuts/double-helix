@@ -10,23 +10,63 @@ use helix_view::{
 };
 
 use crate::{
-    compositor::Context,
+    compositor::{Context, PostAction},
     runtime::{
         ui::command::{FileExplorerCommand, ModifiedBufferCheck},
         UiCommand,
     },
+    ui::confirmation::Confirmation,
 };
 
 use super::{
     input::{CreatePlacement, ExplorerFileOperation, ExplorerOperator, ExplorerPastePlacement},
     model::ExplorerRow,
-    path_ops::{parse_entry_path, selected_cursor, sibling_path_with_label, validate_label},
+    path_ops::{
+        display_name, parse_entry_path, selected_cursor, sibling_path_with_label, validate_label,
+    },
     windows_reserved_basename, windows_reserved_path, ExplorerPath, FileExplorerPanel,
 };
 
 /// Ephemeral path segment for an in-progress create row. Never written to disk;
 /// the commit path uses the typed buffer under `LabelEditKind::Create::parent`.
 const CREATE_ROW_SEGMENT: &str = ".helix-creating";
+
+/// How many target names a ranged-delete confirmation spells out before it
+/// falls back to counting the rest.
+const DELETE_PROMPT_NAMES: usize = 3;
+
+/// "Move 5 items to trash? (a.rs, b.rs, c.rs, +2 more)" — enough to see what
+/// is about to go without a prompt that runs off the screen.
+pub(super) fn delete_many_message(targets: &[std::path::PathBuf]) -> String {
+    let named = targets
+        .iter()
+        .take(DELETE_PROMPT_NAMES)
+        .map(display_name)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let remaining = targets.len().saturating_sub(DELETE_PROMPT_NAMES);
+    if remaining == 0 {
+        format!("Move {} items to trash? ({named})", targets.len())
+    } else {
+        format!(
+            "Move {} items to trash? ({named}, +{remaining} more)",
+            targets.len()
+        )
+    }
+}
+
+/// Guide columns for a child of `row`, matching what `collect_rows` would
+/// have produced. The root row contributes no column — the tree starts its
+/// guides one level in.
+fn child_ancestors(row: &ExplorerRow) -> Vec<bool> {
+    if row.depth == 0 {
+        return Vec::new();
+    }
+    let mut ancestors = row.ancestor_last.clone();
+    ancestors.push(row.is_last);
+    ancestors
+}
+
 #[derive(Clone, Debug)]
 pub(super) struct LabelEdit {
     /// Index into `self.rows` of the row being edited.
@@ -77,9 +117,9 @@ impl FileExplorerPanel {
         operator: ExplorerOperator,
         object: LabelTextObject,
         cx: &mut Context,
-    ) {
+    ) -> Option<PostAction> {
         self.select_label_text_object(object);
-        self.apply_operator_selection_action(operator, cx);
+        self.apply_operator_selection_action(operator, cx)
     }
 
     pub(super) fn apply_operator_motion(
@@ -87,9 +127,9 @@ impl FileExplorerPanel {
         operator: ExplorerOperator,
         motion: LabelMotion,
         cx: &mut Context,
-    ) {
+    ) -> Option<PostAction> {
         self.move_label_selection(motion, CoreMovement::Extend);
-        self.apply_operator_selection_action(operator, cx);
+        self.apply_operator_selection_action(operator, cx)
     }
 
     /// Roll back the most recent file-system mutation made through the
@@ -222,11 +262,21 @@ impl FileExplorerPanel {
         };
     }
 
-    fn apply_operator_selection_action(&mut self, operator: ExplorerOperator, cx: &mut Context) {
+    fn apply_operator_selection_action(
+        &mut self,
+        operator: ExplorerOperator,
+        cx: &mut Context,
+    ) -> Option<PostAction> {
         match operator {
-            ExplorerOperator::Yank => self.set_file_clipboard(ExplorerFileOperation::Copy, cx),
+            ExplorerOperator::Yank => {
+                self.set_file_clipboard(ExplorerFileOperation::Copy, cx);
+                None
+            }
             ExplorerOperator::Delete { yank } => self.delete_label_selection(cx, yank),
-            ExplorerOperator::Change { yank } => self.change_label_selection(cx, yank),
+            ExplorerOperator::Change { yank } => {
+                self.change_label_selection(cx, yank);
+                None
+            }
         }
     }
 
@@ -241,34 +291,91 @@ impl FileExplorerPanel {
         }
     }
 
-    pub(super) fn delete_selected_item(&mut self, cx: &mut Context, yank: bool) {
-        if yank {
-            let paths = self.selected_paths();
-            if !self.write_path_register(cx, &paths) {
-                return;
-            }
+    /// Delete the selected rows. A single row keeps today's flow (the runtime
+    /// builds the "Move X to trash?" confirmation); a multi-row `x` range
+    /// gets one confirmation covering every target, returned as a layer for
+    /// the caller to push.
+    pub(super) fn delete_selected_item(
+        &mut self,
+        cx: &mut Context,
+        yank: bool,
+    ) -> Option<PostAction> {
+        let targets = self.selected_paths();
+        if yank && !self.write_path_register(cx, &targets) {
+            return None;
         }
-        self.prompt_delete(cx);
+        if targets.len() < 2 {
+            self.prompt_delete(cx);
+            return None;
+        }
+        self.confirm_delete_many(cx, &targets)
     }
 
-    pub(super) fn delete_label_selection(&mut self, cx: &mut Context, yank: bool) {
-        let Some(row) = self.selected().cloned() else {
-            return;
-        };
-        let Some(range) = self.selected_label_edit_range() else {
-            return;
-        };
+    pub(super) fn delete_label_selection(
+        &mut self,
+        cx: &mut Context,
+        yank: bool,
+    ) -> Option<PostAction> {
+        let row = self.selected().cloned()?;
+        let range = self.selected_label_edit_range()?;
         if yank && !self.write_label_register(cx, range.selected_text(&row.label)) {
-            return;
+            return None;
         }
 
         if range.is_whole(row.label.chars().count()) {
-            self.delete_selected_item(cx, false);
-            return;
+            return self.delete_selected_item(cx, false);
         }
 
         let new_label = range.remove_from(&row.label);
         self.rename_selected_label(cx, &row, new_label);
+        None
+    }
+
+    /// One confirmation for a ranged delete. Each target still goes through
+    /// `ApplyConfirmedDelete`, so the root-containment check and the
+    /// modified-buffer prompt stay exactly as they are for a single delete.
+    fn confirm_delete_many(
+        &mut self,
+        cx: &mut Context,
+        targets: &[ExplorerPath],
+    ) -> Option<PostAction> {
+        let root = self.root.local_path().map(std::path::Path::to_path_buf);
+        let Some(root) = root else {
+            cx.editor
+                .notify_error("Deleting multiple items is not available on this backend yet");
+            return None;
+        };
+        let locals = targets
+            .iter()
+            .map(|path| path.clone().into_local())
+            .collect::<Option<Vec<_>>>();
+        let Some(locals) = locals else {
+            cx.editor
+                .notify_error("Cannot delete across workspace backends");
+            return None;
+        };
+
+        let message = delete_many_message(&locals);
+        let cursor = selected_cursor(self.selection);
+        // The range is spent once the deletes are queued — the rows it points
+        // at are about to disappear.
+        self.collapse_row_selection();
+
+        Some(
+            Confirmation::new(message, move |cx| {
+                for target in locals {
+                    cx.submit_ui(UiCommand::FileExplorer(
+                        FileExplorerCommand::ApplyConfirmedDelete {
+                            target,
+                            root: root.clone(),
+                            cursor,
+                            modified_buffer_check: ModifiedBufferCheck::Prompt,
+                        },
+                    ));
+                }
+            })
+            .into_post_action(),
+        )
     }
 
     /// Begin an inline rename of the currently-selected row. The row's
@@ -409,27 +516,19 @@ impl FileExplorerPanel {
         placement: CreatePlacement,
     ) -> (ExplorerPath, usize, usize, Vec<bool>) {
         let selection = self.selection;
-        let root_child = || {
-            let mut ancestors = Vec::new();
-            if let Some(root_row) = self.rows.first() {
-                ancestors.push(root_row.is_last);
-            } else {
-                ancestors.push(true);
-            }
-            (self.root.clone(), 1usize, ancestors)
-        };
+        // The root row is the tree header, not a guide column: `collect_rows`
+        // seeds the recursion with `depth: 1` and no ancestors, so root
+        // children draw a connector but no pipe. Matching that here keeps a
+        // create row lined up with the siblings it is being inserted among.
+        let root_child = || (self.root.clone(), 1usize, Vec::new());
 
         match placement {
-            CreatePlacement::Below if row.is_dir && row.expanded => {
-                let mut ancestor_last = row.ancestor_last.clone();
-                ancestor_last.push(row.is_last);
-                (
-                    row.path.clone(),
-                    selection + 1,
-                    row.depth + 1,
-                    ancestor_last,
-                )
-            }
+            CreatePlacement::Below if row.is_dir && row.expanded => (
+                row.path.clone(),
+                selection + 1,
+                row.depth + 1,
+                child_ancestors(row),
+            ),
             CreatePlacement::Below if row.depth == 0 => {
                 let (parent, depth, ancestor_last) = root_child();
                 (parent, selection + 1, depth, ancestor_last)

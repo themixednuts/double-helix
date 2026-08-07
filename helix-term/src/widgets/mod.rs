@@ -79,5 +79,5 @@ pub use toast::{
 };
 pub use tree_list::{
     tree_list, tree_list_item_content_width, tree_list_label_offset, tree_list_scrolled,
-    TreeListIcon, TreeListItem, TreeListStatus, TreeListStyles,
+    tree_list_status_icon_width, TreeListIcon, TreeListItem, TreeListStatus, TreeListStyles,
 };

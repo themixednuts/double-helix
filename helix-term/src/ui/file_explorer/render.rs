@@ -49,6 +49,9 @@ pub(super) struct ExplorerRenderSnapshot {
     tree_pending: bool,
     search_generation: u64,
     selection: usize,
+    /// Absolute row indices covered by the `x` range (just the cursor row
+    /// when no range is active). Every row in it renders selected.
+    row_selection: std::ops::Range<usize>,
     scroll: usize,
     scroll_x: u16,
     focused: bool,
@@ -290,12 +293,12 @@ impl FileExplorerPanel {
         let list_height = area.height.saturating_sub(HEADER_ROWS + SEARCH_ROWS);
         let list_width = area.width.saturating_sub(2).saturating_sub(1);
         let has_scrollbar = self.rows.len() > list_height as usize;
-        self.tree_content_width = if has_scrollbar {
+        let content_width = if has_scrollbar {
             list_width.saturating_sub(1)
         } else {
             list_width
         };
-        self.ensure_selection_horizontally_visible();
+        self.sync_horizontal_viewport(content_width);
 
         let theme = cx.theme();
         let styles = crate::ui::design::FileExplorerStyles::from_theme(theme, self.focused);
@@ -318,6 +321,7 @@ impl FileExplorerPanel {
             tree_pending: self.tree_pending,
             search_generation: self.search_generation,
             selection: self.selection,
+            row_selection: self.selected_row_range(),
             scroll: self.scroll,
             scroll_x: self.scroll_x,
             focused: self.focused,
@@ -513,7 +517,7 @@ impl ExplorerRenderSnapshot {
                 tree_item(
                     row,
                     label_source,
-                    screen_row == self.selection,
+                    self.row_selection.contains(&screen_row),
                     is_active,
                     styles,
                     &icons,

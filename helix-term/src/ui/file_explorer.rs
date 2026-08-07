@@ -178,6 +178,12 @@ pub struct FileExplorerPanel {
     /// call. Don't `= ` this field directly — call into `self.nav`
     /// and let `sync_nav_to_cache` propagate the new value.
     selection: usize,
+    /// Anchor of a contiguous multi-row selection built with `x`, or `None`
+    /// when only the cursor row is selected. The head is always `selection`,
+    /// so the covered range is `anchor..=selection` — the same shape as the
+    /// editor's line-wise selection, and the reason any cursor motion
+    /// collapses it back to a single row.
+    row_selection_anchor: Option<usize>,
     label_selection: LabelSelection,
     /// Cached scroll offset. Read-only mirror of `self.nav.scroll()`;
     /// same rules as `selection`.
@@ -189,6 +195,11 @@ pub struct FileExplorerPanel {
     /// Last known tree content width (excluding status icons / scrollbar).
     /// Used to clamp `scroll_x` and keep the selected label visible.
     tree_content_width: u16,
+    /// Selection + label cursor the horizontal viewport was last aligned to.
+    /// The render path only re-reveals the cursor when this moves (or the
+    /// panel resizes) — same rule as `clamp_viewport` for vertical scroll,
+    /// so a manual `zh`/`zl` isn't undone on the next frame.
+    h_scroll_anchor: Option<(usize, usize)>,
     /// When set, the next successful tree apply restores this vertical
     /// scroll after selection is resolved (session reopen).
     pending_scroll_restore: Option<usize>,
@@ -381,20 +392,24 @@ fn explorer_row_matches(row: &ExplorerRow, query: &str) -> bool {
         || row.path.display().to_ascii_lowercase().contains(query)
 }
 
+/// Columns the renderer reserves at this row's right edge for its status
+/// icons. Shares [`crate::widgets::tree_list_status_icon_width`] with the
+/// widget that actually draws them, so the scroll clamp and the paint can't
+/// disagree about how much room the label has.
 fn row_status_width(row: &ExplorerRow) -> u16 {
     let icons = ICONS.load();
     let mut width = 0u16;
     if let Some(status) = row.vcs_status {
-        width = width.saturating_add(status_icon_width(status.icon(&icons)));
+        width = width.saturating_add(crate::widgets::tree_list_status_icon_width(
+            status.icon(&icons),
+        ));
     }
     if let Some(diagnostic) = row.diagnostic_status {
-        width = width.saturating_add(status_icon_width(diagnostic.icon(&icons)));
+        width = width.saturating_add(crate::widgets::tree_list_status_icon_width(
+            diagnostic.icon(&icons),
+        ));
     }
     width
-}
-
-fn status_icon_width(icon: &str) -> u16 {
-    text_width(icon).max(1).saturating_add(1)
 }
 
 impl FileExplorerPanel {
@@ -443,10 +458,12 @@ impl FileExplorerPanel {
             input: ExplorerInputEngine::default(),
             file_clipboard: None,
             selection: 0,
+            row_selection_anchor: None,
             label_selection: LabelSelection::default(),
             scroll: 0,
             scroll_x: 0,
             tree_content_width: 0,
+            h_scroll_anchor: None,
             pending_scroll_restore: None,
             area: Rect::default(),
             focused: true,
@@ -577,10 +594,50 @@ impl FileExplorerPanel {
     /// jump-session result, …) instead of writing `self.selection = N`
     /// directly — that bypasses `nav` and lets the two diverge.
     fn seek_to(&mut self, index: usize) {
+        self.collapse_row_selection();
         self.prime_nav();
         self.nav.set_selection(index);
         self.sync_nav_to_cache();
         self.ensure_selection_horizontally_visible();
+    }
+
+    /// Drop a multi-row `x` range back to the cursor row. Every cursor
+    /// motion does this — the range is a transient extension of the cursor,
+    /// exactly like the editor's line-wise selection in Normal mode.
+    fn collapse_row_selection(&mut self) {
+        self.row_selection_anchor = None;
+    }
+
+    /// Rows currently selected: the `x` range when one is active, otherwise
+    /// just the cursor row. An empty tree yields an empty range.
+    fn selected_row_range(&self) -> std::ops::Range<usize> {
+        let Some(last) = self.rows.len().checked_sub(1) else {
+            return 0..0;
+        };
+        let head = self.selection.min(last);
+        let anchor = self.row_selection_anchor.unwrap_or(head).min(last);
+        head.min(anchor)..head.max(anchor).saturating_add(1)
+    }
+
+    /// Extend the row range `count` rows down, mirroring the editor's
+    /// line-wise `x`: the first press selects the cursor row (so `count`
+    /// rows total), each repeat adds `count` more, clamped at the last row.
+    fn extend_row_selection(&mut self, count: usize) {
+        let Some(last) = self.rows.len().checked_sub(1) else {
+            return;
+        };
+        let anchor = self.row_selection_anchor.unwrap_or(self.selection);
+        let steps = if self.row_selection_anchor.is_some() {
+            count
+        } else {
+            count.saturating_sub(1)
+        };
+        let head = self.selection.saturating_add(steps).min(last);
+        // `seek_to` collapses the range, so re-anchor after the cursor move.
+        self.seek_to(head);
+        self.row_selection_anchor = Some(anchor.min(last));
+        self.clamp_label_selection();
+        self.collapse_label_selection_to_cursor();
     }
 
     fn scroll_x_by(&mut self, delta: i16) {
@@ -598,17 +655,33 @@ impl FileExplorerPanel {
         self.clamp_scroll_x();
     }
 
-    fn row_content_width(&self, row: &ExplorerRow) -> u16 {
+    /// Columns this row occupies, measured against the *displayed* label so a
+    /// long name typed into an inline edit widens the scrollable content
+    /// instead of being clamped away by `clamp_scroll_x`.
+    fn row_content_width(&self, row: &ExplorerRow, row_index: usize) -> u16 {
         let offset = self.row_label_offset(row, self.config.icons);
-        let label = helix_core::unicode::width::UnicodeWidthStr::width(row.label.as_str()) as u16;
-        let dir_slash = if row.is_dir { 1 } else { 0 };
-        offset.saturating_add(label).saturating_add(dir_slash)
+        let label = text_width(self.display_label_for(row, row_index));
+        // Directories render a trailing `/`, and a row being edited needs one
+        // more column for the insert cursor sitting past the last character.
+        let editing = self
+            .label_edit
+            .as_ref()
+            .is_some_and(|edit| edit.row_index == row_index);
+        let trailing = u16::from(row.is_dir).saturating_add(u16::from(editing));
+        offset.saturating_add(label).saturating_add(trailing)
     }
 
+    /// Widest row in scroll columns: its content plus the status icons the
+    /// renderer reserves at that row's right edge. Without the reservation the
+    /// clamp stops short and a status-carrying row's tail stays unreachable.
     fn max_content_width(&self) -> u16 {
         self.rows
             .iter()
-            .map(|row| self.row_content_width(row))
+            .enumerate()
+            .map(|(index, row)| {
+                self.row_content_width(row, index)
+                    .saturating_add(row_status_width(row))
+            })
             .max()
             .unwrap_or(0)
     }
@@ -621,25 +694,54 @@ impl FileExplorerPanel {
         }
     }
 
+    /// Refresh the horizontal viewport for a frame `content_width` wide.
+    ///
+    /// The cursor is only revealed when the selection or label cursor moved
+    /// since the last frame, or when the panel changed width. A manual
+    /// `zh`/`zl` (or horizontal wheel) owns `scroll_x` until then — otherwise
+    /// every scroll right would be dragged back on the next render.
+    fn sync_horizontal_viewport(&mut self, content_width: u16) {
+        let resized = self.tree_content_width != content_width;
+        self.tree_content_width = content_width;
+
+        let anchor = (self.selection, self.label_cursor());
+        if resized || self.h_scroll_anchor != Some(anchor) {
+            self.h_scroll_anchor = Some(anchor);
+            self.ensure_selection_horizontally_visible();
+        } else {
+            self.clamp_scroll_x();
+        }
+    }
+
     fn ensure_selection_horizontally_visible(&mut self) {
-        let viewport = self.tree_content_width;
-        if viewport == 0 {
+        if self.tree_content_width == 0 {
             return;
         }
         let Some(row) = self.selected() else {
             return;
         };
+        // The label only gets what the status icons leave behind, matching the
+        // content rect `tree_list_scrolled` hands this row.
+        let viewport = self
+            .tree_content_width
+            .saturating_sub(row_status_width(row));
+        if viewport == 0 {
+            return;
+        }
         let start = self.row_label_offset(row, self.config.icons);
+        // Clamp against the displayed label — mid-edit that's the typed
+        // buffer, which is usually longer than the stored row label.
+        let label = self.display_label_for(row, self.selection);
         let label_cursor: u16 = self
             .label_cursor()
-            .min(row.label.chars().count())
+            .min(label.chars().count())
             .try_into()
             .unwrap_or(0);
         // Keep the cursor column (not just the label start) inside the
         // viewport so `cursor_position` doesn't return None and hide the
         // block cursor with focused_without_visible_label.
         let cursor_x = start.saturating_add(label_cursor);
-        let end = self.row_content_width(row);
+        let end = self.row_content_width(row, self.selection);
         if cursor_x < self.scroll_x {
             self.scroll_x = cursor_x;
         } else if cursor_x >= self.scroll_x.saturating_add(viewport) {
@@ -732,7 +834,17 @@ impl FileExplorerPanel {
                         .map(|path| display_path(&path))
                         .unwrap_or_else(|| display_name(&path)),
                     path: path.clone(),
+                    // Every search feed indexes regular files only: the local
+                    // and remote feeds both go through the FFF picker, whose
+                    // result items are `FileItem`s, and the collaboration feed
+                    // filters on `is_file()`. FFF does expose a mixed
+                    // files-and-directories search — if the explorer ever
+                    // switches to it, this flag has to be carried from the
+                    // match rather than assumed (stat-ing every result is not
+                    // an option at this size).
                     is_dir: false,
+                    // Results are a flat ranked list, not a tree slice, so
+                    // there is no depth or lineage to draw.
                     depth: 0,
                     expanded: false,
                     is_last: true,
@@ -797,6 +909,9 @@ impl FileExplorerPanel {
 
     fn apply_search_filter(&mut self, _editor: &Editor) {
         let start = Instant::now();
+        // The row list is about to be replaced; a range built against the old
+        // indices would silently cover different files.
+        self.collapse_row_selection();
         let selected_path = self.selected().map(|row| row.path.clone());
         let query = self.normalized_search_query();
         let mode;
@@ -1121,10 +1236,16 @@ impl FileExplorerPanel {
             .unwrap_or_else(|| self.root.clone())
     }
 
+    /// Paths of every selected row — the whole `x` range when one is active,
+    /// otherwise just the cursor row. Feeds the yank/cut clipboard and the
+    /// delete targets, both of which already operate on path lists.
     fn selected_paths(&self) -> Box<[ExplorerPath]> {
-        self.selected()
-            .map(|row| vec![row.path.clone()].into_boxed_slice())
+        self.rows
+            .get(self.selected_row_range())
             .unwrap_or_default()
+            .iter()
+            .map(|row| row.path.clone())
+            .collect()
     }
 
     fn selected_label(&self) -> Option<&str> {
@@ -1177,6 +1298,7 @@ impl FileExplorerPanel {
     }
 
     fn move_selection_by(&mut self, delta: isize) {
+        self.collapse_row_selection();
         self.prime_nav();
         // File explorer uses Clamp — a wrap from the last file to the
         // top of the tree (or vice versa) would feel teleporty.
@@ -1190,6 +1312,7 @@ impl FileExplorerPanel {
     }
 
     fn page_by(&mut self, delta: isize) {
+        self.collapse_row_selection();
         self.prime_nav();
         // Use FullViewport pages to match the previous file-explorer
         // behavior (the tree was paging by full visible_height).
@@ -1205,6 +1328,7 @@ impl FileExplorerPanel {
     }
 
     fn select_first(&mut self) {
+        self.collapse_row_selection();
         self.prime_nav();
         self.nav.to_first();
         self.sync_nav_to_cache();
@@ -1214,6 +1338,7 @@ impl FileExplorerPanel {
     }
 
     fn select_last(&mut self) {
+        self.collapse_row_selection();
         self.prime_nav();
         self.nav.to_last();
         self.sync_nav_to_cache();
@@ -2477,6 +2602,11 @@ impl FileExplorerPanel {
         let mut retain_preview_request = false;
 
         match action {
+            // Esc cancels a transient multi-row selection first; a second Esc
+            // closes the panel, as it always has.
+            ExplorerAction::Close if self.row_selection_anchor.is_some() => {
+                self.collapse_row_selection();
+            }
             ExplorerAction::Close => return self.close(cx),
             ExplorerAction::MoveSelection(delta) => self.move_selection_by(delta),
             ExplorerAction::Page(delta) => self.page_by(delta),
@@ -2535,24 +2665,42 @@ impl FileExplorerPanel {
                 self.move_label_selection(motion, movement)
             }
             ExplorerAction::SelectLabelTextObject(object) => self.select_label_text_object(object),
+            ExplorerAction::ExtendRowSelection(count) => self.extend_row_selection(count),
             ExplorerAction::SelectWholeLabel => self.select_whole_label(),
             ExplorerAction::CollapseLabelSelection => self.collapse_label_selection_to_cursor(),
             ExplorerAction::FlipLabelSelection => self.flip_label_selection(),
             ExplorerAction::SetMode(mode) => {
+                // Esc back to Normal drops a multi-row range, like the
+                // editor collapsing a selection to its cursor.
+                if mode == helix_view::document::Mode::Normal {
+                    self.collapse_row_selection();
+                }
                 self.input.mode = mode;
             }
             ExplorerAction::ClipboardOperation(operation) => self.set_file_clipboard(operation, cx),
             ExplorerAction::PasteClipboard(placement) => self.paste_file_clipboard(cx, placement),
             ExplorerAction::ApplyOperatorTextObject(operator, object) => {
-                self.apply_operator_text_object(operator, object, cx)
+                if let Some(post) = self.apply_operator_text_object(operator, object, cx) {
+                    return EventResult::Consumed(Some(post));
+                }
             }
             ExplorerAction::ApplyOperatorMotion(operator, motion) => {
-                self.apply_operator_motion(operator, motion, cx)
+                if let Some(post) = self.apply_operator_motion(operator, motion, cx) {
+                    return EventResult::Consumed(Some(post));
+                }
             }
             ExplorerAction::BeginOperator(_) => {}
-            ExplorerAction::DeleteLabelSelection { yank } => self.delete_label_selection(cx, yank),
+            ExplorerAction::DeleteLabelSelection { yank } => {
+                if let Some(post) = self.delete_label_selection(cx, yank) {
+                    return EventResult::Consumed(Some(post));
+                }
+            }
             ExplorerAction::ChangeLabelSelection { yank } => self.change_label_selection(cx, yank),
-            ExplorerAction::DeleteSelectedItem { yank } => self.delete_selected_item(cx, yank),
+            ExplorerAction::DeleteSelectedItem { yank } => {
+                if let Some(post) = self.delete_selected_item(cx, yank) {
+                    return EventResult::Consumed(Some(post));
+                }
+            }
             ExplorerAction::EnterLabelEdit(entry) => {
                 if self.label_edit.is_some() {
                     // Already editing — re-entering from Normal mode just
@@ -3518,6 +3666,109 @@ mod tests {
         });
     }
 
+    #[test]
+    fn manual_horizontal_scroll_survives_the_next_frame() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("a-very-long-file-name-indeed.rs"), "").unwrap();
+        fs::write(temp.path().join("b-second-long-file-name.rs"), "").unwrap();
+        let rt = helix_runtime::test::RuntimeTest::default();
+        rt.block_on(async {
+            let editor = test_editor(100, 30, rt.runtime());
+            let mut panel = FileExplorerPanel::new(temp.path().to_path_buf(), &editor).unwrap();
+            panel.seek_to(row_index_by_name(&panel, "a-very-long-file-name-indeed.rs"));
+            panel.sync_horizontal_viewport(12);
+
+            panel.scroll_x_by(6);
+            let scrolled = panel.scroll_x;
+            assert!(scrolled > 0, "zl should move the viewport right");
+
+            // A frame with no selection change must leave the manual scroll be.
+            panel.sync_horizontal_viewport(12);
+            assert_eq!(panel.scroll_x, scrolled);
+
+            // Moving the cursor re-reveals the selected label.
+            panel.move_selection_by(1);
+            panel.sync_horizontal_viewport(12);
+            let row = panel.selected().expect("selection");
+            let offset = panel.row_label_offset(row, panel.config.icons);
+            assert!(
+                panel.scroll_x <= offset,
+                "selection move should bring the label back into view"
+            );
+        });
+    }
+
+    #[test]
+    fn long_inline_edit_keeps_the_cursor_in_view() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("a.rs"), "").unwrap();
+        let rt = helix_runtime::test::RuntimeTest::default();
+        rt.block_on(async {
+            let mut editor = test_editor(100, 30, rt.runtime());
+            let mut panel = FileExplorerPanel::new(temp.path().to_path_buf(), &editor).unwrap();
+            panel.seek_to(row_index_by_name(&panel, "a.rs"));
+
+            press_key(&mut panel, &mut editor, &rt, key!('A'));
+            for _ in 0..40 {
+                press_key(&mut panel, &mut editor, &rt, key!('x'));
+            }
+
+            let viewport = 12;
+            panel.sync_horizontal_viewport(viewport);
+
+            let row = panel.selected().expect("selection");
+            let cursor_x = panel
+                .row_label_offset(row, panel.config.icons)
+                .saturating_add(panel.label_cursor() as u16);
+            assert!(
+                cursor_x >= panel.scroll_x && cursor_x < panel.scroll_x + viewport,
+                "cursor at {cursor_x} is outside the viewport at scroll_x {}",
+                panel.scroll_x
+            );
+        });
+    }
+
+    /// `tree_list_scrolled` shrinks each row's content rect by that row's
+    /// status-icon width, so the clamp has to reserve the same columns —
+    /// otherwise the tail of a row carrying VCS/diagnostic icons can never be
+    /// scrolled into view.
+    #[test]
+    fn horizontal_scroll_reaches_the_tail_of_rows_with_status_icons() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("a-long-enough-file-name.rs"), "").unwrap();
+        let rt = helix_runtime::test::RuntimeTest::default();
+        rt.block_on(async {
+            let editor = test_editor(100, 30, rt.runtime());
+            let mut panel = FileExplorerPanel::new(temp.path().to_path_buf(), &editor).unwrap();
+            let index = row_index_by_name(&panel, "a-long-enough-file-name.rs");
+
+            let mut rows = panel.rows.to_vec();
+            rows[index].vcs_status = Some(VcsStatus::Modified);
+            rows[index].diagnostic_status = Some(DiagnosticStatus {
+                severity: DiagnosticSeverity::Error,
+                count: 1,
+            });
+            panel.rows = rows.into();
+            panel.seek_to(index);
+
+            let viewport = 12;
+            panel.sync_horizontal_viewport(viewport);
+            panel.scroll_x_to(u16::MAX);
+
+            let row = &panel.rows[index];
+            let status = row_status_width(row);
+            assert!(status > 0, "fixture row must carry status icons");
+            // The row is drawn into `viewport - status` columns of content.
+            let visible = viewport - status;
+            let content_end = panel.row_content_width(row, index);
+            assert!(
+                panel.scroll_x + visible >= content_end,
+                "last content column {content_end} unreachable: scroll_x {} + visible {visible}",
+                panel.scroll_x
+            );
+        });
+    }
+
     fn row_index_by_name(panel: &FileExplorerPanel, name: &str) -> usize {
         panel
             .rows
@@ -4097,11 +4348,8 @@ mod tests {
         let mut input = ExplorerInputEngine::default();
         input.prepare_test_keymaps(EditingEngineConfig::Helix);
 
-        assert_eq!(
-            input.translate(key!('x')),
-            ExplorerInput::Execute(ExplorerAction::SelectWholeLabel)
-        );
-        input.finish_command();
+        // `x` now extends the row selection; `X` and `%` remain the
+        // whole-label entry points.
         assert_eq!(
             input.translate(key!('X')),
             ExplorerInput::Execute(ExplorerAction::SelectWholeLabel)
@@ -4120,6 +4368,23 @@ mod tests {
         assert_eq!(
             input.translate(alt!(';')),
             ExplorerInput::Execute(ExplorerAction::FlipLabelSelection)
+        );
+    }
+
+    #[test]
+    fn helix_modal_engine_extends_row_selection_with_x() {
+        let mut input = ExplorerInputEngine::default();
+        input.prepare_test_keymaps(EditingEngineConfig::Helix);
+
+        assert_eq!(
+            input.translate(key!('x')),
+            ExplorerInput::Execute(ExplorerAction::ExtendRowSelection(1))
+        );
+        input.finish_command();
+        assert_eq!(input.translate(key!('3')), ExplorerInput::Pending(None));
+        assert_eq!(
+            input.translate(key!('x')),
+            ExplorerInput::Execute(ExplorerAction::ExtendRowSelection(3))
         );
     }
 
@@ -4463,6 +4728,444 @@ mod tests {
         });
     }
 
+    /// Every row's guide columns must line up with its depth: `collect_rows`
+    /// seeds the recursion at `depth: 1` with no ancestors, so a row at depth
+    /// `d` carries `d - 1` guide columns and the root carries none. A row that
+    /// breaks the contract renders at the wrong indent relative to its
+    /// siblings and children.
+    fn assert_tree_shape(panel: &FileExplorerPanel) {
+        for (index, row) in panel.rows.iter().enumerate() {
+            assert_eq!(
+                row.ancestor_last.len(),
+                row.depth.saturating_sub(1),
+                "row {index} ({:?}) has {} guide columns at depth {}",
+                row.label,
+                row.ancestor_last.len(),
+                row.depth
+            );
+        }
+    }
+
+    fn label_offsets(panel: &FileExplorerPanel) -> Vec<u16> {
+        panel
+            .rows
+            .iter()
+            .map(|row| panel.row_label_offset(row, panel.config.icons))
+            .collect()
+    }
+
+    #[test]
+    fn children_indent_deeper_than_their_parent() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let backup = root.join("backup-20260803-170543");
+        fs::create_dir(&backup).unwrap();
+        fs::create_dir(backup.join("az-rs")).unwrap();
+        fs::create_dir(backup.join("new-world")).unwrap();
+        fs::write(backup.join("az-rs").join("Cargo.toml"), "").unwrap();
+        fs::write(backup.join("new-world").join("Cargo.toml"), "").unwrap();
+        // Single-child chains exercise the flatten-dirs path, where a row's
+        // label spans several path segments but its depth advances by one.
+        fs::create_dir_all(root.join("wrapper/inner")).unwrap();
+        fs::write(root.join("wrapper/inner/a.rs"), "").unwrap();
+        fs::write(root.join("wrapper/inner/b.rs"), "").unwrap();
+        fs::write(root.join("README.md"), "").unwrap();
+        let rt = helix_runtime::test::RuntimeTest::default();
+        rt.block_on(async {
+            let editor = test_editor(100, 30, rt.runtime());
+            let mut panel = FileExplorerPanel::new(root.to_path_buf(), &editor).unwrap();
+            for _ in 0..3 {
+                panel.expand_loaded_dirs(&editor);
+            }
+
+            assert_tree_shape(&panel);
+            let offsets = label_offsets(&panel);
+            for index in 1..panel.rows.len() {
+                if panel.rows[index].depth <= panel.rows[index - 1].depth {
+                    continue;
+                }
+                assert!(
+                    offsets[index] > offsets[index - 1],
+                    "child {:?} (offset {}) must render right of parent {:?} (offset {})",
+                    panel.rows[index].label,
+                    offsets[index],
+                    panel.rows[index - 1].label,
+                    offsets[index - 1]
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn create_row_indents_like_its_siblings() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir(temp.path().join("az-rs")).unwrap();
+        fs::create_dir(temp.path().join("new-world")).unwrap();
+        fs::write(temp.path().join("README.md"), "").unwrap();
+        let rt = helix_runtime::test::RuntimeTest::default();
+        rt.block_on(async {
+            let mut editor = test_editor(100, 30, rt.runtime());
+            let mut panel = FileExplorerPanel::new(temp.path().to_path_buf(), &editor).unwrap();
+            let sibling_offset = label_offsets(&panel)[1];
+
+            // `o` on the root row opens a create row as the root's first
+            // child — it must line up with the other root children instead of
+            // pushing itself a level deeper.
+            panel.seek_to(0);
+            press_key(&mut panel, &mut editor, &rt, key!('o'));
+
+            let create_index = panel.label_edit.as_ref().expect("create row").row_index;
+            assert_tree_shape(&panel);
+            assert_eq!(label_offsets(&panel)[create_index], sibling_offset);
+        });
+    }
+
+    /// Build a tree of `alpha.rs`..`epsilon.rs` under a root row, so row 0 is
+    /// the root and rows 1..=5 are the files.
+    fn multi_row_panel(
+        temp: &tempfile::TempDir,
+        editor: &Editor,
+    ) -> Result<FileExplorerPanel, std::io::Error> {
+        for name in ["alpha.rs", "beta.rs", "gamma.rs", "delta.rs", "epsilon.rs"] {
+            fs::write(temp.path().join(name), "").unwrap();
+        }
+        FileExplorerPanel::new(temp.path().to_path_buf(), editor)
+    }
+
+    fn ranged_labels(panel: &FileExplorerPanel) -> Vec<String> {
+        panel.rows[panel.selected_row_range()]
+            .iter()
+            .map(|row| row.label.clone())
+            .collect()
+    }
+
+    #[test]
+    fn x_selects_the_cursor_row_then_accumulates_downward() {
+        let temp = tempfile::tempdir().unwrap();
+        let rt = helix_runtime::test::RuntimeTest::default();
+        rt.block_on(async {
+            let mut editor = test_editor(100, 30, rt.runtime());
+            let mut panel = multi_row_panel(&temp, &editor).unwrap();
+            panel.seek_to(row_index_by_name(&panel, "alpha.rs"));
+
+            press_key(&mut panel, &mut editor, &rt, key!('x'));
+            assert_eq!(ranged_labels(&panel), ["alpha.rs"]);
+
+            press_key(&mut panel, &mut editor, &rt, key!('x'));
+            assert_eq!(ranged_labels(&panel), ["alpha.rs", "beta.rs"]);
+
+            press_key(&mut panel, &mut editor, &rt, key!('x'));
+            assert_eq!(ranged_labels(&panel), ["alpha.rs", "beta.rs", "delta.rs"]);
+        });
+    }
+
+    #[test]
+    fn x_with_a_count_selects_that_many_rows_and_clamps_at_the_end() {
+        let temp = tempfile::tempdir().unwrap();
+        let rt = helix_runtime::test::RuntimeTest::default();
+        rt.block_on(async {
+            let mut editor = test_editor(100, 30, rt.runtime());
+            let mut panel = multi_row_panel(&temp, &editor).unwrap();
+            panel.seek_to(row_index_by_name(&panel, "alpha.rs"));
+
+            press_key(&mut panel, &mut editor, &rt, key!('3'));
+            press_key(&mut panel, &mut editor, &rt, key!('x'));
+            assert_eq!(ranged_labels(&panel).len(), 3);
+
+            // Clamps at the last row instead of running past it.
+            press_key(&mut panel, &mut editor, &rt, key!('9'));
+            press_key(&mut panel, &mut editor, &rt, key!('x'));
+            assert_eq!(panel.selected_row_range().end, panel.rows.len());
+            assert_eq!(panel.selection, panel.rows.len() - 1);
+
+            press_key(&mut panel, &mut editor, &rt, key!('x'));
+            assert_eq!(panel.selected_row_range().end, panel.rows.len());
+        });
+    }
+
+    #[test]
+    fn cursor_motion_and_escape_collapse_the_row_selection() {
+        let temp = tempfile::tempdir().unwrap();
+        let rt = helix_runtime::test::RuntimeTest::default();
+        rt.block_on(async {
+            let mut editor = test_editor(100, 30, rt.runtime());
+            let mut panel = multi_row_panel(&temp, &editor).unwrap();
+            panel.seek_to(row_index_by_name(&panel, "alpha.rs"));
+
+            press_key(&mut panel, &mut editor, &rt, key!('x'));
+            press_key(&mut panel, &mut editor, &rt, key!('x'));
+            assert_eq!(ranged_labels(&panel).len(), 2);
+
+            press_key(&mut panel, &mut editor, &rt, key!('j'));
+            assert!(panel.row_selection_anchor.is_none());
+            assert_eq!(ranged_labels(&panel).len(), 1);
+
+            press_key(&mut panel, &mut editor, &rt, key!('x'));
+            press_key(&mut panel, &mut editor, &rt, key!('x'));
+            assert_eq!(ranged_labels(&panel).len(), 2);
+
+            press_key(&mut panel, &mut editor, &rt, key!(Esc));
+            assert!(panel.row_selection_anchor.is_none());
+            assert_eq!(ranged_labels(&panel).len(), 1);
+        });
+    }
+
+    #[test]
+    fn tree_refresh_drops_the_row_selection() {
+        let temp = tempfile::tempdir().unwrap();
+        let rt = helix_runtime::test::RuntimeTest::default();
+        rt.block_on(async {
+            let mut editor = test_editor(100, 30, rt.runtime());
+            let mut panel = multi_row_panel(&temp, &editor).unwrap();
+            panel.seek_to(row_index_by_name(&panel, "alpha.rs"));
+            press_key(&mut panel, &mut editor, &rt, key!('x'));
+            press_key(&mut panel, &mut editor, &rt, key!('x'));
+            assert!(panel.row_selection_anchor.is_some());
+
+            panel.refresh_current(&editor);
+            assert!(panel.row_selection_anchor.is_none());
+        });
+    }
+
+    #[test]
+    fn ranged_delete_targets_exactly_the_selected_rows() {
+        let temp = tempfile::tempdir().unwrap();
+        let rt = helix_runtime::test::RuntimeTest::default();
+        rt.block_on(async {
+            let mut editor = test_editor(100, 30, rt.runtime());
+            let mut panel = multi_row_panel(&temp, &editor).unwrap();
+            panel.seek_to(row_index_by_name(&panel, "alpha.rs"));
+
+            // A lone row keeps the single-item flow (the runtime builds that
+            // confirmation), so no layer comes back here.
+            let single = with_context(&mut editor, &rt, |cx| panel.delete_selected_item(cx, false));
+            assert!(single.is_none());
+
+            press_key(&mut panel, &mut editor, &rt, key!('x'));
+            press_key(&mut panel, &mut editor, &rt, key!('x'));
+            press_key(&mut panel, &mut editor, &rt, key!('x'));
+
+            let targets = panel
+                .selected_paths()
+                .iter()
+                .map(display_name)
+                .collect::<Vec<_>>();
+            assert_eq!(targets, ["alpha.rs", "beta.rs", "delta.rs"]);
+            assert_eq!(
+                super::actions::delete_many_message(
+                    &targets.iter().map(PathBuf::from).collect::<Vec<_>>()
+                ),
+                "Move 3 items to trash? (alpha.rs, beta.rs, delta.rs)"
+            );
+
+            let ranged = with_context(&mut editor, &rt, |cx| panel.delete_selected_item(cx, false));
+            assert!(ranged.is_some(), "ranged delete pushes one confirmation");
+            assert!(
+                panel.row_selection_anchor.is_none(),
+                "range is spent once the deletes are queued"
+            );
+        });
+    }
+
+    #[test]
+    fn ranged_rows_render_as_selected() {
+        let temp = tempfile::tempdir().unwrap();
+        let rt = helix_runtime::test::RuntimeTest::default();
+        rt.block_on(async {
+            let mut editor = test_editor(100, 30, rt.runtime());
+            let mut panel = multi_row_panel(&temp, &editor).unwrap();
+            panel.seek_to(row_index_by_name(&panel, "alpha.rs"));
+            press_key(&mut panel, &mut editor, &rt, key!('x'));
+            press_key(&mut panel, &mut editor, &rt, key!('x'));
+
+            let icons = ICONS.load();
+            let range = panel.selected_row_range();
+            let selected = panel
+                .rows
+                .iter()
+                .enumerate()
+                .map(|(index, row)| {
+                    panel
+                        .tree_item(
+                            row,
+                            index,
+                            range.contains(&index),
+                            false,
+                            row_tree_item_styles(None, panel.config.icons),
+                            &icons,
+                            empty_status_styles(),
+                        )
+                        .selected
+                })
+                .collect::<Vec<_>>();
+
+            assert_eq!(selected, [false, true, true, false, false, false]);
+        });
+    }
+
+    fn remote(path: &str) -> ExplorerPath {
+        ExplorerPath::Remote(if path.is_empty() {
+            helix_remote::WorkspacePath::root()
+        } else {
+            helix_remote::WorkspacePath::from_slash_path(path).expect("workspace path")
+        })
+    }
+
+    fn remote_dir(path: &str) -> ExplorerChild {
+        ExplorerChild {
+            path: remote(path),
+            is_dir: true,
+        }
+    }
+
+    fn remote_file(path: &str) -> ExplorerChild {
+        ExplorerChild {
+            path: remote(path),
+            is_dir: false,
+        }
+    }
+
+    /// Re-point `panel` at a remote workspace and hand it a `children_cache`
+    /// shaped the way `execute_remote` fills it: keys are the expanded
+    /// directories, values are the server's `read_dir` entries as
+    /// root-relative (possibly server-flattened, multi-segment) paths.
+    fn seed_remote_tree(
+        panel: &mut FileExplorerPanel,
+        root: &str,
+        listings: &[(&str, Vec<ExplorerChild>)],
+        expanded: &[&str],
+    ) {
+        panel.root = remote(root);
+        panel.expanded_dirs = expanded.iter().map(|path| remote(path)).collect();
+        panel.children_cache = listings
+            .iter()
+            .map(|(directory, children)| (remote(directory), children.clone()))
+            .collect();
+        panel.vcs_snapshot = VcsSnapshot::empty(&panel.root, false);
+        panel.diagnostic_snapshot = DiagnosticSnapshot::empty(&panel.root, false);
+    }
+
+    /// Assert the shape contract plus strictly-increasing indent whenever a
+    /// row is deeper than the one above it.
+    fn assert_indent_increases_with_depth(panel: &FileExplorerPanel) {
+        assert_tree_shape(panel);
+        let offsets = label_offsets(panel);
+        for index in 1..panel.rows.len() {
+            if panel.rows[index].depth <= panel.rows[index - 1].depth {
+                continue;
+            }
+            assert!(
+                offsets[index] > offsets[index - 1],
+                "child {:?} (offset {}) must render right of parent {:?} (offset {})",
+                panel.rows[index].label,
+                offsets[index],
+                panel.rows[index - 1].label,
+                offsets[index - 1]
+            );
+        }
+    }
+
+    /// The remote feed hands `collect_rows` a prefilled `children_cache` whose
+    /// entries are root-relative and — when the server flattens single-child
+    /// chains — span several path segments. Depth must still advance one level
+    /// per row, never per path segment.
+    #[test]
+    fn remote_tree_indents_children_deeper_than_parents() {
+        let temp = tempfile::tempdir().unwrap();
+        let rt = helix_runtime::test::RuntimeTest::default();
+        rt.block_on(async {
+            let editor = test_editor(100, 30, rt.runtime());
+
+            let mut panel = FileExplorerPanel::new(temp.path().to_path_buf(), &editor).unwrap();
+            seed_remote_tree(
+                &mut panel,
+                "",
+                &[
+                    (
+                        "",
+                        vec![
+                            remote_dir("backup-20260803-170543"),
+                            remote_file("other.txt"),
+                        ],
+                    ),
+                    (
+                        "backup-20260803-170543",
+                        vec![
+                            remote_dir("backup-20260803-170543/az-rs"),
+                            remote_dir("backup-20260803-170543/new-world"),
+                        ],
+                    ),
+                ],
+                &["", "backup-20260803-170543"],
+            );
+            panel
+                .refresh_preserving_tree(&editor, None, Some(0))
+                .unwrap();
+            assert_indent_increases_with_depth(&panel);
+            assert_eq!(
+                panel.rows.iter().map(|row| row.depth).collect::<Vec<_>>(),
+                [0, 1, 2, 2, 1]
+            );
+
+            // Server-flattened entries: multi-segment child paths at several
+            // levels still step exactly one tree level each.
+            let mut panel = FileExplorerPanel::new(temp.path().to_path_buf(), &editor).unwrap();
+            seed_remote_tree(
+                &mut panel,
+                "",
+                &[
+                    ("", vec![remote_dir("wrapper/inner")]),
+                    (
+                        "wrapper/inner",
+                        vec![
+                            remote_file("wrapper/inner/a.rs"),
+                            remote_dir("wrapper/inner/deep/deeper"),
+                        ],
+                    ),
+                    (
+                        "wrapper/inner/deep/deeper",
+                        vec![remote_file("wrapper/inner/deep/deeper/b.rs")],
+                    ),
+                ],
+                &["", "wrapper/inner", "wrapper/inner/deep/deeper"],
+            );
+            panel
+                .refresh_preserving_tree(&editor, None, Some(0))
+                .unwrap();
+            assert_indent_increases_with_depth(&panel);
+            assert_eq!(
+                panel
+                    .rows
+                    .iter()
+                    .map(|row| row.label.clone())
+                    .collect::<Vec<_>>(),
+                [".", "wrapper/inner", "a.rs", "deep/deeper", "b.rs"]
+            );
+
+            // Re-rooted into the directory: the header row carries no guide
+            // column, so its children still sit to its right.
+            let mut panel = FileExplorerPanel::new(temp.path().to_path_buf(), &editor).unwrap();
+            seed_remote_tree(
+                &mut panel,
+                "backup-20260803-170543",
+                &[(
+                    "backup-20260803-170543",
+                    vec![
+                        remote_dir("backup-20260803-170543/az-rs"),
+                        remote_dir("backup-20260803-170543/new-world"),
+                    ],
+                )],
+                &["backup-20260803-170543"],
+            );
+            panel
+                .refresh_preserving_tree(&editor, None, Some(0))
+                .unwrap();
+            assert_indent_increases_with_depth(&panel);
+            let offsets = label_offsets(&panel);
+            assert!(offsets[1] > offsets[0] && offsets[2] > offsets[0]);
+        });
+    }
+
     #[test]
     fn file_explorer_search_filters_rows_and_keeps_ancestors() {
         let temp = tempfile::tempdir().unwrap();
@@ -4605,6 +5308,54 @@ mod tests {
             press_key(&mut panel, &mut editor, &rt, key!(Esc));
             assert!(panel.search_query.is_empty());
             assert_eq!(panel.rows.len(), all_rows);
+        });
+    }
+
+    /// Search results are a flat ranked list of files: root-relative labels,
+    /// no depth or lineage, and no directory treatment. Pins the shape so a
+    /// future move to a directory-aware search feed has to come back here and
+    /// carry `is_dir` from the match.
+    #[test]
+    fn search_result_rows_are_flat_and_file_shaped() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path().join("src").join("nested")).unwrap();
+        let target = temp.path().join("src").join("nested").join("needle.rs");
+        fs::write(&target, "").unwrap();
+        let rt = helix_runtime::test::RuntimeTest::default();
+        rt.block_on(async {
+            let editor = test_editor(100, 30, rt.runtime());
+            let mut panel = FileExplorerPanel::new(temp.path().to_path_buf(), &editor).unwrap();
+            let root = helix_stdx::path::normalize(temp.path());
+            let target = helix_stdx::path::normalize(&target);
+
+            panel.search_query = "needle".to_string();
+            assert!(panel.apply_search_results(
+                &editor,
+                local_path(root),
+                "needle".to_string(),
+                panel.search_generation,
+                vec![local_path(target)],
+            ));
+
+            assert_eq!(panel.rows.len(), 1);
+            let row = &panel.rows[0];
+            assert!(!row.is_dir);
+            assert!(!row.expanded);
+            assert_eq!(row.depth, 0);
+            assert!(row.ancestor_last.is_empty());
+            // The label is the path relative to the root, not just the name.
+            assert!(row.label.ends_with("needle.rs"), "label {:?}", row.label);
+            assert!(row.label.contains("nested"), "label {:?}", row.label);
+
+            // No indent guides and no trailing directory slash.
+            let (_surface, rendered) = render_tree_row(
+                &panel,
+                row,
+                row_tree_item_styles(None, false),
+                Style::default(),
+            );
+            assert!(rendered.starts_with(&row.label), "rendered {rendered:?}");
+            assert!(!rendered.trim_end().ends_with('/'));
         });
     }
 
@@ -6231,10 +6982,12 @@ mod tests {
             input: ExplorerInputEngine::default(),
             file_clipboard: None,
             selection: 0,
+            row_selection_anchor: None,
             label_selection: LabelSelection::default(),
             scroll: 0,
             scroll_x: 0,
             tree_content_width: 0,
+            h_scroll_anchor: None,
             pending_scroll_restore: None,
             area: Rect::default(),
             focused: true,
@@ -6300,10 +7053,12 @@ mod tests {
             input: ExplorerInputEngine::default(),
             file_clipboard: None,
             selection: 0,
+            row_selection_anchor: None,
             label_selection: LabelSelection::default(),
             scroll: 0,
             scroll_x: 0,
             tree_content_width: 0,
+            h_scroll_anchor: None,
             pending_scroll_restore: None,
             area: Rect::default(),
             focused: true,
@@ -6379,10 +7134,12 @@ mod tests {
             input: ExplorerInputEngine::default(),
             file_clipboard: None,
             selection: 0,
+            row_selection_anchor: None,
             label_selection: LabelSelection::default(),
             scroll: 0,
             scroll_x: 0,
             tree_content_width: 0,
+            h_scroll_anchor: None,
             pending_scroll_restore: None,
             area: Rect::default(),
             focused: true,
@@ -6440,10 +7197,12 @@ mod tests {
             input: ExplorerInputEngine::default(),
             file_clipboard: None,
             selection: 0,
+            row_selection_anchor: None,
             label_selection: LabelSelection::default(),
             scroll: 0,
             scroll_x: 0,
             tree_content_width: 0,
+            h_scroll_anchor: None,
             pending_scroll_restore: None,
             area: Rect::default(),
             focused: true,

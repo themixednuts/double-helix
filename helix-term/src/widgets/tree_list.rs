@@ -135,7 +135,7 @@ impl<'a> TreeListItem<'a> {
         self.statuses
             .iter()
             .flatten()
-            .map(|status| status_icon_width(status.text))
+            .map(|status| tree_list_status_icon_width(status.text))
             .sum()
     }
 }
@@ -433,7 +433,11 @@ fn draw_segment_scrolled(
     }
 }
 
-fn status_icon_width(icon: &str) -> u16 {
+/// Columns a single status icon reserves at the right edge of a row: the
+/// glyph plus one column of separation. `tree_list_scrolled` subtracts these
+/// from the row's content rect, so anything that clamps horizontal scrolling
+/// must reserve the same width or the row's tail becomes unreachable.
+pub fn tree_list_status_icon_width(icon: &str) -> u16 {
     text_width(icon).max(1).saturating_add(1)
 }
 
@@ -488,6 +492,29 @@ mod tests {
         assert_eq!(surface[(0, 0)].symbol(), "s");
         assert_eq!(surface[(0, 1)].symbol(), "│");
         assert_eq!(surface[(2, 1)].symbol(), "└");
+    }
+
+    /// The indent step between a row and its children is two columns (one
+    /// guide), but the icon is added *after* that step — so the label offset
+    /// only stays monotonic while sibling icons are within two columns of
+    /// each other. Directory rows are the risky case: an expanded parent and
+    /// its collapsed children draw *different* glyphs, and the file
+    /// explorer's own fallbacks already straddle a BMP glyph (U+E5FF) and a
+    /// plane-15 one (U+F0770). This pins where that budget runs out, so a
+    /// future icon change that inverts the tree fails here rather than on a
+    /// user's screen.
+    #[test]
+    fn label_offset_indent_step_survives_two_columns_of_icon_skew() {
+        // Parent at depth 1, children at depth 2 (one guide column).
+        let parent = |icon| tree_list_label_offset(0, 1, icon);
+        let child = |icon| tree_list_label_offset(1, 2, icon);
+
+        // Equal-width icons: the full two-column step is visible.
+        assert_eq!(child(3) - parent(3), 2);
+        // A parent icon two columns wider eats the step exactly.
+        assert_eq!(child(3), parent(5));
+        // Three columns wider and the child would render left of its parent.
+        assert!(child(3) < parent(6));
     }
 
     #[test]

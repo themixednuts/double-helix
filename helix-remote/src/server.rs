@@ -27,6 +27,41 @@ use tokio_util::sync::CancellationToken;
 
 const OUTBOUND_CAPACITY: usize = 256;
 const SEARCH_INDEX_CACHE_CAPACITY: usize = 4;
+const BACKSLASH_MUTATION_ERROR: &str = "backslash-containing names are refused for writes because they usually indicate a client path-joining bug; creating such names deliberately can be done via a shell";
+
+fn validate_mutating_request(request: &ClientRequest) -> Result<(), RemoteError> {
+    let target = match request {
+        ClientRequest::BeginWrite(request) => Some(&request.path),
+        ClientRequest::ApplyFileTransaction(transaction) => {
+            for operation in &transaction.operations {
+                let target = match operation {
+                    FileOperation::CreateFile { path, .. }
+                    | FileOperation::CreateDirectory { path } => Some(path),
+                    FileOperation::Copy { to, .. } | FileOperation::Rename { to, .. } => Some(to),
+                    FileOperation::Remove { .. } => None,
+                };
+                if let Some(target) = target {
+                    reject_backslash_mutation(target)?;
+                }
+            }
+            None
+        }
+        _ => None,
+    };
+    if let Some(target) = target {
+        reject_backslash_mutation(target)?;
+    }
+    Ok(())
+}
+
+fn reject_backslash_mutation(path: &WorkspacePath) -> Result<(), RemoteError> {
+    if path.segments().iter().any(|segment| segment.contains('\\')) {
+        return Err(
+            RemoteError::new(ErrorCode::InvalidPath, BACKSLASH_MUTATION_ERROR).at(path.clone()),
+        );
+    }
+    Ok(())
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum ServerError {
@@ -303,6 +338,7 @@ impl ServerState {
                 "Hello must be the first remote request",
             ));
         }
+        validate_mutating_request(&request)?;
 
         match request {
             ClientRequest::Hello(_) => unreachable!(),
@@ -1084,6 +1120,59 @@ fn canceled_error() -> RemoteError {
 mod tests {
     use super::*;
     use tokio::io::{duplex, split};
+
+    fn workspace_path(path: &str) -> WorkspacePath {
+        WorkspacePath::new([path.to_owned()]).unwrap()
+    }
+
+    #[test]
+    fn rejects_backslash_names_for_mutating_requests() {
+        let path = workspace_path(r"directory\name");
+        let request = ClientRequest::ApplyFileTransaction(FileTransaction {
+            operations: vec![FileOperation::CreateDirectory { path: path.clone() }],
+        });
+
+        let error = validate_mutating_request(&request).unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidPath);
+        assert_eq!(error.path, Some(path));
+        assert!(error.message.contains("client path-joining bug"));
+
+        let error = validate_mutating_request(&ClientRequest::BeginWrite(BeginWrite {
+            path: workspace_path(r"directory\file.txt"),
+            expected: None,
+            create_parents: true,
+        }))
+        .unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidPath);
+    }
+
+    #[test]
+    fn allows_backslash_read_paths_and_rename_sources() {
+        let source = workspace_path(r"directory\old.txt");
+        assert!(validate_mutating_request(&ClientRequest::Stat {
+            path: source.clone(),
+        })
+        .is_ok());
+        assert!(
+            validate_mutating_request(&ClientRequest::ApplyFileTransaction(FileTransaction {
+                operations: vec![FileOperation::Remove {
+                    path: source.clone(),
+                    recursive: false,
+                }],
+            },))
+            .is_ok()
+        );
+        assert!(
+            validate_mutating_request(&ClientRequest::ApplyFileTransaction(FileTransaction {
+                operations: vec![FileOperation::Rename {
+                    from: source,
+                    to: WorkspacePath::from_slash_path("directory/new.txt").unwrap(),
+                    overwrite: false,
+                }],
+            },))
+            .is_ok()
+        );
+    }
 
     #[tokio::test]
     async fn terminal_frame_ends_output_before_later_producer_events() {

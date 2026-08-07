@@ -1378,14 +1378,10 @@ async fn prepare_remote_language_server(
 }
 
 fn remote_workspace_path(path: &std::path::Path) -> helix_lsp::Result<helix_remote::WorkspacePath> {
-    let path = path.to_str().ok_or_else(|| {
+    helix_remote::WorkspacePath::from_native_path(path).map_err(|error| {
         helix_lsp::Error::Other(anyhow::anyhow!(
-            "remote language-server root is not valid UTF-8"
-        ))
-    })?;
-    helix_remote::WorkspacePath::from_slash_path(&path.replace('\\', "/")).map_err(|error| {
-        helix_lsp::Error::Other(anyhow::anyhow!(
-            "invalid remote language-server root '{path}': {error}"
+            "invalid remote language-server root '{}': {error}",
+            path.display()
         ))
     })
 }

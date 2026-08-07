@@ -2,7 +2,7 @@ use crate::WorkspacePath;
 use std::{
     error::Error,
     fmt, io,
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -222,30 +222,7 @@ pub fn relative_workspace_path(
             "path is outside the workspace root",
         )
     })?;
-    let mut segments = Vec::new();
-    for component in relative.components() {
-        match component {
-            Component::Normal(segment) => {
-                let segment = segment.to_str().ok_or_else(|| {
-                    WorkspaceFsError::new(
-                        WorkspaceFsErrorKind::InvalidPath,
-                        None,
-                        "workspace filename is not valid UTF-8",
-                    )
-                })?;
-                segments.push(segment.to_owned());
-            }
-            Component::CurDir => {}
-            _ => {
-                return Err(WorkspaceFsError::new(
-                    WorkspaceFsErrorKind::InvalidPath,
-                    None,
-                    "invalid workspace-relative path",
-                ));
-            }
-        }
-    }
-    WorkspacePath::new(segments).map_err(|error| {
+    WorkspacePath::from_native_path(relative).map_err(|error| {
         WorkspaceFsError::new(WorkspaceFsErrorKind::InvalidPath, None, error.to_string())
     })
 }

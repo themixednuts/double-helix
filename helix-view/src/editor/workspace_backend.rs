@@ -306,19 +306,25 @@ impl WorkspaceDocumentPath {
     }
 
     pub fn join_relative(&self, relative: &Path) -> Result<Self, String> {
-        let mut joined = self.clone();
-        for component in relative.components() {
-            let std::path::Component::Normal(segment) = component else {
-                return Err(String::from(
-                    "workspace path must contain only normal segments",
-                ));
-            };
-            let segment = segment
-                .to_str()
-                .ok_or_else(|| String::from("workspace path must be valid UTF-8"))?;
-            joined = joined.join(segment).map_err(|error| error.to_string())?;
+        let relative =
+            WorkspacePath::from_native_path(relative).map_err(|error| error.to_string())?;
+        if relative.is_root() {
+            return Ok(self.clone());
         }
-        Ok(joined)
+        match self {
+            Self::Local(path) => Ok(Self::Local(path.join(relative.to_path_buf()))),
+            Self::Remote(path) => path
+                .join_path(&relative)
+                .map(Self::Remote)
+                .map_err(|error| error.to_string()),
+            Self::Collaboration { project, path } => path
+                .join_path(&relative)
+                .map(|path| Self::Collaboration {
+                    project: *project,
+                    path,
+                })
+                .map_err(|error| error.to_string()),
+        }
     }
 
     pub fn starts_with(&self, root: &Self) -> bool {

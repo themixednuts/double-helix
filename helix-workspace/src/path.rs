@@ -1,5 +1,8 @@
 use serde::{Deserialize, Deserializer, Serialize};
-use std::{fmt, path::PathBuf};
+use std::{
+    fmt,
+    path::{Component, Path, PathBuf},
+};
 
 pub const MAX_WORKSPACE_PATH_BYTES: usize = 16 * 1024;
 pub const MAX_WORKSPACE_PATH_SEGMENTS: usize = 256;
@@ -23,6 +26,8 @@ pub enum WorkspacePathError {
     Traversal,
     #[error("workspace path contains a NUL byte")]
     Nul,
+    #[error("workspace path contains a non-UTF-8 segment")]
+    NonUtf8,
     #[error("workspace path segment contains the wire path separator")]
     PathSeparator,
     #[error("workspace path has too many segments")]
@@ -52,6 +57,32 @@ impl WorkspacePath {
             return Err(WorkspacePathError::Absolute);
         }
         Self::new(path.split('/').map(str::to_owned))
+    }
+
+    /// Convert a native filesystem path into platform-independent wire segments.
+    ///
+    /// This is the required entry point for converting any [`Path`] or
+    /// [`PathBuf`] that originated from the local filesystem or the UI into a
+    /// workspace path. Native path components are split according to the
+    /// current platform: a backslash is a separator on Windows and filename
+    /// data on Unix. Absolute paths, prefixes, traversal components, and
+    /// non-UTF-8 components are rejected.
+    pub fn from_native_path(path: &Path) -> Result<Self, WorkspacePathError> {
+        let segments = path
+            .components()
+            .map(|component| match component {
+                Component::Prefix(_) | Component::RootDir => Err(WorkspacePathError::Absolute),
+                Component::CurDir | Component::ParentDir => Err(WorkspacePathError::Traversal),
+                Component::Normal(segment) => segment
+                    .to_str()
+                    .map(str::to_owned)
+                    .ok_or(WorkspacePathError::NonUtf8),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if has_dot_component(path) {
+            return Err(WorkspacePathError::Traversal);
+        }
+        Self::new(segments)
     }
 
     /// Resolve user-entered relative path syntax without allowing it to escape
@@ -182,6 +213,20 @@ fn has_windows_prefix(path: &str) -> bool {
     bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
 }
 
+#[cfg(windows)]
+fn has_dot_component(path: &Path) -> bool {
+    path.to_string_lossy()
+        .split(['/', '\\'])
+        .any(|component| matches!(component, "." | ".."))
+}
+
+#[cfg(not(windows))]
+fn has_dot_component(path: &Path) -> bool {
+    path.to_string_lossy()
+        .split('/')
+        .any(|component| matches!(component, "." | ".."))
+}
+
 impl fmt::Debug for WorkspacePath {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -240,6 +285,53 @@ mod tests {
         assert_eq!(
             WorkspacePath::new(["x".repeat(MAX_WORKSPACE_PATH_SEGMENT_BYTES + 1)]),
             Err(WorkspacePathError::SegmentTooLong)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_windows_paths_split_into_wire_segments() {
+        assert_eq!(
+            WorkspacePath::from_native_path(Path::new(r"src\main.rs"))
+                .unwrap()
+                .segments(),
+            &["src", "main.rs"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_unix_backslashes_remain_filename_data() {
+        assert_eq!(
+            WorkspacePath::from_native_path(Path::new(r"directory\name"))
+                .unwrap()
+                .segments(),
+            &[r"directory\name"]
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_native_paths() {
+        assert_eq!(
+            WorkspacePath::from_native_path(Path::new("/absolute/path")),
+            Err(WorkspacePathError::Absolute)
+        );
+        assert_eq!(
+            WorkspacePath::from_native_path(Path::new("../outside")),
+            Err(WorkspacePathError::Traversal)
+        );
+        assert_eq!(
+            WorkspacePath::from_native_path(Path::new("./current")),
+            Err(WorkspacePathError::Traversal)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rejects_native_path_prefixes() {
+        assert_eq!(
+            WorkspacePath::from_native_path(Path::new(r"C:relative")),
+            Err(WorkspacePathError::Absolute)
         );
     }
 

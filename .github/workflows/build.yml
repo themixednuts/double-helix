@@ -27,7 +27,7 @@ jobs:
     if: github.repository == 'themixednuts/double-helix' || github.event_name != 'schedule'
     steps:
       - name: Checkout sources
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Install MSRV toolchain
         uses: dtolnay/rust-toolchain@master
@@ -63,7 +63,7 @@ jobs:
       HELIX_LOG_LEVEL: error
     steps:
       - name: Checkout sources
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Install MSRV toolchain
         uses: dtolnay/rust-toolchain@master
@@ -100,7 +100,7 @@ jobs:
     if: github.repository == 'themixednuts/double-helix' || github.event_name != 'schedule'
     steps:
       - name: Checkout sources
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Install MSRV toolchain
         uses: dtolnay/rust-toolchain@master
@@ -131,7 +131,7 @@ jobs:
     if: github.repository == 'themixednuts/double-helix' || github.event_name != 'schedule'
     steps:
       - name: Checkout sources
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Install toolchain
         uses: dtolnay/rust-toolchain@master

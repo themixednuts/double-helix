@@ -10,7 +10,7 @@ use helix_view::{
 use crate::compositor::RenderContext;
 
 use super::{
-    icon_width, selected_path_for_log, text_width, ExplorerRow, FileExplorerPanel, VcsStatus,
+    selected_path_for_log, text_width, ExplorerRow, FileExplorerPanel, VcsStatus,
     FALLBACK_FILE_ICON, FALLBACK_FOLDER_ICON, FALLBACK_FOLDER_OPEN_ICON, HEADER_ROWS, SEARCH_ROWS,
 };
 #[derive(Clone)]
@@ -56,6 +56,8 @@ pub(super) struct ExplorerRenderSnapshot {
     scroll_x: u16,
     focused: bool,
     show_icons: bool,
+    /// Uniform icon-column width resolved by the panel for this frame.
+    icon_column: u16,
     label_selection: helix_view::modal_text::ModalTextSelection,
     label_edit: Option<RenderLabelEdit>,
     jump_session: Option<helix_view::jump_labels::JumpSession>,
@@ -141,6 +143,7 @@ fn tree_item<'a>(
     row: &'a ExplorerRow,
     label: &'a str,
     selected: bool,
+    ranged: bool,
     active: bool,
     styles: ExplorerTreeItemStyles,
     icons: &'a Icons,
@@ -183,6 +186,7 @@ fn tree_item<'a>(
         .label_selection(label_selection)
         .statuses(statuses)
         .selected(selected)
+        .ranged(ranged)
         .active(active)
 }
 
@@ -197,13 +201,23 @@ impl FileExplorerPanel {
         row: &'a ExplorerRow,
         row_index: usize,
         selected: bool,
+        ranged: bool,
         active: bool,
         styles: ExplorerTreeItemStyles,
         icons: &'a Icons,
         status_styles: ExplorerStatusStyles,
     ) -> crate::widgets::TreeListItem<'a> {
         let label = self.display_label_for(row, row_index);
-        tree_item(row, label, selected, active, styles, icons, status_styles)
+        tree_item(
+            row,
+            label,
+            selected,
+            ranged,
+            active,
+            styles,
+            icons,
+            status_styles,
+        )
     }
 
     pub(super) fn global_statusline(
@@ -326,6 +340,7 @@ impl FileExplorerPanel {
             scroll_x: self.scroll_x,
             focused: self.focused,
             show_icons: self.config.icons,
+            icon_column: self.icon_column,
             label_selection: self.label_selection,
             label_edit: self.label_edit.as_ref().map(|edit| RenderLabelEdit {
                 row_index: edit.row_index,
@@ -361,48 +376,8 @@ impl ExplorerRenderSnapshot {
         }
     }
 
-    fn row_icon_width(&self, row: &ExplorerRow) -> u16 {
-        let icons = ICONS.load();
-        if row.is_dir {
-            if let Some(icon) = if row.expanded {
-                icons.kind().folder_open()
-            } else {
-                icons.kind().folder()
-            } {
-                return icon_width(&icon);
-            }
-            if let Some(icon) = if row.expanded {
-                icons.mime().directory_open()
-            } else {
-                icons.mime().directory()
-            } {
-                return text_width(icon).saturating_add(2);
-            }
-            let fallback = if row.expanded {
-                FALLBACK_FOLDER_OPEN_ICON
-            } else {
-                FALLBACK_FOLDER_ICON
-            };
-            return text_width(fallback).saturating_add(2);
-        }
-        let icon_path = row.path.icon_path().into_owned();
-        icons
-            .mime()
-            .get(Some(&icon_path), None)
-            .or_else(|| icons.mime().get_or_default(Some(&icon_path), None))
-            .map_or_else(
-                || text_width(FALLBACK_FILE_ICON).saturating_add(2),
-                icon_width,
-            )
-    }
-
     fn row_label_offset(&self, row: &ExplorerRow) -> u16 {
-        let icon_width = if self.show_icons {
-            self.row_icon_width(row)
-        } else {
-            0
-        };
-        crate::widgets::tree_list_label_offset(row.ancestor_last.len(), row.depth, icon_width)
+        crate::widgets::tree_list_label_offset(row.ancestor_last.len(), row.depth, self.icon_column)
     }
 
     pub(super) fn render_surface(
@@ -514,10 +489,16 @@ impl ExplorerRenderSnapshot {
                     .then(|| self.label_selection.span(label_source))
                     .flatten();
                 let is_active = !row.is_dir && active_path.is_some_and(|path| path == &row.path);
+                // A one-row "range" is just the cursor, which keeps its
+                // existing look; the fill only appears once `x` has actually
+                // extended the selection.
+                let ranged =
+                    self.row_selection.len() > 1 && self.row_selection.contains(&screen_row);
                 tree_item(
                     row,
                     label_source,
-                    self.row_selection.contains(&screen_row),
+                    screen_row == self.selection,
+                    ranged,
                     is_active,
                     styles,
                     &icons,
@@ -539,6 +520,7 @@ impl ExplorerRenderSnapshot {
             },
             Some("No files"),
             self.scroll_x,
+            self.icon_column,
         );
         drop(visible_items);
 

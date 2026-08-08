@@ -8,6 +8,27 @@ use helix_core::unicode::width::{UnicodeWidthChar, UnicodeWidthStr};
 use helix_view::graphics::{Rect, Style};
 use tui::ratatui::widgets::Widget;
 
+/// Blank columns between the icon glyph and the label.
+pub const TREE_ICON_GAP: u16 = 2;
+
+/// Width of the icon column: the widest glyph in the set plus [`TREE_ICON_GAP`],
+/// or zero when the tree draws no icons.
+///
+/// The column is uniform across rows on purpose. Sizing it per row would make a
+/// label's x-offset depend on which glyph that row happens to show, so a
+/// terminal that draws one glyph wider than `unicode-width` reports would shove
+/// that row's label right — and an expanded directory (open-folder glyph) could
+/// end up further right than its own children (closed-folder glyph). With a
+/// fixed column an over-wide glyph bleeds into the gap instead, and the
+/// two-column parent/child step holds by construction.
+pub fn tree_list_icon_column(widest_glyph: u16) -> u16 {
+    if widest_glyph == 0 {
+        0
+    } else {
+        widest_glyph.saturating_add(TREE_ICON_GAP)
+    }
+}
+
 pub const TREE_GUIDE: &str = "│ ";
 pub const TREE_MIDDLE: &str = "├╴";
 pub const TREE_LAST: &str = "└╴";
@@ -59,11 +80,16 @@ pub struct TreeListItem<'a> {
     pub icon: Option<TreeListIcon<'a>>,
     pub label_selection: Option<Range<usize>>,
     pub statuses: [Option<TreeListStatus<'a>>; 2],
-    /// When `true` the row gets `styles.selection` as a background fill and a
-    /// `▎` accent rail on the left edge. Used by file-explorer-style trees to
-    /// show "this is the cursor row" without depending on label-character
-    /// fuzzy-match highlighting.
+    /// The cursor row. Draws the tree connector in the selection *foreground*
+    /// colour. Note this is a no-op cue on its own for the common theme where
+    /// `ui.selection` sets only a background — the cursor row is really
+    /// identified by the terminal cursor sitting on its label.
     pub selected: bool,
+    /// Part of a multi-row range. Fills the row with `styles.selection`, which
+    /// is the cue that actually shows up under a background-only selection
+    /// theme (see `selected`). Rows off the cursor have no terminal cursor to
+    /// identify them, so this fill is the only thing that marks them.
+    pub ranged: bool,
     /// When `true` an extra muted dot is drawn after the label, marking
     /// "this row's file is the one currently open in the focused view".
     /// Distinct from `selected` (which is the cursor in the tree).
@@ -82,12 +108,18 @@ impl<'a> TreeListItem<'a> {
             label_selection: None,
             statuses: [None, None],
             selected: false,
+            ranged: false,
             active: false,
         }
     }
 
     pub const fn selected(mut self, selected: bool) -> Self {
         self.selected = selected;
+        self
+    }
+
+    pub const fn ranged(mut self, ranged: bool) -> Self {
+        self.ranged = ranged;
         self
     }
 
@@ -140,7 +172,9 @@ impl<'a> TreeListItem<'a> {
     }
 }
 
-pub fn tree_list_label_offset(ancestor_count: usize, depth: usize, icon_width: u16) -> u16 {
+/// Column the label starts at. `icon_column` is the uniform width from
+/// [`tree_list_icon_column`] — never one row's measured glyph width.
+pub fn tree_list_label_offset(ancestor_count: usize, depth: usize, icon_column: u16) -> u16 {
     let guide_count: u16 = ancestor_count.try_into().unwrap_or(u16::MAX);
     let connector_width = if depth > 0 {
         text_width(TREE_MIDDLE)
@@ -150,16 +184,11 @@ pub fn tree_list_label_offset(ancestor_count: usize, depth: usize, icon_width: u
     guide_count
         .saturating_mul(text_width(TREE_GUIDE))
         .saturating_add(connector_width)
-        .saturating_add(icon_width)
+        .saturating_add(icon_column)
 }
 
-pub fn tree_list_item_content_width(item: &TreeListItem<'_>) -> u16 {
-    let icon_width = item
-        .icon
-        .as_ref()
-        .map(|icon| text_width(icon.text.as_ref()).saturating_add(2))
-        .unwrap_or(0);
-    let label_end = tree_list_label_offset(item.ancestor_last.len(), item.depth, icon_width)
+pub fn tree_list_item_content_width(item: &TreeListItem<'_>, icon_column: u16) -> u16 {
+    let label_end = tree_list_label_offset(item.ancestor_last.len(), item.depth, icon_column)
         .saturating_add(text_width(item.label));
     if item.is_dir {
         label_end.saturating_add(1)
@@ -175,7 +204,20 @@ pub fn tree_list(
     styles: TreeListStyles,
     empty_message: Option<&str>,
 ) -> usize {
-    tree_list_scrolled(surface, area, items, styles, empty_message, 0)
+    // Callers without a tree-wide icon set get the column sized from the rows
+    // they passed, which is uniform across this paint.
+    let icon_column = tree_list_icon_column(widest_icon_glyph(items));
+    tree_list_scrolled(surface, area, items, styles, empty_message, 0, icon_column)
+}
+
+/// Widest icon glyph among `items`, or zero when none of them draw an icon.
+pub fn widest_icon_glyph(items: &[TreeListItem<'_>]) -> u16 {
+    items
+        .iter()
+        .filter_map(|item| item.icon.as_ref())
+        .map(|icon| text_width(icon.text.as_ref()))
+        .max()
+        .unwrap_or(0)
 }
 
 pub fn tree_list_scrolled(
@@ -185,6 +227,7 @@ pub fn tree_list_scrolled(
     styles: TreeListStyles,
     empty_message: Option<&str>,
     scroll_x: u16,
+    icon_column: u16,
 ) -> usize {
     if area.width == 0 || area.height == 0 {
         return 0;
@@ -213,9 +256,17 @@ pub fn tree_list_scrolled(
         let y = area.y + row as u16;
         let row_area = Rect::new(area.x, y, area.width, 1);
 
-        // No bg fill for selected rows — the cue is the accent-coloured
-        // tree guide drawn inside `draw_item`, plus the terminal cursor
-        // sitting on the label.
+        // The cursor row gets no fill — its cue is the accent connector in
+        // `draw_item` plus the terminal cursor on its label. Ranged rows have
+        // neither, so they get the selection fill; glyphs drawn afterwards
+        // only set the fields their own style specifies, so the fill shows
+        // through behind the text.
+        if item.ranged {
+            surface.set_style(
+                tui::ratatui::to_ratatui_rect(row_area),
+                tui::ratatui::to_ratatui_style(styles.selection),
+            );
+        }
 
         let status_width = item.status_width();
         let content = Rect::new(
@@ -224,7 +275,7 @@ pub fn tree_list_scrolled(
             row_area.width.saturating_sub(status_width),
             1,
         );
-        draw_item(surface, content, item, styles, scroll_x);
+        draw_item(surface, content, item, styles, scroll_x, icon_column);
         draw_statuses(surface, row_area, item);
     }
     visible_rows
@@ -236,6 +287,7 @@ fn draw_item(
     item: &TreeListItem<'_>,
     styles: TreeListStyles,
     scroll_x: u16,
+    icon_column: u16,
 ) {
     let mut content_x = 0u16;
 
@@ -271,16 +323,33 @@ fn draw_item(
         );
     }
 
-    if let Some(icon) = item.icon.as_ref() {
+    // The icon column is always `icon_column` wide, whatever this row's glyph
+    // measures — a narrower glyph is padded out, so every label at this depth
+    // starts at the same column. Rows with no icon still consume the column.
+    if icon_column > 0 {
+        let glyph = item.icon.as_ref().map_or(0, |icon| {
+            let style = icon.style;
+            let glyph = text_width(icon.text.as_ref());
+            draw_segment_scrolled(
+                surface,
+                area,
+                &mut content_x,
+                icon.text.as_ref(),
+                style,
+                scroll_x,
+            );
+            glyph
+        });
+        let style = item.icon.as_ref().map_or(styles.text, |icon| icon.style);
+        let padding = usize::from(icon_column.saturating_sub(glyph));
         draw_segment_scrolled(
             surface,
             area,
             &mut content_x,
-            icon.text.as_ref(),
-            icon.style,
+            &" ".repeat(padding),
+            style,
             scroll_x,
         );
-        draw_segment_scrolled(surface, area, &mut content_x, "  ", icon.style, scroll_x);
     }
 
     let label_style = if item.is_dir {
@@ -463,6 +532,7 @@ mod tests {
             TreeListStyles::default(),
             None,
             3,
+            0,
         );
 
         assert_eq!(surface[(0, 0)].symbol(), "d");
@@ -494,27 +564,108 @@ mod tests {
         assert_eq!(surface[(2, 1)].symbol(), "└");
     }
 
-    /// The indent step between a row and its children is two columns (one
-    /// guide), but the icon is added *after* that step — so the label offset
-    /// only stays monotonic while sibling icons are within two columns of
-    /// each other. Directory rows are the risky case: an expanded parent and
-    /// its collapsed children draw *different* glyphs, and the file
-    /// explorer's own fallbacks already straddle a BMP glyph (U+E5FF) and a
-    /// plane-15 one (U+F0770). This pins where that budget runs out, so a
-    /// future icon change that inverts the tree fails here rather than on a
-    /// user's screen.
+    /// Label placement is glyph-independent.
+    ///
+    /// This offset used to be computed from each row's *own* icon width, so a
+    /// row whose glyph measured wider than its neighbours' had its label
+    /// pushed right. Directory rows are the case that bit: an expanded parent
+    /// and its collapsed children draw different glyphs (the file explorer's
+    /// fallbacks straddle a BMP glyph, U+E5FF, and a plane-15 one, U+F0770),
+    /// and a skew of three columns was enough to render children left of their
+    /// parent. Every row now shares one column width, so the only input that
+    /// can move a label is its depth.
     #[test]
-    fn label_offset_indent_step_survives_two_columns_of_icon_skew() {
-        // Parent at depth 1, children at depth 2 (one guide column).
-        let parent = |icon| tree_list_label_offset(0, 1, icon);
-        let child = |icon| tree_list_label_offset(1, 2, icon);
+    fn label_offset_is_independent_of_which_glyph_a_row_draws() {
+        let column = tree_list_icon_column(1);
+        // Same depth, same offset — there is no per-row glyph term left to
+        // vary. (Widths 1 and 4 stood for a narrow vs. an over-wide glyph.)
+        assert_eq!(tree_list_label_offset(1, 2, column), 2 + 2 + column);
+        for widest in [1, 2, 4] {
+            let column = tree_list_icon_column(widest);
+            assert_eq!(
+                tree_list_label_offset(1, 2, column),
+                tree_list_label_offset(1, 2, column),
+            );
+            // …and the parent/child step stays two columns whatever the set.
+            assert_eq!(
+                tree_list_label_offset(1, 2, column) - tree_list_label_offset(0, 1, column),
+                2
+            );
+        }
+    }
 
-        // Equal-width icons: the full two-column step is visible.
-        assert_eq!(child(3) - parent(3), 2);
-        // A parent icon two columns wider eats the step exactly.
-        assert_eq!(child(3), parent(5));
-        // Three columns wider and the child would render left of its parent.
-        assert!(child(3) < parent(6));
+    #[test]
+    fn icon_column_reserves_the_gap_and_collapses_when_icons_are_off() {
+        assert_eq!(tree_list_icon_column(1), 1 + TREE_ICON_GAP);
+        assert_eq!(tree_list_icon_column(2), 2 + TREE_ICON_GAP);
+        // Icons disabled: no column at all, so layout is unchanged.
+        assert_eq!(tree_list_icon_column(0), 0);
+        assert_eq!(tree_list_label_offset(1, 2, 0), 4);
+    }
+
+    /// A narrow glyph is padded out to the column, so the label lands at the
+    /// same screen column as a row whose glyph fills the column.
+    #[test]
+    fn narrow_glyphs_are_padded_to_the_icon_column() {
+        let column = tree_list_icon_column(2);
+        let mut surface = Buffer::empty(RatatuiRect::new(0, 0, 20, 2));
+        let narrow = TreeListIcon::new("x", Style::default());
+        let wide = TreeListIcon::new("ab", Style::default());
+        let items = [
+            TreeListItem::new("one").icon(Some(narrow)),
+            TreeListItem::new("two").icon(Some(wide)),
+        ];
+
+        tree_list_scrolled(
+            &mut surface,
+            Rect::new(0, 0, 20, 2),
+            &items,
+            TreeListStyles::default(),
+            None,
+            0,
+            column,
+        );
+
+        assert_eq!(surface[(column, 0)].symbol(), "o");
+        assert_eq!(surface[(column, 1)].symbol(), "t");
+    }
+
+    /// The cue for a ranged row has to survive the common theme where
+    /// `ui.selection` carries a background and no foreground. The old
+    /// `selected` accent recoloured the tree connector's *foreground*, so
+    /// under such a theme it resolved back to the guide style and painted
+    /// nothing at all.
+    #[test]
+    fn ranged_rows_are_visible_under_a_background_only_selection_theme() {
+        let selection = Style::default().bg(Color::Rgb(20, 40, 80));
+        let styles = TreeListStyles {
+            selection,
+            ..TreeListStyles::default()
+        };
+        let paint = |ranged: bool| {
+            let mut surface = Buffer::empty(RatatuiRect::new(0, 0, 12, 1));
+            let item = TreeListItem::new("alpha").selected(true).ranged(ranged);
+            tree_list_scrolled(
+                &mut surface,
+                Rect::new(0, 0, 12, 1),
+                &[item],
+                styles,
+                None,
+                0,
+                0,
+            );
+            surface
+        };
+
+        let plain = paint(false);
+        let ranged = paint(true);
+        assert_ne!(plain, ranged, "a ranged row must paint differently");
+        let fill = tui::ratatui::to_ratatui_style(selection)
+            .bg
+            .expect("selection background");
+        for x in 0..12 {
+            assert_eq!(ranged[(x, 0)].bg, fill, "column {x} should carry the fill");
+        }
     }
 
     #[test]

@@ -15,7 +15,7 @@ use helix_core::{movement::Movement as CoreMovement, unicode::width::UnicodeWidt
 use helix_view::{
     editor::{Action, CloseError, ClosePolicy, FileExplorerConfig},
     graphics::{CursorKind, Rect},
-    icons::{Icon, ICONS},
+    icons::ICONS,
     input::{KeyEvent, MouseButton, MouseEvent, MouseEventKind},
     keyboard::{KeyCode, KeyModifiers},
     modal_text::{
@@ -195,6 +195,10 @@ pub struct FileExplorerPanel {
     /// Last known tree content width (excluding status icons / scrollbar).
     /// Used to clamp `scroll_x` and keep the selected label visible.
     tree_content_width: u16,
+    /// Uniform width of the icon column, gap included, or 0 when icons are
+    /// off. Single source of truth for label placement: clamp, cursor math,
+    /// and paint all read it, so no row's own glyph can shift its label.
+    icon_column: u16,
     /// Selection + label cursor the horizontal viewport was last aligned to.
     /// The render path only re-reveals the cursor when this moves (or the
     /// panel resizes) — same rule as `clamp_viewport` for vertical scroll,
@@ -314,15 +318,13 @@ fn windows_reserved_path(path: &Path) -> Option<&'static str> {
 fn motion_row_wrap_direction(motion: LabelMotion) -> Option<i32> {
     use helix_view::modal_text::ModalTextMotion;
     match motion {
-        ModalTextMotion::Char(n) => {
-            if n > 0 {
-                Some(1)
-            } else if n < 0 {
-                Some(-1)
-            } else {
-                None
-            }
-        }
+        // Arrow keys are row-local. They used to wrap, which made holding
+        // Right walk to the end of a label and then jump to the next row with
+        // the cursor back at column 0 — the horizontal viewport dutifully
+        // followed it back to the start, so a held key looked like the scroll
+        // was bouncing. Word motions below still wrap; those are deliberate
+        // "keep going" motions, an arrow key is not.
+        ModalTextMotion::Char(_) => None,
         ModalTextMotion::NextWordStart(_) | ModalTextMotion::NextWordEnd(_) => Some(1),
         ModalTextMotion::PrevWordStart(_) | ModalTextMotion::PrevWordEnd(_) => Some(-1),
         ModalTextMotion::LineStart | ModalTextMotion::LineEnd => None,
@@ -333,14 +335,6 @@ fn motion_row_wrap_direction(motion: LabelMotion) -> Option<i32> {
         // user's first encounter with it.
         _ => None,
     }
-}
-
-fn icon_width(icon: &Icon) -> u16 {
-    icon.glyph()
-        .width()
-        .saturating_add(2)
-        .try_into()
-        .unwrap_or(u16::MAX)
 }
 
 fn text_width(text: &str) -> u16 {
@@ -390,6 +384,46 @@ fn filter_explorer_rows(rows: &[ExplorerRow], query: &str) -> Vec<ExplorerRow> {
 fn explorer_row_matches(row: &ExplorerRow, query: &str) -> bool {
     row.label.to_ascii_lowercase().contains(query)
         || row.path.display().to_ascii_lowercase().contains(query)
+}
+
+/// Display width of the glyph this row draws, without the gap. Only feeds
+/// [`FileExplorerPanel::refresh_icon_column`] — no layout uses it per row.
+fn row_icon_glyph_width(row: &ExplorerRow) -> u16 {
+    let icons = ICONS.load();
+    if row.is_dir {
+        if let Some(icon) = if row.expanded {
+            icons.kind().folder_open()
+        } else {
+            icons.kind().folder()
+        } {
+            return text_width(icon.glyph());
+        }
+
+        if let Some(icon) = if row.expanded {
+            icons.mime().directory_open()
+        } else {
+            icons.mime().directory()
+        } {
+            return text_width(icon);
+        }
+
+        let fallback = if row.expanded {
+            FALLBACK_FOLDER_OPEN_ICON
+        } else {
+            FALLBACK_FOLDER_ICON
+        };
+        return text_width(fallback);
+    }
+
+    let icon_path = row.path.icon_path().into_owned();
+    icons
+        .mime()
+        .get(Some(&icon_path), None)
+        .or_else(|| icons.mime().get_or_default(Some(&icon_path), None))
+        .map_or_else(
+            || text_width(FALLBACK_FILE_ICON),
+            |icon| text_width(icon.glyph()),
+        )
 }
 
 /// Columns the renderer reserves at this row's right edge for its status
@@ -463,6 +497,7 @@ impl FileExplorerPanel {
             scroll: 0,
             scroll_x: 0,
             tree_content_width: 0,
+            icon_column: 0,
             h_scroll_anchor: None,
             pending_scroll_restore: None,
             area: Rect::default(),
@@ -659,7 +694,7 @@ impl FileExplorerPanel {
     /// long name typed into an inline edit widens the scrollable content
     /// instead of being clamped away by `clamp_scroll_x`.
     fn row_content_width(&self, row: &ExplorerRow, row_index: usize) -> u16 {
-        let offset = self.row_label_offset(row, self.config.icons);
+        let offset = self.row_label_offset(row);
         let label = text_width(self.display_label_for(row, row_index));
         // Directories render a trailing `/`, and a row being edited needs one
         // more column for the insert cursor sitting past the last character.
@@ -701,6 +736,7 @@ impl FileExplorerPanel {
     /// `zh`/`zl` (or horizontal wheel) owns `scroll_x` until then — otherwise
     /// every scroll right would be dragged back on the next render.
     fn sync_horizontal_viewport(&mut self, content_width: u16) {
+        self.refresh_icon_column();
         let resized = self.tree_content_width != content_width;
         self.tree_content_width = content_width;
 
@@ -728,7 +764,7 @@ impl FileExplorerPanel {
         if viewport == 0 {
             return;
         }
-        let start = self.row_label_offset(row, self.config.icons);
+        let start = self.row_label_offset(row);
         // Clamp against the displayed label — mid-edit that's the typed
         // buffer, which is usually longer than the stored row label.
         let label = self.display_label_for(row, self.selection);
@@ -741,20 +777,18 @@ impl FileExplorerPanel {
         // viewport so `cursor_position` doesn't return None and hide the
         // block cursor with focused_without_visible_label.
         let cursor_x = start.saturating_add(label_cursor);
-        let end = self.row_content_width(row, self.selection);
+        // Minimal reveal: move the viewport just far enough to contain the
+        // cursor, and only in the direction that needs it. Nothing here may
+        // recentre or snap to the label start — this used to also pull `start`
+        // (and the row's end) into view, which meant every step right along a
+        // long name was immediately undone, so a held arrow key looked like
+        // the scroll was bouncing back to zero. When the cursor lands on a new
+        // row it sits at column 0 of that label, so the first branch already
+        // brings the label start into view on its own.
         if cursor_x < self.scroll_x {
             self.scroll_x = cursor_x;
         } else if cursor_x >= self.scroll_x.saturating_add(viewport) {
             self.scroll_x = cursor_x.saturating_add(1).saturating_sub(viewport);
-        } else if start < self.scroll_x {
-            self.scroll_x = start;
-        } else if end > self.scroll_x.saturating_add(viewport) && start >= self.scroll_x {
-            // Prefer keeping the cursor visible; only pull end into view when
-            // it doesn't push the cursor off the left edge.
-            let candidate = end.saturating_sub(viewport);
-            if candidate <= cursor_x {
-                self.scroll_x = candidate;
-            }
         }
         self.clamp_scroll_x();
     }
@@ -913,6 +947,8 @@ impl FileExplorerPanel {
         // indices would silently cover different files.
         self.collapse_row_selection();
         let selected_path = self.selected().map(|row| row.path.clone());
+        // Deliberately deferred to the end of this function — the icon column
+        // is derived from the rows we are about to install.
         let query = self.normalized_search_query();
         let mode;
         if query.is_empty() {
@@ -941,6 +977,9 @@ impl FileExplorerPanel {
             self.rows = filter_explorer_rows(&self.all_rows, &self.search_query).into();
         }
 
+        // New rows can bring new glyphs, so re-derive the column before any
+        // clamp or cursor math reads it — those run well before the next paint.
+        self.refresh_icon_column();
         self.restore_selection_after_row_update(selected_path);
         log::info!(
             "[file_explorer] search_filter_applied mode={} root={} query={:?} generation={} pending={} results_cached={} rows={} all_rows={} expanded_dirs={} selected={} elapsed_us={}",
@@ -3035,52 +3074,25 @@ impl FileExplorerPanel {
         self.handle_mouse_at(event, cx, Instant::now())
     }
 
-    fn row_icon_width(&self, row: &ExplorerRow) -> u16 {
-        let icons = ICONS.load();
-        if row.is_dir {
-            if let Some(icon) = if row.expanded {
-                icons.kind().folder_open()
-            } else {
-                icons.kind().folder()
-            } {
-                return icon_width(&icon);
-            }
-
-            if let Some(icon) = if row.expanded {
-                icons.mime().directory_open()
-            } else {
-                icons.mime().directory()
-            } {
-                return text_width(icon).saturating_add(2);
-            }
-
-            let fallback = if row.expanded {
-                FALLBACK_FOLDER_OPEN_ICON
-            } else {
-                FALLBACK_FOLDER_ICON
-            };
-            return text_width(fallback).saturating_add(2);
-        }
-
-        let icon_path = row.path.icon_path().into_owned();
-        if let Some(icon) = icons
-            .mime()
-            .get(Some(&icon_path), None)
-            .or_else(|| icons.mime().get_or_default(Some(&icon_path), None))
-        {
-            icon_width(icon)
-        } else {
-            text_width(FALLBACK_FILE_ICON).saturating_add(2)
-        }
-    }
-
-    fn row_label_offset(&self, row: &ExplorerRow, show_icons: bool) -> u16 {
-        let icon_width = if show_icons {
-            self.row_icon_width(row)
+    /// Recompute the uniform icon column from the glyphs the current rows
+    /// actually draw. Done once per frame in `sync_horizontal_viewport` and
+    /// cached in `icon_column`, so the clamp, the cursor math, and the paint
+    /// all read one value — and per-row offsets stop doing an icon lookup.
+    fn refresh_icon_column(&mut self) {
+        let widest = if self.config.icons {
+            self.rows
+                .iter()
+                .map(row_icon_glyph_width)
+                .max()
+                .unwrap_or(0)
         } else {
             0
         };
-        crate::widgets::tree_list_label_offset(row.ancestor_last.len(), row.depth, icon_width)
+        self.icon_column = crate::widgets::tree_list_icon_column(widest);
+    }
+
+    fn row_label_offset(&self, row: &ExplorerRow) -> u16 {
+        crate::widgets::tree_list_label_offset(row.ancestor_last.len(), row.depth, self.icon_column)
     }
 
     fn cursor_position(&self, area: Rect, _editor: &Editor) -> Option<Position> {
@@ -3127,7 +3139,7 @@ impl FileExplorerPanel {
         if content_width == 0 {
             return None;
         }
-        let label_offset = self.row_label_offset(row, self.config.icons);
+        let label_offset = self.row_label_offset(row);
         // Use the displayed label length (buffer when editing, row.label
         // otherwise) so the cursor lands at the right column.
         let display_label = self.display_label_for(row, self.selection);
@@ -3690,7 +3702,7 @@ mod tests {
             panel.move_selection_by(1);
             panel.sync_horizontal_viewport(12);
             let row = panel.selected().expect("selection");
-            let offset = panel.row_label_offset(row, panel.config.icons);
+            let offset = panel.row_label_offset(row);
             assert!(
                 panel.scroll_x <= offset,
                 "selection move should bring the label back into view"
@@ -3718,7 +3730,7 @@ mod tests {
 
             let row = panel.selected().expect("selection");
             let cursor_x = panel
-                .row_label_offset(row, panel.config.icons)
+                .row_label_offset(row)
                 .saturating_add(panel.label_cursor() as u16);
             assert!(
                 cursor_x >= panel.scroll_x && cursor_x < panel.scroll_x + viewport,
@@ -3876,7 +3888,16 @@ mod tests {
         selection: Style,
     ) -> (Buffer, String) {
         let icons = ICONS.load();
-        let item = panel.tree_item(row, 0, true, false, styles, &icons, empty_status_styles());
+        let item = panel.tree_item(
+            row,
+            0,
+            true,
+            false,
+            false,
+            styles,
+            &icons,
+            empty_status_styles(),
+        );
         let mut surface = Buffer::empty(RatatuiRect::new(0, 0, 80, 1));
         crate::widgets::tree_list(
             &mut surface,
@@ -4750,7 +4771,7 @@ mod tests {
         panel
             .rows
             .iter()
-            .map(|row| panel.row_label_offset(row, panel.config.icons))
+            .map(|row| panel.row_label_offset(row))
             .collect()
     }
 
@@ -4967,6 +4988,120 @@ mod tests {
         });
     }
 
+    /// Paint a full frame the way the compositor does — `sync`, then
+    /// `render_snapshot`, then the deferred `render_surface` — and hand back
+    /// the cells. Everything below asserts on this rather than on hand-built
+    /// `TreeListItem`s, which is exactly the seam the earlier render test
+    /// skipped over.
+    fn paint_frame(
+        panel: &mut FileExplorerPanel,
+        editor: &mut Editor,
+        rt: &helix_runtime::test::RuntimeTest,
+        area: Rect,
+    ) -> Buffer {
+        panel.sync(area, editor);
+        let (ingress, _rx) = crate::runtime::RuntimeIngress::channel(rt.runtime().clone());
+        let render_ctx =
+            crate::compositor::RenderContext::new(editor, ingress, editor.redraw_handle());
+        let snapshot = panel.render_snapshot(area, &render_ctx);
+        let mut out = crate::render::RenderOutput::sparse(area);
+        snapshot.render_surface(
+            area,
+            out.surface_mut(),
+            &crate::render::RenderCancellation::never(),
+        );
+        out.into_surface()
+    }
+
+    fn row_backgrounds(surface: &Buffer, area: Rect, row: u16) -> Vec<tui::ratatui::style::Color> {
+        (area.x..area.right())
+            .map(|x| surface[(x, row)].bg)
+            .collect()
+    }
+
+    /// `x` has to survive a real frame *and* leave a visible mark. It did the
+    /// first but not the second: the only cue for a selected row was the tree
+    /// connector redrawn in the selection *foreground* colour, and every stock
+    /// theme sets `ui.selection` as a background only — so the accent resolved
+    /// back to the plain guide style and multi-select painted identically to
+    /// no selection at all.
+    #[test]
+    fn extending_the_row_selection_changes_what_gets_painted() {
+        let temp = tempfile::tempdir().unwrap();
+        let rt = helix_runtime::test::RuntimeTest::default();
+        rt.block_on(async {
+            let mut editor = test_editor(100, 30, rt.runtime());
+            let mut panel = multi_row_panel(&temp, &editor).unwrap();
+            panel.seek_to(row_index_by_name(&panel, "alpha.rs"));
+            let area = Rect::new(0, 0, 34, 20);
+
+            let before = paint_frame(&mut panel, &mut editor, &rt, area);
+
+            let beta = row_index_by_name(&panel, "beta.rs");
+            press_key(&mut panel, &mut editor, &rt, key!('x'));
+            press_key(&mut panel, &mut editor, &rt, key!('x'));
+            // State survives the frame …
+            let after = paint_frame(&mut panel, &mut editor, &rt, area);
+            assert_eq!(ranged_labels(&panel), ["alpha.rs", "beta.rs"]);
+
+            // … and the row that is ranged *without* being the cursor row —
+            // the one with no terminal cursor to give it away — is painted
+            // differently than before. Comparing whole frames would pass on
+            // the cursor moving alone, which is what let this ship broken.
+            let y = area.y + HEADER_ROWS + SEARCH_ROWS + (beta - panel.scroll) as u16;
+            assert_ne!(
+                row_backgrounds(&before, area, y),
+                row_backgrounds(&after, area, y),
+                "a ranged non-cursor row must be visibly marked"
+            );
+        });
+    }
+
+    /// Holding Right used to walk the label cursor to the end of the name,
+    /// wrap onto the next row with the cursor back at column 0, and let the
+    /// horizontal viewport follow it home — so the scroll appeared to bounce
+    /// back to the start over and over. Arrow keys are row-local now.
+    #[test]
+    fn holding_right_scrolls_without_bouncing_back() {
+        let temp = tempfile::tempdir().unwrap();
+        let long = "a-very-long-file-name-that-needs-horizontal-scrolling.rs";
+        fs::write(temp.path().join(long), "").unwrap();
+        fs::write(temp.path().join("zz-after.rs"), "").unwrap();
+        let rt = helix_runtime::test::RuntimeTest::default();
+        rt.block_on(async {
+            let mut editor = test_editor(100, 30, rt.runtime());
+            let mut panel = FileExplorerPanel::new(temp.path().to_path_buf(), &editor).unwrap();
+            let index = row_index_by_name(&panel, long);
+            panel.seek_to(index);
+            let area = Rect::new(0, 0, 34, 20);
+            paint_frame(&mut panel, &mut editor, &rt, area);
+
+            let mut previous = panel.scroll_x;
+            let mut moved = false;
+            // Key repeat: press Right and paint, over and over.
+            for press in 0..long.chars().count() + 8 {
+                press_key(&mut panel, &mut editor, &rt, key!(Right));
+                paint_frame(&mut panel, &mut editor, &rt, area);
+                assert!(
+                    panel.scroll_x >= previous,
+                    "scroll_x fell from {previous} to {} on press {press}",
+                    panel.scroll_x
+                );
+                moved |= panel.scroll_x > previous;
+                previous = panel.scroll_x;
+            }
+
+            assert!(
+                moved,
+                "holding Right should have scrolled the label into view"
+            );
+            assert_eq!(
+                panel.selection, index,
+                "arrow keys stay on their row instead of wrapping"
+            );
+        });
+    }
+
     #[test]
     fn ranged_rows_render_as_selected() {
         let temp = tempfile::tempdir().unwrap();
@@ -4989,6 +5124,7 @@ mod tests {
                         .tree_item(
                             row,
                             index,
+                            range.contains(&index),
                             range.contains(&index),
                             false,
                             row_tree_item_styles(None, panel.config.icons),
@@ -6380,9 +6516,7 @@ mod tests {
                 list.y
                     .saturating_add((panel.selection - panel.scroll) as u16)
                     as usize,
-                list.x.saturating_add(
-                    panel.row_label_offset(row, editor.config().file_explorer.icons),
-                ) as usize,
+                list.x.saturating_add(panel.row_label_offset(row)) as usize,
             );
             let (position, kind) = panel.cursor(area, &editor);
 
@@ -6987,6 +7121,7 @@ mod tests {
             scroll: 0,
             scroll_x: 0,
             tree_content_width: 0,
+            icon_column: 0,
             h_scroll_anchor: None,
             pending_scroll_restore: None,
             area: Rect::default(),
@@ -7058,6 +7193,7 @@ mod tests {
             scroll: 0,
             scroll_x: 0,
             tree_content_width: 0,
+            icon_column: 0,
             h_scroll_anchor: None,
             pending_scroll_restore: None,
             area: Rect::default(),
@@ -7139,6 +7275,7 @@ mod tests {
             scroll: 0,
             scroll_x: 0,
             tree_content_width: 0,
+            icon_column: 0,
             h_scroll_anchor: None,
             pending_scroll_restore: None,
             area: Rect::default(),
@@ -7202,6 +7339,7 @@ mod tests {
             scroll: 0,
             scroll_x: 0,
             tree_content_width: 0,
+            icon_column: 0,
             h_scroll_anchor: None,
             pending_scroll_restore: None,
             area: Rect::default(),

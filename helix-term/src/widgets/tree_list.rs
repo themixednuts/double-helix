@@ -85,10 +85,12 @@ pub struct TreeListItem<'a> {
     /// `ui.selection` sets only a background — the cursor row is really
     /// identified by the terminal cursor sitting on its label.
     pub selected: bool,
-    /// Part of a multi-row range. Fills the row with `styles.selection`, which
-    /// is the cue that actually shows up under a background-only selection
-    /// theme (see `selected`). Rows off the cursor have no terminal cursor to
-    /// identify them, so this fill is the only thing that marks them.
+    /// Part of the selected row range. Paints `styles.selection` over the
+    /// label span only — the name plus a directory's trailing `/` — leaving
+    /// the indent guides, icon column, and status gutter alone. That mirrors
+    /// the editor, where a line-wise selection covers the line's text and not
+    /// its gutter, and it shows up under the background-only selection themes
+    /// that are the norm (unlike `selected`, see above).
     pub ranged: bool,
     /// When `true` an extra muted dot is drawn after the label, marking
     /// "this row's file is the one currently open in the focused view".
@@ -256,18 +258,6 @@ pub fn tree_list_scrolled(
         let y = area.y + row as u16;
         let row_area = Rect::new(area.x, y, area.width, 1);
 
-        // The cursor row gets no fill — its cue is the accent connector in
-        // `draw_item` plus the terminal cursor on its label. Ranged rows have
-        // neither, so they get the selection fill; glyphs drawn afterwards
-        // only set the fields their own style specifies, so the fill shows
-        // through behind the text.
-        if item.ranged {
-            surface.set_style(
-                tui::ratatui::to_ratatui_rect(row_area),
-                tui::ratatui::to_ratatui_style(styles.selection),
-            );
-        }
-
         let status_width = item.status_width();
         let content = Rect::new(
             row_area.x,
@@ -365,6 +355,14 @@ fn draw_item(
     } else {
         label_style
     };
+    // Selected rows carry the theme's selection style on the label glyphs
+    // themselves, the same overlay the editor paints over selected text: a
+    // background-only definition (the norm) keeps the label's own foreground.
+    let label_style = if item.ranged {
+        label_style.patch(styles.selection)
+    } else {
+        label_style
+    };
     draw_label_scrolled(
         surface,
         area,
@@ -377,14 +375,14 @@ fn draw_item(
     );
 
     if item.is_dir {
-        draw_segment_scrolled(
-            surface,
-            area,
-            &mut content_x,
-            "/",
-            styles.directory,
-            scroll_x,
-        );
+        // The trailing marker is part of the name as far as the eye is
+        // concerned, so it is inside the highlight.
+        let slash_style = if item.ranged {
+            styles.directory.patch(styles.selection)
+        } else {
+            styles.directory
+        };
+        draw_segment_scrolled(surface, area, &mut content_x, "/", slash_style, scroll_x);
     }
 }
 
@@ -663,8 +661,18 @@ mod tests {
         let fill = tui::ratatui::to_ratatui_style(selection)
             .bg
             .expect("selection background");
-        for x in 0..12 {
-            assert_eq!(ranged[(x, 0)].bg, fill, "column {x} should carry the fill");
+        // "alpha" occupies columns 0..5 at depth 0 with no icon column; the
+        // highlight covers the name and stops there, like the editor leaving
+        // the gutter out of a line selection.
+        for x in 0..5 {
+            assert_eq!(ranged[(x, 0)].bg, fill, "column {x} is part of the label");
+        }
+        for x in 5..12 {
+            assert_eq!(
+                ranged[(x, 0)].bg,
+                plain[(x, 0)].bg,
+                "column {x} is past the label and must be untouched"
+            );
         }
     }
 

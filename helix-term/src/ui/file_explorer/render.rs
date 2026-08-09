@@ -49,9 +49,9 @@ pub(super) struct ExplorerRenderSnapshot {
     tree_pending: bool,
     search_generation: u64,
     selection: usize,
-    /// Absolute row indices covered by the `x` range (just the cursor row
-    /// when no range is active). Every row in it renders selected.
-    row_selection: std::ops::Range<usize>,
+    /// Absolute row indices selected by `x`, or `None` when no row operand is
+    /// active. A one-row range counts — a single `x` has to be visible.
+    row_selection: Option<std::ops::Range<usize>>,
     scroll: usize,
     scroll_x: u16,
     focused: bool,
@@ -335,7 +335,7 @@ impl FileExplorerPanel {
             tree_pending: self.tree_pending,
             search_generation: self.search_generation,
             selection: self.selection,
-            row_selection: self.selected_row_range(),
+            row_selection: self.has_row_operand().then(|| self.selected_row_range()),
             scroll: self.scroll,
             scroll_x: self.scroll_x,
             focused: self.focused,
@@ -489,11 +489,10 @@ impl ExplorerRenderSnapshot {
                     .then(|| self.label_selection.span(label_source))
                     .flatten();
                 let is_active = !row.is_dir && active_path.is_some_and(|path| path == &row.path);
-                // A one-row "range" is just the cursor, which keeps its
-                // existing look; the fill only appears once `x` has actually
-                // extended the selection.
-                let ranged =
-                    self.row_selection.len() > 1 && self.row_selection.contains(&screen_row);
+                let ranged = self
+                    .row_selection
+                    .as_ref()
+                    .is_some_and(|range| range.contains(&screen_row));
                 tree_item(
                     row,
                     label_source,

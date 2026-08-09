@@ -167,7 +167,13 @@ FLAGS:
 async fn connect_remote_workspace(
     uri: &helix_remote::ssh::RemoteUri,
 ) -> Result<RemoteApplicationSession> {
+    // Progress the user is actively waiting on: keep it on the terminal, but record it too.
     eprintln!("Connecting to {}...", uri.target.destination());
+    log::info!(
+        "connecting to remote workspace {} on {}",
+        uri.workspace,
+        uri.target.destination()
+    );
     let config = helix_remote::ssh::SshConfig::new(uri.target.clone());
     let build =
         helix_remote::ssh::ServerBuild::current(VERSION_AND_GIT_HASH, env!("CARGO_PKG_VERSION"));
@@ -177,9 +183,7 @@ async fn connect_remote_workspace(
             uri.target.destination()
         )
     })?;
-    for warning in server.warnings() {
-        eprintln!("warning: {warning}");
-    }
+    // Advisory warnings need no action from the user, `helix-remote` already logs them.
     let mut transport = helix_remote::ssh::SshSession::connect(&config, &server)
         .await
         .with_context(|| format!("failed to connect to {}", uri.target.destination()))?;

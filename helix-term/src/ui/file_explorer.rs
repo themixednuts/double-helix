@@ -5026,20 +5026,128 @@ mod tests {
         out.into_surface()
     }
 
-    fn row_backgrounds(surface: &Buffer, area: Rect, row: u16) -> Vec<tui::ratatui::style::Color> {
+    /// Screen columns of `row` whose painted cell differs between two frames.
+    fn changed_columns(before: &Buffer, after: &Buffer, area: Rect, row: u16) -> Vec<u16> {
         (area.x..area.right())
-            .map(|x| surface[(x, row)].bg)
+            .filter(|&x| before[(x, row)] != after[(x, row)])
             .collect()
     }
 
-    /// `x` has to survive a real frame *and* leave a visible mark. It did the
-    /// first but not the second: the only cue for a selected row was the tree
-    /// connector redrawn in the selection *foreground* colour, and every stock
-    /// theme sets `ui.selection` as a background only — so the accent resolved
-    /// back to the plain guide style and multi-select painted identically to
-    /// no selection at all.
+    /// Screen row a tree row is painted on.
+    fn painted_row_y(panel: &FileExplorerPanel, area: Rect, index: usize) -> u16 {
+        area.y + HEADER_ROWS + SEARCH_ROWS + (index - panel.scroll) as u16
+    }
+
+    /// Columns a row's label occupies, including a directory's trailing `/`.
+    fn label_span_width(panel: &FileExplorerPanel, index: usize) -> u16 {
+        let row = &panel.rows[index];
+        let slash = u16::from(row.is_dir);
+        text_width(row.label.as_str()).saturating_add(slash)
+    }
+
+    /// A selected row must repaint exactly its label span — the name plus a
+    /// directory's `/` — and nothing else. Indent guides, the icon column and
+    /// the status gutter stay untouched, the way the editor leaves the gutter
+    /// out of a line selection.
+    fn assert_label_span_highlighted(
+        panel: &FileExplorerPanel,
+        before: &Buffer,
+        after: &Buffer,
+        area: Rect,
+        index: usize,
+    ) {
+        let y = painted_row_y(panel, area, index);
+        let changed = changed_columns(before, after, area, y);
+        let width = label_span_width(panel, index);
+        let label = &panel.rows[index].label;
+
+        assert!(
+            !changed.is_empty(),
+            "row {index} ({label:?}) was not repainted at all"
+        );
+        assert_eq!(
+            changed.len() as u16,
+            width,
+            "row {index} ({label:?}) highlighted {} columns, label span is {width}",
+            changed.len()
+        );
+        let first = *changed.first().expect("changed columns");
+        let last = *changed.last().expect("changed columns");
+        assert_eq!(
+            last - first + 1,
+            width,
+            "row {index} ({label:?}) highlight is not one contiguous span"
+        );
+        // The span starts after the indent guides and the icon column.
+        let offset = panel.row_label_offset(&panel.rows[index]);
+        assert!(
+            first >= area.x + offset,
+            "row {index} ({label:?}) highlight starts at {first}, left of the label offset {offset}"
+        );
+    }
+
+    /// One `x` has to be visible on the cursor row. This is the exact case
+    /// that shipped invisible twice: first because the only cue was a
+    /// foreground accent under background-only themes, then because the fill
+    /// was gated on the range covering more than one row.
     #[test]
-    fn extending_the_row_selection_changes_what_gets_painted() {
+    fn a_single_x_highlights_the_cursor_row_label() {
+        let temp = tempfile::tempdir().unwrap();
+        let rt = helix_runtime::test::RuntimeTest::default();
+        rt.block_on(async {
+            let mut editor = test_editor(100, 30, rt.runtime());
+            let mut panel = multi_row_panel(&temp, &editor).unwrap();
+            let index = row_index_by_name(&panel, "alpha.rs");
+            panel.seek_to(index);
+            let area = Rect::new(0, 0, 34, 20);
+
+            let before = paint_frame(&mut panel, &mut editor, &rt, area);
+            press_key(&mut panel, &mut editor, &rt, key!('x'));
+            let after = paint_frame(&mut panel, &mut editor, &rt, area);
+
+            assert_label_span_highlighted(&panel, &before, &after, area, index);
+        });
+    }
+
+    /// Every row in a multi-row range gets the same label highlight, cursor
+    /// row included.
+    #[test]
+    fn every_ranged_row_highlights_its_label_span() {
+        let temp = tempfile::tempdir().unwrap();
+        let rt = helix_runtime::test::RuntimeTest::default();
+        rt.block_on(async {
+            let mut editor = test_editor(100, 30, rt.runtime());
+            let mut panel = multi_row_panel(&temp, &editor).unwrap();
+            let first = row_index_by_name(&panel, "alpha.rs");
+            panel.seek_to(first);
+            let area = Rect::new(0, 0, 34, 20);
+
+            let before = paint_frame(&mut panel, &mut editor, &rt, area);
+            for _ in 0..3 {
+                press_key(&mut panel, &mut editor, &rt, key!('x'));
+            }
+            let after = paint_frame(&mut panel, &mut editor, &rt, area);
+
+            let range = panel.selected_row_range();
+            assert_eq!(range.len(), 3);
+            for index in range {
+                assert_label_span_highlighted(&panel, &before, &after, area, index);
+            }
+
+            // A row outside the range is painted exactly as before.
+            let outside = row_index_by_name(&panel, "gamma.rs");
+            let y = painted_row_y(&panel, area, outside);
+            assert!(
+                changed_columns(&before, &after, area, y).is_empty(),
+                "an unselected row must not be repainted"
+            );
+        });
+    }
+
+    /// Collapsing the range restores the previous frame byte for byte, so the
+    /// no-operand case keeps today's appearance.
+    #[test]
+    fn collapsing_the_range_restores_the_unselected_frame() {
         let temp = tempfile::tempdir().unwrap();
         let rt = helix_runtime::test::RuntimeTest::default();
         rt.block_on(async {
@@ -5049,24 +5157,14 @@ mod tests {
             let area = Rect::new(0, 0, 34, 20);
 
             let before = paint_frame(&mut panel, &mut editor, &rt, area);
+            press_key(&mut panel, &mut editor, &rt, key!('x'));
+            let selected = paint_frame(&mut panel, &mut editor, &rt, area);
+            assert_ne!(before, selected);
 
-            let beta = row_index_by_name(&panel, "beta.rs");
-            press_key(&mut panel, &mut editor, &rt, key!('x'));
-            press_key(&mut panel, &mut editor, &rt, key!('x'));
-            // State survives the frame …
+            press_key(&mut panel, &mut editor, &rt, key!(Esc));
+            assert!(!panel.has_row_operand());
             let after = paint_frame(&mut panel, &mut editor, &rt, area);
-            assert_eq!(ranged_labels(&panel), ["alpha.rs", "beta.rs"]);
-
-            // … and the row that is ranged *without* being the cursor row —
-            // the one with no terminal cursor to give it away — is painted
-            // differently than before. Comparing whole frames would pass on
-            // the cursor moving alone, which is what let this ship broken.
-            let y = area.y + HEADER_ROWS + SEARCH_ROWS + (beta - panel.scroll) as u16;
-            assert_ne!(
-                row_backgrounds(&before, area, y),
-                row_backgrounds(&after, area, y),
-                "a ranged non-cursor row must be visibly marked"
-            );
+            assert_eq!(before, after, "no range must paint exactly as before");
         });
     }
 

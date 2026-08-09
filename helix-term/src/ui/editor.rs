@@ -25,7 +25,7 @@ use crate::{
 
 use helix_core::{
     diagnostic::NumberOrString, movement::Direction, text_annotations::TextAnnotations,
-    unicode::width::UnicodeWidthStr, visual_offset_from_block, Position, Range, Selection,
+    visual_offset_from_block, Position, Range, Selection,
 };
 use helix_loader::VERSION_AND_GIT_HASH;
 use helix_view::{
@@ -64,65 +64,29 @@ use helix_view::view::{
 
 const MAX_SEED_LINE_MAP_GAP: usize = 4_096;
 
-fn view_content_area(area: Rect) -> Rect {
-    area.clip_bottom(1)
-}
-
-fn paint_identity_rule(
+/// Paints the separator row a stacked split leaves below itself. Views flush
+/// with the bottom of the editor have no gap there — the global statusline
+/// sits directly below them — so nothing is drawn.
+fn paint_split_separator(
     surface: &mut CellSurface,
     view_area: Rect,
-    identity: &str,
-    modified: bool,
-    is_focused: bool,
+    viewport: Rect,
     theme: &Theme,
 ) {
-    if view_area.width == 0 || view_area.height == 0 {
+    if view_area.width == 0 || view_area.bottom() == viewport.bottom() {
         return;
     }
 
-    let y = view_area.bottom().saturating_sub(1);
-    let rule_style = tui::ratatui::to_ratatui_style(theme.get("ui.window"));
+    // Cover the divider column of a side-by-side neighbour as well, otherwise
+    // the crossing cell belongs to neither line and reads as a hole.
+    let width = view_area.width + u16::from(view_area.right() != viewport.right());
     surface.set_stringn(
         view_area.x,
-        y,
-        "─".repeat(view_area.width as usize),
-        view_area.width as usize,
-        rule_style,
+        view_area.bottom(),
+        "─".repeat(width as usize),
+        width as usize,
+        tui::ratatui::to_ratatui_style(theme.get("ui.window")),
     );
-
-    let label = format!(" {identity} ");
-    let marker = modified.then_some("[+]");
-    let marker_width = marker.map_or(0, UnicodeWidthStr::width);
-    let total_width = label.width().saturating_add(marker_width);
-    let start = view_area
-        .x
-        .saturating_add(view_area.width.saturating_sub(total_width as u16) / 2);
-    let label_style = if is_focused {
-        theme.get("ui.text.focus")
-    } else {
-        theme.get("ui.statusline.inactive")
-    };
-    surface.set_stringn(
-        start,
-        y,
-        &label,
-        view_area.right().saturating_sub(start) as usize,
-        tui::ratatui::to_ratatui_style(label_style),
-    );
-    if let Some(marker) = marker {
-        let marker_x = start.saturating_add(label.width() as u16);
-        let marker_style = theme
-            .try_get("ui.text.focus")
-            .or_else(|| theme.try_get("warning"))
-            .unwrap_or_else(|| theme.get("ui.statusline"));
-        surface.set_stringn(
-            marker_x,
-            y,
-            marker,
-            view_area.right().saturating_sub(marker_x) as usize,
-            tui::ratatui::to_ratatui_style(marker_style),
-        );
-    }
 }
 
 /// View render context grouping parameters for `render_view`.
@@ -289,8 +253,6 @@ struct DeferredViewPaint {
     key: ViewRenderCacheKey,
     view_id: ViewId,
     view_area: Rect,
-    identity: String,
-    modified: bool,
     inner: Rect,
     viewport: Rect,
     view_offset: ViewPosition,
@@ -432,8 +394,6 @@ impl DeferredViewPaint {
             key: ViewRenderCacheKey::new(view.id, doc.id()),
             view_id: view.id,
             view_area: view.area,
-            identity: doc.display_name().into_owned(),
-            modified: doc.is_modified(),
             inner,
             viewport: *viewport,
             view_offset,
@@ -475,10 +435,6 @@ impl DeferredViewPaint {
             self.is_focused,
             self.terminal_focused,
         )
-    }
-
-    fn content_area(&self) -> Rect {
-        view_content_area(self.view_area)
     }
 
     fn clear_dirty_rows(&self, dirty_rows: &HashSet<u16>, surface: &mut CellSurface) {
@@ -890,14 +846,12 @@ impl EditorFrameSnapshot {
             let is_focused = view.is_focused;
             let inner = view.inner;
             let view_area = view.view_area;
-            let identity = view.identity.clone();
-            let modified = view.modified;
             let theme = Arc::clone(&view.theme);
             let cursor = Self::paint_view(view, surface, cache, cancellation, self.frame_num);
             if cancellation.is_cancelled() {
                 return;
             }
-            paint_identity_rule(surface, view_area, &identity, modified, is_focused, &theme);
+            paint_split_separator(surface, view_area, self.area, &theme);
             if self.cursor_owner && is_focused {
                 let mut absolute = cursor.and_then(|position| {
                     let col = usize::from(inner.x).checked_add(position.col)?;
@@ -954,7 +908,7 @@ impl EditorFrameSnapshot {
                 }
 
                 view.clear_dirty_rows(reuse.dirty_rows(), surface);
-                let content_area = view.content_area();
+                let content_area = view.view_area;
                 let syntax = Arc::clone(&reuse.syntax_styles().entries);
                 let output = view.paint(
                     surface,
@@ -982,7 +936,7 @@ impl EditorFrameSnapshot {
             }
             RenderState::Refresh(refresh) => {
                 cache.record_miss();
-                let content_area = view.content_area();
+                let content_area = view.view_area;
                 let selection = Arc::clone(&view.selection);
                 let mode = view.mode;
                 let is_focused = view.is_focused;
@@ -2934,7 +2888,7 @@ struct BufferInfo {
 #[cfg(test)]
 mod tests {
     use super::{
-        view_content_area, BufferlineDocument, BufferlineModel, DeferredViewPaint,
+        paint_split_separator, BufferlineDocument, BufferlineModel, DeferredViewPaint,
         EditorFrameSnapshot, EditorView, ViewRenderCache, ViewRenderContext,
     };
     use crate::compositor::Component;
@@ -2954,7 +2908,7 @@ mod tests {
     };
     use helix_view::{
         editor::{Action, Config, Editor},
-        Document, DocumentId, View,
+        Document, DocumentId,
     };
     use std::borrow::Cow;
     use std::path::Path;
@@ -3354,12 +3308,115 @@ mod tests {
         assert_eq!(after, before);
     }
 
-    #[test]
-    fn content_area_excludes_statusline_row() {
-        let mut view = View::new(DocumentId::default(), Default::default());
-        view.area = Rect::new(5, 7, 80, 10);
+    /// Renders the editor views over `area` and returns one string per row.
+    fn render_editor_rows(editor: &mut Editor, area: Rect) -> Vec<String> {
+        let mut editor_view = test_editor_view();
+        editor.resize(area);
 
-        assert_eq!(view_content_area(view.area), Rect::new(5, 7, 80, 9));
+        let (ingress, _rx) = crate::runtime::RuntimeIngress::channel(editor.runtime().clone());
+        let redraw = editor.redraw_handle();
+        let render_ctx = crate::compositor::RenderContext::new(editor, ingress, redraw);
+        let prepared = editor_view.prepare_render(area, &render_ctx);
+        let mut plan = crate::render::RenderPlan::seeded(
+            area,
+            CellSurface::empty(tui::ratatui::to_ratatui_rect(area)),
+        );
+        plan.extend(crate::render::RenderStep::prepared(
+            "editor_test",
+            vec![prepared],
+        ));
+        plan.extend(render_ctx.take_render_steps());
+        let seed = plan.take_seed().expect("editor test render seed");
+        let surface = plan
+            .execute(
+                seed,
+                &mut crate::render::CacheStore::default(),
+                &crate::render::RenderCancellation::never(),
+            )
+            .surface;
+
+        (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| surface[(area.x + x, area.y + y)].symbol())
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn lone_split_reclaims_its_bottom_row_for_text() {
+        let rt = helix_runtime::test::RuntimeTest::default();
+        rt.block_on(async {
+            let text = (0..40)
+                .map(|idx| format!("line {idx}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let (mut editor, _, _) = test_editor_with_text(&text);
+            let area = Rect::new(0, 0, 80, 24);
+
+            let rows = render_editor_rows(&mut editor, area);
+
+            assert!(
+                rows[23].contains("line 23"),
+                "bottom row is not document text:\n{}",
+                rows.join("\n")
+            );
+            assert!(
+                !rows.iter().any(|row| row.contains("[scratch]")),
+                "split painted its name:\n{}",
+                rows.join("\n")
+            );
+        });
+    }
+
+    #[test]
+    fn stacked_splits_are_parted_by_an_unlabeled_rule() {
+        let rt = helix_runtime::test::RuntimeTest::default();
+        rt.block_on(async {
+            let text = (0..40)
+                .map(|idx| format!("line {idx}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let (mut editor, _, doc_id) = test_editor_with_text(&text);
+            editor.switch(doc_id, Action::HorizontalSplit);
+            let area = Rect::new(0, 0, 80, 24);
+
+            let rows = render_editor_rows(&mut editor, area);
+            let rule = "─".repeat(area.width as usize);
+
+            // 11 rows of text, the separator, then the remaining 12 rows.
+            assert_eq!(rows[11], rule, "unexpected render:\n{}", rows.join("\n"));
+            assert_eq!(
+                rows.iter().filter(|row| **row == rule).count(),
+                1,
+                "expected exactly one separator row:\n{}",
+                rows.join("\n")
+            );
+            assert!(
+                !rows.iter().any(|row| row.contains("[scratch]")),
+                "separator carried a label:\n{}",
+                rows.join("\n")
+            );
+        });
+    }
+
+    #[test]
+    fn split_separator_skips_views_flush_with_the_editor_bottom() {
+        let area = Rect::new(0, 0, 20, 5);
+        let mut surface = CellSurface::empty(tui::ratatui::to_ratatui_rect(area));
+        let theme = theme::Theme::default();
+
+        paint_split_separator(&mut surface, area, area, &theme);
+
+        let rows: Vec<String> = (0..area.height)
+            .map(|y| (0..area.width).map(|x| surface[(x, y)].symbol()).collect())
+            .collect();
+        assert!(
+            rows.iter().all(|row| row.trim().is_empty()),
+            "separator painted below a flush view:\n{}",
+            rows.join("\n")
+        );
     }
 
     #[test]

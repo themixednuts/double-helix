@@ -461,8 +461,16 @@ impl Tree {
                     match container.layout {
                         Layout::Horizontal => {
                             let len = container.children.len();
+                            let len_u16 = len as u16;
+
+                            let inner_gap = 1u16;
+                            // There are (len - 1) inner gaps
+                            let total_gap = inner_gap * len_u16.saturating_sub(1);
+
+                            let used_area = area.height.saturating_sub(total_gap);
+
                             let slots = container.calculate_slots_height();
-                            let slot_height = area.height as f32 / slots as f32;
+                            let slot_height = used_area as f32 / slots as f32;
                             let mut child_y = area.y;
 
                             for (i, child) in container.children.iter().enumerate() {
@@ -478,7 +486,13 @@ impl Tree {
                                     container.area.width,
                                     height,
                                 );
-                                child_y += height;
+
+                                // Advance y; add inner gap only between children
+                                if i < len - 1 {
+                                    child_y = child_y.saturating_add(height + inner_gap);
+                                } else {
+                                    child_y = child_y.saturating_add(height);
+                                }
 
                                 // last child takes the remaining height because we can get uneven
                                 // space from rounding
@@ -1198,6 +1212,40 @@ mod test {
                 .map(|(view, _)| view.area.width)
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn hsplit_leaves_a_separator_row_between_stacked_views() {
+        let (tree_area_width, tree_area_height) = (80, 24);
+        let mut tree = Tree::new(Rect {
+            x: 0,
+            y: 0,
+            width: tree_area_width,
+            height: tree_area_height,
+        });
+        let mut view = View::new(DocumentId::default(), GutterConfig::default());
+        view.area = Rect::new(0, 0, tree_area_width, tree_area_height);
+        tree.insert(view);
+
+        // A lone view owns every row: the status line is global.
+        assert_eq!(
+            vec![(0, tree_area_height)],
+            tree.views()
+                .map(|(view, _)| (view.area.y, view.area.height))
+                .collect::<Vec<_>>()
+        );
+
+        let view = View::new(DocumentId::default(), GutterConfig::default());
+        tree.split(view, Layout::Horizontal);
+
+        let rows = tree
+            .views()
+            .map(|(view, _)| (view.area.y, view.area.height))
+            .collect::<Vec<_>>();
+        assert_eq!(vec![(0, 11), (12, 12)], rows);
+        // One row between the two views, none below the bottom one.
+        assert_eq!(rows[0].0 + rows[0].1 + 1, rows[1].0);
+        assert_eq!(rows[1].0 + rows[1].1, tree_area_height);
     }
 
     #[test]

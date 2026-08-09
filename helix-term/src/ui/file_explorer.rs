@@ -643,6 +643,13 @@ impl FileExplorerPanel {
         self.row_selection_anchor = None;
     }
 
+    /// Whether `x` has made the row(s) the operand for the next operator.
+    /// True even for a single-row range — one `x` then `d` must delete that
+    /// file, not a character of its name.
+    fn has_row_operand(&self) -> bool {
+        self.row_selection_anchor.is_some()
+    }
+
     /// Rows currently selected: the `x` range when one is active, otherwise
     /// just the cursor row. An empty tree yields an empty range.
     fn selected_row_range(&self) -> std::ops::Range<usize> {
@@ -1438,6 +1445,10 @@ impl FileExplorerPanel {
     }
 
     fn move_label_selection(&mut self, motion: LabelMotion, movement: CoreMovement) {
+        // Moving inside the label is an explicit "I mean the text" gesture, so
+        // it drops the row operand — the same rule row motions follow, and the
+        // same thing the editor does when a motion collapses a selection.
+        self.collapse_row_selection();
         let Some(label) = self.selected_label().map(str::to_owned) else {
             return;
         };
@@ -1494,6 +1505,7 @@ impl FileExplorerPanel {
     }
 
     fn select_label_text_object(&mut self, object: LabelTextObject) {
+        self.collapse_row_selection();
         let Some(label) = self.selected_label().map(str::to_owned) else {
             return;
         };
@@ -1504,6 +1516,7 @@ impl FileExplorerPanel {
     }
 
     fn select_whole_label(&mut self) {
+        self.collapse_row_selection();
         let Some(label) = self.selected_label().map(str::to_owned) else {
             return;
         };
@@ -5099,6 +5112,147 @@ mod tests {
                 panel.selection, index,
                 "arrow keys stay on their row instead of wrapping"
             );
+        });
+    }
+
+    /// Send `key` through the panel's real event path with an ingress we can
+    /// read back, so tests observe the same UI commands production emits.
+    fn press_key_capturing(
+        panel: &mut FileExplorerPanel,
+        editor: &mut Editor,
+        ingress: &crate::runtime::RuntimeIngress,
+        key: KeyEvent,
+    ) -> EventResult {
+        with_context_and_ingress(editor, ingress.clone(), |cx| {
+            panel.handle_event(&Event::Key(key), cx)
+        })
+    }
+
+    /// Selection changes queue preview commands; skip past those to the one
+    /// the test is actually about.
+    async fn next_explorer_command(
+        receiver: &mut crate::runtime::RuntimeIngressReceiver,
+        wanted: fn(&FileExplorerCommand) -> bool,
+    ) -> FileExplorerCommand {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match receiver.recv().await {
+                    Some(crate::runtime::ingress::RuntimeDelivery::Ui(
+                        UiCommand::FileExplorer(command),
+                    )) if wanted(&command) => break command,
+                    Some(_) => {}
+                    None => panic!("ingress closed before a file explorer command arrived"),
+                }
+            }
+        })
+        .await
+        .expect("file explorer command")
+    }
+
+    fn labels(panel: &FileExplorerPanel) -> Vec<String> {
+        panel.rows.iter().map(|row| row.label.clone()).collect()
+    }
+
+    /// `x` then `d` deletes the file. This used to chew the first character of
+    /// the label instead: in Helix mode `d` resolves to the label-scoped
+    /// `DeleteLabelSelection`, and the label selection is always at least a
+    /// point, so the operator always had a character to eat.
+    #[test]
+    fn x_then_d_prompts_to_delete_the_cursor_row() {
+        let temp = tempfile::tempdir().unwrap();
+        let rt = helix_runtime::test::RuntimeTest::default();
+        rt.block_on(async {
+            let mut editor = test_editor(100, 30, rt.runtime());
+            let mut panel = multi_row_panel(&temp, &editor).unwrap();
+            let index = row_index_by_name(&panel, "alpha.rs");
+            panel.seek_to(index);
+            let before = labels(&panel);
+
+            let (ingress, mut receiver) =
+                crate::runtime::RuntimeIngress::channel(rt.runtime().clone());
+            press_key_capturing(&mut panel, &mut editor, &ingress, key!('x'));
+            press_key_capturing(&mut panel, &mut editor, &ingress, key!('d'));
+
+            match next_explorer_command(&mut receiver, |command| {
+                matches!(command, FileExplorerCommand::PromptDelete { .. })
+            })
+            .await
+            {
+                FileExplorerCommand::PromptDelete { target, .. } => {
+                    assert_eq!(display_name(&target), "alpha.rs");
+                }
+                other => panic!("expected a delete prompt, got {other:?}"),
+            }
+            assert_eq!(labels(&panel), before, "label text must be untouched");
+            assert!(panel.label_edit.is_none(), "no inline edit should start");
+        });
+    }
+
+    /// `xxx` then `d` is one confirmation covering all three rows.
+    #[test]
+    fn three_x_then_d_prompts_once_for_three_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let rt = helix_runtime::test::RuntimeTest::default();
+        rt.block_on(async {
+            let mut editor = test_editor(100, 30, rt.runtime());
+            let mut panel = multi_row_panel(&temp, &editor).unwrap();
+            panel.seek_to(row_index_by_name(&panel, "alpha.rs"));
+            let before = labels(&panel);
+
+            let (ingress, _receiver) =
+                crate::runtime::RuntimeIngress::channel(rt.runtime().clone());
+            for _ in 0..3 {
+                press_key_capturing(&mut panel, &mut editor, &ingress, key!('x'));
+            }
+            let targets = panel
+                .selected_paths()
+                .iter()
+                .map(display_name)
+                .collect::<Vec<_>>();
+            assert_eq!(targets, ["alpha.rs", "beta.rs", "delta.rs"]);
+
+            let result = press_key_capturing(&mut panel, &mut editor, &ingress, key!('d'));
+            assert!(
+                matches!(
+                    result,
+                    EventResult::Consumed(Some(PostAction::PushLayer(_)))
+                ),
+                "a ranged delete pushes exactly one confirmation layer"
+            );
+            assert_eq!(labels(&panel), before, "label text must be untouched");
+        });
+    }
+
+    /// Without a row range `d` keeps its label-operator behavior, which the
+    /// inline rename flow is built on.
+    #[test]
+    fn d_without_a_row_range_still_operates_on_the_label() {
+        let temp = tempfile::tempdir().unwrap();
+        let rt = helix_runtime::test::RuntimeTest::default();
+        rt.block_on(async {
+            let mut editor = test_editor(100, 30, rt.runtime());
+            let mut panel = multi_row_panel(&temp, &editor).unwrap();
+            panel.seek_to(row_index_by_name(&panel, "alpha.rs"));
+            assert!(!panel.has_row_operand());
+
+            let (ingress, mut receiver) =
+                crate::runtime::RuntimeIngress::channel(rt.runtime().clone());
+            press_key_capturing(&mut panel, &mut editor, &ingress, key!('d'));
+
+            // The label operator renames rather than deleting the file.
+            match next_explorer_command(&mut receiver, |command| {
+                matches!(command, FileExplorerCommand::ApplyMove { .. })
+            })
+            .await
+            {
+                FileExplorerCommand::ApplyMove { destination, .. } => {
+                    assert!(
+                        format!("{destination:?}").contains("lpha.rs"),
+                        "expected the label to lose its first character, got {destination:?}"
+                    );
+                }
+                other => panic!("expected a label rename, got {other:?}"),
+            }
         });
     }
 

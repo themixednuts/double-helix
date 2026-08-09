@@ -922,12 +922,14 @@ impl View {
         first_line..last_line
     }
 
+    /// The view's area is all document content: the status line is global and
+    /// `Tree::recalculate` carves the separator row out between stacked splits.
     pub fn inner_area(&self, doc: &Document) -> Rect {
-        self.area.clip_left(self.gutter_offset(doc)).clip_bottom(1) // -1 for statusline
+        self.area.clip_left(self.gutter_offset(doc))
     }
 
     pub fn inner_height(&self) -> usize {
-        self.area.clip_bottom(1).height.into() // -1 for statusline
+        self.area.height.into()
     }
 
     pub fn inner_width(&self, doc: &Document) -> u16 {
@@ -1216,7 +1218,6 @@ impl View {
         ignore_virtual_text: bool,
     ) -> Option<usize> {
         let inner = self.inner_area(doc);
-        // 1 for status
         if row < inner.top() || row >= inner.bottom() {
             return None;
         }
@@ -1306,7 +1307,6 @@ impl View {
     /// Returns a tuple of usize typed line and column numbers starting with 0.
     /// Returns None if coordinates are not on the gutter.
     pub fn gutter_coords_at_screen_coords(&self, row: u16, column: u16) -> Option<Position> {
-        // 1 for status
         if row < self.area.top() || row >= self.area.bottom() {
             return None;
         }
@@ -2380,6 +2380,24 @@ mod tests {
 
     use crate::document::Document;
     use crate::editor::{Config, GutterConfig, GutterLineNumbersConfig, GutterType};
+
+    #[test]
+    fn inner_area_spans_every_row_of_the_view() {
+        let mut view = View::new(DocumentId::default(), GutterConfig::default());
+        view.area = Rect::new(5, 7, 80, 10);
+        let mut doc = Document::from(
+            Rope::from_str("abc\n"),
+            None,
+            Arc::new(ArcSwap::new(Arc::new(Config::default()))),
+            Arc::new(ArcSwap::from_pointee(syntax::Loader::default())),
+        );
+        doc.ensure_view_init(view.id);
+
+        // The status line is global and `Tree::recalculate` owns the separator
+        // row, so the view renders text all the way down to its last row.
+        assert_eq!(view.inner_height(), 10);
+        assert_eq!(view.inner_area(&doc).bottom(), view.area.bottom());
+    }
 
     #[test]
     fn test_text_pos_at_screen_coords() {

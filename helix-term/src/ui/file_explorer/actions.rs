@@ -316,6 +316,12 @@ impl FileExplorerPanel {
         cx: &mut Context,
         yank: bool,
     ) -> Option<PostAction> {
+        // `x` makes the row(s) the operand, so `d` deletes files — never the
+        // label text under the cursor. Without a range this stays the
+        // label-scoped operator that inline rename flows depend on.
+        if self.has_row_operand() {
+            return self.delete_selected_item(cx, yank);
+        }
         let row = self.selected().cloned()?;
         let range = self.selected_label_edit_range()?;
         if yank && !self.write_label_register(cx, range.selected_text(&row.label)) {
@@ -397,6 +403,9 @@ impl FileExplorerPanel {
             // Root row — refuse to edit.
             return;
         }
+        // Editing a label is label-scoped by definition; a row operand would
+        // only confuse what a following operator applies to.
+        self.collapse_row_selection();
         let original_label = row.label.clone();
         // Seed the region's buffer with the row's current label, placing
         // the region cursor where the user's tree-Normal-mode cursor was
@@ -872,6 +881,9 @@ impl FileExplorerPanel {
     }
 
     pub(super) fn change_label_selection(&mut self, cx: &mut Context, yank: bool) {
+        // Change means "rename this one row", which has no sensible multi-row
+        // form — drop the operand and edit the cursor row.
+        self.collapse_row_selection();
         let Some(row) = self.selected().cloned() else {
             return;
         };

@@ -678,8 +678,29 @@ impl FileExplorerPanel {
         // `seek_to` collapses the range, so re-anchor after the cursor move.
         self.seek_to(head);
         self.row_selection_anchor = Some(anchor.min(last));
-        self.clamp_label_selection();
-        self.collapse_label_selection_to_cursor();
+        self.place_cursor_at_label_end();
+    }
+
+    /// Park the label cursor on the last character of the head row's label,
+    /// the way a line-wise `x` in the editor leaves the block cursor on the
+    /// end of the selected line. Directories show a trailing `/` that the
+    /// highlight covers, so the cursor sits on that.
+    ///
+    /// This writes `label_selection` directly rather than going through
+    /// `move_label_selection`: it is placement done *for* the user, not a
+    /// label gesture by them, so it must not drop the row operand.
+    fn place_cursor_at_label_end(&mut self) {
+        let Some(row) = self.selected() else {
+            self.label_selection = LabelSelection::default();
+            return;
+        };
+        let len = row.label.chars().count();
+        let cursor = if row.is_dir {
+            len
+        } else {
+            len.saturating_sub(1)
+        };
+        self.label_selection = LabelSelection::point(cursor);
     }
 
     fn scroll_x_by(&mut self, delta: i16) {
@@ -4917,6 +4938,40 @@ mod tests {
         });
     }
 
+    /// A line-wise `x` in the editor leaves the block cursor on the end of the
+    /// selection. `x` here parks the label cursor on the head row's last
+    /// character — and, because that placement is done for the user rather
+    /// than by them, it must not trip the "a label gesture drops the operand"
+    /// rule.
+    #[test]
+    fn x_parks_the_cursor_at_the_end_of_the_head_label() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir(temp.path().join("adir")).unwrap();
+        let rt = helix_runtime::test::RuntimeTest::default();
+        rt.block_on(async {
+            let mut editor = test_editor(100, 30, rt.runtime());
+            let mut panel = multi_row_panel(&temp, &editor).unwrap();
+            panel.seek_to(row_index_by_name(&panel, "alpha.rs"));
+
+            press_key(&mut panel, &mut editor, &rt, key!('x'));
+            assert!(panel.has_row_operand(), "placement must keep the operand");
+            assert_eq!(panel.label_cursor(), "alpha.rs".chars().count() - 1);
+
+            // Extending moves the cursor to the new head row's last character.
+            press_key(&mut panel, &mut editor, &rt, key!('x'));
+            let head = &panel.rows[panel.selection];
+            assert_eq!(head.label, "beta.rs");
+            assert_eq!(panel.label_cursor(), "beta.rs".chars().count() - 1);
+            assert!(panel.has_row_operand());
+
+            // A directory's trailing `/` is inside the highlight, so the
+            // cursor sits on it.
+            panel.seek_to(row_index_by_name(&panel, "adir"));
+            press_key(&mut panel, &mut editor, &rt, key!('x'));
+            assert_eq!(panel.label_cursor(), "adir".chars().count());
+        });
+    }
+
     #[test]
     fn cursor_motion_and_escape_collapse_the_row_selection() {
         let temp = tempfile::tempdir().unwrap();
@@ -4970,10 +5025,9 @@ mod tests {
             let mut panel = multi_row_panel(&temp, &editor).unwrap();
             panel.seek_to(row_index_by_name(&panel, "alpha.rs"));
 
-            // A lone row keeps the single-item flow (the runtime builds that
-            // confirmation), so no layer comes back here.
+            // One row is one confirmation, same code path as many rows.
             let single = with_context(&mut editor, &rt, |cx| panel.delete_selected_item(cx, false));
-            assert!(single.is_none());
+            assert!(single.is_some());
 
             press_key(&mut panel, &mut editor, &rt, key!('x'));
             press_key(&mut panel, &mut editor, &rt, key!('x'));
@@ -4986,10 +5040,8 @@ mod tests {
                 .collect::<Vec<_>>();
             assert_eq!(targets, ["alpha.rs", "beta.rs", "delta.rs"]);
             assert_eq!(
-                super::actions::delete_many_message(
-                    &targets.iter().map(PathBuf::from).collect::<Vec<_>>()
-                ),
-                "Move 3 items to trash? (alpha.rs, beta.rs, delta.rs)"
+                super::actions::delete_message(&panel.selected_paths()),
+                "Delete 3 items? (alpha.rs, beta.rs, delta.rs)"
             );
 
             let ranged = with_context(&mut editor, &rt, |cx| panel.delete_selected_item(cx, false));
@@ -5251,44 +5303,13 @@ mod tests {
         panel.rows.iter().map(|row| row.label.clone()).collect()
     }
 
-    /// `x` then `d` deletes the file. This used to chew the first character of
-    /// the label instead: in Helix mode `d` resolves to the label-scoped
+    /// `x` then `d` deletes the file, end to end: the confirmation is answered
+    /// and the delete request checked. This used to chew the first character
+    /// of the label instead — in Helix mode `d` resolves to the label-scoped
     /// `DeleteLabelSelection`, and the label selection is always at least a
     /// point, so the operator always had a character to eat.
     #[test]
-    fn x_then_d_prompts_to_delete_the_cursor_row() {
-        let temp = tempfile::tempdir().unwrap();
-        let rt = helix_runtime::test::RuntimeTest::default();
-        rt.block_on(async {
-            let mut editor = test_editor(100, 30, rt.runtime());
-            let mut panel = multi_row_panel(&temp, &editor).unwrap();
-            let index = row_index_by_name(&panel, "alpha.rs");
-            panel.seek_to(index);
-            let before = labels(&panel);
-
-            let (ingress, mut receiver) =
-                crate::runtime::RuntimeIngress::channel(rt.runtime().clone());
-            press_key_capturing(&mut panel, &mut editor, &ingress, key!('x'));
-            press_key_capturing(&mut panel, &mut editor, &ingress, key!('d'));
-
-            match next_explorer_command(&mut receiver, |command| {
-                matches!(command, FileExplorerCommand::PromptDelete { .. })
-            })
-            .await
-            {
-                FileExplorerCommand::PromptDelete { target, .. } => {
-                    assert_eq!(display_name(&target), "alpha.rs");
-                }
-                other => panic!("expected a delete prompt, got {other:?}"),
-            }
-            assert_eq!(labels(&panel), before, "label text must be untouched");
-            assert!(panel.label_edit.is_none(), "no inline edit should start");
-        });
-    }
-
-    /// `xxx` then `d` is one confirmation covering all three rows.
-    #[test]
-    fn three_x_then_d_prompts_once_for_three_files() {
+    fn x_then_d_deletes_the_cursor_row_end_to_end() {
         let temp = tempfile::tempdir().unwrap();
         let rt = helix_runtime::test::RuntimeTest::default();
         rt.block_on(async {
@@ -5299,25 +5320,145 @@ mod tests {
 
             let (ingress, _receiver) =
                 crate::runtime::RuntimeIngress::channel(rt.runtime().clone());
+            press_key_capturing(&mut panel, &mut editor, &ingress, key!('x'));
+            let result = press_key_capturing(&mut panel, &mut editor, &ingress, key!('d'));
+            let EventResult::Consumed(Some(PostAction::PushLayer(mut layer))) = result else {
+                panic!("a single-row delete must hand over a confirmation layer too");
+            };
+
+            let foreground = confirm_layer(&mut layer, &mut editor, &rt);
+            assert_eq!(confirmed_delete_targets(&foreground), ["alpha.rs"]);
+            assert_eq!(labels(&panel), before, "label text must be untouched");
+            assert!(panel.label_edit.is_none(), "no inline edit should start");
+        });
+    }
+
+    /// Drain every `ApplyConfirmedDelete` target the foreground queue received.
+    fn confirmed_delete_targets(foreground: &crate::runtime::ForegroundEvents) -> Vec<String> {
+        let mut targets = Vec::new();
+        while let Some(delivery) = foreground.pop() {
+            if let crate::runtime::ingress::RuntimeDelivery::Ui(UiCommand::FileExplorer(
+                FileExplorerCommand::ApplyConfirmedDelete { target, .. },
+            )) = delivery
+            {
+                targets.push(display_name(&target));
+            }
+        }
+        targets
+    }
+
+    /// Answer a yes/no confirmation layer with `y`.
+    fn confirm_layer(
+        layer: &mut Box<dyn Component>,
+        editor: &mut Editor,
+        rt: &helix_runtime::test::RuntimeTest,
+    ) -> crate::runtime::ForegroundEvents {
+        with_context(editor, rt, |cx| {
+            layer.handle_event(&Event::Key(key!('y')), cx);
+            layer.handle_event(&Event::Key(key!(Enter)), cx);
+            cx.foreground.clone()
+        })
+    }
+
+    /// End to end: `xxx` then `d`, then actually answer the confirmation, and
+    /// assert a delete is requested for every target. The earlier test stopped
+    /// at "a layer came back", which is precisely the gap that let a broken
+    /// multi-row delete ship.
+    #[test]
+    fn three_x_then_d_deletes_every_target_end_to_end() {
+        let temp = tempfile::tempdir().unwrap();
+        let rt = helix_runtime::test::RuntimeTest::default();
+        rt.block_on(async {
+            let mut editor = test_editor(100, 30, rt.runtime());
+            let mut panel = multi_row_panel(&temp, &editor).unwrap();
+            panel.seek_to(row_index_by_name(&panel, "alpha.rs"));
+
+            let (ingress, _receiver) =
+                crate::runtime::RuntimeIngress::channel(rt.runtime().clone());
+            let area = Rect::new(0, 0, 34, 20);
+            // Frames render between keystrokes in the app; the operand has to
+            // survive them.
+            for _ in 0..3 {
+                press_key_capturing(&mut panel, &mut editor, &ingress, key!('x'));
+                paint_frame(&mut panel, &mut editor, &rt, area);
+            }
+            assert_eq!(panel.selected_row_range().len(), 3, "three x presses");
+
+            let result = press_key_capturing(&mut panel, &mut editor, &ingress, key!('d'));
+            let EventResult::Consumed(Some(PostAction::PushLayer(mut layer))) = result else {
+                panic!("ranged delete must hand the compositor a confirmation layer");
+            };
+
+            let foreground = confirm_layer(&mut layer, &mut editor, &rt);
+            assert_eq!(
+                confirmed_delete_targets(&foreground),
+                ["alpha.rs", "beta.rs", "delta.rs"],
+                "every ranged target must get a delete request"
+            );
+        });
+    }
+
+    /// The bug the user hit: on an SSH workspace `x x x d` deleted nothing.
+    /// A single row went out as `PromptDelete`, whose runtime handler has
+    /// remote and collaboration branches, while the multi-row path built its
+    /// own confirmation that only understood local paths and bailed with
+    /// "not available on this backend". One path now serves both, and remote
+    /// targets collapse into a single workspace transaction.
+    #[test]
+    fn ranged_delete_on_a_remote_root_removes_every_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let rt = helix_runtime::test::RuntimeTest::default();
+        rt.block_on(async {
+            let mut editor = test_editor(100, 30, rt.runtime());
+            let mut panel = FileExplorerPanel::new(temp.path().to_path_buf(), &editor).unwrap();
+            seed_remote_tree(
+                &mut panel,
+                "",
+                &[(
+                    "",
+                    vec![
+                        remote_file("one.rs"),
+                        remote_file("two.rs"),
+                        remote_file("three.rs"),
+                    ],
+                )],
+                &[""],
+            );
+            panel
+                .refresh_preserving_tree(&editor, None, Some(1))
+                .unwrap();
+
+            let (ingress, _receiver) =
+                crate::runtime::RuntimeIngress::channel(rt.runtime().clone());
+            panel.seek_to(1);
             for _ in 0..3 {
                 press_key_capturing(&mut panel, &mut editor, &ingress, key!('x'));
             }
-            let targets = panel
-                .selected_paths()
-                .iter()
-                .map(display_name)
-                .collect::<Vec<_>>();
-            assert_eq!(targets, ["alpha.rs", "beta.rs", "delta.rs"]);
+            assert_eq!(panel.selected_row_range().len(), 3);
 
             let result = press_key_capturing(&mut panel, &mut editor, &ingress, key!('d'));
-            assert!(
-                matches!(
-                    result,
-                    EventResult::Consumed(Some(PostAction::PushLayer(_)))
-                ),
-                "a ranged delete pushes exactly one confirmation layer"
-            );
-            assert_eq!(labels(&panel), before, "label text must be untouched");
+            let EventResult::Consumed(Some(PostAction::PushLayer(mut layer))) = result else {
+                panic!("a remote ranged delete must produce a confirmation, not an error");
+            };
+
+            let foreground = confirm_layer(&mut layer, &mut editor, &rt);
+            let mut removed = Vec::new();
+            while let Some(delivery) = foreground.pop() {
+                if let crate::runtime::ingress::RuntimeDelivery::Ui(UiCommand::FileExplorer(
+                    FileExplorerCommand::ApplyWorkspaceTransaction { transaction, .. },
+                )) = delivery
+                {
+                    for operation in transaction.operations {
+                        if let helix_workspace::FileOperation::Remove { path, .. } = operation {
+                            removed.push(path.to_string());
+                        }
+                    }
+                }
+            }
+            assert_eq!(removed.len(), 3, "every remote target must be removed");
+            assert!(removed.iter().any(|path| path.contains("one.rs")));
+            assert!(removed.iter().any(|path| path.contains("two.rs")));
+            assert!(removed.iter().any(|path| path.contains("three.rs")));
         });
     }
 

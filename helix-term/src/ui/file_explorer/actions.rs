@@ -37,7 +37,10 @@ const DELETE_PROMPT_NAMES: usize = 3;
 
 /// "Move 5 items to trash? (a.rs, b.rs, c.rs, +2 more)" — enough to see what
 /// is about to go without a prompt that runs off the screen.
-pub(super) fn delete_many_message(targets: &[std::path::PathBuf]) -> String {
+pub(super) fn delete_message(targets: &[ExplorerPath]) -> String {
+    if let [target] = targets {
+        return format!("Delete {}?", display_name(target));
+    }
     let named = targets
         .iter()
         .take(DELETE_PROMPT_NAMES)
@@ -46,13 +49,28 @@ pub(super) fn delete_many_message(targets: &[std::path::PathBuf]) -> String {
         .join(", ");
     let remaining = targets.len().saturating_sub(DELETE_PROMPT_NAMES);
     if remaining == 0 {
-        format!("Move {} items to trash? ({named})", targets.len())
+        format!("Delete {} items? ({named})", targets.len())
     } else {
         format!(
-            "Move {} items to trash? ({named}, +{remaining} more)",
+            "Delete {} items? ({named}, +{remaining} more)",
             targets.len()
         )
     }
+}
+
+fn delete_success_message(targets: &[ExplorerPath]) -> String {
+    if let [target] = targets {
+        format!("Deleted {}", display_name(target))
+    } else {
+        format!("Deleted {} items", targets.len())
+    }
+}
+
+/// The workspace-relative path behind a remote or collaboration row.
+fn workspace_path(path: &ExplorerPath) -> Option<helix_workspace::WorkspacePath> {
+    path.remote_path()
+        .cloned()
+        .or_else(|| path.collaboration_path().cloned())
 }
 
 /// Guide columns for a child of `row`, matching what `collect_rows` would
@@ -301,14 +319,13 @@ impl FileExplorerPanel {
         yank: bool,
     ) -> Option<PostAction> {
         let targets = self.selected_paths();
+        if targets.is_empty() {
+            return None;
+        }
         if yank && !self.write_path_register(cx, &targets) {
             return None;
         }
-        if targets.len() < 2 {
-            self.prompt_delete(cx);
-            return None;
-        }
-        self.confirm_delete_many(cx, &targets)
+        self.confirm_delete(cx, &targets)
     }
 
     pub(super) fn delete_label_selection(
@@ -337,48 +354,85 @@ impl FileExplorerPanel {
         None
     }
 
-    /// One confirmation for a ranged delete. Each target still goes through
-    /// `ApplyConfirmedDelete`, so the root-containment check and the
-    /// modified-buffer prompt stay exactly as they are for a single delete.
-    fn confirm_delete_many(
-        &mut self,
-        cx: &mut Context,
-        targets: &[ExplorerPath],
-    ) -> Option<PostAction> {
-        let root = self.root.local_path().map(std::path::Path::to_path_buf);
-        let Some(root) = root else {
-            cx.editor
-                .notify_error("Deleting multiple items is not available on this backend yet");
-            return None;
-        };
-        let locals = targets
+    /// One confirmation for any number of targets, on any backend.
+    ///
+    /// This used to fork: a single local row went out as `PromptDelete` and
+    /// let the runtime build the prompt (which handled remote and
+    /// collaboration roots), while a multi-row delete built its own prompt but
+    /// only understood local paths — so on an SSH workspace `x x x d` bailed
+    /// out and deleted nothing while a single `x d` worked. One path now
+    /// serves both, and the per-backend difference is only *which* command the
+    /// callback submits.
+    fn confirm_delete(&mut self, cx: &mut Context, targets: &[ExplorerPath]) -> Option<PostAction> {
+        let message = delete_message(targets);
+        let cursor = selected_cursor(self.selection);
+        let root = self.root.clone();
+        // The rows are spent once the deletes are queued.
+        self.collapse_row_selection();
+
+        if let Some(local_root) = root.local_path().map(std::path::Path::to_path_buf) {
+            let locals = targets
+                .iter()
+                .map(|path| path.clone().into_local())
+                .collect::<Option<Vec<_>>>();
+            let Some(locals) = locals else {
+                cx.editor
+                    .notify_error("Cannot delete across workspace backends");
+                return None;
+            };
+            // Each target keeps its own `ApplyConfirmedDelete`, so the
+            // root-containment check and the modified-buffer prompt run per
+            // file exactly as they always have.
+            return Some(
+                Confirmation::new(message, move |cx| {
+                    for target in locals {
+                        cx.submit_ui(UiCommand::FileExplorer(
+                            FileExplorerCommand::ApplyConfirmedDelete {
+                                target,
+                                root: local_root.clone(),
+                                cursor,
+                                modified_buffer_check: ModifiedBufferCheck::Prompt,
+                            },
+                        ));
+                    }
+                })
+                .into_post_action(),
+            );
+        }
+
+        // Remote and collaboration roots take one transaction removing every
+        // target — `FileTransaction` is already a list of operations.
+        let operations = targets
             .iter()
-            .map(|path| path.clone().into_local())
-            .collect::<Option<Vec<_>>>();
-        let Some(locals) = locals else {
+            .map(workspace_path)
+            .collect::<Option<Vec<_>>>()
+            .map(|paths| {
+                paths
+                    .into_iter()
+                    .map(|path| helix_workspace::FileOperation::Remove {
+                        path,
+                        recursive: true,
+                    })
+                    .collect::<Vec<_>>()
+            });
+        let Some(operations) = operations else {
             cx.editor
                 .notify_error("Cannot delete across workspace backends");
             return None;
         };
-
-        let message = delete_many_message(&locals);
-        let cursor = selected_cursor(self.selection);
-        // The range is spent once the deletes are queued — the rows it points
-        // at are about to disappear.
-        self.collapse_row_selection();
-
+        let success = delete_success_message(targets);
         Some(
             Confirmation::new(message, move |cx| {
-                for target in locals {
-                    cx.submit_ui(UiCommand::FileExplorer(
-                        FileExplorerCommand::ApplyConfirmedDelete {
-                            target,
-                            root: root.clone(),
-                            cursor,
-                            modified_buffer_check: ModifiedBufferCheck::Prompt,
-                        },
-                    ));
-                }
+                cx.submit_ui(UiCommand::FileExplorer(
+                    FileExplorerCommand::ApplyWorkspaceTransaction {
+                        root: root.clone(),
+                        cursor,
+                        select_path: None,
+                        transaction: helix_workspace::FileTransaction { operations },
+                        success: success.clone(),
+                        modified_buffer_check: ModifiedBufferCheck::Prompt,
+                    },
+                ));
             })
             .into_post_action(),
         )
@@ -428,10 +482,8 @@ impl FileExplorerPanel {
         self.sync_label_edit_from_region(editor);
     }
 
-    /// Begin an inline create by inserting a new tree row (like editor `o`/`O`)
-    /// and editing its empty label.
+    /// Start an inline create. Placement follows the selected row:
     ///
-    /// Target parent / insert position:
     /// - Expanded directory + below → first child inside it
     /// - Expanded directory + above → sibling above the directory
     /// - Collapsed directory → sibling (never inside a closed folder)
@@ -1116,49 +1168,5 @@ impl FileExplorerPanel {
         if clipboard.operation == ExplorerFileOperation::Move {
             self.file_clipboard = None;
         }
-    }
-
-    fn prompt_delete(&self, cx: &mut Context) {
-        let Some(row) = self.selected() else {
-            return;
-        };
-        let target = row.path.clone();
-        if let Some(target) = target.remote_path().cloned() {
-            cx.submit_ui(UiCommand::FileExplorer(
-                FileExplorerCommand::PromptWorkspaceDelete {
-                    root: self.root.clone(),
-                    cursor: selected_cursor(self.selection),
-                    target,
-                },
-            ));
-            return;
-        }
-        if let Some(target) = target.collaboration_path().cloned() {
-            cx.submit_ui(UiCommand::FileExplorer(
-                FileExplorerCommand::PromptWorkspaceDelete {
-                    root: self.root.clone(),
-                    cursor: selected_cursor(self.selection),
-                    target,
-                },
-            ));
-            return;
-        }
-        let Some(target) = target.into_local() else {
-            cx.editor
-                .notify_error("Cannot delete across workspace backends");
-            return;
-        };
-        let Some(root) = self.root.local_path().map(std::path::Path::to_path_buf) else {
-            cx.editor.notify_error("Remote delete is not available yet");
-            return;
-        };
-        let cursor = selected_cursor(self.selection);
-        cx.spawn_ui(async move {
-            Ok(UiCommand::FileExplorer(FileExplorerCommand::PromptDelete {
-                target,
-                root,
-                cursor,
-            }))
-        });
     }
 }

@@ -167,8 +167,6 @@ FLAGS:
 async fn connect_remote_workspace(
     uri: &helix_remote::ssh::RemoteUri,
 ) -> Result<RemoteApplicationSession> {
-    // Progress the user is actively waiting on: keep it on the terminal, but record it too.
-    eprintln!("Connecting to {}...", uri.target.destination());
     log::info!(
         "connecting to remote workspace {} on {}",
         uri.workspace,

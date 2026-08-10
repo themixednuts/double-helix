@@ -629,6 +629,11 @@ impl FileExplorerPanel {
     /// jump-session result, …) instead of writing `self.selection = N`
     /// directly — that bypasses `nav` and lets the two diverge.
     fn seek_to(&mut self, index: usize) {
+        // Not the dispatcher's collapse: most callers are not user actions at
+        // all — a landed tree refresh restoring the cursor, a mouse click, the
+        // jump session resolving a label, a create row being inserted. The
+        // range is built from row indices, so anything that plants the cursor
+        // somewhere new invalidates it regardless of what asked.
         self.collapse_row_selection();
         self.prime_nav();
         self.nav.set_selection(index);
@@ -636,9 +641,15 @@ impl FileExplorerPanel {
         self.ensure_selection_horizontally_visible();
     }
 
-    /// Drop a multi-row `x` range back to the cursor row. Every cursor
-    /// motion does this — the range is a transient extension of the cursor,
-    /// exactly like the editor's line-wise selection in Normal mode.
+    /// Drop a multi-row `x` range back to the cursor row — the range is a
+    /// transient extension of the cursor, exactly like the editor's line-wise
+    /// selection in Normal mode.
+    ///
+    /// Almost nothing should call this. [`Self::execute_action`] already does
+    /// it for every action that has not opted out through
+    /// [`ExplorerAction::preserves_row_operand`], which covers every user
+    /// gesture. The handful of remaining callers are the cases an action
+    /// classification cannot express, and each says why at the call site.
     fn collapse_row_selection(&mut self) {
         self.row_selection_anchor = None;
     }
@@ -972,7 +983,9 @@ impl FileExplorerPanel {
     fn apply_search_filter(&mut self, _editor: &Editor) {
         let start = Instant::now();
         // The row list is about to be replaced; a range built against the old
-        // indices would silently cover different files.
+        // indices would silently cover different files. Filtering is driven by
+        // the search field and by search results landing from the runtime, so
+        // there is no action for the dispatcher to classify.
         self.collapse_row_selection();
         let selected_path = self.selected().map(|row| row.path.clone());
         // Deliberately deferred to the end of this function — the icon column
@@ -1365,7 +1378,6 @@ impl FileExplorerPanel {
     }
 
     fn move_selection_by(&mut self, delta: isize) {
-        self.collapse_row_selection();
         self.prime_nav();
         // File explorer uses Clamp — a wrap from the last file to the
         // top of the tree (or vice versa) would feel teleporty.
@@ -1379,7 +1391,6 @@ impl FileExplorerPanel {
     }
 
     fn page_by(&mut self, delta: isize) {
-        self.collapse_row_selection();
         self.prime_nav();
         // Use FullViewport pages to match the previous file-explorer
         // behavior (the tree was paging by full visible_height).
@@ -1395,7 +1406,6 @@ impl FileExplorerPanel {
     }
 
     fn select_first(&mut self) {
-        self.collapse_row_selection();
         self.prime_nav();
         self.nav.to_first();
         self.sync_nav_to_cache();
@@ -1405,7 +1415,6 @@ impl FileExplorerPanel {
     }
 
     fn select_last(&mut self) {
-        self.collapse_row_selection();
         self.prime_nav();
         self.nav.to_last();
         self.sync_nav_to_cache();
@@ -1469,6 +1478,12 @@ impl FileExplorerPanel {
         // Moving inside the label is an explicit "I mean the text" gesture, so
         // it drops the row operand — the same rule row motions follow, and the
         // same thing the editor does when a motion collapses a selection.
+        //
+        // Not left to the dispatcher's collapse: `apply_operator_motion` runs
+        // this *inside* an operator (`dw`), and the operator then asks
+        // `has_row_operand()` whether `d` means "delete these files" or
+        // "delete this word". The gesture has to have landed by then, so the
+        // collapse is part of the gesture rather than part of the action.
         self.collapse_row_selection();
         let Some(label) = self.selected_label().map(str::to_owned) else {
             return;
@@ -1526,6 +1541,9 @@ impl FileExplorerPanel {
     }
 
     fn select_label_text_object(&mut self, object: LabelTextObject) {
+        // Mid-gesture, for the same reason as `move_label_selection`:
+        // `apply_operator_text_object` runs this inside `diw`, and the
+        // operator reads `has_row_operand()` right afterwards.
         self.collapse_row_selection();
         let Some(label) = self.selected_label().map(str::to_owned) else {
             return;
@@ -1537,7 +1555,6 @@ impl FileExplorerPanel {
     }
 
     fn select_whole_label(&mut self) {
-        self.collapse_row_selection();
         let Some(label) = self.selected_label().map(str::to_owned) else {
             return;
         };
@@ -2662,7 +2679,23 @@ impl FileExplorerPanel {
         doc_id
     }
 
+    /// The one place an [`ExplorerAction`] is executed, and the one place the
+    /// `x` row operand is dropped.
+    ///
+    /// The collapse runs *after* the action so the range-aware operators can
+    /// still read [`Self::selected_row_range`] while they run, and it runs for
+    /// every action that does not opt out through
+    /// [`ExplorerAction::preserves_row_operand`] — so a new motion cannot
+    /// silently inherit a stale range, whatever its author remembers.
     fn execute_action(&mut self, action: ExplorerAction, cx: &mut Context) -> EventResult {
+        let result = self.run_action(action, cx);
+        if !action.preserves_row_operand() {
+            self.collapse_row_selection();
+        }
+        result
+    }
+
+    fn run_action(&mut self, action: ExplorerAction, cx: &mut Context) -> EventResult {
         let start = Instant::now();
         let rows_before = self.rows.len();
         let selection_before = self.selection;
@@ -2676,10 +2709,9 @@ impl FileExplorerPanel {
 
         match action {
             // Esc cancels a transient multi-row selection first; a second Esc
-            // closes the panel, as it always has.
-            ExplorerAction::Close if self.row_selection_anchor.is_some() => {
-                self.collapse_row_selection();
-            }
+            // closes the panel, as it always has. The cancel itself is the
+            // dispatcher's collapse — this arm only has to *not* close.
+            ExplorerAction::Close if self.has_row_operand() => {}
             ExplorerAction::Close => return self.close(cx),
             ExplorerAction::MoveSelection(delta) => self.move_selection_by(delta),
             ExplorerAction::Page(delta) => self.page_by(delta),
@@ -2742,14 +2774,7 @@ impl FileExplorerPanel {
             ExplorerAction::SelectWholeLabel => self.select_whole_label(),
             ExplorerAction::CollapseLabelSelection => self.collapse_label_selection_to_cursor(),
             ExplorerAction::FlipLabelSelection => self.flip_label_selection(),
-            ExplorerAction::SetMode(mode) => {
-                // Esc back to Normal drops a multi-row range, like the
-                // editor collapsing a selection to its cursor.
-                if mode == helix_view::document::Mode::Normal {
-                    self.collapse_row_selection();
-                }
-                self.input.mode = mode;
-            }
+            ExplorerAction::SetMode(mode) => self.input.mode = mode,
             ExplorerAction::ClipboardOperation(operation) => self.set_file_clipboard(operation, cx),
             ExplorerAction::PasteClipboard(placement) => self.paste_file_clipboard(cx, placement),
             ExplorerAction::ApplyOperatorTextObject(operator, object) => {
@@ -4996,6 +5021,187 @@ mod tests {
             press_key(&mut panel, &mut editor, &rt, key!(Esc));
             assert!(panel.row_selection_anchor.is_none());
             assert_eq!(ranged_labels(&panel).len(), 1);
+
+            // A label gesture is a motion too — `w` means "I mean the text".
+            press_key(&mut panel, &mut editor, &rt, key!('x'));
+            press_key(&mut panel, &mut editor, &rt, key!('x'));
+            assert_eq!(ranged_labels(&panel).len(), 2);
+
+            press_key(&mut panel, &mut editor, &rt, key!('w'));
+            assert!(panel.row_selection_anchor.is_none());
+            assert_eq!(ranged_labels(&panel).len(), 1);
+        });
+    }
+
+    /// One sample of every [`ExplorerAction`], paired with whether it may keep
+    /// the `x` row operand.
+    ///
+    /// This match deliberately has no wildcard: adding a variant breaks the
+    /// build here until somebody says out loud which side it is on, while
+    /// `preserves_row_operand`'s wildcard makes the *runtime* default the safe
+    /// one. Loud in the test, safe in production.
+    fn expects_row_operand(action: ExplorerAction) -> bool {
+        match action {
+            ExplorerAction::ExtendRowSelection(_)
+            | ExplorerAction::BeginOperator(_)
+            | ExplorerAction::ClipboardOperation(_)
+            | ExplorerAction::DeleteSelectedItem { .. }
+            | ExplorerAction::DeleteLabelSelection { .. }
+            | ExplorerAction::ApplyOperatorMotion(..)
+            | ExplorerAction::ApplyOperatorTextObject(..)
+            | ExplorerAction::ScrollHorizontal(_)
+            | ExplorerAction::ScrollHorizontalEdge(_)
+            | ExplorerAction::ShowHelp
+            | ExplorerAction::ShowOptions
+            | ExplorerAction::Noop => true,
+            ExplorerAction::SetMode(mode) => mode == Mode::Select,
+            ExplorerAction::Close
+            | ExplorerAction::MoveSelection(_)
+            | ExplorerAction::Page(_)
+            | ExplorerAction::SelectFirst
+            | ExplorerAction::SelectLast
+            | ExplorerAction::Open(_)
+            | ExplorerAction::ToggleDirectory
+            | ExplorerAction::CollapseAll
+            | ExplorerAction::ExpandAll
+            | ExplorerAction::CollapseOrSelectParent
+            | ExplorerAction::RootParent
+            | ExplorerAction::GoWorkspaceRoot
+            | ExplorerAction::UndoFileOperation
+            | ExplorerAction::RedoFileOperation
+            | ExplorerAction::Refresh
+            | ExplorerAction::SelectFirstDiagnostic
+            | ExplorerAction::SelectLastDiagnostic
+            | ExplorerAction::SelectNextDiagnostic
+            | ExplorerAction::SelectPreviousDiagnostic
+            | ExplorerAction::MoveLabelSelection(..)
+            | ExplorerAction::SelectLabelTextObject(_)
+            | ExplorerAction::SelectWholeLabel
+            | ExplorerAction::CollapseLabelSelection
+            | ExplorerAction::FlipLabelSelection
+            | ExplorerAction::PasteClipboard(_)
+            | ExplorerAction::ChangeLabelSelection { .. }
+            | ExplorerAction::EnterLabelEdit(_)
+            | ExplorerAction::EnterCreate(_)
+            | ExplorerAction::StartJumpSession
+            | ExplorerAction::DelegateToEditor => false,
+        }
+    }
+
+    /// Every variant, so the classification cannot drift from the one above.
+    const EVERY_ACTION: &[ExplorerAction] = &[
+        ExplorerAction::Close,
+        ExplorerAction::MoveSelection(1),
+        ExplorerAction::Page(1),
+        ExplorerAction::SelectFirst,
+        ExplorerAction::SelectLast,
+        ExplorerAction::Open(Action::Replace),
+        ExplorerAction::ToggleDirectory,
+        ExplorerAction::CollapseAll,
+        ExplorerAction::ExpandAll,
+        ExplorerAction::CollapseOrSelectParent,
+        ExplorerAction::RootParent,
+        ExplorerAction::GoWorkspaceRoot,
+        ExplorerAction::UndoFileOperation,
+        ExplorerAction::RedoFileOperation,
+        ExplorerAction::Refresh,
+        ExplorerAction::ShowOptions,
+        ExplorerAction::ShowHelp,
+        ExplorerAction::ScrollHorizontal(4),
+        ExplorerAction::ScrollHorizontalEdge(true),
+        ExplorerAction::SelectFirstDiagnostic,
+        ExplorerAction::SelectLastDiagnostic,
+        ExplorerAction::SelectNextDiagnostic,
+        ExplorerAction::SelectPreviousDiagnostic,
+        ExplorerAction::MoveLabelSelection(LabelMotion::LineEnd, CoreMovement::Move),
+        ExplorerAction::SelectLabelTextObject(LabelTextObject::InsideWord),
+        ExplorerAction::ExtendRowSelection(1),
+        ExplorerAction::SelectWholeLabel,
+        ExplorerAction::CollapseLabelSelection,
+        ExplorerAction::FlipLabelSelection,
+        ExplorerAction::SetMode(Mode::Select),
+        ExplorerAction::SetMode(Mode::Normal),
+        ExplorerAction::ClipboardOperation(ExplorerFileOperation::Copy),
+        ExplorerAction::PasteClipboard(ExplorerPastePlacement::After),
+        ExplorerAction::ApplyOperatorTextObject(
+            ExplorerOperator::Delete { yank: true },
+            LabelTextObject::InsideWord,
+        ),
+        ExplorerAction::ApplyOperatorMotion(
+            ExplorerOperator::Delete { yank: true },
+            LabelMotion::LineEnd,
+        ),
+        ExplorerAction::BeginOperator(ExplorerOperator::Delete { yank: true }),
+        ExplorerAction::DeleteLabelSelection { yank: true },
+        ExplorerAction::ChangeLabelSelection { yank: true },
+        ExplorerAction::DeleteSelectedItem { yank: true },
+        ExplorerAction::EnterLabelEdit(helix_view::edit_region::InsertEntry::AtCurrent),
+        ExplorerAction::EnterCreate(CreatePlacement::Below),
+        ExplorerAction::StartJumpSession,
+        ExplorerAction::DelegateToEditor,
+        ExplorerAction::Noop,
+    ];
+
+    #[test]
+    fn only_the_opted_in_actions_claim_the_row_operand() {
+        for &action in EVERY_ACTION {
+            assert_eq!(
+                action.preserves_row_operand(),
+                expects_row_operand(action),
+                "{action:?} is classified differently than the test expects"
+            );
+        }
+    }
+
+    /// The choke point itself: run actions through the real dispatch site and
+    /// watch the operand. `FlipLabelSelection` and `CollapseLabelSelection`
+    /// are the interesting rows — nothing names them anywhere, so they reach
+    /// the wildcard, which is exactly the position a newly added action starts
+    /// from. They must lose the operand.
+    #[test]
+    fn dispatch_collapses_every_action_that_does_not_opt_in() {
+        let temp = tempfile::tempdir().unwrap();
+        let rt = helix_runtime::test::RuntimeTest::default();
+        rt.block_on(async {
+            let mut editor = test_editor(100, 30, rt.runtime());
+            let mut panel = multi_row_panel(&temp, &editor).unwrap();
+            let first = row_index_by_name(&panel, "alpha.rs");
+
+            // Inert actions only: the delete paths spend the operand mid-action
+            // (see `confirm_delete`) and would need a confirmation answered.
+            for (action, keeps) in [
+                (ExplorerAction::ExtendRowSelection(1), true),
+                (
+                    ExplorerAction::BeginOperator(ExplorerOperator::Delete { yank: true }),
+                    true,
+                ),
+                (ExplorerAction::ScrollHorizontal(4), true),
+                (ExplorerAction::ShowHelp, true),
+                (ExplorerAction::SetMode(Mode::Select), true),
+                (ExplorerAction::Noop, true),
+                (ExplorerAction::FlipLabelSelection, false),
+                (ExplorerAction::CollapseLabelSelection, false),
+                (ExplorerAction::MoveSelection(1), false),
+                (ExplorerAction::Page(-1), false),
+                (ExplorerAction::SelectWholeLabel, false),
+                (ExplorerAction::SelectFirst, false),
+                (ExplorerAction::SetMode(Mode::Normal), false),
+                // Esc with a range cancels the range instead of closing.
+                (ExplorerAction::Close, false),
+            ] {
+                panel.input.mode = Mode::Normal;
+                panel.seek_to(first);
+                press_key(&mut panel, &mut editor, &rt, key!('x'));
+                press_key(&mut panel, &mut editor, &rt, key!('x'));
+                assert!(panel.has_row_operand(), "arming failed before {action:?}");
+
+                with_context(&mut editor, &rt, |cx| panel.execute_action(action, cx));
+                assert_eq!(
+                    panel.has_row_operand(),
+                    keeps,
+                    "{action:?} left the operand in the wrong state"
+                );
+            }
         });
     }
 

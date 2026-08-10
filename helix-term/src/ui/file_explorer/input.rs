@@ -243,6 +243,53 @@ pub(super) enum ExplorerAction {
     Noop,
 }
 
+impl ExplorerAction {
+    /// Whether this action may leave the `x` row operand standing.
+    ///
+    /// The dispatcher collapses the operand after every action that answers
+    /// `false`, so classification lives here instead of in a manual
+    /// `collapse_row_selection()` at each handler. The wildcard arm is the
+    /// whole point: the operand feeds a *delete*, so a variant nobody
+    /// classified must lose it (harmless) rather than keep a stale range
+    /// (destructive). Opt in only when the action builds the operand, holds
+    /// it for the next key, consumes it itself, or never touches the tree.
+    pub(super) const fn preserves_row_operand(self) -> bool {
+        match self {
+            // Builds the operand — `x` after `x` grows the range.
+            Self::ExtendRowSelection(_) => true,
+            // A Vim-mode operator parks here waiting for its motion; the
+            // operand has to survive until the completing key arrives.
+            Self::BeginOperator(_) => true,
+            // The range-aware operators. They read `selected_row_range()`
+            // while they run, so the operand outlives them: delete drops it
+            // where it is spent (once the deletes are queued), yank and cut
+            // leave the range standing to be operated on again, and the
+            // operator-with-motion forms drop it through the label gesture
+            // they apply first.
+            Self::ClipboardOperation(_)
+            | Self::DeleteSelectedItem { .. }
+            | Self::DeleteLabelSelection { .. }
+            | Self::ApplyOperatorMotion(..)
+            | Self::ApplyOperatorTextObject(..) => true,
+            // Render-only: they move the viewport or raise an overlay and
+            // never move the cursor, so the range they paint stays valid.
+            Self::ScrollHorizontal(_)
+            | Self::ScrollHorizontalEdge(_)
+            | Self::ShowHelp
+            | Self::ShowOptions => true,
+            // Entering Select mode extends what is already selected. Leaving
+            // it (`Esc` → Normal) falls through to the wildcard and drops the
+            // range, like the editor collapsing a selection to its cursor.
+            Self::SetMode(mode) => matches!(mode, Mode::Select),
+            // An unbound key or a cancelled operator did nothing at all.
+            Self::Noop => true,
+            // Everything else — motions, label gestures, mode changes, opens,
+            // refreshes, and anything added after this was written.
+            _ => false,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ExplorerCommand {
     Close,

@@ -367,7 +367,10 @@ impl FileExplorerPanel {
         let message = delete_message(targets);
         let cursor = selected_cursor(self.selection);
         let root = self.root.clone();
-        // The rows are spent once the deletes are queued.
+        // Mid-action, not the dispatcher's collapse: the delete actions opt
+        // out of it precisely so `targets` above could still read the range,
+        // and the rows are spent at this exact point — once the deletes are
+        // queued, whether or not the confirmation is ever answered.
         self.collapse_row_selection();
 
         if let Some(local_root) = root.local_path().map(std::path::Path::to_path_buf) {
@@ -457,9 +460,6 @@ impl FileExplorerPanel {
             // Root row — refuse to edit.
             return;
         }
-        // Editing a label is label-scoped by definition; a row operand would
-        // only confuse what a following operator applies to.
-        self.collapse_row_selection();
         let original_label = row.label.clone();
         // Seed the region's buffer with the row's current label, placing
         // the region cursor where the user's tree-Normal-mode cursor was
@@ -934,8 +934,7 @@ impl FileExplorerPanel {
 
     pub(super) fn change_label_selection(&mut self, cx: &mut Context, yank: bool) {
         // Change means "rename this one row", which has no sensible multi-row
-        // form — drop the operand and edit the cursor row.
-        self.collapse_row_selection();
+        // form, so the dispatcher drops the operand once this returns.
         let Some(row) = self.selected().cloned() else {
             return;
         };

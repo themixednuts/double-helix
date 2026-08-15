@@ -189,4 +189,4 @@ pub(crate) enum DatabaseKind {
     Cache,
 }
 
-pub(crate) const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const BUSY_TIMEOUT: Duration = Duration::from_secs(15);

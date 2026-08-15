@@ -35,40 +35,43 @@ impl<'a> AssistantThreadsRepo<'a> {
     ///
     /// Returns an error if the SQLite write fails.
     pub fn upsert(&mut self, thread: AssistantThread) -> Result<()> {
-        let table = self.backend.schema.assistant_threads;
-        self.backend
-            .db()
-            .transaction(SQLiteTransactionType::Immediate, |tx| {
-                tx.delete(table)
-                    .r#where(eq(table.id, thread.id.as_str()))
-                    .execute()?;
-                let row = InsertAssistantThreads::new(
-                    thread.id,
-                    thread.scope,
-                    thread.created_at,
-                    thread.updated_at,
-                    bool_to_i64(thread.has_feedback),
-                    thread.record_json,
-                );
-                match (thread.title, thread.rating) {
-                    (Some(title), Some(rating)) => {
-                        tx.insert(table)
-                            .value(row.with_title(title).with_rating(rating))
-                            .execute()?;
+        crate::backend::with_busy_retry(|| {
+            let thread = thread.clone();
+            let table = self.backend.schema.assistant_threads;
+            self.backend
+                .db()
+                .transaction(SQLiteTransactionType::Immediate, |tx| {
+                    tx.delete(table)
+                        .r#where(eq(table.id, thread.id.as_str()))
+                        .execute()?;
+                    let row = InsertAssistantThreads::new(
+                        thread.id,
+                        thread.scope,
+                        thread.created_at,
+                        thread.updated_at,
+                        bool_to_i64(thread.has_feedback),
+                        thread.record_json,
+                    );
+                    match (thread.title, thread.rating) {
+                        (Some(title), Some(rating)) => {
+                            tx.insert(table)
+                                .value(row.with_title(title).with_rating(rating))
+                                .execute()?;
+                        }
+                        (Some(title), None) => {
+                            tx.insert(table).value(row.with_title(title)).execute()?;
+                        }
+                        (None, Some(rating)) => {
+                            tx.insert(table).value(row.with_rating(rating)).execute()?;
+                        }
+                        (None, None) => {
+                            tx.insert(table).value(row).execute()?;
+                        }
                     }
-                    (Some(title), None) => {
-                        tx.insert(table).value(row.with_title(title)).execute()?;
-                    }
-                    (None, Some(rating)) => {
-                        tx.insert(table).value(row.with_rating(rating)).execute()?;
-                    }
-                    (None, None) => {
-                        tx.insert(table).value(row).execute()?;
-                    }
-                }
-                Ok(())
-            })?;
-        Ok(())
+                    Ok(())
+                })?;
+            Ok(())
+        })
     }
 
     /// Lists thread stubs for one serialized scope, newest first.

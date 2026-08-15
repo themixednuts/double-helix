@@ -38,8 +38,8 @@ New Features
 10. SQLite-backed generated state
    Assistant history, assistant layout, assistant permissions, file-picker frecency/query history, and package receipts are stored through `helix-store` in `state.sqlite3` and `cache.sqlite3`, with legacy JSON/TOML/LMDB files kept as import or fallback sources for compatibility.
 
-11. Rust 1.95 toolchain
-   The workspace MSRV is Rust 1.95 and `rust-toolchain.toml` pins `1.95.0` for local builds.
+11. Rust 1.97 toolchain
+   The workspace MSRV is Rust 1.97 and `rust-toolchain.toml` pins `1.97.1` for local builds.
 
 
    

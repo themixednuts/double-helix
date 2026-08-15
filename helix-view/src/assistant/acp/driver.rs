@@ -1570,7 +1570,7 @@ async fn handle_call(
                     );
                     return;
                 };
-                let request_id = permission::RequestId::new(format!("perm:{:?}", &id));
+                let request_id = permission::RequestId::new(format!("perm:{id:?}"));
                 let tool = req
                     .tool_call
                     .fields

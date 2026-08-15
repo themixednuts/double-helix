@@ -38,13 +38,12 @@ impl ModelFloatsRenderSnapshot {
                 }
                 let content = if let Some(model) = entry.content.downcast_ref::<TextFloatModel>() {
                     FloatRenderContent::Text(model.clone())
-                } else if let Some(model) = entry.content.downcast_ref::<DocumentFloatModel>() {
+                } else {
+                    let model = entry.content.downcast_ref::<DocumentFloatModel>()?;
                     FloatRenderContent::Document(
                         cx.document(model.document)
                             .map(|document| document.text().clone()),
                     )
-                } else {
-                    return None;
                 };
                 Some(FloatRenderEntry {
                     title: entry.title.as_deref().map(Arc::from),

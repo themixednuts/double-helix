@@ -106,7 +106,7 @@ impl TerminaBackend {
                 decreset!(AnyEventMouse),
                 decreset!(RXVTMouse),
                 decreset!(SGRMouse),
-                &hook_reset_cursor_command,
+                hook_reset_cursor_command,
                 decreset!(BracketedPaste),
                 decreset!(FocusTracking),
                 Csi::Edit(csi::Edit::EraseInDisplay(csi::EraseInDisplay::EraseDisplay)),
@@ -567,7 +567,7 @@ impl Backend for TerminaBackend {
         write!(
             self.terminal,
             "{}{}{}{}",
-            &self.reset_cursor_command,
+            self.reset_cursor_command,
             decreset!(BracketedPaste),
             decreset!(FocusTracking),
             decreset!(ClearAndEnableAlternateScreen),
@@ -751,7 +751,7 @@ impl Drop for TerminaBackend {
             let _ = write!(
                 self.terminal,
                 "{}{}{}{}",
-                &self.reset_cursor_command,
+                self.reset_cursor_command,
                 decreset!(BracketedPaste),
                 decreset!(FocusTracking),
                 decreset!(ClearAndEnableAlternateScreen),

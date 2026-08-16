@@ -99,7 +99,7 @@ categories = ["editor"]
 repository = "https://github.com/helix-editor/helix"
 homepage = "https://helix-editor.com"
 license = "MPL-2.0"
-rust-version = "1.95"
+rust-version = "1.97"
 
 [patch.crates-io]
 tree-house = { path = "vendor/tree-house" }

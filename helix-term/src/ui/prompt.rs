@@ -1079,7 +1079,7 @@ impl Component for Prompt {
                     .editor
                     .registers
                     .iter_preview()
-                    .map(|(ch, preview)| (0.., format!("{} {}", ch, &preview).into()))
+                    .map(|(ch, preview)| (0.., format!("{} {}", ch, preview).into()))
                     .collect();
                 self.set_completions(completion);
                 self.invalidate_completion_work();

@@ -2182,10 +2182,7 @@ impl Transport {
                 }
                 Err(err) => {
                     if !matches!(err, Error::StreamClosed) {
-                        error!(
-                            "Exiting {} after unexpected error: {err:?}",
-                            &transport.name
-                        );
+                        error!("Exiting {} after unexpected error: {err:?}", transport.name);
                     }
 
                     break;

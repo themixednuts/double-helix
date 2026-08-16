@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use drizzle::sqlite::rusqlite::Drizzle;
 use rusqlite::{params, Connection, Params};
@@ -6,6 +7,23 @@ use rusqlite::{params, Connection, Params};
 use crate::migrations::{has_version_sql, insert_version_sql, migrations, version_table_sql};
 use crate::schema::Schema;
 use crate::{DatabaseKind, Error, Result, BUSY_TIMEOUT};
+
+const BUSY_RETRY_ATTEMPTS: u32 = 4;
+
+pub(crate) fn with_busy_retry<T>(mut op: impl FnMut() -> Result<T>) -> Result<T> {
+    let mut delay = Duration::from_millis(20);
+    for attempt in 0..=BUSY_RETRY_ATTEMPTS {
+        match op() {
+            Ok(value) => return Ok(value),
+            Err(err) if err.is_busy() && attempt < BUSY_RETRY_ATTEMPTS => {
+                std::thread::sleep(delay);
+                delay = delay.saturating_mul(2).min(Duration::from_millis(250));
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    unreachable!("busy retry loop exits on success or the final error")
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum SqliteValue {
@@ -58,20 +76,29 @@ impl DrizzleBackend {
     }
 
     fn configure_connection(&mut self, kind: DatabaseKind) -> Result<()> {
-        self.execute_batch(
-            r#"
+        with_busy_retry(|| {
+            self.execute_batch(
+                r#"
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
 "#,
-        )?;
-        if kind == DatabaseKind::Cache {
-            self.execute_batch("PRAGMA synchronous = NORMAL")?;
-        }
-        self.execute_batch("PRAGMA busy_timeout = 5000")?;
-        Ok(())
+            )?;
+            if kind == DatabaseKind::Cache {
+                self.execute_batch("PRAGMA synchronous = NORMAL")?;
+            }
+            self.execute_batch(&format!(
+                "PRAGMA busy_timeout = {}",
+                BUSY_TIMEOUT.as_millis()
+            ))?;
+            Ok(())
+        })
     }
 
     fn run_migrations(&mut self, kind: DatabaseKind) -> Result<()> {
+        with_busy_retry(|| self.run_migrations_once(kind))
+    }
+
+    fn run_migrations_once(&mut self, kind: DatabaseKind) -> Result<()> {
         self.execute_batch("BEGIN IMMEDIATE")?;
         let result = (|| {
             self.execute_batch(version_table_sql())?;

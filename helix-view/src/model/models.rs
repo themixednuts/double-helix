@@ -929,7 +929,7 @@ impl AssistantEntry {
                     } else {
                         AssistantEntryTone::Inactive
                     },
-                    accessory: Some(" a accept  x reject ".to_string()).filter(|_| pending > 0),
+                    accessory: (pending > 0).then_some(" a accept  x reject ".to_string()),
                     accessory_tone: AssistantEntryTone::Inactive,
                 })
             }

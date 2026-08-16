@@ -30,7 +30,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout sources
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Install stable toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -43,7 +43,7 @@ jobs:
       - name: Bundle grammars
         run: tar cJf grammars.tar.xz -C runtime/grammars/sources .
 
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         with:
           name: grammars
           path: grammars.tar.xz
@@ -111,10 +111,10 @@ jobs:
 
     steps:
       - name: Checkout sources
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Download grammars
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
 
       - name: Move grammars under runtime
         if: "!startsWith(matrix.os, 'windows')"
@@ -256,7 +256,7 @@ jobs:
           fi
           cp -r runtime dist
 
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         with:
           name: bins-${{ matrix.build }}
           path: dist
@@ -269,9 +269,9 @@ jobs:
       contents: write
     steps:
       - name: Checkout sources
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@v8
 
       - name: Build archive
         shell: bash
@@ -351,7 +351,7 @@ jobs:
           overwrite: true
 
       - name: Upload binaries as artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         if: env.preview == 'true'
         with:
           name: release

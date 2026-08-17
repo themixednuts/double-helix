@@ -84,7 +84,7 @@ tar = "0.4"
 flate2 = "1.1"
 bzip2 = "0.6.1"
 xz2 = "0.1"
-ureq = { version = "2.12", default-features = true }
+ureq = { version = "3.4", default-features = true }
 arc-swap = "1.8"
 notify = "8.2"
 getrandom = "0.3"

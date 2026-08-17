@@ -22,7 +22,7 @@ dependencies = [
  "futures",
  "futures-concurrency",
  "rustc-hash",
- "rustix 1.1.4",
+ "rustix",
  "schemars 1.2.2",
  "serde",
  "serde_json",
@@ -224,7 +224,7 @@ dependencies = [
  "futures-lite",
  "parking",
  "polling",
- "rustix 1.1.4",
+ "rustix",
  "slab",
  "windows-sys 0.61.2",
 ]
@@ -255,7 +255,7 @@ dependencies = [
  "cfg-if",
  "event-listener",
  "futures-lite",
- "rustix 1.1.4",
+ "rustix",
 ]
 
 [[package]]
@@ -270,7 +270,7 @@ dependencies = [
  "cfg-if",
  "futures-core",
  "futures-io",
- "rustix 1.1.4",
+ "rustix",
  "signal-hook-registry",
  "slab",
  "windows-sys 0.61.2",
@@ -748,23 +748,6 @@ checksum = "61803da095bee82a81bb1a452ecc25d3b2f1416d1897eb86430c6159ef717c17"
 
 [[package]]
 name = "crossterm"
-version = "0.28.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "829d955a0bb380ef178a640b91779e3987da38c9aea133b20614cfed8cdea9c6"
-dependencies = [
- "bitflags 2.13.1",
- "crossterm_winapi",
- "futures-core",
- "mio",
- "parking_lot",
- "rustix 0.38.44",
- "signal-hook 0.3.18",
- "signal-hook-mio",
- "winapi",
-]
-
-[[package]]
-name = "crossterm"
 version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d8b9f2e4c67f833b660cdb0a3523065869fb35570177239812ed4c905aeff87b"
@@ -773,9 +756,10 @@ dependencies = [
  "crossterm_winapi",
  "derive_more",
  "document-features",
+ "futures-core",
  "mio",
  "parking_lot",
- "rustix 1.1.4",
+ "rustix",
  "signal-hook 0.3.18",
  "signal-hook-mio",
  "winapi",
@@ -1232,12 +1216,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "env_home"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c7f84e12ccf0a7ddc17a6c41c93326024c42920d7ee630d04950e6926645c0fe"
-
-[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1540,7 +1518,7 @@ version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7e72ed92b67c146290f88e9c89d60ca163ea417a446f61ffd7b72df3e7f1dfd5"
 dependencies = [
- "rustix 1.1.4",
+ "rustix",
  "windows-sys 0.61.2",
 ]
 
@@ -2113,7 +2091,7 @@ dependencies = [
  "itoa",
  "libc",
  "memmap2",
- "rustix 1.1.4",
+ "rustix",
  "smallvec",
  "thiserror 2.0.20",
 ]
@@ -2757,7 +2735,7 @@ dependencies = [
  "tree-house",
  "unicode-general-category",
  "unicode-segmentation",
- "unicode-width 0.1.12",
+ "unicode-width",
  "url",
 ]
 
@@ -2820,7 +2798,7 @@ dependencies = [
  "threadpool",
  "toml 1.1.4+spec-1.1.0",
  "tree-house",
- "which 8.0.5",
+ "which",
 ]
 
 [[package]]
@@ -2999,10 +2977,10 @@ dependencies = [
  "regex-automata",
  "regex-cursor",
  "ropey",
- "rustix 1.1.4",
+ "rustix",
  "tempfile",
  "unicode-segmentation",
- "which 8.0.5",
+ "which",
  "windows-sys 0.61.2",
 ]
 
@@ -3030,7 +3008,7 @@ dependencies = [
  "chrono",
  "code-atlas",
  "content_inspector",
- "crossterm 0.28.1",
+ "crossterm",
  "dashmap",
  "fern",
  "fff-search",
@@ -3093,7 +3071,7 @@ name = "helix-tui"
 version = "25.7.1"
 dependencies = [
  "bitflags 2.13.1",
- "crossterm 0.28.1",
+ "crossterm",
  "helix-core",
  "helix-view",
  "log",
@@ -3132,7 +3110,7 @@ dependencies = [
  "chardetng",
  "clipboard-win",
  "content_inspector",
- "crossterm 0.28.1",
+ "crossterm",
  "futures-util",
  "helix-acp",
  "helix-collab",
@@ -3155,7 +3133,7 @@ dependencies = [
  "notify 8.2.0",
  "once_cell",
  "parking_lot",
- "rustix 1.1.4",
+ "rustix",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -3724,12 +3702,6 @@ dependencies = [
 
 [[package]]
 name = "linux-raw-sys"
-version = "0.4.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d26c52dbd32dccf2d10cac7725f8eae5296885fb5703b261f7d0a0739ec807ab"
-
-[[package]]
-name = "linux-raw-sys"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
@@ -3789,21 +3761,21 @@ checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 
 [[package]]
 name = "lua-src"
-version = "547.0.0"
+version = "550.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1edaf29e3517b49b8b746701e5648ccb5785cde1c119062cbabbc5d5cd115e42"
+checksum = "e836dc8ae16806c9bdcf42003a88da27d163433e3f9684c52f0301258004a4fb"
 dependencies = [
  "cc",
 ]
 
 [[package]]
 name = "luajit-src"
-version = "210.5.12+a4f56a4"
+version = "210.6.6+707c12b"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b3a8e7962a5368d5f264d045a5a255e90f9aa3fc1941ae15a8d2940d42cac671"
+checksum = "a86cc925d4053d0526ae7f5bc765dbd0d7a5d1a63d43974f4966cb349ca63295"
 dependencies = [
  "cc",
- "which 7.0.3",
+ "which",
 ]
 
 [[package]]
@@ -3907,14 +3879,15 @@ dependencies = [
 
 [[package]]
 name = "mlua"
-version = "0.10.5"
+version = "0.11.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c1f5f8fbebc7db5f671671134b9321c4b9aa9adeafccfd9a8c020ae45c6a35d0"
+checksum = "ccd36acfa49ce6ee56d1307a061dd302c564eee757e6e4cd67eb4f7204846fab"
 dependencies = [
  "bstr",
  "either",
  "erased-serde",
  "futures-util",
+ "libc",
  "mlua-sys",
  "num-traits",
  "parking_lot",
@@ -3926,12 +3899,13 @@ dependencies = [
 
 [[package]]
 name = "mlua-sys"
-version = "0.6.8"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "380c1f7e2099cafcf40e51d3a9f20a346977587aa4d012eae1f043149a728a93"
+checksum = "0f1c3a7fc7580227ece249fd90aa2fa3b39eb2b49d3aec5e103b3e85f2c3dfc8"
 dependencies = [
  "cc",
  "cfg-if",
+ "libc",
  "lua-src",
  "luajit-src",
  "pkg-config",
@@ -4492,7 +4466,7 @@ dependencies = [
  "concurrent-queue",
  "hermit-abi",
  "pin-project-lite",
- "rustix 1.1.4",
+ "rustix",
  "windows-sys 0.61.2",
 ]
 
@@ -4833,7 +4807,7 @@ dependencies = [
  "thiserror 2.0.20",
  "unicode-segmentation",
  "unicode-truncate",
- "unicode-width 0.2.2",
+ "unicode-width",
 ]
 
 [[package]]
@@ -4843,7 +4817,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "567584a3b0e6a8203c23de40b4861497266725eb5363dbfd18a1edd603cca9f0"
 dependencies = [
  "cfg-if",
- "crossterm 0.29.0",
+ "crossterm",
  "instability",
  "ratatui-core",
 ]
@@ -4897,7 +4871,7 @@ dependencies = [
  "strum",
  "time",
  "unicode-segmentation",
- "unicode-width 0.2.2",
+ "unicode-width",
 ]
 
 [[package]]
@@ -5153,19 +5127,6 @@ dependencies = [
 
 [[package]]
 name = "rustix"
-version = "0.38.44"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fdb5bc1ae2baa591800df16c9ca78619bf65c0488b41b96ccec5d11220d8c154"
-dependencies = [
- "bitflags 2.13.1",
- "errno",
- "libc",
- "linux-raw-sys 0.4.15",
- "windows-sys 0.59.0",
-]
-
-[[package]]
-name = "rustix"
 version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6fe4565b9518b83ef4f91bb47ce29620ca828bd32cb7e408f0062e9930ba190"
@@ -5173,7 +5134,7 @@ dependencies = [
  "bitflags 2.13.1",
  "errno",
  "libc",
- "linux-raw-sys 0.12.1",
+ "linux-raw-sys",
  "windows-sys 0.61.2",
 ]
 
@@ -5774,7 +5735,7 @@ dependencies = [
  "fastrand",
  "getrandom 0.4.3",
  "once_cell",
- "rustix 1.1.4",
+ "rustix",
  "windows-sys 0.61.2",
 ]
 
@@ -5787,7 +5748,7 @@ dependencies = [
  "bitflags 2.13.1",
  "futures-core",
  "parking_lot",
- "rustix 1.1.4",
+ "rustix",
  "signal-hook 0.3.18",
  "windows-sys 0.61.2",
 ]
@@ -5800,7 +5761,7 @@ checksum = "9048a889effe34a5cddee0af7f53285198b16dca3be510858d38dfdb3e62a04e"
 dependencies = [
  "bitflags 2.13.1",
  "parking_lot",
- "rustix 1.1.4",
+ "rustix",
  "signal-hook 0.3.18",
  "windows-sys 0.61.2",
 ]
@@ -5901,7 +5862,7 @@ checksum = "c13547615a44dc9c452a8a534638acdf07120d4b6847c8178705da06306a3057"
 dependencies = [
  "smawk",
  "unicode-linebreak",
- "unicode-width 0.2.2",
+ "unicode-width",
 ]
 
 [[package]]
@@ -6255,7 +6216,7 @@ dependencies = [
  "ropey",
  "slab",
  "tree-house-bindings",
- "unicode-width 0.1.12",
+ "unicode-width",
 ]
 
 [[package]]
@@ -6356,14 +6317,8 @@ checksum = "16b380a1238663e5f8a691f9039c73e1cdae598a30e9855f541d29b08b53e9a5"
 dependencies = [
  "itertools",
  "unicode-segmentation",
- "unicode-width 0.2.2",
+ "unicode-width",
 ]
-
-[[package]]
-name = "unicode-width"
-version = "0.1.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "68f5e5f3158ecfd4b8ff6fe086db7c8467a2dfdac97fe420f2b7c4aa97af66d6"
 
 [[package]]
 name = "unicode-width"
@@ -6642,18 +6597,6 @@ dependencies = [
 
 [[package]]
 name = "which"
-version = "7.0.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "24d643ce3fd3e5b54854602a080f34fb10ab75e0b813ee32d00ca2b44fa74762"
-dependencies = [
- "either",
- "env_home",
- "rustix 1.1.4",
- "winsafe",
-]
-
-[[package]]
-name = "which"
 version = "8.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f3ef584124b911bcc3875c2f1472e80f24361ceb789bd1c62b3e9a3df9ff43c"
@@ -6818,15 +6761,6 @@ name = "windows-sys"
 version = "0.52.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "282be5f36a8ce781fad8c8ae18fa3f9beff57ec1b52cb3de0789201425d9a33d"
-dependencies = [
- "windows-targets 0.52.6",
-]
-
-[[package]]
-name = "windows-sys"
-version = "0.59.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e38bc4d79ed67fd075bcc251a1c39b32a1776bbe92e5bef1f0bf1f8c531853b"
 dependencies = [
  "windows-targets 0.52.6",
 ]
@@ -7054,12 +6988,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "winsafe"
-version = "0.0.19"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d135d17ab770252ad95e9a872d365cf3090e3be864a34ab46f48555993efc904"
-
-[[package]]
 name = "wit-bindgen"
 version = "0.57.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7096,7 +7024,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32e45ad4206f6d2479085147f02bc2ef834ac85886624a23575ae137c8aa8156"
 dependencies = [
  "libc",
- "rustix 1.1.4",
+ "rustix",
 ]
 
 [[package]]

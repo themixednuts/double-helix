@@ -1047,7 +1047,7 @@ impl LuaEngine {
                 }
                 Ok(VmState::Continue)
             },
-        );
+        )?;
 
         let result = f();
         self.lua.remove_hook();

@@ -2067,7 +2067,7 @@ impl EditorView {
             EngineResult::Unbound => {
                 let is_synthetic_null = matches!(key.code, KeyCode::Null | KeyCode::Char('\0'));
                 if !is_synthetic_null {
-                    log::warn!("unbound key: {}", key.key_sequence_format());
+                    log::debug!("unbound key: {}", key.key_sequence_format());
                 }
             }
             EngineResult::ReplayInsert {

@@ -69,7 +69,7 @@ impl Editor {
                         .any(|(_, view)| view.doc == doc.id && view.id != view_id);
 
                 if doc.path().is_none() || doc.is_persistent_scratch() {
-                    log::warn!(
+                    log::debug!(
                         "[acp_scratch] switch action={:?} from_doc={:?} to_doc={:?} modified={} persistent={} remove_empty_scratch={} view_id={:?}",
                         action,
                         doc.id,
@@ -87,7 +87,7 @@ impl Editor {
                 doc.append_changes_to_history(view);
 
                 if remove_empty_scratch {
-                    log::warn!(
+                    log::debug!(
                         "[acp_scratch] removing empty scratch doc={:?} while switching to {:?}",
                         doc.id,
                         id

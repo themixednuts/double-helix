@@ -42,6 +42,38 @@ mod tests {
     }
 
     #[test]
+    fn editor_init_with_host_entries_round_trips() {
+        let mut config = PluginConfig::default();
+        config.hosts.push(crate::PluginHostConfig {
+            name: "local-lua".into(),
+            command: std::path::PathBuf::from(r"C:\Users\me\.cargo\bin\dhx.exe"),
+            args: vec!["--plugin-host".into()],
+            plugin_dirs: Vec::new(),
+        });
+        let value: Frame<HostRequest, HostResponse> = Frame::Notify {
+            body: HostRequest::Init {
+                metadata: ApiMetadata::default(),
+                config,
+            },
+        };
+        let mut codec = FrameCodec::new();
+        let mut bytes = Vec::new();
+        codec.write_sync(&mut bytes, &value).unwrap();
+
+        let decoded: Frame<HostRequest, HostResponse> =
+            codec.read_sync(&mut Cursor::new(bytes)).unwrap();
+        assert!(
+            matches!(
+                decoded,
+                Frame::Notify {
+                    body: HostRequest::Init { .. }
+                }
+            ),
+            "decoded {decoded:?}"
+        );
+    }
+
+    #[test]
     fn partial_reads_are_accumulated_by_read_exact() {
         struct Slow(Cursor<Vec<u8>>);
 

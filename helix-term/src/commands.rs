@@ -3591,12 +3591,6 @@ pub fn accept_inline_completion(cx: &mut Context) {
     }
 }
 
-fn save_selection(cx: &mut Context) {
-    let (view_id, doc) = focused!(cx.editor);
-    let doc_id = doc.id();
-    helix_view::commands::editing::save_selection(cx.editor, view_id, doc_id);
-}
-
 fn rotate_view(cx: &mut Context) {
     cx.editor.focus_next()
 }
@@ -4591,7 +4585,10 @@ fn jump_to_label(cx: &mut Context, labels: Vec<Range>, behaviour: Movement) {
                 } else {
                     range.with_direction(Direction::Forward)
                 };
-                save_selection(cx);
+                // Save to the jumplist without a "Selection saved" status message.
+                cx.editor.with_view_doc_mut(view, doc, |view, doc| {
+                    helix_view::view::push_jump(view, doc);
+                });
                 doc_mut!(cx.editor, &doc).set_selection(view, range.into());
             });
         }

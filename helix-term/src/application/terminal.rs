@@ -96,11 +96,26 @@ impl Application {
 
     #[cfg(not(windows))]
     fn apply_reported_theme_mode(&mut self, mode: termina::escape::csi::ThemeMode) -> bool {
+        // Remember the mode so `:config-reload` picks the right variant, but only
+        // reload the theme when it actually depends on the mode; otherwise a
+        // theme set at runtime with `:theme` would be discarded.
+        let mode: Option<helix_view::theme::Mode> = Some(mode.into());
+        let mode_changed = self.terminal_state.theme_mode != mode;
+        self.terminal_state.theme_mode = mode;
+
+        let config = self.config.load();
+        let adaptive = config
+            .theme
+            .as_ref()
+            .is_some_and(|theme| theme.is_adaptive());
+        if !mode_changed || !adaptive {
+            return false;
+        }
         Self::load_configured_theme(
             &mut self.editor,
-            &self.config.load(),
+            &config,
             self.terminal_state.supports_true_color,
-            Some(mode.into()),
+            mode,
         );
         true
     }

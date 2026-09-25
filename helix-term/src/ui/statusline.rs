@@ -80,18 +80,14 @@ impl StatuslineModel {
     pub fn collect(context: StatuslineContext<'_>, doc: &Document, view: &View) -> Self {
         let cursor = doc.cursor_status(view.id);
         let selection = doc.selection_status(view.id);
-        let first_server = doc.language_servers().next().map(|server| server.id());
-        let spinner_frame = first_server
-            .and_then(|server| {
-                context
-                    .spinners
-                    .get(server)
-                    .and_then(|spinner| spinner.frame_at(context.frame_time))
-            })
-            .unwrap_or(" ");
-        let lsp_progress = first_server
-            .and_then(|server| context.spinners.get(server))
-            .and_then(|spinner| spinner.progress());
+        // Show the spinner of whichever attached server is busy, not just the first.
+        let busy_spinner = doc.language_servers().find_map(|server| {
+            let spinner = context.spinners.get(server.id())?;
+            let frame = spinner.frame_at(context.frame_time)?;
+            Some((spinner, frame))
+        });
+        let spinner_frame = busy_spinner.map_or(" ", |(_, frame)| frame);
+        let lsp_progress = busy_spinner.and_then(|(spinner, _)| spinner.progress());
         // Pre-collect language-server names so the LspStatus
         // element doesn't have to thread the live editor through
         // the render path. Iteration order is attach order — for

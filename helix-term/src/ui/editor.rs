@@ -2332,6 +2332,7 @@ impl EditorView {
             } else if mode_before == Mode::Insert && mode_after != Mode::Insert {
                 // Leaving insert mode — finalize recording.
                 engine.end_insert_recording();
+                engine.insert_exited(cx.editor);
             }
         }
     }

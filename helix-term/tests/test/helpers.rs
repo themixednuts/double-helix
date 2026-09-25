@@ -421,6 +421,13 @@ impl AppBuilder {
         self
     }
 
+    /// Use `config` as is, keymap included (`with_config` merges keys into the default
+    /// keymap).
+    pub fn with_exact_config(mut self, config: Config) -> Self {
+        self.config = config;
+        self
+    }
+
     pub fn with_input_text<S: Into<String>>(mut self, input_text: S) -> Self {
         self.input = Some(test::print(&input_text.into()));
         self

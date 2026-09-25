@@ -180,7 +180,11 @@ pub enum RepeatableCommandId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum OperatorTargetId {
     Motion(MotionId),
-    TextObject(TextObjectId),
+    /// A text object, inside or around.
+    TextObject(TextObjectId, helix_core::textobject::TextObject),
+    /// A text object named by its key in Vim's operator-pending mode (`w`, `(`, `"`, `f`),
+    /// inside or around.
+    Object(char, helix_core::textobject::TextObject),
     CharPending(CharPendingId, KeyEvent),
     Linewise,
 }
@@ -255,6 +259,8 @@ pub enum RecordedAction {
         target: OperatorTargetId,
         motion_count: NonZeroUsize,
         operator_count: NonZeroUsize,
+        /// Whether a count was typed at all: `dG` and `d5G` differ.
+        count_given: bool,
         register: Option<char>,
     },
     /// An insert sequence (both engines: enter insert, type text, exit).
@@ -361,6 +367,9 @@ pub trait EditingEngine: Send {
     /// The engine finalizes the insert recording into a `RecordedAction::InsertSequence`
     /// and stores it as `last_action` for dot-repeat.
     fn end_insert_recording(&mut self);
+
+    /// Insert mode was left: the engine may adjust the cursor (Vim steps back one character).
+    fn insert_exited(&mut self, _editor: &mut Editor) {}
 
     /// Record a key the frontend handled during insert mode (Tab, `C-r`, `C-x`), so `.`
     /// replays it along with the keys the engine handled itself.

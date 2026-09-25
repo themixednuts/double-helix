@@ -50,7 +50,7 @@ fn find_word_boundary(slice: RopeSlice, mut pos: usize, direction: Direction, lo
     pos
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub enum TextObject {
     Around,
     Inside,

@@ -1,5 +1,6 @@
 pub mod default;
 pub mod macros;
+pub mod vim;
 
 pub use crate::commands::MappableCommand;
 use arc_swap::{ArcSwap, Guard};
@@ -24,6 +25,7 @@ use std::{
 
 pub use default::default;
 use macros::key;
+pub use vim::vim;
 
 #[derive(Debug, Clone, Default)]
 pub struct KeyTrieNode {
@@ -779,6 +781,21 @@ impl helix_view::engine::KeymapQuery for Keymaps {
 }
 
 /// Merge default config keys with user overwritten keys for custom user config.
+/// The keymap of `engine` with the user's `[keys]` tables merged in, in order.
+pub fn for_engine(
+    engine: helix_view::editor::EditingEngineConfig,
+    user_keys: &[HashMap<Mode, KeyTrie>],
+) -> HashMap<Mode, KeyTrie> {
+    let mut keys = match engine {
+        helix_view::editor::EditingEngineConfig::Helix => default(),
+        helix_view::editor::EditingEngineConfig::Vim => vim(),
+    };
+    for delta in user_keys {
+        merge_keys(&mut keys, delta.clone());
+    }
+    keys
+}
+
 pub fn merge_keys(dst: &mut HashMap<Mode, KeyTrie>, mut delta: HashMap<Mode, KeyTrie>) {
     for (mode, keys) in dst {
         keys.merge_nodes(

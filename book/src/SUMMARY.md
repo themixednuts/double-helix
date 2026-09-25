@@ -13,6 +13,7 @@
   - [Pickers](./pickers.md)
   - [Jumplist](./jumplist.md)
   - [Keymap](./keymap.md)
+  - [Vim engine](./vim-engine.md)
   - [Command line](./command-line.md)
   - [Commands](./commands.md)
   - [Package Manager](./package-manager.md)

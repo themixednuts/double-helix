@@ -74,7 +74,7 @@
 | `rainbow-brackets` | Whether to render rainbow colors for matching brackets. Requires tree-sitter `rainbows.scm` queries for the language. | `false` |
 | `kitty-keyboard-protocol` | Whether to enable Kitty Keyboard Protocol. Can be `enabled`, `disabled` or `auto` | `"auto"` |
 | `fold-on-open` | Whether to collapse available LSP folding ranges when a document opens | `false` |
-| `editing-engine` | Modal editing model: `helix` (select, then act) or `vim` (operator, then motion). `vim` is experimental: it runs on the Helix keymap and has no visual modes or linewise motions yet | `"helix"` |
+| `editing-engine` | Modal editing model: `helix` (select, then act) or `vim` (operator, then motion, with Vim's keymap; see [Vim engine](./vim-engine.md)) | `"helix"` |
 
 [^3]: In most cases, you also need to enable the `auto-format` setting under `languages.toml`. You can find the reasoning [here](https://github.com/helix-editor/helix/discussions/9043#discussioncomment-7811497).
 

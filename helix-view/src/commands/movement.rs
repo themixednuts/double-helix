@@ -939,6 +939,7 @@ fn goto_para_impl<F>(
     doc_id: DocumentId,
     count: usize,
     move_fn: F,
+    movement: Movement,
 ) where
     F: Fn(RopeSlice, &TextAnnotations, Range, usize, Movement) -> Range
         + Copy
@@ -946,7 +947,6 @@ fn goto_para_impl<F>(
         + Sync
         + 'static,
 {
-    let movement = movement_from_mode(editor);
     editor.apply_motion_in(view_id, doc_id, move |ed: &mut Editor, view_id, doc_id| {
         ed.with_view_doc_mut(view_id, doc_id, |view, doc| {
             goto_paragraph_in(view, doc, count, move_fn, movement);
@@ -955,11 +955,57 @@ fn goto_para_impl<F>(
 }
 
 pub fn goto_prev_paragraph(editor: &mut Editor, view_id: ViewId, doc_id: DocumentId, count: usize) {
-    goto_para_impl(editor, view_id, doc_id, count, move_prev_paragraph);
+    let movement = movement_from_mode(editor);
+    goto_para_impl(
+        editor,
+        view_id,
+        doc_id,
+        count,
+        move_prev_paragraph,
+        movement,
+    );
 }
 
 pub fn goto_next_paragraph(editor: &mut Editor, view_id: ViewId, doc_id: DocumentId, count: usize) {
-    goto_para_impl(editor, view_id, doc_id, count, move_next_paragraph);
+    let movement = movement_from_mode(editor);
+    goto_para_impl(
+        editor,
+        view_id,
+        doc_id,
+        count,
+        move_next_paragraph,
+        movement,
+    );
+}
+
+/// [`goto_next_paragraph`] / [`goto_prev_paragraph`] with an explicit movement, for modal
+/// engines that extend (operator-pending `d}`) outside select mode.
+pub fn goto_paragraph_with(
+    editor: &mut Editor,
+    view_id: ViewId,
+    doc_id: DocumentId,
+    count: usize,
+    direction: Direction,
+    movement: Movement,
+) {
+    match direction {
+        Direction::Forward => goto_para_impl(
+            editor,
+            view_id,
+            doc_id,
+            count,
+            move_next_paragraph,
+            movement,
+        ),
+        Direction::Backward => goto_para_impl(
+            editor,
+            view_id,
+            doc_id,
+            count,
+            move_prev_paragraph,
+            movement,
+        ),
+    }
 }
 
 // --- Goto file start/end ---
@@ -1538,7 +1584,22 @@ pub fn scroll_in<V, D>(
 // ─── Tree-sitter object navigation ──────────────────────────────────
 
 /// Navigate to the next/previous tree-sitter object (function, class, parameter, comment).
+/// Move to the next or previous tree-sitter `object` (`]f`, `[c`, ...); `A-.` repeats it.
 pub fn goto_ts_object(
+    editor: &mut Editor,
+    view_id: ViewId,
+    doc_id: DocumentId,
+    object: &str,
+    direction: Direction,
+    count: usize,
+) {
+    let object = object.to_owned();
+    editor.apply_motion_in(view_id, doc_id, move |editor, view_id, doc_id| {
+        goto_ts_object_once(editor, view_id, doc_id, &object, direction, count)
+    });
+}
+
+fn goto_ts_object_once(
     editor: &mut Editor,
     view_id: ViewId,
     doc_id: DocumentId,

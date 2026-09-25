@@ -47,6 +47,13 @@ impl Application {
                 let old_editor_config = self.editor.config();
                 let mut app_config = (*self.config.load().clone()).clone();
                 app_config.editor = *editor_config;
+                // `:set editing-engine` switches keymaps too.
+                if app_config.editor.editing_engine != old_editor_config.editing_engine {
+                    app_config.keys = crate::keymap::for_engine(
+                        app_config.editor.editing_engine,
+                        &app_config.user_keys,
+                    );
+                }
                 if let Err(err) = self.reconfigure_terminal((&app_config.editor).into()) {
                     self.editor.set_error(err.to_string());
                 };

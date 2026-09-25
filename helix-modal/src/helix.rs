@@ -40,6 +40,9 @@ pub struct HelixEngine {
     last_command: Option<CommandToken>,
     /// Set while replaying a recorded entry command, so the replay does not record itself.
     replaying: bool,
+    /// A char-pending command (`find_next_char`) bound straight to a key waits for the next
+    /// key: the command, count and register it runs with.
+    awaiting_char: Option<(CharPendingId, usize, Option<char>)>,
 }
 
 impl HelixEngine {
@@ -53,6 +56,7 @@ impl HelixEngine {
             insert_recording: None,
             last_command: None,
             replaying: false,
+            awaiting_char: None,
         }
     }
 
@@ -246,12 +250,14 @@ impl HelixEngine {
                 EngineResult::Executed
             }
             CommandRef::TextObject(to) => {
+                // `textobject_word` selects inside the word, as documented; the `_around`
+                // commands select around.
                 let obj_fn = (to.make)(count_val);
                 obj_fn(
                     editor,
                     view_id,
                     doc_id,
-                    helix_core::textobject::TextObject::Around,
+                    helix_core::textobject::TextObject::Inside,
                 );
                 EngineResult::Executed
             }
@@ -272,7 +278,10 @@ impl HelixEngine {
                 }
                 EngineResult::Executed
             }
-            CommandRef::CharPending(_) => EngineResult::Unbound,
+            CommandRef::CharPending(cp) => {
+                self.awaiting_char = Some((cp.id, count_val, register));
+                EngineResult::Pending
+            }
         };
         log_run_phase("engine_execute", "helix", execute_start.elapsed(), || {
             format!(
@@ -316,8 +325,11 @@ impl HelixEngine {
 
         match (cp.resolve)(key, count) {
             CharPendingResolution::Motion(motion) => {
+                // Recorded, so `A-.` repeats `f`/`t` motions.
                 let movement = movement_from_mode(editor);
-                motion(editor, view_id, doc_id, movement);
+                editor.apply_motion_in(view_id, doc_id, move |editor, view_id, doc_id| {
+                    motion(editor, view_id, doc_id, movement)
+                });
             }
             CharPendingResolution::Action(action) => {
                 action(editor, view_id, doc_id, register);
@@ -337,6 +349,14 @@ impl EditingEngine for HelixEngine {
         key: KeyEvent,
     ) -> Option<EngineResult> {
         let start = std::time::Instant::now();
+        if let Some((command, count, register)) = self.awaiting_char.take() {
+            if key.code == helix_view::keyboard::KeyCode::Esc {
+                return Some(EngineResult::Executed);
+            }
+            return Some(
+                self.execute_char_pending(editor, view_id, doc_id, command, key, count, register),
+            );
+        }
         let result = match editor.mode() {
             Mode::Insert => None, // insert mode has no pre-resolve logic
             Mode::Normal | Mode::Select => {
@@ -404,12 +424,13 @@ impl EditingEngine for HelixEngine {
     }
 
     fn is_pending(&self) -> bool {
-        false
+        self.awaiting_char.is_some()
     }
 
     fn reset(&mut self) {
         self.count = None;
         self.register = None;
+        self.awaiting_char = None;
         self.pending_display_buf.clear();
     }
 
@@ -521,6 +542,7 @@ impl EditingEngine for HelixEngine {
                 motion_count,
                 operator_count,
                 register,
+                ..
             } => {
                 let total = if count.get() > 1 {
                     count.get()
@@ -537,17 +559,14 @@ impl EditingEngine for HelixEngine {
                             motion_fn(editor, view_id, doc_id, Movement::Extend);
                         }
                     }
-                    OperatorTargetId::TextObject(text_object) => {
+                    OperatorTargetId::TextObject(text_object, kind) => {
                         if let Some(to) = self.registry.text_object(text_object) {
                             let obj_fn = (to.make)(total);
-                            obj_fn(
-                                editor,
-                                view_id,
-                                doc_id,
-                                helix_core::textobject::TextObject::Around,
-                            );
+                            obj_fn(editor, view_id, doc_id, kind);
                         }
                     }
+                    // Only the Vim engine records these.
+                    OperatorTargetId::Object(..) => {}
                     OperatorTargetId::CharPending(command, key) => {
                         if let Some(cp) = self.registry.char_pending(command) {
                             if let CharPendingResolution::Motion(motion) = (cp.resolve)(key, total)

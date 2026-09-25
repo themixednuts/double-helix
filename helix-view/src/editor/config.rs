@@ -1277,8 +1277,8 @@ pub enum LineNumber {
 pub enum EditingEngineConfig {
     #[default]
     Helix,
-    /// Experimental: Vim-style operator-pending editing on the Helix keymap. There is no Vim
-    /// keymap yet, visual modes are not wired up, and linewise motions are missing.
+    /// Vim-style editing: operators wait for a motion or text object, with Vim's keymap and
+    /// visual modes.
     Vim,
 }
 

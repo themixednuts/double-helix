@@ -96,8 +96,8 @@ pub fn for_each_changed_file(
 /// gix's discovery re-derives trust from `.git` ownership, so a malicious `.git/config` in a
 /// directory the user owns would open as `Trust::Full` whatever workspace trust says. Discovery
 /// and opening are split instead: find the repository, then open it with the trust level forced.
-/// Under `Trust::Reduced` gix ignores the repository's own config for things that run programs,
-/// like `filter.*` clean/smudge drivers.
+/// An untrusted repository's own config is never read, so its `filter.*` clean/smudge drivers
+/// and other configured programs don't run, even where `safe.directory` would trust it.
 pub(crate) fn open_repo(path: &Path, trust_full: bool) -> Result<ThreadSafeRepository> {
     let trust = if trust_full {
         gix::sec::Trust::Full
@@ -128,12 +128,20 @@ pub(crate) fn open_repo(path: &Path, trust_full: bool) -> Result<ThreadSafeRepos
         .context("failed to discover git repo")?;
     let (git_dir, _work_dir) = repo_path.into_repository_and_work_tree_directories();
 
-    let options = gix::open::Options::default()
+    let mut options = gix::open::Options::default()
         .permissions(permissions)
         // `git_dir` is the discovered `.git` (or linked worktree) directory: open it as is
         // instead of letting gix append `.git` again.
         .open_path_as_is(true)
         .with(trust);
+    if !trust_full {
+        // gix lifts a reduced trust back to full when `safe.directory` covers the repository
+        // (CI runners set it to `*`). The editor's decision stands: never read the
+        // repository's own config, where filter drivers and other programs are configured.
+        options = options.filter_config_section(|meta| {
+            meta.source.kind() != gix::config::source::Kind::Repository
+        });
+    }
     Ok(ThreadSafeRepository::open_opts(git_dir, options)?)
 }
 

@@ -2196,23 +2196,12 @@ fn detect_native_manager_with_paths(
     })
 }
 
+/// `which`, not a hand-rolled probe: Node, Python and friends ship an
+/// extensionless shell script next to the `.cmd` launcher on Windows, and
+/// running that script fails with "not a valid Win32 application".
 fn which_in_paths(name: &str, paths: Option<OsString>) -> Option<PathBuf> {
-    let paths = paths?;
-    std::env::split_paths(&paths).find_map(|dir| {
-        let path = dir.join(name);
-        if path.exists() {
-            return Some(path);
-        }
-        if cfg!(windows) {
-            for ext in ["exe", "cmd", "bat"] {
-                let path = dir.join(format!("{name}.{ext}"));
-                if path.exists() {
-                    return Some(path);
-                }
-            }
-        }
-        None
-    })
+    let cwd = std::env::current_dir().ok()?;
+    which::which_in(name, paths, cwd).ok()
 }
 
 fn system_binary(name: &str) -> Result<PathBuf> {

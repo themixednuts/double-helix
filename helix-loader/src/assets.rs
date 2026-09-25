@@ -795,14 +795,12 @@ mod search_path {
     /// executable extension) the name with each PATHEXT extension appended.
     pub(super) fn find(directories: &[Directory], command: &str) -> Option<PathBuf> {
         let extensions = path_extensions();
-        let executable = Path::new(command)
-            .extension()
-            .and_then(OsStr::to_str)
-            .is_some_and(|ext| {
-                extensions
-                    .iter()
-                    .any(|candidate| candidate[1..].eq_ignore_ascii_case(ext))
-            });
+        let extension = Path::new(command).extension().and_then(OsStr::to_str);
+        let executable = extension.is_some_and(|ext| {
+            extensions
+                .iter()
+                .any(|candidate| candidate[1..].eq_ignore_ascii_case(ext))
+        });
         let command = command.to_lowercase();
         let mut candidates = vec![command.clone()];
         if !executable {
@@ -810,12 +808,24 @@ mod search_path {
         }
 
         directories.iter().find_map(|directory| {
-            candidates.iter().find_map(|candidate| {
+            candidates.iter().enumerate().find_map(|(index, candidate)| {
                 let name = directory.files.get(candidate)?;
                 let path = directory.path.join(name);
-                path.is_file().then_some(path)
+                // Like `which`, an extensionless name only counts if it is an
+                // executable image: npm and pip leave shell scripts of that
+                // name beside the `.cmd` launchers, and those can't be run.
+                let bare = index == 0 && extension.is_none();
+                (path.is_file() && (!bare || is_executable_image(&path))).then_some(path)
             })
         })
+    }
+
+    fn is_executable_image(path: &Path) -> bool {
+        use std::io::Read;
+        let mut magic = [0; 2];
+        std::fs::File::open(path)
+            .and_then(|mut file| file.read_exact(&mut magic))
+            .is_ok_and(|()| &magic == b"MZ")
     }
 
     fn path_extensions() -> Vec<String> {
@@ -1449,7 +1459,12 @@ mod tests {
             .with_search_path(Some(std::env::join_paths([&first, &second]).unwrap()));
         let resolver = snapshot.command_resolver();
 
-        for command in ["tool", "other", "missing"] {
+        // npm-style install: an extensionless shell script beside the launcher.
+        fs::write(first.join("shim"), b"#!/bin/sh\n").unwrap();
+        fs::write(first.join(executable_name("shim")), b"launcher").unwrap();
+        make_executable(&first.join(executable_name("shim")));
+
+        for command in ["tool", "other", "shim", "missing"] {
             let batch = resolver.resolve(command).unwrap().map(|launch| launch.program);
             let single = snapshot
                 .resolve_command(command)
@@ -1459,6 +1474,8 @@ mod tests {
         }
         let tool = resolver.resolve("tool").unwrap().expect("tool on the path");
         assert!(tool.program.starts_with(&first));
+        let shim = resolver.resolve("shim").unwrap().expect("launcher on the path");
+        assert!(shim.program.ends_with(executable_name("shim")));
         if cfg!(windows) {
             let upper = resolver.resolve("TOOL").unwrap().expect("case-insensitive");
             assert_eq!(upper.program, tool.program);

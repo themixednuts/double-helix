@@ -1276,6 +1276,12 @@ impl SymbolKind {
 }
 }
 
+impl SymbolKind {
+    pub fn all() -> Vec<Self> {
+        (1..=26).map(Self).collect()
+    }
+}
+
 /// Specific capabilities for the `SymbolKind` in the `workspace/symbol` request.
 #[derive(Debug, Eq, PartialEq, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]

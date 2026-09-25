@@ -108,6 +108,7 @@ pub struct DocumentDiagnosticParams {
     pub identifier: Option<Arc<str>>,
 
     /// The result ID of a previous response if provided.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub previous_result_id: Option<String>,
 
     #[serde(flatten)]
@@ -288,5 +289,26 @@ impl Default for DiagnosticServerCancellationData {
         DiagnosticServerCancellationData {
             retrigger_request: true,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_previous_result_id_is_omitted() {
+        let params = DocumentDiagnosticParams {
+            text_document: TextDocumentIdentifier {
+                uri: Url::parse("file:///main.rs").unwrap(),
+            },
+            identifier: None,
+            previous_result_id: None,
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        };
+
+        let json = serde_json::to_value(&params).unwrap();
+        assert!(json.get("previousResultId").is_none());
     }
 }

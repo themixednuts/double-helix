@@ -1056,6 +1056,9 @@ impl Client {
                     apply_edit: Some(true),
                     symbol: Some(lsp::WorkspaceSymbolClientCapabilities {
                         dynamic_registration: Some(false),
+                        symbol_kind: Some(lsp::SymbolKindCapability {
+                            value_set: Some(lsp::SymbolKind::all()),
+                        }),
                         ..Default::default()
                     }),
                     execute_command: Some(lsp::DynamicRegistrationClientCapabilities {
@@ -1228,6 +1231,14 @@ impl Client {
                     }),
                     call_hierarchy: Some(lsp::CallHierarchyClientCapabilities {
                         dynamic_registration: Some(false),
+                    }),
+                    document_symbol: Some(lsp::DocumentSymbolClientCapabilities {
+                        dynamic_registration: Some(false),
+                        symbol_kind: Some(lsp::SymbolKindCapability {
+                            value_set: Some(lsp::SymbolKind::all()),
+                        }),
+                        hierarchical_document_symbol_support: Some(false),
+                        ..Default::default()
                     }),
                     type_hierarchy: Some(lsp::TypeHierarchyClientCapabilities {
                         dynamic_registration: Some(false),

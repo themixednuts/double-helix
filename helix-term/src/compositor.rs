@@ -895,6 +895,13 @@ impl Compositor {
         self.layers.len()
     }
 
+    /// Whether a floating layer (picker, prompt, popup, ...) is open over the editor.
+    pub fn has_overlay(&self) -> bool {
+        self.layers
+            .iter()
+            .any(|layer| layer.layout_role() == LayoutRole::Overlay)
+    }
+
     pub fn remove(&mut self, id: &'static str) -> Option<Box<dyn Component>> {
         self.remove_by_id(id)
     }

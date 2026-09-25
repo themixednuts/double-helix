@@ -550,7 +550,7 @@ fn content_location(block: &acp::ContentBlock) -> Option<crate::collab::Location
         },
         _ => return None,
     };
-    let url = url::Url::parse(uri).ok()?;
+    let url = helix_stdx::Url::parse(uri).ok()?;
     let uri = Uri::try_from(url).ok()?;
     Some(crate::collab::Location::new(
         uri.as_path()?.to_path_buf(),
@@ -736,7 +736,7 @@ mod tests {
     #[test]
     fn collects_locations_from_resource_updates() {
         let path = helix_stdx::path::normalize(std::env::temp_dir().join("example.js"));
-        let uri = url::Url::from_file_path(&path).unwrap().to_string();
+        let uri = helix_stdx::Url::from_file_path(&path).unwrap().to_string();
         let update = acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(
             "tool-1",
             acp::ToolCallUpdateFields::new().content(vec![acp::ToolCallContent::from(
@@ -753,7 +753,7 @@ mod tests {
     #[test]
     fn thread_event_keeps_chunk_locations() {
         let path = helix_stdx::path::normalize(std::env::temp_dir().join("example.ts"));
-        let uri = url::Url::from_file_path(&path).unwrap().to_string();
+        let uri = helix_stdx::Url::from_file_path(&path).unwrap().to_string();
         let update = acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
             acp::ContentBlock::Resource(acp::EmbeddedResource::new(
                 acp::EmbeddedResourceResource::TextResourceContents(

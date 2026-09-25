@@ -42,8 +42,9 @@ const FORCE_SHUTDOWN_REPLY_WAIT: std::time::Duration = std::time::Duration::from
 fn workspace_for_uri(uri: lsp::Url) -> WorkspaceFolder {
     lsp::WorkspaceFolder {
         name: uri
-            .path_segments()
-            .and_then(|mut segments| segments.next_back())
+            .path()
+            .rsplit('/')
+            .find(|segment| !segment.is_empty())
             .map(|basename| basename.to_string())
             .unwrap_or_default(),
         uri,

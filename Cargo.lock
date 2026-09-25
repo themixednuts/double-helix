@@ -2732,7 +2732,6 @@ dependencies = [
  "unicode-general-category",
  "unicode-segmentation",
  "unicode-width",
- "url",
 ]
 
 [[package]]
@@ -2831,9 +2830,9 @@ name = "helix-lsp-types"
 version = "0.95.1"
 dependencies = [
  "bitflags 2.13.1",
+ "helix-stdx",
  "serde",
  "serde_json",
- "url",
 ]
 
 [[package]]
@@ -2936,6 +2935,7 @@ dependencies = [
  "getrandom 0.3.4",
  "globset",
  "helix-ipc",
+ "helix-stdx",
  "helix-workspace",
  "ignore",
  "log",
@@ -2975,10 +2975,13 @@ dependencies = [
  "dunce",
  "etcetera",
  "once_cell",
+ "percent-encoding",
  "regex-automata",
  "regex-cursor",
  "ropey",
  "rustix",
+ "serde",
+ "serde_json",
  "tempfile",
  "unicode-segmentation",
  "which",
@@ -6355,7 +6358,6 @@ dependencies = [
  "idna",
  "percent-encoding",
  "serde",
- "serde_derive",
 ]
 
 [[package]]

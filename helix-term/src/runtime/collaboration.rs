@@ -131,9 +131,9 @@ impl HostedProject {
         })
     }
 
-    fn host_root_url(&self) -> Option<url::Url> {
+    fn host_root_url(&self) -> Option<helix_stdx::Url> {
         match &self.workspace {
-            HostedWorkspace::Local(root) => url::Url::from_directory_path(root).ok(),
+            HostedWorkspace::Local(root) => helix_stdx::Url::from_directory_path(root).ok(),
             HostedWorkspace::Remote {
                 root,
                 path_separator,
@@ -146,13 +146,13 @@ impl HostedProject {
         }
     }
 
-    fn host_file_url(&self, path: &helix_workspace::WorkspacePath) -> Option<url::Url> {
+    fn host_file_url(&self, path: &helix_workspace::WorkspacePath) -> Option<helix_stdx::Url> {
         if path.is_root() {
             return self.host_root_url();
         }
         match &self.workspace {
             HostedWorkspace::Local(root) => {
-                url::Url::from_file_path(root.join(path.to_path_buf())).ok()
+                helix_stdx::Url::from_file_path(root.join(path.to_path_buf())).ok()
             }
             HostedWorkspace::Remote {
                 root,
@@ -164,7 +164,7 @@ impl HostedProject {
 
     fn workspace_path_from_file_url(
         &self,
-        url: &url::Url,
+        url: &helix_stdx::Url,
     ) -> Option<helix_workspace::WorkspacePath> {
         if url.scheme() != "file" {
             return None;
@@ -190,7 +190,7 @@ impl HostedProject {
 
     pub fn workspace_path_from_language_server_url(
         &self,
-        url: &url::Url,
+        url: &helix_stdx::Url,
     ) -> Option<helix_workspace::WorkspacePath> {
         self.workspace_path_from_file_url(url)
     }
@@ -386,7 +386,7 @@ fn rewrite_json_strings(
 fn rewrite_language_server_request_uri(
     project: helix_collab::ProjectId,
     string: &str,
-    host_file_url: impl FnOnce(&helix_workspace::WorkspacePath) -> Option<url::Url>,
+    host_file_url: impl FnOnce(&helix_workspace::WorkspacePath) -> Option<helix_stdx::Url>,
 ) -> Result<Option<String>, String> {
     let url = match url::Url::parse(string) {
         Ok(url) => url,
@@ -415,9 +415,9 @@ fn rewrite_language_server_request_uri(
 fn rewrite_language_server_response_uri(
     project: helix_collab::ProjectId,
     string: &str,
-    workspace_path: impl FnOnce(&url::Url) -> Option<helix_workspace::WorkspacePath>,
+    workspace_path: impl FnOnce(&helix_stdx::Url) -> Option<helix_workspace::WorkspacePath>,
 ) -> Result<Option<String>, String> {
-    let Ok(url) = url::Url::parse(string) else {
+    let Ok(url) = helix_stdx::Url::parse(string) else {
         return Ok(None);
     };
     if url.scheme() != "file" {
@@ -563,7 +563,7 @@ mod tests {
         let other = helix_collab::ProjectId::from_bytes([2; 16]);
         let path = helix_workspace::WorkspacePath::from_slash_path("src/main.rs").unwrap();
         let collaboration_uri = helix_collab::uri::document_url(project, &path);
-        let host_uri = url::Url::parse("file:///workspace/src/main.rs").unwrap();
+        let host_uri = helix_stdx::Url::parse("file:///workspace/src/main.rs").unwrap();
 
         assert_eq!(
             rewrite_language_server_request_uri(project, collaboration_uri.as_str(), |_| Some(

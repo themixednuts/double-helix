@@ -633,7 +633,7 @@ impl Application {
                 .name()
                 .to_owned();
             Some(CollaborationDiagnosticsPublication {
-                uri: hosted.collaboration_document_url(&path),
+                uri: lsp::Url::parse(hosted.collaboration_document_url(&path).as_str()).ok()?,
                 hosted,
                 path,
                 server,

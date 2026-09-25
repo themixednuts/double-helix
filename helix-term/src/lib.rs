@@ -38,7 +38,7 @@ mod handlers;
 #[cfg(test)]
 pub(crate) mod test_support;
 
-use url::Url;
+use helix_stdx::Url;
 
 #[cfg(windows)]
 fn true_color() -> bool {

@@ -187,7 +187,7 @@ fn context_part(item: context::Kind) -> Part {
 
 /// A `file://` URI for `path`: percent-escaped, and `file:///C:/...` on Windows.
 fn file_uri(path: &std::path::Path) -> String {
-    url::Url::from_file_path(path)
-        .map(String::from)
+    helix_stdx::Url::from_file_path(path)
+        .map(|url| url.to_string())
         .unwrap_or_else(|()| format!("file://{}", path.display()))
 }

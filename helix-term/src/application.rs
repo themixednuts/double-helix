@@ -2589,6 +2589,10 @@ impl Application {
                     ) {
                         self.editor.set_error(format!("Async task failed: {}", err));
                     }
+                    crate::runtime::schedule_chained_exit_tasks(
+                        &mut self.exit.tasks,
+                        &self.exit.work,
+                    );
                     self.invalidate(FRAME_EXIT_TASK);
                 }
             }

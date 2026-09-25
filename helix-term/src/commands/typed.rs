@@ -133,6 +133,7 @@ fn exit(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow:
             WriteOptions {
                 policy: SavePolicy::Safe,
                 auto_format: !args.has_flag(WRITE_NO_FORMAT_FLAG.name),
+                code_actions: !args.has_flag(WRITE_NO_CODE_ACTIONS_FLAG.name),
             },
         )?);
     }
@@ -153,6 +154,7 @@ fn force_exit(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> a
             WriteOptions {
                 policy: SavePolicy::Overwrite,
                 auto_format: !args.has_flag(WRITE_NO_FORMAT_FLAG.name),
+                code_actions: !args.has_flag(WRITE_NO_CODE_ACTIONS_FLAG.name),
             },
         )?);
     }
@@ -529,6 +531,29 @@ fn write_impl(
         bail!("Can't save with no path set!");
     }
 
+    // Code actions on save run first, then format and write, as one chain of exit tasks.
+    {
+        let (view_id, doc) = focused_ref!(cx.editor);
+        let doc_id = doc.id();
+        let kinds = if options.code_actions {
+            crate::effect::code_actions_on_save::kinds_for(cx.editor, doc_id)
+        } else {
+            Default::default()
+        };
+        if !kinds.is_empty() {
+            let finish = crate::runtime::OnSaveFinish {
+                view_id,
+                path,
+                policy: options.policy,
+                auto_format: config.auto_format && options.auto_format,
+            };
+            let step =
+                crate::effect::code_actions_on_save::next_step(cx.editor, doc_id, kinds, finish);
+            cx.exit_task_event(step);
+            return Ok(doc_id);
+        }
+    }
+
     let (format_task, doc_id) = {
         let (view_id, doc) = focused_ref!(cx.editor);
         let format_task = if config.auto_format && options.auto_format {
@@ -622,6 +647,8 @@ fn insert_final_newline(doc: &mut Document, view_id: ViewId) {
 pub struct WriteOptions {
     pub policy: SavePolicy,
     pub auto_format: bool,
+    /// Run the language's `code-actions-on-save` first.
+    pub code_actions: bool,
 }
 
 fn write(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow::Result<()> {
@@ -635,6 +662,7 @@ fn write(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow
         WriteOptions {
             policy: SavePolicy::Safe,
             auto_format: !args.has_flag(WRITE_NO_FORMAT_FLAG.name),
+            code_actions: !args.has_flag(WRITE_NO_CODE_ACTIONS_FLAG.name),
         },
     )
     .map(|_| ())
@@ -651,6 +679,7 @@ fn force_write(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> 
         WriteOptions {
             policy: SavePolicy::Overwrite,
             auto_format: !args.has_flag(WRITE_NO_FORMAT_FLAG.name),
+            code_actions: !args.has_flag(WRITE_NO_CODE_ACTIONS_FLAG.name),
         },
     )
     .map(|_| ())
@@ -671,6 +700,7 @@ fn write_buffer_close(
         WriteOptions {
             policy: SavePolicy::Safe,
             auto_format: !args.has_flag(WRITE_NO_FORMAT_FLAG.name),
+            code_actions: !args.has_flag(WRITE_NO_CODE_ACTIONS_FLAG.name),
         },
     )?;
 
@@ -693,6 +723,7 @@ fn force_write_buffer_close(
         WriteOptions {
             policy: SavePolicy::Overwrite,
             auto_format: !args.has_flag(WRITE_NO_FORMAT_FLAG.name),
+            code_actions: !args.has_flag(WRITE_NO_CODE_ACTIONS_FLAG.name),
         },
     )?;
 
@@ -937,6 +968,7 @@ fn write_quit(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> a
         WriteOptions {
             policy: SavePolicy::Safe,
             auto_format: !args.has_flag(WRITE_NO_FORMAT_FLAG.name),
+            code_actions: !args.has_flag(WRITE_NO_CODE_ACTIONS_FLAG.name),
         },
     )?;
     queue_close_view(cx, &[saved], true);
@@ -958,6 +990,7 @@ fn force_write_quit(
         WriteOptions {
             policy: SavePolicy::Overwrite,
             auto_format: !args.has_flag(WRITE_NO_FORMAT_FLAG.name),
+            code_actions: !args.has_flag(WRITE_NO_CODE_ACTIONS_FLAG.name),
         },
     )?;
     queue_close_view(cx, &[saved], false);
@@ -1002,6 +1035,8 @@ pub struct WriteAllOptions {
     pub policy: SavePolicy,
     pub write_scratch: bool,
     pub auto_format: bool,
+    /// Run each language's `code-actions-on-save` first.
+    pub code_actions: bool,
 }
 
 pub fn write_all_impl(
@@ -1067,6 +1102,33 @@ pub fn write_all_editor_impl(
         // Save an undo checkpoint for any outstanding changes.
         doc.append_changes_to_history(view);
 
+        // Code actions on save run first, then format and write, as one chain of exit tasks.
+        let kinds = if options.code_actions {
+            crate::effect::code_actions_on_save::kinds_for(editor, doc_id)
+        } else {
+            Default::default()
+        };
+        if !kinds.is_empty() {
+            let finish = crate::runtime::OnSaveFinish {
+                view_id: target_view,
+                path: None,
+                policy: options.policy,
+                auto_format: options.auto_format && config.auto_format,
+            };
+            let step =
+                crate::effect::code_actions_on_save::next_step(editor, doc_id, kinds, finish);
+            crate::runtime::schedule_exit_task(
+                exit_tasks
+                    .as_deref_mut()
+                    .expect("write_all_editor_impl requires exit_tasks for code-actions-on-save"),
+                exit_task_work.expect(
+                    "write_all_editor_impl requires exit_task_work for code-actions-on-save",
+                ),
+                step,
+            );
+            continue;
+        }
+
         let fmt = if options.auto_format && config.auto_format {
             let doc = doc!(editor, &doc_id);
             doc.auto_format(editor).map(|fmt| {
@@ -1118,6 +1180,7 @@ fn write_all(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> an
             policy: SavePolicy::Safe,
             write_scratch: true,
             auto_format: !args.has_flag(WRITE_NO_FORMAT_FLAG.name),
+            code_actions: !args.has_flag(WRITE_NO_CODE_ACTIONS_FLAG.name),
         },
     )
     .map(|_| ())
@@ -1138,6 +1201,7 @@ fn force_write_all(
             policy: SavePolicy::Overwrite,
             write_scratch: true,
             auto_format: !args.has_flag(WRITE_NO_FORMAT_FLAG.name),
+            code_actions: !args.has_flag(WRITE_NO_CODE_ACTIONS_FLAG.name),
         },
     )
     .map(|_| ())
@@ -1157,6 +1221,7 @@ fn write_all_quit(
             policy: SavePolicy::Safe,
             write_scratch: true,
             auto_format: !args.has_flag(WRITE_NO_FORMAT_FLAG.name),
+            code_actions: !args.has_flag(WRITE_NO_CODE_ACTIONS_FLAG.name),
         },
     )?;
     quit_all_impl(cx, QuitPolicy::CheckBuffers, &saved)
@@ -1176,6 +1241,7 @@ fn force_write_all_quit(
             policy: SavePolicy::Overwrite,
             write_scratch: true,
             auto_format: !args.has_flag(WRITE_NO_FORMAT_FLAG.name),
+            code_actions: !args.has_flag(WRITE_NO_CODE_ACTIONS_FLAG.name),
         },
     )?;
     quit_all_impl(cx, QuitPolicy::DiscardBuffers, &saved)
@@ -1774,6 +1840,7 @@ fn update(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyho
             WriteOptions {
                 policy: SavePolicy::Safe,
                 auto_format: !args.has_flag(WRITE_NO_FORMAT_FLAG.name),
+                code_actions: !args.has_flag(WRITE_NO_CODE_ACTIONS_FLAG.name),
             },
         )
         .map(|_| ())
@@ -3927,6 +3994,12 @@ const WRITE_NO_FORMAT_FLAG: Flag = Flag {
     ..Flag::DEFAULT
 };
 
+const WRITE_NO_CODE_ACTIONS_FLAG: Flag = Flag {
+    name: "no-code-actions",
+    doc: "skip the language's code-actions-on-save",
+    ..Flag::DEFAULT
+};
+
 fn notifications_history(
     cx: &mut compositor::Context,
     _args: Args,
@@ -4585,7 +4658,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         completer: CommandCompleter::positional(&[completers::filename]),
         signature: Signature {
             positionals: (0, Some(1)),
-            flags: &[WRITE_NO_FORMAT_FLAG],
+            flags: &[WRITE_NO_FORMAT_FLAG, WRITE_NO_CODE_ACTIONS_FLAG],
             ..Signature::DEFAULT
         },
     },
@@ -4597,7 +4670,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         completer: CommandCompleter::positional(&[completers::filename]),
         signature: Signature {
             positionals: (0, Some(1)),
-            flags: &[WRITE_NO_FORMAT_FLAG],
+            flags: &[WRITE_NO_FORMAT_FLAG, WRITE_NO_CODE_ACTIONS_FLAG],
             ..Signature::DEFAULT
         },
     },
@@ -4779,7 +4852,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         completer: CommandCompleter::positional(&[completers::filename]),
         signature: Signature {
             positionals: (0, Some(1)),
-            flags: &[WRITE_NO_FORMAT_FLAG],
+            flags: &[WRITE_NO_FORMAT_FLAG, WRITE_NO_CODE_ACTIONS_FLAG],
             ..Signature::DEFAULT
         },
     },
@@ -4791,7 +4864,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         completer: CommandCompleter::positional(&[completers::filename]),
         signature: Signature {
             positionals: (0, Some(1)),
-            flags: &[WRITE_NO_FORMAT_FLAG],
+            flags: &[WRITE_NO_FORMAT_FLAG, WRITE_NO_CODE_ACTIONS_FLAG],
             ..Signature::DEFAULT
         },
     },
@@ -4803,7 +4876,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         completer: CommandCompleter::positional(&[completers::filename]),
         signature: Signature {
             positionals: (0, Some(1)),
-            flags: &[WRITE_NO_FORMAT_FLAG],
+            flags: &[WRITE_NO_FORMAT_FLAG, WRITE_NO_CODE_ACTIONS_FLAG],
             ..Signature::DEFAULT
         },
     },
@@ -4815,7 +4888,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         completer: CommandCompleter::positional(&[completers::filename]),
         signature: Signature {
             positionals: (0, Some(1)),
-            flags: &[WRITE_NO_FORMAT_FLAG],
+            flags: &[WRITE_NO_FORMAT_FLAG, WRITE_NO_CODE_ACTIONS_FLAG],
             ..Signature::DEFAULT
         },
     },
@@ -4896,7 +4969,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         completer: CommandCompleter::positional(&[completers::filename]),
         signature: Signature {
             positionals: (0, Some(1)),
-            flags: &[WRITE_NO_FORMAT_FLAG],
+            flags: &[WRITE_NO_FORMAT_FLAG, WRITE_NO_CODE_ACTIONS_FLAG],
             ..Signature::DEFAULT
         },
     },
@@ -4908,7 +4981,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         completer: CommandCompleter::positional(&[completers::filename]),
         signature: Signature {
             positionals: (0, Some(1)),
-            flags: &[WRITE_NO_FORMAT_FLAG],
+            flags: &[WRITE_NO_FORMAT_FLAG, WRITE_NO_CODE_ACTIONS_FLAG],
             ..Signature::DEFAULT
         },
     },
@@ -4920,7 +4993,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         completer: CommandCompleter::none(),
         signature: Signature {
             positionals: (0, Some(0)),
-            flags: &[WRITE_NO_FORMAT_FLAG],
+            flags: &[WRITE_NO_FORMAT_FLAG, WRITE_NO_CODE_ACTIONS_FLAG],
             ..Signature::DEFAULT
         },
     },
@@ -4932,7 +5005,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         completer: CommandCompleter::none(),
         signature: Signature {
             positionals: (0, Some(0)),
-            flags: &[WRITE_NO_FORMAT_FLAG],
+            flags: &[WRITE_NO_FORMAT_FLAG, WRITE_NO_CODE_ACTIONS_FLAG],
             ..Signature::DEFAULT
         },
     },
@@ -4944,7 +5017,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         completer: CommandCompleter::none(),
         signature: Signature {
             positionals: (0, Some(0)),
-            flags: &[WRITE_NO_FORMAT_FLAG],
+            flags: &[WRITE_NO_FORMAT_FLAG, WRITE_NO_CODE_ACTIONS_FLAG],
             ..Signature::DEFAULT
         },
     },
@@ -4956,7 +5029,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         completer: CommandCompleter::none(),
         signature: Signature {
             positionals: (0, Some(0)),
-            flags: &[WRITE_NO_FORMAT_FLAG],
+            flags: &[WRITE_NO_FORMAT_FLAG, WRITE_NO_CODE_ACTIONS_FLAG],
             ..Signature::DEFAULT
         },
     },
@@ -5254,7 +5327,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         completer: CommandCompleter::none(),
         signature: Signature {
             positionals: (0, Some(0)),
-            flags: &[WRITE_NO_FORMAT_FLAG],
+            flags: &[WRITE_NO_FORMAT_FLAG, WRITE_NO_CODE_ACTIONS_FLAG],
             ..Signature::DEFAULT
         },
     },

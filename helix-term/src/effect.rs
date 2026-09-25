@@ -4,6 +4,7 @@
 //! application and compositor drain typed ingress and apply those effects here.
 
 pub(crate) mod assistant;
+pub(crate) mod code_actions_on_save;
 pub(crate) mod dap;
 pub(crate) mod file_operation;
 pub(crate) mod language_server;
@@ -463,6 +464,45 @@ pub(crate) fn apply_runtime_task_event(
         }
         RuntimeTaskEvent::RequestInlineValues { doc_id } => {
             language_server::request_inline_values(editor, doc_id, ingress.clone())
+        }
+        RuntimeTaskEvent::CodeActionsOnSaveResponse {
+            doc_id,
+            version,
+            server_id,
+            offset_encoding,
+            kind,
+            actions,
+            remaining,
+            finish,
+        } => code_actions_on_save::on_response(
+            editor,
+            doc_id,
+            version,
+            server_id,
+            offset_encoding,
+            kind,
+            actions,
+            remaining,
+            finish,
+        ),
+        RuntimeTaskEvent::CodeActionsOnSaveResolved {
+            doc_id,
+            version,
+            offset_encoding,
+            edits,
+            remaining,
+            finish,
+        } => code_actions_on_save::on_resolved(
+            editor,
+            doc_id,
+            version,
+            offset_encoding,
+            edits,
+            remaining,
+            finish,
+        ),
+        RuntimeTaskEvent::CodeActionsOnSaveDone { doc_id, finish } => {
+            code_actions_on_save::on_done(editor, doc_id, finish)
         }
         RuntimeTaskEvent::ApplyCodeActionHint {
             doc_id,
@@ -990,6 +1030,7 @@ fn request_auto_save(editor: &mut Editor) {
         policy: helix_view::editor::SavePolicy::Safe,
         write_scratch: false,
         auto_format: false,
+        code_actions: false,
     };
 
     if let Err(err) = commands::typed::write_all_editor_impl(editor, None, None, options) {

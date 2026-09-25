@@ -1,5 +1,5 @@
 use crate::{
-    compositor::{Component, Compositor, Event, EventResult, RenderContext},
+    compositor::{Component, Compositor, Event, EventResult, PostAction, RenderContext},
     plugin_registry::{PluginPanelKeyRoute, PluginUiCallback},
     runtime::ui::command::PluginCommand,
 };
@@ -38,6 +38,11 @@ impl RoutedPluginPanel {
     fn set_content(&mut self, content: std::sync::Arc<[helix_plugin_api::requests::UiRenderNode]>) {
         self.inner.set_content(content);
     }
+
+    fn release_focus(&mut self, editor: &mut helix_view::Editor) {
+        self.inner.set_focused(false);
+        editor.model.focus_editor();
+    }
 }
 
 impl Component for RoutedPluginPanel {
@@ -48,6 +53,20 @@ impl Component for RoutedPluginPanel {
     ) -> EventResult {
         if Focusable::is_focused(&self.inner) {
             if let (Some(route), Event::Key(key_event)) = (&self.host_key_events, event) {
+                // A focused panel gets every key, except the ways back to the editor: `Esc`
+                // leaves the panel, and window commands (`C-w`) leave it and run.
+                if *key_event == crate::key!(Esc) {
+                    self.release_focus(context.editor);
+                    return EventResult::Consumed(None);
+                }
+                if *key_event == crate::ctrl!('w') {
+                    self.release_focus(context.editor);
+                    return EventResult::Consumed(Some(PostAction::ReplayKeys {
+                        keys: vec![*key_event],
+                        count: 1,
+                        pop_macro_replaying: false,
+                    }));
+                }
                 route.dispatch(format!("{key_event}"));
                 return EventResult::Consumed(None);
             }
@@ -249,16 +268,18 @@ pub(crate) fn apply_plugin_command(
             let target_id = crate::ui::plugin_panel::component_id(panel);
             compositor.remove_by_id(&target_id);
         }
-        PluginCommand::ReleaseResources { plugin, panels } => {
+        PluginCommand::ReleaseResources {
+            plugin: _,
+            float_owner,
+            panels,
+        } => {
             for panel in panels {
                 if let Ok(panel_id) = adapt::resolve_panel(&editor.model, panel) {
                     let _ = editor.model.remove_panel(panel_id);
                 }
                 compositor.remove_by_id(&crate::ui::plugin_panel::component_id(panel));
             }
-            editor
-                .model
-                .remove_floats_by_owner(&plugin.raw().get().to_string());
+            editor.model.remove_floats_by_owner(&float_owner);
         }
         PluginCommand::UpdatePanel {
             panel,

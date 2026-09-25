@@ -41,6 +41,8 @@ pub enum PluginCommand {
     },
     ReleaseResources {
         plugin: helix_plugin_api::PluginId,
+        /// Owner key on the plugin's floats (host and plugin).
+        float_owner: String,
         panels: Vec<helix_plugin_api::PanelHandle>,
     },
     UpdatePanel {

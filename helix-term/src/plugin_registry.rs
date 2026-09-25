@@ -732,6 +732,7 @@ impl PluginUiSender {
 
 pub struct TermResourceHost<'a> {
     sender: PluginUiSender,
+    host: PluginHostId,
     panel_owners: &'a mut HashMap<PanelHandle, PluginId>,
 }
 
@@ -744,6 +745,10 @@ impl PluginResourceHost for TermResourceHost<'_> {
             .collect::<Vec<_>>();
         self.sender.ui(PluginCommand::ReleaseResources {
             plugin,
+            float_owner: helix_plugin_editor::bridge::float_owner_key(
+                Some(&self.host.to_string()),
+                plugin,
+            ),
             panels: panels.clone(),
         })?;
         for panel in &panels {
@@ -1317,6 +1322,11 @@ impl PluginHostState {
             .any(|(published, _)| *published == command)
     }
 
+    /// Identifies this host on the editor resources its plugins own.
+    pub(crate) fn host_key(&self) -> String {
+        self.route.id.to_string()
+    }
+
     pub(crate) fn track_plugin(&self, plugin: PluginId) -> ContractResult<()> {
         self.try_lock()?.plugins.insert(plugin);
         Ok(())
@@ -1403,6 +1413,7 @@ impl PluginHostState {
         let sender = PluginUiSender::Foreground(state.ui.sender.clone());
         let mut resources = TermResourceHost {
             sender: sender.clone(),
+            host: self.route.id,
             panel_owners: &mut state.panel.panel_owners,
         };
         resources.release_plugin_resources(plugin)?;
@@ -1426,6 +1437,7 @@ impl PluginHostState {
         for plugin in plugins {
             let mut resources = TermResourceHost {
                 sender: sender.clone(),
+                host: self.route.id,
                 panel_owners: &mut state.panel.panel_owners,
             };
             if let Err(error) = resources.release_plugin_resources(plugin) {
@@ -2376,6 +2388,7 @@ mod tests {
             RuntimeDelivery::Ui(UiCommand::Plugin(PluginCommand::ReleaseResources {
                 plugin,
                 panels,
+                ..
             })) if plugin == plugin_id() && panels == [panel]
         ));
         assert!(matches!(
@@ -2637,6 +2650,7 @@ mod tests {
         ]);
         let mut host = TermResourceHost {
             sender: PluginUiSender::Foreground(sender.clone()),
+            host: PluginHostId::from_raw(NonZeroU64::new(1).unwrap()),
             panel_owners: &mut owners,
         };
 
@@ -2645,9 +2659,15 @@ mod tests {
         match sender.pop().expect("release resources event") {
             RuntimeDelivery::Ui(UiCommand::Plugin(PluginCommand::ReleaseResources {
                 plugin,
+                float_owner,
                 panels,
             })) => {
                 assert_eq!(plugin, plugin_id());
+                // Floats are owned per host: another host's plugin with the same id keeps its own.
+                assert_eq!(
+                    float_owner,
+                    format!("plugin-host(1)/{}", plugin_id().raw().get())
+                );
                 assert_eq!(panels.len(), 1);
                 assert_eq!(panels[0].raw().get(), 11);
             }

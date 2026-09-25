@@ -31,7 +31,7 @@
 | `file_picker_in_current_buffer_directory` | Open file picker at current buffer's directory |  |
 | `file_picker_in_current_directory` | Open file picker at current working directory | normal: `` <space>F ``, select: `` <space>F `` |
 | `file_explorer` | Open file explorer panel in workspace root | normal: `` <space>e ``, select: `` <space>e `` |
-| `file_explorer_in_current_buffer_directory` | Open file explorer panel at current buffer's directory | normal: `` <space>E ``, select: `` <space>E `` |
+| `file_explorer_in_current_buffer_directory` | Open file explorer panel at current buffer's directory | normal: `` <space>E ``, `` <space>. ``, select: `` <space>E ``, `` <space>. `` |
 | `file_explorer_in_current_directory` | Open file explorer panel at current working directory |  |
 | `code_action` | Perform code action | normal: `` <space>a ``, select: `` <space>a `` |
 | `code_action_picker` | Perform code action in a picker |  |

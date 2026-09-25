@@ -329,6 +329,7 @@ pub enum LanguageServerFeature {
     SelectionRange,
     LinkedEditingRange,
     OnTypeFormatting,
+    CallHierarchy,
 }
 
 impl Display for LanguageServerFeature {
@@ -360,6 +361,7 @@ impl Display for LanguageServerFeature {
             SelectionRange => "selection-range",
             LinkedEditingRange => "linked-editing-range",
             OnTypeFormatting => "on-type-formatting",
+            CallHierarchy => "call-hierarchy",
         };
         write!(f, "{feature}",)
     }

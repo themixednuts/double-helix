@@ -212,6 +212,7 @@ The list of supported features is:
 - `linked-editing-range`
 - `selection-range`
 - `on-type-formatting`
+- `call-hierarchy`
 - `workspace-command`
 - `document-symbols`
 - `workspace-symbols`

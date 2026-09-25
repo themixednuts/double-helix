@@ -713,6 +713,13 @@ impl Client {
             LanguageServerFeature::OnTypeFormatting => {
                 capabilities.document_on_type_formatting_provider.is_some()
             }
+            LanguageServerFeature::CallHierarchy => matches!(
+                capabilities.call_hierarchy_provider,
+                Some(
+                    lsp::CallHierarchyServerCapability::Simple(true)
+                        | lsp::CallHierarchyServerCapability::Options(_)
+                )
+            ),
         }
     }
 

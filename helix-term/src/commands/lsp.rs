@@ -1180,7 +1180,7 @@ pub fn call_hierarchy_outgoing(cx: &mut Context) {
 fn call_hierarchy(cx: &mut Context, direction: LspCallHierarchyDirection) {
     let (view_id, doc) = focused_ref!(cx.editor);
     let mut futures: FuturesOrdered<_> = doc
-        .language_servers()
+        .language_servers_with_feature(LanguageServerFeature::CallHierarchy)
         .filter_map(|language_server| {
             let offset_encoding = language_server.offset_encoding();
             let pos = doc.position(view_id, offset_encoding);

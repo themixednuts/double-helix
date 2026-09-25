@@ -2406,7 +2406,7 @@ pub(super) fn goto_line_number(
 
             let (view_id, doc) = focused!(cx.editor);
             let view = view_mut!(cx.editor, view_id);
-            view.history.jumps.push((doc.id(), last_selection));
+            view.history.push_jump(doc, (doc.id(), last_selection));
         }
 
         // When a user hits backspace and there are no numbers left,

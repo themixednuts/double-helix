@@ -673,9 +673,8 @@ impl Jumpable<Document> for EditRegion {
     fn push_jump(&mut self, doc: &mut Document) {
         let view_id = self.id();
         doc.append_changes_to_history(self);
-        self.history
-            .jumps
-            .push((doc.id(), doc.selection(view_id).clone()));
+        let jump = (doc.id(), doc.selection(view_id).clone());
+        self.history.push_jump(doc, jump);
     }
 }
 

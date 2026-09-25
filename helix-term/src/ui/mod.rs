@@ -171,7 +171,7 @@ pub fn raw_regex_prompt(
 
                                     if event == PromptEvent::Validate {
                                         let view = view_mut!(cx.editor, view_id);
-                                        view.history.jumps.push((doc_id, snapshot.clone()));
+                                        view.history.push_jump(doc, (doc_id, snapshot.clone()));
                                     }
 
                                     fun(cx, regex, input, event);
@@ -256,7 +256,7 @@ pub fn raw_regex_prompt(
                                     if event == PromptEvent::Validate {
                                         // Equivalent to push_jump to store selection just before jump
                                         let view = view_mut!(cx.editor, view_id);
-                                        view.history.jumps.push((doc_id, snapshot.clone()));
+                                        view.history.push_jump(doc, (doc_id, snapshot.clone()));
                                     }
 
                                     fun(cx, regex, input, event);

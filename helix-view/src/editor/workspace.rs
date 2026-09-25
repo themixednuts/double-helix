@@ -101,7 +101,7 @@ impl Editor {
                 } else {
                     let view = self.tree.get_mut(view_id);
                     let jump = (view.doc, doc.selection(view_id).clone());
-                    view.history.jumps.push(jump);
+                    view.history.push_jump(doc, jump);
                     if doc.id != id {
                         view.add_to_history(view.doc);
                         if doc.take_modified_since_accessed()

@@ -1172,7 +1172,7 @@ impl Thread {
             }
             terminal::Event::Output { id, chunk } => {
                 if let Some(existing) = self.terminals.iter_mut().find(|item| item.id == id) {
-                    existing.output.push_str(&chunk);
+                    existing.output = chunk;
                 } else {
                     self.terminals.push(terminal::Terminal {
                         id,

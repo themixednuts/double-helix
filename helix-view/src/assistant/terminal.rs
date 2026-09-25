@@ -46,6 +46,13 @@ pub struct Terminal {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
     Open(Terminal),
-    Output { id: Id, chunk: String },
-    Exit { id: Id, state: State },
+    /// Everything the terminal has retained so far (a snapshot, not a delta).
+    Output {
+        id: Id,
+        chunk: String,
+    },
+    Exit {
+        id: Id,
+        state: State,
+    },
 }

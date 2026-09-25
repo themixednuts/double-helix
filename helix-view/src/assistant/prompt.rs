@@ -162,11 +162,13 @@ fn context_part(item: context::Kind) -> Part {
             text: Some(symbol.text),
             data: None,
         }),
-        context::Kind::File(file) => Part::Resource(Resource {
+        // The agent reads the file itself; embedding it here would need its contents.
+        context::Kind::File(file) => Part::Link(Link {
             uri: file_uri(&file.path),
-            mime: None,
-            text: None,
-            data: None,
+            label: file
+                .path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned()),
         }),
         context::Kind::Diagnostics(diagnostics) => Part::Resource(Resource {
             uri: file_uri(&diagnostics.path),
@@ -183,6 +185,9 @@ fn context_part(item: context::Kind) -> Part {
     }
 }
 
+/// A `file://` URI for `path`: percent-escaped, and `file:///C:/...` on Windows.
 fn file_uri(path: &std::path::Path) -> String {
-    format!("file://{}", path.display())
+    url::Url::from_file_path(path)
+        .map(String::from)
+        .unwrap_or_else(|()| format!("file://{}", path.display()))
 }

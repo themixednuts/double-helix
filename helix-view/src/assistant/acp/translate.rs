@@ -57,7 +57,12 @@ pub fn session_load(session: &Session) -> acp::LoadSessionRequest {
 pub fn submit(session: &Session, request: &prompt::Request) -> acp::PromptRequest {
     acp::PromptRequest::new(
         session.to_string(),
-        request.parts().iter().cloned().map(content_block).collect(),
+        request
+            .parts()
+            .iter()
+            .cloned()
+            .map(|part| content_block(part, true))
+            .collect(),
     )
 }
 
@@ -432,7 +437,10 @@ fn field_from_schema(
     }
 }
 
-pub(crate) fn content_block(part: prompt::Part) -> acp::ContentBlock {
+/// Translate one prompt part. Agents that don't advertise `embeddedContext` get attached
+/// text inline in a text block instead of an embedded resource, and a resource with no
+/// contents is always sent as a link rather than as an empty file.
+pub(crate) fn content_block(part: prompt::Part, embedded_context: bool) -> acp::ContentBlock {
     match part {
         prompt::Part::Text(text) => acp::ContentBlock::Text(acp::TextContent::new(text)),
         prompt::Part::Image(image) => acp::ContentBlock::Image(acp::ImageContent::new(
@@ -447,6 +455,19 @@ pub(crate) fn content_block(part: prompt::Part) -> acp::ContentBlock {
             link.label.unwrap_or_else(|| link.uri.clone()),
             link.uri,
         )),
+        prompt::Part::Resource(resource) if resource.text.is_none() && resource.data.is_none() => {
+            acp::ContentBlock::ResourceLink(acp::ResourceLink::new(
+                resource.uri.clone(),
+                resource.uri,
+            ))
+        }
+        prompt::Part::Resource(prompt::Resource {
+            uri,
+            text: Some(text),
+            ..
+        }) if !embedded_context => {
+            acp::ContentBlock::Text(acp::TextContent::new(format!("{uri}\n```\n{text}\n```")))
+        }
         prompt::Part::Resource(resource) => {
             let body = match (resource.text, resource.data) {
                 (Some(text), _) => acp::EmbeddedResourceResource::TextResourceContents(

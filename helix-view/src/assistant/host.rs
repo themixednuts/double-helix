@@ -36,6 +36,17 @@ pub struct CreateTerminal {
     pub args: Vec<String>,
     pub cwd: Option<PathBuf>,
     pub env: Vec<Env>,
+    /// Bytes of output to retain; `None` keeps the host default.
+    pub output_byte_limit: Option<u64>,
+}
+
+/// A terminal's retained output, as of one poll.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Output {
+    pub text: String,
+    pub truncated: bool,
+    /// Set once the command has exited.
+    pub exit: Option<ExitStatus>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -167,7 +178,8 @@ impl Terminal {
                                 .map(|env| helix_acp::types::EnvVariable::new(env.key, env.value))
                                 .collect(),
                         )
-                        .cwd(req.cwd),
+                        .cwd(req.cwd)
+                        .output_byte_limit(req.output_byte_limit),
                     )
                     .await
                     .map_err(Error::Other)?;
@@ -176,7 +188,7 @@ impl Terminal {
         }
     }
 
-    pub async fn output(&self, id: &TerminalId) -> Result<String, Error> {
+    pub async fn output(&self, id: &TerminalId) -> Result<Output, Error> {
         match self {
             Self::Local { inner } => inner
                 .output(&helix_acp::types::TerminalOutputRequest::new(
@@ -184,7 +196,11 @@ impl Terminal {
                     id.to_string(),
                 ))
                 .await
-                .map(|out| out.output)
+                .map(|out| Output {
+                    text: out.output,
+                    truncated: out.truncated,
+                    exit: out.exit_status.map(|status| exit_status(&status)),
+                })
                 .map_err(Error::Other),
         }
     }
@@ -199,16 +215,7 @@ impl Terminal {
                     ))
                     .await
                     .map_err(Error::Other)?;
-                Ok(
-                    match out
-                        .exit_status
-                        .exit_code
-                        .and_then(|code| i32::try_from(code).ok())
-                    {
-                        Some(code) => ExitStatus::Code(code),
-                        None => ExitStatus::Other,
-                    },
-                )
+                Ok(exit_status(&out.exit_status))
             }
         }
     }
@@ -245,5 +252,12 @@ impl Permission {
         match self {
             Self::Local => Ok(permission::Decision::Dismiss),
         }
+    }
+}
+
+fn exit_status(status: &helix_acp::types::TerminalExitStatus) -> ExitStatus {
+    match status.exit_code.and_then(|code| i32::try_from(code).ok()) {
+        Some(code) => ExitStatus::Code(code),
+        None => ExitStatus::Other,
     }
 }

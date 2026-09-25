@@ -217,7 +217,7 @@ impl Editor {
             .insert(handle.id.clone(), handle);
     }
 
-    fn take_live_assistant_backend(
+    pub(super) fn take_live_assistant_backend(
         &mut self,
         backend: &crate::assistant::backend::Id,
     ) -> Option<crate::assistant::BackendHandle> {

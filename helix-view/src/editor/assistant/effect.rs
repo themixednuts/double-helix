@@ -19,6 +19,31 @@ pub(crate) fn accepted_review_apply_decision(
 }
 
 impl Editor {
+    /// The `LoadThread` that re-binds `command`'s thread to its agent session, for commands
+    /// that need a live session.
+    fn assistant_rebind_command(
+        &self,
+        command: &crate::assistant::backend::Command,
+    ) -> Option<crate::assistant::backend::Command> {
+        use crate::assistant::backend::Command;
+        let (Command::Submit { thread, .. }
+        | Command::ForkSubmit { thread, .. }
+        | Command::SetMode { thread, .. }
+        | Command::SetConfig { thread, .. }) = command
+        else {
+            return None;
+        };
+        let crate::assistant::thread::Origin::Backend { remote, .. } =
+            self.assistant.thread(*thread)?.origin()
+        else {
+            return None;
+        };
+        Some(Command::LoadThread {
+            thread: *thread,
+            remote: remote.clone(),
+        })
+    }
+
     pub fn apply_assistant_effects(&mut self, effects: Vec<crate::assistant::effect::Effect>) {
         for effect in effects {
             match effect {
@@ -40,13 +65,25 @@ impl Editor {
                     );
                 }
                 crate::assistant::effect::Effect::SendBackendCommand { backend, command } => {
+                    let was_live = self.take_live_assistant_backend(&backend).is_some();
                     let Some(handle) = self.ensure_assistant_backend(&backend) else {
                         self.set_error(format!("Assistant backend missing: {backend}"));
                         continue;
                     };
+                    // A freshly started agent knows none of the sessions an earlier process had
+                    // (after a crash or restart). Load the thread's session first, so the
+                    // conversation continues instead of failing as unbound.
+                    let rebind = if was_live {
+                        None
+                    } else {
+                        self.assistant_rebind_command(&command)
+                    };
                     self.runtime
                         .work()
                         .spawn(async move {
+                            if let Some(rebind) = rebind {
+                                let _ = handle.send(rebind).await;
+                            }
                             let _ = handle.send(command).await;
                         })
                         .detach();

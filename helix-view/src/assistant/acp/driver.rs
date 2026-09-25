@@ -106,9 +106,13 @@ struct State {
     elicitations: HashMap<String, PendingElicitation>,
     review_modes: HashMap<thread::Id, review::Mode>,
     modes: HashMap<thread::Id, Vec<acp::SessionMode>>,
+    /// The mode the agent last confirmed for each thread, to roll back a refused switch.
+    current_modes: HashMap<thread::Id, acp::SessionModeId>,
     staged: HashMap<thread::Id, HashMap<PathBuf, review::File>>,
     rules: permission::Rules,
     caps: helix_acp::AgentCaps,
+    /// Whether the agent accepts embedded resources in prompts.
+    embedded_context: bool,
     auth_methods: Vec<auth::Method>,
     pending_auth: Option<backend::Command>,
 }
@@ -135,9 +139,11 @@ impl State {
             elicitations: HashMap::new(),
             review_modes: HashMap::new(),
             modes: HashMap::new(),
+            current_modes: HashMap::new(),
             staged: HashMap::new(),
             rules: permission::Rules::load(),
             caps,
+            embedded_context: false,
             auth_methods,
             pending_auth: None,
         }
@@ -210,6 +216,9 @@ async fn send_mode_state(
     modes: &acp::SessionModeState,
 ) {
     state.modes.insert(thread, modes.available_modes.clone());
+    state
+        .current_modes
+        .insert(thread, modes.current_mode_id.clone());
     if let Ok(mode_set) = translate::mode_set(modes) {
         let _ = tx
             .send(backend::Update::Thread {
@@ -365,6 +374,7 @@ async fn run_terminal_auth(
             command: terminal.command.clone().into(),
             args: terminal.args.clone(),
             cwd: std::env::current_dir().ok(),
+            output_byte_limit: None,
             env: terminal
                 .env
                 .iter()
@@ -447,15 +457,16 @@ async fn run_agent(
             (caps, acp_caps, auth_methods)
         });
 
-    let (acp_caps, auth_methods) = match init {
+    let (acp_caps, embedded_context, auth_methods) = match init {
         Ok((caps, acp_caps, auth_methods)) => {
+            let embedded_context = caps.prompt.embedded_context;
             let _ = tx
                 .send(backend::Update::Backend {
                     backend: backend_id.clone(),
                     event: backend::Event::Ready { caps },
                 })
                 .await;
-            (acp_caps, auth_methods)
+            (acp_caps, embedded_context, auth_methods)
         }
         Err(err) => {
             let _ = tx
@@ -469,18 +480,19 @@ async fn run_agent(
     };
 
     let mut state = State::new(acp_caps, auth_methods);
+    state.embedded_context = embedded_context;
 
     loop {
         tokio::select! {
             cmd = handle_rx.recv() => {
                 match cmd {
-                    Some(cmd) => handle_command(&backend_id, &work, &agent, &tx, &host, &mut state, cmd).await,
+                    Some(cmd) => handle_command(&backend_id, &work, &agent, &tx, &host, &mut state, incoming, cmd).await,
                     None => break,
                 }
             }
             msg = incoming.recv() => {
                 match msg {
-                    Some((_id, call)) => handle_call(&backend_id, &agent, &tx, &host, &mut state, call).await,
+                    Some((_id, call)) => handle_call(&backend_id, &work, &agent, &tx, &host, &mut state, call).await,
                     None => break,
                 }
             }
@@ -529,6 +541,7 @@ async fn start_prompt_turn(
     let tx2 = tx.clone();
     let agent = agent.clone();
     let auth_methods = state.auth_methods.clone();
+    let embedded_context = state.embedded_context;
     state.pending_auth = Some(backend::Command::Submit {
         thread,
         prompt: prompt.clone(),
@@ -541,7 +554,7 @@ async fn start_prompt_turn(
                     .parts()
                     .iter()
                     .cloned()
-                    .map(translate::content_block)
+                    .map(|part| translate::content_block(part, embedded_context))
                     .collect(),
             )
             .await;
@@ -588,6 +601,39 @@ fn finished_run(reason: &acp::StopReason) -> thread::Run {
     }
 }
 
+/// Await an agent request while still serving the agent's own messages.
+///
+/// Agents may notify or even call back before they answer: `session/load` replays the
+/// whole history as notifications first. Parking the loop on the response would fill the
+/// transport's queue, stop its reader, and the response would never arrive.
+#[allow(clippy::too_many_arguments)]
+async fn serve_until<T>(
+    request: impl std::future::Future<Output = T>,
+    backend_id: &backend::Id,
+    work: &helix_runtime::Work,
+    agent: &Arc<AcpAgent>,
+    tx: &helix_runtime::Sender<backend::Update>,
+    host: &host::Set,
+    state: &mut State,
+    incoming: &mut IncomingReceiver,
+) -> T {
+    tokio::pin!(request);
+    loop {
+        tokio::select! {
+            biased;
+            result = &mut request => return result,
+            msg = incoming.recv() => match msg {
+                Some((_id, call)) => {
+                    handle_call(backend_id, work, agent, tx, host, state, call).await;
+                }
+                // The agent is gone; the request is about to fail with the closed stream.
+                None => return request.await,
+            },
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn handle_command(
     backend_id: &backend::Id,
     work: &helix_runtime::Work,
@@ -595,11 +641,13 @@ async fn handle_command(
     tx: &helix_runtime::Sender<backend::Update>,
     host: &host::Set,
     state: &mut State,
+    incoming: &mut IncomingReceiver,
     cmd: backend::Command,
 ) {
     match cmd {
         backend::Command::NewThread { thread, scope } => {
-            match agent.new_session(scope.cwd.clone()).await {
+            let request = agent.new_session(scope.cwd.clone());
+            match serve_until(request, backend_id, work, agent, tx, host, state, incoming).await {
                 Ok(resp) => {
                     let session = Session::new(resp.session_id.to_string());
                     state.sessions.insert(thread, session.clone());
@@ -646,11 +694,30 @@ async fn handle_command(
                 }
             }
         }
+        backend::Command::LoadThread { thread, .. } if !state.caps.load_session => {
+            // This agent cannot resume sessions. Continue the thread in a fresh one rather
+            // than leaving it unbound.
+            let scope = thread::Scope::new(std::env::current_dir().unwrap_or_default());
+            Box::pin(handle_command(
+                backend_id,
+                work,
+                agent,
+                tx,
+                host,
+                state,
+                incoming,
+                backend::Command::NewThread { thread, scope },
+            ))
+            .await;
+        }
         backend::Command::LoadThread { thread, remote } => {
-            match agent.load_session(remote.to_string().into()).await {
+            // Bind first: the agent replays the history as updates for this session before
+            // it answers, and updates for unknown sessions are dropped.
+            let session = Session::new(remote.to_string());
+            let previous = state.sessions.insert(thread, session.clone());
+            let request = agent.load_session(remote.to_string().into());
+            match serve_until(request, backend_id, work, agent, tx, host, state, incoming).await {
                 Ok(resp) => {
-                    let session = Session::new(remote.to_string());
-                    state.sessions.insert(thread, session.clone());
                     let _ = tx
                         .send(backend::Update::Backend {
                             backend: backend_id.clone(),
@@ -680,6 +747,10 @@ async fn handle_command(
                         .await;
                 }
                 Err(err) => {
+                    match previous {
+                        Some(previous) => state.sessions.insert(thread, previous),
+                        None => state.sessions.remove(&thread),
+                    };
                     let _ = tx
                         .send(backend::Update::Error {
                             at: backend::Target::Thread(thread),
@@ -705,7 +776,9 @@ async fn handle_command(
                         .await;
                     return;
                 };
-                match agent.fork_session(session.to_string().into()).await {
+                let request = agent.fork_session(session.to_string().into());
+                match serve_until(request, backend_id, work, agent, tx, host, state, incoming).await
+                {
                     Ok(resp) => {
                         let session = Session::new(resp.session_id.to_string());
                         state.sessions.insert(thread, session.clone());
@@ -787,6 +860,15 @@ async fn handle_command(
                         event: thread::Event::Run(thread::Run::Idle),
                     })
                     .await;
+            } else {
+                // No live session (for example after the agent restarted): nothing is running
+                // on the agent's side, so the thread must not stay "canceling".
+                let _ = tx
+                    .send(backend::Update::Thread {
+                        thread,
+                        event: thread::Event::Run(thread::Run::Idle),
+                    })
+                    .await;
             }
         }
         backend::Command::SetMode { thread, mode } => {
@@ -794,10 +876,34 @@ async fn handle_command(
                 let tx2 = tx.clone();
                 let agent = agent.clone();
                 let session = session.clone();
+                let available = state.modes.get(&thread).cloned().unwrap_or_default();
+                let previous = state.current_modes.get(&thread).cloned();
+                let requested = acp::SessionModeId::new(mode.to_string());
+                // Assume success so a quick second switch rolls back to the right mode;
+                // the agent's own mode updates overwrite this.
+                state.current_modes.insert(thread, requested.clone());
                 work.spawn(async move {
                     let result = agent
                         .set_session_mode(session.to_string().into(), mode.to_string())
                         .await;
+                    // Agents need not echo the change as an update, so settle the UI's
+                    // pending switch from the response: confirm it, or roll it back.
+                    let settled = match &result {
+                        Ok(_) => Some(requested),
+                        Err(_) => previous,
+                    };
+                    if let Some(current) = settled {
+                        if let Ok(mode_set) =
+                            translate::mode_set(&acp::SessionModeState::new(current, available))
+                        {
+                            let _ = tx2
+                                .send(backend::Update::Thread {
+                                    thread,
+                                    event: thread::Event::Mode(mode_set),
+                                })
+                                .await;
+                        }
+                    }
                     if let Err(err) = result {
                         let _ = tx2
                             .send(backend::Update::Error {
@@ -928,7 +1034,7 @@ async fn handle_command(
                         .await;
                     if let Some(pending) = state.pending_auth.take() {
                         Box::pin(handle_command(
-                            backend_id, work, agent, tx, host, state, pending,
+                            backend_id, work, agent, tx, host, state, incoming, pending,
                         ))
                         .await;
                     }
@@ -1105,6 +1211,7 @@ async fn handle_command(
 
 async fn handle_call(
     backend_id: &backend::Id,
+    work: &helix_runtime::Work,
     agent: &Arc<AcpAgent>,
     tx: &helix_runtime::Sender<backend::Update>,
     host: &host::Set,
@@ -1125,6 +1232,11 @@ async fn handle_call(
                         .find(|(_, current)| **current == session)
                     {
                         let locations = translate::update_locations(&notif.update);
+                        if let acp::SessionUpdate::CurrentModeUpdate(update) = &notif.update {
+                            state
+                                .current_modes
+                                .insert(thread, update.current_mode_id.clone());
+                        }
                         let modes = state.modes.get(&thread).map(Vec::as_slice);
                         if let Some(event) = translate::thread_event(notif.update, modes) {
                             let _ = tx.send(backend::Update::Thread { thread, event }).await;
@@ -1313,6 +1425,7 @@ async fn handle_call(
                     command: req.command.into(),
                     args: req.args,
                     cwd: req.cwd,
+                    output_byte_limit: req.output_byte_limit,
                     env: req
                         .env
                         .into_iter()
@@ -1394,16 +1507,23 @@ async fn handle_call(
                                 thread: *thread,
                                 event: super::super::terminal::Event::Output {
                                     id: super::super::terminal::Id::new(terminal_id.clone()),
-                                    chunk: output.clone(),
+                                    chunk: output.text.clone(),
                                 },
                             })
                             .await;
+                        let exit_status = output.exit.map(|status| {
+                            terminal_exit_status(match status {
+                                host::ExitStatus::Code(code) => Some(code),
+                                host::ExitStatus::Other => None,
+                            })
+                        });
                         agent
                             .reply(
                                 id,
-                                serde_json::to_value(acp::TerminalOutputResponse::new(
-                                    output, false,
-                                ))
+                                serde_json::to_value(
+                                    acp::TerminalOutputResponse::new(output.text, output.truncated)
+                                        .exit_status(exit_status),
+                                )
                                 .unwrap(),
                             )
                             .await
@@ -1445,48 +1565,58 @@ async fn handle_call(
                     );
                     return;
                 };
-                let delivery = match terminal.wait(term).await {
-                    Ok(status) => {
-                        let (exit_code, state) = match status {
-                            host::ExitStatus::Code(code) => {
-                                (Some(code), super::super::terminal::State::Exited { code })
-                            }
-                            host::ExitStatus::Other => (
-                                None,
-                                super::super::terminal::State::Failed {
-                                    message: "terminal exited without status".to_string(),
-                                },
-                            ),
-                        };
-                        let _ = tx
-                            .send(backend::Update::Terminal {
-                                thread: *thread,
-                                event: super::super::terminal::Event::Exit {
-                                    id: super::super::terminal::Id::new(terminal_id.clone()),
-                                    state,
-                                },
-                            })
-                            .await;
-                        agent
-                            .reply(
-                                id,
-                                serde_json::to_value(acp::WaitForTerminalExitResponse::new(
-                                    terminal_exit_status(exit_code),
-                                ))
-                                .unwrap(),
-                            )
-                            .await
-                    }
-                    Err(err) => {
-                        agent
-                            .reply_error(
-                                id,
-                                helix_acp::jsonrpc::Error::internal_error(err.to_string()),
-                            )
-                            .await
-                    }
-                };
-                log_delivery(delivery);
+                // Waiting can take as long as the command runs (`npm run dev`); doing it here
+                // would stall every other message, including the agent's own kill request.
+                let thread = *thread;
+                let term = term.clone();
+                let terminal = terminal.clone();
+                let agent = Arc::clone(agent);
+                let tx = tx.clone();
+                work.spawn(async move {
+                    let delivery = match terminal.wait(&term).await {
+                        Ok(status) => {
+                            let (exit_code, state) = match status {
+                                host::ExitStatus::Code(code) => {
+                                    (Some(code), super::super::terminal::State::Exited { code })
+                                }
+                                host::ExitStatus::Other => (
+                                    None,
+                                    super::super::terminal::State::Failed {
+                                        message: "terminal exited without status".to_string(),
+                                    },
+                                ),
+                            };
+                            let _ = tx
+                                .send(backend::Update::Terminal {
+                                    thread,
+                                    event: super::super::terminal::Event::Exit {
+                                        id: super::super::terminal::Id::new(terminal_id.clone()),
+                                        state,
+                                    },
+                                })
+                                .await;
+                            agent
+                                .reply(
+                                    id,
+                                    serde_json::to_value(acp::WaitForTerminalExitResponse::new(
+                                        terminal_exit_status(exit_code),
+                                    ))
+                                    .unwrap(),
+                                )
+                                .await
+                        }
+                        Err(err) => {
+                            agent
+                                .reply_error(
+                                    id,
+                                    helix_acp::jsonrpc::Error::internal_error(err.to_string()),
+                                )
+                                .await
+                        }
+                    };
+                    log_delivery(delivery);
+                })
+                .detach();
             }
             Ok(AgentMethodCall::KillTerminal(req)) => {
                 let terminal_id = req.terminal_id.to_string();

@@ -91,17 +91,26 @@ impl ProcessWaiter {
 pub(crate) struct ProcessHandle {
     shutdown_tx: mpsc::Sender<()>,
     waiter: ProcessWaiter,
+    /// Everything the child started. Dropping the last reference kills what is left.
+    _tree: Option<Arc<crate::process_tree::ProcessTree>>,
 }
 
 impl ProcessHandle {
     pub(crate) fn spawn(mut child: Child, description: String) -> Self {
         let (shutdown_tx, mut shutdown_rx) = mpsc::channel(1);
         let (outcome_tx, outcome_rx) = watch::channel(None);
+        let tree = crate::process_tree::ProcessTree::of(&child).map(Arc::new);
+        let task_tree = tree.clone();
 
         tokio::spawn(async move {
             let result = tokio::select! {
                 status = child.wait() => status,
-                _ = shutdown_rx.recv() => terminate_child(&mut child).await,
+                _ = shutdown_rx.recv() => {
+                    if let Some(tree) = &task_tree {
+                        tree.kill();
+                    }
+                    terminate_child(&mut child).await
+                }
             };
 
             let outcome = match result {
@@ -126,6 +135,7 @@ impl ProcessHandle {
         Self {
             shutdown_tx,
             waiter: ProcessWaiter { outcome_rx },
+            _tree: tree,
         }
     }
 

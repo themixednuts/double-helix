@@ -1,5 +1,6 @@
 pub mod client;
 pub mod jsonrpc;
+mod process_tree;
 pub mod registry;
 pub mod terminal;
 pub mod transport;

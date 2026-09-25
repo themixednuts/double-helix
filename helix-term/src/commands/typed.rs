@@ -6162,7 +6162,7 @@ fn execute_command_line(
         Some(cmd) => execute_command(cx, cmd, rest, event),
         None => {
             if event == PromptEvent::Validate {
-                let args: Vec<String> = rest.split_whitespace().map(str::to_owned).collect();
+                let args = super::plugin_command_args(rest);
                 if let Some(remote) = cx
                     .plugin_runtime
                     .command_snapshot()

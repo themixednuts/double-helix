@@ -15,10 +15,14 @@ pub struct PluginLoader {
 }
 
 impl PluginLoader {
-    /// Create a new plugin loader with the given plugin directories
+    /// Create a new plugin loader with the given plugin directories. A leading `~` is the
+    /// home directory, as in the rest of the config.
     pub fn new(plugin_dirs: Vec<PathBuf>) -> Self {
         Self {
-            plugin_dirs,
+            plugin_dirs: plugin_dirs
+                .into_iter()
+                .map(|dir| helix_stdx::path::expand_tilde(dir).into_owned())
+                .collect(),
             plugin_roots: Vec::new(),
         }
     }

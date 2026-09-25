@@ -1969,7 +1969,15 @@ impl LuaEngine {
     /// Panel callbacks must use the configured contract hosts for editor
     /// queries and mutations. Legacy direct-editor access is intentionally not
     /// available here so the callback can execute outside the UI foreground.
-    pub fn handle_panel_key(&self, panel: PanelHandle, key_text: &str) -> Result<bool> {
+    pub fn handle_panel_key<H>(&self, host: &H, panel: PanelHandle, key_text: &str) -> Result<bool>
+    where
+        H: crate::contract::host::PluginFacadeQueryHost
+            + crate::contract::host::PluginFacadeMutationHost
+            + Clone
+            + Send
+            + Sync
+            + 'static,
+    {
         let (plugin_name, callback_id) = {
             let callbacks = self.panel_callbacks.read();
             let Some(callbacks) = callbacks.get(&panel) else {
@@ -1992,12 +2000,15 @@ impl LuaEngine {
         };
         let event = self.lua.create_table().map_err(PluginError::LuaError)?;
         event.set("key", key_text).map_err(PluginError::LuaError)?;
-        with_current_plugin_name(&self.lua, &plugin_name, || {
-            self.with_watchdog(|| {
-                callback
-                    .call::<Option<bool>>(event)
-                    .map(|consumed| consumed.unwrap_or(false))
-                    .map_err(PluginError::LuaError)
+        // Like commands, key handlers may query and change the editor (`helix.workspace`).
+        self.with_facade_host(host, || {
+            with_current_plugin_name(&self.lua, &plugin_name, || {
+                self.with_watchdog(|| {
+                    callback
+                        .call::<Option<bool>>(event)
+                        .map(|consumed| consumed.unwrap_or(false))
+                        .map_err(PluginError::LuaError)
+                })
             })
         })
     }

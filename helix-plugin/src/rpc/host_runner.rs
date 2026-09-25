@@ -808,7 +808,7 @@ fn dispatch_host_notification(
             engine.handle_ui_callback(host, callback_id(callback), value)?
         }
         HostRequest::PanelKey { panel, key } => {
-            engine.handle_panel_key(panel, &key)?;
+            engine.handle_panel_key(host, panel, &key)?;
         }
         HostRequest::Reload => reload_plugins(engine, host, config, api_metadata)?,
         HostRequest::TaskCompleted { operation, result } => {
@@ -973,7 +973,7 @@ pub fn run_plugin_host() {
                         .map(|()| PluginResponse::Unit)
                         .map_err(|err| internal(err.to_string())),
                     HostRequest::PanelKey { panel, key } => engine
-                        .handle_panel_key(panel, &key)
+                        .handle_panel_key(&host, panel, &key)
                         .map(PluginResponse::Bool)
                         .map_err(|err| internal(err.to_string())),
                     HostRequest::Reload => reload_plugins(&mut engine, &mut host, &init, &metadata)

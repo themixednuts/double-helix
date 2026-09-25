@@ -1637,7 +1637,14 @@ impl PluginRuntime {
     pub(crate) async fn shutdown(&self) {
         let hosts = self.host_snapshot();
         request_host_shutdown(&hosts);
-        wait_for_hosts(hosts).await;
+        // A host that stopped reading its input (a plugin stuck in a loop) must not keep the
+        // editor from quitting.
+        if tokio::time::timeout(std::time::Duration::from_secs(3), wait_for_hosts(hosts))
+            .await
+            .is_err()
+        {
+            log::warn!("plugin hosts did not stop within 3s; exiting without them");
+        }
     }
 
     pub(crate) fn reconfigure(

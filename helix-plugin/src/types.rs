@@ -9,6 +9,7 @@ pub struct PluginMetadata {
     /// Plugin name
     pub name: String,
     /// Plugin version
+    #[serde(default = "default_version")]
     pub version: String,
     /// Plugin description
     pub description: Option<String>,
@@ -16,11 +17,20 @@ pub struct PluginMetadata {
     pub author: Option<String>,
     /// Plugin entry point (default: init.lua)
     pub entry: Option<String>,
-    /// Exact host contract version this plugin targets.
+    /// Exact host contract version this plugin targets. Defaults to the current contract.
+    #[serde(default = "default_api_version")]
     pub api_version: u32,
     /// Required host capability names.
     #[serde(default)]
     pub capabilities: Vec<String>,
+}
+
+fn default_version() -> String {
+    "0.1.0".to_string()
+}
+
+fn default_api_version() -> u32 {
+    crate::contract::metadata::API_VERSION
 }
 
 impl Default for PluginMetadata {
@@ -244,6 +254,13 @@ impl UiCallbackCounter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn manifest_needs_only_a_name() {
+        let metadata: PluginMetadata = toml::from_str(r#"name = "hello""#).expect("manifest");
+        assert_eq!(metadata.version, "0.1.0");
+        assert_eq!(metadata.api_version, crate::contract::metadata::API_VERSION);
+    }
 
     #[test]
     fn plugin_config_rejects_ambiguous_names() {

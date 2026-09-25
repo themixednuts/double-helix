@@ -218,6 +218,8 @@ pub(crate) fn apply_plugin_command(
                 "item",
                 |item: &String, _data| item.as_str().into(),
             )];
+            // Closing without a choice resumes the plugin with `nil`, like prompt does.
+            let abort_callback = callback.clone();
             let picker = crate::ui::Picker::new(
                 columns,
                 0,
@@ -228,7 +230,8 @@ pub(crate) fn apply_plugin_command(
                 move |cx: &mut crate::compositor::Context, item: &String, _action| {
                     deliver_plugin_ui_callback(cx, &callback, DynamicValue::String(item.clone()));
                 },
-            );
+            )
+            .on_abort(move |cx| deliver_plugin_ui_callback(cx, &abort_callback, DynamicValue::Nil));
             compositor.push(Box::new(crate::ui::overlay::overlaid(picker)));
         }
         PluginCommand::PushPanel {

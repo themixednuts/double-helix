@@ -70,7 +70,12 @@ use crate::{
         Picker, PickerColumn, Prompt, PromptEvent,
     },
 };
-use std::{collections::HashSet, fmt, num::NonZeroUsize, sync::OnceLock};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+    num::NonZeroUsize,
+    sync::OnceLock,
+};
 
 use std::{
     borrow::Cow,
@@ -156,7 +161,7 @@ impl MappableCommand {
                     .into_iter()
                     .find(|command| command.descriptor.name == *name)
                 {
-                    let args = args.split_whitespace().map(str::to_owned).collect();
+                    let args = plugin_command_args(args);
                     if let Err(error) = cx.plugin_runtime.invoke_command(command.id, args) {
                         cx.editor.set_error(error.to_string());
                     }
@@ -266,6 +271,23 @@ impl MappableCommand {
             );
             commands.into_boxed_slice()
         })
+    }
+
+    /// The builtin command called `name`. Uses an index built on first use, because this
+    /// runs for every dispatched key.
+    pub fn builtin_by_name(name: &str) -> Option<&'static Self> {
+        static INDEX: OnceLock<HashMap<&'static str, usize>> = OnceLock::new();
+        let commands = Self::builtin_commands();
+        let index = INDEX.get_or_init(|| {
+            // Reversed so the first command with a given name wins, as a linear search would.
+            commands
+                .iter()
+                .enumerate()
+                .rev()
+                .map(|(position, command)| (command.name(), position))
+                .collect()
+        });
+        index.get(name).map(|&position| &commands[position])
     }
 
     /// Whether this command can execute against a component-owned `EditRegion`
@@ -893,6 +915,15 @@ fn goto_file_impl(cx: &mut Context, action: Action) {
         });
     }
     crate::runtime::ui::document::queue_document_open_batch(cx.editor, &cx.ingress, requests);
+}
+
+/// Split a plugin command's arguments the way typable commands are split, so quoted
+/// arguments (`:greet "Jane Doe"`) arrive as one argument.
+pub(crate) fn plugin_command_args(args: &str) -> Vec<String> {
+    helix_core::command_line::Tokenizer::new(args, false)
+        .filter_map(Result::ok)
+        .map(|token| token.content.into_owned())
+        .collect()
 }
 
 fn repeat_last_motion(cx: &mut Context) {
@@ -2594,8 +2625,26 @@ fn blame_line(cx: &mut Context) {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_early_shell_stdin_close, CommandScope, MappableCommand};
+    use super::{is_early_shell_stdin_close, plugin_command_args, CommandScope, MappableCommand};
     use helix_modal::CommandRegistry;
+
+    #[test]
+    fn plugin_command_args_keep_quoted_arguments_together() {
+        assert_eq!(
+            plugin_command_args(r#"hello "Jane Doe" 'a b' plain"#),
+            ["hello", "Jane Doe", "a b", "plain"]
+        );
+        assert!(plugin_command_args("   ").is_empty());
+    }
+
+    #[test]
+    fn builtin_by_name_finds_every_builtin_command() {
+        for command in MappableCommand::builtin_commands() {
+            let found = MappableCommand::builtin_by_name(command.name()).expect("indexed");
+            assert_eq!(found.name(), command.name());
+        }
+        assert!(MappableCommand::builtin_by_name("no_such_command").is_none());
+    }
 
     #[test]
     fn engine_commands_are_registered_in_modal_registry() {

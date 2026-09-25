@@ -14,6 +14,7 @@ homepage.workspace = true
 helix-loader = { path = "../helix-loader" }
 helix-ipc = { path = "../helix-ipc" }
 helix-plugin-api = { path = "../helix-plugin-api" }
+helix-stdx = { path = "../helix-stdx" }
 
 mlua = { version = "0.11", features = ["lua54", "async", "send", "serialize", "vendored"] }
 anyhow = "1"

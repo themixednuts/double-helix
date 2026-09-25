@@ -2393,10 +2393,23 @@ pub fn insert_char_transaction(
     let loader: &helix_core::syntax::Loader = &editor.syn_loader.load();
     let auto_pairs = doc.auto_pairs(editor, loader, &view_id);
 
-    auto_pairs
-        .as_ref()
-        .and_then(|ap| auto_pairs::hook(text, selection, c, ap))
-        .or_else(|| insert_single_char(text, selection, c))
+    let insert_char = |range: &Range| {
+        let cursor = range.cursor(text.slice(..));
+        ((cursor, cursor, Some(Tendril::from_iter([c]))), None)
+    };
+
+    // Each range is handled on its own, so auto pairs mix with plain inserts in one transaction.
+    Some(Transaction::change_by_and_with_selection(
+        text,
+        selection,
+        |range| {
+            auto_pairs
+                .as_ref()
+                .and_then(|ap| auto_pairs::hook_insert(text, range, c, ap))
+                .map(|(change, range)| (change, Some(range)))
+                .unwrap_or_else(|| insert_char(range))
+        },
+    ))
 }
 
 /// Insert one character at every cursor. Returns whether a transaction was applied.
@@ -2407,15 +2420,6 @@ pub fn insert_char(editor: &mut Editor, view_id: ViewId, doc_id: DocumentId, c: 
     let doc = crate::doc_mut!(editor, &doc_id);
     doc.apply(&transaction, view_id);
     true
-}
-
-/// Plain character insertion (no auto-pairs).
-#[allow(clippy::unnecessary_wraps)]
-fn insert_single_char(doc: &Rope, selection: &Selection, ch: char) -> Option<Transaction> {
-    let cursors = selection.clone().cursors(doc.slice(..));
-    let mut t = Tendril::new();
-    t.push(ch);
-    Some(Transaction::insert(doc, &cursors, t))
 }
 
 // ─── Insert mode: delete backward ───────────────────────────────────
@@ -2429,71 +2433,73 @@ pub fn delete_char_backward(
 ) {
     let doc = crate::doc!(editor, &doc_id);
     let text = doc.text().slice(..);
-    let tab_width = doc.tab_width();
-    let indent_width = doc.indent_width();
 
     let loader: &helix_core::syntax::Loader = &editor.syn_loader.load();
     let auto_pairs = doc.auto_pairs(editor, loader, &view_id);
 
     let transaction =
-        Transaction::delete_by_selection(doc.text(), doc.selection(view_id), |range| {
+        Transaction::delete_by_and_with_selection(doc.text(), doc.selection(view_id), |range| {
             let pos = range.cursor(text);
             if pos == 0 {
-                return (pos, pos);
+                return ((pos, pos), None);
             }
-            let line_start_pos = text.line_to_char(range.cursor_line(text));
-            let fragment = Cow::from(text.slice(line_start_pos..pos));
-            if !fragment.is_empty() && fragment.chars().all(|ch| ch == ' ' || ch == '\t') {
-                if text.get_char(pos.saturating_sub(1)) == Some('\t') {
-                    (graphemes::nth_prev_grapheme_boundary(text, pos, 1), pos)
-                } else {
-                    let width: usize = fragment
-                        .chars()
-                        .map(|ch| {
-                            if ch == '\t' {
-                                tab_width
-                            } else {
-                                ch.width().unwrap_or(1)
-                            }
-                        })
-                        .sum();
-                    let mut drop = width % indent_width;
-                    if drop == 0 {
-                        drop = indent_width
-                    };
-                    let mut chars = fragment.chars().rev();
-                    let mut start = pos;
-                    for _ in 0..drop {
-                        match chars.next() {
-                            Some(' ') => start -= 1,
-                            _ => break,
-                        }
-                    }
-                    (start, pos)
-                }
-            } else {
-                match (
-                    text.get_char(pos.saturating_sub(1)),
-                    text.get_char(pos),
-                    auto_pairs,
-                ) {
-                    (Some(_x), Some(_y), Some(ap))
-                        if range.is_single_grapheme(text)
-                            && ap.get(_x).is_some()
-                            && ap.get(_x).unwrap().open == _x
-                            && ap.get(_x).unwrap().close == _y =>
-                    {
-                        (
-                            graphemes::nth_prev_grapheme_boundary(text, pos, count),
-                            graphemes::nth_next_grapheme_boundary(text, pos, count),
-                        )
-                    }
-                    _ => (graphemes::nth_prev_grapheme_boundary(text, pos, count), pos),
-                }
-            }
+            dedent(doc, range)
+                .map(|dedent| (dedent, None))
+                .or_else(|| {
+                    auto_pairs::hook_delete(doc.text(), range, auto_pairs?)
+                        .map(|(delete, new_range)| (delete, Some(new_range)))
+                })
+                .unwrap_or_else(|| {
+                    (
+                        (graphemes::nth_prev_grapheme_boundary(text, pos, count), pos),
+                        None,
+                    )
+                })
         });
     let doc = crate::doc_mut!(editor, &doc_id);
     doc.apply(&transaction, view_id);
+}
+
+/// Backspace over indentation: when only whitespace precedes the cursor, delete back to the
+/// previous indent unit (one char for a tab).
+fn dedent(doc: &Document, range: &Range) -> Option<Deletion> {
+    let text = doc.text().slice(..);
+    let pos = range.cursor(text);
+    let line_start_pos = text.line_to_char(range.cursor_line(text));
+    let fragment = Cow::from(text.slice(line_start_pos..pos));
+    if fragment.is_empty() || !fragment.chars().all(|ch| ch == ' ' || ch == '\t') {
+        return None;
+    }
+    if text.get_char(pos.saturating_sub(1)) == Some('\t') {
+        return Some((graphemes::nth_prev_grapheme_boundary(text, pos, 1), pos));
+    }
+
+    let tab_width = doc.tab_width();
+    let indent_width = doc.indent_width();
+    let width: usize = fragment
+        .chars()
+        .map(|ch| {
+            if ch == '\t' {
+                tab_width
+            } else {
+                ch.width().unwrap_or(1)
+            }
+        })
+        .sum();
+    // Round down to the previous unit; at a unit already, drop a whole one.
+    let mut drop = width % indent_width;
+    if drop == 0 {
+        drop = indent_width
+    };
+    let mut chars = fragment.chars().rev();
+    let mut start = pos;
+    for _ in 0..drop {
+        match chars.next() {
+            Some(' ') => start -= 1,
+            _ => break,
+        }
+    }
+    Some((start, pos))
 }
 
 // ─── Insert mode: delete forward ─────────────────────────────────────

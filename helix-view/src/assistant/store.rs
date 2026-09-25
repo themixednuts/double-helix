@@ -3,7 +3,7 @@ use std::num::NonZeroU64;
 use indexmap::IndexMap;
 
 use super::{
-    action, backend, config, context, effect, event, history, mention, mode, review, thread,
+    action, auth, backend, config, context, effect, event, history, mention, mode, review, thread,
 };
 
 #[derive(Debug, Clone)]
@@ -976,14 +976,56 @@ impl Store {
                 if !state.auth_mut().authenticate(&method) {
                     return Vec::new();
                 }
+                // A terminal login runs outside the editor first; the agent is asked once
+                // the user says it finished.
+                let first = match state.auth() {
+                    auth::State::TerminalLogin { method, .. } => {
+                        effect::Effect::LaunchAuthTerminal {
+                            thread,
+                            title: method.name.clone(),
+                            terminal: method.terminal.clone().unwrap_or_else(|| {
+                                unreachable!("terminal logins have a terminal")
+                            }),
+                        }
+                    }
+                    _ => effect::Effect::SendBackendCommand {
+                        backend,
+                        command: backend::Command::Authenticate { thread, method },
+                    },
+                };
+                vec![
+                    first,
+                    effect::Effect::Save { thread },
+                    effect::Effect::SyncModel,
+                ]
+            }
+            action::Action::FinishTerminalLogin { thread } => {
+                let Some(state) = self.thread_mut(thread) else {
+                    return Vec::new();
+                };
+                let thread::Origin::Backend { backend, .. } = state.origin() else {
+                    return Vec::new();
+                };
+                let backend = backend.clone();
+                let Some(method) = state.auth_mut().finish_terminal_login() else {
+                    return Vec::new();
+                };
                 vec![
                     effect::Effect::SendBackendCommand {
                         backend,
                         command: backend::Command::Authenticate { thread, method },
                     },
-                    effect::Effect::Save { thread },
                     effect::Effect::SyncModel,
                 ]
+            }
+            action::Action::CancelTerminalLogin { thread } => {
+                let Some(state) = self.thread_mut(thread) else {
+                    return Vec::new();
+                };
+                if !state.auth_mut().cancel_terminal_login() {
+                    return Vec::new();
+                }
+                vec![effect::Effect::SyncModel]
             }
             action::Action::SetReviewMode { thread, mode } => {
                 let Some(state) = self.thread_mut(thread) else {

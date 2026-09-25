@@ -355,69 +355,6 @@ async fn send_auth_required(
         .await;
 }
 
-async fn run_terminal_auth(
-    host: &host::Set,
-    tx: &helix_runtime::Sender<backend::Update>,
-    thread: thread::Id,
-    method: &auth::Method,
-    terminal: &auth::Terminal,
-) -> Result<(), helix_acp::Error> {
-    let Some(host_terminal) = &host.terminal else {
-        return Err(helix_acp::Error::Other(anyhow::anyhow!(
-            "terminal host unavailable"
-        )));
-    };
-    let host_id = host_terminal
-        .create(host::CreateTerminal {
-            command: terminal.command.clone().into(),
-            args: terminal.args.clone(),
-            cwd: std::env::current_dir().ok(),
-            output_byte_limit: None,
-            env: terminal
-                .env
-                .iter()
-                .map(|(key, value)| host::Env {
-                    key: key.clone(),
-                    value: value.clone(),
-                })
-                .collect(),
-        })
-        .await
-        .map_err(|err| helix_acp::Error::Other(anyhow::anyhow!(err.to_string())))?;
-    let terminal_id = super::super::terminal::Id::new(host_id.to_string());
-    let _ = tx
-        .send(backend::Update::Terminal {
-            thread,
-            event: super::super::terminal::Event::Open(super::super::terminal::Terminal {
-                id: terminal_id.clone(),
-                title: Some(method.name.clone()),
-                state: super::super::terminal::State::Running,
-                output: String::new(),
-            }),
-        })
-        .await;
-    let status = host_terminal
-        .wait(&host_id)
-        .await
-        .map_err(|err| helix_acp::Error::Other(anyhow::anyhow!(err.to_string())))?;
-    let state = match status {
-        host::ExitStatus::Code(code) => super::super::terminal::State::Exited { code },
-        host::ExitStatus::Other => super::super::terminal::State::Failed {
-            message: "terminal exited without status".to_string(),
-        },
-    };
-    let _ = tx
-        .send(backend::Update::Terminal {
-            thread,
-            event: super::super::terminal::Event::Exit {
-                id: terminal_id,
-                state,
-            },
-        })
-        .await;
-    Ok(())
-}
-
 struct RunAgent {
     backend_id: backend::Id,
     work: helix_runtime::Work,
@@ -1021,14 +958,9 @@ async fn handle_command(
                 })
                 .await;
 
-            let result = if let Some(terminal) = &auth_method.terminal {
-                match run_terminal_auth(host, tx, thread, &auth_method, terminal).await {
-                    Ok(()) => agent.authenticate(method.clone()).await.map(|_| ()),
-                    Err(err) => Err(err),
-                }
-            } else {
-                agent.authenticate(method.clone()).await.map(|_| ())
-            };
+            // A terminal login already ran (the editor opens it and waits for the user), so
+            // the agent only checks the result.
+            let result = agent.authenticate(method.clone()).await.map(|_| ());
 
             match result {
                 Ok(()) => {

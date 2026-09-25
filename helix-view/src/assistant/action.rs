@@ -135,6 +135,14 @@ pub enum Action {
         thread: thread::Id,
         method: String,
     },
+    /// The user finished the terminal login.
+    FinishTerminalLogin {
+        thread: thread::Id,
+    },
+    /// The user gave up on the terminal login.
+    CancelTerminalLogin {
+        thread: thread::Id,
+    },
     SetReviewMode {
         thread: thread::Id,
         mode: review::Mode,

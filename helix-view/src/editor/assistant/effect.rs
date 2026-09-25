@@ -108,6 +108,22 @@ impl Editor {
                 crate::assistant::effect::Effect::SetStatus { message } => {
                     self.set_status(message);
                 }
+                crate::assistant::effect::Effect::LaunchAuthTerminal {
+                    thread,
+                    title,
+                    terminal,
+                } => {
+                    if let Err(error) = self.launch_auth_terminal(&terminal) {
+                        let message = format!(
+                            "{error}. Run `{}` in a terminal to sign in with {title}, then press enter.",
+                            terminal.command_line()
+                        );
+                        if let Some(state) = self.assistant.thread_mut(thread) {
+                            state.auth_mut().terminal_login_failed(message);
+                        }
+                        self.request_redraw();
+                    }
+                }
                 crate::assistant::effect::Effect::Save { thread } => {
                     self.save_assistant_thread(thread);
                 }
@@ -127,6 +143,34 @@ impl Editor {
                 }
             }
         }
+    }
+
+    /// Open the login command in the external terminal (`editor.terminal`, as debug adapters
+    /// use). It runs on its own; the user says when it finished.
+    fn launch_auth_terminal(
+        &self,
+        terminal: &crate::assistant::auth::Terminal,
+    ) -> Result<(), String> {
+        let config = self
+            .config()
+            .terminal
+            .clone()
+            .ok_or_else(|| "No external terminal is configured (`editor.terminal`)".to_string())?;
+        let mut child = std::process::Command::new(&config.command)
+            .args(&config.args)
+            .arg(&terminal.command)
+            .args(&terminal.args)
+            .envs(terminal.env.iter().map(|(key, value)| (key, value)))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|err| format!("Could not open a terminal with `{}`: {err}", config.command))?;
+        // Reap it whenever it exits.
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+        Ok(())
     }
 
     fn apply_assistant_review_accepted_file(

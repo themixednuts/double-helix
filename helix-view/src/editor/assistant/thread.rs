@@ -188,6 +188,20 @@ impl Editor {
         self.assistant_act(crate::assistant::Action::Authenticate { thread, method })
     }
 
+    pub fn finish_assistant_terminal_login(
+        &mut self,
+        thread: crate::assistant::thread::Id,
+    ) -> Vec<crate::assistant::effect::Effect> {
+        self.assistant_act(crate::assistant::Action::FinishTerminalLogin { thread })
+    }
+
+    pub fn cancel_assistant_terminal_login(
+        &mut self,
+        thread: crate::assistant::thread::Id,
+    ) -> Vec<crate::assistant::effect::Effect> {
+        self.assistant_act(crate::assistant::Action::CancelTerminalLogin { thread })
+    }
+
     pub fn submit_assistant_prompt(
         &mut self,
         thread: crate::assistant::thread::Id,

@@ -318,7 +318,7 @@ pub(crate) fn spawn_theme_load(
             Ok(theme) => {
                 let _ = ingress
                     .send_ui(UiCommand::Plugin(PluginCommand::SetTheme {
-                        theme,
+                        theme: Box::new(theme),
                         completion,
                     }))
                     .await;
@@ -1539,13 +1539,12 @@ pub struct PluginRuntime {
     commands: Arc<std::sync::Mutex<Option<CommandCache>>>,
 }
 
+/// A host's published commands.
+type PublishedCommands = Arc<Vec<(CommandHandle, helix_plugin_api::CommandDescriptor)>>;
+
 struct CommandCache {
     /// Each host's id, generation and published commands the list was built from.
-    sources: Vec<(
-        PluginHostId,
-        Option<HostGenerationId>,
-        Arc<Vec<(CommandHandle, helix_plugin_api::CommandDescriptor)>>,
-    )>,
+    sources: Vec<(PluginHostId, Option<HostGenerationId>, PublishedCommands)>,
     commands: Arc<[PluginCommandSnapshot]>,
 }
 

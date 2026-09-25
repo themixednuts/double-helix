@@ -345,7 +345,9 @@ impl Deref for KeymapNode {
     type Target = KeyTrieNode;
 
     fn deref(&self) -> &KeyTrieNode {
-        self.trie().node().expect("a keymap node's keys lead to a node")
+        self.trie()
+            .node()
+            .expect("a keymap node's keys lead to a node")
     }
 }
 
@@ -1143,10 +1145,7 @@ mod tests {
 
         // Another Rust file applies the same contributions: nothing to rebuild.
         let snapshot = keymaps.map().clone();
-        assert!(!keymaps.set_context(
-            Some("rust"),
-            Some(std::path::Path::new("workspace/lib.rs")),
-        ));
+        assert!(!keymaps.set_context(Some("rust"), Some(std::path::Path::new("workspace/lib.rs")),));
         assert!(Arc::ptr_eq(&snapshot, &keymaps.map()));
 
         assert!(keymaps.remove_contribution(handle));
@@ -1506,7 +1505,14 @@ m = "move_line_up"
         let (mut editor, mut region) = test_edit_region();
         set_region_text(&region, &mut editor, "ab");
         let policy = HostPolicy::multiline();
-        for key in [key!('A'), key!('x'), key!('y'), key!(Backspace), key!('z'), key!(Esc)] {
+        for key in [
+            key!('A'),
+            key!('x'),
+            key!('y'),
+            key!(Backspace),
+            key!('z'),
+            key!(Esc),
+        ] {
             region.dispatch(&mut editor, key, policy);
         }
         let text = |region: &EditRegion, editor: &Editor| {

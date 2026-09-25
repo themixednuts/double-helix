@@ -1,7 +1,7 @@
 #[derive(Debug, Clone)]
 pub enum PluginCommand {
     SetTheme {
-        theme: helix_view::Theme,
+        theme: Box<helix_view::Theme>,
         completion: crate::plugin_registry::PluginTaskResponder,
     },
     RunCommand {

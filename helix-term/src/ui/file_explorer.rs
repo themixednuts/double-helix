@@ -4633,8 +4633,14 @@ mod tests {
         for key in [key!('2'), key!('d')] {
             assert_eq!(input.translate(key), ExplorerInput::Pending(None));
         }
-        assert!(matches!(input.translate(key!('d')), ExplorerInput::Execute(_)));
-        assert_eq!(input.modal_input_state().count.map(NonZeroUsize::get), Some(2));
+        assert!(matches!(
+            input.translate(key!('d')),
+            ExplorerInput::Execute(_)
+        ));
+        assert_eq!(
+            input.modal_input_state().count.map(NonZeroUsize::get),
+            Some(2)
+        );
     }
 
     #[test]

@@ -6507,7 +6507,7 @@ fn execute_command_line(
                 if let Some(remote) = cx
                     .plugin_runtime
                     .command_snapshot()
-                    .into_iter()
+                    .iter()
                     .find(|candidate| candidate.descriptor.name == command)
                 {
                     cx.plugin_runtime

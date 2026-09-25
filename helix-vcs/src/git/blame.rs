@@ -424,7 +424,7 @@ mod test {
                         // because we won't show it to the user.
                         $(
                             let blame_result =
-                                FileBlame::try_new(file.clone())
+                                FileBlame::try_new(file.clone(), true)
                                     .unwrap()
                                     .blame_for_line(line_number, added_lines, removed_lines)
                                     .commit_title;

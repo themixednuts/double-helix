@@ -1396,8 +1396,6 @@ impl VimEngine {
         };
         match (cp.resolve)(key, count) {
             CharPendingResolution::Motion(motion) => {
-                let motion: Arc<dyn Fn(&mut Editor, ViewId, DocumentId, Movement) + Send + Sync> =
-                    Arc::from(motion);
                 if matches!(self.sub_mode, SubMode::VisualLine | SubMode::VisualBlock) {
                     self.visual_motion(editor, view_id, doc_id, |editor, movement| {
                         motion(editor, view_id, doc_id, movement)
@@ -1572,10 +1570,7 @@ impl VimEngine {
 
     /// Leave visual mode with the cursor where the selection's cursor was.
     fn exit_visual(&mut self, editor: &mut Editor, view_id: ViewId, doc_id: DocumentId) {
-        let cursor = match self.visual {
-            Some(span) => Some(span.cursor),
-            None => None,
-        };
+        let cursor = self.visual.map(|span| span.cursor);
         {
             let doc = helix_view::doc_mut!(editor, &doc_id);
             let text = doc.text().slice(..);

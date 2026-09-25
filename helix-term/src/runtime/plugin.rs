@@ -8,7 +8,8 @@ pub(crate) fn changed_lines(
     let mut lines: Vec<(usize, usize)> = Vec::new();
     for (from, _to, inserted) in changes.changes_iter() {
         let start = changes.map_pos(from, helix_core::Assoc::Before);
-        let end = (start + inserted.map_or(0, |text| text.chars().count())).min(new_text.len_chars());
+        let end =
+            (start + inserted.map_or(0, |text| text.chars().count())).min(new_text.len_chars());
         let range = (new_text.char_to_line(start), new_text.char_to_line(end) + 1);
         match lines.last_mut() {
             Some(last) if range.0 <= last.1 => last.1 = last.1.max(range.1),

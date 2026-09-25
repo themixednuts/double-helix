@@ -1015,7 +1015,7 @@ fn spawn_blame_fetch(
     let blame = editor
         .runtime()
         .block()
-        .spawn(move || FileBlame::try_new(path, trust_full));
+        .spawn(move || FileBlame::try_new(path, trust_full).map(Box::new));
     editor
         .work()
         .spawn(async move {
@@ -1037,12 +1037,12 @@ pub(crate) fn apply_file_blame(
     editor: &mut Editor,
     doc_id: DocumentId,
     line: Option<u32>,
-    result: anyhow::Result<FileBlame>,
+    result: anyhow::Result<Box<FileBlame>>,
 ) {
     let Some(doc) = editor.document_mut(doc_id) else {
         return;
     };
-    doc.set_file_blame(result);
+    doc.set_file_blame(result.map(|blame| *blame));
     if !editor.config().inline_blame.auto_fetch {
         if let Some(line) = line {
             commands::blame_line_impl(editor, doc_id, line);

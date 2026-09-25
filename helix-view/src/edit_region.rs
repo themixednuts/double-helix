@@ -1181,7 +1181,10 @@ mod tests {
             InsertEntry::AtLineStart,
             InsertEntry::AtLineEnd,
         ] {
-            assert_eq!(InsertEntry::from_command(&entry.engine_command()), Some(entry));
+            assert_eq!(
+                InsertEntry::from_command(&entry.engine_command()),
+                Some(entry)
+            );
         }
         assert_eq!(InsertEntry::from_command("change_selection"), None);
     }

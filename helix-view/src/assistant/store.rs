@@ -983,9 +983,10 @@ impl Store {
                         effect::Effect::LaunchAuthTerminal {
                             thread,
                             title: method.name.clone(),
-                            terminal: method.terminal.clone().unwrap_or_else(|| {
-                                unreachable!("terminal logins have a terminal")
-                            }),
+                            terminal: method
+                                .terminal
+                                .clone()
+                                .unwrap_or_else(|| unreachable!("terminal logins have a terminal")),
                         }
                     }
                     _ => effect::Effect::SendBackendCommand {

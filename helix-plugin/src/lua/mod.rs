@@ -3661,7 +3661,11 @@ mod tests {
             .unwrap();
 
         assert_eq!(plugin_global::<u32>(&engine, "scoped", "helper_value"), 42);
-        assert!(plugin_global::<bool>(&engine, "scoped", "system_require_failed"));
+        assert!(plugin_global::<bool>(
+            &engine,
+            "scoped",
+            "system_require_failed"
+        ));
         assert!(plugin_global::<bool>(&engine, "scoped", "package_removed"));
     }
 
@@ -4184,10 +4188,7 @@ mod tests {
             .load_plugin_with_editor(&mut editor, plugin_with("second", second, &[]))
             .unwrap();
 
-        assert_eq!(
-            plugin_global::<String>(&engine, "first", "shared"),
-            "first"
-        );
+        assert_eq!(plugin_global::<String>(&engine, "first", "shared"), "first");
         assert_eq!(
             plugin_global::<Option<String>>(&engine, "second", "saw_shared"),
             None
@@ -4195,7 +4196,12 @@ mod tests {
         for global in ["log_intact", "upper_intact", "insert_intact", "own_global"] {
             assert!(plugin_global::<bool>(&engine, "second", global), "{global}");
         }
-        assert!(engine.lua.globals().get::<Option<String>>("shared").unwrap().is_none());
+        assert!(engine
+            .lua
+            .globals()
+            .get::<Option<String>>("shared")
+            .unwrap()
+            .is_none());
     }
 
     #[test]

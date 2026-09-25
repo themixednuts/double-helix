@@ -723,13 +723,14 @@ fn value_fits(value: &Value, budget: &mut usize) -> bool {
 }
 
 fn map_fits(map: &serde_json::Map<String, Value>, budget: &mut usize) -> bool {
-    map.iter().all(|(key, value)| match budget.checked_sub(key.len()) {
-        Some(rest) => {
-            *budget = rest;
-            value_fits(value, budget)
-        }
-        None => false,
-    })
+    map.iter()
+        .all(|(key, value)| match budget.checked_sub(key.len()) {
+            Some(rest) => {
+                *budget = rest;
+                value_fits(value, budget)
+            }
+            None => false,
+        })
 }
 
 #[cfg(test)]

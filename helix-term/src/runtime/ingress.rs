@@ -1269,7 +1269,7 @@ pub enum RuntimeTaskEvent {
     ApplyFileBlame {
         doc_id: DocumentId,
         line: Option<u32>,
-        result: anyhow::Result<helix_vcs::FileBlame>,
+        result: anyhow::Result<Box<helix_vcs::FileBlame>>,
     },
     /// Apply document highlight selections on the editor main loop.
     SelectDocumentHighlights {

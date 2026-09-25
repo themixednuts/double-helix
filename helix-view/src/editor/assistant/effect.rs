@@ -158,11 +158,10 @@ impl Editor {
         &self,
         terminal: &crate::assistant::auth::Terminal,
     ) -> Result<(), String> {
-        let config = self
-            .config()
-            .terminal
-            .clone()
-            .ok_or_else(|| "No external terminal is configured (`editor.terminal`)".to_string())?;
+        let config =
+            self.config().terminal.clone().ok_or_else(|| {
+                "No external terminal is configured (`editor.terminal`)".to_string()
+            })?;
         let mut child = std::process::Command::new(&config.command)
             .args(&config.args)
             .arg(&terminal.command)

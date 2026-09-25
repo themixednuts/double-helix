@@ -438,6 +438,9 @@ impl From<WorkspaceDocumentPath> for PathOrId<'_> {
 
 type FileCallback<T> = Box<dyn for<'a> Fn(&'a Editor, &'a T) -> Option<FileLocation<'a>> + Send>;
 
+/// Runs when the picker is dismissed without a choice.
+type AbortCallback = Box<dyn FnOnce(&mut Context) + Send>;
+
 /// File path and range of lines (used to align and highlight lines)
 pub type FileLocation<'a> = (PathOrId<'a>, Option<(usize, usize)>);
 
@@ -1354,7 +1357,7 @@ pub struct Picker<T: 'static + Send + Sync, D: 'static> {
 
     callback_fn: PickerCallback<T>,
     /// Runs when the picker is dismissed without choosing anything.
-    on_abort: Option<Box<dyn FnOnce(&mut Context) + Send>>,
+    on_abort: Option<AbortCallback>,
     custom_key_handlers: PickerKeyHandlers<T, D>,
 
     pub truncate_start: bool,

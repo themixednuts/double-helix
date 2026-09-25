@@ -158,7 +158,7 @@ impl MappableCommand {
                 } else if let Some(command) = cx
                     .plugin_runtime
                     .command_snapshot()
-                    .into_iter()
+                    .iter()
                     .find(|command| command.descriptor.name == *name)
                 {
                     let args = plugin_command_args(args);

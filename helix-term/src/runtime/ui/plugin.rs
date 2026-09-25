@@ -129,7 +129,7 @@ pub(crate) fn apply_plugin_command(
     let ingress = context.ingress.clone();
     match cmd {
         PluginCommand::SetTheme { theme, completion } => {
-            editor.set_theme(theme);
+            editor.set_theme(*theme);
             if let Err(error) =
                 completion.complete_foreground(Ok(helix_plugin_api::PluginTaskResult::Unit))
             {

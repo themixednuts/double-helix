@@ -1530,15 +1530,31 @@ impl PluginHostResponder {
 
 #[derive(Clone)]
 pub struct PluginRuntime {
-    hosts: Arc<RwLock<Vec<SupervisedPluginHost>>>,
+    /// Replaced whole on reconfigure, so readers take a cheap snapshot (every editor event
+    /// reads it).
+    hosts: Arc<RwLock<Arc<[SupervisedPluginHost]>>>,
     config: Arc<RwLock<PluginConfig>>,
+    /// The merged command list, rebuilt only when a host's commands change: `:` completion
+    /// reads it on every keystroke.
+    commands: Arc<std::sync::Mutex<Option<CommandCache>>>,
+}
+
+struct CommandCache {
+    /// Each host's id, generation and published commands the list was built from.
+    sources: Vec<(
+        PluginHostId,
+        Option<HostGenerationId>,
+        Arc<Vec<(CommandHandle, helix_plugin_api::CommandDescriptor)>>,
+    )>,
+    commands: Arc<[PluginCommandSnapshot]>,
 }
 
 impl Default for PluginRuntime {
     fn default() -> Self {
         Self {
-            hosts: Arc::default(),
+            hosts: Arc::new(RwLock::new(Arc::from([]))),
             config: Arc::new(RwLock::new(PluginConfig::default())),
+            commands: Arc::default(),
         }
     }
 }
@@ -1555,15 +1571,51 @@ struct SupervisedPluginHost {
 }
 
 impl PluginRuntime {
-    fn host_snapshot(&self) -> Vec<SupervisedPluginHost> {
-        self.hosts
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+    fn host_snapshot(&self) -> Arc<[SupervisedPluginHost]> {
+        Arc::clone(
+            &self
+                .hosts
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
     }
 
-    pub(crate) fn command_snapshot(&self) -> Vec<PluginCommandSnapshot> {
+    /// Every host's commands, sorted by name. Cached until a host's commands change.
+    pub(crate) fn command_snapshot(&self) -> Arc<[PluginCommandSnapshot]> {
         let hosts = self.host_snapshot();
+        let sources: Vec<_> = hosts
+            .iter()
+            .map(|host| {
+                (
+                    host.state.id(),
+                    host.state.route.active_generation(),
+                    host.state.published_commands.load_full(),
+                )
+            })
+            .collect();
+        let mut cache = self
+            .commands
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(cache) = cache.as_ref().filter(|cache| {
+            cache.sources.len() == sources.len()
+                && cache.sources.iter().zip(&sources).all(|(cached, current)| {
+                    cached.0 == current.0
+                        && cached.1 == current.1
+                        && Arc::ptr_eq(&cached.2, &current.2)
+                })
+        }) {
+            return Arc::clone(&cache.commands);
+        }
+        let commands = Self::build_command_snapshot(&hosts);
+        *cache = Some(CommandCache {
+            sources,
+            commands: Arc::clone(&commands),
+        });
+        commands
+    }
+
+    fn build_command_snapshot(hosts: &[SupervisedPluginHost]) -> Arc<[PluginCommandSnapshot]> {
         let mut commands = hosts
             .iter()
             .flat_map(|host| {
@@ -1586,7 +1638,7 @@ impl PluginRuntime {
                         .cmp(&right.id.command.raw().get())
                 })
         });
-        commands
+        commands.into()
     }
 
     pub(crate) fn invoke_command(
@@ -1612,7 +1664,7 @@ impl PluginRuntime {
     }
 
     pub(crate) fn reload(&self) -> ContractResult<()> {
-        for host in self.host_snapshot() {
+        for host in self.host_snapshot().iter() {
             if host.shutdown.is_canceled() {
                 return Err(internal_error(format!(
                     "plugin host '{}' is shutting down",
@@ -1626,7 +1678,7 @@ impl PluginRuntime {
 
     pub(crate) fn notify_event(&self, event: helix_plugin_api::events::PluginEvent) {
         let kind = event.kind();
-        for host in self.host_snapshot() {
+        for host in self.host_snapshot().iter() {
             if !host.state.wants(kind) {
                 continue;
             }
@@ -1681,7 +1733,7 @@ impl PluginRuntime {
                 .hosts
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
-            next,
+            Arc::from(next),
         );
         *active_config = config.clone();
         drop(active_config);
@@ -1701,9 +1753,9 @@ fn request_host_shutdown(hosts: &[SupervisedPluginHost]) {
     }
 }
 
-async fn wait_for_hosts(hosts: Vec<SupervisedPluginHost>) {
-    for host in hosts {
-        let mut stopped = host.stopped;
+async fn wait_for_hosts(hosts: Arc<[SupervisedPluginHost]>) {
+    for host in hosts.iter() {
+        let mut stopped = host.stopped.clone();
         while !*stopped.borrow() {
             if stopped.changed().await.is_err() {
                 break;
@@ -2172,10 +2224,11 @@ pub(crate) fn spawn_plugin_runtime(
 ) -> Result<PluginRuntime, helix_plugin::PluginConfigError> {
     config.validate()?;
     Ok(PluginRuntime {
-        hosts: Arc::new(RwLock::new(spawn_plugin_hosts(
+        hosts: Arc::new(RwLock::new(Arc::from(spawn_plugin_hosts(
             config, ingress, foreground, work,
-        ))),
+        )))),
         config: Arc::new(RwLock::new(config.clone())),
+        commands: Arc::default(),
     })
 }
 
@@ -2519,7 +2572,8 @@ mod tests {
         let (_stopped_a, stopped_a) = tokio::sync::watch::channel(false);
         let (_stopped_b, stopped_b) = tokio::sync::watch::channel(false);
         let hosts = PluginRuntime {
-            hosts: Arc::new(RwLock::new(vec![
+            commands: Arc::default(),
+            hosts: Arc::new(RwLock::new(Arc::from(vec![
                 SupervisedPluginHost {
                     name: "host-a".into(),
                     state: state_a.clone(),
@@ -2538,10 +2592,12 @@ mod tests {
                     shutdown: helix_runtime::Token::new(),
                     stopped: stopped_b,
                 },
-            ])),
+            ]))),
             config: Arc::new(RwLock::new(PluginConfig::default())),
         };
         let snapshot = hosts.command_snapshot();
+        // Unchanged commands come from the cache.
+        assert!(Arc::ptr_eq(&snapshot, &hosts.command_snapshot()));
         assert_eq!(snapshot.len(), 2);
         assert_eq!(snapshot[0].id.command, snapshot[1].id.command);
         assert_ne!(snapshot[0].id.host, snapshot[1].id.host);

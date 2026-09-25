@@ -2491,16 +2491,13 @@ pub(crate) fn show_command_palette(
             }),
     );
 
-    commands.extend(
-        cx.plugin_runtime
-            .command_snapshot()
-            .into_iter()
-            .map(|command| MappableCommand::Typable {
-                name: command.descriptor.name,
-                args: String::new(),
-                doc: command.descriptor.doc,
-            }),
-    );
+    commands.extend(cx.plugin_runtime.command_snapshot().iter().map(|command| {
+        MappableCommand::Typable {
+            name: command.descriptor.name.clone(),
+            args: String::new(),
+            doc: command.descriptor.doc.clone(),
+        }
+    }));
 
     let columns = [
         ui::PickerColumn::new("name", |item, _| match item {

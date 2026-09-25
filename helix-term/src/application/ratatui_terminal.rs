@@ -77,16 +77,35 @@ where
         self.inner.backend()
     }
 
-    pub(super) fn draw(
+    #[cfg(test)]
+    fn draw(
+        &mut self,
+        cursor_position: Option<(u16, u16)>,
+        cursor_kind: CursorKind,
+    ) -> io::Result<()> {
+        HelixBackend::start_sync(self.inner.backend_mut())?;
+        self.finish_frame(cursor_position, cursor_kind)
+    }
+
+    /// Writes the pending cells and the cursor, then closes the synchronized
+    /// frame the caller opened and flushes once.
+    fn finish_frame(
         &mut self,
         cursor_position: Option<(u16, u16)>,
         cursor_kind: CursorKind,
     ) -> io::Result<()> {
         self.inner.flush()?;
 
-        if let Some((x, y)) = cursor_position {
-            self.inner.set_cursor_position(Position::new(x, y))?;
-        }
+        // Without a position the terminal cursor would be left wherever the
+        // diff flush last wrote, so a visible shape would show up at a stray
+        // cell (often the statusline). Only show a cursor we placed.
+        let cursor_kind = match cursor_position {
+            Some((x, y)) => {
+                self.inner.set_cursor_position(Position::new(x, y))?;
+                cursor_kind
+            }
+            None => CursorKind::Hidden,
+        };
 
         match cursor_kind {
             CursorKind::Hidden => self.inner.hide_cursor()?,
@@ -94,6 +113,7 @@ where
         }
         self.cursor_kind = cursor_kind;
 
+        HelixBackend::end_sync(self.inner.backend_mut())?;
         self.inner.swap_buffers();
         HelixBackend::flush(self.inner.backend_mut())
     }
@@ -106,6 +126,11 @@ where
         cursor_kind: CursorKind,
         full_redraw: bool,
     ) -> io::Result<Buffer> {
+        // One synchronized frame from the first write: a resize or full
+        // redraw clears inside it, so the terminal never shows the blank
+        // screen, and the cursor never sits on the last written cell before
+        // moving into place.
+        HelixBackend::start_sync(self.inner.backend_mut())?;
         if area != self.viewport_area {
             self.resize(area)?;
         }
@@ -113,7 +138,7 @@ where
             self.clear()?;
         }
         let retired = std::mem::replace(self.current_buffer_mut(), surface);
-        self.draw(cursor_position, cursor_kind)?;
+        self.finish_frame(cursor_position, cursor_kind)?;
         Ok(retired)
     }
 }
@@ -138,6 +163,16 @@ mod tests {
         terminal.draw(None, CursorKind::Hidden).unwrap();
 
         assert_eq!(terminal.backend().buffer()[(1, 0)].symbol(), "x");
+    }
+
+    #[test]
+    fn app_terminal_hides_a_cursor_without_a_position() {
+        let mut terminal = AppTerminal::new(TestBackend::new(4, 2)).unwrap();
+        terminal.claim().unwrap();
+
+        terminal.draw(None, CursorKind::Block).unwrap();
+
+        assert_eq!(terminal.cursor_kind, CursorKind::Hidden);
     }
 
     #[test]

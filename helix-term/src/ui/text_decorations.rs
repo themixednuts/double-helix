@@ -198,8 +198,10 @@ impl Decoration for Cursor {
         renderer: &mut TextRenderer,
         grapheme: &FormattedGrapheme,
     ) -> usize {
+        // Rows at or below the renderer's vertical offset are on screen,
+        // including the first one.
         if renderer.column_in_bounds(grapheme.visual_pos.col, grapheme.width())
-            && renderer.offset.row < grapheme.visual_pos.row
+            && renderer.offset.row <= grapheme.visual_pos.row
         {
             self.position = Some(grapheme.visual_pos - renderer.offset);
         }

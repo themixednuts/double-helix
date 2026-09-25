@@ -159,10 +159,6 @@ where
         I: Iterator<Item = (u16, u16, &'a C)>,
         C: TerminalCell + 'a,
     {
-        // Begin synchronized update — terminal holds display
-        // until the matching end sequence, preventing partial-frame flicker.
-        write!(self.buffer, "\x1b[?2026h")?;
-
         let mut fg = Color::Reset;
         let mut bg = Color::Reset;
         let mut underline_color = Color::Reset;
@@ -228,8 +224,7 @@ where
             SetAttribute(CAttribute::Reset)
         )?;
 
-        // End synchronized update — terminal renders the complete frame.
-        write!(self.buffer, "\x1b[?2026l")
+        Ok(())
     }
 }
 
@@ -324,8 +319,10 @@ where
         self.draw_cells(content)
     }
 
+    // Cursor and clear writes are queued: the caller flushes once per frame,
+    // inside its synchronized-output block.
     fn hide_cursor(&mut self) -> io::Result<()> {
-        execute!(self.buffer, Hide)
+        queue!(self.buffer, Hide)
     }
 
     fn show_cursor(&mut self, kind: CursorKind) -> io::Result<()> {
@@ -335,15 +332,23 @@ where
             CursorKind::Underline => SetCursorStyle::SteadyUnderScore,
             CursorKind::Hidden => unreachable!(),
         };
-        execute!(self.buffer, Show, shape)
+        queue!(self.buffer, Show, shape)
     }
 
     fn set_cursor(&mut self, x: u16, y: u16) -> io::Result<()> {
-        execute!(self.buffer, MoveTo(x, y))
+        queue!(self.buffer, MoveTo(x, y))
     }
 
     fn clear(&mut self) -> io::Result<()> {
-        execute!(self.buffer, Clear(ClearType::All))
+        queue!(self.buffer, Clear(ClearType::All))
+    }
+
+    fn start_sync(&mut self) -> io::Result<()> {
+        write!(self.buffer, "\x1b[?2026h")
+    }
+
+    fn end_sync(&mut self) -> io::Result<()> {
+        write!(self.buffer, "\x1b[?2026l")
     }
 
     fn size(&self) -> io::Result<Rect> {

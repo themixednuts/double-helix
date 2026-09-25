@@ -42,6 +42,15 @@ pub trait Backend {
     fn set_cursor(&mut self, x: u16, y: u16) -> Result<(), io::Error>;
     /// Clears the terminal
     fn clear(&mut self) -> Result<(), io::Error>;
+    /// Opens a synchronized-output frame, where the terminal supports it, so
+    /// everything written until [`Backend::end_sync`] presents at once.
+    fn start_sync(&mut self) -> Result<(), io::Error> {
+        Ok(())
+    }
+    /// Closes the frame opened by [`Backend::start_sync`].
+    fn end_sync(&mut self) -> Result<(), io::Error> {
+        Ok(())
+    }
     /// Gets the size of the terminal in cells
     fn size(&self) -> Result<Rect, io::Error>;
     /// Flushes the terminal buffer

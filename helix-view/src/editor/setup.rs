@@ -232,6 +232,7 @@ impl Editor {
             assistant_persistence: AssistantPersistenceState {
                 saves: std::collections::BTreeMap::new(),
                 layout_save: helix_runtime::Debounce::new(std::time::Duration::from_millis(300)),
+                layout_key: None,
             },
             assistant_runtime: AssistantRuntimeState {
                 backends: std::collections::BTreeMap::new(),

@@ -134,11 +134,18 @@ impl Editor {
                     self.delete_assistant_thread(thread);
                 }
                 crate::assistant::effect::Effect::SyncModel => {
-                    let scope = crate::assistant::layout::current_scope();
-                    let (open, active) = self.assistant_layout_threads(&scope);
-                    self.debounce_assistant_layout(async move {
-                        let _ = crate::assistant::layout::save_layout(&scope, open, active).await;
-                    });
+                    // Every streamed chunk syncs the model, but the layout (which threads are
+                    // open, which is active) rarely changes: save it only when it did.
+                    let key = self.assistant_layout_key();
+                    if self.assistant_persistence.layout_key != Some(key) {
+                        self.assistant_persistence.layout_key = Some(key);
+                        let scope = crate::assistant::layout::current_scope();
+                        let (open, active) = self.assistant_layout_threads(&scope);
+                        self.debounce_assistant_layout(async move {
+                            let _ =
+                                crate::assistant::layout::save_layout(&scope, open, active).await;
+                        });
+                    }
                     self.request_redraw();
                 }
             }

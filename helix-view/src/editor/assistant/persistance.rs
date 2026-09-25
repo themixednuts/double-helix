@@ -31,6 +31,17 @@ impl Editor {
         (open, active)
     }
 
+    /// A fingerprint of the open threads and the active one: what the saved layout holds.
+    pub(crate) fn assistant_layout_key(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::hash::DefaultHasher::new();
+        for thread in self.assistant.threads() {
+            thread.id.hash(&mut hasher);
+        }
+        self.assistant.active_id().hash(&mut hasher);
+        hasher.finish()
+    }
+
     pub fn persist_assistant_layout(&self) {
         let scope = crate::assistant::layout::current_scope();
         let (open, active) = self.assistant_layout_threads(&scope);

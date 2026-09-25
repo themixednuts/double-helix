@@ -56,6 +56,8 @@ pub(crate) struct PackagedAssistantAgentCache {
 pub(crate) struct AssistantPersistenceState {
     pub(crate) saves: BTreeMap<crate::assistant::thread::Id, helix_runtime::Debounce>,
     pub(crate) layout_save: helix_runtime::Debounce,
+    /// What the last scheduled layout save saw (`Editor::assistant_layout_key`).
+    pub(crate) layout_key: Option<u64>,
 }
 
 pub(crate) struct AssistantFollowState {

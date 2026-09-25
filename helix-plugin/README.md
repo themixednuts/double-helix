@@ -39,7 +39,7 @@ plugin_dirs = ["~/.config/helix/plugins"]
 ```
 ~/.config/helix/plugins/
   my-plugin/
-    plugin.toml    # Metadata (optional)
+    plugin.toml    # Metadata; declares the capabilities the plugin may use
     init.lua       # Entry point (required)
 ```
 
@@ -458,14 +458,16 @@ end
 
 Plugins run in a sandboxed Lua environment inside a supervised child process:
 
-- **Disabled**: `os.execute`, `os.exit`, `io`, `package`, `load`, `loadstring`, `loadfile`, `dofile`
+- **Disabled**: `io`, `package`, `load`, `loadstring`, `loadfile`, `dofile`. `os` keeps only `clock`, `date`, `difftime`, and `time`; `collectgarbage` accepts only `collect`, `count`, and `step`.
+- **Isolated**: each plugin has its own global environment (`_G`), with its own copies of `helix` and the standard libraries, so what one plugin assigns or replaces no other plugin sees.
+- **Capabilities**: a plugin can use only the capabilities its `plugin.toml` declares (`query` is always granted). Anything else fails with `permission_denied`.
 - **Scoped modules**: `require("name")` resolves only to `name.lua` inside the current plugin directory. Absolute paths, path separators, `:`, and `..` are rejected.
 - **Limits**: `max_memory` defaults to 256 MiB and `max_instructions` defaults to 5,000,000 VM instructions per plugin dispatch. Set either to `0` to disable that limit.
 - **No network access** (currently)
 
 ## Versioning and errors
 
-`plugin.toml` declares the exact `api_version` and requested `capabilities`. Loading is refused when the version differs from the host contract or a capability name is unknown. Capability names are `query`, `mutation`, `ui`, `panels`, `commands`, `keymaps`, `events`, `splits`, `tabs`, `floats`, `tasks`, `syntax`, `lsp`, `themes`, and `assistant`.
+`plugin.toml` declares the exact `api_version` and the `capabilities` the plugin may use. Loading is refused when the version differs from the host contract, a capability name is unknown, or the host lacks a declared capability. A call outside the declared capabilities fails with `permission_denied`. Capability names are `query`, `mutation`, `ui`, `panels`, `commands`, `keymaps`, `events`, `splits`, `tabs`, `floats`, `tasks`, `syntax`, `lsp`, `themes`, and `assistant`.
 
 Host contract failures carry stable codes: `not_found`, `stale_handle`, `invalid_request`, `permission_denied`, `unsupported_capability`, `busy`, and `internal_error`. Error text remains human-readable and includes the code for plugin-side handling.
 

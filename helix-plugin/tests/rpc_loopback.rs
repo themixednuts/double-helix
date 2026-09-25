@@ -31,6 +31,14 @@ fn plugin_host_loopback_dispatches_event_and_host_calls() {
     let plugin_dir = plugin_root.join("loopback");
     std::fs::create_dir_all(&plugin_dir).unwrap();
     std::fs::write(
+        plugin_dir.join("plugin.toml"),
+        r#"
+name = "loopback"
+capabilities = ["mutation", "ui", "commands", "keymaps", "events", "syntax", "lsp"]
+"#,
+    )
+    .unwrap();
+    std::fs::write(
         plugin_dir.join("init.lua"),
         r#"
 helix.keymaps.register({

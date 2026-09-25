@@ -10,7 +10,7 @@ use log::{error, warn};
 use mlua::prelude::*;
 use mlua::{HookTriggers, RegistryKey, VmState};
 use parking_lot::{Mutex, RwLock};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -25,6 +25,55 @@ pub use context::{
 pub(crate) struct CurrentPluginName(pub Arc<RwLock<Option<String>>>);
 
 pub(crate) struct PluginRoots(pub Arc<RwLock<HashMap<String, PathBuf>>>);
+
+/// The capabilities each loaded plugin declared in its manifest, keyed by plugin name. The
+/// facade refuses a call outside them.
+pub(crate) struct PluginCapabilities(
+    pub Arc<RwLock<HashMap<String, HashSet<crate::contract::metadata::Capability>>>>,
+);
+
+/// Whether the calling plugin declared `capability`. `query` is always granted.
+pub(crate) fn plugin_has_capability(
+    lua: &Lua,
+    capability: crate::contract::metadata::Capability,
+) -> std::result::Result<bool, mlua::Error> {
+    if capability == crate::contract::metadata::Capability::Query {
+        return Ok(true);
+    }
+    let plugin_name = current_plugin_name(lua)?;
+    Ok(lua
+        .app_data_ref::<PluginCapabilities>()
+        .is_some_and(|granted| {
+            granted
+                .0
+                .read()
+                .get(&plugin_name)
+                .is_some_and(|granted| granted.contains(&capability))
+        }))
+}
+
+/// Registry keys for the per-plugin environments: a function building a fresh one, and the
+/// table of environments by plugin name.
+const NEW_PLUGIN_ENVIRONMENT: &str = "helix.new_plugin_environment";
+const PLUGIN_ENVIRONMENTS: &str = "helix.plugin_environments";
+
+/// Give `plugin_name` a fresh global environment: its own copy of every global table (`helix`,
+/// `string`, `table`, ...), so what one plugin assigns or replaces no other plugin sees.
+fn new_plugin_environment(lua: &Lua, plugin_name: &str) -> LuaResult<LuaTable> {
+    let build: LuaFunction = lua.named_registry_value(NEW_PLUGIN_ENVIRONMENT)?;
+    let env: LuaTable = build.call(())?;
+    let environments: LuaTable = lua.named_registry_value(PLUGIN_ENVIRONMENTS)?;
+    environments.raw_set(plugin_name, &env)?;
+    Ok(env)
+}
+
+/// The environment `plugin_name` was loaded with.
+fn plugin_environment(lua: &Lua, plugin_name: &str) -> LuaResult<LuaTable> {
+    let environments: LuaTable = lua.named_registry_value(PLUGIN_ENVIRONMENTS)?;
+    environments
+        .raw_get::<Option<LuaTable>>(plugin_name)?
+        .ok_or_else(|| LuaError::RuntimeError(format!("plugin not loaded: {plugin_name}")))
+}
 
 pub(crate) fn current_plugin_name(lua: &Lua) -> std::result::Result<String, mlua::Error> {
     let state = lua
@@ -630,18 +679,67 @@ fn setup_sandbox(
 
     lua.load(
         r#"
-        os.execute = nil
-        os.exit = nil
+        -- Only the clock: no processes, files, environment variables or locale.
+        os = { clock = os.clock, date = os.date, difftime = os.difftime, time = os.time }
         io = nil
         package = nil
         load = nil
         loadstring = nil
         loadfile = nil
         dofile = nil
+
+        -- One plugin must not be able to stop the collector for all of them.
+        local collect = collectgarbage
+        collectgarbage = function(option, ...)
+            if option == nil or option == "collect" or option == "count" or option == "step" then
+                return collect(option, ...)
+            end
+            error("collectgarbage('" .. tostring(option) .. "') is not available to plugins", 2)
+        end
+
+        -- Strings share one metatable, whose __index is the real `string` table: hide it, so
+        -- a plugin cannot rewrite string methods for the others.
+        getmetatable("").__metatable = false
         "#,
     )
     .exec()
     .map_err(|e| PluginError::InitializationFailed(format!("Failed to setup sandbox: {e}")))?;
+
+    let new_environment: LuaFunction = lua
+        .load(
+            r#"
+            local base, pairs, type = _G, pairs, type
+            local function copy(t, seen)
+                local c = seen[t]
+                if c then
+                    return c
+                end
+                c = {}
+                seen[t] = c
+                for k, v in pairs(t) do
+                    c[k] = type(v) == "table" and copy(v, seen) or v
+                end
+                return c
+            end
+            -- `_G` maps to the copy itself, since `seen` maps the base table to it.
+            return function()
+                return copy(base, {})
+            end
+            "#,
+        )
+        .set_name("plugin_environment")
+        .eval()
+        .and_then(|build| {
+            lua.set_named_registry_value(PLUGIN_ENVIRONMENTS, lua.create_table()?)?;
+            Ok(build)
+        })
+        .map_err(|e| {
+            PluginError::InitializationFailed(format!("Failed to set up plugin environments: {e}"))
+        })?;
+    lua.set_named_registry_value(NEW_PLUGIN_ENVIRONMENT, new_environment)
+        .map_err(|e| {
+            PluginError::InitializationFailed(format!("Failed to set up plugin environments: {e}"))
+        })?;
 
     // A plugin host's stdout carries its RPC frames, so `print` must not
     // write there; send it to the log like `helix.log.info`.
@@ -708,7 +806,11 @@ fn scoped_require(lua: &Lua, module: String) -> LuaResult<LuaValue> {
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or(module.as_str());
-    let value: LuaValue = lua.load(&code).set_name(name).eval()?;
+    let value: LuaValue = lua
+        .load(&code)
+        .set_name(name)
+        .set_environment(plugin_environment(lua, &plugin_name)?)
+        .eval()?;
     Ok(match value {
         LuaValue::Nil => LuaValue::Boolean(true),
         value => value,
@@ -738,6 +840,9 @@ pub struct LuaEngine {
     current_plugin_name: Arc<RwLock<Option<String>>>,
     /// Canonical plugin root directories keyed by plugin name.
     plugin_roots: Arc<RwLock<HashMap<String, PathBuf>>>,
+    /// Capabilities each plugin declared, keyed by plugin name.
+    plugin_capabilities:
+        Arc<RwLock<HashMap<String, HashSet<crate::contract::metadata::Capability>>>>,
     /// UI callbacks: (plugin_name, callback_id) -> callback_ref
     ui_callbacks: Arc<RwLock<HashMap<PluginCallbackKey, RegistryKey>>>,
     /// Panel render/event callback metadata keyed by panel handle.
@@ -777,7 +882,9 @@ impl LuaEngine {
         let next_plugin_handle = Arc::new(std::sync::atomic::AtomicU64::new(1));
         let current_plugin_name = Arc::new(RwLock::new(None));
         let plugin_roots = Arc::new(RwLock::new(HashMap::new()));
+        let plugin_capabilities = Arc::new(RwLock::new(HashMap::new()));
         lua.set_app_data(CurrentPluginName(Arc::clone(&current_plugin_name)));
+        lua.set_app_data(PluginCapabilities(Arc::clone(&plugin_capabilities)));
         setup_sandbox(
             &lua,
             &crate::types::PluginConfig::default(),
@@ -802,6 +909,7 @@ impl LuaEngine {
             next_plugin_handle,
             current_plugin_name,
             plugin_roots,
+            plugin_capabilities,
             ui_callbacks,
             panel_callbacks,
             next_ui_callback_id,
@@ -837,6 +945,8 @@ impl LuaEngine {
         self.lua = lua;
         self.lua
             .set_app_data(CurrentPluginName(Arc::clone(&self.current_plugin_name)));
+        self.lua
+            .set_app_data(PluginCapabilities(Arc::clone(&self.plugin_capabilities)));
         setup_sandbox(
             &self.lua,
             &crate::types::PluginConfig::default(),
@@ -851,6 +961,7 @@ impl LuaEngine {
         self.plugins.clear();
         self.plugin_registry.write().clear();
         self.plugin_roots.write().clear();
+        self.plugin_capabilities.write().clear();
 
         Ok(())
     }
@@ -1189,11 +1300,16 @@ impl LuaEngine {
         self.lua.set_app_data(HostApiMetadata(self.api_metadata()));
     }
 
-    fn validate_plugin_capabilities(&self, plugin: &crate::types::Plugin) -> Result<()> {
+    /// Check the plugin's declared capabilities against the host, returning them.
+    fn validate_plugin_capabilities(
+        &self,
+        plugin: &crate::types::Plugin,
+    ) -> Result<HashSet<crate::contract::metadata::Capability>> {
         use crate::contract::metadata::Capability;
         use std::str::FromStr;
 
         let metadata = self.api_metadata();
+        let mut granted = HashSet::from([Capability::Query]);
         for name in &plugin.metadata.capabilities {
             let capability = Capability::from_str(name).map_err(PluginError::ConfigError)?;
             if !metadata.has_capability(capability) {
@@ -1202,8 +1318,26 @@ impl LuaEngine {
                     plugin.metadata.name
                 )));
             }
+            granted.insert(capability);
         }
-        Ok(())
+        Ok(granted)
+    }
+
+    /// Record the plugin's identity, root, capabilities and a fresh environment, returning
+    /// the environment its code runs in.
+    fn prepare_plugin(
+        &self,
+        plugin: &crate::types::Plugin,
+        capabilities: HashSet<crate::contract::metadata::Capability>,
+    ) -> Result<LuaTable> {
+        let name = &plugin.metadata.name;
+        self.ensure_plugin_id(name);
+        let root = canonical_root(&plugin.path)?;
+        self.plugin_roots.write().insert(name.clone(), root);
+        self.plugin_capabilities
+            .write()
+            .insert(name.clone(), capabilities);
+        new_plugin_environment(&self.lua, name).map_err(PluginError::LuaError)
     }
 
     /// Register the Helix API with Lua
@@ -1255,6 +1389,8 @@ impl LuaEngine {
             .set_app_data(CurrentPluginName(Arc::clone(&self.current_plugin_name)));
         self.lua
             .set_app_data(PluginRoots(Arc::clone(&self.plugin_roots)));
+        self.lua
+            .set_app_data(PluginCapabilities(Arc::clone(&self.plugin_capabilities)));
         self.lua
             .set_app_data(LoadedPluginRegistryWrapper(Arc::clone(
                 &self.plugin_registry,
@@ -1636,7 +1772,7 @@ impl LuaEngine {
         editor: &mut Editor,
         plugin: crate::types::Plugin,
     ) -> Result<()> {
-        self.validate_plugin_capabilities(&plugin)?;
+        let capabilities = self.validate_plugin_capabilities(&plugin)?;
         let entry_file = plugin
             .path
             .join(plugin.metadata.entry.as_deref().unwrap_or("init.lua"));
@@ -1648,19 +1784,15 @@ impl LuaEngine {
             )));
         }
 
-        // Load and execute the plugin
         let code = std::fs::read_to_string(&entry_file)?;
-        self.ensure_plugin_id(&plugin.metadata.name);
-        let root = canonical_root(&plugin.path)?;
-        self.plugin_roots
-            .write()
-            .insert(plugin.metadata.name.clone(), root);
+        let env = self.prepare_plugin(&plugin, capabilities)?;
         with_editor_context(editor, || {
             with_current_plugin_name(&self.lua, &plugin.metadata.name, || {
                 self.with_watchdog(|| {
                     self.lua
                         .load(&code)
                         .set_name(&plugin.metadata.name)
+                        .set_environment(env)
                         .exec()
                         .map_err(PluginError::LuaError)
                 })
@@ -1682,7 +1814,7 @@ impl LuaEngine {
             + Sync
             + 'static,
     {
-        self.validate_plugin_capabilities(&plugin)?;
+        let capabilities = self.validate_plugin_capabilities(&plugin)?;
         let entry_file = plugin
             .path
             .join(plugin.metadata.entry.as_deref().unwrap_or("init.lua"));
@@ -1695,17 +1827,14 @@ impl LuaEngine {
         }
 
         let code = std::fs::read_to_string(&entry_file)?;
-        self.ensure_plugin_id(&plugin.metadata.name);
-        let root = canonical_root(&plugin.path)?;
-        self.plugin_roots
-            .write()
-            .insert(plugin.metadata.name.clone(), root);
+        let env = self.prepare_plugin(&plugin, capabilities)?;
         self.with_facade_host(host, || {
             with_current_plugin_name(&self.lua, &plugin.metadata.name, || {
                 self.with_watchdog(|| {
                     self.lua
                         .load(&code)
                         .set_name(&plugin.metadata.name)
+                        .set_environment(env)
                         .exec()
                         .map_err(PluginError::LuaError)
                 })
@@ -1742,11 +1871,13 @@ impl LuaEngine {
             return Ok(());
         }
 
-        let event_data = with_editor_context_ref(editor, || {
-            api::facade::contract_event_to_table(&self.lua, event).map_err(PluginError::LuaError)
-        })?;
-
         for (handle, plugin_name) in targets {
+            // Each handler gets its own table: one plugin changing it must not change what
+            // the next one sees.
+            let event_data = with_editor_context_ref(editor, || {
+                api::facade::contract_event_to_table(&self.lua, event)
+                    .map_err(PluginError::LuaError)
+            })?;
             let callback = {
                 let handlers = self.contract_event_handlers.read();
                 let Some(entry) = handlers
@@ -1768,7 +1899,7 @@ impl LuaEngine {
                     with_current_plugin_name(&self.lua, &plugin_name, || {
                         self.with_watchdog(|| {
                             callback
-                                .call::<()>(event_data.clone())
+                                .call::<()>(event_data)
                                 .map_err(PluginError::LuaError)
                         })
                     })
@@ -1823,10 +1954,11 @@ impl LuaEngine {
             return Ok(());
         }
 
-        let event_data = api::facade::contract_event_to_table(&self.lua, event)
-            .map_err(PluginError::LuaError)?;
-
         for (handle, plugin_name) in targets {
+            // Each handler gets its own table: one plugin changing it must not change what
+            // the next one sees.
+            let event_data = api::facade::contract_event_to_table(&self.lua, event)
+                .map_err(PluginError::LuaError)?;
             let callback = {
                 let handlers = self.contract_event_handlers.read();
                 let Some(entry) = handlers
@@ -1848,7 +1980,7 @@ impl LuaEngine {
                     with_current_plugin_name(&self.lua, &plugin_name, || {
                         self.with_watchdog(|| {
                             callback
-                                .call::<()>(event_data.clone())
+                                .call::<()>(event_data)
                                 .map_err(PluginError::LuaError)
                         })
                     })
@@ -2088,14 +2220,36 @@ mod tests {
             .is_err());
     }
 
+    /// Register `name` as loaded, with every capability.
     fn register_loaded_plugin(engine: &LuaEngine, name: &str, id: u64) {
         engine.plugin_registry.write().insert(
             name.into(),
             PluginId::from_raw(NonZeroU64::new(id).unwrap()),
         );
+        grant_all_capabilities(engine, name);
     }
 
+    fn grant_all_capabilities(engine: &LuaEngine, name: &str) {
+        engine.plugin_capabilities.write().insert(
+            name.into(),
+            crate::contract::metadata::Capability::ALL
+                .iter()
+                .copied()
+                .collect(),
+        );
+    }
+
+    /// A global the plugin's code set, in its own environment.
+    fn plugin_global<T: FromLua>(engine: &LuaEngine, plugin: &str, name: &str) -> T {
+        plugin_environment(&engine.lua, plugin)
+            .unwrap()
+            .get(name)
+            .unwrap()
+    }
+
+    /// Run as `name`, with every capability.
     fn set_current_plugin(engine: &LuaEngine, name: &str) {
+        grant_all_capabilities(engine, name);
         *engine.current_plugin_name.write() = Some(name.into());
     }
 
@@ -2256,7 +2410,7 @@ mod tests {
 
         engine.load_plugin_with_editor(&mut editor, plugin).unwrap();
 
-        let mode_at_load: String = engine.lua.globals().get("mode_at_load").unwrap();
+        let mode_at_load: String = plugin_global(&engine, "load-context", "mode_at_load");
         assert_eq!(mode_at_load, "normal");
     }
 
@@ -2266,6 +2420,7 @@ mod tests {
         engine
             .register_api(crate::types::PluginConfig::default())
             .unwrap();
+        set_current_plugin(&engine, "test-plugin");
         let mut editor = test_editor();
         let doc_one = editor.open_markdown_scratch(Action::VerticalSplit, "one".to_owned());
         let view_one = editor.tree.focus;
@@ -3262,14 +3417,8 @@ mod tests {
 
         let registered = Arc::new(Mutex::new(Vec::new()));
         let mut engine = LuaEngine::new().unwrap();
-        engine.plugin_registry.write().insert(
-            "owner-plugin".into(),
-            PluginId::from_raw(NonZeroU64::new(1).unwrap()),
-        );
-        engine.plugin_registry.write().insert(
-            "caller-plugin".into(),
-            PluginId::from_raw(NonZeroU64::new(2).unwrap()),
-        );
+        register_loaded_plugin(&engine, "owner-plugin", 1);
+        register_loaded_plugin(&engine, "caller-plugin", 2);
         engine.set_command_host(Box::new(TestCommandHost {
             registered: Arc::clone(&registered),
         }));
@@ -3511,13 +3660,9 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(engine.lua.globals().get::<u32>("helper_value").unwrap(), 42);
-        assert!(engine
-            .lua
-            .globals()
-            .get::<bool>("system_require_failed")
-            .unwrap());
-        assert!(engine.lua.globals().get::<bool>("package_removed").unwrap());
+        assert_eq!(plugin_global::<u32>(&engine, "scoped", "helper_value"), 42);
+        assert!(plugin_global::<bool>(&engine, "scoped", "system_require_failed"));
+        assert!(plugin_global::<bool>(&engine, "scoped", "package_removed"));
     }
 
     #[test]
@@ -3966,6 +4111,144 @@ mod tests {
         let result: std::result::Result<(), mlua::Error> =
             engine.lua.load("io.open('/etc/passwd')").exec();
         assert!(result.is_err());
+
+        engine
+            .lua
+            .load(
+                r#"
+                assert(os.remove == nil and os.rename == nil and os.getenv == nil)
+                assert(os.tmpname == nil and os.setlocale == nil)
+                assert(type(os.time()) == "number" and type(os.clock()) == "number")
+                assert(not pcall(collectgarbage, "stop"))
+                assert(type(collectgarbage("count")) == "number")
+                assert(getmetatable("") == false)
+                "#,
+            )
+            .exec()
+            .unwrap();
+    }
+
+    fn write_plugin(root: &Path, name: &str, code: &str) -> PathBuf {
+        let dir = root.join(name);
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("init.lua"), code).unwrap();
+        dir
+    }
+
+    fn plugin_with(name: &str, path: PathBuf, capabilities: &[&str]) -> crate::types::Plugin {
+        crate::types::Plugin {
+            metadata: crate::types::PluginMetadata {
+                name: name.into(),
+                capabilities: capabilities.iter().map(|c| c.to_string()).collect(),
+                ..Default::default()
+            },
+            path,
+            enabled: true,
+        }
+    }
+
+    #[test]
+    fn plugins_do_not_share_globals() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let first = write_plugin(
+            temp_dir.path(),
+            "first",
+            r#"
+            shared = "first"
+            helix.log.info = nil
+            string.upper = nil
+            table.insert = nil
+            "#,
+        );
+        let second = write_plugin(
+            temp_dir.path(),
+            "second",
+            r#"
+            saw_shared = shared
+            log_intact = helix.log.info ~= nil
+            upper_intact = string.upper ~= nil and ("a"):upper() == "A"
+            insert_intact = table.insert ~= nil
+            own_global = _G == _ENV
+            "#,
+        );
+
+        let mut engine = LuaEngine::new().unwrap();
+        engine
+            .register_api(crate::types::PluginConfig::default())
+            .unwrap();
+        let mut editor = test_editor();
+        engine
+            .load_plugin_with_editor(&mut editor, plugin_with("first", first, &[]))
+            .unwrap();
+        engine
+            .load_plugin_with_editor(&mut editor, plugin_with("second", second, &[]))
+            .unwrap();
+
+        assert_eq!(
+            plugin_global::<String>(&engine, "first", "shared"),
+            "first"
+        );
+        assert_eq!(
+            plugin_global::<Option<String>>(&engine, "second", "saw_shared"),
+            None
+        );
+        for global in ["log_intact", "upper_intact", "insert_intact", "own_global"] {
+            assert!(plugin_global::<bool>(&engine, "second", global), "{global}");
+        }
+        assert!(engine.lua.globals().get::<Option<String>>("shared").unwrap().is_none());
+    }
+
+    #[test]
+    fn plugins_are_held_to_their_declared_capabilities() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let code = r#"
+            -- Handle methods raise the error text, `helix.*` functions a table.
+            local function code(ok, err)
+                if ok then
+                    return nil
+                elseif type(err) == "table" then
+                    return err.code
+                end
+                return tostring(err):match("code=([%w_]+)")
+            end
+            local doc = helix.workspace.focused_document()
+            text = doc:text()
+            edit_error = code(pcall(function() doc:select_all() end))
+            notify_error = code(pcall(function() helix.ui.notify("hi") end))
+            "#;
+        let reader = write_plugin(temp_dir.path(), "reader", code);
+        let editor_plugin = write_plugin(temp_dir.path(), "writer", code);
+
+        let mut engine = LuaEngine::new().unwrap();
+        engine
+            .register_api(crate::types::PluginConfig::default())
+            .unwrap();
+        let mut editor = test_editor();
+        editor.open_markdown_scratch(Action::VerticalSplit, "text".to_owned());
+        engine
+            .load_plugin_with_editor(&mut editor, plugin_with("reader", reader, &["query"]))
+            .unwrap();
+        engine
+            .load_plugin_with_editor(
+                &mut editor,
+                plugin_with("writer", editor_plugin, &["mutation"]),
+            )
+            .unwrap();
+
+        assert_eq!(plugin_global::<String>(&engine, "reader", "text"), "text");
+        assert_eq!(
+            plugin_global::<Option<String>>(&engine, "reader", "edit_error").as_deref(),
+            Some("permission_denied")
+        );
+        assert_eq!(
+            plugin_global::<Option<String>>(&engine, "writer", "edit_error"),
+            None
+        );
+        // `ui` was declared by neither.
+        assert_eq!(
+            plugin_global::<Option<String>>(&engine, "writer", "notify_error").as_deref(),
+            Some("permission_denied")
+        );
     }
 
     #[test]

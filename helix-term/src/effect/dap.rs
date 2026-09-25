@@ -255,10 +255,15 @@ fn apply_breakpoint_event(editor: &mut Editor, reason: &str, breakpoint: helix_d
                 });
         }
         "changed" => {
+            // Without an id the event would match every unverified breakpoint.
+            let Some(id) = breakpoint.id else {
+                log::warn!("ignoring changed DAP breakpoint without an id");
+                return;
+            };
             for breakpoints in editor.breakpoints.values_mut() {
                 let Some(current) = breakpoints
                     .iter_mut()
-                    .find(|current| current.id == breakpoint.id)
+                    .find(|current| current.id == Some(id))
                 else {
                     continue;
                 };
@@ -275,8 +280,12 @@ fn apply_breakpoint_event(editor: &mut Editor, reason: &str, breakpoint: helix_d
             }
         }
         "removed" => {
+            let Some(id) = breakpoint.id else {
+                log::warn!("ignoring removed DAP breakpoint without an id");
+                return;
+            };
             for breakpoints in editor.breakpoints.values_mut() {
-                breakpoints.retain(|current| current.id != breakpoint.id);
+                breakpoints.retain(|current| current.id != Some(id));
             }
         }
         reason => log::warn!("Unknown breakpoint event: {reason}"),
@@ -320,8 +329,10 @@ fn request_configuration(editor: &mut Editor, ingress: RuntimeIngress, client_id
             },
         ))
         .await;
+        // The response body is optional and adapters may send `{}`, which doesn't
+        // deserialize into `()`; only the response status matters.
         let configuration_result = request
-            .request::<requests::ConfigurationDone>(Some(requests::ConfigurationDoneArguments {}))
+            .call::<requests::ConfigurationDone>(Some(requests::ConfigurationDoneArguments {}))
             .await
             .map(|_| ())
             .map_err(|error| error.to_string());
@@ -400,7 +411,8 @@ fn handle_adapter_request(
             let work = editor.work();
             work.spawn(async move {
                 let mut command = tokio::process::Command::new(config.command);
-                command.args(config.args).arg(arguments.args.join(" "));
+                // Pass each argument through as-is; joining them breaks quoting.
+                command.args(config.args).args(arguments.args);
                 if !arguments.cwd.is_empty() {
                     command.current_dir(arguments.cwd);
                 }
@@ -1245,5 +1257,39 @@ mod tests {
             stopped_status(&body, true),
             "Thread 7 stopped because of breakpoint paused at main (all threads stopped)"
         );
+    }
+
+    #[test]
+    fn breakpoint_events_without_id_leave_breakpoints_untouched() {
+        let mut editor = helix_view::editor::EditorBuilder::new(
+            helix_view::graphics::Rect::new(0, 0, 80, 24),
+            helix_runtime::test::runtime(),
+        )
+        .build();
+        let path = PathBuf::from("main.rs");
+        let unverified = helix_view::editor::Breakpoint {
+            line: 3,
+            ..Default::default()
+        };
+        editor
+            .breakpoints
+            .insert(path.clone(), vec![unverified.clone()]);
+        let event = helix_dap::Breakpoint {
+            id: None,
+            verified: true,
+            message: None,
+            source: None,
+            line: Some(10),
+            column: None,
+            end_line: None,
+            end_column: None,
+            instruction_reference: None,
+            offset: None,
+        };
+
+        apply_breakpoint_event(&mut editor, "changed", event.clone());
+        apply_breakpoint_event(&mut editor, "removed", event);
+
+        assert_eq!(editor.breakpoints[&path], vec![unverified]);
     }
 }

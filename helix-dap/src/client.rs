@@ -555,8 +555,11 @@ impl Client {
     }
 
     pub async fn configuration_done(&self) -> Result<()> {
-        self.request::<requests::ConfigurationDone>(Some(requests::ConfigurationDoneArguments {}))
-            .await
+        // The response body is optional and may be `{}`, so don't deserialize it.
+        self.call::<requests::ConfigurationDone>(Some(requests::ConfigurationDoneArguments {}))
+            .await?;
+
+        Ok(())
     }
 
     pub fn continue_thread(&self, thread_id: ThreadId) -> impl Future<Output = Result<Value>> {

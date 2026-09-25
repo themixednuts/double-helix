@@ -847,7 +847,7 @@ pub mod events {
         #[serde(skip_serializing_if = "Option::is_none")]
         pub all_threads_stopped: Option<bool>,
         #[serde(skip_serializing_if = "Option::is_none")]
-        pub hit_breakpoint_ids: Option<Vec<usize>>,
+        pub hit_breakpoint_ids: Option<Vec<i32>>,
     }
 
     #[derive(Debug)]
@@ -1063,4 +1063,11 @@ fn test_deserialize_module_id_from_string() {
     let raw = r#"{"id": "0", "name": "Name"}"#;
     let module: Module = serde_json::from_str(raw).expect("Error!");
     assert_eq!(module.id, "0");
+}
+
+#[test]
+fn test_deserialize_stopped_body_with_negative_breakpoint_id() {
+    let raw = r#"{"reason": "breakpoint", "hitBreakpointIds": [-1, 2]}"#;
+    let body: events::StoppedBody = serde_json::from_str(raw).expect("Error!");
+    assert_eq!(body.hit_breakpoint_ids, Some(vec![-1, 2]));
 }

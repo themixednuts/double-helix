@@ -847,7 +847,7 @@ pub mod events {
         #[serde(skip_serializing_if = "Option::is_none")]
         pub all_threads_stopped: Option<bool>,
         #[serde(skip_serializing_if = "Option::is_none")]
-        pub hit_breakpoint_ids: Option<Vec<usize>>,
+        pub hit_breakpoint_ids: Option<Vec<i32>>,
     }
 
     #[derive(Debug)]
@@ -936,6 +936,63 @@ pub mod events {
         pub source: Option<Source>,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub data: Option<Value>,
+    }
+
+    #[derive(Debug)]
+    pub enum ProgressStart {}
+
+    impl Event for ProgressStart {
+        type Body = ProgressStartBody;
+        const EVENT: &'static str = "progressStart";
+    }
+
+    #[derive(Debug, PartialEq, Eq, Clone, Deserialize, Serialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct ProgressStartBody {
+        pub progress_id: String,
+        pub title: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub request_id: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub cancellable: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub message: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub percentage: Option<u8>,
+    }
+
+    #[derive(Debug)]
+    pub enum ProgressUpdate {}
+
+    impl Event for ProgressUpdate {
+        type Body = ProgressUpdateBody;
+        const EVENT: &'static str = "progressUpdate";
+    }
+
+    #[derive(Debug, PartialEq, Eq, Clone, Deserialize, Serialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct ProgressUpdateBody {
+        pub progress_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub message: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub percentage: Option<u8>,
+    }
+
+    #[derive(Debug)]
+    pub enum ProgressEnd {}
+
+    impl Event for ProgressEnd {
+        type Body = ProgressEndBody;
+        const EVENT: &'static str = "progressEnd";
+    }
+
+    #[derive(Debug, PartialEq, Eq, Clone, Deserialize, Serialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct ProgressEndBody {
+        pub progress_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub message: Option<String>,
     }
 
     #[derive(Debug)]
@@ -1063,4 +1120,11 @@ fn test_deserialize_module_id_from_string() {
     let raw = r#"{"id": "0", "name": "Name"}"#;
     let module: Module = serde_json::from_str(raw).expect("Error!");
     assert_eq!(module.id, "0");
+}
+
+#[test]
+fn test_deserialize_stopped_body_with_negative_breakpoint_id() {
+    let raw = r#"{"reason": "breakpoint", "hitBreakpointIds": [-1, 2]}"#;
+    let body: events::StoppedBody = serde_json::from_str(raw).expect("Error!");
+    assert_eq!(body.hit_breakpoint_ids, Some(vec![-1, 2]));
 }

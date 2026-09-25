@@ -31,10 +31,12 @@ fn plain_opts() -> GrepSearchOptions {
         max_file_size: 10 * 1024 * 1024,
         max_matches_per_file: 200,
         smart_case: true,
+        casing: None,
         file_offset: 0,
         page_limit: 200,
         mode: GrepMode::PlainText,
         time_budget_ms: 0,
+        enforce_time_budget: false,
         before_context: 0,
         after_context: 0,
         classify_definitions: false,
@@ -105,7 +107,10 @@ fn real_binary_fixtures_are_detected_and_excluded_from_grep() {
     )
     .expect("failed to create FilePicker");
 
-    shared_picker.wait_for_indexing_complete(Duration::from_secs(5));
+    assert!(
+        shared_picker.wait_for_indexing_complete(Duration::from_secs(10)),
+        "indexing/post-scan did not complete in time — binary classification may not have run yet"
+    );
 
     let guard = shared_picker.read().unwrap();
     let picker = guard.as_ref().unwrap();
@@ -150,4 +155,62 @@ fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
     haystack
         .windows(needle.len())
         .any(|window| window == needle)
+}
+
+/// Deterministic regression for the Windows-CI failure where `codex_view`
+/// (a >2 MB no-extension binary) was not flagged `is_binary`. Root cause was a
+/// readiness-signal gap: `scanning` was cleared before `post_scan_indexing_active`
+/// was set, so `wait_for_indexing_complete` could return before the binary sniff
+/// ran. Uses synthetic fixtures (no repo/fixture dependency) covering both the
+/// >2 MB non-indexable sniff path and the <2 MB bigram path, repeated to stress
+/// the signal ordering. With the fix it must pass every iteration.
+#[test]
+fn binary_classification_done_before_indexing_wait_returns() {
+    const ITERATIONS: usize = 8;
+    // NUL bytes => `detect_binary_content` classifies as binary on every path.
+    let large = vec![0u8; 3 * 1024 * 1024]; // > 2 MB -> non-indexable sniff
+    let small = vec![0u8; 64 * 1024]; // < 2 MB -> bigram path
+
+    for iteration in 0..ITERATIONS {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let base = tmp.path();
+        fs::write(base.join("large_binary_no_ext"), &large).unwrap();
+        fs::write(base.join("small.unknownext"), &small).unwrap();
+        fs::write(base.join("readme.txt"), "hello world\n").unwrap();
+
+        let shared_picker = SharedFilePicker::default();
+        let shared_frecency = SharedFrecency::default();
+        FilePicker::new_with_shared_state(
+            shared_picker.clone(),
+            shared_frecency.clone(),
+            FilePickerOptions {
+                base_path: base.to_string_lossy().to_string(),
+                enable_mmap_cache: false,
+                enable_content_indexing: true,
+                mode: FFFMode::Neovim,
+                watch: false,
+                ..Default::default()
+            },
+        )
+        .expect("failed to create FilePicker");
+
+        assert!(
+            shared_picker.wait_for_indexing_complete(Duration::from_secs(10)),
+            "iteration {iteration}: indexing/post-scan did not complete in time"
+        );
+
+        let guard = shared_picker.read().unwrap();
+        let picker = guard.as_ref().unwrap();
+        for name in ["large_binary_no_ext", "small.unknownext"] {
+            let flagged = picker
+                .get_files()
+                .iter()
+                .any(|f| f.relative_path(picker).ends_with(name) && f.is_binary());
+            assert!(
+                flagged,
+                "iteration {iteration}: {name} must be flagged is_binary once \
+                 wait_for_indexing_complete returns"
+            );
+        }
+    }
 }

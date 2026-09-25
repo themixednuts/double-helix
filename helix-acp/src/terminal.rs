@@ -120,9 +120,7 @@ impl TerminalManager {
             anyhow::bail!("Terminal working directory must be absolute");
         }
 
-        let mut cmd = Command::new(&req.command);
-
-        cmd.args(&req.args);
+        let mut cmd = terminal_command(&req.command, &req.args);
 
         for var in &req.env {
             cmd.env(&var.name, &var.value);
@@ -539,6 +537,40 @@ impl Drop for TerminalManager {
     }
 }
 
+/// Agents commonly send a whole command line (`npm test -- --watch=false`) as `command` with
+/// no `args`. Run those through the platform shell, as other ACP clients do; everything else
+/// is spawned directly, with bare program names resolved through `PATH`.
+fn terminal_command(command: &str, args: &[String]) -> Command {
+    let is_command_line = args.is_empty()
+        && command.trim().contains(char::is_whitespace)
+        && !std::path::Path::new(command).is_file();
+    if is_command_line {
+        return shell_command(command);
+    }
+    let mut cmd = Command::new(crate::resolve_program(command));
+    cmd.args(args);
+    cmd
+}
+
+#[cfg(windows)]
+fn shell_command(line: &str) -> Command {
+    let mut cmd = Command::new("cmd");
+    // `raw_arg` keeps the line exactly as the agent wrote it; cmd.exe does its own parsing
+    // and does not understand the MSVC quoting `arg` would apply.
+    cmd.arg("/D")
+        .arg("/S")
+        .arg("/C")
+        .raw_arg(format!("\"{line}\""));
+    cmd
+}
+
+#[cfg(not(windows))]
+fn shell_command(line: &str) -> Command {
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c").arg(line);
+    cmd
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -728,6 +760,49 @@ mod tests {
             .expect("release terminal");
 
         let _ = fs::remove_file(started);
+    }
+
+    #[tokio::test]
+    async fn command_line_without_args_runs_through_the_shell() {
+        let manager = TerminalManager::new();
+        let terminal_id = manager
+            .create(&CreateTerminalRequest::new(
+                "session-1",
+                "echo acp shell ok && echo second",
+            ))
+            .await
+            .expect("create terminal")
+            .terminal_id;
+
+        let exit = tokio::time::timeout(
+            Duration::from_secs(10),
+            manager.wait_for_exit(&WaitForTerminalExitRequest::new(
+                "session-1",
+                terminal_id.clone(),
+            )),
+        )
+        .await
+        .expect("shell command did not exit")
+        .expect("wait for terminal");
+        assert_eq!(exit.exit_status.exit_code, Some(0));
+
+        let output = manager
+            .output(&TerminalOutputRequest::new(
+                "session-1",
+                terminal_id.clone(),
+            ))
+            .await
+            .expect("terminal output");
+        assert!(
+            output.output.contains("acp shell ok"),
+            "{:?}",
+            output.output
+        );
+        assert!(output.output.contains("second"), "{:?}", output.output);
+        manager
+            .release(&ReleaseTerminalRequest::new("session-1", terminal_id))
+            .await
+            .expect("release terminal");
     }
 
     #[tokio::test]

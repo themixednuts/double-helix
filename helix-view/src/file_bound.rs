@@ -82,7 +82,8 @@ pub struct RemoteDocumentLocation {
     pub readonly: bool,
     pub path_separator: char,
     resource_url: Arc<Url>,
-    lsp_url: Arc<Url>,
+    /// The RFC 3986 `file://` URI the remote file has in LSP messages.
+    lsp_url: Arc<helix_stdx::Url>,
 }
 
 impl RemoteDocumentLocation {
@@ -122,7 +123,7 @@ impl RemoteDocumentLocation {
         &self.resource_url
     }
 
-    pub fn lsp_url(&self) -> &Url {
+    pub fn lsp_url(&self) -> &helix_stdx::Url {
         &self.lsp_url
     }
 
@@ -143,6 +144,7 @@ impl RemoteDocumentLocation {
 pub struct FileBoundState {
     location: Option<DocumentLocation>,
     relative_path: OnceCell<Option<PathBuf>>,
+    workspace_root: OnceCell<Option<PathBuf>>,
     encoding: &'static Encoding,
     has_bom: bool,
     last_saved_time: SystemTime,
@@ -155,6 +157,7 @@ impl FileBoundState {
         Self {
             location: None,
             relative_path: OnceCell::new(),
+            workspace_root: OnceCell::new(),
             encoding,
             has_bom,
             last_saved_time: SystemTime::now(),
@@ -165,6 +168,24 @@ impl FileBoundState {
 
     pub fn clear_relative_path(&mut self) {
         self.relative_path.take();
+        self.workspace_root.take();
+    }
+
+    /// The local workspace holding this file: the nearest ancestor with a `.git`, `.jj`, ... or,
+    /// for a scratch buffer, the working directory's. `None` for remote and shared files, whose
+    /// workspace is on another machine.
+    pub fn workspace_root(&self) -> Option<&Path> {
+        self.workspace_root
+            .get_or_init(|| match &self.location {
+                Some(DocumentLocation::Local(path)) => Some(
+                    path.parent()
+                        .map(|dir| helix_loader::find_workspace_in(dir).0)
+                        .unwrap_or_else(|| helix_loader::find_workspace().0),
+                ),
+                None => Some(helix_loader::find_workspace().0),
+                Some(DocumentLocation::Remote(_) | DocumentLocation::Collaboration(_)) => None,
+            })
+            .as_deref()
     }
 
     pub fn set_encoding(&mut self, label: &str) -> Result<(), Error> {
@@ -287,23 +308,27 @@ impl FileBoundState {
         self.readonly = readonly;
     }
 
-    pub fn url(&self) -> Option<Url> {
+    /// The document's URI in LSP messages (RFC 3986).
+    pub fn url(&self) -> Option<helix_stdx::Url> {
         match self.location.as_ref()? {
-            DocumentLocation::Local(path) => Url::from_file_path(path).ok(),
+            DocumentLocation::Local(path) => helix_stdx::Url::from_file_path(path).ok(),
             DocumentLocation::Remote(location) => Some(location.lsp_url().clone()),
-            DocumentLocation::Collaboration(location) => Some(location.resource_url().clone()),
+            DocumentLocation::Collaboration(location) => {
+                helix_stdx::Url::parse(location.resource_url().as_str()).ok()
+            }
         }
     }
 
     pub fn uri(&self) -> Option<helix_core::Uri> {
+        let resource = |url: &Url| {
+            helix_stdx::Url::parse(url.as_str())
+                .ok()
+                .map(|url| helix_core::Uri::Resource(Arc::new(url)))
+        };
         match self.location.as_ref()? {
             DocumentLocation::Local(path) => Some(path.clone().into()),
-            DocumentLocation::Remote(location) => Some(helix_core::Uri::Resource(Arc::new(
-                location.resource_url().clone(),
-            ))),
-            DocumentLocation::Collaboration(location) => Some(helix_core::Uri::Resource(Arc::new(
-                location.resource_url().clone(),
-            ))),
+            DocumentLocation::Remote(location) => resource(location.resource_url()),
+            DocumentLocation::Collaboration(location) => resource(location.resource_url()),
         }
     }
 

@@ -142,7 +142,7 @@ pub fn raw_regex_prompt(
                 move |cx: &mut crate::compositor::Context, input: &str, event: PromptEvent| {
                     match event {
                         PromptEvent::Abort => {
-                            let (view_id, doc) = focused!(cx.editor);
+                            let doc = doc_mut!(cx.editor, &doc_id);
                             doc.set_selection(view_id, snapshot.clone());
                             doc.set_view_offset(view_id, offset_snapshot);
                         }
@@ -157,21 +157,24 @@ pub fn raw_regex_prompt(
                                 false
                             };
 
+                            let is_crlf = doc!(cx.editor, &doc_id).line_ending()
+                                == helix_core::LineEnding::Crlf;
                             match rope::RegexBuilder::new()
                                 .syntax(
                                     rope::Config::new()
                                         .case_insensitive(case_insensitive)
-                                        .multi_line(true),
+                                        .multi_line(true)
+                                        .crlf(is_crlf),
                                 )
                                 .build(input)
                             {
                                 Ok(regex) => {
-                                    let (view_id, doc) = focused!(cx.editor);
+                                    let doc = doc_mut!(cx.editor, &doc_id);
                                     doc.set_selection(view_id, snapshot.clone());
 
                                     if event == PromptEvent::Validate {
                                         let view = view_mut!(cx.editor, view_id);
-                                        view.history.jumps.push((doc_id, snapshot.clone()));
+                                        view.history.push_jump(doc, (doc_id, snapshot.clone()));
                                     }
 
                                     fun(cx, regex, input, event);
@@ -181,7 +184,7 @@ pub fn raw_regex_prompt(
                                     view.ensure_cursor_in_view(doc, scrolloff);
                                 }
                                 Err(err) => {
-                                    let (view_id, doc) = focused!(cx.editor);
+                                    let doc = doc_mut!(cx.editor, &doc_id);
                                     doc.set_selection(view_id, snapshot.clone());
                                     doc.set_view_offset(view_id, offset_snapshot);
 
@@ -224,7 +227,7 @@ pub fn raw_regex_prompt(
                 move |cx: &mut crate::compositor::Context, input: &str, event: PromptEvent| {
                     match event {
                         PromptEvent::Abort => {
-                            let (view_id, doc) = focused!(cx.editor);
+                            let doc = doc_mut!(cx.editor, &doc_id);
                             doc.set_selection(view_id, snapshot.clone());
                             doc.set_view_offset(view_id, offset_snapshot);
                         }
@@ -239,16 +242,19 @@ pub fn raw_regex_prompt(
                                 false
                             };
 
+                            let is_crlf = doc!(cx.editor, &doc_id).line_ending()
+                                == helix_core::LineEnding::Crlf;
                             match rope::RegexBuilder::new()
                                 .syntax(
                                     rope::Config::new()
                                         .case_insensitive(case_insensitive)
-                                        .multi_line(true),
+                                        .multi_line(true)
+                                        .crlf(is_crlf),
                                 )
                                 .build(input)
                             {
                                 Ok(regex) => {
-                                    let (view_id, doc) = focused!(cx.editor);
+                                    let doc = doc_mut!(cx.editor, &doc_id);
 
                                     // revert state to what it was before the last update
                                     doc.set_selection(view_id, snapshot.clone());
@@ -256,7 +262,7 @@ pub fn raw_regex_prompt(
                                     if event == PromptEvent::Validate {
                                         // Equivalent to push_jump to store selection just before jump
                                         let view = view_mut!(cx.editor, view_id);
-                                        view.history.jumps.push((doc_id, snapshot.clone()));
+                                        view.history.push_jump(doc, (doc_id, snapshot.clone()));
                                     }
 
                                     fun(cx, regex, input, event);
@@ -266,7 +272,7 @@ pub fn raw_regex_prompt(
                                     view.ensure_cursor_in_view(doc, scrolloff);
                                 }
                                 Err(err) => {
-                                    let (view_id, doc) = focused!(cx.editor);
+                                    let doc = doc_mut!(cx.editor, &doc_id);
                                     doc.set_selection(view_id, snapshot.clone());
                                     doc.set_view_offset(view_id, offset_snapshot);
 

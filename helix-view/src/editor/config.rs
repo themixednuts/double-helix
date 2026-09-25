@@ -311,6 +311,8 @@ pub struct Config {
     #[serde(deserialize_with = "deserialize_gutter_seq_or_struct")]
     pub gutters: GutterConfig,
     pub middle_click_paste: bool,
+    /// Register that mouse selections yank to and middle click pastes from.
+    pub mouse_yank_register: char,
     pub auto_pairs: AutoPairConfig,
     pub auto_completion: bool,
     pub path_completion: bool,
@@ -406,9 +408,70 @@ pub struct Config {
     pub editing_engine: EditingEngineConfig,
     #[serde(default)]
     pub pkg: PkgConfig,
+    /// `[editor.workspace-trust]`: what workspaces are trusted with. Only the user config sets
+    /// this; a workspace config can't loosen its own gate.
+    #[serde(default)]
+    pub workspace_trust: WorkspaceTrustConfig,
 }
 
 pub type PkgConfig = helix_pkg::PkgConfig;
+
+/// `[editor.workspace-trust]`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
+pub struct WorkspaceTrustConfig {
+    /// What every workspace is trusted with, without a grant.
+    pub level: ImplicitTrustLevelConfig,
+    /// Whether opening a file in a restricted workspace asks for trust. The statusline `[⚠]`
+    /// shows either way.
+    pub prompt: bool,
+    /// Glob patterns of workspaces to trust without a grant (discouraged: skips the change
+    /// check on local config).
+    pub trusted: Vec<String>,
+}
+
+impl Default for WorkspaceTrustConfig {
+    fn default() -> Self {
+        Self {
+            level: ImplicitTrustLevelConfig::default(),
+            prompt: true,
+            trusted: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ImplicitTrustLevelConfig {
+    /// Nothing: language servers, debug adapters, local config and git config all need a grant.
+    None,
+    /// Language servers and debug adapters (their binaries are configured globally); local
+    /// config and repository git config need a grant.
+    #[default]
+    Servers,
+    /// Everything, except excluded workspaces.
+    Insecure,
+}
+
+impl From<ImplicitTrustLevelConfig> for helix_loader::workspace_trust::ImplicitTrustLevel {
+    fn from(level: ImplicitTrustLevelConfig) -> Self {
+        match level {
+            ImplicitTrustLevelConfig::None => Self::None,
+            ImplicitTrustLevelConfig::Servers => Self::Servers,
+            ImplicitTrustLevelConfig::Insecure => Self::Insecure,
+        }
+    }
+}
+
+impl From<&WorkspaceTrustConfig> for helix_loader::workspace_trust::Config {
+    fn from(config: &WorkspaceTrustConfig) -> Self {
+        Self {
+            level: config.level.into(),
+            prompt: config.prompt,
+            trusted_globs: helix_loader::workspace_trust::build_trusted_globs(&config.trusted),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", default, deny_unknown_fields)]
@@ -895,6 +958,8 @@ pub struct LspConfig {
     pub code_lens: bool,
     pub folding: bool,
     pub document_links: bool,
+    /// Highlight the other references to the symbol under the cursor as it moves.
+    pub auto_document_highlight: bool,
     pub on_type_formatting: bool,
     pub selection_ranges: LspSelectionRangeConfig,
     pub color_swatches_string: String,
@@ -919,6 +984,7 @@ impl Default for LspConfig {
             code_lens: true,
             folding: true,
             document_links: true,
+            auto_document_highlight: false,
             on_type_formatting: false,
             selection_ranges: LspSelectionRangeConfig::Fallback,
             snippets: true,
@@ -1143,6 +1209,8 @@ pub enum StatusLineElement {
     /// [`StatusLineConfig::default`] doesn't include it to preserve
     /// existing user layouts.
     LspStatus,
+    /// `⋮` when code actions are available at the cursor.
+    CodeActionHint,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1209,6 +1277,8 @@ pub enum LineNumber {
 pub enum EditingEngineConfig {
     #[default]
     Helix,
+    /// Vim-style editing: operators wait for a motion or text object, with Vim's keymap and
+    /// visual modes.
     Vim,
 }
 
@@ -1231,6 +1301,8 @@ pub enum GutterType {
     LineNumbers,
     Spacer,
     Diff,
+    /// `⋮` on the cursor line when code actions are available there.
+    CodeActionHint,
 }
 
 impl std::str::FromStr for GutterType {
@@ -1242,8 +1314,9 @@ impl std::str::FromStr for GutterType {
             "spacer" => Ok(Self::Spacer),
             "line-numbers" => Ok(Self::LineNumbers),
             "diff" => Ok(Self::Diff),
+            "code-action-hint" => Ok(Self::CodeActionHint),
             _ => anyhow::bail!(
-                "Gutter type can only be `diagnostics`, `spacer`, `line-numbers` or `diff`."
+                "Gutter type can only be `diagnostics`, `spacer`, `line-numbers`, `diff` or `code-action-hint`."
             ),
         }
     }
@@ -1526,6 +1599,7 @@ impl Default for Config {
             cursorcolumn: false,
             gutters: GutterConfig::default(),
             middle_click_paste: true,
+            mouse_yank_register: '*',
             auto_pairs: AutoPairConfig::default(),
             auto_completion: true,
             path_completion: true,
@@ -1596,7 +1670,23 @@ impl Default for Config {
             assistant: AssistantConfig::default(),
             editing_engine: EditingEngineConfig::default(),
             pkg: PkgConfig::default(),
+            workspace_trust: WorkspaceTrustConfig::default(),
         }
+    }
+}
+
+impl Config {
+    /// Whether any gutter or statusline element shows the code action hint, so the editor
+    /// only asks language servers for code actions in the background when it is displayed.
+    pub fn code_action_hint(&self) -> bool {
+        self.gutters.layout.contains(&GutterType::CodeActionHint)
+            || [
+                &self.statusline.left,
+                &self.statusline.center,
+                &self.statusline.right,
+            ]
+            .into_iter()
+            .any(|elements| elements.contains(&StatusLineElement::CodeActionHint))
     }
 }
 

@@ -36,6 +36,12 @@ pub enum Effect {
     SetStatus {
         message: String,
     },
+    /// Run a login command in a terminal outside the editor.
+    LaunchAuthTerminal {
+        thread: thread::Id,
+        title: String,
+        terminal: super::auth::Terminal,
+    },
     Save {
         thread: thread::Id,
     },

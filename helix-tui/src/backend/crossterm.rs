@@ -159,10 +159,6 @@ where
         I: Iterator<Item = (u16, u16, &'a C)>,
         C: TerminalCell + 'a,
     {
-        // Begin synchronized update — terminal holds display
-        // until the matching end sequence, preventing partial-frame flicker.
-        write!(self.buffer, "\x1b[?2026h")?;
-
         let mut fg = Color::Reset;
         let mut bg = Color::Reset;
         let mut underline_color = Color::Reset;
@@ -228,8 +224,7 @@ where
             SetAttribute(CAttribute::Reset)
         )?;
 
-        // End synchronized update — terminal renders the complete frame.
-        write!(self.buffer, "\x1b[?2026l")
+        Ok(())
     }
 }
 
@@ -300,6 +295,9 @@ where
         // reset cursor shape
         self.buffer
             .write_all(self.capabilities.reset_cursor_command.as_bytes())?;
+        // give the terminal its own background back
+        self.buffer
+            .write_all(super::OSC_RESET_BACKGROUND.as_bytes())?;
         if self.config.enable_mouse_capture {
             execute!(self.buffer, DisableMouseCapture)?;
         }
@@ -324,8 +322,10 @@ where
         self.draw_cells(content)
     }
 
+    // Cursor and clear writes are queued: the caller flushes once per frame,
+    // inside its synchronized-output block.
     fn hide_cursor(&mut self) -> io::Result<()> {
-        execute!(self.buffer, Hide)
+        queue!(self.buffer, Hide)
     }
 
     fn show_cursor(&mut self, kind: CursorKind) -> io::Result<()> {
@@ -335,15 +335,23 @@ where
             CursorKind::Underline => SetCursorStyle::SteadyUnderScore,
             CursorKind::Hidden => unreachable!(),
         };
-        execute!(self.buffer, Show, shape)
+        queue!(self.buffer, Show, shape)
     }
 
     fn set_cursor(&mut self, x: u16, y: u16) -> io::Result<()> {
-        execute!(self.buffer, MoveTo(x, y))
+        queue!(self.buffer, MoveTo(x, y))
     }
 
     fn clear(&mut self) -> io::Result<()> {
-        execute!(self.buffer, Clear(ClearType::All))
+        queue!(self.buffer, Clear(ClearType::All))
+    }
+
+    fn start_sync(&mut self) -> io::Result<()> {
+        write!(self.buffer, "\x1b[?2026h")
+    }
+
+    fn end_sync(&mut self) -> io::Result<()> {
+        write!(self.buffer, "\x1b[?2026l")
     }
 
     fn size(&self) -> io::Result<Rect> {
@@ -362,6 +370,11 @@ where
 
     fn get_theme_mode(&self) -> Option<helix_view::theme::Mode> {
         None
+    }
+
+    fn set_background_color(&mut self, color: Option<helix_view::theme::Color>) -> io::Result<()> {
+        self.buffer
+            .write_all(super::osc_background(color).as_bytes())
     }
 }
 
@@ -662,13 +675,22 @@ mod tests {
         cell.underline_color = ratatui::style::Color::Indexed(4);
         cell.modifier = ratatui::style::Modifier::BOLD | ratatui::style::Modifier::UNDERLINED;
 
+        Backend::start_sync(&mut backend).unwrap();
         RatatuiBackend::draw(&mut backend, [(3, 2, &cell)].into_iter()).unwrap();
+        Backend::set_cursor(&mut backend, 0, 0).unwrap();
+        Backend::end_sync(&mut backend).unwrap();
 
         let output = String::from_utf8(backend.buffer.into_inner().unwrap()).unwrap();
-        assert!(output.contains("\x1b[?2026h"));
-        assert!(output.contains("\x1b[3;4H"));
-        assert!(output.contains("x"));
-        assert!(output.contains("\x1b[?2026l"));
+        let begin = output
+            .find("\x1b[?2026h")
+            .expect("frame opens a sync block");
+        let cell_at = output.find("\x1b[3;4H").expect("cell is positioned");
+        let cursor_at = output.rfind("\x1b[1;1H").expect("cursor is placed");
+        let end = output
+            .find("\x1b[?2026l")
+            .expect("frame closes the sync block");
+        assert!(output.contains('x'));
+        assert!(begin < cell_at && cell_at < cursor_at && cursor_at < end);
     }
 
     #[test]

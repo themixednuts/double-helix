@@ -31,6 +31,7 @@ use crate::contract::handles::{
     ViewHandle,
 };
 use crate::contract::host::{PluginFacadeMutationHost, PluginFacadeQueryHost};
+use crate::contract::metadata::Capability;
 use crate::contract::requests;
 use crate::contract::snapshots;
 use crate::contract::UiCallbackToken;
@@ -76,10 +77,34 @@ fn with_query_bridge<T>(
     ))
 }
 
+/// Fail unless the calling plugin declared `capability` in its manifest.
+fn require_capability(lua: &Lua, capability: Capability) -> LuaResult<()> {
+    if crate::lua::plugin_has_capability(lua, capability)? {
+        return Ok(());
+    }
+    Err(permission_denied_error(format!(
+        "plugin '{}' did not declare the '{capability}' capability",
+        current_plugin_name(lua)?
+    )))
+}
+
+/// A query about the assistant's threads, which needs the `assistant` capability.
+fn with_assistant_query<T>(
+    lua: &Lua,
+    f: impl FnOnce(&dyn PluginFacadeQueryHost) -> LuaResult<T>,
+) -> LuaResult<T> {
+    require_capability(lua, Capability::Assistant)?;
+    with_query_bridge(lua, f)
+}
+
+/// Run a change against the editor, which the calling plugin must have declared `capability`
+/// for.
 fn with_mutation_bridge<T>(
     lua: &Lua,
+    capability: Capability,
     f: impl FnOnce(&mut dyn PluginFacadeMutationHost) -> LuaResult<T>,
 ) -> LuaResult<T> {
+    require_capability(lua, capability)?;
     if let Some(host) = lua
         .app_data_ref::<crate::lua::FacadeHostWrapper>()
         .map(|host| std::sync::Arc::clone(&host.0))
@@ -108,6 +133,16 @@ pub(super) fn start_task(
     lua: &Lua,
     request: crate::contract::PluginTaskRequest,
 ) -> LuaResult<LuaValue> {
+    require_capability(
+        lua,
+        match &request {
+            crate::contract::PluginTaskRequest::OpenDocument(_) => Capability::Mutation,
+            crate::contract::PluginTaskRequest::RunCommand(_) => Capability::Commands,
+            crate::contract::PluginTaskRequest::SyntaxQuery(_) => Capability::Syntax,
+            crate::contract::PluginTaskRequest::LspCall(_) => Capability::Lsp,
+            crate::contract::PluginTaskRequest::SetTheme(_) => Capability::Themes,
+        },
+    )?;
     let host = lua
         .app_data_ref::<crate::lua::TaskHostWrapper>()
         .map(|host| std::sync::Arc::clone(&host.0))
@@ -260,6 +295,16 @@ impl LuaUserData for LuaDocumentHandle {
             })
         });
 
+        // Lines `first..last` (0-based) in one call, where `line` in a loop would cost a
+        // round trip per line.
+        methods.add_method("lines", |lua, this, (first, last): (usize, usize)| {
+            with_query_bridge(lua, |bridge| {
+                bridge
+                    .document_lines(this.0, first, last)
+                    .map_err(contract_error)
+            })
+        });
+
         methods.add_method("diagnostics", |lua, this, ()| {
             let snap = with_query_bridge(lua, |bridge| {
                 bridge.diagnostics(this.0).map_err(contract_error)
@@ -276,7 +321,7 @@ impl LuaUserData for LuaDocumentHandle {
                 .iter()
                 .map(parse_text_edit)
                 .collect::<LuaResult<Vec<_>>>()?;
-            with_mutation_bridge(lua, |bridge| {
+            with_mutation_bridge(lua, Capability::Mutation, |bridge| {
                 bridge
                     .apply_edit(requests::ApplyEditRequest {
                         document: this.0,
@@ -291,7 +336,7 @@ impl LuaUserData for LuaDocumentHandle {
             let force = opts
                 .and_then(|t| t.get::<Option<bool>>("force").ok().flatten())
                 .unwrap_or(false);
-            with_mutation_bridge(lua, |bridge| {
+            with_mutation_bridge(lua, Capability::Mutation, |bridge| {
                 bridge
                     .save_document(requests::SaveDocumentRequest {
                         document: this.0,
@@ -309,7 +354,7 @@ impl LuaUserData for LuaDocumentHandle {
                     .iter()
                     .map(parse_selection_range)
                     .collect::<LuaResult<Vec<_>>>()?;
-                with_mutation_bridge(lua, |bridge| {
+                with_mutation_bridge(lua, Capability::Mutation, |bridge| {
                     bridge
                         .set_selection(requests::SetSelectionRequest {
                             document: this.0,
@@ -323,7 +368,7 @@ impl LuaUserData for LuaDocumentHandle {
 
         // doc:undo() — undo the last change, returns true if successful
         methods.add_method("undo", |lua, this, ()| {
-            with_mutation_bridge(lua, |bridge| {
+            with_mutation_bridge(lua, Capability::Mutation, |bridge| {
                 bridge
                     .undo(requests::UndoRequest { document: this.0 })
                     .map_err(contract_error)
@@ -332,7 +377,7 @@ impl LuaUserData for LuaDocumentHandle {
 
         // doc:redo() — redo the last undone change, returns true if successful
         methods.add_method("redo", |lua, this, ()| {
-            with_mutation_bridge(lua, |bridge| {
+            with_mutation_bridge(lua, Capability::Mutation, |bridge| {
                 bridge
                     .redo(requests::RedoRequest { document: this.0 })
                     .map_err(contract_error)
@@ -341,7 +386,7 @@ impl LuaUserData for LuaDocumentHandle {
 
         // doc:select_all() — select all text in the document
         methods.add_method("select_all", |lua, this, ()| {
-            with_mutation_bridge(lua, |host| {
+            with_mutation_bridge(lua, Capability::Mutation, |host| {
                 host.select_all(requests::SelectAllRequest { document: this.0 })
                     .map_err(contract_error)
             })
@@ -358,7 +403,7 @@ impl LuaUserData for LuaDocumentHandle {
                     .map(parse_annotation)
                     .collect::<LuaResult<_>>()?;
                 let plugin = current_plugin_id(lua)?;
-                with_mutation_bridge(lua, |host| {
+                with_mutation_bridge(lua, Capability::Mutation, |host| {
                     host.set_annotations(requests::SetAnnotationsRequest {
                         document: this.0,
                         plugin,
@@ -373,7 +418,7 @@ impl LuaUserData for LuaDocumentHandle {
         // calling plugin on this document.
         methods.add_method("clear_annotations", |lua, this, ()| {
             let plugin = current_plugin_id(lua)?;
-            with_mutation_bridge(lua, |host| {
+            with_mutation_bridge(lua, Capability::Mutation, |host| {
                 host.set_annotations(requests::SetAnnotationsRequest {
                     document: this.0,
                     plugin,
@@ -430,7 +475,7 @@ impl LuaUserData for LuaViewHandle {
 
         // view:focus() — focus this view
         methods.add_method("focus", |lua, this, ()| {
-            with_mutation_bridge(lua, |bridge| {
+            with_mutation_bridge(lua, Capability::Mutation, |bridge| {
                 bridge
                     .focus_view(requests::FocusViewRequest { view: this.0 })
                     .map_err(contract_error)
@@ -439,7 +484,7 @@ impl LuaUserData for LuaViewHandle {
 
         // view:close() — close this view
         methods.add_method("close", |lua, this, ()| {
-            with_mutation_bridge(lua, |bridge| {
+            with_mutation_bridge(lua, Capability::Mutation, |bridge| {
                 bridge
                     .close_view(requests::CloseViewRequest { view: this.0 })
                     .map_err(contract_error)
@@ -692,21 +737,25 @@ fn current_plugin_id(lua: &Lua) -> LuaResult<crate::contract::PluginId> {
 }
 
 fn ui_host(lua: &Lua) -> LuaResult<mlua::AppDataRef<'_, crate::lua::UiHostWrapper>> {
+    require_capability(lua, Capability::Ui)?;
     lua.app_data_ref::<crate::lua::UiHostWrapper>()
         .ok_or_else(|| LuaError::RuntimeError("UI host not available".into()))
 }
 
 fn panel_host(lua: &Lua) -> LuaResult<mlua::AppDataRef<'_, crate::lua::PanelHostWrapper>> {
+    require_capability(lua, Capability::Panels)?;
     lua.app_data_ref::<crate::lua::PanelHostWrapper>()
         .ok_or_else(|| LuaError::RuntimeError("panel host not available".into()))
 }
 
 fn command_host(lua: &Lua) -> LuaResult<mlua::AppDataRef<'_, crate::lua::CommandHostWrapper>> {
+    require_capability(lua, Capability::Commands)?;
     lua.app_data_ref::<crate::lua::CommandHostWrapper>()
         .ok_or_else(|| LuaError::RuntimeError("command host not available".into()))
 }
 
 fn keymap_host(lua: &Lua) -> LuaResult<mlua::AppDataRef<'_, crate::lua::KeymapHostWrapper>> {
+    require_capability(lua, Capability::Keymaps)?;
     lua.app_data_ref::<crate::lua::KeymapHostWrapper>()
         .ok_or_else(|| LuaError::RuntimeError("keymap host not available".into()))
 }
@@ -736,6 +785,7 @@ fn permission_denied_error(reason: impl Into<String>) -> LuaError {
 }
 
 fn event_host(lua: &Lua) -> LuaResult<mlua::AppDataRef<'_, crate::lua::EventHostWrapper>> {
+    require_capability(lua, Capability::Events)?;
     lua.app_data_ref::<crate::lua::EventHostWrapper>()
         .ok_or_else(|| LuaError::RuntimeError("event host not available".into()))
 }
@@ -1309,6 +1359,7 @@ fn register_commands_module(
     raw.set(
         "execute_local",
         lua.create_function(|lua, (cmd, args): (String, Option<Vec<String>>)| {
+            require_capability(lua, Capability::Commands)?;
             let args = args.unwrap_or_default();
             execute_registered_lua_command(lua, &cmd, &args)
         })?,
@@ -1503,7 +1554,7 @@ fn register_registers_module(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
                 .ok_or_else(|| {
                     LuaError::RuntimeError("Register name must be exactly one character".into())
                 })?;
-            with_mutation_bridge(lua, |host| {
+            with_mutation_bridge(lua, Capability::Mutation, |host| {
                 host.write_register(name, values).map_err(contract_error)
             })
         })?,
@@ -1891,7 +1942,7 @@ pub fn register_ui_module(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
     m.set(
         "redraw",
         lua.create_function(|lua, ()| {
-            with_mutation_bridge(lua, |host| {
+            with_mutation_bridge(lua, Capability::Ui, |host| {
                 host.request_redraw();
                 Ok(())
             })
@@ -2085,7 +2136,7 @@ fn register_splits_module(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
                 .as_ref()
                 .and_then(|t| t.get::<Option<LuaViewHandle>>("view").ok().flatten())
                 .map(|v| v.0);
-            let view_handle = with_mutation_bridge(lua, |bridge| {
+            let view_handle = with_mutation_bridge(lua, Capability::Splits, |bridge| {
                 bridge
                     .split_view(requests::SplitViewRequest {
                         view,
@@ -2103,7 +2154,7 @@ fn register_splits_module(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
         "focus_direction",
         lua.create_function(|lua, direction: String| {
             let dir = parse_split_direction(&direction)?;
-            with_mutation_bridge(lua, |bridge| {
+            with_mutation_bridge(lua, Capability::Splits, |bridge| {
                 bridge
                     .focus_direction(requests::FocusDirectionRequest { direction: dir })
                     .map_err(contract_error)?;
@@ -2117,7 +2168,7 @@ fn register_splits_module(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
         "swap",
         lua.create_function(|lua, direction: String| {
             let dir = parse_split_direction(&direction)?;
-            with_mutation_bridge(lua, |bridge| {
+            with_mutation_bridge(lua, Capability::Splits, |bridge| {
                 bridge
                     .swap_split(requests::SwapSplitRequest { direction: dir })
                     .map_err(contract_error)?;
@@ -2130,7 +2181,7 @@ fn register_splits_module(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
     m.set(
         "transpose",
         lua.create_function(|lua, view: Option<LuaViewHandle>| {
-            with_mutation_bridge(lua, |bridge| {
+            with_mutation_bridge(lua, Capability::Splits, |bridge| {
                 bridge
                     .transpose(requests::TransposeSplitRequest {
                         view: view.map(|v| v.0),
@@ -2158,7 +2209,7 @@ fn register_splits_module(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
                 }
             };
             let amount = parse_resize_amount(&amount_str)?;
-            with_mutation_bridge(lua, |bridge| {
+            with_mutation_bridge(lua, Capability::Splits, |bridge| {
                 bridge
                     .resize_split(requests::ResizeSplitRequest {
                         view,
@@ -2298,7 +2349,7 @@ fn register_tabs_module(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
                 .as_ref()
                 .and_then(|t| t.get::<Option<LuaViewHandle>>("view").ok().flatten())
                 .map(|v| v.0);
-            with_mutation_bridge(lua, |bridge| {
+            with_mutation_bridge(lua, Capability::Tabs, |bridge| {
                 bridge
                     .open_tab(requests::OpenTabRequest {
                         view,
@@ -2316,7 +2367,7 @@ fn register_tabs_module(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
         "close",
         lua.create_function(|lua, arg: LuaValue| {
             let (view, index) = parse_tab_close_arg(arg)?;
-            with_mutation_bridge(lua, |bridge| {
+            with_mutation_bridge(lua, Capability::Tabs, |bridge| {
                 bridge
                     .close_tab(requests::CloseTabRequest { view, index })
                     .map_err(contract_error)?;
@@ -2329,7 +2380,7 @@ fn register_tabs_module(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
     m.set(
         "focus",
         lua.create_function(|lua, (index, view): (usize, Option<LuaViewHandle>)| {
-            with_mutation_bridge(lua, |bridge| {
+            with_mutation_bridge(lua, Capability::Tabs, |bridge| {
                 bridge
                     .focus_tab(requests::FocusTabRequest {
                         view: view.map(|v| v.0),
@@ -2345,7 +2396,7 @@ fn register_tabs_module(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
     m.set(
         "next",
         lua.create_function(|lua, view: Option<LuaViewHandle>| {
-            with_mutation_bridge(lua, |bridge| {
+            with_mutation_bridge(lua, Capability::Tabs, |bridge| {
                 bridge
                     .cycle_tab(requests::CycleTabRequest {
                         view: view.map(|v| v.0),
@@ -2361,7 +2412,7 @@ fn register_tabs_module(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
     m.set(
         "previous",
         lua.create_function(|lua, view: Option<LuaViewHandle>| {
-            with_mutation_bridge(lua, |bridge| {
+            with_mutation_bridge(lua, Capability::Tabs, |bridge| {
                 bridge
                     .cycle_tab(requests::CycleTabRequest {
                         view: view.map(|v| v.0),
@@ -2417,7 +2468,7 @@ fn register_floats_module(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
 
             let placement = parse_float_placement(&opts.get::<LuaTable>("placement")?)?;
             let content = parse_float_content(&opts)?;
-            let float = with_mutation_bridge(lua, |bridge| {
+            let float = with_mutation_bridge(lua, Capability::Floats, |bridge| {
                 bridge
                     .create_float(
                         plugin_id,
@@ -2441,7 +2492,7 @@ fn register_floats_module(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
         "close",
         lua.create_function(|lua, float: LuaFloatHandle| {
             let plugin = current_plugin_id(lua)?;
-            with_mutation_bridge(lua, |bridge| {
+            with_mutation_bridge(lua, Capability::Floats, |bridge| {
                 bridge
                     .close_float(plugin, requests::CloseFloatRequest { float: float.0 })
                     .map_err(contract_error)?;
@@ -2456,7 +2507,7 @@ fn register_floats_module(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
         lua.create_function(|lua, ()| {
             let plugin = current_plugin_id(lua)?;
             let result = lua.create_table()?;
-            with_mutation_bridge(lua, |bridge| {
+            with_mutation_bridge(lua, Capability::Floats, |bridge| {
                 for (i, entry) in bridge.list_floats(plugin).into_iter().enumerate() {
                     let t = lua.create_table()?;
                     t.set("handle", LuaFloatHandle(entry.handle))?;
@@ -2497,7 +2548,7 @@ impl LuaUserData for LuaFloatHandle {
         // float:close()
         methods.add_method("close", |lua, this, ()| {
             let plugin = current_plugin_id(lua)?;
-            with_mutation_bridge(lua, |bridge| {
+            with_mutation_bridge(lua, Capability::Floats, |bridge| {
                 bridge
                     .close_float(plugin, requests::CloseFloatRequest { float: this.0 })
                     .map_err(contract_error)?;
@@ -2524,7 +2575,7 @@ impl LuaUserData for LuaFloatHandle {
                 None
             };
 
-            with_mutation_bridge(lua, |bridge| {
+            with_mutation_bridge(lua, Capability::Floats, |bridge| {
                 bridge
                     .update_float(
                         plugin,
@@ -2645,7 +2696,7 @@ fn register_assistant_module(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
     m.set(
         "snapshot",
         lua.create_function(|lua, ()| {
-            let snap = with_query_bridge(lua, |bridge| Ok(bridge.assistant_snapshot()))?;
+            let snap = with_assistant_query(lua, |bridge| Ok(bridge.assistant_snapshot()))?;
             let table = lua.create_table()?;
             table.set("active_thread", snap.active_thread.map(LuaThreadHandle))?;
             table.set("is_ready", snap.is_ready)?;
@@ -2671,7 +2722,7 @@ fn register_assistant_module(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
     m.set(
         "thread",
         lua.create_function(|lua, thread: LuaThreadHandle| {
-            let snap = with_query_bridge(lua, |bridge| {
+            let snap = with_assistant_query(lua, |bridge| {
                 bridge.thread_snapshot(thread.0).map_err(contract_error)
             })?;
             let table = lua.create_table()?;
@@ -2691,7 +2742,7 @@ fn register_assistant_module(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
     m.set(
         "entries",
         lua.create_function(|lua, thread: LuaThreadHandle| {
-            let entries = with_query_bridge(lua, |bridge| {
+            let entries = with_assistant_query(lua, |bridge| {
                 bridge.thread_entries(thread.0).map_err(contract_error)
             })?;
             let result = lua.create_table()?;
@@ -2711,7 +2762,7 @@ fn register_assistant_module(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
     m.set(
         "context",
         lua.create_function(|lua, thread: LuaThreadHandle| {
-            let items = with_query_bridge(lua, |bridge| {
+            let items = with_assistant_query(lua, |bridge| {
                 bridge.thread_context(thread.0).map_err(contract_error)
             })?;
             let result = lua.create_table()?;
@@ -2730,7 +2781,7 @@ fn register_assistant_module(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
     m.set(
         "is_ready",
         lua.create_function(|lua, ()| {
-            with_query_bridge(lua, |host| Ok(host.assistant_snapshot().is_ready))
+            with_assistant_query(lua, |host| Ok(host.assistant_snapshot().is_ready))
         })?,
     )?;
 
@@ -2738,7 +2789,7 @@ fn register_assistant_module(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
     m.set(
         "active_thread",
         lua.create_function(|lua, ()| {
-            with_query_bridge(lua, |host| {
+            with_assistant_query(lua, |host| {
                 Ok(host.assistant_snapshot().active_thread.map(LuaThreadHandle))
             })
         })?,
@@ -2748,7 +2799,7 @@ fn register_assistant_module(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
     m.set(
         "thread_count",
         lua.create_function(|lua, ()| {
-            with_query_bridge(lua, |host| Ok(host.assistant_snapshot().threads.len()))
+            with_assistant_query(lua, |host| Ok(host.assistant_snapshot().threads.len()))
         })?,
     )?;
 
@@ -2756,7 +2807,7 @@ fn register_assistant_module(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
     m.set(
         "submit",
         lua.create_function(|lua, (thread, text): (Option<LuaThreadHandle>, String)| {
-            with_mutation_bridge(lua, |bridge| {
+            with_mutation_bridge(lua, Capability::Assistant, |bridge| {
                 bridge
                     .submit_prompt(thread.map(|thread| thread.0), text)
                     .map_err(contract_error)
@@ -2768,7 +2819,7 @@ fn register_assistant_module(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
     m.set(
         "cancel",
         lua.create_function(|lua, thread: Option<LuaThreadHandle>| {
-            with_mutation_bridge(lua, |bridge| {
+            with_mutation_bridge(lua, Capability::Assistant, |bridge| {
                 bridge
                     .cancel_thread(thread.map(|thread| thread.0))
                     .map_err(contract_error)
@@ -3251,6 +3302,15 @@ pub fn contract_event_to_table(
         }
         E::DocumentChanged(e) => {
             t.set("document", LuaDocumentHandle(e.document))?;
+            t.set("version", e.version)?;
+            let ranges = lua.create_table()?;
+            for (i, range) in e.changed_lines.iter().enumerate() {
+                let entry = lua.create_table()?;
+                entry.set("start", range.start)?;
+                entry.set("end", range.end)?;
+                ranges.set(i + 1, entry)?;
+            }
+            t.set("changed_lines", ranges)?;
         }
         E::DocumentPreSave(e) => {
             t.set("document", LuaDocumentHandle(e.document))?;

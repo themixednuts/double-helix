@@ -1,6 +1,7 @@
 use helix_core::diagnostic::DiagnosticProvider;
 use helix_core::syntax::config::{LanguageConfiguration, LanguageServerFeature};
-use helix_core::{Assoc, ChangeSet, Diagnostic, RopeSlice, Syntax};
+use helix_core::syntax::Loader;
+use helix_core::{Assoc, ChangeSet, Diagnostic, Rope, RopeSlice, Syntax};
 use helix_lsp::{Client, LanguageServerId, LanguageServerName};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -48,11 +49,30 @@ impl SyntaxSnapshot {
     }
 }
 
+/// A tree to update in place, and everything that changed since it was
+/// parsed. Updating reparses only what the changes touched.
+#[derive(Debug, Clone)]
+pub struct IncrementalSyntax {
+    pub tree: Arc<Syntax>,
+    /// The loader `tree` was parsed with; a different loader may number its
+    /// languages differently, so only that one may update it.
+    pub loader: Arc<Loader>,
+    /// The text `tree` was parsed from.
+    pub base: Rope,
+    /// Every change since `base`, composed into one changeset.
+    pub changes: ChangeSet,
+}
+
 #[derive(Debug, Default)]
 struct SyntaxSnapshotState {
     revision: Revision,
     status: SyntaxStatus,
     tree: Option<Arc<Syntax>>,
+    /// Set when `tree` came from a parse whose loader is known.
+    tree_loader: Option<Arc<Loader>>,
+    /// Text and changes since `tree` was parsed, recorded once a document
+    /// edit leaves it behind.
+    edits: Option<(Rope, ChangeSet)>,
 }
 
 impl SyntaxSnapshotState {
@@ -69,6 +89,8 @@ impl SyntaxSnapshotState {
     }
 
     fn set_tree(&mut self, tree: Option<Syntax>) {
+        self.tree_loader = None;
+        self.edits = None;
         self.tree = tree.map(Arc::new);
         self.status = if self.tree.is_some() {
             SyntaxStatus::Fresh
@@ -78,7 +100,34 @@ impl SyntaxSnapshotState {
         self.revision.advance();
     }
 
+    fn set_parsed_tree(&mut self, tree: Syntax, loader: Arc<Loader>) {
+        self.set_tree(Some(tree));
+        self.tree_loader = Some(loader);
+    }
+
+    fn record_edit(&mut self, old_text: &Rope, changes: &ChangeSet) {
+        if self.tree_loader.is_none() {
+            return;
+        }
+        self.edits = Some(match self.edits.take() {
+            Some((base, pending)) => (base, pending.compose(changes.clone())),
+            None => (old_text.clone(), changes.clone()),
+        });
+    }
+
+    fn incremental(&self) -> Option<IncrementalSyntax> {
+        let (base, changes) = self.edits.clone()?;
+        Some(IncrementalSyntax {
+            tree: self.tree.clone()?,
+            loader: self.tree_loader.clone()?,
+            base,
+            changes,
+        })
+    }
+
     fn mark_pending_initial_parse(&mut self) {
+        self.tree_loader = None;
+        self.edits = None;
         self.tree = None;
         if self.status != SyntaxStatus::StalePendingRefresh {
             self.status = SyntaxStatus::StalePendingRefresh;
@@ -309,6 +358,20 @@ impl SyntaxAwareState {
         self.syntax_snapshot.set_tree(syntax);
     }
 
+    /// Installs a tree parsed with `loader`, which later edits may update in
+    /// place; see [`IncrementalSyntax`].
+    pub fn set_parsed_syntax(&mut self, syntax: Syntax, loader: Arc<Loader>) {
+        self.syntax_snapshot.set_parsed_tree(syntax, loader);
+    }
+
+    pub fn record_syntax_edit(&mut self, old_text: &Rope, changes: &ChangeSet) {
+        self.syntax_snapshot.record_edit(old_text, changes);
+    }
+
+    pub fn incremental_syntax(&self) -> Option<IncrementalSyntax> {
+        self.syntax_snapshot.incremental()
+    }
+
     pub fn syntax_snapshot(&self) -> SyntaxSnapshot {
         self.syntax_snapshot.snapshot()
     }
@@ -325,5 +388,56 @@ impl SyntaxAwareState {
                 diagnostic.provider.clone(),
             )
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use helix_core::Transaction;
+
+    fn parse(text: &Rope, loader: &Loader) -> Syntax {
+        let language = loader.language_for_name("rust").unwrap();
+        Syntax::new(text.slice(..), language, loader).unwrap()
+    }
+
+    #[test]
+    fn edits_since_a_parsed_tree_compose_over_its_text() {
+        let loader = Arc::new(helix_core::config::default_lang_loader());
+        let base = Rope::from_str("fn main() {}\n");
+        let mut state = SyntaxAwareState::default();
+        state.set_parsed_syntax(parse(&base, &loader), loader.clone());
+        assert!(state.incremental_syntax().is_none());
+
+        let mut text = base.clone();
+        for (at, insert) in [(12, " // a"), (0, "// b\n")] {
+            let edit = Transaction::change(&text, [(at, at, Some(insert.into()))].into_iter());
+            let before = text.clone();
+            assert!(edit.apply(&mut text));
+            state.record_syntax_edit(&before, edit.changes());
+        }
+
+        let incremental = state.incremental_syntax().expect("edits since the parse");
+        assert!(Arc::ptr_eq(&incremental.loader, &loader));
+        assert_eq!(incremental.base, base);
+        let mut replayed = incremental.base.clone();
+        assert!(incremental.changes.apply(&mut replayed));
+        assert_eq!(replayed, text);
+
+        state.set_parsed_syntax(parse(&text, &loader), loader.clone());
+        assert!(state.incremental_syntax().is_none());
+    }
+
+    #[test]
+    fn a_tree_without_a_known_loader_is_never_updated_in_place() {
+        let loader = helix_core::config::default_lang_loader();
+        let base = Rope::from_str("fn main() {}\n");
+        let mut state = SyntaxAwareState::default();
+        state.set_syntax(Some(parse(&base, &loader)));
+
+        let edit = Transaction::change(&base, [(0, 0, Some("// a\n".into()))].into_iter());
+        state.record_syntax_edit(&base, edit.changes());
+
+        assert!(state.incremental_syntax().is_none());
     }
 }

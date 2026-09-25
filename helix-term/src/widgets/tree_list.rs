@@ -92,6 +92,10 @@ pub struct TreeListItem<'a> {
     /// its gutter, and it shows up under the background-only selection themes
     /// that are the norm (unlike `selected`, see above).
     pub ranged: bool,
+    /// Muted text after the label (a search result's directory). It never
+    /// counts toward the content width, so it clips instead of widening the
+    /// horizontal scroll range.
+    pub detail: Option<&'a str>,
     /// When `true` an extra muted dot is drawn after the label, marking
     /// "this row's file is the one currently open in the focused view".
     /// Distinct from `selected` (which is the cursor in the tree).
@@ -111,8 +115,14 @@ impl<'a> TreeListItem<'a> {
             statuses: [None, None],
             selected: false,
             ranged: false,
+            detail: None,
             active: false,
         }
+    }
+
+    pub const fn detail(mut self, detail: Option<&'a str>) -> Self {
+        self.detail = detail;
+        self
     }
 
     pub const fn selected(mut self, selected: bool) -> Self {
@@ -383,6 +393,25 @@ fn draw_item(
             styles.directory
         };
         draw_segment_scrolled(surface, area, &mut content_x, "/", slash_style, scroll_x);
+    }
+
+    if let Some(detail) = item.detail {
+        draw_segment_scrolled(
+            surface,
+            area,
+            &mut content_x,
+            "  ",
+            styles.inactive,
+            scroll_x,
+        );
+        draw_segment_scrolled(
+            surface,
+            area,
+            &mut content_x,
+            detail,
+            styles.inactive,
+            scroll_x,
+        );
     }
 }
 

@@ -1,6 +1,5 @@
 use std::cmp::min;
 use std::sync::Arc;
-use std::time::Instant;
 
 use helix_core::doc_formatter::{
     DocumentFormatter, DocumentFormatterStats, FormattedGrapheme, GraphemeSource,
@@ -22,7 +21,7 @@ use helix_view::theme::Style;
 use helix_view::view::{RenderSeed, ViewPosition};
 use helix_view::{Document, Theme};
 
-use crate::render::RenderCancellation;
+use crate::render::{RenderCancellation, Stopwatch};
 use crate::ui::text_decorations::DecorationManager;
 use crate::widgets::AnchoredText;
 
@@ -254,16 +253,25 @@ fn render_text(
         text.char_to_line(seed_char_idx.min(text_len)) == line_idx
     }
 
-    let row_offset_start = Instant::now();
+    let row_offset_start = Stopwatch::start();
     let anchor_line = text.char_to_line(anchor.min(text.len_chars()));
-    let (row_off, row_offset_details) = if !text_fmt.soft_wrap
+    let plain_viewport = !text_fmt.soft_wrap
         && matches!(
             text_annotations.plain_viewport_support(anchor_line, anchor_line),
             helix_core::text_annotations::PlainViewportSupport::Supported
-        ) {
-        (
-            0,
-            format!(
+        );
+    let row_offset = (!plain_viewport).then(|| {
+        visual_offset_from_block_with_metrics(text, anchor, anchor, text_fmt, text_annotations)
+    });
+    let row_off = row_offset
+        .as_ref()
+        .map_or(0, |row_offset| row_offset.result.0.row);
+    helix_view::bench::log_run_phase(
+        "render_document",
+        "row_offset",
+        row_offset_start.elapsed(),
+        || match &row_offset {
+            None => format!(
                 concat!(
                     "anchor={} row_off=0 block_start={} soft_wrap=false viewport_width={} ",
                     "text_chars={} text_bytes={} fast_path=plain_viewport"
@@ -274,13 +282,7 @@ fn render_text(
                 text.len_chars(),
                 text.len_bytes(),
             ),
-        )
-    } else {
-        let row_offset =
-            visual_offset_from_block_with_metrics(text, anchor, anchor, text_fmt, text_annotations);
-        (
-            row_offset.result.0.row,
-            format!(
+            Some(row_offset) => format!(
                 concat!(
                     "anchor={} row_off={} block_start={} soft_wrap={} viewport_width={} ",
                     "text_chars={} text_bytes={} next_calls={} formatter_next_calls={} ",
@@ -302,13 +304,7 @@ fn render_text(
                 row_offset.metrics.formatter_inline_annotation_hits,
                 row_offset.metrics.formatter_overlay_hits,
             ),
-        )
-    };
-    helix_view::bench::log_run_phase(
-        "render_document",
-        "row_offset",
-        row_offset_start.elapsed(),
-        || row_offset_details.clone(),
+        },
     );
     let mut reached_view_top = false;
     let mut formatter = if let Some(seed) = seed.filter(|seed| {
@@ -358,7 +354,7 @@ fn render_text(
     let mut last_line_end = 0;
     let mut is_in_indent_area = true;
     let mut last_line_indent_level = 0;
-    let loop_start = Instant::now();
+    let loop_start = Stopwatch::start();
     let mut skipped_before_top = 0usize;
     let mut skipped_left = 0usize;
     let mut skipped_right = 0usize;
@@ -402,11 +398,11 @@ fn render_text(
             break;
         }
         cancellation_counter = cancellation_counter.wrapping_add(1);
-        let next_start = Instant::now();
+        let next_start = Stopwatch::start();
         let Some(mut grapheme) = pending_grapheme.take().or_else(|| formatter.next()) else {
             break;
         };
-        formatter_next_us += next_start.elapsed().as_micros() as u64;
+        formatter_next_us += next_start.elapsed_us();
 
         // skip any graphemes on visual lines before the block start
         if grapheme.visual_pos.row < row_off {
@@ -450,10 +446,10 @@ fn render_text(
                 let prev_row_dirty =
                     dirty_rows.is_none_or(|dr| dr.contains(&last_line_pos.visual_line));
                 if prev_row_dirty {
-                    let line_finalize_start = Instant::now();
+                    let line_finalize_start = Stopwatch::start();
                     renderer.draw_indent_guides(last_line_indent_level, last_line_pos.visual_line);
                     decorations.render_virtual_lines(renderer, last_line_pos, last_line_end);
-                    line_finalize_us += line_finalize_start.elapsed().as_micros() as u64;
+                    line_finalize_us += line_finalize_start.elapsed_us();
                 }
                 is_in_indent_area = true;
 
@@ -502,18 +498,15 @@ fn render_text(
                             next_char_idx,
                             line_end_col,
                         } => {
-                            let skip_left_syntax_start = Instant::now();
+                            let skip_left_syntax_start = Stopwatch::start();
                             syntax_highlighter.advance_to(next_char_idx);
-                            skip_left_syntax_us +=
-                                skip_left_syntax_start.elapsed().as_micros() as u64;
-                            let skip_left_overlay_start = Instant::now();
+                            skip_left_syntax_us += skip_left_syntax_start.elapsed_us();
+                            let skip_left_overlay_start = Stopwatch::start();
                             overlay_highlighter.advance_to(next_char_idx);
-                            skip_left_overlay_us +=
-                                skip_left_overlay_start.elapsed().as_micros() as u64;
-                            let skip_left_decor_start = Instant::now();
+                            skip_left_overlay_us += skip_left_overlay_start.elapsed_us();
+                            let skip_left_decor_start = Stopwatch::start();
                             decorations.fast_forward_to_char(next_char_idx, current_doc_line);
-                            skip_left_decor_us +=
-                                skip_left_decor_start.elapsed().as_micros() as u64;
+                            skip_left_decor_us += skip_left_decor_start.elapsed_us();
                             last_line_end = line_end_col;
                             if let Some(last_entry) = line_map_lines.last_mut() {
                                 last_entry.char_range_end = next_char_idx;
@@ -548,7 +541,7 @@ fn render_text(
                     })
                     .or_else(|| {
                         (renderer.offset.col > 0).then(|| {
-                            let seek_start = Instant::now();
+                            let seek_start = Stopwatch::start();
                             let result =
                                 char_idx_and_visual_offset_at_visual_block_offset_with_kind(
                                     text,
@@ -668,7 +661,7 @@ fn render_text(
 
         // acquire the correct grapheme style — always advance highlighters
         // to maintain state, even for clean rows
-        let advance_start = Instant::now();
+        let advance_start = Stopwatch::start();
         while grapheme.char_idx >= syntax_highlighter.pos {
             syntax_highlighter.advance();
             syntax_advances += 1;
@@ -677,7 +670,7 @@ fn render_text(
             overlay_highlighter.advance();
             overlay_advances += 1;
         }
-        advance_loop_us += advance_start.elapsed().as_micros() as u64;
+        advance_loop_us += advance_start.elapsed_us();
 
         let grapheme_width = grapheme.width();
         let visible_left_edge = grapheme.visual_pos.col + grapheme_width > renderer.offset.col;
@@ -708,8 +701,19 @@ fn render_text(
             skipped_right += 1;
         }
 
+        if !text_fmt.soft_wrap && !visible_right_edge && grapheme.raw == Grapheme::Newline {
+            // A line exactly as wide as the viewport puts its line break just
+            // past the right edge. Yielding the break already moved the
+            // formatter onto the next line, so skipping again would swallow it.
+            last_line_end = viewport_right;
+            if let Some(last_entry) = line_map_lines.last_mut() {
+                last_entry.char_range_end = grapheme.char_idx + grapheme.doc_chars();
+            }
+            continue;
+        }
+
         if !text_fmt.soft_wrap && !visible_right_edge {
-            let skip_right_start = Instant::now();
+            let skip_right_start = Stopwatch::start();
             let current_line = grapheme.line_idx;
             let next_line = formatter.skip_to_next_line();
             let next_line_char = next_line.unwrap_or_else(|| text.len_chars());
@@ -719,24 +723,24 @@ fn render_text(
             if let Some(last_entry) = line_map_lines.last_mut() {
                 last_entry.char_range_end = next_line_char;
             }
-            skip_right_us += skip_right_start.elapsed().as_micros() as u64;
+            skip_right_us += skip_right_start.elapsed_us();
             if next_line.is_none() {
                 skip_right_eof_fast_paths += 1;
                 break 'render;
             }
-            let skip_right_syntax_start = Instant::now();
+            let skip_right_syntax_start = Stopwatch::start();
             skip_right_syntax_advances += syntax_highlighter.advance_to(next_line_char);
-            skip_right_syntax_us += skip_right_syntax_start.elapsed().as_micros() as u64;
-            let skip_right_overlay_start = Instant::now();
+            skip_right_syntax_us += skip_right_syntax_start.elapsed_us();
+            let skip_right_overlay_start = Stopwatch::start();
             overlay_highlighter.advance_to(next_line_char);
-            skip_right_overlay_us += skip_right_overlay_start.elapsed().as_micros() as u64;
-            let skip_right_decor_start = Instant::now();
+            skip_right_overlay_us += skip_right_overlay_start.elapsed_us();
+            let skip_right_decor_start = Stopwatch::start();
             decorations.fast_forward_to_char(next_line_char, current_line);
-            skip_right_decor_us += skip_right_decor_start.elapsed().as_micros() as u64;
+            skip_right_decor_us += skip_right_decor_start.elapsed_us();
             continue;
         }
 
-        let bookkeeping_start = Instant::now();
+        let bookkeeping_start = Stopwatch::start();
         if visible_left_edge && visible_right_edge {
             if let Some(last_entry) = line_map_lines.last_mut() {
                 if !grapheme.is_virtual()
@@ -764,7 +768,7 @@ fn render_text(
                 }
             }
         }
-        bookkeeping_us += bookkeeping_start.elapsed().as_micros() as u64;
+        bookkeeping_us += bookkeeping_start.elapsed_us();
 
         // Skip cell writes for clean rows
         if !row_is_dirty {
@@ -796,15 +800,15 @@ fn render_text(
                 overlay_style: overlay_highlighter.style,
             }
         };
-        let decoration_start = Instant::now();
+        let decoration_start = Stopwatch::start();
         decorations.decorate_grapheme(renderer, &grapheme);
-        decoration_us += decoration_start.elapsed().as_micros() as u64;
+        decoration_us += decoration_start.elapsed_us();
 
         let virt = grapheme.is_virtual();
         if virt {
             virtual_drawn += 1;
         }
-        let draw_start = Instant::now();
+        let draw_start = Stopwatch::start();
         let grapheme_width = renderer.draw_grapheme(
             &grapheme,
             grapheme_style,
@@ -813,7 +817,7 @@ fn render_text(
             &mut is_in_indent_area,
             grapheme.visual_pos,
         );
-        draw_us += draw_start.elapsed().as_micros() as u64;
+        draw_us += draw_start.elapsed_us();
         if grapheme_width == 0 {
             zero_width_drawn += 1;
         }
@@ -823,11 +827,11 @@ fn render_text(
         max_drawn_col = max_drawn_col.max(grapheme.visual_pos.col);
         last_line_end = grapheme.visual_pos.col + grapheme_width;
         // Track char range end for line map
-        let bookkeeping_end_start = Instant::now();
+        let bookkeeping_end_start = Stopwatch::start();
         if let Some(last_entry) = line_map_lines.last_mut() {
             last_entry.char_range_end = grapheme.char_idx + 1;
         }
-        bookkeeping_us += bookkeeping_end_start.elapsed().as_micros() as u64;
+        bookkeeping_us += bookkeeping_end_start.elapsed_us();
     }
 
     // char_range_end is continuously updated during iteration
@@ -836,10 +840,10 @@ fn render_text(
     let last_row_dirty = last_line_pos.doc_line != usize::MAX
         && dirty_rows.is_none_or(|dr| dr.contains(&last_line_pos.visual_line));
     if last_row_dirty {
-        let line_finalize_start = Instant::now();
+        let line_finalize_start = Stopwatch::start();
         renderer.draw_indent_guides(last_line_indent_level, last_line_pos.visual_line);
         decorations.render_virtual_lines(renderer, last_line_pos, last_line_end);
-        line_finalize_us += line_finalize_start.elapsed().as_micros() as u64;
+        line_finalize_us += line_finalize_start.elapsed_us();
     }
     let formatter_stats_end = formatter.stats();
     let formatter_stats = DocumentFormatterStats {
@@ -1218,6 +1222,7 @@ impl<'a> TextRenderer<'a> {
         if (y as usize) < self.offset.row {
             return;
         }
+        let y = y - self.offset.row as u16;
         self.surface.set_string(
             x,
             y + self.viewport.y,
@@ -1237,6 +1242,7 @@ impl<'a> TextRenderer<'a> {
         if (y as usize) < self.offset.row {
             return;
         }
+        let y = y - self.offset.row as u16;
         self.surface.set_stringn(
             x,
             y + self.viewport.y,
@@ -1249,8 +1255,12 @@ impl<'a> TextRenderer<'a> {
     /// Sets the style of an area **within the text viewport* this accounts
     /// both for the renderers vertical offset and its viewport
     pub fn set_style(&mut self, mut area: Rect, style: Style) {
-        area = area.clip_top(self.offset.row as u16);
-        area.y += self.viewport.y;
+        let offset = self.offset.row as u16;
+        if area.y < offset {
+            area.height = area.height.saturating_sub(offset - area.y);
+            area.y = offset;
+        }
+        area.y = area.y - offset + self.viewport.y;
         self.surface.set_style(
             tui::ratatui::to_ratatui_rect(area),
             tui::ratatui::to_ratatui_style(style),
@@ -1271,6 +1281,7 @@ impl<'a> TextRenderer<'a> {
         if (y as usize) < self.offset.row {
             return (x, y);
         }
+        let y = y - self.offset.row as u16;
         let mut style_for_offset = |offset| tui::ratatui::to_ratatui_style(style(offset));
         crate::widgets::draw_string_anchored(
             self.surface,
@@ -1460,6 +1471,7 @@ impl<'t> OverlayHighlighter<'t> {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::time::Instant;
 
     use crate::render::CellSurface as Surface;
     use arc_swap::ArcSwap;
@@ -1516,6 +1528,113 @@ mod tests {
 
         assert!(!output.line_map.lines.is_empty());
         assert!(output.line_map.lines.len() <= viewport.height as usize);
+    }
+
+    fn render_plain(
+        text: &str,
+        viewport: Rect,
+        decorations: DecorationManager,
+    ) -> (Surface, RenderOutput) {
+        let doc = test_doc(text);
+        let mut surface = Surface::empty(tui::ratatui::to_ratatui_rect(viewport));
+        let theme = Theme::default();
+        let document = DocumentRenderSnapshot::new(&doc, viewport.width, Some(&theme));
+        let output = render_document(
+            &mut surface,
+            viewport,
+            &document,
+            ViewPosition::default(),
+            &TextAnnotations::default(),
+            SyntaxRenderSnapshot::plain(),
+            Vec::new(),
+            &theme,
+            decorations,
+            None,
+            None,
+            None,
+            &RenderCancellation::never(),
+        );
+        (surface, output)
+    }
+
+    fn row_text(surface: &Surface, row: u16) -> String {
+        let area = surface.area;
+        (area.x..area.right())
+            .filter_map(|x| surface.cell((x, row)).map(|cell| cell.symbol().to_owned()))
+            .collect::<String>()
+            .trim_end()
+            .to_owned()
+    }
+
+    #[test]
+    #[ignore = "timing probe: cargo test --release -p helix-term render_document_frame_cost -- --ignored --nocapture"]
+    fn render_document_frame_cost() {
+        let text = include_str!("editor.rs");
+        let viewport = Rect::new(0, 0, 200, 60);
+        let doc = test_doc(text);
+        let theme = Theme::default();
+        let document = DocumentRenderSnapshot::new(&doc, viewport.width, Some(&theme));
+        let lines = doc.text().len_lines();
+        let frames = 2_000;
+        let start = Instant::now();
+        for frame in 0..frames {
+            let line = (frame * 37) % lines.saturating_sub(viewport.height as usize);
+            let mut surface = Surface::empty(tui::ratatui::to_ratatui_rect(viewport));
+            let offset = ViewPosition {
+                anchor: doc.text().line_to_char(line),
+                ..ViewPosition::default()
+            };
+            let output = render_document(
+                &mut surface,
+                viewport,
+                &document,
+                offset,
+                &TextAnnotations::default(),
+                SyntaxRenderSnapshot::plain(),
+                Vec::new(),
+                &theme,
+                DecorationManager::default(),
+                None,
+                None,
+                None,
+                &RenderCancellation::never(),
+            );
+            std::hint::black_box(output);
+        }
+        let per_frame = start.elapsed() / frames as u32;
+        eprintln!("render_document_frame_cost: {per_frame:?} per 200x60 frame");
+    }
+
+    #[test]
+    fn render_document_keeps_line_after_full_width_line() {
+        let viewport = Rect::new(0, 0, 10, 4);
+        let (surface, output) = render_plain(
+            "0123456789\nnext\n0123456789abc\nlast\n",
+            viewport,
+            DecorationManager::default(),
+        );
+
+        assert_eq!(row_text(&surface, 0), "0123456789");
+        assert_eq!(row_text(&surface, 1), "next");
+        assert_eq!(row_text(&surface, 2), "0123456789");
+        assert_eq!(row_text(&surface, 3), "last");
+        let doc_lines: Vec<_> = output
+            .line_map
+            .lines
+            .iter()
+            .map(|line| (line.visual_row, line.doc_line))
+            .collect();
+        assert_eq!(doc_lines, [(0, 0), (1, 1), (2, 2), (3, 3)]);
+    }
+
+    #[test]
+    fn render_document_reports_cursor_on_first_row() {
+        let viewport = Rect::new(0, 0, 10, 3);
+        let mut decorations = DecorationManager::default();
+        decorations.add_decoration(crate::ui::text_decorations::Cursor::new(0));
+        let (_, output) = render_plain("first\nsecond\n", viewport, decorations);
+
+        assert_eq!(output.cursor_position, Some(Position::new(0, 0)));
     }
 
     #[test]

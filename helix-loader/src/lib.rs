@@ -1,15 +1,16 @@
 pub mod assets;
 pub mod config;
 pub mod grammar;
+pub mod workspace_trust;
 
 use helix_stdx::{env::current_working_dir, path};
 
 use std::path::{Path, PathBuf};
 
 pub use assets::{
-    bootstrap_runtime_assets, runtime_assets, runtime_assets_if_initialized, ActivePackage, Origin,
-    ResolvedLaunch, ResolvedPath, RuntimeAsset, RuntimeAssetKey, RuntimeAssetKind,
-    RuntimeAssetSpec, RuntimeAssets, RuntimeAssetsChange, RuntimeAssetsError,
+    bootstrap_runtime_assets, runtime_assets, runtime_assets_if_initialized, ActivePackage,
+    CommandResolver, Origin, ResolvedLaunch, ResolvedPath, RuntimeAsset, RuntimeAssetKey,
+    RuntimeAssetKind, RuntimeAssetSpec, RuntimeAssets, RuntimeAssetsChange, RuntimeAssetsError,
     RuntimeAssetsSnapshot, RuntimeSnapshot,
 };
 pub use helix_stdx::paths::{
@@ -129,6 +130,13 @@ pub fn workspace_config_file() -> PathBuf {
         .0
         .join(WORKSPACE_CONFIG_DIR)
         .join("config.toml")
+}
+
+pub fn workspace_lang_config_file() -> PathBuf {
+    find_workspace()
+        .0
+        .join(WORKSPACE_CONFIG_DIR)
+        .join("languages.toml")
 }
 
 pub fn workspace_ignore_file_name() -> &'static str {

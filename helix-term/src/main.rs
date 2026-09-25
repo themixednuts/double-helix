@@ -47,6 +47,7 @@ ARGS:
 
 FLAGS:
     -h, --help                     Print help information
+    --strict                       Bail on error for commands that can fail.
     --tutor                        Load the tutorial
     --migrate                      Copy existing Helix config into Double Helix config paths
     pkg <cmd>                      Manage runtime packages (install, update, rollback, list, search, sync, doctor)
@@ -55,7 +56,7 @@ FLAGS:
                                    'all-languages' or 'all'. 'languages' is filtered according to
                                    user config, 'all-languages' and 'all' are not. If not specified,
                                    the default is the same as 'all', but with languages filtering.
-    -g, --grammar {{fetch|build}}    Fetch or builds tree-sitter grammars listed in languages.toml
+    -g, --grammar {{fetch|build}}    Fetch or builds tree-sitter grammars listed in languages.toml.
     -c, --config <file>            Specify a file to use for configuration
     -v                             Increase logging verbosity each use for up to 3 times
     --log <file>                   Specify a file to use for logging
@@ -99,12 +100,12 @@ FLAGS:
     }
 
     if args.fetch_grammars {
-        helix_loader::grammar::fetch_grammars()?;
+        helix_loader::grammar::fetch_grammars(args.strict)?;
         return Ok(0);
     }
 
     if args.build_grammars {
-        helix_loader::grammar::build_grammars(None)?;
+        helix_loader::grammar::build_grammars(None, args.strict)?;
         return Ok(0);
     }
 
@@ -118,6 +119,10 @@ FLAGS:
     } else if let Some((path, _)) = args.files.first().filter(|p| p.0.is_dir()) {
         // If the first file is a directory, it will be the working directory unless -w was specified
         helix_stdx::env::set_current_working_dir(path)?;
+    } else if let Err(err) = std::env::current_dir() {
+        eprintln!("Couldn't determine the current working directory: {err}");
+        eprintln!("Check that it still exists, or pass an initial directory with `--working-dir`");
+        return Ok(1);
     }
 
     let config = match Config::load_default() {
@@ -142,14 +147,17 @@ FLAGS:
         }
     };
 
-    let lang_loader = helix_core::config::user_lang_loader().unwrap_or_else(|err| {
-        eprintln!("{}", err);
-        eprintln!("Press <ENTER> to continue with default language config");
-        use std::io::Read;
-        // This waits for an enter press.
-        let _ = std::io::stdin().read(&mut []);
-        helix_core::config::default_lang_loader()
-    });
+    let workspace_trust =
+        helix_loader::workspace_trust::WorkspaceTrust::new((&config.editor.workspace_trust).into());
+    let lang_loader =
+        helix_core::config::user_lang_loader(&workspace_trust).unwrap_or_else(|err| {
+            eprintln!("{}", err);
+            eprintln!("Press <ENTER> to continue with default language config");
+            use std::io::Read;
+            // This waits for an enter press.
+            let _ = std::io::stdin().read(&mut []);
+            helix_core::config::default_lang_loader()
+        });
 
     let remote = match args.remote.clone() {
         Some(uri) => Some(connect_remote_workspace(&uri).await?),
@@ -224,7 +232,7 @@ fn run_pkg(command: PkgCommand) -> Result<i32> {
         }
         PkgCommand::Install(names) => {
             let ops = Ops::open_default()?;
-            ops.install(&names, &mut print_pkg_event)?;
+            ops.install(&names, &mut pkg_event_printer())?;
             Ok(0)
         }
         PkgCommand::Remove(name) => {
@@ -278,9 +286,9 @@ fn run_pkg(command: PkgCommand) -> Result<i32> {
             let ops = Ops::open_default()?;
             let options = helix_pkg::LockOptions { fetch_hashes };
             let lock = if let Some(project) = project {
-                ops.lock_project_with_options(&project, &names, options, &mut print_pkg_event)?
+                ops.lock_project_with_options(&project, &names, options, &mut pkg_event_printer())?
             } else {
-                ops.lock_manifest_with_options(&names, options, &mut print_pkg_event)?
+                ops.lock_manifest_with_options(&names, options, &mut pkg_event_printer())?
             };
             println!("wrote pkg.lock with {} package(s)", lock.packages.len());
             Ok(0)
@@ -288,9 +296,9 @@ fn run_pkg(command: PkgCommand) -> Result<i32> {
         PkgCommand::Sync { project } => {
             let ops = Ops::open_default()?;
             if let Some(project) = project {
-                ops.sync_with_project(&project, &mut print_pkg_event)?;
+                ops.sync_with_project(&project, &mut pkg_event_printer())?;
             } else {
-                ops.sync(&mut print_pkg_event)?;
+                ops.sync(&mut pkg_event_printer())?;
             }
             Ok(0)
         }
@@ -335,7 +343,7 @@ fn run_pkg(command: PkgCommand) -> Result<i32> {
         }
         PkgCommand::Update(names) => {
             let ops = Ops::open_default()?;
-            ops.update(&names, &mut print_pkg_event)?;
+            ops.update(&names, &mut pkg_event_printer())?;
             Ok(0)
         }
         PkgCommand::UpdatePlan(names) => {
@@ -469,12 +477,59 @@ fn package_tags(package: &PackageSpec) -> String {
     tags.join(",")
 }
 
-fn print_pkg_event(event: OpEvent) {
-    match event {
-        OpEvent::Started { name } => println!("installing {name}"),
-        OpEvent::Progress { name, message, .. } => println!("{name}: {message}"),
-        OpEvent::Done { name } => println!("done {name}"),
-        OpEvent::Failed { name, message } => eprintln!("failed {name}: {message}"),
+/// Prints package events. A message repeated with a rising percent (a
+/// download) redraws one line on a terminal and prints once when piped,
+/// instead of one line per chunk.
+fn pkg_event_printer() -> impl FnMut(OpEvent) {
+    use std::io::{IsTerminal, Write};
+
+    let terminal = std::io::stdout().is_terminal();
+    let mut last: Option<(String, String)> = None;
+    let mut open_line = false;
+    move |event| {
+        let mut stdout = std::io::stdout();
+        if let OpEvent::Progress {
+            name,
+            message,
+            percent,
+        } = event
+        {
+            let repeat = last.as_ref().is_some_and(|(last_name, last_message)| {
+                *last_name == name && *last_message == message
+            });
+            let line = match percent {
+                Some(percent) => format!("{name}: {message} ({percent}%)"),
+                None => format!("{name}: {message}"),
+            };
+            if terminal {
+                if repeat {
+                    print!("\r\x1b[2K{line}");
+                } else {
+                    if open_line {
+                        println!();
+                    }
+                    print!("{line}");
+                }
+                let _ = stdout.flush();
+                open_line = true;
+            } else if !repeat {
+                println!("{line}");
+            }
+            last = Some((name, message));
+            return;
+        }
+
+        if open_line {
+            println!();
+            open_line = false;
+        }
+        last = None;
+        match event {
+            OpEvent::Started { name } => println!("installing {name}"),
+            OpEvent::Done { name } => println!("done {name}"),
+            OpEvent::Failed { name, message } => eprintln!("failed {name}: {message}"),
+            OpEvent::Progress { .. } => {}
+        }
     }
 }
 

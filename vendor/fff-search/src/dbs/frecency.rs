@@ -244,6 +244,22 @@ impl FrecencyTracker {
     }
 
     fn path_to_hash_bytes(path: &Path) -> Result<[u8; 32]> {
+        // On Windows, resolve to the canonical form (short-name/case/symlink)
+        // so the same file always hashes to one key regardless of how the
+        // caller spelled it. A file that no longer exists (watcher delete or
+        // rename-away events) is keyed by its canonical parent plus file name,
+        // so a rename source spelled with `/` still finds its history. Falls
+        // back to the raw path when the parent is gone too, so the op is never
+        // dropped. No-op on other platforms.
+        #[cfg(windows)]
+        let canonical: Option<std::path::PathBuf> =
+            crate::path_utils::canonicalize(path).ok().or_else(|| {
+                let parent = crate::path_utils::canonicalize(path.parent()?).ok()?;
+                Some(parent.join(path.file_name()?))
+            });
+        #[cfg(windows)]
+        let path: &Path = canonical.as_deref().unwrap_or(path);
+
         let Some(key) = path.to_str() else {
             return Err(Error::InvalidPath(path.to_path_buf()));
         };
@@ -284,6 +300,43 @@ impl FrecencyTracker {
 
         tracing::debug!(?path, accesses = updated.len(), "Tracking access");
         self.store.save(&key_hash, &updated).map_err(storage_error)
+    }
+
+    /// Copy the access history of `from` onto `to` (used to carry frecency
+    /// across renames). Copied, not moved: the source keeps its history.
+    /// Returns `Ok(true)` when the target changed.
+    pub fn copy_history(&self, from: &Path, to: &Path) -> Result<bool> {
+        if from == to {
+            return Ok(false);
+        }
+
+        let Some(source) = self.get_accesses(from)?.filter(|a| !a.is_empty()) else {
+            return Ok(false);
+        };
+
+        let target_key = Self::path_to_hash_bytes(to)?;
+        {
+            let mut entries = self
+                .accesses
+                .write()
+                .map_err(|_| Error::AcquireFrecencyLock)?;
+            if entries.get(&target_key) == Some(&source) {
+                return Ok(false);
+            }
+            entries.insert(target_key, source.clone());
+        }
+
+        tracing::debug!(
+            ?from,
+            ?to,
+            accesses = source.len(),
+            "Copying frecency history"
+        );
+        self.store
+            .save(&target_key, &source)
+            .map_err(storage_error)?;
+
+        Ok(true)
     }
 
     pub fn get_access_score(&self, file_path: &Path, mode: FFFMode) -> i64 {
@@ -382,6 +435,50 @@ fn storage_error(error: FrecencyPersistenceError) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A path that doesn't exist on disk must still hash (canonicalize fails on
+    // Windows -> falls back to the raw string), so watcher delete events and
+    // raced files never drop their frecency op.
+    #[test]
+    fn hashes_nonexistent_path_without_error() {
+        let missing = Path::new("/this/path/definitely/does/not/exist/frecency_test_xyz");
+        assert!(FrecencyTracker::path_to_hash_bytes(missing).is_ok());
+    }
+
+    #[test]
+    fn copy_history_writes_through_to_store() {
+        let tracker = FrecencyTracker::memory_only().unwrap();
+        let from = Path::new("/test/project/src/old.rs");
+        let to = Path::new("/test/project/src/new.rs");
+
+        tracker.track_access(from).unwrap();
+        assert!(tracker.copy_history(from, to).unwrap());
+        assert!(
+            !tracker.copy_history(from, to).unwrap(),
+            "second copy is a no-op"
+        );
+
+        assert_eq!(tracker.access_count(to).unwrap(), 1);
+        assert_eq!(tracker.access_count(from).unwrap(), 1);
+        assert_eq!(tracker.store.entry_count().unwrap(), 2);
+    }
+
+    // A deleted file keeps the key it was tracked under even when the caller
+    // spells it differently (here with `/` separators) once it is gone.
+    #[cfg(windows)]
+    #[test]
+    fn deleted_file_keeps_its_canonical_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = crate::path_utils::canonicalize(dir.path()).unwrap();
+        std::fs::create_dir_all(base.join("src")).unwrap();
+        let native = base.join("src").join("gone.rs");
+        std::fs::write(&native, "x").unwrap();
+        let tracked = FrecencyTracker::path_to_hash_bytes(&native).unwrap();
+
+        std::fs::remove_file(&native).unwrap();
+        let slashed = base.join("src/gone.rs");
+        assert_eq!(FrecencyTracker::path_to_hash_bytes(&slashed).unwrap(), tracked);
+    }
 
     #[test]
     fn test_frecency_calculation() {

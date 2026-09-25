@@ -24,6 +24,7 @@
 - [`[editor.inline-diagnostics]` Section](#editorinline-diagnostics-section)
 - [`[editor.word-completion]` Section](#editorword-completion-section)
 - [`[editor.completion-highlight]` Section](#editorcompletion-highlight-section)
+- [`[editor.workspace-trust]` Section](#editorworkspace-trust-section)
 
 ### `[editor]` Section
 
@@ -33,13 +34,14 @@
 | `mouse` | Enable mouse mode | `true` |
 | `default-yank-register` | Default register used for yank/paste | `'"'` |
 | `middle-click-paste` | Middle click paste support | `true` |
+| `mouse-yank-register` | Register that mouse selections yank to and middle click pastes from | `*` |
 | `scroll-lines` | Number of lines to scroll per scroll wheel step | `3` |
 | `shell` | Shell to use when running external commands | Unix: `["sh", "-c"]`<br/>Windows: `["cmd", "/C"]` |
 | `line-number` | Line number display: `absolute` simply shows each line's number, while `relative` shows the distance from the current line. When unfocused or in insert mode, `relative` will still show absolute line numbers | `"absolute"` |
 | `cursorline` | Highlight all lines with a cursor | `false` |
 | `cursorcolumn` | Highlight all columns with a cursor | `false` |
 | `continue-comments` | if helix should automatically add a line comment token if you create a new line inside a comment. | `true` |
-| `gutters` | Gutters to display: Available are `diagnostics` and `diff` and `line-numbers` and `spacer`, note that `diagnostics` also includes other features like breakpoints, 1-width padding will be inserted if gutters is non-empty | `["diagnostics", "spacer", "line-numbers", "spacer", "diff"]` |
+| `gutters` | Gutters to display: Available are `diagnostics` and `diff` and `line-numbers` and `spacer` and `code-action-hint`, note that `diagnostics` also includes other features like breakpoints, 1-width padding will be inserted if gutters is non-empty | `["diagnostics", "spacer", "line-numbers", "spacer", "diff"]` |
 | `auto-completion` | Enable automatic pop up of auto-completion | `true` |
 | `path-completion` | Enable filepath completion. Show files and directories if an existing path at the cursor was recognized, either absolute or relative to the current opened document or current working directory (if the buffer is not yet saved). Defaults to true. | `true` |
 | `auto-format` | Enable automatic formatting on save[^3] | `true` |
@@ -72,6 +74,7 @@
 | `rainbow-brackets` | Whether to render rainbow colors for matching brackets. Requires tree-sitter `rainbows.scm` queries for the language. | `false` |
 | `kitty-keyboard-protocol` | Whether to enable Kitty Keyboard Protocol. Can be `enabled`, `disabled` or `auto` | `"auto"` |
 | `fold-on-open` | Whether to collapse available LSP folding ranges when a document opens | `false` |
+| `editing-engine` | Modal editing model: `helix` (select, then act) or `vim` (operator, then motion, with Vim's keymap; see [Vim engine](./vim-engine.md)) | `"helix"` |
 
 [^3]: In most cases, you also need to enable the `auto-format` setting under `languages.toml`. You can find the reasoning [here](https://github.com/helix-editor/helix/discussions/9043#discussioncomment-7811497).
 
@@ -162,6 +165,7 @@ The following statusline elements can be configured:
 | `spacer` | Inserts a space between elements (multiple/contiguous spacers may be specified) |
 | `version-control` | The current branch name or detached commit hash of the opened workspace |
 | `register` | The current selected register |
+| `code-action-hint` | `⋮` when code actions are available at the cursor |
 
 ### `[editor.lsp]` Section
 
@@ -174,6 +178,7 @@ The following statusline elements can be configured:
 | `display-inlay-hints` | Display inlay hints[^2]                                     | `false` |
 | `inlay-hints-length-limit` | Maximum displayed length (non-zero number) of inlay hints | Unset by default  |
 | `semantic-tokens` | Overlay LSP semantic token highlighting above tree-sitter highlighting | `false` |
+| `auto-document-highlight` | Highlight the other references to the symbol under the cursor (`ui.highlight`) | `false` |
 | `inline-completion` | Display LSP inline completion ghost text in insert mode. Accept with `Ctrl-y`; request manually with `Alt-y` | `false` |
 | `inline-values` | Display LSP inline values while stopped in a debug session | `false` |
 | `display-color-swatches` | Show color swatches next to colors | `true` |
@@ -455,6 +460,10 @@ Other diff providers will eventually be supported by a future plugin system.
 
 There are currently no options for this section.
 
+#### `[editor.gutters.code-action-hint]` Section
+
+The `code-action-hint` gutter shows `⋮` on the cursor line when a language server offers code actions there. Adding it (or the `code-action-hint` statusline element) makes the editor ask for code actions in the background as the cursor moves. It has no options.
+
 #### `[editor.gutters.spacer]` Section
 
 Currently unused
@@ -569,3 +578,14 @@ Example:
 [editor.completion-highlight]
 highlight-type = "vibrant"
 ```
+
+### `[editor.workspace-trust]` Section
+
+What workspaces are trusted with: their local config, language servers, debug adapters and
+repository git config. Only your user config sets this. See [Workspace trust](./workspace-trust.md).
+
+| Key       | Description                                                                              | Default     |
+| ---       | ---                                                                                      | ---         |
+| `level`   | Trusted without a grant: `"none"`, `"servers"` (language servers and debug adapters) or `"insecure"` (everything) | `"servers"` |
+| `prompt`  | Ask for trust when opening a file in a restricted workspace                             | `true`      |
+| `trusted` | Glob patterns of workspaces trusted without a grant (discouraged)                       | `[]`        |

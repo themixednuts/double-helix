@@ -1761,18 +1761,16 @@ impl crate::traits::HistoryViewport<crate::Document> for AnyViewMut<'_> {
 impl crate::traits::Jumpable<crate::Document> for View {
     fn push_jump(&mut self, doc: &mut crate::Document) {
         doc.append_changes_to_history(self);
-        self.history
-            .jumps
-            .push((doc.id(), doc.selection(self.id).clone()));
+        let jump = (doc.id(), doc.selection(self.id).clone());
+        self.history.push_jump(doc, jump);
     }
 }
 
 impl crate::traits::Jumpable<crate::Document> for ComponentViewState {
     fn push_jump(&mut self, doc: &mut crate::Document) {
         doc.append_changes_to_history(self);
-        self.history
-            .jumps
-            .push((doc.id(), doc.selection(self.id).clone()));
+        let jump = (doc.id(), doc.selection(self.id).clone());
+        self.history.push_jump(doc, jump);
     }
 }
 
@@ -2788,5 +2786,40 @@ mod tests {
             ),
             Some(7)
         );
+    }
+
+    /// A jump pushed at the document's current revision must advance the view's
+    /// `doc_revisions`; otherwise the next `sync_changes` maps it through an older,
+    /// shorter changeset and panics in `ChangeSet::update_positions`.
+    #[test]
+    fn push_jump_keeps_doc_revisions_in_sync() {
+        let mut doc = Document::from(
+            Rope::from_str("ab"),
+            None,
+            Arc::new(ArcSwap::new(Arc::new(Config::default()))),
+            Arc::new(ArcSwap::from_pointee(syntax::Loader::default())),
+        );
+        let mut view1 = View::new(doc.id(), GutterConfig::default());
+        let mut view2 = View::new(doc.id(), GutterConfig::default());
+        doc.ensure_view_init(view1.id);
+        doc.ensure_view_init(view2.id);
+        view1.sync_changes(&mut doc);
+
+        // Grow the document through view2 only; view1 still records revision 0.
+        let insert = Transaction::change(
+            doc.text(),
+            std::iter::once((2, 2, Some("XXXXXXXXXX".into()))),
+        );
+        assert!(doc.apply(&insert, view2.id));
+        doc.append_changes_to_history(&mut view2);
+        let len = doc.text().len_chars();
+        assert_eq!(len, 12);
+
+        let jump = (doc.id(), Selection::point(len));
+        view1.history.push_jump(&mut doc, jump);
+        view1.sync_changes(&mut doc);
+
+        let (_, selection) = view1.history.jumps.iter().next_back().unwrap();
+        assert_eq!(selection.primary().head, len);
     }
 }

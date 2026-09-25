@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak};
 use std::time::{Duration, Instant};
 
@@ -6,8 +6,13 @@ use crate::error::Error;
 use crate::file_picker::FilePicker;
 use crate::frecency::FrecencyTracker;
 use crate::git::GitStatusCache;
+use crate::git_recency;
 use crate::query_tracker::QueryTracker;
+use crate::rescan_stats::{RescanCounters, RescanReason, RescanStats};
+use crate::rescan_throttle::RescanThrottle;
 use crate::scan::ScanJob;
+use crate::watch::{WatchEvent, WatchId, WatchOptions, WatchRegistry};
+use git2::Repository;
 
 /// Poll `.git/index.lock` until it disappears (git write completed), giving up
 /// after [`GIT_LOCK_MAX_WAIT`]. Used by [`SharedPicker::refresh_git_status`]
@@ -37,6 +42,19 @@ fn wait_for_git_index_lock_release(git_root: &Path) {
     }
 }
 
+/// Poll `done` every 10ms until it returns `true`, or until `timeout` elapses.
+/// Returns `true` if the condition was met, `false` on timeout.
+fn poll_until(timeout: Duration, mut done: impl FnMut() -> bool) -> bool {
+    let start = Instant::now();
+    while !done() {
+        if start.elapsed() >= timeout {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    true
+}
+
 /// Thread-safe shared handle to the [`FilePicker`] instance.
 /// This accumulates only asynchronous non-blocking operations against the
 /// file picker: creating, triggering various rescans and so on.
@@ -60,12 +78,20 @@ pub type SharedPicker = SharedFilePicker;
 
 pub struct SharedPickerInner {
     picker: parking_lot::RwLock<Option<FilePicker>>,
+    /// Watch subscriptions live outside the picker lock so delivery and
+    /// (un)subscribing never contend with searches.
+    watchers: Arc<WatchRegistry>,
+    rescans: RescanCounters,
+    rescan_throttle: RescanThrottle,
 }
 
 impl Default for SharedPickerInner {
     fn default() -> Self {
         Self {
             picker: parking_lot::RwLock::new(None),
+            watchers: Arc::new(WatchRegistry::default()),
+            rescans: RescanCounters::default(),
+            rescan_throttle: RescanThrottle::default(),
         }
     }
 }
@@ -100,6 +126,16 @@ impl SharedFilePicker {
         Ok(self.0.picker.write())
     }
 
+    /// Signal the background scan to cancel. Non-blocking: post-scan
+    /// threads check this flag and bail out at their next cancellation point.
+    pub fn cancel(&self) {
+        if let Ok(guard) = self.read()
+            && let Some(picker) = guard.as_ref()
+        {
+            picker.cancel();
+        }
+    }
+
     /// Produce a non-owning handle to the same inner picker.
     /// Use it if you don't need to block internal threads from dropping while owning this ref
     pub(crate) fn weaken(&self) -> WeakFilePicker {
@@ -126,14 +162,9 @@ impl SharedFilePicker {
             }
         };
 
-        let start = std::time::Instant::now();
-        while signal.load(std::sync::atomic::Ordering::Acquire) {
-            if start.elapsed() >= timeout {
-                return false;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        true
+        poll_until(timeout, || {
+            !signal.load(std::sync::atomic::Ordering::Acquire)
+        })
     }
 
     /// Block until the background file watcher is ready.
@@ -147,14 +178,9 @@ impl SharedFilePicker {
             }
         };
 
-        let start = std::time::Instant::now();
-        while !watch_ready_signal.load(std::sync::atomic::Ordering::Acquire) {
-            if start.elapsed() >= timeout {
-                return false;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        true
+        poll_until(timeout, || {
+            watch_ready_signal.load(std::sync::atomic::Ordering::Acquire)
+        })
     }
 
     /// Blocks until both the filesystem walk and post-scan indexing are done.
@@ -171,24 +197,49 @@ impl SharedFilePicker {
             }
         };
 
-        let start = std::time::Instant::now();
-        loop {
-            if start.elapsed() >= timeout {
-                return false;
-            }
-            let s = scanning.load(std::sync::atomic::Ordering::Acquire);
-            let p = post_scan_active.load(std::sync::atomic::Ordering::Acquire);
-            if !s && !p {
-                return true;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        poll_until(timeout, || {
+            !scanning.load(std::sync::atomic::Ordering::Acquire)
+                && !post_scan_active.load(std::sync::atomic::Ordering::Acquire)
+        })
     }
 
     /// Trigger a full filesystem rescan without blocking the caller.
     /// Performs a safe async rescan. Guarantees only single active rescan per picker.
     /// If many rescans requested the last one guaranteed to be finished.
     pub fn trigger_full_rescan_async(&self, shared_frecency: &SharedFrecency) -> Result<(), Error> {
+        self.trigger_full_rescan_with_reason(shared_frecency, RescanReason::Explicit)
+            .map(|_| ())
+    }
+
+    /// Returns admitted and throttled rescan requests by reason.
+    /// Counters start at picker creation or the last reset.
+    pub fn rescan_stats(&self) -> RescanStats {
+        self.0.rescans.snapshot()
+    }
+
+    pub fn reset_rescan_stats(&self) {
+        self.0.rescans.reset();
+    }
+
+    /// Returns `Ok(true)` when a rescan was started (or queued behind an
+    /// active scan) and `Ok(false)` when the request was throttled — the
+    /// caller must then fall back to incremental event processing.
+    pub(crate) fn trigger_full_rescan_with_reason(
+        &self,
+        shared_frecency: &SharedFrecency,
+        reason: RescanReason,
+    ) -> Result<bool, Error> {
+        // for giant folders we have no other choice other than throttling rescans
+        // if user is running application in millions of files with a ton of rescan events
+        // we drop / throttle some of requests to avoid constant burst of IO
+        if reason == RescanReason::Explicit {
+            self.0.rescan_throttle.note_explicit_scan();
+        } else if !self.check_rescan_throttle(reason) {
+            return Ok(false);
+        }
+
+        self.0.rescans.record(reason);
+
         match ScanJob::new_rescan(self, shared_frecency)? {
             Some(job) => {
                 job.spawn();
@@ -209,37 +260,135 @@ impl SharedFilePicker {
                 }
             }
         }
-        Ok(())
+        Ok(true)
     }
 
-    /// Refresh git statuses for all indexed files.
-    pub fn refresh_git_status(&self, shared_frecency: &SharedFrecency) -> Result<usize, Error> {
-        use tracing::debug;
+    fn check_rescan_throttle(&self, reason: RescanReason) -> bool {
+        let (live_files, has_git) = self
+            .read()
+            .ok()
+            .and_then(|guard| {
+                guard
+                    .as_ref()
+                    .map(|picker| (picker.live_file_count(), picker.has_git_repo()))
+            })
+            .unwrap_or((0, false));
 
-        let git_status = {
+        if self.0.rescan_throttle.admit(live_files, has_git) {
+            return true;
+        }
+
+        self.0.rescans.record_throttled(reason);
+        tracing::debug!(%reason, live_files, "Rescan throttled, skipping");
+        false
+    }
+
+    /// Subscribe to filesystem changes matching `pattern`.
+    ///
+    /// Patterns may be base-relative globs (./ works), exact paths inside the indexed
+    /// tree, or existing directories. An empty pattern watches the whole tree.
+    ///
+    /// Events are debounced over a 50-ms window and submitted in batches of at most 128 events.
+    /// Gitignored and other ignored files are never triggering watcher.
+    pub fn watch(
+        &self,
+        pattern: &str,
+        options: WatchOptions,
+        callback: impl Fn(WatchId, &[WatchEvent]) + Send + Sync + 'static,
+    ) -> Result<WatchId, Error> {
+        let (base_path, has_watcher, watcher_ready) = {
+            let guard = self.read()?;
+            let picker = guard.as_ref().ok_or(Error::FilePickerMissing)?;
+
+            (
+                picker.base_path().to_path_buf(),
+                picker.has_watcher(),
+                picker.is_watcher_ready(),
+            )
+        };
+
+        if !has_watcher {
+            return Err(Error::WatcherDisabled);
+        }
+        if !watcher_ready {
+            return Err(Error::WatcherNotReady);
+        }
+
+        self.0
+            .watchers
+            .subscribe(&base_path, pattern, options, Box::new(callback))
+    }
+
+    /// Remove a watch subscription. Returns `true` if the id was active.
+    pub fn unwatch(&self, id: WatchId) -> bool {
+        self.0.watchers.unsubscribe(id)
+    }
+
+    /// Return whether a watch subscription is active.
+    pub fn is_watch_active(&self, id: WatchId) -> bool {
+        self.0.watchers.contains(id)
+    }
+
+    /// Remove every subscription without waiting for an executing callback.
+    pub fn shutdown_watches(&self) {
+        self.0.watchers.shutdown();
+    }
+
+    /// Remove every subscription and wait for an executing callback.
+    /// When called by that callback, it does not wait on itself.
+    pub fn shutdown_watches_and_wait(&self) {
+        self.0.watchers.shutdown_and_wait();
+    }
+
+    pub(crate) fn rebase_watches(&self, base_path: &Path) {
+        self.0.watchers.rebase(base_path);
+    }
+
+    pub(crate) fn watch_registry(&self) -> &Arc<WatchRegistry> {
+        &self.0.watchers
+    }
+
+    /// Refresh git statuses for all indexed files
+    #[tracing::instrument(level = "info", skip_all)]
+    pub fn refresh_git_status(&self, shared_frecency: &SharedFrecency) -> Result<usize, Error> {
+        let (git_root, recency_config, base_path, picker_id) = {
+            // we do the libgit2 off lock cause it might take quite some time on very large repos
             let guard = self.read()?;
             let Some(ref picker) = *guard else {
                 return Err(Error::FilePickerMissing);
             };
-
-            let git_root = picker.git_root().map(|p| p.to_path_buf());
-            drop(guard); // updating git status could take very long time, there is not risky as we
-            // do not allow any mutations and deletions of files from the sync
-
-            debug!(?git_root, "Refreshing git status for picker");
-
-            if let Some(ref root) = git_root {
-                wait_for_git_index_lock_release(root);
-            }
-
-            GitStatusCache::read_git_status(
-                git_root.as_deref(),
-                &mut crate::git::default_status_options(),
+            (
+                picker.git_root().map(|p| p.to_path_buf()),
+                picker.git_recency_config(),
+                picker.base_path().to_path_buf(),
+                picker.trace_id().to_owned(),
             )
         };
 
+        let repo = git_root.as_deref().and_then(|root| {
+            wait_for_git_index_lock_release(root);
+            Repository::open(root)
+                .inspect_err(|e| tracing::error!(?e, "Failed to open repo for git refresh"))
+                .ok()
+        });
+
+        let git_status = repo.as_ref().and_then(|repo| {
+            GitStatusCache::read_status(repo, &mut crate::git::default_status_options())
+                .inspect_err(|e| tracing::error!(?e, "Failed to read git status"))
+                .ok()
+        });
+
+        let recency = repo
+            .as_ref()
+            .and_then(|repo| git_recency::compute_git_recency(repo, &recency_config, &base_path));
+
         let mut guard = self.write()?;
         let picker = guard.as_mut().ok_or(Error::FilePickerMissing)?;
+
+        // ensure consistency
+        if picker.trace_id() != picker_id {
+            return Ok(0);
+        }
 
         let statuses_count = if let Some(git_status) = git_status {
             let count = git_status.statuses_len();
@@ -249,126 +398,136 @@ impl SharedFilePicker {
             0
         };
 
+        picker.apply_git_recency(recency.as_ref());
+
         Ok(statuses_count)
+    }
+
+    /// Recompute and apply git status for a specific set of paths.
+    pub fn update_git_status_for_paths(
+        &self,
+        paths: &[PathBuf],
+        shared_frecency: &SharedFrecency,
+    ) -> Result<(), Error> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+
+        let git_root = {
+            let guard = self.read()?;
+            let Some(ref picker) = *guard else {
+                return Err(Error::FilePickerMissing);
+            };
+            picker.git_root().map(|p| p.to_path_buf())
+        };
+        let Some(git_root) = git_root else {
+            return Ok(());
+        };
+
+        wait_for_git_index_lock_release(&git_root);
+
+        let repo = Repository::open(&git_root)?;
+        let status = GitStatusCache::git_status_for_paths(&repo, paths)?;
+
+        let mut guard = self.write()?;
+        let picker = guard.as_mut().ok_or(Error::FilePickerMissing)?;
+        picker.update_git_statuses(status, shared_frecency)
+    }
+}
+
+/// FFF_STORAGE_TRAITS_BLOCKER: upstream seals [`SharedDb`] over its crate-private
+/// LMDB store trait. Helix strips LMDB (persistence lives behind
+/// `FrecencyStore` / `QueryTrackerStore`), so the handle is sealed over this
+/// marker trait instead: only `FrecencyTracker` / `QueryTracker` implement it.
+pub(crate) trait SharedStore: Send + Sync + 'static {
+    /// Short label used in debug output.
+    const LABEL: &'static str;
+}
+
+impl SharedStore for FrecencyTracker {
+    const LABEL: &'static str = "frecency";
+}
+
+impl SharedStore for QueryTracker {
+    const LABEL: &'static str = "query_tracker";
+}
+
+/// Thread-safe shared handle to a tracker. A disabled (`noop`)
+/// instance silently ignores writes. See the [`SharedFrecency`] and
+/// [`SharedQueryTracker`] aliases.
+#[allow(private_bounds)]
+pub struct SharedDb<T: SharedStore> {
+    inner: Arc<RwLock<Option<T>>>,
+    enabled: bool,
+}
+
+// Hand-written to avoid a spurious `T: Clone` bound — `Arc` is always `Clone`.
+impl<T: SharedStore> Clone for SharedDb<T> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            enabled: self.enabled,
+        }
+    }
+}
+
+impl<T: SharedStore> Default for SharedDb<T> {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(None)),
+            enabled: true,
+        }
+    }
+}
+
+impl<T: SharedStore> std::fmt::Debug for SharedDb<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("SharedDb").field(&T::LABEL).finish()
+    }
+}
+
+#[allow(private_bounds)]
+impl<T: SharedStore> SharedDb<T> {
+    /// Creates a disabled instance that silently ignores all writes.
+    pub fn noop() -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(None)),
+            enabled: false,
+        }
+    }
+
+    pub fn read(&self) -> Result<RwLockReadGuard<'_, Option<T>>, Error> {
+        self.inner.read().map_err(|_| Error::AcquireFrecencyLock)
+    }
+
+    pub fn write(&self) -> Result<RwLockWriteGuard<'_, Option<T>>, Error> {
+        self.inner.write().map_err(|_| Error::AcquireFrecencyLock)
+    }
+
+    /// Initialize the tracker. No-op when disabled.
+    pub fn init(&self, tracker: T) -> Result<(), Error> {
+        if !self.enabled {
+            return Ok(());
+        }
+
+        {
+            let mut guard = self.write()?;
+            *guard = Some(tracker);
+        }
+
+        Ok(())
+    }
+
+    /// Drop the in-memory tracker. fff-search does not own external storage.
+    pub fn destroy(&self) -> Result<Option<PathBuf>, Error> {
+        let mut guard = self.write()?;
+        guard.take();
+        Ok(None)
     }
 }
 
 /// Thread-safe shared handle to the [`FrecencyTracker`] instance.
-#[derive(Clone)]
-pub struct SharedFrecency {
-    inner: Arc<RwLock<Option<FrecencyTracker>>>,
-    enabled: bool,
-}
-
-impl Default for SharedFrecency {
-    fn default() -> Self {
-        Self {
-            inner: Arc::new(RwLock::new(None)),
-            enabled: true,
-        }
-    }
-}
-
-impl std::fmt::Debug for SharedFrecency {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("SharedFrecency").field(&"..").finish()
-    }
-}
-
-impl SharedFrecency {
-    /// Creates a disabled instance that silently ignores all writes.
-    pub fn noop() -> Self {
-        Self {
-            inner: Arc::new(RwLock::new(None)),
-            enabled: false,
-        }
-    }
-
-    pub fn read(&self) -> Result<RwLockReadGuard<'_, Option<FrecencyTracker>>, Error> {
-        self.inner.read().map_err(|_| Error::AcquireFrecencyLock)
-    }
-
-    pub fn write(&self) -> Result<RwLockWriteGuard<'_, Option<FrecencyTracker>>, Error> {
-        self.inner.write().map_err(|_| Error::AcquireFrecencyLock)
-    }
-
-    pub fn init(&self, tracker: FrecencyTracker) -> Result<(), Error> {
-        if !self.enabled {
-            return Ok(());
-        }
-
-        {
-            let mut guard = self.write()?;
-            *guard = Some(tracker);
-        }
-
-        Ok(())
-    }
-
-    /// Drop the in-memory tracker. fff-search does not own external storage.
-    pub fn destroy(&self) -> Result<Option<std::path::PathBuf>, Error> {
-        let mut guard = self.write()?;
-        guard.take();
-        Ok(None)
-    }
-}
+pub type SharedFrecency = SharedDb<FrecencyTracker>;
 
 /// Thread-safe shared handle to the [`QueryTracker`] instance.
-#[derive(Clone)]
-pub struct SharedQueryTracker {
-    inner: Arc<RwLock<Option<QueryTracker>>>,
-    enabled: bool,
-}
-
-impl Default for SharedQueryTracker {
-    fn default() -> Self {
-        Self {
-            inner: Arc::new(RwLock::new(None)),
-            enabled: true,
-        }
-    }
-}
-
-impl std::fmt::Debug for SharedQueryTracker {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("SharedQueryTracker").field(&"..").finish()
-    }
-}
-
-impl SharedQueryTracker {
-    /// Creates a disabled instance that silently ignores all writes.
-    pub fn noop() -> Self {
-        Self {
-            inner: Arc::new(RwLock::new(None)),
-            enabled: false,
-        }
-    }
-
-    pub fn read(&self) -> Result<RwLockReadGuard<'_, Option<QueryTracker>>, Error> {
-        self.inner.read().map_err(|_| Error::AcquireFrecencyLock)
-    }
-
-    pub fn write(&self) -> Result<RwLockWriteGuard<'_, Option<QueryTracker>>, Error> {
-        self.inner.write().map_err(|_| Error::AcquireFrecencyLock)
-    }
-
-    /// Initialize the query tracker. No-op if this is a disabled instance.
-    pub fn init(&self, tracker: QueryTracker) -> Result<(), Error> {
-        if !self.enabled {
-            return Ok(());
-        }
-        {
-            let mut guard = self.write()?;
-            *guard = Some(tracker);
-        }
-
-        Ok(())
-    }
-
-    /// Drop the in-memory tracker. fff-search does not own external storage.
-    pub fn destroy(&self) -> Result<Option<std::path::PathBuf>, Error> {
-        let mut guard = self.write()?;
-        guard.take();
-        Ok(None)
-    }
-}
+pub type SharedQueryTracker = SharedDb<QueryTracker>;

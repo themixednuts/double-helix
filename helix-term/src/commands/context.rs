@@ -166,9 +166,9 @@ impl Context<'_> {
                 } else {
                     Movement::Move
                 };
-                let motion = m
-                    .make
-                    .make(Some(NonZeroUsize::new(count).unwrap_or(NonZeroUsize::MIN)));
+                // Pass "no count" through: `goto_line` without a count goes to the last line,
+                // not line 1.
+                let motion = m.make.make(self.count);
                 motion(self.editor, view_id, doc_id, movement);
             }
             CommandRef::Operator(op) => {
@@ -199,8 +199,11 @@ impl Context<'_> {
                     };
                     match (cp.resolve)(event, count) {
                         CharPendingResolution::Motion(motion) => {
-                            cx.editor
-                                .apply_motion(move |ed| motion(ed, view_id, doc_id, movement));
+                            cx.editor.apply_motion_in(
+                                view_id,
+                                doc_id,
+                                move |ed, view_id, doc_id| motion(ed, view_id, doc_id, movement),
+                            );
                         }
                         CharPendingResolution::Action(action) => {
                             action(cx.editor, view_id, doc_id, register);

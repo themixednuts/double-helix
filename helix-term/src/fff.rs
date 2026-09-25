@@ -7,9 +7,9 @@ use std::{
 use fff_search::{
     grep_byte_sources_page, ByteSourceGrepCursor, ContentOverlay, FFFMode, FilePicker,
     FilePickerOptions, FilePickerScanOptions, FileSearchConfig, FrecencyRecord, FrecencyStore,
-    FrecencyTracker, FuzzySearchOptions, GrepConfig, GrepMode, GrepSearchOptions, PaginationArgs,
-    QueryHistoryKind, QueryMatchEntry, QueryParser, QueryTracker, QueryTrackerStore,
-    SharedFrecency, SharedPicker, SharedQueryTracker,
+    FrecencyTracker, FuzzySearchOptions, GitRecencyConfig, GrepConfig, GrepMode, GrepSearchOptions,
+    PaginationArgs, QueryHistoryKind, QueryMatchEntry, QueryParser, QueryTracker,
+    QueryTrackerStore, SharedFrecency, SharedPicker, SharedQueryTracker,
 };
 use heed::types::{Bytes, SerdeBincode};
 use heed::{Database, EnvOpenOptions};
@@ -165,6 +165,21 @@ pub(crate) fn search_files_available(
     search_workspace_files(&workspace, query, current_file, Duration::ZERO, total_start)
 }
 
+/// Scan rules for explorer search. The tree lists everything by default, but
+/// a recursive search has to skip what ignore files exclude, otherwise build
+/// output under `target/` buries every real match. `hidden` and symlink
+/// handling still follow the explorer's own toggles.
+pub(crate) fn file_explorer_search_options(config: &FileExplorerConfig) -> WorkspaceScanOptions {
+    WorkspaceScanOptions {
+        parents: true,
+        ignore: true,
+        git_ignore: true,
+        git_global: true,
+        git_exclude: true,
+        ..config.workspace_scan_options()
+    }
+}
+
 pub(crate) fn search_file_explorer_available_cancellable(
     root: &Path,
     query: &str,
@@ -172,7 +187,11 @@ pub(crate) fn search_file_explorer_available_cancellable(
     abort_signal: Option<&std::sync::atomic::AtomicBool>,
 ) -> anyhow::Result<Vec<PathBuf>> {
     let total_start = std::time::Instant::now();
-    let workspace = workspace_for_scan(root, config.workspace_scan_options())?;
+    let workspace = workspace_for_scan(root, file_explorer_search_options(config))?;
+    // The first query after opening usually lands mid-scan, before the index
+    // can answer, and nothing would ask again once it could. This runs on a
+    // search worker, so wait for the scan; the next keystroke aborts the wait.
+    wait_for_scan_cancellable(&workspace, INITIAL_SCAN_WAIT, abort_signal);
     search_workspace_files_cancellable(
         &workspace,
         query,
@@ -187,6 +206,22 @@ pub(crate) fn search_file_explorer_available_cancellable(
             .map(|file_match| file_match.path)
             .collect()
     })
+}
+
+fn wait_for_scan_cancellable(
+    workspace: &FffWorkspace,
+    limit: Duration,
+    abort_signal: Option<&std::sync::atomic::AtomicBool>,
+) {
+    const POLL: Duration = Duration::from_millis(50);
+    let start = std::time::Instant::now();
+    while !workspace.picker.wait_for_scan(POLL) {
+        let aborted =
+            abort_signal.is_some_and(|signal| signal.load(std::sync::atomic::Ordering::Relaxed));
+        if aborted || start.elapsed() >= limit {
+            return;
+        }
+    }
 }
 
 pub(crate) fn wait_for_initial_file_scan(
@@ -232,7 +267,7 @@ pub(crate) fn prewarm(root: &Path, config: &FilePickerConfig) {
 }
 
 pub(crate) fn prewarm_file_explorer(root: &Path, config: &FileExplorerConfig) {
-    if let Err(err) = workspace_for_scan(root, config.workspace_scan_options()) {
+    if let Err(err) = workspace_for_scan(root, file_explorer_search_options(config)) {
         log::debug!(
             "failed to prewarm FFF file explorer workspace for {}: {err:#}",
             root.display()
@@ -399,6 +434,9 @@ pub(crate) fn grep_files_page(request: GrepFilesPageRequest<'_>) -> anyhow::Resu
             file_offset: request.file_offset,
             page_limit: request.limit,
             time_budget_ms: 40,
+            // Page on the budget even before anything matched, so a zero-match
+            // query in a large tree still returns a resume cursor promptly.
+            enforce_time_budget: true,
             abort_signal: Some(request.abort_signal),
             ..GrepSearchOptions::default()
         },
@@ -614,6 +652,7 @@ impl FffWorkspace {
                 enable_fs_root_scanning: true,
                 enable_home_dir_scanning: true,
                 scan,
+                git_recency: GitRecencyConfig::default(),
             },
         )?;
 
@@ -1247,6 +1286,20 @@ mod tests {
         assert_eq!(scan.git_global, config.git_global);
         assert_eq!(scan.git_exclude, config.git_exclude);
         assert_eq!(scan.max_depth, None);
+    }
+
+    #[test]
+    fn explorer_search_honors_ignore_files_but_keeps_hidden_toggle() {
+        let config = FileExplorerConfig {
+            hidden: false,
+            ..FileExplorerConfig::default()
+        };
+        let search = file_explorer_search_options(&config);
+
+        assert!(search.git_ignore && search.ignore && search.git_exclude && search.git_global);
+        assert!(search.parents);
+        assert_eq!(search.hidden, config.hidden);
+        assert_eq!(search.follow_symlinks, config.follow_symlinks);
     }
 
     #[test]

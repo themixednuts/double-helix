@@ -18,6 +18,43 @@ pub(crate) struct FramePacket {
     pub cursor: Option<(u16, u16)>,
     pub cursor_kind: CursorKind,
     pub full_redraw: bool,
+    /// The theme's `ui.background`, which the terminal's own background (OSC 11) follows.
+    pub background: Option<helix_view::graphics::Color>,
+}
+
+/// Clock for bench-only phase timings. Outside `bench` builds it never reads
+/// the clock, so per-grapheme instrumentation in hot loops costs nothing.
+#[derive(Clone, Copy)]
+pub(crate) struct Stopwatch {
+    #[cfg(feature = "bench")]
+    start: std::time::Instant,
+}
+
+impl Stopwatch {
+    #[inline(always)]
+    pub(crate) fn start() -> Self {
+        Self {
+            #[cfg(feature = "bench")]
+            start: std::time::Instant::now(),
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn elapsed(self) -> std::time::Duration {
+        #[cfg(feature = "bench")]
+        {
+            self.start.elapsed()
+        }
+        #[cfg(not(feature = "bench"))]
+        {
+            std::time::Duration::ZERO
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn elapsed_us(self) -> u64 {
+        self.elapsed().as_micros() as u64
+    }
 }
 
 #[derive(Clone)]

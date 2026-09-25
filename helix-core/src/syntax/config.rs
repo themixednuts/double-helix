@@ -56,6 +56,11 @@ pub struct LanguageConfiguration {
     #[serde(default)]
     pub auto_format: bool,
 
+    /// LSP code action kinds to apply, in order, before saving
+    /// (`["source.organizeImports", "source.fixAll"]`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code_actions_on_save: Option<Vec<String>>,
+
     #[serde(skip_serializing_if = "Option::is_none")]
     pub formatter: Option<FormatterConfiguration>,
 
@@ -329,6 +334,7 @@ pub enum LanguageServerFeature {
     SelectionRange,
     LinkedEditingRange,
     OnTypeFormatting,
+    CallHierarchy,
 }
 
 impl Display for LanguageServerFeature {
@@ -360,6 +366,7 @@ impl Display for LanguageServerFeature {
             SelectionRange => "selection-range",
             LinkedEditingRange => "linked-editing-range",
             OnTypeFormatting => "on-type-formatting",
+            CallHierarchy => "call-hierarchy",
         };
         write!(f, "{feature}",)
     }

@@ -18,11 +18,9 @@ pub fn absolute_path(root: &str, path: &WorkspacePath, separator: char) -> Strin
     absolute
 }
 
-pub fn file_url(root: &str, path: &WorkspacePath, separator: char) -> url::Url {
-    let normalized = url_path(root, path, separator);
-    let mut url = url::Url::parse("file:///").expect("static file URL is valid");
-    url.set_path(&normalized);
-    url
+/// The RFC 3986 `file://` URI language servers know the remote file by.
+pub fn file_url(root: &str, path: &WorkspacePath, separator: char) -> helix_stdx::Url {
+    helix_stdx::Url::from_url_path(&url_path(root, path, separator))
 }
 
 pub fn url_path(root: &str, path: &WorkspacePath, separator: char) -> String {
@@ -30,12 +28,12 @@ pub fn url_path(root: &str, path: &WorkspacePath, separator: char) -> String {
 }
 
 pub fn workspace_path_from_file_url(
-    url: &url::Url,
+    url: &helix_stdx::Url,
     root: &str,
     separator: char,
     case_sensitive: bool,
 ) -> Option<WorkspacePath> {
-    if url.scheme() != "file" || url.host().is_some() {
+    if url.scheme() != "file" || !url.authority().is_some_and(str::is_empty) {
         return None;
     }
     let decoded = percent_encoding::percent_decode_str(url.path())
@@ -131,14 +129,14 @@ mod tests {
 
     #[test]
     fn reverse_mapping_enforces_root_and_case_boundaries() {
-        let url = url::Url::parse("file:///repo/src/main.rs").unwrap();
+        let url = helix_stdx::Url::parse("file:///repo/src/main.rs").unwrap();
         assert_eq!(
             workspace_path_from_file_url(&url, "/repo", '/', true),
             Some(path("src/main.rs"))
         );
         assert_eq!(
             workspace_path_from_file_url(
-                &url::Url::parse("file:///repository/main.rs").unwrap(),
+                &helix_stdx::Url::parse("file:///repository/main.rs").unwrap(),
                 "/repo",
                 '/',
                 true,
@@ -147,7 +145,7 @@ mod tests {
         );
         assert_eq!(
             workspace_path_from_file_url(
-                &url::Url::parse("file:///Repo/src/main.rs").unwrap(),
+                &helix_stdx::Url::parse("file:///Repo/src/main.rs").unwrap(),
                 "/repo",
                 '/',
                 false,
@@ -160,7 +158,7 @@ mod tests {
     fn reverse_mapping_is_panic_free_at_unicode_boundaries() {
         assert_eq!(
             workspace_path_from_file_url(
-                &url::Url::parse("file:///%C3%A9/src").unwrap(),
+                &helix_stdx::Url::parse("file:///%C3%A9/src").unwrap(),
                 "/a",
                 '/',
                 true,

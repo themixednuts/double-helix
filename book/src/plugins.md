@@ -24,7 +24,21 @@ api_version = 1
 capabilities = ["query", "mutation", "ui", "events"]
 ```
 
-`api_version` is exact. Loading is refused if it differs from the host contract or if a capability name is unknown. Capability names are `query`, `mutation`, `ui`, `panels`, `commands`, `keymaps`, `events`, `splits`, `tabs`, `floats`, `tasks`, `syntax`, `lsp`, `themes`, and `assistant`.
+`api_version` is exact. Loading is refused if it differs from the host contract, if a capability name is unknown, or if the host lacks a declared capability. Capability names are `query`, `mutation`, `ui`, `panels`, `commands`, `keymaps`, `events`, `splits`, `tabs`, `floats`, `tasks`, `syntax`, `lsp`, `themes`, and `assistant`.
+
+A plugin can use only the capabilities it declares; `query` (reading documents, views, the workspace, and registers) is always granted. A call outside them fails with `permission_denied`. The others cover:
+
+| Capability | Allows |
+| --- | --- |
+| `mutation` | Editing, saving, selecting, undo and redo, annotations, opening documents, focusing and closing views, setting the mode, and writing registers |
+| `ui` | Notifications, the status line, prompts, confirmations, pickers, and redraws |
+| `panels` | Side panels |
+| `commands` | Registering, listing, and running commands |
+| `keymaps` | Keymap contributions |
+| `events` | Event subscriptions |
+| `splits`, `tabs`, `floats` | Split layout, per-view tabs, and floating windows |
+| `syntax`, `lsp`, `themes` | Syntax queries, language server requests, and switching themes |
+| `assistant` | Reading assistant threads, submitting prompts, and cancelling runs |
 
 ## Errors
 
@@ -72,7 +86,9 @@ Security follows the configured command. `command = "ssh"` grants the plugin hos
 
 ## Sandbox
 
-The Lua sandbox removes `os.execute`, `os.exit`, `io`, `package`, `load`, `loadstring`, `loadfile`, and `dofile`. `require(name)` is scoped to the current plugin directory only. Module names cannot be absolute, contain path separators, contain `:`, or contain `..`.
+The Lua sandbox removes `io`, `package`, `load`, `loadstring`, `loadfile`, and `dofile`. `os` keeps only `clock`, `date`, `difftime`, and `time`, and `collectgarbage` accepts only `collect`, `count`, and `step`. `require(name)` is scoped to the current plugin directory only. Module names cannot be absolute, contain path separators, contain `:`, or contain `..`.
+
+Each plugin runs in its own global environment, and `_G` is that environment. Its globals and its copies of `helix`, `string`, `table`, and the other libraries are its own, so replacing `helix.log.info` or `string.upper` changes them for that plugin only. Each event handler gets its own event table.
 
 Default limits are `max_memory = 268435456` bytes and `max_instructions = 5000000` VM instructions per plugin dispatch. Setting either value to `0` disables that limit.
 
@@ -80,7 +96,7 @@ Default limits are `max_memory = 268435456` bytes and `max_instructions = 500000
 
 `helix.workspace`: `focused_document()`, `focused_view()`, `mode()`, `set_mode(mode)`, `documents()`, `views()`, `snapshot()`, `theme()`, `editor_config()`.
 
-`DocumentHandle`: `id()`, `snapshot()`, `text()`, `line(index)`, `diagnostics()`, `edit(edits)`, `save(opts?)`, `set_selections(selections, view?)`, `undo()`, `redo()`, `select_all()`, `set_annotations(annotations)`, `clear_annotations()`.
+`DocumentHandle`: `id()`, `snapshot()`, `text()`, `line(index)`, `lines(start, end)`, `diagnostics()`, `edit(edits)`, `save(opts?)`, `set_selections(selections, view?)`, `undo()`, `redo()`, `select_all()`, `set_annotations(annotations)`, `clear_annotations()`.
 
 `ViewHandle`: `id()`, `snapshot()`, `cursor()`, `focus()`, `close()`.
 
@@ -93,6 +109,8 @@ Default limits are `max_memory = 268435456` bytes and `max_instructions = 500000
 `helix.events`: `kind`, `subscribe(kind, handler)`, `unsubscribe(handle)`.
 
 Event kinds are `host_ready`, `document_opened`, `document_changed`, `document_saved`, `document_closed`, `selection_changed`, `mode_changed`, `view_focused`, `diagnostics_updated`, `key_pressed`, `assistant_thread_created`, `assistant_thread_closed`, `assistant_run_started`, `assistant_run_completed`, `assistant_message_received`, and `assistant_context_changed`.
+
+A `document_changed` event carries the document's `version` and `changed_lines`, a list of `{ start, end }` line ranges (0-based, end exclusive) in the new text, so a plugin can re-read just those lines with `doc:lines(start, end)`.
 
 `helix.commands`: `register(spec)`, `update(handle, spec)`, `remove(handle)`, `execute(name, args?)`. `CommandHandle` has `id()`, `update(spec)`, and `remove()`.
 

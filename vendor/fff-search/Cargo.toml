@@ -12,7 +12,7 @@
 [package]
 edition = "2024"
 name = "fff-search"
-version = "0.9.6"
+version = "0.11.0"
 authors = ["Dmitriy Kovalenko <dmtr.kovalenko@outlook.com>"]
 build = "build.rs"
 autolib = false
@@ -26,9 +26,16 @@ license = "MIT"
 resolver = "2"
 
 [features]
-default = []
+default = ["ripgrep"]
+definitions = []
 ffi = []
 mimalloc-collect = ["dep:libmimalloc-sys"]
+rescan-stats = []
+ripgrep = [
+    "dep:ignore",
+    "dep:globset",
+    "fff-query-parser/ripgrep",
+]
 zlob = [
     "dep:zlob",
     "fff-query-parser/zlob",
@@ -36,11 +43,7 @@ zlob = [
 
 [lib]
 name = "fff_search"
-crate-type = [
-    "rlib",
-    "staticlib",
-    "cdylib",
-]
+crate-type = ["rlib"]
 path = "src/lib.rs"
 
 [[test]]
@@ -52,8 +55,20 @@ name = "bigram_overlay_integration"
 path = "tests/bigram_overlay_integration.rs"
 
 [[test]]
+name = "dir_index_consistency_test"
+path = "tests/dir_index_consistency_test.rs"
+
+[[test]]
+name = "dotdir_glob_constraint_test"
+path = "tests/dotdir_glob_constraint_test.rs"
+
+[[test]]
 name = "drop_during_post_scan"
 path = "tests/drop_during_post_scan.rs"
+
+[[test]]
+name = "explicit_cache_budget"
+path = "tests/explicit_cache_budget.rs"
 
 [[test]]
 name = "fs_delete_handler_test"
@@ -72,6 +87,10 @@ name = "fuzz_real_repos"
 path = "tests/fuzz_real_repos.rs"
 
 [[test]]
+name = "git_recency_integration"
+path = "tests/git_recency_integration.rs"
+
+[[test]]
 name = "grep_integration"
 path = "tests/grep_integration.rs"
 
@@ -80,8 +99,20 @@ name = "grep_overflow_path_constraint_segfault"
 path = "tests/grep_overflow_path_constraint_segfault.rs"
 
 [[test]]
+name = "grep_time_budget_zero_match"
+path = "tests/grep_time_budget_zero_match.rs"
+
+[[test]]
+name = "invalid_utf8_paths"
+path = "tests/invalid_utf8_paths.rs"
+
+[[test]]
 name = "new_directory_watcher_test"
 path = "tests/new_directory_watcher_test.rs"
+
+[[test]]
+name = "overflow_frecency_segfault"
+path = "tests/overflow_frecency_segfault.rs"
 
 [[test]]
 name = "path_separator_constraint_test"
@@ -90,6 +121,18 @@ path = "tests/path_separator_constraint_test.rs"
 [[test]]
 name = "real_binary_fixtures"
 path = "tests/real_binary_fixtures.rs"
+
+[[test]]
+name = "rename_frecency_test"
+path = "tests/rename_frecency_test.rs"
+
+[[test]]
+name = "rescan_regression"
+path = "tests/rescan_regression.rs"
+
+[[test]]
+name = "watch_subscription_test"
+path = "tests/watch_subscription_test.rs"
 
 [[test]]
 name = "watcher_stop_under_lock"
@@ -109,6 +152,11 @@ name = "glob_bench"
 path = "benches/glob_bench.rs"
 harness = false
 required-features = ["zlob"]
+
+[[bench]]
+name = "grep_bench"
+path = "benches/grep_bench.rs"
+harness = false
 
 [[bench]]
 name = "memmem_bench"
@@ -133,14 +181,14 @@ version = "1.8.2"
 version = "5.0"
 
 [dependencies.fff-grep]
-version = "0.9.6"
+version = "0.11.0"
 
 [dependencies.fff-query-parser]
-version = "0.9.6"
+version = "0.11.0"
 default-features = false
 
 [dependencies.git2]
-version = "0.21"
+version = "0.21.0"
 features = ["vendored-libgit2"]
 default-features = false
 
@@ -149,9 +197,11 @@ version = "0.1"
 
 [dependencies.globset]
 version = "0.4"
+optional = true
 
 [dependencies.ignore]
 version = "0.4.22"
+optional = true
 
 [dependencies.libc]
 version = "0.2"
@@ -176,7 +226,7 @@ features = ["local_dynamic_tls"]
 optional = true
 
 [dependencies.neo_frizbee]
-version = "0.10.3"
+version = "0.13.3"
 features = ["match_end_col"]
 
 [dependencies.notify]
@@ -226,7 +276,7 @@ version = "0.3"
 features = ["env-filter"]
 
 [dependencies.zlob]
-version = "1.4.1"
+version = "=1.6.5"
 optional = true
 
 [dev-dependencies.criterion]
@@ -251,10 +301,17 @@ features = ["small_rng"]
 [dev-dependencies.tempfile]
 version = "3.8"
 
+[dev-dependencies.tracing-subscriber]
+version = "0.3"
+features = ["env-filter"]
+
 [target."cfg(unix)".dependencies.signal-hook-registry]
 version = "1.4"
 
 [target."cfg(windows)".dependencies.dunce]
 version = "1.0"
+
+[lints.clippy]
+module_inception = "allow"
 
 [workspace]

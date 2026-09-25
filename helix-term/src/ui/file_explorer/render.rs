@@ -188,6 +188,7 @@ fn tree_item<'a>(
         .selected(selected)
         .ranged(ranged)
         .active(active)
+        .detail(row.detail.as_deref())
 }
 
 impl FileExplorerPanel {

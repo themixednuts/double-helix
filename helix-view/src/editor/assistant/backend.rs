@@ -217,7 +217,7 @@ impl Editor {
             .insert(handle.id.clone(), handle);
     }
 
-    fn take_live_assistant_backend(
+    pub(super) fn take_live_assistant_backend(
         &mut self,
         backend: &crate::assistant::backend::Id,
     ) -> Option<crate::assistant::BackendHandle> {
@@ -273,6 +273,60 @@ impl Editor {
         Ok(handle)
     }
 
+    /// Stop `backend`'s agent process. Its threads keep their sessions: the next message
+    /// starts a new process and re-binds them. Returns whether the agent was running.
+    pub fn shutdown_assistant_backend(&mut self, backend: &crate::assistant::backend::Id) -> bool {
+        let Some(handle) = self.assistant_runtime.backends.remove(backend) else {
+            return false;
+        };
+        self.runtime
+            .work()
+            .spawn(async move {
+                let _ = handle
+                    .send(crate::assistant::backend::Command::Shutdown)
+                    .await;
+            })
+            .detach();
+        true
+    }
+
+    /// Restart `backend`'s agent: stop the process, start a new one and re-load the sessions of
+    /// the threads bound to it.
+    pub fn restart_assistant_backend(
+        &mut self,
+        backend: &crate::assistant::backend::Id,
+    ) -> anyhow::Result<()> {
+        self.shutdown_assistant_backend(backend);
+        let handle = self
+            .ensure_assistant_backend(backend)
+            .ok_or_else(|| anyhow::anyhow!("{backend} is not an installed agent; reconnect it"))?;
+        let rebinds: Vec<_> = self
+            .assistant
+            .threads()
+            .filter_map(|thread| match thread.origin() {
+                crate::assistant::thread::Origin::Backend {
+                    backend: thread_backend,
+                    remote,
+                } if thread_backend == backend => {
+                    Some(crate::assistant::backend::Command::LoadThread {
+                        thread: thread.id,
+                        remote: remote.clone(),
+                    })
+                }
+                _ => None,
+            })
+            .collect();
+        self.runtime
+            .work()
+            .spawn(async move {
+                for rebind in rebinds {
+                    let _ = handle.send(rebind).await;
+                }
+            })
+            .detach();
+        Ok(())
+    }
+
     pub fn ensure_assistant_backend(
         &mut self,
         backend: &crate::assistant::backend::Id,
@@ -326,12 +380,13 @@ fn load_packaged_assistant_agents(
     let generation = snapshot.generation();
     let store = helix_pkg::Store::open_default();
     let registry = helix_pkg::Registry::from_config(&config, &store)?;
+    let resolver = snapshot.command_resolver();
     let mut agents = BTreeMap::new();
     for package in registry
         .iter()
         .filter(|package| package.kind == helix_pkg::PkgKind::Acp)
     {
-        if let Some(agent) = packaged_agent_from_package(&snapshot, package)? {
+        if let Some(agent) = packaged_agent_from_package(&resolver, package)? {
             agents.insert(package.name.clone(), agent);
         }
     }
@@ -339,7 +394,7 @@ fn load_packaged_assistant_agents(
 }
 
 fn packaged_agent_from_package(
-    runtime_assets: &helix_loader::RuntimeAssetsSnapshot,
+    commands: &helix_loader::CommandResolver<'_>,
     package: &helix_pkg::PackageSpec,
 ) -> anyhow::Result<Option<crate::editor::AgentConfig>> {
     let Some(artifact) = package
@@ -354,7 +409,7 @@ fn packaged_agent_from_package(
     command_keys.extend(artifact.source.system.as_deref());
     let mut launch = None;
     for key in command_keys {
-        if let Some(resolved) = runtime_assets.resolve_command(key)? {
+        if let Some(resolved) = commands.resolve(key)? {
             launch = Some(resolved);
             break;
         }

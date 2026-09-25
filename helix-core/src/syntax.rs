@@ -33,7 +33,7 @@ use crate::{indent::IndentQuery, tree_sitter, ChangeSet, Language, Rope};
 
 pub use tree_house::{
     highlighter::{Highlight, HighlightEvent},
-    query_iter::QueryIterEvent,
+    query_iter::{CapturedMatch, QueryIterEvent, QueryMatchIter, QueryMatchIterEvent},
     Error as HighlighterError, LanguageLoader, TraceContext as SyntaxTraceContext,
     TraceGuard as SyntaxTraceGuard, TreeCursor, TREE_SITTER_MATCH_LIMIT,
 };
@@ -573,7 +573,7 @@ impl FileTypeGlobMatcher {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Syntax {
     inner: tree_house::Syntax,
 }
@@ -739,8 +739,9 @@ impl Syntax {
         source: RopeSlice<'a>,
         loader: &'a Loader,
         range: impl RangeBounds<u32>,
-    ) -> QueryIter<'a, 'a, impl FnMut(Language) -> Option<&'a Query> + 'a, ()> {
-        self.query_iter(
+    ) -> QueryMatchIter<'a, 'a, impl FnMut(Language) -> Option<&'a Query> + 'a, ()> {
+        QueryMatchIter::new(
+            &self.inner,
             source,
             |lang| loader.tag_query(lang).map(|q| &q.query),
             range,
@@ -1418,6 +1419,42 @@ mod test {
         // The query used in this test case only captures the first line_comment node.
         // Determine if this behavior is intentional in tree-sitter.
         // test("multiple_nodes_grouped", 1..37);
+    }
+
+    fn node_shape(syntax: &Syntax) -> Vec<(String, std::ops::Range<u32>)> {
+        fn walk(node: tree_sitter::Node, out: &mut Vec<(String, std::ops::Range<u32>)>) {
+            out.push((node.kind().to_owned(), node.byte_range()));
+            for child in node.children() {
+                walk(child, out);
+            }
+        }
+        let mut out = Vec::new();
+        walk(syntax.tree().root_node(), &mut out);
+        out
+    }
+
+    #[test]
+    fn incremental_update_of_a_clone_matches_a_full_parse() {
+        let language = LOADER.language_for_name("rust").unwrap();
+        let base = Rope::from_str("fn main() {\n    let a = 1;\n}\n\nfn other() {}\n");
+        let original = Syntax::new(base.slice(..), language, &LOADER).unwrap();
+        let original_shape = node_shape(&original);
+
+        let mut text = base.clone();
+        let first = Transaction::change(&text, [(20, 21, Some("value".into()))].into_iter());
+        assert!(first.apply(&mut text));
+        let second = Transaction::change(&text, [(0, 0, Some("// top\n".into()))].into_iter());
+        assert!(second.apply(&mut text));
+        let changes = first.changes().clone().compose(second.changes().clone());
+
+        let mut updated = original.clone();
+        updated
+            .update(base.slice(..), text.slice(..), &changes, &LOADER)
+            .unwrap();
+        let reparsed = Syntax::new(text.slice(..), language, &LOADER).unwrap();
+
+        assert_eq!(node_shape(&updated), node_shape(&reparsed));
+        assert_eq!(node_shape(&original), original_shape);
     }
 
     #[test]

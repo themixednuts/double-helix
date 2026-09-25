@@ -2,6 +2,8 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::ErrorKind;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use std::{
     collections::{BTreeSet, HashSet},
@@ -109,15 +111,28 @@ pub fn install_pkg_grammar(
     Ok(())
 }
 
-pub fn fetch_grammars() -> Result<()> {
+pub fn fetch_grammars(strict: bool) -> Result<()> {
     ensure_git_is_available()?;
 
     // We do not need to fetch local grammars.
     let mut grammars = get_grammar_configs()?;
     grammars.retain(|grammar| !matches!(grammar.source, GrammarSource::Local { .. }));
 
-    println!("Fetching {} grammars", grammars.len());
-    let results = run_parallel(grammars, fetch_grammar);
+    let total = grammars.len();
+    let counter = Arc::new(AtomicUsize::new(0));
+
+    println!("Fetching {} grammars", total);
+    let counter = Arc::clone(&counter);
+
+    let results = run_parallel(grammars, move |grammar| {
+        let current = counter.fetch_add(1, Ordering::Relaxed) + 1;
+
+        println!(
+            "Fetching grammars ({}/{}): {}",
+            current, total, grammar.grammar_id
+        );
+        fetch_grammar(grammar)
+    });
 
     let mut errors = Vec::new();
     let mut git_updated = Vec::new();
@@ -164,18 +179,32 @@ pub fn fetch_grammars() -> Result<()> {
         for (i, (grammar, error)) in errors.into_iter().enumerate() {
             println!("Failure {}/{len}: {grammar} {error}", i + 1);
         }
-        bail!("{len} grammars failed to fetch");
+        if strict {
+            bail!("{len} grammars failed to fetch");
+        }
     }
 
     Ok(())
 }
 
-pub fn build_grammars(target: Option<String>) -> Result<()> {
+pub fn build_grammars(target: Option<String>, strict: bool) -> Result<()> {
     ensure_git_is_available()?;
 
     let grammars = get_grammar_configs()?;
+
+    let total = grammars.len();
+    let counter = Arc::new(AtomicUsize::new(0));
+
     println!("Building {} grammars", grammars.len());
+
+    let counter = Arc::clone(&counter);
     let results = run_parallel(grammars, move |grammar| {
+        let current = counter.fetch_add(1, Ordering::Relaxed) + 1;
+
+        println!(
+            "Building grammars ({}/{}): {}",
+            current, total, grammar.grammar_id
+        );
         build_grammar(grammar, target.as_deref())
     });
 
@@ -207,10 +236,34 @@ pub fn build_grammars(target: Option<String>) -> Result<()> {
         for (i, (grammar_id, error)) in errors.into_iter().enumerate() {
             println!("Failure {}/{len}: {grammar_id} {error}", i + 1);
         }
-        bail!("{len} grammars failed to build");
+        if strict {
+            bail!("{len} grammars failed to build");
+        }
     }
 
     Ok(())
+}
+
+/// The language config grammars come from. Grammar sources are git URLs that get cloned and
+/// compiled into libraries the editor loads, so a workspace's `languages.toml` only counts once
+/// the workspace was explicitly trusted (`:workspace-trust`); configured implicit trust does not
+/// apply here.
+fn grammar_lang_config() -> Result<Configuration> {
+    let trust = crate::workspace_trust::WorkspaceTrust::explicit_grants_only();
+    let workspace_languages = crate::workspace_lang_config_file();
+    if workspace_languages.exists()
+        && !trust
+            .query_current(crate::workspace_trust::TrustQuery::LocalConfig)
+            .is_trusted()
+    {
+        log::info!(
+            "skipping {} for grammars: the workspace is not trusted",
+            workspace_languages.display()
+        );
+    }
+    Ok(crate::config::user_lang_config(&trust)
+        .context("Could not parse languages.toml")?
+        .try_into()?)
 }
 
 // Returns the set of grammar configurations the user requests.
@@ -218,9 +271,7 @@ pub fn build_grammars(target: Option<String>) -> Result<()> {
 // merged. The `grammar_selection` key of the config is then used to filter
 // down all grammars into a subset of the user's choosing.
 fn get_grammar_configs() -> Result<Vec<GrammarConfiguration>> {
-    let config: Configuration = crate::config::user_lang_config()
-        .context("Could not parse languages.toml")?
-        .try_into()?;
+    let config = grammar_lang_config()?;
 
     let grammars = match config.grammar_selection {
         Some(GrammarSelection::Only { only: selections }) => config
@@ -248,9 +299,7 @@ pub fn configured_grammar_names() -> Result<BTreeSet<String>> {
 }
 
 pub fn get_grammar_names() -> Result<Option<HashSet<String>>> {
-    let config: Configuration = crate::config::user_lang_config()
-        .context("Could not parse languages.toml")?
-        .try_into()?;
+    let config = grammar_lang_config()?;
 
     let grammars = match config.grammar_selection {
         Some(GrammarSelection::Only { only: selections }) => Some(selections),

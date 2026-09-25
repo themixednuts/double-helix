@@ -4,8 +4,8 @@ use crate::{
 };
 use fff_search::{
     FFFMode, FilePicker, FilePickerOptions, FilePickerScanOptions, FileSearchConfig,
-    FuzzySearchOptions, GrepConfig, GrepMode, GrepSearchOptions, PaginationArgs, QueryParser,
-    SharedFrecency, SharedPicker, SymlinkTargetScope,
+    FuzzySearchOptions, GitRecencyConfig, GrepConfig, GrepMode, GrepSearchOptions, PaginationArgs,
+    QueryParser, SharedFrecency, SharedPicker, SymlinkTargetScope,
 };
 use std::{
     collections::HashSet,
@@ -85,6 +85,7 @@ impl WorkspaceSearchIndex {
                     deduplicate_links: options.deduplicate_symlinks,
                     symlink_target_scope: SymlinkTargetScope::BaseDirectory,
                 },
+                git_recency: GitRecencyConfig::default(),
             },
         )
         .map_err(|error| WorkspaceSearchIndexError::Initialize(error.to_string()))?;
@@ -202,6 +203,9 @@ impl WorkspaceSearchIndex {
                 file_offset,
                 page_limit: usize::from(query.limit),
                 time_budget_ms: 40,
+                // Page on the budget even before anything matched, so a
+                // zero-match query still returns a resume cursor promptly.
+                enforce_time_budget: true,
                 abort_signal: Some(canceled),
                 ..GrepSearchOptions::default()
             },

@@ -61,6 +61,15 @@ pub fn dap_start_impl(
     params: Option<Vec<std::borrow::Cow<str>>>,
 ) -> Result<(), anyhow::Error> {
     let (_, doc) = focused_ref!(cx.editor);
+    // Debug adapters run what the language config says: only in workspaces trusted for them.
+    if doc.workspace_root().is_some_and(|workspace| {
+        !cx.editor
+            .workspace_trust
+            .query(workspace, helix_loader::workspace_trust::TrustQuery::Dap)
+            .is_trusted()
+    }) {
+        bail!("Workspace is not trusted. Run `:workspace-trust` to enable the debug adapter.");
+    }
     let config = doc
         .language_config()
         .and_then(|config| config.debugger.as_ref())
@@ -587,11 +596,17 @@ pub fn dap_switch_stack_frame(cx: &mut Context) {
     };
 
     let frames = debugger.stack_frames[&thread_id].clone();
+    let thread_state = debugger
+        .thread_states
+        .get(&thread_id)
+        .cloned()
+        .unwrap_or_else(|| "unknown".to_string());
 
     cx.spawn_ui(async move {
         Ok(UiCommand::Dap(DapCommand::StackFramesPicker {
             thread_id,
             frames,
+            thread_state,
         }))
     });
 }

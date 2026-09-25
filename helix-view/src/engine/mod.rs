@@ -52,9 +52,6 @@ pub trait KeymapQuery {
     /// Keys buffered in an incomplete multi-key sequence.
     fn pending(&self) -> &[KeyEvent];
 
-    /// Whether there's an active sticky keymap node.
-    fn has_sticky(&self) -> bool;
-
     /// Get the infobox for the current sticky node (for autoinfo display).
     fn sticky_infobox(&self) -> Option<Info>;
 
@@ -180,7 +177,11 @@ pub enum RepeatableCommandId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum OperatorTargetId {
     Motion(MotionId),
-    TextObject(TextObjectId),
+    /// A text object, inside or around.
+    TextObject(TextObjectId, helix_core::textobject::TextObject),
+    /// A text object named by its key in Vim's operator-pending mode (`w`, `(`, `"`, `f`),
+    /// inside or around.
+    Object(char, helix_core::textobject::TextObject),
     CharPending(CharPendingId, KeyEvent),
     Linewise,
 }
@@ -255,6 +256,8 @@ pub enum RecordedAction {
         target: OperatorTargetId,
         motion_count: NonZeroUsize,
         operator_count: NonZeroUsize,
+        /// Whether a count was typed at all: `dG` and `d5G` differ.
+        count_given: bool,
         register: Option<char>,
     },
     /// An insert sequence (both engines: enter insert, type text, exit).
@@ -320,9 +323,6 @@ pub trait EditingEngine: Send {
     /// "VIS", "VLN", "VBL", "OPR" for operator-pending).
     fn mode_name(&self) -> &str;
 
-    /// Get the editor Mode (Normal/Insert/Select) for cursor shape, gutter, etc.
-    fn editor_mode(&self) -> Mode;
-
     /// Pending keys display for statusline (e.g., "d" in Vim operator-pending,
     /// "g" in Helix multi-key sequence, "3" during count accumulation).
     fn pending_display(&self) -> &str;
@@ -335,9 +335,6 @@ pub trait EditingEngine: Send {
 
     /// Engine name for config and display.
     fn name(&self) -> &str;
-
-    /// Get the last recorded action for dot-repeat.
-    fn last_action(&self) -> Option<&RecordedAction>;
 
     /// Replay the last recorded action (dot-repeat).
     fn repeat_last(
@@ -361,6 +358,33 @@ pub trait EditingEngine: Send {
     /// The engine finalizes the insert recording into a `RecordedAction::InsertSequence`
     /// and stores it as `last_action` for dot-repeat.
     fn end_insert_recording(&mut self);
+
+    /// Insert mode was left: the engine may adjust the cursor (Vim steps back one character).
+    fn insert_exited(&mut self, _editor: &mut Editor) {}
+
+    /// Record a key the frontend handled during insert mode (Tab, `C-r`, `C-x`), so `.`
+    /// replays it along with the keys the engine handled itself.
+    fn record_frontend_insert_key(&mut self, _key: KeyEvent) {}
+
+    /// Name of the last command this engine executed. When an engine command (`c`, `o`,
+    /// `a`) enters insert mode, this becomes the recording's entry command, so `.` replays
+    /// the whole change rather than a bare `insert_mode`.
+    fn last_command_name(&self) -> Option<&'static str> {
+        None
+    }
+
+    /// Run the engine command `name` without recording it for dot-repeat; used to replay
+    /// the entry command of a recorded insert. Returns `false` when the engine does not
+    /// know the command, so the frontend can run it instead.
+    fn replay_entry(
+        &mut self,
+        _editor: &mut Editor,
+        _view_id: ViewId,
+        _doc_id: DocumentId,
+        _name: &str,
+    ) -> bool {
+        false
+    }
 
     /// Snapshot transient count/register state owned by the engine.
     fn input_state(&self) -> ModalInputState {
@@ -416,10 +440,6 @@ impl EditingEngine for HeadlessEditingEngine {
         "HEADLESS"
     }
 
-    fn editor_mode(&self) -> Mode {
-        Mode::Normal
-    }
-
     fn pending_display(&self) -> &str {
         ""
     }
@@ -432,10 +452,6 @@ impl EditingEngine for HeadlessEditingEngine {
 
     fn name(&self) -> &str {
         "headless"
-    }
-
-    fn last_action(&self) -> Option<&RecordedAction> {
-        None
     }
 
     fn repeat_last(

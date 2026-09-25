@@ -275,3 +275,14 @@ pub struct RegistryHead {
     pub revision: String,
     pub updated_at: i64,
 }
+
+/// A workspace trust decision: trusted with the hash of its local config pinned, or excluded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceTrustGrant {
+    pub workspace: String,
+    /// Hash of the workspace's local configuration when trust was granted; `None` when it had none
+    /// or the workspace is excluded.
+    pub hash: Option<String>,
+    pub excluded: bool,
+    pub updated_at: i64,
+}

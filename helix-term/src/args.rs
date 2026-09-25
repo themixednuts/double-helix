@@ -15,6 +15,7 @@ pub struct Args {
     pub fetch_grammars: bool,
     pub build_grammars: bool,
     pub pkg: Option<PkgArgs>,
+    pub strict: bool,
     pub split: Option<Layout>,
     pub verbosity: u64,
     pub log_file: Option<PathBuf>,
@@ -54,6 +55,7 @@ pub enum PkgCommand {
 }
 
 impl Args {
+    #[allow(clippy::too_many_lines)]
     pub fn parse_args() -> Result<Args> {
         let mut args = Args::default();
         let mut argv = std::env::args().peekable();
@@ -78,6 +80,7 @@ impl Args {
                 "--" => break, // stop parsing at this point treat the remaining as files
                 "--version" => args.display_version = true,
                 "--help" => args.display_help = true,
+                "--strict" => args.strict = true,
                 "--tutor" => args.load_tutor = true,
                 "--migrate" => args.migrate = true,
                 "--vsplit" => match args.split {

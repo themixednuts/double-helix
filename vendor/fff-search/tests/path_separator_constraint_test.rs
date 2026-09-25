@@ -37,10 +37,12 @@ fn plain_opts() -> GrepSearchOptions {
         max_file_size: 10 * 1024 * 1024,
         max_matches_per_file: 200,
         smart_case: true,
+        casing: None,
         file_offset: 0,
         page_limit: 200,
         mode: GrepMode::PlainText,
         time_budget_ms: 0,
+        enforce_time_budget: false,
         before_context: 0,
         after_context: 0,
         classify_definitions: false,
@@ -220,6 +222,17 @@ fn multi_grep_with_file_path_suffix_constraint() {
             "matched path must end with services/handler.lua, got {p:?}"
         );
     }
+}
+
+#[test]
+fn multi_grep_with_missing_file_path_constraint_returns_no_matches() {
+    let tmp = TempDir::new().unwrap();
+    let picker = create_picker(tmp.path(), &[("other.lua", "handleRequest\n")]);
+
+    let constraints = [Constraint::FilePath("missing.lua")];
+    let result = picker.multi_grep(&["handleRequest"], &constraints, &plain_opts());
+
+    assert!(result.matches.is_empty());
 }
 
 /// Glob constraints must match native Windows paths — the picker normalises

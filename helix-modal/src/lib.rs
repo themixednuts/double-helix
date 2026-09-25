@@ -1,17 +1,5 @@
-//! Modal editing engines.
-//!
-//! `helix-modal` has two layers:
-//!
-//! - [`core`] is a dependency-free modal-editing engine. It provides generic
-//!   Helix-style and Vim-style state machines over an embedder-defined context.
-//! - With the default `helix` feature, the crate also exposes the Helix editor
-//!   integration: built-in command registration, `ModalEngineFactory`, and
-//!   `helix_view::engine::EditingEngine` implementations.
-//!
-//! Embedders that do not use Helix can disable default features and build a
-//! registry for their own context type with [`core::Builder`].
-
-pub mod core;
+//! Modal editing engines: built-in command registration, `ModalEngineFactory`, and the
+//! Helix and Vim `helix_view::engine::EditingEngine` implementations.
 
 #[cfg(feature = "helix")]
 pub mod factory;
@@ -43,6 +31,26 @@ pub use registry::CommandRegistry;
 #[cfg(feature = "helix")]
 pub(crate) fn is_char_key(key: KeyEvent, ch: char) -> bool {
     key.code == helix_view::keyboard::KeyCode::Char(ch) && key.modifiers.is_empty()
+}
+
+/// Whether a command should become what `.` repeats: it has to have edited the document
+/// (selection changes, scrolling and yanks never replace the last change), and history
+/// navigation is never a change of its own.
+#[cfg(feature = "helix")]
+pub(crate) fn is_repeatable_edit(
+    command: &str,
+    version_before: Option<i32>,
+    version_after: Option<i32>,
+) -> bool {
+    version_before != version_after && !matches!(command, "undo" | "redo" | "earlier" | "later")
+}
+
+#[cfg(feature = "helix")]
+pub(crate) fn document_version(
+    editor: &helix_view::Editor,
+    doc_id: helix_view::DocumentId,
+) -> Option<i32> {
+    editor.document(doc_id).map(helix_view::Document::version)
 }
 
 /// Extract a digit from an unmodified key event.
@@ -84,7 +92,15 @@ pub(crate) fn record_insert_key(
                 rec.keys.push(key);
             }
             EngineResult::CancelledInsert(pending) => {
-                rec.keys.extend_from_slice(pending);
+                // Only the text: the frontend runs any other key of a cancelled sequence
+                // (`j<Enter>`) on its own, and that run records it.
+                rec.keys.extend(pending.iter().copied().filter(|key| {
+                    key.char().is_some()
+                        && !key.modifiers.intersects(
+                            helix_view::keyboard::KeyModifiers::CONTROL
+                                | helix_view::keyboard::KeyModifiers::ALT,
+                        )
+                }));
             }
             EngineResult::Pending | EngineResult::Unbound | EngineResult::ReplayInsert { .. } => {}
         }

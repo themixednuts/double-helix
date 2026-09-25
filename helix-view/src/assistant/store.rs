@@ -3,7 +3,7 @@ use std::num::NonZeroU64;
 use indexmap::IndexMap;
 
 use super::{
-    action, backend, config, context, effect, event, history, mention, mode, review, thread,
+    action, auth, backend, config, context, effect, event, history, mention, mode, review, thread,
 };
 
 #[derive(Debug, Clone)]
@@ -429,7 +429,32 @@ impl Store {
                 }
             }
             event::Event::Backend { backend, event } => match event {
-                super::backend::Event::Ready { .. } | super::backend::Event::Stopped => Vec::new(),
+                super::backend::Event::Ready { .. } => Vec::new(),
+                // The agent process is gone. A turn that was running (or being cancelled)
+                // will never finish, so end it visibly instead of leaving the thread busy.
+                super::backend::Event::Stopped => {
+                    let stuck: Vec<_> = self
+                        .threads()
+                        .filter(|thread| {
+                            matches!(
+                                thread.origin(),
+                                thread::Origin::Backend { backend: owner, .. } if *owner == backend
+                            ) && matches!(thread.run(), thread::Run::Running | thread::Run::Waiting)
+                        })
+                        .map(|thread| thread.id)
+                        .collect();
+                    stuck
+                        .into_iter()
+                        .flat_map(|thread| {
+                            self.apply(event::Event::Thread {
+                                thread,
+                                event: thread::Event::Run(thread::Run::Failed {
+                                    message: "the agent process exited".to_string(),
+                                }),
+                            })
+                        })
+                        .collect()
+                }
                 super::backend::Event::Bound { thread, remote } => {
                     if self.bind_remote(thread, backend, remote).is_ok() {
                         self.sync_history(thread);
@@ -951,14 +976,57 @@ impl Store {
                 if !state.auth_mut().authenticate(&method) {
                     return Vec::new();
                 }
+                // A terminal login runs outside the editor first; the agent is asked once
+                // the user says it finished.
+                let first = match state.auth() {
+                    auth::State::TerminalLogin { method, .. } => {
+                        effect::Effect::LaunchAuthTerminal {
+                            thread,
+                            title: method.name.clone(),
+                            terminal: method
+                                .terminal
+                                .clone()
+                                .unwrap_or_else(|| unreachable!("terminal logins have a terminal")),
+                        }
+                    }
+                    _ => effect::Effect::SendBackendCommand {
+                        backend,
+                        command: backend::Command::Authenticate { thread, method },
+                    },
+                };
+                vec![
+                    first,
+                    effect::Effect::Save { thread },
+                    effect::Effect::SyncModel,
+                ]
+            }
+            action::Action::FinishTerminalLogin { thread } => {
+                let Some(state) = self.thread_mut(thread) else {
+                    return Vec::new();
+                };
+                let thread::Origin::Backend { backend, .. } = state.origin() else {
+                    return Vec::new();
+                };
+                let backend = backend.clone();
+                let Some(method) = state.auth_mut().finish_terminal_login() else {
+                    return Vec::new();
+                };
                 vec![
                     effect::Effect::SendBackendCommand {
                         backend,
                         command: backend::Command::Authenticate { thread, method },
                     },
-                    effect::Effect::Save { thread },
                     effect::Effect::SyncModel,
                 ]
+            }
+            action::Action::CancelTerminalLogin { thread } => {
+                let Some(state) = self.thread_mut(thread) else {
+                    return Vec::new();
+                };
+                if !state.auth_mut().cancel_terminal_login() {
+                    return Vec::new();
+                }
+                vec![effect::Effect::SyncModel]
             }
             action::Action::SetReviewMode { thread, mode } => {
                 let Some(state) = self.thread_mut(thread) else {
@@ -1440,6 +1508,33 @@ mod tests {
                 effect::Effect::EnsureParticipant { thread: current } if *current == thread
             )
         }));
+    }
+
+    #[test]
+    fn stopped_backend_fails_its_running_threads() {
+        let (mut store, thread) = store();
+        let backend = backend::Id::new("backend");
+        store.apply(event::Event::Backend {
+            backend: backend.clone(),
+            event: backend::Event::Bound {
+                thread,
+                remote: backend::Remote::new("remote"),
+            },
+        });
+        store.apply(event::Event::Thread {
+            thread,
+            event: thread::Event::Run(thread::Run::Running),
+        });
+
+        store.apply(event::Event::Backend {
+            backend,
+            event: backend::Event::Stopped,
+        });
+
+        assert!(matches!(
+            store.thread(thread).expect("thread").run(),
+            thread::Run::Failed { .. }
+        ));
     }
 
     #[test]

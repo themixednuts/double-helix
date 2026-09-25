@@ -3,12 +3,12 @@
 //! This provides an eventually consistent set of words used in any open buffers. This set is
 //! later used for lexical completion.
 
-use std::{borrow::Cow, collections::HashMap, iter, mem, sync::Arc, time::Duration};
+use std::{borrow::Cow, iter, mem, sync::Arc, time::Duration};
 
 use arc_swap::ArcSwap;
+use foldhash::HashMap;
 use helix_core::{
-    chars::char_is_word, diff::compare_ropes, fuzzy::fuzzy_match, movement,
-    text_annotations::TextAnnotations, ChangeSet, Range, Rope, RopeSlice,
+    chars::char_is_word, diff::compare_ropes, fuzzy::fuzzy_match, ChangeSet, Rope, RopeSlice,
 };
 use helix_runtime::{Clock, PulseGate, PulseHandle, PulseReceiver, Runtime};
 use helix_stdx::rope::RopeSliceExt as _;
@@ -446,49 +446,51 @@ fn update_document(index: &mut WordIndexInner, old_text: &Rope, text: &Rope, cha
     }
 }
 
+/// Extracts indexable words from a rope slice.
+///
+/// A word is a run of grapheme clusters whose first character is a
+/// [word character][char_is_word], spanning at least [`MIN_WORD_GRAPHEMES`] clusters and at
+/// most [`MAX_WORD_LEN`] chars. All other text is skipped.
+///
+/// This is a single forward pass over the text's grapheme clusters, and the only rope position
+/// ever sought is the start of an emitted word, so extraction is roughly linear in the text.
 fn words(text: RopeSlice) -> impl Iterator<Item = RopeSlice> {
-    let mut cursor = Range::point(0);
-    if text
-        .get_char(cursor.anchor)
-        .is_some_and(|ch| !ch.is_whitespace())
-    {
-        let cursor_word_end =
-            movement::move_next_word_end(text, &TextAnnotations::default(), cursor, 1);
-        if cursor_word_end.anchor == 0 {
-            cursor = cursor_word_end;
-        }
-    }
+    let mut graphemes = text.grapheme_indices();
+    // The in-progress run: the byte offset of its first cluster, its length in chars, and the
+    // number of graphemes it spans. `graphemes_len == 0` means we are between words.
+    let mut start_byte = 0;
+    let mut char_len = 0;
+    let mut graphemes_len = 0;
 
-    iter::from_fn(move || {
-        while cursor.head <= text.len_chars() {
-            let mut word = None;
-            if text
-                .slice(..cursor.head)
-                .graphemes_rev()
-                .take(MIN_WORD_GRAPHEMES)
-                .take_while(|g| g.chars().all(char_is_word))
-                .count()
-                == MIN_WORD_GRAPHEMES
-            {
-                cursor.anchor += text
-                    .chars_at(cursor.anchor)
-                    .take_while(|&c| !char_is_word(c))
-                    .count();
-                let slice = cursor.slice(text);
-                if slice.len_chars() <= MAX_WORD_LEN {
-                    word = Some(slice);
-                }
+    // Yields `text[start_byte..end_byte]` if that run satisfies the length bounds.
+    let qualify = move |start_byte, end_byte, char_len, graphemes_len| {
+        (graphemes_len >= MIN_WORD_GRAPHEMES && char_len <= MAX_WORD_LEN)
+            .then(|| text.byte_slice(start_byte..end_byte))
+    };
+
+    iter::from_fn(move || loop {
+        let Some((byte_idx, grapheme)) = graphemes.next() else {
+            // Flush a word that runs up to the end of the text.
+            let word = qualify(start_byte, text.len_bytes(), char_len, graphemes_len);
+            graphemes_len = 0;
+            return word;
+        };
+
+        if grapheme.chars().next().is_some_and(char_is_word) {
+            if graphemes_len == 0 {
+                start_byte = byte_idx;
+                char_len = 0;
             }
-            let head = cursor.head;
-            cursor = movement::move_next_word_end(text, &TextAnnotations::default(), cursor, 1);
-            if cursor.head == head {
-                cursor.head = usize::MAX;
-            }
+            graphemes_len += 1;
+            char_len += grapheme.len_chars();
+        } else if graphemes_len != 0 {
+            // A non-word cluster ends the current run; `byte_idx` is one past its end.
+            let word = qualify(start_byte, byte_idx, char_len, graphemes_len);
+            graphemes_len = 0;
             if word.is_some() {
                 return word;
             }
         }
-        None
     })
 }
 
@@ -818,5 +820,37 @@ mod tests {
         let actual = collect_words(index);
         let expected = expected.into_iter().map(str::to_owned).collect();
         assert_eq!(actual, expected);
+    }
+
+    #[track_caller]
+    fn assert_extracts(text: &str, expected: &[&str]) {
+        let rope = Rope::from_str(text);
+        let got: Vec<String> = words(rope.slice(..)).map(|w| w.to_string()).collect();
+        assert_eq!(got, expected, "extracting words from {text:?}");
+    }
+
+    /// `words` categorizes whole grapheme clusters, so a word boundary never falls inside a
+    /// cluster. A non-word combining mark stays attached to the word character it modifies.
+    #[test]
+    fn extract_respects_grapheme_clusters() {
+        // Whitespace and punctuation separate words. Runs under MIN_WORD_GRAPHEMES are dropped.
+        assert_extracts("a foo c", &["foo"]);
+        assert_extracts(
+            "foo.bar.baz qux::quux",
+            &["foo", "bar", "baz", "qux", "quux"],
+        );
+        assert_extracts("snake_case_id CamelCase", &["snake_case_id", "CamelCase"]);
+        // Precomposed and decomposed accents both keep the whole word.
+        assert_extracts("na\u{ef}ve caf\u{e9}", &["na\u{ef}ve", "caf\u{e9}"]);
+        assert_extracts(
+            "nai\u{0308}ve cafe\u{0301}",
+            &["nai\u{0308}ve", "cafe\u{0301}"],
+        );
+        // Hangul syllables are word characters; an emoji cluster is not.
+        assert_extracts(
+            "\u{d55c}\u{ad6d}\u{c5b4} word",
+            &["\u{d55c}\u{ad6d}\u{c5b4}", "word"],
+        );
+        assert_extracts("emoji \u{1f44d}\u{1f3fd} word", &["emoji", "word"]);
     }
 }

@@ -91,17 +91,26 @@ impl ProcessWaiter {
 pub(crate) struct ProcessHandle {
     shutdown_tx: mpsc::Sender<()>,
     waiter: ProcessWaiter,
+    /// Everything the child started. Dropping the last reference kills what is left.
+    _tree: Option<Arc<crate::process_tree::ProcessTree>>,
 }
 
 impl ProcessHandle {
     pub(crate) fn spawn(mut child: Child, description: String) -> Self {
         let (shutdown_tx, mut shutdown_rx) = mpsc::channel(1);
         let (outcome_tx, outcome_rx) = watch::channel(None);
+        let tree = crate::process_tree::ProcessTree::of(&child).map(Arc::new);
+        let task_tree = tree.clone();
 
         tokio::spawn(async move {
             let result = tokio::select! {
                 status = child.wait() => status,
-                _ = shutdown_rx.recv() => terminate_child(&mut child).await,
+                _ = shutdown_rx.recv() => {
+                    if let Some(tree) = &task_tree {
+                        tree.kill();
+                    }
+                    terminate_child(&mut child).await
+                }
             };
 
             let outcome = match result {
@@ -126,6 +135,7 @@ impl ProcessHandle {
         Self {
             shutdown_tx,
             waiter: ProcessWaiter { outcome_rx },
+            _tree: tree,
         }
     }
 
@@ -207,7 +217,7 @@ impl AcpAgent {
     /// Returns the agent and its incoming request/notification receiver.
     /// The caller should poll `incoming_receiver` for agent requests/notifications.
     pub fn start(id: AgentId, config: &AgentConfig) -> Result<(Arc<Self>, IncomingReceiver)> {
-        let mut cmd = Command::new(&config.command);
+        let mut cmd = Command::new(crate::resolve_program(&config.command));
         cmd.args(&config.args)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -322,7 +332,8 @@ impl AcpAgent {
         }
     }
 
-    /// Send a JSON-RPC request and wait for the response.
+    /// Send a JSON-RPC request and wait for the response. A timeout of `0`
+    /// waits for as long as the agent takes.
     fn call<R: Serialize, T: serde::de::DeserializeOwned>(
         &self,
         method: &str,
@@ -349,7 +360,12 @@ impl AcpAgent {
             outbound
                 .deliver(Payload::Request { value: request })
                 .await?;
-            let response = match timeout(Duration::from_secs(timeout_secs), rx.recv()).await {
+            let response = if timeout_secs == 0 {
+                Ok(rx.recv().await)
+            } else {
+                timeout(Duration::from_secs(timeout_secs), rx.recv()).await
+            };
+            let response = match response {
                 Ok(Some(response)) => response,
                 Ok(None) => {
                     warn!(
@@ -538,8 +554,9 @@ impl AcpAgent {
         prompt: Vec<ContentBlock>,
     ) -> impl Future<Output = Result<PromptResponse>> {
         let params = PromptRequest::new(session_id, prompt);
-        // Prompts can take a very long time (agent is doing work)
-        self.call(methods::SESSION_PROMPT, params, 600)
+        // A turn lasts as long as the agent works; the user ends it with a
+        // cancel, and a dead agent closes the stream.
+        self.call(methods::SESSION_PROMPT, params, 0)
     }
 
     /// Cancel an ongoing prompt turn.

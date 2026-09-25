@@ -86,6 +86,8 @@ impl ExplorerOperator {
 struct PendingExplorerOperator {
     operator: ExplorerOperator,
     text_object_kind: Option<ExplorerTextObjectKind>,
+    /// The count typed before the operator, until the motion's own count is known.
+    count: Option<NonZeroUsize>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -839,6 +841,7 @@ impl ExplorerInputEngine {
                 self.pending_operator = Some(PendingExplorerOperator {
                     operator,
                     text_object_kind: None,
+                    count: self.count.take(),
                 });
                 ExplorerInput::Pending(None)
             }
@@ -860,6 +863,13 @@ impl ExplorerInputEngine {
         let Some(mut pending) = self.pending_operator else {
             return ExplorerInput::Execute(ExplorerAction::Noop);
         };
+
+        // Past the motion's digits, the two counts multiply, as in Vim: `2d3w` is six words.
+        if let Some(operator_count) = pending.count.take() {
+            let motion_count = self.count.map_or(1, NonZeroUsize::get);
+            self.count = NonZeroUsize::new(operator_count.get().saturating_mul(motion_count));
+            self.pending_operator = Some(pending);
+        }
 
         if pending.text_object_kind.is_none() {
             if key == key!('i') {

@@ -726,3 +726,48 @@ async fn tree_sitter_motions_work_across_injections() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+/// A count typed before a frontend command is consumed by it and does not
+/// leak into the next command (upstream behaviour).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn count_is_consumed_by_a_frontend_command() -> anyhow::Result<()> {
+    test((
+        indoc! {"\
+            #[foo|]#
+            foo
+            foo
+            foo
+            foo
+            "},
+        "*2nx",
+        indoc! {"\
+            foo
+            foo
+            #[foo
+            |]#foo
+            foo
+            "},
+    ))
+    .await?;
+
+    Ok(())
+}
+
+/// `d` and `y` leave select mode, so the next motion moves instead of extending.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delete_and_yank_exit_select_mode() -> anyhow::Result<()> {
+    test(("#[a|]#b cd ef\n", "vldl", " #[c|]#d ef\n")).await?;
+    test(("#[a|]#b cd ef\n", "vlyl", "ab#[ |]#cd ef\n")).await?;
+
+    Ok(())
+}
+
+/// A digit after `f`/`t` is the character to find, not the start of a count.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn find_char_accepts_digits() -> anyhow::Result<()> {
+    test(("#[a|]#bc1de\n", "f1", "#[abc1|]#de\n")).await?;
+    test(("#[a|]#1b1c\n", "2f1", "#[a1b1|]#c\n")).await?;
+    test(("#[a|]#bc1de\n", "t1", "#[abc|]#1de\n")).await?;
+
+    Ok(())
+}

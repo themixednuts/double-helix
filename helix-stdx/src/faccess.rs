@@ -182,6 +182,8 @@ mod imp {
                 )
             };
 
+            // The security-info APIs return their error code instead of
+            // setting the thread's last error.
             if err == ERROR_SUCCESS {
                 Ok(SecurityDescriptor {
                     sd,
@@ -190,7 +192,7 @@ mod imp {
                     dacl,
                 })
             } else {
-                Err(io::Error::last_os_error())
+                Err(io::Error::from_raw_os_error(err as i32))
             }
         }
 
@@ -412,7 +414,7 @@ mod imp {
             dacl = sd.dacl as *const _;
         }
 
-        let err = unsafe {
+        let set = |si, owner, group| unsafe {
             SetNamedSecurityInfoW(
                 pathw.as_ptr(),
                 SE_FILE_OBJECT,
@@ -423,11 +425,18 @@ mod imp {
                 std::ptr::null(),
             )
         };
+        let mut err = set(si, owner, group);
+        // Handing a file to another owner needs privileges an ordinary save
+        // lacks. Keep the new file ours but still carry the access rules over.
+        let owner_info = OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION;
+        if err != ERROR_SUCCESS && si & owner_info != 0 && si & DACL_SECURITY_INFORMATION != 0 {
+            err = set(si & !owner_info, std::ptr::null_mut(), std::ptr::null_mut());
+        }
 
         if err == ERROR_SUCCESS {
             Ok(())
         } else {
-            Err(io::Error::last_os_error())
+            Err(io::Error::from_raw_os_error(err as i32))
         }
     }
 

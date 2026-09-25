@@ -35,7 +35,6 @@ regex = "1"
 memchr = "2.7"
 bitflags.workspace = true
 foldhash.workspace = true
-url = "2.5.4"
 
 log = "0.4"
 anyhow = "1.0"

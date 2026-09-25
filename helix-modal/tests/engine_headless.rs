@@ -137,10 +137,6 @@ impl KeymapQuery for TestKeymap {
         &[]
     }
 
-    fn has_sticky(&self) -> bool {
-        false
-    }
-
     fn sticky_infobox(&self) -> Option<helix_view::info::Info> {
         None
     }

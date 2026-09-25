@@ -35,7 +35,7 @@ impl JumpList {
         num_removed_from_front
     }
 
-    pub fn push(&mut self, jump: Jump) {
+    pub(crate) fn push(&mut self, jump: Jump) {
         self.push_impl(jump);
     }
 
@@ -144,6 +144,17 @@ impl ViewHistoryState {
         if let Some(transaction) = self.changes_to_sync(doc) {
             self.apply(&transaction, doc);
         }
+    }
+
+    /// Push a jump whose selection is valid at the document's *current* revision.
+    ///
+    /// Syncs to that revision first: otherwise the entry would be left ahead of
+    /// `doc_revisions[doc]` and the next `sync_changes` would map it through a
+    /// changeset whose pre-image predates it, panicking in
+    /// `ChangeSet::update_positions` once the document has grown.
+    pub fn push_jump(&mut self, doc: &mut Document, jump: Jump) {
+        self.sync_changes(doc);
+        self.jumps.push(jump);
     }
 
     pub fn changes_to_sync(&mut self, doc: &mut Document) -> Option<Transaction> {

@@ -248,6 +248,272 @@ fn register_commands(catalog: &mut impl EngineCommandCatalog) {
     register_text_objects(catalog);
     register_actions(catalog);
     register_char_pending(catalog);
+    register_vim_commands(catalog);
+}
+
+// ─── Vim commands ────────────────────────────────────────────────────
+//
+// Commands the Vim keymap binds that have no Helix counterpart: operators for `>`, `<`, `gu`,
+// `gU`, `g~`, and the single-key edits (`x`, `D`, `Y`, `s`, ...) Vim defines relative to the
+// cursor rather than a selection.
+
+fn yank_register(ed: &helix_view::Editor, register: Option<char>) -> char {
+    register.unwrap_or_else(|| ed.config().default_yank_register)
+}
+
+/// Replace each range with the one `f` computes from its cursor.
+fn select_from_cursor(
+    ed: &mut helix_view::Editor,
+    vid: ViewId,
+    did: DocumentId,
+    f: impl Fn(helix_core::RopeSlice, usize) -> helix_core::Range,
+) {
+    let doc = helix_view::doc_mut!(ed, &did);
+    let text = doc.text().slice(..);
+    let selection = doc
+        .selection(vid)
+        .clone()
+        .transform(|range| f(text, range.cursor(text)));
+    doc.set_selection(vid, selection);
+}
+
+/// `count` characters from the cursor, stopping at the line break.
+fn chars_forward(text: helix_core::RopeSlice, cursor: usize, count: usize) -> helix_core::Range {
+    let line = text.char_to_line(cursor);
+    let end = helix_core::line_ending::line_end_char_index(&text, line).max(cursor);
+    helix_core::Range::new(cursor, (cursor + count).min(end))
+}
+
+/// From the cursor to the end of the `count`th line (not its line break).
+fn to_line_end(text: helix_core::RopeSlice, cursor: usize, count: usize) -> helix_core::Range {
+    let line = text.char_to_line(cursor);
+    let last = (line + count.saturating_sub(1)).min(text.len_lines().saturating_sub(1));
+    let end = helix_core::line_ending::line_end_char_index(&text, last).max(cursor);
+    helix_core::Range::new(cursor, end)
+}
+
+/// `count` whole lines from the cursor's, line breaks included.
+fn whole_lines(text: helix_core::RopeSlice, cursor: usize, count: usize) -> helix_core::Range {
+    let line = text.char_to_line(cursor);
+    let start = text.line_to_char(line);
+    let end = text.line_to_char((line + count).min(text.len_lines()));
+    helix_core::Range::new(start, end)
+}
+
+fn delete(ed: &mut helix_view::Editor, vid: ViewId, did: DocumentId, register: Option<char>) {
+    let r = yank_register(ed, register);
+    editing::delete_selection(ed, vid, did, r, true);
+    editing::exit_select_mode(ed, vid, did);
+}
+
+fn change(ed: &mut helix_view::Editor, vid: ViewId, did: DocumentId, register: Option<char>) {
+    let r = yank_register(ed, register);
+    if editing::change_selection(ed, vid, did, r, true) {
+        editing::open(
+            ed,
+            vid,
+            did,
+            1,
+            editing::Open::Above,
+            editing::CommentContinuation::Disabled,
+        );
+    } else {
+        ed.mode = helix_view::document::Mode::Insert;
+    }
+}
+
+fn register_vim_commands(catalog: &mut impl EngineCommandCatalog) {
+    catalog.motion_optional(
+        "vim_goto_line",
+        "Goto line <n>, else the last line (Vim G)",
+        CommandScope::Viewport,
+        |count| {
+            Box::new(move |ed, vid, did, m| match count {
+                Some(_) => mv::goto_line(ed, vid, did, count, m),
+                None => mv::goto_last_line(ed, vid, did, m),
+            })
+        },
+    );
+    catalog.operator(
+        "vim_indent",
+        "Indent (Vim operator)",
+        CommandScope::Viewport,
+        |ed, vid, did, _register| {
+            editing::indent(ed, vid, did, 1);
+            editing::exit_select_mode(ed, vid, did);
+        },
+    );
+    catalog.operator(
+        "vim_unindent",
+        "Unindent (Vim operator)",
+        CommandScope::Viewport,
+        |ed, vid, did, _register| {
+            editing::unindent(ed, vid, did, 1);
+            editing::exit_select_mode(ed, vid, did);
+        },
+    );
+    catalog.operator(
+        "vim_lowercase",
+        "Lowercase (Vim operator)",
+        CommandScope::Viewport,
+        |ed, vid, did, _register| {
+            editing::switch_to_lowercase(ed, vid, did);
+            editing::exit_select_mode(ed, vid, did);
+        },
+    );
+    catalog.operator(
+        "vim_uppercase",
+        "Uppercase (Vim operator)",
+        CommandScope::Viewport,
+        |ed, vid, did, _register| {
+            editing::switch_to_uppercase(ed, vid, did);
+            editing::exit_select_mode(ed, vid, did);
+        },
+    );
+    catalog.operator(
+        "vim_toggle_case",
+        "Toggle case (Vim operator)",
+        CommandScope::Viewport,
+        |ed, vid, did, _register| {
+            editing::switch_case(ed, vid, did);
+            editing::exit_select_mode(ed, vid, did);
+        },
+    );
+
+    catalog.action(
+        "vim_delete_char",
+        "Delete characters under the cursor (Vim x)",
+        CommandScope::Viewport,
+        |ed, vid, did, count, register| {
+            select_from_cursor(ed, vid, did, |text, cursor| {
+                chars_forward(text, cursor, count)
+            });
+            delete(ed, vid, did, register);
+        },
+    );
+    catalog.action(
+        "vim_delete_char_backward",
+        "Delete characters before the cursor (Vim X)",
+        CommandScope::Viewport,
+        |ed, vid, did, count, register| {
+            select_from_cursor(ed, vid, did, |text, cursor| {
+                let line_start = text.line_to_char(text.char_to_line(cursor));
+                helix_core::Range::new(cursor.saturating_sub(count).max(line_start), cursor)
+            });
+            delete(ed, vid, did, register);
+        },
+    );
+    catalog.action(
+        "vim_delete_to_line_end",
+        "Delete to the end of the line (Vim D)",
+        CommandScope::Viewport,
+        |ed, vid, did, count, register| {
+            select_from_cursor(ed, vid, did, |text, cursor| {
+                to_line_end(text, cursor, count)
+            });
+            delete(ed, vid, did, register);
+        },
+    );
+    catalog.action(
+        "vim_change_to_line_end",
+        "Change to the end of the line (Vim C)",
+        CommandScope::Viewport,
+        |ed, vid, did, count, register| {
+            select_from_cursor(ed, vid, did, |text, cursor| {
+                to_line_end(text, cursor, count)
+            });
+            change(ed, vid, did, register);
+        },
+    );
+    catalog.action(
+        "vim_yank_line",
+        "Yank whole lines (Vim Y)",
+        CommandScope::Viewport,
+        |ed, vid, did, count, register| {
+            let doc = helix_view::doc!(ed, &did);
+            let original = doc.selection(vid).clone();
+            select_from_cursor(ed, vid, did, |text, cursor| {
+                whole_lines(text, cursor, count)
+            });
+            let r = yank_register(ed, register);
+            editing::yank(ed, vid, did, r);
+            helix_view::doc_mut!(ed, &did).set_selection(vid, original);
+        },
+    );
+    catalog.action(
+        "vim_substitute",
+        "Replace characters under the cursor with typed text (Vim s)",
+        CommandScope::Viewport,
+        |ed, vid, did, count, register| {
+            select_from_cursor(ed, vid, did, |text, cursor| {
+                chars_forward(text, cursor, count)
+            });
+            change(ed, vid, did, register);
+        },
+    );
+    catalog.action(
+        "vim_substitute_line",
+        "Replace whole lines, keeping their indentation (Vim S)",
+        CommandScope::Viewport,
+        |ed, vid, did, count, register| {
+            select_from_cursor(ed, vid, did, |text, cursor| {
+                let line = text.char_to_line(cursor);
+                let indent = text
+                    .line(line)
+                    .chars()
+                    .take_while(|ch| matches!(ch, ' ' | '\t'))
+                    .count();
+                let first = text.line_to_char(line) + indent;
+                to_line_end(text, first, count)
+            });
+            change(ed, vid, did, register);
+        },
+    );
+    catalog.action(
+        "vim_toggle_case_char",
+        "Toggle the case of characters under the cursor and move past them (Vim ~)",
+        CommandScope::Viewport,
+        |ed, vid, did, count, _register| {
+            select_from_cursor(ed, vid, did, |text, cursor| {
+                chars_forward(text, cursor, count)
+            });
+            editing::switch_case(ed, vid, did);
+            select_from_cursor(ed, vid, did, |text, cursor| {
+                let line = text.char_to_line(cursor);
+                let last = helix_core::line_ending::line_end_char_index(&text, line)
+                    .saturating_sub(1)
+                    .max(text.line_to_char(line));
+                helix_core::Range::point(cursor).put_cursor(text, (cursor + count).min(last), false)
+            });
+        },
+    );
+    catalog.action(
+        "vim_visual_line",
+        "Select whole lines (Vim V)",
+        CommandScope::Viewport,
+        |ed, vid, did, count, _register| {
+            select_from_cursor(ed, vid, did, |text, cursor| {
+                whole_lines(text, cursor, count)
+            });
+            ed.mode = helix_view::document::Mode::Select;
+        },
+    );
+    catalog.action(
+        "vim_visual_char",
+        "Select characters (Vim v)",
+        CommandScope::Viewport,
+        |ed, _vid, _did, _count, _register| {
+            ed.mode = helix_view::document::Mode::Select;
+        },
+    );
+    catalog.action(
+        "vim_visual_block",
+        "Select a block of columns (Vim C-v)",
+        CommandScope::Viewport,
+        |ed, _vid, _did, _count, _register| {
+            ed.mode = helix_view::document::Mode::Select;
+        },
+    );
 }
 
 pub fn engine_command_specs() -> &'static [EngineCommandSpec] {
@@ -667,13 +933,21 @@ fn register_motions(catalog: &mut impl EngineCommandCatalog) {
         "goto_prev_paragraph",
         "Goto previous paragraph",
         CommandScope::Viewport,
-        |count| Box::new(move |ed, vid, did, _m| mv::goto_prev_paragraph(ed, vid, did, count)),
+        |count| {
+            Box::new(move |ed, vid, did, m| {
+                mv::goto_paragraph_with(ed, vid, did, count, Direction::Backward, m)
+            })
+        },
     );
     catalog.motion(
         "goto_next_paragraph",
         "Goto next paragraph",
         CommandScope::Viewport,
-        |count| Box::new(move |ed, vid, did, _m| mv::goto_next_paragraph(ed, vid, did, count)),
+        |count| {
+            Box::new(move |ed, vid, did, m| {
+                mv::goto_paragraph_with(ed, vid, did, count, Direction::Forward, m)
+            })
+        },
     );
 
     // File/line position motions
@@ -838,7 +1112,12 @@ fn register_motions(catalog: &mut impl EngineCommandCatalog) {
         "match_brackets",
         "Goto matching bracket",
         CommandScope::Viewport,
-        |_count| Box::new(|ed, vid, did, _m| editing::match_brackets(ed, vid, did)),
+        |_count| {
+            Box::new(|ed, vid, did, m| {
+                let doc = helix_view::doc_mut!(ed, &did);
+                editing::match_brackets_in(&vid, doc, m);
+            })
+        },
     );
 }
 
@@ -851,7 +1130,8 @@ fn register_operators(catalog: &mut impl EngineCommandCatalog) {
         CommandScope::Viewport,
         |ed, vid, did, register| {
             let r = register.unwrap_or_else(|| ed.config().default_yank_register);
-            editing::delete_selection(ed, vid, did, r, true)
+            editing::delete_selection(ed, vid, did, r, true);
+            editing::exit_select_mode(ed, vid, did);
         },
     );
     catalog.operator(
@@ -860,7 +1140,8 @@ fn register_operators(catalog: &mut impl EngineCommandCatalog) {
         CommandScope::Viewport,
         |ed, vid, did, register| {
             let r = register.unwrap_or_else(|| ed.config().default_yank_register);
-            editing::delete_selection(ed, vid, did, r, false)
+            editing::delete_selection(ed, vid, did, r, false);
+            editing::exit_select_mode(ed, vid, did);
         },
     );
     catalog.operator(
@@ -910,6 +1191,7 @@ fn register_operators(catalog: &mut impl EngineCommandCatalog) {
         |ed, vid, did, register| {
             let r = register.unwrap_or_else(|| ed.config().default_yank_register);
             editing::yank(ed, vid, did, r);
+            editing::exit_select_mode(ed, vid, did);
         },
     );
     catalog.operator(
@@ -918,7 +1200,8 @@ fn register_operators(catalog: &mut impl EngineCommandCatalog) {
         CommandScope::Viewport,
         |ed, vid, did, register| {
             let r = register.unwrap_or_else(|| ed.config().default_yank_register);
-            editing::yank_joined(ed, vid, did, r, "\n")
+            editing::yank_joined(ed, vid, did, r, "\n");
+            editing::exit_select_mode(ed, vid, did);
         },
     );
 }
@@ -964,6 +1247,54 @@ fn register_text_objects(catalog: &mut impl EngineCommandCatalog) {
         |count| {
             Box::new(move |ed, vid, did, obj| {
                 editing::textobject_closest_surrounding_pair(ed, vid, did, obj, count)
+            })
+        },
+    );
+
+    // The same objects, always around (the commands above select inside when bound to a key).
+    catalog.text_object(
+        "textobject_word_around",
+        "Select around word",
+        CommandScope::Viewport,
+        |count| {
+            Box::new(move |ed, vid, did, _obj| {
+                editing::textobject_word(ed, vid, did, textobject::TextObject::Around, count, false)
+            })
+        },
+    );
+    catalog.text_object(
+        "textobject_long_word_around",
+        "Select around WORD",
+        CommandScope::Viewport,
+        |count| {
+            Box::new(move |ed, vid, did, _obj| {
+                editing::textobject_word(ed, vid, did, textobject::TextObject::Around, count, true)
+            })
+        },
+    );
+    catalog.text_object(
+        "textobject_paragraph_around",
+        "Select around paragraph",
+        CommandScope::Viewport,
+        |count| {
+            Box::new(move |ed, vid, did, _obj| {
+                editing::textobject_paragraph(ed, vid, did, textobject::TextObject::Around, count)
+            })
+        },
+    );
+    catalog.text_object(
+        "textobject_closest_surrounding_pair_around",
+        "Select around closest surrounding pair (tree-sitter)",
+        CommandScope::Viewport,
+        |count| {
+            Box::new(move |ed, vid, did, _obj| {
+                editing::textobject_closest_surrounding_pair(
+                    ed,
+                    vid,
+                    did,
+                    textobject::TextObject::Around,
+                    count,
+                )
             })
         },
     );
@@ -1585,7 +1916,7 @@ fn register_actions(catalog: &mut impl EngineCommandCatalog) {
         "Move page up",
         CommandScope::Viewport,
         |ed, vid, did, count, _reg| {
-            mv::scroll(ed, vid, did, count, Direction::Backward, true);
+            mv::scroll_page(ed, vid, did, count, false, Direction::Backward, false);
         },
     );
     catalog.action(
@@ -1593,7 +1924,7 @@ fn register_actions(catalog: &mut impl EngineCommandCatalog) {
         "Move page down",
         CommandScope::Viewport,
         |ed, vid, did, count, _reg| {
-            mv::scroll(ed, vid, did, count, Direction::Forward, true);
+            mv::scroll_page(ed, vid, did, count, false, Direction::Forward, false);
         },
     );
     catalog.action(
@@ -1601,7 +1932,7 @@ fn register_actions(catalog: &mut impl EngineCommandCatalog) {
         "Move page and cursor half up",
         CommandScope::Viewport,
         |ed, vid, did, count, _reg| {
-            mv::scroll(ed, vid, did, count, Direction::Backward, true);
+            mv::scroll_page(ed, vid, did, count, true, Direction::Backward, true);
         },
     );
     catalog.action(
@@ -1609,7 +1940,7 @@ fn register_actions(catalog: &mut impl EngineCommandCatalog) {
         "Move page and cursor half down",
         CommandScope::Viewport,
         |ed, vid, did, count, _reg| {
-            mv::scroll(ed, vid, did, count, Direction::Forward, true);
+            mv::scroll_page(ed, vid, did, count, true, Direction::Forward, true);
         },
     );
 

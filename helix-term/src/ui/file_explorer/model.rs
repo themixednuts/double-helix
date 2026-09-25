@@ -26,6 +26,9 @@ pub(super) struct ExplorerRow {
     pub(super) ancestor_last: Vec<bool>,
     pub(super) vcs_status: Option<VcsStatus>,
     pub(super) diagnostic_status: Option<DiagnosticStatus>,
+    /// Muted text drawn after the label and outside the editable name, such
+    /// as a search result's parent directory.
+    pub(super) detail: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

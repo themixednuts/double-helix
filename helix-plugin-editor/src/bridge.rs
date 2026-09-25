@@ -160,6 +160,19 @@ impl PluginQueryHost for EditorQueryBridge<'_> {
         }
         Ok(text.line(line).to_string())
     }
+
+    fn document_lines(
+        &self,
+        handle: DocumentHandle,
+        start: usize,
+        end: usize,
+    ) -> ContractResult<Vec<String>> {
+        let text = self.doc(handle)?.text();
+        let end = end.min(text.len_lines());
+        Ok((start.min(end)..end)
+            .map(|line| text.line(line).to_string())
+            .collect())
+    }
 }
 
 impl PluginFacadeQueryHost for EditorQueryBridge<'_> {
@@ -224,11 +237,25 @@ impl PluginFacadeMutationHost for EditorMutationBridge<'_> {
 /// Mutable bridge from the plugin contract to `&mut Editor`.
 pub struct EditorMutationBridge<'a> {
     pub editor: &'a mut Editor,
+    /// The plugin host the requests come from. Plugin ids are only unique within a host, so
+    /// ownership of editor resources is keyed by both.
+    host: Option<String>,
 }
 
 impl<'a> EditorMutationBridge<'a> {
     pub fn new(editor: &'a mut Editor) -> Self {
-        Self { editor }
+        Self { editor, host: None }
+    }
+
+    /// A bridge for requests from the plugin host `host`.
+    #[must_use]
+    pub fn for_host(mut self, host: impl Into<String>) -> Self {
+        self.host = Some(host.into());
+        self
+    }
+
+    fn owner_key(&self, plugin: PluginId) -> String {
+        float_owner_key(self.host.as_deref(), plugin)
     }
 }
 
@@ -706,7 +733,7 @@ impl PluginFloatHost for EditorMutationBridge<'_> {
         req: CreateFloatRequest,
     ) -> ContractResult<FloatHandle> {
         let placement = contract_to_model_placement(self.editor, &req.placement)?;
-        let plugin_owner = plugin_owner_key(plugin);
+        let plugin_owner = self.owner_key(plugin);
         let content = contract_to_model_content(self.editor, req.content)?;
 
         let float_id = self.editor.model.create_float(
@@ -730,7 +757,7 @@ impl PluginFloatHost for EditorMutationBridge<'_> {
             .map(|placement| contract_to_model_placement(self.editor, placement))
             .transpose()?;
         let float_id = adapt::resolve_float(&self.editor.model, req.float)?;
-        let plugin_owner = plugin_owner_key(plugin);
+        let plugin_owner = self.owner_key(plugin);
         let owner = self
             .editor
             .model
@@ -768,7 +795,7 @@ impl PluginFloatHost for EditorMutationBridge<'_> {
 
     fn close_float(&mut self, plugin: PluginId, req: CloseFloatRequest) -> ContractResult<()> {
         let float_id = adapt::resolve_float(&self.editor.model, req.float)?;
-        let plugin_owner = plugin_owner_key(plugin);
+        let plugin_owner = self.owner_key(plugin);
         let entry = self
             .editor
             .model
@@ -785,7 +812,7 @@ impl PluginFloatHost for EditorMutationBridge<'_> {
     }
 
     fn list_floats(&self, plugin: PluginId) -> Vec<FloatSnapshot> {
-        let plugin_owner = plugin_owner_key(plugin);
+        let plugin_owner = self.owner_key(plugin);
         self.editor
             .model
             .floats
@@ -1141,8 +1168,12 @@ fn contract_to_anchor_bias(prefer: AnchorPreference) -> helix_view::layout::Anch
     }
 }
 
-fn plugin_owner_key(plugin: PluginId) -> String {
-    plugin.raw().get().to_string()
+/// The owner recorded on a float created by `plugin` of plugin host `host`.
+pub fn float_owner_key(host: Option<&str>, plugin: PluginId) -> String {
+    match host {
+        Some(host) => format!("{host}/{}", plugin.raw().get()),
+        None => plugin.raw().get().to_string(),
+    }
 }
 
 fn contract_to_model_content(
@@ -1353,6 +1384,18 @@ mod tests {
         assert_eq!(selection.from(), 0);
         assert_eq!(selection.to(), 3);
         assert_eq!(editor.tree.focus, view_one);
+    }
+
+    #[test]
+    fn document_lines_reads_a_clamped_range() {
+        let mut editor = test_editor();
+        let doc = open_scratch(&mut editor, Action::VerticalSplit, "a\nb\nc");
+        let bridge = EditorQueryBridge::new(&editor);
+        let handle = adapt::document_handle(doc);
+
+        assert_eq!(bridge.document_lines(handle, 1, 3).unwrap(), ["b\n", "c"]);
+        assert_eq!(bridge.document_lines(handle, 2, 99).unwrap(), ["c"]);
+        assert!(bridge.document_lines(handle, 5, 9).unwrap().is_empty());
     }
 
     #[test]

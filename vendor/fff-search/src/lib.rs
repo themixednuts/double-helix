@@ -1,9 +1,12 @@
 //! # FFF Search — High-performance file finder core
 //!
-//! This crate provides the core search engine for [FFF (Fast File Finder)](https://github.com/dmtrKovalenko/fff.nvim).
+//! This crate provides the core search engine for [FFF (Fast File Finder)](https://github.com/dmtrKovalenko/fff).
 //! It includes filesystem indexing with real-time watching, fuzzy matching powered
 //! by [frizbee](https://docs.rs/neo_frizbee), frecency scoring backed by LMDB,
 //! and multi-mode grep search.
+//!
+//! > [!Important performance information]  
+//! > For the most optimized fff build use `zlob` feature. It requires zig v0.16.0 to be installed on the machine.
 //!
 //! ## Architecture
 //!
@@ -17,6 +20,9 @@
 //! - [`grep`] — Live grep search supporting regex, plain-text, and fuzzy modes
 //!   with optional constraint filtering.
 //! - [`git`] — Git status caching and repository detection.
+//! - [`watch`] — Client-facing filesystem watch subscriptions: glob, exact
+//!   path, or directory subtree with normalized batch delivery
+//!   (see [`SharedFilePicker::watch`]).
 //!
 //! ## Shared State
 //!
@@ -91,67 +97,84 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
-mod background_watcher;
-pub(crate) mod parallelism;
-mod scan;
-// public only for benchmarks — the inverted index is still re-exported via
-// `pub use bigram_filter::*` below for external consumers.
-#[doc(hidden)]
-pub mod bigram_filter;
-pub mod bigram_query;
-pub mod constants;
-mod constraints;
-mod error;
-mod score;
-mod sort_buffer;
-pub(crate) mod stable_vec;
-// this is pub only for benchmarks
-pub mod case_insensitive_memmem;
+#[cfg(not(any(feature = "ripgrep", feature = "zlob")))]
+compile_error!(
+    "fff-search requires either the `ripgrep` (default) or `zlob` feature. \
+     Enable one, e.g. `--features ripgrep` or `--features zlob`."
+);
 
-pub(crate) mod simd_path;
+/// Primary entry points with thread-safe [`SharedFilePicker`](shared::FilePicker) instance
+pub mod shared;
+pub use shared::*;
 
-/// Core file picker: filesystem indexing, background watching, and fuzzy search.
-///
+/// Core file picker single thread: filesystem indexing, background watching, and fuzzy search.
 /// See [`FilePicker`](file_picker::FilePicker) for the main entry point.
 pub mod file_picker;
+pub use file_picker::*;
 
-/// Database-backed persistence: frecency, query history, LMDB plumbing.
+/// Frecency and query-history tracking behind caller-provided storage traits.
 pub mod dbs;
-pub use dbs::frecency;
+pub use dbs::*;
 
 /// Git status caching and repository detection utilities.
 pub mod git;
 
-/// Live grep search with regex, plain-text, and fuzzy matching modes.
-///
-/// Supports constraint filtering (file extensions, path segments, globs)
-/// and parallel execution via rayon.
-pub mod grep;
+pub mod git_recency;
+pub use git_recency::GitRecencyConfig;
 
-/// Tracing/logging initialization and panic hook setup.
+/// Live grep search with regex, plain-text, and fuzzy matching modes.
+pub mod grep;
+pub use grep::*;
+
+/// Tracing/logging initialization
 pub mod log;
 
-/// Path manipulation utilities: cross platform canonicalization, tilde expansion, and
-/// directory distance penalties for search scoring.
+/// Various path utils might be handy for you to work with fff paths
 pub mod path_utils;
-
-pub use dbs::query_tracker;
 
 /// Core data types shared across the crate.
 pub mod types;
-
-mod ignore;
-/// Thread-safe shared handles for [`FilePicker`], [`FrecencyTracker`],
-/// and [`QueryTracker`].
-pub mod shared;
-
-pub use bigram_filter::*;
-pub use dbs::db_healthcheck::{DbHealth, DbHealthChecker};
-pub use error::{Error, Result};
-pub use fff_query_parser::*;
-pub use file_picker::*;
-pub use frecency::*;
-pub use grep::*;
-pub use query_tracker::*;
-pub use shared::*;
 pub use types::*;
+
+pub mod constants;
+
+/// Watcher rescan request accounting.
+pub mod rescan_stats;
+pub use rescan_stats::{RESCAN_STATS_ENABLED, RescanReason, RescanStats};
+
+mod rescan_throttle;
+
+// FFF_SCAN_OPTIONS_BLOCKER: Helix scan options (re-exported via `file_picker`).
+mod scan_options;
+
+// ==================================
+// these are public only for benchmarks, no backward compatibility guaranteed
+#[doc(hidden)]
+pub use index::bigram_filter;
+#[doc(hidden)]
+pub mod simd_string_utils;
+// ==================================
+
+mod error;
+mod git_status_worker;
+mod ignore;
+mod scan;
+mod score;
+mod sort_buffer;
+
+pub(crate) mod index;
+pub(crate) mod parallelism;
+pub(crate) mod simd_path;
+pub(crate) mod stable_vec;
+pub(crate) mod walk;
+
+/// Filesystem watch subscriptions with glob filtering and batched delivery,
+/// plus the background OS watcher.
+#[path = "watcher/mod.rs"]
+pub mod watch;
+pub use watch::{WatchEvent, WatchEventKind, WatchId, WatchOptions};
+
+// fff error
+pub use error::{Error, Result};
+
+pub use fff_query_parser::*;

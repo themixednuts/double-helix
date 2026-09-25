@@ -1621,9 +1621,12 @@ fn install_npm(package: &str, version: &str, dest: &Path, store: &Store) -> Resu
 
 fn install_pip(package: &str, version: &str, dest: &Path) -> Result<()> {
     let python = python_tool()?;
+    // Bootstrap pip as its own step: `venv` reports a failed ensurepip only
+    // as "returned non-zero exit status 1" and swallows the reason.
     let venv_args = vec![
         "-m".to_owned(),
         "venv".to_owned(),
+        "--without-pip".to_owned(),
         dest.display().to_string(),
     ];
     let mut venv = Command::new(&python);
@@ -1631,6 +1634,16 @@ fn install_pip(package: &str, version: &str, dest: &Path) -> Result<()> {
     run_command(python.as_os_str(), &venv_args, &mut venv)?;
 
     let venv_python = python_venv_python(dest);
+    let ensurepip_args = vec![
+        "-m".to_owned(),
+        "ensurepip".to_owned(),
+        "--upgrade".to_owned(),
+        "--default-pip".to_owned(),
+    ];
+    let mut ensurepip = Command::new(&venv_python);
+    ensurepip.args(&ensurepip_args);
+    run_command(venv_python.as_os_str(), &ensurepip_args, &mut ensurepip)?;
+
     let install_spec = format!("{package}=={version}");
     let pip_args = vec![
         "-m".to_owned(),
@@ -2196,23 +2209,12 @@ fn detect_native_manager_with_paths(
     })
 }
 
+/// `which`, not a hand-rolled probe: Node, Python and friends ship an
+/// extensionless shell script next to the `.cmd` launcher on Windows, and
+/// running that script fails with "not a valid Win32 application".
 fn which_in_paths(name: &str, paths: Option<OsString>) -> Option<PathBuf> {
-    let paths = paths?;
-    std::env::split_paths(&paths).find_map(|dir| {
-        let path = dir.join(name);
-        if path.exists() {
-            return Some(path);
-        }
-        if cfg!(windows) {
-            for ext in ["exe", "cmd", "bat"] {
-                let path = dir.join(format!("{name}.{ext}"));
-                if path.exists() {
-                    return Some(path);
-                }
-            }
-        }
-        None
-    })
+    let cwd = std::env::current_dir().ok()?;
+    which::which_in(name, paths, cwd).ok()
 }
 
 fn system_binary(name: &str) -> Result<PathBuf> {
@@ -3337,8 +3339,8 @@ bin = "demo.exe"
         let dir = TempDir::new().unwrap();
         let bin = dir.path().join("bin");
         fs::create_dir_all(&bin).unwrap();
-        fs::write(bin.join(executable_name("dnf")), b"").unwrap();
-        fs::write(bin.join(executable_name("apt")), b"").unwrap();
+        write_fake_executable(&bin, "dnf");
+        write_fake_executable(&bin, "apt");
         let paths = std::env::join_paths([bin]).unwrap();
         let source = NativeSource {
             apt: Some("demo".to_owned()),
@@ -3652,11 +3654,19 @@ bin = "demo.exe"
         zip.finish().unwrap();
     }
 
-    fn executable_name(name: &str) -> String {
-        if cfg!(windows) {
-            format!("{name}.exe")
+    /// An empty file that `which` resolves as the command `name`: `name.exe` on Windows, and
+    /// executable elsewhere, since `which` skips files without the execute bit.
+    fn write_fake_executable(dir: &Path, name: &str) {
+        let path = if cfg!(windows) {
+            dir.join(format!("{name}.exe"))
         } else {
-            name.to_owned()
+            dir.join(name)
+        };
+        fs::write(&path, b"").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
         }
     }
 

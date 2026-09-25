@@ -90,7 +90,7 @@ pub struct DocumentOpenRequest {
     pub alignment: DocumentOpenAlignment,
     pub default_folding_if_new: bool,
     pub fff_record: Option<FffOpenRecord>,
-    pub external_if_binary: Option<url::Url>,
+    pub external_if_binary: Option<helix_stdx::Url>,
     pub post_action: DocumentOpenPostAction,
     pub completion: DocumentOpenCompletionTarget,
 }

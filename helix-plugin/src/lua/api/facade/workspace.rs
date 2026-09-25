@@ -33,7 +33,7 @@ pub fn register(lua: &Lua, helix_table: &LuaTable) -> Result<()> {
         "set_mode",
         lua.create_function(|lua, mode_str: String| {
             let mode = parse_edit_mode(&mode_str)?;
-            with_mutation_bridge(lua, |bridge| {
+            with_mutation_bridge(lua, Capability::Mutation, |bridge| {
                 bridge
                     .set_mode(requests::SetModeRequest { mode })
                     .map_err(contract_error)

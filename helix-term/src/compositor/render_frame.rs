@@ -127,6 +127,10 @@ impl<'a> EditorRenderView<'a> {
         self.document(self.focused_document_id())
     }
 
+    pub fn workspace_restricted(&self) -> bool {
+        self.editor.workspace_restricted()
+    }
+
     pub fn component_document_count(&self) -> usize {
         self.editor.component_docs.len()
     }
@@ -447,6 +451,10 @@ impl<'a> RenderContext<'a> {
 
     pub fn focused_document(&self) -> Option<&'a helix_view::Document> {
         self.editor.focused_document()
+    }
+
+    pub fn workspace_restricted(&self) -> bool {
+        self.editor.workspace_restricted()
     }
 
     pub fn component_document_count(&self) -> usize {

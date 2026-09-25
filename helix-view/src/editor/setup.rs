@@ -17,6 +17,25 @@ use super::{
     Config, CursorCache, Editor, NotificationManager, WorkspaceDiagnosticCounts,
 };
 
+/// The workspace-trust check a diff provider registry asks before letting a repository use its
+/// own `.git/config`.
+pub(crate) fn repo_trust(
+    trust: &helix_loader::workspace_trust::WorkspaceTrust,
+) -> helix_vcs::RepoTrust {
+    let trust = trust.clone();
+    std::sync::Arc::new(move |path: &std::path::Path| {
+        let dir = if path.is_dir() {
+            path
+        } else {
+            path.parent().unwrap_or(path)
+        };
+        let workspace = helix_loader::find_workspace_in(dir).0;
+        trust
+            .query(&workspace, helix_loader::workspace_trust::TrustQuery::Git)
+            .is_trusted()
+    })
+}
+
 pub struct EditorBuilder {
     area: Rect,
     theme_loader: Arc<theme::Loader>,
@@ -101,9 +120,30 @@ impl Editor {
     ) -> Self {
         let language_servers = helix_lsp::Registry::new(&runtime);
         let conf = config.load();
+        let workspace_trust =
+            helix_loader::workspace_trust::WorkspaceTrust::new((&conf.workspace_trust).into());
         let auto_pairs = (&conf.auto_pairs).into();
         let (assistant_updates_tx, assistant_updates_rx) = helix_runtime::channel(128);
         let lifecycle = std::sync::Arc::new(super::hooks::LifecycleBus::default());
+        let open_buffers = crate::open_buffers::OpenBuffers::default();
+        lifecycle.on_document_change({
+            let open_buffers = open_buffers.clone();
+            move |event| {
+                if let Some(path) = event.doc.path() {
+                    open_buffers.changed(path, event.doc.text());
+                }
+                Ok(())
+            }
+        });
+        lifecycle.on_document_close({
+            let open_buffers = open_buffers.clone();
+            move |event| {
+                if let Some(path) = event.doc.path() {
+                    open_buffers.forget(path);
+                }
+                Ok(())
+            }
+        });
         let collaboration = crate::collab::Replication::default();
 
         area.height = area.height.saturating_sub(1);
@@ -131,7 +171,10 @@ impl Editor {
             diagnostic_summaries: Default::default(),
             diagnostic_path_summaries: Default::default(),
             workspace_diagnostic_counts: WorkspaceDiagnosticCounts::default(),
-            diff_providers: DiffProviderRegistry::new(conf.vcs.provider.into()),
+            diff_providers: DiffProviderRegistry::new(conf.vcs.provider.into())
+                .with_repo_trust(repo_trust(&workspace_trust)),
+            workspace_trust,
+            open_buffers,
             debug_adapters: dap::registry::Registry::new(),
             breakpoints: HashMap::new(),
             runtime,
@@ -150,6 +193,7 @@ impl Editor {
             last_motion: None,
             last_completion: None,
             last_cwd: None,
+            dir_stack: std::collections::VecDeque::with_capacity(super::DIR_STACK_CAP),
             config,
             auto_pairs,
             exit_code: 0,
@@ -188,6 +232,7 @@ impl Editor {
             assistant_persistence: AssistantPersistenceState {
                 saves: std::collections::BTreeMap::new(),
                 layout_save: helix_runtime::Debounce::new(std::time::Duration::from_millis(300)),
+                layout_key: None,
             },
             assistant_runtime: AssistantRuntimeState {
                 backends: std::collections::BTreeMap::new(),
@@ -211,6 +256,20 @@ impl Editor {
             Ok(())
         });
         editor
+    }
+}
+
+impl Editor {
+    /// A diff provider registry for `provider` that asks this editor's workspace trust before
+    /// letting a repository use its own config.
+    pub fn diff_provider_registry(&self, provider: helix_vcs::VcsProvider) -> DiffProviderRegistry {
+        DiffProviderRegistry::new(provider).with_repo_trust(repo_trust(&self.workspace_trust))
+    }
+
+    /// Replace the workspace trust state (tests, embedders); diff providers follow it.
+    pub fn set_workspace_trust(&mut self, trust: helix_loader::workspace_trust::WorkspaceTrust) {
+        self.workspace_trust = trust;
+        self.diff_providers = self.diff_provider_registry(self.diff_providers.provider());
     }
 }
 

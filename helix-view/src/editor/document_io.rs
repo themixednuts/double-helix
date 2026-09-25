@@ -1184,16 +1184,27 @@ impl Editor {
 
         let scrolloff = self.config().scrolloff;
         let Self {
-            tree, documents, ..
+            tree,
+            documents,
+            component_views,
+            ..
         } = self;
         let doc = documents
             .get_mut(&document)
             .expect("reload document disappeared during apply");
+        // The reload diff was committed through the primary view only. Sync every
+        // other view onto this document too, otherwise their jumplists keep
+        // pre-reload positions and a later commit maps them out of bounds.
         for view_id in view_ids {
             if tree.contains(view_id) {
                 let view = tree.get_mut(view_id);
                 if view.doc == document {
+                    view.sync_changes(doc);
                     view.ensure_cursor_in_view(doc, scrolloff);
+                }
+            } else if let Some(view) = component_views.get_mut(&view_id) {
+                if view.doc == document {
+                    view.sync_changes(doc);
                 }
             }
         }
@@ -1244,6 +1255,59 @@ mod tests {
         assert_eq!(doc.text().to_string(), "from disk\r\n");
         assert_eq!(doc.line_ending(), LineEnding::Crlf);
         assert!(!doc.is_modified());
+    }
+
+    #[test]
+    fn prepared_reload_syncs_every_view_of_the_document() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("document.txt");
+        std::fs::write(&path, "short\n").unwrap();
+        let mut editor = collab_test_editor();
+        let document = editor.focused_document_id();
+        let first = editor.focused_view_id();
+        editor.document_mut(document).unwrap().set_path(Some(&path));
+        editor.switch(document, Action::HorizontalSplit);
+        let second = editor.focused_view_id();
+        assert_ne!(first, second);
+
+        // Grow the buffer past its on-disk size and jump to its end in both views.
+        let doc = editor.documents.get_mut(&document).unwrap();
+        let transaction = Transaction::insert(
+            doc.text(),
+            doc.selection(first),
+            "a buffer much longer than the file on disk\n".into(),
+        );
+        doc.apply(&transaction, first);
+        doc.append_changes_to_history(editor.tree.get_mut(first));
+        let end = doc.text().len_chars();
+        for view_id in [first, second] {
+            editor
+                .tree
+                .get_mut(view_id)
+                .history
+                .push_jump(doc, (document, helix_core::Selection::point(end)));
+        }
+
+        let prepared = editor
+            .prepare_document_reload(document)
+            .unwrap()
+            .execute()
+            .unwrap();
+        assert_eq!(
+            editor.apply_prepared_document_reload(prepared),
+            DocumentReloadApply::Applied
+        );
+
+        let doc = editor.documents.get_mut(&document).unwrap();
+        let len = doc.text().len_chars();
+        for view_id in [first, second] {
+            let history = &mut editor.tree.get_mut(view_id).history;
+            assert!(history.changes_to_sync(doc).is_none());
+            assert!(history
+                .jumps
+                .iter()
+                .all(|(_, selection)| selection.primary().to() <= len));
+        }
     }
 
     #[test]

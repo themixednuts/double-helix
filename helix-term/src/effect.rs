@@ -4,6 +4,7 @@
 //! application and compositor drain typed ingress and apply those effects here.
 
 pub(crate) mod assistant;
+pub(crate) mod code_actions_on_save;
 pub(crate) mod dap;
 pub(crate) mod file_operation;
 pub(crate) mod language_server;
@@ -179,6 +180,7 @@ pub(crate) fn apply_runtime_task_event(
             document,
             version,
             syntax,
+            loader,
             input_barrier,
         } => {
             let _input_barrier = input_barrier;
@@ -186,7 +188,7 @@ pub(crate) fn apply_runtime_task_event(
                 if doc.version() != version || !doc.syntax_snapshot().is_stale() {
                     return false;
                 }
-                doc.set_syntax(Some(syntax));
+                doc.set_parsed_syntax(syntax, loader);
                 true
             });
             if !applied {
@@ -334,6 +336,20 @@ pub(crate) fn apply_runtime_task_event(
                         LspFeatureRefreshKind::DocumentLinks => {
                             language_server::request_document_links(editor, doc_id, ingress.clone())
                         }
+                        LspFeatureRefreshKind::CodeActionHint => {
+                            language_server::request_code_action_hint(
+                                editor,
+                                doc_id,
+                                ingress.clone(),
+                            )
+                        }
+                        LspFeatureRefreshKind::SymbolHighlights => {
+                            language_server::request_symbol_highlights(
+                                editor,
+                                doc_id,
+                                ingress.clone(),
+                            )
+                        }
                         LspFeatureRefreshKind::FoldingRanges => {
                             language_server::request_folding_ranges(editor, doc_id, ingress.clone())
                         }
@@ -399,8 +415,13 @@ pub(crate) fn apply_runtime_task_event(
             );
         }
         RuntimeTaskEvent::BlameFetchDebounced { doc_id, path, line } => {
-            apply_blame_fetch_debounced(editor, doc_id, path, line);
+            spawn_blame_fetch(editor, ingress, doc_id, path, line);
         }
+        RuntimeTaskEvent::ApplyFileBlame {
+            doc_id,
+            line,
+            result,
+        } => apply_file_blame(editor, doc_id, line, result),
         RuntimeTaskEvent::SelectDocumentHighlights {
             offset_encoding,
             highlights,
@@ -449,6 +470,74 @@ pub(crate) fn apply_runtime_task_event(
         RuntimeTaskEvent::RequestInlineValues { doc_id } => {
             language_server::request_inline_values(editor, doc_id, ingress.clone())
         }
+        RuntimeTaskEvent::CodeActionsOnSaveResponse {
+            doc_id,
+            version,
+            server_id,
+            offset_encoding,
+            kind,
+            actions,
+            remaining,
+            finish,
+        } => code_actions_on_save::on_response(
+            editor,
+            doc_id,
+            version,
+            server_id,
+            offset_encoding,
+            kind,
+            actions,
+            remaining,
+            finish,
+        ),
+        RuntimeTaskEvent::CodeActionsOnSaveResolved {
+            doc_id,
+            version,
+            offset_encoding,
+            edits,
+            remaining,
+            finish,
+        } => code_actions_on_save::on_resolved(
+            editor,
+            doc_id,
+            version,
+            offset_encoding,
+            edits,
+            remaining,
+            finish,
+        ),
+        RuntimeTaskEvent::CodeActionsOnSaveDone { doc_id, finish } => {
+            code_actions_on_save::on_done(editor, doc_id, finish)
+        }
+        RuntimeTaskEvent::ApplyCodeActionHint {
+            doc_id,
+            view_id,
+            expected_version,
+            request,
+            available,
+        } => {
+            if let Some(doc) = editor.document_mut(doc_id) {
+                if doc.version() == expected_version && doc.is_current_code_action_hint(&request) {
+                    doc.set_code_action_hint(view_id, available);
+                }
+            }
+        }
+        RuntimeTaskEvent::ApplySymbolHighlights {
+            doc_id,
+            view_id,
+            expected_version,
+            request,
+            offset_encoding,
+            highlights,
+        } => language_server::apply_symbol_highlights(
+            editor,
+            doc_id,
+            view_id,
+            expected_version,
+            &request,
+            offset_encoding,
+            highlights,
+        ),
         RuntimeTaskEvent::ApplyDocumentLinks {
             doc_id,
             expected_version,
@@ -567,10 +656,11 @@ pub(crate) fn apply_runtime_task_event(
             if !changed_grammars.is_empty() {
                 let generation = change.generation;
                 let loader_ingress = ingress.clone();
+                let trust = editor.workspace_trust.clone();
                 let loader = editor
                     .runtime()
                     .block()
-                    .spawn(helix_core::config::user_lang_loader);
+                    .spawn(move || helix_core::config::user_lang_loader(&trust));
                 editor
                     .work()
                     .spawn(async move {
@@ -912,17 +1002,47 @@ pub(crate) fn apply_exit_task_result(
     }
 }
 
-pub(crate) fn apply_blame_fetch_debounced(
-    editor: &mut Editor,
+/// Compute the file's blame on a blocking thread (it walks the file's whole history), then apply
+/// it on the main loop.
+fn spawn_blame_fetch(
+    editor: &Editor,
+    ingress: crate::runtime::RuntimeIngress,
     doc_id: DocumentId,
     path: PathBuf,
     line: Option<u32>,
 ) {
+    let trust_full = editor.diff_providers.trusts(&path);
+    let blame = editor
+        .runtime()
+        .block()
+        .spawn(move || FileBlame::try_new(path, trust_full).map(Box::new));
+    editor
+        .work()
+        .spawn(async move {
+            let result = blame
+                .await
+                .unwrap_or_else(|error| Err(anyhow::anyhow!("blame task failed: {error}")));
+            let _ = ingress
+                .send_task(RuntimeTaskEvent::ApplyFileBlame {
+                    doc_id,
+                    line,
+                    result,
+                })
+                .await;
+        })
+        .detach();
+}
+
+pub(crate) fn apply_file_blame(
+    editor: &mut Editor,
+    doc_id: DocumentId,
+    line: Option<u32>,
+    result: anyhow::Result<Box<FileBlame>>,
+) {
     let Some(doc) = editor.document_mut(doc_id) else {
         return;
     };
-    let result = FileBlame::try_new(path);
-    doc.set_file_blame(result);
+    doc.set_file_blame(result.map(|blame| *blame));
     if !editor.config().inline_blame.auto_fetch {
         if let Some(line) = line {
             commands::blame_line_impl(editor, doc_id, line);
@@ -946,6 +1066,7 @@ fn request_auto_save(editor: &mut Editor) {
         policy: helix_view::editor::SavePolicy::Safe,
         write_scratch: false,
         auto_format: false,
+        code_actions: false,
     };
 
     if let Err(err) = commands::typed::write_all_editor_impl(editor, None, None, options) {

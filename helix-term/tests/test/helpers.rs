@@ -234,12 +234,18 @@ pub async fn test_key_sequence_with_input_text<T: Into<TestCase>>(
 
     let mut app = match app {
         Some(app) => app,
-        None => Application::new(
-            Args::default(),
-            test_config(),
-            test_syntax_loader(None),
-            test_runtime(),
-        )?,
+        None => {
+            let mut app = Application::new(
+                Args::default(),
+                test_config(),
+                test_syntax_loader(None),
+                test_runtime(),
+            )?;
+            app.editor.set_workspace_trust(
+                helix_loader::workspace_trust::WorkspaceTrust::fully_trusted(),
+            );
+            app
+        }
     };
 
     run_event_loop_until_idle(&mut app).await;
@@ -339,6 +345,11 @@ pub fn test_editor_config() -> helix_view::editor::Config {
             enable: false,
             ..Default::default()
         },
+        // Trust everything so no trust prompt takes the test's keys.
+        workspace_trust: helix_view::editor::WorkspaceTrustConfig {
+            level: helix_view::editor::ImplicitTrustLevelConfig::Insecure,
+            ..Default::default()
+        },
         ..Default::default()
     }
 }
@@ -410,6 +421,13 @@ impl AppBuilder {
         self
     }
 
+    /// Use `config` as is, keymap included (`with_config` merges keys into the default
+    /// keymap).
+    pub fn with_exact_config(mut self, config: Config) -> Self {
+        self.config = config;
+        self
+    }
+
     pub fn with_input_text<S: Into<String>>(mut self, input_text: S) -> Self {
         self.input = Some(test::print(&input_text.into()));
         self
@@ -432,6 +450,8 @@ impl AppBuilder {
         }
 
         let mut app = Application::new(self.args, self.config, self.syn_loader, test_runtime())?;
+        app.editor
+            .set_workspace_trust(helix_loader::workspace_trust::WorkspaceTrust::fully_trusted());
 
         if let Some((text, selection)) = self.input {
             let (view_id, doc) = helix_view::focused!(app.editor);

@@ -76,6 +76,18 @@ pub trait PluginQueryHost {
 
     /// Get a single line (0-based) from a document.
     fn document_line(&self, handle: DocumentHandle, line: usize) -> ContractResult<String>;
+
+    /// Get lines `start..end` (0-based, clamped to the document) in one call.
+    fn document_lines(
+        &self,
+        handle: DocumentHandle,
+        start: usize,
+        end: usize,
+    ) -> ContractResult<Vec<String>> {
+        (start..end)
+            .map(|line| self.document_line(handle, line))
+            .collect()
+    }
 }
 
 // ---------------------------------------------------------------------------

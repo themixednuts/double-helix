@@ -20,7 +20,8 @@ use helix_view::{DocumentId, Editor, ViewId};
 
 use crate::registry::{CharPendingResolution, CommandRef, CommandRegistry};
 use crate::{
-    finalize_insert_recording, is_char_key, key_to_digit, record_insert_key, InsertRecording,
+    document_version, finalize_insert_recording, is_char_key, is_repeatable_edit, key_to_digit,
+    record_insert_key, InsertRecording,
 };
 
 /// The Helix editing engine.
@@ -32,9 +33,15 @@ pub struct HelixEngine {
     count: Option<NonZeroUsize>,
     register: Option<char>,
     last_action: Option<RecordedAction>,
-    pending_display_buf: String,
     /// Active insert recording, present while in insert mode.
     insert_recording: Option<InsertRecording>,
+    /// The last command executed, the entry command if it entered insert mode.
+    last_command: Option<CommandToken>,
+    /// Set while replaying a recorded entry command, so the replay does not record itself.
+    replaying: bool,
+    /// A char-pending command (`find_next_char`) bound straight to a key waits for the next
+    /// key: the command, count and register it runs with.
+    awaiting_char: Option<(CharPendingId, usize, Option<char>)>,
 }
 
 impl HelixEngine {
@@ -44,8 +51,10 @@ impl HelixEngine {
             count: None,
             register: None,
             last_action: None,
-            pending_display_buf: String::new(),
             insert_recording: None,
+            last_command: None,
+            replaying: false,
+            awaiting_char: None,
         }
     }
 
@@ -61,8 +70,10 @@ impl HelixEngine {
     ) -> Option<EngineResult> {
         let mode = editor.mode();
 
-        // Count accumulation: digit with existing count → append
-        if let Some(digit) = key_to_digit(key) {
+        // Count accumulation: digit with existing count → append. A digit the pending
+        // sequence takes (`f1`, `t2`) is not a count; one it doesn't is (`g10g`).
+        let sequence_takes_key = !keymaps.pending().is_empty() && keymaps.contains_key(mode, key);
+        if let Some(digit) = key_to_digit(key).filter(|_| !sequence_takes_key) {
             if let Some(count) = self.count {
                 let new = count.get() * 10 + digit;
                 if new <= 100_000_000 {
@@ -208,6 +219,9 @@ impl HelixEngine {
             return EngineResult::Unbound;
         };
         let count_val = count.map_or(1, NonZeroUsize::get);
+        self.last_command = Some(command);
+        let version_before = document_version(editor, doc_id);
+        let record = !self.replaying;
 
         let result = match kind {
             CommandRef::Motion(m) => {
@@ -218,33 +232,54 @@ impl HelixEngine {
             }
             CommandRef::Operator(op) => {
                 (op.execute)(editor, view_id, doc_id, register);
-                self.last_action = Some(RecordedAction::CountedAction {
-                    command: RepeatableCommandId::Operator(op.id),
-                    count: NonZeroUsize::new(count_val).unwrap_or(NonZeroUsize::MIN),
-                    register,
-                });
+                if record
+                    && is_repeatable_edit(
+                        op.id.as_str(),
+                        version_before,
+                        document_version(editor, doc_id),
+                    )
+                {
+                    self.last_action = Some(RecordedAction::CountedAction {
+                        command: RepeatableCommandId::Operator(op.id),
+                        count: NonZeroUsize::new(count_val).unwrap_or(NonZeroUsize::MIN),
+                        register,
+                    });
+                }
                 EngineResult::Executed
             }
             CommandRef::TextObject(to) => {
+                // `textobject_word` selects inside the word, as documented; the `_around`
+                // commands select around.
                 let obj_fn = (to.make)(count_val);
                 obj_fn(
                     editor,
                     view_id,
                     doc_id,
-                    helix_core::textobject::TextObject::Around,
+                    helix_core::textobject::TextObject::Inside,
                 );
                 EngineResult::Executed
             }
             CommandRef::Action(a) => {
                 (a.execute)(editor, view_id, doc_id, count_val, register);
-                self.last_action = Some(RecordedAction::CountedAction {
-                    command: RepeatableCommandId::Action(a.id),
-                    count: NonZeroUsize::new(count_val).unwrap_or(NonZeroUsize::MIN),
-                    register,
-                });
+                if record
+                    && is_repeatable_edit(
+                        a.id.as_str(),
+                        version_before,
+                        document_version(editor, doc_id),
+                    )
+                {
+                    self.last_action = Some(RecordedAction::CountedAction {
+                        command: RepeatableCommandId::Action(a.id),
+                        count: NonZeroUsize::new(count_val).unwrap_or(NonZeroUsize::MIN),
+                        register,
+                    });
+                }
                 EngineResult::Executed
             }
-            CommandRef::CharPending(_) => EngineResult::Unbound,
+            CommandRef::CharPending(cp) => {
+                self.awaiting_char = Some((cp.id, count_val, register));
+                EngineResult::Pending
+            }
         };
         log_run_phase("engine_execute", "helix", execute_start.elapsed(), || {
             format!(
@@ -288,8 +323,11 @@ impl HelixEngine {
 
         match (cp.resolve)(key, count) {
             CharPendingResolution::Motion(motion) => {
+                // Recorded, so `A-.` repeats `f`/`t` motions.
                 let movement = movement_from_mode(editor);
-                motion(editor, view_id, doc_id, movement);
+                editor.apply_motion_in(view_id, doc_id, move |editor, view_id, doc_id| {
+                    motion(editor, view_id, doc_id, movement)
+                });
             }
             CharPendingResolution::Action(action) => {
                 action(editor, view_id, doc_id, register);
@@ -309,6 +347,14 @@ impl EditingEngine for HelixEngine {
         key: KeyEvent,
     ) -> Option<EngineResult> {
         let start = std::time::Instant::now();
+        if let Some((command, count, register)) = self.awaiting_char.take() {
+            if key.code == helix_view::keyboard::KeyCode::Esc {
+                return Some(EngineResult::Executed);
+            }
+            return Some(
+                self.execute_char_pending(editor, view_id, doc_id, command, key, count, register),
+            );
+        }
         let result = match editor.mode() {
             Mode::Insert => None, // insert mode has no pre-resolve logic
             Mode::Normal | Mode::Select => {
@@ -338,6 +384,7 @@ impl EditingEngine for HelixEngine {
         lookup: KeymapLookup,
     ) -> EngineResult {
         let start = std::time::Instant::now();
+        self.last_command = None;
         let result = match editor.mode() {
             Mode::Insert => {
                 self.process_lookup_insert(editor, view_id, doc_id, keymaps, key, lookup)
@@ -364,32 +411,23 @@ impl EditingEngine for HelixEngine {
         ""
     }
 
-    fn editor_mode(&self) -> Mode {
-        // Helix engine doesn't track mode internally — it reads editor.mode().
-        // This is only used as a fallback; callers should prefer editor.mode().
-        Mode::Normal
-    }
-
     fn pending_display(&self) -> &str {
-        &self.pending_display_buf
+        // The frontend shows the keymap's pending keys; the engine has none of its own.
+        ""
     }
 
     fn is_pending(&self) -> bool {
-        false
+        self.awaiting_char.is_some()
     }
 
     fn reset(&mut self) {
         self.count = None;
         self.register = None;
-        self.pending_display_buf.clear();
+        self.awaiting_char = None;
     }
 
     fn name(&self) -> &str {
         "helix"
-    }
-
-    fn last_action(&self) -> Option<&RecordedAction> {
-        self.last_action.as_ref()
     }
 
     fn begin_insert_recording(&mut self, entry_command: Cow<'static, str>) {
@@ -403,6 +441,32 @@ impl EditingEngine for HelixEngine {
         if let Some(action) = finalize_insert_recording(self.insert_recording.take()) {
             self.last_action = Some(action);
         }
+    }
+
+    fn record_frontend_insert_key(&mut self, key: KeyEvent) {
+        if let Some(recording) = &mut self.insert_recording {
+            recording.keys.push(key);
+        }
+    }
+
+    fn last_command_name(&self) -> Option<&'static str> {
+        self.last_command.map(CommandToken::as_str)
+    }
+
+    fn replay_entry(
+        &mut self,
+        editor: &mut Editor,
+        view_id: ViewId,
+        doc_id: DocumentId,
+        name: &str,
+    ) -> bool {
+        let Some(command) = self.registry.tokens().find(|token| token.as_str() == name) else {
+            return false;
+        };
+        self.replaying = true;
+        let result = self.execute(editor, view_id, doc_id, command, None, None);
+        self.replaying = false;
+        !matches!(result, EngineResult::Unbound)
     }
 
     fn input_state(&self) -> ModalInputState {
@@ -466,6 +530,7 @@ impl EditingEngine for HelixEngine {
                 motion_count,
                 operator_count,
                 register,
+                ..
             } => {
                 let total = if count.get() > 1 {
                     count.get()
@@ -482,17 +547,14 @@ impl EditingEngine for HelixEngine {
                             motion_fn(editor, view_id, doc_id, Movement::Extend);
                         }
                     }
-                    OperatorTargetId::TextObject(text_object) => {
+                    OperatorTargetId::TextObject(text_object, kind) => {
                         if let Some(to) = self.registry.text_object(text_object) {
                             let obj_fn = (to.make)(total);
-                            obj_fn(
-                                editor,
-                                view_id,
-                                doc_id,
-                                helix_core::textobject::TextObject::Around,
-                            );
+                            obj_fn(editor, view_id, doc_id, kind);
                         }
                     }
+                    // Only the Vim engine records these.
+                    OperatorTargetId::Object(..) => {}
                     OperatorTargetId::CharPending(command, key) => {
                         if let Some(cp) = self.registry.char_pending(command) {
                             if let CharPendingResolution::Motion(motion) = (cp.resolve)(key, total)

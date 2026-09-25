@@ -13,8 +13,11 @@
 edition = "2021"
 rust-version = "1.76.0"
 name = "tree-house-bindings"
-version = "0.2.3"
-authors = ["Pascal Kuthe <pascalkuthe@pm.me>"]
+version = "0.3.2"
+authors = [
+    "Pascal Kuthe <pascalkuthe@pm.me>",
+    "Michael Davis <mcarsondavis@gmail.com>",
+]
 build = "build.rs"
 autolib = false
 autobins = false

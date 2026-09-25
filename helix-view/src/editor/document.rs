@@ -21,6 +21,15 @@ impl Editor {
     /// LSP `will*`, and notifications are owned by the terminal operation
     /// pipeline; this method only maintains editor document identity.
     pub fn set_doc_path(&mut self, doc_id: DocumentId, path: &Path) {
+        // Moving away from a path (save as): its unsaved text no longer belongs to it.
+        if let Some(old_path) = self
+            .document(doc_id)
+            .and_then(|doc| doc.path())
+            .filter(|old_path| old_path.as_path() != path)
+            .cloned()
+        {
+            self.open_buffers.forget(&old_path);
+        }
         let doc = doc_mut!(self, &doc_id);
         let old_path = doc.path();
 

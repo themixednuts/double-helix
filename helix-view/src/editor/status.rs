@@ -201,6 +201,22 @@ impl Editor {
         self.workspace_diagnostic_counts
     }
 
+    /// Whether the focused document's workspace runs restricted in a way trusting it would
+    /// change (local config not loaded, servers not started): the statusline `[⚠]`.
+    pub fn workspace_restricted(&self) -> bool {
+        let Some(doc) = self
+            .tree
+            .try_get(self.tree.focus)
+            .and_then(|view| self.document(view.doc))
+        else {
+            return false;
+        };
+        doc.workspace_root().is_some_and(|workspace| {
+            self.workspace_trust
+                .restricted_for_doc(workspace, doc.servers_to_load())
+        })
+    }
+
     pub fn diagnostics_revision(&self) -> u64 {
         self.diagnostics_revision
     }

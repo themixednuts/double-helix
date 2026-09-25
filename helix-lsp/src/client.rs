@@ -36,11 +36,15 @@ use tokio::{
     sync::{Mutex as AsyncMutex, OnceCell},
 };
 
+/// How long [`Client::force_shutdown`] waits for the `shutdown` reply before sending `exit`.
+const FORCE_SHUTDOWN_REPLY_WAIT: std::time::Duration = std::time::Duration::from_millis(1000);
+
 fn workspace_for_uri(uri: lsp::Url) -> WorkspaceFolder {
     lsp::WorkspaceFolder {
         name: uri
-            .path_segments()
-            .and_then(|mut segments| segments.next_back())
+            .path()
+            .rsplit('/')
+            .find(|segment| !segment.is_empty())
             .map(|basename| basename.to_string())
             .unwrap_or_default(),
         uri,
@@ -713,6 +717,13 @@ impl Client {
             LanguageServerFeature::OnTypeFormatting => {
                 capabilities.document_on_type_formatting_provider.is_some()
             }
+            LanguageServerFeature::CallHierarchy => matches!(
+                capabilities.call_hierarchy_provider,
+                Some(
+                    lsp::CallHierarchyServerCapability::Simple(true)
+                        | lsp::CallHierarchyServerCapability::Options(_)
+                )
+            ),
         }
     }
 
@@ -1056,6 +1067,9 @@ impl Client {
                     apply_edit: Some(true),
                     symbol: Some(lsp::WorkspaceSymbolClientCapabilities {
                         dynamic_registration: Some(false),
+                        symbol_kind: Some(lsp::SymbolKindCapability {
+                            value_set: Some(lsp::SymbolKind::all()),
+                        }),
                         ..Default::default()
                     }),
                     execute_command: Some(lsp::DynamicRegistrationClientCapabilities {
@@ -1229,6 +1243,14 @@ impl Client {
                     call_hierarchy: Some(lsp::CallHierarchyClientCapabilities {
                         dynamic_registration: Some(false),
                     }),
+                    document_symbol: Some(lsp::DocumentSymbolClientCapabilities {
+                        dynamic_registration: Some(false),
+                        symbol_kind: Some(lsp::SymbolKindCapability {
+                            value_set: Some(lsp::SymbolKind::all()),
+                        }),
+                        hierarchical_document_symbol_support: Some(false),
+                        ..Default::default()
+                    }),
                     type_hierarchy: Some(lsp::TypeHierarchyClientCapabilities {
                         dynamic_registration: Some(false),
                     }),
@@ -1339,10 +1361,18 @@ impl Client {
         Ok(())
     }
 
-    /// Forcefully shuts down the language server ignoring any errors.
+    /// Shuts down the language server ignoring any errors. The `shutdown` reply is awaited
+    /// only briefly: a slow server (gopls flushing its log first) must not hold up a restart or
+    /// quitting. `exit` follows either way, and callers kill the process if it lingers.
     pub async fn force_shutdown(&self) -> Result<()> {
-        if let Err(e) = self.shutdown().await {
-            log::warn!("language server failed to terminate gracefully - {}", e);
+        match tokio::time::timeout(FORCE_SHUTDOWN_REPLY_WAIT, self.shutdown()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => log::warn!("language server failed to terminate gracefully - {}", e),
+            Err(_) => log::info!(
+                "language server '{}' did not answer shutdown within {:?}; sending exit",
+                self.name(),
+                FORCE_SHUTDOWN_REPLY_WAIT
+            ),
         }
         self.exit();
         Ok(())

@@ -438,6 +438,9 @@ impl From<WorkspaceDocumentPath> for PathOrId<'_> {
 
 type FileCallback<T> = Box<dyn for<'a> Fn(&'a Editor, &'a T) -> Option<FileLocation<'a>> + Send>;
 
+/// Runs when the picker is dismissed without a choice.
+type AbortCallback = Box<dyn FnOnce(&mut Context) + Send>;
+
 /// File path and range of lines (used to align and highlight lines)
 pub type FileLocation<'a> = (PathOrId<'a>, Option<(usize, usize)>);
 
@@ -1353,6 +1356,8 @@ pub struct Picker<T: 'static + Send + Sync, D: 'static> {
     nav: helix_view::list_nav::ListNav,
 
     callback_fn: PickerCallback<T>,
+    /// Runs when the picker is dismissed without choosing anything.
+    on_abort: Option<AbortCallback>,
     custom_key_handlers: PickerKeyHandlers<T, D>,
 
     pub truncate_start: bool,
@@ -1574,6 +1579,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             show_preview: true,
             external_filtering: false,
             callback_fn: Box::new(callback_fn),
+            on_abort: None,
             completion_height: 0,
             widths,
             list_region: ContentRegion::default(),
@@ -1679,6 +1685,13 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
         // assumption: if we have a preview we are matching paths... If this is ever
         // not true this could be a separate builder function
         self.matcher.update_config(Config::DEFAULT.match_paths());
+        self
+    }
+
+    /// Runs `on_abort` when the picker is dismissed without a choice, for
+    /// callers that owe someone an answer either way.
+    pub fn on_abort(mut self, on_abort: impl FnOnce(&mut Context) + Send + 'static) -> Self {
+        self.on_abort = Some(Box::new(on_abort));
         self
     }
 
@@ -3171,6 +3184,9 @@ impl<I: 'static + Send + Sync, D: 'static + Send + Sync> Component for Picker<I,
             Event::Key(event) => *event,
             Event::Paste(..) => return self.prompt_handle_event(event, ctx),
             Event::Resize(..) => return EventResult::Consumed(None),
+            // Picker is a modal and should consume mouse events so clicks don't fall
+            // through to the editor underneath
+            Event::Mouse(_) => return EventResult::Consumed(None),
             _ => return EventResult::Ignored(None),
         };
 
@@ -3241,7 +3257,12 @@ impl<I: 'static + Send + Sync, D: 'static + Send + Sync> Component for Picker<I,
                     self.prompt_handle_event(event, ctx);
                 }
             }
-            PickerBindingAction::Close => return close_fn(self),
+            PickerBindingAction::Close => {
+                if let Some(on_abort) = self.on_abort.take() {
+                    on_abort(ctx);
+                }
+                return close_fn(self);
+            }
             PickerBindingAction::OpenKeep => {
                 self.activate_selection(ctx, Action::Replace);
             }

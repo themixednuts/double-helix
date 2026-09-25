@@ -1,5 +1,5 @@
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
-use fff_search::case_insensitive_memmem;
+use fff_search::simd_string_utils::memmem;
 use std::path::Path;
 
 /// Load real source files from the repository as benchmark haystacks.
@@ -41,7 +41,7 @@ fn load_real_files() -> Vec<(&'static str, Vec<u8>)> {
 }
 
 fn bench_memmem(c: &mut Criterion) {
-    let mut group = c.benchmark_group("case_insensitive_memmem");
+    let mut group = c.benchmark_group("simd_string_utils_memmem");
 
     let files = load_real_files();
     assert!(!files.is_empty(), "No source files found for benchmarking");
@@ -69,18 +69,10 @@ fn bench_memmem(c: &mut Criterion) {
             let id = format!("{file_label}/{needle_label}");
 
             group.bench_with_input(
-                BenchmarkId::new("packed_pair", &id),
+                BenchmarkId::new("find", &id),
                 &(haystack, &needle_lower),
                 |b, &(h, n)| {
-                    b.iter(|| black_box(case_insensitive_memmem::search_packed_pair(h, n)));
-                },
-            );
-
-            group.bench_with_input(
-                BenchmarkId::new("memchr2_search", &id),
-                &(haystack, &needle_lower),
-                |b, &(h, n)| {
-                    b.iter(|| black_box(case_insensitive_memmem::search(h, n)));
+                    b.iter(|| black_box(memmem::find(h, n)));
                 },
             );
         }

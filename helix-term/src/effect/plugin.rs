@@ -27,6 +27,16 @@ fn with_mutation<T>(
     f(&mut bridge)
 }
 
+/// A mutation bridge that records `state`'s host on the resources it creates.
+fn with_host_mutation<T>(
+    editor: &mut Editor,
+    state: &crate::plugin_registry::PluginHostState,
+    f: impl FnOnce(&mut EditorMutationBridge<'_>) -> ContractResult<T>,
+) -> ContractResult<T> {
+    let mut bridge = EditorMutationBridge::new(editor).for_host(state.host_key());
+    f(&mut bridge)
+}
+
 fn unit(result: ContractResult<()>) -> ContractResult<HostResponse> {
     result.map(|()| HostResponse::Unit)
 }
@@ -113,6 +123,13 @@ fn service_plugin_host_request(
                 host.document_line(document, line)
             })?))
         }
+        PluginRequest::DocumentLines {
+            document,
+            start,
+            end,
+        } => Ok(HostResponse::DocumentLines(with_query(editor, |host| {
+            host.document_lines(document, start, end)
+        })?)),
         PluginRequest::StartTask { .. } | PluginRequest::CancelTask { .. } => {
             unreachable!("tasks are routed through the asynchronous task dispatcher")
         }
@@ -271,17 +288,23 @@ fn service_plugin_host_request(
         }
         PluginRequest::CreateFloat { plugin, request } => {
             state.track_plugin(plugin)?;
-            let float = with_mutation(editor, |host| host.create_float(plugin, request))?;
+            let float =
+                with_host_mutation(editor, &state, |host| host.create_float(plugin, request))?;
             Ok(HostResponse::FloatHandle(float))
         }
-        PluginRequest::UpdateFloat { plugin, request } => unit(with_mutation(editor, |host| {
-            host.update_float(plugin, request)
-        })),
-        PluginRequest::CloseFloat { plugin, request } => unit(with_mutation(editor, |host| {
-            host.close_float(plugin, request)
-        })),
-        PluginRequest::ListFloats(plugin) => Ok(HostResponse::FloatSnapshots(with_mutation(
+        PluginRequest::UpdateFloat { plugin, request } => {
+            unit(with_host_mutation(editor, &state, |host| {
+                host.update_float(plugin, request)
+            }))
+        }
+        PluginRequest::CloseFloat { plugin, request } => {
+            unit(with_host_mutation(editor, &state, |host| {
+                host.close_float(plugin, request)
+            }))
+        }
+        PluginRequest::ListFloats(plugin) => Ok(HostResponse::FloatSnapshots(with_host_mutation(
             editor,
+            &state,
             |host| Ok(host.list_floats(plugin)),
         )?)),
         PluginRequest::AssistantSnapshot => Ok(HostResponse::AssistantSnapshot(with_query(
@@ -521,11 +544,20 @@ pub(crate) fn notification_to_event(
                 },
             ))
         }
-        PluginNotification::BufferChanged { document_id } => Some(
-            events::PluginEvent::DocumentChanged(events::DocumentChangedEvent {
+        PluginNotification::BufferChanged {
+            document_id,
+            version,
+            changed_lines,
+        } => Some(events::PluginEvent::DocumentChanged(
+            events::DocumentChangedEvent {
                 document: adapt::document_handle(*document_id),
-            }),
-        ),
+                version: *version,
+                changed_lines: changed_lines
+                    .iter()
+                    .map(|&(start, end)| events::LineRange { start, end })
+                    .collect(),
+            },
+        )),
         PluginNotification::BufferClosed { document_id } => Some(
             events::PluginEvent::DocumentClosed(events::DocumentClosedEvent {
                 document: adapt::document_handle(*document_id),

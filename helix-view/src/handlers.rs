@@ -777,7 +777,12 @@ impl CoalescingState for SignatureHelpEventState {
             .completion
             .map_or(u64::MAX, |(_, sequence, _)| sequence);
 
-        if cancel_sequence <= intent_sequence && cancel_sequence <= completion_sequence {
+        // With nothing pending every sequence is `u64::MAX`, so the ordering
+        // test alone would keep delivering phantom cancels back to back.
+        if self.cancel.is_some()
+            && cancel_sequence <= intent_sequence
+            && cancel_sequence <= completion_sequence
+        {
             self.cancel = None;
             self.in_flight = Some(SignatureDelivery::Cancel);
             return Some((lsp::SignatureHelpEvent::Cancel, SignatureDelivery::Cancel));
@@ -1046,6 +1051,18 @@ mod tests {
         state.finish_delivery(delivery);
         let (event, _) = state.begin_delivery().expect("insert-mode exit");
         assert!(matches!(event, AutoReloadEvent::LeftInsertMode));
+    }
+
+    #[test]
+    fn signature_help_state_drains_to_nothing() {
+        let mut state = SignatureHelpEventState::default();
+        assert!(state.begin_delivery().is_none());
+
+        state.push(lsp::SignatureHelpEvent::Cancel);
+        let (event, delivery) = state.begin_delivery().expect("pending cancel");
+        assert!(matches!(event, lsp::SignatureHelpEvent::Cancel));
+        state.finish_delivery(delivery);
+        assert!(state.begin_delivery().is_none());
     }
 
     #[test]

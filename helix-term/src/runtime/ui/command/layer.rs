@@ -40,4 +40,6 @@ pub enum LayerCommand {
     },
     /// `:run-shell-command` output: positioned markdown popup (if non-empty) + status.
     ShellRunOutput { output: String },
+    /// Ask whether to trust a workspace.
+    WorkspaceTrustPrompt { workspace: std::path::PathBuf },
 }

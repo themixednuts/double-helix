@@ -68,6 +68,15 @@ pub struct PendingFormatWrite {
     pub policy: SavePolicy,
 }
 
+/// What a save does once its `code-actions-on-save` have run: format (maybe), then write.
+#[derive(Debug, Clone)]
+pub struct OnSaveFinish {
+    pub view_id: ViewId,
+    pub path: Option<helix_view::editor::WorkspaceDocumentPath>,
+    pub policy: SavePolicy,
+    pub auto_format: bool,
+}
+
 pub struct PreparedLanguageLoader {
     pub generation: u64,
     pub changed_grammars: BTreeSet<String>,
@@ -1054,6 +1063,31 @@ impl RuntimeUiDebouncer {
 pub enum RuntimeTaskEvent {
     /// No-op success (e.g. best-effort steps that did not need an effect).
     Stub,
+    /// A server's code actions for one `code-actions-on-save` kind.
+    CodeActionsOnSaveResponse {
+        doc_id: DocumentId,
+        version: i32,
+        server_id: LanguageServerId,
+        offset_encoding: helix_lsp::OffsetEncoding,
+        kind: String,
+        actions: Vec<lsp::CodeActionOrCommand>,
+        remaining: std::collections::VecDeque<String>,
+        finish: OnSaveFinish,
+    },
+    /// The resolved edits for one `code-actions-on-save` kind, ready to apply.
+    CodeActionsOnSaveResolved {
+        doc_id: DocumentId,
+        version: i32,
+        offset_encoding: helix_lsp::OffsetEncoding,
+        edits: Vec<lsp::WorkspaceEdit>,
+        remaining: std::collections::VecDeque<String>,
+        finish: OnSaveFinish,
+    },
+    /// Every `code-actions-on-save` kind ran: format and write.
+    CodeActionsOnSaveDone {
+        doc_id: DocumentId,
+        finish: OnSaveFinish,
+    },
     /// A collaboration session update ready for main-thread editor application.
     Collaboration(helix_collab::GuestSessionUpdate),
     /// A fully connected collaboration session ready for application ownership.
@@ -1105,6 +1139,7 @@ pub enum RuntimeTaskEvent {
         document: DocumentId,
         version: i32,
         syntax: helix_core::Syntax,
+        loader: std::sync::Arc<helix_core::syntax::Loader>,
         input_barrier: Option<InputBarrier>,
     },
     /// Blocking inspection completed for the active file-operation FIFO entry.
@@ -1230,6 +1265,12 @@ pub enum RuntimeTaskEvent {
         path: PathBuf,
         line: Option<u32>,
     },
+    /// A file's blame, computed off the main loop, to store on the document.
+    ApplyFileBlame {
+        doc_id: DocumentId,
+        line: Option<u32>,
+        result: anyhow::Result<Box<helix_vcs::FileBlame>>,
+    },
     /// Apply document highlight selections on the editor main loop.
     SelectDocumentHighlights {
         offset_encoding: helix_lsp::OffsetEncoding,
@@ -1270,6 +1311,21 @@ pub enum RuntimeTaskEvent {
     /// Request debugger inline values after a stack-frame document is ready.
     RequestInlineValues {
         doc_id: DocumentId,
+    },
+    ApplyCodeActionHint {
+        doc_id: DocumentId,
+        view_id: helix_view::ViewId,
+        expected_version: i32,
+        request: Token,
+        available: bool,
+    },
+    ApplySymbolHighlights {
+        doc_id: DocumentId,
+        view_id: helix_view::ViewId,
+        expected_version: i32,
+        request: Token,
+        offset_encoding: helix_lsp::OffsetEncoding,
+        highlights: Vec<lsp::DocumentHighlight>,
     },
     ApplyDocumentLinks {
         doc_id: DocumentId,

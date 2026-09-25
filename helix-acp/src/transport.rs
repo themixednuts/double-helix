@@ -27,6 +27,10 @@ const MAX_ACP_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_STDERR_LINE_BYTES: usize = 64 * 1024;
 const MAX_LOG_METADATA_BYTES: usize = 128;
 const MAX_TRACE_PAYLOAD_BYTES: usize = 4 * 1024;
+/// Messages up to this size are parsed and serialized in place. Streamed updates are small
+/// and many, and a hop to the blocking pool costs more than the parse; big ones (prompts
+/// with embedded files, file reads) still move off the runtime thread.
+const INLINE_JSON_BYTES: usize = 64 * 1024;
 const LOG_TRUNCATION_MARKER: &str = "...<truncated>";
 
 #[derive(Debug)]
@@ -317,6 +321,36 @@ async fn read_bounded_line(
     }
 }
 
+/// Like [`read_bounded_line`], but keeps only the first `limit` bytes of an overlong line and
+/// discards the rest instead of failing. Used for streams that must keep draining (stderr),
+/// where giving up would leave the child blocked on a full pipe.
+async fn read_truncated_line(
+    reader: &mut (impl AsyncBufRead + Unpin + Send),
+    buffer: &mut Vec<u8>,
+    limit: usize,
+) -> io::Result<usize> {
+    buffer.clear();
+    let mut read = 0;
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return Ok(read);
+        }
+        let consumed = available
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(available.len(), |index| index + 1);
+        let keep = consumed.min(limit.saturating_sub(buffer.len()));
+        buffer.extend_from_slice(&available[..keep]);
+        let complete = available[..consumed].ends_with(b"\n");
+        reader.consume(consumed);
+        read += consumed;
+        if complete {
+            return Ok(read);
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Transport {
     id: AgentId,
@@ -361,9 +395,15 @@ impl Transport {
                 return Err(Error::StreamClosed);
             }
 
-            let line = std::str::from_utf8(buffer)
-                .context("agent message is not valid UTF-8")?
-                .trim_end_matches(['\r', '\n']);
+            let Ok(line) = std::str::from_utf8(buffer) else {
+                warn!(
+                    "{} <- skipped stdout line that is not valid UTF-8 ({} bytes)",
+                    bounded_metadata(agent_name),
+                    buffer.len()
+                );
+                continue;
+            };
+            let line = line.trim_end_matches(['\r', '\n']);
             if line.trim().is_empty() {
                 continue; // skip blank lines
             }
@@ -374,20 +414,38 @@ impl Transport {
                 TracePayload(line)
             );
             let line_len = line.len();
-            let bytes = std::mem::take(buffer);
-            let (mut bytes, message) = tokio::task::spawn_blocking(move || {
-                let end = bytes
-                    .iter()
-                    .rposition(|byte| !matches!(byte, b'\r' | b'\n'))
-                    .map_or(0, |index| index + 1);
-                let message = serde_json::from_slice(&bytes[..end]);
-                (bytes, message)
-            })
-            .await
-            .map_err(|error| Error::Other(error.into()))?;
-            bytes.clear();
-            *buffer = bytes;
-            let message = message?;
+            let message = if line_len <= INLINE_JSON_BYTES {
+                let message = serde_json::from_str(line);
+                buffer.clear();
+                message
+            } else {
+                let bytes = std::mem::take(buffer);
+                let (mut bytes, message) = tokio::task::spawn_blocking(move || {
+                    let end = bytes
+                        .iter()
+                        .rposition(|byte| !matches!(byte, b'\r' | b'\n'))
+                        .map_or(0, |index| index + 1);
+                    let message = serde_json::from_slice(&bytes[..end]);
+                    (bytes, message)
+                })
+                .await
+                .map_err(|error| Error::Other(error.into()))?;
+                bytes.clear();
+                *buffer = bytes;
+                message
+            };
+            // Agents launched through package runners (npx, uvx) sometimes print banners or
+            // warnings on stdout. One stray line must not tear down the whole session.
+            let message = match message {
+                Ok(message) => message,
+                Err(error) => {
+                    warn!(
+                        "{} <- skipped non-JSON-RPC stdout line ({line_len} bytes): {error}",
+                        bounded_metadata(agent_name)
+                    );
+                    continue;
+                }
+            };
             let metadata = MessageLogMetadata::from_agent_message(&message);
             info!(
                 "{}",
@@ -404,7 +462,7 @@ impl Transport {
         buffer: &mut Vec<u8>,
         agent_name: &str,
     ) -> Result<()> {
-        if read_bounded_line(err, buffer, MAX_STDERR_LINE_BYTES).await? == 0 {
+        if read_truncated_line(err, buffer, MAX_STDERR_LINE_BYTES).await? == 0 {
             return Err(Error::StreamClosed);
         }
         let line = String::from_utf8_lossy(buffer);
@@ -441,13 +499,19 @@ impl Transport {
                 return Ok(());
             }
         }
-        let json = tokio::task::spawn_blocking(move || match payload {
+        let small = payload_is_small(&payload);
+        let serialize = move || match payload {
             Payload::Request { value } => serde_json::to_string(&value),
             Payload::Notification(value) => serde_json::to_string(&value),
             Payload::Response(output) => serde_json::to_string(&output),
-        })
-        .await
-        .map_err(|error| Error::Other(error.into()))??;
+        };
+        let json = if small {
+            serialize()?
+        } else {
+            tokio::task::spawn_blocking(serialize)
+                .await
+                .map_err(|error| Error::Other(error.into()))??
+        };
 
         info!(
             "{}",
@@ -617,6 +681,58 @@ impl Transport {
     }
 }
 
+/// Whether `payload` surely serializes to about `INLINE_JSON_BYTES` or less, judged by walking
+/// it no further than that.
+fn payload_is_small(payload: &Payload) -> bool {
+    let mut budget = INLINE_JSON_BYTES;
+    match payload {
+        Payload::Request { value } => params_fit(&value.params, &mut budget),
+        Payload::Notification(value) => params_fit(&value.params, &mut budget),
+        Payload::Response(jsonrpc::Output::Success(success)) => {
+            value_fits(&success.result, &mut budget)
+        }
+        Payload::Response(jsonrpc::Output::Failure(_)) => true,
+    }
+}
+
+fn params_fit(params: &jsonrpc::Params, budget: &mut usize) -> bool {
+    match params {
+        jsonrpc::Params::None => true,
+        jsonrpc::Params::Array(values) => values.iter().all(|value| value_fits(value, budget)),
+        jsonrpc::Params::Map(map) => map_fits(map, budget),
+    }
+}
+
+/// Take `value`'s rough serialized size out of `budget`, failing once it runs out.
+fn value_fits(value: &Value, budget: &mut usize) -> bool {
+    // Punctuation, numbers and literals.
+    const OVERHEAD: usize = 8;
+    let cost = match value {
+        Value::String(text) => text.len() + OVERHEAD,
+        _ => OVERHEAD,
+    };
+    let Some(rest) = budget.checked_sub(cost) else {
+        return false;
+    };
+    *budget = rest;
+    match value {
+        Value::Array(values) => values.iter().all(|value| value_fits(value, budget)),
+        Value::Object(map) => map_fits(map, budget),
+        _ => true,
+    }
+}
+
+fn map_fits(map: &serde_json::Map<String, Value>, budget: &mut usize) -> bool {
+    map.iter()
+        .all(|(key, value)| match budget.checked_sub(key.len()) {
+            Some(rest) => {
+                *budget = rest;
+                value_fits(value, budget)
+            }
+            None => false,
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -638,6 +754,20 @@ mod tests {
             name: "test-agent".to_string(),
             pending_requests: Arc::new(PendingRequests::default()),
         })
+    }
+
+    #[test]
+    fn only_small_payloads_are_serialized_inline() {
+        let response = |text: String| {
+            Payload::Response(jsonrpc::Output::Success(jsonrpc::Success {
+                jsonrpc: Some(jsonrpc::Version::V2),
+                result: serde_json::json!({ "content": text, "lines": [1, 2, 3] }),
+                id: jsonrpc::Id::Num(1),
+            }))
+        };
+        assert!(payload_is_small(&request(jsonrpc::Id::Num(1))));
+        assert!(payload_is_small(&response("small".repeat(100))));
+        assert!(!payload_is_small(&response("x".repeat(INLINE_JSON_BYTES))));
     }
 
     fn request(id: jsonrpc::Id) -> Payload {
@@ -754,6 +884,45 @@ mod tests {
         assert!(buffer.len() <= 8);
     }
 
+    #[tokio::test]
+    async fn truncated_line_reader_keeps_draining_past_the_limit() {
+        let mut reader = BufReader::new(&b"123456789\nnext\n"[..]);
+        let mut buffer = Vec::new();
+
+        let read = read_truncated_line(&mut reader, &mut buffer, 4)
+            .await
+            .expect("overlong line is truncated, not rejected");
+        assert_eq!(read, 10);
+        assert_eq!(buffer, b"1234");
+
+        read_truncated_line(&mut reader, &mut buffer, 4)
+            .await
+            .expect("next line");
+        assert_eq!(buffer, b"next");
+    }
+
+    #[tokio::test]
+    async fn non_json_stdout_line_is_skipped() {
+        let transport = test_transport();
+        let (response_tx, mut response_rx) = channel(1);
+        let _guard = transport
+            .pending_requests
+            .register(jsonrpc::Id::Num(1), response_tx)
+            .expect("open pending registry");
+        let (client_tx, _client_rx) = channel(1);
+
+        Transport::recv(
+            transport.clone(),
+            BufReader::new(
+                &b"npm warn exec banner\n{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":null}\n"[..],
+            ),
+            client_tx,
+        )
+        .await;
+
+        assert!(matches!(response_rx.recv().await, Some(Ok(_))));
+    }
+
     #[test]
     fn dropping_pending_request_guard_removes_registration() {
         let pending = Arc::new(PendingRequests::default());
@@ -797,7 +966,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn malformed_stdout_closes_pending_requests_and_reports_exit() {
+    async fn stdout_eof_after_noise_closes_pending_requests_and_reports_exit() {
         let transport = test_transport();
         let (response_tx, mut response_rx) = channel(1);
         let _guard = transport

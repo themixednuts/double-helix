@@ -203,7 +203,7 @@ pub(crate) fn request_document_colors(
     let expected_version = doc.version();
 
     let mut seen_language_servers = HashSet::new();
-    let mut futures: FuturesOrdered<_> = doc
+    let mut futures: FuturesUnordered<_> = doc
         .language_servers_with_feature(LanguageServerFeature::DocumentColors)
         .filter(|language_server| seen_language_servers.insert(language_server.id()))
         .map(|language_server| {
@@ -338,6 +338,228 @@ pub(crate) fn request_code_lenses(
         .detach();
 }
 
+/// The view showing `doc_id`, the focused one if it does.
+fn view_showing(editor: &Editor, doc_id: DocumentId) -> Option<ViewId> {
+    let focus = editor.tree.focus;
+    match editor.tree.try_get(focus) {
+        Some(view) if view.doc == doc_id => Some(focus),
+        _ => editor
+            .tree
+            .views()
+            .find_map(|(view, _)| (view.doc == doc_id).then_some(view.id)),
+    }
+}
+
+/// Asks the language servers whether code actions are available at the cursor of the view
+/// showing `doc_id`, for the code action hint (gutter or statusline).
+pub(crate) fn request_code_action_hint(
+    editor: &mut Editor,
+    doc_id: DocumentId,
+    ingress: crate::runtime::RuntimeIngress,
+) {
+    if !editor.config().code_action_hint() {
+        return;
+    }
+    let Some(view_id) = view_showing(editor, doc_id) else {
+        return;
+    };
+    let Some(doc) = editor.document_mut(doc_id) else {
+        return;
+    };
+    let range = doc.selection(view_id).primary();
+    let mut seen_language_servers = HashSet::new();
+    let mut futures: FuturesUnordered<_> = doc
+        .language_servers_with_feature(LanguageServerFeature::CodeAction)
+        .filter(|language_server| seen_language_servers.insert(language_server.id()))
+        .filter_map(|language_server| {
+            let offset_encoding = language_server.offset_encoding();
+            let lsp_range = helix_lsp::util::range_to_lsp_range(doc.text(), range, offset_encoding);
+            let context = lsp::CodeActionContext {
+                diagnostics: doc
+                    .diagnostics()
+                    .iter()
+                    .filter(|diag| {
+                        range.overlaps(&helix_core::Range::new(diag.range.start, diag.range.end))
+                    })
+                    .map(|diag| {
+                        helix_lsp::util::diagnostic_to_lsp_diagnostic(
+                            doc.text(),
+                            diag,
+                            offset_encoding,
+                        )
+                    })
+                    .collect(),
+                only: None,
+                trigger_kind: Some(lsp::CodeActionTriggerKind::AUTOMATIC),
+            };
+            language_server.code_actions(doc.identifier(), lsp_range, context)
+        })
+        .map(|request| async move {
+            let actions = request.await?.unwrap_or_default();
+            // Disabled actions can't be run, so they don't count.
+            anyhow::Ok(actions.iter().any(|action| {
+                matches!(
+                    action,
+                    lsp::CodeActionOrCommand::Command(_)
+                        | lsp::CodeActionOrCommand::CodeAction(lsp::CodeAction {
+                            disabled: None,
+                            ..
+                        })
+                )
+            }))
+        })
+        .collect();
+    if futures.is_empty() {
+        doc.set_code_action_hint(view_id, false);
+        return;
+    }
+    let cancel = doc.restart_code_action_hint();
+    let expected_version = doc.version();
+    editor
+        .runtime()
+        .work()
+        .clone()
+        .spawn(async move {
+            let mut available = false;
+            loop {
+                let next = tokio::select! {
+                    _ = cancel.canceled() => return,
+                    next = futures.next() => next,
+                };
+                match next {
+                    Some(Ok(true)) => available = true,
+                    Some(Ok(false)) => {}
+                    Some(Err(err)) => log::debug!("code action hint request failed: {err}"),
+                    None => break,
+                }
+            }
+            send_task_event_with(
+                RuntimeTaskEvent::ApplyCodeActionHint {
+                    doc_id,
+                    view_id,
+                    expected_version,
+                    request: cancel,
+                    available,
+                },
+                ingress,
+            )
+            .await;
+        })
+        .detach();
+}
+
+/// Requests the references to the symbol under the cursor of the view showing `doc_id`
+/// (the focused one if it does), for `auto-document-highlight`.
+pub(crate) fn request_symbol_highlights(
+    editor: &mut Editor,
+    doc_id: DocumentId,
+    ingress: crate::runtime::RuntimeIngress,
+) {
+    if !editor.config().lsp.auto_document_highlight {
+        return;
+    }
+    let focus = editor.tree.focus;
+    let view_id = match editor.tree.try_get(focus) {
+        Some(view) if view.doc == doc_id => focus,
+        _ => match editor
+            .tree
+            .views()
+            .find_map(|(view, _)| (view.doc == doc_id).then_some(view.id))
+        {
+            Some(view_id) => view_id,
+            None => return,
+        },
+    };
+    let Some(doc) = editor.document_mut(doc_id) else {
+        return;
+    };
+    let Some(language_server) = doc
+        .language_servers_with_feature(LanguageServerFeature::DocumentHighlight)
+        .next()
+    else {
+        doc.clear_symbol_highlights();
+        return;
+    };
+    let offset_encoding = language_server.offset_encoding();
+    let position = doc.position(view_id, offset_encoding);
+    let Some(request) =
+        language_server.text_document_document_highlight(doc.identifier(), position, None)
+    else {
+        return;
+    };
+    let cancel = doc.restart_symbol_highlights();
+    let expected_version = doc.version();
+    editor
+        .runtime()
+        .work()
+        .clone()
+        .spawn(async move {
+            let response = tokio::select! {
+                _ = cancel.canceled() => return,
+                response = request => response,
+            };
+            let highlights = match response {
+                Ok(highlights) => highlights.unwrap_or_default(),
+                Err(err) => {
+                    log::debug!("document highlight request failed: {err}");
+                    return;
+                }
+            };
+            send_task_event_with(
+                RuntimeTaskEvent::ApplySymbolHighlights {
+                    doc_id,
+                    view_id,
+                    expected_version,
+                    request: cancel,
+                    offset_encoding,
+                    highlights,
+                },
+                ingress,
+            )
+            .await;
+        })
+        .detach();
+}
+
+pub(crate) fn apply_symbol_highlights(
+    editor: &mut Editor,
+    doc_id: DocumentId,
+    view_id: helix_view::ViewId,
+    expected_version: i32,
+    request: &helix_runtime::Token,
+    offset_encoding: helix_lsp::OffsetEncoding,
+    highlights: Vec<lsp::DocumentHighlight>,
+) {
+    if !editor.config().lsp.auto_document_highlight {
+        return;
+    }
+    let Some(doc) = editor.document_mut(doc_id) else {
+        return;
+    };
+    if doc.version() != expected_version || !doc.is_current_symbol_highlights(request) {
+        return;
+    }
+    let text = doc.text();
+    let slice = text.slice(..);
+    let mut ranges: Vec<std::ops::Range<usize>> = highlights
+        .into_iter()
+        .filter_map(|highlight| lsp_range_to_range(text, highlight.range, offset_encoding))
+        .map(|range| range.min_width_1(slice))
+        .filter(|range| range.from() < range.to())
+        .map(|range| range.from()..range.to())
+        .collect();
+    // Overlays must not overlap: sort, then merge touching ranges.
+    ranges.sort_by_key(|range| (range.start, range.end));
+    let mut merged: Vec<std::ops::Range<usize>> = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        match merged.last_mut() {
+            Some(last) if range.start <= last.end => last.end = last.end.max(range.end),
+            _ => merged.push(range),
+        }
+    }
+    doc.set_symbol_highlights(view_id, merged);
+}
+
 pub(crate) fn request_document_links(
     editor: &mut Editor,
     doc_id: DocumentId,
@@ -352,7 +574,7 @@ pub(crate) fn request_document_links(
     let cancel = doc.restart_document_links();
     let expected_version = doc.version();
     let mut seen_language_servers = HashSet::new();
-    let mut futures: FuturesOrdered<_> = doc
+    let mut futures: FuturesUnordered<_> = doc
         .language_servers_with_feature(LanguageServerFeature::DocumentLinks)
         .filter(|language_server| seen_language_servers.insert(language_server.id()))
         .map(|language_server| {

@@ -1,7 +1,7 @@
 #[derive(Debug, Clone)]
 pub enum PluginCommand {
     SetTheme {
-        theme: helix_view::Theme,
+        theme: Box<helix_view::Theme>,
         completion: crate::plugin_registry::PluginTaskResponder,
     },
     RunCommand {
@@ -41,6 +41,8 @@ pub enum PluginCommand {
     },
     ReleaseResources {
         plugin: helix_plugin_api::PluginId,
+        /// Owner key on the plugin's floats (host and plugin).
+        float_owner: String,
         panels: Vec<helix_plugin_api::PanelHandle>,
     },
     UpdatePanel {

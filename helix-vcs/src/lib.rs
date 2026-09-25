@@ -24,12 +24,27 @@ mod status;
 
 pub use status::FileChange;
 
+/// Decides whether the repository holding a path may use its own config (workspace trust).
+pub type RepoTrust = Arc<dyn Fn(&Path) -> bool + Send + Sync>;
+
 /// Contains all active diff providers. Diff providers are compiled in via features when they
 /// need optional dependencies.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct DiffProviderRegistry {
     provider: VcsProvider,
     providers: Vec<DiffProvider>,
+    /// Without one, no repository is trusted with its own config.
+    repo_trust: Option<RepoTrust>,
+}
+
+impl std::fmt::Debug for DiffProviderRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DiffProviderRegistry")
+            .field("provider", &self.provider)
+            .field("providers", &self.providers)
+            .field("repo_trust", &self.repo_trust.is_some())
+            .finish()
+    }
 }
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
@@ -51,11 +66,24 @@ impl DiffProviderRegistry {
         Self {
             provider,
             providers,
+            repo_trust: None,
         }
+    }
+
+    /// Consult `trust` before letting a repository use its own `.git/config`.
+    #[must_use]
+    pub fn with_repo_trust(mut self, trust: RepoTrust) -> Self {
+        self.repo_trust = Some(trust);
+        self
     }
 
     pub const fn provider(&self) -> VcsProvider {
         self.provider
+    }
+
+    /// Whether the repository holding `path` may use its own config (git `Trust::Full`).
+    pub fn trusts(&self, path: &Path) -> bool {
+        self.repo_trust.as_ref().is_some_and(|trust| trust(path))
     }
 
     /// Get the given file from the VCS. This provides the unedited document as a "base"
@@ -65,16 +93,16 @@ impl DiffProviderRegistry {
             return None;
         }
 
-        self.providers
-            .iter()
-            .find_map(|provider| match provider.get_diff_base(file) {
+        self.providers.iter().find_map(|provider| {
+            match provider.get_diff_base(file, self.trusts(file)) {
                 Ok(res) => Some(res),
                 Err(err) => {
                     log::debug!("{err:#?}");
                     log::debug!("failed to open diff base for {}", file.display());
                     None
                 }
-            })
+            }
+        })
     }
 
     /// Get the current name of the current [HEAD](https://stackoverflow.com/questions/2304087/what-is-head-in-git).
@@ -83,16 +111,16 @@ impl DiffProviderRegistry {
             return None;
         }
 
-        self.providers
-            .iter()
-            .find_map(|provider| match provider.get_current_head_name(file) {
+        self.providers.iter().find_map(|provider| {
+            match provider.get_current_head_name(file, self.trusts(file)) {
                 Ok(res) => Some(res),
                 Err(err) => {
                     log::debug!("{err:#?}");
                     log::debug!("failed to obtain current head name for {}", file.display());
                     None
                 }
-            })
+            }
+        })
     }
 
     /// Fire-and-forget changed file iteration. Runs everything in a background task. Keeps
@@ -152,16 +180,16 @@ impl DiffProviderRegistry {
     ) -> Result<()> {
         self.providers
             .iter()
-            .find_map(
-                |provider| match provider.for_each_changed_file(cwd, &mut f) {
+            .find_map(|provider| {
+                match provider.for_each_changed_file(cwd, self.trusts(cwd), &mut f) {
                     Ok(()) => Some(Ok(())),
                     Err(err) => {
                         log::debug!("{err:#?}");
                         log::debug!("failed to collect changed files for {}", cwd.display());
                         None
                     }
-                },
-            )
+                }
+            })
             .unwrap_or_else(|| Err(anyhow!("no diff provider returns success")))
     }
 }
@@ -184,18 +212,22 @@ enum DiffProvider {
 }
 
 impl DiffProvider {
-    fn get_diff_base(&self, _file: &Path) -> Result<Vec<u8>> {
+    fn get_diff_base(&self, _file: &Path, _trust_full: bool) -> Result<Vec<u8>> {
         match self {
             #[cfg(feature = "git")]
-            Self::Git => git::get_diff_base(_file),
+            Self::Git => git::get_diff_base(_file, _trust_full),
             Self::None => bail!("No diff support compiled in"),
         }
     }
 
-    fn get_current_head_name(&self, _file: &Path) -> Result<Arc<ArcSwap<Box<str>>>> {
+    fn get_current_head_name(
+        &self,
+        _file: &Path,
+        _trust_full: bool,
+    ) -> Result<Arc<ArcSwap<Box<str>>>> {
         match self {
             #[cfg(feature = "git")]
-            Self::Git => git::get_current_head_name(_file),
+            Self::Git => git::get_current_head_name(_file, _trust_full),
             Self::None => bail!("No diff support compiled in"),
         }
     }
@@ -203,11 +235,12 @@ impl DiffProvider {
     fn for_each_changed_file(
         &self,
         _cwd: &Path,
+        _trust_full: bool,
         _f: impl FnMut(Result<FileChange>) -> bool,
     ) -> Result<()> {
         match self {
             #[cfg(feature = "git")]
-            Self::Git => git::for_each_changed_file(_cwd, _f),
+            Self::Git => git::for_each_changed_file(_cwd, _trust_full, _f),
             Self::None => bail!("No diff support compiled in"),
         }
     }

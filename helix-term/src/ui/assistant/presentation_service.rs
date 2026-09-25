@@ -778,6 +778,9 @@ fn elicitation_message(
 }
 
 fn auth_message(state: &auth::State, auth_selected: usize, theme: &Theme) -> Option<Message> {
+    if let auth::State::TerminalLogin { method, error, .. } = state {
+        return Some(terminal_login_message(method, error.as_deref(), theme));
+    }
     let (methods, error, authenticating) = match state {
         auth::State::Required { methods, error, .. } => {
             (methods.as_slice(), error.as_deref(), None)
@@ -822,6 +825,33 @@ fn auth_message(state: &auth::State, auth_selected: usize, theme: &Theme) -> Opt
         )));
     }
     Some(Message::plain(lines))
+}
+
+fn terminal_login_message(method: &auth::Method, error: Option<&str>, theme: &Theme) -> Message {
+    let title_style = theme.get("ui.text.focus").add_modifier(Modifier::BOLD);
+    let muted_style = theme.get("ui.text.inactive");
+    let mut lines = vec![Spans::from(vec![
+        Span::styled(" ! ", theme.get("warning")),
+        Span::styled(format!("Sign in with {}", method.name), title_style),
+        Span::styled("  enter done  esc back", muted_style),
+    ])];
+    match error {
+        Some(error) => lines.push(Spans::from(Span::styled(
+            format!("   {error}"),
+            theme.get("error"),
+        ))),
+        None => lines.push(Spans::from(Span::styled(
+            "   Finish signing in in the terminal window, then press enter.",
+            muted_style,
+        ))),
+    }
+    if let Some(terminal) = &method.terminal {
+        lines.push(Spans::from(Span::styled(
+            format!("   {}", terminal.command_line()),
+            muted_style,
+        )));
+    }
+    Message::plain(lines)
 }
 
 fn terminal_message(terminal: &TerminalPresentation, theme: &Theme) -> Message {

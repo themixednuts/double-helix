@@ -72,15 +72,7 @@ impl Component for PluginPanel {
             return;
         }
 
-        match editor.model.focus {
-            FocusTarget::Panel(id) => {
-                self.focused = id == self.model_panel_id;
-            }
-            FocusTarget::Editor => {}
-            FocusTarget::Layer(_) | FocusTarget::Float(_) => {
-                self.focused = false;
-            }
-        }
+        self.focused = editor.model.focus == FocusTarget::Panel(self.model_panel_id);
     }
 
     fn prepare_render(&mut self, area: Rect, cx: &RenderContext) -> crate::render::PreparedRender {
@@ -217,10 +209,12 @@ mod tests {
         panel.sync(Rect::new(0, 0, 120, 40), &mut editor);
         assert!(!Focusable::is_focused(&panel));
 
+        // Focus back on the editor releases the panel.
         panel.set_focused(true);
         editor.model.focus = FocusTarget::Editor;
         panel.sync(Rect::new(0, 0, 120, 40), &mut editor);
-        assert!(Focusable::is_focused(&panel));
+        assert!(!Focusable::is_focused(&panel));
+        editor.model.focus_panel(panel_id);
 
         assert_eq!(editor.model.toggle_panel(panel_id), Some(false));
         panel.sync(Rect::new(0, 0, 120, 40), &mut editor);

@@ -455,40 +455,45 @@ pub mod util {
             }
         }
 
-        Transaction::change(
-            doc,
-            edits.into_iter().map(|edit| {
-                // simplify "" into None for cleaner changesets
-                let replacement = if !edit.new_text.is_empty() {
-                    Some(edit.new_text.into())
-                } else {
-                    None
-                };
+        // `ChangeSet::from_changes` requires sorted, non-overlapping changes (it
+        // does `retain(from - last)`, which underflows when `from < last`). The
+        // LSP spec forbids overlapping edits but some servers send them anyway, so
+        // drop any edit that overlaps an earlier one (or fails to map) instead of
+        // panicking.
+        let mut last_end = 0;
+        let mut changes: Vec<(usize, usize, Option<Tendril>)> = Vec::with_capacity(edits.len());
+        for edit in edits {
+            let Some(start) = lsp_pos_to_pos(doc, edit.range.start, offset_encoding) else {
+                continue;
+            };
+            let Some(end) = lsp_pos_to_pos(doc, edit.range.end, offset_encoding) else {
+                continue;
+            };
 
-                let start =
-                    if let Some(start) = lsp_pos_to_pos(doc, edit.range.start, offset_encoding) {
-                        start
-                    } else {
-                        return (0, 0, None);
-                    };
-                let end = if let Some(end) = lsp_pos_to_pos(doc, edit.range.end, offset_encoding) {
-                    end
-                } else {
-                    return (0, 0, None);
-                };
+            if start > end {
+                log::error!("Invalid LSP text edit start {start:?} > end {end:?}, discarding");
+                continue;
+            }
 
-                if start > end {
-                    log::error!(
-                        "Invalid LSP text edit start {:?} > end {:?}, discarding",
-                        start,
-                        end
-                    );
-                    return (0, 0, None);
-                }
+            if start < last_end {
+                log::error!(
+                    "Overlapping LSP text edit {start}..{end} (after {last_end}), discarding"
+                );
+                continue;
+            }
+            last_end = end;
 
-                (start, end, replacement)
-            }),
-        )
+            // simplify "" into None for cleaner changesets
+            let replacement = if edit.new_text.is_empty() {
+                None
+            } else {
+                Some(edit.new_text.into())
+            };
+
+            changes.push((start, end, replacement));
+        }
+
+        Transaction::change(doc, changes.into_iter())
     }
 }
 
@@ -1488,6 +1493,27 @@ mod tests {
         let transaction = generate_transaction_from_edits(&source, edits, OffsetEncoding::Utf16);
         assert!(transaction.apply(&mut source));
         assert_eq!(source, "[\n  \"🇺🇸\",\n  \"🎄\",\n]");
+    }
+
+    #[test]
+    fn overlapping_edits_are_dropped() {
+        use lsp::{Position, Range, TextEdit};
+
+        let edit = |sc, ec, text: &str| TextEdit {
+            range: Range {
+                start: Position::new(0, sc),
+                end: Position::new(0, ec),
+            },
+            new_text: text.to_string(),
+        };
+
+        // After sorting, 2..4 starts before 0..3 ends and must be discarded.
+        let edits = vec![edit(4, 5, "Z"), edit(0, 3, "X"), edit(2, 4, "Y")];
+
+        let mut source = Rope::from_str("abcdef");
+        let transaction = generate_transaction_from_edits(&source, edits, OffsetEncoding::Utf16);
+        assert!(transaction.apply(&mut source));
+        assert_eq!(source, "XdZf");
     }
 
     #[test]

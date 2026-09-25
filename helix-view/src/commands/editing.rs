@@ -16,6 +16,7 @@ use helix_core::{
     doc_formatter::TextFormat,
     graphemes::{self, prev_grapheme_boundary},
     increment as hx_increment,
+    indent::IndentStyle,
     line_ending::line_end_char_index,
     movement::{self, Direction, Movement},
     object,
@@ -161,22 +162,23 @@ pub fn open(
     editor.mode = Mode::Insert;
     let config = editor.config();
     let doc = crate::doc!(editor, &doc_id);
-    let view = crate::view!(editor, view_id);
     let loader = editor.syn_loader.load();
-    let mut annotations = view.text_annotations(doc, None);
+    // Component regions (prompts, the assistant composer) have views outside the window tree
+    // and no folds, so they get empty annotations.
+    let mut annotations = match crate::view::AnyViewRef::from_editor(editor, view_id) {
+        crate::view::AnyViewRef::Tree(view) => view.text_annotations(doc, None),
+        crate::view::AnyViewRef::Component(_) => {
+            helix_core::text_annotations::TextAnnotations::default()
+        }
+    };
 
     let text = doc.text().slice(..);
     let contents = doc.text();
     let selection = doc.selection(view_id);
     let mut offs = 0;
     let mut ranges = SmallVec::with_capacity(selection.len());
-    let continue_comment_tokens =
-        if comment_continuation == CommentContinuation::Enabled && config.continue_comments {
-            doc.language_config()
-                .and_then(|config| config.comment_tokens.as_ref())
-        } else {
-            None
-        };
+    let continue_comments =
+        comment_continuation == CommentContinuation::Enabled && config.continue_comments;
 
     let mut transaction = Transaction::change_by_selection(contents, selection, |range| {
         let (range, open) = (open == Open::Below)
@@ -213,8 +215,17 @@ pub fn open(
             Open::Above => curr_line_num,
         };
         let above_next_new_line_num = next_new_line_num.saturating_sub(1);
-        let continue_comment_token = continue_comment_tokens
-            .and_then(|tokens| comment::get_comment_token(text, tokens, curr_line_num));
+        // Continue the comment leader of the layer the line's comment starts in.
+        let continue_comment_token = continue_comments
+            .then(|| {
+                let line_start = text.line_to_char(curr_line_num);
+                let first = text
+                    .line(curr_line_num)
+                    .first_non_whitespace_char()
+                    .map_or(line_start, |offset| line_start + offset);
+                doc.continued_comment_token(&loader, curr_line_num, text.char_to_byte(first))
+            })
+            .flatten();
         let (above_next_line_end_index, above_next_line_end_width) = if next_new_line_num == 0 {
             (0, 0)
         } else {
@@ -799,9 +810,14 @@ pub fn align_selections_in(
     let selection = doc.selection(target.id());
     let tab_width = doc.tab_width();
 
-    let mut column_widths: Vec<Vec<(usize, usize)>> = Vec::new();
-    let mut last_line = text.len_lines() + 1;
-    let mut col = 0;
+    // Width of each selection column: the widest gap between a selection and the
+    // previous selection on its row. Rows may hold different numbers of selections.
+    let mut column_widths: Vec<usize> = Vec::new();
+    let mut coordinates = Vec::with_capacity(selection.len());
+
+    let mut previous_line = usize::MAX;
+    let mut col_idx = 0;
+    let mut running_offset = 0;
 
     for range in selection {
         let coords = visual_coords_at_pos(text, range.head, tab_width);
@@ -810,46 +826,56 @@ pub fn align_selections_in(
         if coords.row != anchor_coords.row {
             return Err(AlignSelectionsError::MultilineSelection);
         }
-
-        col = if coords.row == last_line { col + 1 } else { 0 };
-
-        if col >= column_widths.len() {
-            column_widths.push(Vec::new());
+        if coords.row != previous_line {
+            col_idx = 0;
+            running_offset = 0;
+            previous_line = coords.row;
         }
-        column_widths[col].push((range.from(), coords.col));
 
-        last_line = coords.row;
+        let width = coords.col - running_offset;
+        match column_widths.get_mut(col_idx) {
+            Some(n) => *n = (*n).max(width),
+            None => column_widths.push(width),
+        }
+        coordinates.push(coords);
+
+        running_offset += width;
+        col_idx += 1;
     }
 
-    let mut changes = Vec::with_capacity(selection.len());
-    let len = column_widths.first().map(|cols| cols.len()).unwrap_or(0);
-    let mut offs = vec![0; len];
+    let column_positions: Vec<_> = column_widths
+        .into_iter()
+        .scan(0, |sum, n| {
+            *sum += n;
+            Some(*sum)
+        })
+        .collect();
 
-    for col in column_widths {
-        let max_col = col
-            .iter()
-            .enumerate()
-            .map(|(row, (_, cursor))| *cursor + offs[row])
-            .max()
-            .unwrap_or(0);
+    previous_line = usize::MAX;
 
-        for (row, (insert_pos, last_col)) in col.into_iter().enumerate() {
-            let ins_count = max_col - (last_col + offs[row]);
-            if ins_count == 0 {
-                continue;
+    let changes = coordinates
+        .into_iter()
+        .zip(selection)
+        .map(|(coords, range)| {
+            if coords.row != previous_line {
+                col_idx = 0;
+                running_offset = 0;
+                previous_line = coords.row;
             }
-            offs[row] += ins_count;
-            changes.push((
+            let inserts = column_positions[col_idx] - coords.col - running_offset;
+            let insert_pos = range.from();
+
+            col_idx += 1;
+            running_offset += inserts;
+
+            (
                 insert_pos,
                 insert_pos,
-                Some(Tendril::from(" ".repeat(ins_count))),
-            ));
-        }
-    }
+                Some(Tendril::from(" ".repeat(inserts))),
+            )
+        });
 
-    changes.sort_unstable_by_key(|(from, _, _)| *from);
-
-    let transaction = Transaction::change(doc.text(), changes.into_iter());
+    let transaction = Transaction::change(doc.text(), changes);
     doc.apply(&transaction, target.id());
     Ok(())
 }
@@ -1413,7 +1439,8 @@ pub fn indent_in(
     count: usize,
 ) {
     let lines = get_lines_in(target, doc);
-    let indent = Tendril::from(doc.indent_style().as_str().repeat(count));
+    let indent_style = doc.indent_style();
+    let indent = Tendril::from(indent_style.as_str().repeat(count));
 
     let transaction = Transaction::change(
         doc.text(),
@@ -1423,7 +1450,17 @@ pub fn indent_in(
                 return None;
             }
             let pos = doc.text().line_to_char(line);
-            Some((pos, pos, Some(indent.clone())))
+
+            // Snap space indentation to the next multiple of the indent width.
+            let indent = if let IndentStyle::Spaces(indent_width) = indent_style {
+                let line = doc.text().line(line);
+                let offset = line.first_non_whitespace_char().unwrap_or(0) % indent_width as usize;
+                indent.clone().split_off(offset)
+            } else {
+                indent.clone()
+            };
+
+            Some((pos, pos, Some(indent)))
         }),
     );
     doc.apply(&transaction, target.id());
@@ -1694,14 +1731,23 @@ fn toggle_comments_impl(
     doc_id: DocumentId,
     comment_transaction: CommentTransactionFn,
 ) {
+    let loader = editor.syn_loader.load();
     let doc = crate::doc_mut!(editor, &doc_id);
-    let line_token: Option<&str> = doc
-        .language_config()
+    // Pick the token the primary cursor's line is already commented with (longest
+    // match, so `///` wins over `//`). If the line isn't commented yet, fall back to
+    // the primary token for adding a comment. Tokens come from the syntax layer at the
+    // cursor, so embedded languages are commented in their own syntax.
+    let text = doc.text().slice(..);
+    let cursor = doc.selection(view_id).primary().cursor(text);
+    let cursor_line = text.char_to_line(cursor);
+    let lang_config = doc.language_config_at(&loader, text.char_to_byte(cursor));
+    let line_token: Option<&str> = lang_config
         .and_then(|lc| lc.comment_tokens.as_ref())
-        .and_then(|tc| tc.first())
-        .map(|tc| tc.as_str());
-    let block_tokens: Option<&[BlockCommentToken]> = doc
-        .language_config()
+        .and_then(|tokens| {
+            comment::get_comment_token(text, tokens, cursor_line)
+                .or_else(|| tokens.first().map(|token| token.as_str()))
+        });
+    let block_tokens: Option<&[BlockCommentToken]> = lang_config
         .and_then(|lc| lc.block_comment_tokens.as_ref())
         .map(|tc| &tc[..]);
 
@@ -1832,6 +1878,7 @@ fn join_selections_impl(
     use helix_stdx::rope::RopeSliceExt;
     use movement::skip_while;
 
+    let loader = editor.syn_loader.load();
     let doc = crate::doc_mut!(editor, &doc_id);
     let text = doc.text();
     let slice = text.slice(..);
@@ -1873,6 +1920,22 @@ fn join_selections_impl(
         let lines = start..end;
 
         changes.reserve(lines.len());
+
+        // Strip the comment leaders of the syntax layer at this selection, so joining lines
+        // inside an embedded language removes that language's tokens.
+        let layer_tokens = doc
+            .language_config_at(&loader, slice.char_to_byte(slice.line_to_char(start)))
+            .and_then(|config| config.comment_tokens.as_deref());
+        let layer_tokens: Vec<&str> = match layer_tokens {
+            Some(tokens) => {
+                let mut tokens: Vec<&str> = tokens.iter().map(|x| x.as_str()).collect();
+                // Sort by length to handle Rust's /// vs //
+                tokens.sort_unstable_by_key(|x| std::cmp::Reverse(x.len()));
+                tokens
+            }
+            None => comment_tokens.clone(),
+        };
+        let comment_tokens = &layer_tokens;
 
         let first_line_idx = slice.line_to_char(start);
         let first_line_idx = skip_while(slice, first_line_idx, |ch| matches!(ch, ' ' | '\t'))
@@ -2291,11 +2354,22 @@ fn get_adjusted_selection(
 /// Insert `count` copies of the document's indent style at each cursor.
 pub fn insert_tab(editor: &mut Editor, view_id: ViewId, doc_id: DocumentId, count: usize) {
     let doc = crate::doc_mut!(editor, &doc_id);
-    let indent = Tendril::from(doc.indent_style().as_str().repeat(count));
-    let transaction = Transaction::insert(
+    let indent_style = doc.indent_style();
+    let text = doc.text().slice(..);
+    let transaction = Transaction::change(
         doc.text(),
-        &doc.selection(view_id).clone().cursors(doc.text().slice(..)),
-        indent,
+        doc.selection(view_id).ranges().iter().map(|range| {
+            let cursor = range.cursor(text);
+            let mut indent = Tendril::from(indent_style.as_str().repeat(count));
+            // Snap space indentation to the next multiple of the indent width.
+            if let IndentStyle::Spaces(indent_width) = indent_style {
+                let line_start = text.line_to_char(range.cursor_line(text));
+                let offset = (cursor - line_start) % indent_width as usize;
+                indent = indent.split_off(offset);
+            }
+
+            (cursor, cursor, Some(indent))
+        }),
     );
     doc.apply(&transaction, view_id);
 }
@@ -2319,10 +2393,23 @@ pub fn insert_char_transaction(
     let loader: &helix_core::syntax::Loader = &editor.syn_loader.load();
     let auto_pairs = doc.auto_pairs(editor, loader, &view_id);
 
-    auto_pairs
-        .as_ref()
-        .and_then(|ap| auto_pairs::hook(text, selection, c, ap))
-        .or_else(|| insert_single_char(text, selection, c))
+    let insert_char = |range: &Range| {
+        let cursor = range.cursor(text.slice(..));
+        ((cursor, cursor, Some(Tendril::from_iter([c]))), None)
+    };
+
+    // Each range is handled on its own, so auto pairs mix with plain inserts in one transaction.
+    Some(Transaction::change_by_and_with_selection(
+        text,
+        selection,
+        |range| {
+            auto_pairs
+                .as_ref()
+                .and_then(|ap| auto_pairs::hook_insert(text, range, c, ap))
+                .map(|(change, range)| (change, Some(range)))
+                .unwrap_or_else(|| insert_char(range))
+        },
+    ))
 }
 
 /// Insert one character at every cursor. Returns whether a transaction was applied.
@@ -2333,15 +2420,6 @@ pub fn insert_char(editor: &mut Editor, view_id: ViewId, doc_id: DocumentId, c: 
     let doc = crate::doc_mut!(editor, &doc_id);
     doc.apply(&transaction, view_id);
     true
-}
-
-/// Plain character insertion (no auto-pairs).
-#[allow(clippy::unnecessary_wraps)]
-fn insert_single_char(doc: &Rope, selection: &Selection, ch: char) -> Option<Transaction> {
-    let cursors = selection.clone().cursors(doc.slice(..));
-    let mut t = Tendril::new();
-    t.push(ch);
-    Some(Transaction::insert(doc, &cursors, t))
 }
 
 // ─── Insert mode: delete backward ───────────────────────────────────
@@ -2355,71 +2433,73 @@ pub fn delete_char_backward(
 ) {
     let doc = crate::doc!(editor, &doc_id);
     let text = doc.text().slice(..);
-    let tab_width = doc.tab_width();
-    let indent_width = doc.indent_width();
 
     let loader: &helix_core::syntax::Loader = &editor.syn_loader.load();
     let auto_pairs = doc.auto_pairs(editor, loader, &view_id);
 
     let transaction =
-        Transaction::delete_by_selection(doc.text(), doc.selection(view_id), |range| {
+        Transaction::delete_by_and_with_selection(doc.text(), doc.selection(view_id), |range| {
             let pos = range.cursor(text);
             if pos == 0 {
-                return (pos, pos);
+                return ((pos, pos), None);
             }
-            let line_start_pos = text.line_to_char(range.cursor_line(text));
-            let fragment = Cow::from(text.slice(line_start_pos..pos));
-            if !fragment.is_empty() && fragment.chars().all(|ch| ch == ' ' || ch == '\t') {
-                if text.get_char(pos.saturating_sub(1)) == Some('\t') {
-                    (graphemes::nth_prev_grapheme_boundary(text, pos, 1), pos)
-                } else {
-                    let width: usize = fragment
-                        .chars()
-                        .map(|ch| {
-                            if ch == '\t' {
-                                tab_width
-                            } else {
-                                ch.width().unwrap_or(1)
-                            }
-                        })
-                        .sum();
-                    let mut drop = width % indent_width;
-                    if drop == 0 {
-                        drop = indent_width
-                    };
-                    let mut chars = fragment.chars().rev();
-                    let mut start = pos;
-                    for _ in 0..drop {
-                        match chars.next() {
-                            Some(' ') => start -= 1,
-                            _ => break,
-                        }
-                    }
-                    (start, pos)
-                }
-            } else {
-                match (
-                    text.get_char(pos.saturating_sub(1)),
-                    text.get_char(pos),
-                    auto_pairs,
-                ) {
-                    (Some(_x), Some(_y), Some(ap))
-                        if range.is_single_grapheme(text)
-                            && ap.get(_x).is_some()
-                            && ap.get(_x).unwrap().open == _x
-                            && ap.get(_x).unwrap().close == _y =>
-                    {
-                        (
-                            graphemes::nth_prev_grapheme_boundary(text, pos, count),
-                            graphemes::nth_next_grapheme_boundary(text, pos, count),
-                        )
-                    }
-                    _ => (graphemes::nth_prev_grapheme_boundary(text, pos, count), pos),
-                }
-            }
+            dedent(doc, range)
+                .map(|dedent| (dedent, None))
+                .or_else(|| {
+                    auto_pairs::hook_delete(doc.text(), range, auto_pairs?)
+                        .map(|(delete, new_range)| (delete, Some(new_range)))
+                })
+                .unwrap_or_else(|| {
+                    (
+                        (graphemes::nth_prev_grapheme_boundary(text, pos, count), pos),
+                        None,
+                    )
+                })
         });
     let doc = crate::doc_mut!(editor, &doc_id);
     doc.apply(&transaction, view_id);
+}
+
+/// Backspace over indentation: when only whitespace precedes the cursor, delete back to the
+/// previous indent unit (one char for a tab).
+fn dedent(doc: &Document, range: &Range) -> Option<Deletion> {
+    let text = doc.text().slice(..);
+    let pos = range.cursor(text);
+    let line_start_pos = text.line_to_char(range.cursor_line(text));
+    let fragment = Cow::from(text.slice(line_start_pos..pos));
+    if fragment.is_empty() || !fragment.chars().all(|ch| ch == ' ' || ch == '\t') {
+        return None;
+    }
+    if text.get_char(pos.saturating_sub(1)) == Some('\t') {
+        return Some((graphemes::nth_prev_grapheme_boundary(text, pos, 1), pos));
+    }
+
+    let tab_width = doc.tab_width();
+    let indent_width = doc.indent_width();
+    let width: usize = fragment
+        .chars()
+        .map(|ch| {
+            if ch == '\t' {
+                tab_width
+            } else {
+                ch.width().unwrap_or(1)
+            }
+        })
+        .sum();
+    // Round down to the previous unit; at a unit already, drop a whole one.
+    let mut drop = width % indent_width;
+    if drop == 0 {
+        drop = indent_width
+    };
+    let mut chars = fragment.chars().rev();
+    let mut start = pos;
+    for _ in 0..drop {
+        match chars.next() {
+            Some(' ') => start -= 1,
+            _ => break,
+        }
+    }
+    Some((start, pos))
 }
 
 // ─── Insert mode: delete forward ─────────────────────────────────────
@@ -2549,13 +2629,6 @@ pub fn insert_newline(editor: &mut Editor, view_id: ViewId, doc_id: DocumentId) 
     let mut global_offs = 0;
     let mut new_text = String::new();
 
-    let continue_comment_tokens = if config.continue_comments {
-        doc.language_config()
-            .and_then(|config| config.comment_tokens.as_ref())
-    } else {
-        None
-    };
-
     let mut last_pos = 0;
     let mut transaction = Transaction::change_by_selection(contents, selection, |range| {
         let mut chars_deleted = 0;
@@ -2571,8 +2644,11 @@ pub fn insert_newline(editor: &mut Editor, view_id: ViewId, doc_id: DocumentId) 
         let current_line = text.char_to_line(pos);
         let line_start = text.line_to_char(current_line);
 
-        let continue_comment_token = continue_comment_tokens
-            .and_then(|tokens| comment::get_comment_token(text, tokens, current_line));
+        // Continue the comment leader of the layer at the cursor.
+        let continue_comment_token = config
+            .continue_comments
+            .then(|| doc.continued_comment_token(&loader, current_line, text.char_to_byte(pos)))
+            .flatten();
 
         let (from, to, local_offs) = if let Some(idx) =
             text.slice(line_start..pos).last_non_whitespace_char()
@@ -3268,6 +3344,25 @@ mod tests {
         text
     }
 
+    #[test]
+    fn open_buffers_follow_unsaved_edits() {
+        let (mut editor, view_id, doc_id) = test_editor_with_text("saved\n");
+        let dir = tempfile::tempdir().unwrap();
+        let path = helix_stdx::path::canonicalize(dir.path().join("a.txt"));
+        editor.set_doc_path(doc_id, &path);
+        assert!(editor.open_buffers.text(&path).is_none());
+
+        let doc = editor.document_mut(doc_id).unwrap();
+        let edit = Transaction::change(doc.text(), [(0, 5, Some("edited".into()))].into_iter());
+        doc.apply(&edit, view_id);
+        assert_eq!(editor.open_buffers.text(&path).unwrap(), "edited\n");
+
+        // Saved elsewhere: the text no longer belongs to the old path.
+        let moved = helix_stdx::path::canonicalize(dir.path().join("b.txt"));
+        editor.set_doc_path(doc_id, &moved);
+        assert!(editor.open_buffers.text(&path).is_none());
+    }
+
     fn test_editor_with_text(text: &str) -> (Editor, ViewId, DocumentId) {
         let theme_loader = theme::Loader::new(&[]);
         let syn_loader = helix_core::config::default_lang_loader();
@@ -3298,6 +3393,103 @@ mod tests {
             .expect("document")
             .set_selection(view_id, Selection::single(0, end));
         (editor, view_id, doc_id)
+    }
+
+    #[test]
+    fn repeated_motion_follows_focus_after_its_view_closes() {
+        let (mut editor, first_view, first_doc) = test_editor_with_text("a\n\nb\n\nc\n");
+        crate::commands::movement::goto_next_paragraph(&mut editor, first_view, first_doc, 1);
+
+        let second_doc =
+            editor.new_file_from_document(Action::VerticalSplit, test_doc("x\n\ny\n\nz\n"));
+        let second_view = editor.tree.focus;
+        editor
+            .document_mut(second_doc)
+            .expect("second document")
+            .set_selection(second_view, Selection::point(0));
+        editor.close(first_view);
+        assert_eq!(editor.tree.focus, second_view);
+
+        editor.repeat_last_motion(1);
+
+        let doc = editor.document(second_doc).expect("second document");
+        assert_ne!(doc.selection(second_view).primary(), Range::point(0));
+    }
+
+    #[test]
+    fn page_and_half_page_scroll_by_view_height() {
+        let text: String = (0..200).map(|line| format!("line {line}\n")).collect();
+        let (mut editor, view_id, doc_id) = test_editor_with_text(&text);
+        editor
+            .document_mut(doc_id)
+            .expect("document")
+            .set_selection(view_id, Selection::point(0));
+        let height = {
+            let doc = editor.document(doc_id).expect("document");
+            usize::from(editor.tree.get(view_id).inner_area(doc).height)
+        };
+        assert!(height > 2);
+        let top_line = |editor: &Editor| {
+            let doc = editor.document(doc_id).expect("document");
+            doc.text().char_to_line(doc.view_offset(view_id).anchor)
+        };
+
+        crate::commands::movement::scroll_page(
+            &mut editor,
+            view_id,
+            doc_id,
+            1,
+            false,
+            Direction::Forward,
+            false,
+        );
+        assert_eq!(top_line(&editor), height);
+
+        crate::commands::movement::scroll_page(
+            &mut editor,
+            view_id,
+            doc_id,
+            2,
+            true,
+            Direction::Backward,
+            true,
+        );
+        assert_eq!(top_line(&editor), height - 2 * (height / 2));
+    }
+
+    #[test]
+    fn repeated_motion_is_skipped_once_every_view_is_gone() {
+        let (mut editor, view_id, doc_id) = test_editor_with_text("a\n\nb\n");
+        crate::commands::movement::goto_next_paragraph(&mut editor, view_id, doc_id, 1);
+        editor.close(view_id);
+
+        editor.repeat_last_motion(1);
+    }
+
+    #[test]
+    fn open_below_works_in_a_component_view() {
+        let (mut editor, _, _) = test_editor_with_text("");
+        let doc_id = editor.new_component_doc(test_doc("foo\n"));
+        let view_id = editor.allocate_view_id();
+        editor.ensure_component_view(view_id, doc_id);
+        editor
+            .document_mut(doc_id)
+            .expect("component document")
+            .set_selection(view_id, Selection::single(0, 4));
+
+        open(
+            &mut editor,
+            view_id,
+            doc_id,
+            1,
+            Open::Below,
+            CommentContinuation::Disabled,
+        );
+
+        let doc = editor.document(doc_id).expect("component document");
+        assert_eq!(doc.text().len_lines(), 3);
+        assert!(doc.text().to_string().starts_with("foo"));
+        assert_eq!(editor.mode(), Mode::Insert);
     }
 
     fn lsp_selection_range(
@@ -3790,5 +3982,88 @@ mod tests {
 
         assert_eq!(result, Ok(()));
         assert_eq!(doc.text().to_string(), "a  = 1\nbb= 2");
+    }
+
+    #[test]
+    fn align_selections_in_aligns_rows_with_different_selection_counts() {
+        let view_id = ViewId::default();
+        let text = "I    I  II I\nIIIIIIIII\nIIIII\nIIIIIIIII\n";
+        let mut doc = test_doc(text);
+        let ranges = text
+            .char_indices()
+            .filter(|&(_, c)| c == 'I')
+            .map(|(i, _)| Range::new(i, i + 1))
+            .collect();
+        doc.set_selection(view_id, Selection::new(ranges, 0));
+
+        let result = align_selections_in(&view_id, &mut doc);
+
+        assert_eq!(result, Ok(()));
+        assert_eq!(
+            doc.text().to_string(),
+            "I    I  II I\nI    I  II IIIII\nI    I  II I\nI    I  II IIIII\n"
+        );
+    }
+
+    #[test]
+    fn indent_in_snaps_spaces_to_indent_width() {
+        let view_id = ViewId::default();
+        let mut doc = test_doc("a\n  b\n c\n");
+        doc.set_indent_style(IndentStyle::Spaces(4));
+        doc.set_selection(view_id, Selection::single(0, doc.text().len_chars()));
+
+        indent_in(&view_id, &mut doc, 1);
+
+        assert_eq!(doc.text().to_string(), "    a\n    b\n    c\n");
+    }
+
+    #[test]
+    fn insert_tab_snaps_spaces_to_indent_width() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let _guard = runtime.enter();
+        let (mut editor, view_id, doc_id) = test_editor_with_text("ab\nabc\n");
+        let doc = editor.document_mut(doc_id).expect("document");
+        doc.set_indent_style(IndentStyle::Spaces(4));
+        doc.set_selection(
+            view_id,
+            Selection::new(
+                SmallVec::from_vec(vec![Range::point(2), Range::point(6)]),
+                0,
+            ),
+        );
+
+        insert_tab(&mut editor, view_id, doc_id, 1);
+
+        assert_eq!(
+            editor
+                .document(doc_id)
+                .expect("document")
+                .text()
+                .to_string(),
+            "ab  \nabc \n"
+        );
+    }
+
+    #[test]
+    fn toggle_comments_uses_the_token_already_on_the_line() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let _guard = runtime.enter();
+        let (mut editor, view_id, doc_id) = test_editor_with_text("/// abc\n");
+        let loader = editor.syn_loader.load_full();
+        let doc = editor.document_mut(doc_id).expect("document");
+        doc.set_language_by_language_id("rust", &loader)
+            .expect("rust language");
+        doc.set_selection(view_id, Selection::point(4));
+
+        toggle_comments(&mut editor, view_id, doc_id);
+
+        assert_eq!(
+            editor
+                .document(doc_id)
+                .expect("document")
+                .text()
+                .to_string(),
+            "abc\n"
+        );
     }
 }

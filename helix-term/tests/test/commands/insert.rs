@@ -583,3 +583,56 @@ async fn test_jump_undo_redo() -> anyhow::Result<()> {
     .await?;
     Ok(())
 }
+
+/// With a two-key insert-mode escape (`jk`), a `j` followed by another key inserts the `j`
+/// and still runs the other key, instead of dropping it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn interrupted_insert_sequence_keeps_non_character_keys() -> anyhow::Result<()> {
+    use helix_core::hashmap;
+    use helix_term::keymap;
+    use helix_view::document::Mode;
+
+    let mut config = Config::default();
+    config.keys.insert(
+        Mode::Insert,
+        keymap!({"Insert Mode"
+            "j" => { "Escape"
+                "k" => normal_mode,
+            },
+        }),
+    );
+
+    test_with_config(
+        AppBuilder::new().with_config(config),
+        ("#[\n|]#", "ia<ret>j<ret>b<esc>", "a\nj\nb#[|\n]#"),
+    )
+    .await?;
+    Ok(())
+}
+
+/// A binding mixing engine and frontend commands runs all of them, in order.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mixed_engine_and_frontend_sequence_runs_every_command() -> anyhow::Result<()> {
+    use helix_core::hashmap;
+    use helix_term::keymap;
+    use helix_view::document::Mode;
+
+    let mut config = Config::default();
+    config.keys.insert(
+        Mode::Normal,
+        keymap!({"Normal Mode"
+            "C-l" => [move_char_right, insert_mode],
+        }),
+    );
+
+    test_key_sequence_with_input_text(
+        Some(AppBuilder::new().with_config(config).build()?),
+        ("#[a|]#bc\n", "<C-l>X<esc>", "#[|]#"),
+        &|app| {
+            let (_, doc) = helix_view::focused_ref!(app.editor);
+            assert_eq!(doc.text().to_string().replace("\r\n", "\n"), "aXbc\n");
+        },
+        false,
+    )
+    .await
+}

@@ -140,11 +140,11 @@ impl PluginQueryHost for RpcHost {
         match self.call(PluginRequest::ApiMetadata) {
             Ok(HostResponse::ApiMetadata(metadata)) => metadata,
             Err(err) => {
-                eprintln!("helix-plugin-host: api_metadata failed: {err}");
+                log::error!("helix-plugin-host: api_metadata failed: {err}");
                 metadata::ApiMetadata::default()
             }
             Ok(other) => {
-                eprintln!("helix-plugin-host: unexpected api_metadata response: {other:?}");
+                log::error!("helix-plugin-host: unexpected api_metadata response: {other:?}");
                 metadata::ApiMetadata::default()
             }
         }
@@ -248,6 +248,22 @@ impl PluginQueryHost for RpcHost {
             line,
         })? {
             HostResponse::DocumentLine(text) => Ok(text),
+            other => Err(internal(format!("unexpected response: {other:?}"))),
+        }
+    }
+
+    fn document_lines(
+        &self,
+        handle: DocumentHandle,
+        start: usize,
+        end: usize,
+    ) -> ContractResult<Vec<String>> {
+        match self.call(PluginRequest::DocumentLines {
+            document: handle,
+            start,
+            end,
+        })? {
+            HostResponse::DocumentLines(lines) => Ok(lines),
             other => Err(internal(format!("unexpected response: {other:?}"))),
         }
     }
@@ -730,7 +746,7 @@ fn parse_args(config: &mut PluginConfig) {
                 eprintln!("usage: helix-plugin-host [--plugin-dir PATH]...");
                 std::process::exit(0);
             }
-            other => eprintln!("helix-plugin-host: ignoring unknown argument: {other}"),
+            other => log::warn!("helix-plugin-host: ignoring unknown argument: {other}"),
         }
     }
 }
@@ -759,7 +775,7 @@ fn load_plugins(
             }
         }
         if let Err(err) = engine.load_plugin(host, plugin) {
-            eprintln!("helix-plugin-host: failed to load plugin: {err}");
+            log::error!("helix-plugin-host: failed to load plugin: {err}");
         }
     }
     Ok(())
@@ -785,7 +801,23 @@ fn reload_plugins(
     configure_engine_hosts(engine, host);
     engine.set_api_metadata(api_metadata.clone());
     engine.register_api(config.clone())?;
-    load_plugins(engine, host, config)
+    load_plugins(engine, host, config)?;
+    announce_ready(engine, host, api_metadata);
+    Ok(())
+}
+
+/// Fire `host_ready` for the plugins just loaded: the host now takes their calls.
+fn announce_ready(
+    engine: &mut LuaEngine,
+    host: &mut RpcHost,
+    api_metadata: &metadata::ApiMetadata,
+) {
+    let event = events::PluginEvent::HostReady(events::HostReadyEvent {
+        api_version: api_metadata.version,
+    });
+    if let Err(err) = engine.call_event_handlers(host, &event) {
+        log::warn!("helix-plugin-host: host_ready handlers failed: {err}");
+    }
 }
 
 fn callback_id(callback: UiCallbackToken) -> UiCallbackId {
@@ -808,7 +840,7 @@ fn dispatch_host_notification(
             engine.handle_ui_callback(host, callback_id(callback), value)?
         }
         HostRequest::PanelKey { panel, key } => {
-            engine.handle_panel_key(panel, &key)?;
+            engine.handle_panel_key(host, panel, &key)?;
         }
         HostRequest::Reload => reload_plugins(engine, host, config, api_metadata)?,
         HostRequest::TaskCompleted { operation, result } => {
@@ -836,7 +868,32 @@ fn drain_deferred_requests(
     Ok(false)
 }
 
+/// The host's logs go to stderr, which the editor reads and files under the
+/// host's name at the same level. Stdout carries the RPC frames and must not
+/// see a stray byte.
+struct StderrLogger;
+
+impl log::Log for StderrLogger {
+    fn enabled(&self, _metadata: &log::Metadata) -> bool {
+        true
+    }
+
+    fn log(&self, record: &log::Record) {
+        let message = record.args().to_string();
+        for line in message.lines() {
+            eprintln!("{} {line}", record.level());
+        }
+    }
+
+    fn flush(&self) {}
+}
+
+static STDERR_LOGGER: StderrLogger = StderrLogger;
+
 pub fn run_plugin_host() {
+    if log::set_logger(&STDERR_LOGGER).is_ok() {
+        log::set_max_level(log::LevelFilter::Debug);
+    }
     let peer = Arc::new(Mutex::new(Peer::new()));
     let mut host = RpcHost::new(Arc::clone(&peer));
 
@@ -860,11 +917,11 @@ pub fn run_plugin_host() {
             (config, metadata)
         }
         Ok(_) => {
-            eprintln!("helix-plugin-host: expected Init as first frame");
+            log::error!("helix-plugin-host: expected Init as first frame");
             return;
         }
         Err(err) => {
-            eprintln!("helix-plugin-host: failed to read Init: {err}");
+            log::error!("helix-plugin-host: failed to read Init: {err}");
             return;
         }
     };
@@ -872,25 +929,26 @@ pub fn run_plugin_host() {
     let mut engine = match LuaEngine::new() {
         Ok(engine) => engine,
         Err(err) => {
-            eprintln!("helix-plugin-host: Lua initialization failed: {err}");
+            log::error!("helix-plugin-host: Lua initialization failed: {err}");
             return;
         }
     };
     configure_engine_hosts(&mut engine, &host);
     engine.set_api_metadata(metadata.clone());
     if let Err(err) = engine.register_api(init.clone()) {
-        eprintln!("helix-plugin-host: API registration failed: {err}");
+        log::error!("helix-plugin-host: API registration failed: {err}");
         return;
     }
     if let Err(err) = load_plugins(&mut engine, &mut host, &init) {
-        eprintln!("helix-plugin-host: plugin discovery failed: {err}");
+        log::error!("helix-plugin-host: plugin discovery failed: {err}");
         return;
     }
+    announce_ready(&mut engine, &mut host, &metadata);
     match drain_deferred_requests(&mut engine, &mut host, &init, &metadata) {
         Ok(false) => {}
         Ok(true) => return,
         Err(err) => {
-            eprintln!("helix-plugin-host: initialization dispatch failed: {err}");
+            log::error!("helix-plugin-host: initialization dispatch failed: {err}");
             return;
         }
     }
@@ -899,17 +957,34 @@ pub fn run_plugin_host() {
             Ok(frame) => frame,
             Err(err) if err.to_string().contains("early eof") => break,
             Err(err) => {
-                eprintln!("helix-plugin-host: read failed: {err}");
+                log::error!("helix-plugin-host: read failed: {err}");
                 break;
             }
         };
 
         match frame {
             Frame::Notify { body } => {
+                let user_action = matches!(
+                    body,
+                    HostRequest::CommandInvoke { .. } | HostRequest::UiCallback { .. }
+                );
                 match dispatch_host_notification(&mut engine, &mut host, &init, &metadata, body) {
                     Ok(true) => break,
                     Ok(false) => {}
-                    Err(err) => eprintln!("helix-plugin-host: notification failed: {err}"),
+                    Err(err) => {
+                        log::error!("helix-plugin-host: notification failed: {err}");
+                        // Something the user ran failed; say so rather than
+                        // doing nothing.
+                        if user_action {
+                            let _ = PluginUiHost::notify(
+                                &mut host,
+                                requests::NotifyRequest {
+                                    message: format!("plugin error: {err}"),
+                                    level: requests::NotifyLevel::Error,
+                                },
+                            );
+                        }
+                    }
                 }
             }
             Frame::Request { id, body } => {
@@ -931,7 +1006,7 @@ pub fn run_plugin_host() {
                         .map(|()| PluginResponse::Unit)
                         .map_err(|err| internal(err.to_string())),
                     HostRequest::PanelKey { panel, key } => engine
-                        .handle_panel_key(panel, &key)
+                        .handle_panel_key(&host, panel, &key)
                         .map(PluginResponse::Bool)
                         .map_err(|err| internal(err.to_string())),
                     HostRequest::Reload => reload_plugins(&mut engine, &mut host, &init, &metadata)
@@ -941,19 +1016,19 @@ pub fn run_plugin_host() {
                     HostRequest::Init { .. } => Err(internal("duplicate Init")),
                 };
                 if let Err(err) = peer.lock().respond(id, result) {
-                    eprintln!("helix-plugin-host: response write failed: {err}");
+                    log::error!("helix-plugin-host: response write failed: {err}");
                     break;
                 }
             }
             Frame::Response { .. } => {
-                eprintln!("helix-plugin-host: unexpected response frame");
+                log::error!("helix-plugin-host: unexpected response frame");
             }
         }
 
         match drain_deferred_requests(&mut engine, &mut host, &init, &metadata) {
             Ok(false) => {}
             Ok(true) => break,
-            Err(err) => eprintln!("helix-plugin-host: deferred notification failed: {err}"),
+            Err(err) => log::error!("helix-plugin-host: deferred notification failed: {err}"),
         }
     }
 }

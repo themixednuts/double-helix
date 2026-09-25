@@ -217,6 +217,14 @@ impl Editor {
         if let DocumentLocation::Local(path) = &location {
             self.set_doc_path(doc_id, path);
         }
+        // Saved with nothing typed since: the file on disk is the document again.
+        if let Some(path) = self
+            .document(doc_id)
+            .filter(|doc| !doc.is_modified())
+            .and_then(|doc| doc.path().cloned())
+        {
+            self.open_buffers.forget(&path);
+        }
 
         Some(DocumentSaveReport {
             doc_id,

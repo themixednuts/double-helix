@@ -277,16 +277,32 @@ pub(crate) fn apply_assistant_command(
                 (),
                 crate::ui::PickerRuntime::new(editor),
                 ingress.clone(),
-                move |cx: &mut crate::compositor::Context, item: &PermissionPickerItem, _action| {
-                    if let Err(error) = cx.foreground.assistant_permission_resolved(
-                        thread,
-                        request_id.clone(),
-                        helix_view::assistant::permission::Decision::Choose(item.id.clone()),
-                    ) {
-                        cx.editor.set_error(error.to_string());
+                {
+                    let request_id = request_id.clone();
+                    move |cx: &mut crate::compositor::Context,
+                          item: &PermissionPickerItem,
+                          _action| {
+                        if let Err(error) = cx.foreground.assistant_permission_resolved(
+                            thread,
+                            request_id.clone(),
+                            helix_view::assistant::permission::Decision::Choose(item.id.clone()),
+                        ) {
+                            cx.editor.set_error(error.to_string());
+                        }
                     }
                 },
-            );
+            )
+            // The agent blocks until it hears back; dismissing the picker is
+            // an answer too.
+            .on_abort(move |cx| {
+                if let Err(error) = cx.foreground.assistant_permission_resolved(
+                    thread,
+                    request_id,
+                    helix_view::assistant::permission::Decision::Dismiss,
+                ) {
+                    cx.editor.set_error(error.to_string());
+                }
+            });
 
             compositor.push(Box::new(crate::ui::overlay::overlaid(picker)));
         }

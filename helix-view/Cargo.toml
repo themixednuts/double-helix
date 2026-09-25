@@ -18,6 +18,7 @@ mock-acp = []
 bench = ["helix-core/bench"]
 
 [dependencies]
+foldhash.workspace = true
 helix-collab = { path = "../helix-collab" }
 helix-workspace = { path = "../helix-workspace" }
 helix-stdx = { path = "../helix-stdx" }

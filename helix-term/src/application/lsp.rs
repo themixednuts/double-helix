@@ -158,6 +158,7 @@ impl Application {
                                     self.language.progress.end_progress(server_id, &token);
                                     if !self.language.progress.is_progressing(server_id) {
                                         editor_view.spinners_mut().get_or_create(server_id).stop();
+                                        self.refresh_pull_diagnostics_after_progress(server_id);
                                     }
                                     self.editor.clear_status();
                                     return;
@@ -211,13 +212,18 @@ impl Application {
                                 self.language.progress.end_progress(server_id, &token);
                                 if !self.language.progress.is_progressing(server_id) {
                                     editor_view.spinners_mut().get_or_create(server_id).stop();
+                                    self.refresh_pull_diagnostics_after_progress(server_id);
                                 };
                             }
                         }
                     }
                     Notification::ProgressMessage(_params) => {}
                     Notification::Exit => {
-                        self.editor.set_status("Language server exited");
+                        let status = match self.editor.language_server_by_id(server_id) {
+                            Some(server) => format!("Language server exited: {}", server.name()),
+                            None => "Language server exited".to_string(),
+                        };
+                        self.editor.set_status(status);
                         self.editor.remove_language_server_diagnostics(server_id);
                         self.editor
                             .clear_language_server_document_diagnostics(server_id);
@@ -514,6 +520,15 @@ impl Application {
         self.apply_language_server_refreshes(language_servers, refresh.kind);
     }
 
+    /// Re-pull diagnostics once a server has finished all its progress: results
+    /// served while it was still busy (e.g. indexing) may be incomplete.
+    fn refresh_pull_diagnostics_after_progress(&mut self, server_id: LanguageServerId) {
+        self.apply_language_server_refreshes(
+            std::collections::HashSet::from([server_id]),
+            helix_collab::LanguageServerRefreshKind::WorkspaceDiagnostics,
+        );
+    }
+
     fn apply_language_server_refreshes(
         &mut self,
         language_servers: std::collections::HashSet<LanguageServerId>,
@@ -618,7 +633,7 @@ impl Application {
                 .name()
                 .to_owned();
             Some(CollaborationDiagnosticsPublication {
-                uri: hosted.collaboration_document_url(&path),
+                uri: lsp::Url::parse(hosted.collaboration_document_url(&path).as_str()).ok()?,
                 hosted,
                 path,
                 server,
@@ -837,9 +852,13 @@ impl Application {
             return lsp::ShowDocumentResult { success: false };
         };
 
-        let action = match take_focus {
-            Some(true) => helix_view::editor::Action::Replace,
-            _ => helix_view::editor::Action::VerticalSplit,
+        // Jump straight to the document unless a picker, prompt or popup is open;
+        // then only load it in the background so the user's input isn't
+        // interrupted, unless the server explicitly asks to take focus.
+        let action = if !self.compositor.has_overlay() || take_focus == Some(true) {
+            helix_view::editor::Action::Replace
+        } else {
+            helix_view::editor::Action::Load
         };
 
         let target = self.editor.focused_view_id();

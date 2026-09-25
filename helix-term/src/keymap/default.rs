@@ -268,7 +268,8 @@ pub fn default() -> HashMap<Mode, KeyTrie> {
             "f" => file_picker,
             "F" => file_picker_in_current_directory,
             "e" => file_explorer,
-            "E" => file_explorer_in_current_buffer_directory,
+            // `space .` is upstream's binding; `space E` stays for existing muscle memory.
+            "E" | "." => file_explorer_in_current_buffer_directory,
             "b" => buffer_picker,
             "j" => jumplist_picker,
             "s" => lsp_or_syntax_symbol_picker,

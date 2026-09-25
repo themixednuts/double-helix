@@ -42,10 +42,41 @@ pub trait Backend {
     fn set_cursor(&mut self, x: u16, y: u16) -> Result<(), io::Error>;
     /// Clears the terminal
     fn clear(&mut self) -> Result<(), io::Error>;
+    /// Opens a synchronized-output frame, where the terminal supports it, so
+    /// everything written until [`Backend::end_sync`] presents at once.
+    fn start_sync(&mut self) -> Result<(), io::Error> {
+        Ok(())
+    }
+    /// Closes the frame opened by [`Backend::start_sync`].
+    fn end_sync(&mut self) -> Result<(), io::Error> {
+        Ok(())
+    }
     /// Gets the size of the terminal in cells
     fn size(&self) -> Result<Rect, io::Error>;
     /// Flushes the terminal buffer
     fn flush(&mut self) -> Result<(), io::Error>;
     fn supports_true_color(&self) -> bool;
     fn get_theme_mode(&self) -> Option<helix_view::theme::Mode>;
+    /// Sets the terminal's own background color (OSC 11) so the area outside the editor and
+    /// the terminal's padding match the theme; `None` restores the terminal's default.
+    fn set_background_color(
+        &mut self,
+        _color: Option<helix_view::theme::Color>,
+    ) -> Result<(), io::Error> {
+        Ok(())
+    }
 }
+
+/// The OSC 11 sequence that sets the terminal background to `color`, or the OSC 111 sequence
+/// that restores the terminal's default when there's no RGB color to set.
+pub(crate) fn osc_background(color: Option<helix_view::theme::Color>) -> String {
+    match color {
+        Some(helix_view::theme::Color::Rgb(r, g, b)) => {
+            format!("\x1b]11;rgb:{r:02x}/{g:02x}/{b:02x}\x1b\\")
+        }
+        _ => OSC_RESET_BACKGROUND.to_owned(),
+    }
+}
+
+/// OSC 111: restore the terminal's default background.
+pub(crate) const OSC_RESET_BACKGROUND: &str = "\x1b]111\x1b\\";

@@ -1,5 +1,5 @@
 use crate::keymap;
-use crate::keymap::{merge_keys, KeyTrie};
+use crate::keymap::KeyTrie;
 use helix_loader::merge_toml_values;
 use helix_view::{
     document::Mode,
@@ -17,7 +17,11 @@ use toml::de::Error as TomlError;
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
     pub theme: Option<theme::Config>,
+    /// The editing engine's keymap with `user_keys` merged in.
     pub keys: HashMap<Mode, KeyTrie>,
+    /// The `[keys]` tables from the user and workspace configs, in merge order, so the keymap
+    /// can be rebuilt when the editing engine changes.
+    pub user_keys: Vec<HashMap<Mode, KeyTrie>>,
     pub editor: helix_view::editor::Config,
     pub plugins: helix_plugin::PluginConfig,
 }
@@ -38,6 +42,7 @@ impl Default for Config {
         Config {
             theme: None,
             keys: keymap::default(),
+            user_keys: Vec::new(),
             editor: helix_view::editor::Config::default(),
             plugins: helix_plugin::PluginConfig::default(),
         }
@@ -79,13 +84,7 @@ impl Config {
 
         let res = match (global_config, local_config) {
             (Ok(global), Ok(local)) => {
-                let mut keys = keymap::default();
-                if let Some(global_keys) = global.keys {
-                    merge_keys(&mut keys, global_keys)
-                }
-                if let Some(local_keys) = local.keys {
-                    merge_keys(&mut keys, local_keys)
-                }
+                let user_keys: Vec<_> = global.keys.into_iter().chain(local.keys).collect();
 
                 let mut editor = match (global.editor, local.editor) {
                     (None, None) => helix_view::editor::Config::default(),
@@ -117,7 +116,8 @@ impl Config {
 
                 Config {
                     theme: local.theme.or(global.theme),
-                    keys,
+                    keys: keymap::for_engine(editor.editing_engine, &user_keys),
+                    user_keys,
                     editor,
                     plugins,
                 }
@@ -128,10 +128,7 @@ impl Config {
                 return Err(ConfigLoadError::BadConfig(err))
             }
             (Ok(config), Err(_)) | (Err(_), Ok(config)) => {
-                let mut keys = keymap::default();
-                if let Some(keymap) = config.keys {
-                    merge_keys(&mut keys, keymap);
-                }
+                let user_keys: Vec<_> = config.keys.into_iter().collect();
 
                 let icons = config.icons.map_or_else(
                     || Ok(Icons::default()),
@@ -143,20 +140,20 @@ impl Config {
                 let plugins = merge_plugin_config(config.plugins, None)?.unwrap_or_default();
                 plugins.validate().map_err(ConfigLoadError::Plugin)?;
 
+                let mut editor = config.editor.map_or_else(
+                    || Ok(helix_view::editor::Config::default()),
+                    |val| val.try_into().map_err(ConfigLoadError::BadConfig),
+                )?;
+                if let Some(pkg) = merge_pkg_config(config.pkg, None)? {
+                    editor.pkg = pkg;
+                }
+
                 Config {
                     theme: config.theme,
-                    keys,
+                    keys: keymap::for_engine(editor.editing_engine, &user_keys),
+                    user_keys,
                     plugins,
-                    editor: {
-                        let mut editor = config.editor.map_or_else(
-                            || Ok(helix_view::editor::Config::default()),
-                            |val| val.try_into().map_err(ConfigLoadError::BadConfig),
-                        )?;
-                        if let Some(pkg) = merge_pkg_config(config.pkg, None)? {
-                            editor.pkg = pkg;
-                        }
-                        editor
-                    },
+                    editor,
                 }
             }
 
@@ -170,10 +167,36 @@ impl Config {
     pub fn load_default() -> Result<Config, ConfigLoadError> {
         let global_config =
             fs::read_to_string(helix_loader::config_file()).map_err(ConfigLoadError::Error);
-        let local_config = fs::read_to_string(helix_loader::workspace_config_file())
-            .map_err(ConfigLoadError::Error);
-        Config::load(global_config, local_config)
+        let trust_config = global_config
+            .as_deref()
+            .map(workspace_trust_config)
+            .unwrap_or_default();
+        let trust = helix_loader::workspace_trust::WorkspaceTrust::new((&trust_config).into());
+        let local_config = if trust
+            .query_current(helix_loader::workspace_trust::TrustQuery::LocalConfig)
+            .is_trusted()
+        {
+            fs::read_to_string(helix_loader::workspace_config_file())
+                .map_err(ConfigLoadError::Error)
+        } else {
+            Err(ConfigLoadError::default())
+        };
+        let mut config = Config::load(global_config, local_config)?;
+        // The gate's own settings come from the user config only: a trusted workspace setting
+        // `level = "insecure"` would otherwise loosen it for every workspace opened afterwards.
+        config.editor.workspace_trust = trust_config;
+        Ok(config)
     }
+}
+
+/// `[editor.workspace-trust]` from the user config. An invalid table falls back to the defaults
+/// here; loading the whole config reports the error.
+fn workspace_trust_config(global: &str) -> helix_view::editor::WorkspaceTrustConfig {
+    toml::from_str::<toml::Value>(global)
+        .ok()
+        .and_then(|config| config.get("editor")?.get("workspace-trust").cloned())
+        .and_then(|config| config.try_into().ok())
+        .unwrap_or_default()
 }
 
 fn merge_pkg_config(
@@ -197,6 +220,19 @@ fn merge_plugin_config(
     global: Option<toml::Value>,
     local: Option<toml::Value>,
 ) -> Result<Option<helix_plugin::PluginConfig>, ConfigLoadError> {
+    // A cloned repository must not be able to make the editor spawn a
+    // program or load its Lua just by being opened, so a workspace config
+    // may tune plugins but not add hosts or plugin directories.
+    let local = local.map(|mut local| {
+        if let Some(table) = local.as_table_mut() {
+            for key in ["hosts", "plugin-dirs", "plugin_dirs"] {
+                if table.remove(key).is_some() {
+                    log::warn!("ignoring `plugins.{key}` from the workspace config");
+                }
+            }
+        }
+        local
+    });
     match (global, local) {
         (None, None) => Ok(None),
         (None, Some(value)) | (Some(value), None) => value
@@ -213,6 +249,7 @@ fn merge_plugin_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::keymap::merge_keys;
 
     impl Config {
         fn load_test(config: &str) -> Config {
@@ -249,13 +286,29 @@ mod tests {
             },
         );
 
-        assert_eq!(
-            Config::load_test(sample_keymaps),
-            Config {
-                keys,
-                ..Default::default()
-            }
+        assert_eq!(Config::load_test(sample_keymaps).keys, keys);
+    }
+
+    #[test]
+    fn vim_engine_loads_the_vim_keymap_under_user_keys() {
+        use crate::keymap::KeyTrie;
+        use helix_view::document::Mode;
+
+        let config = Config::load_test(
+            r#"
+            [editor]
+            editing-engine = "vim"
+
+            [keys.normal]
+            A-F12 = "move_next_word_end"
+        "#,
         );
+        let command = |key: &str| match config.keys[&Mode::Normal].search(&[key.parse().unwrap()]) {
+            Some(KeyTrie::MappableCommand(command)) => command.name().to_string(),
+            other => panic!("{key}: {other:?}"),
+        };
+        assert_eq!(command("x"), "vim_delete_char");
+        assert_eq!(command("A-F12"), "move_next_word_end");
     }
 
     #[test]
@@ -348,6 +401,35 @@ mod tests {
             [std::path::PathBuf::from("global-plugins")]
         );
         assert_eq!(config.plugins.max_memory, 2048);
+        assert_eq!(config.plugins.max_instructions, 4000);
+    }
+
+    #[test]
+    fn workspace_config_cannot_add_plugin_hosts_or_directories() {
+        let config = Config::load(
+            Ok(r#"
+                [plugins]
+                plugin_dirs = ["global-plugins"]
+                "#
+            .to_owned()),
+            Ok(r#"
+                [plugins]
+                max_instructions = 4000
+                plugin_dirs = ["repo-plugins"]
+
+                [[plugins.hosts]]
+                name = "evil"
+                command = "calc.exe"
+                "#
+            .to_owned()),
+        )
+        .unwrap();
+
+        assert!(config.plugins.hosts.is_empty());
+        assert_eq!(
+            config.plugins.plugin_dirs,
+            [std::path::PathBuf::from("global-plugins")]
+        );
         assert_eq!(config.plugins.max_instructions, 4000);
     }
 

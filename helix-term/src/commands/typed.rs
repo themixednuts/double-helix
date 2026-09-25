@@ -133,6 +133,7 @@ fn exit(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow:
             WriteOptions {
                 policy: SavePolicy::Safe,
                 auto_format: !args.has_flag(WRITE_NO_FORMAT_FLAG.name),
+                code_actions: !args.has_flag(WRITE_NO_CODE_ACTIONS_FLAG.name),
             },
         )?);
     }
@@ -153,6 +154,7 @@ fn force_exit(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> a
             WriteOptions {
                 policy: SavePolicy::Overwrite,
                 auto_format: !args.has_flag(WRITE_NO_FORMAT_FLAG.name),
+                code_actions: !args.has_flag(WRITE_NO_CODE_ACTIONS_FLAG.name),
             },
         )?);
     }
@@ -529,6 +531,29 @@ fn write_impl(
         bail!("Can't save with no path set!");
     }
 
+    // Code actions on save run first, then format and write, as one chain of exit tasks.
+    {
+        let (view_id, doc) = focused_ref!(cx.editor);
+        let doc_id = doc.id();
+        let kinds = if options.code_actions {
+            crate::effect::code_actions_on_save::kinds_for(cx.editor, doc_id)
+        } else {
+            Default::default()
+        };
+        if !kinds.is_empty() {
+            let finish = crate::runtime::OnSaveFinish {
+                view_id,
+                path,
+                policy: options.policy,
+                auto_format: config.auto_format && options.auto_format,
+            };
+            let step =
+                crate::effect::code_actions_on_save::next_step(cx.editor, doc_id, kinds, finish);
+            cx.exit_task_event(step);
+            return Ok(doc_id);
+        }
+    }
+
     let (format_task, doc_id) = {
         let (view_id, doc) = focused_ref!(cx.editor);
         let format_task = if config.auto_format && options.auto_format {
@@ -622,6 +647,8 @@ fn insert_final_newline(doc: &mut Document, view_id: ViewId) {
 pub struct WriteOptions {
     pub policy: SavePolicy,
     pub auto_format: bool,
+    /// Run the language's `code-actions-on-save` first.
+    pub code_actions: bool,
 }
 
 fn write(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow::Result<()> {
@@ -635,6 +662,7 @@ fn write(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow
         WriteOptions {
             policy: SavePolicy::Safe,
             auto_format: !args.has_flag(WRITE_NO_FORMAT_FLAG.name),
+            code_actions: !args.has_flag(WRITE_NO_CODE_ACTIONS_FLAG.name),
         },
     )
     .map(|_| ())
@@ -651,6 +679,7 @@ fn force_write(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> 
         WriteOptions {
             policy: SavePolicy::Overwrite,
             auto_format: !args.has_flag(WRITE_NO_FORMAT_FLAG.name),
+            code_actions: !args.has_flag(WRITE_NO_CODE_ACTIONS_FLAG.name),
         },
     )
     .map(|_| ())
@@ -671,6 +700,7 @@ fn write_buffer_close(
         WriteOptions {
             policy: SavePolicy::Safe,
             auto_format: !args.has_flag(WRITE_NO_FORMAT_FLAG.name),
+            code_actions: !args.has_flag(WRITE_NO_CODE_ACTIONS_FLAG.name),
         },
     )?;
 
@@ -693,6 +723,7 @@ fn force_write_buffer_close(
         WriteOptions {
             policy: SavePolicy::Overwrite,
             auto_format: !args.has_flag(WRITE_NO_FORMAT_FLAG.name),
+            code_actions: !args.has_flag(WRITE_NO_CODE_ACTIONS_FLAG.name),
         },
     )?;
 
@@ -937,6 +968,7 @@ fn write_quit(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> a
         WriteOptions {
             policy: SavePolicy::Safe,
             auto_format: !args.has_flag(WRITE_NO_FORMAT_FLAG.name),
+            code_actions: !args.has_flag(WRITE_NO_CODE_ACTIONS_FLAG.name),
         },
     )?;
     queue_close_view(cx, &[saved], true);
@@ -958,6 +990,7 @@ fn force_write_quit(
         WriteOptions {
             policy: SavePolicy::Overwrite,
             auto_format: !args.has_flag(WRITE_NO_FORMAT_FLAG.name),
+            code_actions: !args.has_flag(WRITE_NO_CODE_ACTIONS_FLAG.name),
         },
     )?;
     queue_close_view(cx, &[saved], false);
@@ -1002,6 +1035,8 @@ pub struct WriteAllOptions {
     pub policy: SavePolicy,
     pub write_scratch: bool,
     pub auto_format: bool,
+    /// Run each language's `code-actions-on-save` first.
+    pub code_actions: bool,
 }
 
 pub fn write_all_impl(
@@ -1067,6 +1102,33 @@ pub fn write_all_editor_impl(
         // Save an undo checkpoint for any outstanding changes.
         doc.append_changes_to_history(view);
 
+        // Code actions on save run first, then format and write, as one chain of exit tasks.
+        let kinds = if options.code_actions {
+            crate::effect::code_actions_on_save::kinds_for(editor, doc_id)
+        } else {
+            Default::default()
+        };
+        if !kinds.is_empty() {
+            let finish = crate::runtime::OnSaveFinish {
+                view_id: target_view,
+                path: None,
+                policy: options.policy,
+                auto_format: options.auto_format && config.auto_format,
+            };
+            let step =
+                crate::effect::code_actions_on_save::next_step(editor, doc_id, kinds, finish);
+            crate::runtime::schedule_exit_task(
+                exit_tasks
+                    .as_deref_mut()
+                    .expect("write_all_editor_impl requires exit_tasks for code-actions-on-save"),
+                exit_task_work.expect(
+                    "write_all_editor_impl requires exit_task_work for code-actions-on-save",
+                ),
+                step,
+            );
+            continue;
+        }
+
         let fmt = if options.auto_format && config.auto_format {
             let doc = doc!(editor, &doc_id);
             doc.auto_format(editor).map(|fmt| {
@@ -1118,6 +1180,7 @@ fn write_all(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> an
             policy: SavePolicy::Safe,
             write_scratch: true,
             auto_format: !args.has_flag(WRITE_NO_FORMAT_FLAG.name),
+            code_actions: !args.has_flag(WRITE_NO_CODE_ACTIONS_FLAG.name),
         },
     )
     .map(|_| ())
@@ -1138,6 +1201,7 @@ fn force_write_all(
             policy: SavePolicy::Overwrite,
             write_scratch: true,
             auto_format: !args.has_flag(WRITE_NO_FORMAT_FLAG.name),
+            code_actions: !args.has_flag(WRITE_NO_CODE_ACTIONS_FLAG.name),
         },
     )
     .map(|_| ())
@@ -1157,6 +1221,7 @@ fn write_all_quit(
             policy: SavePolicy::Safe,
             write_scratch: true,
             auto_format: !args.has_flag(WRITE_NO_FORMAT_FLAG.name),
+            code_actions: !args.has_flag(WRITE_NO_CODE_ACTIONS_FLAG.name),
         },
     )?;
     quit_all_impl(cx, QuitPolicy::CheckBuffers, &saved)
@@ -1176,6 +1241,7 @@ fn force_write_all_quit(
             policy: SavePolicy::Overwrite,
             write_scratch: true,
             auto_format: !args.has_flag(WRITE_NO_FORMAT_FLAG.name),
+            code_actions: !args.has_flag(WRITE_NO_CODE_ACTIONS_FLAG.name),
         },
     )?;
     quit_all_impl(cx, QuitPolicy::DiscardBuffers, &saved)
@@ -1474,6 +1540,24 @@ fn change_current_directory(
         return Ok(());
     }
 
+    let dir = directory_argument(cx, &args)?;
+    apply_directory_change(cx, &dir)
+}
+
+/// The directory named by a `:cd`-style argument: `-` for the previous one, none for home.
+fn directory_argument(cx: &mut compositor::Context, args: &Args) -> anyhow::Result<PathBuf> {
+    match args.first().map(AsRef::as_ref) {
+        Some("-") => cx
+            .editor
+            .get_last_cwd()
+            .map(Path::to_path_buf)
+            .ok_or_else(|| anyhow!("No previous working directory")),
+        Some(path) => Ok(helix_stdx::path::expand_tilde(Path::new(path)).into_owned()),
+        None => Ok(home_dir()?),
+    }
+}
+
+fn apply_directory_change(cx: &mut compositor::Context, dir: &Path) -> anyhow::Result<()> {
     ensure!(
         matches!(
             cx.editor.workspace_backend,
@@ -1482,17 +1566,7 @@ fn change_current_directory(
         ":cd cannot change the root of a remote or collaborative workspace"
     );
 
-    let dir = match args.first().map(AsRef::as_ref) {
-        Some("-") => cx
-            .editor
-            .get_last_cwd()
-            .map(|path| Cow::Owned(path.to_path_buf()))
-            .ok_or_else(|| anyhow!("No previous working directory"))?,
-        Some(path) => helix_stdx::path::expand_tilde(Path::new(path)),
-        None => Cow::Owned(home_dir()?),
-    };
-
-    cx.editor.set_cwd(&dir).map_err(|err| {
+    cx.editor.set_cwd(dir).map_err(|err| {
         anyhow!(
             "Could not change working directory to '{}': {err}",
             dir.display()
@@ -1504,6 +1578,61 @@ fn change_current_directory(
         std::env::current_dir().unwrap_or_default().display()
     ));
 
+    Ok(())
+}
+
+fn push_directory(
+    cx: &mut compositor::Context,
+    args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+
+    let dir = directory_argument(cx, &args)?;
+    let previous = helix_stdx::env::current_working_dir();
+    apply_directory_change(cx, &dir)?;
+    cx.editor.push_dir_stack(previous);
+    Ok(())
+}
+
+fn pop_directory(
+    cx: &mut compositor::Context,
+    _args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+
+    let Some(dir) = cx.editor.pop_dir_stack() else {
+        bail!("The directory stack is empty");
+    };
+    if let Err(err) = apply_directory_change(cx, &dir) {
+        // Keep the entry so a transient failure doesn't lose it.
+        cx.editor.push_dir_stack(dir);
+        return Err(err);
+    }
+    Ok(())
+}
+
+fn show_directory_stack(
+    cx: &mut compositor::Context,
+    _args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+
+    let stack = cx
+        .editor
+        .dir_stack()
+        .map(|dir| dir.display().to_string())
+        .collect::<Vec<_>>();
+    ensure!(!stack.is_empty(), "The directory stack is empty");
+    cx.editor.set_status(stack.join(" "));
     Ok(())
 }
 
@@ -1711,6 +1840,7 @@ fn update(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyho
             WriteOptions {
                 policy: SavePolicy::Safe,
                 auto_format: !args.has_flag(WRITE_NO_FORMAT_FLAG.name),
+                code_actions: !args.has_flag(WRITE_NO_CODE_ACTIONS_FLAG.name),
             },
         )
         .map(|_| ())
@@ -2406,7 +2536,7 @@ pub(super) fn goto_line_number(
 
             let (view_id, doc) = focused!(cx.editor);
             let view = view_mut!(cx.editor, view_id);
-            view.history.jumps.push((doc.id(), last_selection));
+            view.history.push_jump(doc, (doc.id(), last_selection));
         }
 
         // When a user hits backspace and there are no numbers left,
@@ -2875,6 +3005,72 @@ fn refresh_config(
     }
 
     queue_config_event(cx, ConfigEvent::Refresh)
+}
+
+/// The focused document's workspace, for the workspace trust commands.
+fn current_workspace(cx: &compositor::Context) -> anyhow::Result<std::path::PathBuf> {
+    let (_, doc) = focused_ref!(cx.editor);
+    doc.workspace_root()
+        .map(std::path::Path::to_path_buf)
+        .context("workspace trust applies to local workspaces; this document is remote")
+}
+
+fn workspace_trust(
+    cx: &mut compositor::Context,
+    _args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+    let workspace = current_workspace(cx)?;
+    let saved = cx.editor.workspace_trust.trust(&workspace);
+    // Reloading loads the workspace config and starts the servers trust allows.
+    queue_config_event(cx, ConfigEvent::Refresh)?;
+    saved.context("trusted for this session only: saving the decision failed")?;
+    cx.editor
+        .set_status(format!("Trusted workspace {}", workspace.display()));
+    Ok(())
+}
+
+fn workspace_untrust(
+    cx: &mut compositor::Context,
+    _args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+    let workspace = current_workspace(cx)?;
+    let saved = cx.editor.workspace_trust.untrust(&workspace);
+    // Drops workspace config from the live config. Running language servers keep running
+    // (`:lsp-stop` stops them).
+    queue_config_event(cx, ConfigEvent::Refresh)?;
+    saved.context("saving the decision failed")?;
+    cx.editor.set_status(format!(
+        "Revoked trust for workspace {}",
+        workspace.display()
+    ));
+    Ok(())
+}
+
+fn workspace_exclude(
+    cx: &mut compositor::Context,
+    _args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+    let workspace = current_workspace(cx)?;
+    let saved = cx.editor.workspace_trust.exclude(&workspace);
+    queue_config_event(cx, ConfigEvent::Refresh)?;
+    saved.context("excluded for this session only: saving the decision failed")?;
+    cx.editor.set_status(format!(
+        "Excluded workspace {}: it won't ask for trust again",
+        workspace.display()
+    ));
+    Ok(())
 }
 
 fn queue_config_event(cx: &mut compositor::Context, event: ConfigEvent) -> anyhow::Result<()> {
@@ -3864,6 +4060,12 @@ const WRITE_NO_FORMAT_FLAG: Flag = Flag {
     ..Flag::DEFAULT
 };
 
+const WRITE_NO_CODE_ACTIONS_FLAG: Flag = Flag {
+    name: "no-code-actions",
+    doc: "skip the language's code-actions-on-save",
+    ..Flag::DEFAULT
+};
+
 fn notifications_history(
     cx: &mut compositor::Context,
     _args: Args,
@@ -4017,6 +4219,57 @@ fn understand(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> 
         return Ok(());
     }
     cx.submit_ui(super::understanding::prepare(cx.editor)?);
+    Ok(())
+}
+
+/// The agent behind the active assistant thread.
+fn active_assistant_backend(
+    editor: &helix_view::Editor,
+) -> anyhow::Result<helix_view::assistant::backend::Id> {
+    let thread = editor
+        .assistant
+        .active()
+        .and_then(|thread| editor.assistant.thread(thread))
+        .context("no assistant thread is open")?;
+    match thread.origin() {
+        helix_view::assistant::thread::Origin::Backend { backend, .. } => Ok(backend.clone()),
+        helix_view::assistant::thread::Origin::Local => {
+            bail!("the active assistant thread has no agent")
+        }
+    }
+}
+
+fn assistant_restart(
+    cx: &mut compositor::Context,
+    _args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+    let backend = active_assistant_backend(cx.editor)?;
+    cx.editor.restart_assistant_backend(&backend)?;
+    cx.editor.set_status(format!("Restarted agent {backend}"));
+    Ok(())
+}
+
+fn assistant_disconnect(
+    cx: &mut compositor::Context,
+    _args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+    let backend = active_assistant_backend(cx.editor)?;
+    if cx.editor.shutdown_assistant_backend(&backend) {
+        cx.editor.set_status(format!(
+            "Stopped agent {backend}; your next message starts it again"
+        ));
+    } else {
+        cx.editor
+            .set_status(format!("Agent {backend} is not running"));
+    }
     Ok(())
 }
 
@@ -4522,7 +4775,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         completer: CommandCompleter::positional(&[completers::filename]),
         signature: Signature {
             positionals: (0, Some(1)),
-            flags: &[WRITE_NO_FORMAT_FLAG],
+            flags: &[WRITE_NO_FORMAT_FLAG, WRITE_NO_CODE_ACTIONS_FLAG],
             ..Signature::DEFAULT
         },
     },
@@ -4534,7 +4787,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         completer: CommandCompleter::positional(&[completers::filename]),
         signature: Signature {
             positionals: (0, Some(1)),
-            flags: &[WRITE_NO_FORMAT_FLAG],
+            flags: &[WRITE_NO_FORMAT_FLAG, WRITE_NO_CODE_ACTIONS_FLAG],
             ..Signature::DEFAULT
         },
     },
@@ -4716,7 +4969,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         completer: CommandCompleter::positional(&[completers::filename]),
         signature: Signature {
             positionals: (0, Some(1)),
-            flags: &[WRITE_NO_FORMAT_FLAG],
+            flags: &[WRITE_NO_FORMAT_FLAG, WRITE_NO_CODE_ACTIONS_FLAG],
             ..Signature::DEFAULT
         },
     },
@@ -4728,7 +4981,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         completer: CommandCompleter::positional(&[completers::filename]),
         signature: Signature {
             positionals: (0, Some(1)),
-            flags: &[WRITE_NO_FORMAT_FLAG],
+            flags: &[WRITE_NO_FORMAT_FLAG, WRITE_NO_CODE_ACTIONS_FLAG],
             ..Signature::DEFAULT
         },
     },
@@ -4740,7 +4993,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         completer: CommandCompleter::positional(&[completers::filename]),
         signature: Signature {
             positionals: (0, Some(1)),
-            flags: &[WRITE_NO_FORMAT_FLAG],
+            flags: &[WRITE_NO_FORMAT_FLAG, WRITE_NO_CODE_ACTIONS_FLAG],
             ..Signature::DEFAULT
         },
     },
@@ -4752,7 +5005,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         completer: CommandCompleter::positional(&[completers::filename]),
         signature: Signature {
             positionals: (0, Some(1)),
-            flags: &[WRITE_NO_FORMAT_FLAG],
+            flags: &[WRITE_NO_FORMAT_FLAG, WRITE_NO_CODE_ACTIONS_FLAG],
             ..Signature::DEFAULT
         },
     },
@@ -4833,7 +5086,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         completer: CommandCompleter::positional(&[completers::filename]),
         signature: Signature {
             positionals: (0, Some(1)),
-            flags: &[WRITE_NO_FORMAT_FLAG],
+            flags: &[WRITE_NO_FORMAT_FLAG, WRITE_NO_CODE_ACTIONS_FLAG],
             ..Signature::DEFAULT
         },
     },
@@ -4845,7 +5098,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         completer: CommandCompleter::positional(&[completers::filename]),
         signature: Signature {
             positionals: (0, Some(1)),
-            flags: &[WRITE_NO_FORMAT_FLAG],
+            flags: &[WRITE_NO_FORMAT_FLAG, WRITE_NO_CODE_ACTIONS_FLAG],
             ..Signature::DEFAULT
         },
     },
@@ -4857,7 +5110,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         completer: CommandCompleter::none(),
         signature: Signature {
             positionals: (0, Some(0)),
-            flags: &[WRITE_NO_FORMAT_FLAG],
+            flags: &[WRITE_NO_FORMAT_FLAG, WRITE_NO_CODE_ACTIONS_FLAG],
             ..Signature::DEFAULT
         },
     },
@@ -4869,7 +5122,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         completer: CommandCompleter::none(),
         signature: Signature {
             positionals: (0, Some(0)),
-            flags: &[WRITE_NO_FORMAT_FLAG],
+            flags: &[WRITE_NO_FORMAT_FLAG, WRITE_NO_CODE_ACTIONS_FLAG],
             ..Signature::DEFAULT
         },
     },
@@ -4881,7 +5134,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         completer: CommandCompleter::none(),
         signature: Signature {
             positionals: (0, Some(0)),
-            flags: &[WRITE_NO_FORMAT_FLAG],
+            flags: &[WRITE_NO_FORMAT_FLAG, WRITE_NO_CODE_ACTIONS_FLAG],
             ..Signature::DEFAULT
         },
     },
@@ -4893,7 +5146,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         completer: CommandCompleter::none(),
         signature: Signature {
             positionals: (0, Some(0)),
-            flags: &[WRITE_NO_FORMAT_FLAG],
+            flags: &[WRITE_NO_FORMAT_FLAG, WRITE_NO_CODE_ACTIONS_FLAG],
             ..Signature::DEFAULT
         },
     },
@@ -5096,6 +5349,39 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         },
     },
     TypableCommand {
+        name: "push-directory",
+        aliases: &["pushd"],
+        doc: "Save the current working directory on the directory stack, then change to the given one.",
+        fun: push_directory,
+        completer: CommandCompleter::positional(&[completers::directory]),
+        signature: Signature {
+            positionals: (0, Some(1)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "pop-directory",
+        aliases: &["popd"],
+        doc: "Change back to the directory most recently saved by :push-directory.",
+        fun: pop_directory,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "show-directory-stack",
+        aliases: &[],
+        doc: "Show the directories saved by :push-directory, most recent first.",
+        fun: show_directory_stack,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
         name: "show-directory",
         aliases: &["pwd"],
         doc: "Show the current working directory.",
@@ -5158,7 +5444,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         completer: CommandCompleter::none(),
         signature: Signature {
             positionals: (0, Some(0)),
-            flags: &[WRITE_NO_FORMAT_FLAG],
+            flags: &[WRITE_NO_FORMAT_FLAG, WRITE_NO_CODE_ACTIONS_FLAG],
             ..Signature::DEFAULT
         },
     },
@@ -5171,6 +5457,39 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         signature: Signature {
             positionals: (0, None),
             raw_after: Some(1),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "workspace-trust",
+        aliases: &[],
+        doc: "Trust the current workspace: load its local config and allow language servers, debug adapters and its git config.",
+        fun: workspace_trust,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "workspace-untrust",
+        aliases: &[],
+        doc: "Revoke the current workspace's trust grant or exclusion.",
+        fun: workspace_untrust,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "workspace-exclude",
+        aliases: &[],
+        doc: "Never trust the current workspace, and don't ask again.",
+        fun: workspace_exclude,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
             ..Signature::DEFAULT
         },
     },
@@ -5865,6 +6184,28 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         },
     },
     TypableCommand {
+        name: "assistant-restart",
+        aliases: &[],
+        doc: "Restart the active assistant thread's agent, keeping its conversations.",
+        fun: assistant_restart,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "assistant-disconnect",
+        aliases: &[],
+        doc: "Stop the active assistant thread's agent. Your next message starts it again.",
+        fun: assistant_disconnect,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
         name: "assistant-agents",
         aliases: &["acp-agents"],
         doc: "Browse, install, update, remove, and connect ACP assistant agents.",
@@ -6162,11 +6503,11 @@ fn execute_command_line(
         Some(cmd) => execute_command(cx, cmd, rest, event),
         None => {
             if event == PromptEvent::Validate {
-                let args: Vec<String> = rest.split_whitespace().map(str::to_owned).collect();
+                let args = super::plugin_command_args(rest);
                 if let Some(remote) = cx
                     .plugin_runtime
                     .command_snapshot()
-                    .into_iter()
+                    .iter()
                     .find(|candidate| candidate.descriptor.name == command)
                 {
                     cx.plugin_runtime
@@ -6514,6 +6855,9 @@ pub(crate) fn complete_command_args(
             complete_variable_expansion(&token.content, offset + token.content_start)
         }
         TokenKind::Expansion(ExpansionKind::Unicode) => Vec::new(),
+        TokenKind::Expansion(ExpansionKind::Register) => {
+            complete_register_expansion(&token.content, offset + token.content_start)
+        }
         TokenKind::ExpansionKind => {
             complete_expansion_kind(&token.content, offset + token.content_start)
         }
@@ -6643,6 +6987,20 @@ fn complete_variable_expansion(content: &str, offset: usize) -> Vec<ui::prompt::
     .into_iter()
     .map(|(name, _)| (offset.., (*name).into()))
     .collect()
+}
+
+/// Completes `%reg{…}`. Completion runs off the editor thread, so it offers the special
+/// registers and `a`–`z` rather than only the registers that hold something.
+fn complete_register_expansion(content: &str, offset: usize) -> Vec<ui::prompt::Completion> {
+    let register_names: Vec<String> = ['"', '/', '*', '+', '_', '#', '.', '%']
+        .into_iter()
+        .chain('a'..='z')
+        .map(String::from)
+        .collect();
+    fuzzy_match(content, register_names, false)
+        .into_iter()
+        .map(|(name, _)| (offset.., name.to_string().into()))
+        .collect()
 }
 
 fn complete_expansion_kind(content: &str, offset: usize) -> Vec<ui::prompt::Completion> {

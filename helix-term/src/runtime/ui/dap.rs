@@ -146,15 +146,22 @@ pub(crate) fn apply_dap_command(
             });
             compositor.push(Box::new(picker));
         }
-        DapCommand::StackFramesPicker { thread_id, frames } => {
-            let columns = [ui::PickerColumn::new("frame", |item: &StackFrame, _| {
-                item.name.as_str().into()
-            })];
+        DapCommand::StackFramesPicker {
+            thread_id,
+            frames,
+            thread_state,
+        } => {
+            let columns = [ui::PickerColumn::new(
+                "frame",
+                |item: &StackFrame, thread_state: &String| {
+                    format!("{} ({thread_state})", item.name).into()
+                },
+            )];
             let picker = Picker::new(
                 columns,
                 0,
                 frames,
-                (),
+                thread_state,
                 crate::ui::PickerRuntime::new(editor),
                 ingress.clone(),
                 move |cx: &mut crate::compositor::Context, frame: &StackFrame, _action| {

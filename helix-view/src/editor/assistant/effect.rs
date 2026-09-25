@@ -19,6 +19,31 @@ pub(crate) fn accepted_review_apply_decision(
 }
 
 impl Editor {
+    /// The `LoadThread` that re-binds `command`'s thread to its agent session, for commands
+    /// that need a live session.
+    fn assistant_rebind_command(
+        &self,
+        command: &crate::assistant::backend::Command,
+    ) -> Option<crate::assistant::backend::Command> {
+        use crate::assistant::backend::Command;
+        let (Command::Submit { thread, .. }
+        | Command::ForkSubmit { thread, .. }
+        | Command::SetMode { thread, .. }
+        | Command::SetConfig { thread, .. }) = command
+        else {
+            return None;
+        };
+        let crate::assistant::thread::Origin::Backend { remote, .. } =
+            self.assistant.thread(*thread)?.origin()
+        else {
+            return None;
+        };
+        Some(Command::LoadThread {
+            thread: *thread,
+            remote: remote.clone(),
+        })
+    }
+
     pub fn apply_assistant_effects(&mut self, effects: Vec<crate::assistant::effect::Effect>) {
         for effect in effects {
             match effect {
@@ -40,13 +65,25 @@ impl Editor {
                     );
                 }
                 crate::assistant::effect::Effect::SendBackendCommand { backend, command } => {
+                    let was_live = self.take_live_assistant_backend(&backend).is_some();
                     let Some(handle) = self.ensure_assistant_backend(&backend) else {
                         self.set_error(format!("Assistant backend missing: {backend}"));
                         continue;
                     };
+                    // A freshly started agent knows none of the sessions an earlier process had
+                    // (after a crash or restart). Load the thread's session first, so the
+                    // conversation continues instead of failing as unbound.
+                    let rebind = if was_live {
+                        None
+                    } else {
+                        self.assistant_rebind_command(&command)
+                    };
                     self.runtime
                         .work()
                         .spawn(async move {
+                            if let Some(rebind) = rebind {
+                                let _ = handle.send(rebind).await;
+                            }
                             let _ = handle.send(command).await;
                         })
                         .detach();
@@ -71,6 +108,22 @@ impl Editor {
                 crate::assistant::effect::Effect::SetStatus { message } => {
                     self.set_status(message);
                 }
+                crate::assistant::effect::Effect::LaunchAuthTerminal {
+                    thread,
+                    title,
+                    terminal,
+                } => {
+                    if let Err(error) = self.launch_auth_terminal(&terminal) {
+                        let message = format!(
+                            "{error}. Run `{}` in a terminal to sign in with {title}, then press enter.",
+                            terminal.command_line()
+                        );
+                        if let Some(state) = self.assistant.thread_mut(thread) {
+                            state.auth_mut().terminal_login_failed(message);
+                        }
+                        self.request_redraw();
+                    }
+                }
                 crate::assistant::effect::Effect::Save { thread } => {
                     self.save_assistant_thread(thread);
                 }
@@ -81,15 +134,49 @@ impl Editor {
                     self.delete_assistant_thread(thread);
                 }
                 crate::assistant::effect::Effect::SyncModel => {
-                    let scope = crate::assistant::layout::current_scope();
-                    let (open, active) = self.assistant_layout_threads(&scope);
-                    self.debounce_assistant_layout(async move {
-                        let _ = crate::assistant::layout::save_layout(&scope, open, active).await;
-                    });
+                    // Every streamed chunk syncs the model, but the layout (which threads are
+                    // open, which is active) rarely changes: save it only when it did.
+                    let key = self.assistant_layout_key();
+                    if self.assistant_persistence.layout_key != Some(key) {
+                        self.assistant_persistence.layout_key = Some(key);
+                        let scope = crate::assistant::layout::current_scope();
+                        let (open, active) = self.assistant_layout_threads(&scope);
+                        self.debounce_assistant_layout(async move {
+                            let _ =
+                                crate::assistant::layout::save_layout(&scope, open, active).await;
+                        });
+                    }
                     self.request_redraw();
                 }
             }
         }
+    }
+
+    /// Open the login command in the external terminal (`editor.terminal`, as debug adapters
+    /// use). It runs on its own; the user says when it finished.
+    fn launch_auth_terminal(
+        &self,
+        terminal: &crate::assistant::auth::Terminal,
+    ) -> Result<(), String> {
+        let config =
+            self.config().terminal.clone().ok_or_else(|| {
+                "No external terminal is configured (`editor.terminal`)".to_string()
+            })?;
+        let mut child = std::process::Command::new(&config.command)
+            .args(&config.args)
+            .arg(&terminal.command)
+            .args(&terminal.args)
+            .envs(terminal.env.iter().map(|(key, value)| (key, value)))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|err| format!("Could not open a terminal with `{}`: {err}", config.command))?;
+        // Reap it whenever it exits.
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+        Ok(())
     }
 
     fn apply_assistant_review_accepted_file(

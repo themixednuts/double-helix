@@ -26,6 +26,8 @@ pub enum Error {
         path: std::path::PathBuf,
         source: std::io::Error,
     },
+    // FFF_STORAGE_TRAITS_BLOCKER: storage errors come from the caller-provided
+    // `FrecencyStore` / `QueryTrackerStore`; upstream heed/LMDB variants are stripped.
     #[error("Persistent picker cache error: {0}")]
     Persistence(String),
     #[error("Failed to start file system watcher: {0}")]
@@ -36,6 +38,24 @@ pub enum Error {
 
     #[error("libgit2 error occurred: {0}")]
     Git(#[from] git2::Error),
+
+    #[error("Filesystem walk failed: {0}")]
+    WalkFailed(String),
+
+    #[error("Invalid glob pattern '{pattern}': {reason}")]
+    InvalidGlobPattern { pattern: String, reason: String },
+
+    #[error("File system watching is disabled for this picker")]
+    WatcherDisabled,
+
+    #[error("File system watcher is not ready")]
+    WatcherNotReady,
+
+    #[error("Indexed base path changed while creating the watch subscription")]
+    WatchBaseChanged,
+
+    #[error("Failed to start watch callback dispatcher: {0}")]
+    WatchDispatcherStart(#[source] std::io::Error),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

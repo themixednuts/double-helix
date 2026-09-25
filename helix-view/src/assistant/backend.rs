@@ -160,6 +160,8 @@ impl Handle {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
+    /// Stop the agent process. Threads keep their sessions and reconnect to a new process.
+    Shutdown,
     NewThread {
         thread: thread::Id,
         scope: thread::Scope,

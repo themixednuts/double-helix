@@ -240,6 +240,8 @@ fn presenter_loop(
 ) {
     let mut claimed = false;
     let mut force_full_redraw = false;
+    // The background last sent to the terminal; `None` until one is sent after each claim.
+    let mut applied_background: Option<Option<helix_view::graphics::Color>> = None;
     loop {
         let (config, control, frame, replaced_frames, closed) = {
             let mut state = shared
@@ -289,6 +291,7 @@ fn presenter_loop(
                     if result.is_ok() {
                         claimed = true;
                         force_full_redraw = true;
+                        applied_background = None;
                     }
                     can_present = claimed;
                     let _ = reply.send(result);
@@ -297,6 +300,8 @@ fn presenter_loop(
                     let result = if claimed { terminal.restore() } else { Ok(()) };
                     if result.is_ok() {
                         claimed = false;
+                        // Restoring hands the terminal back its own background.
+                        applied_background = None;
                     }
                     can_present = false;
                     let _ = reply.send(result);
@@ -327,6 +332,12 @@ fn presenter_loop(
             if let Some(frame) = frame {
                 let started_at = Instant::now();
                 let generation = frame.generation;
+                if applied_background != Some(frame.background) {
+                    if let Err(error) = terminal.set_background_color(frame.background) {
+                        log::warn!("failed to set the terminal background: {error}");
+                    }
+                    applied_background = Some(frame.background);
+                }
                 let result = terminal.present(
                     frame.area,
                     frame.surface,
@@ -418,6 +429,7 @@ mod tests {
             cursor: None,
             cursor_kind: CursorKind::Hidden,
             full_redraw: false,
+            background: None,
         }
     }
 

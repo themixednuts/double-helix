@@ -1656,6 +1656,7 @@ impl AssistantPanel {
                 model.auth,
                 helix_view::assistant::auth::State::Required { .. }
                     | helix_view::assistant::auth::State::Failed { .. }
+                    | helix_view::assistant::auth::State::TerminalLogin { .. }
             )
         {
             AssistantLayer::Auth
@@ -1961,6 +1962,37 @@ impl AssistantPanel {
         }
         let len = methods.len() as isize;
         self.auth_selected = (self.auth_selected as isize + delta).rem_euclid(len) as usize;
+        true
+    }
+
+    /// The active thread, when it waits for the user to finish a terminal login.
+    fn terminal_login_thread(editor: &Editor) -> Option<helix_view::assistant::thread::Id> {
+        let model = Self::assistant_model(editor);
+        matches!(
+            model.auth,
+            helix_view::assistant::auth::State::TerminalLogin { .. }
+        )
+        .then_some(model.active_thread)
+        .flatten()
+    }
+
+    /// Enter in a terminal login: the user signed in, so ask the agent to check.
+    fn finish_terminal_login(&mut self, editor: &mut Editor) -> bool {
+        let Some(thread) = Self::terminal_login_thread(editor) else {
+            return false;
+        };
+        let effects = editor.finish_assistant_terminal_login(thread);
+        Self::apply_assistant_effects(editor, effects);
+        true
+    }
+
+    /// Esc in a terminal login: back to the methods.
+    fn cancel_terminal_login(&mut self, editor: &mut Editor) -> bool {
+        let Some(thread) = Self::terminal_login_thread(editor) else {
+            return false;
+        };
+        let effects = editor.cancel_assistant_terminal_login(thread);
+        Self::apply_assistant_effects(editor, effects);
         true
     }
 
@@ -3140,12 +3172,20 @@ impl AssistantPanel {
                 }
                 true
             }
-            EngineResult::ReplayInsert { keys, .. } => {
-                // For dot-repeat in the input region, just replay the keys as chars.
-                for ev in keys.iter() {
-                    if let Some(ch) = ev.char() {
-                        self.insert_char_into_input(ch, cx.editor);
+            EngineResult::ReplayInsert {
+                entry_command,
+                keys,
+            } => {
+                // `.`: enter insert mode the recorded way, then run the recorded keys the
+                // way typed ones run (Backspace and Enter included).
+                if self.input.begin_insert_replay(cx.editor, &entry_command) {
+                    for key in keys.iter().copied() {
+                        if self.input.mode() != Mode::Insert {
+                            break;
+                        }
+                        self.dispatch_input_key(key, cx);
                     }
+                    self.input.finish_insert_replay();
                 }
                 true
             }
@@ -3324,7 +3364,9 @@ impl AssistantPanel {
                 if self.enter_pending_elicitation(cx.editor) {
                     return EventResult::Consumed(None);
                 }
-                if Self::active_auth_methods(cx.editor).is_some() {
+                if Self::active_auth_methods(cx.editor).is_some()
+                    || Self::terminal_login_thread(cx.editor).is_some()
+                {
                     self.auth_transient = true;
                     self.set_focus(cx.editor, helix_view::assistant::thread::Focus::Messages);
                     return EventResult::Consumed(None);
@@ -3477,10 +3519,17 @@ impl AssistantPanel {
         cx: &mut Context,
     ) -> EventResult {
         match action {
+            AssistantAction::TransientPop
+                if layer == AssistantLayer::Auth && self.cancel_terminal_login(cx.editor) => {}
             AssistantAction::TransientPop => {
                 self.elicitation_form = None;
                 self.auth_transient = false;
                 self.focus_messages(cx.editor);
+            }
+            AssistantAction::TransientSubmit
+                if layer == AssistantLayer::Auth && self.finish_terminal_login(cx.editor) =>
+            {
+                self.auth_transient = false;
             }
             AssistantAction::TransientSubmit
                 if layer == AssistantLayer::Elicitation
@@ -3491,7 +3540,8 @@ impl AssistantPanel {
             AssistantAction::TransientSubmit
                 if layer == AssistantLayer::Auth && self.accept_auth_method(cx.editor) =>
             {
-                self.auth_transient = false;
+                // A terminal login stays open until the user says it finished.
+                self.auth_transient = Self::terminal_login_thread(cx.editor).is_some();
             }
             AssistantAction::TransientNext if layer == AssistantLayer::Elicitation => {
                 if let Some(form) = &mut self.elicitation_form {

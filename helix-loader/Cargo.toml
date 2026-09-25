@@ -35,4 +35,9 @@ cc = { version = "1" }
 threadpool = { version = "1.0" }
 tempfile.workspace = true
 
+# workspace trust
+globset.workspace = true
+parking_lot.workspace = true
+sha2.workspace = true
+
 tree-house.workspace = true

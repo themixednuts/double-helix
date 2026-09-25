@@ -665,12 +665,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
-name = "cov-mark"
-version = "2.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "90863d8442510cddf7f46618c4f92413774635771a3e80830c8b30d183420b14"
-
-[[package]]
 name = "cpufeatures"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1348,9 +1342,9 @@ dependencies = [
 
 [[package]]
 name = "fff-grep"
-version = "0.9.6"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5ac5720676a3e1cb901683073c0bcc0a8f04e1bfe6bea391e1f14b9f95dbdef2"
+checksum = "d75a741baa9142c1cbe7df7948d93a809296cd3a28f5c117964a0048b4711258"
 dependencies = [
  "bstr",
  "memchr",
@@ -1372,13 +1366,13 @@ dependencies = [
 
 [[package]]
 name = "fff-query-parser"
-version = "0.9.6"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2e83290e48a8e4dc6ff7cfdfcf382b2a07b6ef1f07e7d477427e3ebb60192307"
+checksum = "cc1aa71c8268c77b2b7d9982eeaa6aa42abb22eaaaa3b72b1b636946c72a8982"
 
 [[package]]
 name = "fff-search"
-version = "0.9.6"
+version = "0.11.0"
 dependencies = [
  "ahash",
  "aho-corasick",
@@ -2662,6 +2656,7 @@ dependencies = [
  "anyhow",
  "futures-util",
  "helix-runtime",
+ "helix-stdx",
  "log",
  "serde",
  "serde_json",
@@ -2669,6 +2664,7 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tokio-stream",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2736,7 +2732,6 @@ dependencies = [
  "unicode-general-category",
  "unicode-segmentation",
  "unicode-width",
- "url",
 ]
 
 [[package]]
@@ -2787,12 +2782,15 @@ dependencies = [
  "anyhow",
  "arc-swap",
  "cc",
+ "globset",
  "helix-ipc",
  "helix-stdx",
  "helix-store",
  "log",
  "once_cell",
+ "parking_lot",
  "serde",
+ "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.20",
  "threadpool",
@@ -2832,9 +2830,9 @@ name = "helix-lsp-types"
 version = "0.95.1"
 dependencies = [
  "bitflags 2.13.1",
+ "helix-stdx",
  "serde",
  "serde_json",
- "url",
 ]
 
 [[package]]
@@ -2874,6 +2872,7 @@ dependencies = [
  "thiserror 2.0.20",
  "toml 1.1.4+spec-1.1.0",
  "ureq",
+ "which",
  "xz2",
  "zip",
 ]
@@ -2891,6 +2890,7 @@ dependencies = [
  "helix-plugin-api",
  "helix-plugin-editor",
  "helix-runtime",
+ "helix-stdx",
  "helix-view",
  "log",
  "mlua",
@@ -2935,6 +2935,7 @@ dependencies = [
  "getrandom 0.3.4",
  "globset",
  "helix-ipc",
+ "helix-stdx",
  "helix-workspace",
  "ignore",
  "log",
@@ -2974,10 +2975,13 @@ dependencies = [
  "dunce",
  "etcetera",
  "once_cell",
+ "percent-encoding",
  "regex-automata",
  "regex-cursor",
  "ropey",
  "rustix",
+ "serde",
+ "serde_json",
  "tempfile",
  "unicode-segmentation",
  "which",
@@ -3111,6 +3115,7 @@ dependencies = [
  "clipboard-win",
  "content_inspector",
  "crossterm",
+ "foldhash 0.2.0",
  "futures-util",
  "helix-acp",
  "helix-collab",
@@ -3933,12 +3938,11 @@ dependencies = [
 
 [[package]]
 name = "neo_frizbee"
-version = "0.10.4"
+version = "0.13.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "12af02496d6e51f324af42ffbd1ed31eb275d4aedd17b18b2cb4542f103f86cb"
+checksum = "fb0dd0e69b342eaddb657120a21a56f3e887ddc505fac780cf430dbbbb3aed26"
 dependencies = [
- "itertools",
- "raw-cpuid",
+ "serde",
 ]
 
 [[package]]
@@ -4875,15 +4879,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "raw-cpuid"
-version = "11.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "498cd0dc59d73224351ee52a95fee0f1a617a2eae0e7d9d720cc622c73a54186"
-dependencies = [
- "bitflags 2.13.1",
-]
-
-[[package]]
 name = "rayon"
 version = "1.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5140,9 +5135,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.43"
+version = "0.23.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0283386ce02abc0151e1761d08802dfe86c173b0b494af5cbc086574e453da06"
+checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
 dependencies = [
  "log",
  "once_cell",
@@ -6202,10 +6197,9 @@ dependencies = [
 
 [[package]]
 name = "tree-house"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "arc-swap",
- "cov-mark",
  "hashbrown 0.15.5",
  "indexmap 2.14.0",
  "kstring",
@@ -6221,7 +6215,7 @@ dependencies = [
 
 [[package]]
 name = "tree-house-bindings"
-version = "0.2.3"
+version = "0.3.2"
 dependencies = [
  "cc",
  "libloading",
@@ -6364,7 +6358,6 @@ dependencies = [
  "idna",
  "percent-encoding",
  "serde",
- "serde_derive",
 ]
 
 [[package]]
@@ -7033,8 +7026,10 @@ version = "25.7.1"
 dependencies = [
  "helix-core",
  "helix-loader",
+ "helix-stdx",
  "helix-term",
  "helix-view",
+ "ropey",
  "toml 1.1.4+spec-1.1.0",
 ]
 

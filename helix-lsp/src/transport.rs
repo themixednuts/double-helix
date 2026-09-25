@@ -1682,6 +1682,9 @@ pub struct Transport {
     outbound: OutboundMailbox,
     inbound: InboundDispatcher,
     initialization: Initialization,
+    /// Set once `shutdown` has gone to the server. From then on nothing in the editor handles
+    /// server requests, so the transport answers them itself.
+    shutdown_requested: std::sync::atomic::AtomicBool,
 }
 
 impl Transport {
@@ -1761,6 +1764,7 @@ impl Transport {
             outbound: outbound.clone(),
             inbound: inbound.clone(),
             initialization: initialization.clone(),
+            shutdown_requested: std::sync::atomic::AtomicBool::new(false),
         };
 
         let transport = Arc::new(transport);
@@ -2110,6 +2114,23 @@ impl Transport {
             ServerMessage::Output(output) => {
                 self.process_request_response(output, language_server_name)?
             }
+            ServerMessage::Call(jsonrpc::Call::MethodCall(call))
+                if self
+                    .shutdown_requested
+                    .load(std::sync::atomic::Ordering::Acquire) =>
+            {
+                // Some servers (gopls) send requests such as client/registerCapability while
+                // shutting down and won't answer `shutdown` until they get a reply. Answer with
+                // a null result: an error reply makes vscode-languageserver based servers abort.
+                let _ = self.outbound.send_control(ControlMessage::Response {
+                    output: jsonrpc::Output::Success(jsonrpc::Success {
+                        jsonrpc: Some(jsonrpc::Version::V2),
+                        id: call.id,
+                        result: Value::Null,
+                    }),
+                    sent: None,
+                });
+            }
             ServerMessage::Call(call) => self.inbound.send(call).await?,
         };
         Ok(())
@@ -2253,6 +2274,13 @@ impl Transport {
                             )
                         }
                         InitializationState::Pending | InitializationState::Initialized => {
+                            // Before writing, so no server request can slip in between the
+                            // server seeing `shutdown` and the flag being set.
+                            if is_shutdown(&payload) {
+                                transport
+                                    .shutdown_requested
+                                    .store(true, std::sync::atomic::Ordering::Release);
+                            }
                             transport
                                 .send_payload_to_server(&mut server_stdin, payload)
                                 .await
@@ -2734,6 +2762,7 @@ mod tests {
             outbound: handle.outbound.clone(),
             inbound: handle.inbound.clone(),
             initialization: handle.initialization.clone(),
+            shutdown_requested: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -2819,6 +2848,45 @@ mod tests {
             .write_all(format!("Content-Length: {}\r\n\r\n{json}", json.len()).as_bytes())
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn server_requests_after_shutdown_get_a_null_reply() {
+        let handle = detached_handle(4);
+        let transport = detached_transport(&handle);
+        transport
+            .shutdown_requested
+            .store(true, std::sync::atomic::Ordering::Release);
+
+        transport
+            .process_server_message(
+                ServerMessage::Call(jsonrpc::Call::MethodCall(jsonrpc::MethodCall {
+                    jsonrpc: Some(jsonrpc::Version::V2),
+                    method: "client/registerCapability".to_string(),
+                    params: jsonrpc::Params::None,
+                    id: jsonrpc::Id::Num(7),
+                })),
+                "test",
+            )
+            .await
+            .unwrap();
+
+        let mut priority_streak = 0;
+        let reply = handle
+            .outbound
+            .recv(&mut priority_streak, NormalReceiveMode::Any)
+            .await;
+        assert!(matches!(
+            reply,
+            Some(OutboundMessage::Control(ControlMessage::Response {
+                output: jsonrpc::Output::Success(jsonrpc::Success {
+                    id: jsonrpc::Id::Num(7),
+                    result: Value::Null,
+                    ..
+                }),
+                ..
+            }))
+        ));
     }
 
     #[tokio::test]

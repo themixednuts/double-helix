@@ -104,6 +104,8 @@ Authentication method choice and elicitation form editing are transient layers e
 | `h` / `l` / `Space` | Change select and boolean fields |
 | `Enter` | Submit or confirm |
 | `Esc` | Pop back to Messages |
+
+Some agents sign in through a command run in a terminal. Choosing such a method opens it in the external terminal set by `editor.terminal`, the same one debug adapters use. Finish signing in there, then press `Enter` in the assistant so the agent checks the login, or `Esc` to pick another method. When no terminal can be opened, the card shows the command to run yourself.
 | `Ctrl-c` | Cancel pending assistant work |
 
 The panel header shows the active thread title, focus mode, current profile, current mode/model when the agent provides them, local rating/note state, compact token usage, and run state. The first token number is cumulative thread usage, and `last` is the most recent turn.

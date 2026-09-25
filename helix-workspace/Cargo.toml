@@ -10,7 +10,7 @@ repository.workspace = true
 homepage.workspace = true
 
 [dependencies]
-fff-search = "=0.9.6"
+fff-search = "=0.11.0"
 rmp-serde = "1"
 serde.workspace = true
 thiserror.workspace = true

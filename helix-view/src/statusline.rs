@@ -86,6 +86,8 @@ pub struct StatuslineSnapshot<'a> {
     /// (binary, scratch, unsupported language) so renderers can
     /// skip the element entirely without reserving dead space.
     pub lsp_server_names: Vec<String>,
+    /// Code actions are available at the cursor.
+    pub code_action_hint: bool,
 }
 
 /// Produces cursor-oriented statusline data.
@@ -227,6 +229,7 @@ impl StatuslineSnapshot<'_> {
             current_working_directory: Cow::Owned(self.current_working_directory.into_owned()),
             function_name: self.function_name,
             lsp_server_names: self.lsp_server_names,
+            code_action_hint: self.code_action_hint,
         }
     }
 }

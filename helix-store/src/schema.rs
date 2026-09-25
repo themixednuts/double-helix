@@ -118,6 +118,15 @@ pub struct PkgRegistryHeads {
     pub updated_at: i64,
 }
 
+#[SQLiteTable(name = "workspace_trust")]
+pub struct WorkspaceTrust {
+    #[column(primary)]
+    pub workspace: String,
+    pub hash: Option<String>,
+    pub excluded: i64,
+    pub updated_at: i64,
+}
+
 #[derive(SQLiteSchema)]
 pub struct Schema {
     pub assistant_threads: AssistantThreads,
@@ -130,4 +139,5 @@ pub struct Schema {
     pub pkg_activation_history: PkgActivationHistory,
     pub pkg_runtime_meta: PkgRuntimeMeta,
     pub pkg_registry_heads: PkgRegistryHeads,
+    pub workspace_trust: WorkspaceTrust,
 }

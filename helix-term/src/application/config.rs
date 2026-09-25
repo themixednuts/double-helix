@@ -21,8 +21,14 @@ impl Application {
 
     fn refresh_keymaps(&mut self) {
         let keys = self.config.load().keys.clone();
+        let engine = self
+            .editor
+            .frontend()
+            .engine_factory
+            .create(self.config.load().editor.editing_engine);
         if let Some(editor_view) = self.compositor.find::<crate::ui::EditorView>() {
             editor_view.keymaps.replace_base(keys.clone());
+            editor_view.replace_engine(engine);
         }
         self.editor
             .set_modal_keymaps(crate::keymap::to_component_modal_keymaps(&keys));
@@ -41,11 +47,19 @@ impl Application {
                 let old_editor_config = self.editor.config();
                 let mut app_config = (*self.config.load().clone()).clone();
                 app_config.editor = *editor_config;
+                // `:set editing-engine` switches keymaps too.
+                if app_config.editor.editing_engine != old_editor_config.editing_engine {
+                    app_config.keys = crate::keymap::for_engine(
+                        app_config.editor.editing_engine,
+                        &app_config.user_keys,
+                    );
+                }
                 if let Err(err) = self.reconfigure_terminal((&app_config.editor).into()) {
                     self.editor.set_error(err.to_string());
                 };
-                self.editor.diff_providers =
-                    helix_vcs::DiffProviderRegistry::new(app_config.editor.vcs.provider.into());
+                self.editor.diff_providers = self
+                    .editor
+                    .diff_provider_registry(app_config.editor.vcs.provider.into());
                 self.config.store(Arc::new(app_config));
                 self.editor
                     .dispatch_editor_config_change(&old_editor_config);
@@ -63,6 +77,7 @@ impl Application {
         self.editor.set_status("Refreshing config...");
         let ingress = self.ingress_sender();
         let block = self.runtime.block().clone();
+        let trust = self.editor.workspace_trust.clone();
         self.runtime
             .work()
             .spawn(async move {
@@ -70,7 +85,11 @@ impl Application {
                     .spawn(move || -> Result<_, Error> {
                         let config = Config::load_default()
                             .map_err(|error| anyhow::anyhow!("Failed to load config: {error}"))?;
-                        let language_loader = helix_core::config::user_lang_loader()?;
+                        // New trust settings apply before the workspace's languages.toml is
+                        // considered; this also drops cached decisions, so edits to the
+                        // workspace config since the last load are re-checked.
+                        trust.set_config((&config.editor.workspace_trust).into());
+                        let language_loader = helix_core::config::user_lang_loader(&trust)?;
                         Ok((config, language_loader))
                     })
                     .await;
@@ -144,8 +163,9 @@ impl Application {
             self.terminal_state.supports_true_color,
             self.terminal_state.theme_mode,
         );
-        self.editor.diff_providers =
-            helix_vcs::DiffProviderRegistry::new(self.config.load().editor.vcs.provider.into());
+        self.editor.diff_providers = self
+            .editor
+            .diff_provider_registry(self.config.load().editor.vcs.provider.into());
         self.editor.refresh_document_languages();
         self.editor
             .dispatch_editor_config_change(&old_editor_config);

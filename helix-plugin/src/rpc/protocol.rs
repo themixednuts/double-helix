@@ -91,6 +91,11 @@ pub enum PluginRequest {
         document: DocumentHandle,
         line: usize,
     },
+    DocumentLines {
+        document: DocumentHandle,
+        start: usize,
+        end: usize,
+    },
     StartTask {
         plugin: PluginId,
         operation: PluginOperationToken,
@@ -257,6 +262,7 @@ pub enum HostResponse {
     DiagnosticSnapshot(DiagnosticSnapshot),
     DocumentText(String),
     DocumentLine(String),
+    DocumentLines(Vec<String>),
     EventCatalog(Vec<EventKindInfo>),
     PanelSnapshots(Vec<PanelSnapshot>),
     FloatSnapshots(Vec<FloatSnapshot>),

@@ -15,19 +15,21 @@ pub type ExitTaskSet = WaitSet<anyhow::Result<RuntimeTaskEvent>>;
 
 pub use app_event::{AppEvent, ForegroundAdmissionError, ForegroundEvents};
 pub use exit::{
-    apply_exit_task, drain_exit_tasks_blocking, drain_exit_tasks_collect, schedule_exit_task,
+    apply_exit_task, chain_exit_task, drain_exit_tasks_blocking, drain_exit_tasks_collect,
+    schedule_chained_exit_tasks, schedule_exit_task,
 };
 pub use idle::{IdleResetGate, IdleResetHandle, IdleResetReceiver, IdleResetRequest};
 pub use ingress::{
     send_status_message_with, send_task_event_with, send_ui_command_with, status_error_reporter,
     AssistantBackendConnection, DapStackFramesCompletion, DapStoppedCompletion, IdleRender,
-    PendingFormatWrite, PreparedAssistantAgents, PreparedConfigReload, PreparedLanguageLoader,
-    RuntimeDelivery, RuntimeIngress, RuntimeIngressReceiver, RuntimeTaskDebouncer,
-    RuntimeTaskEvent, RuntimeUiDebouncer,
+    OnSaveFinish, PendingFormatWrite, PreparedAssistantAgents, PreparedConfigReload,
+    PreparedLanguageLoader, RuntimeDelivery, RuntimeIngress, RuntimeIngressReceiver,
+    RuntimeTaskDebouncer, RuntimeTaskEvent, RuntimeUiDebouncer,
 };
 pub use pkg::{
     PkgAdmissionError, PkgFailure, PkgOperation, PkgOperationOrigin, PkgOperationOutcome,
 };
+pub(crate) use plugin::changed_lines;
 pub use plugin::PluginNotification;
 pub use ui::{
     apply_ui_command, AssistantCommand, DapCommand, DocumentCommand, DocumentOpenAlignment,

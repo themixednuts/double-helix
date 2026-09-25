@@ -318,7 +318,7 @@ pub(crate) fn spawn_theme_load(
             Ok(theme) => {
                 let _ = ingress
                     .send_ui(UiCommand::Plugin(PluginCommand::SetTheme {
-                        theme,
+                        theme: Box::new(theme),
                         completion,
                     }))
                     .await;
@@ -732,6 +732,7 @@ impl PluginUiSender {
 
 pub struct TermResourceHost<'a> {
     sender: PluginUiSender,
+    host: PluginHostId,
     panel_owners: &'a mut HashMap<PanelHandle, PluginId>,
 }
 
@@ -744,6 +745,10 @@ impl PluginResourceHost for TermResourceHost<'_> {
             .collect::<Vec<_>>();
         self.sender.ui(PluginCommand::ReleaseResources {
             plugin,
+            float_owner: helix_plugin_editor::bridge::float_owner_key(
+                Some(&self.host.to_string()),
+                plugin,
+            ),
             panels: panels.clone(),
         })?;
         for panel in &panels {
@@ -1071,7 +1076,14 @@ impl TermKeymapHost {
 
 pub struct TermEventHost {
     next_subscription_handle: std::sync::atomic::AtomicU64,
-    subscriptions: HashMap<SubscriptionHandle, PluginId>,
+    subscriptions: HashMap<SubscriptionHandle, (PluginId, helix_plugin_api::events::EventKind)>,
+    /// One bit per event kind with a subscriber. Read without the host lock
+    /// so events nobody subscribed to are never encoded or sent.
+    subscribed: Arc<std::sync::atomic::AtomicU64>,
+}
+
+fn event_bit(kind: helix_plugin_api::events::EventKind) -> u64 {
+    1 << (kind as u32)
 }
 
 impl PluginEventHost for TermEventHost {
@@ -1088,7 +1100,8 @@ impl PluginEventHost for TermEventHost {
         let handle = helix_plugin_api::SubscriptionHandle::from_raw(next_non_zero(
             &self.next_subscription_handle,
         ));
-        self.subscriptions.insert(handle, plugin);
+        self.subscriptions.insert(handle, (plugin, kind));
+        self.publish_subscribed();
         Ok(handle)
     }
 
@@ -1098,8 +1111,9 @@ impl PluginEventHost for TermEventHost {
         handle: helix_plugin_api::SubscriptionHandle,
     ) -> ContractResult<()> {
         match self.subscriptions.get(&handle) {
-            Some(owner) if *owner == plugin => {
+            Some((owner, _)) if *owner == plugin => {
                 self.subscriptions.remove(&handle);
+                self.publish_subscribed();
                 Ok(())
             }
             Some(_) => Err(permission_denied(plugin, handle)),
@@ -1114,7 +1128,17 @@ impl PluginEventHost for TermEventHost {
 
 impl TermEventHost {
     fn release_plugin(&mut self, plugin: PluginId) {
-        self.subscriptions.retain(|_, owner| *owner != plugin);
+        self.subscriptions.retain(|_, (owner, _)| *owner != plugin);
+        self.publish_subscribed();
+    }
+
+    fn publish_subscribed(&self) {
+        let mask = self
+            .subscriptions
+            .values()
+            .fold(0, |mask, (_, kind)| mask | event_bit(*kind));
+        self.subscribed
+            .store(mask, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -1138,6 +1162,7 @@ struct HostOperation {
 pub struct PluginHostState {
     route: PluginHostRoute,
     inner: Arc<Mutex<PluginHostStateInner>>,
+    subscribed_events: Arc<std::sync::atomic::AtomicU64>,
     cleanup_ingress: crate::runtime::RuntimeIngress,
     published_commands: Arc<PublishedPluginCommands>,
     generation: Option<HostGenerationId>,
@@ -1168,6 +1193,7 @@ impl PluginHostState {
             active_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
         let published_commands = Arc::new(arc_swap::ArcSwap::from_pointee(Vec::new()));
+        let subscribed_events = Arc::new(std::sync::atomic::AtomicU64::new(0));
         Self {
             inner: Arc::new(Mutex::new(PluginHostStateInner {
                 ui: TermUiHost {
@@ -1193,10 +1219,12 @@ impl PluginHostState {
                 event: TermEventHost {
                     next_subscription_handle: std::sync::atomic::AtomicU64::new(1),
                     subscriptions: HashMap::new(),
+                    subscribed: Arc::clone(&subscribed_events),
                 },
                 operations: HashMap::new(),
                 plugins: HashSet::new(),
             })),
+            subscribed_events,
             route,
             cleanup_ingress,
             published_commands,
@@ -1206,6 +1234,14 @@ impl PluginHostState {
 
     pub(crate) fn id(&self) -> PluginHostId {
         self.route.id
+    }
+
+    /// Whether any plugin in this host subscribed to `kind`.
+    pub(crate) fn wants(&self, kind: helix_plugin_api::events::EventKind) -> bool {
+        self.subscribed_events
+            .load(std::sync::atomic::Ordering::Acquire)
+            & event_bit(kind)
+            != 0
     }
 
     fn lock_for_worker(&self) -> MutexGuard<'_, PluginHostStateInner> {
@@ -1240,6 +1276,7 @@ impl PluginHostState {
         Self {
             route: self.route.clone(),
             inner: Arc::clone(&self.inner),
+            subscribed_events: Arc::clone(&self.subscribed_events),
             cleanup_ingress: self.cleanup_ingress.clone(),
             published_commands: Arc::clone(&self.published_commands),
             generation: Some(generation),
@@ -1283,6 +1320,11 @@ impl PluginHostState {
             .load()
             .iter()
             .any(|(published, _)| *published == command)
+    }
+
+    /// Identifies this host on the editor resources its plugins own.
+    pub(crate) fn host_key(&self) -> String {
+        self.route.id.to_string()
     }
 
     pub(crate) fn track_plugin(&self, plugin: PluginId) -> ContractResult<()> {
@@ -1371,6 +1413,7 @@ impl PluginHostState {
         let sender = PluginUiSender::Foreground(state.ui.sender.clone());
         let mut resources = TermResourceHost {
             sender: sender.clone(),
+            host: self.route.id,
             panel_owners: &mut state.panel.panel_owners,
         };
         resources.release_plugin_resources(plugin)?;
@@ -1394,6 +1437,7 @@ impl PluginHostState {
         for plugin in plugins {
             let mut resources = TermResourceHost {
                 sender: sender.clone(),
+                host: self.route.id,
                 panel_owners: &mut state.panel.panel_owners,
             };
             if let Err(error) = resources.release_plugin_resources(plugin) {
@@ -1486,15 +1530,30 @@ impl PluginHostResponder {
 
 #[derive(Clone)]
 pub struct PluginRuntime {
-    hosts: Arc<RwLock<Vec<SupervisedPluginHost>>>,
+    /// Replaced whole on reconfigure, so readers take a cheap snapshot (every editor event
+    /// reads it).
+    hosts: Arc<RwLock<Arc<[SupervisedPluginHost]>>>,
     config: Arc<RwLock<PluginConfig>>,
+    /// The merged command list, rebuilt only when a host's commands change: `:` completion
+    /// reads it on every keystroke.
+    commands: Arc<std::sync::Mutex<Option<CommandCache>>>,
+}
+
+/// A host's published commands.
+type PublishedCommands = Arc<Vec<(CommandHandle, helix_plugin_api::CommandDescriptor)>>;
+
+struct CommandCache {
+    /// Each host's id, generation and published commands the list was built from.
+    sources: Vec<(PluginHostId, Option<HostGenerationId>, PublishedCommands)>,
+    commands: Arc<[PluginCommandSnapshot]>,
 }
 
 impl Default for PluginRuntime {
     fn default() -> Self {
         Self {
-            hosts: Arc::default(),
+            hosts: Arc::new(RwLock::new(Arc::from([]))),
             config: Arc::new(RwLock::new(PluginConfig::default())),
+            commands: Arc::default(),
         }
     }
 }
@@ -1511,15 +1570,51 @@ struct SupervisedPluginHost {
 }
 
 impl PluginRuntime {
-    fn host_snapshot(&self) -> Vec<SupervisedPluginHost> {
-        self.hosts
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+    fn host_snapshot(&self) -> Arc<[SupervisedPluginHost]> {
+        Arc::clone(
+            &self
+                .hosts
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
     }
 
-    pub(crate) fn command_snapshot(&self) -> Vec<PluginCommandSnapshot> {
+    /// Every host's commands, sorted by name. Cached until a host's commands change.
+    pub(crate) fn command_snapshot(&self) -> Arc<[PluginCommandSnapshot]> {
         let hosts = self.host_snapshot();
+        let sources: Vec<_> = hosts
+            .iter()
+            .map(|host| {
+                (
+                    host.state.id(),
+                    host.state.route.active_generation(),
+                    host.state.published_commands.load_full(),
+                )
+            })
+            .collect();
+        let mut cache = self
+            .commands
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(cache) = cache.as_ref().filter(|cache| {
+            cache.sources.len() == sources.len()
+                && cache.sources.iter().zip(&sources).all(|(cached, current)| {
+                    cached.0 == current.0
+                        && cached.1 == current.1
+                        && Arc::ptr_eq(&cached.2, &current.2)
+                })
+        }) {
+            return Arc::clone(&cache.commands);
+        }
+        let commands = Self::build_command_snapshot(&hosts);
+        *cache = Some(CommandCache {
+            sources,
+            commands: Arc::clone(&commands),
+        });
+        commands
+    }
+
+    fn build_command_snapshot(hosts: &[SupervisedPluginHost]) -> Arc<[PluginCommandSnapshot]> {
         let mut commands = hosts
             .iter()
             .flat_map(|host| {
@@ -1542,7 +1637,7 @@ impl PluginRuntime {
                         .cmp(&right.id.command.raw().get())
                 })
         });
-        commands
+        commands.into()
     }
 
     pub(crate) fn invoke_command(
@@ -1568,7 +1663,7 @@ impl PluginRuntime {
     }
 
     pub(crate) fn reload(&self) -> ContractResult<()> {
-        for host in self.host_snapshot() {
+        for host in self.host_snapshot().iter() {
             if host.shutdown.is_canceled() {
                 return Err(internal_error(format!(
                     "plugin host '{}' is shutting down",
@@ -1581,7 +1676,11 @@ impl PluginRuntime {
     }
 
     pub(crate) fn notify_event(&self, event: helix_plugin_api::events::PluginEvent) {
-        for host in self.host_snapshot() {
+        let kind = event.kind();
+        for host in self.host_snapshot().iter() {
+            if !host.state.wants(kind) {
+                continue;
+            }
             if let Err(error) = host.events.try_send(event.clone()) {
                 let dropped = host
                     .dropped_events
@@ -1601,7 +1700,14 @@ impl PluginRuntime {
     pub(crate) async fn shutdown(&self) {
         let hosts = self.host_snapshot();
         request_host_shutdown(&hosts);
-        wait_for_hosts(hosts).await;
+        // A host that stopped reading its input (a plugin stuck in a loop) must not keep the
+        // editor from quitting.
+        if tokio::time::timeout(std::time::Duration::from_secs(3), wait_for_hosts(hosts))
+            .await
+            .is_err()
+        {
+            log::warn!("plugin hosts did not stop within 3s; exiting without them");
+        }
     }
 
     pub(crate) fn reconfigure(
@@ -1626,7 +1732,7 @@ impl PluginRuntime {
                 .hosts
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
-            next,
+            Arc::from(next),
         );
         *active_config = config.clone();
         drop(active_config);
@@ -1646,9 +1752,9 @@ fn request_host_shutdown(hosts: &[SupervisedPluginHost]) {
     }
 }
 
-async fn wait_for_hosts(hosts: Vec<SupervisedPluginHost>) {
-    for host in hosts {
-        let mut stopped = host.stopped;
+async fn wait_for_hosts(hosts: Arc<[SupervisedPluginHost]>) {
+    for host in hosts.iter() {
+        let mut stopped = host.stopped.clone();
         while !*stopped.borrow() {
             if stopped.changed().await.is_err() {
                 break;
@@ -1833,7 +1939,13 @@ async fn log_plugin_stderr(name: String, stderr: tokio::process::ChildStderr) {
 
     let mut lines = tokio::io::BufReader::new(stderr).lines();
     while let Ok(Some(line)) = lines.next_line().await {
-        log::warn!("plugin host '{name}' stderr: {line}");
+        // Our own hosts prefix each line with its level; anything else (a
+        // third-party host, a crash message) is filed as a warning.
+        let (level, message) = line
+            .split_once(' ')
+            .and_then(|(level, message)| Some((level.parse::<log::Level>().ok()?, message)))
+            .unwrap_or((log::Level::Warn, line.as_str()));
+        log::log!(target: "helix_plugin_host", level, "plugin host '{name}': {message}");
     }
 }
 
@@ -2111,10 +2223,11 @@ pub(crate) fn spawn_plugin_runtime(
 ) -> Result<PluginRuntime, helix_plugin::PluginConfigError> {
     config.validate()?;
     Ok(PluginRuntime {
-        hosts: Arc::new(RwLock::new(spawn_plugin_hosts(
+        hosts: Arc::new(RwLock::new(Arc::from(spawn_plugin_hosts(
             config, ingress, foreground, work,
-        ))),
+        )))),
         config: Arc::new(RwLock::new(config.clone())),
+        commands: Arc::default(),
     })
 }
 
@@ -2327,6 +2440,7 @@ mod tests {
             RuntimeDelivery::Ui(UiCommand::Plugin(PluginCommand::ReleaseResources {
                 plugin,
                 panels,
+                ..
             })) if plugin == plugin_id() && panels == [panel]
         ));
         assert!(matches!(
@@ -2457,7 +2571,8 @@ mod tests {
         let (_stopped_a, stopped_a) = tokio::sync::watch::channel(false);
         let (_stopped_b, stopped_b) = tokio::sync::watch::channel(false);
         let hosts = PluginRuntime {
-            hosts: Arc::new(RwLock::new(vec![
+            commands: Arc::default(),
+            hosts: Arc::new(RwLock::new(Arc::from(vec![
                 SupervisedPluginHost {
                     name: "host-a".into(),
                     state: state_a.clone(),
@@ -2476,10 +2591,12 @@ mod tests {
                     shutdown: helix_runtime::Token::new(),
                     stopped: stopped_b,
                 },
-            ])),
+            ]))),
             config: Arc::new(RwLock::new(PluginConfig::default())),
         };
         let snapshot = hosts.command_snapshot();
+        // Unchanged commands come from the cache.
+        assert!(Arc::ptr_eq(&snapshot, &hosts.command_snapshot()));
         assert_eq!(snapshot.len(), 2);
         assert_eq!(snapshot[0].id.command, snapshot[1].id.command);
         assert_ne!(snapshot[0].id.host, snapshot[1].id.host);
@@ -2588,6 +2705,7 @@ mod tests {
         ]);
         let mut host = TermResourceHost {
             sender: PluginUiSender::Foreground(sender.clone()),
+            host: PluginHostId::from_raw(NonZeroU64::new(1).unwrap()),
             panel_owners: &mut owners,
         };
 
@@ -2596,9 +2714,15 @@ mod tests {
         match sender.pop().expect("release resources event") {
             RuntimeDelivery::Ui(UiCommand::Plugin(PluginCommand::ReleaseResources {
                 plugin,
+                float_owner,
                 panels,
             })) => {
                 assert_eq!(plugin, plugin_id());
+                // Floats are owned per host: another host's plugin with the same id keeps its own.
+                assert_eq!(
+                    float_owner,
+                    format!("plugin-host(1)/{}", plugin_id().raw().get())
+                );
                 assert_eq!(panels.len(), 1);
                 assert_eq!(panels[0].raw().get(), 11);
             }
@@ -3010,10 +3134,37 @@ mod tests {
     }
 
     #[test]
+    fn subscribed_event_mask_follows_subscriptions() {
+        use helix_plugin_api::events::EventKind;
+
+        let subscribed = Arc::<std::sync::atomic::AtomicU64>::default();
+        let mut host = TermEventHost {
+            next_subscription_handle: std::sync::atomic::AtomicU64::new(1),
+            subscriptions: HashMap::new(),
+            subscribed: Arc::clone(&subscribed),
+        };
+        let wants =
+            |kind| subscribed.load(std::sync::atomic::Ordering::Acquire) & event_bit(kind) != 0;
+        assert!(!wants(EventKind::KeyPressed));
+
+        let keys = host.subscribe(plugin_id(), EventKind::KeyPressed).unwrap();
+        host.subscribe(other_plugin_id(), EventKind::ModeChanged)
+            .unwrap();
+        assert!(wants(EventKind::KeyPressed) && wants(EventKind::ModeChanged));
+        assert!(!wants(EventKind::DocumentChanged));
+
+        host.unsubscribe(plugin_id(), keys).unwrap();
+        assert!(!wants(EventKind::KeyPressed));
+        host.release_plugin(other_plugin_id());
+        assert!(!wants(EventKind::ModeChanged));
+    }
+
+    #[test]
     fn event_host_rejects_foreign_subscription_handles() {
         let mut host = TermEventHost {
             next_subscription_handle: std::sync::atomic::AtomicU64::new(1),
             subscriptions: HashMap::new(),
+            subscribed: Arc::default(),
         };
         let handle = host
             .subscribe(plugin_id(), helix_plugin_api::events::EventKind::HostReady)

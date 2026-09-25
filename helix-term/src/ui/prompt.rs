@@ -865,9 +865,12 @@ impl Prompt {
             .documentation(cx.work(), cx.block(), cx.redraw.clone())
             .map(|documentation| {
                 let max_width = (BASE_WIDTH * 3).min(area.width);
+                // `paint_documentation` draws inside a border plus a one-column margin
+                // on each side, so wrap at that narrower width.
+                let text_width = max_width.saturating_sub(4);
                 let max_height = completion_area.y.saturating_sub(area.y);
                 let height =
-                    estimated_prompt_document_height(&documentation, max_width, max_height);
+                    estimated_prompt_document_height(&documentation, text_width, max_height);
                 let panel_height = height.saturating_add(2).min(max_height);
                 let doc_area = area.intersection(Rect::new(
                     completion_area.x,
@@ -955,6 +958,9 @@ impl Component for Prompt {
             }
             Event::Key(event) => *event,
             Event::Resize(..) => return EventResult::Consumed(None),
+            // Prompt is a modal and should consume mouse events so clicks don't fall
+            // through to the editor underneath
+            Event::Mouse(_) => return EventResult::Consumed(None),
             _ => return EventResult::Ignored(None),
         };
 

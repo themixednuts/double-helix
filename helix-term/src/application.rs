@@ -352,6 +352,12 @@ pub struct Application {
     language: LanguageState,
     foreground: crate::runtime::ForegroundEvents,
     plugin_runtime: crate::plugin_registry::PluginRuntime,
+    /// The entry each assistant thread's reply is streaming into, reported to plugins when the
+    /// turn ends.
+    streamed_replies: std::collections::HashMap<
+        helix_view::assistant::thread::Id,
+        helix_view::assistant::thread::EntryId,
+    >,
     remote: Option<RemoteApplicationSession>,
     collaboration: Option<CollaborationApplicationSession>,
     collaboration_shutdowns: Vec<helix_runtime::Task<()>>,
@@ -705,6 +711,11 @@ impl Application {
         editor.lifecycle().on_document_change(move |event| {
             plugin_foreground.plugin(PluginNotification::BufferChanged {
                 document_id: event.doc.id(),
+                version: event.doc.version(),
+                changed_lines: crate::runtime::changed_lines(
+                    event.changes,
+                    event.doc.text().slice(..),
+                ),
             })?;
             Ok(())
         });
@@ -824,6 +835,7 @@ impl Application {
             },
             foreground,
             plugin_runtime,
+            streamed_replies: std::collections::HashMap::new(),
             remote,
             collaboration: None,
             collaboration_shutdowns: Vec::new(),
@@ -2304,13 +2316,15 @@ impl Application {
             .renderer
             .as_ref()
             .expect("render actor must be running while rendering")
-            .submit(render_actor::PreparedFrame::new(
-                generation,
-                render_plan,
-                pos,
-                kind,
-                full_redraw,
-            ));
+            .submit(
+                render_actor::PreparedFrame::new(generation, render_plan, pos, kind, full_redraw)
+                    .with_background(
+                        self.editor
+                            .theme
+                            .try_get_exact("ui.background")
+                            .and_then(|style| style.bg),
+                    ),
+            );
         if let Err(error) = submit_result {
             self.compositor.full_redraw = true;
             log::error!("failed to submit terminal frame: {error}");
@@ -2587,6 +2601,10 @@ impl Application {
                     ) {
                         self.editor.set_error(format!("Async task failed: {}", err));
                     }
+                    crate::runtime::schedule_chained_exit_tasks(
+                        &mut self.exit.tasks,
+                        &self.exit.work,
+                    );
                     self.invalidate(FRAME_EXIT_TASK);
                 }
             }

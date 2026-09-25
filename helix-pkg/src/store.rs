@@ -1,6 +1,5 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    env,
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -1016,21 +1015,7 @@ fn legacy_command_keys(receipt: &Receipt) -> std::collections::BTreeSet<String> 
 }
 
 fn find_on_path(command: &str) -> Option<PathBuf> {
-    env::split_paths(&env::var_os("PATH")?).find_map(|directory| {
-        let direct = directory.join(command);
-        if direct.is_file() {
-            return Some(direct);
-        }
-        if cfg!(windows) && Path::new(command).extension().is_none() {
-            for extension in ["exe", "cmd", "bat"] {
-                let candidate = directory.join(format!("{command}.{extension}"));
-                if candidate.is_file() {
-                    return Some(candidate);
-                }
-            }
-        }
-        None
-    })
+    which::which(command).ok()
 }
 
 fn recovery_timestamp() -> String {

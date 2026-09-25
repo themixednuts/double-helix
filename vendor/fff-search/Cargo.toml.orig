@@ -1,14 +1,17 @@
 [package]
 name = "fff-search"
-version = "0.9.6"
+version = "0.11.0"
 edition = "2024"
 license = "MIT"
 authors = ["Dmitriy Kovalenko <dmtr.kovalenko@outlook.com>"]
 description = "Faboulous & Fast File Finder - a fast and extremely correct file finder SDK with typo resistance, SIMD, prefiltering, and more"
 
+[lints]
+workspace = true
+
 [lib]
 path = "src/lib.rs"
-crate-type = ["rlib", "staticlib", "cdylib"]
+crate-type = ["rlib"]
 
 [[bench]]
 name = "parse_bench"
@@ -27,10 +30,24 @@ name = "glob_bench"
 harness = false
 required-features = ["zlob"]
 
+[[bench]]
+name = "grep_bench"
+harness = false
+
 [features]
-default = []
+# `ripgrep` is the pure-Rust walker/glob backend and is on by default so
+# consumers build without a Zig toolchain. CI/release opt into zlob via
+# `--no-default-features --features zlob`.
+default = ["ripgrep"]
 # Enable C FFI exports
 ffi = []
+# Count full rescans and their causes. Always on in debug builds; enable this
+# to keep the accounting in a release build (used by the rescan_probe binary).
+rescan-stats = []
+# Enables POC definition classification for grep result matched lines
+definitions = []
+# Pure-Rust filesystem walker + glob matcher (ignore + globset crates).
+ripgrep = ["dep:ignore", "dep:globset", "fff-query-parser/ripgrep"]
 # Call mi_collect(true) after large allocator churn (bigram build).
 # Requires mimalloc to be the global allocator (linked by fff-nvim).
 mimalloc-collect = ["dep:libmimalloc-sys"]
@@ -48,13 +65,13 @@ fff-query-parser = { workspace = true , version = "0.9.0" }
 blake3 = { workspace = true }
 dirs = { workspace = true }
 libc = "0.2"
-git2 = { version = "0.21", default-features = false, features = ["vendored-libgit2"] }
+git2 = { workspace = true }
 glidesort = { workspace = true }
-globset = { workspace = true }
+globset = { workspace = true, optional = true }
 fff-grep = { workspace = true , version = "0.9.0" }
 aho-corasick = "1"
 memchr = "2"
-ignore = { workspace = true }
+ignore = { workspace = true, optional = true }
 memmap2 = { workspace = true }
 neo_frizbee = { workspace = true }
 notify = { workspace = true }
@@ -83,3 +100,5 @@ ctor = "0.2"
 proptest = { version = "1", default-features = false, features = ["std", "fork"] }
 rand = { version = "0.8", features = ["small_rng"] }
 tempfile = "3.8"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+

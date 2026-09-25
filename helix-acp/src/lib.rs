@@ -1,5 +1,6 @@
 pub mod client;
 pub mod jsonrpc;
+mod process_tree;
 pub mod registry;
 pub mod terminal;
 pub mod transport;
@@ -14,6 +15,18 @@ use slotmap::new_key_type;
 
 new_key_type! {
     pub struct AgentId;
+}
+
+/// Resolve a bare program name through `PATH` (and `PATHEXT` on Windows, so `npx` finds
+/// `npx.cmd`, which `Command::new` alone never does). Anything with a directory component is
+/// left for the OS to interpret relative to the working directory.
+pub(crate) fn resolve_program(command: &str) -> std::ffi::OsString {
+    if std::path::Path::new(command).components().count() == 1 {
+        if let Ok(resolved) = helix_stdx::env::which(command) {
+            return resolved.into_os_string();
+        }
+    }
+    command.into()
 }
 
 /// ACP protocol version

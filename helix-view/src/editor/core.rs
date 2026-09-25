@@ -56,6 +56,8 @@ pub(crate) struct PackagedAssistantAgentCache {
 pub(crate) struct AssistantPersistenceState {
     pub(crate) saves: BTreeMap<crate::assistant::thread::Id, helix_runtime::Debounce>,
     pub(crate) layout_save: helix_runtime::Debounce,
+    /// What the last scheduled layout save saw (`Editor::assistant_layout_key`).
+    pub(crate) layout_key: Option<u64>,
 }
 
 pub(crate) struct AssistantFollowState {
@@ -102,6 +104,10 @@ pub struct Editor {
         std::collections::BTreeMap<PathBuf, WorkspaceDiagnosticCounts>,
     pub workspace_diagnostic_counts: WorkspaceDiagnosticCounts,
     pub diff_providers: DiffProviderRegistry,
+    /// Unsaved text of open documents, for readers off the main thread (assistant agents).
+    pub open_buffers: crate::open_buffers::OpenBuffers,
+    /// What each workspace is trusted with (local config, servers, git config).
+    pub workspace_trust: helix_loader::workspace_trust::WorkspaceTrust,
 
     pub debug_adapters: dap::registry::Registry,
     pub breakpoints: HashMap<PathBuf, Vec<Breakpoint>>,
@@ -127,6 +133,8 @@ pub struct Editor {
     pub(super) last_motion: Option<Motion>,
     pub last_completion: Option<CompleteAction>,
     pub(super) last_cwd: Option<PathBuf>,
+    /// Directories saved by `:pushd`, most recent first.
+    pub(super) dir_stack: std::collections::VecDeque<PathBuf>,
 
     pub exit_code: i32,
 

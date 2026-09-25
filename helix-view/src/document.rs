@@ -3090,6 +3090,11 @@ impl Document {
     ) -> Vec<OverlayHighlights> {
         use helix_core::diagnostic::{DiagnosticTag, Range, Severity};
 
+        // Runs every frame for every view; most documents have nothing to paint.
+        if self.diagnostics().is_empty() {
+            return Vec::new();
+        }
+
         let get_scope = |scope| {
             theme
                 .find_highlight_exact(scope)

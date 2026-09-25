@@ -195,6 +195,7 @@ impl FileExplorerTreeWork {
             ancestor_last: Vec::new(),
             vcs_status: self.vcs.status(&self.root),
             diagnostic_status: self.diagnostics.status(&self.root),
+            detail: None,
         });
         if root_expanded {
             let mut build = RowBuildContext {
@@ -446,6 +447,7 @@ impl FileExplorerPanel {
             ancestor_last: Vec::new(),
             vcs_status: self.vcs_snapshot.status(&root),
             diagnostic_status: self.diagnostic_snapshot.status(&root),
+            detail: None,
         });
         if root_expanded {
             let mut build = RowBuildContext {
@@ -858,6 +860,7 @@ impl FileExplorerPanel {
                 ancestor_last: ancestor_last.to_vec(),
                 vcs_status: build.vcs.status(&child.path),
                 diagnostic_status: build.diagnostics.status(&child.path),
+                detail: None,
             });
 
             if !expanded {

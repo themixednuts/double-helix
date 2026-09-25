@@ -165,6 +165,21 @@ pub(crate) fn search_files_available(
     search_workspace_files(&workspace, query, current_file, Duration::ZERO, total_start)
 }
 
+/// Scan rules for explorer search. The tree lists everything by default, but
+/// a recursive search has to skip what ignore files exclude, otherwise build
+/// output under `target/` buries every real match. `hidden` and symlink
+/// handling still follow the explorer's own toggles.
+pub(crate) fn file_explorer_search_options(config: &FileExplorerConfig) -> WorkspaceScanOptions {
+    WorkspaceScanOptions {
+        parents: true,
+        ignore: true,
+        git_ignore: true,
+        git_global: true,
+        git_exclude: true,
+        ..config.workspace_scan_options()
+    }
+}
+
 pub(crate) fn search_file_explorer_available_cancellable(
     root: &Path,
     query: &str,
@@ -172,7 +187,7 @@ pub(crate) fn search_file_explorer_available_cancellable(
     abort_signal: Option<&std::sync::atomic::AtomicBool>,
 ) -> anyhow::Result<Vec<PathBuf>> {
     let total_start = std::time::Instant::now();
-    let workspace = workspace_for_scan(root, config.workspace_scan_options())?;
+    let workspace = workspace_for_scan(root, file_explorer_search_options(config))?;
     search_workspace_files_cancellable(
         &workspace,
         query,
@@ -232,7 +247,7 @@ pub(crate) fn prewarm(root: &Path, config: &FilePickerConfig) {
 }
 
 pub(crate) fn prewarm_file_explorer(root: &Path, config: &FileExplorerConfig) {
-    if let Err(err) = workspace_for_scan(root, config.workspace_scan_options()) {
+    if let Err(err) = workspace_for_scan(root, file_explorer_search_options(config)) {
         log::debug!(
             "failed to prewarm FFF file explorer workspace for {}: {err:#}",
             root.display()
@@ -1247,6 +1262,20 @@ mod tests {
         assert_eq!(scan.git_global, config.git_global);
         assert_eq!(scan.git_exclude, config.git_exclude);
         assert_eq!(scan.max_depth, None);
+    }
+
+    #[test]
+    fn explorer_search_honors_ignore_files_but_keeps_hidden_toggle() {
+        let config = FileExplorerConfig {
+            hidden: false,
+            ..FileExplorerConfig::default()
+        };
+        let search = file_explorer_search_options(&config);
+
+        assert!(search.git_ignore && search.ignore && search.git_exclude && search.git_global);
+        assert!(search.parents);
+        assert_eq!(search.hidden, config.hidden);
+        assert_eq!(search.follow_symlinks, config.follow_symlinks);
     }
 
     #[test]

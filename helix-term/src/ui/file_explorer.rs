@@ -283,6 +283,22 @@ const WINDOWS_RESERVED_NAMES: &[&str] = &[
     "COM8", "COM9", "LPT0", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
 ];
 
+/// Keys that move through the result list while the search field has focus.
+fn search_navigation(key: KeyEvent) -> Option<ExplorerAction> {
+    let action = match (key.code, key.modifiers) {
+        (KeyCode::Up, KeyModifiers::NONE) | (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
+            ExplorerAction::MoveSelection(-1)
+        }
+        (KeyCode::Down, KeyModifiers::NONE) | (KeyCode::Char('n'), KeyModifiers::CONTROL) => {
+            ExplorerAction::MoveSelection(1)
+        }
+        (KeyCode::PageUp, KeyModifiers::NONE) => ExplorerAction::Page(-1),
+        (KeyCode::PageDown, KeyModifiers::NONE) => ExplorerAction::Page(1),
+        _ => return None,
+    };
+    Some(action)
+}
+
 /// If `label` (case-insensitive, ignoring the extension) matches a Windows
 /// reserved device name, return the matching reserved name; otherwise None.
 fn windows_reserved_label(label: &str) -> Option<&'static str> {
@@ -900,12 +916,16 @@ impl FileExplorerPanel {
                     return None;
                 }
 
+                // The label is the bare file name so a narrow panel never clips
+                // it away and an inline rename edits just the name; the parent
+                // directory rides along as muted detail.
+                let detail = path
+                    .parent()
+                    .and_then(|parent| parent.relative_to(&self.root))
+                    .filter(|parent| !parent.is_root())
+                    .map(|parent| display_path(&parent));
                 Some(ExplorerRow {
-                    label: path
-                        .relative_to(&self.root)
-                        .filter(|path| !path.is_root())
-                        .map(|path| display_path(&path))
-                        .unwrap_or_else(|| display_name(&path)),
+                    label: display_name(&path),
                     path: path.clone(),
                     // Every search feed indexes regular files only: the local
                     // and remote feeds both go through the FFF picker, whose
@@ -924,6 +944,7 @@ impl FileExplorerPanel {
                     ancestor_last: Vec::new(),
                     vcs_status: self.vcs_snapshot.status(&path),
                     diagnostic_status: self.diagnostic_snapshot.status(&path),
+                    detail,
                 })
             })
             .collect::<Vec<_>>();
@@ -1087,6 +1108,10 @@ impl FileExplorerPanel {
             query,
             paths: matches,
         });
+        // Rows still on screen answered an older query; start the new ones at
+        // their best match instead of chasing the old selection's path.
+        self.rows = Arc::from([]);
+        self.seek_to(0);
         self.apply_search_filter(editor);
         log::info!(
             "[file_explorer] search_results_applied root={} query={:?} generation={} matches={} first_match={} rows={} selection={} selected={} elapsed_us={}",
@@ -1204,7 +1229,7 @@ impl FileExplorerPanel {
         let rows_before = self.rows.len();
         let generation = self.bump_search_generation();
         let query = self.normalized_search_query();
-        self.search_results = None;
+        let refining = self.search_results.take().is_some();
 
         if query.is_empty() {
             self.search_pending = false;
@@ -1223,9 +1248,14 @@ impl FileExplorerPanel {
             self.search_saved_expanded_dirs = Some(self.expanded_dirs.clone());
         }
         self.search_pending = true;
-        self.rows = Arc::from([]);
-        self.label_selection = LabelSelection::default();
-        self.seek_to(0);
+        // Refining a query keeps the previous results on screen until the new
+        // ones land, so the list doesn't blank out on every keystroke. The
+        // first keystroke still clears the tree: its rows aren't results.
+        if !refining {
+            self.rows = Arc::from([]);
+            self.label_selection = LabelSelection::default();
+            self.seek_to(0);
+        }
 
         cx.submit_ui(UiCommand::FileExplorer(FileExplorerCommand::StartSearch {
             source: self.source.clone(),
@@ -1249,6 +1279,11 @@ impl FileExplorerPanel {
 
     fn handle_search_key(&mut self, key: KeyEvent, cx: &mut Context) -> Option<EventResult> {
         if self.search_active {
+            // Walk the results without leaving the query, like every other
+            // filtered list in the editor.
+            if let Some(action) = search_navigation(key) {
+                return Some(self.execute_action(action, cx));
+            }
             match key {
                 KeyEvent {
                     code: KeyCode::Esc | KeyCode::Enter,
@@ -6046,10 +6081,10 @@ mod tests {
         });
     }
 
-    /// Search results are a flat ranked list of files: root-relative labels,
-    /// no depth or lineage, and no directory treatment. Pins the shape so a
-    /// future move to a directory-aware search feed has to come back here and
-    /// carry `is_dir` from the match.
+    /// Search results are a flat ranked list of files: file-name labels with the
+    /// directory as detail, no depth or lineage, and no directory treatment.
+    /// Pins the shape so a future move to a directory-aware search feed has to
+    /// come back here and carry `is_dir` from the match.
     #[test]
     fn search_result_rows_are_flat_and_file_shaped() {
         let temp = tempfile::tempdir().unwrap();
@@ -6078,9 +6113,11 @@ mod tests {
             assert!(!row.expanded);
             assert_eq!(row.depth, 0);
             assert!(row.ancestor_last.is_empty());
-            // The label is the path relative to the root, not just the name.
-            assert!(row.label.ends_with("needle.rs"), "label {:?}", row.label);
-            assert!(row.label.contains("nested"), "label {:?}", row.label);
+            // The label is just the name, so it survives a narrow panel and an
+            // inline rename edits the name alone; the directory is detail.
+            assert_eq!(row.label, "needle.rs");
+            let detail = row.detail.as_deref().expect("parent directory detail");
+            assert!(detail.contains("nested"), "detail {detail:?}");
 
             // No indent guides and no trailing directory slash.
             let (_surface, rendered) = render_tree_row(
@@ -7689,6 +7726,7 @@ mod tests {
             ancestor_last: Vec::new(),
             vcs_status: None,
             diagnostic_status: None,
+            detail: None,
         };
         let panel = FileExplorerPanel {
             source: ExplorerSource::from_backend(
@@ -7761,6 +7799,7 @@ mod tests {
             ancestor_last: Vec::new(),
             vcs_status: None,
             diagnostic_status: None,
+            detail: None,
         };
         let panel = FileExplorerPanel {
             source: ExplorerSource::from_backend(
@@ -7843,6 +7882,7 @@ mod tests {
             ancestor_last: vec![false],
             vcs_status: None,
             diagnostic_status: None,
+            detail: None,
         };
         let panel = FileExplorerPanel {
             source: ExplorerSource::from_backend(
@@ -7966,6 +8006,7 @@ mod tests {
             ancestor_last: Vec::new(),
             vcs_status: None,
             diagnostic_status: None,
+            detail: None,
         };
         let closed_row = ExplorerRow {
             expanded: false,

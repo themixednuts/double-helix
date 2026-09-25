@@ -278,7 +278,7 @@ impl FileExplorerPreviewQueue {
                                 })
                         }
                         WorkspaceDocumentOpenWork::Remote(work) => work
-                            .execute(token.child_token(), false)
+                            .execute(token.child_token(), true)
                             .await
                             .map(PreparedWorkspaceDocumentOpen::Remote),
                         WorkspaceDocumentOpenWork::Collaboration(work) => work
@@ -397,6 +397,11 @@ fn prepare_local_file_explorer_preview(
     token: &tokio_util::sync::CancellationToken,
 ) -> Result<PreparedWorkspaceDocumentOpen, DocumentOpenError> {
     let start = Instant::now();
+    // Previews never load binaries as text; the panel keeps whatever it last
+    // showed, the same as it does for a directory.
+    if super::document::file_is_binary(work.path()).unwrap_or(false) {
+        return Err(DocumentOpenError::BinaryFile);
+    }
     let prepared = work.execute()?;
     if token.is_cancelled() {
         return Err(DocumentOpenError::Worker(String::from(
@@ -675,7 +680,7 @@ async fn execute_remote_file_explorer_search(
                 .cloned()
                 .unwrap_or_else(helix_remote::WorkspacePath::root),
             request.query.clone(),
-            request.config.workspace_scan_options(),
+            crate::fff::file_explorer_search_options(&request.config),
             100_000,
             canceled.child_token(),
         )

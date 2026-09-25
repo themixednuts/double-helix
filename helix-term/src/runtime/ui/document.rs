@@ -824,7 +824,7 @@ fn one_based_position(text: &helix_core::Rope, line: usize, column: usize) -> Op
     Some(line + column.saturating_sub(1))
 }
 
-fn file_is_binary(path: &std::path::Path) -> std::io::Result<bool> {
+pub(super) fn file_is_binary(path: &std::path::Path) -> std::io::Result<bool> {
     let mut read_buffer = Vec::with_capacity(1024);
     let file = std::fs::File::open(path)?;
     let read = file.take(1024).read_to_end(&mut read_buffer)?;

@@ -530,6 +530,7 @@ impl FileExplorerPanel {
                 ancestor_last,
                 vcs_status: None,
                 diagnostic_status: None,
+                detail: None,
             },
         );
         self.rows = rows.into();

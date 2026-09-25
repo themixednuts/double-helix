@@ -577,7 +577,9 @@ async fn start_prompt_turn(
 fn finished_run(reason: &acp::StopReason) -> thread::Run {
     let message = match reason {
         acp::StopReason::MaxTokens => "stopped: the agent reached its token limit",
-        acp::StopReason::MaxTurnRequests => "stopped: the agent reached its request limit for this turn",
+        acp::StopReason::MaxTurnRequests => {
+            "stopped: the agent reached its request limit for this turn"
+        }
         acp::StopReason::Refusal => "the agent refused to continue",
         _ => return thread::Run::Idle,
     };
@@ -1778,7 +1780,11 @@ fn select_lines(content: String, line: Option<u32>, limit: Option<u32>) -> Strin
     }
     let skip = line.map_or(0, |line| line.saturating_sub(1) as usize);
     let take = limit.map_or(usize::MAX, |limit| limit as usize);
-    content.split_inclusive('\n').skip(skip).take(take).collect()
+    content
+        .split_inclusive('\n')
+        .skip(skip)
+        .take(take)
+        .collect()
 }
 
 fn permission_choice(option: acp::PermissionOption) -> permission::Choice {

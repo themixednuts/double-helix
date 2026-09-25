@@ -279,7 +279,9 @@ pub(crate) fn apply_assistant_command(
                 ingress.clone(),
                 {
                     let request_id = request_id.clone();
-                    move |cx: &mut crate::compositor::Context, item: &PermissionPickerItem, _action| {
+                    move |cx: &mut crate::compositor::Context,
+                          item: &PermissionPickerItem,
+                          _action| {
                         if let Err(error) = cx.foreground.assistant_permission_resolved(
                             thread,
                             request_id.clone(),

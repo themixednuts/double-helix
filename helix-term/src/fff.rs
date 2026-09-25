@@ -7,9 +7,9 @@ use std::{
 use fff_search::{
     grep_byte_sources_page, ByteSourceGrepCursor, ContentOverlay, FFFMode, FilePicker,
     FilePickerOptions, FilePickerScanOptions, FileSearchConfig, FrecencyRecord, FrecencyStore,
-    FrecencyTracker, FuzzySearchOptions, GitRecencyConfig, GrepConfig, GrepMode,
-    GrepSearchOptions, PaginationArgs, QueryHistoryKind, QueryMatchEntry, QueryParser,
-    QueryTracker, QueryTrackerStore, SharedFrecency, SharedPicker, SharedQueryTracker,
+    FrecencyTracker, FuzzySearchOptions, GitRecencyConfig, GrepConfig, GrepMode, GrepSearchOptions,
+    PaginationArgs, QueryHistoryKind, QueryMatchEntry, QueryParser, QueryTracker,
+    QueryTrackerStore, SharedFrecency, SharedPicker, SharedQueryTracker,
 };
 use heed::types::{Bytes, SerdeBincode};
 use heed::{Database, EnvOpenOptions};

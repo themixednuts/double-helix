@@ -500,16 +500,13 @@ fn render_text(
                         } => {
                             let skip_left_syntax_start = Stopwatch::start();
                             syntax_highlighter.advance_to(next_char_idx);
-                            skip_left_syntax_us +=
-                                skip_left_syntax_start.elapsed_us();
+                            skip_left_syntax_us += skip_left_syntax_start.elapsed_us();
                             let skip_left_overlay_start = Stopwatch::start();
                             overlay_highlighter.advance_to(next_char_idx);
-                            skip_left_overlay_us +=
-                                skip_left_overlay_start.elapsed_us();
+                            skip_left_overlay_us += skip_left_overlay_start.elapsed_us();
                             let skip_left_decor_start = Stopwatch::start();
                             decorations.fast_forward_to_char(next_char_idx, current_doc_line);
-                            skip_left_decor_us +=
-                                skip_left_decor_start.elapsed_us();
+                            skip_left_decor_us += skip_left_decor_start.elapsed_us();
                             last_line_end = line_end_col;
                             if let Some(last_entry) = line_map_lines.last_mut() {
                                 last_entry.char_range_end = next_char_idx;

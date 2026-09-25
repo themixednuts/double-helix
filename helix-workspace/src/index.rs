@@ -4,8 +4,8 @@ use crate::{
 };
 use fff_search::{
     FFFMode, FilePicker, FilePickerOptions, FilePickerScanOptions, FileSearchConfig,
-    FuzzySearchOptions, GitRecencyConfig, GrepConfig, GrepMode, GrepSearchOptions,
-    PaginationArgs, QueryParser, SharedFrecency, SharedPicker, SymlinkTargetScope,
+    FuzzySearchOptions, GitRecencyConfig, GrepConfig, GrepMode, GrepSearchOptions, PaginationArgs,
+    QueryParser, SharedFrecency, SharedPicker, SymlinkTargetScope,
 };
 use std::{
     collections::HashSet,

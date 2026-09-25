@@ -557,7 +557,10 @@ fn shell_command(line: &str) -> Command {
     let mut cmd = Command::new("cmd");
     // `raw_arg` keeps the line exactly as the agent wrote it; cmd.exe does its own parsing
     // and does not understand the MSVC quoting `arg` would apply.
-    cmd.arg("/D").arg("/S").arg("/C").raw_arg(format!("\"{line}\""));
+    cmd.arg("/D")
+        .arg("/S")
+        .arg("/C")
+        .raw_arg(format!("\"{line}\""));
     cmd
 }
 
@@ -784,10 +787,17 @@ mod tests {
         assert_eq!(exit.exit_status.exit_code, Some(0));
 
         let output = manager
-            .output(&TerminalOutputRequest::new("session-1", terminal_id.clone()))
+            .output(&TerminalOutputRequest::new(
+                "session-1",
+                terminal_id.clone(),
+            ))
             .await
             .expect("terminal output");
-        assert!(output.output.contains("acp shell ok"), "{:?}", output.output);
+        assert!(
+            output.output.contains("acp shell ok"),
+            "{:?}",
+            output.output
+        );
         assert!(output.output.contains("second"), "{:?}", output.output);
         manager
             .release(&ReleaseTerminalRequest::new("session-1", terminal_id))

@@ -808,15 +808,18 @@ mod search_path {
         }
 
         directories.iter().find_map(|directory| {
-            candidates.iter().enumerate().find_map(|(index, candidate)| {
-                let name = directory.files.get(candidate)?;
-                let path = directory.path.join(name);
-                // Like `which`, an extensionless name only counts if it is an
-                // executable image: npm and pip leave shell scripts of that
-                // name beside the `.cmd` launchers, and those can't be run.
-                let bare = index == 0 && extension.is_none();
-                (path.is_file() && (!bare || is_executable_image(&path))).then_some(path)
-            })
+            candidates
+                .iter()
+                .enumerate()
+                .find_map(|(index, candidate)| {
+                    let name = directory.files.get(candidate)?;
+                    let path = directory.path.join(name);
+                    // Like `which`, an extensionless name only counts if it is an
+                    // executable image: npm and pip leave shell scripts of that
+                    // name beside the `.cmd` launchers, and those can't be run.
+                    let bare = index == 0 && extension.is_none();
+                    (path.is_file() && (!bare || is_executable_image(&path))).then_some(path)
+                })
         })
     }
 
@@ -1455,8 +1458,9 @@ mod tests {
         make_executable(&first.join(executable_name("tool")));
         make_executable(&second.join(executable_name("tool")));
         make_executable(&second.join(executable_name("other")));
-        let snapshot = RuntimeAssetsSnapshot::new(RuntimeSnapshot::default(), Vec::new(), Vec::new())
-            .with_search_path(Some(std::env::join_paths([&first, &second]).unwrap()));
+        let snapshot =
+            RuntimeAssetsSnapshot::new(RuntimeSnapshot::default(), Vec::new(), Vec::new())
+                .with_search_path(Some(std::env::join_paths([&first, &second]).unwrap()));
         let resolver = snapshot.command_resolver();
 
         // npm-style install: an extensionless shell script beside the launcher.
@@ -1465,7 +1469,10 @@ mod tests {
         make_executable(&first.join(executable_name("shim")));
 
         for command in ["tool", "other", "shim", "missing"] {
-            let batch = resolver.resolve(command).unwrap().map(|launch| launch.program);
+            let batch = resolver
+                .resolve(command)
+                .unwrap()
+                .map(|launch| launch.program);
             let single = snapshot
                 .resolve_command(command)
                 .unwrap()
@@ -1474,7 +1481,10 @@ mod tests {
         }
         let tool = resolver.resolve("tool").unwrap().expect("tool on the path");
         assert!(tool.program.starts_with(&first));
-        let shim = resolver.resolve("shim").unwrap().expect("launcher on the path");
+        let shim = resolver
+            .resolve("shim")
+            .unwrap()
+            .expect("launcher on the path");
         assert!(shim.program.ends_with(executable_name("shim")));
         if cfg!(windows) {
             let upper = resolver.resolve("TOOL").unwrap().expect("case-insensitive");

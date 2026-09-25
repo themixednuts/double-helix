@@ -3061,11 +3061,13 @@ mod tests {
             subscriptions: HashMap::new(),
             subscribed: Arc::clone(&subscribed),
         };
-        let wants = |kind| subscribed.load(std::sync::atomic::Ordering::Acquire) & event_bit(kind) != 0;
+        let wants =
+            |kind| subscribed.load(std::sync::atomic::Ordering::Acquire) & event_bit(kind) != 0;
         assert!(!wants(EventKind::KeyPressed));
 
         let keys = host.subscribe(plugin_id(), EventKind::KeyPressed).unwrap();
-        host.subscribe(other_plugin_id(), EventKind::ModeChanged).unwrap();
+        host.subscribe(other_plugin_id(), EventKind::ModeChanged)
+            .unwrap();
         assert!(wants(EventKind::KeyPressed) && wants(EventKind::ModeChanged));
         assert!(!wants(EventKind::DocumentChanged));
 

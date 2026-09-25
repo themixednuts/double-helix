@@ -8,8 +8,8 @@ use std::path::{Path, PathBuf};
 
 pub use assets::{
     bootstrap_runtime_assets, runtime_assets, runtime_assets_if_initialized, ActivePackage,
-    CommandResolver, Origin, ResolvedLaunch, ResolvedPath, RuntimeAsset, RuntimeAssetKey, RuntimeAssetKind,
-    RuntimeAssetSpec, RuntimeAssets, RuntimeAssetsChange, RuntimeAssetsError,
+    CommandResolver, Origin, ResolvedLaunch, ResolvedPath, RuntimeAsset, RuntimeAssetKey,
+    RuntimeAssetKind, RuntimeAssetSpec, RuntimeAssets, RuntimeAssetsChange, RuntimeAssetsError,
     RuntimeAssetsSnapshot, RuntimeSnapshot,
 };
 pub use helix_stdx::paths::{

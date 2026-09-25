@@ -396,8 +396,22 @@ fn draw_item(
     }
 
     if let Some(detail) = item.detail {
-        draw_segment_scrolled(surface, area, &mut content_x, "  ", styles.inactive, scroll_x);
-        draw_segment_scrolled(surface, area, &mut content_x, detail, styles.inactive, scroll_x);
+        draw_segment_scrolled(
+            surface,
+            area,
+            &mut content_x,
+            "  ",
+            styles.inactive,
+            scroll_x,
+        );
+        draw_segment_scrolled(
+            surface,
+            area,
+            &mut content_x,
+            detail,
+            styles.inactive,
+            scroll_x,
+        );
     }
 }
 

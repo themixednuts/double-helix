@@ -245,7 +245,16 @@ pub struct Rule {
     pub choice: String,
 }
 
+/// The rules every agent consults, loaded once. One set in memory means a reset reaches running
+/// agents, and an agent saving a new rule can't write back rules that were reset.
+static SHARED: std::sync::OnceLock<parking_lot::RwLock<Rules>> = std::sync::OnceLock::new();
+
 impl Rules {
+    #[must_use]
+    pub fn shared() -> &'static parking_lot::RwLock<Rules> {
+        SHARED.get_or_init(|| parking_lot::RwLock::new(Rules::load()))
+    }
+
     #[must_use]
     pub fn path() -> PathBuf {
         helix_loader::cache_dir()
@@ -299,6 +308,9 @@ impl Rules {
     }
 
     pub fn reset() -> anyhow::Result<()> {
+        if let Some(shared) = SHARED.get() {
+            shared.write().rules.clear();
+        }
         match Self::reset_store() {
             Ok(()) => Ok(()),
             Err(err) => {

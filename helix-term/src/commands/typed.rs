@@ -4222,6 +4222,57 @@ fn understand(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> 
     Ok(())
 }
 
+/// The agent behind the active assistant thread.
+fn active_assistant_backend(
+    editor: &helix_view::Editor,
+) -> anyhow::Result<helix_view::assistant::backend::Id> {
+    let thread = editor
+        .assistant
+        .active()
+        .and_then(|thread| editor.assistant.thread(thread))
+        .context("no assistant thread is open")?;
+    match thread.origin() {
+        helix_view::assistant::thread::Origin::Backend { backend, .. } => Ok(backend.clone()),
+        helix_view::assistant::thread::Origin::Local => {
+            bail!("the active assistant thread has no agent")
+        }
+    }
+}
+
+fn assistant_restart(
+    cx: &mut compositor::Context,
+    _args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+    let backend = active_assistant_backend(cx.editor)?;
+    cx.editor.restart_assistant_backend(&backend)?;
+    cx.editor.set_status(format!("Restarted agent {backend}"));
+    Ok(())
+}
+
+fn assistant_disconnect(
+    cx: &mut compositor::Context,
+    _args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+    let backend = active_assistant_backend(cx.editor)?;
+    if cx.editor.shutdown_assistant_backend(&backend) {
+        cx.editor.set_status(format!(
+            "Stopped agent {backend}; your next message starts it again"
+        ));
+    } else {
+        cx.editor
+            .set_status(format!("Agent {backend} is not running"));
+    }
+    Ok(())
+}
+
 fn assistant_agents(
     cx: &mut compositor::Context,
     _args: Args,
@@ -6129,6 +6180,28 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         completer: CommandCompleter::none(),
         signature: Signature {
             positionals: (0, None),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "assistant-restart",
+        aliases: &[],
+        doc: "Restart the active assistant thread's agent, keeping its conversations.",
+        fun: assistant_restart,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "assistant-disconnect",
+        aliases: &[],
+        doc: "Stop the active assistant thread's agent. Your next message starts it again.",
+        fun: assistant_disconnect,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
             ..Signature::DEFAULT
         },
     },

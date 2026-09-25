@@ -273,6 +273,60 @@ impl Editor {
         Ok(handle)
     }
 
+    /// Stop `backend`'s agent process. Its threads keep their sessions: the next message
+    /// starts a new process and re-binds them. Returns whether the agent was running.
+    pub fn shutdown_assistant_backend(&mut self, backend: &crate::assistant::backend::Id) -> bool {
+        let Some(handle) = self.assistant_runtime.backends.remove(backend) else {
+            return false;
+        };
+        self.runtime
+            .work()
+            .spawn(async move {
+                let _ = handle
+                    .send(crate::assistant::backend::Command::Shutdown)
+                    .await;
+            })
+            .detach();
+        true
+    }
+
+    /// Restart `backend`'s agent: stop the process, start a new one and re-load the sessions of
+    /// the threads bound to it.
+    pub fn restart_assistant_backend(
+        &mut self,
+        backend: &crate::assistant::backend::Id,
+    ) -> anyhow::Result<()> {
+        self.shutdown_assistant_backend(backend);
+        let handle = self
+            .ensure_assistant_backend(backend)
+            .ok_or_else(|| anyhow::anyhow!("{backend} is not an installed agent; reconnect it"))?;
+        let rebinds: Vec<_> = self
+            .assistant
+            .threads()
+            .filter_map(|thread| match thread.origin() {
+                crate::assistant::thread::Origin::Backend {
+                    backend: thread_backend,
+                    remote,
+                } if thread_backend == backend => {
+                    Some(crate::assistant::backend::Command::LoadThread {
+                        thread: thread.id,
+                        remote: remote.clone(),
+                    })
+                }
+                _ => None,
+            })
+            .collect();
+        self.runtime
+            .work()
+            .spawn(async move {
+                for rebind in rebinds {
+                    let _ = handle.send(rebind).await;
+                }
+            })
+            .detach();
+        Ok(())
+    }
+
     pub fn ensure_assistant_backend(
         &mut self,
         backend: &crate::assistant::backend::Id,

@@ -109,7 +109,6 @@ struct State {
     /// The mode the agent last confirmed for each thread, to roll back a refused switch.
     current_modes: HashMap<thread::Id, acp::SessionModeId>,
     staged: HashMap<thread::Id, HashMap<PathBuf, review::File>>,
-    rules: permission::Rules,
     caps: helix_acp::AgentCaps,
     /// Whether the agent accepts embedded resources in prompts.
     embedded_context: bool,
@@ -141,7 +140,6 @@ impl State {
             modes: HashMap::new(),
             current_modes: HashMap::new(),
             staged: HashMap::new(),
-            rules: permission::Rules::load(),
             caps,
             embedded_context: false,
             auth_methods,
@@ -486,6 +484,12 @@ async fn run_agent(
         tokio::select! {
             cmd = handle_rx.recv() => {
                 match cmd {
+                    Some(backend::Command::Shutdown) => {
+                        if let Err(err) = agent.shutdown().await {
+                            log::warn!("stopping agent {backend_id}: {err}");
+                        }
+                        break;
+                    }
                     Some(cmd) => handle_command(&backend_id, &work, &agent, &tx, &host, &mut state, incoming, cmd).await,
                     None => break,
                 }
@@ -645,6 +649,8 @@ async fn handle_command(
     cmd: backend::Command,
 ) {
     match cmd {
+        // The run loop stops the agent before a command gets here.
+        backend::Command::Shutdown => {}
         backend::Command::NewThread { thread, scope } => {
             let request = agent.new_session(scope.cwd.clone());
             match serve_until(request, backend_id, work, agent, tx, host, state, incoming).await {
@@ -1061,11 +1067,11 @@ async fn handle_command(
                         if let Some(selected) =
                             pending.choices.iter().find(|item| item.id == choice)
                         {
-                            if let Err(err) =
-                                state
-                                    .rules
-                                    .remember(&pending.agent, &pending.tool, selected)
-                            {
+                            if let Err(err) = permission::Rules::shared().write().remember(
+                                &pending.agent,
+                                &pending.tool,
+                                selected,
+                            ) {
                                 log::warn!("assistant permission rule save failed: {err}");
                             }
                         }
@@ -1749,6 +1755,7 @@ async fn handle_call(
                     .title
                     .clone()
                     .unwrap_or_else(|| req.tool_call.tool_call_id.to_string());
+                let rule_key = permission_rule_key(&req.tool_call.fields, &tool);
                 let description = req
                     .tool_call
                     .fields
@@ -1767,11 +1774,12 @@ async fn handle_call(
                     builder = builder.choice(permission_choice(option));
                 }
                 let request = builder.build();
-                if let Some(choice) =
-                    state
-                        .rules
-                        .choice(backend_id.as_str(), &tool, request.choices())
-                {
+                let remembered = permission::Rules::shared().read().choice(
+                    backend_id.as_str(),
+                    &rule_key,
+                    request.choices(),
+                );
+                if let Some(choice) = remembered {
                     let verb = request
                         .choices()
                         .iter()
@@ -1819,7 +1827,7 @@ async fn handle_call(
                         rpc: id,
                         thread,
                         agent: backend_id.as_str().to_string(),
-                        tool,
+                        tool: rule_key,
                         choices: request.choices().to_vec(),
                     },
                 );
@@ -1901,6 +1909,40 @@ async fn handle_call(
         },
         _ => {}
     }
+}
+
+/// What an "always" answer to a permission request covers: the kind of tool call (`edit`,
+/// `read`, `fetch`), and for commands the program they run, so allowing `cargo test` once
+/// doesn't allow `rm`. Titles usually embed the path or command, so they would rarely match
+/// again; tool calls without a kind still fall back to theirs.
+fn permission_rule_key(fields: &acp::ToolCallUpdateFields, title: &str) -> String {
+    let Some(kind) = fields.kind.as_ref() else {
+        return title.to_owned();
+    };
+    let kind_name = serde_json::to_value(kind)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_else(|| title.to_owned());
+    if !matches!(kind, acp::ToolKind::Execute) {
+        return kind_name;
+    }
+    let command = fields
+        .raw_input
+        .as_ref()
+        .and_then(|input| input.get("command"))
+        .and_then(|command| match command {
+            serde_json::Value::String(command) => Some(command.clone()),
+            serde_json::Value::Array(parts) => parts.first()?.as_str().map(str::to_owned),
+            _ => None,
+        })
+        .unwrap_or_else(|| title.to_owned());
+    let program = command.split_whitespace().next().unwrap_or_default();
+    let program = program
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(program)
+        .trim_matches(['"', '\'', '`']);
+    format!("{kind_name}:{program}")
 }
 
 /// Apply `fs/read_text_file`'s optional window: `line` is 1-based, `limit` counts lines.
@@ -2001,6 +2043,44 @@ fn changed_range(before: &str, after: &str) -> Option<crate::collab::RangeAnchor
     }
 
     Some(crate::collab::RangeAnchor::new(prefix, after_suffix))
+}
+
+#[cfg(test)]
+mod permission_rule_key_tests {
+    use super::*;
+
+    fn fields(json: serde_json::Value) -> acp::ToolCallUpdateFields {
+        serde_json::from_value(json).unwrap()
+    }
+
+    #[test]
+    fn keys_by_kind_and_command_program() {
+        assert_eq!(
+            permission_rule_key(&fields(serde_json::json!({"kind": "edit"})), "Edit a.rs"),
+            "edit"
+        );
+        assert_eq!(
+            permission_rule_key(
+                &fields(serde_json::json!({
+                    "kind": "execute",
+                    "rawInput": {"command": "/usr/bin/cargo test --all"}
+                })),
+                "Run cargo"
+            ),
+            "execute:cargo"
+        );
+        assert_eq!(
+            permission_rule_key(
+                &fields(serde_json::json!({"kind": "execute"})),
+                "git status"
+            ),
+            "execute:git"
+        );
+        assert_eq!(
+            permission_rule_key(&fields(serde_json::json!({})), "Custom tool"),
+            "Custom tool"
+        );
+    }
 }
 
 #[cfg(test)]

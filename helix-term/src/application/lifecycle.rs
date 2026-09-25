@@ -86,7 +86,8 @@ impl Application {
         update: helix_view::assistant::backend::Update,
     ) {
         // Extract plugin events from the update before consuming it.
-        let plugin_events = assistant_update_plugin_events(&update);
+        let mut plugin_events = assistant_update_plugin_events(&update);
+        let message = assistant_message_update(&update);
         let assistant_panel_focused = self
             .compositor
             .find_id::<crate::ui::assistant::AssistantPanel>(crate::ui::assistant::ID)
@@ -99,6 +100,7 @@ impl Application {
         );
 
         let outcome = self.editor.apply_assistant_update(update);
+        plugin_events.extend(self.assistant_message_events(message));
         if let Some((thread, request)) = outcome.permission_request {
             let ingress = self.ingress().tx.clone();
             crate::runtime::ui::assistant::apply_assistant_command(
@@ -225,6 +227,89 @@ fn assistant_completion_toast_for_update(
     assistant_completion_toast(previous, next, notify_on_done, panel_focused)
 }
 
+/// What an assistant update means for `assistant_message_received`.
+enum MessageUpdate {
+    /// An entry was appended (a tool call, a status line).
+    Appended(helix_view::assistant::thread::Id),
+    /// The agent's reply streamed into an entry.
+    Streamed(helix_view::assistant::thread::Id),
+    /// The turn ended: a reply that streamed is complete.
+    TurnEnded(helix_view::assistant::thread::Id),
+    None,
+}
+
+fn assistant_message_update(update: &helix_view::assistant::backend::Update) -> MessageUpdate {
+    use helix_view::assistant::{backend, thread};
+    match update {
+        backend::Update::Thread {
+            thread,
+            event: thread::Event::Content(thread::Content::Append(_)),
+        } => MessageUpdate::Appended(*thread),
+        backend::Update::Thread {
+            thread,
+            event: thread::Event::Content(thread::Content::Stream(_)),
+        } => MessageUpdate::Streamed(*thread),
+        backend::Update::Thread {
+            thread,
+            event: thread::Event::Run(thread::Run::Idle | thread::Run::Failed { .. }),
+        } => MessageUpdate::TurnEnded(*thread),
+        _ => MessageUpdate::None,
+    }
+}
+
+impl Application {
+    /// `assistant_message_received` for an applied update: appended entries right away, a
+    /// streamed reply once its turn ends (not per chunk), each with its entry id.
+    fn assistant_message_events(
+        &mut self,
+        update: MessageUpdate,
+    ) -> Vec<helix_plugin_api::events::PluginEvent> {
+        use helix_plugin_api::events;
+        use helix_plugin_editor::adapt;
+
+        let last_entry = |editor: &helix_view::Editor, thread| {
+            editor
+                .assistant
+                .thread(thread)
+                .and_then(|thread| thread.entries().last())
+                .map(|entry| (entry.id, entry.kind.clone()))
+        };
+        let (thread, entry) = match update {
+            MessageUpdate::Appended(thread) => (thread, last_entry(&self.editor, thread)),
+            MessageUpdate::Streamed(thread) => {
+                if let Some((id, _)) = last_entry(&self.editor, thread) {
+                    self.streamed_replies.insert(thread, id);
+                }
+                return Vec::new();
+            }
+            MessageUpdate::TurnEnded(thread) => {
+                let Some(id) = self.streamed_replies.remove(&thread) else {
+                    return Vec::new();
+                };
+                let entry = self
+                    .editor
+                    .assistant
+                    .thread(thread)
+                    .and_then(|t| t.entries().iter().find(|entry| entry.id == id))
+                    .map(|entry| (entry.id, entry.kind.clone()));
+                (thread, entry)
+            }
+            MessageUpdate::None => return Vec::new(),
+        };
+        let Some((id, kind)) = entry else {
+            return Vec::new();
+        };
+        let (kind, _) = adapt::entry_kind_to_contract(&kind);
+        vec![events::PluginEvent::AssistantMessageReceived(
+            events::AssistantMessageReceivedEvent {
+                thread: adapt::thread_handle(thread),
+                entry_id: id.value().get(),
+                kind,
+            },
+        )]
+    }
+}
+
 /// Extract plugin-visible events from an assistant backend update.
 ///
 /// Inspects the update variant to determine which contract events to emit.
@@ -265,21 +350,8 @@ fn assistant_update_plugin_events(
                 thread::Run::Waiting => Vec::new(),
             }
         }
-        backend::Update::Thread {
-            thread,
-            event: thread::Event::Content(thread::Content::Append(entry)),
-        } => {
-            let (kind, _) = adapt::entry_kind_to_contract(&entry.kind);
-            vec![events::PluginEvent::AssistantMessageReceived(
-                events::AssistantMessageReceivedEvent {
-                    thread: adapt::thread_handle(*thread),
-                    // Entry ID is assigned during apply, so we use 0 as placeholder.
-                    // Plugins should use thread_entries() for full entry data.
-                    entry_id: 0,
-                    kind,
-                },
-            )]
-        }
+        // Appended entries (tool calls, status lines) and streamed replies are reported with
+        // their entry id once the update is applied; see `assistant_message_events`.
         _ => Vec::new(),
     }
 }

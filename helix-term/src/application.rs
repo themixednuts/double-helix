@@ -352,6 +352,12 @@ pub struct Application {
     language: LanguageState,
     foreground: crate::runtime::ForegroundEvents,
     plugin_runtime: crate::plugin_registry::PluginRuntime,
+    /// The entry each assistant thread's reply is streaming into, reported to plugins when the
+    /// turn ends.
+    streamed_replies: std::collections::HashMap<
+        helix_view::assistant::thread::Id,
+        helix_view::assistant::thread::EntryId,
+    >,
     remote: Option<RemoteApplicationSession>,
     collaboration: Option<CollaborationApplicationSession>,
     collaboration_shutdowns: Vec<helix_runtime::Task<()>>,
@@ -824,6 +830,7 @@ impl Application {
             },
             foreground,
             plugin_runtime,
+            streamed_replies: std::collections::HashMap::new(),
             remote,
             collaboration: None,
             collaboration_shutdowns: Vec::new(),

@@ -785,7 +785,23 @@ fn reload_plugins(
     configure_engine_hosts(engine, host);
     engine.set_api_metadata(api_metadata.clone());
     engine.register_api(config.clone())?;
-    load_plugins(engine, host, config)
+    load_plugins(engine, host, config)?;
+    announce_ready(engine, host, api_metadata);
+    Ok(())
+}
+
+/// Fire `host_ready` for the plugins just loaded: the host now takes their calls.
+fn announce_ready(
+    engine: &mut LuaEngine,
+    host: &mut RpcHost,
+    api_metadata: &metadata::ApiMetadata,
+) {
+    let event = events::PluginEvent::HostReady(events::HostReadyEvent {
+        api_version: api_metadata.version,
+    });
+    if let Err(err) = engine.call_event_handlers(host, &event) {
+        log::warn!("helix-plugin-host: host_ready handlers failed: {err}");
+    }
 }
 
 fn callback_id(callback: UiCallbackToken) -> UiCallbackId {
@@ -911,6 +927,7 @@ pub fn run_plugin_host() {
         log::error!("helix-plugin-host: plugin discovery failed: {err}");
         return;
     }
+    announce_ready(&mut engine, &mut host, &metadata);
     match drain_deferred_requests(&mut engine, &mut host, &init, &metadata) {
         Ok(false) => {}
         Ok(true) => return,

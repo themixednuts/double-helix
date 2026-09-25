@@ -106,7 +106,8 @@ pub(crate) struct ViewRenderContext<'a> {
 
 #[derive(Clone)]
 struct PreparedGutterCell {
-    text: String,
+    /// Byte range of this cell's text in its column's `text`.
+    text: std::ops::Range<usize>,
     style: Option<Style>,
     selected: bool,
 }
@@ -115,8 +116,26 @@ struct PreparedGutterColumn {
     x: u16,
     width: usize,
     first_doc_line: usize,
+    /// Every cell's text packed into one buffer: gutters are collected on the
+    /// main thread each frame, so they get one allocation per column rather
+    /// than one per line.
+    text: String,
     first_visual: Vec<PreparedGutterCell>,
     continuation: Vec<PreparedGutterCell>,
+}
+
+impl PreparedGutterColumn {
+    fn cell_text(&self, cell: &PreparedGutterCell) -> &str {
+        &self.text[cell.text.clone()]
+    }
+}
+
+/// Moves `scratch` onto the end of `text`, returning where it landed.
+fn pack_gutter_text(text: &mut String, scratch: &mut String) -> std::ops::Range<usize> {
+    let start = text.len();
+    text.push_str(scratch);
+    scratch.clear();
+    start..text.len()
 }
 
 struct PreparedGutters {
@@ -165,31 +184,31 @@ impl PreparedGutters {
             );
             let mut first_visual = Vec::with_capacity(line_count);
             let mut continuation = Vec::with_capacity(line_count);
-            let mut text = String::with_capacity(width);
+            let mut text = String::with_capacity(width.saturating_mul(line_count));
+            let mut scratch = String::with_capacity(width);
 
             for line in first_doc_line..=last_doc_line {
                 let selected = cursor_lines.contains(&line);
-                let style = first_renderer(line, selected, true, &mut text);
+                let style = first_renderer(line, selected, true, &mut scratch);
                 first_visual.push(PreparedGutterCell {
-                    text: std::mem::take(&mut text),
+                    text: pack_gutter_text(&mut text, &mut scratch),
                     style,
                     selected,
                 });
-                text = String::with_capacity(width);
 
-                let style = continuation_renderer(line, selected, false, &mut text);
+                let style = continuation_renderer(line, selected, false, &mut scratch);
                 continuation.push(PreparedGutterCell {
-                    text: std::mem::take(&mut text),
+                    text: pack_gutter_text(&mut text, &mut scratch),
                     style,
                     selected,
                 });
-                text = String::with_capacity(width);
             }
 
             columns.push(PreparedGutterColumn {
                 x,
                 width,
                 first_doc_line,
+                text,
                 first_visual,
                 continuation,
             });
@@ -228,7 +247,7 @@ impl PreparedGutters {
                     renderer.set_stringn(
                         column.x,
                         pos.visual_line,
-                        &cell.text,
+                        column.cell_text(cell),
                         column.width,
                         gutter_style.patch(style),
                     );

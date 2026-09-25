@@ -43,13 +43,24 @@ pub enum InsertEntry {
 }
 
 impl InsertEntry {
-    /// The Helix engine command name corresponding to this entry. Used
-    /// for insert recording (so `.` repeat / macros can replay the entry
-    /// later) and for telemetry.
+    /// The command name for this entry, as the main editor records it: what `.` replays.
     pub fn engine_command(self) -> std::borrow::Cow<'static, str> {
         match self {
-            InsertEntry::AtCurrent | InsertEntry::AtLineStart => "insert_mode".into(),
-            InsertEntry::Append | InsertEntry::AtLineEnd => "append_mode".into(),
+            InsertEntry::AtCurrent => "insert_mode".into(),
+            InsertEntry::Append => "append_mode".into(),
+            InsertEntry::AtLineStart => "insert_at_line_start".into(),
+            InsertEntry::AtLineEnd => "insert_at_line_end".into(),
+        }
+    }
+
+    /// The entry a recorded insert's entry command names, if it is one of these.
+    pub fn from_command(name: &str) -> Option<Self> {
+        match name {
+            "insert_mode" => Some(InsertEntry::AtCurrent),
+            "append_mode" => Some(InsertEntry::Append),
+            "insert_at_line_start" => Some(InsertEntry::AtLineStart),
+            "insert_at_line_end" => Some(InsertEntry::AtLineEnd),
+            _ => None,
         }
     }
 }
@@ -344,6 +355,51 @@ impl EditRegion {
         doc.set_selection(view_id, selection);
     }
 
+    /// Start replaying a recorded insert (`.`): run its entry command (`i`, `A`, or an
+    /// engine command such as `c` or `o`), which starts recording it again. Returns whether
+    /// the region is now inserting; the host then dispatches the recorded keys the way it
+    /// dispatches typed ones, and calls [`Self::finish_insert_replay`].
+    pub fn begin_insert_replay(&mut self, editor: &mut Editor, entry_command: &str) -> bool {
+        match InsertEntry::from_command(entry_command) {
+            Some(entry) => self.enter_insert_at(editor, entry),
+            None => self.replay_engine_entry(editor, entry_command),
+        }
+        self.mode == Mode::Insert
+    }
+
+    /// End a replay whose keys did not leave insert mode themselves.
+    pub fn finish_insert_replay(&mut self) {
+        if self.mode == Mode::Insert {
+            self.exit_insert_mode();
+        }
+    }
+
+    /// Run the engine command that entered a recorded insert, against this region.
+    fn replay_engine_entry(&mut self, editor: &mut Editor, name: &str) {
+        let Some(doc_id) = self.doc_id else { return };
+        let area = self.area();
+        let Some(mut engine) = self.engine.take() else {
+            return;
+        };
+        let state = editor.ensure_component_view(self.region.id(), doc_id);
+        state.doc = doc_id;
+        state.area = area;
+        state.history = self.history.clone();
+
+        let global_mode = editor.mode;
+        editor.mode = self.mode;
+        engine.replay_entry(editor, self.region.id(), doc_id, name);
+        self.mode = editor.mode;
+        editor.mode = global_mode;
+        if self.mode == Mode::Insert {
+            engine.begin_insert_recording(std::borrow::Cow::Owned(name.to_owned()));
+        }
+        if let Some(state) = editor.component_view(self.region.id()) {
+            self.history = state.history.clone();
+        }
+        self.engine = Some(engine);
+    }
+
     /// Exit insert mode: set the region mode back to normal and finalize
     /// the engine's insert recording.
     pub fn exit_insert_mode(&mut self) {
@@ -536,8 +592,24 @@ impl EditRegion {
                 self.insert_key_chars(editor, &keys, policy);
                 DispatchSignal::Consumed
             }
-            EngineResult::ReplayInsert { keys, .. } => {
-                self.insert_key_chars(editor, &keys, policy);
+            EngineResult::ReplayInsert {
+                entry_command,
+                keys,
+            } => {
+                if !self.begin_insert_replay(editor, &entry_command) {
+                    return DispatchSignal::Consumed;
+                }
+                for key in keys.iter().copied() {
+                    if self.mode != Mode::Insert {
+                        break;
+                    }
+                    let signal = self.dispatch(editor, key, policy);
+                    if matches!(signal, DispatchSignal::Submit | DispatchSignal::Cancel) {
+                        self.finish_insert_replay();
+                        return signal;
+                    }
+                }
+                self.finish_insert_replay();
                 DispatchSignal::Consumed
             }
         }
@@ -1101,15 +1173,34 @@ mod tests {
     }
 
     #[test]
-    fn insert_entry_engine_command_groups_i_and_capital_i() {
-        // Helix records `i` and `I` under the same engine command so dot-
-        // repeat replays them identically; same for `a` and `A`. This
-        // matches the editor's `commands::insert_mode` /
-        // `commands::insert_at_line_start` both starting with
-        // `enter_insert_mode` and the `_` ID being `insert_mode`.
-        assert_eq!(InsertEntry::AtCurrent.engine_command(), "insert_mode");
-        assert_eq!(InsertEntry::AtLineStart.engine_command(), "insert_mode");
-        assert_eq!(InsertEntry::Append.engine_command(), "append_mode");
-        assert_eq!(InsertEntry::AtLineEnd.engine_command(), "append_mode");
+    fn insert_entries_round_trip_through_their_command_names() {
+        // `.` replays the entry it recorded: `I` repeats as `I`, not `i`.
+        for entry in [
+            InsertEntry::AtCurrent,
+            InsertEntry::Append,
+            InsertEntry::AtLineStart,
+            InsertEntry::AtLineEnd,
+        ] {
+            assert_eq!(InsertEntry::from_command(&entry.engine_command()), Some(entry));
+        }
+        assert_eq!(InsertEntry::from_command("change_selection"), None);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn insert_replay_enters_at_the_recorded_place_and_ends_in_normal_mode() {
+        let runtime = helix_runtime::test::runtime();
+        let mut editor = test_editor(runtime);
+        let mut region = EditRegion::default();
+        seed(&mut region, &mut editor, "hello world", 3);
+
+        assert!(region.begin_insert_replay(&mut editor, "insert_at_line_end"));
+        assert_eq!(region.mode(), Mode::Insert);
+        assert_eq!(cursor(&region, &editor), 11);
+        region.finish_insert_replay();
+        assert_eq!(region.mode(), Mode::Normal);
+
+        // Without an engine, an engine entry command cannot run.
+        assert!(!region.begin_insert_replay(&mut editor, "change_selection"));
+        assert_eq!(region.mode(), Mode::Normal);
     }
 }

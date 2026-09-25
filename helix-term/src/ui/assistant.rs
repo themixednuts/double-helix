@@ -3172,12 +3172,20 @@ impl AssistantPanel {
                 }
                 true
             }
-            EngineResult::ReplayInsert { keys, .. } => {
-                // For dot-repeat in the input region, just replay the keys as chars.
-                for ev in keys.iter() {
-                    if let Some(ch) = ev.char() {
-                        self.insert_char_into_input(ch, cx.editor);
+            EngineResult::ReplayInsert {
+                entry_command,
+                keys,
+            } => {
+                // `.`: enter insert mode the recorded way, then run the recorded keys the
+                // way typed ones run (Backspace and Enter included).
+                if self.input.begin_insert_replay(cx.editor, &entry_command) {
+                    for key in keys.iter().copied() {
+                        if self.input.mode() != Mode::Insert {
+                            break;
+                        }
+                        self.dispatch_input_key(key, cx);
                     }
+                    self.input.finish_insert_replay();
                 }
                 true
             }

@@ -1391,6 +1391,28 @@ m = "move_line_up"
     }
 
     #[tokio::test]
+    async fn edit_region_dot_repeats_the_insert_entry_and_every_key() {
+        use helix_view::edit_region::HostPolicy;
+
+        let (mut editor, mut region) = test_edit_region();
+        set_region_text(&region, &mut editor, "ab");
+        let policy = HostPolicy::multiline();
+        for key in [key!('A'), key!('x'), key!('y'), key!(Backspace), key!('z'), key!(Esc)] {
+            region.dispatch(&mut editor, key, policy);
+        }
+        let text = |region: &EditRegion, editor: &Editor| {
+            region.document(editor).unwrap().text().to_string()
+        };
+        assert_eq!(text(&region, &editor), "abxz");
+
+        // `.` from the start of the line appends at its end again, Backspace included.
+        set_region_cursor(&region, &mut editor, 0);
+        region.dispatch(&mut editor, key!('.'), policy);
+        assert_eq!(text(&region, &editor), "abxzxz");
+        assert_eq!(region.mode(), Mode::Normal);
+    }
+
+    #[tokio::test]
     async fn edit_region_dispatch_rejects_tree_only_jumplist_motion() {
         let (mut editor, mut region) = test_edit_region();
 

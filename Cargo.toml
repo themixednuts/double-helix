@@ -45,6 +45,13 @@ codegen-units = 1
 strip = true
 opt-level = 3
 
+# Release code with symbols for samply/cdb. `just profile` and `just stacks`
+# use it; see docs/perf-notes.md.
+[profile.profiling]
+inherits = "release"
+debug = "line-tables-only"
+strip = false
+
 [profile.integration]
 inherits = "test"
 package.helix-core.opt-level = 2

@@ -2652,15 +2652,17 @@ mod tests {
 
     #[test]
     fn journal_rejects_stale_completion_and_keeps_fifo_order() {
+        // The first create really runs; keep it out of the working directory.
+        let temp = tempfile::tempdir().unwrap();
         let mut journal = FileOperationJournal::default();
         let first = journal.enqueue(FileOperationRequest::create(
             FileOperationOrigin::Command,
-            PathBuf::from("one"),
+            temp.path().join("one"),
             false,
         ));
         let second = journal.enqueue(FileOperationRequest::create(
             FileOperationOrigin::Command,
-            PathBuf::from("two"),
+            temp.path().join("two"),
             false,
         ));
         let FileOperationDispatch::Inspect(inspection) = journal.next_dispatch().unwrap() else {

@@ -326,12 +326,13 @@ fn load_packaged_assistant_agents(
     let generation = snapshot.generation();
     let store = helix_pkg::Store::open_default();
     let registry = helix_pkg::Registry::from_config(&config, &store)?;
+    let resolver = snapshot.command_resolver();
     let mut agents = BTreeMap::new();
     for package in registry
         .iter()
         .filter(|package| package.kind == helix_pkg::PkgKind::Acp)
     {
-        if let Some(agent) = packaged_agent_from_package(&snapshot, package)? {
+        if let Some(agent) = packaged_agent_from_package(&resolver, package)? {
             agents.insert(package.name.clone(), agent);
         }
     }
@@ -339,7 +340,7 @@ fn load_packaged_assistant_agents(
 }
 
 fn packaged_agent_from_package(
-    runtime_assets: &helix_loader::RuntimeAssetsSnapshot,
+    commands: &helix_loader::CommandResolver<'_>,
     package: &helix_pkg::PackageSpec,
 ) -> anyhow::Result<Option<crate::editor::AgentConfig>> {
     let Some(artifact) = package
@@ -354,7 +355,7 @@ fn packaged_agent_from_package(
     command_keys.extend(artifact.source.system.as_deref());
     let mut launch = None;
     for key in command_keys {
-        if let Some(resolved) = runtime_assets.resolve_command(key)? {
+        if let Some(resolved) = commands.resolve(key)? {
             launch = Some(resolved);
             break;
         }

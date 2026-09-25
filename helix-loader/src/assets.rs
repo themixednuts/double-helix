@@ -156,6 +156,32 @@ impl RuntimeAssetsSnapshot {
     }
 
     pub fn resolve_command(&self, command: &str) -> Result<Option<ResolvedLaunch>> {
+        self.resolve_command_with(command, |command| {
+            which::which_in(
+                command,
+                self.search_path.as_ref(),
+                helix_stdx::env::current_working_dir(),
+            )
+            .ok()
+        })
+    }
+
+    /// A resolver for looking up many commands in one pass; see
+    /// [`CommandResolver`].
+    #[must_use]
+    pub fn command_resolver(&self) -> CommandResolver<'_> {
+        CommandResolver {
+            snapshot: self,
+            #[cfg(windows)]
+            search_path: std::cell::OnceCell::new(),
+        }
+    }
+
+    fn resolve_command_with(
+        &self,
+        command: &str,
+        search_path: impl FnOnce(&str) -> Option<PathBuf>,
+    ) -> Result<Option<ResolvedLaunch>> {
         let explicit = Path::new(command);
         if is_explicit_command(explicit) {
             return Ok(explicit.is_file().then(|| ResolvedLaunch {
@@ -182,13 +208,7 @@ impl RuntimeAssetsSnapshot {
             }));
         }
 
-        let program = which::which_in(
-            command,
-            self.search_path.as_ref(),
-            helix_stdx::env::current_working_dir(),
-        )
-        .ok();
-        Ok(program.map(|program| ResolvedLaunch {
+        Ok(search_path(command).map(|program| ResolvedLaunch {
             generation: self.generation(),
             program,
             prefix_args: Vec::new(),
@@ -691,6 +711,123 @@ fn ensure_managed_path(asset: &RuntimeAsset, path_type: ManagedPathType) -> Resu
         package: Box::new(asset.package.clone()),
         path: asset.path.clone(),
     })
+}
+
+/// Resolves many commands against one snapshot.
+///
+/// On Windows `which` probes every search-path directory with every PATHEXT
+/// extension, one file open per candidate. Resolving a batch (the ACP agent
+/// table at startup) cost thousands of opens and seconds of CPU. The resolver
+/// lists each directory once and answers from memory, trying candidates in
+/// the same order as `which`. Elsewhere it defers to `which`, which is one
+/// cheap stat per directory there.
+pub struct CommandResolver<'a> {
+    snapshot: &'a RuntimeAssetsSnapshot,
+    #[cfg(windows)]
+    search_path: std::cell::OnceCell<Vec<search_path::Directory>>,
+}
+
+impl CommandResolver<'_> {
+    pub fn resolve(&self, command: &str) -> Result<Option<ResolvedLaunch>> {
+        self.snapshot
+            .resolve_command_with(command, |command| self.search(command))
+    }
+
+    #[cfg(windows)]
+    fn search(&self, command: &str) -> Option<PathBuf> {
+        let directories = self
+            .search_path
+            .get_or_init(|| search_path::list(self.snapshot.search_path.as_deref()));
+        search_path::find(directories, command)
+    }
+
+    #[cfg(not(windows))]
+    fn search(&self, command: &str) -> Option<PathBuf> {
+        which::which_in(
+            command,
+            self.snapshot.search_path.as_ref(),
+            helix_stdx::env::current_working_dir(),
+        )
+        .ok()
+    }
+}
+
+#[cfg(windows)]
+mod search_path {
+    use std::collections::HashMap;
+    use std::ffi::OsStr;
+    use std::path::{Path, PathBuf};
+
+    /// One search-path directory: lowercased file name to the name as listed.
+    pub(super) struct Directory {
+        path: PathBuf,
+        files: HashMap<String, String>,
+    }
+
+    pub(super) fn list(search_path: Option<&OsStr>) -> Vec<Directory> {
+        let Some(search_path) = search_path else {
+            return Vec::new();
+        };
+        let cwd = helix_stdx::env::current_working_dir();
+        std::env::split_paths(search_path)
+            .filter(|path| !path.as_os_str().is_empty())
+            .map(|path| {
+                let path = if path.is_relative() {
+                    cwd.join(path)
+                } else {
+                    path
+                };
+                let files = std::fs::read_dir(&path)
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                    .filter_map(|entry| {
+                        let name = entry.file_name().into_string().ok()?;
+                        Some((name.to_lowercase(), name))
+                    })
+                    .collect();
+                Directory { path, files }
+            })
+            .collect()
+    }
+
+    /// Per directory: the name as given, then (unless it already ends in an
+    /// executable extension) the name with each PATHEXT extension appended.
+    pub(super) fn find(directories: &[Directory], command: &str) -> Option<PathBuf> {
+        let extensions = path_extensions();
+        let executable = Path::new(command)
+            .extension()
+            .and_then(OsStr::to_str)
+            .is_some_and(|ext| {
+                extensions
+                    .iter()
+                    .any(|candidate| candidate[1..].eq_ignore_ascii_case(ext))
+            });
+        let command = command.to_lowercase();
+        let mut candidates = vec![command.clone()];
+        if !executable {
+            candidates.extend(extensions.iter().map(|ext| command.clone() + ext));
+        }
+
+        directories.iter().find_map(|directory| {
+            candidates.iter().find_map(|candidate| {
+                let name = directory.files.get(candidate)?;
+                let path = directory.path.join(name);
+                path.is_file().then_some(path)
+            })
+        })
+    }
+
+    fn path_extensions() -> Vec<String> {
+        std::env::var("PATHEXT")
+            .ok()
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| String::from(".COM;.EXE;.BAT;.CMD"))
+            .split(';')
+            .filter(|ext| ext.len() > 1 && ext.starts_with('.'))
+            .map(str::to_lowercase)
+            .collect()
+    }
 }
 
 fn is_explicit_command(command: &Path) -> bool {
@@ -1293,6 +1430,39 @@ mod tests {
             ActivePackage::new(package_kind, package_name, version),
             RuntimeAssetSpec::new(kind, key, path),
         )
+    }
+
+    #[test]
+    fn command_resolver_matches_which_on_the_search_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        fs::write(second.join(executable_name("tool")), b"second").unwrap();
+        fs::write(first.join(executable_name("tool")), b"first").unwrap();
+        fs::write(second.join(executable_name("other")), b"other").unwrap();
+        make_executable(&first.join(executable_name("tool")));
+        make_executable(&second.join(executable_name("tool")));
+        make_executable(&second.join(executable_name("other")));
+        let snapshot = RuntimeAssetsSnapshot::new(RuntimeSnapshot::default(), Vec::new(), Vec::new())
+            .with_search_path(Some(std::env::join_paths([&first, &second]).unwrap()));
+        let resolver = snapshot.command_resolver();
+
+        for command in ["tool", "other", "missing"] {
+            let batch = resolver.resolve(command).unwrap().map(|launch| launch.program);
+            let single = snapshot
+                .resolve_command(command)
+                .unwrap()
+                .map(|launch| launch.program);
+            assert_eq!(batch, single, "{command}");
+        }
+        let tool = resolver.resolve("tool").unwrap().expect("tool on the path");
+        assert!(tool.program.starts_with(&first));
+        if cfg!(windows) {
+            let upper = resolver.resolve("TOOL").unwrap().expect("case-insensitive");
+            assert_eq!(upper.program, tool.program);
+        }
     }
 
     fn executable_name(name: &str) -> String {

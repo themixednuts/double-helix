@@ -7,8 +7,8 @@ use helix_stdx::{env::current_working_dir, path};
 use std::path::{Path, PathBuf};
 
 pub use assets::{
-    bootstrap_runtime_assets, runtime_assets, runtime_assets_if_initialized, ActivePackage, Origin,
-    ResolvedLaunch, ResolvedPath, RuntimeAsset, RuntimeAssetKey, RuntimeAssetKind,
+    bootstrap_runtime_assets, runtime_assets, runtime_assets_if_initialized, ActivePackage,
+    CommandResolver, Origin, ResolvedLaunch, ResolvedPath, RuntimeAsset, RuntimeAssetKey, RuntimeAssetKind,
     RuntimeAssetSpec, RuntimeAssets, RuntimeAssetsChange, RuntimeAssetsError,
     RuntimeAssetsSnapshot, RuntimeSnapshot,
 };

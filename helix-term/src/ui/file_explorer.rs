@@ -6007,7 +6007,8 @@ mod tests {
 
             assert_eq!(panel.rows.len(), 1);
             assert!(panel.rows.iter().any(|row| row.path == target));
-            assert_eq!(panel.rows[0].label, "src/nested/deep/needle.rs");
+            assert_eq!(panel.rows[0].label, "needle.rs");
+            assert_eq!(panel.rows[0].detail.as_deref(), Some("src/nested/deep"));
             assert!(!panel.expanded_dirs.contains(&local_path(src.clone())));
             assert!(!panel.expanded_dirs.contains(&local_path(nested.clone())));
             assert!(!panel.expanded_dirs.contains(&local_path(deep.clone())));

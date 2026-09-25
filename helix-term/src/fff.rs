@@ -188,6 +188,10 @@ pub(crate) fn search_file_explorer_available_cancellable(
 ) -> anyhow::Result<Vec<PathBuf>> {
     let total_start = std::time::Instant::now();
     let workspace = workspace_for_scan(root, file_explorer_search_options(config))?;
+    // The first query after opening usually lands mid-scan, before the index
+    // can answer, and nothing would ask again once it could. This runs on a
+    // search worker, so wait for the scan; the next keystroke aborts the wait.
+    wait_for_scan_cancellable(&workspace, INITIAL_SCAN_WAIT, abort_signal);
     search_workspace_files_cancellable(
         &workspace,
         query,
@@ -202,6 +206,22 @@ pub(crate) fn search_file_explorer_available_cancellable(
             .map(|file_match| file_match.path)
             .collect()
     })
+}
+
+fn wait_for_scan_cancellable(
+    workspace: &FffWorkspace,
+    limit: Duration,
+    abort_signal: Option<&std::sync::atomic::AtomicBool>,
+) {
+    const POLL: Duration = Duration::from_millis(50);
+    let start = std::time::Instant::now();
+    while !workspace.picker.wait_for_scan(POLL) {
+        let aborted =
+            abort_signal.is_some_and(|signal| signal.load(std::sync::atomic::Ordering::Relaxed));
+        if aborted || start.elapsed() >= limit {
+            return;
+        }
+    }
 }
 
 pub(crate) fn wait_for_initial_file_scan(

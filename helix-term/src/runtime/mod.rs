@@ -29,6 +29,7 @@ pub use ingress::{
 pub use pkg::{
     PkgAdmissionError, PkgFailure, PkgOperation, PkgOperationOrigin, PkgOperationOutcome,
 };
+pub(crate) use plugin::changed_lines;
 pub use plugin::PluginNotification;
 pub use ui::{
     apply_ui_command, AssistantCommand, DapCommand, DocumentCommand, DocumentOpenAlignment,

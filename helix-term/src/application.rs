@@ -711,6 +711,11 @@ impl Application {
         editor.lifecycle().on_document_change(move |event| {
             plugin_foreground.plugin(PluginNotification::BufferChanged {
                 document_id: event.doc.id(),
+                version: event.doc.version(),
+                changed_lines: crate::runtime::changed_lines(
+                    event.changes,
+                    event.doc.text().slice(..),
+                ),
             })?;
             Ok(())
         });

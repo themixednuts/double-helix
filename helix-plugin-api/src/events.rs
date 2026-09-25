@@ -186,6 +186,20 @@ pub struct DocumentOpenedEvent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DocumentChangedEvent {
     pub document: DocumentHandle,
+    /// The document's version after the change.
+    #[serde(default)]
+    pub version: i32,
+    /// The lines the change touched, in the changed text: `start..end`, 0-based, sorted and
+    /// disjoint. A plugin can re-read just these (`doc:lines`) instead of the whole text.
+    #[serde(default)]
+    pub changed_lines: Vec<LineRange>,
+}
+
+/// A range of lines, `start..end`, 0-based.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LineRange {
+    pub start: usize,
+    pub end: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

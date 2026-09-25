@@ -102,6 +102,7 @@ local doc = helix.workspace.focused_document()
 local snap = doc:snapshot()     -- { path, language, is_modified, line_count, selections, ... }
 local text = doc:text()         -- full text as string
 local line = doc:line(0)        -- 0-based line
+local lines = doc:lines(0, 10)  -- lines 0..10 in one call
 local diags = doc:diagnostics() -- { diagnostics = [...] }
 
 -- Mutations
@@ -154,6 +155,14 @@ local subscription = helix.events.subscribe("document_opened", function(event)
 end)
 
 helix.events.unsubscribe(subscription)
+
+-- document_changed says what changed: event.version, and event.changed_lines, a list of
+-- { start, end } line ranges (0-based, end exclusive) in the new text. Re-read just those:
+helix.events.subscribe("document_changed", function(event)
+    for _, range in ipairs(event.changed_lines) do
+        local lines = event.document:lines(range.start, range["end"])
+    end
+end)
 
 -- Available event kinds (also as constants on helix.events.kind):
 -- document_opened, document_changed, document_saved, document_closed,

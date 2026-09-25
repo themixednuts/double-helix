@@ -123,6 +123,13 @@ fn service_plugin_host_request(
                 host.document_line(document, line)
             })?))
         }
+        PluginRequest::DocumentLines {
+            document,
+            start,
+            end,
+        } => Ok(HostResponse::DocumentLines(with_query(editor, |host| {
+            host.document_lines(document, start, end)
+        })?)),
         PluginRequest::StartTask { .. } | PluginRequest::CancelTask { .. } => {
             unreachable!("tasks are routed through the asynchronous task dispatcher")
         }
@@ -537,11 +544,20 @@ pub(crate) fn notification_to_event(
                 },
             ))
         }
-        PluginNotification::BufferChanged { document_id } => Some(
-            events::PluginEvent::DocumentChanged(events::DocumentChangedEvent {
+        PluginNotification::BufferChanged {
+            document_id,
+            version,
+            changed_lines,
+        } => Some(events::PluginEvent::DocumentChanged(
+            events::DocumentChangedEvent {
                 document: adapt::document_handle(*document_id),
-            }),
-        ),
+                version: *version,
+                changed_lines: changed_lines
+                    .iter()
+                    .map(|&(start, end)| events::LineRange { start, end })
+                    .collect(),
+            },
+        )),
         PluginNotification::BufferClosed { document_id } => Some(
             events::PluginEvent::DocumentClosed(events::DocumentClosedEvent {
                 document: adapt::document_handle(*document_id),

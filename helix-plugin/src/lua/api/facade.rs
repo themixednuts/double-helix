@@ -260,6 +260,16 @@ impl LuaUserData for LuaDocumentHandle {
             })
         });
 
+        // Lines `first..last` (0-based) in one call, where `line` in a loop would cost a
+        // round trip per line.
+        methods.add_method("lines", |lua, this, (first, last): (usize, usize)| {
+            with_query_bridge(lua, |bridge| {
+                bridge
+                    .document_lines(this.0, first, last)
+                    .map_err(contract_error)
+            })
+        });
+
         methods.add_method("diagnostics", |lua, this, ()| {
             let snap = with_query_bridge(lua, |bridge| {
                 bridge.diagnostics(this.0).map_err(contract_error)
@@ -3251,6 +3261,15 @@ pub fn contract_event_to_table(
         }
         E::DocumentChanged(e) => {
             t.set("document", LuaDocumentHandle(e.document))?;
+            t.set("version", e.version)?;
+            let ranges = lua.create_table()?;
+            for (i, range) in e.changed_lines.iter().enumerate() {
+                let entry = lua.create_table()?;
+                entry.set("start", range.start)?;
+                entry.set("end", range.end)?;
+                ranges.set(i + 1, entry)?;
+            }
+            t.set("changed_lines", ranges)?;
         }
         E::DocumentPreSave(e) => {
             t.set("document", LuaDocumentHandle(e.document))?;

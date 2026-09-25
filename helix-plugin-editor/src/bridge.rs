@@ -160,6 +160,19 @@ impl PluginQueryHost for EditorQueryBridge<'_> {
         }
         Ok(text.line(line).to_string())
     }
+
+    fn document_lines(
+        &self,
+        handle: DocumentHandle,
+        start: usize,
+        end: usize,
+    ) -> ContractResult<Vec<String>> {
+        let text = self.doc(handle)?.text();
+        let end = end.min(text.len_lines());
+        Ok((start.min(end)..end)
+            .map(|line| text.line(line).to_string())
+            .collect())
+    }
 }
 
 impl PluginFacadeQueryHost for EditorQueryBridge<'_> {
@@ -1371,6 +1384,18 @@ mod tests {
         assert_eq!(selection.from(), 0);
         assert_eq!(selection.to(), 3);
         assert_eq!(editor.tree.focus, view_one);
+    }
+
+    #[test]
+    fn document_lines_reads_a_clamped_range() {
+        let mut editor = test_editor();
+        let doc = open_scratch(&mut editor, Action::VerticalSplit, "a\nb\nc");
+        let bridge = EditorQueryBridge::new(&editor);
+        let handle = adapt::document_handle(doc);
+
+        assert_eq!(bridge.document_lines(handle, 1, 3).unwrap(), ["b\n", "c"]);
+        assert_eq!(bridge.document_lines(handle, 2, 99).unwrap(), ["c"]);
+        assert!(bridge.document_lines(handle, 5, 9).unwrap().is_empty());
     }
 
     #[test]

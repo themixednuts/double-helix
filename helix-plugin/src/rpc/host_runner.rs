@@ -251,6 +251,22 @@ impl PluginQueryHost for RpcHost {
             other => Err(internal(format!("unexpected response: {other:?}"))),
         }
     }
+
+    fn document_lines(
+        &self,
+        handle: DocumentHandle,
+        start: usize,
+        end: usize,
+    ) -> ContractResult<Vec<String>> {
+        match self.call(PluginRequest::DocumentLines {
+            document: handle,
+            start,
+            end,
+        })? {
+            HostResponse::DocumentLines(lines) => Ok(lines),
+            other => Err(internal(format!("unexpected response: {other:?}"))),
+        }
+    }
 }
 
 impl PluginMutationHost for RpcHost {

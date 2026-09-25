@@ -80,7 +80,7 @@ Default limits are `max_memory = 268435456` bytes and `max_instructions = 500000
 
 `helix.workspace`: `focused_document()`, `focused_view()`, `mode()`, `set_mode(mode)`, `documents()`, `views()`, `snapshot()`, `theme()`, `editor_config()`.
 
-`DocumentHandle`: `id()`, `snapshot()`, `text()`, `line(index)`, `diagnostics()`, `edit(edits)`, `save(opts?)`, `set_selections(selections, view?)`, `undo()`, `redo()`, `select_all()`, `set_annotations(annotations)`, `clear_annotations()`.
+`DocumentHandle`: `id()`, `snapshot()`, `text()`, `line(index)`, `lines(start, end)`, `diagnostics()`, `edit(edits)`, `save(opts?)`, `set_selections(selections, view?)`, `undo()`, `redo()`, `select_all()`, `set_annotations(annotations)`, `clear_annotations()`.
 
 `ViewHandle`: `id()`, `snapshot()`, `cursor()`, `focus()`, `close()`.
 
@@ -93,6 +93,8 @@ Default limits are `max_memory = 268435456` bytes and `max_instructions = 500000
 `helix.events`: `kind`, `subscribe(kind, handler)`, `unsubscribe(handle)`.
 
 Event kinds are `host_ready`, `document_opened`, `document_changed`, `document_saved`, `document_closed`, `selection_changed`, `mode_changed`, `view_focused`, `diagnostics_updated`, `key_pressed`, `assistant_thread_created`, `assistant_thread_closed`, `assistant_run_started`, `assistant_run_completed`, `assistant_message_received`, and `assistant_context_changed`.
+
+A `document_changed` event carries the document's `version` and `changed_lines`, a list of `{ start, end }` line ranges (0-based, end exclusive) in the new text, so a plugin can re-read just those lines with `doc:lines(start, end)`.
 
 `helix.commands`: `register(spec)`, `update(handle, spec)`, `remove(handle)`, `execute(name, args?)`. `CommandHandle` has `id()`, `update(spec)`, and `remove()`.
 

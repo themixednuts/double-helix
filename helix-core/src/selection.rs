@@ -1179,6 +1179,35 @@ mod test {
     }
 
     #[test]
+    fn test_select_on_matches_crlf() {
+        let r = Rope::from_str("This\r\nString\r\n\r\ncontains multiple\r\nlines");
+        let s = r.slice(..);
+        let regex = |pattern: &str| {
+            rope::RegexBuilder::new()
+                .syntax(rope::Config::new().multi_line(true).crlf(true))
+                .build(pattern)
+                .unwrap()
+        };
+
+        // `$` matches before the `\r`, not between `\r` and `\n`.
+        assert_eq!(
+            select_on_matches(s, &Selection::single(0, 6), &regex(r"$")),
+            Some(Selection::single(4, 4))
+        );
+        assert_eq!(
+            select_on_matches(
+                s,
+                &Selection::single(0, s.len_chars()),
+                &regex(r"^[a-z ]*$")
+            ),
+            Some(Selection::new(
+                smallvec![Range::point(14), Range::new(16, 33), Range::new(35, 40)],
+                0
+            ))
+        );
+    }
+
+    #[test]
     fn test_line_range() {
         let r = Rope::from_str("\r\nHi\r\nthere!");
         let s = r.slice(..);

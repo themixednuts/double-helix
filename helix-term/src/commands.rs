@@ -1197,11 +1197,13 @@ fn search_next_or_prev_impl(cx: &mut Context, movement: Movement, direction: Dir
             false
         };
         let wrap_around = search_config.wrap_around;
+        let is_crlf = focused_ref!(cx.editor).1.line_ending() == LineEnding::Crlf;
         if let Ok(regex) = rope::RegexBuilder::new()
             .syntax(
                 rope::Config::new()
                     .case_insensitive(case_insensitive)
-                    .multi_line(true),
+                    .multi_line(true)
+                    .crlf(is_crlf),
             )
             .build(&query)
         {
@@ -2686,6 +2688,7 @@ fn insert_at_line_end(cx: &mut Context) {
 // Enter insert mode and auto-indent the current line if it is empty.
 // If the line is not empty, move the cursor to the specified fallback position.
 fn insert_with_indent(cx: &mut Context, cursor_fallback: IndentFallbackPos) {
+    let was_select_mode = cx.editor.mode == Mode::Select;
     enter_insert_mode(cx);
 
     let (view_id, doc) = focused!(cx.editor);
@@ -2733,7 +2736,7 @@ fn insert_with_indent(cx: &mut Context, cursor_fallback: IndentFallbackPos) {
                 IndentFallbackPos::LineEnd => line_end_char_index(&text, cursor_line),
             };
 
-            ranges.push(range.put_cursor(text, pos + offs, cx.editor.mode == Mode::Select));
+            ranges.push(range.put_cursor(text, pos + offs, was_select_mode));
 
             (cursor_line_start, cursor_line_start, None)
         }
@@ -3717,6 +3720,8 @@ fn select_register(cx: &mut Context) {
 }
 
 fn insert_register(cx: &mut Context) {
+    // The count is reset before the next key, so capture it for the callback.
+    let count = cx.count();
     cx.editor.autoinfo = Some(Info::from_registers(
         "Insert register",
         &cx.editor.registers,
@@ -3730,7 +3735,7 @@ fn insert_register(cx: &mut Context) {
                 cx.register
                     .unwrap_or(cx.editor.config().default_yank_register),
                 Paste::Cursor,
-                cx.count(),
+                count,
             );
         }
     })

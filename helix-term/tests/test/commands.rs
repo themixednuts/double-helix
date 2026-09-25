@@ -774,6 +774,15 @@ async fn test_join_selections_comment() -> anyhow::Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_insert_at_line_end_extends_in_select_mode() -> anyhow::Result<()> {
+    // `A` enters insert mode before placing the cursor, so it must check for select
+    // mode beforehand to extend the selection instead of collapsing it.
+    test(("#[a|]#bc\n", "vA", "#[abc\n|]#")).await?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_read_file() -> anyhow::Result<()> {
     let mut file = tempfile::NamedTempFile::new()?;
     let contents_to_read = "some contents";

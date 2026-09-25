@@ -16,6 +16,7 @@ use helix_core::{
     doc_formatter::TextFormat,
     graphemes::{self, prev_grapheme_boundary},
     increment as hx_increment,
+    indent::IndentStyle,
     line_ending::line_end_char_index,
     movement::{self, Direction, Movement},
     object,
@@ -799,9 +800,14 @@ pub fn align_selections_in(
     let selection = doc.selection(target.id());
     let tab_width = doc.tab_width();
 
-    let mut column_widths: Vec<Vec<(usize, usize)>> = Vec::new();
-    let mut last_line = text.len_lines() + 1;
-    let mut col = 0;
+    // Width of each selection column: the widest gap between a selection and the
+    // previous selection on its row. Rows may hold different numbers of selections.
+    let mut column_widths: Vec<usize> = Vec::new();
+    let mut coordinates = Vec::with_capacity(selection.len());
+
+    let mut previous_line = usize::MAX;
+    let mut col_idx = 0;
+    let mut running_offset = 0;
 
     for range in selection {
         let coords = visual_coords_at_pos(text, range.head, tab_width);
@@ -810,46 +816,56 @@ pub fn align_selections_in(
         if coords.row != anchor_coords.row {
             return Err(AlignSelectionsError::MultilineSelection);
         }
-
-        col = if coords.row == last_line { col + 1 } else { 0 };
-
-        if col >= column_widths.len() {
-            column_widths.push(Vec::new());
+        if coords.row != previous_line {
+            col_idx = 0;
+            running_offset = 0;
+            previous_line = coords.row;
         }
-        column_widths[col].push((range.from(), coords.col));
 
-        last_line = coords.row;
+        let width = coords.col - running_offset;
+        match column_widths.get_mut(col_idx) {
+            Some(n) => *n = (*n).max(width),
+            None => column_widths.push(width),
+        }
+        coordinates.push(coords);
+
+        running_offset += width;
+        col_idx += 1;
     }
 
-    let mut changes = Vec::with_capacity(selection.len());
-    let len = column_widths.first().map(|cols| cols.len()).unwrap_or(0);
-    let mut offs = vec![0; len];
+    let column_positions: Vec<_> = column_widths
+        .into_iter()
+        .scan(0, |sum, n| {
+            *sum += n;
+            Some(*sum)
+        })
+        .collect();
 
-    for col in column_widths {
-        let max_col = col
-            .iter()
-            .enumerate()
-            .map(|(row, (_, cursor))| *cursor + offs[row])
-            .max()
-            .unwrap_or(0);
+    previous_line = usize::MAX;
 
-        for (row, (insert_pos, last_col)) in col.into_iter().enumerate() {
-            let ins_count = max_col - (last_col + offs[row]);
-            if ins_count == 0 {
-                continue;
+    let changes = coordinates
+        .into_iter()
+        .zip(selection)
+        .map(|(coords, range)| {
+            if coords.row != previous_line {
+                col_idx = 0;
+                running_offset = 0;
+                previous_line = coords.row;
             }
-            offs[row] += ins_count;
-            changes.push((
+            let inserts = column_positions[col_idx] - coords.col - running_offset;
+            let insert_pos = range.from();
+
+            col_idx += 1;
+            running_offset += inserts;
+
+            (
                 insert_pos,
                 insert_pos,
-                Some(Tendril::from(" ".repeat(ins_count))),
-            ));
-        }
-    }
+                Some(Tendril::from(" ".repeat(inserts))),
+            )
+        });
 
-    changes.sort_unstable_by_key(|(from, _, _)| *from);
-
-    let transaction = Transaction::change(doc.text(), changes.into_iter());
+    let transaction = Transaction::change(doc.text(), changes);
     doc.apply(&transaction, target.id());
     Ok(())
 }
@@ -1413,7 +1429,8 @@ pub fn indent_in(
     count: usize,
 ) {
     let lines = get_lines_in(target, doc);
-    let indent = Tendril::from(doc.indent_style().as_str().repeat(count));
+    let indent_style = doc.indent_style();
+    let indent = Tendril::from(indent_style.as_str().repeat(count));
 
     let transaction = Transaction::change(
         doc.text(),
@@ -1423,7 +1440,17 @@ pub fn indent_in(
                 return None;
             }
             let pos = doc.text().line_to_char(line);
-            Some((pos, pos, Some(indent.clone())))
+
+            // Snap space indentation to the next multiple of the indent width.
+            let indent = if let IndentStyle::Spaces(indent_width) = indent_style {
+                let line = doc.text().line(line);
+                let offset = line.first_non_whitespace_char().unwrap_or(0) % indent_width as usize;
+                indent.clone().split_off(offset)
+            } else {
+                indent.clone()
+            };
+
+            Some((pos, pos, Some(indent)))
         }),
     );
     doc.apply(&transaction, target.id());
@@ -1695,11 +1722,18 @@ fn toggle_comments_impl(
     comment_transaction: CommentTransactionFn,
 ) {
     let doc = crate::doc_mut!(editor, &doc_id);
+    // Pick the token the primary cursor's line is already commented with (longest
+    // match, so `///` wins over `//`). If the line isn't commented yet, fall back to
+    // the primary token for adding a comment.
+    let text = doc.text().slice(..);
+    let cursor_line = doc.selection(view_id).primary().cursor_line(text);
     let line_token: Option<&str> = doc
         .language_config()
         .and_then(|lc| lc.comment_tokens.as_ref())
-        .and_then(|tc| tc.first())
-        .map(|tc| tc.as_str());
+        .and_then(|tokens| {
+            comment::get_comment_token(text, tokens, cursor_line)
+                .or_else(|| tokens.first().map(|token| token.as_str()))
+        });
     let block_tokens: Option<&[BlockCommentToken]> = doc
         .language_config()
         .and_then(|lc| lc.block_comment_tokens.as_ref())
@@ -2291,11 +2325,22 @@ fn get_adjusted_selection(
 /// Insert `count` copies of the document's indent style at each cursor.
 pub fn insert_tab(editor: &mut Editor, view_id: ViewId, doc_id: DocumentId, count: usize) {
     let doc = crate::doc_mut!(editor, &doc_id);
-    let indent = Tendril::from(doc.indent_style().as_str().repeat(count));
-    let transaction = Transaction::insert(
+    let indent_style = doc.indent_style();
+    let text = doc.text().slice(..);
+    let transaction = Transaction::change(
         doc.text(),
-        &doc.selection(view_id).clone().cursors(doc.text().slice(..)),
-        indent,
+        doc.selection(view_id).ranges().iter().map(|range| {
+            let cursor = range.cursor(text);
+            let mut indent = Tendril::from(indent_style.as_str().repeat(count));
+            // Snap space indentation to the next multiple of the indent width.
+            if let IndentStyle::Spaces(indent_width) = indent_style {
+                let line_start = text.line_to_char(range.cursor_line(text));
+                let offset = (cursor - line_start) % indent_width as usize;
+                indent = indent.split_off(offset);
+            }
+
+            (cursor, cursor, Some(indent))
+        }),
     );
     doc.apply(&transaction, view_id);
 }
@@ -3790,5 +3835,88 @@ mod tests {
 
         assert_eq!(result, Ok(()));
         assert_eq!(doc.text().to_string(), "a  = 1\nbb= 2");
+    }
+
+    #[test]
+    fn align_selections_in_aligns_rows_with_different_selection_counts() {
+        let view_id = ViewId::default();
+        let text = "I    I  II I\nIIIIIIIII\nIIIII\nIIIIIIIII\n";
+        let mut doc = test_doc(text);
+        let ranges = text
+            .char_indices()
+            .filter(|&(_, c)| c == 'I')
+            .map(|(i, _)| Range::new(i, i + 1))
+            .collect();
+        doc.set_selection(view_id, Selection::new(ranges, 0));
+
+        let result = align_selections_in(&view_id, &mut doc);
+
+        assert_eq!(result, Ok(()));
+        assert_eq!(
+            doc.text().to_string(),
+            "I    I  II I\nI    I  II IIIII\nI    I  II I\nI    I  II IIIII\n"
+        );
+    }
+
+    #[test]
+    fn indent_in_snaps_spaces_to_indent_width() {
+        let view_id = ViewId::default();
+        let mut doc = test_doc("a\n  b\n c\n");
+        doc.set_indent_style(IndentStyle::Spaces(4));
+        doc.set_selection(view_id, Selection::single(0, doc.text().len_chars()));
+
+        indent_in(&view_id, &mut doc, 1);
+
+        assert_eq!(doc.text().to_string(), "    a\n    b\n    c\n");
+    }
+
+    #[test]
+    fn insert_tab_snaps_spaces_to_indent_width() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let _guard = runtime.enter();
+        let (mut editor, view_id, doc_id) = test_editor_with_text("ab\nabc\n");
+        let doc = editor.document_mut(doc_id).expect("document");
+        doc.set_indent_style(IndentStyle::Spaces(4));
+        doc.set_selection(
+            view_id,
+            Selection::new(
+                SmallVec::from_vec(vec![Range::point(2), Range::point(6)]),
+                0,
+            ),
+        );
+
+        insert_tab(&mut editor, view_id, doc_id, 1);
+
+        assert_eq!(
+            editor
+                .document(doc_id)
+                .expect("document")
+                .text()
+                .to_string(),
+            "ab  \nabc \n"
+        );
+    }
+
+    #[test]
+    fn toggle_comments_uses_the_token_already_on_the_line() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let _guard = runtime.enter();
+        let (mut editor, view_id, doc_id) = test_editor_with_text("/// abc\n");
+        let loader = editor.syn_loader.load_full();
+        let doc = editor.document_mut(doc_id).expect("document");
+        doc.set_language_by_language_id("rust", &loader)
+            .expect("rust language");
+        doc.set_selection(view_id, Selection::point(4));
+
+        toggle_comments(&mut editor, view_id, doc_id);
+
+        assert_eq!(
+            editor
+                .document(doc_id)
+                .expect("document")
+                .text()
+                .to_string(),
+            "abc\n"
+        );
     }
 }

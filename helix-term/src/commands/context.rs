@@ -166,9 +166,9 @@ impl Context<'_> {
                 } else {
                     Movement::Move
                 };
-                let motion = m
-                    .make
-                    .make(Some(NonZeroUsize::new(count).unwrap_or(NonZeroUsize::MIN)));
+                // Pass "no count" through: `goto_line` without a count goes to the last line,
+                // not line 1.
+                let motion = m.make.make(self.count);
                 motion(self.editor, view_id, doc_id, movement);
             }
             CommandRef::Operator(op) => {

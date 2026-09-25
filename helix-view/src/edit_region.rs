@@ -464,7 +464,14 @@ impl EditRegion {
 
         match self.mode() {
             Mode::Normal => {
-                if key.modifiers.is_empty() {
+                // `fa`, `ta`, `mi(` and a Vim `diw` need their `a`/`i`; only grab the insert
+                // keys when nothing is waiting for more input.
+                let idle = self.keymaps.pending().is_empty()
+                    && self
+                        .engine
+                        .as_ref()
+                        .is_none_or(|engine| !engine.is_pending());
+                if key.modifiers.is_empty() && idle {
                     let entry = match key.code {
                         KeyCode::Char('i') => Some(InsertEntry::AtCurrent),
                         KeyCode::Char('a') => Some(InsertEntry::Append),
@@ -560,11 +567,13 @@ impl EditRegion {
         state.history = history;
 
         let global_mode = editor.mode;
+        let mode_before = self.mode;
         editor.mode = self.mode;
 
         if let Some(result) = engine.pre_resolve(editor, self.region.id(), doc_id, keymaps, key) {
             self.mode = editor.mode;
             editor.mode = global_mode;
+            sync_insert_recording(engine.as_mut(), mode_before, self.mode);
             if self.region.is_focused() {
                 editor.frontend_mut().focused_modal_input = engine.input_state();
             }
@@ -577,6 +586,7 @@ impl EditRegion {
 
         self.mode = editor.mode;
         editor.mode = global_mode;
+        sync_insert_recording(engine.as_mut(), mode_before, self.mode);
         if self.region.is_focused() {
             editor.frontend_mut().focused_modal_input = engine.input_state();
         }
@@ -585,6 +595,22 @@ impl EditRegion {
         }
         self.engine = Some(engine);
         Some(result)
+    }
+}
+
+/// Start or finish the engine's insert recording when an engine command (`c`, `o`, Vim
+/// `cw`) moved the region into or out of insert mode, as the main editor does. Without it
+/// the engine never learns it is inserting and typed keys come back unbound.
+fn sync_insert_recording(
+    engine: &mut dyn crate::engine::EditingEngine,
+    mode_before: Mode,
+    mode_after: Mode,
+) {
+    if mode_before != Mode::Insert && mode_after == Mode::Insert {
+        let entry = engine.last_command_name().unwrap_or("insert_mode");
+        engine.begin_insert_recording(std::borrow::Cow::Borrowed(entry));
+    } else if mode_before == Mode::Insert && mode_after != Mode::Insert {
+        engine.end_insert_recording();
     }
 }
 

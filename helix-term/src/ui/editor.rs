@@ -1043,6 +1043,8 @@ pub struct EditorView {
     /// Tracks if there are prompt layers active (updated by compositor)
     pub prompt_active: bool,
     notification_popup: NotificationPopup,
+    /// Set while `.` replays a recorded insert, so a replay never starts another one.
+    replaying_insert: bool,
 }
 
 impl EditorView {
@@ -1209,6 +1211,7 @@ impl EditorView {
             terminal_focused: true,
             prompt_active: false,
             notification_popup: NotificationPopup::new(),
+            replaying_insert: false,
         }
     }
 
@@ -1222,6 +1225,18 @@ impl EditorView {
             factory.create_engine(engine_config),
             factory.registry(),
         )
+    }
+
+    /// Switch to `engine` when it differs from the current one (the config's
+    /// `editing-engine` changed). The same engine is kept, with its `.` history.
+    pub fn replace_engine(&mut self, engine: Box<dyn helix_view::engine::EditingEngine>) {
+        if self
+            .engine
+            .as_ref()
+            .is_some_and(|current| current.name() != engine.name())
+        {
+            self.engine = Some(engine);
+        }
     }
 
     pub fn spinners_mut(&mut self) -> &mut ProgressSpinners {
@@ -1977,6 +1992,17 @@ impl EditorView {
 
         let is_frontend = crate::keymap::is_frontend_result(&result);
 
+        // A sequence mixing engine and frontend commands (`["extend_to_line_bounds",
+        // "yank_main_selection_to_clipboard"]`, select mode's `esc`) runs item by item; the
+        // engine alone would drop the frontend items.
+        if let crate::keymap::KeymapResult::MatchedSequence(cmds) = &result {
+            if !is_frontend && cmds.iter().any(crate::keymap::is_frontend_command) {
+                self.run_mixed_sequence(cx, key, cmds);
+                self.publish_focused_modal_input(cx.editor);
+                return;
+            }
+        }
+
         // Step 3: If frontend result → execute frontend command.
         if is_frontend {
             // Reset engine pending state since frontend is taking over.
@@ -2011,7 +2037,20 @@ impl EditorView {
                 | crate::keymap::KeymapResult::Fallback(_, _) => unreachable!(),
             }
 
+            if mode_before == Mode::Insert && cx.editor.mode() == Mode::Insert {
+                self.engine
+                    .as_mut()
+                    .expect("engine is always present")
+                    .record_frontend_insert_key(key);
+            }
             self.handle_mode_change(cx, mode_before, cmd_name.or(Some("unknown")));
+            // As upstream: a command that ran consumes the count and register. They only
+            // carry over while the keymap is still waiting for more keys. A register picked
+            // by an `on_next_key` callback (`"a`) is set on the next key, after this point.
+            if self.keymaps.pending().is_empty() {
+                cx.count = None;
+                cx.register = None;
+            }
             self.sync_engine_from_context(cx);
             self.publish_focused_modal_input(cx.editor);
             helix_view::bench::log_run_phase(
@@ -2044,9 +2083,20 @@ impl EditorView {
                 )
             },
         );
+        let executed = matches!(engine_result, helix_view::engine::EngineResult::Executed);
+        let engine_command = engine.last_command_name();
         self.engine = Some(engine);
 
         self.handle_engine_result(cx, key, engine_result, mode_before);
+        // Engine commands typed in insert mode get the same completion follow-up as
+        // frontend ones: Backspace re-filters the menu, anything else closes it.
+        if executed && mode_before == Mode::Insert && cx.editor.mode() == Mode::Insert {
+            if let Some(command) =
+                engine_command.and_then(commands::MappableCommand::builtin_by_name)
+            {
+                crate::handlers::local::post_command(command, cx);
+            }
+        }
         self.sync_context_from_engine(cx);
         self.publish_focused_modal_input(cx.editor);
         helix_view::bench::log_run_phase(
@@ -2077,9 +2127,16 @@ impl EditorView {
                 commands::insert::insert_char(cx, ch);
             }
             EngineResult::CancelledInsert(pending_keys) => {
-                for ev in pending_keys.iter() {
-                    if let Some(ch) = ev.char() {
-                        commands::insert::insert_char(cx, ch);
+                // An insert-mode sequence (a `jk` escape) didn't complete: its characters are
+                // text, and any other key (`j<Enter>`) still does what it does on its own.
+                for &ev in pending_keys.iter() {
+                    let text = ev.char().filter(|_| {
+                        !ev.modifiers
+                            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                    });
+                    match text {
+                        Some(ch) => commands::insert::insert_char(cx, ch),
+                        None => self.dispatch_key(cx, ev),
                     }
                 }
             }
@@ -2098,46 +2155,125 @@ impl EditorView {
         }
     }
 
+    /// Run a key's command sequence one command at a time, each through the path that owns
+    /// it: engine commands through the engine, the rest through the frontend.
+    fn run_mixed_sequence(
+        &mut self,
+        cx: &mut commands::Context,
+        key: KeyEvent,
+        cmds: &[commands::MappableCommand],
+    ) {
+        for cmd in cmds {
+            let mode_before = cx.editor.mode();
+            match cmd.modal_command() {
+                Some(token) if !crate::keymap::is_frontend_command(cmd) => {
+                    // A frontend command earlier in the sequence may have moved focus.
+                    let focus = cx.editor.focused_view_id();
+                    let Some(view) = cx.editor.tree.try_get(focus) else {
+                        break;
+                    };
+                    let (view_id, doc_id) = (view.id, view.doc);
+                    let mut engine = self.engine.take().expect("engine is always present");
+                    let result = engine.process_lookup(
+                        cx.editor,
+                        view_id,
+                        doc_id,
+                        &mut self.keymaps,
+                        key,
+                        helix_view::engine::KeymapLookup::Matched(token),
+                    );
+                    self.engine = Some(engine);
+                    self.handle_engine_result(cx, key, result, mode_before);
+                }
+                _ => {
+                    self.execute_frontend_command(cx, cmd);
+                    self.handle_mode_change(cx, mode_before, cmd.static_name());
+                }
+            }
+        }
+        // The whole sequence consumed the count and register.
+        cx.count = None;
+        cx.register = None;
+        self.sync_engine_from_context(cx);
+    }
+
     /// Replay a recorded insert sequence for dot-repeat.
+    ///
+    /// The entry command runs through the engine when it is an engine command (`c`, `o`),
+    /// otherwise through the frontend. The replay records itself again, which keeps the
+    /// engine in its insert state (so a replayed `.` is typed, not repeated) and leaves the
+    /// same sequence as the thing `.` repeats next.
     fn replay_insert(
         &mut self,
         cx: &mut commands::Context,
         entry_command: &str,
         keys: &[KeyEvent],
     ) {
-        if let Some(cmd) = commands::MappableCommand::builtin_commands()
-            .iter()
-            .find(|cmd| cmd.name() == entry_command)
-        {
-            let mode_before = cx.editor.mode();
-            self.sync_context_from_engine(cx);
+        if self.replaying_insert {
+            log::warn!("replay_insert: ignoring nested replay of '{entry_command}'");
+            return;
+        }
+        let focus = cx.editor.focused_view_id();
+        let Some(view) = cx.editor.tree.try_get(focus) else {
+            return;
+        };
+        let (view_id, doc_id) = (view.id, view.doc);
+
+        let mode_before = cx.editor.mode();
+        self.sync_context_from_engine(cx);
+        let engine = self.engine.as_mut().expect("engine is always present");
+        if !engine.replay_entry(cx.editor, view_id, doc_id, entry_command) {
+            let Some(cmd) = commands::MappableCommand::builtin_by_name(entry_command) else {
+                log::warn!("replay_insert: unknown entry command '{}'", entry_command);
+                return;
+            };
             cmd.execute(cx);
-            self.sync_engine_from_context(cx);
-            let mode_after = cx.editor.mode();
-            if mode_after != mode_before {
-                let mut event = crate::handlers::local::ModeSwitch {
-                    old_mode: mode_before,
-                    new_mode: mode_after,
-                    cx,
-                };
-                crate::handlers::local::mode_switch(&mut event);
-                cx.notifier.mode_switch(mode_before, mode_after);
-            }
-        } else {
-            log::warn!("replay_insert: unknown entry command '{}'", entry_command);
+        }
+        self.sync_engine_from_context(cx);
+        self.notify_mode_switch(cx, mode_before);
+        if cx.editor.mode() != Mode::Insert {
             return;
         }
 
+        self.engine
+            .as_mut()
+            .expect("engine is always present")
+            .begin_insert_recording(std::borrow::Cow::Owned(entry_command.to_owned()));
+        self.replaying_insert = true;
         for &key in keys {
             if cx.editor.mode() != Mode::Insert {
                 break;
             }
             self.dispatch_key(cx, key);
         }
+        self.replaying_insert = false;
 
         if cx.editor.mode() == Mode::Insert {
             cx.editor.enter_normal_mode();
+            self.notify_mode_switch(cx, Mode::Insert);
         }
+        // Leaving insert mode through a replayed key already ended the recording; ending
+        // it again is a no-op.
+        self.engine
+            .as_mut()
+            .expect("engine is always present")
+            .end_insert_recording();
+    }
+
+    /// Fire the mode-switch hooks (diagnostics, signature help, auto-save events) when the
+    /// mode differs from `mode_before`, without touching insert recording.
+    fn notify_mode_switch(&mut self, cx: &mut commands::Context, mode_before: Mode) {
+        let mode_after = cx.editor.mode();
+        if mode_after == mode_before {
+            return;
+        }
+        let mut event = crate::handlers::local::ModeSwitch {
+            old_mode: mode_before,
+            new_mode: mode_after,
+            cx,
+        };
+        crate::handlers::local::mode_switch(&mut event);
+        cx.notifier.mode_switch(mode_before, mode_after);
     }
 
     fn execute_frontend_command(
@@ -2149,10 +2285,7 @@ impl EditorView {
         command.execute(cx);
         self.sync_engine_from_context(cx);
 
-        if let Some(static_command) = commands::MappableCommand::builtin_commands()
-            .iter()
-            .find(|candidate| candidate.name() == command.name())
-        {
+        if let Some(static_command) = commands::MappableCommand::builtin_by_name(command.name()) {
             crate::handlers::local::post_command(static_command, cx);
         }
     }
@@ -2181,9 +2314,11 @@ impl EditorView {
             let engine = self.engine.as_mut().expect("engine is always present");
 
             if mode_after == Mode::Insert && mode_before != Mode::Insert {
-                // Entering insert mode — start recording for dot-repeat.
+                // Entering insert mode — start recording for dot-repeat. An engine command
+                // (`c`, `o`) names itself so `.` repeats the whole change.
                 let entry = command_name
                     .map(|n| std::borrow::Cow::Owned(n.to_string()))
+                    .or_else(|| engine.last_command_name().map(std::borrow::Cow::Borrowed))
                     .unwrap_or(std::borrow::Cow::Borrowed("insert_mode"));
                 engine.begin_insert_recording(entry);
             } else if mode_before == Mode::Insert && mode_after != Mode::Insert {

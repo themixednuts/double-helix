@@ -425,13 +425,18 @@ impl Keymaps {
         &self.state
     }
 
+    /// Whether the node the pending keys lead to takes `key`: it binds it, or (like `f` and
+    /// `t`) it takes any character.
     pub fn contains_key(&self, mode: Mode, key: KeyEvent) -> bool {
         let keymaps = &*self.map();
         let keymap = &keymaps[&mode];
         keymap
             .search(self.pending())
             .and_then(KeyTrie::node)
-            .is_some_and(|node| node.contains_key(&key))
+            .is_some_and(|node| {
+                node.contains_key(&key)
+                    || (node.fallback.is_some() && matches!(key.code, KeyCode::Char(_)))
+            })
     }
 
     /// Lookup `key` in the keymap to try and find a command to execute. Escape

@@ -20,7 +20,8 @@ use helix_view::{DocumentId, Editor, ViewId};
 
 use crate::registry::{CharPendingResolution, CommandRef, CommandRegistry};
 use crate::{
-    finalize_insert_recording, is_char_key, key_to_digit, record_insert_key, InsertRecording,
+    document_version, finalize_insert_recording, is_char_key, is_repeatable_edit, key_to_digit,
+    record_insert_key, InsertRecording,
 };
 
 /// The Helix editing engine.
@@ -35,6 +36,10 @@ pub struct HelixEngine {
     pending_display_buf: String,
     /// Active insert recording, present while in insert mode.
     insert_recording: Option<InsertRecording>,
+    /// The last command executed, the entry command if it entered insert mode.
+    last_command: Option<CommandToken>,
+    /// Set while replaying a recorded entry command, so the replay does not record itself.
+    replaying: bool,
 }
 
 impl HelixEngine {
@@ -46,6 +51,8 @@ impl HelixEngine {
             last_action: None,
             pending_display_buf: String::new(),
             insert_recording: None,
+            last_command: None,
+            replaying: false,
         }
     }
 
@@ -61,8 +68,10 @@ impl HelixEngine {
     ) -> Option<EngineResult> {
         let mode = editor.mode();
 
-        // Count accumulation: digit with existing count → append
-        if let Some(digit) = key_to_digit(key) {
+        // Count accumulation: digit with existing count → append. A digit the pending
+        // sequence takes (`f1`, `t2`) is not a count; one it doesn't is (`g10g`).
+        let sequence_takes_key = !keymaps.pending().is_empty() && keymaps.contains_key(mode, key);
+        if let Some(digit) = key_to_digit(key).filter(|_| !sequence_takes_key) {
             if let Some(count) = self.count {
                 let new = count.get() * 10 + digit;
                 if new <= 100_000_000 {
@@ -208,6 +217,9 @@ impl HelixEngine {
             return EngineResult::Unbound;
         };
         let count_val = count.map_or(1, NonZeroUsize::get);
+        self.last_command = Some(command);
+        let version_before = document_version(editor, doc_id);
+        let record = !self.replaying;
 
         let result = match kind {
             CommandRef::Motion(m) => {
@@ -218,11 +230,19 @@ impl HelixEngine {
             }
             CommandRef::Operator(op) => {
                 (op.execute)(editor, view_id, doc_id, register);
-                self.last_action = Some(RecordedAction::CountedAction {
-                    command: RepeatableCommandId::Operator(op.id),
-                    count: NonZeroUsize::new(count_val).unwrap_or(NonZeroUsize::MIN),
-                    register,
-                });
+                if record
+                    && is_repeatable_edit(
+                        op.id.as_str(),
+                        version_before,
+                        document_version(editor, doc_id),
+                    )
+                {
+                    self.last_action = Some(RecordedAction::CountedAction {
+                        command: RepeatableCommandId::Operator(op.id),
+                        count: NonZeroUsize::new(count_val).unwrap_or(NonZeroUsize::MIN),
+                        register,
+                    });
+                }
                 EngineResult::Executed
             }
             CommandRef::TextObject(to) => {
@@ -237,11 +257,19 @@ impl HelixEngine {
             }
             CommandRef::Action(a) => {
                 (a.execute)(editor, view_id, doc_id, count_val, register);
-                self.last_action = Some(RecordedAction::CountedAction {
-                    command: RepeatableCommandId::Action(a.id),
-                    count: NonZeroUsize::new(count_val).unwrap_or(NonZeroUsize::MIN),
-                    register,
-                });
+                if record
+                    && is_repeatable_edit(
+                        a.id.as_str(),
+                        version_before,
+                        document_version(editor, doc_id),
+                    )
+                {
+                    self.last_action = Some(RecordedAction::CountedAction {
+                        command: RepeatableCommandId::Action(a.id),
+                        count: NonZeroUsize::new(count_val).unwrap_or(NonZeroUsize::MIN),
+                        register,
+                    });
+                }
                 EngineResult::Executed
             }
             CommandRef::CharPending(_) => EngineResult::Unbound,
@@ -338,6 +366,7 @@ impl EditingEngine for HelixEngine {
         lookup: KeymapLookup,
     ) -> EngineResult {
         let start = std::time::Instant::now();
+        self.last_command = None;
         let result = match editor.mode() {
             Mode::Insert => {
                 self.process_lookup_insert(editor, view_id, doc_id, keymaps, key, lookup)
@@ -403,6 +432,32 @@ impl EditingEngine for HelixEngine {
         if let Some(action) = finalize_insert_recording(self.insert_recording.take()) {
             self.last_action = Some(action);
         }
+    }
+
+    fn record_frontend_insert_key(&mut self, key: KeyEvent) {
+        if let Some(recording) = &mut self.insert_recording {
+            recording.keys.push(key);
+        }
+    }
+
+    fn last_command_name(&self) -> Option<&'static str> {
+        self.last_command.map(CommandToken::as_str)
+    }
+
+    fn replay_entry(
+        &mut self,
+        editor: &mut Editor,
+        view_id: ViewId,
+        doc_id: DocumentId,
+        name: &str,
+    ) -> bool {
+        let Some(command) = self.registry.tokens().find(|token| token.as_str() == name) else {
+            return false;
+        };
+        self.replaying = true;
+        let result = self.execute(editor, view_id, doc_id, command, None, None);
+        self.replaying = false;
+        !matches!(result, EngineResult::Unbound)
     }
 
     fn input_state(&self) -> ModalInputState {

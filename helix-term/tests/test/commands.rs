@@ -2,6 +2,7 @@ use helix_term::application::Application;
 
 use super::*;
 
+mod dot_repeat;
 mod golden;
 mod insert;
 mod movement;

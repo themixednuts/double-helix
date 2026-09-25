@@ -851,7 +851,8 @@ fn register_operators(catalog: &mut impl EngineCommandCatalog) {
         CommandScope::Viewport,
         |ed, vid, did, register| {
             let r = register.unwrap_or_else(|| ed.config().default_yank_register);
-            editing::delete_selection(ed, vid, did, r, true)
+            editing::delete_selection(ed, vid, did, r, true);
+            editing::exit_select_mode(ed, vid, did);
         },
     );
     catalog.operator(
@@ -860,7 +861,8 @@ fn register_operators(catalog: &mut impl EngineCommandCatalog) {
         CommandScope::Viewport,
         |ed, vid, did, register| {
             let r = register.unwrap_or_else(|| ed.config().default_yank_register);
-            editing::delete_selection(ed, vid, did, r, false)
+            editing::delete_selection(ed, vid, did, r, false);
+            editing::exit_select_mode(ed, vid, did);
         },
     );
     catalog.operator(
@@ -910,6 +912,7 @@ fn register_operators(catalog: &mut impl EngineCommandCatalog) {
         |ed, vid, did, register| {
             let r = register.unwrap_or_else(|| ed.config().default_yank_register);
             editing::yank(ed, vid, did, r);
+            editing::exit_select_mode(ed, vid, did);
         },
     );
     catalog.operator(
@@ -918,7 +921,8 @@ fn register_operators(catalog: &mut impl EngineCommandCatalog) {
         CommandScope::Viewport,
         |ed, vid, did, register| {
             let r = register.unwrap_or_else(|| ed.config().default_yank_register);
-            editing::yank_joined(ed, vid, did, r, "\n")
+            editing::yank_joined(ed, vid, did, r, "\n");
+            editing::exit_select_mode(ed, vid, did);
         },
     );
 }

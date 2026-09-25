@@ -362,6 +362,30 @@ pub trait EditingEngine: Send {
     /// and stores it as `last_action` for dot-repeat.
     fn end_insert_recording(&mut self);
 
+    /// Record a key the frontend handled during insert mode (Tab, `C-r`, `C-x`), so `.`
+    /// replays it along with the keys the engine handled itself.
+    fn record_frontend_insert_key(&mut self, _key: KeyEvent) {}
+
+    /// Name of the last command this engine executed. When an engine command (`c`, `o`,
+    /// `a`) enters insert mode, this becomes the recording's entry command, so `.` replays
+    /// the whole change rather than a bare `insert_mode`.
+    fn last_command_name(&self) -> Option<&'static str> {
+        None
+    }
+
+    /// Run the engine command `name` without recording it for dot-repeat; used to replay
+    /// the entry command of a recorded insert. Returns `false` when the engine does not
+    /// know the command, so the frontend can run it instead.
+    fn replay_entry(
+        &mut self,
+        _editor: &mut Editor,
+        _view_id: ViewId,
+        _doc_id: DocumentId,
+        _name: &str,
+    ) -> bool {
+        false
+    }
+
     /// Snapshot transient count/register state owned by the engine.
     fn input_state(&self) -> ModalInputState {
         ModalInputState::default()

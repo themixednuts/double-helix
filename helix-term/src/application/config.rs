@@ -21,8 +21,14 @@ impl Application {
 
     fn refresh_keymaps(&mut self) {
         let keys = self.config.load().keys.clone();
+        let engine = self
+            .editor
+            .frontend()
+            .engine_factory
+            .create(self.config.load().editor.editing_engine);
         if let Some(editor_view) = self.compositor.find::<crate::ui::EditorView>() {
             editor_view.keymaps.replace_base(keys.clone());
+            editor_view.replace_engine(engine);
         }
         self.editor
             .set_modal_keymaps(crate::keymap::to_component_modal_keymaps(&keys));

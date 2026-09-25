@@ -179,10 +179,14 @@ impl<T: Copy + Send + Sync + 'static> ModalKeymapState<T> {
         let Some(keymap) = keymaps.get(&mode) else {
             return false;
         };
+        // A node that takes any character (`f`, `t`) takes this key too.
         keymap
             .search(self.pending())
             .and_then(ModalTrie::node)
-            .is_some_and(|node| node.contains_key(&key))
+            .is_some_and(|node| {
+                node.contains_key(&key)
+                    || (node.fallback.is_some() && matches!(key.code, KeyCode::Char(_)))
+            })
     }
 }
 
@@ -223,6 +227,12 @@ fn lookup_keymap<T: Copy>(
                 .map(ModalBinding::target)
                 .collect::<Vec<_>>();
             return ModalLookup::MatchedSequence(targets.into_boxed_slice());
+        }
+        // Keys left pending from another mode's keymap (the mode changed mid-sequence)
+        // can never complete here. Drop them and look the key up on its own.
+        None if !state.is_empty() => {
+            state.clear();
+            return lookup_keymap(keymap, state, sticky, key);
         }
         None => return ModalLookup::NotFound,
         Some(trie) => trie,

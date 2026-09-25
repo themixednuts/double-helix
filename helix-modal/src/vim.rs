@@ -21,7 +21,8 @@ use helix_view::{DocumentId, Editor, ViewId};
 
 use crate::registry::{CharPendingResolution, CommandRef, CommandRegistry};
 use crate::{
-    finalize_insert_recording, is_char_key, key_to_digit, record_insert_key, InsertRecording,
+    document_version, finalize_insert_recording, is_char_key, is_repeatable_edit, key_to_digit,
+    record_insert_key, InsertRecording,
 };
 
 /// Vim's internal mode state machine.
@@ -121,6 +122,8 @@ pub struct VimEngine {
     pending_display_buf: String,
     /// Active insert recording, present while in insert mode.
     insert_recording: Option<InsertRecording>,
+    /// `"` was pressed; the next character names the register.
+    awaiting_register: bool,
 }
 
 impl VimEngine {
@@ -134,6 +137,7 @@ impl VimEngine {
             last_action: None,
             pending_display_buf: String::new(),
             insert_recording: None,
+            awaiting_register: false,
         }
     }
 
@@ -148,8 +152,21 @@ impl VimEngine {
         keymaps: &dyn KeymapQuery,
         key: KeyEvent,
     ) -> Option<EngineResult> {
+        if self.awaiting_register {
+            self.awaiting_register = false;
+            if let Some(register) = key.char().filter(|_| key.modifiers.is_empty()) {
+                self.register = Some(register);
+            }
+            return Some(EngineResult::Pending);
+        }
+
+        // A key the pending sequence takes (`f1`, `f"`) belongs to it, not to a count or a
+        // register prefix.
+        let sequence_pending =
+            !keymaps.pending().is_empty() && keymaps.contains_key(editor.mode(), key);
+
         // Count accumulation
-        if let Some(digit) = key_to_digit(key) {
+        if let Some(digit) = key_to_digit(key).filter(|_| !sequence_pending) {
             if self.count.is_some() || digit > 0 {
                 let current = self.count.map_or(0, NonZeroUsize::get);
                 let new = current * 10 + digit;
@@ -161,7 +178,8 @@ impl VimEngine {
         }
 
         // Register selection: " prefix
-        if is_char_key(key, '"') && self.register.is_none() {
+        if is_char_key(key, '"') && !sequence_pending {
+            self.awaiting_register = true;
             return Some(EngineResult::Pending);
         }
 
@@ -186,6 +204,7 @@ impl VimEngine {
         // Escape → cancel
         if key.code == helix_view::keyboard::KeyCode::Esc {
             self.sub_mode = SubMode::Normal;
+            self.motion_count = None;
             self.pending_display_buf.clear();
             return Some(EngineResult::Executed);
         }
@@ -527,12 +546,19 @@ impl VimEngine {
                 EngineResult::Executed
             }
             CommandRef::Action(a) => {
+                let version_before = document_version(editor, doc_id);
                 (a.execute)(editor, view_id, doc_id, count_val, register);
-                self.last_action = Some(RecordedAction::CountedAction {
-                    command: RepeatableCommandId::Action(a.id),
-                    count: NonZeroUsize::new(count_val).unwrap_or(NonZeroUsize::MIN),
-                    register,
-                });
+                if is_repeatable_edit(
+                    a.id.as_str(),
+                    version_before,
+                    document_version(editor, doc_id),
+                ) {
+                    self.last_action = Some(RecordedAction::CountedAction {
+                        command: RepeatableCommandId::Action(a.id),
+                        count: NonZeroUsize::new(count_val).unwrap_or(NonZeroUsize::MIN),
+                        register,
+                    });
+                }
                 EngineResult::Executed
             }
             CommandRef::TextObject(_) => EngineResult::Unbound,
@@ -777,7 +803,9 @@ impl EditingEngine for VimEngine {
     }
 
     fn is_pending(&self) -> bool {
-        matches!(self.sub_mode, SubMode::OperatorPending(_)) || self.count.is_some()
+        matches!(self.sub_mode, SubMode::OperatorPending(_))
+            || self.count.is_some()
+            || self.awaiting_register
     }
 
     fn reset(&mut self) {
@@ -785,6 +813,7 @@ impl EditingEngine for VimEngine {
         self.count = None;
         self.motion_count = None;
         self.register = None;
+        self.awaiting_register = false;
         self.pending_display_buf.clear();
     }
 
@@ -898,6 +927,12 @@ impl EditingEngine for VimEngine {
             entry_command,
             keys: Vec::new(),
         });
+    }
+
+    fn record_frontend_insert_key(&mut self, key: KeyEvent) {
+        if let Some(recording) = &mut self.insert_recording {
+            recording.keys.push(key);
+        }
     }
 
     fn end_insert_recording(&mut self) {

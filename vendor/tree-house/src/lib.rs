@@ -13,6 +13,7 @@ use tree_sitter::{IncompatibleGrammarError, Node, Parser, Tree};
 pub use crate::config::{read_query, LanguageConfig, LanguageLoader};
 pub use crate::injections_query::{InjectionLanguageMarker, InjectionsQuery};
 use crate::parse::LayerUpdateFlags;
+pub use crate::query_iter::{CapturedMatch, QueryMatchIter, QueryMatchIterEvent};
 pub use crate::tree_cursor::TreeCursor;
 pub use tree_sitter;
 // pub use pretty_print::pretty_print_tree;
@@ -159,12 +160,12 @@ impl Syntax {
             query_stale: false,
             language,
             flags: LayerUpdateFlags::default(),
-            ranges: vec![tree_sitter::Range {
-                start_byte: 0,
-                end_byte: u32::MAX,
-                start_point: tree_sitter::Point::ZERO,
-                end_point: tree_sitter::Point::MAX,
-            }],
+            ranges: vec![tree_sitter::Range::new(
+                tree_sitter::Point::ZERO,
+                tree_sitter::Point::MAX,
+                0,
+                u32::MAX,
+            )],
             injections: Vec::new(),
             parent: None,
             locals: Locals::default(),
@@ -263,10 +264,8 @@ impl Syntax {
             let injection_at_start = layer
                 .injection_at_byte_idx(start)
                 .filter(|injection| self.has_layer(injection.layer))?;
-
-            // +1 because the end is exclusive.
             let injection_at_end = layer
-                .injection_at_byte_idx(end + 1)
+                .injection_at_byte_idx(end)
                 .filter(|injection| self.has_layer(injection.layer))?;
 
             (injection_at_start.layer == injection_at_end.layer).then(|| {
@@ -409,7 +408,7 @@ impl LayerData {
         }
         let i = self
             .injections
-            .partition_point(|range| range.range.end < idx);
+            .partition_point(|range| range.range.end <= idx);
         self.injections[i..].iter()
     }
 
@@ -575,5 +574,37 @@ mod unit_tests {
         );
         assert!(checked_byte_slice_usize(slice, &(5..9)).is_none());
         assert!(checked_byte_slice_usize(slice, &std::ops::Range { start: 5, end: 4 }).is_none());
+    }
+
+    fn make_injection(start: u32, end: u32) -> Injection {
+        Injection {
+            range: start..end,
+            layer: Layer(0),
+            matched_node_range: start..end,
+        }
+    }
+
+    fn layer_with_injections(injections: Vec<Injection>) -> LayerData {
+        LayerData {
+            injections,
+            ..layer(None)
+        }
+    }
+
+    #[test]
+    fn injection_at_byte_idx_exclusive_end() {
+        let layer = layer_with_injections(vec![make_injection(5, 10)]);
+        // Byte 9 is the last byte of the range 5..10.
+        assert!(layer.injection_at_byte_idx(9).is_some());
+        // Byte 10 is the exclusive end and is not in the range.
+        assert!(layer.injection_at_byte_idx(10).is_none());
+    }
+
+    #[test]
+    fn injection_at_byte_idx_adjacent() {
+        // The boundary byte belongs to the second of two adjacent injections.
+        let layer = layer_with_injections(vec![make_injection(0, 10), make_injection(10, 20)]);
+        let inj = layer.injection_at_byte_idx(10).unwrap();
+        assert_eq!(inj.range, 10..20);
     }
 }

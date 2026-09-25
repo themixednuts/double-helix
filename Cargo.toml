@@ -61,7 +61,7 @@ package.helix-term.opt-level = 2
 [workspace.dependencies]
 automerge = "0.10"
 base64 = "0.22"
-tree-house = { version = "0.3.0", default-features = false }
+tree-house = { version = "0.4.0", default-features = false }
 nucleo = "0.5.0"
 slotmap = "1.1.1"
 thiserror = "2.0"

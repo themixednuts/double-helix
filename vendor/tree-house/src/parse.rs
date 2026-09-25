@@ -342,7 +342,6 @@ impl Syntax {
                         layer_data.parser = tree_sitter::Parser::new();
                         layer_data.parse_incomplete = false;
                     }
-                    layer_data.parser.set_timeout(timeout);
 
                     let parse_start = Instant::now();
                     let parse_result = if let Some(tree) = &mut layer_data.parse_tree {
@@ -356,7 +355,7 @@ impl Syntax {
                         }
                         if layer_data.flags.modified {
                             reparsed_layers += 1;
-                            layer_data.parse(source, loader)
+                            layer_data.parse(source, timeout, loader)
                         } else {
                             Ok(ParseCallStats {
                                 reused_old_tree: false,
@@ -382,7 +381,7 @@ impl Syntax {
                         }
                     } else {
                         fresh_parse_layers += 1;
-                        layer_data.parse(source, loader)
+                        layer_data.parse(source, timeout, loader)
                     };
                     let parse_elapsed = parse_start.elapsed();
                     let parse_outcome = match &parse_result {
@@ -707,6 +706,7 @@ impl LayerData {
     fn parse(
         &mut self,
         source: RopeSlice,
+        timeout: Duration,
         loader: &impl LanguageLoader,
     ) -> Result<ParseCallStats, Error> {
         let Some(config) = loader.get_config(self.language) else {
@@ -769,7 +769,9 @@ impl LayerData {
         });
         let reused_old_tree = tree.is_some();
 
-        match self.parser.parse(source, tree) {
+        // A parse that runs out of time keeps its state in this layer's parser; the next call
+        // resumes it (`parse_incomplete`).
+        match self.parser.parse_with_timeout(source, tree, timeout) {
             Some(tree) => {
                 self.parse_tree = Some(tree);
                 self.parse_incomplete = false;

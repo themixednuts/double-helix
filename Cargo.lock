@@ -665,12 +665,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
-name = "cov-mark"
-version = "2.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "90863d8442510cddf7f46618c4f92413774635771a3e80830c8b30d183420b14"
-
-[[package]]
 name = "cpufeatures"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5727,7 +5721,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -6196,10 +6190,9 @@ dependencies = [
 
 [[package]]
 name = "tree-house"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "arc-swap",
- "cov-mark",
  "hashbrown 0.15.5",
  "indexmap 2.14.0",
  "kstring",
@@ -6215,7 +6208,7 @@ dependencies = [
 
 [[package]]
 name = "tree-house-bindings"
-version = "0.2.3"
+version = "0.3.2"
 dependencies = [
  "cc",
  "libloading",

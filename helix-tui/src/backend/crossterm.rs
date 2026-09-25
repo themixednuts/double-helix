@@ -667,13 +667,18 @@ mod tests {
         cell.underline_color = ratatui::style::Color::Indexed(4);
         cell.modifier = ratatui::style::Modifier::BOLD | ratatui::style::Modifier::UNDERLINED;
 
+        Backend::start_sync(&mut backend).unwrap();
         RatatuiBackend::draw(&mut backend, [(3, 2, &cell)].into_iter()).unwrap();
+        Backend::set_cursor(&mut backend, 0, 0).unwrap();
+        Backend::end_sync(&mut backend).unwrap();
 
         let output = String::from_utf8(backend.buffer.into_inner().unwrap()).unwrap();
-        assert!(output.contains("\x1b[?2026h"));
-        assert!(output.contains("\x1b[3;4H"));
-        assert!(output.contains("x"));
-        assert!(output.contains("\x1b[?2026l"));
+        let begin = output.find("\x1b[?2026h").expect("frame opens a sync block");
+        let cell_at = output.find("\x1b[3;4H").expect("cell is positioned");
+        let cursor_at = output.rfind("\x1b[1;1H").expect("cursor is placed");
+        let end = output.find("\x1b[?2026l").expect("frame closes the sync block");
+        assert!(output.contains('x'));
+        assert!(begin < cell_at && cell_at < cursor_at && cursor_at < end);
     }
 
     #[test]

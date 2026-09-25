@@ -115,6 +115,7 @@ struct State {
 
 struct PendingPermission {
     rpc: helix_acp::jsonrpc::Id,
+    thread: thread::Id,
     agent: String,
     tool: String,
     choices: Vec<permission::Choice>,
@@ -545,9 +546,9 @@ async fn start_prompt_turn(
             )
             .await;
         let event = match result {
-            Ok(_) => backend::Update::Thread {
+            Ok(response) => backend::Update::Thread {
                 thread,
-                event: thread::Event::Run(thread::Run::Idle),
+                event: thread::Event::Run(finished_run(&response.stop_reason)),
             },
             Err(err) if is_auth_required(&err) => backend::Update::Auth {
                 thread,
@@ -557,14 +558,32 @@ async fn start_prompt_turn(
                     error: Some(err.to_string()),
                 },
             },
-            Err(err) => backend::Update::Error {
-                at: backend::Target::Thread(thread),
-                error: backend::Error::Other(anyhow::anyhow!(err.to_string())),
+            // The turn is over either way; leaving the thread running would
+            // lock the composer ("assistant is busy") for good.
+            Err(err) => backend::Update::Thread {
+                thread,
+                event: thread::Event::Run(thread::Run::Failed {
+                    message: err.to_string(),
+                }),
             },
         };
         let _ = tx2.send(event).await;
     })
     .detach();
+}
+
+/// How a finished turn leaves its thread. Limits and refusals cut the turn
+/// short, which should not look like a normal reply.
+fn finished_run(reason: &acp::StopReason) -> thread::Run {
+    let message = match reason {
+        acp::StopReason::MaxTokens => "stopped: the agent reached its token limit",
+        acp::StopReason::MaxTurnRequests => "stopped: the agent reached its request limit for this turn",
+        acp::StopReason::Refusal => "the agent refused to continue",
+        _ => return thread::Run::Idle,
+    };
+    thread::Run::Failed {
+        message: message.to_owned(),
+    }
 }
 
 async fn handle_command(
@@ -719,6 +738,26 @@ async fn handle_command(
         }
         backend::Command::Cancel { thread } => {
             if let Some(session) = state.sessions.get(&thread) {
+                // ACP: cancelling a turn answers its open permission requests
+                // as cancelled, or the agent keeps waiting on them.
+                let pending = state
+                    .permissions
+                    .iter()
+                    .filter(|(_, pending)| pending.thread == thread)
+                    .map(|(request, _)| request.clone())
+                    .collect::<Vec<_>>();
+                for request in pending {
+                    if let Some(pending) = state.permissions.remove(&request) {
+                        let response = acp::RequestPermissionResponse::new(
+                            acp::RequestPermissionOutcome::Cancelled,
+                        );
+                        log_delivery(
+                            agent
+                                .reply(pending.rpc, serde_json::to_value(response).unwrap())
+                                .await,
+                        );
+                    }
+                }
                 if let Err(err) = agent.cancel(session.to_string().into()).await {
                     let _ = tx
                         .send(backend::Update::Error {
@@ -1138,6 +1177,7 @@ async fn handle_call(
                                 })
                                 .await;
                         }
+                        let content = select_lines(content, req.line, req.limit);
                         agent
                             .reply(
                                 id,
@@ -1645,6 +1685,7 @@ async fn handle_call(
                     request_id,
                     PendingPermission {
                         rpc: id,
+                        thread,
                         agent: backend_id.as_str().to_string(),
                         tool,
                         choices: request.choices().to_vec(),
@@ -1710,6 +1751,14 @@ async fn handle_call(
                     .await;
             }
             Err(err) => {
+                // Always answer: an agent awaiting this request would otherwise block forever.
+                let rpc_error = match &err {
+                    helix_acp::Error::Unhandled(method) => {
+                        helix_acp::jsonrpc::Error::method_not_found(method.clone())
+                    }
+                    other => helix_acp::jsonrpc::Error::invalid_params(other.to_string()),
+                };
+                log_delivery(agent.reply_error(id, rpc_error).await);
                 let _ = tx
                     .send(backend::Update::Error {
                         at: backend::Target::Backend(backend_id.clone()),
@@ -1720,6 +1769,16 @@ async fn handle_call(
         },
         _ => {}
     }
+}
+
+/// Apply `fs/read_text_file`'s optional window: `line` is 1-based, `limit` counts lines.
+fn select_lines(content: String, line: Option<u32>, limit: Option<u32>) -> String {
+    if line.is_none() && limit.is_none() {
+        return content;
+    }
+    let skip = line.map_or(0, |line| line.saturating_sub(1) as usize);
+    let take = limit.map_or(usize::MAX, |limit| limit as usize);
+    content.split_inclusive('\n').skip(skip).take(take).collect()
 }
 
 fn permission_choice(option: acp::PermissionOption) -> permission::Choice {
@@ -1810,9 +1869,20 @@ fn changed_range(before: &str, after: &str) -> Option<crate::collab::RangeAnchor
 
 #[cfg(test)]
 mod tests {
-    use super::{changed_range, write_location, Driver, State};
+    use super::{changed_range, select_lines, write_location, Driver, State};
     use crate::assistant::{backend, review, thread};
     use std::num::NonZeroU64;
+
+    #[test]
+    fn read_text_file_window_is_one_based_and_bounded() {
+        let text = "one\ntwo\nthree\nfour".to_owned();
+        assert_eq!(select_lines(text.clone(), None, None), text);
+        assert_eq!(select_lines(text.clone(), Some(2), Some(2)), "two\nthree\n");
+        assert_eq!(select_lines(text.clone(), Some(0), Some(1)), "one\n");
+        assert_eq!(select_lines(text.clone(), Some(4), None), "four");
+        assert_eq!(select_lines(text.clone(), None, Some(1)), "one\n");
+        assert_eq!(select_lines(text, Some(9), None), "");
+    }
 
     #[test]
     fn driver_keeps_supplied_backend_identity_and_display_name() {

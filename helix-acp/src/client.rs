@@ -207,7 +207,7 @@ impl AcpAgent {
     /// Returns the agent and its incoming request/notification receiver.
     /// The caller should poll `incoming_receiver` for agent requests/notifications.
     pub fn start(id: AgentId, config: &AgentConfig) -> Result<(Arc<Self>, IncomingReceiver)> {
-        let mut cmd = Command::new(&config.command);
+        let mut cmd = Command::new(crate::resolve_program(&config.command));
         cmd.args(&config.args)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -322,7 +322,8 @@ impl AcpAgent {
         }
     }
 
-    /// Send a JSON-RPC request and wait for the response.
+    /// Send a JSON-RPC request and wait for the response. A timeout of `0`
+    /// waits for as long as the agent takes.
     fn call<R: Serialize, T: serde::de::DeserializeOwned>(
         &self,
         method: &str,
@@ -349,7 +350,12 @@ impl AcpAgent {
             outbound
                 .deliver(Payload::Request { value: request })
                 .await?;
-            let response = match timeout(Duration::from_secs(timeout_secs), rx.recv()).await {
+            let response = if timeout_secs == 0 {
+                Ok(rx.recv().await)
+            } else {
+                timeout(Duration::from_secs(timeout_secs), rx.recv()).await
+            };
+            let response = match response {
                 Ok(Some(response)) => response,
                 Ok(None) => {
                     warn!(
@@ -538,8 +544,9 @@ impl AcpAgent {
         prompt: Vec<ContentBlock>,
     ) -> impl Future<Output = Result<PromptResponse>> {
         let params = PromptRequest::new(session_id, prompt);
-        // Prompts can take a very long time (agent is doing work)
-        self.call(methods::SESSION_PROMPT, params, 600)
+        // A turn lasts as long as the agent works; the user ends it with a
+        // cancel, and a dead agent closes the stream.
+        self.call(methods::SESSION_PROMPT, params, 0)
     }
 
     /// Cancel an ongoing prompt turn.

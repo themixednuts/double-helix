@@ -2662,6 +2662,7 @@ dependencies = [
  "anyhow",
  "futures-util",
  "helix-runtime",
+ "helix-stdx",
  "log",
  "serde",
  "serde_json",

@@ -317,6 +317,36 @@ async fn read_bounded_line(
     }
 }
 
+/// Like [`read_bounded_line`], but keeps only the first `limit` bytes of an overlong line and
+/// discards the rest instead of failing. Used for streams that must keep draining (stderr),
+/// where giving up would leave the child blocked on a full pipe.
+async fn read_truncated_line(
+    reader: &mut (impl AsyncBufRead + Unpin + Send),
+    buffer: &mut Vec<u8>,
+    limit: usize,
+) -> io::Result<usize> {
+    buffer.clear();
+    let mut read = 0;
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return Ok(read);
+        }
+        let consumed = available
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(available.len(), |index| index + 1);
+        let keep = consumed.min(limit.saturating_sub(buffer.len()));
+        buffer.extend_from_slice(&available[..keep]);
+        let complete = available[..consumed].ends_with(b"\n");
+        reader.consume(consumed);
+        read += consumed;
+        if complete {
+            return Ok(read);
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Transport {
     id: AgentId,
@@ -361,9 +391,15 @@ impl Transport {
                 return Err(Error::StreamClosed);
             }
 
-            let line = std::str::from_utf8(buffer)
-                .context("agent message is not valid UTF-8")?
-                .trim_end_matches(['\r', '\n']);
+            let Ok(line) = std::str::from_utf8(buffer) else {
+                warn!(
+                    "{} <- skipped stdout line that is not valid UTF-8 ({} bytes)",
+                    bounded_metadata(agent_name),
+                    buffer.len()
+                );
+                continue;
+            };
+            let line = line.trim_end_matches(['\r', '\n']);
             if line.trim().is_empty() {
                 continue; // skip blank lines
             }
@@ -387,7 +423,18 @@ impl Transport {
             .map_err(|error| Error::Other(error.into()))?;
             bytes.clear();
             *buffer = bytes;
-            let message = message?;
+            // Agents launched through package runners (npx, uvx) sometimes print banners or
+            // warnings on stdout. One stray line must not tear down the whole session.
+            let message = match message {
+                Ok(message) => message,
+                Err(error) => {
+                    warn!(
+                        "{} <- skipped non-JSON-RPC stdout line ({line_len} bytes): {error}",
+                        bounded_metadata(agent_name)
+                    );
+                    continue;
+                }
+            };
             let metadata = MessageLogMetadata::from_agent_message(&message);
             info!(
                 "{}",
@@ -404,7 +451,7 @@ impl Transport {
         buffer: &mut Vec<u8>,
         agent_name: &str,
     ) -> Result<()> {
-        if read_bounded_line(err, buffer, MAX_STDERR_LINE_BYTES).await? == 0 {
+        if read_truncated_line(err, buffer, MAX_STDERR_LINE_BYTES).await? == 0 {
             return Err(Error::StreamClosed);
         }
         let line = String::from_utf8_lossy(buffer);
@@ -754,6 +801,45 @@ mod tests {
         assert!(buffer.len() <= 8);
     }
 
+    #[tokio::test]
+    async fn truncated_line_reader_keeps_draining_past_the_limit() {
+        let mut reader = BufReader::new(&b"123456789\nnext\n"[..]);
+        let mut buffer = Vec::new();
+
+        let read = read_truncated_line(&mut reader, &mut buffer, 4)
+            .await
+            .expect("overlong line is truncated, not rejected");
+        assert_eq!(read, 10);
+        assert_eq!(buffer, b"1234");
+
+        read_truncated_line(&mut reader, &mut buffer, 4)
+            .await
+            .expect("next line");
+        assert_eq!(buffer, b"next");
+    }
+
+    #[tokio::test]
+    async fn non_json_stdout_line_is_skipped() {
+        let transport = test_transport();
+        let (response_tx, mut response_rx) = channel(1);
+        let _guard = transport
+            .pending_requests
+            .register(jsonrpc::Id::Num(1), response_tx)
+            .expect("open pending registry");
+        let (client_tx, _client_rx) = channel(1);
+
+        Transport::recv(
+            transport.clone(),
+            BufReader::new(
+                &b"npm warn exec banner\n{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":null}\n"[..],
+            ),
+            client_tx,
+        )
+        .await;
+
+        assert!(matches!(response_rx.recv().await, Some(Ok(_))));
+    }
+
     #[test]
     fn dropping_pending_request_guard_removes_registration() {
         let pending = Arc::new(PendingRequests::default());
@@ -797,7 +883,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn malformed_stdout_closes_pending_requests_and_reports_exit() {
+    async fn stdout_eof_after_noise_closes_pending_requests_and_reports_exit() {
         let transport = test_transport();
         let (response_tx, mut response_rx) = channel(1);
         let _guard = transport

@@ -643,6 +643,23 @@ fn setup_sandbox(
     .exec()
     .map_err(|e| PluginError::InitializationFailed(format!("Failed to setup sandbox: {e}")))?;
 
+    // A plugin host's stdout carries its RPC frames, so `print` must not
+    // write there; send it to the log like `helix.log.info`.
+    lua.create_function(|lua, args: LuaMultiValue| {
+            let tostring: LuaFunction = lua.globals().get("tostring")?;
+            let mut line = String::new();
+            for (index, value) in args.into_iter().enumerate() {
+                if index > 0 {
+                    line.push('\t');
+                }
+                line.push_str(&tostring.call::<String>(value)?);
+            }
+            log::info!("[plugin] {line}");
+            Ok(())
+        })
+        .and_then(|print| lua.globals().set("print", print))
+        .map_err(|e| PluginError::InitializationFailed(format!("Failed to install print: {e}")))?;
+
     let require = lua.create_function(scoped_require).map_err(|e| {
         PluginError::InitializationFailed(format!("Failed to install require: {e}"))
     })?;

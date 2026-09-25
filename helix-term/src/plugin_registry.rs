@@ -1071,7 +1071,14 @@ impl TermKeymapHost {
 
 pub struct TermEventHost {
     next_subscription_handle: std::sync::atomic::AtomicU64,
-    subscriptions: HashMap<SubscriptionHandle, PluginId>,
+    subscriptions: HashMap<SubscriptionHandle, (PluginId, helix_plugin_api::events::EventKind)>,
+    /// One bit per event kind with a subscriber. Read without the host lock
+    /// so events nobody subscribed to are never encoded or sent.
+    subscribed: Arc<std::sync::atomic::AtomicU64>,
+}
+
+fn event_bit(kind: helix_plugin_api::events::EventKind) -> u64 {
+    1 << (kind as u32)
 }
 
 impl PluginEventHost for TermEventHost {
@@ -1088,7 +1095,8 @@ impl PluginEventHost for TermEventHost {
         let handle = helix_plugin_api::SubscriptionHandle::from_raw(next_non_zero(
             &self.next_subscription_handle,
         ));
-        self.subscriptions.insert(handle, plugin);
+        self.subscriptions.insert(handle, (plugin, kind));
+        self.publish_subscribed();
         Ok(handle)
     }
 
@@ -1098,8 +1106,9 @@ impl PluginEventHost for TermEventHost {
         handle: helix_plugin_api::SubscriptionHandle,
     ) -> ContractResult<()> {
         match self.subscriptions.get(&handle) {
-            Some(owner) if *owner == plugin => {
+            Some((owner, _)) if *owner == plugin => {
                 self.subscriptions.remove(&handle);
+                self.publish_subscribed();
                 Ok(())
             }
             Some(_) => Err(permission_denied(plugin, handle)),
@@ -1114,7 +1123,17 @@ impl PluginEventHost for TermEventHost {
 
 impl TermEventHost {
     fn release_plugin(&mut self, plugin: PluginId) {
-        self.subscriptions.retain(|_, owner| *owner != plugin);
+        self.subscriptions.retain(|_, (owner, _)| *owner != plugin);
+        self.publish_subscribed();
+    }
+
+    fn publish_subscribed(&self) {
+        let mask = self
+            .subscriptions
+            .values()
+            .fold(0, |mask, (_, kind)| mask | event_bit(*kind));
+        self.subscribed
+            .store(mask, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -1138,6 +1157,7 @@ struct HostOperation {
 pub struct PluginHostState {
     route: PluginHostRoute,
     inner: Arc<Mutex<PluginHostStateInner>>,
+    subscribed_events: Arc<std::sync::atomic::AtomicU64>,
     cleanup_ingress: crate::runtime::RuntimeIngress,
     published_commands: Arc<PublishedPluginCommands>,
     generation: Option<HostGenerationId>,
@@ -1168,6 +1188,7 @@ impl PluginHostState {
             active_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
         let published_commands = Arc::new(arc_swap::ArcSwap::from_pointee(Vec::new()));
+        let subscribed_events = Arc::new(std::sync::atomic::AtomicU64::new(0));
         Self {
             inner: Arc::new(Mutex::new(PluginHostStateInner {
                 ui: TermUiHost {
@@ -1193,10 +1214,12 @@ impl PluginHostState {
                 event: TermEventHost {
                     next_subscription_handle: std::sync::atomic::AtomicU64::new(1),
                     subscriptions: HashMap::new(),
+                    subscribed: Arc::clone(&subscribed_events),
                 },
                 operations: HashMap::new(),
                 plugins: HashSet::new(),
             })),
+            subscribed_events,
             route,
             cleanup_ingress,
             published_commands,
@@ -1206,6 +1229,14 @@ impl PluginHostState {
 
     pub(crate) fn id(&self) -> PluginHostId {
         self.route.id
+    }
+
+    /// Whether any plugin in this host subscribed to `kind`.
+    pub(crate) fn wants(&self, kind: helix_plugin_api::events::EventKind) -> bool {
+        self.subscribed_events
+            .load(std::sync::atomic::Ordering::Acquire)
+            & event_bit(kind)
+            != 0
     }
 
     fn lock_for_worker(&self) -> MutexGuard<'_, PluginHostStateInner> {
@@ -1240,6 +1271,7 @@ impl PluginHostState {
         Self {
             route: self.route.clone(),
             inner: Arc::clone(&self.inner),
+            subscribed_events: Arc::clone(&self.subscribed_events),
             cleanup_ingress: self.cleanup_ingress.clone(),
             published_commands: Arc::clone(&self.published_commands),
             generation: Some(generation),
@@ -1581,7 +1613,11 @@ impl PluginRuntime {
     }
 
     pub(crate) fn notify_event(&self, event: helix_plugin_api::events::PluginEvent) {
+        let kind = event.kind();
         for host in self.host_snapshot() {
+            if !host.state.wants(kind) {
+                continue;
+            }
             if let Err(error) = host.events.try_send(event.clone()) {
                 let dropped = host
                     .dropped_events
@@ -1833,7 +1869,13 @@ async fn log_plugin_stderr(name: String, stderr: tokio::process::ChildStderr) {
 
     let mut lines = tokio::io::BufReader::new(stderr).lines();
     while let Ok(Some(line)) = lines.next_line().await {
-        log::warn!("plugin host '{name}' stderr: {line}");
+        // Our own hosts prefix each line with its level; anything else (a
+        // third-party host, a crash message) is filed as a warning.
+        let (level, message) = line
+            .split_once(' ')
+            .and_then(|(level, message)| Some((level.parse::<log::Level>().ok()?, message)))
+            .unwrap_or((log::Level::Warn, line.as_str()));
+        log::log!(target: "helix_plugin_host", level, "plugin host '{name}': {message}");
     }
 }
 
@@ -3010,10 +3052,35 @@ mod tests {
     }
 
     #[test]
+    fn subscribed_event_mask_follows_subscriptions() {
+        use helix_plugin_api::events::EventKind;
+
+        let subscribed = Arc::<std::sync::atomic::AtomicU64>::default();
+        let mut host = TermEventHost {
+            next_subscription_handle: std::sync::atomic::AtomicU64::new(1),
+            subscriptions: HashMap::new(),
+            subscribed: Arc::clone(&subscribed),
+        };
+        let wants = |kind| subscribed.load(std::sync::atomic::Ordering::Acquire) & event_bit(kind) != 0;
+        assert!(!wants(EventKind::KeyPressed));
+
+        let keys = host.subscribe(plugin_id(), EventKind::KeyPressed).unwrap();
+        host.subscribe(other_plugin_id(), EventKind::ModeChanged).unwrap();
+        assert!(wants(EventKind::KeyPressed) && wants(EventKind::ModeChanged));
+        assert!(!wants(EventKind::DocumentChanged));
+
+        host.unsubscribe(plugin_id(), keys).unwrap();
+        assert!(!wants(EventKind::KeyPressed));
+        host.release_plugin(other_plugin_id());
+        assert!(!wants(EventKind::ModeChanged));
+    }
+
+    #[test]
     fn event_host_rejects_foreign_subscription_handles() {
         let mut host = TermEventHost {
             next_subscription_handle: std::sync::atomic::AtomicU64::new(1),
             subscriptions: HashMap::new(),
+            subscribed: Arc::default(),
         };
         let handle = host
             .subscribe(plugin_id(), helix_plugin_api::events::EventKind::HostReady)

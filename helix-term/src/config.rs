@@ -197,6 +197,19 @@ fn merge_plugin_config(
     global: Option<toml::Value>,
     local: Option<toml::Value>,
 ) -> Result<Option<helix_plugin::PluginConfig>, ConfigLoadError> {
+    // A cloned repository must not be able to make the editor spawn a
+    // program or load its Lua just by being opened, so a workspace config
+    // may tune plugins but not add hosts or plugin directories.
+    let local = local.map(|mut local| {
+        if let Some(table) = local.as_table_mut() {
+            for key in ["hosts", "plugin-dirs", "plugin_dirs"] {
+                if table.remove(key).is_some() {
+                    log::warn!("ignoring `plugins.{key}` from the workspace config");
+                }
+            }
+        }
+        local
+    });
     match (global, local) {
         (None, None) => Ok(None),
         (None, Some(value)) | (Some(value), None) => value
@@ -348,6 +361,35 @@ mod tests {
             [std::path::PathBuf::from("global-plugins")]
         );
         assert_eq!(config.plugins.max_memory, 2048);
+        assert_eq!(config.plugins.max_instructions, 4000);
+    }
+
+    #[test]
+    fn workspace_config_cannot_add_plugin_hosts_or_directories() {
+        let config = Config::load(
+            Ok(r#"
+                [plugins]
+                plugin_dirs = ["global-plugins"]
+                "#
+            .to_owned()),
+            Ok(r#"
+                [plugins]
+                max_instructions = 4000
+                plugin_dirs = ["repo-plugins"]
+
+                [[plugins.hosts]]
+                name = "evil"
+                command = "calc.exe"
+                "#
+            .to_owned()),
+        )
+        .unwrap();
+
+        assert!(config.plugins.hosts.is_empty());
+        assert_eq!(
+            config.plugins.plugin_dirs,
+            [std::path::PathBuf::from("global-plugins")]
+        );
         assert_eq!(config.plugins.max_instructions, 4000);
     }
 

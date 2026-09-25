@@ -10,7 +10,7 @@ use crate::backend::{Backend, DrizzleBackend};
 use crate::dto::{
     ActivationHistory, ActivePackage, AssistantLayout, AssistantPermission, AssistantThread,
     FrecencyEntry, PackageActivation, PackageState, PackageStateCommit, PkgReceipt, QueryHistory,
-    RegistryHead, RuntimeAsset, RuntimeAssetKind, RuntimeSnapshot,
+    RegistryHead, RuntimeAsset, RuntimeAssetKind, RuntimeSnapshot, WorkspaceTrustGrant,
 };
 use crate::error::Result;
 use crate::schema::{
@@ -1879,6 +1879,99 @@ fn generation_to_i64(generation: u64) -> Result<i64> {
     })
 }
 
+pub struct WorkspaceTrustRepo<'a> {
+    backend: &'a mut DrizzleBackend,
+}
+
+impl<'a> WorkspaceTrustRepo<'a> {
+    pub(crate) fn new(backend: &'a mut DrizzleBackend) -> Self {
+        Self { backend }
+    }
+
+    /// Records or replaces the trust decision for one workspace.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the SQLite write fails.
+    pub fn put(&mut self, grant: WorkspaceTrustGrant) -> Result<()> {
+        crate::backend::with_busy_retry(|| {
+            self.backend.conn().execute(
+                r#"
+INSERT INTO workspace_trust(workspace, hash, excluded, updated_at)
+VALUES (?1, ?2, ?3, ?4)
+ON CONFLICT(workspace) DO UPDATE SET
+    hash = excluded.hash,
+    excluded = excluded.excluded,
+    updated_at = excluded.updated_at
+"#,
+                params![
+                    grant.workspace,
+                    grant.hash,
+                    i64::from(grant.excluded),
+                    grant.updated_at
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Loads the trust decision for one workspace.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the SQLite query fails.
+    pub fn get(&mut self, workspace: &str) -> Result<Option<WorkspaceTrustGrant>> {
+        self.backend
+            .conn()
+            .query_row(
+                "SELECT workspace, hash, excluded, updated_at FROM workspace_trust WHERE workspace = ?1",
+                params![workspace],
+                workspace_trust_from_row,
+            )
+            .optional()
+            .map_err(crate::Error::from)
+    }
+
+    /// Lists every trust decision, ordered by workspace.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the SQLite query fails.
+    pub fn all(&mut self) -> Result<Vec<WorkspaceTrustGrant>> {
+        let mut statement = self.backend.conn().prepare(
+            "SELECT workspace, hash, excluded, updated_at FROM workspace_trust ORDER BY workspace",
+        )?;
+        let rows = statement
+            .query_map([], workspace_trust_from_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Forgets the trust decision for one workspace.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the SQLite delete fails.
+    pub fn remove(&mut self, workspace: &str) -> Result<()> {
+        crate::backend::with_busy_retry(|| {
+            self.backend.conn().execute(
+                "DELETE FROM workspace_trust WHERE workspace = ?1",
+                params![workspace],
+            )?;
+            Ok(())
+        })
+    }
+}
+
+fn workspace_trust_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkspaceTrustGrant> {
+    Ok(WorkspaceTrustGrant {
+        workspace: row.get(0)?,
+        hash: row.get(1)?,
+        excluded: row.get::<_, i64>(2)? != 0,
+        updated_at: row.get(3)?,
+    })
+}
+
 fn registry_head_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RegistryHead> {
     Ok(RegistryHead {
         registry: row.get(0)?,
@@ -2216,6 +2309,43 @@ fn stable_hash(parts: &[&str]) -> u64 {
         hash = hash.wrapping_mul(FNV_PRIME);
     }
     hash
+}
+
+#[cfg(test)]
+mod workspace_trust_tests {
+    use super::*;
+    use crate::DatabaseKind;
+
+    #[test]
+    fn workspace_trust_round_trips_and_replaces() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut backend =
+            DrizzleBackend::open(temp.path().join("state.sqlite3"), DatabaseKind::State)
+                .expect("open state database");
+        let mut repo = WorkspaceTrustRepo::new(&mut backend);
+        assert_eq!(repo.get("/w").unwrap(), None);
+
+        let trusted = WorkspaceTrustGrant {
+            workspace: "/w".into(),
+            hash: Some("sha256:ab".into()),
+            excluded: false,
+            updated_at: 1,
+        };
+        repo.put(trusted.clone()).unwrap();
+        assert_eq!(repo.get("/w").unwrap(), Some(trusted));
+
+        let excluded = WorkspaceTrustGrant {
+            workspace: "/w".into(),
+            hash: None,
+            excluded: true,
+            updated_at: 2,
+        };
+        repo.put(excluded.clone()).unwrap();
+        assert_eq!(repo.all().unwrap(), vec![excluded]);
+
+        repo.remove("/w").unwrap();
+        assert_eq!(repo.get("/w").unwrap(), None);
+    }
 }
 
 #[cfg(test)]

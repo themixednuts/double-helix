@@ -143,6 +143,7 @@ impl RemoteDocumentLocation {
 pub struct FileBoundState {
     location: Option<DocumentLocation>,
     relative_path: OnceCell<Option<PathBuf>>,
+    workspace_root: OnceCell<Option<PathBuf>>,
     encoding: &'static Encoding,
     has_bom: bool,
     last_saved_time: SystemTime,
@@ -155,6 +156,7 @@ impl FileBoundState {
         Self {
             location: None,
             relative_path: OnceCell::new(),
+            workspace_root: OnceCell::new(),
             encoding,
             has_bom,
             last_saved_time: SystemTime::now(),
@@ -165,6 +167,24 @@ impl FileBoundState {
 
     pub fn clear_relative_path(&mut self) {
         self.relative_path.take();
+        self.workspace_root.take();
+    }
+
+    /// The local workspace holding this file: the nearest ancestor with a `.git`, `.jj`, ... or,
+    /// for a scratch buffer, the working directory's. `None` for remote and shared files, whose
+    /// workspace is on another machine.
+    pub fn workspace_root(&self) -> Option<&Path> {
+        self.workspace_root
+            .get_or_init(|| match &self.location {
+                Some(DocumentLocation::Local(path)) => Some(
+                    path.parent()
+                        .map(|dir| helix_loader::find_workspace_in(dir).0)
+                        .unwrap_or_else(|| helix_loader::find_workspace().0),
+                ),
+                None => Some(helix_loader::find_workspace().0),
+                Some(DocumentLocation::Remote(_) | DocumentLocation::Collaboration(_)) => None,
+            })
+            .as_deref()
     }
 
     pub fn set_encoding(&mut self, label: &str) -> Result<(), Error> {

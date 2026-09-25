@@ -170,10 +170,36 @@ impl Config {
     pub fn load_default() -> Result<Config, ConfigLoadError> {
         let global_config =
             fs::read_to_string(helix_loader::config_file()).map_err(ConfigLoadError::Error);
-        let local_config = fs::read_to_string(helix_loader::workspace_config_file())
-            .map_err(ConfigLoadError::Error);
-        Config::load(global_config, local_config)
+        let trust_config = global_config
+            .as_deref()
+            .map(workspace_trust_config)
+            .unwrap_or_default();
+        let trust = helix_loader::workspace_trust::WorkspaceTrust::new((&trust_config).into());
+        let local_config = if trust
+            .query_current(helix_loader::workspace_trust::TrustQuery::LocalConfig)
+            .is_trusted()
+        {
+            fs::read_to_string(helix_loader::workspace_config_file())
+                .map_err(ConfigLoadError::Error)
+        } else {
+            Err(ConfigLoadError::default())
+        };
+        let mut config = Config::load(global_config, local_config)?;
+        // The gate's own settings come from the user config only: a trusted workspace setting
+        // `level = "insecure"` would otherwise loosen it for every workspace opened afterwards.
+        config.editor.workspace_trust = trust_config;
+        Ok(config)
     }
+}
+
+/// `[editor.workspace-trust]` from the user config. An invalid table falls back to the defaults
+/// here; loading the whole config reports the error.
+fn workspace_trust_config(global: &str) -> helix_view::editor::WorkspaceTrustConfig {
+    toml::from_str::<toml::Value>(global)
+        .ok()
+        .and_then(|config| config.get("editor")?.get("workspace-trust").cloned())
+        .and_then(|config| config.try_into().ok())
+        .unwrap_or_default()
 }
 
 fn merge_pkg_config(

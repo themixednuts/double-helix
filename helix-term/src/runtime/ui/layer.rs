@@ -9,6 +9,9 @@ pub(crate) fn apply_layer_command(
 ) {
     match cmd {
         LayerCommand::PushNotificationHistory => push_notification_history(editor, compositor),
+        LayerCommand::WorkspaceTrustPrompt { workspace } => {
+            crate::handlers::workspace_trust::push_prompt(compositor, workspace)
+        }
         LayerCommand::InvalidRegexPopup { message } => invalid_regex_popup(compositor, message),
         LayerCommand::DismissPromptIfPresent => {
             if compositor.find::<crate::ui::Prompt>().is_some() {

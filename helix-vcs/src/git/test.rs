@@ -58,7 +58,7 @@ fn missing_file() {
     let file = temp_git.path().join("file.txt");
     File::create(&file).unwrap().write_all(b"foo").unwrap();
 
-    assert!(git::get_diff_base(&file).is_err());
+    assert!(git::get_diff_base(&file, true).is_err());
 }
 
 #[test]
@@ -68,7 +68,40 @@ fn unmodified_file() {
     let contents = b"foo".as_slice();
     File::create(&file).unwrap().write_all(contents).unwrap();
     create_commit(temp_git.path(), true);
-    assert_eq!(git::get_diff_base(&file).unwrap(), Vec::from(contents));
+    assert_eq!(
+        git::get_diff_base(&file, true).unwrap(),
+        Vec::from(contents)
+    );
+}
+
+/// An untrusted repository's own filter drivers don't run: a required driver that always fails
+/// breaks the diff base only when the repository is trusted.
+#[test]
+fn untrusted_repository_config_filters_do_not_run() {
+    let temp_git = empty_git_repo();
+    let file = temp_git.path().join("file.txt");
+    let contents = b"foo".as_slice();
+    File::create(&file).unwrap().write_all(contents).unwrap();
+    create_commit(temp_git.path(), true);
+
+    exec_git_cmd(
+        &["config", "filter.broken.smudge", "false"],
+        temp_git.path(),
+    );
+    exec_git_cmd(
+        &["config", "filter.broken.required", "true"],
+        temp_git.path(),
+    );
+    File::create(temp_git.path().join(".gitattributes"))
+        .unwrap()
+        .write_all(b"*.txt filter=broken\n")
+        .unwrap();
+
+    assert_eq!(
+        git::get_diff_base(&file, false).unwrap(),
+        Vec::from(contents)
+    );
+    assert!(git::get_diff_base(&file, true).is_err());
 }
 
 #[test]
@@ -80,7 +113,10 @@ fn modified_file() {
     create_commit(temp_git.path(), true);
     File::create(&file).unwrap().write_all(b"bar").unwrap();
 
-    assert_eq!(git::get_diff_base(&file).unwrap(), Vec::from(contents));
+    assert_eq!(
+        git::get_diff_base(&file, true).unwrap(),
+        Vec::from(contents)
+    );
 }
 
 /// Test that `get_file_head` does not return content for a directory.
@@ -99,7 +135,7 @@ fn directory() {
 
     std::fs::remove_dir_all(&dir).unwrap();
     File::create(&dir).unwrap().write_all(b"bar").unwrap();
-    assert!(git::get_diff_base(&dir).is_err());
+    assert!(git::get_diff_base(&dir, true).is_err());
 }
 
 /// Test that `get_diff_base` resolves symlinks so that the same diff base is
@@ -133,8 +169,8 @@ fn symlink() {
     }
     create_commit(temp_git.path(), true);
 
-    assert_eq!(git::get_diff_base(&file_link).unwrap(), contents);
-    assert_eq!(git::get_diff_base(&file).unwrap(), contents);
+    assert_eq!(git::get_diff_base(&file_link, true).unwrap(), contents);
+    assert_eq!(git::get_diff_base(&file, true).unwrap(), contents);
 }
 
 /// Test that `get_diff_base` returns content when the file is a symlink to
@@ -165,6 +201,6 @@ fn symlink_to_git_repo() {
         panic!("symlink failed: {err}");
     }
 
-    assert_eq!(git::get_diff_base(&file_link).unwrap(), contents);
-    assert_eq!(git::get_diff_base(&file).unwrap(), contents);
+    assert_eq!(git::get_diff_base(&file_link, true).unwrap(), contents);
+    assert_eq!(git::get_diff_base(&file, true).unwrap(), contents);
 }

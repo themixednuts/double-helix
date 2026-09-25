@@ -20,6 +20,7 @@
   - [Assistant](./assistant.md)
   - [Language support](./lang-support.md)
   - [Plugins](./plugins.md)
+  - [Workspace trust](./workspace-trust.md)
 - [Ecosystem](./ecosystem.md)
   - [Migrating from Vim](./from-vim.md)
   - [Helix mode in other software](./other-software.md)

@@ -41,14 +41,14 @@ pub use config::{
     BufferLineRenderMode, BufferPickerConfig, CmdlineConfig, CmdlineIcons, CmdlineStyle,
     CompletionHighlight, CompletionHighlightType, Config, CursorShapeConfig, EditingEngineConfig,
     FileExplorerConfig, FilePickerConfig, GradientBorderConfig, GradientDirection, GutterConfig,
-    GutterLineNumbersConfig, GutterType, IndentGuidesConfig, InlineBlameConfig, InlineBlameShow,
-    KittyKeyboardProtocolConfig, LineEndingConfig, LineNumber, LspConfig, LspSelectionRangeConfig,
-    ModeConfig, NotificationBorderConfig, NotificationBorderStyle, NotificationConfig,
-    NotificationEmojis, NotificationIcons, NotificationPosition, NotificationShadowConfig,
-    NotificationStyle, PickerStartPosition, PkgConfig, PopupBorderConfig, SearchConfig,
-    SignatureHelpPosition, SmartTabConfig, StatusLineConfig, StatusLineElement, TerminalConfig,
-    WhitespaceCharacters, WhitespaceConfig, WhitespaceRender, WhitespaceRenderValue,
-    WordCompletion,
+    GutterLineNumbersConfig, GutterType, ImplicitTrustLevelConfig, IndentGuidesConfig,
+    InlineBlameConfig, InlineBlameShow, KittyKeyboardProtocolConfig, LineEndingConfig, LineNumber,
+    LspConfig, LspSelectionRangeConfig, ModeConfig, NotificationBorderConfig,
+    NotificationBorderStyle, NotificationConfig, NotificationEmojis, NotificationIcons,
+    NotificationPosition, NotificationShadowConfig, NotificationStyle, PickerStartPosition,
+    PkgConfig, PopupBorderConfig, SearchConfig, SignatureHelpPosition, SmartTabConfig,
+    StatusLineConfig, StatusLineElement, TerminalConfig, WhitespaceCharacters, WhitespaceConfig,
+    WhitespaceRender, WhitespaceRenderValue, WordCompletion, WorkspaceTrustConfig,
 };
 pub use core::Editor;
 pub use document_io::{

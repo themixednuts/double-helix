@@ -415,8 +415,13 @@ pub(crate) fn apply_runtime_task_event(
             );
         }
         RuntimeTaskEvent::BlameFetchDebounced { doc_id, path, line } => {
-            apply_blame_fetch_debounced(editor, doc_id, path, line);
+            spawn_blame_fetch(editor, ingress, doc_id, path, line);
         }
+        RuntimeTaskEvent::ApplyFileBlame {
+            doc_id,
+            line,
+            result,
+        } => apply_file_blame(editor, doc_id, line, result),
         RuntimeTaskEvent::SelectDocumentHighlights {
             offset_encoding,
             highlights,
@@ -651,10 +656,11 @@ pub(crate) fn apply_runtime_task_event(
             if !changed_grammars.is_empty() {
                 let generation = change.generation;
                 let loader_ingress = ingress.clone();
+                let trust = editor.workspace_trust.clone();
                 let loader = editor
                     .runtime()
                     .block()
-                    .spawn(helix_core::config::user_lang_loader);
+                    .spawn(move || helix_core::config::user_lang_loader(&trust));
                 editor
                     .work()
                     .spawn(async move {
@@ -996,16 +1002,46 @@ pub(crate) fn apply_exit_task_result(
     }
 }
 
-pub(crate) fn apply_blame_fetch_debounced(
-    editor: &mut Editor,
+/// Compute the file's blame on a blocking thread (it walks the file's whole history), then apply
+/// it on the main loop.
+fn spawn_blame_fetch(
+    editor: &Editor,
+    ingress: crate::runtime::RuntimeIngress,
     doc_id: DocumentId,
     path: PathBuf,
     line: Option<u32>,
 ) {
+    let trust_full = editor.diff_providers.trusts(&path);
+    let blame = editor
+        .runtime()
+        .block()
+        .spawn(move || FileBlame::try_new(path, trust_full));
+    editor
+        .work()
+        .spawn(async move {
+            let result = blame
+                .await
+                .unwrap_or_else(|error| Err(anyhow::anyhow!("blame task failed: {error}")));
+            let _ = ingress
+                .send_task(RuntimeTaskEvent::ApplyFileBlame {
+                    doc_id,
+                    line,
+                    result,
+                })
+                .await;
+        })
+        .detach();
+}
+
+pub(crate) fn apply_file_blame(
+    editor: &mut Editor,
+    doc_id: DocumentId,
+    line: Option<u32>,
+    result: anyhow::Result<FileBlame>,
+) {
     let Some(doc) = editor.document_mut(doc_id) else {
         return;
     };
-    let result = FileBlame::try_new(path);
     doc.set_file_blame(result);
     if !editor.config().inline_blame.auto_fetch {
         if let Some(line) = line {

@@ -24,6 +24,7 @@
 - [`[editor.inline-diagnostics]` Section](#editorinline-diagnostics-section)
 - [`[editor.word-completion]` Section](#editorword-completion-section)
 - [`[editor.completion-highlight]` Section](#editorcompletion-highlight-section)
+- [`[editor.workspace-trust]` Section](#editorworkspace-trust-section)
 
 ### `[editor]` Section
 
@@ -577,3 +578,14 @@ Example:
 [editor.completion-highlight]
 highlight-type = "vibrant"
 ```
+
+### `[editor.workspace-trust]` Section
+
+What workspaces are trusted with: their local config, language servers, debug adapters and
+repository git config. Only your user config sets this. See [Workspace trust](./workspace-trust.md).
+
+| Key       | Description                                                                              | Default     |
+| ---       | ---                                                                                      | ---         |
+| `level`   | Trusted without a grant: `"none"`, `"servers"` (language servers and debug adapters) or `"insecure"` (everything) | `"servers"` |
+| `prompt`  | Ask for trust when opening a file in a restricted workspace                             | `true`      |
+| `trusted` | Glob patterns of workspaces trusted without a grant (discouraged)                       | `[]`        |

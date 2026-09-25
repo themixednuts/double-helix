@@ -13,11 +13,13 @@ pub use dto::{
     ActivationHistory, ActivePackage, AssistantLayout, AssistantPermission, AssistantThread,
     FrecencyEntry, PackageActivation, PackageState, PackageStateCommit, PkgReceipt, QueryHistory,
     RegistryHead, RuntimeAsset, RuntimeAssetKind, RuntimeAssetSpec, RuntimeSnapshot,
+    WorkspaceTrustGrant,
 };
 pub use error::{Error, Result};
 pub use repos::{
     AssistantLayoutRepo, AssistantPermissionsRepo, AssistantThreadsRepo, FrecencyRepo,
     PackageStateRepo, PkgReceiptsRepo, QueryHistoryRepo, RegistryHeadsRepo, RuntimeAssetsRepo,
+    WorkspaceTrustRepo,
 };
 
 use backend::DrizzleBackend;
@@ -119,6 +121,11 @@ impl Store {
     #[must_use]
     pub fn registry_heads(&mut self) -> RegistryHeadsRepo<'_> {
         RegistryHeadsRepo::new(&mut self.state)
+    }
+
+    #[must_use]
+    pub fn workspace_trust(&mut self) -> WorkspaceTrustRepo<'_> {
+        WorkspaceTrustRepo::new(&mut self.state)
     }
 
     /// Returns the SQLite journal mode currently reported by the durable state database.

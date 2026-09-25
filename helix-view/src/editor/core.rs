@@ -102,6 +102,8 @@ pub struct Editor {
         std::collections::BTreeMap<PathBuf, WorkspaceDiagnosticCounts>,
     pub workspace_diagnostic_counts: WorkspaceDiagnosticCounts,
     pub diff_providers: DiffProviderRegistry,
+    /// What each workspace is trusted with (local config, servers, git config).
+    pub workspace_trust: helix_loader::workspace_trust::WorkspaceTrust,
 
     pub debug_adapters: dap::registry::Registry,
     pub breakpoints: HashMap<PathBuf, Vec<Breakpoint>>,

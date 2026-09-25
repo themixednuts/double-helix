@@ -1265,6 +1265,12 @@ pub enum RuntimeTaskEvent {
         path: PathBuf,
         line: Option<u32>,
     },
+    /// A file's blame, computed off the main loop, to store on the document.
+    ApplyFileBlame {
+        doc_id: DocumentId,
+        line: Option<u32>,
+        result: anyhow::Result<helix_vcs::FileBlame>,
+    },
     /// Apply document highlight selections on the editor main loop.
     SelectDocumentHighlights {
         offset_encoding: helix_lsp::OffsetEncoding,

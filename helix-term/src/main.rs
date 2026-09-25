@@ -147,14 +147,17 @@ FLAGS:
         }
     };
 
-    let lang_loader = helix_core::config::user_lang_loader().unwrap_or_else(|err| {
-        eprintln!("{}", err);
-        eprintln!("Press <ENTER> to continue with default language config");
-        use std::io::Read;
-        // This waits for an enter press.
-        let _ = std::io::stdin().read(&mut []);
-        helix_core::config::default_lang_loader()
-    });
+    let workspace_trust =
+        helix_loader::workspace_trust::WorkspaceTrust::new((&config.editor.workspace_trust).into());
+    let lang_loader =
+        helix_core::config::user_lang_loader(&workspace_trust).unwrap_or_else(|err| {
+            eprintln!("{}", err);
+            eprintln!("Press <ENTER> to continue with default language config");
+            use std::io::Read;
+            // This waits for an enter press.
+            let _ = std::io::stdin().read(&mut []);
+            helix_core::config::default_lang_loader()
+        });
 
     let remote = match args.remote.clone() {
         Some(uri) => Some(connect_remote_workspace(&uri).await?),

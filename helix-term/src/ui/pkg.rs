@@ -651,10 +651,18 @@ fn manager_with_kind(
     Ok(manager)
 }
 
+/// The language config the catalog lists tools for. A workspace's `languages.toml` counts only
+/// once the workspace was explicitly trusted, so an untrusted checkout can't put tools up for
+/// install.
+fn catalog_lang_config() -> helix_core::syntax::config::Configuration {
+    let trust = helix_loader::workspace_trust::WorkspaceTrust::explicit_grants_only();
+    user_lang_config(&trust).unwrap_or_else(|_| default_lang_config())
+}
+
 fn load_catalog_data(ops: &Ops) -> anyhow::Result<PkgManagerData> {
     let receipts = ops.store().receipts()?;
     let runtime_assets = helix_loader::runtime_assets()?;
-    let config = user_lang_config().unwrap_or_else(|_| default_lang_config());
+    let config = catalog_lang_config();
     let grammars = helix_loader::grammar::configured_grammar_names()?;
     let mut entries: Vec<_> = CapabilityCatalog::new(ops.registry(), runtime_assets)
         .receipts(receipts)
@@ -680,7 +688,7 @@ fn load_data(ops: &Ops) -> anyhow::Result<PkgManagerData> {
     let doctor = ops.doctor().ok();
     let runtime_assets = helix_loader::runtime_assets()?;
 
-    let config = user_lang_config().unwrap_or_else(|_| default_lang_config());
+    let config = catalog_lang_config();
     let grammars = helix_loader::grammar::configured_grammar_names()?;
     let mut entries: Vec<_> = CapabilityCatalog::new(ops.registry(), runtime_assets)
         .receipts(receipts)

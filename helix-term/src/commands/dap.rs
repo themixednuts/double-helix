@@ -61,6 +61,15 @@ pub fn dap_start_impl(
     params: Option<Vec<std::borrow::Cow<str>>>,
 ) -> Result<(), anyhow::Error> {
     let (_, doc) = focused_ref!(cx.editor);
+    // Debug adapters run what the language config says: only in workspaces trusted for them.
+    if doc.workspace_root().is_some_and(|workspace| {
+        !cx.editor
+            .workspace_trust
+            .query(workspace, helix_loader::workspace_trust::TrustQuery::Dap)
+            .is_trusted()
+    }) {
+        bail!("Workspace is not trusted. Run `:workspace-trust` to enable the debug adapter.");
+    }
     let config = doc
         .language_config()
         .and_then(|config| config.debugger.as_ref())

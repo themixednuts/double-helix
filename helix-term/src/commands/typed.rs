@@ -3007,6 +3007,72 @@ fn refresh_config(
     queue_config_event(cx, ConfigEvent::Refresh)
 }
 
+/// The focused document's workspace, for the workspace trust commands.
+fn current_workspace(cx: &compositor::Context) -> anyhow::Result<std::path::PathBuf> {
+    let (_, doc) = focused_ref!(cx.editor);
+    doc.workspace_root()
+        .map(std::path::Path::to_path_buf)
+        .context("workspace trust applies to local workspaces; this document is remote")
+}
+
+fn workspace_trust(
+    cx: &mut compositor::Context,
+    _args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+    let workspace = current_workspace(cx)?;
+    let saved = cx.editor.workspace_trust.trust(&workspace);
+    // Reloading loads the workspace config and starts the servers trust allows.
+    queue_config_event(cx, ConfigEvent::Refresh)?;
+    saved.context("trusted for this session only: saving the decision failed")?;
+    cx.editor
+        .set_status(format!("Trusted workspace {}", workspace.display()));
+    Ok(())
+}
+
+fn workspace_untrust(
+    cx: &mut compositor::Context,
+    _args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+    let workspace = current_workspace(cx)?;
+    let saved = cx.editor.workspace_trust.untrust(&workspace);
+    // Drops workspace config from the live config. Running language servers keep running
+    // (`:lsp-stop` stops them).
+    queue_config_event(cx, ConfigEvent::Refresh)?;
+    saved.context("saving the decision failed")?;
+    cx.editor.set_status(format!(
+        "Revoked trust for workspace {}",
+        workspace.display()
+    ));
+    Ok(())
+}
+
+fn workspace_exclude(
+    cx: &mut compositor::Context,
+    _args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+    let workspace = current_workspace(cx)?;
+    let saved = cx.editor.workspace_trust.exclude(&workspace);
+    queue_config_event(cx, ConfigEvent::Refresh)?;
+    saved.context("excluded for this session only: saving the decision failed")?;
+    cx.editor.set_status(format!(
+        "Excluded workspace {}: it won't ask for trust again",
+        workspace.display()
+    ));
+    Ok(())
+}
+
 fn queue_config_event(cx: &mut compositor::Context, event: ConfigEvent) -> anyhow::Result<()> {
     match cx.editor.config_events.0.try_send(event) {
         Ok(()) => Ok(()),
@@ -5340,6 +5406,39 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         signature: Signature {
             positionals: (0, None),
             raw_after: Some(1),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "workspace-trust",
+        aliases: &[],
+        doc: "Trust the current workspace: load its local config and allow language servers, debug adapters and its git config.",
+        fun: workspace_trust,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "workspace-untrust",
+        aliases: &[],
+        doc: "Revoke the current workspace's trust grant or exclusion.",
+        fun: workspace_untrust,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "workspace-exclude",
+        aliases: &[],
+        doc: "Never trust the current workspace, and don't ask again.",
+        fun: workspace_exclude,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
             ..Signature::DEFAULT
         },
     },

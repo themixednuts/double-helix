@@ -3782,6 +3782,19 @@ impl Document {
         self.file.location()
     }
 
+    /// The local workspace this document belongs to, for workspace trust; `None` for remote and
+    /// shared documents. Cached until the document's location changes.
+    pub fn workspace_root(&self) -> Option<&Path> {
+        self.file.workspace_root()
+    }
+
+    /// Whether the document's language would start a language server or has a debugger: what
+    /// trusting its workspace can unlock beyond local config.
+    pub fn servers_to_load(&self) -> bool {
+        self.language_config()
+            .is_some_and(|lang| !lang.language_servers.is_empty() || lang.debugger.is_some())
+    }
+
     pub fn remote_location(&self) -> Option<&RemoteDocumentLocation> {
         self.file.remote()
     }

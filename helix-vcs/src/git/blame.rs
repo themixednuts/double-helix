@@ -87,10 +87,11 @@ impl FileBlame {
         line_blame
     }
 
-    /// Compute blame for this file (expensive)
-    pub fn try_new(file: PathBuf) -> Result<Self> {
+    /// Compute blame for this file (expensive: run it off the main thread). `trust_full` is
+    /// whether workspace trust allows the repository's own config.
+    pub fn try_new(file: PathBuf, trust_full: bool) -> Result<Self> {
         let thread_safe_repo =
-            open_repo(get_repo_dir(&file)?).context("Failed to open git repo")?;
+            open_repo(get_repo_dir(&file)?, trust_full).context("Failed to open git repo")?;
         let repo = thread_safe_repo.to_thread_local();
         let head = repo.head()?.peel_to_commit()?.id;
 

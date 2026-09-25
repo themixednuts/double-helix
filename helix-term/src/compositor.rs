@@ -329,6 +329,8 @@ struct GlobalStatusRowRender {
     message: Option<(Arc<str>, helix_view::graphics::Style)>,
     pending: Option<crate::ui::statusline::PendingKeys>,
     pending_style: helix_view::graphics::Style,
+    /// Show `[⚠]`: the workspace runs restricted and `:workspace-trust` would change that.
+    workspace_restricted: bool,
 }
 
 impl GlobalStatusRowRender {
@@ -358,6 +360,7 @@ impl GlobalStatusRowRender {
             message,
             pending,
             pending_style: theme.get("ui.text"),
+            workspace_restricted: ctx.workspace_restricted(),
         }
     }
 
@@ -370,10 +373,18 @@ impl GlobalStatusRowRender {
             tui::ratatui::to_ratatui_style(self.background),
         );
 
-        let pending_width = self.pending.as_ref().map_or(0, |pending| {
-            let display_width = pending.display.width().min(15) as u16;
-            display_width.saturating_add(u16::from(pending.register.is_some()) * 3)
-        });
+        // Right to left: the macro register `[q]`, the trust indicator `[⚠]`, pending keys.
+        let register_width = self
+            .pending
+            .as_ref()
+            .map_or(0, |pending| u16::from(pending.register.is_some()) * 3);
+        let trust_width = u16::from(self.workspace_restricted) * 3;
+        let pending_width = self
+            .pending
+            .as_ref()
+            .map_or(0, |pending| pending.display.width().min(15) as u16)
+            .saturating_add(register_width)
+            .saturating_add(trust_width);
         if let Some((message, style)) = self.message {
             let message_width = self
                 .area
@@ -389,16 +400,29 @@ impl GlobalStatusRowRender {
             );
         }
 
+        let right_edge = self.area.right();
+        if self.workspace_restricted {
+            let style = self
+                .pending_style
+                .fg(helix_view::graphics::Color::Yellow)
+                .add_modifier(helix_view::graphics::Modifier::BOLD);
+            surface.set_stringn(
+                right_edge.saturating_sub(register_width + 3),
+                self.area.y,
+                "[⚠]",
+                3,
+                tui::ratatui::to_ratatui_style(style),
+            );
+        }
         let Some(pending) = self.pending else {
             return;
         };
         let display_width = pending.display.width().min(15) as u16;
-        let right_edge = self.area.right();
         if display_width > 0 {
             surface.set_stringn(
                 right_edge
                     .saturating_sub(display_width)
-                    .saturating_sub(u16::from(pending.register.is_some()) * 3),
+                    .saturating_sub(register_width + trust_width),
                 self.area.y,
                 &pending.display,
                 display_width as usize,

@@ -244,14 +244,34 @@ pub fn build_grammars(target: Option<String>, strict: bool) -> Result<()> {
     Ok(())
 }
 
+/// The language config grammars come from. Grammar sources are git URLs that get cloned and
+/// compiled into libraries the editor loads, so a workspace's `languages.toml` only counts once
+/// the workspace was explicitly trusted (`:workspace-trust`); configured implicit trust does not
+/// apply here.
+fn grammar_lang_config() -> Result<Configuration> {
+    let trust = crate::workspace_trust::WorkspaceTrust::explicit_grants_only();
+    let workspace_languages = crate::workspace_lang_config_file();
+    if workspace_languages.exists()
+        && !trust
+            .query_current(crate::workspace_trust::TrustQuery::LocalConfig)
+            .is_trusted()
+    {
+        log::info!(
+            "skipping {} for grammars: the workspace is not trusted",
+            workspace_languages.display()
+        );
+    }
+    Ok(crate::config::user_lang_config(&trust)
+        .context("Could not parse languages.toml")?
+        .try_into()?)
+}
+
 // Returns the set of grammar configurations the user requests.
 // Grammars are configured in the default and user `languages.toml` and are
 // merged. The `grammar_selection` key of the config is then used to filter
 // down all grammars into a subset of the user's choosing.
 fn get_grammar_configs() -> Result<Vec<GrammarConfiguration>> {
-    let config: Configuration = crate::config::user_lang_config()
-        .context("Could not parse languages.toml")?
-        .try_into()?;
+    let config = grammar_lang_config()?;
 
     let grammars = match config.grammar_selection {
         Some(GrammarSelection::Only { only: selections }) => config
@@ -279,9 +299,7 @@ pub fn configured_grammar_names() -> Result<BTreeSet<String>> {
 }
 
 pub fn get_grammar_names() -> Result<Option<HashSet<String>>> {
-    let config: Configuration = crate::config::user_lang_config()
-        .context("Could not parse languages.toml")?
-        .try_into()?;
+    let config = grammar_lang_config()?;
 
     let grammars = match config.grammar_selection {
         Some(GrammarSelection::Only { only: selections }) => Some(selections),

@@ -408,9 +408,70 @@ pub struct Config {
     pub editing_engine: EditingEngineConfig,
     #[serde(default)]
     pub pkg: PkgConfig,
+    /// `[editor.workspace-trust]`: what workspaces are trusted with. Only the user config sets
+    /// this; a workspace config can't loosen its own gate.
+    #[serde(default)]
+    pub workspace_trust: WorkspaceTrustConfig,
 }
 
 pub type PkgConfig = helix_pkg::PkgConfig;
+
+/// `[editor.workspace-trust]`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
+pub struct WorkspaceTrustConfig {
+    /// What every workspace is trusted with, without a grant.
+    pub level: ImplicitTrustLevelConfig,
+    /// Whether opening a file in a restricted workspace asks for trust. The statusline `[⚠]`
+    /// shows either way.
+    pub prompt: bool,
+    /// Glob patterns of workspaces to trust without a grant (discouraged: skips the change
+    /// check on local config).
+    pub trusted: Vec<String>,
+}
+
+impl Default for WorkspaceTrustConfig {
+    fn default() -> Self {
+        Self {
+            level: ImplicitTrustLevelConfig::default(),
+            prompt: true,
+            trusted: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ImplicitTrustLevelConfig {
+    /// Nothing: language servers, debug adapters, local config and git config all need a grant.
+    None,
+    /// Language servers and debug adapters (their binaries are configured globally); local
+    /// config and repository git config need a grant.
+    #[default]
+    Servers,
+    /// Everything, except excluded workspaces.
+    Insecure,
+}
+
+impl From<ImplicitTrustLevelConfig> for helix_loader::workspace_trust::ImplicitTrustLevel {
+    fn from(level: ImplicitTrustLevelConfig) -> Self {
+        match level {
+            ImplicitTrustLevelConfig::None => Self::None,
+            ImplicitTrustLevelConfig::Servers => Self::Servers,
+            ImplicitTrustLevelConfig::Insecure => Self::Insecure,
+        }
+    }
+}
+
+impl From<&WorkspaceTrustConfig> for helix_loader::workspace_trust::Config {
+    fn from(config: &WorkspaceTrustConfig) -> Self {
+        Self {
+            level: config.level.into(),
+            prompt: config.prompt,
+            trusted_globs: helix_loader::workspace_trust::build_trusted_globs(&config.trusted),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", default, deny_unknown_fields)]
@@ -1609,6 +1670,7 @@ impl Default for Config {
             assistant: AssistantConfig::default(),
             editing_engine: EditingEngineConfig::default(),
             pkg: PkgConfig::default(),
+            workspace_trust: WorkspaceTrustConfig::default(),
         }
     }
 }

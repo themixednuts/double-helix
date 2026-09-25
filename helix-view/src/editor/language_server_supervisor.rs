@@ -367,6 +367,17 @@ impl Editor {
             self.remove_document_language_server_demands(document, &HashSet::new());
             return;
         }
+        // Local documents start servers only in workspaces trusted for them; remote and shared
+        // documents run theirs on the host.
+        if doc.workspace_root().is_some_and(|workspace| {
+            !self
+                .workspace_trust
+                .query(workspace, helix_loader::workspace_trust::TrustQuery::Lsp)
+                .is_trusted()
+        }) {
+            self.remove_document_language_server_demands(document, &HashSet::new());
+            return;
+        }
         let Some(language) = doc.language_configuration().cloned() else {
             self.remove_document_language_server_demands(document, &HashSet::new());
             return;

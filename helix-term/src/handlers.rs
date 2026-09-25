@@ -28,6 +28,7 @@ mod selection_range;
 mod signature_help;
 mod snippet;
 mod syntax;
+pub(crate) mod workspace_trust;
 
 fn attach_assistant_hooks(editor: &helix_view::Editor) {
     editor.lifecycle().on_document_close(move |event| {
@@ -86,7 +87,8 @@ pub fn attach(
     snippet::attach(editor, handlers);
     document_colors::attach(editor, handlers, ingress.clone());
     lsp_features::attach(editor, handlers, ingress.clone());
-    prompt::attach(editor, handlers, foreground);
+    prompt::attach(editor, handlers, foreground.clone());
+    workspace_trust::attach(editor, foreground);
     blame::attach(editor, handlers);
     attach_assistant_hooks(editor);
 }

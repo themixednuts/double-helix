@@ -133,6 +133,18 @@ CREATE TABLE IF NOT EXISTS pkg_registry_heads (
 );
 "#,
     },
+    Migration {
+        version: 5,
+        name: "workspace_trust",
+        sql: r#"
+CREATE TABLE IF NOT EXISTS workspace_trust (
+    workspace TEXT PRIMARY KEY NOT NULL,
+    hash TEXT,
+    excluded INTEGER NOT NULL DEFAULT 0 CHECK(excluded IN (0, 1)),
+    updated_at INTEGER NOT NULL
+);
+"#,
+    },
 ];
 
 const CACHE_MIGRATIONS: &[Migration] = &[Migration {

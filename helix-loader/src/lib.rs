@@ -1,6 +1,7 @@
 pub mod assets;
 pub mod config;
 pub mod grammar;
+pub mod workspace_trust;
 
 use helix_stdx::{env::current_working_dir, path};
 
@@ -129,6 +130,13 @@ pub fn workspace_config_file() -> PathBuf {
         .0
         .join(WORKSPACE_CONFIG_DIR)
         .join("config.toml")
+}
+
+pub fn workspace_lang_config_file() -> PathBuf {
+    find_workspace()
+        .0
+        .join(WORKSPACE_CONFIG_DIR)
+        .join("languages.toml")
 }
 
 pub fn workspace_ignore_file_name() -> &'static str {

@@ -3339,8 +3339,8 @@ bin = "demo.exe"
         let dir = TempDir::new().unwrap();
         let bin = dir.path().join("bin");
         fs::create_dir_all(&bin).unwrap();
-        fs::write(bin.join(executable_name("dnf")), b"").unwrap();
-        fs::write(bin.join(executable_name("apt")), b"").unwrap();
+        write_fake_executable(&bin, "dnf");
+        write_fake_executable(&bin, "apt");
         let paths = std::env::join_paths([bin]).unwrap();
         let source = NativeSource {
             apt: Some("demo".to_owned()),
@@ -3654,11 +3654,19 @@ bin = "demo.exe"
         zip.finish().unwrap();
     }
 
-    fn executable_name(name: &str) -> String {
-        if cfg!(windows) {
-            format!("{name}.exe")
+    /// An empty file that `which` resolves as the command `name`: `name.exe` on Windows, and
+    /// executable elsewhere, since `which` skips files without the execute bit.
+    fn write_fake_executable(dir: &Path, name: &str) {
+        let path = if cfg!(windows) {
+            dir.join(format!("{name}.exe"))
         } else {
-            name.to_owned()
+            dir.join(name)
+        };
+        fs::write(&path, b"").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
         }
     }
 

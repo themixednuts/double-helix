@@ -104,6 +104,13 @@ pub(super) struct LabelEdit {
     pub(super) cursor: usize,
 }
 
+impl LabelEdit {
+    /// The row being edited is a placeholder with nothing on disk behind it.
+    pub(super) fn is_create(&self) -> bool {
+        matches!(self.kind, LabelEditKind::Create { .. })
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(super) enum LabelEditKind {
     /// Renaming an existing path. `source` is the on-disk path of the row

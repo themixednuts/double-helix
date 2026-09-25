@@ -2444,7 +2444,17 @@ impl FileExplorerPanel {
         _editor: &Editor,
         ingress: crate::runtime::RuntimeIngress,
     ) -> Option<FileExplorerPreviewRequest> {
-        let Some(row) = self.selected().filter(|row| !row.is_dir).cloned() else {
+        // A create row stands in for a file that doesn't exist yet; previewing
+        // it would open an empty document for the placeholder path.
+        let creating = self
+            .label_edit
+            .as_ref()
+            .is_some_and(|edit| edit.is_create() && edit.row_index == self.selection);
+        let Some(row) = self
+            .selected()
+            .filter(|row| !row.is_dir && !creating)
+            .cloned()
+        else {
             self.cancel_preview_request(&ingress);
             log::info!(
                 "[file_explorer] preview_queue_skip reason=no_selected_file selection={} selected={}",
@@ -6695,6 +6705,30 @@ mod tests {
             assert!(panel.preview_request.is_none());
             assert!(panel.preview_generation > request.generation);
             assert!(ingress.take_file_explorer_preview(&request).is_none());
+        });
+    }
+
+    #[test]
+    fn create_row_is_not_previewed() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("main.rs"), "fn main() {}\n").unwrap();
+        let rt = helix_runtime::test::RuntimeTest::default();
+        rt.block_on(async {
+            let mut editor = test_editor(100, 30, rt.runtime());
+            let mut panel = FileExplorerPanel::new(temp.path().to_path_buf(), &editor).unwrap();
+            let (ingress, _receiver) =
+                crate::runtime::RuntimeIngress::channel(rt.runtime().clone());
+            panel.seek_to(row_index_by_name(&panel, "main.rs"));
+
+            with_context(&mut editor, &rt, |cx| {
+                panel.execute_action(ExplorerAction::EnterCreate(CreatePlacement::Below), cx)
+            });
+
+            assert!(panel.label_edit.as_ref().is_some_and(LabelEdit::is_create));
+            assert!(panel
+                .queue_selected_preview_request(&editor, ingress)
+                .is_none());
+            assert!(panel.preview_request.is_none());
         });
     }
 

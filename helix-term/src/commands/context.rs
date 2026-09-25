@@ -199,8 +199,11 @@ impl Context<'_> {
                     };
                     match (cp.resolve)(event, count) {
                         CharPendingResolution::Motion(motion) => {
-                            cx.editor
-                                .apply_motion(move |ed| motion(ed, view_id, doc_id, movement));
+                            cx.editor.apply_motion_in(
+                                view_id,
+                                doc_id,
+                                move |ed, view_id, doc_id| motion(ed, view_id, doc_id, movement),
+                            );
                         }
                         CharPendingResolution::Action(action) => {
                             action(cx.editor, view_id, doc_id, register);

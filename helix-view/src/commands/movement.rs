@@ -947,7 +947,7 @@ fn goto_para_impl<F>(
         + 'static,
 {
     let movement = movement_from_mode(editor);
-    editor.apply_motion(move |ed: &mut Editor| {
+    editor.apply_motion_in(view_id, doc_id, move |ed: &mut Editor, view_id, doc_id| {
         ed.with_view_doc_mut(view_id, doc_id, |view, doc| {
             goto_paragraph_in(view, doc, count, move_fn, movement);
         });
@@ -1396,6 +1396,31 @@ pub fn scroll(
     editor.with_view_doc_mut(view_id, doc_id, |view, doc| {
         scroll_in(view, doc, mode, scrolloff, offset, direction, sync_cursor);
     });
+}
+
+/// Scroll by `count` pages of the view's height, or half pages when `half` is set.
+#[allow(clippy::too_many_arguments)]
+pub fn scroll_page(
+    editor: &mut Editor,
+    view_id: ViewId,
+    doc_id: DocumentId,
+    count: usize,
+    half: bool,
+    direction: Direction,
+    sync_cursor: bool,
+) {
+    let height = editor.with_view_doc_mut(view_id, doc_id, |view, doc| {
+        usize::from(view.text_area(doc).height)
+    });
+    let page = if half { height / 2 } else { height };
+    scroll(
+        editor,
+        view_id,
+        doc_id,
+        page.max(1).saturating_mul(count.max(1)),
+        direction,
+        sync_cursor,
+    );
 }
 
 /// Scroll a text viewport by visual lines.

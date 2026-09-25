@@ -162,9 +162,15 @@ pub fn open(
     editor.mode = Mode::Insert;
     let config = editor.config();
     let doc = crate::doc!(editor, &doc_id);
-    let view = crate::view!(editor, view_id);
     let loader = editor.syn_loader.load();
-    let mut annotations = view.text_annotations(doc, None);
+    // Component regions (prompts, the assistant composer) have views outside the window tree
+    // and no folds, so they get empty annotations.
+    let mut annotations = match crate::view::AnyViewRef::from_editor(editor, view_id) {
+        crate::view::AnyViewRef::Tree(view) => view.text_annotations(doc, None),
+        crate::view::AnyViewRef::Component(_) => {
+            helix_core::text_annotations::TextAnnotations::default()
+        }
+    };
 
     let text = doc.text().slice(..);
     let contents = doc.text();
@@ -3343,6 +3349,103 @@ mod tests {
             .expect("document")
             .set_selection(view_id, Selection::single(0, end));
         (editor, view_id, doc_id)
+    }
+
+    #[test]
+    fn repeated_motion_follows_focus_after_its_view_closes() {
+        let (mut editor, first_view, first_doc) = test_editor_with_text("a\n\nb\n\nc\n");
+        crate::commands::movement::goto_next_paragraph(&mut editor, first_view, first_doc, 1);
+
+        let second_doc =
+            editor.new_file_from_document(Action::VerticalSplit, test_doc("x\n\ny\n\nz\n"));
+        let second_view = editor.tree.focus;
+        editor
+            .document_mut(second_doc)
+            .expect("second document")
+            .set_selection(second_view, Selection::point(0));
+        editor.close(first_view);
+        assert_eq!(editor.tree.focus, second_view);
+
+        editor.repeat_last_motion(1);
+
+        let doc = editor.document(second_doc).expect("second document");
+        assert_ne!(doc.selection(second_view).primary(), Range::point(0));
+    }
+
+    #[test]
+    fn page_and_half_page_scroll_by_view_height() {
+        let text: String = (0..200).map(|line| format!("line {line}\n")).collect();
+        let (mut editor, view_id, doc_id) = test_editor_with_text(&text);
+        editor
+            .document_mut(doc_id)
+            .expect("document")
+            .set_selection(view_id, Selection::point(0));
+        let height = {
+            let doc = editor.document(doc_id).expect("document");
+            usize::from(editor.tree.get(view_id).inner_area(doc).height)
+        };
+        assert!(height > 2);
+        let top_line = |editor: &Editor| {
+            let doc = editor.document(doc_id).expect("document");
+            doc.text().char_to_line(doc.view_offset(view_id).anchor)
+        };
+
+        crate::commands::movement::scroll_page(
+            &mut editor,
+            view_id,
+            doc_id,
+            1,
+            false,
+            Direction::Forward,
+            false,
+        );
+        assert_eq!(top_line(&editor), height);
+
+        crate::commands::movement::scroll_page(
+            &mut editor,
+            view_id,
+            doc_id,
+            2,
+            true,
+            Direction::Backward,
+            true,
+        );
+        assert_eq!(top_line(&editor), height - 2 * (height / 2));
+    }
+
+    #[test]
+    fn repeated_motion_is_skipped_once_every_view_is_gone() {
+        let (mut editor, view_id, doc_id) = test_editor_with_text("a\n\nb\n");
+        crate::commands::movement::goto_next_paragraph(&mut editor, view_id, doc_id, 1);
+        editor.close(view_id);
+
+        editor.repeat_last_motion(1);
+    }
+
+    #[test]
+    fn open_below_works_in_a_component_view() {
+        let (mut editor, _, _) = test_editor_with_text("");
+        let doc_id = editor.new_component_doc(test_doc("foo\n"));
+        let view_id = editor.allocate_view_id();
+        editor.ensure_component_view(view_id, doc_id);
+        editor
+            .document_mut(doc_id)
+            .expect("component document")
+            .set_selection(view_id, Selection::single(0, 4));
+
+        open(
+            &mut editor,
+            view_id,
+            doc_id,
+            1,
+            Open::Below,
+            CommentContinuation::Disabled,
+        );
+
+        let doc = editor.document(doc_id).expect("component document");
+        assert_eq!(doc.text().len_lines(), 3);
+        assert!(doc.text().to_string().starts_with("foo"));
+        assert_eq!(editor.mode(), Mode::Insert);
     }
 
     fn lsp_selection_range(

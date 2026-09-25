@@ -440,6 +440,47 @@ impl Editor {
         self.last_motion = Some(Box::new(motion));
     }
 
+    /// Like [`Self::apply_motion`], for motions that act on a specific view and document.
+    ///
+    /// A repeat (`A-.`) targets the recorded view only while it is still focused (or is a live
+    /// component view) and still shows the same document. Otherwise it follows focus, so a
+    /// closed split or buffer never leaves a dangling id behind.
+    pub fn apply_motion_in<F>(&mut self, view_id: crate::ViewId, doc_id: DocumentId, motion: F)
+    where
+        F: Fn(&mut Self, crate::ViewId, DocumentId) + Send + Sync + 'static,
+    {
+        motion(self, view_id, doc_id);
+        self.last_motion = Some(Box::new(move |editor: &mut Self| {
+            if let Some((view_id, doc_id)) = editor.motion_target(view_id, doc_id) {
+                motion(editor, view_id, doc_id);
+            }
+        }));
+    }
+
+    fn motion_target(
+        &self,
+        view_id: crate::ViewId,
+        doc_id: DocumentId,
+    ) -> Option<(crate::ViewId, DocumentId)> {
+        let recorded_is_live = if self.tree.contains(view_id) {
+            self.tree.focus == view_id
+                && self
+                    .tree
+                    .try_get(view_id)
+                    .is_some_and(|view| view.doc == doc_id)
+        } else {
+            self.component_views
+                .get(&view_id)
+                .is_some_and(|view| view.doc == doc_id)
+        };
+        if recorded_is_live && self.document(doc_id).is_some() {
+            return Some((view_id, doc_id));
+        }
+        let focus = self.tree.focus;
+        let doc_id = self.tree.try_get(focus)?.doc;
+        self.document(doc_id).is_some().then_some((focus, doc_id))
+    }
+
     pub fn repeat_last_motion(&mut self, count: usize) {
         if let Some(motion) = self.last_motion.take() {
             for _ in 0..count {

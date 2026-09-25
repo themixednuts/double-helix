@@ -1585,7 +1585,7 @@ fn register_actions(catalog: &mut impl EngineCommandCatalog) {
         "Move page up",
         CommandScope::Viewport,
         |ed, vid, did, count, _reg| {
-            mv::scroll(ed, vid, did, count, Direction::Backward, true);
+            mv::scroll_page(ed, vid, did, count, false, Direction::Backward, false);
         },
     );
     catalog.action(
@@ -1593,7 +1593,7 @@ fn register_actions(catalog: &mut impl EngineCommandCatalog) {
         "Move page down",
         CommandScope::Viewport,
         |ed, vid, did, count, _reg| {
-            mv::scroll(ed, vid, did, count, Direction::Forward, true);
+            mv::scroll_page(ed, vid, did, count, false, Direction::Forward, false);
         },
     );
     catalog.action(
@@ -1601,7 +1601,7 @@ fn register_actions(catalog: &mut impl EngineCommandCatalog) {
         "Move page and cursor half up",
         CommandScope::Viewport,
         |ed, vid, did, count, _reg| {
-            mv::scroll(ed, vid, did, count, Direction::Backward, true);
+            mv::scroll_page(ed, vid, did, count, true, Direction::Backward, true);
         },
     );
     catalog.action(
@@ -1609,7 +1609,7 @@ fn register_actions(catalog: &mut impl EngineCommandCatalog) {
         "Move page and cursor half down",
         CommandScope::Viewport,
         |ed, vid, did, count, _reg| {
-            mv::scroll(ed, vid, did, count, Direction::Forward, true);
+            mv::scroll_page(ed, vid, did, count, true, Direction::Forward, true);
         },
     );
 

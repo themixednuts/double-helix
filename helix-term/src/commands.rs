@@ -3780,11 +3780,15 @@ fn goto_ts_object_impl(cx: &mut Context, object: &'static str, direction: Direct
     let count = cx.count();
     let (view_id, doc) = focused!(cx.editor);
     let doc_id = doc.id();
-    cx.editor.apply_motion(move |editor: &mut Editor| {
-        helix_view::commands::movement::goto_ts_object(
-            editor, view_id, doc_id, object, direction, count,
-        );
-    });
+    cx.editor.apply_motion_in(
+        view_id,
+        doc_id,
+        move |editor: &mut Editor, view_id, doc_id| {
+            helix_view::commands::movement::goto_ts_object(
+                editor, view_id, doc_id, object, direction, count,
+            );
+        },
+    );
 }
 
 fn goto_next_xml_element(cx: &mut Context) {

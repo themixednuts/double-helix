@@ -1714,14 +1714,6 @@ impl EditingEngine for VimEngine {
         }
     }
 
-    fn editor_mode(&self) -> Mode {
-        match self.sub_mode {
-            SubMode::Normal | SubMode::OperatorPending(_) => Mode::Normal,
-            SubMode::Insert => Mode::Insert,
-            SubMode::Visual | SubMode::VisualLine | SubMode::VisualBlock => Mode::Select,
-        }
-    }
-
     fn pending_display(&self) -> &str {
         &self.pending_display_buf
     }
@@ -1749,10 +1741,6 @@ impl EditingEngine for VimEngine {
 
     fn name(&self) -> &str {
         "vim"
-    }
-
-    fn last_action(&self) -> Option<&RecordedAction> {
-        self.last_action.as_ref()
     }
 
     fn repeat_last(

@@ -322,10 +322,6 @@ impl KeymapQuery for ModalKeymaps {
         Self::pending(self)
     }
 
-    fn has_sticky(&self) -> bool {
-        self.sticky.is_some()
-    }
-
     fn sticky_infobox(&self) -> Option<Info> {
         self.sticky.as_ref().map(ModalTrieNode::infobox)
     }

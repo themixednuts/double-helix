@@ -19,10 +19,6 @@ helix-core = { path = "../helix-core", optional = true }
 helix-view = { path = "../helix-view", optional = true }
 log = { version = "0.4", optional = true }
 
-[[example]]
-name = "standalone"
-required-features = []
-
 [dev-dependencies]
 arc-swap.workspace = true
 helix-loader = { path = "../helix-loader" }

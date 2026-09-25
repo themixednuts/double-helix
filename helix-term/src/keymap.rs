@@ -681,57 +681,6 @@ fn semantic_modal_binding(cmd: &MappableCommand) -> Option<ModalIntentBinding> {
     }
 }
 
-pub fn to_modal_keymaps(map: &HashMap<Mode, KeyTrie>) -> HashMap<Mode, ModalKeyTrie> {
-    map.iter()
-        .filter_map(|(&mode, trie)| to_modal_trie(trie).map(|trie| (mode, trie)))
-        .collect()
-}
-
-fn to_modal_trie(trie: &KeyTrie) -> Option<ModalKeyTrie> {
-    match trie {
-        KeyTrie::MappableCommand(MappableCommand::Engine { spec }) => Some(ModalKeyTrie::Binding(
-            ModalCommandBinding::new(spec.token(), spec.doc()),
-        )),
-        KeyTrie::MappableCommand(
-            MappableCommand::Frontend { .. }
-            | MappableCommand::Typable { .. }
-            | MappableCommand::Macro { .. },
-        ) => None,
-        KeyTrie::Sequence(cmds) => {
-            let commands = cmds
-                .iter()
-                .filter_map(|cmd| match cmd {
-                    MappableCommand::Engine { spec } => {
-                        Some(ModalCommandBinding::new(spec.token(), spec.doc()))
-                    }
-                    MappableCommand::Frontend { .. }
-                    | MappableCommand::Typable { .. }
-                    | MappableCommand::Macro { .. } => None,
-                })
-                .collect::<Vec<_>>();
-            if commands.is_empty() {
-                None
-            } else {
-                Some(ModalKeyTrie::Sequence(commands.into_boxed_slice()))
-            }
-        }
-        KeyTrie::Node(node) => {
-            let map = node
-                .iter()
-                .filter_map(|(&key, trie)| to_modal_trie(trie).map(|trie| (key, trie)))
-                .collect::<HashMap<_, _>>();
-            if map.is_empty() && node.fallback.is_none() {
-                return None;
-            }
-
-            let mut modal = ModalKeyTrieNode::new(&node.name, map, node.order.clone());
-            modal.is_sticky = node.is_sticky;
-            modal.fallback = node.fallback;
-            Some(ModalKeyTrie::Node(modal))
-        }
-    }
-}
-
 /// Convert a frontend `KeymapResult` into an engine `KeymapLookup`.
 ///
 /// Engine commands are resolved via `modal_command()` on `MappableCommand`.
@@ -765,10 +714,6 @@ impl helix_view::engine::KeymapQuery for Keymaps {
 
     fn pending(&self) -> &[KeyEvent] {
         Keymaps::pending(self)
-    }
-
-    fn has_sticky(&self) -> bool {
-        self.sticky.is_some()
     }
 
     fn sticky_infobox(&self) -> Option<Info> {

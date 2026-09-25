@@ -1,17 +1,5 @@
-//! Modal editing engines.
-//!
-//! `helix-modal` has two layers:
-//!
-//! - [`core`] is a dependency-free modal-editing engine. It provides generic
-//!   Helix-style and Vim-style state machines over an embedder-defined context.
-//! - With the default `helix` feature, the crate also exposes the Helix editor
-//!   integration: built-in command registration, `ModalEngineFactory`, and
-//!   `helix_view::engine::EditingEngine` implementations.
-//!
-//! Embedders that do not use Helix can disable default features and build a
-//! registry for their own context type with [`core::Builder`].
-
-pub mod core;
+//! Modal editing engines: built-in command registration, `ModalEngineFactory`, and the
+//! Helix and Vim `helix_view::engine::EditingEngine` implementations.
 
 #[cfg(feature = "helix")]
 pub mod factory;

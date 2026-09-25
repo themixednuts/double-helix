@@ -52,9 +52,6 @@ pub trait KeymapQuery {
     /// Keys buffered in an incomplete multi-key sequence.
     fn pending(&self) -> &[KeyEvent];
 
-    /// Whether there's an active sticky keymap node.
-    fn has_sticky(&self) -> bool;
-
     /// Get the infobox for the current sticky node (for autoinfo display).
     fn sticky_infobox(&self) -> Option<Info>;
 
@@ -326,9 +323,6 @@ pub trait EditingEngine: Send {
     /// "VIS", "VLN", "VBL", "OPR" for operator-pending).
     fn mode_name(&self) -> &str;
 
-    /// Get the editor Mode (Normal/Insert/Select) for cursor shape, gutter, etc.
-    fn editor_mode(&self) -> Mode;
-
     /// Pending keys display for statusline (e.g., "d" in Vim operator-pending,
     /// "g" in Helix multi-key sequence, "3" during count accumulation).
     fn pending_display(&self) -> &str;
@@ -341,9 +335,6 @@ pub trait EditingEngine: Send {
 
     /// Engine name for config and display.
     fn name(&self) -> &str;
-
-    /// Get the last recorded action for dot-repeat.
-    fn last_action(&self) -> Option<&RecordedAction>;
 
     /// Replay the last recorded action (dot-repeat).
     fn repeat_last(
@@ -449,10 +440,6 @@ impl EditingEngine for HeadlessEditingEngine {
         "HEADLESS"
     }
 
-    fn editor_mode(&self) -> Mode {
-        Mode::Normal
-    }
-
     fn pending_display(&self) -> &str {
         ""
     }
@@ -465,10 +452,6 @@ impl EditingEngine for HeadlessEditingEngine {
 
     fn name(&self) -> &str {
         "headless"
-    }
-
-    fn last_action(&self) -> Option<&RecordedAction> {
-        None
     }
 
     fn repeat_last(

@@ -33,7 +33,6 @@ pub struct HelixEngine {
     count: Option<NonZeroUsize>,
     register: Option<char>,
     last_action: Option<RecordedAction>,
-    pending_display_buf: String,
     /// Active insert recording, present while in insert mode.
     insert_recording: Option<InsertRecording>,
     /// The last command executed, the entry command if it entered insert mode.
@@ -52,7 +51,6 @@ impl HelixEngine {
             count: None,
             register: None,
             last_action: None,
-            pending_display_buf: String::new(),
             insert_recording: None,
             last_command: None,
             replaying: false,
@@ -413,14 +411,9 @@ impl EditingEngine for HelixEngine {
         ""
     }
 
-    fn editor_mode(&self) -> Mode {
-        // Helix engine doesn't track mode internally — it reads editor.mode().
-        // This is only used as a fallback; callers should prefer editor.mode().
-        Mode::Normal
-    }
-
     fn pending_display(&self) -> &str {
-        &self.pending_display_buf
+        // The frontend shows the keymap's pending keys; the engine has none of its own.
+        ""
     }
 
     fn is_pending(&self) -> bool {
@@ -431,15 +424,10 @@ impl EditingEngine for HelixEngine {
         self.count = None;
         self.register = None;
         self.awaiting_char = None;
-        self.pending_display_buf.clear();
     }
 
     fn name(&self) -> &str {
         "helix"
-    }
-
-    fn last_action(&self) -> Option<&RecordedAction> {
-        self.last_action.as_ref()
     }
 
     fn begin_insert_recording(&mut self, entry_command: Cow<'static, str>) {

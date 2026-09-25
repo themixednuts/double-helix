@@ -4613,6 +4613,31 @@ mod tests {
     }
 
     #[test]
+    fn operator_and_motion_counts_multiply() {
+        let mut input = ExplorerInputEngine::default();
+        input.prepare_test_keymaps(EditingEngineConfig::Vim);
+
+        for key in [key!('2'), key!('d'), key!('3')] {
+            assert_eq!(input.translate(key), ExplorerInput::Pending(None));
+        }
+        assert_eq!(
+            input.translate(key!('w')),
+            ExplorerInput::Execute(ExplorerAction::ApplyOperatorMotion(
+                ExplorerOperator::Delete { yank: true },
+                LabelMotion::NextWordStart(6)
+            ))
+        );
+
+        // A count before the operator alone still reaches a doubled operator.
+        input.finish_command();
+        for key in [key!('2'), key!('d')] {
+            assert_eq!(input.translate(key), ExplorerInput::Pending(None));
+        }
+        assert!(matches!(input.translate(key!('d')), ExplorerInput::Execute(_)));
+        assert_eq!(input.modal_input_state().count.map(NonZeroUsize::get), Some(2));
+    }
+
+    #[test]
     fn vim_modal_engine_applies_operator_to_motion_and_text_object() {
         let mut input = ExplorerInputEngine::default();
         input.prepare_test_keymaps(EditingEngineConfig::Vim);

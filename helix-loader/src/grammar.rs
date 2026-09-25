@@ -2,6 +2,8 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::ErrorKind;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use std::{
     collections::{BTreeSet, HashSet},
@@ -109,15 +111,28 @@ pub fn install_pkg_grammar(
     Ok(())
 }
 
-pub fn fetch_grammars() -> Result<()> {
+pub fn fetch_grammars(strict: bool) -> Result<()> {
     ensure_git_is_available()?;
 
     // We do not need to fetch local grammars.
     let mut grammars = get_grammar_configs()?;
     grammars.retain(|grammar| !matches!(grammar.source, GrammarSource::Local { .. }));
 
-    println!("Fetching {} grammars", grammars.len());
-    let results = run_parallel(grammars, fetch_grammar);
+    let total = grammars.len();
+    let counter = Arc::new(AtomicUsize::new(0));
+
+    println!("Fetching {} grammars", total);
+    let counter = Arc::clone(&counter);
+
+    let results = run_parallel(grammars, move |grammar| {
+        let current = counter.fetch_add(1, Ordering::Relaxed) + 1;
+
+        println!(
+            "Fetching grammars ({}/{}): {}",
+            current, total, grammar.grammar_id
+        );
+        fetch_grammar(grammar)
+    });
 
     let mut errors = Vec::new();
     let mut git_updated = Vec::new();
@@ -164,18 +179,32 @@ pub fn fetch_grammars() -> Result<()> {
         for (i, (grammar, error)) in errors.into_iter().enumerate() {
             println!("Failure {}/{len}: {grammar} {error}", i + 1);
         }
-        bail!("{len} grammars failed to fetch");
+        if strict {
+            bail!("{len} grammars failed to fetch");
+        }
     }
 
     Ok(())
 }
 
-pub fn build_grammars(target: Option<String>) -> Result<()> {
+pub fn build_grammars(target: Option<String>, strict: bool) -> Result<()> {
     ensure_git_is_available()?;
 
     let grammars = get_grammar_configs()?;
+
+    let total = grammars.len();
+    let counter = Arc::new(AtomicUsize::new(0));
+
     println!("Building {} grammars", grammars.len());
+
+    let counter = Arc::clone(&counter);
     let results = run_parallel(grammars, move |grammar| {
+        let current = counter.fetch_add(1, Ordering::Relaxed) + 1;
+
+        println!(
+            "Building grammars ({}/{}): {}",
+            current, total, grammar.grammar_id
+        );
         build_grammar(grammar, target.as_deref())
     });
 
@@ -207,7 +236,9 @@ pub fn build_grammars(target: Option<String>) -> Result<()> {
         for (i, (grammar_id, error)) in errors.into_iter().enumerate() {
             println!("Failure {}/{len}: {grammar_id} {error}", i + 1);
         }
-        bail!("{len} grammars failed to build");
+        if strict {
+            bail!("{len} grammars failed to build");
+        }
     }
 
     Ok(())

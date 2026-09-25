@@ -118,6 +118,14 @@ where
         HelixBackend::flush(self.inner.backend_mut())
     }
 
+    /// Queue the terminal background change; it goes out with the next presented frame.
+    pub(super) fn set_background_color(
+        &mut self,
+        color: Option<helix_view::graphics::Color>,
+    ) -> io::Result<()> {
+        HelixBackend::set_background_color(self.inner.backend_mut(), color)
+    }
+
     pub(super) fn present(
         &mut self,
         area: Rect,

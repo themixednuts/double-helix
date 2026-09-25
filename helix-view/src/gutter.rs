@@ -54,6 +54,7 @@ impl GutterType {
             GutterType::LineNumbers => line_numbers(context, doc, view, theme, is_focused),
             GutterType::Spacer => padding(context, doc, view, theme, is_focused),
             GutterType::Diff => diff(context, doc, view, theme, is_focused),
+            GutterType::CodeActionHint => code_action_hint(context, doc, view, theme, is_focused),
         }
     }
 
@@ -63,6 +64,7 @@ impl GutterType {
             GutterType::LineNumbers => line_numbers_width(view, doc),
             GutterType::Spacer => 1,
             GutterType::Diff => 1,
+            GutterType::CodeActionHint => 1,
         }
     }
 }
@@ -325,6 +327,28 @@ fn line_numbers_width(view: &View, doc: &Document) -> usize {
     let digits = count_digits(last_drawn);
     let n_min = view.gutters.line_numbers.min_width;
     digits.max(n_min)
+}
+
+/// `⋮` on the cursor line of the focused view when code actions are available there.
+pub fn code_action_hint<'doc>(
+    _context: &'doc GutterContext<'doc>,
+    doc: &'doc Document,
+    view: &View,
+    theme: &Theme,
+    is_focused: bool,
+) -> GutterFn<'doc> {
+    let style = theme.get("ui.text");
+    let text = doc.text().slice(..);
+    let show = is_focused && doc.code_action_hint(view.id);
+    let cursor_line = text.char_to_line(doc.selection(view.id).primary().cursor(text));
+    Box::new(
+        move |line: usize, _selected: bool, first_visual_line: bool, out: &mut String| {
+            (show && line == cursor_line && first_visual_line).then(|| {
+                out.push('⋮');
+                style
+            })
+        },
+    )
 }
 
 pub fn padding<'doc>(

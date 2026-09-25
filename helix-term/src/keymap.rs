@@ -40,10 +40,12 @@ impl<'de> Deserialize<'de> for KeyTrieNode {
     where
         D: serde::Deserializer<'de>,
     {
-        let map = HashMap::<KeyEvent, KeyTrie>::deserialize(deserializer)?;
-        let order = map.keys().copied().collect::<Vec<_>>(); // NOTE: map.keys() has arbitrary order
+        // An IndexMap keeps the keys in the order the config lists them, which is the order the
+        // infobox shows them in.
+        let map = indexmap::IndexMap::<KeyEvent, KeyTrie>::deserialize(deserializer)?;
+        let order = map.keys().copied().collect::<Vec<_>>();
         Ok(Self {
-            map,
+            map: map.into_iter().collect(),
             order,
             ..Default::default()
         })
@@ -65,7 +67,25 @@ impl KeyTrieNode {
     /// corresponding keyevent in self, except when both other and self have
     /// subnodes for same key. In that case the merge is recursive.
     pub fn merge(&mut self, mut other: Self) {
-        for (key, trie) in std::mem::take(&mut other.map) {
+        let mut other_map = std::mem::take(&mut other.map);
+        // Take the other node's keys in its own order, so keys it adds are listed the way its
+        // config wrote them.
+        let mut keys = std::mem::take(&mut other.order);
+        keys.retain(|key| other_map.contains_key(key));
+        keys.extend(
+            other_map
+                .keys()
+                .filter(|key| !keys.contains(key))
+                .copied()
+                .collect::<Vec<_>>(),
+        );
+        for key in keys {
+            let Some(trie) = other_map.remove(&key) else {
+                continue;
+            };
+            if !self.order.contains(&key) {
+                self.order.push(key);
+            }
             if let Some(KeyTrie::Node(node)) = self.map.get_mut(&key) {
                 if let KeyTrie::Node(other_node) = trie {
                     node.merge(other_node);
@@ -1128,6 +1148,24 @@ mod tests {
         // Make sure an order was set during merge
         let node = keymap.search(&[crate::key!(' ')]).unwrap();
         assert!(!node.node().unwrap().order.as_slice().is_empty())
+    }
+
+    #[test]
+    fn deserialized_node_keeps_config_order() {
+        let source = r#"
+z = "move_char_left"
+a = "move_char_right"
+m = "move_line_up"
+"#;
+        let expected = vec![key!('z'), key!('a'), key!('m')];
+
+        let node: KeyTrieNode = toml::from_str(source).unwrap();
+        assert_eq!(node.order, expected);
+
+        // Config files are merged as `toml::Value`s before they are deserialized.
+        let value: toml::Value = toml::from_str(source).unwrap();
+        let node = KeyTrieNode::deserialize(value).unwrap();
+        assert_eq!(node.order, expected);
     }
 
     #[test]

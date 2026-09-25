@@ -31,6 +31,9 @@ mod workspace_backend;
 
 use crate::document::Mode;
 
+/// How many directories `:pushd` remembers.
+pub const DIR_STACK_CAP: usize = 10;
+
 pub use crate::bench::{BenchSnapshot, BenchState};
 pub use assistant::AssistantBackendLaunch;
 pub use config::{

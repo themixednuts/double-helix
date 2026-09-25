@@ -186,6 +186,29 @@ fn handle_event(
             log::info!("{output}");
             editor.set_status(format!("{prefix} {output}"));
         }
+        Event::ProgressStart(body) => {
+            let Some(debugger) = editor.debug_adapters.get_client_mut(client_id) else {
+                return false;
+            };
+            let status = debugger.progress_start(body);
+            editor.set_status(status);
+        }
+        Event::ProgressUpdate(body) => {
+            let Some(debugger) = editor.debug_adapters.get_client_mut(client_id) else {
+                return false;
+            };
+            if let Some(status) = debugger.progress_update(body) {
+                editor.set_status(status);
+            }
+        }
+        Event::ProgressEnd(body) => {
+            let Some(debugger) = editor.debug_adapters.get_client_mut(client_id) else {
+                return false;
+            };
+            if let Some(status) = debugger.progress_end(body) {
+                editor.set_status(status);
+            }
+        }
         Event::Initialized(_) => request_configuration(editor, ingress, client_id),
         Event::Terminated(terminated) => request_termination(
             editor,
@@ -241,6 +264,10 @@ fn apply_breakpoint_event(editor: &mut Editor, reason: &str, breakpoint: helix_d
                 log::warn!("ignoring new DAP breakpoint without a source line");
                 return;
             };
+            // The adapter explains here why a breakpoint could not be verified.
+            if let Some(message) = &breakpoint.message {
+                editor.set_status(format!("Breakpoint: {message}"));
+            }
             editor
                 .breakpoints
                 .entry(path)
@@ -277,6 +304,9 @@ fn apply_breakpoint_event(editor: &mut Editor, reason: &str, breakpoint: helix_d
                 if breakpoint.column.is_some() {
                     current.column = breakpoint.column;
                 }
+            }
+            if let Some(message) = &breakpoint.message {
+                editor.set_status(format!("Breakpoint: {message}"));
             }
         }
         "removed" => {

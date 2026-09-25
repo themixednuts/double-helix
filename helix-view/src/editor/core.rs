@@ -127,6 +127,8 @@ pub struct Editor {
     pub(super) last_motion: Option<Motion>,
     pub last_completion: Option<CompleteAction>,
     pub(super) last_cwd: Option<PathBuf>,
+    /// Directories saved by `:pushd`, most recent first.
+    pub(super) dir_stack: std::collections::VecDeque<PathBuf>,
 
     pub exit_code: i32,
 

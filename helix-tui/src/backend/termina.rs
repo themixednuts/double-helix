@@ -562,7 +562,8 @@ impl Backend for TerminaBackend {
         self.disable_mouse_capture()?;
         write!(
             self.terminal,
-            "{}{}{}{}",
+            "{}{}{}{}{}",
+            super::OSC_RESET_BACKGROUND,
             self.reset_cursor_command,
             decreset!(BracketedPaste),
             decreset!(FocusTracking),
@@ -643,6 +644,10 @@ impl Backend for TerminaBackend {
 
     fn get_theme_mode(&self) -> Option<theme::Mode> {
         self.capabilities.theme_mode
+    }
+
+    fn set_background_color(&mut self, color: Option<theme::Color>) -> io::Result<()> {
+        write!(self.terminal, "{}", super::osc_background(color))
     }
 }
 

@@ -587,11 +587,17 @@ pub fn dap_switch_stack_frame(cx: &mut Context) {
     };
 
     let frames = debugger.stack_frames[&thread_id].clone();
+    let thread_state = debugger
+        .thread_states
+        .get(&thread_id)
+        .cloned()
+        .unwrap_or_else(|| "unknown".to_string());
 
     cx.spawn_ui(async move {
         Ok(UiCommand::Dap(DapCommand::StackFramesPicker {
             thread_id,
             frames,
+            thread_state,
         }))
     });
 }

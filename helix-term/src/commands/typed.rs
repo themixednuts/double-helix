@@ -1474,6 +1474,24 @@ fn change_current_directory(
         return Ok(());
     }
 
+    let dir = directory_argument(cx, &args)?;
+    apply_directory_change(cx, &dir)
+}
+
+/// The directory named by a `:cd`-style argument: `-` for the previous one, none for home.
+fn directory_argument(cx: &mut compositor::Context, args: &Args) -> anyhow::Result<PathBuf> {
+    match args.first().map(AsRef::as_ref) {
+        Some("-") => cx
+            .editor
+            .get_last_cwd()
+            .map(Path::to_path_buf)
+            .ok_or_else(|| anyhow!("No previous working directory")),
+        Some(path) => Ok(helix_stdx::path::expand_tilde(Path::new(path)).into_owned()),
+        None => Ok(home_dir()?),
+    }
+}
+
+fn apply_directory_change(cx: &mut compositor::Context, dir: &Path) -> anyhow::Result<()> {
     ensure!(
         matches!(
             cx.editor.workspace_backend,
@@ -1482,17 +1500,7 @@ fn change_current_directory(
         ":cd cannot change the root of a remote or collaborative workspace"
     );
 
-    let dir = match args.first().map(AsRef::as_ref) {
-        Some("-") => cx
-            .editor
-            .get_last_cwd()
-            .map(|path| Cow::Owned(path.to_path_buf()))
-            .ok_or_else(|| anyhow!("No previous working directory"))?,
-        Some(path) => helix_stdx::path::expand_tilde(Path::new(path)),
-        None => Cow::Owned(home_dir()?),
-    };
-
-    cx.editor.set_cwd(&dir).map_err(|err| {
+    cx.editor.set_cwd(dir).map_err(|err| {
         anyhow!(
             "Could not change working directory to '{}': {err}",
             dir.display()
@@ -1504,6 +1512,61 @@ fn change_current_directory(
         std::env::current_dir().unwrap_or_default().display()
     ));
 
+    Ok(())
+}
+
+fn push_directory(
+    cx: &mut compositor::Context,
+    args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+
+    let dir = directory_argument(cx, &args)?;
+    let previous = helix_stdx::env::current_working_dir();
+    apply_directory_change(cx, &dir)?;
+    cx.editor.push_dir_stack(previous);
+    Ok(())
+}
+
+fn pop_directory(
+    cx: &mut compositor::Context,
+    _args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+
+    let Some(dir) = cx.editor.pop_dir_stack() else {
+        bail!("The directory stack is empty");
+    };
+    if let Err(err) = apply_directory_change(cx, &dir) {
+        // Keep the entry so a transient failure doesn't lose it.
+        cx.editor.push_dir_stack(dir);
+        return Err(err);
+    }
+    Ok(())
+}
+
+fn show_directory_stack(
+    cx: &mut compositor::Context,
+    _args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+
+    let stack = cx
+        .editor
+        .dir_stack()
+        .map(|dir| dir.display().to_string())
+        .collect::<Vec<_>>();
+    ensure!(!stack.is_empty(), "The directory stack is empty");
+    cx.editor.set_status(stack.join(" "));
     Ok(())
 }
 
@@ -5096,6 +5159,39 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         },
     },
     TypableCommand {
+        name: "push-directory",
+        aliases: &["pushd"],
+        doc: "Save the current working directory on the directory stack, then change to the given one.",
+        fun: push_directory,
+        completer: CommandCompleter::positional(&[completers::directory]),
+        signature: Signature {
+            positionals: (0, Some(1)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "pop-directory",
+        aliases: &["popd"],
+        doc: "Change back to the directory most recently saved by :push-directory.",
+        fun: pop_directory,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "show-directory-stack",
+        aliases: &[],
+        doc: "Show the directories saved by :push-directory, most recent first.",
+        fun: show_directory_stack,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
         name: "show-directory",
         aliases: &["pwd"],
         doc: "Show the current working directory.",
@@ -6514,6 +6610,9 @@ pub(crate) fn complete_command_args(
             complete_variable_expansion(&token.content, offset + token.content_start)
         }
         TokenKind::Expansion(ExpansionKind::Unicode) => Vec::new(),
+        TokenKind::Expansion(ExpansionKind::Register) => {
+            complete_register_expansion(&token.content, offset + token.content_start)
+        }
         TokenKind::ExpansionKind => {
             complete_expansion_kind(&token.content, offset + token.content_start)
         }
@@ -6643,6 +6742,20 @@ fn complete_variable_expansion(content: &str, offset: usize) -> Vec<ui::prompt::
     .into_iter()
     .map(|(name, _)| (offset.., (*name).into()))
     .collect()
+}
+
+/// Completes `%reg{…}`. Completion runs off the editor thread, so it offers the special
+/// registers and `a`–`z` rather than only the registers that hold something.
+fn complete_register_expansion(content: &str, offset: usize) -> Vec<ui::prompt::Completion> {
+    let register_names: Vec<String> = ['"', '/', '*', '+', '_', '#', '.', '%']
+        .into_iter()
+        .chain('a'..='z')
+        .map(String::from)
+        .collect();
+    fuzzy_match(content, register_names, false)
+        .into_iter()
+        .map(|(name, _)| (offset.., name.to_string().into()))
+        .collect()
 }
 
 fn complete_expansion_kind(content: &str, offset: usize) -> Vec<ui::prompt::Completion> {

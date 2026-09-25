@@ -91,7 +91,7 @@ tokio-util = { version = "0.7", features = ["rt"] }
 futures-util = { version = "0.3", features = ["std", "async-await"], default-features = false }
 arc-swap.workspace = true
 termini = "1"
-indexmap = "2.13"
+indexmap = { version = "2.13", features = ["serde"] }
 
 # Logging
 fern = { version = "0.7", optional = true }

@@ -37,6 +37,8 @@ pub enum DapCommand {
     StackFramesPicker {
         thread_id: ThreadId,
         frames: Vec<StackFrame>,
+        /// The thread's state (`stopped`, `running`), shown next to each frame.
+        thread_state: String,
     },
     VariablesPopup {
         scopes: Vec<DapScopeVariables>,
@@ -62,10 +64,15 @@ impl std::fmt::Debug for DapCommand {
                 .field("threads", threads)
                 .field("action", action)
                 .finish_non_exhaustive(),
-            Self::StackFramesPicker { thread_id, frames } => f
+            Self::StackFramesPicker {
+                thread_id,
+                frames,
+                thread_state,
+            } => f
                 .debug_struct("StackFramesPicker")
                 .field("thread_id", thread_id)
                 .field("frames", frames)
+                .field("thread_state", thread_state)
                 .finish_non_exhaustive(),
             Self::VariablesPopup { scopes } => f
                 .debug_struct("VariablesPopup")

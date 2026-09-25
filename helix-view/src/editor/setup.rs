@@ -150,6 +150,7 @@ impl Editor {
             last_motion: None,
             last_completion: None,
             last_cwd: None,
+            dir_stack: std::collections::VecDeque::with_capacity(super::DIR_STACK_CAP),
             config,
             auto_pairs,
             exit_code: 0,

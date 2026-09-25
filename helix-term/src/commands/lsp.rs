@@ -1,4 +1,4 @@
-use futures_util::stream::FuturesOrdered;
+use futures_util::stream::{FuturesOrdered, FuturesUnordered};
 use helix_lsp::{
     lsp::{
         self, CodeAction, CodeActionOrCommand, CodeActionTriggerKind, DiagnosticSeverity,
@@ -260,7 +260,7 @@ pub fn symbol_picker(cx: &mut Context) {
 
     let mut seen_language_servers = HashSet::new();
 
-    let mut futures: FuturesOrdered<_> = doc
+    let mut futures: FuturesUnordered<_> = doc
         .language_servers_with_feature(LanguageServerFeature::DocumentSymbols)
         .filter(|ls| seen_language_servers.insert(ls.id()))
         .map(|language_server| {
@@ -349,7 +349,7 @@ pub fn workspace_symbol_picker(cx: &mut Context) {
                        _block: helix_runtime::Block| {
         let (_, doc) = focused_ref!(editor);
         let mut seen_language_servers = HashSet::new();
-        let mut futures: FuturesOrdered<_> = doc
+        let mut futures: FuturesUnordered<_> = doc
             .language_servers_with_feature(LanguageServerFeature::WorkspaceSymbols)
             .filter(|ls| seen_language_servers.insert(ls.id()))
             .map(|language_server| {
@@ -780,33 +780,45 @@ fn open_document_link(
     );
 }
 
+/// Opens every LSP document link a selection covers: the link under the cursor for a
+/// one-character selection, every overlapping link for a wider one. Returns whether any link
+/// was found, so `gf` can fall back to plain path detection.
 pub(crate) fn try_open_document_link_at_cursor(cx: &mut Context, action: Action) -> bool {
     let (view_id, doc) = focused_ref!(cx.editor);
-    let text = doc.text();
-    let cursor = doc.selection(view_id).primary().cursor(text.slice(..));
+    let text = doc.text().slice(..);
     let Some(document_links) = doc.document_links() else {
         return false;
     };
-    let Some(link) = document_links
-        .links
-        .iter()
-        .find(|link| link.range.contains(cursor))
-    else {
+    let mut items: Vec<LspDocumentLinkPickerItem> = Vec::new();
+    for range in doc.selection(view_id).iter() {
+        let covered = document_links.links.iter().filter(|link| {
+            if range.len() <= 1 {
+                link.range.contains(range.cursor(text))
+            } else {
+                link.range.from() < range.to() && link.range.to() > range.from()
+            }
+        });
+        for link in covered {
+            let seen = items
+                .iter()
+                .any(|item| item.server_id == link.server_id && item.link.range == link.link.range);
+            if !seen {
+                items.push(LspDocumentLinkPickerItem {
+                    doc_id: doc.id(),
+                    expected_version: doc.version(),
+                    server_id: link.server_id,
+                    link: link.link.clone(),
+                    text: String::new(),
+                });
+            }
+        }
+    }
+    if items.is_empty() {
         return false;
-    };
-    open_document_link(
-        cx.editor,
-        &cx.foreground,
-        cx.ingress.clone(),
-        LspDocumentLinkPickerItem {
-            doc_id: doc.id(),
-            expected_version: doc.version(),
-            server_id: link.server_id,
-            link: link.link.clone(),
-            text: String::new(),
-        },
-        action,
-    );
+    }
+    for item in items {
+        open_document_link(cx.editor, &cx.foreground, cx.ingress.clone(), item, action);
+    }
     true
 }
 
@@ -889,7 +901,7 @@ pub fn code_action_inner(cx: &mut Context, use_picker: bool) {
 
     let mut seen_language_servers = HashSet::new();
 
-    let mut futures: FuturesOrdered<_> = doc
+    let mut futures: FuturesUnordered<_> = doc
         .language_servers_with_feature(LanguageServerFeature::CodeAction)
         .filter(|ls| seen_language_servers.insert(ls.id()))
         // TODO this should probably already been filtered in something like "language_servers_with_feature"
@@ -1034,7 +1046,7 @@ where
     F: Future<Output = helix_lsp::Result<Option<lsp::GotoDefinitionResponse>>> + 'static + Send,
 {
     let (view_id, doc) = focused_ref!(cx.editor);
-    let mut futures: FuturesOrdered<_> = doc
+    let mut futures: FuturesUnordered<_> = doc
         .language_servers_with_feature(feature)
         .map(|language_server| {
             let offset_encoding = language_server.offset_encoding();
@@ -1133,7 +1145,7 @@ pub fn goto_reference(cx: &mut Context) {
     let config = cx.editor.config();
     let (view_id, doc) = focused_ref!(cx.editor);
 
-    let mut futures: FuturesOrdered<_> = doc
+    let mut futures: FuturesUnordered<_> = doc
         .language_servers_with_feature(LanguageServerFeature::GotoReference)
         .map(|language_server| {
             let offset_encoding = language_server.offset_encoding();
@@ -1382,7 +1394,7 @@ fn hover_impl(cx: &mut Context, display: LspHoverDisplay) {
     }
 
     let mut seen_language_servers = HashSet::new();
-    let mut futures: FuturesOrdered<_> = doc
+    let mut futures: FuturesUnordered<_> = doc
         .language_servers_with_feature(LanguageServerFeature::Hover)
         .filter(|ls| seen_language_servers.insert(ls.id()))
         .map(|language_server| {

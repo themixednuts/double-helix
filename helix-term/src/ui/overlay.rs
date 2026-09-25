@@ -14,11 +14,22 @@ pub struct Overlay<T> {
     pub calc_child_size: Box<dyn Fn(Rect) -> Rect + Send>,
 }
 
-/// Surrounds the component with a margin of 5% on each side, and an additional 2 rows at the bottom
+/// Below this width, overlays take the whole screen instead of leaving a margin.
+pub const FULL_OVERLAID_MAX_WIDTH: u16 = 200;
+
+/// Surrounds the component with a margin of 5% on each side (none on screens narrower than
+/// [`FULL_OVERLAID_MAX_WIDTH`]), and an additional 2 rows at the bottom
 pub fn overlaid<T>(content: T) -> Overlay<T> {
     Overlay {
         content,
-        calc_child_size: Box::new(|rect: Rect| clip_rect_relative(rect.clip_bottom(2), 90, 90)),
+        calc_child_size: Box::new(|rect: Rect| {
+            let percentage = if rect.width < FULL_OVERLAID_MAX_WIDTH {
+                100
+            } else {
+                90
+            };
+            clip_rect_relative(rect.clip_bottom(2), percentage, percentage)
+        }),
     }
 }
 

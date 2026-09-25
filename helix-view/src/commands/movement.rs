@@ -1551,7 +1551,6 @@ pub fn goto_ts_object(
     let mut syntax_missing = false;
     editor.with_view_doc_mut(view_id, doc_id, |view, doc| {
         if let Some((syntax, text)) = doc.syntax_text() {
-            let root = syntax.tree().root_node();
             let annotations = view.text_annotations(doc);
 
             let selection = doc.selection(view_id).clone().transform(|range| {
@@ -1561,7 +1560,6 @@ pub fn goto_ts_object(
                     range,
                     object,
                     direction,
-                    &root,
                     syntax,
                     &loader,
                     count,

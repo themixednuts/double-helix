@@ -2116,6 +2116,65 @@ fn open_file_explorer_panel(cx: &mut Context, root: helix_view::editor::Workspac
         .push(crate::compositor::PostAction::OpenFileExplorer { root });
 }
 
+/// How pickers show a path: file icon, dimmed directory, file name and an optional `:line`.
+struct PathStyles {
+    directory: Style,
+    number: Style,
+    colon: Style,
+}
+
+impl PathStyles {
+    fn new(theme: &helix_view::Theme) -> Self {
+        Self {
+            directory: theme.get("ui.text.directory"),
+            number: theme.get("constant.numeric.integer"),
+            colon: theme.get("punctuation"),
+        }
+    }
+
+    /// `path` relative to the working directory, e.g. `src/ui/editor.rs:120` for a 0-based
+    /// `line` of 119. `None` is the scratch buffer.
+    fn spans(&self, path: Option<&Path>, line: Option<usize>) -> Spans<'static> {
+        let path = path.map(helix_stdx::path::get_relative_path);
+        let mut spans = Vec::with_capacity(5);
+
+        let icons = ICONS.load();
+        if let Some(icon) = icons
+            .mime()
+            .get(path.as_ref().map(|path| path.to_path_buf()).as_ref(), None)
+        {
+            let glyph = format!("{}  ", icon.glyph());
+            spans.push(match icon.color() {
+                Some(color) => Span::styled(glyph, Style::default().fg(color)),
+                None => Span::raw(glyph),
+            });
+        }
+
+        match path.as_deref() {
+            Some(path) => {
+                if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+                    spans.push(Span::styled(
+                        format!("{}{}", parent.display(), std::path::MAIN_SEPARATOR),
+                        self.directory,
+                    ));
+                }
+                let name = path.file_name().map_or_else(
+                    || helix_stdx::path::display_path(path),
+                    |name| name.to_string_lossy(),
+                );
+                spans.push(Span::raw(name.into_owned()));
+            }
+            None => spans.push(Span::raw(SCRATCH_BUFFER_NAME)),
+        }
+
+        if let Some(line) = line {
+            spans.push(Span::styled(":", self.colon));
+            spans.push(Span::styled((line + 1).to_string(), self.number));
+        }
+        Spans::from(spans)
+    }
+}
+
 fn buffer_picker(cx: &mut Context) {
     let current = view!(cx.editor).doc;
 
@@ -2157,37 +2216,8 @@ fn buffer_picker(cx: &mut Context) {
             }
             flags.into()
         }),
-        PickerColumn::new("path", |meta: &BufferMeta, _| {
-            let path = meta
-                .path
-                .as_deref()
-                .map(helix_stdx::path::get_relative_path);
-
-            let name = path
-                .as_deref()
-                .map(helix_stdx::path::display_path)
-                .unwrap_or_else(|| SCRATCH_BUFFER_NAME.into());
-            let icons = ICONS.load();
-
-            let mut spans = Vec::with_capacity(2);
-
-            if let Some(icon) = icons
-                .mime()
-                .get(path.as_ref().map(|path| path.to_path_buf()).as_ref(), None)
-            {
-                if let Some(color) = icon.color() {
-                    spans.push(Span::styled(
-                        format!("{}  ", icon.glyph()),
-                        Style::default().fg(color),
-                    ));
-                } else {
-                    spans.push(Span::raw(format!("{}  ", icon.glyph())));
-                }
-            }
-
-            spans.push(Span::raw(name.into_owned()));
-
-            Spans::from(spans).into()
+        PickerColumn::new("path", |meta: &BufferMeta, styles: &PathStyles| {
+            styles.spans(meta.path.as_deref(), None).into()
         }),
     ];
 
@@ -2208,7 +2238,7 @@ fn buffer_picker(cx: &mut Context) {
         columns,
         2,
         items,
-        (),
+        PathStyles::new(&cx.editor.theme),
         crate::ui::PickerRuntime::new(cx.editor),
         cx.ingress.clone(),
         |cx, meta, action| {
@@ -2232,6 +2262,7 @@ fn jumplist_picker(cx: &mut Context) {
         id: DocumentId,
         path: Option<PathBuf>,
         selection: Selection,
+        line: usize,
         text: String,
         is_current: bool,
     }
@@ -2259,49 +2290,24 @@ fn jumplist_picker(cx: &mut Context) {
                 .collect::<Vec<_>>()
                 .join(" ")
         });
+        let line = doc.map_or(0, |d| selection.primary().cursor_line(d.text().slice(..)));
 
         JumpMeta {
             id: doc_id,
             path: doc.and_then(|d| d.path().cloned()),
             selection,
+            line,
             text,
             is_current: view.doc == doc_id,
         }
     };
 
+    let styles = PathStyles::new(&cx.editor.theme);
+
     let columns = [
         ui::PickerColumn::new("id", |item: &JumpMeta, _| item.id.to_string().into()),
-        ui::PickerColumn::new("path", |item: &JumpMeta, _| {
-            let path = item
-                .path
-                .as_deref()
-                .map(helix_stdx::path::get_relative_path);
-
-            let name = path
-                .as_deref()
-                .map(helix_stdx::path::display_path)
-                .unwrap_or_else(|| SCRATCH_BUFFER_NAME.into());
-            let icons = ICONS.load();
-
-            let mut spans = Vec::with_capacity(2);
-
-            if let Some(icon) = icons
-                .mime()
-                .get(path.as_ref().map(|path| path.to_path_buf()).as_ref(), None)
-            {
-                if let Some(color) = icon.color() {
-                    spans.push(Span::styled(
-                        format!("{}  ", icon.glyph()),
-                        Style::default().fg(color),
-                    ));
-                } else {
-                    spans.push(Span::raw(format!("{}  ", icon.glyph())));
-                }
-            }
-
-            spans.push(Span::raw(name.into_owned()));
-
-            Spans::from(spans).into()
+        ui::PickerColumn::new("path", |item: &JumpMeta, styles: &PathStyles| {
+            styles.spans(item.path.as_deref(), Some(item.line)).into()
         }),
         ui::PickerColumn::new("flags", |item: &JumpMeta, _| {
             let mut flags = Vec::new();
@@ -2328,7 +2334,7 @@ fn jumplist_picker(cx: &mut Context) {
                 .rev()
                 .map(|(doc_id, selection)| new_meta(view, *doc_id, selection.clone()))
         }),
-        (),
+        styles,
         crate::ui::PickerRuntime::new(cx.editor),
         cx.ingress.clone(),
         |cx, meta, action| {
@@ -3312,6 +3318,23 @@ fn yank_main_selection_to_clipboard(cx: &mut Context) {
 fn yank_main_selection_to_primary_clipboard(cx: &mut Context) {
     yank_primary_selection_impl(cx.editor, '*');
     exit_select_mode(cx);
+}
+
+/// Mouse selection: yank the main selection to `register` (`editor.mouse-yank-register`).
+pub(crate) fn yank_main_selection_to_register(cx: &mut Context, register: char) {
+    yank_primary_selection_impl(cx.editor, register);
+    exit_select_mode(cx);
+}
+
+/// Alt + middle click: replace the selections with `register`'s contents.
+pub(crate) fn replace_selections_with_register(cx: &mut Context, register: char) {
+    replace_with_yanked_impl(cx.editor, register, cx.count());
+    exit_select_mode(cx);
+}
+
+/// Middle click: paste `register` before the cursor.
+pub(crate) fn paste_register_before(cx: &mut Context, register: char) {
+    paste(cx.editor, register, Paste::Before, cx.count());
 }
 
 #[derive(Copy, Clone)]

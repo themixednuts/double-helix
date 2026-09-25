@@ -1272,6 +1272,21 @@ pub enum RuntimeTaskEvent {
     RequestInlineValues {
         doc_id: DocumentId,
     },
+    ApplyCodeActionHint {
+        doc_id: DocumentId,
+        view_id: helix_view::ViewId,
+        expected_version: i32,
+        request: Token,
+        available: bool,
+    },
+    ApplySymbolHighlights {
+        doc_id: DocumentId,
+        view_id: helix_view::ViewId,
+        expected_version: i32,
+        request: Token,
+        offset_encoding: helix_lsp::OffsetEncoding,
+        highlights: Vec<lsp::DocumentHighlight>,
+    },
     ApplyDocumentLinks {
         doc_id: DocumentId,
         expected_version: i32,

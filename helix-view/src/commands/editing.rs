@@ -177,13 +177,8 @@ pub fn open(
     let selection = doc.selection(view_id);
     let mut offs = 0;
     let mut ranges = SmallVec::with_capacity(selection.len());
-    let continue_comment_tokens =
-        if comment_continuation == CommentContinuation::Enabled && config.continue_comments {
-            doc.language_config()
-                .and_then(|config| config.comment_tokens.as_ref())
-        } else {
-            None
-        };
+    let continue_comments =
+        comment_continuation == CommentContinuation::Enabled && config.continue_comments;
 
     let mut transaction = Transaction::change_by_selection(contents, selection, |range| {
         let (range, open) = (open == Open::Below)
@@ -220,8 +215,17 @@ pub fn open(
             Open::Above => curr_line_num,
         };
         let above_next_new_line_num = next_new_line_num.saturating_sub(1);
-        let continue_comment_token = continue_comment_tokens
-            .and_then(|tokens| comment::get_comment_token(text, tokens, curr_line_num));
+        // Continue the comment leader of the layer the line's comment starts in.
+        let continue_comment_token = continue_comments
+            .then(|| {
+                let line_start = text.line_to_char(curr_line_num);
+                let first = text
+                    .line(curr_line_num)
+                    .first_non_whitespace_char()
+                    .map_or(line_start, |offset| line_start + offset);
+                doc.continued_comment_token(&loader, curr_line_num, text.char_to_byte(first))
+            })
+            .flatten();
         let (above_next_line_end_index, above_next_line_end_width) = if next_new_line_num == 0 {
             (0, 0)
         } else {
@@ -1727,21 +1731,23 @@ fn toggle_comments_impl(
     doc_id: DocumentId,
     comment_transaction: CommentTransactionFn,
 ) {
+    let loader = editor.syn_loader.load();
     let doc = crate::doc_mut!(editor, &doc_id);
     // Pick the token the primary cursor's line is already commented with (longest
     // match, so `///` wins over `//`). If the line isn't commented yet, fall back to
-    // the primary token for adding a comment.
+    // the primary token for adding a comment. Tokens come from the syntax layer at the
+    // cursor, so embedded languages are commented in their own syntax.
     let text = doc.text().slice(..);
-    let cursor_line = doc.selection(view_id).primary().cursor_line(text);
-    let line_token: Option<&str> = doc
-        .language_config()
+    let cursor = doc.selection(view_id).primary().cursor(text);
+    let cursor_line = text.char_to_line(cursor);
+    let lang_config = doc.language_config_at(&loader, text.char_to_byte(cursor));
+    let line_token: Option<&str> = lang_config
         .and_then(|lc| lc.comment_tokens.as_ref())
         .and_then(|tokens| {
             comment::get_comment_token(text, tokens, cursor_line)
                 .or_else(|| tokens.first().map(|token| token.as_str()))
         });
-    let block_tokens: Option<&[BlockCommentToken]> = doc
-        .language_config()
+    let block_tokens: Option<&[BlockCommentToken]> = lang_config
         .and_then(|lc| lc.block_comment_tokens.as_ref())
         .map(|tc| &tc[..]);
 
@@ -1872,6 +1878,7 @@ fn join_selections_impl(
     use helix_stdx::rope::RopeSliceExt;
     use movement::skip_while;
 
+    let loader = editor.syn_loader.load();
     let doc = crate::doc_mut!(editor, &doc_id);
     let text = doc.text();
     let slice = text.slice(..);
@@ -1913,6 +1920,22 @@ fn join_selections_impl(
         let lines = start..end;
 
         changes.reserve(lines.len());
+
+        // Strip the comment leaders of the syntax layer at this selection, so joining lines
+        // inside an embedded language removes that language's tokens.
+        let layer_tokens = doc
+            .language_config_at(&loader, slice.char_to_byte(slice.line_to_char(start)))
+            .and_then(|config| config.comment_tokens.as_deref());
+        let layer_tokens: Vec<&str> = match layer_tokens {
+            Some(tokens) => {
+                let mut tokens: Vec<&str> = tokens.iter().map(|x| x.as_str()).collect();
+                // Sort by length to handle Rust's /// vs //
+                tokens.sort_unstable_by_key(|x| std::cmp::Reverse(x.len()));
+                tokens
+            }
+            None => comment_tokens.clone(),
+        };
+        let comment_tokens = &layer_tokens;
 
         let first_line_idx = slice.line_to_char(start);
         let first_line_idx = skip_while(slice, first_line_idx, |ch| matches!(ch, ' ' | '\t'))
@@ -2600,13 +2623,6 @@ pub fn insert_newline(editor: &mut Editor, view_id: ViewId, doc_id: DocumentId) 
     let mut global_offs = 0;
     let mut new_text = String::new();
 
-    let continue_comment_tokens = if config.continue_comments {
-        doc.language_config()
-            .and_then(|config| config.comment_tokens.as_ref())
-    } else {
-        None
-    };
-
     let mut last_pos = 0;
     let mut transaction = Transaction::change_by_selection(contents, selection, |range| {
         let mut chars_deleted = 0;
@@ -2622,8 +2638,11 @@ pub fn insert_newline(editor: &mut Editor, view_id: ViewId, doc_id: DocumentId) 
         let current_line = text.char_to_line(pos);
         let line_start = text.line_to_char(current_line);
 
-        let continue_comment_token = continue_comment_tokens
-            .and_then(|tokens| comment::get_comment_token(text, tokens, current_line));
+        // Continue the comment leader of the layer at the cursor.
+        let continue_comment_token = config
+            .continue_comments
+            .then(|| doc.continued_comment_token(&loader, current_line, text.char_to_byte(pos)))
+            .flatten();
 
         let (from, to, local_offs) = if let Some(idx) =
             text.slice(line_start..pos).last_non_whitespace_char()

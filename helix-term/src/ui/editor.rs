@@ -359,6 +359,14 @@ impl DeferredViewPaint {
                 overlays.push(overlay);
             }
         }
+        if let Some(overlay) = doc.document_link_highlights(&theme) {
+            overlays.push(overlay);
+        }
+        if config.lsp.auto_document_highlight {
+            if let Some(overlay) = doc.symbol_highlight_overlay(view.id, &theme) {
+                overlays.push(overlay);
+            }
+        }
         overlays.extend(doc.diagnostic_highlights(&theme, Some(viewport_range)));
         if *is_focused {
             if let Some(tabstops) = doc.tabstop_highlights(&theme) {
@@ -2609,10 +2617,7 @@ impl EditorView {
                 };
 
                 if should_yank {
-                    commands::MappableCommand::builtin_named(
-                        "yank_main_selection_to_primary_clipboard",
-                    )
-                    .execute(cxt);
+                    commands::yank_main_selection_to_register(cxt, config.mouse_yank_register);
                     EventResult::Consumed(None)
                 } else {
                     EventResult::Ignored(None)
@@ -2657,11 +2662,7 @@ impl EditorView {
                 }
 
                 if modifiers == KeyModifiers::ALT {
-                    commands::MappableCommand::builtin_named(
-                        "replace_selections_with_primary_clipboard",
-                    )
-                    .execute(cxt);
-
+                    commands::replace_selections_with_register(cxt, config.mouse_yank_register);
                     return EventResult::Consumed(None);
                 }
 
@@ -2669,9 +2670,7 @@ impl EditorView {
                     let doc = doc_mut!(editor, &view!(editor, view_id).doc);
                     doc.set_selection(view_id, Selection::point(pos));
                     cxt.editor.focus(view_id);
-                    commands::MappableCommand::named("paste_primary_clipboard_before")
-                        .expect("engine command must exist")
-                        .execute(cxt);
+                    commands::paste_register_before(cxt, config.mouse_yank_register);
 
                     return EventResult::Consumed(None);
                 }

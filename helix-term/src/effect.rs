@@ -335,6 +335,20 @@ pub(crate) fn apply_runtime_task_event(
                         LspFeatureRefreshKind::DocumentLinks => {
                             language_server::request_document_links(editor, doc_id, ingress.clone())
                         }
+                        LspFeatureRefreshKind::CodeActionHint => {
+                            language_server::request_code_action_hint(
+                                editor,
+                                doc_id,
+                                ingress.clone(),
+                            )
+                        }
+                        LspFeatureRefreshKind::SymbolHighlights => {
+                            language_server::request_symbol_highlights(
+                                editor,
+                                doc_id,
+                                ingress.clone(),
+                            )
+                        }
                         LspFeatureRefreshKind::FoldingRanges => {
                             language_server::request_folding_ranges(editor, doc_id, ingress.clone())
                         }
@@ -450,6 +464,35 @@ pub(crate) fn apply_runtime_task_event(
         RuntimeTaskEvent::RequestInlineValues { doc_id } => {
             language_server::request_inline_values(editor, doc_id, ingress.clone())
         }
+        RuntimeTaskEvent::ApplyCodeActionHint {
+            doc_id,
+            view_id,
+            expected_version,
+            request,
+            available,
+        } => {
+            if let Some(doc) = editor.document_mut(doc_id) {
+                if doc.version() == expected_version && doc.is_current_code_action_hint(&request) {
+                    doc.set_code_action_hint(view_id, available);
+                }
+            }
+        }
+        RuntimeTaskEvent::ApplySymbolHighlights {
+            doc_id,
+            view_id,
+            expected_version,
+            request,
+            offset_encoding,
+            highlights,
+        } => language_server::apply_symbol_highlights(
+            editor,
+            doc_id,
+            view_id,
+            expected_version,
+            &request,
+            offset_encoding,
+            highlights,
+        ),
         RuntimeTaskEvent::ApplyDocumentLinks {
             doc_id,
             expected_version,

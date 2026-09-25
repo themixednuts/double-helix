@@ -295,6 +295,9 @@ where
         // reset cursor shape
         self.buffer
             .write_all(self.capabilities.reset_cursor_command.as_bytes())?;
+        // give the terminal its own background back
+        self.buffer
+            .write_all(super::OSC_RESET_BACKGROUND.as_bytes())?;
         if self.config.enable_mouse_capture {
             execute!(self.buffer, DisableMouseCapture)?;
         }
@@ -367,6 +370,11 @@ where
 
     fn get_theme_mode(&self) -> Option<helix_view::theme::Mode> {
         None
+    }
+
+    fn set_background_color(&mut self, color: Option<helix_view::theme::Color>) -> io::Result<()> {
+        self.buffer
+            .write_all(super::osc_background(color).as_bytes())
     }
 }
 

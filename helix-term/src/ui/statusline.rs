@@ -124,6 +124,7 @@ impl StatuslineModel {
                 current_working_directory,
                 function_name,
                 lsp_server_names,
+                code_action_hint: doc.code_action_hint(view.id),
             }
             .into_owned(),
             bench_overlay: context.bench_overlay.map(|bench| BenchOverlay {
@@ -489,6 +490,16 @@ where
         StatusLineElementId::Register => render_register,
         StatusLineElementId::CurrentWorkingDirectory => render_cwd,
         StatusLineElementId::FunctionName => render_function_name,
+        StatusLineElementId::CodeActionHint => render_code_action_hint,
+    }
+}
+
+fn render_code_action_hint<'a, F>(statusline: &mut Statusline<'a>, write: F)
+where
+    F: Fn(&mut Statusline<'a>, Span<'a>) + Copy,
+{
+    if statusline.model.snapshot.code_action_hint {
+        write(statusline, " ⋮ ".into());
     }
 }
 

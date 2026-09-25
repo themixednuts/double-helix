@@ -128,9 +128,97 @@ pub struct DocumentLspState {
     inline_completion_cancel: Option<Token>,
     inline_value_cancel: Option<Token>,
     lsp_fold_views: HashSet<ViewId>,
+    /// References to the symbol under each view's cursor (`auto-document-highlight`), as
+    /// char ranges.
+    symbol_highlights: HashMap<ViewId, Vec<StdRange<usize>>>,
+    symbol_highlight_cancel: Option<Token>,
+    /// Views whose cursor has code actions available (the code action hint).
+    code_action_hint_views: HashSet<ViewId>,
+    code_action_hint_cancel: Option<Token>,
 }
 
 impl DocumentLspState {
+    pub fn restart_code_action_hint(&mut self) -> Token {
+        if let Some(token) = self.code_action_hint_cancel.take() {
+            token.cancel();
+        }
+        let token = Token::new();
+        self.code_action_hint_cancel = Some(token.clone());
+        token
+    }
+
+    pub fn is_current_code_action_hint(&self, request: &Token) -> bool {
+        Self::is_current_request(&self.code_action_hint_cancel, request)
+    }
+
+    pub fn code_action_hint(&self, view: ViewId) -> bool {
+        self.code_action_hint_views.contains(&view)
+    }
+
+    pub fn set_code_action_hint(&mut self, view: ViewId, available: bool) {
+        if available {
+            self.code_action_hint_views.insert(view);
+        } else {
+            self.code_action_hint_views.remove(&view);
+        }
+    }
+
+    pub fn clear_code_action_hints(&mut self) {
+        self.code_action_hint_views.clear();
+        if let Some(token) = self.code_action_hint_cancel.take() {
+            token.cancel();
+        }
+    }
+
+    pub fn restart_symbol_highlights(&mut self) -> Token {
+        if let Some(token) = self.symbol_highlight_cancel.take() {
+            token.cancel();
+        }
+        let token = Token::new();
+        self.symbol_highlight_cancel = Some(token.clone());
+        token
+    }
+
+    pub fn is_current_symbol_highlights(&self, request: &Token) -> bool {
+        Self::is_current_request(&self.symbol_highlight_cancel, request)
+    }
+
+    pub fn symbol_highlights(&self, view: ViewId) -> Option<&[StdRange<usize>]> {
+        self.symbol_highlights.get(&view).map(Vec::as_slice)
+    }
+
+    pub fn set_symbol_highlights(&mut self, view: ViewId, ranges: Vec<StdRange<usize>>) {
+        if ranges.is_empty() {
+            self.symbol_highlights.remove(&view);
+        } else {
+            self.symbol_highlights.insert(view, ranges);
+        }
+    }
+
+    pub fn clear_symbol_highlights(&mut self) {
+        self.symbol_highlights.clear();
+        if let Some(token) = self.symbol_highlight_cancel.take() {
+            token.cancel();
+        }
+    }
+
+    /// Keep highlights on their text through an edit until the refreshed ones arrive.
+    pub fn update_symbol_highlights(&mut self, changes: &ChangeSet, text_len: usize) {
+        for ranges in self.symbol_highlights.values_mut() {
+            ranges.retain_mut(|range| {
+                changes.update_positions(
+                    [
+                        (&mut range.start, Assoc::After),
+                        (&mut range.end, Assoc::After),
+                    ]
+                    .into_iter(),
+                );
+                range.end = range.end.min(text_len);
+                range.start < range.end
+            });
+        }
+    }
+
     fn is_current_request(current: &Option<Token>, request: &Token) -> bool {
         !request.is_canceled()
             && current

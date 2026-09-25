@@ -18,6 +18,8 @@ pub(crate) struct FramePacket {
     pub cursor: Option<(u16, u16)>,
     pub cursor_kind: CursorKind,
     pub full_redraw: bool,
+    /// The theme's `ui.background`, which the terminal's own background (OSC 11) follows.
+    pub background: Option<helix_view::graphics::Color>,
 }
 
 /// Clock for bench-only phase timings. Outside `bench` builds it never reads

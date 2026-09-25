@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use futures_util::future;
 
@@ -234,6 +234,25 @@ impl Editor {
 
     pub fn get_last_cwd(&mut self) -> Option<&Path> {
         self.last_cwd.as_deref()
+    }
+
+    /// Save `dir` on the directory stack (`:pushd`). The stack keeps the
+    /// [`super::DIR_STACK_CAP`] most recent entries.
+    pub fn push_dir_stack(&mut self, dir: PathBuf) {
+        if self.dir_stack.len() >= super::DIR_STACK_CAP {
+            self.dir_stack.pop_back();
+        }
+        self.dir_stack.push_front(dir);
+    }
+
+    /// Take the most recently saved directory (`:popd`).
+    pub fn pop_dir_stack(&mut self) -> Option<PathBuf> {
+        self.dir_stack.pop_front()
+    }
+
+    /// Saved directories, most recent first.
+    pub fn dir_stack(&self) -> impl Iterator<Item = &Path> {
+        self.dir_stack.iter().map(PathBuf::as_path)
     }
 }
 

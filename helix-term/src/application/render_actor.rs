@@ -15,6 +15,7 @@ pub(super) struct PreparedFrame {
     cursor_kind: CursorKind,
     full_redraw: bool,
     plan: RenderPlan,
+    background: Option<helix_view::graphics::Color>,
 }
 
 impl PreparedFrame {
@@ -33,7 +34,14 @@ impl PreparedFrame {
             cursor_kind,
             full_redraw,
             plan,
+            background: None,
         }
+    }
+
+    /// The theme background the terminal should show around and behind the editor.
+    pub fn with_background(mut self, background: Option<helix_view::graphics::Color>) -> Self {
+        self.background = background;
+        self
     }
 
     fn preserve_full_redraw(pending: &mut Self, mut newer: Self) {
@@ -104,6 +112,7 @@ impl RenderActor {
                     cursor_kind,
                     full_redraw,
                     mut plan,
+                    background,
                 } = frame;
                 let surface = plan
                     .take_seed()
@@ -169,6 +178,7 @@ impl RenderActor {
                     cursor,
                     cursor_kind,
                     full_redraw: full_redraw || inherited_full_redraw,
+                    background,
                 };
                 if let Err(error) = actor_presenter.submit(packet) {
                     log::error!("failed to submit rendered frame: {error}");

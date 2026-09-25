@@ -2014,6 +2014,8 @@ impl Document {
         self.presentation.mark_inlay_hints_outdated();
         self.lsp.update_code_lenses(changes);
         self.lsp.update_document_links(changes);
+        self.lsp
+            .update_symbol_highlights(changes, self.text().len_chars());
         self.lsp.update_semantic_tokens(changes);
         let inlay_start = Instant::now();
         for text_annotation in self.presentation.inlay_hints_mut() {
@@ -2493,6 +2495,51 @@ impl Document {
         self.syntax_aware.language_config()
     }
 
+    /// The language configuration of the injection layer at `byte_pos`, so language-specific
+    /// behavior (comment tokens) follows embedded languages. Falls back to the document's own
+    /// language without a syntax tree.
+    pub fn language_config_at<'a>(
+        &'a self,
+        loader: &'a helix_core::syntax::Loader,
+        byte_pos: usize,
+    ) -> Option<&'a LanguageConfiguration> {
+        match self.syntax() {
+            Some(syntax) => {
+                let layer = syntax.layer_for_byte_range(byte_pos as u32, byte_pos as u32);
+                Some(&**loader.language(syntax.layer(layer).language).config())
+            }
+            None => self.language_config(),
+        }
+    }
+
+    /// The line comment token to continue on `line`, which starts a comment at `byte_pos`.
+    ///
+    /// Takes the innermost layer at `byte_pos` whose language defines a matching token.
+    /// Layers without comment tokens are skipped: Go injects a `comment` language into its
+    /// comments, and that layer defines none.
+    pub fn continued_comment_token<'a>(
+        &'a self,
+        loader: &'a helix_core::syntax::Loader,
+        line: usize,
+        byte_pos: usize,
+    ) -> Option<&'a str> {
+        let text = self.text().slice(..);
+        let Some(syntax) = self.syntax() else {
+            return self
+                .language_config()
+                .and_then(|config| config.comment_tokens.as_ref())
+                .and_then(|tokens| helix_core::comment::get_comment_token(text, tokens, line));
+        };
+        let mut token = None;
+        for layer in syntax.layers_for_byte_range(byte_pos as u32, byte_pos as u32) {
+            let config = loader.language(syntax.layer(layer).language).config();
+            if let Some(tokens) = config.comment_tokens.as_ref() {
+                token = helix_core::comment::get_comment_token(text, tokens, line).or(token);
+            }
+        }
+        token
+    }
+
     pub fn language_configuration(&self) -> Option<&Arc<LanguageConfiguration>> {
         self.syntax_aware.language_configuration()
     }
@@ -2770,6 +2817,61 @@ impl Document {
 
     pub fn restart_document_links(&mut self) -> helix_runtime::Token {
         self.lsp.restart_document_links()
+    }
+
+    pub fn restart_code_action_hint(&mut self) -> helix_runtime::Token {
+        self.lsp.restart_code_action_hint()
+    }
+
+    pub fn is_current_code_action_hint(&self, request: &helix_runtime::Token) -> bool {
+        self.lsp.is_current_code_action_hint(request)
+    }
+
+    /// Whether code actions are available at `view`'s cursor (the code action hint).
+    pub fn code_action_hint(&self, view: ViewId) -> bool {
+        self.lsp.code_action_hint(view)
+    }
+
+    pub fn set_code_action_hint(&mut self, view: ViewId, available: bool) {
+        self.lsp.set_code_action_hint(view, available);
+    }
+
+    pub fn clear_code_action_hints(&mut self) {
+        self.lsp.clear_code_action_hints();
+    }
+
+    pub fn restart_symbol_highlights(&mut self) -> helix_runtime::Token {
+        self.lsp.restart_symbol_highlights()
+    }
+
+    pub fn is_current_symbol_highlights(&self, request: &helix_runtime::Token) -> bool {
+        self.lsp.is_current_symbol_highlights(request)
+    }
+
+    pub fn set_symbol_highlights(&mut self, view: ViewId, ranges: Vec<std::ops::Range<usize>>) {
+        self.lsp.set_symbol_highlights(view, ranges);
+    }
+
+    pub fn clear_symbol_highlights(&mut self) {
+        self.lsp.clear_symbol_highlights();
+    }
+
+    /// The references to the symbol under `view`'s cursor (`auto-document-highlight`), drawn
+    /// with `ui.highlight` (else `ui.selection`, else `ui.cursor`).
+    pub fn symbol_highlight_overlay(
+        &self,
+        view: ViewId,
+        theme: &Theme,
+    ) -> Option<OverlayHighlights> {
+        let ranges = self.lsp.symbol_highlights(view)?;
+        let highlight = theme
+            .find_highlight_exact("ui.highlight")
+            .or_else(|| theme.find_highlight_exact("ui.selection"))
+            .or_else(|| theme.find_highlight_exact("ui.cursor"))?;
+        Some(OverlayHighlights::Homogeneous {
+            highlight,
+            ranges: ranges.to_vec(),
+        })
     }
 
     pub fn cancel_document_links(&mut self) -> bool {
@@ -3566,6 +3668,31 @@ impl Document {
             ch,
             skip,
         )
+    }
+
+    /// Underlines the LSP document links (`markup.link.url`, else `markup.link`), so it's
+    /// visible where `gf` opens something.
+    pub fn document_link_highlights(&self, theme: &Theme) -> Option<OverlayHighlights> {
+        let links = self.document_links()?;
+        if links.links.is_empty() {
+            return None;
+        }
+        let highlight = theme
+            .find_highlight_exact("markup.link.url")
+            .or_else(|| theme.find_highlight_exact("markup.link"))?;
+        // Links are sorted by start; merge overlapping ones, as overlays must not overlap.
+        let mut ranges: Vec<std::ops::Range<usize>> = Vec::new();
+        for link in &links.links {
+            let (start, end) = (link.range.from(), link.range.to());
+            if start >= end {
+                continue;
+            }
+            match ranges.last_mut() {
+                Some(last) if start <= last.end => last.end = last.end.max(end),
+                _ => ranges.push(start..end),
+            }
+        }
+        Some(OverlayHighlights::Homogeneous { highlight, ranges })
     }
 
     pub fn tabstop_highlights(&self, theme: &Theme) -> Option<OverlayHighlights> {

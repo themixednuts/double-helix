@@ -155,11 +155,46 @@ pub(super) fn attach(
             Ok(())
         });
 
+    // Refresh the references highlighted around the cursor as it moves (debounced).
+    let highlight_refreshes = handlers.lsp_feature_refresh.clone();
+    editor.lifecycle().on_selection_change(move |event| {
+        let config = event.doc.config.load();
+        if config.lsp.auto_document_highlight {
+            highlight_refreshes.send(LspFeatureRefreshEvent {
+                doc_id: event.doc.id(),
+                kind: LspFeatureRefreshKind::SymbolHighlights,
+            });
+        }
+        if config.code_action_hint() {
+            // The hint belonged to the old cursor position.
+            event.doc.set_code_action_hint(event.view, false);
+            highlight_refreshes.send(LspFeatureRefreshEvent {
+                doc_id: event.doc.id(),
+                kind: LspFeatureRefreshKind::CodeActionHint,
+            });
+        }
+        Ok(())
+    });
+
+    // Diagnostics change which quick fixes exist at the cursor.
+    let diagnostic_refreshes = handlers.lsp_feature_refresh.clone();
+    editor.lifecycle().on_diagnostics_change(move |event| {
+        if event.editor.config().code_action_hint() {
+            diagnostic_refreshes.send(LspFeatureRefreshEvent {
+                doc_id: event.doc,
+                kind: LspFeatureRefreshKind::CodeActionHint,
+            });
+        }
+        Ok(())
+    });
+
     editor.lifecycle().on_language_server_exited(move |event| {
         for doc in event.editor.documents_mut() {
             if doc.supports_language_server(event.server_id) {
                 doc.clear_code_lenses();
                 doc.clear_document_links();
+                doc.clear_symbol_highlights();
+                doc.clear_code_action_hints();
                 doc.clear_semantic_tokens();
                 doc.clear_inline_completion();
                 doc.clear_plugin_annotations(CODE_LENS_PLUGIN_SCOPE);

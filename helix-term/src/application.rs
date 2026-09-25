@@ -2304,13 +2304,15 @@ impl Application {
             .renderer
             .as_ref()
             .expect("render actor must be running while rendering")
-            .submit(render_actor::PreparedFrame::new(
-                generation,
-                render_plan,
-                pos,
-                kind,
-                full_redraw,
-            ));
+            .submit(
+                render_actor::PreparedFrame::new(generation, render_plan, pos, kind, full_redraw)
+                    .with_background(
+                        self.editor
+                            .theme
+                            .try_get_exact("ui.background")
+                            .and_then(|style| style.bg),
+                    ),
+            );
         if let Err(error) = submit_result {
             self.compositor.full_redraw = true;
             log::error!("failed to submit terminal frame: {error}");

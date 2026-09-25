@@ -36,6 +36,10 @@ pub struct SelectionRangeResponse {
 pub enum LspFeatureRefreshKind {
     CodeLens,
     DocumentLinks,
+    /// References to the symbol under the cursor (`auto-document-highlight`).
+    SymbolHighlights,
+    /// Whether code actions are available at the cursor (the code action hint).
+    CodeActionHint,
     FoldingRanges,
     SemanticTokens,
     InlineCompletion,

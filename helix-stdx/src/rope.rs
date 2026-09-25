@@ -193,6 +193,9 @@ pub trait RopeSliceExt<'a>: Sized {
     /// );
     /// ```
     fn grapheme_indices_at(self, byte_idx: usize) -> RopeGraphemeIndices<'a>;
+    /// Returns an iterator over the grapheme clusters in a rope and the byte index where each
+    /// grapheme cluster starts. Same as `grapheme_indices_at(0)`.
+    fn grapheme_indices(self) -> RopeGraphemeIndices<'a>;
     /// Finds the byte index of the next grapheme boundary after `byte_idx`.
     ///
     /// If the byte index lies on the last grapheme cluster in the slice then this function
@@ -478,6 +481,10 @@ impl<'a> RopeSliceExt<'a> for RopeSlice<'a> {
             cursor: GraphemeCursor::new(byte_idx, self.len_bytes(), true),
             is_reversed: false,
         }
+    }
+
+    fn grapheme_indices(self) -> RopeGraphemeIndices<'a> {
+        self.grapheme_indices_at(0)
     }
 
     fn grapheme_indices_at(self, byte_idx: usize) -> RopeGraphemeIndices<'a> {

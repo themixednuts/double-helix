@@ -1621,9 +1621,12 @@ fn install_npm(package: &str, version: &str, dest: &Path, store: &Store) -> Resu
 
 fn install_pip(package: &str, version: &str, dest: &Path) -> Result<()> {
     let python = python_tool()?;
+    // Bootstrap pip as its own step: `venv` reports a failed ensurepip only
+    // as "returned non-zero exit status 1" and swallows the reason.
     let venv_args = vec![
         "-m".to_owned(),
         "venv".to_owned(),
+        "--without-pip".to_owned(),
         dest.display().to_string(),
     ];
     let mut venv = Command::new(&python);
@@ -1631,6 +1634,16 @@ fn install_pip(package: &str, version: &str, dest: &Path) -> Result<()> {
     run_command(python.as_os_str(), &venv_args, &mut venv)?;
 
     let venv_python = python_venv_python(dest);
+    let ensurepip_args = vec![
+        "-m".to_owned(),
+        "ensurepip".to_owned(),
+        "--upgrade".to_owned(),
+        "--default-pip".to_owned(),
+    ];
+    let mut ensurepip = Command::new(&venv_python);
+    ensurepip.args(&ensurepip_args);
+    run_command(venv_python.as_os_str(), &ensurepip_args, &mut ensurepip)?;
+
     let install_spec = format!("{package}=={version}");
     let pip_args = vec![
         "-m".to_owned(),

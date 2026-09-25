@@ -228,7 +228,7 @@ fn run_pkg(command: PkgCommand) -> Result<i32> {
         }
         PkgCommand::Install(names) => {
             let ops = Ops::open_default()?;
-            ops.install(&names, &mut print_pkg_event)?;
+            ops.install(&names, &mut pkg_event_printer())?;
             Ok(0)
         }
         PkgCommand::Remove(name) => {
@@ -282,9 +282,9 @@ fn run_pkg(command: PkgCommand) -> Result<i32> {
             let ops = Ops::open_default()?;
             let options = helix_pkg::LockOptions { fetch_hashes };
             let lock = if let Some(project) = project {
-                ops.lock_project_with_options(&project, &names, options, &mut print_pkg_event)?
+                ops.lock_project_with_options(&project, &names, options, &mut pkg_event_printer())?
             } else {
-                ops.lock_manifest_with_options(&names, options, &mut print_pkg_event)?
+                ops.lock_manifest_with_options(&names, options, &mut pkg_event_printer())?
             };
             println!("wrote pkg.lock with {} package(s)", lock.packages.len());
             Ok(0)
@@ -292,9 +292,9 @@ fn run_pkg(command: PkgCommand) -> Result<i32> {
         PkgCommand::Sync { project } => {
             let ops = Ops::open_default()?;
             if let Some(project) = project {
-                ops.sync_with_project(&project, &mut print_pkg_event)?;
+                ops.sync_with_project(&project, &mut pkg_event_printer())?;
             } else {
-                ops.sync(&mut print_pkg_event)?;
+                ops.sync(&mut pkg_event_printer())?;
             }
             Ok(0)
         }
@@ -339,7 +339,7 @@ fn run_pkg(command: PkgCommand) -> Result<i32> {
         }
         PkgCommand::Update(names) => {
             let ops = Ops::open_default()?;
-            ops.update(&names, &mut print_pkg_event)?;
+            ops.update(&names, &mut pkg_event_printer())?;
             Ok(0)
         }
         PkgCommand::UpdatePlan(names) => {
@@ -473,12 +473,59 @@ fn package_tags(package: &PackageSpec) -> String {
     tags.join(",")
 }
 
-fn print_pkg_event(event: OpEvent) {
-    match event {
-        OpEvent::Started { name } => println!("installing {name}"),
-        OpEvent::Progress { name, message, .. } => println!("{name}: {message}"),
-        OpEvent::Done { name } => println!("done {name}"),
-        OpEvent::Failed { name, message } => eprintln!("failed {name}: {message}"),
+/// Prints package events. A message repeated with a rising percent (a
+/// download) redraws one line on a terminal and prints once when piped,
+/// instead of one line per chunk.
+fn pkg_event_printer() -> impl FnMut(OpEvent) {
+    use std::io::{IsTerminal, Write};
+
+    let terminal = std::io::stdout().is_terminal();
+    let mut last: Option<(String, String)> = None;
+    let mut open_line = false;
+    move |event| {
+        let mut stdout = std::io::stdout();
+        if let OpEvent::Progress {
+            name,
+            message,
+            percent,
+        } = event
+        {
+            let repeat = last.as_ref().is_some_and(|(last_name, last_message)| {
+                *last_name == name && *last_message == message
+            });
+            let line = match percent {
+                Some(percent) => format!("{name}: {message} ({percent}%)"),
+                None => format!("{name}: {message}"),
+            };
+            if terminal {
+                if repeat {
+                    print!("\r\x1b[2K{line}");
+                } else {
+                    if open_line {
+                        println!();
+                    }
+                    print!("{line}");
+                }
+                let _ = stdout.flush();
+                open_line = true;
+            } else if !repeat {
+                println!("{line}");
+            }
+            last = Some((name, message));
+            return;
+        }
+
+        if open_line {
+            println!();
+            open_line = false;
+        }
+        last = None;
+        match event {
+            OpEvent::Started { name } => println!("installing {name}"),
+            OpEvent::Done { name } => println!("done {name}"),
+            OpEvent::Failed { name, message } => eprintln!("failed {name}: {message}"),
+            OpEvent::Progress { .. } => {}
+        }
     }
 }
 

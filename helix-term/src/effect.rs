@@ -179,6 +179,7 @@ pub(crate) fn apply_runtime_task_event(
             document,
             version,
             syntax,
+            loader,
             input_barrier,
         } => {
             let _input_barrier = input_barrier;
@@ -186,7 +187,7 @@ pub(crate) fn apply_runtime_task_event(
                 if doc.version() != version || !doc.syntax_snapshot().is_stale() {
                     return false;
                 }
-                doc.set_syntax(Some(syntax));
+                doc.set_parsed_syntax(syntax, loader);
                 true
             });
             if !applied {

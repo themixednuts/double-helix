@@ -93,6 +93,7 @@ impl SyntaxService {
                     input_barrier,
                 } = job;
                 let version = request.version;
+                let loader = request.loader().clone();
                 let started = std::time::Instant::now();
                 let result = block.spawn(move || request.execute()).await;
                 if !actor_generations.is_current(document, generation) {
@@ -110,6 +111,7 @@ impl SyntaxService {
                                 document,
                                 version,
                                 syntax,
+                                loader,
                                 input_barrier,
                             })
                             .await

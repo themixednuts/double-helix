@@ -139,7 +139,7 @@ impl Language {
 /// separate injections. That is done while parsing/running the query capture. As
 /// a result the injections form a tree. Note that such other queries must account for
 /// such multi injection nodes.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Syntax {
     layers: Slab<LayerData>,
     root: Layer,
@@ -321,6 +321,27 @@ pub struct LayerData {
     flags: LayerUpdateFlags,
     parent: Option<Layer>,
     locals: Locals,
+}
+
+impl Clone for LayerData {
+    /// Trees are reference counted and copy-on-write under edits, so a clone
+    /// can be updated incrementally without disturbing the original. The
+    /// parser carries nothing between parses (grammar, included ranges and
+    /// timeout are set before each one), so the clone starts with its own.
+    fn clone(&self) -> Self {
+        Self {
+            language: self.language,
+            parse_tree: self.parse_tree.clone(),
+            parser: Parser::new(),
+            parse_incomplete: self.parse_incomplete,
+            query_stale: self.query_stale,
+            ranges: self.ranges.clone(),
+            injections: self.injections.clone(),
+            flags: self.flags.clone(),
+            parent: self.parent,
+            locals: self.locals.clone(),
+        }
+    }
 }
 
 impl fmt::Debug for LayerData {

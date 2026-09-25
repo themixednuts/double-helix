@@ -232,6 +232,7 @@ pub struct SyntaxRefreshRequest {
     text: Rope,
     language: Arc<LanguageConfiguration>,
     loader: Arc<syntax::Loader>,
+    incremental: Option<crate::syntax_aware::IncrementalSyntax>,
 }
 
 impl fmt::Debug for SyntaxRefreshRequest {
@@ -242,12 +243,35 @@ impl fmt::Debug for SyntaxRefreshRequest {
             .field("version", &self.version)
             .field("lines", &self.text.len_lines())
             .field("bytes", &self.text.len_bytes())
+            .field("incremental", &self.incremental.is_some())
             .finish_non_exhaustive()
     }
 }
 
 impl SyntaxRefreshRequest {
+    /// The loader the result is parsed with; install it alongside the tree so
+    /// later edits can update that tree in place.
+    pub fn loader(&self) -> &Arc<syntax::Loader> {
+        &self.loader
+    }
+
     pub fn execute(self) -> Result<Syntax, syntax::HighlighterError> {
+        // Update the last tree with the edits since it was parsed when there
+        // is one; that reparses only what changed. Fall back to a full parse
+        // if the update fails or runs out of time.
+        if let Some(incremental) = self.incremental {
+            let mut syntax = Syntax::clone(&incremental.tree);
+            let updated = syntax.update_with_timeout(
+                incremental.base.slice(..),
+                self.text.slice(..),
+                &incremental.changes,
+                &self.loader,
+                syntax::BACKGROUND_PARSE_TIMEOUT,
+            );
+            if updated.is_ok() {
+                return Ok(syntax);
+            }
+        }
         Syntax::new_with_timeout(
             self.text.slice(..),
             self.language.language(),
@@ -1930,6 +1954,7 @@ impl Document {
         // The syntax service reconstructs the newest document version off the
         // foreground thread. The previous tree remains readable while stale.
         let syntax_start = Instant::now();
+        self.syntax_aware.record_syntax_edit(&old_doc, changes);
         self.syntax_aware.mark_syntax_stale();
         let syntax_dur = syntax_start.elapsed();
         log_command_phase("document_apply", "invalidate_syntax", syntax_dur, || {
@@ -3557,17 +3582,28 @@ impl Document {
         self.syntax_aware.set_syntax(syntax);
     }
 
+    /// Installs a tree the syntax service parsed with `loader`.
+    pub fn set_parsed_syntax(&mut self, syntax: Syntax, loader: Arc<syntax::Loader>) {
+        self.syntax_aware.set_parsed_syntax(syntax, loader);
+    }
+
     pub fn prepare_syntax_refresh(&self) -> Option<SyntaxRefreshRequest> {
         if self.text().len_bytes() > syntax::MAX_FULL_DOCUMENT_SYNTAX_BYTES {
             return None;
         }
         self.syntax_snapshot().is_stale().then_some(())?;
+        let loader = self.syn_loader.load_full();
+        let incremental = self
+            .syntax_aware
+            .incremental_syntax()
+            .filter(|incremental| Arc::ptr_eq(&incremental.loader, &loader));
         Some(SyntaxRefreshRequest {
             document: self.id,
             version: self.version(),
             text: self.text().clone(),
             language: self.language_configuration()?.clone(),
-            loader: self.syn_loader.load_full(),
+            loader,
+            incremental,
         })
     }
 

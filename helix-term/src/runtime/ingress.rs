@@ -1105,6 +1105,7 @@ pub enum RuntimeTaskEvent {
         document: DocumentId,
         version: i32,
         syntax: helix_core::Syntax,
+        loader: std::sync::Arc<helix_core::syntax::Loader>,
         input_barrier: Option<InputBarrier>,
     },
     /// Blocking inspection completed for the active file-operation FIFO entry.

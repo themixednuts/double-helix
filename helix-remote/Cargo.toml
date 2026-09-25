@@ -13,7 +13,7 @@ homepage.workspace = true
 [dependencies]
 helix-ipc = { path = "../helix-ipc" }
 helix-workspace = { path = "../helix-workspace" }
-fff-search = "=0.9.6"
+fff-search = "=0.11.0"
 getrandom.workspace = true
 globset.workspace = true
 ignore = "0.4"

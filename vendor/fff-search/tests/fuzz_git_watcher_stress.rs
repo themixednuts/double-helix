@@ -192,8 +192,10 @@ fn op_strategy() -> impl Strategy<Value = AbstractOp> {
 }
 
 fn ops_strategy() -> impl Strategy<Value = Vec<AbstractOp>> {
-    let min = stress_min_ops();
-    let max = stress_max_ops();
+    ops_strategy_bounded(stress_min_ops(), stress_max_ops())
+}
+
+fn ops_strategy_bounded(min: usize, max: usize) -> impl Strategy<Value = Vec<AbstractOp>> {
     prop::collection::vec(op_strategy(), min..=max)
 }
 
@@ -283,6 +285,65 @@ fn stress_seeded() {
         );
         run_stress_scenario(&ops);
     }
+}
+
+/// Pinned deterministic regression for the git-status divergence found on
+/// Windows CI (run 28264744320): after a `GitCommit` the picker retained stale
+/// `INDEX_*` bits because a pre-commit per-path status snapshot was applied
+/// after the post-commit full rescan.
+///
+/// The op sequence is regenerated from the proptest seed persisted in the
+/// regressions file (`cc 2c9d...`) using the CI op bounds (30..=60) that were
+/// in effect when the failure was found. The fingerprint assertion fails
+/// loudly if `ops_strategy()` ever changes shape — a changed strategy would
+/// silently decode the same seed into a *different* scenario, turning this
+/// regression guard into a no-op.
+#[test]
+fn stress_regression_stale_index_after_commit() {
+    let ops = ops_from_chacha_seed(REGRESSION_SEED_HEX, 30, 60);
+    assert_eq!(
+        (ops.len(), fingerprint_ops(&ops)),
+        (59, 0xc73f_16ce_b249_78eb),
+        "ops_strategy() changed shape: the pinned seed no longer decodes to \
+         the original Windows-CI scenario. Either revert the strategy change \
+         or re-pin this regression (the original literal op list is in git \
+         history of this file).",
+    );
+    run_stress_scenario(&ops);
+}
+
+/// 32-byte ChaCha seed persisted by proptest for the Windows CI failure
+/// (the `cc 2c9d...` entry in the regressions file).
+const REGRESSION_SEED_HEX: &str =
+    "2c9d1ea2efbf6161f84b69598e884dbf1bde6039c70625adde0374817e20e2ea";
+
+/// Regenerate an op sequence from a persisted proptest ChaCha seed by
+/// replaying `ops_strategy()` the same way proptest does for regressions.
+/// `min`/`max` must match the `FFF_STRESS_{MIN,MAX}_OPS` bounds that were
+/// in effect when the seed was persisted — the strategy's value tree
+/// depends on them.
+fn ops_from_chacha_seed(seed_hex: &str, min: usize, max: usize) -> Vec<AbstractOp> {
+    let seed_bytes: Vec<u8> = (0..seed_hex.len() / 2)
+        .map(|i| u8::from_str_radix(&seed_hex[2 * i..2 * i + 2], 16).expect("valid hex seed"))
+        .collect();
+    let mut config = proptest_config();
+    config.failure_persistence = Some(Box::new(FileFailurePersistence::Off));
+    let rng = TestRng::from_seed(RngAlgorithm::ChaCha, &seed_bytes);
+    let mut runner = TestRunner::new_with_rng(config, rng);
+    ops_strategy_bounded(min, max)
+        .new_tree(&mut runner)
+        .expect("ops_strategy::new_tree")
+        .current()
+}
+
+/// FNV-1a over the debug repr of the ops; stable across platforms and runs.
+fn fingerprint_ops(ops: &[AbstractOp]) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for b in format!("{ops:?}").bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
 }
 
 /// Parse `FFF_STRESS_SEED` as either decimal or `0x`-prefixed hex.
@@ -712,7 +773,7 @@ fn read_truth_status(base: &Path) -> BTreeMap<String, Status> {
 
     let mut out = BTreeMap::new();
     for entry in statuses.iter() {
-        if let Some(p) = entry.path() {
+        if let Ok(p) = entry.path() {
             // git2 returns forward-slash paths; accept as-is.
             out.insert(p.to_string(), entry.status());
         }
@@ -892,10 +953,12 @@ fn grep_plain_matches(shared: &SharedFilePicker, query: &str) -> Vec<String> {
         max_file_size: 10 * 1024 * 1024,
         max_matches_per_file: 200,
         smart_case: true,
+        casing: None,
         file_offset: 0,
         page_limit: 500,
         mode: GrepMode::PlainText,
         time_budget_ms: 0,
+        enforce_time_budget: false,
         before_context: 0,
         after_context: 0,
         classify_definitions: false,
@@ -929,10 +992,12 @@ fn grep_fuzzy_matches(shared: &SharedFilePicker, query: &str) -> Vec<String> {
         max_file_size: 10 * 1024 * 1024,
         max_matches_per_file: 200,
         smart_case: true,
+        casing: None,
         file_offset: 0,
         page_limit: 500,
         mode: GrepMode::Fuzzy,
         time_budget_ms: 0,
+        enforce_time_budget: false,
         before_context: 0,
         after_context: 0,
         classify_definitions: false,
@@ -961,10 +1026,12 @@ fn grep_regex_matches(shared: &SharedFilePicker, query: &str) -> Vec<String> {
         max_file_size: 10 * 1024 * 1024,
         max_matches_per_file: 200,
         smart_case: true,
+        casing: None,
         file_offset: 0,
         page_limit: 500,
         mode: GrepMode::Regex,
         time_budget_ms: 0,
+        enforce_time_budget: false,
         before_context: 0,
         after_context: 0,
         classify_definitions: false,
@@ -1197,7 +1264,7 @@ fn get_baseline_status_from_git(base: &Path) -> Vec<Live> {
         Err(_) => return out,
     };
     for entry in statuses.iter() {
-        if let Some(p) = entry.path() {
+        if let Ok(p) = entry.path() {
             let abs = base.join(p);
             // Must be a real file *right now* — ignore stale WT_DELETED rows.
             if abs.is_file() {

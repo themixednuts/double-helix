@@ -5,31 +5,7 @@ use smallvec::SmallVec;
 
 use crate::git::is_modified_status;
 use crate::simd_path::ArenaPtr;
-
-/// `needle` must already be lowercase.
-#[inline]
-fn contains_ascii_ci(haystack: &str, needle: &str) -> bool {
-    let h = haystack.as_bytes();
-    let n = needle.as_bytes();
-    if n.len() > h.len() {
-        return false;
-    }
-    if n.is_empty() {
-        return true;
-    }
-    let first = n[0];
-    for i in 0..=(h.len() - n.len()) {
-        if h[i].to_ascii_lowercase() == first
-            && h[i..i + n.len()]
-                .iter()
-                .zip(n)
-                .all(|(a, b)| a.to_ascii_lowercase() == *b)
-        {
-            return true;
-        }
-    }
-    false
-}
+use crate::simd_string_utils::memmem::find_case_insensitive_short;
 
 const PAR_THRESHOLD: usize = 10_000;
 
@@ -40,17 +16,11 @@ pub(crate) trait Constrainable {
     fn is_overflow(&self) -> bool;
 }
 
-/// Windows stores paths with `\\`; `/` comes from user queries.
+/// Stored/canonical paths use `/`; also accept `\` so a Windows user typing
+/// a native separator in a query still matches.
 #[inline]
 fn is_path_sep(b: u8) -> bool {
-    #[cfg(windows)]
-    {
-        b == b'/' || b == b'\\'
-    }
-    #[cfg(not(windows))]
-    {
-        b == b'/'
-    }
+    b == b'/' || b == b'\\'
 }
 
 #[inline]
@@ -174,9 +144,15 @@ pub(crate) fn apply_constraints<'a, T: Constrainable + Sync>(
 }
 
 #[cfg(feature = "zlob")]
-type GlobPattern = zlob::ZlobPattern;
-#[cfg(not(feature = "zlob"))]
-type GlobPattern = globset::GlobMatcher;
+pub(crate) type GlobPattern = zlob::ZlobPattern;
+#[cfg(all(not(feature = "zlob"), feature = "ripgrep"))]
+pub(crate) type GlobPattern = globset::GlobMatcher;
+
+/// `PERIOD` on top of `RECOMMENDED`: we filter an index that already contains
+/// dotfiles, so `**/x` must cross `.config`/`.pi` components. Without it zlob
+/// applies fnmatch's leading-dot rule and diverges from the globset backend.
+#[cfg(feature = "zlob")]
+const GLOB_FLAGS: zlob::ZlobFlags = zlob::ZlobFlags::RECOMMENDED.union(zlob::ZlobFlags::PERIOD);
 
 /// How `Constraint::Glob` is evaluated for each item.
 enum GlobStrategy {
@@ -222,7 +198,7 @@ impl<'q, 'c> ConstraintPlan<'q, 'c> {
         overflow_arena: ArenaPtr,
     ) -> Self {
         let mut extensions = SmallVec::new();
-        let mut rest = SmallVec::new();
+        let mut rest: SmallVec<[&'c Constraint<'q>; 8]> = SmallVec::new();
         for c in constraints {
             match c {
                 Constraint::Extension(ext) => extensions.push(*ext),
@@ -290,56 +266,16 @@ impl<'q, 'c> ConstraintPlan<'q, 'c> {
 
         let mut glob_idx = 0;
         self.rest.iter().all(|c| {
-            let glob: &GlobStrategy = &self.glob;
-            let glob_idx: &mut usize = &mut glob_idx;
-            let negate = false;
-            let raw = match c {
-                Constraint::Glob(_) => {
-                    let m = match glob {
-                        GlobStrategy::None => true,
-                        GlobStrategy::Prepass(masks) => masks
-                            .get(*glob_idx)
-                            .and_then(|mask| mask.get(index).copied())
-                            .unwrap_or(false),
-                        GlobStrategy::Inline(patterns) => {
-                            item.write_relative_path(arena, &mut scratch.path);
-                            patterns
-                                .get(*glob_idx)
-                                .and_then(|p| p.as_ref())
-                                .map(|p| compiled_matches(p, &scratch.path))
-                                .unwrap_or(false)
-                        }
-                    };
-                    *glob_idx += 1;
-                    m
-                }
-                // Reachable only via `Not(Extension(_))` — bare extensions are split out
-                // up front and handled in `passes_extensions`.
-                Constraint::Extension(ext) => {
-                    item.write_file_name(arena, &mut scratch.fname);
-                    file_has_extension(&scratch.fname, ext)
-                }
-                Constraint::PathSegment(segment) => {
-                    item.write_relative_path(arena, &mut scratch.path);
-                    path_contains_segment(&scratch.path, segment)
-                }
-                Constraint::FilePath(suffix) => {
-                    item.write_relative_path(arena, &mut scratch.path);
-                    path_ends_with_suffix(&scratch.path, suffix)
-                }
-                Constraint::Text(text) => {
-                    // Only meaningful under negation (used as exclude filter).
-                    item.write_relative_path(arena, &mut scratch.path);
-                    contains_ascii_ci(&scratch.path, text)
-                }
-                Constraint::GitStatus(filter) => matches_git_status(item.git_status(), filter),
-                Constraint::Not(inner) => {
-                    return evaluate(item, index, inner, glob, glob_idx, !negate, arena, scratch);
-                }
-                // Pass-throughs — handled at higher levels.
-                Constraint::Parts(_) | Constraint::Exclude(_) | Constraint::FileType(_) => true,
-            };
-            if negate { !raw } else { raw }
+            evaluate(
+                item,
+                index,
+                c,
+                &self.glob,
+                &mut glob_idx,
+                false,
+                arena,
+                scratch,
+            )
         })
     }
 
@@ -409,7 +345,7 @@ fn evaluate<T: Constrainable>(
         Constraint::Text(text) => {
             // Only meaningful under negation (used as exclude filter).
             item.write_relative_path(arena, &mut scratch.path);
-            contains_ascii_ci(&scratch.path, text)
+            find_case_insensitive_short(scratch.path.as_bytes(), text.as_bytes()).is_some()
         }
         Constraint::GitStatus(filter) => matches_git_status(item.git_status(), filter),
         Constraint::Not(inner) => {
@@ -441,14 +377,32 @@ fn matches_git_status(status: Option<git2::Status>, filter: &GitStatusFilter) ->
 
 #[inline]
 #[cfg(feature = "zlob")]
-fn compiled_matches(p: &GlobPattern, path: &str) -> bool {
+pub(crate) fn compiled_matches(p: &GlobPattern, path: &str) -> bool {
     p.matches_default(path)
 }
 
 #[inline]
-#[cfg(not(feature = "zlob"))]
-fn compiled_matches(p: &GlobPattern, path: &str) -> bool {
+#[cfg(all(not(feature = "zlob"), feature = "ripgrep"))]
+pub(crate) fn compiled_matches(p: &GlobPattern, path: &str) -> bool {
     p.is_match(path)
+}
+
+/// Append indices (into `rels`) of paths matching `p`, in input order.
+/// zlob backend: ONE FFI call for the whole batch.
+#[cfg(feature = "zlob")]
+pub(crate) fn glob_matches_into(p: &GlobPattern, rels: &[&str], out: &mut Vec<usize>) {
+    match p.match_indices(rels, p.flags()) {
+        Ok(ix) => out.extend_from_slice(ix.as_slice()),
+        Err(e) => {
+            tracing::warn!(?e, "zlob batch match failed, falling back to per-path");
+            out.extend((0..rels.len()).filter(|&i| p.matches_default(rels[i])));
+        }
+    }
+}
+
+#[cfg(all(not(feature = "zlob"), feature = "ripgrep"))]
+pub(crate) fn glob_matches_into(p: &GlobPattern, rels: &[&str], out: &mut Vec<usize>) {
+    out.extend((0..rels.len()).filter(|&i| p.is_match(rels[i])));
 }
 
 /// Decide between batch prepass and inline compiled patterns.
@@ -511,12 +465,6 @@ impl PathBuffer {
             let start = bytes.len();
             item.write_relative_path(item_arena, &mut tmp);
             bytes.extend_from_slice(tmp.as_bytes());
-            #[cfg(windows)]
-            for b in &mut bytes[start..] {
-                if *b == b'\\' {
-                    *b = b'/';
-                }
-            }
             offsets.push((start, bytes.len() - start));
         }
         Self { bytes, offsets }
@@ -561,12 +509,12 @@ fn walk_globs<F: FnMut(&str)>(c: &Constraint<'_>, f: &mut F) {
 }
 
 #[cfg(feature = "zlob")]
-fn compile_one(pattern: &str) -> Option<GlobPattern> {
-    zlob::ZlobPattern::compile(pattern, zlob::ZlobFlags::RECOMMENDED).ok()
+pub(crate) fn compile_one(pattern: &str) -> Option<GlobPattern> {
+    zlob::ZlobPattern::compile(pattern, GLOB_FLAGS).ok()
 }
 
-#[cfg(not(feature = "zlob"))]
-fn compile_one(pattern: &str) -> Option<GlobPattern> {
+#[cfg(all(not(feature = "zlob"), feature = "ripgrep"))]
+pub(crate) fn compile_one(pattern: &str) -> Option<GlobPattern> {
     globset::Glob::new(pattern)
         .ok()
         .map(|g| g.compile_matcher())
@@ -577,8 +525,7 @@ fn compile_one(pattern: &str) -> Option<GlobPattern> {
 #[cfg(feature = "zlob")]
 fn match_glob_pattern(pattern: &str, paths: &[&str]) -> Vec<bool> {
     let mut mask = vec![false; paths.len()];
-    let Ok(hits) = zlob::zlob_match_paths_indices(pattern, paths, zlob::ZlobFlags::RECOMMENDED)
-    else {
+    let Ok(hits) = zlob::zlob_match_paths_indices(pattern, paths, GLOB_FLAGS) else {
         return mask;
     };
     for i in hits.to_iter() {
@@ -589,7 +536,7 @@ fn match_glob_pattern(pattern: &str, paths: &[&str]) -> Vec<bool> {
     mask
 }
 
-#[cfg(not(feature = "zlob"))]
+#[cfg(all(not(feature = "zlob"), feature = "ripgrep"))]
 fn match_glob_pattern(pattern: &str, paths: &[&str]) -> Vec<bool> {
     let mut mask = vec![false; paths.len()];
     let Ok(glob) = globset::Glob::new(pattern) else {
@@ -849,7 +796,7 @@ mod tests {
 
     #[test]
     fn test_apply_constraints_file_path_with_unicode_suffix() {
-        let arena_ptr = ArenaPtr(std::ptr::null());
+        let arena_ptr = ArenaPtr::null();
 
         let item = TestItem {
             relative_path: "data/유니코드_파일_테스트.csv",
@@ -899,7 +846,7 @@ mod tests {
 
     #[test]
     fn test_negated_glob_excludes_matching_files() {
-        let arena_ptr = ArenaPtr(std::ptr::null());
+        let arena_ptr = ArenaPtr::null();
 
         let items = vec![
             TestItem {
@@ -935,7 +882,7 @@ mod tests {
     fn test_inline_glob_path_matches_prepass() {
         // Mixed (extensions + glob) takes the inline-compiled path.
         // Pure glob takes the prepass bitmap path. Both must give identical results.
-        let arena_ptr = ArenaPtr(std::ptr::null());
+        let arena_ptr = ArenaPtr::null();
         let items = vec![
             TestItem {
                 relative_path: "src/main.rs",
@@ -978,7 +925,7 @@ mod tests {
     fn test_inline_negated_glob_with_extension() {
         // Mixed Not(Glob) on inline path — exercise the negate=true branch in
         // glob_matches_inline through the Not->Glob recursion.
-        let arena_ptr = ArenaPtr(std::ptr::null());
+        let arena_ptr = ArenaPtr::null();
         let items = vec![
             TestItem {
                 relative_path: "src/main.rs",

@@ -34,8 +34,15 @@ mod sigsegv {
 
     static LOG_FD: AtomicI32 = AtomicI32::new(-1);
 
+    // Must `create(true)` — this runs before init_tracing opens/creates the
+    // writer file, so an append-only open on a non-existent path silently
+    // fails, LOG_FD stays -1, and the SIGSEGV banner never reaches the log.
     pub fn set_log_fd(path: &Path) {
-        if let Ok(file) = std::fs::OpenOptions::new().append(true).open(path) {
+        if let Ok(file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
             let prev = LOG_FD.swap(file.into_raw_fd(), Ordering::Relaxed);
             if prev >= 0 {
                 unsafe { libc::close(prev) };

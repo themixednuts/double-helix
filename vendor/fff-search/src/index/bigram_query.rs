@@ -1,25 +1,47 @@
-//! Regex → bigram decomposition for the inverted bigram index.
-//!
-//! Parses a regex pattern with `regex-syntax`, walks the HIR to extract
-//! guaranteed bigram keys (u16), and evaluates them as an AND/OR query tree
-//! against [`BigramFilter`]'s inverted posting lists.
-//!
-//! Two bigram types are extracted:
-//! - **Consecutive** (gap=0): adjacent byte pairs `(pattern[i], pattern[i+1])`
-//! - **Sparse-1** (gap=1): pairs across a single-byte wildcard, e.g. `a.b → (a,b)`
-//!
-//! The sparse-1 extraction is the key feature: regex patterns like `foo.bar`
-//! yield the cross-boundary sparse-1 bigram `(o,b)` that provides strong
-//! filtering even when the `.` prevents any consecutive cross-boundary bigram.
-
-use crate::bigram_filter::BigramFilter;
+use crate::index::bigram_filter::BigramFilter;
 use regex_syntax::hir::{Class, Hir, HirKind};
 use smallvec::SmallVec;
 use std::borrow::Cow;
 
-/// Maximum byte values to enumerate from a character class.
-/// Larger classes are treated as unknown (no bigram extractable).
 const MAX_CLASS_EXPAND: usize = 16;
+
+// stack inlined array padded with 0 and tracked length
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct InlineArray {
+    bytes: [u8; MAX_CLASS_EXPAND],
+    len: usize,
+}
+
+impl InlineArray {
+    const fn new() -> Self {
+        Self {
+            bytes: [0; MAX_CLASS_EXPAND],
+            len: 0,
+        }
+    }
+
+    fn from_byte(b: u8) -> Self {
+        let mut set = Self::new();
+        set.push(b);
+        set
+    }
+
+    /// Append a byte; no-op if already full (callers guard against this).
+    fn push(&mut self, b: u8) {
+        if self.len < MAX_CLASS_EXPAND {
+            self.bytes[self.len] = b;
+            self.len += 1;
+        }
+    }
+}
+
+impl std::ops::Deref for InlineArray {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
+}
 
 #[inline]
 fn consec_key(a: u8, b: u8) -> Option<u16> {
@@ -70,34 +92,9 @@ impl BigramQuery {
         match self {
             BigramQuery::Any => None,
 
-            BigramQuery::Consec(key) => {
-                let col = index.lookup()[*key as usize];
-                if col == u16::MAX {
-                    return None;
-                }
-                let words = index.words();
-                let offset = col as usize * words;
-                let data = index.dense_data();
-                if offset + words > data.len() {
-                    return None;
-                }
-                Some(Cow::Borrowed(&data[offset..offset + words]))
-            }
+            BigramQuery::Consec(key) => index.column_bitset(*key),
 
-            BigramQuery::Skip1(key) => {
-                let skip = index.skip_index()?;
-                let col = skip.lookup()[*key as usize];
-                if col == u16::MAX {
-                    return None;
-                }
-                let words = skip.words();
-                let offset = col as usize * words;
-                let data = skip.dense_data();
-                if offset + words > data.len() {
-                    return None;
-                }
-                Some(Cow::Borrowed(&data[offset..offset + words]))
-            }
+            BigramQuery::Skip1(key) => index.skip_index()?.column_bitset(*key),
 
             BigramQuery::And(children) => {
                 let mut result: Option<Vec<u64>> = None;
@@ -121,19 +118,15 @@ impl BigramQuery {
                 }
                 let mut result: Option<Vec<u64>> = None;
                 for child in children {
-                    match child.evaluate_cow(index) {
-                        // Any branch can't be filtered → whole OR can't be filtered
-                        None => return None,
-                        Some(child_bits) => {
-                            result = Some(match result {
-                                None => child_bits.into_owned(),
-                                Some(mut r) => {
-                                    bitset_or(&mut r, &child_bits);
-                                    r
-                                }
-                            });
+                    // Any branch can't be filtered -> whole OR can't be filtered
+                    let child_bits = child.evaluate_cow(index)?;
+                    result = Some(match result {
+                        None => child_bits.into_owned(),
+                        Some(mut r) => {
+                            bitset_or(&mut r, &child_bits);
+                            r
                         }
-                    }
+                    });
                 }
                 result.map(Cow::Owned)
             }
@@ -141,14 +134,10 @@ impl BigramQuery {
     }
 }
 
-/// Intermediate state tracked during HIR traversal for bigram extraction.
 struct HirInfo {
     query: BigramQuery,
-    /// Possible first bytes (lowercased, printable ASCII) when this node matches.
-    first: Option<SmallVec<[u8; MAX_CLASS_EXPAND]>>,
-    /// Possible last bytes.
-    last: Option<SmallVec<[u8; MAX_CLASS_EXPAND]>>,
-    /// Whether this node can match the empty string.
+    first: Option<InlineArray>,
+    last: Option<InlineArray>,
     can_be_empty: bool,
 }
 
@@ -185,7 +174,7 @@ pub(crate) fn fuzzy_to_bigram_query(query: &str, num_probes: usize) -> BigramQue
         return BigramQuery::Any;
     }
 
-    // For very short queries (0 typos), AND all bigrams — exact subsequence.
+    // the simplest case, just check that every bigram is present either consec or not
     if max_typos == 0 {
         return simplify_and(
             bigram_keys
@@ -225,7 +214,7 @@ pub(crate) fn fuzzy_to_bigram_query(query: &str, num_probes: usize) -> BigramQue
         return simplify_and(probes.iter().map(|&k| BigramQuery::Consec(k)).collect());
     }
 
-    // Generate all C(n, required) subsets → OR(AND(subset), ...)
+    // Generate all C(n, required) subsets as OR(AND(subset), ...)
     let mut branches = Vec::new();
     let mut combo = vec![0u16; required];
     combine(&probes, required, 0, 0, &mut combo, &mut branches);
@@ -282,7 +271,7 @@ fn decompose(hir: &Hir) -> HirInfo {
             match bytes {
                 Some(b) if !b.is_empty() => HirInfo {
                     query: BigramQuery::Any,
-                    first: Some(b.clone()),
+                    first: Some(b),
                     last: Some(b),
                     can_be_empty,
                 },
@@ -344,13 +333,13 @@ fn decompose_literal(bytes: &[u8]) -> HirInfo {
     if lower.len() == 1 {
         let b = lower[0];
         let first = if (32..=126).contains(&b) {
-            Some(SmallVec::from_slice(&[b]))
+            Some(InlineArray::from_byte(b))
         } else {
             None
         };
         return HirInfo {
             query: BigramQuery::Any,
-            first: first.clone(),
+            first,
             last: first,
             can_be_empty: false,
         };
@@ -380,12 +369,12 @@ fn decompose_literal(bytes: &[u8]) -> HirInfo {
     HirInfo {
         query: simplify_and(qs),
         first: if (32..=126).contains(&first_byte) {
-            Some(SmallVec::from_slice(&[first_byte]))
+            Some(InlineArray::from_byte(first_byte))
         } else {
             None
         },
         last: if (32..=126).contains(&last_byte) {
-            Some(SmallVec::from_slice(&[last_byte]))
+            Some(InlineArray::from_byte(last_byte))
         } else {
             None
         },
@@ -401,22 +390,20 @@ fn decompose_concat(parts: &[Hir]) -> HirInfo {
     let infos: Vec<HirInfo> = parts.iter().map(decompose).collect();
     let mut qs: Vec<BigramQuery> = Vec::new();
 
-    // 1. Collect child bigrams
     for info in &infos {
         if !info.query.is_any() {
             qs.push(info.query.clone());
         }
     }
 
-    // 2. Dense cross-boundary between adjacent mandatory parts
+    //  Dense cross-boundary between adjacent mandatory parts
     for pair in infos.windows(2) {
         if !pair[0].can_be_empty && !pair[1].can_be_empty {
             push_cross_consec(&mut qs, pair[0].last.as_deref(), pair[1].first.as_deref());
         }
     }
 
-    // 3. Sparse-1 cross-boundary: across a single 1-byte-wide middle part.
-    //    Catches `foo.bar` → sparse-1 `(o,b)` across the dot.
+    //  Sparse-1 cross-boundary: across a single 1 byte wide middle part
     if parts.len() >= 3 {
         for i in 0..parts.len() - 2 {
             let left = &infos[i];
@@ -464,8 +451,8 @@ fn decompose_alternation(alts: &[Hir]) -> HirInfo {
     }
 }
 
-fn expand_class(class: &Class) -> Option<SmallVec<[u8; MAX_CLASS_EXPAND]>> {
-    let mut bytes: SmallVec<[u8; MAX_CLASS_EXPAND]> = SmallVec::new();
+fn expand_class(class: &Class) -> Option<InlineArray> {
+    let mut bytes = InlineArray::new();
     match class {
         Class::Bytes(bc) => {
             for range in bc.ranges() {
@@ -473,6 +460,7 @@ fn expand_class(class: &Class) -> Option<SmallVec<[u8; MAX_CLASS_EXPAND]>> {
                 if bytes.len() + count > MAX_CLASS_EXPAND {
                     return None;
                 }
+
                 for b in range.start()..=range.end() {
                     if (32..=126).contains(&b) {
                         let lower = b.to_ascii_lowercase();
@@ -554,11 +542,11 @@ fn cross_product(last: Option<&[u8]>, first: Option<&[u8]>, skip: bool) -> Optio
     }
 }
 
-fn collect_first(infos: &[HirInfo]) -> Option<SmallVec<[u8; MAX_CLASS_EXPAND]>> {
-    let mut result: SmallVec<[u8; MAX_CLASS_EXPAND]> = SmallVec::new();
+fn collect_first(infos: &[HirInfo]) -> Option<InlineArray> {
+    let mut result = InlineArray::new();
     for info in infos {
         if let Some(ref bytes) = info.first {
-            for &b in bytes {
+            for &b in bytes.iter() {
                 if !result.contains(&b) {
                     if result.len() >= MAX_CLASS_EXPAND {
                         return None;
@@ -580,11 +568,11 @@ fn collect_first(infos: &[HirInfo]) -> Option<SmallVec<[u8; MAX_CLASS_EXPAND]>> 
     }
 }
 
-fn collect_last(infos: &[HirInfo]) -> Option<SmallVec<[u8; MAX_CLASS_EXPAND]>> {
-    let mut result: SmallVec<[u8; MAX_CLASS_EXPAND]> = SmallVec::new();
+fn collect_last(infos: &[HirInfo]) -> Option<InlineArray> {
+    let mut result = InlineArray::new();
     for info in infos.iter().rev() {
         if let Some(ref bytes) = info.last {
-            for &b in bytes {
+            for &b in bytes.iter() {
                 if !result.contains(&b) {
                     if result.len() >= MAX_CLASS_EXPAND {
                         return None;
@@ -606,22 +594,17 @@ fn collect_last(infos: &[HirInfo]) -> Option<SmallVec<[u8; MAX_CLASS_EXPAND]>> {
     }
 }
 
-fn merge_byte_sets<'a>(
-    iter: impl Iterator<Item = &'a Option<SmallVec<[u8; MAX_CLASS_EXPAND]>>>,
-) -> Option<SmallVec<[u8; MAX_CLASS_EXPAND]>> {
-    let mut result: SmallVec<[u8; MAX_CLASS_EXPAND]> = SmallVec::new();
+fn merge_byte_sets<'a>(iter: impl Iterator<Item = &'a Option<InlineArray>>) -> Option<InlineArray> {
+    let mut result = InlineArray::new();
     for opt in iter {
-        match opt {
-            None => return None,
-            Some(bytes) => {
-                for &b in bytes {
-                    if !result.contains(&b) {
-                        if result.len() >= MAX_CLASS_EXPAND {
-                            return None;
-                        }
-                        result.push(b);
-                    }
+        let bytes = opt.as_ref()?;
+
+        for &b in bytes.iter() {
+            if !result.contains(&b) {
+                if result.len() >= MAX_CLASS_EXPAND {
+                    return None;
                 }
+                result.push(b);
             }
         }
     }
@@ -669,7 +652,7 @@ fn simplify_or(children: Vec<BigramQuery>) -> BigramQuery {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bigram_filter::BigramIndexBuilder;
+    use crate::index::bigram_filter::BigramIndexBuilder;
 
     /// Build a tiny index from the given file contents for testing.
     fn build_test_index(files: &[&[u8]]) -> BigramFilter {
@@ -757,7 +740,7 @@ mod tests {
 
     #[test]
     fn sparse1_across_digit() {
-        // "foo\dbar" → sparse-1 (o,b) across \d
+        // "foo\dbar" -> sparse-1 (o,b) across \d
         let idx = build_test_index(&[
             b"foo3bar baz", // 0: has all bigrams
             b"foobar baz",  // 1: has consecutive (o,b) but pattern needs sparse-1
@@ -795,7 +778,6 @@ mod tests {
 
     #[test]
     fn optional_group_excluded() {
-        // (bar)? is optional — its bigrams are not required
         let q = regex_to_bigram_query("foo(bar)?baz");
         assert!(!q.is_any());
 
@@ -813,7 +795,7 @@ mod tests {
 
     #[test]
     fn repetition_min2_cross_boundary() {
-        // (ab){2,} → bigram "ab" + cross-boundary "b","a"
+        // (ab){2,} -> bigram "ab" + cross-boundary "b","a"
         let q = regex_to_bigram_query("(ab){2,}");
         assert!(!q.is_any());
 
@@ -830,16 +812,14 @@ mod tests {
 
     #[test]
     fn two_dots_no_sparse1() {
-        // "a..b" — two 1-byte parts between a and b, not a single 1-byte part
-        // No sparse-1 (a,b) should be extracted
         let q = regex_to_bigram_query("a..b");
-        // Single-char literals with 2 unknown bytes between → Any
+        // Single-char literals with 2 unknown bytes between -> Any
         assert!(q.is_any());
     }
 
     #[test]
     fn character_class_cross_boundary() {
-        // [abc]de → cross-boundary OR(ad,bd,cd) + bigram de
+        // [abc]de -> cross-boundary OR(ad,bd,cd) + bigram de
         // All three class variants must appear in the corpus so the OR
         // branches are tracked in the index (untracked bigrams make the
         // OR conservatively return None, which is correct but untestable).
@@ -860,8 +840,6 @@ mod tests {
         // file 3 doesn't have ad/bd/cd so should be filtered
         assert!(!BigramFilter::is_candidate(&candidates, 3));
     }
-
-    // ── Helpers for inspecting query trees ──────────────────────────
 
     fn has_consec(q: &BigramQuery, a: u8, b: u8) -> bool {
         let Some(key) = consec_key(a, b) else {
@@ -896,13 +874,12 @@ mod tests {
     /// plus typical grep patterns used by agentic tools.
     ///
     /// Each entry: `(regex, Option<&[Bg]>)`.
-    ///   - `None`        → pure classes / unsupported syntax, Any is acceptable.
-    ///   - `Some(&[..])` → must be non-Any, and every listed bigram must appear.
+    ///   - `None`        -> pure classes / unsupported syntax, Any is acceptable.
+    ///   - `Some(&[..])` -> must be non-Any, and every listed bigram must appear.
     #[test]
     fn common_regex_patterns() {
         #[rustfmt::skip]
         let cases: &[(&str, Option<&[Bg]>)] = &[
-            // ── Pure-class / anchor / unsupported → Any is fine ──────
             (r"^\d+$",                                                      None), // 1.  whole numbers
             (r"^\d*\.\d+$",                                                 None), // 2.  decimals
             (r"^\d*(\.\d+)?$",                                              None), // 3.  whole + decimal
@@ -931,11 +908,9 @@ mod tests {
             (r"^[\w,\s-]+\.[A-Za-z]{3}$",                                 None), // 27. filename
             (r"^[A-PR-WY][1-9]\d\s?\d{4}[1-9]$",                         None), // 28. HK ID
 
-            // ── Patterns with extractable literal bigrams ────────────
-
             // 13. URL with required protocol
             (r"https?://(www\.)?[-a-zA-Z0-9@:%._\+~#=]{2,256}\.[a-z]{2,6}\b([-a-zA-Z0-9@:%_\+.~#?&//=]*)", Some(&[
-                ("ht", C), ("tt", C), ("tp", C),   // from "http"
+                ("ht", C), ("tt", C), ("tp", C),    // from "http"
                 ("ht", S), ("tp", S),               // from "http" skip-1
                 (":/", C), ("//", C),               // from "://"
             ])),
@@ -943,31 +918,31 @@ mod tests {
             // 29. fn\s+\w+
             (r"fn\s+\w+", Some(&[
                 ("fn", C),                          // from "fn"
-                ("n ", C),                          // cross-boundary: 'n' → \s starts ' '
+                ("n ", C),                          // cross-boundary: 'n' -> \s starts ' '
             ])),
 
             // 30. use\s+crate::
             (r"use\s+crate::", Some(&[
-                ("us", C), ("se", C), ("ue", S),   // from "use"
-                ("cr", C), ("ra", C), ("at", C),   // from "crate"
+                ("us", C), ("se", C), ("ue", S),    // from "use"
+                ("cr", C), ("ra", C), ("at", C),    // from "crate"
                 ("te", C), ("::", C),
-                ("ca", S), ("rt", S), ("ae", S),   // "crate" skip-1
+                ("ca", S), ("rt", S), ("ae", S),    // "crate" skip-1
             ])),
 
             // 31. unwrap\(\)|expect\(
             (r"unwrap\(\)|expect\(", Some(&[
-                ("nw", C), ("wr", C), ("ra", C),   // "unwrap("
+                ("nw", C), ("wr", C), ("ra", C),    // "unwrap("
                 ("ap", C), ("p(", C),
-                ("xp", C), ("pe", C), ("ec", C),   // "expect("
+                ("xp", C), ("pe", C), ("ec", C),    // "expect("
                 ("ct", C), ("t(", C),
             ])),
 
             // 32. TODO|FIXME|HACK
             (r"TODO|FIXME|HACK", Some(&[
-                ("to", C), ("od", C), ("do", C),   // "TODO"
-                ("fi", C), ("ix", C), ("xm", C),   // "FIXME"
+                ("to", C), ("od", C), ("do", C),    // "TODO"
+                ("fi", C), ("ix", C), ("xm", C),    // "FIXME"
                 ("me", C),
-                ("ha", C), ("ac", C), ("ck", C),   // "HACK"
+                ("ha", C), ("ac", C), ("ck", C),    // "HACK"
                 ("hc", S), ("ak", S),               // "HACK" skip-1
             ])),
         ];

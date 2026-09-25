@@ -1348,9 +1348,9 @@ dependencies = [
 
 [[package]]
 name = "fff-grep"
-version = "0.9.6"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5ac5720676a3e1cb901683073c0bcc0a8f04e1bfe6bea391e1f14b9f95dbdef2"
+checksum = "d75a741baa9142c1cbe7df7948d93a809296cd3a28f5c117964a0048b4711258"
 dependencies = [
  "bstr",
  "memchr",
@@ -1372,13 +1372,13 @@ dependencies = [
 
 [[package]]
 name = "fff-query-parser"
-version = "0.9.6"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2e83290e48a8e4dc6ff7cfdfcf382b2a07b6ef1f07e7d477427e3ebb60192307"
+checksum = "cc1aa71c8268c77b2b7d9982eeaa6aa42abb22eaaaa3b72b1b636946c72a8982"
 
 [[package]]
 name = "fff-search"
-version = "0.9.6"
+version = "0.11.0"
 dependencies = [
  "ahash",
  "aho-corasick",
@@ -3933,12 +3933,11 @@ dependencies = [
 
 [[package]]
 name = "neo_frizbee"
-version = "0.10.4"
+version = "0.13.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "12af02496d6e51f324af42ffbd1ed31eb275d4aedd17b18b2cb4542f103f86cb"
+checksum = "fb0dd0e69b342eaddb657120a21a56f3e887ddc505fac780cf430dbbbb3aed26"
 dependencies = [
- "itertools",
- "raw-cpuid",
+ "serde",
 ]
 
 [[package]]
@@ -4872,15 +4871,6 @@ dependencies = [
  "time",
  "unicode-segmentation",
  "unicode-width",
-]
-
-[[package]]
-name = "raw-cpuid"
-version = "11.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "498cd0dc59d73224351ee52a95fee0f1a617a2eae0e7d9d720cc622c73a54186"
-dependencies = [
- "bitflags 2.13.1",
 ]
 
 [[package]]

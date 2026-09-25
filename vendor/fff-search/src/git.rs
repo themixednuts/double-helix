@@ -6,6 +6,21 @@ use std::{
     path::{Path, PathBuf},
 };
 
+/// Process-wide libgit2 tuning for read-heavy local use. By default libgit2
+/// never caches trees over 4KB and additionally verifies every object. This roughly costs 150% of
+/// its valuable runtime
+pub(crate) fn tune_libgit2_for_local_reads() {
+    static TUNE: std::sync::Once = std::sync::Once::new();
+    TUNE.call_once(|| {
+        // Same tradeoff cargo makes: local objects are trusted, skip hashing.
+        git2::opts::strict_hash_verification(false);
+        // SAFETY: plain process-global size limit; total memory stays bounded
+        // by libgit2's 256MB odb cache.
+        let _ =
+            unsafe { git2::opts::set_cache_object_limit(git2::ObjectType::Tree, 8 * 1024 * 1024) };
+    });
+}
+
 pub(crate) fn default_status_options() -> StatusOptions {
     let mut opts = StatusOptions::new();
     opts.include_untracked(true)
@@ -52,7 +67,10 @@ impl GitStatusCache {
     }
 
     #[tracing::instrument(skip(repo, status_options))]
-    fn read_status_impl(repo: &Repository, status_options: &mut StatusOptions) -> Result<Self> {
+    pub(crate) fn read_status(
+        repo: &Repository,
+        status_options: &mut StatusOptions,
+    ) -> Result<Self> {
         let statuses = repo.statuses(Some(status_options))?;
         let Some(repo_path) = repo.workdir() else {
             return Ok(Self(AHashMap::new())); // repo is bare
@@ -80,7 +98,7 @@ impl GitStatusCache {
         let git_workdir = git_workdir.as_ref()?;
         let repository = Repository::open(git_workdir).ok()?;
 
-        let status = Self::read_status_impl(&repository, status_options);
+        let status = Self::read_status(&repository, status_options);
 
         match status {
             Ok(status) => Some(status),
@@ -123,7 +141,7 @@ impl GitStatusCache {
             status_options.pathspec(path.as_ref().strip_prefix(&workdir)?);
         }
 
-        let git_status_cache = Self::read_status_impl(repo, &mut status_options)?;
+        let git_status_cache = Self::read_status(repo, &mut status_options)?;
         Ok(git_status_cache)
     }
 }
@@ -159,7 +177,9 @@ pub fn format_git_status_opt(status: Option<Status>) -> Option<&'static str> {
                 Some("staged_deleted")
             } else if status.contains(Status::IGNORED) {
                 Some("ignored")
-            } else if status.contains(Status::CURRENT) || status.is_empty() {
+            // `Status::CURRENT` is 0, so `contains` is true for every status:
+            // testing it here labelled conflicted/typechanged files "clean".
+            } else if status.is_empty() {
                 Some("clean")
             } else {
                 None
@@ -190,6 +210,35 @@ mod tests {
             .output()
             .unwrap();
         assert!(out.status.success(), "git {args:?} failed");
+    }
+
+    #[test]
+    fn unclassified_status_is_not_reported_as_clean() {
+        // A merge-conflicted file must not claim to be clean.
+        assert_eq!(format_git_status_opt(Some(Status::CONFLICTED)), None);
+        assert_eq!(format_git_status(Some(Status::CONFLICTED)), "unknown");
+        assert_eq!(format_git_status(Some(Status::WT_TYPECHANGE)), "unknown");
+
+        // Every already-classified state keeps its label.
+        assert_eq!(format_git_status_opt(None), Some("clean"));
+        assert_eq!(format_git_status_opt(Some(Status::empty())), Some("clean"));
+        assert_eq!(format_git_status_opt(Some(Status::CURRENT)), Some("clean"));
+        assert_eq!(
+            format_git_status_opt(Some(Status::WT_NEW)),
+            Some("untracked")
+        );
+        assert_eq!(
+            format_git_status_opt(Some(Status::WT_MODIFIED)),
+            Some("modified")
+        );
+        assert_eq!(
+            format_git_status_opt(Some(Status::INDEX_MODIFIED)),
+            Some("staged_modified")
+        );
+        assert_eq!(
+            format_git_status_opt(Some(Status::IGNORED)),
+            Some("ignored")
+        );
     }
 
     /// Regression: on case-insensitive filesystems libgit2 returns

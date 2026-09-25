@@ -4,7 +4,7 @@ use tempfile::TempDir;
 
 use fff_search::FilePickerOptions;
 use fff_search::file_picker::FilePicker;
-use fff_search::grep::{GrepMode, GrepSearchOptions, parse_grep_query};
+use fff_search::grep::{Casing, GrepMode, GrepSearchOptions, parse_grep_query};
 
 /// Build a batch of test files and return a FilePicker with them indexed.
 fn create_picker(base: &Path, specs: &[(&str, &str)]) -> FilePicker {
@@ -32,10 +32,12 @@ fn plain_opts() -> GrepSearchOptions {
         max_file_size: 10 * 1024 * 1024,
         max_matches_per_file: 200,
         smart_case: true,
+        casing: None,
         file_offset: 0,
         page_limit: 200,
         mode: GrepMode::PlainText,
         time_budget_ms: 0,
+        enforce_time_budget: false,
         before_context: 0,
         after_context: 0,
         classify_definitions: false,
@@ -50,10 +52,12 @@ fn regex_opts() -> GrepSearchOptions {
         max_file_size: 10 * 1024 * 1024,
         max_matches_per_file: 200,
         smart_case: true,
+        casing: None,
         file_offset: 0,
         page_limit: 200,
         mode: GrepMode::Regex,
         time_budget_ms: 0,
+        enforce_time_budget: false,
         before_context: 0,
         after_context: 0,
         classify_definitions: false,
@@ -68,10 +72,12 @@ fn fuzzy_opts() -> GrepSearchOptions {
         max_file_size: 10 * 1024 * 1024,
         max_matches_per_file: 200,
         smart_case: true,
+        casing: None,
         file_offset: 0,
         page_limit: 200,
         mode: GrepMode::Fuzzy,
         time_budget_ms: 0,
+        enforce_time_budget: false,
         before_context: 0,
         after_context: 0,
         classify_definitions: false,
@@ -614,7 +620,13 @@ fn large_unknown_extension_binary_is_classified_at_scan_time() {
             .ok()
             .and_then(|g| {
                 g.as_ref()
-                    .map(|p| !p.is_scan_active() && p.bigram_index().is_some())
+                    // Local fix: the binary sniff runs after the bigram index is
+                    // published, so wait for the whole post-scan phase.
+                    .map(|p| {
+                        !p.is_scan_active()
+                            && p.bigram_index().is_some()
+                            && !p.is_post_scan_active()
+                    })
             })
             .unwrap_or(false);
         if ready {
@@ -704,7 +716,13 @@ fn large_binary_with_nuls_past_header_is_classified() {
             .ok()
             .and_then(|g| {
                 g.as_ref()
-                    .map(|p| !p.is_scan_active() && p.bigram_index().is_some())
+                    // Local fix: the binary sniff runs after the bigram index is
+                    // published, so wait for the whole post-scan phase.
+                    .map(|p| {
+                        !p.is_scan_active()
+                            && p.bigram_index().is_some()
+                            && !p.is_post_scan_active()
+                    })
             })
             .unwrap_or(false);
         if ready {
@@ -1833,5 +1851,178 @@ fn plain_text_smart_case_finds_uppercase_content_with_lowercase_query() {
         result.matches.len(),
         1,
         "lowercase query should case-insensitively match 'VFIO-KVM'"
+    );
+}
+
+/// Bug pinning: `!=` was parsed as a Not("=") exclusion constraint, dropping it
+/// from the needle. Operator tokens must stay literal search text.
+#[test]
+fn plain_text_not_equals_operator_is_literal() {
+    let tmp = TempDir::new().unwrap();
+    let picker = create_picker(
+        tmp.path(),
+        &[(
+            "watch.rs",
+            "if delivery.sub.epoch.load(Ordering::Acquire) != delivery.epoch {\n",
+        )],
+    );
+
+    let parsed = parse_grep_query("Ordering::Acquire) != delivery.epoch");
+    let result = picker.grep(&parsed, &plain_opts());
+
+    assert_eq!(
+        result.matches.len(),
+        1,
+        "operator `!=` must match literally"
+    );
+    assert!(!result.literal_fallback, "no fallback should be needed");
+    assert!(result.matches[0].line_content.contains("!= delivery.epoch"));
+}
+
+#[test]
+fn literal_fallback_when_constraints_find_nothing() {
+    let tmp = TempDir::new().unwrap();
+    let picker = create_picker(tmp.path(), &[("a.txt", "foo !bar_baz qux\n")]);
+
+    // `!bar_baz` becomes Not(Text) so the constrained needle is "foo qux" → no
+    // match; the search must retry the raw query as literal text.
+    let parsed = parse_grep_query("foo !bar_baz qux");
+    let result = picker.grep(&parsed, &plain_opts());
+
+    assert_eq!(result.matches.len(), 1);
+    assert!(
+        result.literal_fallback,
+        "literal fallback should be flagged"
+    );
+    assert!(result.matches[0].line_content.contains("!bar_baz"));
+}
+
+#[test]
+fn literal_fallback_not_triggered_when_constraints_match() {
+    let tmp = TempDir::new().unwrap();
+    let picker = create_picker(
+        tmp.path(),
+        &[
+            ("src/lib.rs", "needle here\n"),
+            ("test/lib.rs", "needle here\n"),
+        ],
+    );
+
+    let parsed = parse_grep_query("needle !test");
+    let result = picker.grep(&parsed, &plain_opts());
+
+    assert_eq!(result.matches.len(), 1, "exclusion should still apply");
+    assert!(!result.literal_fallback);
+}
+
+fn casing_picker(tmp: &TempDir) -> FilePicker {
+    create_picker(
+        tmp.path(),
+        &[("a.txt", "Hello World\nhello world\nHELLO WORLD\n")],
+    )
+}
+
+fn with_casing(mut opts: GrepSearchOptions, mode: Casing) -> GrepSearchOptions {
+    opts.casing = Some(mode);
+    opts
+}
+
+#[test]
+fn casing_overrides_legacy_smart_case() {
+    let smart = GrepSearchOptions {
+        smart_case: true,
+        casing: None,
+        ..Default::default()
+    };
+    let sensitive = GrepSearchOptions {
+        smart_case: false,
+        casing: None,
+        ..Default::default()
+    };
+    let explicit = GrepSearchOptions {
+        smart_case: true,
+        casing: Some(Casing::Insensitive),
+        ..Default::default()
+    };
+    assert_eq!(smart.effective_casing(), Casing::Smart);
+    assert_eq!(sensitive.effective_casing(), Casing::Sensitive);
+    assert_eq!(explicit.effective_casing(), Casing::Insensitive);
+}
+
+#[test]
+fn plain_text_casing_insensitive_matches_all_with_uppercase_query() {
+    let tmp = TempDir::new().unwrap();
+    let picker = casing_picker(&tmp);
+    let parsed = parse_grep_query("Hello");
+    let opts = with_casing(plain_opts(), Casing::Insensitive);
+    assert_eq!(picker.grep(&parsed, &opts).matches.len(), 3);
+}
+
+#[test]
+fn plain_text_casing_sensitive_with_lowercase_query() {
+    let tmp = TempDir::new().unwrap();
+    let picker = casing_picker(&tmp);
+    let parsed = parse_grep_query("hello");
+    let opts = with_casing(plain_opts(), Casing::Sensitive);
+    let result = picker.grep(&parsed, &opts);
+    assert_eq!(result.matches.len(), 1);
+    assert_eq!(result.matches[0].line_number, 2);
+}
+
+#[test]
+fn plain_text_legacy_smart_case_false_is_sensitive() {
+    let tmp = TempDir::new().unwrap();
+    let picker = casing_picker(&tmp);
+    let parsed = parse_grep_query("hello");
+    let mut opts = plain_opts();
+    opts.smart_case = false;
+    assert_eq!(picker.grep(&parsed, &opts).matches.len(), 1);
+}
+
+#[test]
+fn regex_casing_insensitive_and_sensitive() {
+    let tmp = TempDir::new().unwrap();
+    let picker = casing_picker(&tmp);
+
+    let parsed = parse_grep_query("H.llo");
+    let opts = with_casing(regex_opts(), Casing::Insensitive);
+    assert_eq!(picker.grep(&parsed, &opts).matches.len(), 3);
+
+    let parsed = parse_grep_query("h.llo");
+    let opts = with_casing(regex_opts(), Casing::Sensitive);
+    let result = picker.grep(&parsed, &opts);
+    assert_eq!(result.matches.len(), 1);
+    assert_eq!(result.matches[0].line_number, 2);
+}
+
+#[test]
+fn multi_grep_casing_insensitive_and_sensitive() {
+    let tmp = TempDir::new().unwrap();
+    let picker = casing_picker(&tmp);
+    let patterns = ["Hello", "WORLD"];
+
+    let opts = with_casing(plain_opts(), Casing::Insensitive);
+    assert_eq!(picker.multi_grep(&patterns, &[], &opts).matches.len(), 3);
+
+    let opts = with_casing(plain_opts(), Casing::Sensitive);
+    let result = picker.multi_grep(&["hello"], &[], &opts);
+    assert_eq!(result.matches.len(), 1);
+    assert_eq!(result.matches[0].line_number, 2);
+
+    // Smart: any uppercase in any pattern makes the whole set sensitive
+    let opts = with_casing(plain_opts(), Casing::Smart);
+    assert_eq!(
+        picker
+            .multi_grep(&["hello", "WORLD"], &[], &opts)
+            .matches
+            .len(),
+        2
+    );
+    assert_eq!(
+        picker
+            .multi_grep(&["hello", "world"], &[], &opts)
+            .matches
+            .len(),
+        3
     );
 }

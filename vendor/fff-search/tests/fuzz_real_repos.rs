@@ -3,17 +3,6 @@
 //! Clones real repository, runs the simulated close to real user sereies of file system ewvents and
 //! verifies that fff can still find the correct files. Test cases are randomized and preserved
 //! using proptest
-//!
-//! Run:
-//! ```sh
-//! RUSTFLAGS="--cfg stress" cargo test -p fff-search --test fuzz_real_repos -- --nocapture
-//! ```
-//!
-//! Increase coverage:
-//! ```sh
-//! FFF_FUZZ_CASES=4 FFF_FUZZ_MAX_OPS=60 \
-//!     RUSTFLAGS="--cfg stress" cargo test -p fff-search --test fuzz_real_repos -- --nocapture
-//! ```
 #![cfg(stress)]
 
 use std::fs;
@@ -218,19 +207,17 @@ fn revert_marker(path: &Path, marker: &str, original_line: &str) {
     let _ = fs::write(path, result);
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// Search helpers
-// ═══════════════════════════════════════════════════════════════════════════
-
 fn grep_opts(mode: GrepMode) -> GrepSearchOptions {
     GrepSearchOptions {
         max_file_size: 10 * 1024 * 1024,
         max_matches_per_file: 200,
         smart_case: true,
+        casing: None,
         file_offset: 0,
         page_limit: 500,
         mode,
         time_budget_ms: 5000,
+        enforce_time_budget: false,
         before_context: 0,
         after_context: 0,
         classify_definitions: false,
@@ -689,35 +676,22 @@ fn proptest_config() -> ProptestConfig {
 
 #[derive(Debug, Clone)]
 enum Op {
-    /// Create a new file with a unique marker
     CreateFile { seed: u32 },
-    /// Edit a tracked file, replacing the marker line with a new marker
     EditTracked { seed: u32 },
-    /// Edit a random repo file, injecting a marker at a deterministic line
     EditRandom { seed: u32 },
-    /// Delete a tracked file
     DeleteTracked,
-    /// Revert a tracked edit, restoring the original line (marker disappears)
     RevertTracked,
-    /// Burst of writes into ignored directory
     IgnoredBurst { count: u8, seed: u32 },
-    /// Search verification round (no mutation)
     Verify,
 }
 
 fn op_strategy() -> impl Strategy<Value = Op> {
     prop_oneof![
-        // Create new files — exercises overflow path
         12 => any::<u32>().prop_map(|s| Op::CreateFile { seed: s }),
-        // Edit tracked files — exercises content invalidation
         18 => any::<u32>().prop_map(|s| Op::EditTracked { seed: s }),
-        // Edit random repo files — exercises bigram overlay for base files
         18 => any::<u32>().prop_map(|s| Op::EditRandom { seed: s }),
-        // Delete tracked files — exercises tombstoning
         8 => Just(Op::DeleteTracked),
-        // Revert tracked edits — marker must disappear from search
         10 => Just(Op::RevertTracked),
-        // Burst ignored writes — exercises .gitignore filtering under load
         9 => (1u8..20, any::<u32>()).prop_map(|(c, s)| Op::IgnoredBurst { count: c, seed: s }),
         // Explicit verification rounds
         25 => Just(Op::Verify),

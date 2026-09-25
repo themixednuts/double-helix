@@ -7,9 +7,9 @@ use std::{
 use fff_search::{
     grep_byte_sources_page, ByteSourceGrepCursor, ContentOverlay, FFFMode, FilePicker,
     FilePickerOptions, FilePickerScanOptions, FileSearchConfig, FrecencyRecord, FrecencyStore,
-    FrecencyTracker, FuzzySearchOptions, GrepConfig, GrepMode, GrepSearchOptions, PaginationArgs,
-    QueryHistoryKind, QueryMatchEntry, QueryParser, QueryTracker, QueryTrackerStore,
-    SharedFrecency, SharedPicker, SharedQueryTracker,
+    FrecencyTracker, FuzzySearchOptions, GitRecencyConfig, GrepConfig, GrepMode,
+    GrepSearchOptions, PaginationArgs, QueryHistoryKind, QueryMatchEntry, QueryParser,
+    QueryTracker, QueryTrackerStore, SharedFrecency, SharedPicker, SharedQueryTracker,
 };
 use heed::types::{Bytes, SerdeBincode};
 use heed::{Database, EnvOpenOptions};
@@ -434,6 +434,9 @@ pub(crate) fn grep_files_page(request: GrepFilesPageRequest<'_>) -> anyhow::Resu
             file_offset: request.file_offset,
             page_limit: request.limit,
             time_budget_ms: 40,
+            // Page on the budget even before anything matched, so a zero-match
+            // query in a large tree still returns a resume cursor promptly.
+            enforce_time_budget: true,
             abort_signal: Some(request.abort_signal),
             ..GrepSearchOptions::default()
         },
@@ -649,6 +652,7 @@ impl FffWorkspace {
                 enable_fs_root_scanning: true,
                 enable_home_dir_scanning: true,
                 scan,
+                git_recency: GitRecencyConfig::default(),
             },
         )?;
 

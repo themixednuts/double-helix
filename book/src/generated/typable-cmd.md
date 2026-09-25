@@ -52,6 +52,9 @@
 | `:primary-clipboard-paste-replace` | Replace selections with content of system primary clipboard. |
 | `:show-clipboard-provider` | Show clipboard provider name in status bar. |
 | `:change-current-directory`, `:cd` | Change the current working directory. |
+| `:push-directory`, `:pushd` | Save the current working directory on the directory stack, then change to the given one. |
+| `:pop-directory`, `:popd` | Change back to the directory most recently saved by :push-directory. |
+| `:show-directory-stack` | Show the directories saved by :push-directory, most recent first. |
 | `:show-directory`, `:pwd` | Show the current working directory. |
 | `:encoding` | Set encoding. Based on `https://encoding.spec.whatwg.org`. |
 | `:character-info`, `:char` | Get info about the character under the primary cursor. |
@@ -59,6 +62,9 @@
 | `:reload-all`, `:rla` | Discard changes and reload all documents from the source files. |
 | `:update`, `:u` | Write changes only if the file has been modified. |
 | `:lsp-workspace-command` | Open workspace command picker |
+| `:workspace-trust` | Trust the current workspace: load its local config and allow language servers, debug adapters and its git config. |
+| `:workspace-untrust` | Revoke the current workspace's trust grant or exclusion. |
+| `:workspace-exclude` | Never trust the current workspace, and don't ask again. |
 | `:lsp-restart` | Restarts the given language servers, or all language servers that are used by the current file if no arguments are supplied |
 | `:lsp-stop` | Stops the given language servers, or all language servers that are used by the current file if no arguments are supplied |
 | `:tree-sitter-scopes` | Display tree sitter scopes, primarily for theming and development. |
@@ -107,6 +113,15 @@
 | `:notifications-clear`, `:notif-clear`, `:nc` | Clear notification history. |
 | `:notifications-dismiss`, `:notif-dismiss`, `:nd` | Dismiss all active notifications. |
 | `:notifications-test`, `:notif-test`, `:nt` | Test notification system with sample notifications. |
+| `:collab-share`, `:share` | Share the current local or Remote SSH project. Optionally provide the reachable IP address and UDP port to advertise. |
+| `:collab-join`, `:join` | Join a shared project using a collaboration invitation, with an optional participant name. |
+| `:collab-invite` | Create and copy a single-use collaboration invitation for an optional observe, read, or write role. |
+| `:collab-set-role` | Set a collaboration participant's role. |
+| `:collab-remove` | Remove a participant from the collaboration session. |
+| `:collab-participants` | Manage participants in the active collaboration session. |
+| `:collab-follow` | Follow a collaboration participant's active location. |
+| `:collab-unfollow` | Stop following the active collaboration participant. |
+| `:collab-leave` | Leave the active collaboration session and stop its host when sharing. |
 | `:assistant-connect`, `:agent` | Connect to an assistant backend. Shows picker if no args, or use: :assistant-connect <command> [args...] |
 | `:assistant-agents`, `:acp-agents` | Browse, install, update, remove, and connect ACP assistant agents. |
 | `:assistant-prompt`, `:ask` | Send a prompt to the active assistant thread. Usage: :assistant-prompt <message> |

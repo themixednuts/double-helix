@@ -31,7 +31,7 @@
 | `file_picker_in_current_buffer_directory` | Open file picker at current buffer's directory |  |
 | `file_picker_in_current_directory` | Open file picker at current working directory | normal: `` <space>F ``, select: `` <space>F `` |
 | `file_explorer` | Open file explorer panel in workspace root | normal: `` <space>e ``, select: `` <space>e `` |
-| `file_explorer_in_current_buffer_directory` | Open file explorer panel at current buffer's directory | normal: `` <space>E ``, `` <space>. ``, select: `` <space>E ``, `` <space>. `` |
+| `file_explorer_in_current_buffer_directory` | Open file explorer panel at current buffer's directory | normal: `` <space>. ``, `` <space>E ``, select: `` <space>. ``, `` <space>E `` |
 | `file_explorer_in_current_directory` | Open file explorer panel at current working directory |  |
 | `code_action` | Perform code action | normal: `` <space>a ``, select: `` <space>a `` |
 | `code_action_picker` | Perform code action in a picker |  |
@@ -64,6 +64,7 @@
 | `call_hierarchy_outgoing` | Show outgoing calls | normal: `` <space>Ho ``, select: `` <space>Ho `` |
 | `type_hierarchy_super` | Show supertypes | normal: `` <space>Hs ``, select: `` <space>Hs `` |
 | `type_hierarchy_sub` | Show subtypes | normal: `` <space>Ht ``, select: `` <space>Ht `` |
+| `understand` | Open an evidence-backed briefing for the current file |  |
 | `goto_file` | Goto files/URLs in selections | normal: `` gf ``, select: `` gf `` |
 | `goto_file_hsplit` | Goto files in selections (hsplit) | normal: `` <C-w>f ``, `` <space>wf ``, select: `` <C-w>f ``, `` <space>wf `` |
 | `goto_file_vsplit` | Goto files in selections (vsplit) | normal: `` <C-w>F ``, `` <space>wF ``, select: `` <C-w>F ``, `` <space>wF `` |

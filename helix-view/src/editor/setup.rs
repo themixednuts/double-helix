@@ -125,6 +125,25 @@ impl Editor {
         let auto_pairs = (&conf.auto_pairs).into();
         let (assistant_updates_tx, assistant_updates_rx) = helix_runtime::channel(128);
         let lifecycle = std::sync::Arc::new(super::hooks::LifecycleBus::default());
+        let open_buffers = crate::open_buffers::OpenBuffers::default();
+        lifecycle.on_document_change({
+            let open_buffers = open_buffers.clone();
+            move |event| {
+                if let Some(path) = event.doc.path() {
+                    open_buffers.changed(path, event.doc.text());
+                }
+                Ok(())
+            }
+        });
+        lifecycle.on_document_close({
+            let open_buffers = open_buffers.clone();
+            move |event| {
+                if let Some(path) = event.doc.path() {
+                    open_buffers.forget(path);
+                }
+                Ok(())
+            }
+        });
         let collaboration = crate::collab::Replication::default();
 
         area.height = area.height.saturating_sub(1);
@@ -155,6 +174,7 @@ impl Editor {
             diff_providers: DiffProviderRegistry::new(conf.vcs.provider.into())
                 .with_repo_trust(repo_trust(&workspace_trust)),
             workspace_trust,
+            open_buffers,
             debug_adapters: dap::registry::Registry::new(),
             breakpoints: HashMap::new(),
             runtime,

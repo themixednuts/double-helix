@@ -3344,6 +3344,25 @@ mod tests {
         text
     }
 
+    #[test]
+    fn open_buffers_follow_unsaved_edits() {
+        let (mut editor, view_id, doc_id) = test_editor_with_text("saved\n");
+        let dir = tempfile::tempdir().unwrap();
+        let path = helix_stdx::path::canonicalize(dir.path().join("a.txt"));
+        editor.set_doc_path(doc_id, &path);
+        assert!(editor.open_buffers.text(&path).is_none());
+
+        let doc = editor.document_mut(doc_id).unwrap();
+        let edit = Transaction::change(doc.text(), [(0, 5, Some("edited".into()))].into_iter());
+        doc.apply(&edit, view_id);
+        assert_eq!(editor.open_buffers.text(&path).unwrap(), "edited\n");
+
+        // Saved elsewhere: the text no longer belongs to the old path.
+        let moved = helix_stdx::path::canonicalize(dir.path().join("b.txt"));
+        editor.set_doc_path(doc_id, &moved);
+        assert!(editor.open_buffers.text(&path).is_none());
+    }
+
     fn test_editor_with_text(text: &str) -> (Editor, ViewId, DocumentId) {
         let theme_loader = theme::Loader::new(&[]);
         let syn_loader = helix_core::config::default_lang_loader();

@@ -32,6 +32,7 @@ pub mod layout;
 pub mod list_nav;
 pub mod modal_text;
 pub mod model;
+pub mod open_buffers;
 pub mod presentation_state;
 pub mod register;
 pub mod revision;

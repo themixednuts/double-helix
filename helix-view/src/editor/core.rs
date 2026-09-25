@@ -102,6 +102,8 @@ pub struct Editor {
         std::collections::BTreeMap<PathBuf, WorkspaceDiagnosticCounts>,
     pub workspace_diagnostic_counts: WorkspaceDiagnosticCounts,
     pub diff_providers: DiffProviderRegistry,
+    /// Unsaved text of open documents, for readers off the main thread (assistant agents).
+    pub open_buffers: crate::open_buffers::OpenBuffers,
     /// What each workspace is trusted with (local config, servers, git config).
     pub workspace_trust: helix_loader::workspace_trust::WorkspaceTrust,
 

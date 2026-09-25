@@ -90,7 +90,9 @@ pub enum ExitStatus {
 
 #[derive(Debug, Clone)]
 pub enum Fs {
-    Local,
+    Local {
+        open_buffers: crate::open_buffers::OpenBuffers,
+    },
 }
 
 #[derive(Clone)]
@@ -114,7 +116,9 @@ pub struct Set {
 
 pub fn local_set(editor: &Editor) -> Set {
     Set {
-        fs: Fs::Local,
+        fs: Fs::Local {
+            open_buffers: editor.open_buffers.clone(),
+        },
         terminal: Some(Terminal::Local {
             inner: editor.assistant_terminals(),
         }),
@@ -137,17 +141,24 @@ pub enum Error {
 }
 
 impl Fs {
+    /// The file's text as the user sees it: an open document's unsaved edits win over the file
+    /// on disk.
     pub async fn read_text(&self, path: &Path) -> Result<String, Error> {
         match self {
-            Self::Local => tokio::fs::read_to_string(path)
-                .await
-                .map_err(|err| Error::Other(err.into())),
+            Self::Local { open_buffers } => {
+                if let Some(text) = open_buffers.text(path) {
+                    return Ok(text.to_string());
+                }
+                tokio::fs::read_to_string(path)
+                    .await
+                    .map_err(|err| Error::Other(err.into()))
+            }
         }
     }
 
     pub async fn write_text(&self, req: Write) -> Result<(), Error> {
         match self {
-            Self::Local => {
+            Self::Local { .. } => {
                 if let Some(parent) = req.path.parent() {
                     tokio::fs::create_dir_all(parent)
                         .await

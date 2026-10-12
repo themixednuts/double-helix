@@ -38,7 +38,6 @@ struct InstanceKey {
 
 #[derive(Clone, Debug, PartialEq)]
 struct DemandSignature {
-    config_generation: u64,
     language: String,
     location: DemandLocation,
     command: String,
@@ -461,7 +460,6 @@ impl Editor {
             }
 
             let signature = DemandSignature {
-                config_generation: self.config_gen,
                 language: language.language_id.clone(),
                 location: demand_location.clone(),
                 command: server.command.clone(),
@@ -668,6 +666,10 @@ impl Editor {
                 MAX_RESTART_ATTEMPTS,
                 key.document
             );
+            let server = key.server.clone();
+            self.notify_error(format!(
+                "language server '{server}' failed to start after {MAX_RESTART_ATTEMPTS} attempts; see the log (:log-open) and use :lsp-restart to try again"
+            ));
             return false;
         }
         let delay = BASE_RESTART_DELAY.saturating_mul(1_u32 << (state.failure_count - 1));
@@ -1063,7 +1065,9 @@ impl Editor {
             }
         }
         if let Some(state) = self.language_server_supervisor.demands.get_mut(key) {
-            state.failure_count = 0;
+            // `failure_count` is only reset once the server finishes initializing
+            // (see `reset_language_server_failures`): a server that spawns but dies
+            // during `initialize` must keep backing off and eventually give up.
             state.stage = DemandStage::Attached {
                 client: client.id(),
             };
@@ -1132,6 +1136,19 @@ impl Editor {
                 "failed to restart language server '{}': {error}",
                 key.server
             ));
+        }
+    }
+
+    /// Clears the restart backoff of every demand attached to a server that finished
+    /// initializing, so later crashes start backing off from scratch again.
+    pub(super) fn reset_language_server_failures(
+        &mut self,
+        server_id: helix_lsp::LanguageServerId,
+    ) {
+        for state in self.language_server_supervisor.demands.values_mut() {
+            if matches!(state.stage, DemandStage::Attached { client } if client == server_id) {
+                state.failure_count = 0;
+            }
         }
     }
 

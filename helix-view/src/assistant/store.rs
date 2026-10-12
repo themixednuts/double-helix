@@ -1149,17 +1149,12 @@ impl Store {
     ) -> Vec<effect::Effect> {
         match self {
             Self::Empty(history) => {
-                let count = entries.len();
+                // History loads in the background (e.g. at startup); refreshing it is
+                // not something the user asked for, so it stays silent.
                 history.replace(scope, entries, next);
-                vec![
-                    effect::Effect::SetStatus {
-                        message: format!("Assistant history updated ({count} sessions)"),
-                    },
-                    effect::Effect::SyncModel,
-                ]
+                vec![effect::Effect::SyncModel]
             }
             Self::Ready { threads, history } => {
-                let count = entries.len();
                 history.replace(scope, entries, next);
                 let ids: Vec<_> = threads.threads.keys().copied().collect();
                 for id in ids {
@@ -1167,12 +1162,7 @@ impl Store {
                         history.sync_thread(&thread);
                     }
                 }
-                vec![
-                    effect::Effect::SetStatus {
-                        message: format!("Assistant history updated ({count} sessions)"),
-                    },
-                    effect::Effect::SyncModel,
-                ]
+                vec![effect::Effect::SyncModel]
             }
         }
     }
@@ -2012,19 +2002,18 @@ mod tests {
     }
 
     #[test]
-    fn replace_history_emits_status_effect() {
+    fn replace_history_is_silent() {
         let mut store = Store::default();
         let scope = thread::Scope::new(std::path::PathBuf::from("."));
 
         let effects = store.replace_history(scope, Vec::new(), None);
 
-        assert!(effects.iter().any(|effect| {
-            matches!(
-                effect,
-                effect::Effect::SetStatus { message }
-                    if message == "Assistant history updated (0 sessions)"
-            )
-        }));
+        assert!(!effects
+            .iter()
+            .any(|effect| matches!(effect, effect::Effect::SetStatus { .. })));
+        assert!(effects
+            .iter()
+            .any(|effect| matches!(effect, effect::Effect::SyncModel)));
     }
 
     #[test]

@@ -71,8 +71,13 @@ impl Editor {
         &mut self,
         language_server_id: helix_lsp::LanguageServerId,
     ) -> bool {
-        self.language_servers
-            .mark_initialization_dispatched(language_server_id)
+        let first = self
+            .language_servers
+            .mark_initialization_dispatched(language_server_id);
+        if first {
+            self.reset_language_server_failures(language_server_id);
+        }
+        first
     }
 
     pub fn notify_file_changed(&self, path: std::path::PathBuf) {

@@ -293,9 +293,12 @@ impl Editor {
             .collect()
     }
 
+    /// Clears the status-line message. Popup notifications are left alone: they
+    /// expire on their own timeout or via the explicit dismiss commands, and callers
+    /// use this to drop stale status text (e.g. on entering command mode or when an
+    /// LSP progress report ends), which must not wipe unrelated toasts.
     pub fn clear_status(&mut self) {
         self.status_msg = None;
-        self.notifications.dismiss_all();
     }
 
     #[inline]

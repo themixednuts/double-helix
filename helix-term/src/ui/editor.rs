@@ -2935,6 +2935,7 @@ mod tests {
             area: Rect::new(0, 0, width, 10),
             config_gen: 1,
             annotation,
+            cursorline_diagnostics: false,
         }
     }
 

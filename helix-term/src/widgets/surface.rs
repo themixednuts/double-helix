@@ -65,20 +65,26 @@ pub fn draw_string_anchored(
         return (x, y);
     }
 
+    // A leading marker is explicit: callers that pre-scroll the text (e.g. text inputs)
+    // request it to show that content is hidden before `text`. The trailing marker is
+    // only drawn when the text actually overflows what is left after the leading one.
+    let lead_marker = usize::from(truncate_start);
+    let overflows =
+        crate::ui::text_layout::display_width(text) > available.saturating_sub(lead_marker);
+    let tail_marker = usize::from(overflows && truncate_end);
+    let content_limit = available.saturating_sub(lead_marker + tail_marker);
+    let graphemes = crate::ui::text_layout::visible_graphemes(text, content_limit);
+
     let mut next_x = x;
-    let mut used = 0usize;
-    if truncate_start {
+    if lead_marker == 1 {
         if let Some(cell) = surface.cell_mut((next_x, y)) {
             cell.set_symbol("…");
             cell.set_style(style(0));
         }
         next_x = next_x.saturating_add(1);
-        used += 1;
     }
 
-    let reserve_end = usize::from(truncate_end && used < available);
-    let content_limit = available.saturating_sub(used + reserve_end);
-    for grapheme in crate::ui::text_layout::visible_graphemes(text, content_limit) {
+    for grapheme in graphemes {
         if let Some(cell) = surface.cell_mut((next_x, y)) {
             cell.set_symbol(grapheme.text);
             cell.set_style(style(grapheme.byte));
@@ -89,10 +95,9 @@ pub fn draw_string_anchored(
             }
         }
         next_x = next_x.saturating_add(grapheme.width as u16);
-        used += grapheme.width;
     }
 
-    if truncate_end && used < available {
+    if tail_marker == 1 {
         if let Some(cell) = surface.cell_mut((next_x, y)) {
             cell.set_symbol("…");
             cell.set_style(style(text.len()));
@@ -122,5 +127,22 @@ mod tests {
         assert_eq!(surface[(0, 0)].symbol(), "a");
         assert_eq!(surface[(0, 0)].fg, tui::ratatui::style::Color::LightBlue);
         assert_eq!(surface[(3, 0)].symbol(), "…");
+    }
+
+    #[test]
+    fn anchored_text_only_marks_overflow() {
+        let mut surface = Buffer::empty(tui::ratatui::layout::Rect::new(0, 0, 8, 1));
+        let mut style = |_| RatatuiStyle::default();
+
+        let end = draw_string_anchored(
+            &mut surface,
+            AnchoredText::new(0, 0, "abc", 8)
+                .truncate_end(true)
+                .truncate_start(false),
+            &mut style,
+        );
+
+        assert_eq!(end, (3, 0));
+        assert_eq!(surface[(3, 0)].symbol(), " ");
     }
 }

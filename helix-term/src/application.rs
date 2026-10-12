@@ -634,11 +634,11 @@ impl Application {
                 if nr_of_files == 0 {
                     editor.new_file(Action::VerticalSplit);
                 } else {
-                    editor.set_status(format!(
-                        "Loaded {} file{}.",
-                        nr_of_files,
-                        if nr_of_files == 1 { "" } else { "s" } // avoid "Loaded 1 files." grammo
-                    ));
+                    // Opening a single file is self-evident; only summarize multi-file opens
+                    // so startup doesn't greet the user with a redundant toast.
+                    if nr_of_files > 1 {
+                        editor.set_status(format!("Loaded {nr_of_files} files."));
+                    }
                     // align the view to center after all files are loaded,
                     // does not affect views without pos since it is at the top
                     let (view_id, doc) = focused!(editor);

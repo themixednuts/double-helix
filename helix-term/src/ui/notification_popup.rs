@@ -6,9 +6,8 @@ use helix_core::unicode::width::UnicodeWidthStr;
 use helix_view::theme::Modifier;
 use helix_view::{
     editor::{
-        CmdlineStyle, Config, Notification, NotificationConfig, NotificationEmojis,
-        NotificationIcons, NotificationPosition, NotificationShadowConfig, NotificationStyle,
-        Severity,
+        Config, Notification, NotificationConfig, NotificationEmojis, NotificationIcons,
+        NotificationPosition, NotificationShadowConfig, NotificationStyle, Severity,
     },
     graphics::{Color, Rect, Style},
     Theme,
@@ -82,10 +81,9 @@ impl NotificationPopup {
     ) {
         let notifications_config = &config.notifications;
 
-        if !notifications_config.enable
-            || notifications_config.style != NotificationStyle::Popup
-            || config.cmdline.style != CmdlineStyle::Popup
-        {
+        // Popup notifications are independent of the command line style: with the
+        // default bottom command line, `set_status` only reaches the user through here.
+        if !notifications_config.enable || notifications_config.style != NotificationStyle::Popup {
             self.notifications.clear();
             self.queue.dismiss_all();
             self.timeout_tasks.clear();
@@ -176,7 +174,6 @@ impl NotificationPopup {
         };
         self.layout_rounded = config.rounded_corners || notifications_config.border.radius > 0;
         self.layout_padding = notifications_config.padding;
-
         if self.notifications.is_empty() {
             return None;
         }
@@ -196,11 +193,6 @@ impl NotificationPopup {
         let mut areas = Vec::new();
         for item in &self.notifications {
             let message = &item.notification.message;
-            let wrap_inner_width = max_width
-                .saturating_sub(self.layout_thickness * 2)
-                .saturating_sub(self.layout_padding * 2)
-                .max(1);
-
             let mut prefix = String::new();
             if config.show_emojis {
                 prefix.push_str(notification_emoji(
@@ -217,19 +209,23 @@ impl NotificationPopup {
             }
             let prefix_width = prefix.width() as u16;
 
-            let content_lines = wrap_text(message, wrap_inner_width);
+            // Wrap exactly like `render_notification`: the prefix is a hanging indent
+            // reserved on every line, so the measured box always fits the drawn text.
+            let content_width = max_width
+                .saturating_sub(self.layout_thickness * 2)
+                .saturating_sub(self.layout_padding * 2);
+            let text_width = content_width.saturating_sub(prefix_width).max(1);
+
+            let content_lines = wrap_text(message, text_width);
             let content_height = content_lines.len() as u16;
 
-            let mut content_max_w: u16 = 1;
-            for (i, ln) in content_lines.iter().enumerate() {
-                let mut w = ln.width() as u16;
-                if i == 0 {
-                    w = w.saturating_add(prefix_width);
-                }
-                if w > content_max_w {
-                    content_max_w = w;
-                }
-            }
+            let content_max_w = content_lines
+                .iter()
+                .map(|ln| ln.width() as u16)
+                .max()
+                .unwrap_or(0)
+                .saturating_add(prefix_width)
+                .max(1);
 
             let width = content_max_w
                 .saturating_add(self.layout_padding * 2)
@@ -527,7 +523,7 @@ fn prepare_notification_render(
         area,
     };
     PreparedRender::snapshot(tag, model, move |mut model, cancellation| {
-        let mut output = RenderOutput::new(area);
+        let mut output = RenderOutput::sparse(area);
         let items: Vec<NotificationRenderItem> = model.items.clone();
         for item in items.iter().rev() {
             if cancellation.is_cancelled() {
@@ -636,8 +632,6 @@ fn render_notification(
     }
 
     // Render text content
-    let content_lines = wrap_text(&item.message, content_area.width.max(1));
-
     let mut prefix = String::new();
     if model.show_emojis {
         prefix.push_str(notification_emoji(&item.severity, &model.emojis));
@@ -649,6 +643,9 @@ fn render_notification(
 
     let prefix_width = prefix.width() as u16;
     let show_prefix = !prefix.is_empty() && content_area.width > prefix_width + 1;
+    let x_offset = if show_prefix { prefix_width } else { 0 };
+    let text_width = content_area.width.saturating_sub(x_offset).max(1);
+    let content_lines = wrap_text(&item.message, text_width);
 
     for (y_pos, (i, line)) in (content_area.y..).zip(content_lines.iter().enumerate()) {
         if y_pos >= content_area.y + content_area.height {
@@ -664,17 +661,11 @@ fn render_notification(
             );
         }
 
-        let x_offset = if i == 0 && show_prefix {
-            prefix_width
-        } else {
-            0
-        };
-        let available = content_area.width.saturating_sub(x_offset).max(1) as usize;
         surface.set_stringn(
             content_area.x + x_offset,
             y_pos,
             line,
-            available,
+            text_width as usize,
             tui::ratatui::to_ratatui_style(notification_style),
         );
     }

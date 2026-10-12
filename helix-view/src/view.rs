@@ -186,6 +186,9 @@ pub struct ViewLayoutInputs {
     pub area: Rect,
     pub config_gen: u64,
     pub annotation: crate::presentation_state::AnnotationSnapshot,
+    /// Whether the debounced cursor-line inline diagnostics are visible. They insert
+    /// virtual lines, so toggling them changes the layout even when nothing else did.
+    pub cursorline_diagnostics: bool,
 }
 
 impl ViewLayoutInputs {
@@ -193,6 +196,7 @@ impl ViewLayoutInputs {
         self.doc_id == current.doc_id
             && self.doc_version == current.doc_version
             && self.annotation == current.annotation
+            && self.cursorline_diagnostics == current.cursorline_diagnostics
             && self.config_gen == current.config_gen
             && self.area.width == current.area.width
     }
@@ -453,6 +457,9 @@ impl View {
             area: self.area,
             config_gen,
             annotation: doc.annotation_snapshot(),
+            cursorline_diagnostics: self
+                .diagnostics_handler
+                .cursorline_diagnostics_visible(doc, self.id),
         }
     }
 
@@ -1804,6 +1811,7 @@ mod tests {
             annotation: crate::presentation_state::AnnotationSnapshot::new(
                 crate::Revision::default(),
             ),
+            cursorline_diagnostics: false,
         }
     }
 

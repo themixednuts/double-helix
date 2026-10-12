@@ -3065,6 +3065,9 @@ fn redraw(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> anyh
         return Ok(());
     }
 
+    // Invalidate cached view layouts too, not just the terminal buffer, so a
+    // redraw actually repaints every view from scratch.
+    cx.editor.bump_config_generation();
     let callback = Box::pin(async move { Ok(UiCommand::NeedFullRedraw) });
 
     cx.spawn_ui(callback);

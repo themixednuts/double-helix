@@ -888,7 +888,15 @@ fn blit_sparse_cells(src: &CellSurface, dst: &mut CellSurface) {
                 continue;
             }
             let destination = &mut dst.content[dst_start + column];
+            // Sparse layers are drawn onto a reset surface, so a `Reset` background only
+            // means "not specified" by that layer (e.g. popup content drawn over popup
+            // chrome). Keep the background underneath instead of punching through to the
+            // terminal default.
+            let underlying_bg = destination.bg;
             destination.clone_from(source);
+            if destination.bg == tui::ratatui::style::Color::Reset {
+                destination.bg = underlying_bg;
+            }
             if destination.symbol() == SPARSE_CELL_MARKER {
                 destination.set_symbol(" ");
             }
@@ -1289,6 +1297,26 @@ mod tests {
         assert!(cache
             .lookup(retired.id, retired.key, retired.area)
             .is_none());
+    }
+
+    #[test]
+    fn sparse_blit_keeps_underlying_background_for_unstyled_cells() {
+        let area = Rect::new(0, 0, 2, 1);
+        let mut dst = CellSurface::empty(tui::ratatui::to_ratatui_rect(area));
+        for cell in &mut dst.content {
+            cell.bg = tui::ratatui::style::Color::Blue;
+        }
+
+        let mut output = RenderOutput::sparse(area);
+        output.surface_mut()[(0, 0)].set_symbol("a");
+        output.surface_mut()[(0, 0)].bg = tui::ratatui::style::Color::Reset;
+        output.surface_mut()[(1, 0)].set_symbol("b");
+        output.surface_mut()[(1, 0)].bg = tui::ratatui::style::Color::Red;
+        blit_sparse_cells(output.surface(), &mut dst);
+
+        assert_eq!(dst[(0, 0)].symbol(), "a");
+        assert_eq!(dst[(0, 0)].bg, tui::ratatui::style::Color::Blue);
+        assert_eq!(dst[(1, 0)].bg, tui::ratatui::style::Color::Red);
     }
 
     #[test]

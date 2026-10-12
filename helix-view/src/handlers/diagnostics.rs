@@ -282,6 +282,22 @@ impl DiagnosticsHandler {
             .store(self.generation.load(Ordering::Relaxed), Ordering::Relaxed);
     }
 
+    /// Side-effect free variant of [`Self::show_cursorline_diagnostics`]: reports whether
+    /// cursor-line diagnostics are currently shown without scheduling a new debounce.
+    pub fn cursorline_diagnostics_visible(&self, doc: &Document, view: ViewId) -> bool {
+        if !self.active {
+            return false;
+        }
+        let cursor_line = doc
+            .selection(view)
+            .primary()
+            .cursor_line(doc.text().slice(..));
+        self.last_cursor_line.load(Ordering::Relaxed) == cursor_line
+            && self.load_last_doc() == doc.id()
+            && self.generation.load(Ordering::Relaxed)
+                == self.active_generation.load(Ordering::Relaxed)
+    }
+
     pub fn show_cursorline_diagnostics(&self, doc: &Document, view: ViewId) -> bool {
         if !self.active {
             return false;

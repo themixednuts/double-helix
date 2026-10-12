@@ -6,7 +6,7 @@
 use helix_core::unicode::width::UnicodeWidthStr;
 use helix_view::graphics::{Rect, Style};
 use tui::{
-    ratatui::layout::{Constraint, Direction as TuiDirection, Layout as TuiLayout},
+    ratatui::layout::Constraint,
     text::{Span, Spans},
 };
 
@@ -16,40 +16,57 @@ use super::{TableCell, TableRow};
 
 const PICKER_COLUMN_SPACING: u16 = 1;
 
+/// Fits the requested column widths into `max_width`.
+///
+/// When the columns overflow, the widest ones are shrunk first (down to a common cap)
+/// so short columns such as names, key bindings, severities or codes stay readable and
+/// the long descriptive column absorbs the truncation, wherever it sits.
 fn picker_column_widths(
     widths: &[Constraint],
     max_width: u16,
     highlight_symbol_width: u16,
 ) -> Vec<u16> {
-    let has_selection = highlight_symbol_width > 0;
-    let mut constraints = Vec::with_capacity(widths.len() * 2 + usize::from(has_selection));
-    if has_selection {
-        constraints.push(Constraint::Length(highlight_symbol_width));
-    }
-    for constraint in widths {
-        constraints.push(*constraint);
-        constraints.push(Constraint::Length(PICKER_COLUMN_SPACING));
-    }
-    if !widths.is_empty() {
-        constraints.pop();
-    }
-
-    let chunks = TuiLayout::default()
-        .direction(TuiDirection::Horizontal)
-        .constraints(constraints)
-        .split(tui::ratatui::to_ratatui_rect(Rect {
-            x: 0,
-            y: 0,
-            width: max_width,
-            height: 1,
-        }));
-
-    chunks
+    let spacing = PICKER_COLUMN_SPACING.saturating_mul(widths.len().saturating_sub(1) as u16);
+    let available = max_width
+        .saturating_sub(highlight_symbol_width)
+        .saturating_sub(spacing) as usize;
+    let requested: Vec<usize> = widths
         .iter()
-        .skip(usize::from(has_selection))
-        .step_by(2)
-        .map(|chunk| chunk.width)
-        .collect()
+        .map(|constraint| match constraint {
+            Constraint::Length(width) => *width as usize,
+            _ => available,
+        })
+        .collect();
+    if requested.iter().sum::<usize>() <= available {
+        return requested.into_iter().map(|width| width as u16).collect();
+    }
+
+    // Largest cap such that sum(min(width, cap)) <= available.
+    let mut sorted = requested.clone();
+    sorted.sort_unstable();
+    let mut budget = available;
+    let mut cap = 0;
+    for (index, width) in sorted.iter().enumerate() {
+        let columns_left = sorted.len() - index;
+        if width * columns_left > budget {
+            cap = budget / columns_left;
+            break;
+        }
+        budget -= width;
+    }
+    let mut out: Vec<usize> = requested.iter().map(|width| (*width).min(cap)).collect();
+    // Hand the rounding remainder to the capped columns, left to right.
+    let mut spare = available.saturating_sub(out.iter().sum());
+    for (width, request) in out.iter_mut().zip(&requested) {
+        if spare == 0 {
+            break;
+        }
+        if *request > *width {
+            *width += 1;
+            spare -= 1;
+        }
+    }
+    out.into_iter().map(|width| width as u16).collect()
 }
 
 fn set_spans_truncated_start(
@@ -296,6 +313,24 @@ impl PickerTable<'_> {
 mod tests {
     use super::*;
     use tui::ratatui::{buffer::Buffer, layout::Rect as RatatuiRect};
+
+    #[test]
+    fn overflowing_columns_shrink_the_widest_first() {
+        let widths = [
+            Constraint::Length(39),
+            Constraint::Length(8),
+            Constraint::Length(80),
+        ];
+        // 52 - 1 (highlight) - 2 (spacing) = 49 cells for content.
+        assert_eq!(picker_column_widths(&widths, 52, 1), vec![21, 8, 20]);
+
+        let fits = [Constraint::Length(10), Constraint::Length(5)];
+        assert_eq!(picker_column_widths(&fits, 40, 1), vec![10, 5]);
+
+        // A short trailing column (e.g. a diagnostic code) keeps its width.
+        let trailing = [Constraint::Length(70), Constraint::Length(5)];
+        assert_eq!(picker_column_widths(&trailing, 40, 1), vec![33, 5]);
+    }
 
     #[test]
     fn selected_row_uses_picker_symbol() {

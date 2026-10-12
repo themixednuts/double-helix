@@ -2526,7 +2526,9 @@ pub(crate) fn show_command_palette(
                 }
             }
         },
-    );
+    )
+    // Descriptions read left to right; keep their start visible when truncated.
+    .truncate_start(false);
     compositor.push(Box::new(overlaid(picker)));
 }
 

@@ -126,11 +126,13 @@ impl Application {
                             };
                         }
                     }
-                    Notification::ProgressMessage(params)
-                        if !self
+                    Notification::ProgressMessage(params) => {
+                        // Progress state must always be tracked: dropping `End` while a prompt
+                        // is open would leave the spinner and percentage stuck forever. Only
+                        // the status text is suppressed so it doesn't clobber the prompt.
+                        let prompt_open = self
                             .compositor
-                            .has_component(std::any::type_name::<ui::Prompt>()) =>
-                    {
+                            .has_component(std::any::type_name::<ui::Prompt>());
                         let editor_view = self
                             .compositor
                             .find::<ui::EditorView>()
@@ -165,7 +167,7 @@ impl Application {
                             }
                         };
 
-                        if self.editor.config().lsp.display_progress_messages {
+                        if !prompt_open && self.editor.config().lsp.display_progress_messages {
                             let title =
                                 title.or_else(|| self.language.progress.title(server_id, &token));
                             if title.is_some() || percentage.is_some() || message.is_some() {
@@ -215,7 +217,6 @@ impl Application {
                             }
                         }
                     }
-                    Notification::ProgressMessage(_params) => {}
                     Notification::Exit => {
                         self.editor.set_status("Language server exited");
                         self.editor.remove_language_server_diagnostics(server_id);

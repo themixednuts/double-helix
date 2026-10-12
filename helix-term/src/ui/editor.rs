@@ -89,11 +89,31 @@ fn paint_split_separator(
     );
 }
 
+/// Paints the divider column a side-by-side split leaves to its right. It lies outside
+/// the view's cached cell region, so it is painted every frame like the row separator.
+fn paint_vertical_separator(
+    surface: &mut CellSurface,
+    view_area: Rect,
+    viewport: Rect,
+    theme: &Theme,
+) {
+    if viewport.right() == view_area.right() {
+        return;
+    }
+    let x = view_area.right();
+    let style = tui::ratatui::to_ratatui_style(theme.get("ui.window"));
+    for y in view_area.top()..view_area.bottom() {
+        if let Some(cell) = surface.cell_mut((x, y)) {
+            cell.set_symbol(tui::symbols::line::VERTICAL);
+            cell.set_style(style);
+        }
+    }
+}
+
 /// View render context grouping parameters for `render_view`.
 pub(crate) struct ViewRenderContext<'a> {
     pub doc: &'a Document,
     pub view: &'a View,
-    pub viewport: Rect,
     pub is_focused: bool,
     pub config: &'a Config,
     pub config_gen: u64,
@@ -145,7 +165,9 @@ impl PreparedGutters {
         let (_, cursor_lines) = doc.cursor_lines(view.id);
         let cursor_lines: HashSet<usize> = cursor_lines.into_iter().collect();
         let mut columns = Vec::with_capacity(view.gutters().len());
-        let mut x = vctx.viewport.x;
+        // Gutters start at this view's own left edge; `vctx.viewport` is the whole editor
+        // area, which would stack every split's gutter on the leftmost column.
+        let mut x = view.area.x;
 
         for gutter_type in view.gutters() {
             let width = gutter_type.width(view, doc);
@@ -254,7 +276,6 @@ struct DeferredViewPaint {
     view_id: ViewId,
     view_area: Rect,
     inner: Rect,
-    viewport: Rect,
     view_offset: ViewPosition,
     is_focused: bool,
     terminal_focused: bool,
@@ -286,7 +307,6 @@ impl DeferredViewPaint {
         let ViewRenderContext {
             doc,
             view,
-            viewport,
             is_focused,
             config,
             config_gen,
@@ -395,7 +415,6 @@ impl DeferredViewPaint {
             view_id: view.id,
             view_area: view.area,
             inner,
-            viewport: *viewport,
             view_offset,
             is_focused: *is_focused,
             terminal_focused: editor.terminal_focused,
@@ -575,16 +594,6 @@ impl DeferredViewPaint {
             surface,
             &self.theme,
         );
-        if self.viewport.right() != self.view_area.right() {
-            let x = self.view_area.right();
-            let style = tui::ratatui::to_ratatui_style(self.theme.get("ui.window"));
-            for y in self.view_area.top()..self.view_area.bottom() {
-                if let Some(cell) = surface.cell_mut((x, y)) {
-                    cell.set_symbol(tui::symbols::line::VERTICAL);
-                    cell.set_style(style);
-                }
-            }
-        }
         output
     }
 }
@@ -780,7 +789,6 @@ impl EditorFrameSnapshot {
             let vctx = ViewRenderContext {
                 doc,
                 view,
-                viewport: area,
                 is_focused,
                 config: &config,
                 config_gen,
@@ -851,6 +859,7 @@ impl EditorFrameSnapshot {
             if cancellation.is_cancelled() {
                 return;
             }
+            paint_vertical_separator(surface, view_area, self.area, &theme);
             paint_split_separator(surface, view_area, self.area, &theme);
             if self.cursor_owner && is_focused {
                 let mut absolute = cursor.and_then(|position| {
@@ -3208,7 +3217,6 @@ mod tests {
             let vctx = ViewRenderContext {
                 doc,
                 view,
-                viewport: area,
                 is_focused: true,
                 config: &config,
                 config_gen: editor.config_gen,
@@ -3568,7 +3576,6 @@ mod tests {
             let vctx = ViewRenderContext {
                 doc,
                 view,
-                viewport: area,
                 is_focused: true,
                 config: &config,
                 config_gen: editor.config_gen,

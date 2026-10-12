@@ -91,7 +91,13 @@ impl PkgHandler {
                 .await;
             return;
         }
-        let package = status.package.map(|package| package.name);
+        // The registry falls back to any package for the language; only a package that
+        // actually ships `command` can fix this missing server (installing `taplo` does
+        // not provide a missing `tombi`).
+        let package = status
+            .package
+            .filter(|package| helix_pkg::registry::package_provides_command(package, &command))
+            .map(|package| package.name);
         log::info!(
             "[pkg] missing_language_server server={server} language={language} command={command} package={} auto_install={}",
             package.as_deref().unwrap_or("<none>"),

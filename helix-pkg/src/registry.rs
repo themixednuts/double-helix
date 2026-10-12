@@ -163,24 +163,10 @@ impl Registry {
         language: Option<&str>,
         command: &str,
     ) -> Option<&PackageSpec> {
-        let requested = command_candidates(command);
         self.packages
             .values()
             .filter(|package| package.kind == kind && !package.is_system_only())
-            .find(|package| {
-                package
-                    .artifacts
-                    .iter()
-                    .flat_map(|artifact| {
-                        [
-                            artifact.bin.as_str(),
-                            artifact.source.bin.as_deref().unwrap_or_default(),
-                            artifact.source.system.as_deref().unwrap_or_default(),
-                        ]
-                    })
-                    .flat_map(command_candidates)
-                    .any(|candidate| requested.contains(&candidate))
-            })
+            .find(|package| package_provides_command(package, command))
             .or_else(|| {
                 let language = language?;
                 self.packages
@@ -244,6 +230,27 @@ impl Registry {
         }
         Ok(())
     }
+}
+
+/// Whether one of `package`'s artifacts installs an executable named `command`.
+///
+/// [`Registry::package_for_command`] falls back to any package for the same language,
+/// so callers that need the exact binary (e.g. to fix a missing language server) must
+/// check this before suggesting or installing the package.
+pub fn package_provides_command(package: &PackageSpec, command: &str) -> bool {
+    let requested = command_candidates(command);
+    package
+        .artifacts
+        .iter()
+        .flat_map(|artifact| {
+            [
+                artifact.bin.as_str(),
+                artifact.source.bin.as_deref().unwrap_or_default(),
+                artifact.source.system.as_deref().unwrap_or_default(),
+            ]
+        })
+        .flat_map(command_candidates)
+        .any(|candidate| requested.contains(&candidate))
 }
 
 fn command_candidates(command: &str) -> BTreeSet<String> {

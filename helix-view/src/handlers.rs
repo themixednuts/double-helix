@@ -743,7 +743,14 @@ impl CoalescingState for SignatureHelpEventState {
                 }
             }
             lsp::SignatureHelpEvent::ReTrigger => {
-                if !matches!(self.intent, Some((_, SignatureIntent::Invoked))) {
+                // A retrigger only refreshes an already open popup. It must not replace a
+                // pending trigger/invocation: typing `(` sends `Trigger` immediately
+                // followed by document/selection-change `ReTrigger`s, and downgrading it
+                // would make the handler drop the request while the popup is closed.
+                if !matches!(
+                    self.intent,
+                    Some((_, SignatureIntent::Invoked | SignatureIntent::Trigger))
+                ) {
                     self.intent = Some((sequence, SignatureIntent::ReTrigger));
                 }
             }
@@ -777,7 +784,13 @@ impl CoalescingState for SignatureHelpEventState {
             .completion
             .map_or(u64::MAX, |(_, sequence, _)| sequence);
 
-        if cancel_sequence <= intent_sequence && cancel_sequence <= completion_sequence {
+        // All three default to `u64::MAX` when absent, so the cancel branch must check
+        // that a cancel is actually pending; otherwise an idle state would deliver a
+        // phantom `Cancel` forever and the relay would spin (wiping every new trigger).
+        if self.cancel.is_some()
+            && cancel_sequence <= intent_sequence
+            && cancel_sequence <= completion_sequence
+        {
             self.cancel = None;
             self.in_flight = Some(SignatureDelivery::Cancel);
             return Some((lsp::SignatureHelpEvent::Cancel, SignatureDelivery::Cancel));
@@ -1156,6 +1169,27 @@ mod tests {
             rx.try_recv(),
             Err(helix_runtime::TryRecvError::Empty)
         ));
+    }
+
+    #[test]
+    fn signature_idle_state_delivers_nothing() {
+        let mut state = SignatureHelpEventState::default();
+        assert!(state.begin_delivery().is_none());
+
+        state.push(lsp::SignatureHelpEvent::Trigger);
+        let (_, delivery) = state.begin_delivery().expect("pending trigger");
+        state.finish_delivery(delivery);
+        assert!(state.begin_delivery().is_none());
+    }
+
+    #[test]
+    fn signature_retrigger_does_not_downgrade_pending_trigger() {
+        let mut state = SignatureHelpEventState::default();
+        state.push(lsp::SignatureHelpEvent::Trigger);
+        state.push(lsp::SignatureHelpEvent::ReTrigger);
+
+        let (event, _) = state.begin_delivery().expect("pending trigger");
+        assert!(matches!(event, lsp::SignatureHelpEvent::Trigger));
     }
 
     #[test]

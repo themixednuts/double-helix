@@ -27,6 +27,9 @@ pub struct Hover {
     contents: Vec<(Option<Markdown>, Markdown)>,
     render_cache_id: crate::render::CacheId,
     content_revision: u64,
+    /// `(active_index, text_width) -> laid-out body height`, so the popup can scroll
+    /// over the real contents without re-running markdown layout every frame.
+    body_height: Option<((usize, u16), u16)>,
 }
 
 static NEXT_HOVER_RENDER_CACHE: AtomicU64 = AtomicU64::new(1);
@@ -72,6 +75,7 @@ impl Hover {
                 NEXT_HOVER_RENDER_CACHE.fetch_add(1, Ordering::Relaxed),
             )),
             content_revision: hasher.finish(),
+            body_height: None,
         }
     }
 
@@ -160,41 +164,12 @@ impl HoverPaintSnapshot {
         let contents = self
             .contents
             .layout(contents_area.width as usize, &self.theme);
-        let (_, content_height) = crate::ui::text::required_size(&contents, contents_area.width);
-        let needs_scrollbar = content_height > contents_area.height;
-        let body_area = if needs_scrollbar {
-            contents_area.clip_right(1)
-        } else {
-            contents_area
-        };
+        // The enclosing popup owns scrolling and the scrollbar: `scroll` is its offset,
+        // clamped against the height reported by `required_size`.
         Paragraph::new(tui::ratatui::to_ratatui_text(&contents))
             .wrap(Wrap { trim: false })
             .scroll((self.scroll as u16, 0))
-            .render(tui::ratatui::to_ratatui_rect(body_area), surface);
-
-        if needs_scrollbar && contents_area.height > 0 && contents_area.width > 0 {
-            let thumb_style = self
-                .theme
-                .try_get("ui.menu.scroll")
-                .or_else(|| self.theme.try_get("ui.text.inactive"))
-                .unwrap_or_default();
-            crate::widgets::Scrollbar::new(
-                content_height as usize,
-                self.scroll,
-                contents_area.height as usize,
-            )
-            .symbol("▌")
-            .thumb_style(thumb_style)
-            .render(
-                Rect::new(
-                    contents_area.right().saturating_sub(1),
-                    contents_area.y,
-                    1,
-                    contents_area.height,
-                ),
-                surface,
-            );
-        }
+            .render(tui::ratatui::to_ratatui_rect(contents_area), surface);
         output
     }
 }
@@ -238,12 +213,28 @@ impl Component for Hover {
 
         let header_width = header
             .as_ref()
-            .map(|header| header.estimated_size(max_text_width, viewport.1).0)
+            .map(|header| header.estimated_size(max_text_width, u16::MAX).0)
             .unwrap_or_default();
+        let (content_width, _) = contents.estimated_size(max_text_width, u16::MAX);
+        let text_width = header_width.max(content_width).max(1);
 
-        let (content_width, content_height) = contents.estimated_size(max_text_width, viewport.1);
+        // Report the real, uncapped height of the laid-out body (what `render` paints)
+        // so the popup knows how far it can scroll. Capping it to the offered space
+        // made the contents look like they fit, which left paging keys without effect.
+        let key = (active_index, text_width);
+        let content_height = match self.body_height {
+            Some((cached, height)) if cached == key => height,
+            _ => {
+                let text = contents
+                    .render_source()
+                    .layout_unstyled(text_width as usize);
+                let height = crate::ui::text::required_size(&text, text_width).1;
+                self.body_height = Some((key, height));
+                height
+            }
+        };
 
-        let width = PADDING_HORIZONTAL + header_width.max(content_width);
+        let width = PADDING_HORIZONTAL + text_width;
         let height = if has_header {
             PADDING_TOP + HEADER_HEIGHT + SEPARATOR_HEIGHT + content_height + PADDING_BOTTOM
         } else {

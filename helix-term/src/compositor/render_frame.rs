@@ -346,6 +346,21 @@ impl<'a> RenderContext<'a> {
         self.frame_area
     }
 
+    /// The part of the frame floating popups may cover: everything above the reserved
+    /// statusline and message rows, which are painted last and would otherwise cut a
+    /// popup off.
+    pub fn popup_bounds(&self) -> helix_view::graphics::Rect {
+        let area = self.frame_area;
+        let layout = crate::compositor::compute_panel_layout(area, self.editor.editor);
+        let reserved_top = [layout.statusline_row, layout.global_status_row]
+            .into_iter()
+            .filter(|row| row.height > 0)
+            .map(|row| row.y)
+            .min()
+            .unwrap_or(area.bottom());
+        area.with_height(reserved_top.saturating_sub(area.y))
+    }
+
     pub fn focus_target(&self) -> helix_view::model::FocusTarget {
         self.editor.editor.model.focus
     }

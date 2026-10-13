@@ -428,6 +428,19 @@ impl MarkdownRenderSource {
         Self { contents, loader }
     }
 
+    /// Lays the markdown out without a theme. Line breaks match [`Self::layout`] (code
+    /// blocks are merely left unhighlighted), so this is suitable for measuring.
+    pub(crate) fn layout_unstyled(&self, width: usize) -> Text<'static> {
+        Text::from(render_markdown(
+            &self.contents,
+            width,
+            Style::default(),
+            &Markdown::styles(None),
+            None,
+            &self.loader,
+        ))
+    }
+
     pub(crate) fn layout(&self, width: usize, theme: &Theme) -> Text<'static> {
         let base = theme.get(Markdown::TEXT_STYLE);
         let styles = Markdown::styles(Some(theme));

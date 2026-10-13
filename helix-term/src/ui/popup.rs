@@ -11,7 +11,6 @@ use helix_view::{
     Editor,
 };
 
-const MIN_HEIGHT: u16 = 6;
 const MAX_HEIGHT: u16 = 26;
 const MAX_WIDTH: u16 = 120;
 
@@ -30,7 +29,11 @@ pub struct Popup<T: Component> {
     position: Option<Position>,
     pub(crate) area: Rect,
     position_bias: Open,
-    pub(crate) scroll_half_pages: usize,
+    /// Scroll offset into the contents, in rows. Clamped against the contents' height
+    /// every frame.
+    pub(crate) scroll: usize,
+    /// Visible content height of the last frame; one "page" for paging keys.
+    page_height: usize,
     auto_close: bool,
     ignore_escape_key: bool,
     id: &'static str,
@@ -44,7 +47,8 @@ impl<T: Component> Popup<T> {
             position: None,
             position_bias: Open::Below,
             area: Rect::new(0, 0, 0, 0),
-            scroll_half_pages: 0,
+            scroll: 0,
+            page_height: 0,
             auto_close: false,
             ignore_escape_key: false,
             id,
@@ -91,12 +95,32 @@ impl<T: Component> Popup<T> {
         self
     }
 
+    fn half_page(&self) -> usize {
+        (self.page_height / 2).max(1)
+    }
+
     pub fn scroll_half_page_down(&mut self) {
-        self.scroll_half_pages += 1;
+        self.scroll = self.scroll.saturating_add(self.half_page());
     }
 
     pub fn scroll_half_page_up(&mut self) {
-        self.scroll_half_pages = self.scroll_half_pages.saturating_sub(1);
+        self.scroll = self.scroll.saturating_sub(self.half_page());
+    }
+
+    pub fn scroll_page_down(&mut self) {
+        self.scroll = self.scroll.saturating_add(self.page_height.max(1));
+    }
+
+    pub fn scroll_page_up(&mut self) {
+        self.scroll = self.scroll.saturating_sub(self.page_height.max(1));
+    }
+
+    fn scroll_lines_down(&mut self, lines: usize) {
+        self.scroll = self.scroll.saturating_add(lines);
+    }
+
+    fn scroll_lines_up(&mut self, lines: usize) {
+        self.scroll = self.scroll.saturating_sub(lines);
     }
 
     /// Toggles the Popup's scrollbar.
@@ -165,67 +189,56 @@ impl<T: Component> Popup<T> {
 
         // -- make sure frame doesn't stick out of bounds
         let mut rel_x = position.col as u16;
-        let mut rel_y = position.row as u16;
+        let rel_y =
+            (position.row as u16).clamp(viewport.top(), viewport.bottom().saturating_sub(1));
 
-        // if there's a orientation preference, use that
-        // if we're on the top part of the screen, do below
-        // if we're on the bottom part, do above
-        let can_put_below = viewport.height > rel_y + MIN_HEIGHT;
-        let can_put_above = rel_y.checked_sub(MIN_HEIGHT).is_some();
-        let final_pos = match self.position_bias {
-            Open::Below => match can_put_below {
-                true => Open::Below,
-                false => Open::Above,
-            },
-            Open::Above => match can_put_above {
-                true => Open::Above,
-                false => Open::Below,
-            },
-        };
+        let space_above = rel_y.saturating_sub(viewport.top()).min(MAX_HEIGHT);
+        let space_below = viewport
+            .bottom()
+            .saturating_sub(rel_y.saturating_add(1))
+            .min(MAX_HEIGHT);
+        let border_size = |space: u16| if render_borders && space > 3 { 2 } else { 0 };
 
-        // compute maximum space available for child
-        let mut max_height = match final_pos {
-            Open::Above => rel_y,
-            Open::Below => viewport.height.saturating_sub(1 + rel_y),
-        };
-        max_height = max_height.min(MAX_HEIGHT);
         let mut max_width = viewport.width.saturating_sub(2).min(MAX_WIDTH);
-        render_borders = render_borders && max_height > 3 && max_width > 3;
-        if render_borders {
+        if render_borders && max_width > 3 {
             max_width -= 2;
-            max_height -= 2;
         }
 
-        // compute required child size and reclamp
+        // Measure against the larger side, then open where the contents fit: the
+        // preferred side if they fit there, otherwise whichever side has more room.
+        let roomiest = space_above.max(space_below);
         let (mut width, child_height) = self
             .contents
-            .required_size((max_width, max_height))
+            .required_size((max_width, roomiest.saturating_sub(border_size(roomiest))))
             .expect("Component needs required_size implemented in order to be embedded in a popup");
+        let fits = |space: u16| child_height.saturating_add(border_size(space)) <= space;
+        let final_pos = match self.position_bias {
+            Open::Below if fits(space_below) || space_below >= space_above => Open::Below,
+            Open::Below => Open::Above,
+            Open::Above if fits(space_above) || space_above >= space_below => Open::Above,
+            Open::Above => Open::Below,
+        };
+        let space = match final_pos {
+            Open::Above => space_above,
+            Open::Below => space_below,
+        };
+        render_borders = render_borders && space > 3 && max_width > 3;
+        let border = if render_borders { 2 } else { 0 };
 
         width = width.min(MAX_WIDTH);
-        let height = if render_borders {
-            (child_height + 2).min(MAX_HEIGHT)
-        } else {
-            child_height.min(MAX_HEIGHT)
-        };
         if render_borders {
             width += 2;
         }
-        if viewport.width <= rel_x + width + 2 {
-            rel_x = viewport.width.saturating_sub(width + 2);
-            width = viewport.width.saturating_sub(rel_x + 2)
+        let height = child_height.saturating_add(border).min(space);
+        let right_limit = viewport.right().saturating_sub(2);
+        if rel_x.saturating_add(width) > right_limit {
+            rel_x = right_limit.saturating_sub(width).max(viewport.left());
+            width = width.min(right_limit.saturating_sub(rel_x));
         }
 
         let area = match final_pos {
-            Open::Above => {
-                rel_y = rel_y.saturating_sub(height);
-                Rect::new(rel_x, rel_y, width, position.row as u16 - rel_y)
-            }
-            Open::Below => {
-                rel_y += 1;
-                let y_max = viewport.bottom().min(height + rel_y);
-                Rect::new(rel_x, rel_y, width, y_max - rel_y)
-            }
+            Open::Above => Rect::new(rel_x, rel_y - height, width, height),
+            Open::Below => Rect::new(rel_x, rel_y + 1, width, height),
         };
         RenderInfo {
             area,
@@ -261,11 +274,11 @@ impl<T: Component> Popup<T> {
 
         match kind {
             MouseEventKind::ScrollDown if self.has_scrollbar => {
-                self.scroll_half_page_down();
+                self.scroll_lines_down(3);
                 EventResult::Consumed(None)
             }
             MouseEventKind::ScrollUp if self.has_scrollbar => {
-                self.scroll_half_page_up();
+                self.scroll_lines_up(3);
                 EventResult::Consumed(None)
             }
             _ => EventResult::Ignored(None),
@@ -302,11 +315,19 @@ impl<T: Component> Component for Popup<T> {
                         let _ = self.contents.handle_event(event, cx);
                         EventResult::Consumed(Some(close_fn))
                     }
-                    key!(PageDown) | ctrl!('d') => {
+                    key!(PageDown) => {
+                        self.scroll_page_down();
+                        EventResult::Consumed(None)
+                    }
+                    key!(PageUp) => {
+                        self.scroll_page_up();
+                        EventResult::Consumed(None)
+                    }
+                    ctrl!('d') => {
                         self.scroll_half_page_down();
                         EventResult::Consumed(None)
                     }
-                    key!(PageUp) | ctrl!('u') => {
+                    ctrl!('u') => {
                         self.scroll_half_page_up();
                         EventResult::Consumed(None)
                     }
@@ -331,13 +352,15 @@ impl<T: Component> Component for Popup<T> {
         viewport: Rect,
         cx: &RenderContext,
     ) -> crate::render::PreparedRender {
+        // Never cover the statusline / message rows: they are painted last.
+        let bounds = viewport.intersection(cx.popup_bounds());
         let RenderInfo {
             area,
             child_height,
             render_borders,
             is_menu,
         } = self.render_info_at(
-            viewport,
+            bounds,
             cx.cursor_position(),
             cx.popup_border(),
             cx.menu_border(),
@@ -363,11 +386,9 @@ impl<T: Component> Component for Popup<T> {
         });
 
         let max_offset = child_height.saturating_sub(inner.height) as usize;
-        let half_page_size = (inner.height / 2) as usize;
-        let scroll = max_offset.min(self.scroll_half_pages * half_page_size);
-        if let Some(div) = scroll.checked_div(half_page_size) {
-            self.scroll_half_pages = div;
-        }
+        self.page_height = inner.height as usize;
+        self.scroll = self.scroll.min(max_offset);
+        let scroll = self.scroll;
         cx.set_scroll(Some(scroll));
         let child = self.contents.prepare_render(inner, cx);
         cx.defer_prepared("popup_content", vec![child]);
@@ -401,5 +422,68 @@ impl<T: Component> Component for Popup<T> {
 
     fn id(&self) -> Option<&str> {
         Some(self.id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Fixed(u16, u16);
+
+    impl Component for Fixed {
+        fn prepare_render(
+            &mut self,
+            area: Rect,
+            _cx: &RenderContext,
+        ) -> crate::render::PreparedRender {
+            crate::render::PreparedRender::ready(crate::render::RenderOutput::sparse(area))
+        }
+
+        fn required_size(&mut self, _viewport: (u16, u16)) -> Option<(u16, u16)> {
+            Some((self.0, self.1))
+        }
+    }
+
+    fn place(popup: &mut Popup<Fixed>, bounds: Rect, row: usize) -> Rect {
+        popup
+            .render_info_at(bounds, Some(Position::new(row, 10)), false, false)
+            .area
+    }
+
+    #[test]
+    fn popup_stays_inside_bounds_and_prefers_the_side_that_fits() {
+        let bounds = Rect::new(0, 0, 80, 28);
+
+        // Fits below: open below, preferred side.
+        let area = place(&mut Popup::new("t", Fixed(20, 5)), bounds, 4);
+        assert_eq!(area.y, 5);
+        assert!(area.bottom() <= bounds.bottom());
+
+        // Does not fit below but fits above: open above.
+        let area = place(&mut Popup::new("t", Fixed(20, 10)), bounds, 22);
+        assert_eq!(area.bottom(), 22);
+        assert_eq!(area.height, 10);
+
+        // Fits nowhere: use the roomier side and clip to it, never past the bounds.
+        let area = place(&mut Popup::new("t", Fixed(20, 50)), bounds, 20);
+        assert!(area.bottom() <= 20);
+        let area = place(&mut Popup::new("t", Fixed(20, 50)), bounds, 6);
+        assert_eq!(area.y, 7);
+        assert!(area.bottom() <= bounds.bottom());
+    }
+
+    #[test]
+    fn paging_moves_by_the_visible_height() {
+        let mut popup = Popup::new("t", Fixed(20, 100));
+        popup.page_height = 10;
+        popup.scroll_page_down();
+        assert_eq!(popup.scroll, 10);
+        popup.scroll_half_page_down();
+        assert_eq!(popup.scroll, 15);
+        popup.scroll_page_up();
+        assert_eq!(popup.scroll, 5);
+        popup.scroll_page_up();
+        assert_eq!(popup.scroll, 0);
     }
 }

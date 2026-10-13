@@ -89,8 +89,14 @@ impl Error {
 }
 
 impl std::fmt::Display for Error {
+    /// Servers write their error messages for humans; the numeric code only matters for
+    /// programmatic handling, so it is shown only when there is no message.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}: {}", self.code, self.message)
+        if self.message.trim().is_empty() {
+            write!(f, "{:?}", self.code)
+        } else {
+            f.write_str(self.message.trim())
+        }
     }
 }
 

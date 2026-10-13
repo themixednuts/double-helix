@@ -9,7 +9,6 @@ pub(crate) fn apply_layer_command(
 ) {
     match cmd {
         LayerCommand::PushNotificationHistory => push_notification_history(editor, compositor),
-        LayerCommand::InvalidRegexPopup { message } => invalid_regex_popup(compositor, message),
         LayerCommand::DismissPromptIfPresent => {
             if compositor.find::<crate::ui::Prompt>().is_some() {
                 compositor.remove_type::<crate::ui::Prompt>();
@@ -130,15 +129,4 @@ fn push_notification_history(editor: &mut helix_view::Editor, compositor: &mut C
     let popup = crate::ui::Popup::new("notification-history", crate::ui::Text::new(content))
         .auto_close(true);
     compositor.push(Box::new(popup));
-}
-
-fn invalid_regex_popup(compositor: &mut Compositor, message: String) {
-    use helix_core::Position;
-
-    let contents = crate::ui::Text::new(message);
-    let size = compositor.size();
-    let popup = crate::ui::Popup::new("invalid-regex", contents)
-        .position(Some(Position::new(size.height as usize - 2, 0)))
-        .auto_close(true);
-    compositor.replace_or_push("invalid-regex", popup);
 }

@@ -217,6 +217,9 @@ pub struct FileExplorerPanel {
     area: Rect,
     focused: bool,
     preview: ExplorerPreview,
+    /// The view and document that were shown before browsing started previewing files.
+    /// Dismissing the explorer without an explicit open switches back to it.
+    preview_origin: Option<(helix_view::ViewId, DocumentId)>,
     preview_cache: PreviewDocumentCache,
     preview_generation: u64,
     preview_request: Option<FileExplorerPreviewRequest>,
@@ -503,6 +506,7 @@ impl FileExplorerPanel {
             area: Rect::default(),
             focused: true,
             preview: ExplorerPreview::None,
+            preview_origin: None,
             preview_cache: PreviewDocumentCache::default(),
             preview_generation: 0,
             preview_request: None,
@@ -1917,6 +1921,8 @@ impl FileExplorerPanel {
     ) {
         self.queue_restore_tree_after_search_open(editor, ingress, path);
         self.center_selection();
+        // An explicit open keeps the file; dismissing must not switch back anymore.
+        self.preview_origin = None;
         self.focused = false;
         editor.model.focus_editor();
         self.dismiss_after_open = !self.config.sticky;
@@ -1943,6 +1949,58 @@ impl FileExplorerPanel {
         std::mem::take(&mut self.dismiss_after_open)
     }
 
+    /// Remembers what the focused view showed before the first preview of a browsing
+    /// session replaces it.
+    fn remember_preview_origin(&mut self, editor: &Editor) {
+        if self.preview_origin.is_none() {
+            self.preview_origin = Some((editor.focused_view_id(), editor.focused_document_id()));
+        }
+    }
+
+    /// Browsing only previews files: when the explorer is dismissed without an explicit
+    /// open, put the original document back in its view and park an untouched preview
+    /// document in the preview cache. Returns `false` when there is nothing to restore
+    /// (no browsing happened, the origin is gone, or the preview was edited).
+    fn restore_preview_origin(&mut self, editor: &mut Editor) -> bool {
+        let Some((view_id, origin_doc)) = self.preview_origin.take() else {
+            return false;
+        };
+        if !editor.tree.contains(view_id) || !editor.contains_document(origin_doc) {
+            return false;
+        }
+        let shown = editor.tree.get(view_id).doc;
+        if shown == origin_doc {
+            return true;
+        }
+        if editor.document(shown).is_some_and(|doc| doc.is_modified()) {
+            return false;
+        }
+        let focus = editor.tree.focus;
+        editor.focus(view_id);
+        editor.switch(origin_doc, Action::Replace);
+        if editor.tree.contains(focus) {
+            editor.focus(focus);
+        }
+        if let ExplorerPreview::Owned(preview) = self.preview {
+            if let Some(doc) = editor.take_preview_document(preview) {
+                if let Some(path) = doc.location().and_then(|location| match location {
+                    helix_view::file_bound::DocumentLocation::Local(path) => {
+                        Some(ExplorerPath::Local(path.clone()))
+                    }
+                    helix_view::file_bound::DocumentLocation::Remote(location) => {
+                        Some(ExplorerPath::Remote(location.path.clone()))
+                    }
+                    helix_view::file_bound::DocumentLocation::Collaboration(_) => None,
+                }) {
+                    self.preview_cache.insert(path, doc);
+                }
+            } else {
+                let _ = editor.close_document(preview, ClosePolicy::ProtectModified);
+            }
+        }
+        true
+    }
+
     pub(crate) fn dismiss_panel(
         &mut self,
         editor: &mut Editor,
@@ -1950,10 +2008,13 @@ impl FileExplorerPanel {
     ) {
         self.stash_ui_state();
         self.cancel_preview_request(ingress);
-        if let ExplorerPreview::Owned(doc_id) = self.preview {
-            editor.promote_preview_document(doc_id);
+        if !self.restore_preview_origin(editor) {
+            if let ExplorerPreview::Owned(doc_id) = self.preview {
+                editor.promote_preview_document(doc_id);
+            }
         }
         self.preview = ExplorerPreview::None;
+        self.preview_origin = None;
         if let Some(id) = self.model_panel_id.take() {
             editor.model.remove_panel(id);
         }
@@ -2157,6 +2218,7 @@ impl FileExplorerPanel {
             documents_before,
             component_documents_before,
         );
+        self.remember_preview_origin(editor);
         let open_start = Instant::now();
         let cached_preview = if existing_doc.is_none() {
             self.preview_cache.take(&path)
@@ -2630,6 +2692,7 @@ impl FileExplorerPanel {
         editor: &mut Editor,
         path: &ExplorerPath,
     ) -> Option<DocumentId> {
+        self.remember_preview_origin(editor);
         let focus = editor.model.focus;
         let (doc_id, owned) = if let Some(doc_id) = self.document_id_for_path(editor, path) {
             if editor.focused_document_id() != doc_id {
@@ -2658,6 +2721,7 @@ impl FileExplorerPanel {
         path: &ExplorerPath,
         prepared: helix_view::editor::PreparedWorkspaceDocumentOpen,
     ) -> DocumentId {
+        self.remember_preview_origin(editor);
         if let Some(doc_id) = self.show_existing_or_cached_preview(editor, path) {
             return doc_id;
         }
@@ -3668,6 +3732,33 @@ mod tests {
 
             assert_eq!(editor.model.focus, FocusTarget::Editor);
             assert!(!panel.focused);
+        });
+    }
+
+    #[test]
+    fn dismiss_without_open_restores_the_browsed_from_document() {
+        session::clear();
+        let temp = tempfile::tempdir().unwrap();
+        let current = helix_stdx::path::normalize(temp.path().join("alpha.rs"));
+        fs::write(&current, "fn alpha() {}\n").unwrap();
+        fs::write(temp.path().join("beta.rs"), "fn beta() {}\n").unwrap();
+        let rt = helix_runtime::test::RuntimeTest::default();
+        rt.block_on(async {
+            let mut editor = test_editor(100, 30, rt.runtime());
+            editor.open(&current, Action::Replace).unwrap();
+            let origin = editor.focused_document_id();
+            let mut panel = FileExplorerPanel::new(temp.path().to_path_buf(), &editor).unwrap();
+
+            panel.selection = row_index_by_name(&panel, "beta.rs");
+            panel.preview_selected_file(&mut editor);
+            let preview = editor.focused_document_id();
+            assert_ne!(preview, origin);
+
+            let (ingress, _rx) = crate::runtime::RuntimeIngress::channel(rt.runtime().clone());
+            panel.dismiss_panel(&mut editor, &ingress);
+
+            assert_eq!(editor.focused_document_id(), origin);
+            assert!(!editor.contains_document(preview));
         });
     }
 
@@ -7727,6 +7818,7 @@ mod tests {
             area: Rect::default(),
             focused: true,
             preview: ExplorerPreview::None,
+            preview_origin: None,
             preview_cache: PreviewDocumentCache::default(),
             preview_generation: 0,
             preview_request: None,
@@ -7799,6 +7891,7 @@ mod tests {
             area: Rect::default(),
             focused: true,
             preview: ExplorerPreview::None,
+            preview_origin: None,
             preview_cache: PreviewDocumentCache::default(),
             preview_generation: 0,
             preview_request: None,
@@ -7881,6 +7974,7 @@ mod tests {
             area: Rect::default(),
             focused: true,
             preview: ExplorerPreview::None,
+            preview_origin: None,
             preview_cache: PreviewDocumentCache::default(),
             preview_generation: 0,
             preview_request: None,
@@ -7945,6 +8039,7 @@ mod tests {
             area: Rect::default(),
             focused: true,
             preview: ExplorerPreview::None,
+            preview_origin: None,
             preview_cache: PreviewDocumentCache::default(),
             preview_generation: 0,
             preview_request: None,

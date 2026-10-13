@@ -175,6 +175,9 @@ pub(crate) fn apply_runtime_task_event(
         RuntimeTaskEvent::CollaborationNotice(message) => {
             editor.notify_info(message);
         }
+        RuntimeTaskEvent::SyntaxParseFailed { document, error } => {
+            report_syntax_parse_failure(editor, document, &error);
+        }
         RuntimeTaskEvent::ApplySyntax {
             document,
             version,
@@ -1038,6 +1041,37 @@ pub(crate) fn apply_formatting_result(
             editor.set_error(format!("Error saving: {}", err));
         }
     }
+}
+
+/// Tells the user once per language why a file has no syntax highlighting. Without
+/// this a missing or misconfigured grammar (e.g. a wrong `DOUBLE_HELIX_RUNTIME`) only
+/// shows up as plain text and a warning in the log.
+fn report_syntax_parse_failure(editor: &mut Editor, document: DocumentId, error: &str) {
+    static REPORTED: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::LazyLock::new(Default::default);
+
+    let Some(language) = editor
+        .document(document)
+        .and_then(|doc| doc.language_name())
+        .map(ToOwned::to_owned)
+    else {
+        return;
+    };
+    let first = REPORTED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(language.clone());
+    if !first {
+        return;
+    }
+    let reason = if error.contains("returned `None`") {
+        "its tree-sitter grammar could not be loaded".to_owned()
+    } else {
+        error.to_owned()
+    };
+    editor.notify_warning(format!(
+        "No syntax highlighting for {language}: {reason} (see `dhx --health {language}`)"
+    ));
 }
 
 #[cfg(test)]

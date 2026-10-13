@@ -281,6 +281,11 @@ impl Decoration for InlineDiagnostics {
         pos: LinePos,
         virt_off: Position,
     ) -> Position {
+        // Diagnostics of a soft-wrapped line are drawn after its last visual row, where
+        // the layout reserved their virtual lines; earlier rows keep accumulating.
+        if !pos.is_last_visual_line {
+            return Position::new(0, 0);
+        }
         let mut col_off = 0;
         let filter = self.state.filter();
         let diagnostics = self.state.diagnostics_arc();

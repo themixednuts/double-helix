@@ -1678,7 +1678,9 @@ pub fn rename_symbol(cx: &mut Context) {
     if let Some((ls_id, offset_encoding, text, future)) = prepare_rename {
         let fallback_prefill = get_prefill_from_word_boundary(cx.editor);
         cx.spawn_ui(async move {
-            let response = future.await?;
+            let response = future
+                .await
+                .map_err(|err| anyhow::anyhow!("Cannot rename here: {err}"))?;
             let prefill =
                 get_prefill_from_lsp_response(&text, &fallback_prefill, offset_encoding, response)
                     .map_err(anyhow::Error::msg)?;

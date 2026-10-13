@@ -1107,6 +1107,11 @@ pub enum RuntimeTaskEvent {
         syntax: helix_core::Syntax,
         input_barrier: Option<InputBarrier>,
     },
+    /// A background syntax parse failed (e.g. the grammar could not be loaded).
+    SyntaxParseFailed {
+        document: DocumentId,
+        error: String,
+    },
     /// Blocking inspection completed for the active file-operation FIFO entry.
     FileOperationInspected {
         id: helix_view::editor::FileOperationId,

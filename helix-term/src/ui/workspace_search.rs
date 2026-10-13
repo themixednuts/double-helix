@@ -33,6 +33,8 @@ impl WorkspaceContentOverlay {
 pub(crate) struct WorkspaceContentMatch {
     pub(crate) path: ExplorerPath,
     pub(crate) line: usize,
+    /// Matched line text; empty when the backend does not report it (remote search).
+    pub(crate) line_content: String,
 }
 
 #[derive(Debug, Default)]
@@ -173,6 +175,7 @@ impl WorkspaceContentSearch {
                         Ok(WorkspaceContentMatch {
                             path: overlay.target.clone(),
                             line: item.line_num,
+                            line_content: item.line_content,
                         })
                     })
                     .collect::<anyhow::Result<Vec<_>>>()?;
@@ -237,6 +240,7 @@ impl WorkspaceContentSearch {
                         .map(|item| WorkspaceContentMatch {
                             path: ExplorerPath::Local(item.path),
                             line: item.line_num,
+                            line_content: item.line_content,
                         })
                         .collect();
                     if matches.is_empty() && !self.done {
@@ -303,6 +307,7 @@ impl WorkspaceContentSearch {
                     path: target(entry.path),
                     line: usize::try_from(entry.line)
                         .map_err(|_| anyhow::anyhow!("content match line is too large"))?,
+                    line_content: String::new(),
                 })
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
@@ -400,6 +405,7 @@ mod tests {
                 vec![WorkspaceContentMatch {
                     path: ExplorerPath::Local(path),
                     line: 0,
+                    line_content: "fresh_only".to_owned(),
                 }]
             );
         });

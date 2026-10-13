@@ -1093,6 +1093,8 @@ fn search_impl(
         if show_warnings {
             if wrap_around && mat.is_some() {
                 editor.set_status("Wrapped around document");
+            } else if wrap_around {
+                editor.set_error("No matches found");
             } else {
                 editor.set_error("No more matches");
             }
@@ -1169,6 +1171,7 @@ fn searcher(cx: &mut Context, direction: Direction) {
             } else if event != PromptEvent::Update {
                 return;
             }
+            // Stay quiet while typing; report wrap-around / no match once confirmed.
             search_impl(
                 cx.editor,
                 &regex,
@@ -1176,7 +1179,7 @@ fn searcher(cx: &mut Context, direction: Direction) {
                 direction,
                 scrolloff,
                 wrap_around,
-                false,
+                event == PromptEvent::Validate,
             );
         },
     );
@@ -1353,11 +1356,20 @@ fn global_search(cx: &mut Context) {
         path: helix_view::editor::WorkspaceDocumentPath,
         /// 0 indexed lines
         line_num: usize,
+        line_content: String,
     }
 
     impl FileResult {
-        fn new(path: helix_view::editor::WorkspaceDocumentPath, line_num: usize) -> Self {
-            Self { path, line_num }
+        fn new(
+            path: helix_view::editor::WorkspaceDocumentPath,
+            line_num: usize,
+            line_content: String,
+        ) -> Self {
+            Self {
+                path,
+                line_num,
+                line_content,
+            }
         }
 
         fn display_path(&self) -> String {
@@ -1403,7 +1415,12 @@ fn global_search(cx: &mut Context) {
                 Span::styled((item.line_num + 1).to_string(), config.number_style),
             ]))
         }),
-        PickerColumn::hidden("contents"),
+        // The query drives the search itself, so this column displays the matched line
+        // without being fuzzy-filtered by the (regex) query.
+        PickerColumn::new("contents", |item: &FileResult, _: &GlobalSearchConfig| {
+            item.line_content.trim().into()
+        })
+        .without_filtering(),
     ];
 
     let get_files = |query: &str,
@@ -1485,7 +1502,7 @@ fn global_search(cx: &mut Context) {
                         .await?;
                     for item in page.matches.into_iter().take(remaining) {
                         if injector
-                            .push(FileResult::new(item.path, item.line))
+                            .push(FileResult::new(item.path, item.line, item.line_content))
                             .is_err()
                         {
                             return Ok(());

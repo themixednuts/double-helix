@@ -40,6 +40,8 @@ pub(crate) struct FileMatch {
 pub(crate) struct GrepMatch {
     pub(crate) path: PathBuf,
     pub(crate) line_num: usize,
+    /// The matched line, shown next to the location in the global search picker.
+    pub(crate) line_content: String,
 }
 
 #[derive(Debug)]
@@ -55,10 +57,11 @@ pub(crate) struct OverlayGrepPage {
     pub(crate) next: Option<ByteSourceGrepCursor>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct OverlayGrepMatch {
     pub(crate) source: usize,
     pub(crate) line_num: usize,
+    pub(crate) line_content: String,
 }
 
 #[derive(Debug)]
@@ -416,6 +419,7 @@ pub(crate) fn grep_files_page(request: GrepFilesPageRequest<'_>) -> anyhow::Resu
         .map(|item| GrepMatch {
             path: item.path,
             line_num: item.line_number.saturating_sub(1) as usize,
+            line_content: item.line_content,
         })
         .collect();
 
@@ -431,6 +435,15 @@ pub(crate) fn grep_files_page(request: GrepFilesPageRequest<'_>) -> anyhow::Resu
         next_file_offset,
         done: scan_complete && next_file_offset.is_none(),
     })
+}
+
+/// Extracts one (zero-based) line from an unsaved buffer snapshot for display.
+fn overlay_line(bytes: &[u8], line_num: usize) -> String {
+    bytes
+        .split(|byte| *byte == b'\n')
+        .nth(line_num)
+        .map(|line| String::from_utf8_lossy(line.strip_suffix(b"\r").unwrap_or(line)).into_owned())
+        .unwrap_or_default()
 }
 
 pub(crate) fn grep_overlays_page(
@@ -463,9 +476,13 @@ pub(crate) fn grep_overlays_page(
         matches: page
             .matches
             .into_iter()
-            .map(|item| OverlayGrepMatch {
-                source: item.source,
-                line_num: item.line_number.saturating_sub(1) as usize,
+            .map(|item| {
+                let line_num = item.line_number.saturating_sub(1) as usize;
+                OverlayGrepMatch {
+                    source: item.source,
+                    line_num,
+                    line_content: overlay_line(&overlays[item.source].bytes, line_num),
+                }
             })
             .collect(),
         next: page.next,

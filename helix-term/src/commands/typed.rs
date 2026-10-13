@@ -317,12 +317,7 @@ pub(crate) fn close_documents_now(
         if !modified_ids.contains(&current.id()) {
             editor.switch(*first, Action::Replace);
         }
-        bail!(
-            "{} unsaved buffer{} remaining: {:?}",
-            modified_names.len(),
-            if modified_names.len() == 1 { "" } else { "s" },
-            modified_names,
-        );
+        bail!(unsaved_buffers_message(&modified_names));
     }
 
     Ok(())
@@ -987,12 +982,7 @@ pub(crate) fn buffers_remaining_impl(editor: &mut Editor) -> anyhow::Result<()> 
             .map(|doc_id| doc!(editor, doc_id).display_name())
             .collect();
 
-        bail!(
-            "{} unsaved buffer{} remaining: {:?}",
-            modified_names.len(),
-            if modified_names.len() == 1 { "" } else { "s" },
-            modified_names,
-        );
+        bail!(unsaved_buffers_message(&modified_names));
     }
     Ok(())
 }
@@ -2446,11 +2436,27 @@ fn set_option(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> a
     let (key, arg) = (&args[0].to_lowercase(), args[1].trim());
 
     let key_error = || anyhow::anyhow!("Unknown key `{}`", key);
-    let field_error = |_| anyhow::anyhow!("Could not parse field `{}`", arg);
 
     let mut config = serde_json::json!(&cx.editor.config().deref());
     let pointer = format!("/{}", key.replace('.', "/"));
     let value = config.pointer_mut(&pointer).ok_or_else(key_error)?;
+    // Say which option was rejected and what it expects instead of a bare parse error.
+    let expected = match value {
+        Value::Bool(_) => "true or false",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "a list, e.g. [\"a\", \"b\"]",
+        Value::Object(_) => "a table, e.g. {\"key\": \"value\"}",
+        Value::Null => "a value",
+    };
+    let field_error = |_| {
+        anyhow::anyhow!(
+            "Invalid value `{}` for `{}`: expected {}",
+            arg,
+            key,
+            expected
+        )
+    };
 
     *value = if value.is_string() {
         // JSON strings require quotes, so we can't .parse() directly
@@ -2458,7 +2464,9 @@ fn set_option(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> a
     } else {
         arg.parse().map_err(field_error)?
     };
-    let config = serde_json::from_value(config).map_err(field_error)?;
+    let config = serde_json::from_value(config).map_err(|err: serde_json::Error| {
+        anyhow::anyhow!("Invalid value `{}` for `{}`: {}", arg, key, err)
+    })?;
 
     queue_config_event(cx, ConfigEvent::Update(config))?;
     Ok(())
@@ -3073,6 +3081,20 @@ fn redraw(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> anyh
     cx.spawn_ui(callback);
 
     Ok(())
+}
+
+/// Explains why a close/quit was refused and how to proceed.
+fn unsaved_buffers_message<T: std::fmt::Display>(names: &[T]) -> String {
+    let list = names
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "{} unsaved buffer{} remaining: {list} (write with :w, or add ! to discard changes)",
+        names.len(),
+        if names.len() == 1 { "" } else { "s" },
+    )
 }
 
 #[derive(Debug, Clone, Copy)]

@@ -301,32 +301,47 @@ impl Editor {
         self.status_msg = None;
     }
 
+    /// Whether the layout reserves the bottom message row (everything but the
+    /// full-height popup command line does).
+    fn has_message_row(config: &super::Config) -> bool {
+        !(config.cmdline.style == super::CmdlineStyle::Popup && config.cmdline.use_full_height)
+    }
+
+    /// Reports direct feedback to something the user just did.
+    ///
+    /// It goes to the message row next to where they typed, cleared on the next key,
+    /// and is recorded in the notification history. It only becomes a popup toast
+    /// when there is no message row to show it in. Background events that are not
+    /// tied to the current action should use the `notify_*` methods instead.
+    fn report(&mut self, message: Cow<'static, str>, severity: Severity) {
+        let config = self.config();
+        if config.notifications.enable && !Self::has_message_row(&config) {
+            drop(config);
+            self.notify_with_severity(message, severity);
+            return;
+        }
+        let record = config.notifications.enable && config.notifications.enable_history;
+        drop(config);
+        if record {
+            let mut notification = Notification::new(message.clone(), severity);
+            notification.dismiss();
+            self.notifications.add(notification);
+        }
+        self.status_msg = Some((message, severity));
+    }
+
     #[inline]
     pub fn set_status<T: Into<Cow<'static, str>>>(&mut self, status: T) {
         let status = status.into();
         log::debug!("editor status: {}", status);
-
-        let config = self.config();
-        if config.notifications.enable && config.notifications.style == NotificationStyle::Popup {
-            self.notify_info(status);
-        } else {
-            self.status_msg = Some((status.clone(), Severity::Info));
-            if config.notifications.enable {
-                self.notify_info(status);
-            }
-        }
+        self.report(status, Severity::Info);
     }
 
     #[inline]
     pub fn set_error<T: Into<Cow<'static, str>>>(&mut self, error: T) {
         let error = error.into();
         log::debug!("editor error: {}", error);
-
-        let config = self.config();
-        self.status_msg = Some((error.clone(), Severity::Error));
-        if config.notifications.enable {
-            self.notify_error(error);
-        }
+        self.report(error, Severity::Error);
     }
 
     #[inline]
@@ -341,29 +356,14 @@ impl Editor {
     pub fn set_warning<T: Into<Cow<'static, str>>>(&mut self, warning: T) {
         let warning = warning.into();
         log::warn!("editor warning: {}", warning);
-
-        let config = self.config();
-        if config.notifications.enable && config.notifications.style == NotificationStyle::Popup {
-            self.notify_warning(warning);
-        } else {
-            self.status_msg = Some((warning.clone(), Severity::Warning));
-            if config.notifications.enable {
-                self.notify_warning(warning);
-            }
-        }
+        self.report(warning, Severity::Warning);
     }
 
     #[inline]
     pub fn get_status(&self) -> Option<(&Cow<'static, str>, &Severity)> {
-        self.status_msg
-            .as_ref()
-            .map(|(status, sev)| (status, sev))
-            .or_else(|| {
-                self.notifications
-                    .get_active()
-                    .last()
-                    .map(|n| (&n.message, &n.severity))
-            })
+        // Toasts are shown by the notification popup; mirroring the newest one here
+        // would print it twice. Statusline-style notifications set `status_msg` directly.
+        self.status_msg.as_ref().map(|(status, sev)| (status, sev))
     }
 
     #[inline]

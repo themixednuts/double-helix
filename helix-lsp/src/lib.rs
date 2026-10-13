@@ -30,7 +30,7 @@ pub use helix_core::diagnostic::LanguageServerId;
 
 #[derive(Error, Debug)]
 pub enum Error {
-    #[error("protocol error: {0}")]
+    #[error("{0}")]
     Rpc(#[from] jsonrpc::Error),
     #[error("failed to parse: {0}")]
     Parse(Box<dyn std::error::Error + Send + Sync>),

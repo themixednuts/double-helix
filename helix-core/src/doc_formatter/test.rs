@@ -418,3 +418,24 @@ fn checkpoint_resume_derives_line_from_char_idx() {
     assert_eq!(grapheme.line_idx, 1);
     assert_eq!(grapheme.char_idx, second_line_char);
 }
+
+#[test]
+fn softwrap_keeps_punctuation_runs_together() {
+    // `::` must never be split across rows, and rows never start with `)`/`;`.
+    let softwrap = |text: &str| {
+        let mut text_fmt = TextFormat::new_test(true);
+        text_fmt.max_wrap = 20;
+        let annotations = TextAnnotations::default();
+        let mut formatter =
+            DocumentFormatter::new_at_prev_checkpoint(text.into(), &text_fmt, &annotations, 0);
+        formatter.collect_to_str()
+    };
+    let wrapped = softwrap("let value = HashMap::new();\n");
+    assert!(!wrapped.contains(":\n:"), "{wrapped:?}");
+    assert_eq!(wrapped, "let value = \nHashMap::new(); \n ");
+    // Breaking after punctuation that is followed by a word is still allowed.
+    assert_eq!(
+        softwrap("aaaa/bbbb/cccc/dddd/eeee\n"),
+        "aaaa/bbbb/cccc/\ndddd/eeee \n "
+    );
+}

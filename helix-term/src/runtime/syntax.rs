@@ -119,7 +119,11 @@ impl SyntaxService {
                             "[syntax_service] parse_failed document={document:?} version={version} elapsed_us={} error={error}",
                             started.elapsed().as_micros(),
                         );
-                        true
+                        sink.send(RuntimeTaskEvent::SyntaxParseFailed {
+                            document,
+                            error: error.to_string(),
+                        })
+                        .await
                     }
                     Err(error) => {
                         log::warn!(

@@ -5,8 +5,6 @@ use helix_lsp::{lsp, LanguageServerId};
 pub enum LayerCommand {
     /// Show notification history in a popup (content derived from editor state at apply time).
     PushNotificationHistory,
-    /// Regex compile failed in cmdline; show error in a small overlay.
-    InvalidRegexPopup { message: String },
     /// Remove cmdline prompt overlay if present (focus lost).
     DismissPromptIfPresent,
     /// Markdown in a popup (`Markdown::new` uses editor `syn_loader` at apply time).

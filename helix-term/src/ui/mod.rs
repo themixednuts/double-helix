@@ -34,10 +34,7 @@ mod text_decorations;
 pub(crate) mod text_layout;
 mod workspace_search;
 
-use crate::{
-    alt,
-    runtime::{send_ui_command_with, LayerCommand, UiCommand},
-};
+use crate::alt;
 pub use cmdline_popup::CmdlinePopup;
 pub use completion::Completion;
 pub use confirmation::Confirmation;
@@ -99,6 +96,25 @@ pub fn prompt_with_input(
         .with_line(input, cx.editor);
     prompt.dispatch_completion_work(cx.editor.runtime(), cx.ingress.clone());
     cx.push_layer(Box::new(prompt));
+}
+
+/// One-line description of a regex compile error, e.g. ``Invalid regex `(`: unclosed group``.
+/// The underlying error renders a multi-line caret diagram that does not fit a message row.
+fn invalid_regex_message(input: &str, err: &(dyn std::error::Error + 'static)) -> String {
+    // The top-level error only says "error parsing pattern 0"; the cause is in the chain.
+    let mut root = err;
+    while let Some(source) = root.source() {
+        root = source;
+    }
+    let err = root.to_string();
+    let reason = err
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default();
+    let reason = reason.strip_prefix("error: ").unwrap_or(reason);
+    format!("Invalid regex `{input}`: {reason}")
 }
 
 pub fn regex_prompt(
@@ -186,22 +202,7 @@ pub fn raw_regex_prompt(
                                     doc.set_view_offset(view_id, offset_snapshot);
 
                                     if event == PromptEvent::Validate {
-                                        let msg = err.to_string();
-                                        let ingress = cx.ingress.clone();
-                                        cx.editor
-                                            .work()
-                                            .spawn(async move {
-                                                send_ui_command_with(
-                                                    UiCommand::Layer(
-                                                        LayerCommand::InvalidRegexPopup {
-                                                            message: msg,
-                                                        },
-                                                    ),
-                                                    ingress,
-                                                )
-                                                .await;
-                                            })
-                                            .detach();
+                                        cx.editor.set_error(invalid_regex_message(input, &err));
                                     }
                                 }
                             }
@@ -271,22 +272,7 @@ pub fn raw_regex_prompt(
                                     doc.set_view_offset(view_id, offset_snapshot);
 
                                     if event == PromptEvent::Validate {
-                                        let msg = err.to_string();
-                                        let ingress = cx.ingress.clone();
-                                        cx.editor
-                                            .work()
-                                            .spawn(async move {
-                                                send_ui_command_with(
-                                                    UiCommand::Layer(
-                                                        LayerCommand::InvalidRegexPopup {
-                                                            message: msg,
-                                                        },
-                                                    ),
-                                                    ingress,
-                                                )
-                                                .await;
-                                            })
-                                            .detach();
+                                        cx.editor.set_error(invalid_regex_message(input, &err));
                                     }
                                 }
                             }

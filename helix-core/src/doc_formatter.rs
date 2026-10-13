@@ -509,11 +509,26 @@ impl<'t> DocumentFormatter<'t> {
             }
 
             let is_word_boundary = grapheme.is_word_boundary();
+            let is_whitespace = grapheme.is_whitespace();
             word_width += grapheme.width();
             self.word_buf.push(grapheme);
 
             if is_word_boundary {
-                return;
+                // Whitespace always ends a word. Punctuation only allows a break when the
+                // next grapheme starts a new word: runs such as `::`, `->`, `()` or `");`
+                // stay together, so soft wrap never splits `HashMap::new()` as
+                // `HashMap:` / `:new()` or starts a row with closing punctuation.
+                if is_whitespace {
+                    return;
+                }
+                let next_col = self.visual_pos.col + word_width;
+                let next_pos = self.char_pos + word_chars;
+                let glued = self.peek_grapheme(next_col, next_pos).is_some_and(|next| {
+                    !next.is_whitespace() && !next.is_eof() && next.is_word_boundary()
+                });
+                if !glued {
+                    return;
+                }
             }
         }
     }

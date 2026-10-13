@@ -1414,8 +1414,10 @@ impl EditorView {
         let start_drawing_left_align_at_x =
             area.x + (area.width / 2).saturating_sub(len_of_longest_left_align / 2) + 2;
 
+        // `start_drawing_left_align_at_x` is absolute, so compare against the right edge
+        // (views to the right of a split or a side panel do not start at x = 0).
         let are_any_left_aligned_lines_overflowing_x =
-            (start_drawing_left_align_at_x + len_of_longest_left_align) > area.width;
+            (start_drawing_left_align_at_x + len_of_longest_left_align) > area.right();
 
         let are_any_center_aligned_lines_overflowing_x =
             len_of_longest_center_align as u16 > area.width;

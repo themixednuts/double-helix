@@ -384,10 +384,23 @@ impl LineAnnotation for InlineDiagnostics {
 
     fn insert_virtual_lines(
         &mut self,
-        _line_end_char_idx: usize,
+        line_end_char_idx: usize,
         _line_end_visual_pos: Position,
-        _doc_line: usize,
+        doc_line: usize,
     ) -> Position {
+        // Soft-wrap breaks also end a visual line. Keep collecting the document line's
+        // diagnostics until its real end so they are laid out below the whole line
+        // instead of splitting the wrapped text (the renderer does the same).
+        let text = &self.state.text;
+        let next_line = (doc_line + 1).min(text.len_lines());
+        let line_end = if next_line >= text.len_lines() {
+            text.len_chars()
+        } else {
+            text.line_to_char(next_line)
+        };
+        if line_end_char_idx < line_end {
+            return Position::new(0, 0);
+        }
         self.state.compute_line_diagnostics();
         let multi = self.state.has_multi(self.width);
         let diagnostics = self.state.diagnostics_arc();

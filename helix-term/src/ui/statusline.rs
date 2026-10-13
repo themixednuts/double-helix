@@ -30,24 +30,34 @@ pub struct BenchOverlay {
     pub remaining_seconds: f64,
 }
 
+/// Everything the single, full-width statusline renders for one frame.
+///
+/// The statusline is owned by the compositor. Surfaces never draw it themselves: the
+/// editor always supplies its [`StatuslineModel`] (which also carries the editor-wide
+/// globals such as workspace diagnostics, LSP progress and the pending register), and
+/// a focused non-editor surface (file explorer, assistant, ...) communicates what it
+/// wants shown through a [`StatuslineContribution`].
 #[derive(Clone)]
-pub(crate) enum GlobalStatusline {
-    Editor(StatuslineModel),
-    Panel {
-        panel: PanelStatusline,
-        editor: StatuslineModel,
-    },
+pub(crate) struct StatuslineFrame {
+    pub editor: StatuslineModel,
+    pub surface: Option<StatuslineContribution>,
 }
 
+/// What a focused non-editor surface contributes to the global statusline.
 #[derive(Clone)]
-pub struct PanelStatusline {
-    pub state: PanelStatuslineState,
-    pub identity: String,
+pub struct StatuslineContribution {
+    /// Mode or label chip shown at the far left.
+    pub state: StatuslineState,
+    /// Short name of the surface, e.g. `Files`. Never truncated before `detail`.
+    pub title: String,
+    /// Context such as the selected path; elided from the start when space is tight.
+    pub detail: Option<String>,
+    /// Surface-specific segments shown before the editor-wide globals on the right.
     pub right: Vec<StatuslineText>,
 }
 
 #[derive(Clone)]
-pub enum PanelStatuslineState {
+pub enum StatuslineState {
     Mode(Mode),
     Label { label: String, style: ThemeStyle },
 }
@@ -56,6 +66,21 @@ pub enum PanelStatuslineState {
 pub struct StatuslineText {
     pub text: String,
     pub style: ThemeStyle,
+}
+
+impl StatuslineContribution {
+    fn cache_key(&self) -> String {
+        let state = match &self.state {
+            StatuslineState::Mode(mode) => format!("mode:{mode:?}"),
+            StatuslineState::Label { label, style } => format!("label:{label}:{style:?}"),
+        };
+        let right: Vec<String> = self
+            .right
+            .iter()
+            .map(|item| format!("{}:{:?}", item.text, item.style))
+            .collect();
+        format!("{state}|{}|{:?}|{right:?}", self.title, self.detail)
+    }
 }
 
 #[derive(Clone)]
@@ -178,170 +203,61 @@ impl<'a> Statusline<'a> {
         }
     }
 
-    pub fn prepare(
-        model: StatuslineModel,
+    pub(crate) fn prepare(
+        frame: StatuslineFrame,
         area: helix_view::graphics::Rect,
         focus_target: FocusTarget,
     ) -> crate::render::PreparedRender {
+        let editor = &frame.editor;
         let tag = CacheTag {
             id: cache_id(focus_target),
             key: CacheKey::hashed(&(
-                &model.config,
-                &model.theme_name,
-                model.color_modes,
-                &model.snapshot,
-                &model.pkg_progress,
-                model.bench_overlay.map(|overlay| {
+                &editor.config,
+                &editor.theme_name,
+                editor.color_modes,
+                &editor.snapshot,
+                &editor.pkg_progress,
+                editor.bench_overlay.map(|overlay| {
                     (
                         overlay.rolling_fps.to_bits(),
                         overlay.actions_executed,
                         overlay.remaining_seconds.to_bits(),
                     )
                 }),
+                frame
+                    .surface
+                    .as_ref()
+                    .map(StatuslineContribution::cache_key),
             )),
             area,
         };
-        PreparedRender::snapshot(tag, model, move |model, _cancellation| {
-            let mut component = Statusline::new(model);
+        PreparedRender::snapshot(tag, frame, move |frame, _cancellation| {
             let mut output = RenderOutput::new(area);
-            component.render_surface(area, output.surface_mut());
+            render_frame(frame, area, output.surface_mut());
             output
         })
     }
 
-    pub(crate) fn prepare_global(
-        source: GlobalStatusline,
-        area: helix_view::graphics::Rect,
-        focus_target: FocusTarget,
-    ) -> crate::render::PreparedRender {
-        match source {
-            GlobalStatusline::Editor(model) => Self::prepare(model, area, focus_target),
-            GlobalStatusline::Panel { panel, editor } => {
-                let right_text: Vec<&str> =
-                    panel.right.iter().map(|item| item.text.as_str()).collect();
-                let state = match &panel.state {
-                    PanelStatuslineState::Mode(mode) => format!("mode:{mode:?}"),
-                    PanelStatuslineState::Label { label, .. } => format!("label:{label}"),
-                };
-                let tag = CacheTag {
-                    id: cache_id(focus_target),
-                    key: CacheKey::hashed(&(
-                        &editor.config,
-                        &editor.theme_name,
-                        editor.color_modes,
-                        &editor.snapshot,
-                        &editor.pkg_progress,
-                        editor.bench_overlay.map(|overlay| {
-                            (
-                                overlay.rolling_fps.to_bits(),
-                                overlay.actions_executed,
-                                overlay.remaining_seconds.to_bits(),
-                            )
-                        }),
-                        state,
-                        &panel.identity,
-                        right_text,
-                    )),
-                    area,
-                };
-                PreparedRender::snapshot(
-                    tag,
-                    PanelStatuslineSnapshot { panel, editor },
-                    move |model, _cancellation| {
-                        let mut output = RenderOutput::new(area);
-                        render_panel_surface(model, area, output.surface_mut());
-                        output
-                    },
-                )
-            }
-        }
-    }
-
-    pub fn render_surface(
-        &mut self,
-        viewport: helix_view::graphics::Rect,
-        surface: &mut crate::render::CellSurface,
-    ) {
-        let statusline_styles = StatuslineStyles::from_theme(&self.model.theme);
-        let base_style = rat_style(statusline_styles.base);
-
-        surface.set_style(
-            tui::ratatui::to_ratatui_rect(viewport.with_height(1)),
-            base_style,
-        );
-
-        for element_id in self.model.config.left.clone() {
+    /// Runs the configured editor elements of one side into its line.
+    fn collect_side(&mut self, side: StatuslineSide, base_style: RatatuiStyle) {
+        let elements = match side {
+            StatuslineSide::Left => self.model.config.left.clone(),
+            StatuslineSide::Center => self.model.config.center.clone(),
+            StatuslineSide::Right => self.model.config.right.clone(),
+        };
+        for element_id in elements {
             let element_start = std::time::Instant::now();
             let render = get_render_function(element_id);
             (render)(self, |statusline, span| {
-                append(&mut statusline.parts.left, span, base_style)
+                append(statusline.parts.side_mut(side), span, base_style)
             });
             helix_view::bench::log_run_phase(
                 "statusline",
                 "element",
                 element_start.elapsed(),
-                || format!("side=left element={element_id:?}"),
+                || format!("side={side:?} element={element_id:?}"),
             );
         }
-
-        surface.set_line(
-            viewport.x,
-            viewport.y,
-            &self.parts.left,
-            self.parts.left.width() as u16,
-        );
-
-        for element_id in self.model.config.right.clone() {
-            let element_start = std::time::Instant::now();
-            let render = get_render_function(element_id);
-            (render)(self, |statusline, span| {
-                append(&mut statusline.parts.right, span, base_style)
-            });
-            helix_view::bench::log_run_phase(
-                "statusline",
-                "element",
-                element_start.elapsed(),
-                || format!("side=right element={element_id:?}"),
-            );
-        }
-
-        append_bench_overlay(&self.model, &mut self.parts.right, base_style);
-
-        surface.set_line(
-            viewport.x
-                + viewport
-                    .width
-                    .saturating_sub(self.parts.right.width() as u16),
-            viewport.y,
-            &self.parts.right,
-            self.parts.right.width() as u16,
-        );
-
-        for element_id in self.model.config.center.clone() {
-            let element_start = std::time::Instant::now();
-            let render = get_render_function(element_id);
-            (render)(self, |statusline, span| {
-                append(&mut statusline.parts.center, span, base_style)
-            });
-            helix_view::bench::log_run_phase(
-                "statusline",
-                "element",
-                element_start.elapsed(),
-                || format!("side=center element={element_id:?}"),
-            );
-        }
-
-        let spacing = 1u16;
-        let edge_width = self.parts.left.width().max(self.parts.right.width()) as u16;
-        let center_max_width = viewport.width.saturating_sub(2 * edge_width + 2 * spacing);
-        let center_width = center_max_width.min(self.parts.center.width() as u16);
-
-        surface.set_line(
-            viewport.x + viewport.width / 2 - center_width / 2,
-            viewport.y,
-            &self.parts.center,
-            center_width,
-        );
     }
 
     fn append_editor_globals(&mut self, base_style: RatatuiStyle) {
@@ -359,68 +275,180 @@ impl<'a> Statusline<'a> {
     }
 }
 
-struct PanelStatuslineSnapshot {
-    panel: PanelStatusline,
-    editor: StatuslineModel,
+#[derive(Debug, Clone, Copy)]
+enum StatuslineSide {
+    Left,
+    Center,
+    Right,
 }
 
-fn render_panel_surface(
-    model: PanelStatuslineSnapshot,
+impl<'a> RenderBuffer<'a> {
+    fn side_mut(&mut self, side: StatuslineSide) -> &mut Line<'a> {
+        match side {
+            StatuslineSide::Left => &mut self.left,
+            StatuslineSide::Center => &mut self.center,
+            StatuslineSide::Right => &mut self.right,
+        }
+    }
+}
+
+/// Gap kept between the left, center and right groups.
+const GROUP_GAP: u16 = 1;
+
+/// Renders the full-width statusline for one frame. Editor and surface contributions
+/// go through the same composition and layout, so they look and truncate alike.
+fn render_frame(
+    frame: StatuslineFrame,
     viewport: helix_view::graphics::Rect,
     surface: &mut crate::render::CellSurface,
 ) {
     if viewport.width == 0 || viewport.height == 0 {
         return;
     }
-
-    let styles = StatuslineStyles::from_theme(&model.editor.theme);
+    let styles = StatuslineStyles::from_theme(&frame.editor.theme);
     let base_style = rat_style(styles.base);
-    let identity_style = rat_style(styles.base.patch(model.editor.theme.get("ui.text.focus")));
     surface.set_style(
         tui::ratatui::to_ratatui_rect(viewport.with_height(1)),
         base_style,
     );
 
-    let (state_label, state_style) = match &model.panel.state {
-        PanelStatuslineState::Mode(mode) => (
-            helix_view::statusline_mode::padded_mode_name(*mode, &model.editor.config.mode),
-            helix_view::statusline_mode::mode_style(*mode, &model.editor.theme, styles.base),
-        ),
-        PanelStatuslineState::Label { label, style } => (format!(" {label} "), *style),
-    };
-    let state_chip = crate::widgets::Chip::new(&state_label, styles.base.patch(state_style));
-
-    let mut editor_statusline = Statusline::new(model.editor);
-    editor_statusline.append_editor_globals(base_style);
-    let mut right = editor_statusline.parts.right;
-    for item in &model.panel.right {
-        append(
-            &mut right,
-            themed_span(item.text.as_str(), item.style),
-            base_style,
-        );
+    let theme = frame.editor.theme.clone();
+    let mut statusline = Statusline::new(frame.editor);
+    let mut detail = None;
+    match frame.surface {
+        None => {
+            statusline.collect_side(StatuslineSide::Left, base_style);
+            statusline.collect_side(StatuslineSide::Center, base_style);
+            statusline.collect_side(StatuslineSide::Right, base_style);
+            append_bench_overlay(&statusline.model, &mut statusline.parts.right, base_style);
+        }
+        Some(contribution) => {
+            let chip = match &contribution.state {
+                StatuslineState::Mode(mode) => mode_span(&statusline.model, *mode),
+                StatuslineState::Label { label, style } => {
+                    themed_span(format!(" {label} "), *style)
+                }
+            };
+            append(&mut statusline.parts.left, chip, base_style);
+            let title_style = styles.base.patch(theme.get("ui.text.focus"));
+            append(
+                &mut statusline.parts.left,
+                themed_span(format!(" {}", contribution.title), title_style),
+                base_style,
+            );
+            detail = contribution
+                .detail
+                .filter(|detail| !detail.is_empty())
+                .map(|detail| (detail, statusline_muted(&theme)));
+            for item in contribution.right {
+                append(
+                    &mut statusline.parts.right,
+                    themed_span(item.text, item.style),
+                    base_style,
+                );
+            }
+            statusline.append_editor_globals(base_style);
+        }
     }
-    let right_width = (right.width() as u16).min(viewport.width);
-    let right_x = viewport.right().saturating_sub(right_width);
+
+    layout_parts(statusline.parts, detail, viewport, surface, base_style);
+}
+
+/// Places the three groups on one row: right is anchored to the right edge, left is
+/// truncated so it never runs into the right group, and center is centered on the row
+/// when it fits between them (otherwise in the remaining gap, or dropped).
+fn layout_parts(
+    parts: RenderBuffer<'_>,
+    detail: Option<(String, ThemeStyle)>,
+    viewport: helix_view::graphics::Rect,
+    surface: &mut crate::render::CellSurface,
+    base_style: RatatuiStyle,
+) {
+    let RenderBuffer {
+        mut left,
+        center,
+        right,
+    } = parts;
+    let width = viewport.width;
+
+    let right_width = (right.width() as u16).min(width);
+    let right_x = viewport.right() - right_width;
     surface.set_line(right_x, viewport.y, &right, right_width);
 
-    let left_end = crate::widgets::chip_strip_left(
-        surface,
-        viewport.x,
-        right_x,
-        viewport.y,
-        std::slice::from_ref(&state_chip),
-    );
-    if left_end < right_x {
-        let identity_x = left_end.saturating_add(1);
-        surface.set_stringn(
-            identity_x,
-            viewport.y,
-            &model.panel.identity,
-            right_x.saturating_sub(identity_x) as usize,
-            identity_style,
-        );
+    let gap = if right_width > 0 { GROUP_GAP } else { 0 };
+    let left_budget = width.saturating_sub(right_width).saturating_sub(gap);
+    if let Some((detail, style)) = detail {
+        let used = left.width() as u16 + 1;
+        let available = left_budget.saturating_sub(used) as usize;
+        if available > 0 {
+            let detail = crate::ui::text_layout::truncate(
+                &detail,
+                available,
+                crate::ui::text_layout::TruncateAt::Start,
+            );
+            append(
+                &mut left,
+                themed_span(format!(" {detail}"), style),
+                base_style,
+            );
+        }
     }
+    let left = truncate_line_end(left, left_budget);
+    let left_width = left.width() as u16;
+    surface.set_line(viewport.x, viewport.y, &left, left_width);
+
+    let center_width = center.width() as u16;
+    if center_width == 0 {
+        return;
+    }
+    let free_start = viewport.x + left_width + if left_width > 0 { GROUP_GAP } else { 0 };
+    let free_end = right_x.saturating_sub(gap);
+    if free_end <= free_start {
+        return;
+    }
+    let centered_x = viewport.x + width.saturating_sub(center_width) / 2;
+    let (x, max_width) = if centered_x >= free_start && centered_x + center_width <= free_end {
+        (centered_x, center_width)
+    } else {
+        let room = free_end - free_start;
+        let shown = center_width.min(room);
+        (free_start + (room - shown) / 2, shown)
+    };
+    let center = truncate_line_end(center, max_width);
+    surface.set_line(x, viewport.y, &center, max_width);
+}
+
+/// Truncates a styled line to `max_width` cells, ending it with `…` when cut.
+fn truncate_line_end(line: Line<'_>, max_width: u16) -> Line<'_> {
+    let max_width = max_width as usize;
+    if line.width() <= max_width {
+        return line;
+    }
+    let mut out = Line::default();
+    if max_width == 0 {
+        return out;
+    }
+    let mut budget = max_width - 1;
+    let mut last_style = RatatuiStyle::default();
+    for span in line.spans {
+        last_style = span.style;
+        if budget == 0 {
+            break;
+        }
+        let text = crate::ui::text_layout::visible_graphemes(&span.content, budget)
+            .into_iter()
+            .map(|grapheme| grapheme.text)
+            .collect::<String>();
+        let shown = helix_core::unicode::width::UnicodeWidthStr::width(text.as_str());
+        let complete = shown == span.width();
+        budget -= shown;
+        out.spans.push(Span::styled(text, span.style));
+        if !complete {
+            break;
+        }
+    }
+    out.spans.push(Span::styled("…", last_style));
+    out
 }
 
 fn rat_style(style: ThemeStyle) -> RatatuiStyle {
@@ -500,12 +528,16 @@ fn render_mode<'a, F>(statusline: &mut Statusline<'a>, write: F)
 where
     F: Fn(&mut Statusline<'a>, Span<'a>) + Copy,
 {
-    let modenames = &statusline.model.config.mode;
-    let mode = statusline.model.snapshot.modal.mode;
-    let mode_str = helix_view::statusline_mode::mode_name(mode, modenames);
+    let span = mode_span(&statusline.model, statusline.model.snapshot.modal.mode);
+    write(statusline, span);
+}
+
+/// The mode chip, shared by the editor and by surfaces that report their own mode.
+fn mode_span(model: &StatuslineModel, mode: Mode) -> Span<'static> {
+    let mode_str = helix_view::statusline_mode::mode_name(mode, &model.config.mode);
     let content = format!(" {mode_str} ");
-    let style = if statusline.model.color_modes {
-        let styles = StatuslineStyles::from_theme(&statusline.model.theme);
+    let style = if model.color_modes {
+        let styles = StatuslineStyles::from_theme(&model.theme);
         match mode {
             Mode::Insert => styles.insert,
             Mode::Select => styles.select,
@@ -514,7 +546,7 @@ where
     } else {
         ThemeStyle::default()
     };
-    write(statusline, themed_span(content, style));
+    themed_span(content, style)
 }
 
 fn lsp_progress_status_text(spinner_frame: &str, progress: u8) -> String {
@@ -1033,6 +1065,46 @@ fn get_current_function_name(doc: &Document, cursor_char: usize) -> Option<Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn line(spans: &[&str]) -> Line<'static> {
+        Line::from(
+            spans
+                .iter()
+                .map(|text| Span::raw(text.to_string()))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    fn row(surface: &crate::render::CellSurface) -> String {
+        surface.content.iter().map(|cell| cell.symbol()).collect()
+    }
+
+    #[test]
+    fn truncate_line_end_marks_the_cut() {
+        assert_eq!(truncate_line_end(line(&["ab", "cd"]), 4).width(), 4);
+        let cut = truncate_line_end(line(&["ab", "cdef"]), 4);
+        let text: String = cut.spans.iter().map(|span| span.content.as_ref()).collect();
+        assert_eq!(text, "abc…");
+    }
+
+    #[test]
+    fn layout_keeps_left_clear_of_right_and_elides_detail_start() {
+        let area = helix_view::graphics::Rect::new(0, 0, 24, 1);
+        let mut surface = crate::render::CellSurface::empty(tui::ratatui::to_ratatui_rect(area));
+        let parts = RenderBuffer {
+            left: line(&[" NOR ", " Files"]),
+            center: Line::default(),
+            right: line(&[" 3 "]),
+        };
+        layout_parts(
+            parts,
+            Some(("/a/long/path/file.rs".to_string(), ThemeStyle::default())),
+            area,
+            &mut surface,
+            RatatuiStyle::default(),
+        );
+        assert_eq!(row(&surface), " NOR  Files …file.rs  3 ");
+    }
 
     #[test]
     fn lsp_progress_status_keeps_spinner_with_percentage() {

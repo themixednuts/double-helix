@@ -220,10 +220,10 @@ impl FileExplorerPanel {
         )
     }
 
-    pub(super) fn global_statusline(
+    pub(super) fn statusline_contribution(
         &self,
         cx: &RenderContext,
-    ) -> crate::ui::statusline::PanelStatusline {
+    ) -> crate::ui::statusline::StatuslineContribution {
         use helix_core::diagnostic::Severity;
 
         let icons = ICONS.load();
@@ -283,12 +283,17 @@ impl FileExplorerPanel {
                 .unwrap_or_else(|| theme.get("ui.statusline")),
         });
 
-        crate::ui::statusline::PanelStatusline {
-            state: crate::ui::statusline::PanelStatuslineState::Mode(self.input.mode),
-            identity: format!(
-                "Files - {}",
-                selected_path_for_log(&self.rows, self.selection)
-            ),
+        crate::ui::statusline::StatuslineContribution {
+            state: crate::ui::statusline::StatuslineState::Mode(self.input.mode),
+            title: "Files".to_owned(),
+            detail: self.rows.get(self.selection).map(|row| {
+                let path = super::display_path(&row.path);
+                let cwd = helix_stdx::env::current_working_dir();
+                std::path::Path::new(&path)
+                    .strip_prefix(&cwd)
+                    .map(|relative| relative.display().to_string())
+                    .unwrap_or(path)
+            }),
             right,
         }
     }

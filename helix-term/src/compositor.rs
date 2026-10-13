@@ -514,17 +514,27 @@ fn focus_statusline_source_kind(
 fn focus_statusline_source(
     focus: helix_view::model::FocusTarget,
     editor: Option<crate::ui::statusline::StatuslineModel>,
-    panel: Option<crate::ui::statusline::PanelStatusline>,
-    previous: Option<crate::ui::statusline::GlobalStatusline>,
-) -> Option<crate::ui::statusline::GlobalStatusline> {
-    match focus_statusline_source_kind(focus, editor.is_some(), panel.is_some(), previous.is_some())
-    {
+    contribution: Option<crate::ui::statusline::StatuslineContribution>,
+    previous: Option<crate::ui::statusline::StatuslineFrame>,
+) -> Option<crate::ui::statusline::StatuslineFrame> {
+    match focus_statusline_source_kind(
+        focus,
+        editor.is_some(),
+        contribution.is_some(),
+        previous.is_some(),
+    ) {
         Some(FocusStatuslineSourceKind::Editor) => {
-            editor.map(crate::ui::statusline::GlobalStatusline::Editor)
+            editor.map(|editor| crate::ui::statusline::StatuslineFrame {
+                editor,
+                surface: None,
+            })
         }
-        Some(FocusStatuslineSourceKind::Panel) => panel.zip(editor).map(|(panel, editor)| {
-            crate::ui::statusline::GlobalStatusline::Panel { panel, editor }
-        }),
+        Some(FocusStatuslineSourceKind::Panel) => {
+            editor.map(|editor| crate::ui::statusline::StatuslineFrame {
+                editor,
+                surface: contribution,
+            })
+        }
         Some(FocusStatuslineSourceKind::Previous) => previous,
         None => None,
     }
@@ -725,12 +735,12 @@ pub trait Component: Any + Send {
     /// Capture owned frame data and defer all cell painting to the render actor.
     fn prepare_render(&mut self, area: Rect, ctx: &RenderContext) -> PreparedRender;
 
-    /// Provide the component's content for the compositor-owned global
-    /// statusline when this component is the focused surface.
-    fn global_status(
+    /// Describe what the compositor-owned, full-width statusline should show while this
+    /// component is the focused surface. Components never draw the statusline themselves.
+    fn statusline_contribution(
         &self,
         _ctx: &RenderContext,
-    ) -> Option<crate::ui::statusline::PanelStatusline> {
+    ) -> Option<crate::ui::statusline::StatuslineContribution> {
         None
     }
 
@@ -838,7 +848,7 @@ pub struct Compositor {
     /// Cached from the most recent render pass so mouse events can do hit-testing.
     last_layout: Option<PanelLayout>,
     /// Most recent editor/panel statusline retained while a layer or float has focus.
-    last_statusline: Option<crate::ui::statusline::GlobalStatusline>,
+    last_statusline: Option<crate::ui::statusline::StatuslineFrame>,
     render_cache: CacheStore,
 }
 
@@ -1191,23 +1201,22 @@ impl Compositor {
     fn global_statusline_for_frame(
         &mut self,
         ctx: &RenderContext,
-    ) -> Option<crate::ui::statusline::GlobalStatusline> {
+    ) -> Option<crate::ui::statusline::StatuslineFrame> {
         let focus = ctx.focus_target();
         let mut editor = None;
-        let mut panel = None;
+        let mut contribution = None;
         for layer in &self.layers {
             if let Some(statusline) = layer.editor_statusline(ctx) {
                 editor = Some(statusline);
             }
-            if let Some(statusline) = layer.global_status(ctx) {
-                if matches!(focus, helix_view::model::FocusTarget::Panel(id) if layer.panel_id() == Some(id))
-                {
-                    panel = Some(statusline);
-                }
+            if matches!(focus, helix_view::model::FocusTarget::Panel(id) if layer.panel_id() == Some(id))
+            {
+                contribution = layer.statusline_contribution(ctx);
             }
         }
 
-        let source = focus_statusline_source(focus, editor, panel, self.last_statusline.clone());
+        let source =
+            focus_statusline_source(focus, editor, contribution, self.last_statusline.clone());
         if source.is_some() {
             self.last_statusline = source.clone();
         }
@@ -1325,7 +1334,7 @@ impl Compositor {
             .find_map(|layer| layer.pending_keys(&render_ctx));
         let prepared_global_statusline = if layout.statusline_row.height > 0 {
             global_statusline.map(|source| {
-                crate::ui::statusline::Statusline::prepare_global(
+                crate::ui::statusline::Statusline::prepare(
                     source,
                     layout.statusline_row,
                     render_ctx.focus_target(),

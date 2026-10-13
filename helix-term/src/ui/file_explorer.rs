@@ -3265,8 +3265,11 @@ impl Scrollable for FileExplorerPanel {
 }
 
 impl Component for FileExplorerPanel {
-    fn global_status(&self, cx: &RenderContext) -> Option<crate::ui::statusline::PanelStatusline> {
-        Some(self.global_statusline(cx))
+    fn statusline_contribution(
+        &self,
+        cx: &RenderContext,
+    ) -> Option<crate::ui::statusline::StatuslineContribution> {
+        Some(self.statusline_contribution(cx))
     }
 
     fn sync(&mut self, _viewport: Rect, editor: &mut Editor) {
@@ -6213,16 +6216,14 @@ mod tests {
                 crate::runtime::RuntimeIngress::channel(rt.runtime().clone());
             let render_ctx =
                 crate::compositor::RenderContext::new(&editor, ingress, editor.redraw_handle());
-            let status = panel.global_statusline(&render_ctx);
+            let status = panel.statusline_contribution(&render_ctx);
 
             assert!(matches!(
                 status.state,
-                crate::ui::statusline::PanelStatuslineState::Mode(Mode::Normal)
+                crate::ui::statusline::StatuslineState::Mode(Mode::Normal)
             ));
-            assert_eq!(
-                status.identity,
-                format!("Files - {}", panel.selected_path_for_log())
-            );
+            assert_eq!(status.title, "Files");
+            assert!(status.detail.is_some());
             let expected_count = format!(" {} · {} ", panel.selection + 1, panel.rows.len());
             assert_eq!(
                 status.right.last().map(|item| item.text.as_str()),

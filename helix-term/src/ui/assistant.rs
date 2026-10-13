@@ -3639,7 +3639,10 @@ impl Scrollable for AssistantPanel {
 // ---------------------------------------------------------------------------
 
 impl Component for AssistantPanel {
-    fn global_status(&self, cx: &RenderContext) -> Option<crate::ui::statusline::PanelStatusline> {
+    fn statusline_contribution(
+        &self,
+        cx: &RenderContext,
+    ) -> Option<crate::ui::statusline::StatuslineContribution> {
         let model = self.render_model.as_ref();
         let layer = self.active_layer_for_model(model);
         let badge = if self.editing.is_some() {
@@ -3660,11 +3663,6 @@ impl Component for AssistantPanel {
             .filter(|label| !label.is_empty())
             .unwrap_or_else(|| "Assistant".to_owned());
         let status = self.status_bar_parts(model).join("  ");
-        let identity = if status.is_empty() {
-            identity
-        } else {
-            format!("{identity}  {status}")
-        };
         let position = if layer == AssistantLayer::Messages {
             let total = self.output.content().len();
             (total > 0).then(|| {
@@ -3693,15 +3691,16 @@ impl Component for AssistantPanel {
                     .unwrap_or_else(|| cx.assistant_theme().get("ui.statusline")),
             });
         }
-        Some(crate::ui::statusline::PanelStatusline {
-            state: crate::ui::statusline::PanelStatuslineState::Label {
+        Some(crate::ui::statusline::StatuslineContribution {
+            state: crate::ui::statusline::StatuslineState::Label {
                 label: badge.to_owned(),
                 style: cx
                     .assistant_theme()
                     .get("ui.text.focus")
                     .add_modifier(Modifier::BOLD),
             },
-            identity,
+            title: identity,
+            detail: (!status.is_empty()).then_some(status),
             right,
         })
     }
@@ -4088,14 +4087,16 @@ mod tests {
             let (ingress, _receiver) =
                 crate::runtime::RuntimeIngress::channel(editor.runtime().clone());
             let render_ctx = RenderContext::new(&editor, ingress, editor.redraw_handle());
-            let status = panel.global_status(&render_ctx).expect("assistant status");
+            let status = panel
+                .statusline_contribution(&render_ctx)
+                .expect("assistant status");
 
             assert!(matches!(
                 status.state,
-                crate::ui::statusline::PanelStatuslineState::Label { ref label, .. }
+                crate::ui::statusline::StatuslineState::Label { ref label, .. }
                     if label == "INPUT"
             ));
-            assert!(status.identity.starts_with("Assistant"));
+            assert!(status.title.starts_with("Assistant"));
             assert!(status.right.is_empty());
         });
     }

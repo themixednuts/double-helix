@@ -680,7 +680,7 @@ impl FileExplorerPanel {
                 self.seek_to(restore_selection.min(self.rows.len().saturating_sub(1)));
             }
         }
-        self.label_selection = LabelSelection::default();
+        self.set_label_selection(LabelSelection::default());
         self.input.mode = Mode::Normal;
         self.label_edit_region.clear(editor);
     }
@@ -698,7 +698,7 @@ impl FileExplorerPanel {
             return;
         };
         self.input.mode = Mode::Normal;
-        self.label_selection = LabelSelection::default();
+        self.set_label_selection(LabelSelection::default());
         // Clear the EditRegion now that we've snapshotted the buffer into
         // `edit.buffer` — the next rename starts from a clean slate
         // (empty doc, no leftover undo history from this edit).

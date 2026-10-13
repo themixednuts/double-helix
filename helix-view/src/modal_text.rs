@@ -129,7 +129,9 @@ impl ModalTextSelection {
             return 0;
         }
         let rope = Rope::from(text);
-        self.to_range().cursor(rope.slice(..))
+        // The selection may have been made on different text (e.g. a longer label in
+        // another row); clamp so the cursor lookup never indexes past the end.
+        self.clamp(text).to_range().cursor(rope.slice(..))
     }
 
     pub fn span(self, text: &str) -> Option<std::ops::Range<usize>> {

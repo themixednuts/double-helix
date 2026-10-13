@@ -480,7 +480,7 @@ impl FileExplorerPanel {
 
         let selection_start = Instant::now();
         if self.rows.is_empty() {
-            self.label_selection = LabelSelection::default();
+            self.set_label_selection(LabelSelection::default());
             self.seek_to(0); // empty list: nav resets selection + scroll
         } else {
             let followed_selection = followed_file
@@ -495,7 +495,6 @@ impl FileExplorerPanel {
                 .unwrap_or(self.selection)
                 .min(self.rows.len() - 1);
             self.seek_to(target);
-            self.clamp_label_selection();
         }
         let selection_us = selection_start.elapsed().as_micros();
         log::info!(
@@ -623,7 +622,7 @@ impl FileExplorerPanel {
         }
         self.apply_search_filter(editor);
         if self.rows.is_empty() {
-            self.label_selection = LabelSelection::default();
+            self.set_label_selection(LabelSelection::default());
             self.seek_to(0);
         } else {
             let followed_selection = prepared
@@ -665,7 +664,6 @@ impl FileExplorerPanel {
                 self.center_selection();
             }
             self.ensure_selection_horizontally_visible();
-            self.clamp_label_selection();
             self.collapse_label_selection_to_cursor();
         }
         log::info!(
@@ -822,7 +820,7 @@ impl FileExplorerPanel {
     #[cfg(test)]
     fn select_path_or_index(&mut self, path: &std::path::Path, fallback: usize) {
         if self.rows.is_empty() {
-            self.label_selection = LabelSelection::default();
+            self.set_label_selection(LabelSelection::default());
             self.seek_to(0);
             return;
         }
@@ -832,7 +830,6 @@ impl FileExplorerPanel {
             .unwrap_or(fallback)
             .min(self.rows.len() - 1);
         self.seek_to(target);
-        self.clamp_label_selection();
         self.collapse_label_selection_to_cursor();
     }
 

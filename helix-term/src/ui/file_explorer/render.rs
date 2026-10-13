@@ -346,7 +346,7 @@ impl FileExplorerPanel {
             focused: self.focused,
             show_icons: self.config.icons,
             icon_column: self.icon_column,
-            label_selection: self.label_selection,
+            label_selection: self.label_selection(),
             label_edit: self.label_edit.as_ref().map(|edit| RenderLabelEdit {
                 row_index: edit.row_index,
                 buffer: edit.buffer.clone(),

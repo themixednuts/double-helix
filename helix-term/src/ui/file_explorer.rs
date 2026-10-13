@@ -148,6 +148,16 @@ const VCS_DELETED_ICON: &str = "";
 const VCS_RENAMED_ICON: &str = "";
 const VCS_CONFLICT_ICON: &str = "";
 const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(500);
+/// A label selection together with the row it was made on; see
+/// [`FileExplorerPanel::label_selection`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct RowLabelSelection {
+    row: Option<ExplorerPath>,
+    selection: LabelSelection,
+    /// Cursor column when the selection was stored, carried over to other rows.
+    column: usize,
+}
+
 pub struct FileExplorerPanel {
     source: ExplorerSource,
     root: ExplorerPath,
@@ -184,7 +194,9 @@ pub struct FileExplorerPanel {
     /// editor's line-wise selection, and the reason any cursor motion
     /// collapses it back to a single row.
     row_selection_anchor: Option<usize>,
-    label_selection: LabelSelection,
+    /// Label selection, bound to the row it was made on. Read and written only via
+    /// [`Self::label_selection`] / [`Self::set_label_selection`].
+    label_state: RowLabelSelection,
     /// Cached scroll offset. Read-only mirror of `self.nav.scroll()`;
     /// same rules as `selection`.
     scroll: usize,
@@ -496,7 +508,7 @@ impl FileExplorerPanel {
             file_clipboard: None,
             selection: 0,
             row_selection_anchor: None,
-            label_selection: LabelSelection::default(),
+            label_state: RowLabelSelection::default(),
             scroll: 0,
             scroll_x: 0,
             tree_content_width: 0,
@@ -706,7 +718,7 @@ impl FileExplorerPanel {
     /// label gesture by them, so it must not drop the row operand.
     fn place_cursor_at_label_end(&mut self) {
         let Some(row) = self.selected() else {
-            self.label_selection = LabelSelection::default();
+            self.set_label_selection(LabelSelection::default());
             return;
         };
         let len = row.label.chars().count();
@@ -715,7 +727,7 @@ impl FileExplorerPanel {
         } else {
             len.saturating_sub(1)
         };
-        self.label_selection = LabelSelection::point(cursor);
+        self.set_label_selection(LabelSelection::point(cursor));
     }
 
     fn scroll_x_by(&mut self, delta: i16) {
@@ -949,7 +961,7 @@ impl FileExplorerPanel {
     fn restore_selection_after_row_update(&mut self, selected_path: Option<ExplorerPath>) {
         let before = self.selection;
         if self.rows.is_empty() {
-            self.label_selection = LabelSelection::default();
+            self.set_label_selection(LabelSelection::default());
             self.seek_to(0);
             log::info!(
                 "[file_explorer] selection_restore rows=0 selection_before={} selection_after={} selected_before={} selected_after={}",
@@ -969,7 +981,6 @@ impl FileExplorerPanel {
             .and_then(|path| self.rows.iter().position(|row| row.path == *path))
             .unwrap_or_else(|| self.selection.min(self.rows.len() - 1));
         self.seek_to(target);
-        self.clamp_label_selection();
         self.collapse_label_selection_to_cursor();
         log::info!(
             "[file_explorer] selection_restore rows={} selection_before={} selection_after={} selected_before={} selected_after={}",
@@ -1228,7 +1239,7 @@ impl FileExplorerPanel {
         }
         self.search_pending = true;
         self.rows = Arc::from([]);
-        self.label_selection = LabelSelection::default();
+        self.set_label_selection(LabelSelection::default());
         self.seek_to(0);
 
         cx.submit_ui(UiCommand::FileExplorer(FileExplorerCommand::StartSearch {
@@ -1353,7 +1364,7 @@ impl FileExplorerPanel {
             return edit.cursor;
         }
         self.selected_label()
-            .map_or(0, |label| self.label_selection.cursor(label))
+            .map_or(0, |label| self.label_selection().cursor(label))
     }
 
     /// The text that should be displayed for `row` at `row_index` — usually
@@ -1368,17 +1379,40 @@ impl FileExplorerPanel {
         row.label.as_str()
     }
 
-    fn clamp_label_selection(&mut self) {
-        let Some(label) = self.selected_label().map(str::to_owned) else {
-            self.label_selection = LabelSelection::default();
-            return;
+    /// The label selection as it applies to the *currently selected* row.
+    ///
+    /// A selection only means something on the row (and text) it was made on, and the
+    /// selected row changes through many paths (motions, clicks, jump labels, search,
+    /// refreshes, renames). Rather than every path remembering to fix it up, the stored
+    /// selection is bound to its row: on that row it is clamped to the current label; on
+    /// any other row it collapses to a cursor at the same column, clamped to the label.
+    fn label_selection(&self) -> LabelSelection {
+        let Some(label) = self.selected_label() else {
+            return LabelSelection::default();
         };
-        self.label_selection = self.label_selection.clamp(&label);
+        let on_same_row = self.label_state.row.as_ref() == self.selected().map(|row| &row.path);
+        if on_same_row {
+            self.label_state.selection.clamp(label)
+        } else {
+            LabelSelection::point(self.label_state.column).clamp(label)
+        }
+    }
+
+    /// Stores `selection` for the currently selected row (see [`Self::label_selection`]).
+    fn set_label_selection(&mut self, selection: LabelSelection) {
+        let column = self
+            .selected_label()
+            .map_or(0, |label| selection.cursor(label));
+        self.label_state = RowLabelSelection {
+            row: self.selected().map(|row| row.path.clone()),
+            selection,
+            column,
+        };
     }
 
     fn collapse_label_selection_to_cursor(&mut self) {
         let cursor = self.label_cursor();
-        self.label_selection = LabelSelection::point(cursor);
+        self.set_label_selection(LabelSelection::point(cursor));
     }
 
     fn move_selection_by(&mut self, delta: isize) {
@@ -1390,7 +1424,6 @@ impl FileExplorerPanel {
             .move_by(delta, helix_view::list_nav::WrapBehavior::Clamp);
         self.sync_nav_to_cache();
         self.ensure_selection_horizontally_visible();
-        self.clamp_label_selection();
         self.collapse_label_selection_to_cursor();
     }
 
@@ -1405,7 +1438,6 @@ impl FileExplorerPanel {
         );
         self.sync_nav_to_cache();
         self.ensure_selection_horizontally_visible();
-        self.clamp_label_selection();
         self.collapse_label_selection_to_cursor();
     }
 
@@ -1414,7 +1446,6 @@ impl FileExplorerPanel {
         self.nav.to_first();
         self.sync_nav_to_cache();
         self.ensure_selection_horizontally_visible();
-        self.clamp_label_selection();
         self.collapse_label_selection_to_cursor();
     }
 
@@ -1423,13 +1454,11 @@ impl FileExplorerPanel {
         self.nav.to_last();
         self.sync_nav_to_cache();
         self.ensure_selection_horizontally_visible();
-        self.clamp_label_selection();
         self.collapse_label_selection_to_cursor();
     }
 
     fn select_diagnostic_at(&mut self, index: usize) {
         self.seek_to(index);
-        self.clamp_label_selection();
         self.collapse_label_selection_to_cursor();
     }
 
@@ -1492,9 +1521,11 @@ impl FileExplorerPanel {
         let Some(label) = self.selected_label().map(str::to_owned) else {
             return;
         };
-        let before = self.label_selection;
-        let after = self.label_selection.apply_motion(&label, motion, movement);
-        self.label_selection = after;
+        let before = self.label_selection();
+        let after = self
+            .label_selection()
+            .apply_motion(&label, motion, movement);
+        self.set_label_selection(after);
 
         // Row-wrap behavior: when a word motion would have moved the
         // cursor but didn't (we were already at the boundary), spill
@@ -1539,9 +1570,15 @@ impl FileExplorerPanel {
         }
         self.seek_to(next_index);
 
-        // Land the label cursor at the row-entry edge. Cross-row label
-        // selection is not represented, so wrapping resets to the new label.
-        self.label_selection = LabelSelection::point(0);
+        // Land at the row-entry edge: the start when moving forward, the end when
+        // moving backward, so `b` continues through the previous label's words.
+        let entry = if direction < 0 {
+            self.selected_label()
+                .map_or(0, |label| label.chars().count().saturating_sub(1))
+        } else {
+            0
+        };
+        self.set_label_selection(LabelSelection::point(entry));
     }
 
     fn select_label_text_object(&mut self, object: LabelTextObject) {
@@ -1553,28 +1590,29 @@ impl FileExplorerPanel {
             return;
         };
         let count = self.input.count.map(NonZeroUsize::get).unwrap_or(1);
-        self.label_selection = self
-            .label_selection
-            .select_text_object(&label, object, count);
+        self.set_label_selection(
+            self.label_selection()
+                .select_text_object(&label, object, count),
+        );
     }
 
     fn select_whole_label(&mut self) {
         let Some(label) = self.selected_label().map(str::to_owned) else {
             return;
         };
-        self.label_selection = LabelSelection::all(&label);
+        self.set_label_selection(LabelSelection::all(&label));
     }
 
     fn flip_label_selection(&mut self) {
         let Some(label) = self.selected_label().map(str::to_owned) else {
             return;
         };
-        self.label_selection = self.label_selection.flip().clamp(&label);
+        self.set_label_selection(self.label_selection().flip().clamp(&label));
     }
 
     fn selected_label_edit_range(&self) -> Option<LabelEditRange> {
         let label = self.selected_label()?;
-        LabelEditRange::from_selection(self.label_selection, label)
+        LabelEditRange::from_selection(self.label_selection(), label)
     }
 
     fn toggle_selected_dir_state(&mut self) -> bool {
@@ -1701,7 +1739,6 @@ impl FileExplorerPanel {
             .rposition(|candidate| candidate.depth + 1 == row.depth)
         {
             self.seek_to(parent_index);
-            self.clamp_label_selection();
             self.collapse_label_selection_to_cursor();
         }
     }
@@ -1731,7 +1768,6 @@ impl FileExplorerPanel {
             .rposition(|candidate| candidate.depth + 1 == row.depth)
         {
             self.seek_to(parent_index);
-            self.clamp_label_selection();
             self.collapse_label_selection_to_cursor();
         }
     }
@@ -3158,7 +3194,6 @@ impl FileExplorerPanel {
             let path = self.rows[index].path.clone();
             let double_click = self.is_double_click(&path, now);
             self.seek_to(index);
-            self.clamp_label_selection();
             self.collapse_label_selection_to_cursor();
 
             if double_click {
@@ -3732,6 +3767,44 @@ mod tests {
 
             assert_eq!(editor.model.focus, FocusTarget::Editor);
             assert!(!panel.focused);
+        });
+    }
+
+    #[test]
+    fn word_motions_wrap_onto_shorter_labels_without_panicking() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("a-very-long-file-name.rs"), "").unwrap();
+        fs::write(temp.path().join("b.rs"), "").unwrap();
+        let rt = helix_runtime::test::RuntimeTest::default();
+        rt.block_on(async {
+            let mut editor = test_editor(100, 30, rt.runtime());
+            let mut panel = FileExplorerPanel::new(temp.path().to_path_buf(), &editor).unwrap();
+            let long = row_index_by_name(&panel, "a-very-long-file-name.rs");
+            let short = row_index_by_name(&panel, "b.rs");
+            assert_eq!(short, long + 1);
+
+            // `w` through every word of the long label, then onto the next row.
+            panel.selection = long;
+            panel.set_label_selection(LabelSelection::point(0));
+            for _ in 0..12 {
+                press_key(&mut panel, &mut editor, &rt, key!('w'));
+                if panel.selection == short {
+                    break;
+                }
+            }
+            assert_eq!(panel.selection, short);
+            assert_eq!(panel.label_cursor(), 0);
+
+            // `b` from the start of a row lands on the end of the previous label.
+            press_key(&mut panel, &mut editor, &rt, key!('b'));
+            assert_eq!(panel.selection, long);
+            assert!(panel.label_cursor() > 0);
+
+            // A stale selection from a long label must not break a shorter row.
+            panel.set_label_selection(LabelSelection::point(20));
+            press_key(&mut panel, &mut editor, &rt, key!('j'));
+            assert_eq!(panel.selection, short);
+            assert!(panel.label_cursor() <= "b.rs".len());
         });
     }
 
@@ -4747,7 +4820,7 @@ mod tests {
             assert_eq!(display_name(&panel.rows[panel.selection].path), "docs");
 
             panel.selection = row_index_by_name(&panel, "alpha-beta.rs");
-            panel.label_selection = LabelSelection::point(0);
+            panel.set_label_selection(LabelSelection::point(0));
             let label = "alpha-beta.rs";
 
             let mut expected = LabelSelection::point(0).apply_motion(
@@ -4757,24 +4830,24 @@ mod tests {
             );
             press_key(&mut panel, &mut editor, &rt, key!('w'));
             assert_eq!(panel.label_cursor(), expected.cursor(label));
-            assert_eq!(panel.label_selection, expected);
+            assert_eq!(panel.label_selection(), expected);
 
             expected =
                 expected.apply_motion(label, LabelMotion::NextWordEnd(1), CoreMovement::Move);
             press_key(&mut panel, &mut editor, &rt, key!('e'));
             assert_eq!(panel.label_cursor(), expected.cursor(label));
-            assert_eq!(panel.label_selection, expected);
+            assert_eq!(panel.label_selection(), expected);
 
             expected =
                 expected.apply_motion(label, LabelMotion::PrevWordStart(1), CoreMovement::Move);
             press_key(&mut panel, &mut editor, &rt, key!('b'));
             assert_eq!(panel.label_cursor(), expected.cursor(label));
-            assert_eq!(panel.label_selection, expected);
+            assert_eq!(panel.label_selection(), expected);
 
             press_key(&mut panel, &mut editor, &rt, key!('m'));
             press_key(&mut panel, &mut editor, &rt, key!('i'));
             press_key(&mut panel, &mut editor, &rt, key!('w'));
-            assert_eq!(panel.label_selection.span(label), Some(0..5));
+            assert_eq!(panel.label_selection().span(label), Some(0..5));
 
             press_key(&mut panel, &mut editor, &rt, key!('"'));
             press_key(&mut panel, &mut editor, &rt, key!('a'));
@@ -7303,24 +7376,24 @@ mod tests {
             );
             panel.move_label_selection(LabelMotion::NextWordStart(1), CoreMovement::Move);
             assert_eq!(panel.label_cursor(), expected.cursor(label));
-            assert_eq!(panel.label_selection, expected);
+            assert_eq!(panel.label_selection(), expected);
 
             expected =
                 expected.apply_motion(label, LabelMotion::NextWordEnd(1), CoreMovement::Move);
             panel.move_label_selection(LabelMotion::NextWordEnd(1), CoreMovement::Move);
             assert_eq!(panel.label_cursor(), expected.cursor(label));
-            assert_eq!(panel.label_selection, expected);
+            assert_eq!(panel.label_selection(), expected);
 
             expected =
                 expected.apply_motion(label, LabelMotion::PrevWordStart(1), CoreMovement::Move);
             panel.move_label_selection(LabelMotion::PrevWordStart(1), CoreMovement::Move);
             assert_eq!(panel.label_cursor(), expected.cursor(label));
-            assert_eq!(panel.label_selection, expected);
+            assert_eq!(panel.label_selection(), expected);
 
             expected = expected.apply_motion(label, LabelMotion::LineEnd, CoreMovement::Move);
             panel.move_label_selection(LabelMotion::LineEnd, CoreMovement::Move);
             assert_eq!(panel.label_cursor(), "alpha-beta.rs".chars().count() - 1);
-            assert_eq!(panel.label_selection, expected);
+            assert_eq!(panel.label_selection(), expected);
         });
     }
 
@@ -7341,7 +7414,7 @@ mod tests {
             let initial_row = panel.selection;
             // Move cursor to the last position on alpha.rs's label so
             // the next `w` has nowhere to go within this row.
-            panel.label_selection = LabelSelection::point("alpha.rs".chars().count());
+            panel.set_label_selection(LabelSelection::point("alpha.rs".chars().count()));
             // Drive `w` motion straight through the explorer's action
             // dispatch path (matches what the modal engine routes).
             panel.move_label_selection(LabelMotion::NextWordStart(1), CoreMovement::Move);
@@ -7370,7 +7443,7 @@ mod tests {
             let mut panel = FileExplorerPanel::new(temp.path().to_path_buf(), &editor).unwrap();
             panel.selection = row_index_by_name(&panel, "beta.rs");
             let initial_row = panel.selection;
-            panel.label_selection = LabelSelection::point(0);
+            panel.set_label_selection(LabelSelection::point(0));
             panel.move_label_selection(LabelMotion::PrevWordStart(1), CoreMovement::Move);
 
             assert!(
@@ -7396,7 +7469,7 @@ mod tests {
             let mut panel = FileExplorerPanel::new(temp.path().to_path_buf(), &editor).unwrap();
             panel.selection = row_index_by_name(&panel, "alpha-beta.rs");
             let initial_row = panel.selection;
-            panel.label_selection = LabelSelection::point(0);
+            panel.set_label_selection(LabelSelection::point(0));
 
             panel.move_label_selection(
                 LabelMotion::NextWordStart(1),
@@ -7430,7 +7503,7 @@ mod tests {
                 .selected_label()
                 .map(|l| l.chars().count())
                 .unwrap_or(0);
-            panel.label_selection = LabelSelection::point(label_len);
+            panel.set_label_selection(LabelSelection::point(label_len));
 
             panel.move_label_selection(LabelMotion::NextWordStart(1), CoreMovement::Move);
 
@@ -7449,7 +7522,7 @@ mod tests {
             let editor = test_editor(100, 30, rt.runtime());
             let mut panel = FileExplorerPanel::new(temp.path().to_path_buf(), &editor).unwrap();
             panel.selection = 0;
-            panel.label_selection = LabelSelection::point(0);
+            panel.set_label_selection(LabelSelection::point(0));
 
             panel.move_label_selection(LabelMotion::PrevWordStart(1), CoreMovement::Move);
 
@@ -7808,7 +7881,7 @@ mod tests {
             file_clipboard: None,
             selection: 0,
             row_selection_anchor: None,
-            label_selection: LabelSelection::default(),
+            label_state: RowLabelSelection::default(),
             scroll: 0,
             scroll_x: 0,
             tree_content_width: 0,
@@ -7881,7 +7954,7 @@ mod tests {
             file_clipboard: None,
             selection: 0,
             row_selection_anchor: None,
-            label_selection: LabelSelection::default(),
+            label_state: RowLabelSelection::default(),
             scroll: 0,
             scroll_x: 0,
             tree_content_width: 0,
@@ -7964,7 +8037,7 @@ mod tests {
             file_clipboard: None,
             selection: 0,
             row_selection_anchor: None,
-            label_selection: LabelSelection::default(),
+            label_state: RowLabelSelection::default(),
             scroll: 0,
             scroll_x: 0,
             tree_content_width: 0,
@@ -8029,7 +8102,7 @@ mod tests {
             file_clipboard: None,
             selection: 0,
             row_selection_anchor: None,
-            label_selection: LabelSelection::default(),
+            label_state: RowLabelSelection::default(),
             scroll: 0,
             scroll_x: 0,
             tree_content_width: 0,
@@ -8274,7 +8347,7 @@ mod tests {
             assert_eq!(edit.buffer, "alpha.rs");
             assert!(matches!(edit.kind, LabelEditKind::Rename { .. }));
             assert_eq!(panel.input.mode, Mode::Insert);
-            assert_eq!(panel.label_selection.cursor(&edit.buffer), 0);
+            assert_eq!(panel.label_selection().cursor(&edit.buffer), 0);
         });
     }
 
@@ -8322,7 +8395,7 @@ mod tests {
             panel.selection = row_index_by_name(&panel, "alpha.rs");
             // Pre-move the row cursor (tree-mode cursor on the label) so
             // the entry has somewhere meaningful to flatten from.
-            panel.label_selection = LabelSelection::point(3);
+            panel.set_label_selection(LabelSelection::point(3));
 
             press_key(&mut panel, &mut editor, &rt, key!('I'));
 
@@ -8342,7 +8415,7 @@ mod tests {
             let mut editor = test_editor(100, 30, rt.runtime());
             let mut panel = FileExplorerPanel::new(temp.path().to_path_buf(), &editor).unwrap();
             panel.selection = row_index_by_name(&panel, "alpha.rs");
-            panel.label_selection = LabelSelection::point(2);
+            panel.set_label_selection(LabelSelection::point(2));
 
             press_key(&mut panel, &mut editor, &rt, key!('A'));
 
@@ -8366,7 +8439,7 @@ mod tests {
             let mut panel = FileExplorerPanel::new(temp.path().to_path_buf(), &editor).unwrap();
             panel.selection = row_index_by_name(&panel, "alpha.rs");
             let len = "alpha.rs".chars().count();
-            panel.label_selection = LabelSelection::point(len);
+            panel.set_label_selection(LabelSelection::point(len));
 
             press_key(&mut panel, &mut editor, &rt, key!('a'));
 
@@ -8695,7 +8768,7 @@ mod tests {
                 .unwrap()
                 .buffer
                 .push_str("beta.rs");
-            panel.label_selection = LabelSelection::point("beta.rs".chars().count());
+            panel.set_label_selection(LabelSelection::point("beta.rs".chars().count()));
 
             with_context(&mut editor, &rt, |cx| panel.commit_label_edit(cx));
 
